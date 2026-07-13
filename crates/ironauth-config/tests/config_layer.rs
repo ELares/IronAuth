@@ -6,7 +6,7 @@
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use ironauth_config::{Config, Feature, FeatureRegistry, Maturity, Warning};
+use ironauth_config::{Config, Feature, FeatureRegistry, Warning};
 
 /// A unique scratch path per call without entropy or clock reads (both are
 /// banned outside ironauth-env): process id plus a process-wide counter.
@@ -142,14 +142,12 @@ fn ack_gate_lifecycle_unset_then_acked_then_stale() {
     //    the feature moved to 0.2.0-exp.1 refuses to boot, calls the ack
     //    stale, and points at the changelog.
     let mut bumped = FeatureRegistry::new();
-    bumped.register(Feature {
-        name: "sample-experimental",
-        maturity: Maturity::Experimental {
-            version: "0.2.0-exp.1",
-            changelog: "crates/ironauth-config/CHANGELOG.md",
-        },
-        doc: "simulated breaking bump of the sample flag",
-    });
+    bumped.register(Feature::experimental(
+        "sample-experimental",
+        "simulated breaking bump of the sample flag",
+        "0.2.0-exp.1",
+        "crates/ironauth-config/CHANGELOG.md",
+    ));
     let err = bumped.validate(&acked).expect_err("stale ack");
     let msg = err.to_string();
     assert!(

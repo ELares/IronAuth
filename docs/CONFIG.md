@@ -22,7 +22,7 @@ at the top of the file, or map it in `.taplo.toml`).
 | `dev_mode` | boolean | `false` | Development mode. Relaxes operational nagging (currently: the literal-secret warning) but never relaxes parse strictness or the feature acknowledgment gate. Never set this in production. |
 | `features` | table | empty | Feature toggles keyed by registered feature name. Enabling an experimental feature additionally requires `ack` equal to the feature's exact current version; see the feature reference in the generated docs/CONFIG.md. |
 | `features.<name>.ack` | string or unset | unset | Exact-version acknowledgment, required to enable an experimental feature. Ignored for preview and supported features. |
-| `features.<name>.enabled` | boolean | `false` | Whether the feature is enabled. |
+| `features.<name>.enabled` | boolean or unset | unset | Whether the feature is enabled. When omitted, the feature's own default applies (on only for a Supported feature declared on by default), so naming a feature just to attach an `ack` does not silently turn a default-on feature off. Set `enabled = false` to force it off. |
 | `proxy` | table | see fields | Trusted-proxy policy. Controls whether forwarding headers are honored; the safe default trusts nothing. |
 | `proxy.trust_forwarded` | boolean | `false` | Whether to honor forwarding headers at all. False (the default) ignores every forwarding header regardless of `trusted_hops`. Both this and a non-zero `trusted_hops` are required before any header is consulted. |
 | `proxy.trusted_hops` | integer | `0` | Exact number of trusted reverse-proxy hops in front of the server. Zero (the default) means the server is exposed directly and no forwarding header is ever honored. Forwarding is honored only when the request presents exactly this many forwarding entries; any other count fails closed to the transport peer. |
@@ -41,8 +41,10 @@ Entries under `[features]` must name a feature registered in this build.
 Experimental features boot only with `ack` equal to the exact version below;
 a breaking change bumps the version and invalidates old acks (review the
 changelog, then re-ack). Preview features need only `enabled = true`.
-Supported features ignore `ack`.
+Supported features ignore `ack`. A feature whose `Default on` is `yes` is
+enabled even when absent from `[features]`, and can be turned off with
+`enabled = false` (only Supported features may default on).
 
-| Feature | Maturity | Version | Changelog | Description |
-|---------|----------|---------|-----------|-------------|
-| `sample-experimental` | experimental | 0.1.0-exp.1 | crates/ironauth-config/CHANGELOG.md | Sample experimental flag exercising the acknowledgment gate; gates no behavior. |
+| Feature | Maturity | Default on | Version | Changelog | Description |
+|---------|----------|------------|---------|-----------|-------------|
+| `sample-experimental` | experimental | no | 0.1.0-exp.1 | crates/ironauth-config/CHANGELOG.md | Sample experimental flag exercising the acknowledgment gate; gates no behavior. |

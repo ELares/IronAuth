@@ -13,7 +13,7 @@ fn main() {
     let features: Vec<serde_json::Value> = FeatureRegistry::builtin()
         .iter()
         .map(|feature| {
-            let (maturity, version, changelog) = match feature.maturity {
+            let (maturity, version, changelog) = match feature.maturity() {
                 Maturity::Experimental { version, changelog } => {
                     ("experimental", Some(version), Some(changelog))
                 }
@@ -21,11 +21,12 @@ fn main() {
                 Maturity::Supported => ("supported", None, None),
             };
             serde_json::json!({
-                "name": feature.name,
+                "name": feature.name(),
                 "maturity": maturity,
                 "version": version,
                 "changelog": changelog,
-                "doc": feature.doc,
+                "doc": feature.doc(),
+                "default_enabled": feature.default_enabled(),
             })
         })
         .collect();
