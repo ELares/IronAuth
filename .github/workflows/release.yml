@@ -65,7 +65,7 @@ jobs:
           cp docs/config-schema.json dist/config-schema.json
           cd dist && sha256sum * > SHA256SUMS
       - name: Attest build provenance
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest-build-provenance@v4
         with:
           subject-path: dist/ironauth-x86_64-linux-musl
       - name: Extract changelog section
@@ -131,7 +131,7 @@ jobs:
       - name: Sign image (keyless)
         run: cosign sign --yes "${{ steps.push.outputs.image }}@${{ steps.push.outputs.digest }}"
       - name: Attest image provenance
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest-build-provenance@v4
         with:
           subject-name: ${{ steps.push.outputs.image }}
           subject-digest: ${{ steps.push.outputs.digest }}
