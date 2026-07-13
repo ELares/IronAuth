@@ -31,8 +31,10 @@ organizations, SCIM, and agent-native OAuth.
 
 Three covenants, stated once and never moved: no paywalled security features,
 no mandatory first-party infrastructure, no unexportable data. The full
-covenant text, threat model, and a "will not implement, and why" page land in
-milestone M1 and will be linked here.
+covenant text, including the supporting commitments and the falsifiable
+commercial line, is in [COVENANTS.md](COVENANTS.md). The threat model and the
+"will not implement, and why" page land with the M1 security-program issue
+and will be linked here.
 
 ## Repository layout
 
@@ -59,5 +61,7 @@ enforced in CI.
 
 ## License
 
-Dual-licensed under MIT or Apache-2.0, at your option, matching the sibling
-Iron projects (license files land with the M1 governance issue).
+Dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at
+your option (see [LICENSE](LICENSE)), matching the sibling Iron projects.
+The licensing commitments, including no mid-flight relicensing, are part of
+[COVENANTS.md](COVENANTS.md).

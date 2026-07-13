@@ -118,3 +118,10 @@ jobs:
         run: |
           scripts/compat-matrix.sh
           git diff --exit-code docs/COMPATIBILITY.md
+      - name: governance files present
+        # The license and covenant files are trust infrastructure; this lint
+        # ensures they cannot be silently removed or renamed.
+        run: |
+          for f in LICENSE LICENSE-APACHE LICENSE-MIT COVENANTS.md; do
+            test -s "$f" || { echo "missing required root file: $f"; exit 1; }
+          done
