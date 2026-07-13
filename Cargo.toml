@@ -3,16 +3,18 @@
 # IronAuth Cargo virtual workspace. The crate graph mirrors the design seams laid
 # down in milestone M1: ironauth-env is the determinism seam (all wall-clock time,
 # monotonic time, and entropy access flows through it, enforced by
-# scripts/invariant-lints.sh), and ironauth is the single-binary entry point.
-# Later M1 issues add ironauth-config (#4), the server skeleton (#5), the
-# persistence substrate (#6, #7), the JOSE and signing cores (#8, #9), the
-# SSRF-hardened fetcher (#10), and the management API skeleton (#11), each as its
-# own crate behind a documented seam.
+# scripts/invariant-lints.sh), ironauth-config is the strict configuration layer
+# (fail-fast parsing, secret indirection, the feature maturity ladder), and
+# ironauth is the single-binary entry point. Later M1 issues add the server
+# skeleton (#5), the persistence substrate (#6, #7), the JOSE and signing cores
+# (#8, #9), the SSRF-hardened fetcher (#10), and the management API skeleton
+# (#11), each as its own crate behind a documented seam.
 
 [workspace]
 resolver = "2"
 members = [
     "crates/ironauth-env",
+    "crates/ironauth-config",
     "crates/ironauth",
 ]
 
@@ -24,7 +26,12 @@ repository = "https://github.com/ELares/IronAuth"
 
 [workspace.dependencies]
 ironauth-env = { path = "crates/ironauth-env", version = "0.1.0" }
+ironauth-config = { path = "crates/ironauth-config", version = "0.1.0" }
 getrandom = "0.3"
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.9"
+schemars = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 
 [workspace.lints.rust]
 unsafe_code = "deny"

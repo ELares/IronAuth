@@ -118,6 +118,10 @@ jobs:
         run: |
           scripts/compat-matrix.sh
           git diff --exit-code docs/COMPATIBILITY.md
+      - name: config schema freshness
+        run: |
+          scripts/config-schema.sh
+          git diff --exit-code docs/config-schema.json docs/CONFIG.md
       - name: governance files present
         # The license and covenant files are trust infrastructure; this lint
         # ensures they cannot be silently removed or renamed.
