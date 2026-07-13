@@ -251,6 +251,10 @@ pub struct ClientRecord {
     pub id: ClientId,
     /// The human-facing display name.
     pub display_name: String,
+    /// Whether the client registered `require_auth_time`: when true, every ID
+    /// token issued to it carries `auth_time` even without a `max_age` request
+    /// (issue #14).
+    pub require_auth_time: bool,
 }
 
 /// The client-authentication metadata for a client, read within scope (issue
@@ -322,7 +326,7 @@ impl ClientRepo<'_> {
         }
         let mut tx = begin_scoped(self.store, self.scope).await?;
         let row = sqlx::query(
-            "SELECT id, display_name FROM clients \
+            "SELECT id, display_name, require_auth_time FROM clients \
              WHERE id = $1 AND tenant_id = $2 AND environment_id = $3",
         )
         .bind(id.to_string())
@@ -343,7 +347,7 @@ impl ClientRepo<'_> {
     pub async fn list(&self) -> Result<Vec<ClientRecord>, StoreError> {
         let mut tx = begin_scoped(self.store, self.scope).await?;
         let rows = sqlx::query(
-            "SELECT id, display_name FROM clients \
+            "SELECT id, display_name, require_auth_time FROM clients \
              WHERE tenant_id = $1 AND environment_id = $2 ORDER BY created_at, id",
         )
         .bind(self.scope.tenant().to_string())
@@ -397,6 +401,7 @@ impl ClientRepo<'_> {
         Ok(ClientRecord {
             id,
             display_name: row.get("display_name"),
+            require_auth_time: row.get("require_auth_time"),
         })
     }
 }
@@ -521,6 +526,50 @@ impl ActingClientRepo<'_> {
             false,
         )
         .await
+    }
+
+    /// Create a PUBLIC client that registered `require_auth_time` (issue #14):
+    /// every ID token issued to it carries `auth_time` even without a `max_age`
+    /// request. Writes a `client.create` audit row in the same transaction,
+    /// returning the fresh identifier.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn create_requiring_auth_time(
+        &self,
+        env: &Env,
+        display_name: &str,
+    ) -> Result<ClientId, StoreError> {
+        let id = ClientId::generate(env, &self.scope);
+        let scope = self.scope;
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::ClientCreate,
+                target: &id,
+            },
+            async move |tx| {
+                sqlx::query(
+                    "INSERT INTO clients \
+                     (id, tenant_id, environment_id, display_name, require_auth_time) \
+                     VALUES ($1, $2, $3, $4, true)",
+                )
+                .bind(id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(display_name)
+                .execute(&mut **tx)
+                .await?;
+                Ok(())
+            },
+            false,
+        )
+        .await?;
+        Ok(id)
     }
 
     /// Shared body of the client-create path. `poison_after_audit` is always
@@ -662,6 +711,14 @@ pub struct IssueCode<'a> {
     pub subject: &'a str,
     /// The requested OAuth `scope` value, if any.
     pub oauth_scope: Option<&'a str>,
+    /// The recorded authentication method tokens frozen onto the code
+    /// (space-separated RFC 8176 values). The ID token's `amr` and achieved
+    /// `acr` derive from these (issue #14).
+    pub auth_methods: &'a str,
+    /// The recorded authentication instant in epoch microseconds, set ONLY when
+    /// the ID token must carry `auth_time` (`max_age` requested or the client
+    /// registered `require_auth_time`); [`None`] omits the claim (issue #14).
+    pub auth_time_micros: Option<i64>,
     /// The authenticating session handle (a seam for later M2 issues).
     pub session_ref: Option<&'a str>,
     /// The recorded consent handle (a seam for later M2 issues).
@@ -710,6 +767,15 @@ pub struct CodeBindings {
     pub subject: String,
     /// The requested OAuth `scope` value, if any.
     pub oauth_scope: Option<String>,
+    /// The recorded authentication method tokens frozen onto the code at
+    /// issuance (space-separated RFC 8176 values). The ID token's `amr` and
+    /// achieved `acr` derive from these (issue #14).
+    pub auth_methods: String,
+    /// The recorded authentication instant, in microseconds since the Unix
+    /// epoch, present ONLY when the ID token must carry `auth_time` (the request
+    /// asked for `max_age`, or the client registered `require_auth_time`). A
+    /// [`None`] means the `auth_time` claim is omitted (issue #14).
+    pub auth_time_unix_micros: Option<i64>,
 }
 
 impl fmt::Debug for CodeBindings {
@@ -792,7 +858,8 @@ impl AuthorizationRepo<'_> {
         let mut tx = begin_scoped(self.store, self.scope).await?;
         let row = sqlx::query(
             "SELECT grant_id, client_id, redirect_uri, nonce, code_challenge, \
-             code_challenge_method, subject, oauth_scope \
+             code_challenge_method, subject, oauth_scope, auth_methods, \
+             (EXTRACT(EPOCH FROM auth_time) * 1000000)::bigint AS auth_time_us \
              FROM authorization_codes \
              WHERE id = $1 AND tenant_id = $2 AND environment_id = $3",
         )
@@ -905,11 +972,14 @@ impl ActingAuthorizationRepo<'_> {
                 sqlx::query(
                     "INSERT INTO authorization_codes \
                      (id, tenant_id, environment_id, grant_id, client_id, redirect_uri, nonce, \
-                      code_challenge, code_challenge_method, subject, oauth_scope, expires_at, \
-                      created_at) \
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, \
-                             TIMESTAMPTZ 'epoch' + ($12::text || ' microseconds')::interval, \
-                             TIMESTAMPTZ 'epoch' + ($13::text || ' microseconds')::interval)",
+                      code_challenge, code_challenge_method, subject, oauth_scope, auth_methods, \
+                      auth_time, expires_at, created_at) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, \
+                             CASE WHEN $13::bigint IS NULL THEN NULL \
+                                  ELSE TIMESTAMPTZ 'epoch' \
+                                       + ($13::text || ' microseconds')::interval END, \
+                             TIMESTAMPTZ 'epoch' + ($14::text || ' microseconds')::interval, \
+                             TIMESTAMPTZ 'epoch' + ($15::text || ' microseconds')::interval)",
                 )
                 .bind(code.code_id.to_string())
                 .bind(scope.tenant().to_string())
@@ -922,6 +992,8 @@ impl ActingAuthorizationRepo<'_> {
                 .bind(code.code_challenge_method)
                 .bind(code.subject)
                 .bind(code.oauth_scope)
+                .bind(code.auth_methods)
+                .bind(code.auth_time_micros)
                 .bind(code.expires_at_micros)
                 .bind(code.created_at_micros)
                 .execute(&mut **tx)
@@ -1508,6 +1580,8 @@ fn bindings_from_row(row: &PgRow, scope: &Scope) -> Result<CodeBindings, StoreEr
         code_challenge_method: row.get("code_challenge_method"),
         subject: row.get("subject"),
         oauth_scope: row.get("oauth_scope"),
+        auth_methods: row.get("auth_methods"),
+        auth_time_unix_micros: row.get("auth_time_us"),
     })
 }
 
@@ -1661,8 +1735,13 @@ pub struct SessionRecord {
     /// The authenticated end-user subject the tokens are minted for.
     pub subject: String,
     /// When the subject authenticated, in microseconds since the Unix epoch (the
-    /// seam `auth_time`/`max_age` build on).
+    /// recorded authentication event's time; the ID token's `auth_time` derives
+    /// from it).
     pub auth_time_unix_micros: i64,
+    /// The recorded authentication method tokens (space-separated RFC 8176
+    /// values, `pwd` for the bootstrap password login). The single source the ID
+    /// token's `amr` and achieved `acr` are derived from (issue #14).
+    pub auth_methods: String,
 }
 
 /// The read-only bootstrap session repository (issue #20).
@@ -1690,7 +1769,7 @@ impl SessionRepo<'_> {
         }
         let mut tx = begin_scoped(self.store, self.scope).await?;
         let row = sqlx::query(
-            "SELECT subject, \
+            "SELECT subject, auth_methods, \
              (EXTRACT(EPOCH FROM auth_time) * 1000000)::bigint AS auth_us \
              FROM sessions \
              WHERE id = $1 AND tenant_id = $2 AND environment_id = $3 \
@@ -1706,6 +1785,7 @@ impl SessionRepo<'_> {
         Ok(row.map(|row| SessionRecord {
             subject: row.get("subject"),
             auth_time_unix_micros: row.get("auth_us"),
+            auth_methods: row.get("auth_methods"),
         }))
     }
 }
@@ -1718,9 +1798,12 @@ pub struct ActingSessionRepo<'a> {
 }
 
 impl ActingSessionRepo<'_> {
-    /// Create a session for `subject`, with `auth_time` and `expires_at` from the
-    /// application clock seam (bound as epoch microseconds). Writes a
-    /// `session.create` audit row in the same transaction.
+    /// Create a session for `subject`, recording the authentication event: the
+    /// `auth_methods` (space-separated RFC 8176 method tokens, `pwd` for the
+    /// bootstrap password login) and the `auth_time`, both alongside the session
+    /// `expires_at`. Times come from the application clock seam (bound as epoch
+    /// microseconds). Writes a `session.create` audit row in the same
+    /// transaction.
     ///
     /// # Errors
     ///
@@ -1731,6 +1814,7 @@ impl ActingSessionRepo<'_> {
         env: &Env,
         id: &SessionId,
         subject: &str,
+        auth_methods: &str,
         auth_time_micros: i64,
         expires_at_micros: i64,
     ) -> Result<(), StoreError> {
@@ -1750,15 +1834,17 @@ impl ActingSessionRepo<'_> {
             async move |tx| {
                 sqlx::query(
                     "INSERT INTO sessions \
-                     (id, tenant_id, environment_id, subject, auth_time, expires_at) \
-                     VALUES ($1, $2, $3, $4, \
-                             TIMESTAMPTZ 'epoch' + ($5::text || ' microseconds')::interval, \
-                             TIMESTAMPTZ 'epoch' + ($6::text || ' microseconds')::interval)",
+                     (id, tenant_id, environment_id, subject, auth_methods, auth_time, \
+                      expires_at) \
+                     VALUES ($1, $2, $3, $4, $5, \
+                             TIMESTAMPTZ 'epoch' + ($6::text || ' microseconds')::interval, \
+                             TIMESTAMPTZ 'epoch' + ($7::text || ' microseconds')::interval)",
                 )
                 .bind(id.to_string())
                 .bind(scope.tenant().to_string())
                 .bind(scope.environment().to_string())
                 .bind(subject)
+                .bind(auth_methods)
                 .bind(auth_time_micros)
                 .bind(expires_at_micros)
                 .execute(&mut **tx)

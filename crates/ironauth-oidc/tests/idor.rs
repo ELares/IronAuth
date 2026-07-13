@@ -57,6 +57,8 @@ async fn oidc_probes_deny_cross_scope_redeem_and_token_status() {
                 code_challenge_method: None,
                 subject: "victim-subject",
                 oauth_scope: None,
+                auth_methods: "pwd",
+                auth_time_micros: None,
                 session_ref: None,
                 consent_ref: None,
                 expires_at_micros: FAR_FUTURE_MICROS,

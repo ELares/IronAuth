@@ -115,6 +115,15 @@ name = "flow"
 path = "tests/flow.rs"
 required-features = ["testing"]
 
+# The conditional ID-token claims end to end (issue #14): the REQUIRED claims,
+# exact nonce echo, honest acr/amr, auth_time emitted only when due and always
+# truthful (incl max_age=0 and require_auth_time), and no at_hash/c_hash/azp from
+# a token-endpoint ID token. Over a real database (DATABASE_URL).
+[[test]]
+name = "id_token"
+path = "tests/id_token.rs"
+required-features = ["testing"]
+
 # The single-use concurrency race: N concurrent exchanges of one code against one
 # shared Postgres, exactly one 200 and N-1 invalid_grant.
 [[test]]

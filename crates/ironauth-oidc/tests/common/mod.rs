@@ -309,17 +309,37 @@ impl Harness {
             .expect("grant consent");
     }
 
-    /// Create a session for `subject` and return the `Cookie` header value. The
-    /// session is far-future so it survives the clock advances in the expiry and
-    /// reuse tests.
+    /// Create a session for `subject` (a bootstrap `pwd` authentication event at
+    /// the epoch) and return the `Cookie` header value. The session is far-future
+    /// so it survives the clock advances in the expiry and reuse tests.
     pub async fn session_cookie(&self, subject: &str) -> String {
+        self.session_cookie_at(subject, "pwd", 0).await
+    }
+
+    /// Like [`Harness::session_cookie`] but with an explicit `auth_methods` and
+    /// recorded `auth_time` (epoch microseconds), so the ID-token claim tests can
+    /// pin the authentication event a token derives its `auth_time`/`amr`/`acr`
+    /// from.
+    pub async fn session_cookie_at(
+        &self,
+        subject: &str,
+        auth_methods: &str,
+        auth_time_micros: i64,
+    ) -> String {
         let session_id = SessionId::generate(&self.env, &self.scope);
         let (actor, corr) = self.seeding_actor();
         self.store()
             .scoped(self.scope)
             .acting(actor, corr)
             .sessions()
-            .create(&self.env, &session_id, subject, 0, FAR_FUTURE_MICROS)
+            .create(
+                &self.env,
+                &session_id,
+                subject,
+                auth_methods,
+                auth_time_micros,
+                FAR_FUTURE_MICROS,
+            )
             .await
             .expect("create session");
         format!("{SESSION_COOKIE}={session_id}")
@@ -329,10 +349,32 @@ impl Harness {
     /// user, records consent to the harness client, and returns the cookie. Each
     /// call is independent (a distinct user), so it can be used per code issuance.
     pub async fn authenticated_cookie(&self) -> String {
+        self.authenticated_cookie_for(&self.client_id.to_string())
+            .await
+    }
+
+    /// A ready authenticated `Cookie` value for an arbitrary `client_id`: seeds a
+    /// fresh user, records consent to that client, and returns the cookie. Used by
+    /// the ID-token claim tests that drive a purpose-built client (for example one
+    /// that registered `require_auth_time`).
+    pub async fn authenticated_cookie_for(&self, client_id: &str) -> String {
         let subject = self.seed_unique_user().await;
-        self.grant_consent(&subject, &self.client_id.to_string())
-            .await;
+        self.grant_consent(&subject, client_id).await;
         self.session_cookie(&subject).await
+    }
+
+    /// Create a PUBLIC client that registered `require_auth_time` (issue #14), so
+    /// its ID tokens carry `auth_time` even without a `max_age` request. Returns
+    /// its id.
+    pub async fn create_client_requiring_auth_time(&self) -> ClientId {
+        let (actor, corr) = self.seeding_actor();
+        self.store()
+            .scoped(self.scope)
+            .acting(actor, corr)
+            .clients()
+            .create_requiring_auth_time(&self.env, "require-auth-time client")
+            .await
+            .expect("create require_auth_time client")
     }
 
     /// Issue an `authorization_code` bound to `client_id` for a fresh consenting

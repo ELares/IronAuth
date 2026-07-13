@@ -15,11 +15,13 @@ use axum::response::Response;
 use ironauth_store::{ActorRef, CorrelationId, HumanId, StoreError};
 use serde::Deserialize;
 
+use crate::authn::AuthenticationEvent;
 use crate::interaction::{self, parse_resume};
 use crate::login::ResumeQuery;
 use crate::pages;
 use crate::password;
 use crate::state::OidcState;
+use crate::util::epoch_micros;
 
 /// The minimum bootstrap password length. The full password policy (breach
 /// screening, composition, and the rest) is M7; the bootstrap enforces only a
@@ -93,8 +95,17 @@ pub async fn register_post(
         Ok(user_id) => {
             let subject = user_id.to_string();
             let session_actor = interaction::user_actor(&user_id);
-            match interaction::establish_session(&state, resume.scope, &subject, session_actor)
-                .await
+            // Registration authenticates the new user with the password they just
+            // set: a `pwd` authentication event at the current clock instant.
+            let event = AuthenticationEvent::password(epoch_micros(state.now()));
+            match interaction::establish_session(
+                &state,
+                resume.scope,
+                &subject,
+                &event,
+                session_actor,
+            )
+            .await
             {
                 Ok(cookie) => interaction::redirect_setting_cookie(&resume.return_to, &cookie),
                 Err(_) => interaction::server_error_page(),
