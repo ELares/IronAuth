@@ -20,14 +20,21 @@
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 
-# The tenant-scoped tables (mandatory tenant_id + environment_id + row-level
-# security). Keep in sync with crates/ironauth-store/migrations and the design
-# doc docs/design/TENANCY.md. CHECKLIST: any migration that adds a new
-# tenant-scoped table MUST (a) set up ENABLE + FORCE row-level security, the
-# (tenant, environment) isolation policy, and the nonempty-scope CHECK in the
-# same migration, and (b) add the table name here. `audit_log` (the
-# same-transaction audit log, issue #7) is scoped exactly like `clients`.
-SCOPED_TABLES='clients|organizations|audit_log'
+# The tables whose SQL must live only in the repository module. Keep in sync
+# with crates/ironauth-store/migrations and the design doc docs/design/TENANCY.md.
+#
+# Most are TENANT-SCOPED (mandatory tenant_id + environment_id + forced row-level
+# security): clients, organizations, audit_log (#7), and management_credentials
+# (#11). CHECKLIST for a new tenant-scoped table: the migration MUST (a) ENABLE +
+# FORCE row-level security, add the (tenant, environment) isolation policy, and
+# add the nonempty-scope CHECK in the same migration, and (b) add the name here.
+#
+# idempotency_keys (#11) is the one exception: it is CREDENTIAL-scoped, not
+# tenant-row-level-security scoped, because an operator-plane POST is looked up
+# for a replay before any tenant exists (see 0003_management_api.sql). It is
+# still confined to the repository module and reachable only by ironauth_control,
+# so it is listed here to keep its SQL out of every other file.
+SCOPED_TABLES='clients|organizations|audit_log|management_credentials|idempotency_keys'
 
 # The one module allowed to name a scoped table in SQL.
 REPO_MODULE='crates/ironauth-store/src/repository.rs'

@@ -10,7 +10,7 @@
 
 use ironauth_env::Env;
 use ironauth_store::test_support::TestDatabase;
-use ironauth_store::{ClientId, CorrelationId};
+use ironauth_store::{ClientId, CorrelationId, ManagementKeyId};
 use sqlx::Row;
 
 // The test walks four distinct scenarios (deny-by-default, mis-scoped read,
@@ -244,6 +244,210 @@ async fn empty_scope_rows_are_rejected() {
     assert!(
         result.is_err(),
         "a row with an empty environment_id must be rejected"
+    );
+}
+
+/// The `management_credentials` mirror of the clients RLS test: as the
+/// low-privilege CONTROL role, a cross-scope raw SELECT and UPDATE are denied by
+/// the forced policy even with the app-layer filter subverted, and the write-side
+/// WITH CHECK rejects forging another scope's row. (issue #11)
+#[allow(clippy::too_many_lines)]
+#[tokio::test]
+async fn rls_blocks_cross_scope_management_credentials_for_the_control_role() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+
+    // Two scopes sharing one database.
+    let scope_a = db.seed_scope(&env).await;
+    let scope_b = db.seed_scope(&env).await;
+
+    // A management credential owned by scope B, inserted as the owner (a
+    // superuser, so it bypasses row-level security) to set up the fixture.
+    let key_b = ManagementKeyId::generate(&env, &scope_b).to_string();
+    sqlx::query(
+        "INSERT INTO management_credentials \
+         (id, tenant_id, environment_id, key_hash, display_name) \
+         VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(&key_b)
+    .bind(scope_b.tenant().to_string())
+    .bind(scope_b.environment().to_string())
+    .bind("hash-b")
+    .bind("scope B key")
+    .execute(db.owner_pool())
+    .await
+    .expect("seed credential in B");
+
+    let pool = db.control_pool();
+
+    // Precondition: we really are the low-privilege CONTROL role, not a superuser.
+    let who = sqlx::query(
+        "SELECT current_user AS u, \
+         (SELECT rolsuper FROM pg_roles WHERE rolname = current_user) AS is_super",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("identify session role");
+    assert_eq!(
+        who.get::<String, _>("u"),
+        "ironauth_control",
+        "test must run as the low-privilege control role"
+    );
+    assert!(
+        !who.get::<bool, _>("is_super"),
+        "the control role must not be a superuser"
+    );
+
+    // 1. Deny by default: no scope set on the session, zero rows.
+    let unset: i64 = sqlx::query("SELECT count(*) AS c FROM management_credentials")
+        .fetch_one(pool)
+        .await
+        .expect("count with unset scope")
+        .get("c");
+    assert_eq!(
+        unset, 0,
+        "an unset scope must see no management credentials"
+    );
+
+    // 2. Mis-scoped session with the app filter SUBVERTED: scoped to A, the query
+    //    explicitly targets B's rows. Row-level security still returns zero.
+    {
+        let mut tx = pool.begin().await.expect("begin as scope A");
+        bind_scope(
+            &mut tx,
+            &scope_a.tenant().to_string(),
+            &scope_a.environment().to_string(),
+        )
+        .await;
+        let attacker_filtered: i64 = sqlx::query(
+            "SELECT count(*) AS c FROM management_credentials \
+             WHERE tenant_id = $1 AND environment_id = $2",
+        )
+        .bind(scope_b.tenant().to_string())
+        .bind(scope_b.environment().to_string())
+        .fetch_one(&mut *tx)
+        .await
+        .expect("cross-scope count")
+        .get("c");
+        assert_eq!(
+            attacker_filtered, 0,
+            "RLS must hide scope B credentials from a scope A session even when the app filter is bypassed"
+        );
+        tx.commit().await.expect("commit A read");
+    }
+
+    // 3. Positive control: scoped to B, the same role sees exactly B's row.
+    {
+        let mut tx = pool.begin().await.expect("begin as scope B");
+        bind_scope(
+            &mut tx,
+            &scope_b.tenant().to_string(),
+            &scope_b.environment().to_string(),
+        )
+        .await;
+        let visible: i64 = sqlx::query("SELECT count(*) AS c FROM management_credentials")
+            .fetch_one(&mut *tx)
+            .await
+            .expect("count in B")
+            .get("c");
+        assert_eq!(visible, 1, "scope B sees its own credential");
+        tx.commit().await.expect("commit B read");
+    }
+
+    // 4. Write-side isolation. A scope A session cannot UPDATE scope B's row (the
+    //    USING clause hides it) nor INSERT one claiming scope B (the WITH CHECK
+    //    rejects it).
+    {
+        let mut tx = pool.begin().await.expect("begin as scope A for write");
+        bind_scope(
+            &mut tx,
+            &scope_a.tenant().to_string(),
+            &scope_a.environment().to_string(),
+        )
+        .await;
+        let updated = sqlx::query(
+            "UPDATE management_credentials SET display_name = 'hijacked' WHERE tenant_id = $1",
+        )
+        .bind(scope_b.tenant().to_string())
+        .execute(&mut *tx)
+        .await
+        .expect("update runs")
+        .rows_affected();
+        assert_eq!(
+            updated, 0,
+            "RLS must hide scope B rows from a scope A UPDATE"
+        );
+
+        let forged = ManagementKeyId::generate(&env, &scope_b).to_string();
+        let insert = sqlx::query(
+            "INSERT INTO management_credentials \
+             (id, tenant_id, environment_id, key_hash, display_name) \
+             VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind(forged)
+        .bind(scope_b.tenant().to_string())
+        .bind(scope_b.environment().to_string())
+        .bind("forged")
+        .bind("smuggled")
+        .execute(&mut *tx)
+        .await;
+        assert!(
+            insert.is_err(),
+            "RLS WITH CHECK must reject writing another scope's credential"
+        );
+        let _ = tx.rollback().await;
+    }
+}
+
+/// Deny-by-default on a warmed control connection: after a scoped transaction
+/// commits, the scope variables revert to the EMPTY STRING (not NULL), and the
+/// nonempty-scope CHECK forbids any credential from carrying an empty scope, so
+/// the connection still sees nothing. Mirrors the clients warmed-connection test.
+#[tokio::test]
+async fn management_credentials_deny_by_default_on_a_warmed_connection() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+
+    // A real credential exists, owned by a real scope.
+    sqlx::query(
+        "INSERT INTO management_credentials \
+         (id, tenant_id, environment_id, key_hash, display_name) \
+         VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(ManagementKeyId::generate(&env, &scope).to_string())
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .bind("hash")
+    .bind("a real key")
+    .execute(db.owner_pool())
+    .await
+    .expect("seed credential");
+
+    // Warm a control connection into the empty-string scope state (the observable
+    // post-commit revert of a scoped transaction's local variables).
+    let mut conn = db
+        .control_pool()
+        .acquire()
+        .await
+        .expect("acquire control connection");
+    sqlx::query("SELECT set_config('ironauth.tenant_id', '', false)")
+        .execute(&mut *conn)
+        .await
+        .expect("warm tenant variable");
+    sqlx::query("SELECT set_config('ironauth.environment_id', '', false)")
+        .execute(&mut *conn)
+        .await
+        .expect("warm environment variable");
+
+    let warmed: i64 = sqlx::query("SELECT count(*) AS c FROM management_credentials")
+        .fetch_one(&mut *conn)
+        .await
+        .expect("warmed count")
+        .get("c");
+    assert_eq!(
+        warmed, 0,
+        "a warmed (empty-scope) control connection must still see no credentials"
     );
 }
 

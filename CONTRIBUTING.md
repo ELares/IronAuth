@@ -10,7 +10,9 @@ to pick an open issue in the current milestone and say so on the issue.
   their issue get split.
 - **Green gate before review.** Run `scripts/gate.sh` locally; it runs the
   same fmt, clippy pedantic, test, invariant-lint, dash-scan, and
-  compatibility checks CI enforces.
+  compatibility checks CI enforces. Changes to the management API additionally
+  run `scripts/openapi-check.sh` (the served-versus-committed OpenAPI drift
+  check).
 - **Prose rule.** No em dashes and no en dashes anywhere in repo text
   (code, comments, docs, commit messages). CI enforces this.
 - **Determinism seam.** All time and randomness flows through
@@ -19,6 +21,30 @@ to pick an open issue in the current milestone and say so on the issue.
   reason on the same line.
 - **Changelogs.** User-visible changes update the owning artifact's
   `CHANGELOG.md` (Unreleased section) in the same PR.
+
+## The management-api-first rule (mandatory)
+
+Every admin capability is a documented public API before any UI exposes it. The
+management API (`crates/ironauth-admin`, served on the management plane) is the
+single source of truth for administration; the admin SPA (M9), the CLI, the TUI,
+Terraform, and the MCP server (M12/M13) are all THIN CLIENTS of it. This is what
+prevents console-only features and secret private endpoints, and it is the
+substrate the generated SDKs are diffed against.
+
+Concretely, a PR that adds an admin capability must:
+
+- add or extend the endpoint in `ironauth-admin` with an accurate
+  `#[utoipa::path]` annotation (a stable `operation_id`, typed request and
+  response schemas, and typed errors), so it lands in the OpenAPI spec;
+- inherit the cross-cutting discipline: cursor pagination on every list (opaque
+  cursors, a config-capped page size, never offset), Idempotency-Key on every
+  POST, RateLimit headers on every response, and a same-transaction audit row on
+  every mutation;
+- regenerate the committed spec with `scripts/openapi-check.sh` (CI fails the
+  build if the served API drifts from `docs/openapi/management.json`).
+
+A UI or client that needs a capability the API does not yet expose is a signal to
+add the API first, not to reach past it.
 
 ## The threat-model rule (mandatory)
 

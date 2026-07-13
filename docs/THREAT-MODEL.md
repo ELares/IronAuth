@@ -10,13 +10,14 @@ or the tracked issue that will land it.
 ## Surfaces shipped today
 
 As of milestone M1, the shipped surfaces are the repository and release
-infrastructure and the HTTP server skeleton (dual-plane listener, observability,
-log scrubbing, and the trusted-proxy policy). The skeleton is network-facing but
-carries no protocol endpoint yet: those arrive in M2. The remaining sections are
-forward-looking: they model the surfaces the later M1 and M2 issues are about to
-ship, so that every implementation PR lands into an existing threat frame rather
-than inventing one after the fact. Each mitigation cell cites the issue that owns
-it; a cell without a citation is shipped.
+infrastructure, the HTTP server skeleton (dual-plane listener, observability, log
+scrubbing, and the trusted-proxy policy), the persistence and tenant-isolation
+substrate, the outbound fetcher, and the OpenAPI-first management API skeleton.
+The protocol endpoints arrive in M2. The remaining sections are forward-looking:
+they model the surfaces the later M1 and M2 issues are about to ship, so that
+every implementation PR lands into an existing threat frame rather than inventing
+one after the fact. Each mitigation cell cites the issue that owns it; a cell
+without a citation is shipped.
 
 ## Attacker model
 
@@ -113,16 +114,24 @@ shipped; later features consume this dispatcher, they do not weaken it.
 | Denial of service | Hashing or signing resource exhaustion | Bounded pools with admission control (#62 for password hashing); rate limits per client and tenant (#50, M15) |
 | Elevation | Grant-type confusion, ambient trust on exchange | Pluggable grant seams with per-grant revalidation; the no-ambient-trust rule (#9 seams; M13 token exchange) |
 
-## Surface: management API (planned; lands with issue #11)
+## Surface: management API (shipped)
 
-| STRIDE | Threat | Control (owning issue) |
+The management API is the OpenAPI-first control plane on the management plane
+(never the public data plane). It parses untrusted resource identifiers and admin
+credentials and mutates the operator, tenant, and environment tables, so its
+attacker is a holder of a stolen or wrong-scoped admin credential and a caller
+probing for cross-tenant resources. See docs/adr/0005-management-api.md. Cells
+without a citation are shipped by the skeleton; later milestones extend, never
+weaken, them.
+
+| STRIDE | Threat | Control |
 |---|---|---|
-| Spoofing | Stolen or replayed admin credentials | Environment-scoped credentials; control-plane and data-plane keys separated (#11, #42) |
-| Tampering | Unaudited mutation | Audit events on every mutation, written in the same transaction (#7, #11) |
-| Repudiation | Untraceable admin actions | Admin-action audit stream separated from authn events (M11) |
-| Information disclosure | Cross-tenant reads (IDOR) | Deny-by-default repository scoping, typed scoped IDs, forced row-level security, and the dedicated IDOR harness (all shipped; see the persistence and tenant isolation substrate above); the management API registers each of its endpoints with that harness |
-| Denial of service | Pagination and query abuse | Cursor pagination everywhere; structured rate limits with headers (#11) |
-| Elevation | Overbroad admin roles | Scoped admin roles and delegated administration (M10); every admin capability is a documented public API, so there are no hidden privileged paths (#11) |
+| Spoofing | Stolen or replayed admin credentials; a credential used against the wrong environment or plane | Environment-scoped management keys (`mak_`, bound to `(tenant, environment)`) with only the token hash stored; a distinct control-plane database role (`ironauth_control`) separated from the data-plane role at the pool; a credential presented against the wrong environment or plane fails LOUD naming expected and actual scope; the full operator-plane credential class lands in M5 (#42) |
+| Tampering | Unaudited mutation | Every management mutation writes its same-transaction audit row through the store's single audited-write primitive; a mutation without its audit row is structurally impossible |
+| Repudiation | Untraceable admin actions | Same-transaction audit rows name the acting credential; the admin-action versus authn-event stream separation lands in M11 |
+| Information disclosure | Cross-tenant reads (IDOR); an existence or error-shape oracle | Deny-by-default repository scoping, typed scoped IDs, and forced row-level security (shipped in the persistence substrate above); a cross-scope resource-ID probe is the UNIFORM not-found, registered with the #6 IDOR harness and run in CI |
+| Denial of service | Pagination and query abuse | Cursor pagination on every list (opaque cursors, a config-capped page size, no offset); structured RateLimit and legacy X-RateLimit-* headers on every response, wired to a placeholder limiter until the real layered limiter lands (#50, M15) |
+| Elevation | Overbroad admin roles; hidden privileged paths | The control role holds only the level tables plus append-only audit and the management tables, nothing on the data-plane scoped tables; every admin capability is a documented public API (the management-api-first rule), so there are no console-only or secret private paths; scoped admin roles and delegated administration land in M10 |
 
 ## Surface: hosted pages (planned; bootstrap with issue #20, full in M9)
 

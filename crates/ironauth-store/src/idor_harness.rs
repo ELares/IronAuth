@@ -120,6 +120,22 @@ impl IdorHarness {
         self
     }
 
+    /// Register the management-plane probes (issue #11): the scoped-resource
+    /// resolve-by-id operations of the management API. Today that is the
+    /// environment-scoped management-credential repository:
+    /// `management_credentials.get` and `management_credentials.delete`.
+    ///
+    /// Run these with a store whose pool authenticates as `ironauth_control`
+    /// (the data-plane role has no grant on `management_credentials`); a
+    /// control-plane store is what [`crate::test_support::TestDatabase::control_store`]
+    /// hands back. As every management resource endpoint lands, its probe is
+    /// registered here so the harness covers it in CI.
+    pub fn register_management_probes(&mut self) -> &mut Self {
+        self.register(Box::new(ManagementCredentialGetProbe));
+        self.register(Box::new(ManagementCredentialDeleteProbe));
+        self
+    }
+
     /// The names of the registered probes, in registration order.
     #[must_use]
     pub fn probe_names(&self) -> Vec<&'static str> {
@@ -209,6 +225,70 @@ impl IsolationProbe for ClientDeleteProbe {
                 Ok(()) => ProbeOutcome::Leaked,
                 // Not found affects zero rows (the foreign resource is
                 // untouched); a database fault is likewise not a leak.
+                Err(_) => ProbeOutcome::Denied,
+            }
+        })
+    }
+}
+
+/// Built-in probe for `ManagementCredentialRepo::get` (issue #11). `store` must
+/// authenticate as `ironauth_control`.
+struct ManagementCredentialGetProbe;
+
+impl IsolationProbe for ManagementCredentialGetProbe {
+    fn name(&self) -> &'static str {
+        "management_credentials.get"
+    }
+
+    fn probe<'a>(
+        &'a self,
+        store: &'a Store,
+        caller: Scope,
+        foreign_id: &'a str,
+    ) -> BoxProbeFuture<'a> {
+        Box::pin(async move {
+            let credentials = store.management().credentials(caller);
+            // Parse the untrusted id under the caller's OWN scope; a management
+            // key minted in another scope fails here as a uniform not-found.
+            let Ok(id) = credentials.parse_id(foreign_id) else {
+                return ProbeOutcome::Denied;
+            };
+            match credentials.get(&id).await {
+                Ok(_) => ProbeOutcome::Leaked,
+                Err(_) => ProbeOutcome::Denied,
+            }
+        })
+    }
+}
+
+/// Built-in probe for `ActingManagementCredentialRepo::delete` (issue #11).
+/// `store` must authenticate as `ironauth_control`.
+struct ManagementCredentialDeleteProbe;
+
+impl IsolationProbe for ManagementCredentialDeleteProbe {
+    fn name(&self) -> &'static str {
+        "management_credentials.delete"
+    }
+
+    fn probe<'a>(
+        &'a self,
+        store: &'a Store,
+        caller: Scope,
+        foreign_id: &'a str,
+    ) -> BoxProbeFuture<'a> {
+        Box::pin(async move {
+            let env = Env::system();
+            let Ok(id) = store.management().credentials(caller).parse_id(foreign_id) else {
+                return ProbeOutcome::Denied;
+            };
+            let actor = ActorRef::service(ServiceId::generate(&env));
+            let correlation = CorrelationId::generate(&env);
+            let credentials = store
+                .management()
+                .acting(actor, correlation)
+                .credentials(caller);
+            match credentials.delete(&env, &id).await {
+                Ok(()) => ProbeOutcome::Leaked,
                 Err(_) => ProbeOutcome::Denied,
             }
         })

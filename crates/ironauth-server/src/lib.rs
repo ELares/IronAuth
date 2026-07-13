@@ -81,6 +81,7 @@ pub struct Server {
     readiness: Arc<ReadinessProbe>,
     metrics: PrometheusHandle,
     env: Env,
+    management_extension: Option<Router>,
 }
 
 impl Server {
@@ -107,7 +108,22 @@ impl Server {
             readiness,
             metrics: handle,
             env,
+            management_extension: None,
         })
+    }
+
+    /// Mount an additional router on the MANAGEMENT plane.
+    ///
+    /// The management API (`ironauth-admin`, issue #11) is built as a
+    /// self-contained `Router` and mounted here, so the server crate stays
+    /// decoupled from it (it accepts any router, not a specific type). The routes
+    /// are merged into the management plane only, never the public data plane,
+    /// and inherit the plane's observability and panic-catching layers. The
+    /// caller is responsible for the router's own state, auth, and middleware.
+    #[must_use]
+    pub fn mount_management(mut self, router: Router) -> Self {
+        self.management_extension = Some(router);
+        self
     }
 
     /// The config-derived base URL (issuer root); always config-sourced.
@@ -143,19 +159,27 @@ impl Server {
             .with_state(self.state())
     }
 
-    /// The MANAGEMENT-plane router. Serves liveness, readiness, and metrics
-    /// only; bind it to a private interface.
+    /// The MANAGEMENT-plane router. Serves liveness, readiness, and metrics, plus
+    /// any router mounted via [`Server::mount_management`] (the management API);
+    /// bind it to a private interface.
     pub fn management_app(&self) -> Router {
-        Router::new()
+        let mut router = Router::new()
             .route("/healthz", get(routes::healthz))
             .route("/readyz", get(routes::readyz))
             .route("/metrics", get(routes::metrics))
+            .with_state(self.state());
+        // Merge the mounted management API (already carrying its own state), if
+        // any, onto the management plane. Merging keeps the health/metrics routes
+        // and adds the API routes; both then share the observe and panic layers.
+        if let Some(extension) = &self.management_extension {
+            router = router.merge(extension.clone());
+        }
+        router
             .layer(CatchPanicLayer::custom(on_panic))
             .layer(axum::middleware::from_fn_with_state(
                 self.state(),
                 observe::observe,
             ))
-            .with_state(self.state())
     }
 
     /// Serve both planes until `shutdown` resolves, then drain in-flight

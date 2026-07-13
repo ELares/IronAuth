@@ -12,6 +12,13 @@ repository.workspace = true
 ironauth-env.workspace = true
 ironauth-config.workspace = true
 ironauth-server.workspace = true
+# The management API (issue #11) is mounted on the management plane when a
+# bootstrap operator token is configured; the store provides the control-plane
+# connection. Both are rustls/ring only (no openssl/native-tls), so the musl
+# static lane holds.
+ironauth-store.workspace = true
+ironauth-admin.workspace = true
+axum = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread"] }
 tracing.workspace = true
 

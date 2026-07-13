@@ -11,6 +11,7 @@ manifest:
 - [crates/ironauth-store/CHANGELOG.md](crates/ironauth-store/CHANGELOG.md): the persistence and tenant isolation layer library
 - [crates/ironauth-fetch/CHANGELOG.md](crates/ironauth-fetch/CHANGELOG.md): the SSRF-hardened outbound fetcher library
 - [crates/ironauth-jose/CHANGELOG.md](crates/ironauth-jose/CHANGELOG.md): the hardened JOSE verification core library
+- [crates/ironauth-admin/CHANGELOG.md](crates/ironauth-admin/CHANGELOG.md): the OpenAPI-first management API library
 
 The authoritative artifact list with versions is the generated
 [docs/COMPATIBILITY.md](docs/COMPATIBILITY.md). The release process and the

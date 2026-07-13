@@ -242,16 +242,16 @@ async fn expand_contract_example_chain_runs_all_three_phases_and_contract_remove
     );
 }
 
-/// The PRODUCTION chain (`MigrationRunner::new`) contains exactly the two real
+/// The PRODUCTION chain (`MigrationRunner::new`) contains exactly the three real
 /// migrations and leaves no throwaway demo object in a real database.
 #[tokio::test]
-async fn production_chain_is_only_the_two_real_migrations_and_ships_no_demo_object() {
+async fn production_chain_is_only_the_three_real_migrations_and_ships_no_demo_object() {
     // TestDatabase::start runs Store::migrate() (the production chain) on a
     // fresh, empty database.
     let db = TestDatabase::start().await;
     let pool = db.owner_pool();
 
-    // Re-running is idempotent and reports exactly two tracked migrations.
+    // Re-running is idempotent and reports exactly three tracked migrations.
     let report = MigrationRunner::new(pool)
         .run()
         .await
@@ -262,12 +262,12 @@ async fn production_chain_is_only_the_two_real_migrations_and_ships_no_demo_obje
     );
     assert_eq!(
         report.already_applied(),
-        2,
-        "the production chain is exactly two migrations (isolation, audit log)"
+        3,
+        "the production chain is exactly three migrations (isolation, audit log, management API)"
     );
 
-    // The ledger holds exactly versions 1 and 2.
-    assert_eq!(applied_versions(pool).await, vec![1_i64, 2]);
+    // The ledger holds exactly versions 1, 2, and 3.
+    assert_eq!(applied_versions(pool).await, vec![1_i64, 2, 3]);
     let phase_of = |version: i64| async move {
         sqlx::query("SELECT phase FROM _schema_migrations WHERE version = $1")
             .bind(version)
@@ -278,6 +278,7 @@ async fn production_chain_is_only_the_two_real_migrations_and_ships_no_demo_obje
     };
     assert_eq!(phase_of(1).await, "expand");
     assert_eq!(phase_of(2).await, "expand");
+    assert_eq!(phase_of(3).await, "expand");
 
     // The demo object never reaches a production database.
     assert!(
@@ -287,6 +288,15 @@ async fn production_chain_is_only_the_two_real_migrations_and_ships_no_demo_obje
     // The real tables and the audit log do exist.
     assert!(table_exists(pool, "clients").await, "clients exists");
     assert!(table_exists(pool, "audit_log").await, "audit_log exists");
+    // The management-plane tables (issue #11) exist.
+    assert!(
+        table_exists(pool, "management_credentials").await,
+        "management_credentials exists"
+    );
+    assert!(
+        table_exists(pool, "idempotency_keys").await,
+        "idempotency_keys exists"
+    );
 }
 
 #[tokio::test]

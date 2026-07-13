@@ -123,6 +123,18 @@ pub enum Action {
     ClientCreate,
     /// A client was deleted.
     ClientDelete,
+    /// A tenant was created (management plane, issue #11).
+    TenantCreate,
+    /// A tenant was deactivated (management plane, issue #11).
+    TenantDelete,
+    /// An environment was created (management plane, issue #11).
+    EnvironmentCreate,
+    /// An environment was deactivated (management plane, issue #11).
+    EnvironmentDelete,
+    /// A management API key was minted (management plane, issue #11).
+    ManagementKeyCreate,
+    /// A management API key was revoked (management plane, issue #11).
+    ManagementKeyDelete,
 }
 
 impl Action {
@@ -132,6 +144,12 @@ impl Action {
         match self {
             Action::ClientCreate => "client.create",
             Action::ClientDelete => "client.delete",
+            Action::TenantCreate => "tenant.create",
+            Action::TenantDelete => "tenant.delete",
+            Action::EnvironmentCreate => "environment.create",
+            Action::EnvironmentDelete => "environment.delete",
+            Action::ManagementKeyCreate => "management_key.create",
+            Action::ManagementKeyDelete => "management_key.delete",
         }
     }
 }

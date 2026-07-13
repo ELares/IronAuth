@@ -105,6 +105,17 @@ impl ScopedKind for AuditKind {
     const PREFIX: &'static str = "aud";
 }
 
+/// Marker for a management API key (`mak_`), the environment-scoped credential
+/// the management API authenticates on (issue #11). A tenant-scoped resource, so
+/// its identifier embeds its `(tenant, environment)`: the scope is recoverable
+/// from a presented token without a database lookup, and a key minted in one
+/// scope parses as a uniform not-found under another.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ManagementKeyKind;
+impl ScopedKind for ManagementKeyKind {
+    const PREFIX: &'static str = "mak";
+}
+
 /// Marker for a human actor (an interactive user). One of the three actor kinds
 /// an audit envelope can name (see [`crate::audit::ActorRef`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -181,6 +192,27 @@ impl<K: LevelKind> LevelId<K> {
         self.bytes
     }
 
+    /// Construct a level identifier from fixed seed bytes, for a WELL-KNOWN or
+    /// DERIVED identity rather than a freshly minted random one.
+    ///
+    /// Random identifiers must always come from [`LevelId::generate`] (the
+    /// entropy seam). This bypass is only for the two deliberate exceptions the
+    /// management API (issue #11) needs: a well-known constant identity (the
+    /// bootstrap operator and its audit service-actor, which must be stable
+    /// across restarts) and an identity deterministically derived from other
+    /// PUBLIC identifier bytes (a management key's audit service-actor, derived
+    /// from the key's public unique component so the audit row names the key).
+    /// Passing attacker-influenced or low-entropy bytes here would forfeit the
+    /// non-guessability property, so callers must pass a constant or
+    /// public-derived value only.
+    #[must_use]
+    pub fn from_seed_bytes(bytes: [u8; COMPONENT_BYTES]) -> Self {
+        Self {
+            bytes,
+            _kind: PhantomData,
+        }
+    }
+
     /// Reconstruct from raw payload bytes (internal; used when decoding a
     /// scoped identifier's embedded components).
     pub(crate) fn from_bytes(bytes: [u8; COMPONENT_BYTES]) -> Self {
@@ -244,6 +276,8 @@ pub type ClientId = ScopedId<ClientKind>;
 pub type OrganizationId = ScopedId<OrganizationKind>;
 /// An audit-log event identifier (`aud_...`).
 pub type AuditId = ScopedId<AuditKind>;
+/// A management API key identifier (`mak_...`), environment-scoped (issue #11).
+pub type ManagementKeyId = ScopedId<ManagementKeyKind>;
 
 impl<K: ScopedKind> ScopedId<K> {
     /// Mint a fresh scoped identifier under `scope`, drawing the unique
@@ -278,6 +312,14 @@ impl<K: ScopedKind> ScopedId<K> {
     #[must_use]
     pub fn scope(&self) -> Scope {
         Scope::new(self.tenant, self.environment)
+    }
+
+    /// This identifier's own unique 128-bit component. It is PUBLIC (the scope is
+    /// the other two components), so it may be used to derive a stable
+    /// service-actor identity for a credential ([`LevelId::from_seed_bytes`]).
+    #[must_use]
+    pub fn unique_bytes(&self) -> [u8; COMPONENT_BYTES] {
+        self.unique
     }
 
     /// Parse a scoped identifier and confirm it belongs to `scope`.
@@ -317,6 +359,38 @@ impl<K: ScopedKind> ScopedId<K> {
         })
     }
 
+    /// Parse a scoped identifier WITHOUT enforcing a caller scope, recovering the
+    /// `(tenant, environment)` it embeds.
+    ///
+    /// This is deliberately NOT the request-handler entry point for resolving a
+    /// scoped resource: it performs no scope check, so it must NEVER decide
+    /// whether untrusted input names an in-scope resource (that path is
+    /// [`ScopedId::parse_in_scope`], the anti-oracle boundary). Its one
+    /// legitimate use is a self-authenticating credential token (a management API
+    /// key, issue #11): the token declares its own scope in the clear, and the
+    /// caller then proves possession of the token's SECRET within that scope, so
+    /// recovering the declared scope leaks nothing the caller did not present.
+    ///
+    /// # Errors
+    ///
+    /// [`IdParseError`] if the prefix is wrong, the payload is not canonical
+    /// URL-safe base64, or the decoded length is not three components.
+    pub fn parse_declared_scope(raw: &str) -> Result<Self, IdParseError> {
+        let payload = decode_component::<SCOPED_BYTES>(raw, K::PREFIX)?;
+        let mut tenant = [0_u8; COMPONENT_BYTES];
+        let mut environment = [0_u8; COMPONENT_BYTES];
+        let mut unique = [0_u8; COMPONENT_BYTES];
+        tenant.copy_from_slice(&payload[0..COMPONENT_BYTES]);
+        environment.copy_from_slice(&payload[COMPONENT_BYTES..COMPONENT_BYTES * 2]);
+        unique.copy_from_slice(&payload[COMPONENT_BYTES * 2..SCOPED_BYTES]);
+        Ok(Self {
+            tenant: TenantId::from_bytes(tenant),
+            environment: EnvironmentId::from_bytes(environment),
+            unique,
+            _kind: PhantomData,
+        })
+    }
+
     /// The wire byte payload (tenant then environment then unique), for binding
     /// the identifier as a query parameter.
     fn payload(&self) -> [u8; SCOPED_BYTES] {
@@ -342,6 +416,42 @@ impl<K: ScopedKind> fmt::Display for ScopedId<K> {
 impl<K: ScopedKind> fmt::Debug for ScopedId<K> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{self}")
+    }
+}
+
+/// A resource identifier that can be named as the target of an audit row.
+///
+/// An audit row records the typed-prefix kind and the wire form of the resource
+/// a mutation acted on. Both single-level identifiers ([`LevelId`], e.g. the
+/// [`TenantId`] targeted by `tenant.create`) and tenant-scoped identifiers
+/// ([`ScopedId`], e.g. the [`ClientId`] targeted by `client.create`) can be audit
+/// targets, so the audited-write primitive is generic over this trait rather than
+/// over one identifier shape.
+pub trait AuditTarget {
+    /// The typed-prefix kind recorded in `audit_log.target_kind` (e.g. `ten`).
+    fn audit_target_kind(&self) -> &'static str;
+
+    /// The identifier's wire form recorded in `audit_log.target_id`.
+    fn audit_target_id(&self) -> String;
+}
+
+impl<K: ScopedKind> AuditTarget for ScopedId<K> {
+    fn audit_target_kind(&self) -> &'static str {
+        K::PREFIX
+    }
+
+    fn audit_target_id(&self) -> String {
+        self.to_string()
+    }
+}
+
+impl<K: LevelKind> AuditTarget for LevelId<K> {
+    fn audit_target_kind(&self) -> &'static str {
+        K::PREFIX
+    }
+
+    fn audit_target_id(&self) -> String {
+        self.to_string()
     }
 }
 

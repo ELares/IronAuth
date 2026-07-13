@@ -130,6 +130,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      # This job compiles ironauth-admin and ironauth-config through the
+      # openapi-check / config-schema freshness steps; cache the build so those
+      # do not pay a cold compile on every run.
+      - uses: Swatinem/rust-cache@v2
       - name: invariant lints
         run: scripts/invariant-lints.sh
       - name: query audit (no scoped-table SQL outside the repository module)
@@ -146,6 +150,8 @@ jobs:
         run: |
           scripts/config-schema.sh
           git diff --exit-code docs/config-schema.json docs/CONFIG.md
+      - name: openapi freshness (served management spec vs committed artifact)
+        run: scripts/openapi-check.sh
       - name: governance files present
         # The license and covenant files are trust infrastructure; this lint
         # ensures they cannot be silently removed or renamed.

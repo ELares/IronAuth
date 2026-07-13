@@ -27,6 +27,11 @@ pub enum StoreError {
     /// A schema migration could not be applied or was refused (out of order or
     /// checksum drift). Returned only by [`crate::Store::migrate`].
     Migration(MigrationError),
+    /// A concurrent request already stored a result under this Idempotency-Key
+    /// (a unique-key race on the idempotency table). The caller re-reads the
+    /// now-committed original response and replays it; the mutation did not run
+    /// a second time. Returned only by the management-plane create paths.
+    IdempotencyConflict,
 }
 
 impl fmt::Display for StoreError {
@@ -35,6 +40,7 @@ impl fmt::Display for StoreError {
             StoreError::NotFound => f.write_str("resource not found"),
             StoreError::Database(_) => f.write_str("database error"),
             StoreError::Migration(_) => f.write_str("migration error"),
+            StoreError::IdempotencyConflict => f.write_str("idempotency-key conflict"),
         }
     }
 }
@@ -42,7 +48,7 @@ impl fmt::Display for StoreError {
 impl std::error::Error for StoreError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            StoreError::NotFound => None,
+            StoreError::NotFound | StoreError::IdempotencyConflict => None,
             StoreError::Database(source) => Some(source),
             StoreError::Migration(source) => Some(source),
         }

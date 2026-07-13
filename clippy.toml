@@ -1,1 +1,1 @@
-doc-valid-idents = ["IronAuth", "IronCache", "IronBus", "OpenID", "OAuth", "GitHub", "PostgreSQL", "WebAuthn", "JavaScript", "TypeScript", ".."]
+doc-valid-idents = ["IronAuth", "IronCache", "IronBus", "OpenID", "OAuth", "OpenAPI", "RateLimit", "GitHub", "PostgreSQL", "WebAuthn", "JavaScript", "TypeScript", ".."]
