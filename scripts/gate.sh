@@ -27,6 +27,10 @@ echo "==> compatibility matrix freshness"
 scripts/compat-matrix.sh
 git diff --exit-code docs/COMPATIBILITY.md
 
+echo "==> config schema freshness"
+scripts/config-schema.sh
+git diff --exit-code docs/config-schema.json docs/CONFIG.md
+
 if command -v cargo-deny >/dev/null 2>&1; then
   echo "==> cargo deny"
   cargo deny check

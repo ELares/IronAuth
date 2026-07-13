@@ -1,0 +1,22 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+[package]
+name = "ironauth-config"
+version = "0.1.0"
+description = "Strict configuration layer for IronAuth: fail-fast TOML, secret indirection, feature maturity ladder"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde.workspace = true
+toml.workspace = true
+schemars.workspace = true
+
+[dev-dependencies]
+# Only the schema-printing example and the schema-shape tests need JSON
+# serialization; serde_json is already in the graph as a schemars dependency.
+serde_json.workspace = true
+
+[lints]
+workspace = true
