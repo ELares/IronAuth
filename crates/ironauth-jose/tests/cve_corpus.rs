@@ -276,6 +276,15 @@ fn zip_compression_header_is_rejected_before_inflation() {
 }
 
 #[test]
+fn bare_b64_header_member_is_rejected() {
+    // RFC 7797: a bare `b64` (not in crit) steers payload encoding and must not
+    // be silently ignored.
+    let header = r#"{"alg":"EdDSA","b64":false}"#;
+    let token = common::assemble(header, &common::standard_claims(), b"sig");
+    assert_rejected(&token, RejectReason::UnsupportedHeaderParam);
+}
+
+#[test]
 fn five_segment_jwe_is_rejected_structurally() {
     // A JWE has five dot-separated segments; rejected before any field is read.
     let token = "eyJhbGciOiJSU0EtT0FFUCIsImVuYyI6IkExMjhHQ00ifQ.encrypted_key.iv.ciphertext.tag";

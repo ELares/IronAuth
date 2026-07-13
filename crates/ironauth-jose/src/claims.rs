@@ -163,37 +163,52 @@ fn enforce_audience(raw: &Map<String, Value>, expected: &str) -> Result<Vec<Stri
 /// The largest integer an `f64` represents exactly (2^53).
 const MAX_EXACT_F64_INT: f64 = 9_007_199_254_740_992.0;
 
-/// Read a `NumericDate` claim as integer seconds. A non-number is malformed.
+/// The largest absolute `NumericDate` (in seconds) accepted. Anything at or
+/// beyond 2^53 seconds is a date near year 285-million: no legitimate token
+/// carries one, and 2^53 is also the largest integer an `f64` represents
+/// exactly, so this is the clean fail-closed boundary for both branches below.
+const MAX_ABS_NUMERIC_DATE: i64 = 9_007_199_254_740_992; // 2^53
+
+/// Read a `NumericDate` claim as integer seconds. A non-number, a non-finite
+/// float, or an absurd magnitude (|seconds| >= 2^53) is malformed.
+///
+/// Rejecting the absurd magnitude uniformly is what keeps `exp` fail-closed like
+/// `nbf`/`iat`: without it a huge `exp` would silently make a token
+/// non-expiring, while a huge `nbf`/`iat` already fails closed.
 fn numeric_date(value: &Value) -> Result<i64, RejectReason> {
-    if let Some(n) = value.as_i64() {
-        Ok(n)
+    let secs = if let Some(n) = value.as_i64() {
+        n
     } else if let Some(f) = value.as_f64() {
         if !f.is_finite() {
             // NaN or infinity is not a valid NumericDate.
             return Err(RejectReason::ClaimsMalformed);
         }
-        // NumericDate may be fractional; floor to whole seconds. Clamp against
-        // 2^53 (the largest integer f64 represents exactly) so the cast neither
-        // wraps nor loses precision; a value that large is fail-safe (it only
-        // makes a far-future exp look valid and a far-future nbf/iat invalid,
-        // and no real token carries one).
+        // NumericDate may be fractional; floor to whole seconds. The magnitude
+        // guard below rejects anything outside the exact-integer f64 range, so
+        // this cast never truncates or wraps for a value it lets through; a
+        // value at or beyond the range is rejected rather than clamped.
         let floored = f.floor();
-        let secs = if floored >= MAX_EXACT_F64_INT {
-            i64::MAX
-        } else if floored <= -MAX_EXACT_F64_INT {
-            i64::MIN
-        } else {
-            #[allow(
-                clippy::cast_possible_truncation,
-                reason = "value is bounded to the exact-integer f64 range, so this neither truncates nor wraps"
-            )]
-            let v = floored as i64;
-            v
-        };
-        Ok(secs)
+        if floored >= MAX_EXACT_F64_INT || floored <= -MAX_EXACT_F64_INT {
+            return Err(RejectReason::ClaimsMalformed);
+        }
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "value is bounded to the exact-integer f64 range, so this neither truncates nor wraps"
+        )]
+        let v = floored as i64;
+        v
     } else {
-        Err(RejectReason::ClaimsMalformed)
+        return Err(RejectReason::ClaimsMalformed);
+    };
+
+    // Uniform fail-closed guard for both branches: an absurd magnitude (a date
+    // near year 285-million) is malformed, so a huge exp cannot make a token
+    // non-expiring. Compared by bounds rather than abs() so i64::MIN cannot
+    // overflow.
+    if secs >= MAX_ABS_NUMERIC_DATE || secs <= -MAX_ABS_NUMERIC_DATE {
+        return Err(RejectReason::ClaimsMalformed);
     }
+    Ok(secs)
 }
 
 fn enforce_exp(

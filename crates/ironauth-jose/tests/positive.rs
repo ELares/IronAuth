@@ -95,6 +95,16 @@ fn ps512_verifies() {
 }
 
 #[test]
+fn rsa_key_rejects_all_zero_exponent() {
+    // A zero exponent strips to empty and is not a valid RSA public exponent;
+    // the check is on the STRIPPED value, so `[0x00]` is refused.
+    assert!(TrustedKey::rsa(Some("rsa-1".into()), vectors::RSA_N, &[0x00]).is_err());
+    assert!(TrustedKey::rsa(Some("rsa-1".into()), vectors::RSA_N, &[0x00, 0x00]).is_err());
+    // A normal exponent (65537 = 0x01 0x00 0x01) is still accepted.
+    assert!(TrustedKey::rsa(Some("rsa-1".into()), vectors::RSA_N, &[0x01, 0x00, 0x01]).is_ok());
+}
+
+#[test]
 fn ecdsa_coordinates_constructor_matches_point_constructor() {
     // The x,y coordinate constructor and the SEC1-point constructor accept the
     // same P-256 key (0x04 || x || y).

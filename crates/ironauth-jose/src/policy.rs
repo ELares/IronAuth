@@ -248,7 +248,10 @@ impl TrustedKey {
                 actual: n_trimmed.len(),
             });
         }
-        if e.is_empty() {
+        // Check the STRIPPED exponent: an all-zero exponent (for example
+        // `[0x00]`) strips to empty and is not a valid RSA public exponent.
+        let e_trimmed = strip_leading_zeros(e);
+        if e_trimmed.is_empty() {
             return Err(KeyError::BadLength {
                 expected: 1,
                 actual: 0,
@@ -258,7 +261,7 @@ impl TrustedKey {
             kid,
             material: KeyMaterial::Rsa {
                 n: n_trimmed.to_vec(),
-                e: strip_leading_zeros(e).to_vec(),
+                e: e_trimmed.to_vec(),
             },
         })
     }

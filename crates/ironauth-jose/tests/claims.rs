@@ -89,6 +89,54 @@ fn exp_exactly_at_skew_boundary_is_accepted() {
 }
 
 #[test]
+fn huge_integer_exp_is_malformed() {
+    // An integer exp beyond 2^53 seconds (a date near year 285-million) must
+    // fail closed, not silently make the token non-expiring.
+    let claims = format!(
+        r#"{{"iss":"{}","aud":"{}","exp":5000000000000000000,"nbf":{},"iat":{}}}"#,
+        common::ISS,
+        common::AUD,
+        NOW_I - 60,
+        NOW_I - 60
+    );
+    assert_eq!(
+        outcome(&claims, Duration::from_secs(60)),
+        Err(RejectReason::ClaimsMalformed)
+    );
+}
+
+#[test]
+fn huge_float_exp_is_malformed() {
+    for exp in ["1e18", "1e999"] {
+        let claims = format!(
+            r#"{{"iss":"{}","aud":"{}","exp":{exp},"nbf":{},"iat":{}}}"#,
+            common::ISS,
+            common::AUD,
+            NOW_I - 60,
+            NOW_I - 60
+        );
+        assert_eq!(
+            outcome(&claims, Duration::from_secs(60)),
+            Err(RejectReason::ClaimsMalformed),
+            "float exp {exp} must be malformed",
+        );
+    }
+}
+
+#[test]
+fn far_future_exp_still_verifies() {
+    // Year ~3000 (about 3.25e10 seconds) is far below the 2^53 guard and valid.
+    let claims = common::claims_with(
+        common::ISS,
+        r#""client-abc""#,
+        32_503_680_000,
+        NOW_I - 60,
+        NOW_I - 60,
+    );
+    assert_eq!(outcome(&claims, Duration::from_secs(60)), Ok(()));
+}
+
+#[test]
 fn missing_exp_is_rejected_by_default() {
     let claims = format!(
         r#"{{"iss":"{}","aud":"{}","nbf":{},"iat":{}}}"#,

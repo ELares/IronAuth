@@ -113,6 +113,10 @@ pub enum RejectReason {
     /// at the header stage, before anything can be inflated (decompression-bomb
     /// defense).
     CompressionPresent,
+    /// The header carried a trust-steering parameter this core does not honor as
+    /// a bare member, such as `b64` (RFC 7797 requires `b64` to appear in `crit`
+    /// if used; a bare `b64` is rejected rather than silently ignored).
+    UnsupportedHeaderParam,
     /// The header indicated PBES2 key derivation (a `PBES2-*` alg, or a `p2c` or
     /// `p2s` parameter), or the `p2c` iteration count exceeded the cap. PBES2 is
     /// excluded; the count cap rejects a bomb-shaped input cheaply.
@@ -164,6 +168,7 @@ impl RejectReason {
             RejectReason::MalformedCrit => "malformed_crit",
             RejectReason::EncryptionPresent => "encryption_present",
             RejectReason::CompressionPresent => "compression_present",
+            RejectReason::UnsupportedHeaderParam => "unsupported_header_param",
             RejectReason::Pbes2Present => "pbes2_present",
             RejectReason::UnknownKid => "unknown_kid",
             RejectReason::KeyTypeMismatch => "key_type_mismatch",

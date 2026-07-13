@@ -50,6 +50,14 @@ pub(crate) fn parse(
         return Err(RejectReason::CompressionPresent);
     }
 
+    // RFC 7797: `b64` steers whether the payload is base64url-encoded and MUST
+    // appear in `crit` if used. A `b64` inside `crit` is already rejected (any
+    // crit is); a BARE `b64` member is a trust-steering parameter we do not
+    // honor, so reject it rather than silently ignore it.
+    if object.contains_key("b64") {
+        return Err(RejectReason::UnsupportedHeaderParam);
+    }
+
     // PBES2: reject the key-derivation parameters outright, and reject a
     // bomb-shaped iteration count cheaply.
     if object.contains_key("p2s") {
