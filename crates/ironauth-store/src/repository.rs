@@ -536,8 +536,8 @@ pub enum RedeemOutcome {
     RetryWithinGrace,
     /// The code was already consumed beyond the grace window: a genuine reuse. The
     /// grant chain was revoked and the reuse audited, both in this transaction, so
-    /// every token issued from the code is now inactive (RFC 9700). The token
-    /// endpoint returns a plain `invalid_grant`.
+    /// every token issued from the code now derives as revoked through the grant
+    /// chain (RFC 9700). The token endpoint returns a plain `invalid_grant`.
     Reused,
     /// The code is absent or expired: a plain `invalid_grant` with no reuse.
     Invalid,
@@ -894,7 +894,8 @@ impl ActingAuthorizationRepo<'_> {
         }
 
         // Beyond the window: a genuine reuse. Revoke the grant chain and audit it
-        // in this transaction, so every token issued from the code goes inactive.
+        // in this transaction, so every token issued from the code derives as
+        // revoked through the grant chain.
         let grant_text: String = row.get("grant_id");
         let revoked = sqlx::query(
             "UPDATE grants SET revoked_at = \
