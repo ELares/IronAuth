@@ -10,6 +10,7 @@ manifest:
 - [crates/ironauth-server/CHANGELOG.md](crates/ironauth-server/CHANGELOG.md): the HTTP server skeleton library
 - [crates/ironauth-store/CHANGELOG.md](crates/ironauth-store/CHANGELOG.md): the persistence and tenant isolation layer library
 - [crates/ironauth-fetch/CHANGELOG.md](crates/ironauth-fetch/CHANGELOG.md): the SSRF-hardened outbound fetcher library
+- [crates/ironauth-admin/CHANGELOG.md](crates/ironauth-admin/CHANGELOG.md): the OpenAPI-first management API library
 
 The authoritative artifact list with versions is the generated
 [docs/COMPATIBILITY.md](docs/COMPATIBILITY.md). The release process and the

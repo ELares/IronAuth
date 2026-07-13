@@ -35,14 +35,21 @@ use crate::id::{EnvironmentId, HumanId, OperatorId, TenantId};
 use crate::scope::Scope;
 use crate::store::Store;
 
-/// The low-privilege application role provisioned by the migration.
+/// The low-privilege data-plane role the migration grants to.
 const APP_ROLE: &str = "ironauth_app";
+
+/// The low-privilege control-plane role the management-API migration grants to
+/// (issue #11). A peer of [`APP_ROLE`], never a superset: still never a
+/// superuser and never a table owner, so forced row-level security applies.
+const CONTROL_ROLE: &str = "ironauth_control";
 
 /// A fresh, isolated database plus the handles the isolation tests need.
 pub struct TestDatabase {
     owner_pool: PgPool,
     app_pool: PgPool,
+    control_pool: PgPool,
     store: Store,
+    control_store: Store,
 }
 
 impl TestDatabase {
@@ -69,21 +76,24 @@ impl TestDatabase {
             .await
             .expect("connect as owner to fresh database");
 
-        // Provision the low-privilege application role BEFORE applying the schema:
-        // the migration GRANTs to this role but deliberately neither creates it
-        // nor ships a password (see the migration header). This is test-only -- a
+        // Provision the low-privilege roles BEFORE applying the schema: the
+        // migrations GRANT to these roles but deliberately neither create them
+        // nor ship a password (see the migration headers). This is test-only -- a
         // throwaway credential for a throwaway cluster -- and production
-        // provisions the role out of band instead.
-        provision_app_role(&owner_pool).await;
+        // provisions the roles out of band instead. Both the data-plane
+        // (`ironauth_app`) and the control-plane (`ironauth_control`, issue #11)
+        // roles are provisioned the same race-safe way.
+        provision_role(&owner_pool, APP_ROLE).await;
+        provision_role(&owner_pool, CONTROL_ROLE).await;
 
-        // Apply the minimal isolation schema (tables, forced RLS, policies, and
-        // the grants to the role provisioned above) as the owner.
+        // Apply the schema (tables, forced RLS, policies, and the grants to the
+        // roles provisioned above) as the owner.
         Store::from_pool(owner_pool.clone())
             .migrate()
             .await
             .expect("apply isolation migrations");
 
-        // The application handles authenticate as the low-privilege role, so
+        // The data-plane handles authenticate as the low-privilege app role, so
         // they are subject to row-level security exactly as production is.
         let app_url = format!("postgres://{APP_ROLE}:{APP_ROLE}@{host}:{port}/{db_name}");
         let app_pool = PgPool::connect(&app_url)
@@ -91,10 +101,22 @@ impl TestDatabase {
             .expect("connect as low-privilege app role");
         let store = Store::from_pool(app_pool.clone());
 
+        // The control-plane handle authenticates as the SEPARATE control role;
+        // its pool is distinct from the data-plane pool, mirroring production
+        // where the two credential classes never share a connection.
+        let control_url =
+            format!("postgres://{CONTROL_ROLE}:{CONTROL_ROLE}@{host}:{port}/{db_name}");
+        let control_pool = PgPool::connect(&control_url)
+            .await
+            .expect("connect as low-privilege control role");
+        let control_store = Store::from_pool(control_pool.clone());
+
         Self {
             owner_pool,
             app_pool,
+            control_pool,
             store,
+            control_store,
         }
     }
 
@@ -105,12 +127,27 @@ impl TestDatabase {
         &self.store
     }
 
+    /// The store bound to the low-privilege control-plane role (issue #11).
+    /// Management-plane repository operations run through here; its pool is
+    /// distinct from the data-plane [`TestDatabase::store`] pool.
+    #[must_use]
+    pub fn control_store(&self) -> &Store {
+        &self.control_store
+    }
+
     /// A raw pool as the low-privilege application role. The RLS test uses it to
     /// issue adversarial SQL directly, bypassing the repository's app-layer
     /// filter, and prove row-level security still holds.
     #[must_use]
     pub fn app_pool(&self) -> &PgPool {
         &self.app_pool
+    }
+
+    /// A raw pool as the low-privilege control-plane role. For adversarial SQL
+    /// that proves row-level security holds on the management tables too.
+    #[must_use]
+    pub fn control_pool(&self) -> &PgPool {
+        &self.control_pool
     }
 
     /// A raw pool as the connection `DATABASE_URL` supplies. For seeding the
@@ -211,7 +248,8 @@ fn unique_suffix() -> String {
     out
 }
 
-/// Create the low-privilege application role the schema grants to.
+/// Create a low-privilege login role the schema grants to (`ironauth_app` or
+/// `ironauth_control`).
 ///
 /// The role is cluster-global, but the harness sets up many fresh per-run
 /// databases concurrently, so a plain check-then-`CREATE ROLE` loses the race:
@@ -219,20 +257,21 @@ fn unique_suffix() -> String {
 /// Catching both the higher-level `duplicate_object` and the underlying catalog
 /// `unique_violation` (either can surface depending on timing) makes creation
 /// idempotent and race-safe. The password is a throwaway for the test cluster
-/// only; production provisions this role out of band (see the migration header).
-async fn provision_app_role(owner_pool: &PgPool) {
-    sqlx::raw_sql(
+/// only; production provisions these roles out of band (see the migration
+/// headers). `role` is a fixed identifier from this module, never user input.
+async fn provision_role(owner_pool: &PgPool, role: &str) {
+    sqlx::raw_sql(&format!(
         "DO $$ \
          BEGIN \
-             CREATE ROLE ironauth_app LOGIN PASSWORD 'ironauth_app'; \
+             CREATE ROLE {role} LOGIN PASSWORD '{role}'; \
          EXCEPTION WHEN duplicate_object OR unique_violation THEN \
              NULL; \
          END \
-         $$;",
-    )
+         $$;"
+    ))
     .execute(owner_pool)
     .await
-    .expect("provision low-privilege app role");
+    .unwrap_or_else(|e| panic!("provision low-privilege role {role}: {e}"));
 }
 
 /// Create `db_name` via a transient connection to the maintenance database.

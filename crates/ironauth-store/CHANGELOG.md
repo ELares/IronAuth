@@ -6,6 +6,48 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Management-plane control substrate (issue #11). Adds the control-plane role,
+  the management repositories, and the third production migration; the #6 and #7
+  isolation and audit tests stay green.
+  - **A distinct control-plane role, `ironauth_control`.** Migration 3 GRANTs it
+    the operator, tenant, and environment LEVEL tables that the data-plane
+    `ironauth_app` cannot see, plus append-only audit and the two new management
+    tables, and nothing on `clients`/`organizations`. Like `ironauth_app` it is a
+    peer, never a superset (never a superuser or owner, so forced row-level
+    security applies), and the migration GRANTs but never creates it or ships a
+    password. The test harness (`test_support`) provisions it race-safely and
+    exposes a separate `control_store()`; the two pools are kept distinct.
+  - **Management repositories reusing `write_audited`.** `Store::management()`
+    reaches `TenantRepo`/`EnvironmentRepo` (operator plane, level tables) and the
+    tenant-scoped `ManagementCredentialRepo`, plus the credential-scoped
+    `IdempotencyRepo`. Every mutation routes through the same single audited-write
+    primitive, so a management mutation without its same-transaction audit row is
+    as impossible as a data-plane one. The primitive is now generic over an
+    `AuditTarget` so a level-id target (a tenant, an environment) audits through
+    the same path as a scoped-id target. New `Action` variants: `tenant.create`,
+    `tenant.delete`, `environment.create`, `environment.delete`,
+    `management_key.create`, `management_key.delete`.
+  - **Operator-plane audit scoping.** Creating a tenant creates its first
+    environment in the same transaction and audits scoped to that fresh
+    `(tenant, environment)`; environment CRUD scopes to `(tenant, environment)`;
+    tenant deactivation scopes to the tenant's retained oldest environment. See
+    `docs/adr/0005-management-api.md`.
+  - **New scoped tables.** `management_credentials` (environment-scoped `mak_`
+    keys: forced row-level security, nonempty-scope CHECK, the same foreign keys
+    as `clients`; only the key hash is stored) and `idempotency_keys` (the
+    Idempotency-Key replay store, deliberately CREDENTIAL-scoped rather than
+    tenant-RLS-scoped, because an operator-plane POST is looked up before any
+    tenant exists). Both are added to `scripts/query-audit.sh`'s scoped-table
+    list. `tenants` and `environments` gain a `deleted_at` soft-delete column, so
+    a DELETE is a deactivation that keeps the row and the append-only audit
+    foreign keys satisfiable.
+  - New id types and helpers: `ManagementKeyId` (`mak_`, scoped),
+    `ScopedId::parse_declared_scope` (recovers a credential token's declared scope
+    without a caller scope, for self-authenticating tokens only),
+    `LevelId::from_seed_bytes`/`ScopedId::unique_bytes` (well-known and derived
+    identities: the bootstrap operator and a management key's service actor).
+  - No new dependency; still runtime sqlx only and musl/MSRV-1.85 clean.
+
 - Relational primary store with a same-transaction audit log and an
   expand-contract migration framework (issue #7). Builds directly on the #6
   isolation substrate.

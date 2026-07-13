@@ -9,9 +9,12 @@
 
 use std::process::ExitCode;
 
+use axum::Router;
+use ironauth_admin::AdminState;
 use ironauth_config::{Config, Loaded};
 use ironauth_env::Env;
 use ironauth_server::Server;
+use ironauth_store::Store;
 
 /// Semantic version of this build, injected by Cargo.
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -81,13 +84,24 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
             tracing::warn!(%warning, "configuration warning");
         }
 
-        let server = match Server::new(config, Env::system()) {
+        let env = Env::system();
+
+        // Build the management API router (issue #11) before moving config into
+        // the server. It mounts on the management plane only when a bootstrap
+        // operator token is configured; otherwise the server boots exactly as the
+        // DB-free skeleton it was, serving only health, readiness, and metrics.
+        let management = build_management_router(&config, &env).await;
+
+        let mut server = match Server::new(config, env) {
             Ok(server) => server,
             Err(error) => {
                 tracing::error!(%error, "failed to build server");
                 return ExitCode::FAILURE;
             }
         };
+        if let Some(router) = management {
+            server = server.mount_management(router);
+        }
         tracing::info!(base_url = %server.base_url(), "starting ironauth");
 
         match server.run(ironauth_server::shutdown_signal()).await {
@@ -101,6 +115,44 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
             }
         }
     })
+}
+
+/// Build the management API router, or `None` if it should not be mounted.
+///
+/// The management API mounts only when a bootstrap operator token is configured,
+/// so the default (token unset) config still boots without a database, exactly
+/// like the server skeleton. When configured, it connects a control-plane store
+/// from `database.url` (which must authenticate as `ironauth_control`); a failure
+/// to connect or an invalid admin config is logged and the server continues to
+/// serve health, readiness, and metrics rather than refusing to boot.
+async fn build_management_router(config: &Config, env: &Env) -> Option<Router> {
+    if config.admin.bootstrap_operator_token.is_none() {
+        tracing::info!(
+            "management API not mounted: admin.bootstrap_operator_token is unset (operator plane \
+             would be unauthorized)"
+        );
+        return None;
+    }
+    let store = match Store::connect(config.database.url.expose()).await {
+        Ok(store) => store,
+        Err(error) => {
+            tracing::error!(
+                %error,
+                "management API not mounted: cannot connect the control-plane store"
+            );
+            return None;
+        }
+    };
+    match AdminState::new(store, env.clone(), &config.admin) {
+        Ok(state) => {
+            tracing::info!("management API mounted on the management plane");
+            Some(ironauth_admin::management_router(state))
+        }
+        Err(error) => {
+            tracing::error!(%error, "management API not mounted: invalid admin config");
+            None
+        }
+    }
 }
 
 /// Parse `--config PATH` (or `--config=PATH`) out of the serve arguments.

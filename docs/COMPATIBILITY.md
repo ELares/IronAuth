@@ -7,6 +7,7 @@ table is the authoritative list of artifacts and their versions at HEAD.
 | Artifact | Version | Kind | MSRV |
 |----------|---------|------|------|
 | ironauth | 0.1.0 | binary | 1.85 |
+| ironauth-admin | 0.1.0 | library | 1.85 |
 | ironauth-config | 0.1.0 | library | 1.85 |
 | ironauth-env | 0.1.0 | library | 1.85 |
 | ironauth-fetch | 0.1.0 | library | 1.85 |

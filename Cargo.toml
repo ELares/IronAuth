@@ -18,6 +18,7 @@ members = [
     "crates/ironauth-server",
     "crates/ironauth-store",
     "crates/ironauth-fetch",
+    "crates/ironauth-admin",
     "crates/ironauth",
 ]
 
@@ -33,7 +34,21 @@ ironauth-config = { path = "crates/ironauth-config", version = "0.1.0" }
 ironauth-server = { path = "crates/ironauth-server", version = "0.1.0" }
 ironauth-store = { path = "crates/ironauth-store", version = "0.1.0" }
 ironauth-fetch = { path = "crates/ironauth-fetch", version = "0.1.0" }
+ironauth-admin = { path = "crates/ironauth-admin", version = "0.1.0" }
 getrandom = "0.3"
+
+# OpenAPI 3.1 source of truth for the management API (crates/ironauth-admin,
+# issue #11). utoipa derives the OpenAPI 3.1 document from the `#[utoipa::path]`
+# annotations on the axum handlers; the handlers are listed once in the
+# `#[derive(OpenApi)]` `paths(...)` and wired to the same paths in the router, and
+# scripts/openapi-check.sh regenerates and git-diffs the committed spec so any
+# drift fails the build. utoipa is MIT OR Apache-2.0 with MSRV 1.75 (below the
+# workspace 1.85 floor), pulls no non-permissive dependency, and is pure Rust
+# (musl static clean). axum_extras teaches the macros axum's Path/Query
+# extractors. The utoipa-axum route-binding helper is deliberately NOT used: it
+# pulls the unmaintained `paste` crate (RUSTSEC-2024-0436), which `cargo deny`
+# rejects; wiring the router by hand keeps the dependency graph clean.
+utoipa = { version = "5", features = ["axum_extras"] }
 
 # Persistence and isolation layer (crates/ironauth-store). Runtime query API
 # only (sqlx::query / query_as / QueryBuilder), never the compile-time-checked

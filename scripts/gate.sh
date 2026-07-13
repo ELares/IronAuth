@@ -40,6 +40,9 @@ echo "==> config schema freshness"
 scripts/config-schema.sh
 git diff --exit-code docs/config-schema.json docs/CONFIG.md
 
+echo "==> openapi freshness (served management spec vs committed artifact)"
+scripts/openapi-check.sh
+
 if command -v cargo-deny >/dev/null 2>&1; then
   echo "==> cargo deny"
   cargo deny check

@@ -61,6 +61,9 @@ pub struct Config {
     /// Primary database settings.
     pub database: DatabaseConfig,
 
+    /// Management API settings (issue #11).
+    pub admin: AdminConfig,
+
     /// Feature toggles keyed by registered feature name. Enabling an
     /// experimental feature additionally requires `ack` equal to the
     /// feature's exact current version; see the feature reference in the
@@ -177,6 +180,44 @@ impl Default for DatabaseConfig {
             url: Dsn::parse("postgres://ironauth@localhost:5432/ironauth")
                 .expect("default DSN is valid by construction (covered by test)"),
             password: None,
+        }
+    }
+}
+
+/// Management API settings (issue #11).
+///
+/// The management API is the OpenAPI-first control plane on the management port.
+/// It authorizes the operator plane (tenant CRUD) in M1 with a single config
+/// bootstrap operator token; the full operator-plane credential class lands in
+/// M5. Page-size limits are configurable (the tunability principle) with safe
+/// defaults, never a baked-in one-way choice.
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields, default)]
+pub struct AdminConfig {
+    /// The bootstrap operator bearer token that authorizes the operator plane
+    /// (tenant CRUD) in M1, presented as `Authorization: Bearer <token>`. Unset
+    /// leaves the operator plane unauthorized (the management API still mounts,
+    /// but every operator-plane request is rejected). Use the `file`/`env` secret
+    /// indirection, never a literal, outside dev mode. The full operator-plane
+    /// credential class lands in M5.
+    pub bootstrap_operator_token: Option<Secret>,
+
+    /// The largest page a list endpoint will return, regardless of a larger
+    /// caller-supplied `limit`. A ceiling that bounds any one response so a
+    /// caller cannot request an unbounded scan.
+    pub max_page_size: u32,
+
+    /// The page size a list endpoint uses when the caller supplies no `limit`.
+    /// Clamped to `max_page_size`.
+    pub default_page_size: u32,
+}
+
+impl Default for AdminConfig {
+    fn default() -> Self {
+        Self {
+            bootstrap_operator_token: None,
+            max_page_size: 200,
+            default_page_size: 50,
         }
     }
 }
@@ -298,6 +339,9 @@ impl Config {
         if let Some(password) = &self.database.password {
             visit("database.password", password);
         }
+        if let Some(token) = &self.admin.bootstrap_operator_token {
+            visit("admin.bootstrap_operator_token", token);
+        }
     }
 }
 
@@ -391,6 +435,35 @@ mod tests {
         assert_eq!(config.database.url.host(), "localhost");
         assert!(config.database.password.is_none());
         assert!(config.features.is_empty());
+    }
+
+    #[test]
+    fn admin_section_defaults_parse_and_flag_a_literal_token() {
+        // Defaults: operator plane unauthorized, safe page-size caps.
+        let config = Config::from_toml_str("", "<inline>").expect("valid").config;
+        assert!(config.admin.bootstrap_operator_token.is_none());
+        assert_eq!(config.admin.max_page_size, 200);
+        assert_eq!(config.admin.default_page_size, 50);
+
+        // The bootstrap token is a secret: a literal value is flagged outside
+        // dev mode and never echoed.
+        let input = "[admin]\nbootstrap_operator_token = \"op-secret-123\"\nmax_page_size = 10\n";
+        let loaded = Config::from_toml_str(input, "<inline>").expect("valid");
+        assert_eq!(
+            loaded.warnings,
+            vec![Warning::LiteralSecret {
+                key: "admin.bootstrap_operator_token".to_owned()
+            }]
+        );
+        assert_eq!(loaded.config.admin.max_page_size, 10);
+        assert!(!loaded.warnings[0].to_string().contains("op-secret-123"));
+
+        // Unknown admin keys abort with the accepted fields.
+        let err = Config::from_toml_str("[admin]\nmax_pages = 5\n", "ironauth.toml")
+            .expect_err("unknown admin key");
+        let msg = err.to_string();
+        assert!(msg.contains("max_pages"), "{msg}");
+        assert!(msg.contains("max_page_size"), "{msg}");
     }
 
     #[test]
@@ -517,6 +590,7 @@ mod tests {
             "ProxyConfig",
             "TelemetryConfig",
             "DatabaseConfig",
+            "AdminConfig",
             "FeatureToggle",
         ] {
             assert_eq!(

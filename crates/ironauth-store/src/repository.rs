@@ -53,7 +53,10 @@ use sqlx::{Postgres, Row, Transaction};
 
 use crate::audit::{ActingContext, Action, ActorRef};
 use crate::error::StoreError;
-use crate::id::{AuditId, ClientId, CorrelationId, ScopedId, ScopedKind};
+use crate::id::{
+    AuditId, AuditTarget, ClientId, CorrelationId, EnvironmentId, ManagementKeyId, OperatorId,
+    TenantId,
+};
 use crate::scope::Scope;
 use crate::store::Store;
 
@@ -453,14 +456,16 @@ async fn begin_scoped(
 
 /// Everything the audited-write primitive needs besides the mutation itself:
 /// the connection, the scope, the acting context, the clock/entropy seam, and
-/// the envelope's action and typed target.
-struct AuditedWrite<'a, K: ScopedKind> {
+/// the envelope's action and typed target. The target is any [`AuditTarget`], so
+/// a management mutation on a level table (a tenant, an environment) audits
+/// through the same primitive as a scoped-resource mutation.
+struct AuditedWrite<'a, T: AuditTarget> {
     store: &'a Store,
     scope: Scope,
     acting: &'a ActingContext,
     env: &'a Env,
     action: Action,
-    target: &'a ScopedId<K>,
+    target: &'a T,
 }
 
 /// The single committing write path: perform a data mutation and its audit row
@@ -478,13 +483,13 @@ struct AuditedWrite<'a, K: ScopedKind> {
 /// `poison_after_audit` is `false` on every production path; the testing
 /// atomicity probe sets it to force a guaranteed in-transaction failure after
 /// both inserts, to demonstrate they roll back together.
-async fn write_audited<K, M>(
-    spec: AuditedWrite<'_, K>,
+async fn write_audited<T, M>(
+    spec: AuditedWrite<'_, T>,
     mutate: M,
     poison_after_audit: bool,
 ) -> Result<(), StoreError>
 where
-    K: ScopedKind,
+    T: AuditTarget,
     M: AsyncFnOnce(&mut Transaction<'_, Postgres>) -> Result<(), StoreError>,
 {
     let mut tx = begin_scoped(spec.store, spec.scope).await?;
@@ -503,9 +508,9 @@ where
 
 /// Insert exactly one audit row into the current transaction. Called only by
 /// [`write_audited`], after the data change and before the commit.
-async fn insert_audit_row<K: ScopedKind>(
+async fn insert_audit_row<T: AuditTarget>(
     tx: &mut Transaction<'_, Postgres>,
-    spec: &AuditedWrite<'_, K>,
+    spec: &AuditedWrite<'_, T>,
 ) -> Result<(), StoreError> {
     let audit_id = AuditId::generate(spec.env, &spec.scope);
     // Event time from the application clock seam, never the database clock, so
@@ -526,8 +531,8 @@ async fn insert_audit_row<K: ScopedKind>(
     .bind(spec.action.as_str())
     .bind(actor.kind_str())
     .bind(actor.id_string())
-    .bind(K::PREFIX)
-    .bind(spec.target.to_string())
+    .bind(spec.target.audit_target_kind())
+    .bind(spec.target.audit_target_id())
     .bind(spec.acting.correlation().to_string())
     .bind(occurred_micros)
     .execute(&mut **tx)
@@ -544,4 +549,928 @@ fn epoch_micros(at: SystemTime) -> i64 {
             i64::try_from(before.duration().as_micros()).map_or(i64::MIN, |micros| -micros)
         }
     }
+}
+
+// ===========================================================================
+// Management (control) plane (issue #11).
+//
+// The management API mutates the operator, tenant, and environment LEVEL tables
+// the data-plane role cannot see, plus the environment-scoped
+// `management_credentials` table. Everything below routes through the SAME
+// `write_audited` primitive, so every management mutation writes its audit row
+// in the same transaction as the data change; a management mutation without its
+// audit row is as structurally impossible as a data-plane one.
+//
+// These repositories are reached only through [`Store::management`], whose pool
+// must authenticate as `ironauth_control`. The data-plane [`Store::scoped`] and
+// its pool stay entirely separate: control-plane credentials are a distinct
+// class from data-plane keys, made real at the pool boundary.
+// ===========================================================================
+
+/// The maximum number of rows any management list query returns in one call.
+/// The management API caps the caller-supplied page size below this; this is a
+/// last-resort ceiling so an internal caller cannot ask for an unbounded scan.
+const MANAGEMENT_LIST_HARD_CAP: i64 = 1000;
+
+/// A cursor position for keyset pagination: the `(created_at, id)` of the last
+/// row of the previous page. Ordering is by `created_at` then `id`, both stable
+/// and total, so paging never loses or duplicates a row.
+#[derive(Debug, Clone)]
+pub struct CursorPosition {
+    /// The `created_at` of the last row of the previous page, in microseconds
+    /// since the Unix epoch.
+    pub created_at_unix_micros: i64,
+    /// The identifier of the last row of the previous page, in wire form.
+    pub id: String,
+}
+
+/// The original response stored under an Idempotency-Key, replayed verbatim when
+/// the same key is presented again so the mutation never runs twice.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredIdempotentResponse {
+    /// Hash of the original request (method, path, body). A replay whose request
+    /// fingerprint differs is a key reused for a different operation.
+    pub request_fingerprint: String,
+    /// The original HTTP status code.
+    pub response_status: u16,
+    /// The original response body, replayed byte for byte.
+    pub response_body: String,
+}
+
+/// A pending Idempotency-Key record, written in the same transaction as the
+/// mutation it guards so a stored response and its side effects commit together.
+#[derive(Debug, Clone, Copy)]
+pub struct IdempotencyWrite<'a> {
+    /// The acting credential's audit-actor id (the isolation key here).
+    pub credential_ref: &'a str,
+    /// The client-supplied Idempotency-Key header value.
+    pub key: &'a str,
+    /// Hash of the request (method, path, body).
+    pub request_fingerprint: &'a str,
+    /// The status the caller is about to return.
+    pub response_status: u16,
+    /// The body the caller is about to return, stored for verbatim replay.
+    pub response_body: &'a str,
+}
+
+/// A tenant row (management plane).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TenantRecord {
+    /// The tenant identifier.
+    pub id: TenantId,
+    /// The operator that owns the tenant.
+    pub operator_id: OperatorId,
+    /// The human-facing display name.
+    pub display_name: String,
+    /// Creation time in microseconds since the Unix epoch (the pagination key).
+    pub created_at_unix_micros: i64,
+}
+
+/// An environment row (management plane).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnvironmentRecord {
+    /// The environment identifier.
+    pub id: EnvironmentId,
+    /// The tenant the environment belongs to.
+    pub tenant_id: TenantId,
+    /// The human-facing display name.
+    pub display_name: String,
+    /// Creation time in microseconds since the Unix epoch (the pagination key).
+    pub created_at_unix_micros: i64,
+}
+
+/// A management API key row (metadata only; the secret is never stored).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManagementCredentialRecord {
+    /// The key identifier (embeds its `(tenant, environment)` scope).
+    pub id: ManagementKeyId,
+    /// The human-facing display name.
+    pub display_name: String,
+    /// Creation time in microseconds since the Unix epoch (the pagination key).
+    pub created_at_unix_micros: i64,
+}
+
+/// The control-plane entry point: reads and the acting door for writes.
+///
+/// Reached through [`Store::management`]. Its pool must authenticate as
+/// `ironauth_control`.
+pub struct ManagementStore<'a> {
+    store: &'a Store,
+}
+
+impl<'a> ManagementStore<'a> {
+    /// Bind the control plane to a store. Crate-internal: callers reach this
+    /// only through [`Store::management`].
+    pub(crate) fn new(store: &'a Store) -> Self {
+        Self { store }
+    }
+
+    /// The read-only tenant repository under `operator`.
+    #[must_use]
+    pub fn tenants(&self, operator: OperatorId) -> TenantRepo<'a> {
+        TenantRepo {
+            store: self.store,
+            operator,
+        }
+    }
+
+    /// The read-only environment repository under `tenant`.
+    #[must_use]
+    pub fn environments(&self, tenant: TenantId) -> EnvironmentRepo<'a> {
+        EnvironmentRepo {
+            store: self.store,
+            tenant,
+        }
+    }
+
+    /// The read-only management-credential repository for `scope`.
+    #[must_use]
+    pub fn credentials(&self, scope: Scope) -> ManagementCredentialRepo<'a> {
+        ManagementCredentialRepo {
+            store: self.store,
+            scope,
+        }
+    }
+
+    /// The idempotency replay store (credential-scoped).
+    #[must_use]
+    pub fn idempotency(&self) -> IdempotencyRepo<'a> {
+        IdempotencyRepo { store: self.store }
+    }
+
+    /// Enter an acting context for management writes. Every mutation reached
+    /// through the returned store carries an actor and correlation id into its
+    /// audit row.
+    #[must_use]
+    pub fn acting(&self, actor: ActorRef, correlation: CorrelationId) -> ActingManagementStore<'a> {
+        ActingManagementStore {
+            store: self.store,
+            acting: ActingContext::new(actor, correlation),
+        }
+    }
+}
+
+/// The acting door to the mutating management repositories.
+pub struct ActingManagementStore<'a> {
+    store: &'a Store,
+    acting: ActingContext,
+}
+
+impl<'a> ActingManagementStore<'a> {
+    /// The mutating tenant repository under `operator`.
+    #[must_use]
+    pub fn tenants(&self, operator: OperatorId) -> ActingTenantRepo<'a> {
+        ActingTenantRepo {
+            store: self.store,
+            acting: self.acting,
+            operator,
+        }
+    }
+
+    /// The mutating environment repository under `tenant`.
+    #[must_use]
+    pub fn environments(&self, tenant: TenantId) -> ActingEnvironmentRepo<'a> {
+        ActingEnvironmentRepo {
+            store: self.store,
+            acting: self.acting,
+            tenant,
+        }
+    }
+
+    /// The mutating management-credential repository for `scope`.
+    #[must_use]
+    pub fn credentials(&self, scope: Scope) -> ActingManagementCredentialRepo<'a> {
+        ActingManagementCredentialRepo {
+            store: self.store,
+            acting: self.acting,
+            scope,
+        }
+    }
+}
+
+/// Read-only tenants under one operator.
+pub struct TenantRepo<'a> {
+    store: &'a Store,
+    operator: OperatorId,
+}
+
+impl TenantRepo<'_> {
+    /// Parse an untrusted tenant identifier. A malformed identifier is the
+    /// uniform not-found, exactly like an absent one.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the identifier is malformed.
+    pub fn parse_id(&self, raw: &str) -> Result<TenantId, StoreError> {
+        TenantId::parse(raw).map_err(|_| StoreError::NotFound)
+    }
+
+    /// Fetch a live tenant under this operator.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if no such live tenant exists under this operator
+    /// (absent, deactivated, or owned by another operator: indistinguishable).
+    pub async fn get(&self, id: &TenantId) -> Result<TenantRecord, StoreError> {
+        let row = sqlx::query(
+            "SELECT id, operator_id, display_name, \
+             (EXTRACT(EPOCH FROM created_at) * 1000000)::bigint AS created_us \
+             FROM tenants \
+             WHERE id = $1 AND operator_id = $2 AND deleted_at IS NULL",
+        )
+        .bind(id.to_string())
+        .bind(self.operator.to_string())
+        .fetch_optional(self.store.pool())
+        .await?
+        .ok_or(StoreError::NotFound)?;
+        tenant_from_row(&row)
+    }
+
+    /// One page of live tenants under this operator, ordered by `(created_at,
+    /// id)`. Returns up to `limit` rows starting strictly after `after`.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn list(
+        &self,
+        limit: i64,
+        after: Option<&CursorPosition>,
+    ) -> Result<Vec<TenantRecord>, StoreError> {
+        let (after_micros, after_id) = split_cursor(after);
+        let rows = sqlx::query(
+            "SELECT id, operator_id, display_name, \
+             (EXTRACT(EPOCH FROM created_at) * 1000000)::bigint AS created_us \
+             FROM tenants \
+             WHERE operator_id = $1 AND deleted_at IS NULL \
+             AND ($2::bigint IS NULL OR (created_at, id) > \
+                  (TIMESTAMPTZ 'epoch' + ($2::text || ' microseconds')::interval, $3::text)) \
+             ORDER BY created_at, id LIMIT $4",
+        )
+        .bind(self.operator.to_string())
+        .bind(after_micros)
+        .bind(after_id)
+        .bind(limit.clamp(0, MANAGEMENT_LIST_HARD_CAP))
+        .fetch_all(self.store.pool())
+        .await?;
+        rows.iter().map(tenant_from_row).collect()
+    }
+}
+
+/// Read-only environments under one tenant.
+pub struct EnvironmentRepo<'a> {
+    store: &'a Store,
+    tenant: TenantId,
+}
+
+impl EnvironmentRepo<'_> {
+    /// Parse an untrusted environment identifier. A malformed identifier is the
+    /// uniform not-found, exactly like an absent or cross-tenant one.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the identifier is malformed.
+    pub fn parse_id(&self, raw: &str) -> Result<EnvironmentId, StoreError> {
+        EnvironmentId::parse(raw).map_err(|_| StoreError::NotFound)
+    }
+
+    /// Fetch a live environment under this tenant. An environment of ANOTHER
+    /// tenant is the uniform not-found (the tenant filter is the anti-oracle).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if no such live environment exists under this
+    /// tenant.
+    pub async fn get(&self, id: &EnvironmentId) -> Result<EnvironmentRecord, StoreError> {
+        let row = sqlx::query(
+            "SELECT id, tenant_id, display_name, \
+             (EXTRACT(EPOCH FROM created_at) * 1000000)::bigint AS created_us \
+             FROM environments \
+             WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL",
+        )
+        .bind(id.to_string())
+        .bind(self.tenant.to_string())
+        .fetch_optional(self.store.pool())
+        .await?
+        .ok_or(StoreError::NotFound)?;
+        environment_from_row(&row)
+    }
+
+    /// One page of live environments under this tenant, ordered by `(created_at,
+    /// id)`.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn list(
+        &self,
+        limit: i64,
+        after: Option<&CursorPosition>,
+    ) -> Result<Vec<EnvironmentRecord>, StoreError> {
+        let (after_micros, after_id) = split_cursor(after);
+        let rows = sqlx::query(
+            "SELECT id, tenant_id, display_name, \
+             (EXTRACT(EPOCH FROM created_at) * 1000000)::bigint AS created_us \
+             FROM environments \
+             WHERE tenant_id = $1 AND deleted_at IS NULL \
+             AND ($2::bigint IS NULL OR (created_at, id) > \
+                  (TIMESTAMPTZ 'epoch' + ($2::text || ' microseconds')::interval, $3::text)) \
+             ORDER BY created_at, id LIMIT $4",
+        )
+        .bind(self.tenant.to_string())
+        .bind(after_micros)
+        .bind(after_id)
+        .bind(limit.clamp(0, MANAGEMENT_LIST_HARD_CAP))
+        .fetch_all(self.store.pool())
+        .await?;
+        rows.iter().map(environment_from_row).collect()
+    }
+}
+
+/// Read-only management credentials for one scope.
+pub struct ManagementCredentialRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl ManagementCredentialRepo<'_> {
+    /// Parse an untrusted management-key identifier under this scope. A malformed
+    /// identifier and one minted in another scope both return the uniform
+    /// not-found.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if malformed or out of scope.
+    pub fn parse_id(&self, raw: &str) -> Result<ManagementKeyId, StoreError> {
+        Ok(ManagementKeyId::parse_in_scope(raw, &self.scope)?)
+    }
+
+    /// Fetch a live management key by id, within scope.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if no such live key is visible in this scope.
+    pub async fn get(
+        &self,
+        id: &ManagementKeyId,
+    ) -> Result<ManagementCredentialRecord, StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT id, display_name, \
+             (EXTRACT(EPOCH FROM created_at) * 1000000)::bigint AS created_us \
+             FROM management_credentials \
+             WHERE id = $1 AND tenant_id = $2 AND environment_id = $3 AND deleted_at IS NULL",
+        )
+        .bind(id.to_string())
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        let row = row.ok_or(StoreError::NotFound)?;
+        credential_from_row(&row, &self.scope)
+    }
+
+    /// One page of live management keys in this scope, ordered by `(created_at,
+    /// id)`.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn list(
+        &self,
+        limit: i64,
+        after: Option<&CursorPosition>,
+    ) -> Result<Vec<ManagementCredentialRecord>, StoreError> {
+        let (after_micros, after_id) = split_cursor(after);
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let rows = sqlx::query(
+            "SELECT id, display_name, \
+             (EXTRACT(EPOCH FROM created_at) * 1000000)::bigint AS created_us \
+             FROM management_credentials \
+             WHERE tenant_id = $1 AND environment_id = $2 AND deleted_at IS NULL \
+             AND ($3::bigint IS NULL OR (created_at, id) > \
+                  (TIMESTAMPTZ 'epoch' + ($3::text || ' microseconds')::interval, $4::text)) \
+             ORDER BY created_at, id LIMIT $5",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(after_micros)
+        .bind(after_id)
+        .bind(limit.clamp(0, MANAGEMENT_LIST_HARD_CAP))
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        rows.iter()
+            .map(|row| credential_from_row(row, &self.scope))
+            .collect()
+    }
+
+    /// Whether a live key with `id` and this exact `key_hash` exists in scope.
+    /// The authentication primitive: the caller has already recovered the scope
+    /// from the presented token's id half, so this look-up runs within it.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn authenticate(
+        &self,
+        id: &ManagementKeyId,
+        key_hash: &str,
+    ) -> Result<bool, StoreError> {
+        if id.scope() != self.scope {
+            return Ok(false);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT 1 AS ok FROM management_credentials \
+             WHERE id = $1 AND tenant_id = $2 AND environment_id = $3 \
+             AND key_hash = $4 AND deleted_at IS NULL",
+        )
+        .bind(id.to_string())
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(key_hash)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(row.is_some())
+    }
+}
+
+/// The idempotency replay store (credential-scoped). See the migration for why
+/// isolation here is by credential rather than tenant row-level security.
+pub struct IdempotencyRepo<'a> {
+    store: &'a Store,
+}
+
+impl IdempotencyRepo<'_> {
+    /// Look up a stored response for `(credential_ref, key)`.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn lookup(
+        &self,
+        credential_ref: &str,
+        key: &str,
+    ) -> Result<Option<StoredIdempotentResponse>, StoreError> {
+        let row = sqlx::query(
+            "SELECT request_fingerprint, response_status, response_body \
+             FROM idempotency_keys \
+             WHERE credential_ref = $1 AND idempotency_key = $2",
+        )
+        .bind(credential_ref)
+        .bind(key)
+        .fetch_optional(self.store.pool())
+        .await?;
+        Ok(row.map(|row| {
+            let status: i32 = row.get("response_status");
+            StoredIdempotentResponse {
+                request_fingerprint: row.get("request_fingerprint"),
+                response_status: u16::try_from(status).unwrap_or(500),
+                response_body: row.get("response_body"),
+            }
+        }))
+    }
+}
+
+/// Mutating tenants under one operator.
+pub struct ActingTenantRepo<'a> {
+    store: &'a Store,
+    acting: ActingContext,
+    operator: OperatorId,
+}
+
+impl ActingTenantRepo<'_> {
+    /// Create a tenant and its first environment in one transaction, and audit
+    /// the creation scoped to `(new_tenant, new_first_environment)`.
+    ///
+    /// The operator-plane audit wrinkle: an operator-plane "create tenant" has no
+    /// pre-existing `(tenant, environment)` scope to key the audit row on. It is
+    /// resolved exactly as the design mandates: the tenant AND its first
+    /// environment are created in the same transaction, then the audit row is
+    /// written scoped to that fresh `(tenant, environment)` pair (both rows exist
+    /// by the time the audit insert runs, so its foreign keys and the row-level
+    /// security check are satisfied). The bootstrap operator row is ensured
+    /// idempotently in the same transaction (platform self-bootstrap, not a
+    /// caller mutation, so it is not itself audited).
+    ///
+    /// The identifiers are supplied by the caller (minted from the entropy seam)
+    /// so the HTTP response can be built before the write and stored verbatim for
+    /// idempotent replay.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::IdempotencyConflict`] if a concurrent request already stored
+    /// this Idempotency-Key; [`StoreError::Database`] on a persistence failure.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create(
+        &self,
+        env: &Env,
+        tenant_id: &TenantId,
+        environment_id: &EnvironmentId,
+        created_at_micros: i64,
+        operator_display_name: &str,
+        tenant_display_name: &str,
+        environment_display_name: &str,
+        idempotency: Option<IdempotencyWrite<'_>>,
+    ) -> Result<(), StoreError> {
+        let scope = Scope::new(*tenant_id, *environment_id);
+        let operator = self.operator;
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::TenantCreate,
+                target: tenant_id,
+            },
+            async move |tx| {
+                // Ensure the (well-known) bootstrap operator exists so the tenant
+                // foreign key resolves. Idempotent and not audited: this is the
+                // platform bootstrapping itself, like a migration, not a
+                // caller-visible mutation.
+                sqlx::query(
+                    "INSERT INTO operators (id, display_name) VALUES ($1, $2) \
+                     ON CONFLICT (id) DO NOTHING",
+                )
+                .bind(operator.to_string())
+                .bind(operator_display_name)
+                .execute(&mut **tx)
+                .await?;
+                // created_at is bound from the application clock seam (not the
+                // database clock), so the response body built before the write
+                // matches the stored row exactly and paging stays deterministic
+                // under a manual clock in tests.
+                sqlx::query(
+                    "INSERT INTO tenants (id, operator_id, display_name, created_at) \
+                     VALUES ($1, $2, $3, \
+                             TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval)",
+                )
+                .bind(tenant_id.to_string())
+                .bind(operator.to_string())
+                .bind(tenant_display_name)
+                .bind(created_at_micros)
+                .execute(&mut **tx)
+                .await?;
+                sqlx::query(
+                    "INSERT INTO environments (id, tenant_id, display_name, created_at) \
+                     VALUES ($1, $2, $3, \
+                             TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval)",
+                )
+                .bind(environment_id.to_string())
+                .bind(tenant_id.to_string())
+                .bind(environment_display_name)
+                .bind(created_at_micros)
+                .execute(&mut **tx)
+                .await?;
+                insert_idempotency(tx, idempotency).await?;
+                Ok(())
+            },
+            false,
+        )
+        .await
+    }
+
+    /// Deactivate a tenant (soft delete) and audit it scoped to the tenant and
+    /// its oldest environment (which is retained, so the audit foreign key
+    /// holds).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if no live tenant matched under this operator.
+    pub async fn delete(&self, env: &Env, id: &TenantId) -> Result<(), StoreError> {
+        // The audit scope needs an environment of this tenant; pick the oldest
+        // (it is retained through soft delete, so its row satisfies the audit
+        // foreign key). A tenant always has its first environment.
+        let scope_env = sqlx::query(
+            "SELECT id FROM environments WHERE tenant_id = $1 ORDER BY created_at, id LIMIT 1",
+        )
+        .bind(id.to_string())
+        .fetch_optional(self.store.pool())
+        .await?;
+        let Some(scope_env) = scope_env else {
+            return Err(StoreError::NotFound);
+        };
+        let environment = EnvironmentId::parse(&scope_env.get::<String, _>("id"))
+            .map_err(|e| StoreError::Database(sqlx::Error::Decode(Box::new(e))))?;
+        let scope = Scope::new(*id, environment);
+        let operator = self.operator;
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::TenantDelete,
+                target: id,
+            },
+            async move |tx| {
+                let result = sqlx::query(
+                    "UPDATE tenants SET deleted_at = \
+                     TIMESTAMPTZ 'epoch' + ($1::text || ' microseconds')::interval \
+                     WHERE id = $2 AND operator_id = $3 AND deleted_at IS NULL",
+                )
+                .bind(epoch_micros(env.clock().now_utc()))
+                .bind(id.to_string())
+                .bind(operator.to_string())
+                .execute(&mut **tx)
+                .await?;
+                if result.rows_affected() == 0 {
+                    return Err(StoreError::NotFound);
+                }
+                Ok(())
+            },
+            false,
+        )
+        .await
+    }
+}
+
+/// Mutating environments under one tenant.
+pub struct ActingEnvironmentRepo<'a> {
+    store: &'a Store,
+    acting: ActingContext,
+    tenant: TenantId,
+}
+
+impl ActingEnvironmentRepo<'_> {
+    /// Create an environment under this tenant, audited scoped to `(tenant,
+    /// new_environment)`.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::IdempotencyConflict`] on a concurrent Idempotency-Key race;
+    /// [`StoreError::Database`] on a persistence failure (including a missing
+    /// tenant, which surfaces as the tenant foreign-key violation).
+    pub async fn create(
+        &self,
+        env: &Env,
+        environment_id: &EnvironmentId,
+        created_at_micros: i64,
+        display_name: &str,
+        idempotency: Option<IdempotencyWrite<'_>>,
+    ) -> Result<(), StoreError> {
+        let scope = Scope::new(self.tenant, *environment_id);
+        let tenant = self.tenant;
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::EnvironmentCreate,
+                target: environment_id,
+            },
+            async move |tx| {
+                sqlx::query(
+                    "INSERT INTO environments (id, tenant_id, display_name, created_at) \
+                     VALUES ($1, $2, $3, \
+                             TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval)",
+                )
+                .bind(environment_id.to_string())
+                .bind(tenant.to_string())
+                .bind(display_name)
+                .bind(created_at_micros)
+                .execute(&mut **tx)
+                .await?;
+                insert_idempotency(tx, idempotency).await?;
+                Ok(())
+            },
+            false,
+        )
+        .await
+    }
+
+    /// Deactivate an environment (soft delete) under this tenant, audited scoped
+    /// to `(tenant, environment)`. The row is retained, so the audit foreign key
+    /// holds.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if no live environment matched under this tenant.
+    pub async fn delete(&self, env: &Env, id: &EnvironmentId) -> Result<(), StoreError> {
+        let scope = Scope::new(self.tenant, *id);
+        let tenant = self.tenant;
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::EnvironmentDelete,
+                target: id,
+            },
+            async move |tx| {
+                let result = sqlx::query(
+                    "UPDATE environments SET deleted_at = \
+                     TIMESTAMPTZ 'epoch' + ($1::text || ' microseconds')::interval \
+                     WHERE id = $2 AND tenant_id = $3 AND deleted_at IS NULL",
+                )
+                .bind(epoch_micros(env.clock().now_utc()))
+                .bind(id.to_string())
+                .bind(tenant.to_string())
+                .execute(&mut **tx)
+                .await?;
+                if result.rows_affected() == 0 {
+                    return Err(StoreError::NotFound);
+                }
+                Ok(())
+            },
+            false,
+        )
+        .await
+    }
+}
+
+/// Mutating management credentials for one scope.
+pub struct ActingManagementCredentialRepo<'a> {
+    store: &'a Store,
+    acting: ActingContext,
+    scope: Scope,
+}
+
+impl ActingManagementCredentialRepo<'_> {
+    /// Mint a management key: store the key HASH (never the secret) and audit
+    /// `management_key.create` in the same transaction, scoped to this scope.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::IdempotencyConflict`] on a concurrent Idempotency-Key race;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn create(
+        &self,
+        env: &Env,
+        id: &ManagementKeyId,
+        created_at_micros: i64,
+        key_hash: &str,
+        display_name: &str,
+        idempotency: Option<IdempotencyWrite<'_>>,
+    ) -> Result<(), StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::ManagementKeyCreate,
+                target: id,
+            },
+            async move |tx| {
+                sqlx::query(
+                    "INSERT INTO management_credentials \
+                     (id, tenant_id, environment_id, key_hash, display_name, created_at) \
+                     VALUES ($1, $2, $3, $4, $5, \
+                             TIMESTAMPTZ 'epoch' + ($6::text || ' microseconds')::interval)",
+                )
+                .bind(id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(key_hash)
+                .bind(display_name)
+                .bind(created_at_micros)
+                .execute(&mut **tx)
+                .await?;
+                insert_idempotency(tx, idempotency).await?;
+                Ok(())
+            },
+            false,
+        )
+        .await
+    }
+
+    /// Revoke a management key (soft delete) and audit `management_key.delete`.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if no live key matched in this scope.
+    pub async fn delete(&self, env: &Env, id: &ManagementKeyId) -> Result<(), StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::ManagementKeyDelete,
+                target: id,
+            },
+            async move |tx| {
+                let result = sqlx::query(
+                    "UPDATE management_credentials SET deleted_at = \
+                     TIMESTAMPTZ 'epoch' + ($1::text || ' microseconds')::interval \
+                     WHERE id = $2 AND tenant_id = $3 AND environment_id = $4 \
+                     AND deleted_at IS NULL",
+                )
+                .bind(epoch_micros(env.clock().now_utc()))
+                .bind(id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .execute(&mut **tx)
+                .await?;
+                if result.rows_affected() == 0 {
+                    return Err(StoreError::NotFound);
+                }
+                Ok(())
+            },
+            false,
+        )
+        .await
+    }
+}
+
+/// Insert a pending idempotency row, if the caller supplied one. A primary-key
+/// collision (a concurrent request already stored this key) surfaces as the
+/// distinct [`StoreError::IdempotencyConflict`] so the caller can re-read and
+/// replay rather than double-execute.
+async fn insert_idempotency(
+    tx: &mut Transaction<'_, Postgres>,
+    idempotency: Option<IdempotencyWrite<'_>>,
+) -> Result<(), StoreError> {
+    let Some(idem) = idempotency else {
+        return Ok(());
+    };
+    let result = sqlx::query(
+        "INSERT INTO idempotency_keys \
+         (credential_ref, idempotency_key, request_fingerprint, response_status, response_body) \
+         VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(idem.credential_ref)
+    .bind(idem.key)
+    .bind(idem.request_fingerprint)
+    .bind(i32::from(idem.response_status))
+    .bind(idem.response_body)
+    .execute(&mut **tx)
+    .await;
+    match result {
+        Ok(_) => Ok(()),
+        Err(error) if is_idempotency_conflict(&error) => Err(StoreError::IdempotencyConflict),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Whether a database error is a primary-key collision on `idempotency_keys`.
+fn is_idempotency_conflict(error: &sqlx::Error) -> bool {
+    let Some(db) = error.as_database_error() else {
+        return false;
+    };
+    db.code().as_deref() == Some("23505") && db.constraint() == Some("idempotency_keys_pkey")
+}
+
+/// Split an optional cursor into its bound parameters (both `None` when absent).
+fn split_cursor(after: Option<&CursorPosition>) -> (Option<i64>, Option<String>) {
+    match after {
+        Some(cursor) => (Some(cursor.created_at_unix_micros), Some(cursor.id.clone())),
+        None => (None, None),
+    }
+}
+
+/// Reconstruct a [`TenantRecord`] from a row.
+fn tenant_from_row(row: &PgRow) -> Result<TenantRecord, StoreError> {
+    let decode =
+        |e: crate::id::IdParseError| StoreError::Database(sqlx::Error::Decode(Box::new(e)));
+    Ok(TenantRecord {
+        id: TenantId::parse(&row.get::<String, _>("id")).map_err(decode)?,
+        operator_id: OperatorId::parse(&row.get::<String, _>("operator_id")).map_err(decode)?,
+        display_name: row.get("display_name"),
+        created_at_unix_micros: row.get("created_us"),
+    })
+}
+
+/// Reconstruct an [`EnvironmentRecord`] from a row.
+fn environment_from_row(row: &PgRow) -> Result<EnvironmentRecord, StoreError> {
+    let decode =
+        |e: crate::id::IdParseError| StoreError::Database(sqlx::Error::Decode(Box::new(e)));
+    Ok(EnvironmentRecord {
+        id: EnvironmentId::parse(&row.get::<String, _>("id")).map_err(decode)?,
+        tenant_id: TenantId::parse(&row.get::<String, _>("tenant_id")).map_err(decode)?,
+        display_name: row.get("display_name"),
+        created_at_unix_micros: row.get("created_us"),
+    })
+}
+
+/// Reconstruct a [`ManagementCredentialRecord`] from a row read within scope.
+fn credential_from_row(
+    row: &PgRow,
+    scope: &Scope,
+) -> Result<ManagementCredentialRecord, StoreError> {
+    let id_text: String = row.get("id");
+    let id = ManagementKeyId::parse_in_scope(&id_text, scope)?;
+    Ok(ManagementCredentialRecord {
+        id,
+        display_name: row.get("display_name"),
+        created_at_unix_micros: row.get("created_us"),
+    })
 }

@@ -68,14 +68,19 @@ pub mod test_support;
 pub use audit::{ActingContext, Action, ActorRef};
 pub use error::StoreError;
 pub use id::{
-    AgentId, AgentKind, AuditId, AuditKind, COMPONENT_BYTES, ClientId, ClientKind, CorrelationId,
-    CorrelationKind, EnvironmentId, EnvironmentKind, HumanId, HumanKind, IdParseError, LevelId,
-    LevelKind, NotInScope, OperatorId, OperatorKind, OrganizationId, OrganizationKind, ScopedId,
-    ScopedKind, ServiceId, ServiceKind, TenantId, TenantKind,
+    AgentId, AgentKind, AuditId, AuditKind, AuditTarget, COMPONENT_BYTES, ClientId, ClientKind,
+    CorrelationId, CorrelationKind, EnvironmentId, EnvironmentKind, HumanId, HumanKind,
+    IdParseError, LevelId, LevelKind, ManagementKeyId, ManagementKeyKind, NotInScope, OperatorId,
+    OperatorKind, OrganizationId, OrganizationKind, ScopedId, ScopedKind, ServiceId, ServiceKind,
+    TenantId, TenantKind,
 };
 pub use migrate::{Migration, MigrationError, MigrationReport, MigrationRunner, Phase};
 pub use repository::{
-    ActingClientRepo, ActingStore, AuditRecord, AuditRepo, ClientRecord, ClientRepo, ScopedStore,
+    ActingClientRepo, ActingEnvironmentRepo, ActingManagementCredentialRepo, ActingManagementStore,
+    ActingStore, ActingTenantRepo, AuditRecord, AuditRepo, ClientRecord, ClientRepo,
+    CursorPosition, EnvironmentRecord, EnvironmentRepo, IdempotencyRepo, IdempotencyWrite,
+    ManagementCredentialRecord, ManagementCredentialRepo, ManagementStore, ScopedStore,
+    StoredIdempotentResponse, TenantRecord, TenantRepo,
 };
 pub use scope::Scope;
 pub use store::Store;

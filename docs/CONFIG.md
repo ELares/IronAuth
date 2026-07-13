@@ -11,6 +11,10 @@ at the top of the file, or map it in `.taplo.toml`).
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
+| `admin` | table | see fields | Management API settings (issue #11). |
+| `admin.bootstrap_operator_token` | string or table or unset | unset | The bootstrap operator bearer token that authorizes the operator plane (tenant CRUD) in M1, presented as `Authorization: Bearer <token>`. Unset leaves the operator plane unauthorized (the management API still mounts, but every operator-plane request is rejected). Use the `file`/`env` secret indirection, never a literal, outside dev mode. The full operator-plane credential class lands in M5. |
+| `admin.default_page_size` | integer | `50` | The page size a list endpoint uses when the caller supplies no `limit`. Clamped to `max_page_size`. |
+| `admin.max_page_size` | integer | `200` | The largest page a list endpoint will return, regardless of a larger caller-supplied `limit`. A ceiling that bounds any one response so a caller cannot request an unbounded scan. |
 | `database` | table | see fields | Primary database settings. |
 | `database.password` | string or table or unset | unset | Database password supplied out of band, overriding any password embedded in `url`. |
 | `database.url` | string | `"postgres://ironauth@localhost:5432/ironauth"` | Postgres connection string. Embedding the password here is discouraged; prefer the `password` secret, which is merged at connection time. |
