@@ -134,6 +134,8 @@ jobs:
         run: scripts/invariant-lints.sh
       - name: query audit (no scoped-table SQL outside the repository module)
         run: scripts/query-audit.sh
+      - name: http audit (no outbound HTTP client outside the fetch dispatcher)
+        run: scripts/http-audit.sh
       - name: dash scan
         run: scripts/dash-scan.sh
       - name: compatibility matrix freshness

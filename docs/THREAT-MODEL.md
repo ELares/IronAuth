@@ -70,6 +70,27 @@ the same-transaction audit log is owned by #7.
 | Denial of service | Query and pagination abuse | Cursor pagination and per-tenant rate limits land with the surfaces that expose these repositories (#11, #50, M15) |
 | Elevation | A raw unscoped query bypassing the repository to read across tenants | The pool and scoped tables are crate-private (no cross-crate raw access); repositories are constructible only from a scope (compile-fail tested); `scripts/query-audit.sh` fails CI on any scoped-table SQL outside the repository module |
 
+## Surface: outbound fetcher (shipped)
+
+The fetcher parses attacker-influenced URLs (a client's `jwks_uri`,
+`sector_identifier_uri`, `logo_uri`, client-metadata documents, webhook targets)
+and makes server-side HTTP requests to them, so its attacker is a client or
+tenant who controls the URL and, through DNS, the address it resolves to. It
+ships no inbound endpoint, but every later fetching feature consumes it, so its
+controls are structural. See docs/adr/0003-outbound-fetch.md. Cells here are all
+shipped; later features consume this dispatcher, they do not weaken it.
+
+| STRIDE | Threat | Control |
+|---|---|---|
+| Spoofing | A URL or DNS answer pointing at the cloud metadata service or an internal host (the SSRF class; the Casdoor webhook-SSRF CVE) | The destination is validated by RESOLVED ADDRESS, not by hostname: loopback, private, link-local (`169.254.169.254`, `fe80::/10`), unique-local, shared-CGN, multicast, unspecified, documentation, and other special-use ranges are denied for IPv4, IPv6, and the IPv4-in-IPv6 forms; a host resolving to ANY denied address blocks the whole fetch |
+| Tampering | A DNS record that flips between the validation lookup and the connect (DNS rebinding) | The host is resolved exactly once and the connection is pinned to a validated address by value; the socket layer never re-resolves the hostname, so there is no connect-time lookup for a flipped record to poison (proven by an injectable-resolver rebinding test) |
+| Tampering | A redirect (3xx `Location`) steering a validated fetch to an internal address | Redirects are never followed; a 3xx with a `Location` is returned to the caller as an error |
+| Repudiation | Unattributable outbound requests and blocks | Every fetch is metered by caller-declared `FetchPurpose` and outcome (`ironauth_outbound_fetch_requests_total`), and every block additionally by reason (`ironauth_outbound_fetch_blocked_total`), with a structured scrubbed log line per block |
+| Information disclosure | The error as an oracle for internal network topology; the target URL leaking into logs | A blocked destination returns the single uniform `FetchError::Blocked` (scheme, denied address, DNS failure, and rebinding all collapse into it); the structured reason and purpose are bounded labels; the attacker-influenced host and URL are never logged as free-form fields |
+| Denial of service | A size bomb, a slow-loris body, or a metadata-label blow-up via crafted URLs | A response size cap aborts mid-body and a total deadline aborts mid-flight (safe defaults, configurable); purpose, outcome, and reason labels are fixed closed sets, so an attacker URL cannot grow the series set |
+| Elevation | A second, unhardened outbound path in another crate re-introducing the class | The connector and socket construction are module-private and the injectable seams are behind a test-only feature; no other crate may declare an HTTP-client dependency or construct an HTTP/TLS client, enforced by `scripts/http-audit.sh` |
+| Elevation | Ambient credentials or proxy trust riding an outbound request | No cookie jar, no default credentials, no `HTTP_PROXY`/`NO_PROXY` trust, and userinfo in a URL is rejected; a request carries only what the caller set plus the destination `Host` |
+
 ## Surface: authorization endpoint (planned; lands with issue #12)
 
 | STRIDE | Threat | Control (owning issue) |

@@ -1,0 +1,95 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+[package]
+name = "ironauth-fetch"
+version = "0.1.0"
+description = "IronAuth SSRF-hardened outbound fetcher: the single hardened dispatcher for every server-side HTTP request, with resolve-validate-pin destination control, no redirects, response caps, and no ambient authority"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# Explicit target list: the adversarial integration tests drive the dispatcher
+# through injected resolver/dialer seams, which live behind the `test-harness`
+# feature. Auto-discovery is off so a new test file cannot silently run without
+# the seam it needs (and its required-features gate).
+autotests = false
+
+[dependencies]
+# hyper's low-level client connection API (client + http1) only. No high-level
+# pooling client, so nothing re-resolves the host or pools connections behind
+# our back; the connector resolves, validates, and pins the address itself.
+hyper = { workspace = true, features = ["client", "http1"] }
+# TokioIo adapts a tokio socket to hyper's IO traits. The `tokio` feature is the
+# only one enabled: hyper-util's own legacy Client (which would re-resolve and
+# honor proxy env) is never compiled in.
+hyper-util = { workspace = true, features = ["tokio"] }
+http.workspace = true
+http-body-util.workspace = true
+bytes.workspace = true
+# Client TLS: rustls + ring stream over the pinned socket, with the OS trust
+# store. tokio-rustls re-exports rustls, so no separate rustls entry is needed.
+tokio-rustls.workspace = true
+rustls-native-certs.workspace = true
+
+tokio = { workspace = true, features = ["net", "io-util", "time", "rt"] }
+
+# Observability of blocked and completed fetches. The `metrics` facade routes to
+# whatever recorder the binary installed (ironauth-server); no exporter or extra
+# HTTP client enters this crate's graph. tracing carries the structured
+# diagnostics for blocked attempts.
+tracing.workspace = true
+metrics.workspace = true
+
+[features]
+# Default build is lean and production-shaped: only the system resolver and
+# system dialer exist, and the only outbound path is the private connector.
+default = []
+# Test-support surface: exposes the injectable resolver/dialer seams and the
+# in-crate test doubles (static, sequenced, recording) so the adversarial
+# integration tests can drive rebinding, redirect, cap, and no-ambient-authority
+# scenarios deterministically. It adds no dependency and no production code path;
+# the seam types are unreachable outside the crate without it.
+test-harness = []
+
+[dev-dependencies]
+tokio = { workspace = true, features = [
+    "rt-multi-thread",
+    "macros",
+    "net",
+    "io-util",
+    "time",
+] }
+
+# Adversarial destination controls: cloud-metadata, private, loopback,
+# link-local, unique-local, IPv6, and IPv4-mapped targets, as literal-IP URLs
+# and as hostnames that resolve to those addresses.
+[[test]]
+name = "ssrf"
+path = "tests/ssrf.rs"
+required-features = ["test-harness"]
+
+# The DNS-rebinding crux: a resolver whose record flips between validation and
+# connect cannot reach a private address, because the connection is pinned to
+# the once-validated address.
+[[test]]
+name = "rebinding"
+path = "tests/rebinding.rs"
+required-features = ["test-harness"]
+
+# Transport behavior against a raw in-process server: redirects surface as
+# errors and are never followed, oversized bodies abort mid-stream at the size
+# cap, slow responses abort at the time cap, and requests carry no cookies,
+# credentials, or proxy headers the caller did not set.
+[[test]]
+name = "behavior"
+path = "tests/behavior.rs"
+required-features = ["test-harness"]
+
+# Stable, in-CI adversarial table over crafted URLs, hosts, and addresses,
+# mirroring the fuzz target's input space so coverage exists on the stable lanes.
+[[test]]
+name = "adversarial_table"
+path = "tests/adversarial_table.rs"
+
+[lints]
+workspace = true
