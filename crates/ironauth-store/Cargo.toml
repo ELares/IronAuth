@@ -98,6 +98,14 @@ name = "migration"
 path = "tests/migration.rs"
 required-features = ["testing"]
 
+# Per-environment signing-key persistence and isolation (issue #19): disjoint key
+# sets across environments and tenants, uniform cross-scope denial, and the
+# provision audit row. Needs a real database (DATABASE_URL).
+[[test]]
+name = "signing_keys"
+path = "tests/signing_keys.rs"
+required-features = ["testing"]
+
 # Compile-fail proofs. Database-free, so it runs on every lane (including MSRV).
 [[test]]
 name = "compile_fail"

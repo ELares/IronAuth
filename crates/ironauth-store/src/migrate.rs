@@ -220,13 +220,14 @@ CREATE TABLE IF NOT EXISTS _schema_migrations ( \
 /// role, soft-delete columns, and the `management_credentials` and
 /// `idempotency_keys` tables) is version 3; the OIDC authorization-code grant
 /// tables (issue #12: `grants`, `authorization_codes`, and `issued_tokens`) are
-/// version 4. That is the whole production chain: it deliberately carries no
-/// throwaway objects, so a real database never gains a demo table or ledger rows
-/// beyond what the product needs. The worked expand-contract example (add a
-/// nullable column, backfill, drop the old column) lives entirely in the
-/// migration framework's own test (`tests/migration.rs`), driven through
-/// [`MigrationRunner::from_migrations`] against a throwaway test database, so all
-/// three phases are exercised in CI without ever touching the real schema.
+/// version 4; the per-environment `signing_keys` table (issue #19) is version 5.
+/// That is the whole production chain: it deliberately carries no throwaway
+/// objects, so a real database never gains a demo table or ledger rows beyond what
+/// the product needs. The worked expand-contract example (add a nullable column,
+/// backfill, drop the old column) lives entirely in the migration framework's own
+/// test (`tests/migration.rs`), driven through [`MigrationRunner::from_migrations`]
+/// against a throwaway test database, so all three phases are exercised in CI
+/// without ever touching the real schema.
 fn registry() -> Vec<Migration> {
     vec![
         Migration {
@@ -252,6 +253,12 @@ fn registry() -> Vec<Migration> {
             name: "oidc_authorization",
             phase: Phase::Expand,
             sql: include_str!("../migrations/0004_oidc_authorization.sql"),
+        },
+        Migration {
+            version: 5,
+            name: "signing_keys",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0005_signing_keys.sql"),
         },
     ]
 }

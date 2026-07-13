@@ -145,6 +145,9 @@ pub enum Action {
     AuthorizationCodeReuse,
     /// Tokens (access and/or ID) were issued from a grant (issue #12).
     TokenIssue,
+    /// A per-environment signing key was provisioned (issue #19). Covers both a
+    /// day-one key and a manually rotated-in successor.
+    SigningKeyProvision,
 }
 
 impl Action {
@@ -164,6 +167,7 @@ impl Action {
             Action::AuthorizationCodeRedeem => "authorization_code.redeem",
             Action::AuthorizationCodeReuse => "authorization_code.reuse",
             Action::TokenIssue => "token.issue",
+            Action::SigningKeyProvision => "signing_key.provision",
         }
     }
 }

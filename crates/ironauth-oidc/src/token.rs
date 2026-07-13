@@ -219,13 +219,19 @@ fn mint_tokens(
         .signer_for(&scope.environment())
         .ok_or(TokenError::ServerError)?;
     let issuer = state.issuer_for(&scope);
+    // Resolve the `sub` through the ONE shared subject-derivation function, so the
+    // ID token's subject can never diverge from what `UserInfo`/introspection would
+    // return for the same client and user (OIDC Core 8.1). Public today; the
+    // per-client pairwise configuration is client-registration state a later issue
+    // persists (see OidcState::resolve_public_subject).
+    let subject = state.resolve_public_subject(&bindings.subject);
     tokens::mint(
         state,
         signer,
         &MintRequest {
             scope,
             issuer: &issuer,
-            subject: &bindings.subject,
+            subject: &subject,
             client_id: &bindings.client_id,
             nonce: bindings.nonce.as_deref(),
             oauth_scope: bindings.oauth_scope.as_deref(),

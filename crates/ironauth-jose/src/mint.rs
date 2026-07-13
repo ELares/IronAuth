@@ -25,6 +25,7 @@ use serde_json::{Map, Value};
 use crate::redact::Redacted;
 use crate::sign;
 use crate::signing_key::SigningKey;
+use crate::signing_policy::SigningPolicy;
 
 /// Options that steer how a protected header is EMITTED (not what is trusted).
 ///
@@ -102,6 +103,31 @@ pub fn sign_jws(
     let signature =
         sign::sign_asymmetric(key, signing_input.as_bytes()).map_err(|()| SignError::Backend)?;
     Ok(assemble(&signing_input, &signature))
+}
+
+/// Sign `payload` as a compact JWS, but only if `key`'s algorithm is permitted by
+/// `policy`.
+///
+/// This is the mint-side enforcement of an environment's [`SigningPolicy`]: an
+/// `ES256`-only environment can never emit an `EdDSA`-signed token, because a key
+/// whose algorithm the policy does not permit is refused BEFORE any signing
+/// happens. Selecting the signer is the caller's job; this closes the gap where a
+/// wrong-algorithm key is somehow reached.
+///
+/// # Errors
+///
+/// [`SignError::AlgorithmNotPermitted`] if `policy` does not permit `key`'s
+/// algorithm; otherwise the same errors as [`sign_jws`].
+pub fn sign_jws_with_policy(
+    policy: &SigningPolicy,
+    key: &SigningKey,
+    payload: &[u8],
+    options: &EmissionOptions,
+) -> Result<String, SignError> {
+    if !policy.permits(key.algorithm()) {
+        return Err(SignError::AlgorithmNotPermitted);
+    }
+    sign_jws(key, payload, options)
 }
 
 /// A JOSE MAC algorithm, usable ONLY for restricted client-secret signing.
@@ -263,6 +289,8 @@ pub enum SignError {
     Backend,
     /// The protected header could not be serialized.
     Header,
+    /// The environment's signing policy does not permit this key's algorithm.
+    AlgorithmNotPermitted,
 }
 
 impl std::fmt::Display for SignError {
@@ -270,6 +298,9 @@ impl std::fmt::Display for SignError {
         f.write_str(match self {
             SignError::Backend => "signature backend failed to sign",
             SignError::Header => "protected header could not be serialized",
+            SignError::AlgorithmNotPermitted => {
+                "the environment signing policy does not permit this key's algorithm"
+            }
         })
     }
 }

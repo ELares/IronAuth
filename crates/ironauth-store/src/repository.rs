@@ -56,7 +56,7 @@ use crate::audit::{ActingContext, Action, ActorRef};
 use crate::error::StoreError;
 use crate::id::{
     AuditId, AuditTarget, AuthorizationCodeId, ClientId, CorrelationId, EnvironmentId, GrantId,
-    IssuedTokenId, ManagementKeyId, OperatorId, TenantId,
+    IssuedTokenId, ManagementKeyId, OperatorId, SigningKeyId, TenantId,
 };
 use crate::scope::Scope;
 use crate::store::Store;
@@ -107,6 +107,18 @@ impl<'a> ScopedStore<'a> {
         }
     }
 
+    /// The read-only signing-key repository for this scope (issue #19). Lists and
+    /// fetches the environment's signing keys; provisioning lives on
+    /// [`ActingStore::signing_keys`]. The scope is fixed here, so a key of another
+    /// tenant or environment is not reachable.
+    #[must_use]
+    pub fn signing_keys(&self) -> SigningKeyRepo<'a> {
+        SigningKeyRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
     /// Enter an acting context (who is acting, and under which correlation id).
     /// The returned store hands out the *mutating* repositories, so every write
     /// carries an actor and a correlation id into its audit row.
@@ -146,6 +158,18 @@ impl<'a> ActingStore<'a> {
     #[must_use]
     pub fn authorization(&self) -> ActingAuthorizationRepo<'a> {
         ActingAuthorizationRepo {
+            store: self.store,
+            scope: self.scope,
+            acting: self.acting,
+        }
+    }
+
+    /// The mutating signing-key repository for this scope and actor (issue #19).
+    /// Provisions a day-one key or a manually rotated-in successor; every
+    /// provision writes its audit row in the same transaction.
+    #[must_use]
+    pub fn signing_keys(&self) -> ActingSigningKeyRepo<'a> {
+        ActingSigningKeyRepo {
             store: self.store,
             scope: self.scope,
             acting: self.acting,
@@ -977,6 +1001,314 @@ impl ActingAuthorizationRepo<'_> {
         )
         .await
     }
+}
+
+// ===========================================================================
+// Per-environment signing keys (issue #19).
+//
+// The persistence half of issuer and key isolation: every signing key is a
+// tenant-scoped row, isolated exactly like `clients`, so the signing core's key
+// lookup structurally cannot express a cross-tenant read. The row id is a `sik_`
+// scoped identifier that doubles as the JOSE `kid`, so a kid is unique across an
+// issuer's whole key history by construction. Everything below routes through the
+// SAME scope filter and (for the provision) the SAME audited-write primitive as
+// the rest of the data plane.
+// ===========================================================================
+
+/// The encoding of a stored signing key's private material.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SigningKeyMaterialKind {
+    /// A raw 32-byte Ed25519 seed (RFC 8032).
+    Ed25519Seed,
+    /// An ECDSA PKCS#8 v1 document (P-256 or P-384).
+    EcdsaPkcs8,
+    /// An RSA PKCS#1 `RSAPrivateKey` DER document.
+    RsaPkcs1Der,
+}
+
+impl SigningKeyMaterialKind {
+    /// The stable wire string recorded in `signing_keys.material_kind`.
+    #[must_use]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SigningKeyMaterialKind::Ed25519Seed => "ed25519_seed",
+            SigningKeyMaterialKind::EcdsaPkcs8 => "ecdsa_pkcs8",
+            SigningKeyMaterialKind::RsaPkcs1Der => "rsa_pkcs1_der",
+        }
+    }
+
+    /// Parse a stored `material_kind` value.
+    #[must_use]
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "ed25519_seed" => Some(SigningKeyMaterialKind::Ed25519Seed),
+            "ecdsa_pkcs8" => Some(SigningKeyMaterialKind::EcdsaPkcs8),
+            "rsa_pkcs1_der" => Some(SigningKeyMaterialKind::RsaPkcs1Der),
+            _ => None,
+        }
+    }
+}
+
+/// Private signing-key material, wrapped so it never prints or logs.
+///
+/// The bytes are exposed only through [`SigningKeyMaterial::expose`], at the one
+/// call site that reconstructs a live signing key. A struct dump or a `tracing`
+/// field renders `<redacted>` instead.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SigningKeyMaterial(Vec<u8>);
+
+impl SigningKeyMaterial {
+    /// The raw material bytes, for reconstructing a signing key.
+    #[must_use]
+    pub fn expose(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl fmt::Debug for SigningKeyMaterial {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Never render private key material: only that it is present and its size.
+        f.debug_struct("SigningKeyMaterial")
+            .field("len", &self.0.len())
+            .finish_non_exhaustive()
+    }
+}
+
+/// A signing key to provision, all values minted or resolved under the caller's
+/// scope. The four lifecycle instants are epoch microseconds from the application
+/// clock seam (never the database clock). `Debug` redacts the material.
+#[derive(Clone, Copy)]
+pub struct NewSigningKey<'a> {
+    /// The `sik_` identifier (also the JOSE `kid`), minted under this scope.
+    pub id: &'a SigningKeyId,
+    /// The JOSE algorithm name (for example `EdDSA`, `ES256`, `RS256`).
+    pub algorithm: &'a str,
+    /// How the private material is encoded.
+    pub material_kind: SigningKeyMaterialKind,
+    /// The private key material bytes.
+    pub material: &'a [u8],
+    /// When the key first appears in the published JWKS, in epoch microseconds.
+    pub publish_at_micros: i64,
+    /// When the key first signs, in epoch microseconds.
+    pub activate_at_micros: i64,
+    /// When a successor takes over, in epoch microseconds (absent while head).
+    pub retire_at_micros: Option<i64>,
+    /// When the key is withdrawn from the JWKS, in epoch microseconds (absent
+    /// while not retired).
+    pub expire_at_micros: Option<i64>,
+}
+
+impl fmt::Debug for NewSigningKey<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("NewSigningKey")
+            .field("id", &self.id)
+            .field("algorithm", &self.algorithm)
+            .field("material_kind", &self.material_kind)
+            .field("publish_at_micros", &self.publish_at_micros)
+            .field("activate_at_micros", &self.activate_at_micros)
+            .finish_non_exhaustive()
+    }
+}
+
+/// A signing key read back from the `signing_keys` table, always within scope.
+/// `Debug` redacts the private material.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SigningKeyRecord {
+    /// The `sik_` identifier (also the JOSE `kid`), embedding its scope.
+    pub id: SigningKeyId,
+    /// The JOSE algorithm name.
+    pub algorithm: String,
+    /// How the private material is encoded.
+    pub material_kind: SigningKeyMaterialKind,
+    /// The private key material, redacted in `Debug`.
+    pub material: SigningKeyMaterial,
+    /// When the key first appears in the published JWKS, in epoch microseconds.
+    pub publish_at_unix_micros: i64,
+    /// When the key first signs, in epoch microseconds.
+    pub activate_at_unix_micros: i64,
+    /// When a successor takes over, in epoch microseconds (absent while head).
+    pub retire_at_unix_micros: Option<i64>,
+    /// When the key is withdrawn from the JWKS, in epoch microseconds (absent
+    /// while not retired).
+    pub expire_at_unix_micros: Option<i64>,
+}
+
+impl fmt::Debug for SigningKeyRecord {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SigningKeyRecord")
+            .field("id", &self.id)
+            .field("algorithm", &self.algorithm)
+            .field("material_kind", &self.material_kind)
+            .field("publish_at_unix_micros", &self.publish_at_unix_micros)
+            .field("activate_at_unix_micros", &self.activate_at_unix_micros)
+            .field("retire_at_unix_micros", &self.retire_at_unix_micros)
+            .field("expire_at_unix_micros", &self.expire_at_unix_micros)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The read-only repository for a scope's signing keys (issue #19).
+pub struct SigningKeyRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl SigningKeyRepo<'_> {
+    /// Parse an untrusted signing-key identifier under this scope. A malformed
+    /// identifier and one minted in another scope both return the uniform
+    /// not-found.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if malformed or out of scope.
+    pub fn parse_id(&self, raw: &str) -> Result<SigningKeyId, StoreError> {
+        Ok(SigningKeyId::parse_in_scope(raw, &self.scope)?)
+    }
+
+    /// Fetch a signing key by identifier, within scope.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if no such key is visible in this scope.
+    pub async fn get(&self, id: &SigningKeyId) -> Result<SigningKeyRecord, StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT id, algorithm, material_kind, key_material, \
+             (EXTRACT(EPOCH FROM publish_at) * 1000000)::bigint AS publish_us, \
+             (EXTRACT(EPOCH FROM activate_at) * 1000000)::bigint AS activate_us, \
+             (EXTRACT(EPOCH FROM retire_at) * 1000000)::bigint AS retire_us, \
+             (EXTRACT(EPOCH FROM expire_at) * 1000000)::bigint AS expire_us \
+             FROM signing_keys \
+             WHERE id = $1 AND tenant_id = $2 AND environment_id = $3",
+        )
+        .bind(id.to_string())
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        let row = row.ok_or(StoreError::NotFound)?;
+        signing_key_from_row(&row, &self.scope)
+    }
+
+    /// Every signing key in this scope, oldest first (the key history for this
+    /// environment's issuer).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure, or if a stored row fails
+    /// to decode.
+    pub async fn list(&self) -> Result<Vec<SigningKeyRecord>, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let rows = sqlx::query(
+            "SELECT id, algorithm, material_kind, key_material, \
+             (EXTRACT(EPOCH FROM publish_at) * 1000000)::bigint AS publish_us, \
+             (EXTRACT(EPOCH FROM activate_at) * 1000000)::bigint AS activate_us, \
+             (EXTRACT(EPOCH FROM retire_at) * 1000000)::bigint AS retire_us, \
+             (EXTRACT(EPOCH FROM expire_at) * 1000000)::bigint AS expire_us \
+             FROM signing_keys \
+             WHERE tenant_id = $1 AND environment_id = $2 \
+             ORDER BY created_at, id",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        rows.iter()
+            .map(|row| signing_key_from_row(row, &self.scope))
+            .collect()
+    }
+}
+
+/// The mutating signing-key repository (issue #19). Reachable only through
+/// [`ScopedStore::acting`], so every provision carries an actor and correlation
+/// id, and routes through the module's single audited-write primitive.
+pub struct ActingSigningKeyRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+    acting: ActingContext,
+}
+
+impl ActingSigningKeyRepo<'_> {
+    /// Provision a signing key (a day-one key or a manually rotated-in successor)
+    /// and audit `signing_key.provision` in the same transaction.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the identifier is out of this scope;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn provision(&self, env: &Env, key: NewSigningKey<'_>) -> Result<(), StoreError> {
+        if key.id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::SigningKeyProvision,
+                target: key.id,
+            },
+            async move |tx| {
+                sqlx::query(
+                    "INSERT INTO signing_keys \
+                     (id, tenant_id, environment_id, algorithm, material_kind, key_material, \
+                      publish_at, activate_at, retire_at, expire_at) \
+                     VALUES ($1, $2, $3, $4, $5, $6, \
+                             TIMESTAMPTZ 'epoch' + ($7::text || ' microseconds')::interval, \
+                             TIMESTAMPTZ 'epoch' + ($8::text || ' microseconds')::interval, \
+                             CASE WHEN $9::bigint IS NULL THEN NULL ELSE \
+                                 TIMESTAMPTZ 'epoch' + ($9::text || ' microseconds')::interval END, \
+                             CASE WHEN $10::bigint IS NULL THEN NULL ELSE \
+                                 TIMESTAMPTZ 'epoch' + ($10::text || ' microseconds')::interval END)",
+                )
+                .bind(key.id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(key.algorithm)
+                .bind(key.material_kind.as_str())
+                .bind(key.material)
+                .bind(key.publish_at_micros)
+                .bind(key.activate_at_micros)
+                .bind(key.retire_at_micros)
+                .bind(key.expire_at_micros)
+                .execute(&mut **tx)
+                .await?;
+                Ok(())
+            },
+            false,
+        )
+        .await
+    }
+}
+
+/// Reconstruct a [`SigningKeyRecord`] from a row read within scope.
+fn signing_key_from_row(row: &PgRow, scope: &Scope) -> Result<SigningKeyRecord, StoreError> {
+    let id_text: String = row.get("id");
+    let id = SigningKeyId::parse_in_scope(&id_text, scope)?;
+    let kind_text: String = row.get("material_kind");
+    let material_kind = SigningKeyMaterialKind::parse(&kind_text).ok_or_else(|| {
+        StoreError::Database(sqlx::Error::Decode(
+            format!("unknown signing key material kind: {kind_text}").into(),
+        ))
+    })?;
+    let material: Vec<u8> = row.get("key_material");
+    Ok(SigningKeyRecord {
+        id,
+        algorithm: row.get("algorithm"),
+        material_kind,
+        material: SigningKeyMaterial(material),
+        publish_at_unix_micros: row.get("publish_us"),
+        activate_at_unix_micros: row.get("activate_us"),
+        retire_at_unix_micros: row.get("retire_us"),
+        expire_at_unix_micros: row.get("expire_us"),
+    })
 }
 
 /// Reconstruct [`CodeBindings`] from a consumed-code row.
