@@ -24,6 +24,10 @@ sqlx.workspace = true
 # non-canonical trailing bits on decode, so a malformed identifier cannot masquerade
 # as a valid one.
 base64.workspace = true
+# SHA-256 over migration text for the expand-contract runner's checksums (drift
+# and tamper detection). Pure Rust, permissive, already present transitively via
+# sqlx, so no new crate enters the graph; keeps MSRV 1.85 and musl clean.
+sha2.workspace = true
 
 [features]
 # Default build is lean: no test-support surface. Production only ever needs the
@@ -63,6 +67,35 @@ required-features = ["testing"]
 [[test]]
 name = "repository"
 path = "tests/repository.rs"
+required-features = ["testing"]
+
+# Every mutation writes exactly one audit row carrying the full envelope, in
+# scope. Needs a real database (DATABASE_URL).
+[[test]]
+name = "audit"
+path = "tests/audit.rs"
+required-features = ["testing"]
+
+# Same-transaction atomicity: a mid-transaction failure leaves no orphan data
+# row and no orphan audit row, and the inverse. Needs a real database.
+[[test]]
+name = "atomicity"
+path = "tests/atomicity.rs"
+required-features = ["testing"]
+
+# Append-only enforcement: as the low-privilege app role, UPDATE and DELETE on
+# audit rows are denied while INSERT/SELECT in scope work. Needs a real database.
+[[test]]
+name = "append_only"
+path = "tests/append_only.rs"
+required-features = ["testing"]
+
+# Migration framework: in-order apply and record, out-of-order rejection,
+# checksum-mismatch rejection, and the expand-contract example end to end. Needs
+# a real database (DATABASE_URL).
+[[test]]
+name = "migration"
+path = "tests/migration.rs"
 required-features = ["testing"]
 
 # Compile-fail proofs. Database-free, so it runs on every lane (including MSRV).

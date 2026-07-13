@@ -6,6 +6,72 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Relational primary store with a same-transaction audit log and an
+  expand-contract migration framework (issue #7). Builds directly on the #6
+  isolation substrate.
+  - **Postgres relations are the sole source of truth** (normalized tables,
+    foreign keys enforced, explicitly not event sourced). The decision and the
+    zitadel#9599 evidence are recorded in
+    `docs/adr/0002-relational-primary-store.md`.
+  - **Same-transaction audit log, structurally enforced.** A new tenant-scoped
+    `audit_log` table (scoped, forced row-level security, nonempty-scope CHECK,
+    same foreign keys as `clients`). Every repository mutation routes through a
+    single private audited-write primitive (`write_audited`) that performs the
+    data change and writes exactly one audit row in one transaction and is the
+    only committing write path; the public mutators cannot commit without it, so
+    "a mutation without an audit row" is unrepresentable and a failed mutation
+    leaves no trace. The envelope carries a typed `ActorRef`
+    (`Human`/`Service`/`Agent`, each with a typed actor id), an `Action`, the
+    typed scoped target, `(tenant, environment)`, `occurred_at` (from the
+    `ironauth-env` clock seam, never the database clock), and a `CorrelationId`.
+    It is the substrate for later OCSF mapping and stream separation (M11); no
+    streams or OCSF are built here.
+  - **Acting context for writes.** Reads (`ScopedStore::clients`,
+    `ScopedStore::audit`) need no actor; writes are reachable only through
+    `ScopedStore::acting(actor, correlation)`, so an actor and correlation id are
+    required at the type level for every mutation. This changed the
+    `create`/`delete` signatures; all #6 call sites and the IDOR delete probe
+    were updated and every #6 isolation test stays green.
+  - **Append-only enforcement.** The application role is granted SELECT and
+    INSERT on `audit_log` and neither UPDATE nor DELETE; a privilege test as
+    `ironauth_app` proves UPDATE and DELETE are refused while INSERT/SELECT in
+    scope work. Retention is a later, explicit operation.
+  - **Expand-contract migration runner** (`MigrationRunner`), replacing the
+    single-file raw apply. Tracks applied migrations in a `_schema_migrations`
+    ledger (version, name, SHA-256 checksum, phase, applied_at), applies pending
+    migrations in order each inside its own transaction, and refuses out-of-order
+    application, checksum drift on an already-applied migration, and a ledger
+    version unknown to the running build (the N/N-1 downgrade guard), all as
+    typed `MigrationError`s. Concurrent runners (several replicas booting during
+    a rolling upgrade) serialize through a session-level Postgres advisory lock,
+    so the losers wait and find the chain applied instead of racing to create the
+    same objects. The production chain is exactly two migrations: the #6 schema
+    (version 1) and the audit log (version 2); it ships no throwaway objects. The
+    worked expand-contract example (add a nullable column, backfill, drop the old
+    column) exercises all three phases in the migration test only, never in a
+    real schema. Migration safety: any migration adding a tenant-scoped table
+    must set up forced row-level security, the isolation policy, and the
+    nonempty-scope CHECK (extended to `scripts/query-audit.sh`'s scoped-table
+    list, now including `audit_log`).
+  - Minimum PostgreSQL 14: the audit `occurred_at` is read back exactly (its
+    integer microseconds) only where `EXTRACT(EPOCH FROM timestamptz)` returns
+    numeric, which is PostgreSQL 14+; older versions return double precision and
+    can round the read-back by +/- 1 us. The stored value is exact regardless.
+  - Adds `sha2` (migration checksums): pure Rust, permissive (MIT OR
+    Apache-2.0), already present transitively via sqlx, so no new crate enters
+    the dependency graph; MSRV 1.85 and the musl static lane are unaffected.
+  - New integration tests against a real database: transactional atomicity
+    (injected mid-transaction failure leaves no orphan data or audit row, and a
+    data-insert failure writes no audit row), every-mutation-audits with the full
+    envelope, append-only privilege (UPDATE, DELETE, and TRUNCATE all denied to
+    the application role; INSERT/SELECT in scope allowed), and the migration
+    framework (in-order/idempotent, out-of-order rejection, checksum-mismatch
+    rejection, NotSorted for descending and duplicate versions, the N/N-1
+    downgrade guard, per-migration rollback of a failed DDL, concurrent-runner
+    serialization via the advisory lock, the production chain being exactly two
+    migrations with no demo object, and the test-only expand-contract example end
+    to end).
+
 - Initial persistence and tenant isolation layer (issue #6). Isolation is
   enforced below the application in three independent layers:
   - **Typed scoped identifiers** (`TenantId`, `EnvironmentId`, `OperatorId`,

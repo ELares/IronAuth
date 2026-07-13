@@ -13,13 +13,9 @@ use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
 
 use crate::error::StoreError;
+use crate::migrate::MigrationRunner;
 use crate::repository::ScopedStore;
 use crate::scope::Scope;
-
-/// The minimal isolation schema, embedded at build time so no `migrations/`
-/// directory has to travel with the binary and no database is touched to
-/// compile. Applied by [`Store::migrate`].
-const MIGRATION_SQL: &str = include_str!("../migrations/0001_tenant_isolation.sql");
 
 /// The database handle. Cheap to clone (the pool is reference counted).
 #[derive(Clone)]
@@ -63,24 +59,30 @@ impl Store {
         &self.pool
     }
 
-    /// Apply the minimal schema this issue needs: the four-level tables, the
-    /// forced row-level-security policies, and the low-privilege application
-    /// role and grants.
+    /// Apply the full IronAuth migration chain to bring the schema current.
     ///
-    /// This is intentionally minimal. The full expand-contract migration
-    /// framework and the same-transaction audit log are owned by the relational
-    /// primary store issue (#7); this ships only what tenant isolation (#6)
-    /// requires. The schema is embedded with `include_str!` and applied via the
-    /// runtime API (no `query!`/`migrate!` macros), so nothing here needs a
-    /// database at build time. It is idempotent enough for a fresh database and
-    /// a shared cluster's per-test databases (the role guard); the full
-    /// re-runnable, versioned migration bookkeeping is #7's.
+    /// Runs the runtime [`MigrationRunner`] over the two production migrations:
+    /// the four-level isolation tables and policies (version 1) and the
+    /// same-transaction audit log (version 2). The runner tracks applied
+    /// migrations in a `_schema_migrations` ledger, applies each pending one in
+    /// order inside its own transaction, serializes concurrent runners with a
+    /// session advisory lock, and refuses out-of-order, checksum-drifted, or
+    /// unknown-version application. It is idempotent: on an up-to-date database
+    /// it applies nothing. Only the runtime sqlx API is used (no `migrate!`
+    /// macro), so nothing here needs a database at build time.
+    ///
+    /// The pool must authenticate as a schema-owning role (never the
+    /// low-privilege application role): migrations run DDL and GRANTs. The
+    /// `ironauth_app` role must already exist so the grants resolve; it is
+    /// provisioned out of band in production and by the test harness in tests.
     ///
     /// # Errors
     ///
-    /// [`StoreError::Database`] if the schema fails to apply.
+    /// [`StoreError::Migration`] if the migration chain cannot be applied or is
+    /// refused (out of order, checksum mismatch); [`StoreError::Database`] on a
+    /// connection failure.
     pub async fn migrate(&self) -> Result<(), StoreError> {
-        sqlx::raw_sql(MIGRATION_SQL).execute(&self.pool).await?;
+        MigrationRunner::new(&self.pool).run().await?;
         Ok(())
     }
 

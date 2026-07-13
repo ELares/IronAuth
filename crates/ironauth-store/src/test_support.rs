@@ -30,7 +30,8 @@
 use ironauth_env::Env;
 use sqlx::PgPool;
 
-use crate::id::{EnvironmentId, OperatorId, TenantId};
+use crate::audit::ActorRef;
+use crate::id::{EnvironmentId, HumanId, OperatorId, TenantId};
 use crate::scope::Scope;
 use crate::store::Store;
 
@@ -117,6 +118,37 @@ impl TestDatabase {
     #[must_use]
     pub fn owner_pool(&self) -> &PgPool {
         &self.owner_pool
+    }
+
+    /// A throwaway human actor for tests that need to perform a write. Writes
+    /// require an acting context; tests that only need *an* actor (not a
+    /// specific one) can use this rather than minting their own.
+    #[must_use]
+    pub fn test_actor(&self, env: &Env) -> ActorRef {
+        ActorRef::human(HumanId::generate(env))
+    }
+
+    /// A fresh, empty database's owner pool with no schema applied.
+    ///
+    /// For migration-framework tests that drive a [`crate::MigrationRunner`] over
+    /// a custom chain from a clean slate (an empty `_schema_migrations` ledger),
+    /// separate from the full IronAuth chain [`TestDatabase::start`] applies.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `DATABASE_URL` is unset or the database cannot be created, for
+    /// the same fail-loud reason as [`TestDatabase::start`].
+    pub async fn fresh_owner_pool() -> PgPool {
+        let owner_base = std::env::var("DATABASE_URL").expect(
+            "DATABASE_URL must point at a Postgres superuser/owner connection for the \
+             migration tests; scripts/with-test-db.sh starts a throwaway one and exports it",
+        );
+        let db_name = format!("ironauth_test_{}", unique_suffix());
+        create_database(&owner_base, &db_name).await;
+        let owner_url = swap_database(&owner_base, &db_name);
+        PgPool::connect(&owner_url)
+            .await
+            .expect("connect as owner to fresh database")
     }
 
     /// Seed a full operator -> tenant -> environment chain and return the

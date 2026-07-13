@@ -831,6 +831,7 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "ironauth-env",
+ "sha2",
  "sqlx",
  "tokio",
  "trybuild",

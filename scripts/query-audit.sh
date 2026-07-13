@@ -22,8 +22,12 @@ cd "$(git rev-parse --show-toplevel)"
 
 # The tenant-scoped tables (mandatory tenant_id + environment_id + row-level
 # security). Keep in sync with crates/ironauth-store/migrations and the design
-# doc docs/design/TENANCY.md.
-SCOPED_TABLES='clients|organizations'
+# doc docs/design/TENANCY.md. CHECKLIST: any migration that adds a new
+# tenant-scoped table MUST (a) set up ENABLE + FORCE row-level security, the
+# (tenant, environment) isolation policy, and the nonempty-scope CHECK in the
+# same migration, and (b) add the table name here. `audit_log` (the
+# same-transaction audit log, issue #7) is scoped exactly like `clients`.
+SCOPED_TABLES='clients|organizations|audit_log'
 
 # The one module allowed to name a scoped table in SQL.
 REPO_MODULE='crates/ironauth-store/src/repository.rs'
