@@ -14,6 +14,7 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use axum::extract::{ConnectInfo, FromRequestParts, MatchedPath, Request, State};
+use axum::http::Method;
 use axum::http::StatusCode;
 use axum::http::request::Parts;
 use axum::middleware::Next;
@@ -29,6 +30,32 @@ use crate::proxy::{ClientContext, FailClosedReason, ForwardDecision};
 /// Route-template placeholder for requests that matched no route (a 404). Using
 /// a constant instead of the raw path keeps metric cardinality bounded.
 const UNMATCHED_ROUTE: &str = "<unmatched>";
+
+/// Catch-all method label for any request method outside the fixed set.
+const OTHER_METHOD: &str = "<other>";
+
+/// Bucket an HTTP method into a fixed, closed label set.
+///
+/// HTTP permits arbitrary extension-method tokens, and the observe middleware
+/// runs before routing, so an unauthenticated caller controls `method`. Using
+/// the raw token as a metric label (or log field) would let sustained distinct
+/// methods grow the never-evicted Prometheus series set without bound, an
+/// unauthenticated memory-exhaustion vector on the public plane. Only the nine
+/// registered methods pass through; everything else collapses to `<other>`.
+fn method_label(method: &Method) -> &'static str {
+    match *method {
+        Method::GET => "GET",
+        Method::POST => "POST",
+        Method::PUT => "PUT",
+        Method::DELETE => "DELETE",
+        Method::PATCH => "PATCH",
+        Method::HEAD => "HEAD",
+        Method::OPTIONS => "OPTIONS",
+        Method::CONNECT => "CONNECT",
+        Method::TRACE => "TRACE",
+        _ => OTHER_METHOD,
+    }
+}
 
 /// The tower middleware that spans, times, and meters every request and
 /// resolves the effective client context under the trusted-proxy policy.
@@ -46,6 +73,7 @@ pub async fn observe(State(state): State<AppState>, mut req: Request, next: Next
     let client_ip = resolution.client_ip;
 
     let method = req.method().clone();
+    let method_label = method_label(&method);
     let route = req
         .extensions()
         .get::<MatchedPath>()
@@ -62,7 +90,7 @@ pub async fn observe(State(state): State<AppState>, mut req: Request, next: Next
 
     let span = tracing::info_span!(
         "http_request",
-        "http.request.method" = %method,
+        "http.request.method" = method_label,
         "http.route" = %route,
         "url.scheme" = %state.site.scheme(),
         "client.ip" = %client_ip,
@@ -77,11 +105,10 @@ pub async fn observe(State(state): State<AppState>, mut req: Request, next: Next
 
         tracing::Span::current().record("http.response.status_code", status.as_u16());
 
-        let method_label = method.as_str().to_owned();
         let status_label = status.as_u16().to_string();
         metrics::counter!(
             HTTP_REQUESTS_TOTAL,
-            "method" => method_label.clone(),
+            "method" => method_label,
             "route" => route.clone(),
             "status" => status_label.clone(),
         )
@@ -127,5 +154,30 @@ where
             .get::<ClientContext>()
             .cloned()
             .ok_or(StatusCode::INTERNAL_SERVER_ERROR)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{OTHER_METHOD, method_label};
+    use axum::http::Method;
+
+    #[test]
+    fn registered_methods_pass_through() {
+        assert_eq!(method_label(&Method::GET), "GET");
+        assert_eq!(method_label(&Method::POST), "POST");
+        assert_eq!(method_label(&Method::DELETE), "DELETE");
+        assert_eq!(method_label(&Method::OPTIONS), "OPTIONS");
+    }
+
+    #[test]
+    fn extension_methods_collapse_to_other() {
+        // An attacker-chosen extension-method token must never become its own
+        // metric label; unbounded distinct tokens would grow the series set
+        // without eviction (memory-exhaustion vector on the public plane).
+        for raw in ["EVILMETHOD", "FROBNICATE", "aaaaaaaaaaaaaaaa", "PROPFIND"] {
+            let method = Method::from_bytes(raw.as_bytes()).expect("valid token");
+            assert_eq!(method_label(&method), OTHER_METHOD, "{raw} must bucket");
+        }
     }
 }

@@ -43,11 +43,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::Router;
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use ironauth_config::Config;
 use ironauth_env::Env;
 use metrics_exporter_prometheus::PrometheusHandle;
 use tokio::net::TcpListener;
+use tower_http::catch_panic::CatchPanicLayer;
 
 pub use error::ServerError;
 pub use proxy::{
@@ -129,6 +132,10 @@ impl Server {
         Router::new()
             .route("/", get(routes::root))
             .route("/.well-known/security.txt", get(routes::security_txt))
+            // CatchPanicLayer is added before observe so it sits INSIDE it: a
+            // handler panic becomes an opaque 500 that still flows back through
+            // request logging and metrics rather than resetting the connection.
+            .layer(CatchPanicLayer::custom(on_panic))
             .layer(axum::middleware::from_fn_with_state(
                 self.state(),
                 observe::observe,
@@ -143,6 +150,7 @@ impl Server {
             .route("/healthz", get(routes::healthz))
             .route("/readyz", get(routes::readyz))
             .route("/metrics", get(routes::metrics))
+            .layer(CatchPanicLayer::custom(on_panic))
             .layer(axum::middleware::from_fn_with_state(
                 self.state(),
                 observe::observe,
@@ -227,6 +235,17 @@ impl Server {
     }
 }
 
+/// Turn a caught handler panic into an opaque 500.
+///
+/// The panic payload is never rendered: it may carry request-derived data, and
+/// rendering it would bypass the log-scrubbing guarantee. The panic location is
+/// reported separately by the scrubbing-safe panic hook (see
+/// `telemetry::install_panic_hook`); here the client only ever sees a generic
+/// error.
+fn on_panic(_payload: Box<dyn std::any::Any + Send + 'static>) -> Response {
+    (StatusCode::INTERNAL_SERVER_ERROR, "internal server error").into_response()
+}
+
 /// Resolve when the broadcast channel signals shutdown.
 async fn wait_for_broadcast(mut rx: tokio::sync::broadcast::Receiver<()>) {
     let _ = rx.recv().await;
@@ -255,5 +274,44 @@ pub async fn shutdown_signal() {
     #[cfg(not(unix))]
     {
         let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::on_panic;
+    use axum::Router;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use axum::routing::get;
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+    use tower_http::catch_panic::CatchPanicLayer;
+
+    async fn boom() -> StatusCode {
+        panic!("SENTINEL_PANIC_PAYLOAD_secret")
+    }
+
+    #[tokio::test]
+    async fn caught_panic_becomes_opaque_500() {
+        // A handler that panics with request-derived data must not reset the
+        // connection or render the payload; the layer returns a generic 500.
+        let app = Router::new()
+            .route("/boom", get(boom))
+            .layer(CatchPanicLayer::custom(on_panic));
+
+        let response = app
+            .oneshot(Request::builder().uri("/boom").body(Body::empty()).unwrap())
+            .await
+            .expect("service responds rather than resetting");
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            !text.contains("SENTINEL_PANIC_PAYLOAD"),
+            "payload leaked: {text}"
+        );
+        assert_eq!(text, "internal server error");
     }
 }

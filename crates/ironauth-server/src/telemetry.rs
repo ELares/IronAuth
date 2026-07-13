@@ -70,6 +70,7 @@ pub fn init(telemetry: &TelemetryConfig) -> TelemetryGuard {
     };
 
     Registry::default().with(layers).init();
+    install_panic_hook();
 
     #[cfg(not(feature = "otlp"))]
     if telemetry.otlp_endpoint.is_some() {
@@ -84,6 +85,34 @@ pub fn init(telemetry: &TelemetryConfig) -> TelemetryGuard {
         #[cfg(feature = "otlp")]
         otel,
     }
+}
+
+/// Replace the default panic hook so a panicking worker reports through the
+/// scrubbed tracing subscriber instead of raw stderr.
+///
+/// The default hook prints the panic payload to stderr, which bypasses the
+/// log-scrubbing guarantee: a handler that ever panics with request-derived
+/// data would leak it outside the redaction path. This hook logs the panic
+/// LOCATION (file, line, column) only, never the payload, which is enough to
+/// locate the bug without emitting attacker-influenced content. The
+/// `CatchPanicLayer` on both routers separately converts the unwind into an
+/// opaque 500 so the request still flows back through request logging and
+/// metrics.
+fn install_panic_hook() {
+    std::panic::set_hook(Box::new(|info| {
+        if let Some(location) = info.location() {
+            tracing::error!(
+                panic.file = location.file(),
+                panic.line = location.line(),
+                panic.column = location.column(),
+                "a task panicked; payload withheld to preserve log scrubbing"
+            );
+        } else {
+            tracing::error!(
+                "a task panicked at an unknown location; payload withheld to preserve log scrubbing"
+            );
+        }
+    }));
 }
 
 /// Build a standalone subscriber writing to `make_writer`, for tests that
