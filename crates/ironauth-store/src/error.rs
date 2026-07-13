@@ -11,6 +11,7 @@
 use std::fmt;
 
 use crate::id::NotInScope;
+use crate::migrate::MigrationError;
 
 /// Why a store operation failed.
 #[derive(Debug)]
@@ -23,6 +24,9 @@ pub enum StoreError {
     NotFound,
     /// A database or connection error. Never carries tenant data.
     Database(sqlx::Error),
+    /// A schema migration could not be applied or was refused (out of order or
+    /// checksum drift). Returned only by [`crate::Store::migrate`].
+    Migration(MigrationError),
 }
 
 impl fmt::Display for StoreError {
@@ -30,6 +34,7 @@ impl fmt::Display for StoreError {
         match self {
             StoreError::NotFound => f.write_str("resource not found"),
             StoreError::Database(_) => f.write_str("database error"),
+            StoreError::Migration(_) => f.write_str("migration error"),
         }
     }
 }
@@ -39,7 +44,14 @@ impl std::error::Error for StoreError {
         match self {
             StoreError::NotFound => None,
             StoreError::Database(source) => Some(source),
+            StoreError::Migration(source) => Some(source),
         }
+    }
+}
+
+impl From<MigrationError> for StoreError {
+    fn from(source: MigrationError) -> Self {
+        StoreError::Migration(source)
     }
 }
 

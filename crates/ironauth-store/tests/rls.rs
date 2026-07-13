@@ -9,8 +9,8 @@
 //! database still refuses the cross-tenant read.
 
 use ironauth_env::Env;
-use ironauth_store::ClientId;
 use ironauth_store::test_support::TestDatabase;
+use ironauth_store::{ClientId, CorrelationId};
 use sqlx::Row;
 
 // The test walks four distinct scenarios (deny-by-default, mis-scoped read,
@@ -30,6 +30,7 @@ async fn rls_blocks_cross_tenant_reads_for_a_low_privilege_role() {
     let id_b = db
         .store()
         .scoped(scope_b)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
         .clients()
         .create(&env, "tenant B client")
         .await
@@ -170,6 +171,7 @@ async fn rls_denies_by_default_on_a_warmed_connection() {
     let scope = db.seed_scope(&env).await;
     db.store()
         .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
         .clients()
         .create(&env, "a real client")
         .await

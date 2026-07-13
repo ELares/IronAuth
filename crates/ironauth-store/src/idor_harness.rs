@@ -40,6 +40,10 @@
 use std::future::Future;
 use std::pin::Pin;
 
+use ironauth_env::Env;
+
+use crate::audit::ActorRef;
+use crate::id::{CorrelationId, ServiceId};
 use crate::scope::Scope;
 use crate::store::Store;
 
@@ -188,11 +192,19 @@ impl IsolationProbe for ClientDeleteProbe {
         foreign_id: &'a str,
     ) -> BoxProbeFuture<'a> {
         Box::pin(async move {
-            let clients = store.scoped(caller).clients();
-            let Ok(id) = clients.parse_id(foreign_id) else {
+            let env = Env::system();
+            // Parsing the untrusted id happens under the caller's own scope on
+            // the read repository; a cross-scope id fails here as a uniform
+            // not-found before any mutating repository is reached.
+            let Ok(id) = store.scoped(caller).clients().parse_id(foreign_id) else {
                 return ProbeOutcome::Denied;
             };
-            match clients.delete(&id).await {
+            // Mutations require an acting context; the probe fabricates a service
+            // actor and a fresh correlation id (this is test-support code).
+            let actor = ActorRef::service(ServiceId::generate(&env));
+            let correlation = CorrelationId::generate(&env);
+            let clients = store.scoped(caller).acting(actor, correlation).clients();
+            match clients.delete(&env, &id).await {
                 // A leaked deletion would affect the foreign row and report Ok.
                 Ok(()) => ProbeOutcome::Leaked,
                 // Not found affects zero rows (the foreign resource is

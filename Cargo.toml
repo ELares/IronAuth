@@ -51,6 +51,10 @@ sqlx = { version = "0.8", default-features = false, features = [
     "postgres",
 ] }
 base64 = "0.22"
+# SHA-256 for migration checksums (drift and tamper detection). Pure Rust
+# (no asm/C feature), permissive (MIT OR Apache-2.0), already in the tree via
+# sqlx, so this adds a direct edge but no new crate; MSRV 1.85 and musl clean.
+sha2 = "0.10"
 trybuild = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 toml = "0.9"

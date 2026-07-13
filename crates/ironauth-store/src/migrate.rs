@@ -1,0 +1,372 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
+//! A runtime, expand-contract migration runner.
+//!
+//! Schema evolution for an identity provider is nearly irreversible and must be
+//! zero-downtime N/N+1 safe, so every change moves through three phases:
+//!
+//! - **expand**: add the new shape additively (a nullable column, a new table),
+//!   leaving the old shape in place so both binaries keep working;
+//! - **migrate**: backfill the new shape from the old;
+//! - **contract**: remove the old shape once no binary reads it.
+//!
+//! This runner tracks what it has applied in a `_schema_migrations` ledger,
+//! applies each pending migration in order inside its own transaction (so a
+//! failed migration leaves neither a partial schema change nor a ledger row),
+//! and refuses two dangerous states outright: applying migrations out of order
+//! (a lower version still pending while a higher one is already applied), and a
+//! checksum drift on an already-applied migration (its text changed since it was
+//! recorded, which means either tampering or an edit to shipped history). Both
+//! surface as a typed [`MigrationError`].
+//!
+//! Only the runtime sqlx query API is used (no `migrate!`/`query!` macros), so
+//! the database-free build lanes stay database-free; the migration text is
+//! embedded with `include_str!` and its checksum is computed at run time.
+//!
+//! ## Migration safety obligation
+//!
+//! A migration that introduces a new tenant-scoped table MUST, in the same
+//! migration, ENABLE and FORCE row-level security, add the `(tenant, environment)`
+//! isolation policy, and add the nonempty-scope CHECK constraint, exactly as the
+//! isolation schema does. It must also be added to `scripts/query-audit.sh`'s
+//! scoped-table list. The tenant-isolation discipline does not stop at the first
+//! migration; it extends to every one.
+
+use std::collections::BTreeMap;
+
+use sha2::{Digest, Sha256};
+use sqlx::{PgPool, Row};
+
+/// The phase a migration belongs to in the expand-contract lifecycle. Recorded
+/// on the ledger row so an operator can see, per applied migration, whether it
+/// added, backfilled, or removed schema.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Phase {
+    /// Additive: a new column or table, safe for the old binary to ignore.
+    Expand,
+    /// Backfill: populate the new shape from the old.
+    Migrate,
+    /// Removal: drop the old shape once nothing reads it.
+    Contract,
+}
+
+impl Phase {
+    /// The stable wire string recorded in the ledger.
+    #[must_use]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Phase::Expand => "expand",
+            Phase::Migrate => "migrate",
+            Phase::Contract => "contract",
+        }
+    }
+}
+
+/// One migration: an ordered version, a name, its phase, and its SQL text.
+///
+/// The SQL is a `'static` string (embedded with `include_str!` for the real
+/// chain), so the checksum is over exactly the text that will run.
+#[derive(Debug, Clone, Copy)]
+pub struct Migration {
+    /// The strictly ascending version. Versions must be unique and applied in
+    /// ascending order with no gaps.
+    pub version: i64,
+    /// A short human-facing name (also stored in the ledger).
+    pub name: &'static str,
+    /// The expand-contract phase this migration belongs to.
+    pub phase: Phase,
+    /// The migration's SQL text, run verbatim (may contain many statements).
+    pub sql: &'static str,
+}
+
+impl Migration {
+    /// The hex SHA-256 checksum of this migration's SQL text. The ledger stores
+    /// this at apply time; a later run recomputes it and refuses to proceed if
+    /// it no longer matches (tamper and drift detection).
+    #[must_use]
+    pub fn checksum(&self) -> String {
+        use std::fmt::Write as _;
+        let digest = Sha256::digest(self.sql.as_bytes());
+        let mut out = String::with_capacity(digest.len() * 2);
+        for byte in digest {
+            let _ = write!(out, "{byte:02x}");
+        }
+        out
+    }
+}
+
+/// The outcome of a [`MigrationRunner::run`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MigrationReport {
+    /// The versions applied by this run, in order. Empty when the schema was
+    /// already current.
+    newly_applied: Vec<i64>,
+    /// How many migrations were already applied before this run.
+    already_applied: usize,
+}
+
+impl MigrationReport {
+    /// The versions applied by this run, in ascending order.
+    #[must_use]
+    pub fn newly_applied(&self) -> &[i64] {
+        &self.newly_applied
+    }
+
+    /// How many migrations had already been applied before this run.
+    #[must_use]
+    pub fn already_applied(&self) -> usize {
+        self.already_applied
+    }
+}
+
+/// Why a migration run was refused or failed.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum MigrationError {
+    /// A database or connection error.
+    Database(sqlx::Error),
+    /// The registry is not strictly ascending by version (a programming error
+    /// in the migration set). Carries the offending version.
+    NotSorted {
+        /// The version that was not greater than its predecessor.
+        version: i64,
+    },
+    /// A higher version is already applied while a lower version is still
+    /// pending: applying now would run migrations out of order.
+    OutOfOrder {
+        /// The already-applied higher version.
+        applied: i64,
+        /// The still-pending lower version that should have come first.
+        missing: i64,
+    },
+    /// An already-applied migration's SQL text no longer matches the checksum
+    /// recorded when it was applied (tampering or an edit to shipped history).
+    ChecksumMismatch {
+        /// The version whose checksum drifted.
+        version: i64,
+    },
+    /// The ledger records a version the current registry does not contain (the
+    /// database was migrated by a newer or different build).
+    UnknownApplied {
+        /// The applied version missing from the registry.
+        version: i64,
+    },
+}
+
+impl std::fmt::Display for MigrationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MigrationError::Database(_) => f.write_str("migration database error"),
+            MigrationError::NotSorted { version } => {
+                write!(
+                    f,
+                    "migration registry is not strictly ascending at version {version}"
+                )
+            }
+            MigrationError::OutOfOrder { applied, missing } => write!(
+                f,
+                "out-of-order migrations: version {applied} is applied but lower version {missing} is still pending"
+            ),
+            MigrationError::ChecksumMismatch { version } => {
+                write!(
+                    f,
+                    "checksum mismatch on already-applied migration version {version}"
+                )
+            }
+            MigrationError::UnknownApplied { version } => write!(
+                f,
+                "applied migration version {version} is absent from this build's registry"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for MigrationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            MigrationError::Database(source) => Some(source),
+            _ => None,
+        }
+    }
+}
+
+impl From<sqlx::Error> for MigrationError {
+    fn from(source: sqlx::Error) -> Self {
+        MigrationError::Database(source)
+    }
+}
+
+/// Bootstrap the ledger. Executed before the ledger is consulted; it is not
+/// itself a tracked migration (it is the table the tracked migrations record
+/// into). `IF NOT EXISTS` makes it a no-op on an already-initialized database.
+const CREATE_LEDGER_SQL: &str = "\
+CREATE TABLE IF NOT EXISTS _schema_migrations ( \
+    version    bigint      PRIMARY KEY, \
+    name       text        NOT NULL, \
+    checksum   text        NOT NULL, \
+    phase      text        NOT NULL, \
+    applied_at timestamptz NOT NULL DEFAULT now() \
+)";
+
+/// The applied, ordered migration chain for IronAuth.
+///
+/// The `#6` isolation schema is version 1; the same-transaction audit log is
+/// version 2; versions 3 to 5 are the checked expand-contract example, run
+/// against a throwaway demo object so they exercise all three phases in CI
+/// without changing the meaning of the real schema.
+fn registry() -> Vec<Migration> {
+    vec![
+        Migration {
+            version: 1,
+            name: "tenant_isolation",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0001_tenant_isolation.sql"),
+        },
+        Migration {
+            version: 2,
+            name: "audit_log",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0002_audit_log.sql"),
+        },
+        Migration {
+            version: 3,
+            name: "demo_expand",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0003_demo_expand.sql"),
+        },
+        Migration {
+            version: 4,
+            name: "demo_migrate",
+            phase: Phase::Migrate,
+            sql: include_str!("../migrations/0004_demo_migrate.sql"),
+        },
+        Migration {
+            version: 5,
+            name: "demo_contract",
+            phase: Phase::Contract,
+            sql: include_str!("../migrations/0005_demo_contract.sql"),
+        },
+    ]
+}
+
+/// Applies an ordered, checksummed migration chain against a Postgres pool.
+///
+/// Build it with [`MigrationRunner::new`] for the real IronAuth chain, or with
+/// [`MigrationRunner::from_migrations`] to drive a custom chain (the migration
+/// framework's own tests do this against a throwaway database). The pool must
+/// authenticate as a role that owns the schema (never the low-privilege
+/// application role): migrations run DDL and GRANTs.
+pub struct MigrationRunner<'a> {
+    pool: &'a PgPool,
+    migrations: Vec<Migration>,
+}
+
+impl<'a> MigrationRunner<'a> {
+    /// A runner for IronAuth's real migration chain.
+    #[must_use]
+    pub fn new(pool: &'a PgPool) -> Self {
+        Self {
+            pool,
+            migrations: registry(),
+        }
+    }
+
+    /// A runner for an explicit migration chain (test and tooling use).
+    #[must_use]
+    pub fn from_migrations(pool: &'a PgPool, migrations: Vec<Migration>) -> Self {
+        Self { pool, migrations }
+    }
+
+    /// Apply every pending migration in order, recording each in the ledger.
+    ///
+    /// # Errors
+    ///
+    /// [`MigrationError::NotSorted`] if the registry is not strictly ascending;
+    /// [`MigrationError::OutOfOrder`] if a higher version is already applied
+    /// while a lower one is pending; [`MigrationError::ChecksumMismatch`] if an
+    /// already-applied migration's text changed; [`MigrationError::UnknownApplied`]
+    /// if the ledger names a version this build does not have;
+    /// [`MigrationError::Database`] on any database failure. On refusal nothing
+    /// is applied.
+    pub async fn run(&self) -> Result<MigrationReport, MigrationError> {
+        // 1. The registry must be strictly ascending by version.
+        let mut prev: Option<i64> = None;
+        for migration in &self.migrations {
+            if prev.is_some_and(|p| migration.version <= p) {
+                return Err(MigrationError::NotSorted {
+                    version: migration.version,
+                });
+            }
+            prev = Some(migration.version);
+        }
+
+        // 2. Ensure the ledger exists before consulting it.
+        sqlx::query(CREATE_LEDGER_SQL).execute(self.pool).await?;
+
+        // 3. Load the applied set: version -> recorded checksum.
+        let rows = sqlx::query("SELECT version, checksum FROM _schema_migrations ORDER BY version")
+            .fetch_all(self.pool)
+            .await?;
+        let mut applied: BTreeMap<i64, String> = BTreeMap::new();
+        for row in &rows {
+            applied.insert(row.get("version"), row.get("checksum"));
+        }
+
+        // 4. Tamper and drift: every applied version must be known to this build
+        //    and its recorded checksum must still match the migration text.
+        for (&version, recorded) in &applied {
+            let Some(migration) = self.migrations.iter().find(|m| m.version == version) else {
+                return Err(MigrationError::UnknownApplied { version });
+            };
+            if &migration.checksum() != recorded {
+                return Err(MigrationError::ChecksumMismatch { version });
+            }
+        }
+
+        // 5. Ordering: walking ascending, once a version is pending, no later
+        //    version may already be applied.
+        let mut first_pending: Option<i64> = None;
+        for migration in &self.migrations {
+            let is_applied = applied.contains_key(&migration.version);
+            match (first_pending, is_applied) {
+                (None, false) => first_pending = Some(migration.version),
+                (Some(missing), true) => {
+                    return Err(MigrationError::OutOfOrder {
+                        applied: migration.version,
+                        missing,
+                    });
+                }
+                _ => {}
+            }
+        }
+
+        // 6. Apply each pending migration in order, atomically with its ledger
+        //    row: a failure rolls back both, so a partial migration is never
+        //    recorded as applied.
+        let mut newly_applied = Vec::new();
+        for migration in &self.migrations {
+            if applied.contains_key(&migration.version) {
+                continue;
+            }
+            let mut tx = self.pool.begin().await?;
+            sqlx::raw_sql(migration.sql).execute(&mut *tx).await?;
+            sqlx::query(
+                "INSERT INTO _schema_migrations (version, name, checksum, phase) \
+                 VALUES ($1, $2, $3, $4)",
+            )
+            .bind(migration.version)
+            .bind(migration.name)
+            .bind(migration.checksum())
+            .bind(migration.phase.as_str())
+            .execute(&mut *tx)
+            .await?;
+            tx.commit().await?;
+            newly_applied.push(migration.version);
+        }
+
+        Ok(MigrationReport {
+            newly_applied,
+            already_applied: applied.len(),
+        })
+    }
+}

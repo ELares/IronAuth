@@ -96,6 +96,47 @@ impl ScopedKind for OrganizationKind {
     const PREFIX: &'static str = "org";
 }
 
+/// Marker for an audit-log event, the tenant-scoped record the audit log writes
+/// in the same transaction as every mutation. Scoped like any other resource so
+/// audit rows are themselves subject to the tenant-isolation policies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct AuditKind;
+impl ScopedKind for AuditKind {
+    const PREFIX: &'static str = "aud";
+}
+
+/// Marker for a human actor (an interactive user). One of the three actor kinds
+/// an audit envelope can name (see [`crate::audit::ActorRef`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct HumanKind;
+impl LevelKind for HumanKind {
+    const PREFIX: &'static str = "hum";
+}
+
+/// Marker for a service actor (a machine client acting on its own behalf).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ServiceKind;
+impl LevelKind for ServiceKind {
+    const PREFIX: &'static str = "svc";
+}
+
+/// Marker for an agent actor (an autonomous agent acting for a principal). A
+/// first-class actor kind because agent-mediated administration is a stated
+/// target surface, and its actions must be attributable in the audit log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct AgentKind;
+impl LevelKind for AgentKind {
+    const PREFIX: &'static str = "agt";
+}
+
+/// Marker for a correlation (request) identifier, threaded through the caller
+/// context so every audit row can be tied back to the request that caused it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CorrelationKind;
+impl LevelKind for CorrelationKind {
+    const PREFIX: &'static str = "req";
+}
+
 /// A single-level identifier: a typed prefix over a random 128-bit payload.
 ///
 /// Used for the levels that are not themselves tenant-scoped ([`OperatorId`])
@@ -112,6 +153,14 @@ pub type OperatorId = LevelId<OperatorKind>;
 pub type TenantId = LevelId<TenantKind>;
 /// An environment identifier (`env_...`).
 pub type EnvironmentId = LevelId<EnvironmentKind>;
+/// A human actor identifier (`hum_...`).
+pub type HumanId = LevelId<HumanKind>;
+/// A service actor identifier (`svc_...`).
+pub type ServiceId = LevelId<ServiceKind>;
+/// An agent actor identifier (`agt_...`).
+pub type AgentId = LevelId<AgentKind>;
+/// A correlation (request) identifier (`req_...`).
+pub type CorrelationId = LevelId<CorrelationKind>;
 
 impl<K: LevelKind> LevelId<K> {
     /// Mint a fresh identifier from the environment's entropy seam.
@@ -193,6 +242,8 @@ pub struct ScopedId<K: ScopedKind> {
 pub type ClientId = ScopedId<ClientKind>;
 /// An organization identifier (`org_...`); schema slot only in M1.
 pub type OrganizationId = ScopedId<OrganizationKind>;
+/// An audit-log event identifier (`aud_...`).
+pub type AuditId = ScopedId<AuditKind>;
 
 impl<K: ScopedKind> ScopedId<K> {
     /// Mint a fresh scoped identifier under `scope`, drawing the unique
