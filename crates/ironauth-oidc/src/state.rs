@@ -35,6 +35,7 @@ struct Inner {
     issuer_base: String,
     code_ttl: Duration,
     access_token_ttl: Duration,
+    reuse_grace: Duration,
 }
 
 impl OidcState {
@@ -62,6 +63,7 @@ impl OidcState {
                 issuer_base: issuer_base.into(),
                 code_ttl: Duration::from_secs(config.authorization_code_ttl_secs),
                 access_token_ttl: Duration::from_secs(config.access_token_ttl_secs),
+                reuse_grace: Duration::from_secs(config.reuse_grace_secs),
             }),
         }
     }
@@ -88,6 +90,14 @@ impl OidcState {
     #[must_use]
     pub fn access_token_ttl(&self) -> Duration {
         self.inner.access_token_ttl
+    }
+
+    /// The configured reuse grace window for an already-consumed code. A second
+    /// presentation within this window is a benign retry (no grant-chain revoke);
+    /// beyond it, a genuine reuse that revokes the chain.
+    #[must_use]
+    pub fn reuse_grace(&self) -> Duration {
+        self.inner.reuse_grace
     }
 
     /// The current wall-clock time from the environment clock seam.
@@ -124,6 +134,7 @@ impl std::fmt::Debug for OidcState {
             .field("issuer_base", &self.inner.issuer_base)
             .field("code_ttl", &self.inner.code_ttl)
             .field("access_token_ttl", &self.inner.access_token_ttl)
+            .field("reuse_grace", &self.inner.reuse_grace)
             .finish_non_exhaustive()
     }
 }

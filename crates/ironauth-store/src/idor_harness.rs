@@ -39,11 +39,12 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::time::Duration;
 
 use ironauth_env::Env;
 
 use crate::audit::ActorRef;
-use crate::id::{CorrelationId, IssuedTokenId, ServiceId};
+use crate::id::{CorrelationId, GrantId, IssuedTokenId, ServiceId};
 use crate::repository::{RedeemOutcome, TokenStatus};
 use crate::scope::Scope;
 use crate::store::Store;
@@ -339,11 +340,21 @@ impl IsolationProbe for AuthorizationCodeRedeemProbe {
                 .scoped(caller)
                 .acting(actor, correlation)
                 .authorization();
-            match authorization.redeem(&env, &code_id).await {
-                // Consuming or replaying a foreign code would be a leak.
-                Ok(RedeemOutcome::Consumed(_) | RedeemOutcome::Replayed { .. }) => {
-                    ProbeOutcome::Leaked
-                }
+            // Redeem now folds the issued-token records in; the probe passes a
+            // grant minted in the caller's own scope and no tokens, since a
+            // foreign code never gets this far (parse_code_id above denies it).
+            let grant_id = GrantId::generate(&env, &caller);
+            match authorization
+                .redeem(&env, &code_id, &grant_id, &[], Duration::ZERO)
+                .await
+            {
+                // Any outcome that shows the code existed (consumed now, a benign
+                // grace retry, or a genuine reuse) would be a cross-scope leak.
+                Ok(
+                    RedeemOutcome::Consumed
+                    | RedeemOutcome::RetryWithinGrace
+                    | RedeemOutcome::Reused,
+                ) => ProbeOutcome::Leaked,
                 // Invalid (nothing matched in scope) or an error is the denial.
                 Ok(RedeemOutcome::Invalid) | Err(_) => ProbeOutcome::Denied,
             }

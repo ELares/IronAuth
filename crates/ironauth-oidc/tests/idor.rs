@@ -6,6 +6,8 @@
 
 mod common;
 
+use std::time::Duration;
+
 use common::{Harness, REDIRECT_URI};
 use ironauth_store::idor_harness::IdorHarness;
 use ironauth_store::{
@@ -97,17 +99,18 @@ async fn oidc_probes_deny_cross_scope_redeem_and_token_status() {
     assert!(leaks.is_empty(), "cross-scope leak detected: {leaks:?}");
 
     // The redeem probe must not have consumed the victim code: it is still
-    // redeemable in its own scope B.
+    // redeemable in its own scope B. (No issued tokens and a zero grace: this
+    // check only proves the code was still live and consumable.)
     let outcome = harness
         .store()
         .scoped(scope_b)
         .acting(actor(), corr())
         .authorization()
-        .redeem(&env, &code_b)
+        .redeem(&env, &code_b, &grant_b, &[], Duration::ZERO)
         .await
         .expect("redeem victim in its own scope");
     assert!(
-        matches!(outcome, RedeemOutcome::Consumed(_)),
+        matches!(outcome, RedeemOutcome::Consumed),
         "the victim code must be untouched by the cross-scope probe",
     );
 

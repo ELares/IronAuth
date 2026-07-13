@@ -139,10 +139,9 @@ pub fn redirect_response(location: &str) -> Response {
 pub enum TokenError {
     /// A required parameter is missing or malformed.
     InvalidRequest(String),
-    /// Client authentication failed or the client is unknown. Renders 401.
-    InvalidClient(String),
     /// The authorization code is invalid, expired, revoked, replayed, or one of
-    /// its bindings did not match. Uniform on purpose: it never says which.
+    /// its bindings did not match (including a wrong `client_id`). Uniform on
+    /// purpose: it never says which.
     InvalidGrant,
     /// The `grant_type` is not one this server supports (only
     /// `authorization_code`). This is where ROPC and every other grant land.
@@ -157,7 +156,6 @@ impl TokenError {
     fn code(&self) -> &'static str {
         match self {
             TokenError::InvalidRequest(_) => "invalid_request",
-            TokenError::InvalidClient(_) => "invalid_client",
             TokenError::InvalidGrant => "invalid_grant",
             TokenError::UnsupportedGrantType => "unsupported_grant_type",
             TokenError::ServerError => "server_error",
@@ -167,7 +165,6 @@ impl TokenError {
     /// The HTTP status this error renders to.
     fn status(&self) -> StatusCode {
         match self {
-            TokenError::InvalidClient(_) => StatusCode::UNAUTHORIZED,
             TokenError::ServerError => StatusCode::INTERNAL_SERVER_ERROR,
             _ => StatusCode::BAD_REQUEST,
         }
@@ -177,7 +174,7 @@ impl TokenError {
     /// so no binding-specific detail leaks.
     fn description(&self) -> &str {
         match self {
-            TokenError::InvalidRequest(message) | TokenError::InvalidClient(message) => message,
+            TokenError::InvalidRequest(message) => message,
             TokenError::InvalidGrant => {
                 "the authorization code is invalid, expired, or already used"
             }
@@ -194,7 +191,7 @@ impl IntoResponse for TokenError {
             "error_description": self.description(),
         })
         .to_string();
-        let mut response = (
+        (
             self.status(),
             [
                 (header::CONTENT_TYPE, "application/json"),
@@ -203,13 +200,6 @@ impl IntoResponse for TokenError {
             ],
             body,
         )
-            .into_response();
-        if matches!(self, TokenError::InvalidClient(_)) {
-            response.headers_mut().insert(
-                header::WWW_AUTHENTICATE,
-                header::HeaderValue::from_static("Basic"),
-            );
-        }
-        response
+            .into_response()
     }
 }

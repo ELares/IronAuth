@@ -14,6 +14,8 @@ mod common;
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
 use common::{Harness, PKCE_VERIFIER, REDIRECT_URI, form, json, send_through};
+use ironauth_jose::verify;
+use ironauth_store::{IssuedTokenId, TokenStatus};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn one_code_redeemed_concurrently_succeeds_exactly_once() {
@@ -59,6 +61,7 @@ async fn one_code_redeemed_concurrently_succeeds_exactly_once() {
 
     let mut successes = 0_usize;
     let mut invalid_grants = 0_usize;
+    let mut winner_access = None;
     for task in tasks {
         let (status, _headers, body) = task.await.expect("task joins");
         match status {
@@ -68,6 +71,12 @@ async fn one_code_redeemed_concurrently_succeeds_exactly_once() {
                 let value = json(&body);
                 assert!(value["access_token"].is_string(), "success has a token");
                 assert!(value["id_token"].is_string(), "success has an id token");
+                winner_access = Some(
+                    value["access_token"]
+                        .as_str()
+                        .expect("access token string")
+                        .to_owned(),
+                );
             }
             StatusCode::BAD_REQUEST => {
                 invalid_grants += 1;
@@ -82,5 +91,59 @@ async fn one_code_redeemed_concurrently_succeeds_exactly_once() {
         invalid_grants,
         RACERS - 1,
         "every other concurrent exchange must be invalid_grant"
+    );
+
+    let winner = winner_access.expect("exactly one winner produced a token");
+    assert_single_redeem_no_reuse(&harness, &client_id, &winner).await;
+}
+
+/// The losers all raced WITHIN the grace window (the manual clock is frozen at
+/// issuance), so every one is a benign retry: exactly one redeem is audited, NO
+/// reuse is audited, and the single winner's token is active. The concurrency
+/// gate never mistakes a race for a reuse.
+async fn assert_single_redeem_no_reuse(harness: &Harness, client_id: &str, winner_access: &str) {
+    let audits = harness
+        .store()
+        .scoped(harness.scope())
+        .audit()
+        .list()
+        .await
+        .expect("audit list");
+    assert_eq!(
+        audits
+            .iter()
+            .filter(|r| r.action == "authorization_code.redeem")
+            .count(),
+        1,
+        "exactly one redeem is audited across the whole race",
+    );
+    assert_eq!(
+        audits
+            .iter()
+            .filter(|r| r.action == "authorization_code.reuse")
+            .count(),
+        0,
+        "a concurrent within-grace race is never audited as a reuse",
+    );
+
+    let policy = harness.policy(client_id);
+    let jti = verify(winner_access, &policy, &common::verify_clock())
+        .expect("winner token verifies")
+        .claims()
+        .get("jti")
+        .and_then(|v| v.as_str())
+        .expect("jti claim")
+        .to_owned();
+    let jti_id = IssuedTokenId::parse_in_scope(&jti, &harness.scope()).expect("jti in scope");
+    assert_eq!(
+        harness
+            .store()
+            .scoped(harness.scope())
+            .authorization()
+            .token_status(&jti_id)
+            .await
+            .expect("token status"),
+        TokenStatus::Active,
+        "the winning exchange's token is active",
     );
 }

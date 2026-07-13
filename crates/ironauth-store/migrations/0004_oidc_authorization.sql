@@ -10,14 +10,16 @@
 -- the isolation layer just like every other data-plane surface.
 --
 --   1. grants: the revocation spine. Links a code to its session, its consent,
---      and every token issued from it. Revoking the chain (revoked_at) is what
---      invalidates every token already issued from a reused code.
+--      and every token issued from it. Revoking the chain (revoked_at) flips the
+--      observable active state of every token already issued from a reused code
+--      (it does not cryptographically invalidate an already-minted JWT).
 --   2. authorization_codes: the single-use codes. Every code binds its
 --      client_id, redirect_uri, nonce, and PKCE code_challenge, so the token
 --      endpoint re-checks every binding at redemption. Single use is enforced by
 --      one atomic UPDATE that consumes the code (consumed_at) only while it is
---      still NULL; zero rows affected is a replay, detected across N stateless
---      nodes without any in-memory marker.
+--      still NULL; zero rows affected is a miss that is then classified (a benign
+--      within-grace retry, a genuine reuse, or an expired/absent code), detected
+--      across N stateless nodes without any in-memory marker.
 --   3. issued_tokens: the jti of each access or ID token, recorded against its
 --      grant, so grant-chain revocation is observable (a token is active only
 --      while its issued row exists and its grant is not revoked).
@@ -50,6 +52,10 @@ CREATE TABLE grants (
     created_at     timestamptz NOT NULL DEFAULT now(),
     CONSTRAINT grants_scope_nonempty
         CHECK (tenant_id <> '' AND environment_id <> ''),
+    -- The composite key the child tables' isolation-preserving FKs reference, so
+    -- a code or token can only point at a grant in its OWN tenant and environment
+    -- (a bare id reference would let a child bind a grant in another scope).
+    UNIQUE (id, tenant_id, environment_id),
     FOREIGN KEY (tenant_id) REFERENCES tenants (id),
     FOREIGN KEY (environment_id, tenant_id) REFERENCES environments (id, tenant_id)
 );
@@ -82,13 +88,20 @@ GRANT SELECT, INSERT, UPDATE ON grants TO ironauth_app;
 -- the client_id, redirect_uri, nonce, and PKCE code_challenge presented at the
 -- authorization endpoint; the token endpoint re-checks each binding.
 --
--- Single use is the partial index plus one atomic statement: the token endpoint
--- runs `UPDATE ... SET consumed_at = <now> WHERE id = $1 AND consumed_at IS NULL
--- AND expires_at > <now> RETURNING ...`. Postgres serializes concurrent updates
--- of the one row, so exactly one exchange sees consumed_at NULL and succeeds; the
--- rest affect zero rows. No in-memory marker is involved, so it holds across N
+-- Single use is one atomic statement: the token endpoint runs `UPDATE ... SET
+-- consumed_at = <now> WHERE id = $1 AND consumed_at IS NULL AND expires_at >
+-- <now> RETURNING ...`. Under READ COMMITTED (pinned in begin_scoped) Postgres
+-- serializes concurrent updates of the one row, so exactly one exchange sees
+-- consumed_at NULL and succeeds; the rest block, re-read the committed row, and
+-- affect zero rows. No in-memory marker is involved, so it holds across N
 -- stateless nodes. A future cache-based accelerator can front this without
 -- changing the authoritative constraint (a seam, not built here).
+--
+-- Clock-skew note: expires_at and consumed_at are both written and compared with
+-- <now> read from each node's application clock seam, never the database clock.
+-- Across N stateless nodes a code's usable lifetime and the reuse-grace boundary
+-- can therefore shift by up to the inter-node clock skew. Keep nodes NTP-synced
+-- and the code TTL (default 60s) well above expected skew.
 CREATE TABLE authorization_codes (
     id                    text        PRIMARY KEY,
     tenant_id             text        NOT NULL,
@@ -112,8 +125,11 @@ CREATE TABLE authorization_codes (
         CHECK (tenant_id <> '' AND environment_id <> ''),
     FOREIGN KEY (tenant_id) REFERENCES tenants (id),
     FOREIGN KEY (environment_id, tenant_id) REFERENCES environments (id, tenant_id),
-    -- The grant must exist in the same tenant (isolation-preserving reference).
-    FOREIGN KEY (grant_id) REFERENCES grants (id)
+    -- The grant must exist in the SAME tenant and environment: the reference is
+    -- composite (grant_id, tenant_id, environment_id), so a code can never bind a
+    -- grant belonging to another scope.
+    FOREIGN KEY (grant_id, tenant_id, environment_id)
+        REFERENCES grants (id, tenant_id, environment_id)
 );
 
 CREATE INDEX authorization_codes_scope_idx
@@ -139,10 +155,13 @@ GRANT SELECT, INSERT, UPDATE ON authorization_codes TO ironauth_app;
 -- ---------------------------------------------------------------------------
 -- Issued tokens: the jti of each access or ID token, recorded against its grant.
 --
--- Recording issued tokens is what makes grant-chain revocation observable: a
--- token is active only while its issued row exists AND its grant is not revoked.
--- token_kind is 'access' or 'id'. This is also the spine the M3 refresh families
--- build on.
+-- Recording issued tokens is what makes grant-chain revocation observable to a
+-- checker that consults issued state: a token counts as active only while its
+-- issued row exists AND its grant is not revoked. (Revoking the grant does not
+-- cryptographically invalidate an already-minted JWT; a verifier that only
+-- checks the signature and expiry still accepts it until it expires. The
+-- introspection/active-state path is what observes the revocation.) token_kind
+-- is 'access' or 'id'. This is also the spine the M3 refresh families build on.
 CREATE TABLE issued_tokens (
     id             text        PRIMARY KEY,
     tenant_id      text        NOT NULL,
@@ -155,7 +174,9 @@ CREATE TABLE issued_tokens (
         CHECK (tenant_id <> '' AND environment_id <> ''),
     FOREIGN KEY (tenant_id) REFERENCES tenants (id),
     FOREIGN KEY (environment_id, tenant_id) REFERENCES environments (id, tenant_id),
-    FOREIGN KEY (grant_id) REFERENCES grants (id)
+    -- Isolation-preserving composite reference (same tenant and environment).
+    FOREIGN KEY (grant_id, tenant_id, environment_id)
+        REFERENCES grants (id, tenant_id, environment_id)
 );
 
 CREATE INDEX issued_tokens_scope_idx ON issued_tokens (tenant_id, environment_id);

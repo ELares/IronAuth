@@ -25,15 +25,14 @@ use axum::response::{IntoResponse, Response};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use ironauth_store::{
-    ActorRef, AuthorizationCodeId, ClientId, CorrelationId, GrantId, IssueCode, Scope, ServiceId,
-    StoreError,
+    AuthorizationCodeId, ClientId, CorrelationId, GrantId, IssueCode, Scope, StoreError,
 };
 use serde::Deserialize;
 
 use crate::error::{AuthorizeError, AuthzErrorCode, redirect_response};
 use crate::registry::{PkceMethod, ResponseType};
 use crate::state::OidcState;
-use crate::util::{append_query, epoch_micros, redirect_uri_is_valid};
+use crate::util::{append_query, client_service_actor, epoch_micros, redirect_uri_is_valid};
 
 /// The authorization-request parameters. Every field is optional at
 /// deserialization so a missing parameter is a validated error (with the correct
@@ -237,7 +236,9 @@ async fn finalize_issue(
         created_at_micros: epoch_micros(now),
     };
 
-    let actor = ActorRef::service(ServiceId::generate(state.env()));
+    // Attribute the issue audit to the client the code is for (stable, derived
+    // from the client id), under a fresh per-request correlation id.
+    let actor = client_service_actor(client_id);
     let correlation = CorrelationId::generate(state.env());
     if let Err(error) = state
         .store()

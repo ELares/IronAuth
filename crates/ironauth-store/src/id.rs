@@ -55,6 +55,17 @@ pub trait LevelKind: Copy + Eq + Hash + fmt::Debug {
 pub trait ScopedKind: Copy + Eq + Hash + fmt::Debug {
     /// The wire prefix, without the trailing underscore (for example `cli`).
     const PREFIX: &'static str;
+
+    /// Whether the [`fmt::Debug`] of a [`ScopedId`] of this kind must REDACT the
+    /// payload (rendering `prefix_<redacted>` instead of the wire value).
+    ///
+    /// Most identifiers are opaque, non-secret handles, so their debug output is
+    /// the legible wire form. A few identifiers double as bearer secrets: an
+    /// authorization code IS the credential the token endpoint redeems, and an
+    /// issued token's `jti` is the exact `jti` on the wire. Rendering those in a
+    /// `Debug` (a struct field, a `tracing` field, a panic message) would put a
+    /// live secret in the logs, so those kinds set this to `true`.
+    const REDACT_DEBUG: bool = false;
 }
 
 /// Marker for the operator level (the platform deployment). Top of the
@@ -126,6 +137,9 @@ impl ScopedKind for ManagementKeyKind {
 pub struct AuthorizationCodeKind;
 impl ScopedKind for AuthorizationCodeKind {
     const PREFIX: &'static str = "ac";
+    // The code IS the single-use bearer credential; never render it in a debug
+    // or log line.
+    const REDACT_DEBUG: bool = true;
 }
 
 /// Marker for an OIDC grant (`grt_`), the record linking a code, its session and
@@ -146,6 +160,8 @@ impl ScopedKind for GrantKind {
 pub struct IssuedTokenKind;
 impl ScopedKind for IssuedTokenKind {
     const PREFIX: &'static str = "tok";
+    // The `jti` is the exact identifier on the minted token; keep it out of logs.
+    const REDACT_DEBUG: bool = true;
 }
 
 /// Marker for a human actor (an interactive user). One of the three actor kinds
@@ -455,7 +471,15 @@ impl<K: ScopedKind> fmt::Display for ScopedId<K> {
 
 impl<K: ScopedKind> fmt::Debug for ScopedId<K> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{self}")
+        // A few scoped identifiers double as bearer secrets (an authorization
+        // code, an issued token's `jti`). For those the debug form redacts the
+        // payload so a struct field or a `tracing` field cannot leak the live
+        // value; the scope prefix is kept so the record stays legible.
+        if K::REDACT_DEBUG {
+            write!(f, "{}_<redacted>", K::PREFIX)
+        } else {
+            write!(f, "{self}")
+        }
     }
 }
 
@@ -674,6 +698,27 @@ mod tests {
             and_acc, [0x00_u8; COMPONENT_BYTES],
             "some bit never set to 0"
         );
+    }
+
+    #[test]
+    fn secret_scoped_ids_redact_their_debug_but_not_display() {
+        let env = test_env();
+        let scope = Scope::new(TenantId::generate(&env), EnvironmentId::generate(&env));
+
+        // An authorization code and an issued token are bearer secrets: Debug
+        // must not reveal the payload, but Display (the wire form) still must.
+        let code = AuthorizationCodeId::generate(&env, &scope);
+        assert_eq!(format!("{code:?}"), "ac_<redacted>");
+        assert!(code.to_string().starts_with("ac_"));
+        assert!(!format!("{code:?}").contains(&code.to_string()[3..]));
+
+        let token = IssuedTokenId::generate(&env, &scope);
+        assert_eq!(format!("{token:?}"), "tok_<redacted>");
+        assert!(token.to_string().starts_with("tok_"));
+
+        // A non-secret handle (a client id) keeps its legible debug form.
+        let client = ClientId::generate(&env, &scope);
+        assert_eq!(format!("{client:?}"), client.to_string());
     }
 
     #[test]

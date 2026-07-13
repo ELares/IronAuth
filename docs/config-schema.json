@@ -135,6 +135,13 @@
           "default": false,
           "description": "Whether to mount the public OIDC endpoints (`/authorize`, `/token`). Off\nby default so the default boot serves only the skeleton and needs no\ndatabase. When on, the provider connects the data-plane store using\n`database.url`.",
           "type": "boolean"
+        },
+        "reuse_grace_secs": {
+          "default": 10,
+          "description": "Reuse grace window in seconds for an already-consumed authorization code.\nA second presentation of a consumed code within this window (a concurrent\ndouble-submit or an immediate client retry) is treated as a BENIGN retry:\nit fails with `invalid_grant` but does NOT revoke the grant chain and does\nNOT audit a reuse. A second presentation AFTER the window is a genuine\nreuse: it revokes the grant chain and audits it (RFC 9700). The default\n(10) tolerates realistic retry and clock jitter without a false revoke; set\nit to 0 to treat every reuse as genuine. At most `OIDC_MAX_LIFETIME_SECS`.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
         }
       },
       "type": "object"
@@ -286,7 +293,8 @@
       "default": {
         "access_token_ttl_secs": 300,
         "authorization_code_ttl_secs": 60,
-        "enabled": false
+        "enabled": false,
+        "reuse_grace_secs": 10
       },
       "description": "OIDC provider settings (issue #12)."
     },

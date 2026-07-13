@@ -17,8 +17,8 @@ use common::{
 use ironauth_config::OidcConfig;
 use ironauth_jose::verify;
 use ironauth_store::{
-    ActorRef, ClientId, CorrelationId, IssuedTokenId, RedeemOutcome, Scope, ServiceId, StoreError,
-    TokenStatus,
+    ActorRef, ClientId, CorrelationId, GrantId, IssuedTokenId, RedeemOutcome, Scope, ServiceId,
+    StoreError, TokenStatus,
 };
 
 /// Build the happy-path authorization query for the harness client.
@@ -121,20 +121,20 @@ async fn full_code_flow_issues_verifiable_tokens_end_to_end() {
     );
 }
 
-#[tokio::test]
-async fn code_is_single_use_and_reuse_revokes_the_grant_chain() {
-    let harness = Harness::start().await;
+/// Issue a code, exchange it once (asserting the issued token is active), and
+/// return `(client_id, code, active_jti_id)` so the reuse tests can drive the
+/// SECOND presentation their own way.
+async fn first_exchange(harness: &Harness) -> (String, String, IssuedTokenId) {
     let client_id = harness.client_id().to_string();
-    let code = get_code(&harness).await;
+    let code = get_code(harness).await;
 
-    // First exchange succeeds and issues tokens.
     let (status, _, body) = harness.token(&token_form(&code, &client_id)).await;
     assert_eq!(status, StatusCode::OK, "first exchange: {body}");
     let access_token = json(&body)["access_token"]
         .as_str()
         .expect("access_token")
         .to_owned();
-    let jti = access_jti(&harness, &access_token, &client_id);
+    let jti = access_jti(harness, &access_token, &client_id);
     let jti_id = IssuedTokenId::parse_in_scope(&jti, &harness.scope()).expect("jti in scope");
     assert_eq!(
         harness
@@ -145,15 +145,70 @@ async fn code_is_single_use_and_reuse_revokes_the_grant_chain() {
             .await
             .unwrap(),
         TokenStatus::Active,
-        "issued token is active before reuse"
+        "issued token is active before any reuse"
     );
+    (client_id, code, jti_id)
+}
 
-    // Reusing the same code is invalid_grant AND revokes the grant chain.
+/// Every `authorization_code.reuse` audit row in the seeded scope.
+async fn reuse_audit_count(harness: &Harness) -> usize {
+    harness
+        .store()
+        .scoped(harness.scope())
+        .audit()
+        .list()
+        .await
+        .expect("audit list")
+        .iter()
+        .filter(|r| r.action == "authorization_code.reuse")
+        .count()
+}
+
+#[tokio::test]
+async fn code_is_single_use_and_reuse_within_grace_is_benign() {
+    // A second presentation of a just-consumed code (well within the default
+    // 10-second grace window: the clock does not advance) is a benign retry. It
+    // is rejected with invalid_grant, but it does NOT revoke the grant chain and
+    // does NOT audit a reuse.
+    let harness = Harness::start().await;
+    let (client_id, code, jti_id) = first_exchange(&harness).await;
+
     let (status, _, body) = harness.token(&token_form(&code, &client_id)).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "reuse rejected: {body}");
     assert_eq!(json(&body)["error"], "invalid_grant");
 
-    // The previously issued token is now inactive: reuse revoked the chain.
+    assert_eq!(
+        harness
+            .store()
+            .scoped(harness.scope())
+            .authorization()
+            .token_status(&jti_id)
+            .await
+            .unwrap(),
+        TokenStatus::Active,
+        "a within-grace retry must NOT revoke the issued token"
+    );
+    assert_eq!(
+        reuse_audit_count(&harness).await,
+        0,
+        "a within-grace retry is not audited as a reuse"
+    );
+}
+
+#[tokio::test]
+async fn code_reuse_after_grace_revokes_the_grant_chain() {
+    // A second presentation AFTER the grace window is a genuine reuse: it is
+    // rejected with invalid_grant AND revokes the grant chain, and the reuse is
+    // audited (RFC 9700). The default grace is 10s; advance the clock well past it.
+    let harness = Harness::start().await;
+    let (client_id, code, jti_id) = first_exchange(&harness).await;
+
+    harness.clock().advance(Duration::from_secs(30));
+
+    let (status, _, body) = harness.token(&token_form(&code, &client_id)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "reuse rejected: {body}");
+    assert_eq!(json(&body)["error"], "invalid_grant");
+
     assert_eq!(
         harness
             .store()
@@ -163,21 +218,12 @@ async fn code_is_single_use_and_reuse_revokes_the_grant_chain() {
             .await
             .unwrap(),
         TokenStatus::Revoked,
-        "reuse revokes every token issued from the grant"
+        "reuse beyond grace revokes every token issued from the grant"
     );
-
-    // The reuse is audited.
-    let audit = harness
-        .store()
-        .scoped(harness.scope())
-        .audit()
-        .list()
-        .await
-        .expect("audit list");
-    assert!(
-        audit.iter().any(|r| r.action == "authorization_code.reuse"),
-        "the reuse event is audited: {:?}",
-        audit.iter().map(|r| &r.action).collect::<Vec<_>>()
+    assert_eq!(
+        reuse_audit_count(&harness).await,
+        1,
+        "the genuine reuse is audited exactly once"
     );
 }
 
@@ -323,6 +369,9 @@ async fn a_code_from_another_scope_cannot_be_redeemed() {
     // A second environment of the same tenant is a different scope.
     let scope_b: Scope = harness.second_scope().await;
 
+    // Redeeming the scope-A code under scope B (with a grant minted in scope B) is
+    // a uniform not-found (defense in depth), never a Consumed/Reused/Invalid.
+    let grant_b = GrantId::generate(harness.env(), &scope_b);
     let outcome = harness
         .store()
         .scoped(scope_b)
@@ -331,16 +380,24 @@ async fn a_code_from_another_scope_cannot_be_redeemed() {
             CorrelationId::generate(harness.env()),
         )
         .authorization()
-        .redeem(harness.env(), &code_id)
+        .redeem(harness.env(), &code_id, &grant_b, &[], Duration::ZERO)
         .await;
-    // The code declares scope A, so redeeming it under scope B is a uniform
-    // not-found (defense in depth), never a Consumed or Replayed.
     assert!(
         matches!(outcome, Err(StoreError::NotFound)),
         "cross-scope redeem must be a uniform not-found, got {outcome:?}"
     );
 
-    // And it is still redeemable in its own scope afterwards (untouched).
+    // And it is still redeemable in its own scope afterwards (untouched). The
+    // grant id comes from a non-consuming read of the code's own bindings.
+    let grant_a = harness
+        .store()
+        .scoped(harness.scope())
+        .authorization()
+        .load_code(&code_id)
+        .await
+        .expect("load code")
+        .expect("code present in its own scope")
+        .grant_id;
     let good = harness
         .store()
         .scoped(harness.scope())
@@ -349,10 +406,10 @@ async fn a_code_from_another_scope_cannot_be_redeemed() {
             CorrelationId::generate(harness.env()),
         )
         .authorization()
-        .redeem(harness.env(), &code_id)
+        .redeem(harness.env(), &code_id, &grant_a, &[], Duration::ZERO)
         .await
         .expect("redeem in own scope");
-    assert!(matches!(good, RedeemOutcome::Consumed(_)));
+    assert!(matches!(good, RedeemOutcome::Consumed));
 }
 
 #[tokio::test]

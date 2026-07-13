@@ -32,6 +32,10 @@ base64.workspace = true
 # already in the tree via ironauth-store; no new crate.
 sha2.workspace = true
 tracing.workspace = true
+# The metrics facade (already in the tree; the server installs the Prometheus
+# recorder). Meters authorization-code reuse and redeem faults so a dropped
+# revoke or a burst of reuse is visible in aggregate, not just per-request logs.
+metrics.workspace = true
 
 [features]
 default = []

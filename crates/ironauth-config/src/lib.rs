@@ -279,6 +279,16 @@ pub struct OidcConfig {
     /// minutes; refresh handling (rotation, families) lands in M3. Must be at
     /// least 1 and at most `OIDC_MAX_LIFETIME_SECS`.
     pub access_token_ttl_secs: u64,
+
+    /// Reuse grace window in seconds for an already-consumed authorization code.
+    /// A second presentation of a consumed code within this window (a concurrent
+    /// double-submit or an immediate client retry) is treated as a BENIGN retry:
+    /// it fails with `invalid_grant` but does NOT revoke the grant chain and does
+    /// NOT audit a reuse. A second presentation AFTER the window is a genuine
+    /// reuse: it revokes the grant chain and audits it (RFC 9700). The default
+    /// (10) tolerates realistic retry and clock jitter without a false revoke; set
+    /// it to 0 to treat every reuse as genuine. At most `OIDC_MAX_LIFETIME_SECS`.
+    pub reuse_grace_secs: u64,
 }
 
 impl Default for OidcConfig {
@@ -287,6 +297,7 @@ impl Default for OidcConfig {
             enabled: false,
             authorization_code_ttl_secs: 60,
             access_token_ttl_secs: 300,
+            reuse_grace_secs: 10,
         }
     }
 }
@@ -445,6 +456,16 @@ impl Config {
             "oidc.access_token_ttl_secs",
             self.oidc.access_token_ttl_secs,
         )?;
+        // The reuse grace window differs from the lifetimes: 0 is valid (it means
+        // treat every reuse as genuine), so only the upper bound is enforced.
+        if self.oidc.reuse_grace_secs > OIDC_MAX_LIFETIME_SECS {
+            return Err(ConfigError::Invalid {
+                message: format!(
+                    "oidc.reuse_grace_secs ({}) must not exceed {OIDC_MAX_LIFETIME_SECS} seconds",
+                    self.oidc.reuse_grace_secs
+                ),
+            });
+        }
         Ok(())
     }
 }
@@ -640,11 +661,12 @@ mod tests {
 
     #[test]
     fn oidc_section_defaults_and_rejects_bad_lifetimes_and_unknown_keys() {
-        // Defaults: not mounted, 60s code, 300s access token.
+        // Defaults: not mounted, 60s code, 300s access token, 10s reuse grace.
         let config = Config::from_toml_str("", "<inline>").expect("valid").config;
         assert!(!config.oidc.enabled);
         assert_eq!(config.oidc.authorization_code_ttl_secs, 60);
         assert_eq!(config.oidc.access_token_ttl_secs, 300);
+        assert_eq!(config.oidc.reuse_grace_secs, 10);
 
         // A configured, in-bounds override parses.
         let input = "[oidc]\nenabled = true\nauthorization_code_ttl_secs = 30\n";
@@ -653,6 +675,13 @@ mod tests {
             .config;
         assert!(config.oidc.enabled);
         assert_eq!(config.oidc.authorization_code_ttl_secs, 30);
+
+        // A zero reuse grace is VALID (treat every reuse as genuine); a zero
+        // lifetime is not.
+        let config = Config::from_toml_str("[oidc]\nreuse_grace_secs = 0\n", "<inline>")
+            .expect("zero grace is valid")
+            .config;
+        assert_eq!(config.oidc.reuse_grace_secs, 0);
 
         // A zero lifetime (born expired) is rejected.
         let err =
@@ -670,6 +699,14 @@ mod tests {
         );
         let err = Config::from_toml_str(&over, "ironauth.toml").expect_err("over cap");
         assert!(err.to_string().contains("access_token_ttl_secs"), "{err}");
+
+        // A reuse grace above the ceiling is rejected too.
+        let over = format!(
+            "[oidc]\nreuse_grace_secs = {}\n",
+            OIDC_MAX_LIFETIME_SECS + 1
+        );
+        let err = Config::from_toml_str(&over, "ironauth.toml").expect_err("grace over cap");
+        assert!(err.to_string().contains("reuse_grace_secs"), "{err}");
 
         // Unknown oidc keys abort with the accepted fields.
         let err = Config::from_toml_str("[oidc]\nttl = 5\n", "ironauth.toml")

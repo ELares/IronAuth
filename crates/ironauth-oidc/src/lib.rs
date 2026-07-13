@@ -16,15 +16,25 @@
 //! # What makes this safe by construction
 //!
 //! - **Single use across N stateless nodes.** The code is consumed by ONE atomic
-//!   database statement (`UPDATE ... WHERE consumed_at IS NULL RETURNING ...`);
-//!   zero rows affected is a replay. There is no in-memory marker, so the property
-//!   holds no matter how many nodes serve the token endpoint. A seam is left for a
-//!   future cache-based accelerator (never mandatory, per the covenants).
-//! - **Every binding re-checked, uniformly.** At redemption the `client_id`,
-//!   `redirect_uri`, and PKCE `code_challenge` are all re-checked; any mismatch is
-//!   a uniform `invalid_grant` that never says which one failed.
-//! - **Reuse revokes the chain.** Redeeming a consumed code revokes its grant, so
-//!   every token issued from it becomes inactive, and the reuse is audited.
+//!   database statement (`UPDATE ... WHERE consumed_at IS NULL RETURNING ...`)
+//!   under READ COMMITTED; zero rows affected is a miss that is then classified.
+//!   There is no in-memory marker, so the property holds no matter how many nodes
+//!   serve the token endpoint. A seam is left for a future cache-based accelerator
+//!   (never mandatory, per the covenants).
+//! - **Every binding re-checked, uniformly, BEFORE the code is burned.** The token
+//!   endpoint reads the code (without consuming it), re-checks the `client_id`,
+//!   `redirect_uri`, and PKCE `code_challenge`, and pre-signs the tokens; only
+//!   then does the atomic redeem consume the code. A wrong-binding presentation or
+//!   a signing failure therefore never burns the one-time code. Any mismatch is a
+//!   uniform `invalid_grant` that never says which one failed.
+//! - **Reuse revokes the chain; a benign retry does not.** Presenting a
+//!   still-consumed code within a small configurable grace window
+//!   (`oidc.reuse_grace_secs`, default 10s) is treated as a benign double-submit
+//!   or client retry: it fails with `invalid_grant` but does NOT revoke. Beyond
+//!   the window it is a genuine reuse: the grant is revoked, which flips the
+//!   observable active state of every token issued from it (an introspection or
+//!   active-state check then rejects them; it does not cryptographically
+//!   invalidate an already-minted JWT), and the reuse is audited.
 //! - **Forbidden flows are structurally absent** (see [`registry`]): no ROPC
 //!   handler, no access-token issuance from the authorization endpoint, no plain
 //!   PKCE. The grant-type, response-type, and PKCE-method registries cannot
@@ -38,6 +48,11 @@
 //! exact redirect matching and RFC 9207 `iss` (#13); the conditional ID-token
 //! claim rules (#14); refresh rotation and families (M3); the legacy response
 //! types and `form_post` (#17); and the IronCache-backed replay accelerator.
+//!
+//! Because the strict registered-redirect match and mandatory-S256 enforcement
+//! are #13, this provider MUST NOT be enabled in production before #13 lands:
+//! `oidc.enabled` is `false` by default, and even when enabled it fails closed
+//! without per-environment signing keys.
 //!
 //! # Mounting
 //!
