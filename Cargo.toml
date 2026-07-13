@@ -18,6 +18,7 @@ members = [
     "crates/ironauth-server",
     "crates/ironauth-store",
     "crates/ironauth-fetch",
+    "crates/ironauth-jose",
     "crates/ironauth",
 ]
 
@@ -33,6 +34,7 @@ ironauth-config = { path = "crates/ironauth-config", version = "0.1.0" }
 ironauth-server = { path = "crates/ironauth-server", version = "0.1.0" }
 ironauth-store = { path = "crates/ironauth-store", version = "0.1.0" }
 ironauth-fetch = { path = "crates/ironauth-fetch", version = "0.1.0" }
+ironauth-jose = { path = "crates/ironauth-jose", version = "0.1.0" }
 getrandom = "0.3"
 
 # Persistence and isolation layer (crates/ironauth-store). Runtime query API
@@ -53,6 +55,15 @@ sqlx = { version = "0.8", default-features = false, features = [
     "postgres",
 ] }
 base64 = "0.22"
+# Direct crypto primitives for the hardened JOSE verifier (crates/ironauth-jose;
+# see docs/adr/0004-jose-verification.md). ring is ALREADY in the tree via
+# rustls; this adds a direct edge, not a new crate, so the graph, licenses
+# (Apache-2.0 AND ISC, both on the deny.toml allowlist), MSRV 1.85, and the musl
+# static lane are unchanged. Default features keep `alloc` on, which the RSA
+# verification path requires. The verifier is built on ring's low-level
+# signature primitives on purpose: high-level JOSE crates carry the very CVE
+# classes issue #8 closes.
+ring = "0.17"
 # SHA-256 for migration checksums (drift and tamper detection). Pure Rust
 # (no asm/C feature), permissive (MIT OR Apache-2.0), already in the tree via
 # sqlx, so this adds a direct edge but no new crate; MSRV 1.85 and musl clean.
