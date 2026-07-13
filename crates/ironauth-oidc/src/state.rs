@@ -38,9 +38,12 @@ struct Inner {
     code_ttl: Duration,
     access_token_ttl: Duration,
     reuse_grace: Duration,
-    // The one shared subject-derivation cache. Every surface that emits a `sub`
-    // (the ID token here, and `UserInfo`/introspection later) resolves it through
-    // this cache, so a pairwise subject can never diverge between surfaces.
+    // The one shared subject-derivation cache. The surface that emits a `sub` (the
+    // ID token today, and `UserInfo`/introspection once they land) resolves it
+    // through this cache; because it is a single shared derivation, any two
+    // surfaces that call it agree, so a pairwise subject cannot diverge between
+    // them. The cache partitions by the per-environment salt, keeping environments
+    // isolated.
     subjects: SubjectCache,
 }
 

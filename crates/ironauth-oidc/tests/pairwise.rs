@@ -1,11 +1,14 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Pairwise subject derivation across surfaces (issue #19), database-free.
+//! Pairwise subject derivation (issue #19), database-free.
 //!
-//! Acceptance criterion 5: the pairwise `sub` is deterministic and IDENTICAL
-//! across the ID token and `UserInfo`, through one shared derivation function, and
-//! switching a client to pairwise never changes an already-derived `sub`
-//! (memoization).
+//! Acceptance criterion 5 requires the pairwise `sub` to be deterministic and
+//! IDENTICAL across the ID token and `UserInfo` through one shared derivation
+//! function, and stable once derived. There is no `UserInfo` surface yet (it lands
+//! with issue #15), so what these tests prove is the property that MAKES the
+//! cross-surface guarantee hold: the single shared derivation is deterministic and
+//! memoized per environment, so any two surfaces that call it necessarily agree.
+//! The cross-surface parity itself is exercised end to end once `UserInfo` exists.
 
 use ironauth_env::FixedEntropy;
 use ironauth_oidc::{PairwiseSalt, SubjectCache, SubjectConfig, resolve_subject};
@@ -16,33 +19,30 @@ const LOCAL_SUBJECT: &str = "user-4f2a";
 const SECTOR: &str = "client.example.test";
 
 #[test]
-fn pairwise_sub_is_identical_across_id_token_and_userinfo() {
-    // One environment salt, one shared cache: the ID token path and the UserInfo
-    // path both resolve the subject through the SAME function and cache.
+fn one_shared_derivation_gives_every_surface_the_same_sub() {
+    // Any two call sites that resolve through the SAME shared function and cache
+    // (with the same environment salt) get the identical sub. This is the property
+    // that guarantees the ID token and a future UserInfo (#15) cannot diverge: they
+    // are not two independent derivations, they are two calls to one function.
     let salt = PairwiseSalt::generate(&FixedEntropy::new(0x5A));
     let cache = SubjectCache::new();
     let config = SubjectConfig::pairwise(SECTOR);
 
-    // The ID token surface derives the sub...
-    let id_token_sub = cache.resolve(&config, LOCAL_SUBJECT, &salt);
-    // ...and the UserInfo surface derives it independently.
-    let userinfo_sub = cache.resolve(&config, LOCAL_SUBJECT, &salt);
+    let first_call = cache.resolve(&config, LOCAL_SUBJECT, &salt);
+    let second_call = cache.resolve(&config, LOCAL_SUBJECT, &salt);
 
     assert_eq!(
-        id_token_sub, userinfo_sub,
-        "the ID token and UserInfo must return the identical pairwise sub"
+        first_call, second_call,
+        "two resolutions of the same subject return the identical pairwise sub"
     );
     // It is opaque (not the local account id) and pairwise (sector-specific).
-    assert_ne!(id_token_sub, LOCAL_SUBJECT);
+    assert_ne!(first_call, LOCAL_SUBJECT);
     let other_sector = cache.resolve(
         &SubjectConfig::pairwise("other.example.test"),
         LOCAL_SUBJECT,
         &salt,
     );
-    assert_ne!(
-        id_token_sub, other_sector,
-        "different sector, different sub"
-    );
+    assert_ne!(first_call, other_sector, "different sector, different sub");
 }
 
 #[test]
@@ -58,16 +58,26 @@ fn derivation_is_deterministic_across_fresh_state() {
 }
 
 #[test]
-fn memoized_sub_never_changes_once_derived() {
-    // Once a sub has been derived and (conceptually) issued to the relying party,
-    // re-deriving it must return the identical value, even if the environment salt
-    // were rotated underneath: memoization pins the already-issued identifier.
+fn memoized_sub_is_stable_within_an_environment_and_isolated_across_them() {
+    // Within one environment (one salt) a re-derivation returns the identical,
+    // already-issued value: memoization pins it for the process. A DIFFERENT
+    // environment salt is a distinct partition and correctly yields a different
+    // sub, so the two environments cannot correlate the user by comparing subs.
     let cache = SubjectCache::new();
     let config = SubjectConfig::pairwise(SECTOR);
-    let first = cache.resolve(&config, LOCAL_SUBJECT, &PairwiseSalt::new(vec![1_u8; 32]));
-    let after_salt_change =
-        cache.resolve(&config, LOCAL_SUBJECT, &PairwiseSalt::new(vec![2_u8; 32]));
-    assert_eq!(first, after_salt_change, "an already-derived sub is stable");
+    let env_a = PairwiseSalt::new(vec![1_u8; 32]);
+    let first = cache.resolve(&config, LOCAL_SUBJECT, &env_a);
+    let again = cache.resolve(&config, LOCAL_SUBJECT, &env_a);
+    assert_eq!(
+        first, again,
+        "an already-derived sub is stable within its environment"
+    );
+    let env_b = PairwiseSalt::new(vec![2_u8; 32]);
+    let other_env = cache.resolve(&config, LOCAL_SUBJECT, &env_b);
+    assert_ne!(
+        first, other_env,
+        "a different environment salt derives a different, isolated sub"
+    );
 }
 
 #[test]

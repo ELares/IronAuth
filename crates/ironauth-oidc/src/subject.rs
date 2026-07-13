@@ -9,7 +9,10 @@
 //! future introspection response) returns the SAME value. Half-implementations
 //! that return one `sub` from the ID token and another from `UserInfo` fail
 //! certification, so this module exposes exactly one derivation function,
-//! [`resolve_subject`], and every surface calls it.
+//! [`resolve_subject`]. The ID token path routes through it today; the `UserInfo`
+//! and introspection surfaces arrive in later issues and must call the same
+//! function (a single shared derivation, held by convention until those surfaces
+//! exist).
 //!
 //! Derivation, per OIDC Core 8.1, hashes the sector identifier, the local (per
 //! user) account identifier, and a per-environment salt:
@@ -21,9 +24,10 @@
 //! The `0x00` separators make the concatenation unambiguous (so `("ab", "c")` and
 //! `("a", "bc")` never collide). The salt is per environment, so the same user
 //! and sector yield different `sub`s in different environments, keeping issuers
-//! isolated. A [`SubjectCache`] memoizes derivations so repeated lookups (across
-//! the ID token, `UserInfo`, and introspection paths) return the identical value
-//! and re-derivation is stable.
+//! isolated. A [`SubjectCache`] memoizes PAIRWISE derivations, partitioned by the
+//! per-environment salt, so repeated lookups within an environment return the
+//! identical value while different environments stay isolated. Public subjects are
+//! returned directly (the value is just the local identifier, nothing to cache).
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -158,18 +162,39 @@ pub fn resolve_subject(config: &SubjectConfig, local_subject: &str, salt: &Pairw
     }
 }
 
-/// A memoizing cache over [`resolve_subject`].
+/// A non-reversible fingerprint of a per-environment salt.
 ///
-/// Once a `sub` has been derived for a `(subject_type, sector, local_subject)`
-/// triple it is returned verbatim on every later lookup, so re-derivation is
-/// stable and every surface that consults the cache agrees. The cache is keyed on
-/// the derivation inputs (never the salt, which is fixed per environment), so a
-/// switch to pairwise recomputes once and then memoizes.
+/// Used only to PARTITION the memo so two environments (which hold different
+/// salts) never share a cache entry. Fingerprinting rather than storing the salt
+/// keeps the secret out of the map key, and the fingerprint is domain-separated
+/// from [`resolve_subject`] so it can never coincide with a derived `sub`.
+fn salt_fingerprint(salt: &PairwiseSalt) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"ironauth.pairwise.salt.fingerprint.v1");
+    hasher.update(salt.bytes());
+    hasher.finalize().into()
+}
+
+/// A memoizing cache over [`resolve_subject`] for PAIRWISE subjects.
+///
+/// Once a pairwise `sub` has been derived for a `(salt, sector, local_subject)`
+/// triple it is returned verbatim on every later lookup within that environment,
+/// so re-derivation is stable and every surface that consults the cache agrees.
+/// The key includes a fingerprint of the per-environment salt, so two environments
+/// deriving a `sub` for the same `(sector, local_subject)` never collide: each
+/// environment's salt is a distinct partition, preserving per-environment
+/// isolation. Public subjects are not cached (the value is the local identifier
+/// verbatim, so there is nothing to memoize).
 #[derive(Debug, Default)]
 pub struct SubjectCache {
-    // Keyed by (subject_type discriminant, sector identifier, local subject).
-    memo: Mutex<HashMap<(SubjectType, String, String), String>>,
+    // Keyed by (per-environment salt fingerprint, sector identifier, local
+    // subject). Only pairwise subjects are stored.
+    memo: Mutex<HashMap<MemoKey, String>>,
 }
+
+/// The memo key: a per-environment salt fingerprint, the sector identifier, and
+/// the local subject. Two environments (different salts) never share an entry.
+type MemoKey = ([u8; 32], String, String);
 
 impl SubjectCache {
     /// An empty cache.
@@ -192,8 +217,20 @@ impl SubjectCache {
         local_subject: &str,
         salt: &PairwiseSalt,
     ) -> String {
+        // A public sub is the local account identifier verbatim, so there is
+        // nothing to memoize; caching it would only grow the map by one entry per
+        // end user for no benefit. Only pairwise derivations (an actual hash) are
+        // cached.
+        if config.subject_type == SubjectType::Public {
+            return resolve_subject(config, local_subject, salt);
+        }
+        // Partition the memo by a fingerprint of the per-environment salt, so two
+        // environments deriving a sub for the same (sector, local_subject) never
+        // collide on one entry. Without the salt in the key, a second environment
+        // would inherit the first environment's salt-derived value, breaking the
+        // per-environment isolation the salt exists to provide.
         let key = (
-            config.subject_type,
+            salt_fingerprint(salt),
             config.sector_identifier.clone(),
             local_subject.to_owned(),
         );
@@ -254,15 +291,40 @@ mod tests {
     }
 
     #[test]
-    fn cache_memoizes_and_stays_stable() {
+    fn cache_memoizes_within_a_salt_and_isolates_across_salts() {
         let cache = SubjectCache::new();
         let config = SubjectConfig::pairwise("client.example.test");
-        let first = cache.resolve(&config, "user-123", &salt());
-        // A second lookup returns the memoized value, even with a DIFFERENT salt:
-        // once derived, the sub never changes underneath an already-issued token.
-        let other_salt = PairwiseSalt::new(vec![1_u8; 32]);
-        let second = cache.resolve(&config, "user-123", &other_salt);
-        assert_eq!(first, second, "memoized sub is stable");
+        let env_a = salt();
+        let first = cache.resolve(&config, "user-123", &env_a);
+        // Same salt and inputs: the memoized value is returned unchanged.
+        let repeat = cache.resolve(&config, "user-123", &env_a);
+        assert_eq!(first, repeat, "same salt memoizes to a stable sub");
+        // A different per-environment salt is a distinct partition, so the sub must
+        // differ: two environments never share a pairwise sub for one user+sector.
+        let env_b = PairwiseSalt::new(vec![1_u8; 32]);
+        let across = cache.resolve(&config, "user-123", &env_b);
+        assert_ne!(
+            first, across,
+            "a different environment salt derives a different sub"
+        );
+        assert_eq!(
+            across,
+            resolve_subject(&config, "user-123", &env_b),
+            "and the cached value matches the pure derivation for that salt"
+        );
+    }
+
+    #[test]
+    fn public_subjects_are_not_cached() {
+        // A public subject returns the local id verbatim through the cache, but the
+        // cache must not retain an entry for it (it would grow per end user).
+        let cache = SubjectCache::new();
+        let config = SubjectConfig::public();
+        assert_eq!(cache.resolve(&config, "user-123", &salt()), "user-123");
+        assert!(
+            cache.memo.lock().expect("lock").is_empty(),
+            "public subjects leave no cache entry"
+        );
     }
 
     #[test]
