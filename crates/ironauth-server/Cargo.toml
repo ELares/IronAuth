@@ -1,0 +1,52 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+[package]
+name = "ironauth-server"
+version = "0.1.0"
+description = "IronAuth HTTP server skeleton: dual-plane axum server, observability, and the trusted-proxy policy"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+ironauth-env.workspace = true
+ironauth-config.workspace = true
+
+tokio = { workspace = true, features = ["rt-multi-thread", "net", "signal", "time", "sync", "macros"] }
+axum = { workspace = true, features = ["http1", "tokio", "matched-path"] }
+tower = { workspace = true }
+tower-http = { workspace = true, features = ["catch-panic"] }
+http.workspace = true
+
+tracing.workspace = true
+tracing-subscriber = { workspace = true, features = ["fmt", "json", "std", "ansi"] }
+# Core recorder only: no http-listener or push-gateway features, so no extra
+# HTTP client or TLS crate enters the graph (the /metrics route is served by
+# axum and rendered from the handle).
+metrics.workspace = true
+metrics-exporter-prometheus.workspace = true
+
+# OTLP trace export, behind the non-default `otlp` feature only.
+opentelemetry = { workspace = true, optional = true }
+opentelemetry_sdk = { workspace = true, optional = true, features = ["rt-tokio"] }
+opentelemetry-otlp = { workspace = true, optional = true, features = ["grpc-tonic", "trace"] }
+tracing-opentelemetry = { workspace = true, optional = true }
+
+[features]
+# Trace export via OTLP. Off by default so the default build and the musl
+# static lane stay lean and protoc-free; the tracing subscriber is wired
+# regardless, this only attaches the exporter.
+otlp = [
+    "dep:opentelemetry",
+    "dep:opentelemetry_sdk",
+    "dep:opentelemetry-otlp",
+    "dep:tracing-opentelemetry",
+]
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "net", "io-util", "time"] }
+tower = { workspace = true, features = ["util"] }
+http-body-util.workspace = true
+
+[lints]
+workspace = true

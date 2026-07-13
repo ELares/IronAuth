@@ -1,0 +1,30 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+#
+# IronAuth configuration for the docker compose stack. Validated against
+# docs/config-schema.json. See docs/CONFIG.md for the full key reference.
+
+[server]
+# Public data plane on all interfaces so the published port reaches it.
+bind = "0.0.0.0:8443"
+# Management plane (health, readiness, metrics) on loopback only: never
+# published, only the in-container healthcheck reaches it.
+management_bind = "127.0.0.1:9443"
+# Scheme, host, and issuer derive from this, never from request headers.
+public_url = "http://localhost:8443"
+shutdown_grace_secs = 25
+
+# Trust nothing by default: the compose stack has no reverse proxy in front, so
+# forwarding headers are ignored and the client IP is the transport peer.
+[proxy]
+trusted_hops = 0
+trust_forwarded = false
+
+[telemetry]
+log_format = "json"
+# Plaintext OTLP gRPC to the bundled collector on the internal compose network.
+otlp_endpoint = "http://otel-collector:4317"
+
+[database]
+url = "postgres://ironauth@postgres:5432/ironauth"
+# Supplied out of band via the container environment; never in the file.
+password = { env = "IRONAUTH_DB_PASSWORD" }

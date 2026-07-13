@@ -1,0 +1,54 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+#
+# Single-command bring-up of IronAuth plus its only required dependency,
+# Postgres, and a bundled OpenTelemetry collector for traces. From this
+# directory: `docker compose up`. The stack reaches healthy when Postgres is
+# ready and ironauth's /readyz (on the private management port) returns 200.
+#
+# This is a development stack: the credentials below are throwaway and must
+# never be reused in production.
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: ironauth
+      POSTGRES_PASSWORD: ironauth-dev-password
+      POSTGRES_DB: ironauth
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ironauth -d ironauth"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  otel-collector:
+    image: otel/opentelemetry-collector:0.115.1
+    command: ["--config=/etc/otel-collector-config.yaml"]
+    volumes:
+      - ./otel-collector-config.yaml:/etc/otel-collector-config.yaml:ro
+
+  ironauth:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+      otel-collector:
+        condition: service_started
+    environment:
+      # Merged into the database connection at connect time (see the config's
+      # database.password secret indirection).
+      IRONAUTH_DB_PASSWORD: ironauth-dev-password
+    volumes:
+      - ./ironauth.toml:/etc/ironauth/ironauth.toml:ro
+    ports:
+      # Public data plane only. The management plane stays on container
+      # loopback and is never published.
+      - "8443:8443"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:9443/readyz"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
