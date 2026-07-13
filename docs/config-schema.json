@@ -50,6 +50,40 @@
       },
       "type": "object"
     },
+    "LogFormat": {
+      "description": "Structured-log output format.",
+      "oneOf": [
+        {
+          "const": "json",
+          "description": "One JSON object per line with ECS-friendly field names. The production\ndefault: machine-parseable and safe to ship to a log pipeline.",
+          "type": "string"
+        },
+        {
+          "const": "pretty",
+          "description": "Human-readable multi-line output for local development. Never emit this\nwhere logs are ingested by tooling.",
+          "type": "string"
+        }
+      ]
+    },
+    "ProxyConfig": {
+      "additionalProperties": false,
+      "description": "Trusted-proxy policy.\n\nForwarding headers (RFC 7239 `Forwarded`, `X-Forwarded-For`,\n`X-Forwarded-Proto`, `X-Forwarded-Host`) and the `Host` header are an\naccount-takeover class when trusted blindly. The default trusts NOTHING:\n`trusted_hops = 0` and `trust_forwarded = false` mean the effective client\nIP is the transport peer and the scheme, host, and issuer derive entirely\nfrom `server.public_url`. Only when the server genuinely runs behind a\nfixed number of trusted reverse proxies should these be raised, and even\nthen scheme and issuer stay config-derived.",
+      "properties": {
+        "trust_forwarded": {
+          "default": false,
+          "description": "Whether to honor forwarding headers at all. False (the default) ignores\nevery forwarding header regardless of `trusted_hops`. Both this and a\nnon-zero `trusted_hops` are required before any header is consulted.",
+          "type": "boolean"
+        },
+        "trusted_hops": {
+          "default": 0,
+          "description": "Exact number of trusted reverse-proxy hops in front of the server.\nZero (the default) means the server is exposed directly and no\nforwarding header is ever honored. Forwarding is honored only when the\nrequest presents exactly this many forwarding entries; any other count\nfails closed to the transport peer.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
     "Secret": {
       "description": "A secret value by indirection: the contents of a file ({ file = \"/path\" }), an environment variable ({ env = \"VAR_NAME\" }), or a literal string (discouraged; flagged outside dev mode).",
       "oneOf": [
@@ -91,12 +125,44 @@
       "properties": {
         "bind": {
           "default": "127.0.0.1:8443",
-          "description": "Socket address the server listens on.",
+          "description": "Socket address the public data plane listens on. This plane serves the\nprotocol and hosted-page surfaces; health, readiness, and metrics are\nnever exposed here.",
+          "type": "string"
+        },
+        "management_bind": {
+          "default": "127.0.0.1:9443",
+          "description": "Socket address the management plane listens on. Liveness, readiness,\nand the Prometheus metrics endpoint live here so the data plane is\nnever probed publicly; bind it to a private interface.",
           "type": "string"
         },
         "public_url": {
           "default": null,
-          "description": "Externally visible base URL (scheme and host) used to mint issuer and\nendpoint URLs. Unset means single-host development behind the bind\naddress.",
+          "description": "Externally visible base URL (scheme and host) used to mint issuer and\nendpoint URLs. Unset means single-host development behind the bind\naddress. The scheme, host, and issuer always derive from this value,\nnever from request headers (see the `[proxy]` policy).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "shutdown_grace_secs": {
+          "default": 25,
+          "description": "Maximum seconds to drain in-flight requests after a shutdown signal\nbefore the process exits regardless. Zero exits without draining.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "TelemetryConfig": {
+      "additionalProperties": false,
+      "description": "Observability settings.",
+      "properties": {
+        "log_format": {
+          "$ref": "#/$defs/LogFormat",
+          "default": "json",
+          "description": "Structured-log output format for the process log stream."
+        },
+        "otlp_endpoint": {
+          "default": null,
+          "description": "OpenTelemetry OTLP collector endpoint for trace export (for example\n`http://otel-collector:4317`). Trace export is compiled in only when\nthe binary is built with the non-default `otlp` feature; setting this\non a build without that feature logs a warning and is otherwise inert.",
           "type": [
             "string",
             "null"
@@ -131,13 +197,31 @@
       "description": "Feature toggles keyed by registered feature name. Enabling an\nexperimental feature additionally requires `ack` equal to the\nfeature's exact current version; see the feature reference in the\ngenerated docs/CONFIG.md.",
       "type": "object"
     },
+    "proxy": {
+      "$ref": "#/$defs/ProxyConfig",
+      "default": {
+        "trust_forwarded": false,
+        "trusted_hops": 0
+      },
+      "description": "Trusted-proxy policy. Controls whether forwarding headers are honored;\nthe safe default trusts nothing."
+    },
     "server": {
       "$ref": "#/$defs/ServerConfig",
       "default": {
         "bind": "127.0.0.1:8443",
-        "public_url": null
+        "management_bind": "127.0.0.1:9443",
+        "public_url": null,
+        "shutdown_grace_secs": 25
       },
       "description": "HTTP server settings."
+    },
+    "telemetry": {
+      "$ref": "#/$defs/TelemetryConfig",
+      "default": {
+        "log_format": "json",
+        "otlp_endpoint": null
+      },
+      "description": "Observability settings: log format and trace export."
     }
   },
   "title": "Config",

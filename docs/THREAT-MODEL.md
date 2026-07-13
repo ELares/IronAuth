@@ -9,13 +9,14 @@ or the tracked issue that will land it.
 
 ## Surfaces shipped today
 
-As of milestone M1 scaffolding, the shipped surfaces are the repository and
-release infrastructure only (CI workflows, release automation, supply-chain
-artifacts). No network-facing service exists yet. The sections below are
-forward-looking: they model the four surfaces the M1 and M2 issues are about
-to ship, so that every implementation PR lands into an existing threat frame
-rather than inventing one after the fact. Each mitigation cell cites the
-issue that owns it; a cell without a citation is shipped.
+As of milestone M1, the shipped surfaces are the repository and release
+infrastructure and the HTTP server skeleton (dual-plane listener, observability,
+log scrubbing, and the trusted-proxy policy). The skeleton is network-facing but
+carries no protocol endpoint yet: those arrive in M2. The remaining sections are
+forward-looking: they model the surfaces the later M1 and M2 issues are about to
+ship, so that every implementation PR lands into an existing threat frame rather
+than inventing one after the fact. Each mitigation cell cites the issue that owns
+it; a cell without a citation is shipped.
 
 ## Attacker model
 
@@ -36,6 +37,21 @@ do not assume a compromised host OS or hypervisor.
 | Information disclosure | Secrets in repo or logs | GitHub secret scanning plus push protection enabled; no secrets in CI beyond GITHUB_TOKEN |
 | Denial of service | CI-lane rot blocking releases | Job timeouts; per-artifact release lanes are independent |
 | Elevation | Workflow permission escalation | Least-privilege per-job permissions; default contents: read |
+
+## Surface: HTTP server skeleton (shipped)
+
+The properties below are structural: they exist before any protocol endpoint,
+so every later surface inherits them. Cells without a citation are shipped by
+the skeleton; later issues extend, never weaken, them.
+
+| STRIDE | Threat | Control |
+|---|---|---|
+| Spoofing | Forged `Forwarded`/`X-Forwarded-*`/`Host` to move the issuer, scheme, or client IP (the Zitadel forwarded-header account-takeover class) | Scheme, host, and issuer derive from `server.public_url` config, never from headers; forwarding is honored only under an exact trusted-hop topology (`proxy.trusted_hops`/`trust_forwarded`, default trust-nothing) and fails closed on any ambiguity |
+| Tampering | Spoofed hop count or conflicting forwarding headers to smuggle a false client IP | Exactly `trusted_hops` entries are required; extra, missing, malformed, or conflicting (`Forwarded` and `X-Forwarded-For` together) entries fail closed to the transport peer and increment `ironauth_proxy_forwarding_rejected_total` |
+| Repudiation | Unattributable request handling | Structured JSON request logs (method, route template, config-derived scheme, effective client IP, status) with an async writer; per-surface audit rows land with the persistence substrate (#7) |
+| Information disclosure | Secrets, tokens, or PII in logs (the Okta 2023 HAR class) | Request logging carries route TEMPLATES and safe fields only, never query strings, `Authorization`, `Cookie`, other headers, or bodies; sensitive runtime values are typed `Redacted<T>`; a scrubbing corpus test asserts zero leaks; management plane (health/readiness/metrics) is bound separately and absent from the public data plane |
+| Denial of service | Metric-label cardinality blow-up via crafted paths; unclean shutdown dropping in-flight work | Metric labels are route templates, never raw paths (unmatched requests collapse to one series); `SIGTERM`/`SIGINT` drains in-flight requests within `server.shutdown_grace_secs`; per-tenant rate limiting lands later (#50, M15) |
+| Elevation | Public probing of privileged management endpoints | Health, readiness, and metrics live only on the management plane (`server.management_bind`, loopback by default) and 404 on the public plane |
 
 ## Surface: authorization endpoint (planned; lands with issue #12)
 

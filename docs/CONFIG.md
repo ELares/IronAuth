@@ -18,9 +18,17 @@ at the top of the file, or map it in `.taplo.toml`).
 | `features` | table | empty | Feature toggles keyed by registered feature name. Enabling an experimental feature additionally requires `ack` equal to the feature's exact current version; see the feature reference in the generated docs/CONFIG.md. |
 | `features.<name>.ack` | string or unset | unset | Exact-version acknowledgment, required to enable an experimental feature. Ignored for preview and supported features. |
 | `features.<name>.enabled` | boolean | `false` | Whether the feature is enabled. |
+| `proxy` | table | see fields | Trusted-proxy policy. Controls whether forwarding headers are honored; the safe default trusts nothing. |
+| `proxy.trust_forwarded` | boolean | `false` | Whether to honor forwarding headers at all. False (the default) ignores every forwarding header regardless of `trusted_hops`. Both this and a non-zero `trusted_hops` are required before any header is consulted. |
+| `proxy.trusted_hops` | integer | `0` | Exact number of trusted reverse-proxy hops in front of the server. Zero (the default) means the server is exposed directly and no forwarding header is ever honored. Forwarding is honored only when the request presents exactly this many forwarding entries; any other count fails closed to the transport peer. |
 | `server` | table | see fields | HTTP server settings. |
-| `server.bind` | string | `"127.0.0.1:8443"` | Socket address the server listens on. |
-| `server.public_url` | string or unset | unset | Externally visible base URL (scheme and host) used to mint issuer and endpoint URLs. Unset means single-host development behind the bind address. |
+| `server.bind` | string | `"127.0.0.1:8443"` | Socket address the public data plane listens on. This plane serves the protocol and hosted-page surfaces; health, readiness, and metrics are never exposed here. |
+| `server.management_bind` | string | `"127.0.0.1:9443"` | Socket address the management plane listens on. Liveness, readiness, and the Prometheus metrics endpoint live here so the data plane is never probed publicly; bind it to a private interface. |
+| `server.public_url` | string or unset | unset | Externally visible base URL (scheme and host) used to mint issuer and endpoint URLs. Unset means single-host development behind the bind address. The scheme, host, and issuer always derive from this value, never from request headers (see the `[proxy]` policy). |
+| `server.shutdown_grace_secs` | integer | `25` | Maximum seconds to drain in-flight requests after a shutdown signal before the process exits regardless. Zero exits without draining. |
+| `telemetry` | table | see fields | Observability settings: log format and trace export. |
+| `telemetry.log_format` | string | `"json"` | Structured-log output format for the process log stream. |
+| `telemetry.otlp_endpoint` | string or unset | unset | OpenTelemetry OTLP collector endpoint for trace export (for example `http://otel-collector:4317`). Trace export is compiled in only when the binary is built with the non-default `otlp` feature; setting this on a build without that feature logs a warning and is otherwise inert. |
 
 ## Feature maturity ladder
 

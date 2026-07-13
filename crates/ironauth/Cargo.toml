@@ -10,6 +10,15 @@ repository.workspace = true
 
 [dependencies]
 ironauth-env.workspace = true
+ironauth-config.workspace = true
+ironauth-server.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread"] }
+tracing.workspace = true
+
+[features]
+# Forwarded to the server crate: OTLP trace export off by default so the
+# default build and the musl static lane stay lean and protoc-free.
+otlp = ["ironauth-server/otlp"]
 
 [lints]
 workspace = true

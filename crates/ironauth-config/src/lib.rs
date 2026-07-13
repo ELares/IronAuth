@@ -51,6 +51,13 @@ pub struct Config {
     /// HTTP server settings.
     pub server: ServerConfig,
 
+    /// Trusted-proxy policy. Controls whether forwarding headers are honored;
+    /// the safe default trusts nothing.
+    pub proxy: ProxyConfig,
+
+    /// Observability settings: log format and trace export.
+    pub telemetry: TelemetryConfig,
+
     /// Primary database settings.
     pub database: DatabaseConfig,
 
@@ -65,22 +72,89 @@ pub struct Config {
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields, default)]
 pub struct ServerConfig {
-    /// Socket address the server listens on.
+    /// Socket address the public data plane listens on. This plane serves the
+    /// protocol and hosted-page surfaces; health, readiness, and metrics are
+    /// never exposed here.
     pub bind: String,
+
+    /// Socket address the management plane listens on. Liveness, readiness,
+    /// and the Prometheus metrics endpoint live here so the data plane is
+    /// never probed publicly; bind it to a private interface.
+    pub management_bind: String,
 
     /// Externally visible base URL (scheme and host) used to mint issuer and
     /// endpoint URLs. Unset means single-host development behind the bind
-    /// address.
+    /// address. The scheme, host, and issuer always derive from this value,
+    /// never from request headers (see the `[proxy]` policy).
     pub public_url: Option<String>,
+
+    /// Maximum seconds to drain in-flight requests after a shutdown signal
+    /// before the process exits regardless. Zero exits without draining.
+    pub shutdown_grace_secs: u64,
 }
 
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             bind: "127.0.0.1:8443".to_owned(),
+            management_bind: "127.0.0.1:9443".to_owned(),
             public_url: None,
+            shutdown_grace_secs: 25,
         }
     }
+}
+
+/// Trusted-proxy policy.
+///
+/// Forwarding headers (RFC 7239 `Forwarded`, `X-Forwarded-For`,
+/// `X-Forwarded-Proto`, `X-Forwarded-Host`) and the `Host` header are an
+/// account-takeover class when trusted blindly. The default trusts NOTHING:
+/// `trusted_hops = 0` and `trust_forwarded = false` mean the effective client
+/// IP is the transport peer and the scheme, host, and issuer derive entirely
+/// from `server.public_url`. Only when the server genuinely runs behind a
+/// fixed number of trusted reverse proxies should these be raised, and even
+/// then scheme and issuer stay config-derived.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields, default)]
+pub struct ProxyConfig {
+    /// Exact number of trusted reverse-proxy hops in front of the server.
+    /// Zero (the default) means the server is exposed directly and no
+    /// forwarding header is ever honored. Forwarding is honored only when the
+    /// request presents exactly this many forwarding entries; any other count
+    /// fails closed to the transport peer.
+    pub trusted_hops: u32,
+
+    /// Whether to honor forwarding headers at all. False (the default) ignores
+    /// every forwarding header regardless of `trusted_hops`. Both this and a
+    /// non-zero `trusted_hops` are required before any header is consulted.
+    pub trust_forwarded: bool,
+}
+
+/// Observability settings.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields, default)]
+pub struct TelemetryConfig {
+    /// Structured-log output format for the process log stream.
+    pub log_format: LogFormat,
+
+    /// OpenTelemetry OTLP collector endpoint for trace export (for example
+    /// `http://otel-collector:4317`). Trace export is compiled in only when
+    /// the binary is built with the non-default `otlp` feature; setting this
+    /// on a build without that feature logs a warning and is otherwise inert.
+    pub otlp_endpoint: Option<String>,
+}
+
+/// Structured-log output format.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum LogFormat {
+    /// One JSON object per line with ECS-friendly field names. The production
+    /// default: machine-parseable and safe to ship to a log pipeline.
+    #[default]
+    Json,
+    /// Human-readable multi-line output for local development. Never emit this
+    /// where logs are ingested by tooling.
+    Pretty,
 }
 
 /// Primary database settings.
@@ -305,10 +379,46 @@ mod tests {
         let config = loaded.config;
         assert!(!config.dev_mode);
         assert_eq!(config.server.bind, "127.0.0.1:8443");
+        assert_eq!(config.server.management_bind, "127.0.0.1:9443");
         assert_eq!(config.server.public_url, None);
+        assert_eq!(config.server.shutdown_grace_secs, 25);
+        // Trusted-proxy policy defaults to trusting nothing.
+        assert_eq!(config.proxy.trusted_hops, 0);
+        assert!(!config.proxy.trust_forwarded);
+        // Telemetry defaults to machine-parseable JSON with no exporter.
+        assert_eq!(config.telemetry.log_format, LogFormat::Json);
+        assert_eq!(config.telemetry.otlp_endpoint, None);
         assert_eq!(config.database.url.host(), "localhost");
         assert!(config.database.password.is_none());
         assert!(config.features.is_empty());
+    }
+
+    #[test]
+    fn proxy_and_telemetry_sections_parse_and_reject_unknown_keys() {
+        let input = "[proxy]\ntrusted_hops = 2\ntrust_forwarded = true\n\
+                     [telemetry]\nlog_format = \"pretty\"\notlp_endpoint = \"http://c:4317\"\n";
+        let config = Config::from_toml_str(input, "<inline>")
+            .expect("valid")
+            .config;
+        assert_eq!(config.proxy.trusted_hops, 2);
+        assert!(config.proxy.trust_forwarded);
+        assert_eq!(config.telemetry.log_format, LogFormat::Pretty);
+        assert_eq!(
+            config.telemetry.otlp_endpoint.as_deref(),
+            Some("http://c:4317")
+        );
+
+        let err = Config::from_toml_str("[proxy]\nhops = 1\n", "ironauth.toml")
+            .expect_err("unknown proxy key");
+        let msg = err.to_string();
+        assert!(msg.contains("hops"), "{msg}");
+        assert!(msg.contains("trusted_hops"), "{msg}");
+
+        let err = Config::from_toml_str("[telemetry]\nlog_format = \"yaml\"\n", "ironauth.toml")
+            .expect_err("unknown log format");
+        let msg = err.to_string();
+        assert!(msg.contains("yaml"), "{msg}");
+        assert!(msg.contains("json") && msg.contains("pretty"), "{msg}");
     }
 
     #[test]
@@ -402,7 +512,13 @@ mod tests {
         // Strictness must reach the schema: unknown keys invalid at the root
         // and in every section definition.
         assert_eq!(value["additionalProperties"], serde_json::json!(false));
-        for section in ["ServerConfig", "DatabaseConfig", "FeatureToggle"] {
+        for section in [
+            "ServerConfig",
+            "ProxyConfig",
+            "TelemetryConfig",
+            "DatabaseConfig",
+            "FeatureToggle",
+        ] {
             assert_eq!(
                 value["$defs"][section]["additionalProperties"],
                 serde_json::json!(false),
