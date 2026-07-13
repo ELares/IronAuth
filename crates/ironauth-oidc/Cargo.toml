@@ -86,12 +86,31 @@ ironauth-fetch = { workspace = true, features = ["test-harness"] }
 name = "structural"
 path = "tests/structural.rs"
 
-# Per-issuer JWKS and discovery HTTP surface (issue #19): explicit Cache-Control
-# and ETag, 304 on a matching If-None-Match, and disjoint issuers and key sets
-# across environments. Database-free.
+# Per-issuer JWKS HTTP surface (issue #19): explicit Cache-Control and ETag, 304
+# on a matching If-None-Match, and disjoint issuers and key sets across
+# environments. Database-free.
 [[test]]
 name = "issuer_http"
 path = "tests/issuer_http.rs"
+
+# Discovery generated from live config on both well-known forms (issue #18):
+# exact issuer-string match, policy-filtered algorithm arrays with the RS256
+# floor, the explicit defaults-if-omitted traps, config-driven capability
+# toggles, and the config-driven half of the advertised-vs-observed diff harness.
+# Database-free and key-free (discovery needs only config, the issuer string, and
+# the algorithm policy), so it runs on every lane.
+[[test]]
+name = "discovery"
+path = "tests/discovery.rs"
+
+# The runtime half of the discovery diff harness (issue #18): the LIVE merged
+# router (protocol + discovery, as main.rs mounts it) is probed so every
+# advertised endpoint is observed as mounted and every served protocol endpoint
+# is advertised. Needs a database (it builds the real oidc_router).
+[[test]]
+name = "discovery_probe"
+path = "tests/discovery_probe.rs"
+required-features = ["testing"]
 
 # Pairwise subject derivation (issue #19): the one shared derivation returns an
 # identical sub across the ID token and UserInfo call sites, and memoization keeps

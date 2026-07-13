@@ -54,6 +54,16 @@ pub enum ClientAuthMethod {
 }
 
 impl ClientAuthMethod {
+    /// Every token-endpoint authentication method this build supports, in the
+    /// order discovery advertises them (issue #18 sources
+    /// `token_endpoint_auth_methods_supported` from here). Asymmetric/JWT client
+    /// authentication is a later milestone and is absent until it lands.
+    pub const ALL: &'static [ClientAuthMethod] = &[
+        ClientAuthMethod::Basic,
+        ClientAuthMethod::Post,
+        ClientAuthMethod::None,
+    ];
+
     /// The wire / stored string for this method.
     #[must_use]
     pub fn as_str(self) -> &'static str {

@@ -19,6 +19,19 @@
 //! - [`PkceMethod`] has exactly one variant, [`PkceMethod::S256`]. There is no
 //!   `Plain` variant, so `code_challenge_method=plain` can never be represented.
 //!
+//! Two further registries name the metadata sets discovery advertises (issue #18),
+//! kept here so discovery sources them from the owning subsystem rather than
+//! hand-listing them:
+//!
+//! - [`ResponseMode`] has exactly one variant, [`ResponseMode::Query`]: the
+//!   authorization endpoint returns the code in the redirect query, never a
+//!   fragment. `form_post` is issue #17 and appears only when enabled per
+//!   environment.
+//! - [`PromptValue`] has exactly one variant, [`PromptValue::Create`]: the only
+//!   `prompt` value the bootstrap acts on (route an unauthenticated user to
+//!   registration). The rest of the `prompt` semantics build on the session model
+//!   in later issues.
+//!
 //! A structural test (`tests/structural.rs`) enumerates each registry's full
 //! variant set and asserts every forbidden spelling parses to `None`, so a future
 //! edit that reintroduced a forbidden variant would fail the build.
@@ -124,6 +137,77 @@ impl PkceMethod {
     pub fn parse(raw: &str) -> Option<Self> {
         match raw {
             "S256" => Some(PkceMethod::S256),
+            _ => None,
+        }
+    }
+}
+
+/// The OAuth response modes the authorization endpoint can return a result by.
+///
+/// Closed on purpose: the only member is `query` (the code is returned in the
+/// redirect query string; the endpoint never uses a fragment). `form_post` is
+/// issue #17 and, when it lands, appears in discovery only for environments that
+/// enable it, so it is a per-environment capability rather than a variant here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResponseMode {
+    /// `query`: the authorization response parameters are in the redirect query.
+    Query,
+}
+
+impl ResponseMode {
+    /// Every response mode this build serves. Exactly one, by design.
+    pub const ALL: &'static [ResponseMode] = &[ResponseMode::Query];
+
+    /// The wire / metadata `response_mode` value.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ResponseMode::Query => "query",
+        }
+    }
+
+    /// Parse a wire `response_mode`. Returns `None` for every value that is not
+    /// `query`, so `fragment` and `form_post` never resolve to a served mode.
+    #[must_use]
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "query" => Some(ResponseMode::Query),
+            _ => None,
+        }
+    }
+}
+
+/// The OIDC `prompt` values the authorization endpoint acts on.
+///
+/// Closed on purpose: the only member the bootstrap acts on is `create` (route an
+/// unauthenticated user to registration, per the Initiating User Registration
+/// spec). The remaining `prompt` values (`none`, `login`, `consent`,
+/// `select_account`) build on the session model in later issues and are advertised
+/// only once they are acted on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptValue {
+    /// `create`: route an unauthenticated user to the registration surface.
+    Create,
+}
+
+impl PromptValue {
+    /// Every prompt value this build acts on. Exactly one today, by design.
+    pub const ALL: &'static [PromptValue] = &[PromptValue::Create];
+
+    /// The wire / metadata `prompt` value.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PromptValue::Create => "create",
+        }
+    }
+
+    /// Parse a wire `prompt` value. Returns `None` for every value the bootstrap
+    /// does not act on, so only `create` resolves.
+    #[must_use]
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "create" => Some(PromptValue::Create),
             _ => None,
         }
     }

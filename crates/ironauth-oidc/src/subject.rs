@@ -48,6 +48,12 @@ pub enum SubjectType {
 }
 
 impl SubjectType {
+    /// Every subject type this build supports, in the order discovery advertises
+    /// them (issue #18 sources `subject_types_supported` from here). Both are
+    /// supported: pairwise derivation is in [`resolve_subject`], and public is the
+    /// local identifier verbatim.
+    pub const ALL: &'static [SubjectType] = &[SubjectType::Public, SubjectType::Pairwise];
+
     /// The OIDC metadata value (`public` or `pairwise`).
     #[must_use]
     pub fn as_str(self) -> &'static str {

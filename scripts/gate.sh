@@ -32,6 +32,9 @@ scripts/http-audit.sh
 echo "==> dash scan"
 scripts/dash-scan.sh
 
+echo "==> discovery scan (no static discovery JSON; generated at serve time)"
+scripts/discovery-scan.sh
+
 echo "==> compatibility matrix freshness"
 scripts/compat-matrix.sh
 git diff --exit-code docs/COMPATIBILITY.md
