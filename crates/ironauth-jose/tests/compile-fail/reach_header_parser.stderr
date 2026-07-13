@@ -1,0 +1,13 @@
+error[E0603]: module `header` is private
+ --> tests/compile-fail/reach_header_parser.rs:9:28
+  |
+9 |     let _ = ironauth_jose::header::parse;
+  |                            ^^^^^^  ----- function `parse` is not publicly re-exported
+  |                            |
+  |                            private module
+  |
+note: the module `header` is defined here
+ --> src/lib.rs
+  |
+  | mod header;
+  | ^^^^^^^^^^
