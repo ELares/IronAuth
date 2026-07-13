@@ -82,6 +82,7 @@ pub struct Server {
     metrics: PrometheusHandle,
     env: Env,
     management_extension: Option<Router>,
+    public_extension: Option<Router>,
 }
 
 impl Server {
@@ -109,7 +110,22 @@ impl Server {
             metrics: handle,
             env,
             management_extension: None,
+            public_extension: None,
         })
+    }
+
+    /// Mount an additional router on the PUBLIC data plane.
+    ///
+    /// The public-facing protocol surfaces (the OIDC provider, `ironauth-oidc`,
+    /// issue #12) are built as self-contained `Router`s and mounted here, so the
+    /// server crate stays decoupled from them (it accepts any router, not a
+    /// specific type). The routes are merged into the PUBLIC plane only, never the
+    /// management plane, and inherit the plane's observability and panic-catching
+    /// layers. The caller owns the router's state, auth, and middleware.
+    #[must_use]
+    pub fn mount_public(mut self, router: Router) -> Self {
+        self.public_extension = Some(router);
+        self
     }
 
     /// Mount an additional router on the MANAGEMENT plane.
@@ -142,12 +158,21 @@ impl Server {
         }
     }
 
-    /// The PUBLIC data-plane router. Serves only the skeleton surfaces; health,
+    /// The PUBLIC data-plane router. Serves the skeleton surfaces plus any router
+    /// mounted via [`Server::mount_public`] (the OIDC provider); health,
     /// readiness, and metrics are intentionally absent here.
     pub fn app(&self) -> Router {
-        Router::new()
+        let mut router = Router::new()
             .route("/", get(routes::root))
             .route("/.well-known/security.txt", get(routes::security_txt))
+            .with_state(self.state());
+        // Merge the mounted public API (already carrying its own state), if any,
+        // onto the public plane. Merging keeps the skeleton routes and adds the
+        // protocol routes; both then share the observe and panic layers.
+        if let Some(extension) = &self.public_extension {
+            router = router.merge(extension.clone());
+        }
+        router
             // CatchPanicLayer is added before observe so it sits INSIDE it: a
             // handler panic becomes an opaque 500 that still flows back through
             // request logging and metrics rather than resetting the connection.
@@ -156,7 +181,6 @@ impl Server {
                 self.state(),
                 observe::observe,
             ))
-            .with_state(self.state())
     }
 
     /// The MANAGEMENT-plane router. Serves liveness, readiness, and metrics, plus

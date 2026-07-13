@@ -34,7 +34,11 @@ cd "$(git rev-parse --show-toplevel)"
 # for a replay before any tenant exists (see 0003_management_api.sql). It is
 # still confined to the repository module and reachable only by ironauth_control,
 # so it is listed here to keep its SQL out of every other file.
-SCOPED_TABLES='clients|organizations|audit_log|management_credentials|idempotency_keys'
+#
+# grants, authorization_codes, and issued_tokens (#12) are the OIDC
+# authorization-code grant tables: all three are TENANT-SCOPED with forced
+# row-level security, so their SQL stays in the repository module too.
+SCOPED_TABLES='clients|organizations|audit_log|management_credentials|idempotency_keys|grants|authorization_codes|issued_tokens'
 
 # The one module allowed to name a scoped table in SQL.
 REPO_MODULE='crates/ironauth-store/src/repository.rs'

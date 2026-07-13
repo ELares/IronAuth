@@ -782,6 +782,8 @@ dependencies = [
  "ironauth-admin",
  "ironauth-config",
  "ironauth-env",
+ "ironauth-jose",
+ "ironauth-oidc",
  "ironauth-server",
  "ironauth-store",
  "tokio",
@@ -852,6 +854,27 @@ dependencies = [
  "serde",
  "serde_json",
  "trybuild",
+]
+
+[[package]]
+name = "ironauth-oidc"
+version = "0.1.0"
+dependencies = [
+ "axum 0.8.9",
+ "base64",
+ "http",
+ "http-body-util",
+ "ironauth-config",
+ "ironauth-env",
+ "ironauth-jose",
+ "ironauth-store",
+ "metrics",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "tower 0.5.3",
+ "tracing",
 ]
 
 [[package]]

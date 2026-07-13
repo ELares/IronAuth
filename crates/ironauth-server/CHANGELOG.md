@@ -6,6 +6,8 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Add `Server::mount_public` (issue #12): mount a self-contained router on the
+  PUBLIC data plane, mirroring `mount_management`. The OIDC provider mounts here.
 - Initial HTTP server skeleton on tokio + axum (see docs/adr/0001-http-runtime.md):
   - Dual-plane `Server`: a public data plane (`server.bind`) and a private
     management plane (`server.management_bind`) serving disjoint routes.

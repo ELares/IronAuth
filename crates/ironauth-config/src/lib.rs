@@ -64,6 +64,9 @@ pub struct Config {
     /// Management API settings (issue #11).
     pub admin: AdminConfig,
 
+    /// OIDC provider settings (issue #12).
+    pub oidc: OidcConfig,
+
     /// Feature toggles keyed by registered feature name. Enabling an
     /// experimental feature additionally requires `ack` equal to the
     /// feature's exact current version; see the feature reference in the
@@ -243,6 +246,62 @@ impl Default for AdminConfig {
     }
 }
 
+/// The largest an authorization-code or access-token lifetime may be configured
+/// to, in seconds. A code is a short-lived, single-use bearer credential and an
+/// access token a bearer credential; a lifetime beyond one day is almost always
+/// a misconfiguration, so config load rejects it (fail fast rather than mint a
+/// long-lived code). The safe defaults are far below this ceiling.
+pub const OIDC_MAX_LIFETIME_SECS: u64 = 86_400;
+
+/// OIDC provider settings (issue #12).
+///
+/// The public authorization and token endpoints. Lifetimes are configurable (the
+/// tunability principle) with safe defaults, never a baked-in one-way choice: the
+/// authorization code is short-lived and single-use, the access token a little
+/// longer. Mounting is opt-in so the default (and database-free) boot is
+/// unchanged.
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields, default)]
+pub struct OidcConfig {
+    /// Whether to mount the public OIDC endpoints (`/authorize`, `/token`). Off
+    /// by default so the default boot serves only the skeleton and needs no
+    /// database. When on, the provider connects the data-plane store using
+    /// `database.url`.
+    pub enabled: bool,
+
+    /// Authorization-code lifetime in seconds. A code is single-use and
+    /// short-lived; the default (60) follows the OAuth 2.1 guidance that codes
+    /// live about a minute. Must be at least 1 and at most
+    /// `OIDC_MAX_LIFETIME_SECS`.
+    pub authorization_code_ttl_secs: u64,
+
+    /// Access-token lifetime in seconds. The default (300) is a conservative five
+    /// minutes; refresh handling (rotation, families) lands in M3. Must be at
+    /// least 1 and at most `OIDC_MAX_LIFETIME_SECS`.
+    pub access_token_ttl_secs: u64,
+
+    /// Reuse grace window in seconds for an already-consumed authorization code.
+    /// A second presentation of a consumed code within this window (a concurrent
+    /// double-submit or an immediate client retry) is treated as a BENIGN retry:
+    /// it fails with `invalid_grant` but does NOT revoke the grant chain and does
+    /// NOT audit a reuse. A second presentation AFTER the window is a genuine
+    /// reuse: it revokes the grant chain and audits it (RFC 9700). The default
+    /// (10) tolerates realistic retry and clock jitter without a false revoke; set
+    /// it to 0 to treat every reuse as genuine. At most `OIDC_MAX_LIFETIME_SECS`.
+    pub reuse_grace_secs: u64,
+}
+
+impl Default for OidcConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            authorization_code_ttl_secs: 60,
+            access_token_ttl_secs: 300,
+            reuse_grace_secs: 10,
+        }
+    }
+}
+
 /// One entry in the `[features]` table.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields, default)]
@@ -389,8 +448,42 @@ impl Config {
                 ),
             });
         }
+        check_oidc_lifetime(
+            "oidc.authorization_code_ttl_secs",
+            self.oidc.authorization_code_ttl_secs,
+        )?;
+        check_oidc_lifetime(
+            "oidc.access_token_ttl_secs",
+            self.oidc.access_token_ttl_secs,
+        )?;
+        // The reuse grace window differs from the lifetimes: 0 is valid (it means
+        // treat every reuse as genuine), so only the upper bound is enforced.
+        if self.oidc.reuse_grace_secs > OIDC_MAX_LIFETIME_SECS {
+            return Err(ConfigError::Invalid {
+                message: format!(
+                    "oidc.reuse_grace_secs ({}) must not exceed {OIDC_MAX_LIFETIME_SECS} seconds",
+                    self.oidc.reuse_grace_secs
+                ),
+            });
+        }
         Ok(())
     }
+}
+
+/// Validate one OIDC lifetime: at least one second (a zero-second credential is
+/// born expired) and no more than [`OIDC_MAX_LIFETIME_SECS`].
+fn check_oidc_lifetime(key: &str, value: u64) -> Result<(), ConfigError> {
+    if value < 1 {
+        return Err(ConfigError::Invalid {
+            message: format!("{key} must be at least 1 second"),
+        });
+    }
+    if value > OIDC_MAX_LIFETIME_SECS {
+        return Err(ConfigError::Invalid {
+            message: format!("{key} ({value}) must not exceed {OIDC_MAX_LIFETIME_SECS} seconds"),
+        });
+    }
+    Ok(())
 }
 
 /// Translate a byte offset into 1-based line and column (in characters).
@@ -567,6 +660,63 @@ mod tests {
     }
 
     #[test]
+    fn oidc_section_defaults_and_rejects_bad_lifetimes_and_unknown_keys() {
+        // Defaults: not mounted, 60s code, 300s access token, 10s reuse grace.
+        let config = Config::from_toml_str("", "<inline>").expect("valid").config;
+        assert!(!config.oidc.enabled);
+        assert_eq!(config.oidc.authorization_code_ttl_secs, 60);
+        assert_eq!(config.oidc.access_token_ttl_secs, 300);
+        assert_eq!(config.oidc.reuse_grace_secs, 10);
+
+        // A configured, in-bounds override parses.
+        let input = "[oidc]\nenabled = true\nauthorization_code_ttl_secs = 30\n";
+        let config = Config::from_toml_str(input, "<inline>")
+            .expect("valid")
+            .config;
+        assert!(config.oidc.enabled);
+        assert_eq!(config.oidc.authorization_code_ttl_secs, 30);
+
+        // A zero reuse grace is VALID (treat every reuse as genuine); a zero
+        // lifetime is not.
+        let config = Config::from_toml_str("[oidc]\nreuse_grace_secs = 0\n", "<inline>")
+            .expect("zero grace is valid")
+            .config;
+        assert_eq!(config.oidc.reuse_grace_secs, 0);
+
+        // A zero lifetime (born expired) is rejected.
+        let err =
+            Config::from_toml_str("[oidc]\nauthorization_code_ttl_secs = 0\n", "ironauth.toml")
+                .expect_err("zero ttl");
+        assert!(
+            err.to_string().contains("authorization_code_ttl_secs"),
+            "{err}"
+        );
+
+        // A lifetime above the ceiling is rejected.
+        let over = format!(
+            "[oidc]\naccess_token_ttl_secs = {}\n",
+            OIDC_MAX_LIFETIME_SECS + 1
+        );
+        let err = Config::from_toml_str(&over, "ironauth.toml").expect_err("over cap");
+        assert!(err.to_string().contains("access_token_ttl_secs"), "{err}");
+
+        // A reuse grace above the ceiling is rejected too.
+        let over = format!(
+            "[oidc]\nreuse_grace_secs = {}\n",
+            OIDC_MAX_LIFETIME_SECS + 1
+        );
+        let err = Config::from_toml_str(&over, "ironauth.toml").expect_err("grace over cap");
+        assert!(err.to_string().contains("reuse_grace_secs"), "{err}");
+
+        // Unknown oidc keys abort with the accepted fields.
+        let err = Config::from_toml_str("[oidc]\nttl = 5\n", "ironauth.toml")
+            .expect_err("unknown oidc key");
+        let msg = err.to_string();
+        assert!(msg.contains("ttl"), "{msg}");
+        assert!(msg.contains("authorization_code_ttl_secs"), "{msg}");
+    }
+
+    #[test]
     fn proxy_and_telemetry_sections_parse_and_reject_unknown_keys() {
         let input = "[proxy]\ntrusted_hops = 2\ntrust_forwarded = true\n\
                      [telemetry]\nlog_format = \"pretty\"\notlp_endpoint = \"http://c:4317\"\n";
@@ -691,6 +841,7 @@ mod tests {
             "TelemetryConfig",
             "DatabaseConfig",
             "AdminConfig",
+            "OidcConfig",
             "FeatureToggle",
         ] {
             assert_eq!(

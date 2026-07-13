@@ -11,10 +11,12 @@ use std::process::ExitCode;
 
 use axum::Router;
 use ironauth_admin::AdminState;
-use ironauth_config::{Config, Loaded};
+use ironauth_config::{Config, Loaded, OidcConfig};
 use ironauth_env::Env;
+use ironauth_jose::EnvironmentKeyStore;
+use ironauth_oidc::{OidcState, oidc_router};
 use ironauth_server::Server;
-use ironauth_store::Store;
+use ironauth_store::{EnvironmentId, Store};
 
 /// Semantic version of this build, injected by Cargo.
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -92,6 +94,19 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
         // DB-free skeleton it was, serving only health, readiness, and metrics.
         let management = build_management_router(&config, &env).await;
 
+        // Capture what the OIDC mount (issue #12) needs before config and env
+        // move into the server: the OIDC settings, the data-plane DSN, and an env
+        // handle. The public issuer root is taken from the built server below.
+        let oidc_inputs = if config.oidc.enabled {
+            Some((
+                config.oidc.clone(),
+                config.database.url.expose().to_owned(),
+                env.clone(),
+            ))
+        } else {
+            None
+        };
+
         let mut server = match Server::new(config, env) {
             Ok(server) => server,
             Err(error) => {
@@ -101,6 +116,17 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
         };
         if let Some(router) = management {
             server = server.mount_management(router);
+        }
+        // Mount the OIDC provider on the PUBLIC plane when enabled. The issuer root
+        // is the server's config-derived base URL, so issuers are per environment.
+        if let Some((oidc_config, dsn, oidc_env)) = oidc_inputs {
+            let issuer_base = server.base_url();
+            if let Some(router) = build_oidc_router(&oidc_config, &dsn, oidc_env, issuer_base).await
+            {
+                server = server.mount_public(router);
+            }
+        } else {
+            tracing::info!("OIDC provider not mounted: oidc.enabled is false");
         }
         tracing::info!(base_url = %server.base_url(), "starting ironauth");
 
@@ -156,6 +182,48 @@ async fn build_management_router(config: &Config, env: &Env) -> Option<Router> {
             None
         }
     }
+}
+
+/// Build the OIDC provider router (issue #12), or `None` if it should not be
+/// mounted.
+///
+/// Mounts only when `oidc.enabled` is set (checked by the caller), connecting the
+/// DATA-plane store with `database.url` (the least-privilege `ironauth_app` DSN in
+/// production). A failure to connect is logged and the server keeps serving the
+/// rest of the public plane rather than refusing to boot.
+///
+/// The per-environment signing keys start EMPTY here: key provisioning and
+/// rotation are a later milestone (there is no key-management dependency for this
+/// issue). Until keys are provisioned for an environment, that environment's token
+/// endpoint fails closed with a `server_error`, which is the correct behavior for
+/// a provider with no signing key. The authorization endpoint and every binding,
+/// single-use, and revocation guarantee work regardless.
+async fn build_oidc_router(
+    oidc_config: &OidcConfig,
+    data_plane_dsn: &str,
+    env: Env,
+    issuer_base: String,
+) -> Option<Router> {
+    let store = match Store::connect(data_plane_dsn).await {
+        Ok(store) => store,
+        Err(error) => {
+            tracing::error!(
+                %error,
+                "OIDC provider not mounted: cannot connect the data-plane store"
+            );
+            return None;
+        }
+    };
+    let keys: EnvironmentKeyStore<EnvironmentId> = EnvironmentKeyStore::new();
+    tracing::warn!(
+        "OIDC provider mounted with NO signing keys provisioned. Per-environment key \
+         provisioning is a later milestone; until an environment has a signing key, its token \
+         endpoint fails closed. The authorization endpoint and the single-use, binding, and \
+         revocation guarantees are unaffected."
+    );
+    let state = OidcState::new(store, env, keys, oidc_config, issuer_base);
+    tracing::info!("OIDC provider mounted on the public plane");
+    Some(oidc_router(state))
 }
 
 /// Choose the control-plane database DSN for the management store (D2).

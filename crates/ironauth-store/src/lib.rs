@@ -68,19 +68,22 @@ pub mod test_support;
 pub use audit::{ActingContext, Action, ActorRef};
 pub use error::StoreError;
 pub use id::{
-    AgentId, AgentKind, AuditId, AuditKind, AuditTarget, COMPONENT_BYTES, ClientId, ClientKind,
-    CorrelationId, CorrelationKind, EnvironmentId, EnvironmentKind, HumanId, HumanKind,
-    IdParseError, LevelId, LevelKind, ManagementKeyId, ManagementKeyKind, NotInScope, OperatorId,
-    OperatorKind, OrganizationId, OrganizationKind, ScopedId, ScopedKind, ServiceId, ServiceKind,
-    TenantId, TenantKind,
+    AgentId, AgentKind, AuditId, AuditKind, AuditTarget, AuthorizationCodeId,
+    AuthorizationCodeKind, COMPONENT_BYTES, ClientId, ClientKind, CorrelationId, CorrelationKind,
+    EnvironmentId, EnvironmentKind, GrantId, GrantKind, HumanId, HumanKind, IdParseError,
+    IssuedTokenId, IssuedTokenKind, LevelId, LevelKind, ManagementKeyId, ManagementKeyKind,
+    NotInScope, OperatorId, OperatorKind, OrganizationId, OrganizationKind, ScopedId, ScopedKind,
+    ServiceId, ServiceKind, TenantId, TenantKind,
 };
 pub use migrate::{Migration, MigrationError, MigrationReport, MigrationRunner, Phase};
 pub use repository::{
-    ActingClientRepo, ActingEnvironmentRepo, ActingManagementCredentialRepo, ActingManagementStore,
-    ActingStore, ActingTenantRepo, AuditRecord, AuditRepo, ClientRecord, ClientRepo,
+    ActingAuthorizationRepo, ActingClientRepo, ActingEnvironmentRepo,
+    ActingManagementCredentialRepo, ActingManagementStore, ActingStore, ActingTenantRepo,
+    AuditRecord, AuditRepo, AuthorizationRepo, ClientRecord, ClientRepo, CodeBindings,
     CursorPosition, EnvironmentRecord, EnvironmentRepo, IdempotencyRepo, IdempotencyWrite,
-    MANAGEMENT_LIST_HARD_CAP, ManagementCredentialRecord, ManagementCredentialRepo,
-    ManagementStore, ScopedStore, StoredIdempotentResponse, TenantRecord, TenantRepo,
+    IssueCode, IssuedTokenRecord, MANAGEMENT_LIST_HARD_CAP, ManagementCredentialRecord,
+    ManagementCredentialRepo, ManagementStore, RedeemOutcome, ScopedStore,
+    StoredIdempotentResponse, TenantRecord, TenantRepo, TokenKind, TokenStatus,
 };
 pub use scope::Scope;
 pub use store::Store;

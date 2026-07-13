@@ -55,6 +55,17 @@ pub trait LevelKind: Copy + Eq + Hash + fmt::Debug {
 pub trait ScopedKind: Copy + Eq + Hash + fmt::Debug {
     /// The wire prefix, without the trailing underscore (for example `cli`).
     const PREFIX: &'static str;
+
+    /// Whether the [`fmt::Debug`] of a [`ScopedId`] of this kind must REDACT the
+    /// payload (rendering `prefix_<redacted>` instead of the wire value).
+    ///
+    /// Most identifiers are opaque, non-secret handles, so their debug output is
+    /// the legible wire form. A few identifiers double as bearer secrets: an
+    /// authorization code IS the credential the token endpoint redeems, and an
+    /// issued token's `jti` is the exact `jti` on the wire. Rendering those in a
+    /// `Debug` (a struct field, a `tracing` field, a panic message) would put a
+    /// live secret in the logs, so those kinds set this to `true`.
+    const REDACT_DEBUG: bool = false;
 }
 
 /// Marker for the operator level (the platform deployment). Top of the
@@ -114,6 +125,43 @@ impl ScopedKind for AuditKind {
 pub struct ManagementKeyKind;
 impl ScopedKind for ManagementKeyKind {
     const PREFIX: &'static str = "mak";
+}
+
+/// Marker for an OIDC authorization code (`ac_`), the single-use code the
+/// authorization-code grant issues and the token endpoint redeems (issue #12).
+/// A tenant-scoped resource: the code embeds its `(tenant, environment)` in the
+/// clear, so the token endpoint recovers the scope from the presented code
+/// exactly as the management API recovers a key's scope, and a code minted in
+/// one scope parses as a uniform not-found under another.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct AuthorizationCodeKind;
+impl ScopedKind for AuthorizationCodeKind {
+    const PREFIX: &'static str = "ac";
+    // The code IS the single-use bearer credential; never render it in a debug
+    // or log line.
+    const REDACT_DEBUG: bool = true;
+}
+
+/// Marker for an OIDC grant (`grt_`), the record linking a code, its session and
+/// consent, and every token issued from it (issue #12). The revocation spine:
+/// revoking the grant chain invalidates every token issued from it. Tenant
+/// scoped like every other resource.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct GrantKind;
+impl ScopedKind for GrantKind {
+    const PREFIX: &'static str = "grt";
+}
+
+/// Marker for an issued token (`tok_`), the `jti` of an access or ID token
+/// recorded against its grant (issue #12). Recording issued tokens is what makes
+/// grant-chain revocation observable: a token is active only while its issued
+/// row exists and its grant is not revoked. Tenant scoped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct IssuedTokenKind;
+impl ScopedKind for IssuedTokenKind {
+    const PREFIX: &'static str = "tok";
+    // The `jti` is the exact identifier on the minted token; keep it out of logs.
+    const REDACT_DEBUG: bool = true;
 }
 
 /// Marker for a human actor (an interactive user). One of the three actor kinds
@@ -278,6 +326,14 @@ pub type OrganizationId = ScopedId<OrganizationKind>;
 pub type AuditId = ScopedId<AuditKind>;
 /// A management API key identifier (`mak_...`), environment-scoped (issue #11).
 pub type ManagementKeyId = ScopedId<ManagementKeyKind>;
+/// An OIDC authorization code identifier (`ac_...`), the single-use code the
+/// authorization-code grant issues and the token endpoint redeems (issue #12).
+pub type AuthorizationCodeId = ScopedId<AuthorizationCodeKind>;
+/// An OIDC grant identifier (`grt_...`), the revocation spine (issue #12).
+pub type GrantId = ScopedId<GrantKind>;
+/// An issued-token identifier (`tok_...`), the `jti` recorded against a grant
+/// (issue #12).
+pub type IssuedTokenId = ScopedId<IssuedTokenKind>;
 
 impl<K: ScopedKind> ScopedId<K> {
     /// Mint a fresh scoped identifier under `scope`, drawing the unique
@@ -415,7 +471,15 @@ impl<K: ScopedKind> fmt::Display for ScopedId<K> {
 
 impl<K: ScopedKind> fmt::Debug for ScopedId<K> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{self}")
+        // A few scoped identifiers double as bearer secrets (an authorization
+        // code, an issued token's `jti`). For those the debug form redacts the
+        // payload so a struct field or a `tracing` field cannot leak the live
+        // value; the scope prefix is kept so the record stays legible.
+        if K::REDACT_DEBUG {
+            write!(f, "{}_<redacted>", K::PREFIX)
+        } else {
+            write!(f, "{self}")
+        }
     }
 }
 
@@ -634,6 +698,27 @@ mod tests {
             and_acc, [0x00_u8; COMPONENT_BYTES],
             "some bit never set to 0"
         );
+    }
+
+    #[test]
+    fn secret_scoped_ids_redact_their_debug_but_not_display() {
+        let env = test_env();
+        let scope = Scope::new(TenantId::generate(&env), EnvironmentId::generate(&env));
+
+        // An authorization code and an issued token are bearer secrets: Debug
+        // must not reveal the payload, but Display (the wire form) still must.
+        let code = AuthorizationCodeId::generate(&env, &scope);
+        assert_eq!(format!("{code:?}"), "ac_<redacted>");
+        assert!(code.to_string().starts_with("ac_"));
+        assert!(!format!("{code:?}").contains(&code.to_string()[3..]));
+
+        let token = IssuedTokenId::generate(&env, &scope);
+        assert_eq!(format!("{token:?}"), "tok_<redacted>");
+        assert!(token.to_string().starts_with("tok_"));
+
+        // A non-secret handle (a client id) keeps its legible debug form.
+        let client = ClientId::generate(&env, &scope);
+        assert_eq!(format!("{client:?}"), client.to_string());
     }
 
     #[test]

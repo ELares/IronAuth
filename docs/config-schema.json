@@ -113,6 +113,39 @@
         }
       ]
     },
+    "OidcConfig": {
+      "additionalProperties": false,
+      "description": "OIDC provider settings (issue #12).\n\nThe public authorization and token endpoints. Lifetimes are configurable (the\ntunability principle) with safe defaults, never a baked-in one-way choice: the\nauthorization code is short-lived and single-use, the access token a little\nlonger. Mounting is opt-in so the default (and database-free) boot is\nunchanged.",
+      "properties": {
+        "access_token_ttl_secs": {
+          "default": 300,
+          "description": "Access-token lifetime in seconds. The default (300) is a conservative five\nminutes; refresh handling (rotation, families) lands in M3. Must be at\nleast 1 and at most `OIDC_MAX_LIFETIME_SECS`.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "authorization_code_ttl_secs": {
+          "default": 60,
+          "description": "Authorization-code lifetime in seconds. A code is single-use and\nshort-lived; the default (60) follows the OAuth 2.1 guidance that codes\nlive about a minute. Must be at least 1 and at most\n`OIDC_MAX_LIFETIME_SECS`.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "enabled": {
+          "default": false,
+          "description": "Whether to mount the public OIDC endpoints (`/authorize`, `/token`). Off\nby default so the default boot serves only the skeleton and needs no\ndatabase. When on, the provider connects the data-plane store using\n`database.url`.",
+          "type": "boolean"
+        },
+        "reuse_grace_secs": {
+          "default": 10,
+          "description": "Reuse grace window in seconds for an already-consumed authorization code.\nA second presentation of a consumed code within this window (a concurrent\ndouble-submit or an immediate client retry) is treated as a BENIGN retry:\nit fails with `invalid_grant` but does NOT revoke the grant chain and does\nNOT audit a reuse. A second presentation AFTER the window is a genuine\nreuse: it revokes the grant chain and audits it (RFC 9700). The default\n(10) tolerates realistic retry and clock jitter without a false revoke; set\nit to 0 to treat every reuse as genuine. At most `OIDC_MAX_LIFETIME_SECS`.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
     "ProxyConfig": {
       "additionalProperties": false,
       "description": "Trusted-proxy policy.\n\nForwarding headers (RFC 7239 `Forwarded`, `X-Forwarded-For`,\n`X-Forwarded-Proto`, `X-Forwarded-Host`) and the `Host` header are an\naccount-takeover class when trusted blindly. The default trusts NOTHING:\n`trusted_hops = 0` and `trust_forwarded = false` mean the effective client\nIP is the transport peer and the scheme, host, and issuer derive entirely\nfrom `server.public_url`. Only when the server genuinely runs behind a\nfixed number of trusted reverse proxies should these be raised, and even\nthen scheme and issuer stay config-derived.",
@@ -254,6 +287,16 @@
       "default": {},
       "description": "Feature toggles keyed by registered feature name. Enabling an\nexperimental feature additionally requires `ack` equal to the\nfeature's exact current version; see the feature reference in the\ngenerated docs/CONFIG.md.",
       "type": "object"
+    },
+    "oidc": {
+      "$ref": "#/$defs/OidcConfig",
+      "default": {
+        "access_token_ttl_secs": 300,
+        "authorization_code_ttl_secs": 60,
+        "enabled": false,
+        "reuse_grace_secs": 10
+      },
+      "description": "OIDC provider settings (issue #12)."
     },
     "proxy": {
       "$ref": "#/$defs/ProxyConfig",
