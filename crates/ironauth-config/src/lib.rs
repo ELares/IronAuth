@@ -247,8 +247,11 @@ impl Default for AdminConfig {
 #[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields, default)]
 pub struct FeatureToggle {
-    /// Whether the feature is enabled.
-    pub enabled: bool,
+    /// Whether the feature is enabled. When omitted, the feature's own default
+    /// applies (on only for a Supported feature declared on by default), so
+    /// naming a feature just to attach an `ack` does not silently turn a
+    /// default-on feature off. Set `enabled = false` to force it off.
+    pub enabled: Option<bool>,
 
     /// Exact-version acknowledgment, required to enable an experimental
     /// feature. Ignored for preview and supported features.

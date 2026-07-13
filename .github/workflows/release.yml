@@ -59,6 +59,10 @@ jobs:
           mkdir -p dist
           cp target/x86_64-unknown-linux-musl/release/ironauth dist/ironauth-x86_64-linux-musl
           find . -name '*.cdx.json' -not -path './dist/*' -exec cp {} dist/ \;
+          # The config JSON schema drives editor autocomplete for operators and
+          # is freshness-checked in CI (scripts/config-schema.sh); ship it as a
+          # release asset so it is downloadable per version alongside the binary.
+          cp docs/config-schema.json dist/config-schema.json
           cd dist && sha256sum * > SHA256SUMS
       - name: Attest build provenance
         uses: actions/attest-build-provenance@v2
@@ -76,7 +80,7 @@ jobs:
           gh release create "$GITHUB_REF_NAME" \
             --title "$GITHUB_REF_NAME" \
             --notes-file dist/RELEASE_NOTES.md \
-            dist/ironauth-x86_64-linux-musl dist/SHA256SUMS dist/*.cdx.json
+            dist/ironauth-x86_64-linux-musl dist/SHA256SUMS dist/config-schema.json dist/*.cdx.json
 
   image:
     name: container image, signed

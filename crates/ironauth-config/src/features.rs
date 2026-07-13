@@ -37,14 +37,90 @@ pub enum Maturity {
 }
 
 /// A registered feature flag.
+///
+/// Construct through [`Feature::experimental`], [`Feature::preview`], or
+/// [`Feature::supported`] rather than a struct literal. The constructors bind
+/// the default-enabled policy to the maturity (only a Supported feature may be
+/// on by default), and keeping the fields private means a later field addition
+/// changes only the constructors, not every registration site.
 #[derive(Debug, Clone, Copy)]
 pub struct Feature {
+    name: &'static str,
+    maturity: Maturity,
+    doc: &'static str,
+    default_enabled: bool,
+}
+
+impl Feature {
+    /// An Experimental feature: off by default, and enabling it requires an
+    /// `ack` equal to `version` (see [`Maturity::Experimental`]). It is never
+    /// on by default, because an ungated default-on experiment would silently
+    /// change behavior across a breaking version bump, which is exactly what
+    /// the ack gate exists to prevent.
+    #[must_use]
+    pub const fn experimental(
+        name: &'static str,
+        doc: &'static str,
+        version: &'static str,
+        changelog: &'static str,
+    ) -> Self {
+        Self {
+            name,
+            maturity: Maturity::Experimental { version, changelog },
+            doc,
+            default_enabled: false,
+        }
+    }
+
+    /// A Preview feature: stable enough to toggle freely, off by default.
+    #[must_use]
+    pub const fn preview(name: &'static str, doc: &'static str) -> Self {
+        Self {
+            name,
+            maturity: Maturity::Preview,
+            doc,
+            default_enabled: false,
+        }
+    }
+
+    /// A Supported (first-class) feature. `on_by_default` decides whether it is
+    /// enabled when the config does not mention it; either way an operator can
+    /// still set it explicitly, including `enabled = false` to turn a
+    /// default-on feature off.
+    #[must_use]
+    pub const fn supported(name: &'static str, doc: &'static str, on_by_default: bool) -> Self {
+        Self {
+            name,
+            maturity: Maturity::Supported,
+            doc,
+            default_enabled: on_by_default,
+        }
+    }
+
     /// The name config files use in the `[features]` table.
-    pub name: &'static str,
+    #[must_use]
+    pub const fn name(&self) -> &'static str {
+        self.name
+    }
+
     /// Where the feature sits on the maturity ladder.
-    pub maturity: Maturity,
+    #[must_use]
+    pub const fn maturity(&self) -> Maturity {
+        self.maturity
+    }
+
     /// One-line operator-facing description.
-    pub doc: &'static str,
+    #[must_use]
+    pub const fn doc(&self) -> &'static str {
+        self.doc
+    }
+
+    /// Whether the feature is enabled when the config does not mention it.
+    /// True only for a Supported feature declared on by default.
+    #[must_use]
+    pub const fn default_enabled(&self) -> bool {
+        self.default_enabled
+    }
 }
 
 /// The set of feature flags this build knows about.
@@ -80,6 +156,18 @@ impl FeatureRegistry {
     /// programming error that must fail the build's tests, not be resolved
     /// silently at runtime.
     pub fn register(&mut self, feature: Feature) {
+        // The single choke point every feature passes through, so it enforces
+        // the maturity coupling regardless of how the Feature was built: only a
+        // Supported feature may be on by default. A default-on ack-gated or
+        // preview feature would be enabled without appearing in [features] and
+        // so bypass the validate() gate entirely. The constructors already
+        // guarantee this; this backstops any struct literal added inside the
+        // module (where the private fields are reachable).
+        debug_assert!(
+            !feature.default_enabled || matches!(feature.maturity, Maturity::Supported),
+            "feature '{}' is on by default but not Supported; only Supported features may default on",
+            feature.name
+        );
         let previous = self.features.insert(feature.name, feature);
         assert!(
             previous.is_none(),
@@ -93,15 +181,13 @@ impl FeatureRegistry {
     /// tested against a real registered feature from day one.
     #[doc(hidden)]
     pub fn register_sample_experimental(&mut self) {
-        self.register(Feature {
-            name: "sample-experimental",
-            maturity: Maturity::Experimental {
-                version: "0.1.0-exp.1",
-                changelog: "crates/ironauth-config/CHANGELOG.md",
-            },
-            doc: "Sample experimental flag exercising the acknowledgment gate; \
-                  gates no behavior.",
-        });
+        self.register(Feature::experimental(
+            "sample-experimental",
+            "Sample experimental flag exercising the acknowledgment gate; \
+             gates no behavior.",
+            "0.1.0-exp.1",
+            "crates/ironauth-config/CHANGELOG.md",
+        ));
     }
 
     /// Look up a registered feature.
@@ -115,15 +201,22 @@ impl FeatureRegistry {
         self.features.values()
     }
 
-    /// Whether `name` is registered and enabled in `config`, with its gate
-    /// satisfied. Call only after [`FeatureRegistry::validate`] passed.
+    /// Whether `name` is registered and enabled, with its gate satisfied. An
+    /// explicit `enabled = true`/`false` wins; a feature the config does not
+    /// mention, or mentions without an explicit `enabled`, falls back to its
+    /// [`Feature::default_enabled`] (true only for a Supported feature declared
+    /// on by default). This can therefore return `true` for a feature entirely
+    /// absent from `[features]`. Call only after [`FeatureRegistry::validate`]
+    /// passed; it does not itself check the ack gate.
     #[must_use]
     pub fn is_enabled(&self, config: &Config, name: &str) -> bool {
-        self.features.contains_key(name)
-            && config
+        self.features.get(name).is_some_and(|feature| {
+            config
                 .features
                 .get(name)
-                .is_some_and(|toggle| toggle.enabled)
+                .and_then(|toggle| toggle.enabled)
+                .unwrap_or(feature.default_enabled)
+        })
     }
 
     /// The boot-time gate. Checks every entry in `config.features` against
@@ -168,9 +261,11 @@ impl<'a> IntoIterator for &'a FeatureRegistry {
 }
 
 /// The per-feature gate rule. Disabled features are never gated: an ack for
-/// a disabled feature is inert, and Preview/Supported ignore ack entirely.
+/// a disabled feature is inert, and Preview/Supported ignore ack entirely. A
+/// toggle that omits `enabled` resolves to the feature's default (so a bare or
+/// ack-only entry does not accidentally gate, nor accidentally disable).
 fn check_gate(feature: &Feature, toggle: &FeatureToggle) -> Option<FeatureViolation> {
-    if !toggle.enabled {
+    if !toggle.enabled.unwrap_or(feature.default_enabled) {
         return None;
     }
     match feature.maturity {
@@ -317,16 +412,8 @@ mod tests {
     #[test]
     fn preview_requires_enabled_only_and_supported_ignores_ack() {
         let mut registry = FeatureRegistry::new();
-        registry.register(Feature {
-            name: "preview-thing",
-            maturity: Maturity::Preview,
-            doc: "test",
-        });
-        registry.register(Feature {
-            name: "supported-thing",
-            maturity: Maturity::Supported,
-            doc: "test",
-        });
+        registry.register(Feature::preview("preview-thing", "test"));
+        registry.register(Feature::supported("supported-thing", "test", false));
         // The stale ack on the supported feature simulates a feature promoted
         // out of Experimental: old acks must not break the boot.
         let config = config_with_features(
@@ -336,6 +423,83 @@ mod tests {
         registry.validate(&config).expect("no gate applies");
         assert!(registry.is_enabled(&config, "preview-thing"));
         assert!(registry.is_enabled(&config, "supported-thing"));
+    }
+
+    #[test]
+    fn a_supported_feature_defaults_on_when_absent_and_can_be_disabled() {
+        let mut registry = FeatureRegistry::new();
+        registry.register(Feature::supported("on-by-default", "test", true));
+
+        // Absent from [features]: resolves enabled by default.
+        let absent = config_with_features("");
+        registry
+            .validate(&absent)
+            .expect("no gate applies to a default-on supported feature");
+        assert!(
+            registry.is_enabled(&absent, "on-by-default"),
+            "a Supported feature not mentioned in [features] resolves as enabled"
+        );
+
+        // Explicit enabled = false turns it off.
+        let disabled = config_with_features("\"on-by-default\" = { enabled = false }");
+        registry
+            .validate(&disabled)
+            .expect("explicit disable is fine");
+        assert!(
+            !registry.is_enabled(&disabled, "on-by-default"),
+            "an explicit enabled = false disables a default-on feature"
+        );
+
+        // Present but with `enabled` omitted (a bare table, or one attaching
+        // only an inert ack) must NOT silently disable a default-on feature: an
+        // omitted `enabled` falls back to the default.
+        for present in [
+            "\"on-by-default\" = {}",
+            "\"on-by-default\" = { ack = \"x\" }",
+        ] {
+            let cfg = config_with_features(present);
+            registry.validate(&cfg).expect("no gate applies");
+            assert!(
+                registry.is_enabled(&cfg, "on-by-default"),
+                "a present entry without an explicit enabled must keep the default ({present})"
+            );
+        }
+    }
+
+    #[test]
+    fn an_ack_only_entry_does_not_enable_a_default_off_experimental_feature() {
+        // Naming an experimental feature to attach an ack, without enabling it,
+        // must leave it off and must not trip the ack gate (nothing is enabled
+        // to gate). Only an explicit enabled = true arms the gate.
+        let registry = FeatureRegistry::builtin();
+        let ack_only = config_with_features("\"sample-experimental\" = { ack = \"0.1.0-exp.1\" }");
+        registry
+            .validate(&ack_only)
+            .expect("an ack without enable is inert, not a gate violation");
+        assert!(!registry.is_enabled(&ack_only, "sample-experimental"));
+    }
+
+    #[test]
+    fn a_supported_feature_off_by_default_stays_off_when_absent() {
+        let mut registry = FeatureRegistry::new();
+        registry.register(Feature::supported("off-by-default", "test", false));
+        let absent = config_with_features("");
+        registry.validate(&absent).expect("no gate");
+        assert!(
+            !registry.is_enabled(&absent, "off-by-default"),
+            "an off-by-default Supported feature stays off when absent"
+        );
+    }
+
+    #[test]
+    fn the_maturity_constructors_set_the_expected_default_enabled() {
+        // Only a Supported feature can be on by default; the ack-gated and
+        // preview constructors force off-by-default so an ungated feature can
+        // never be enabled without appearing in [features].
+        assert!(!Feature::experimental("e", "d", "1", "c").default_enabled());
+        assert!(!Feature::preview("p", "d").default_enabled());
+        assert!(Feature::supported("s", "d", true).default_enabled());
+        assert!(!Feature::supported("s", "d", false).default_enabled());
     }
 
     #[test]

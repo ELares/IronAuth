@@ -118,15 +118,18 @@ lines.append("Entries under `[features]` must name a feature registered in this 
 lines.append("Experimental features boot only with `ack` equal to the exact version below;")
 lines.append("a breaking change bumps the version and invalidates old acks (review the")
 lines.append("changelog, then re-ack). Preview features need only `enabled = true`.")
-lines.append("Supported features ignore `ack`.")
+lines.append("Supported features ignore `ack`. A feature whose `Default on` is `yes` is")
+lines.append("enabled even when absent from `[features]`, and can be turned off with")
+lines.append("`enabled = false` (only Supported features may default on).")
 lines.append("")
-lines.append("| Feature | Maturity | Version | Changelog | Description |")
-lines.append("|---------|----------|---------|-----------|-------------|")
+lines.append("| Feature | Maturity | Default on | Version | Changelog | Description |")
+lines.append("|---------|----------|------------|---------|-----------|-------------|")
 for feature in sorted(features, key=lambda f: f["name"]):
     name, maturity, doc = feature["name"], feature["maturity"], feature["doc"]
     version = feature["version"] or ""
     changelog = feature["changelog"] or ""
-    lines.append(f"| `{name}` | {maturity} | {version} | {changelog} | {doc} |")
+    default_on = "yes" if feature["default_enabled"] else "no"
+    lines.append(f"| `{name}` | {maturity} | {default_on} | {version} | {changelog} | {doc} |")
 lines.append("")
 
 with open("docs/CONFIG.md", "w") as fh:

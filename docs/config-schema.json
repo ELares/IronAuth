@@ -88,9 +88,12 @@
           ]
         },
         "enabled": {
-          "default": false,
-          "description": "Whether the feature is enabled.",
-          "type": "boolean"
+          "default": null,
+          "description": "Whether the feature is enabled. When omitted, the feature's own default\napplies (on only for a Supported feature declared on by default), so\nnaming a feature just to attach an `ack` does not silently turn a\ndefault-on feature off. Set `enabled = false` to force it off.",
+          "type": [
+            "boolean",
+            "null"
+          ]
         }
       },
       "type": "object"
