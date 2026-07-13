@@ -146,6 +146,8 @@ jobs:
         run: |
           scripts/config-schema.sh
           git diff --exit-code docs/config-schema.json docs/CONFIG.md
+      - name: openapi freshness (served management spec vs committed artifact)
+        run: scripts/openapi-check.sh
       - name: governance files present
         # The license and covenant files are trust infrastructure; this lint
         # ensures they cannot be silently removed or renamed.
