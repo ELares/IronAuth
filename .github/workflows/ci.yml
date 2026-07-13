@@ -59,6 +59,11 @@ jobs:
     name: msrv (1.85)
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    env:
+      # rust-toolchain.toml pins 1.97.0 and outranks `rustup default`, which
+      # would silently turn this lane into a no-op. RUSTUP_TOOLCHAIN outranks
+      # the toolchain file, so the check genuinely runs under 1.85.
+      RUSTUP_TOOLCHAIN: "1.85"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.85

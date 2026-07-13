@@ -31,7 +31,7 @@ scan() {
 }
 
 scan time-via-env 'SystemTime::now|Instant::now'
-scan entropy-via-env 'getrandom::|[^a-z_]rand::|rand_core::'
+scan entropy-via-env 'getrandom::|(^|[^a-z_])rand::|rand_core::'
 
 if [ "$fail" -ne 0 ]; then
   exit 1

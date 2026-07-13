@@ -67,7 +67,7 @@ jobs:
       - name: Extract changelog section
         run: |
           version="${GITHUB_REF_NAME#ironauth-v}"
-          awk -v ver="$version" '/^## /{p=($0 ~ ver)} p' crates/ironauth/CHANGELOG.md > dist/RELEASE_NOTES.md
+          awk -v ver="$version" '/^## /{p=($0 == "## " ver)} p' crates/ironauth/CHANGELOG.md > dist/RELEASE_NOTES.md
           test -s dist/RELEASE_NOTES.md || echo "See crates/ironauth/CHANGELOG.md" > dist/RELEASE_NOTES.md
       - name: Create GitHub release
         env:
