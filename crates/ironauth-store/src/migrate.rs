@@ -19,6 +19,11 @@
 //! recorded, which means either tampering or an edit to shipped history). Both
 //! surface as a typed [`MigrationError`].
 //!
+//! Concurrent runners (several replicas booting at once during a rolling
+//! upgrade) are serialized by a session-level Postgres advisory lock, so the
+//! losers wait and then find the chain already applied instead of racing to
+//! create the same objects and failing with a raw error.
+//!
 //! Only the runtime sqlx query API is used (no `migrate!`/`query!` macros), so
 //! the database-free build lanes stay database-free; the migration text is
 //! embedded with `include_str!` and its checksum is computed at run time.
@@ -211,9 +216,13 @@ CREATE TABLE IF NOT EXISTS _schema_migrations ( \
 /// The applied, ordered migration chain for IronAuth.
 ///
 /// The `#6` isolation schema is version 1; the same-transaction audit log is
-/// version 2; versions 3 to 5 are the checked expand-contract example, run
-/// against a throwaway demo object so they exercise all three phases in CI
-/// without changing the meaning of the real schema.
+/// version 2. That is the whole production chain: it deliberately carries no
+/// throwaway objects, so a real database never gains a demo table or ledger
+/// rows beyond what the product needs. The worked expand-contract example
+/// (add a nullable column, backfill, drop the old column) lives entirely in the
+/// migration framework's own test (`tests/migration.rs`), driven through
+/// [`MigrationRunner::from_migrations`] against a throwaway test database, so
+/// all three phases are exercised in CI without ever touching the real schema.
 fn registry() -> Vec<Migration> {
     vec![
         Migration {
@@ -228,26 +237,16 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0002_audit_log.sql"),
         },
-        Migration {
-            version: 3,
-            name: "demo_expand",
-            phase: Phase::Expand,
-            sql: include_str!("../migrations/0003_demo_expand.sql"),
-        },
-        Migration {
-            version: 4,
-            name: "demo_migrate",
-            phase: Phase::Migrate,
-            sql: include_str!("../migrations/0004_demo_migrate.sql"),
-        },
-        Migration {
-            version: 5,
-            name: "demo_contract",
-            phase: Phase::Contract,
-            sql: include_str!("../migrations/0005_demo_contract.sql"),
-        },
     ]
 }
+
+/// The fixed key for the migration advisory lock. A session-level Postgres
+/// advisory lock on this key serializes concurrent runners: during a rolling
+/// upgrade several replicas may call the runner at once, and without this the
+/// losers would race to create the same objects and fail their boot with a raw
+/// "relation already exists" error. The value is the ASCII bytes of "IRONAUTH"
+/// (fixed and process independent, so every runner contends on the same key).
+const MIGRATION_ADVISORY_LOCK_KEY: i64 = 0x4952_4F4E_4155_5448;
 
 /// Applies an ordered, checksummed migration chain against a Postgres pool.
 ///
@@ -289,7 +288,8 @@ impl<'a> MigrationRunner<'a> {
     /// [`MigrationError::Database`] on any database failure. On refusal nothing
     /// is applied.
     pub async fn run(&self) -> Result<MigrationReport, MigrationError> {
-        // 1. The registry must be strictly ascending by version.
+        // 1. The registry must be strictly ascending by version. Checked in
+        //    memory before any connection is touched.
         let mut prev: Option<i64> = None;
         for migration in &self.migrations {
             if prev.is_some_and(|p| migration.version <= p) {
@@ -300,6 +300,44 @@ impl<'a> MigrationRunner<'a> {
             prev = Some(migration.version);
         }
 
+        // Serialize concurrent runners (the rolling-upgrade boot race) with a
+        // SESSION-level Postgres advisory lock on a dedicated connection. A
+        // session advisory lock on a POOLED connection is NOT released when the
+        // connection returns to the pool, so we MUST unlock explicitly on every
+        // path: acquire, lock, run the ledger logic capturing its result, then
+        // ALWAYS unlock before returning (no `?` between lock and unlock skips
+        // it). While one runner holds the lock, others block at pg_advisory_lock
+        // and, on acquiring it, find the chain already applied.
+        let mut lock_conn = self.pool.acquire().await?;
+        sqlx::query("SELECT pg_advisory_lock($1)")
+            .bind(MIGRATION_ADVISORY_LOCK_KEY)
+            .execute(&mut *lock_conn)
+            .await?;
+
+        let result = self.run_locked().await;
+
+        let unlock = sqlx::query("SELECT pg_advisory_unlock($1)")
+            .bind(MIGRATION_ADVISORY_LOCK_KEY)
+            .execute(&mut *lock_conn)
+            .await;
+
+        match result {
+            // The run succeeded: surface an unlock failure if one occurred, so a
+            // stuck lock is never hidden behind a success.
+            Ok(report) => {
+                unlock?;
+                Ok(report)
+            }
+            // The run failed: return its (more informative) error. The unlock was
+            // still attempted above regardless.
+            Err(error) => Err(error),
+        }
+    }
+
+    /// The ledger logic (steps 2 to 6), run while holding the migration advisory
+    /// lock. Kept exactly as the reviewed-correct ordering, checksum, and apply
+    /// logic; only the surrounding serialization is new.
+    async fn run_locked(&self) -> Result<MigrationReport, MigrationError> {
         // 2. Ensure the ledger exists before consulting it.
         sqlx::query(CREATE_LEDGER_SQL).execute(self.pool).await?;
 

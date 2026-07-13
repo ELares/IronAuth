@@ -4,11 +4,12 @@
 //! application role.
 //!
 //! The application role is granted SELECT and INSERT on `audit_log` but never
-//! UPDATE or DELETE. A row, once written, cannot be rewritten or erased by the
-//! role the application connects as; retention is a separate, privileged
-//! operation. This runs every statement as `ironauth_app` (neither a superuser
-//! nor the table owner, so grants and row-level security genuinely apply) and
-//! proves UPDATE and DELETE are refused while INSERT and SELECT in scope work.
+//! UPDATE, DELETE, or TRUNCATE. A row, once written, cannot be rewritten or
+//! erased by the role the application connects as, nor can the log be wiped
+//! wholesale; retention is a separate, privileged operation. This runs every
+//! statement as `ironauth_app` (neither a superuser nor the table owner, so
+//! grants and row-level security genuinely apply) and proves UPDATE, DELETE, and
+//! TRUNCATE are refused while INSERT and SELECT in scope work.
 
 use ironauth_env::Env;
 use ironauth_store::test_support::TestDatabase;
@@ -76,33 +77,18 @@ async fn app_role_may_select_and_insert_but_never_update_or_delete_audit_rows() 
         tx.commit().await.expect("commit select");
     }
 
-    // UPDATE is denied: the role has no UPDATE grant on audit_log.
-    {
-        let mut tx = pool.begin().await.expect("begin update");
-        bind_scope(&mut tx, &tenant, &environment).await;
-        let result = sqlx::query("UPDATE audit_log SET action = 'tampered'")
-            .execute(&mut *tx)
-            .await;
-        let err = result.expect_err("UPDATE on an audit row must be denied");
-        assert!(
-            is_permission_denied(&err),
-            "UPDATE must be refused as insufficient privilege, got: {err:?}"
-        );
-        let _ = tx.rollback().await;
-    }
-
-    // DELETE is denied: the role has no DELETE grant on audit_log.
-    {
-        let mut tx = pool.begin().await.expect("begin delete");
-        bind_scope(&mut tx, &tenant, &environment).await;
-        let result = sqlx::query("DELETE FROM audit_log").execute(&mut *tx).await;
-        let err = result.expect_err("DELETE on an audit row must be denied");
-        assert!(
-            is_permission_denied(&err),
-            "DELETE must be refused as insufficient privilege, got: {err:?}"
-        );
-        let _ = tx.rollback().await;
-    }
+    // UPDATE, DELETE, and TRUNCATE are each denied: the role has none of those
+    // grants on audit_log, so a row can be neither rewritten, erased, nor the
+    // log wiped wholesale.
+    assert_denied_in_scope(
+        pool,
+        &tenant,
+        &environment,
+        "UPDATE audit_log SET action = 'tampered'",
+    )
+    .await;
+    assert_denied_in_scope(pool, &tenant, &environment, "DELETE FROM audit_log").await;
+    assert_denied_in_scope(pool, &tenant, &environment, "TRUNCATE audit_log").await;
 
     // INSERT in scope works: append-only permits appends.
     {
@@ -131,6 +117,24 @@ async fn app_role_may_select_and_insert_but_never_update_or_delete_audit_rows() 
         );
         tx.commit().await.expect("commit insert");
     }
+}
+
+/// Run `statement` in a scoped transaction as the application role and assert it
+/// is refused as insufficient privilege (append-only enforcement).
+async fn assert_denied_in_scope(
+    pool: &sqlx::PgPool,
+    tenant: &str,
+    environment: &str,
+    statement: &str,
+) {
+    let mut tx = pool.begin().await.expect("begin denied-statement tx");
+    bind_scope(&mut tx, tenant, environment).await;
+    let result = sqlx::query(statement).execute(&mut *tx).await;
+    assert!(
+        result.as_ref().err().is_some_and(is_permission_denied),
+        "statement must be refused as insufficient privilege: {statement:?} -> {result:?}"
+    );
+    let _ = tx.rollback().await;
 }
 
 /// Bind the transaction-local row-level-security scope variables, exactly as the

@@ -61,12 +61,13 @@ impl Store {
 
     /// Apply the full IronAuth migration chain to bring the schema current.
     ///
-    /// Runs the runtime [`MigrationRunner`]: the four-level isolation tables and
-    /// policies (version 1), the same-transaction audit log (version 2), and the
-    /// checked expand-contract example (versions 3 to 5). The runner tracks
-    /// applied migrations in a `_schema_migrations` ledger, applies each pending
-    /// one in order inside its own transaction, and refuses out-of-order or
-    /// checksum-drifted application. It is idempotent: on an up-to-date database
+    /// Runs the runtime [`MigrationRunner`] over the two production migrations:
+    /// the four-level isolation tables and policies (version 1) and the
+    /// same-transaction audit log (version 2). The runner tracks applied
+    /// migrations in a `_schema_migrations` ledger, applies each pending one in
+    /// order inside its own transaction, serializes concurrent runners with a
+    /// session advisory lock, and refuses out-of-order, checksum-drifted, or
+    /// unknown-version application. It is idempotent: on an up-to-date database
     /// it applies nothing. Only the runtime sqlx API is used (no `migrate!`
     /// macro), so nothing here needs a database at build time.
     ///

@@ -3,8 +3,10 @@
 //! The expand-contract migration framework, against a real database.
 //!
 //! Custom chains run against a fresh, empty database (an empty ledger) so they
-//! are isolated from the full IronAuth chain. The expand-contract example is
-//! verified on the database the harness already migrated with the real chain.
+//! are isolated from the two-migration production chain. The worked
+//! expand-contract example lives here as a test-only chain (it never ships to a
+//! real schema), and the production chain is separately asserted to contain
+//! only its two migrations and leave no demo object behind.
 
 use ironauth_store::test_support::TestDatabase;
 use ironauth_store::{Migration, MigrationError, MigrationRunner, Phase};
@@ -166,45 +168,61 @@ async fn checksum_mismatch_on_an_applied_migration_is_rejected() {
     );
 }
 
+/// The worked expand-contract example, TEST-ONLY (it never ships to the
+/// production schema). Expand adds a nullable column and seeds a row; migrate
+/// backfills it; contract drops the old column. Proves all three phases run in
+/// order and that contract removed the expanded-from artifact.
 #[tokio::test]
-async fn expand_contract_example_applies_forward_and_contract_removes_the_old_column() {
-    // TestDatabase::start applies the full real chain (versions 1 to 5) to a
-    // fresh, empty database, so the expand-contract example ran end to end.
-    let db = TestDatabase::start().await;
-    let pool = db.owner_pool();
+async fn expand_contract_example_chain_runs_all_three_phases_and_contract_removes_the_old_column() {
+    let pool = TestDatabase::fresh_owner_pool().await;
+    let chain = vec![
+        step(
+            1,
+            Phase::Expand,
+            "CREATE TABLE migration_demo (id text PRIMARY KEY, legacy_name text NOT NULL); \
+             INSERT INTO migration_demo (id, legacy_name) VALUES ('demo-1', 'alpha'); \
+             ALTER TABLE migration_demo ADD COLUMN display_name text;",
+        ),
+        step(
+            2,
+            Phase::Migrate,
+            "UPDATE migration_demo SET display_name = legacy_name WHERE display_name IS NULL;",
+        ),
+        step(
+            3,
+            Phase::Contract,
+            "ALTER TABLE migration_demo DROP COLUMN legacy_name;",
+        ),
+    ];
 
-    // The whole chain is recorded and current; re-running applies nothing.
-    let report = MigrationRunner::new(pool)
+    let report = MigrationRunner::from_migrations(&pool, chain)
         .run()
         .await
-        .expect("re-run the real chain");
-    assert!(
-        report.newly_applied().is_empty(),
-        "the harness already applied the full chain"
-    );
+        .expect("apply the expand-contract chain");
     assert_eq!(
-        report.already_applied(),
-        5,
-        "all five migrations are tracked"
+        report.newly_applied().to_vec(),
+        vec![1_i64, 2, 3],
+        "all three phases applied in order"
     );
 
-    // The three example phases are recorded with their phase tags.
+    // The phases are recorded in order.
+    let pool_ref = &pool;
     let phase_of = |version: i64| async move {
         sqlx::query("SELECT phase FROM _schema_migrations WHERE version = $1")
             .bind(version)
-            .fetch_one(pool)
+            .fetch_one(pool_ref)
             .await
             .expect("phase lookup")
             .get::<String, _>("phase")
     };
-    assert_eq!(phase_of(3).await, "expand");
-    assert_eq!(phase_of(4).await, "migrate");
-    assert_eq!(phase_of(5).await, "contract");
+    assert_eq!(phase_of(1).await, "expand");
+    assert_eq!(phase_of(2).await, "migrate");
+    assert_eq!(phase_of(3).await, "contract");
 
     // Forward chain: the migrate step backfilled display_name from legacy_name.
     let display: String =
         sqlx::query("SELECT display_name FROM migration_demo WHERE id = 'demo-1'")
-            .fetch_one(pool)
+            .fetch_one(&pool)
             .await
             .expect("demo row")
             .get("display_name");
@@ -213,13 +231,223 @@ async fn expand_contract_example_applies_forward_and_contract_removes_the_old_co
         "the migrate phase backfilled display_name from legacy_name"
     );
 
-    // Contract: the old column is gone, the expanded column remains.
+    // Contract removed the expanded-from artifact; the expanded column remains.
     assert!(
-        !column_exists(pool, "migration_demo", "legacy_name").await,
+        !column_exists(&pool, "migration_demo", "legacy_name").await,
         "the contract phase dropped legacy_name"
     );
     assert!(
-        column_exists(pool, "migration_demo", "display_name").await,
+        column_exists(&pool, "migration_demo", "display_name").await,
         "the expanded column remains after contract"
     );
+}
+
+/// The PRODUCTION chain (`MigrationRunner::new`) contains exactly the two real
+/// migrations and leaves no throwaway demo object in a real database.
+#[tokio::test]
+async fn production_chain_is_only_the_two_real_migrations_and_ships_no_demo_object() {
+    // TestDatabase::start runs Store::migrate() (the production chain) on a
+    // fresh, empty database.
+    let db = TestDatabase::start().await;
+    let pool = db.owner_pool();
+
+    // Re-running is idempotent and reports exactly two tracked migrations.
+    let report = MigrationRunner::new(pool)
+        .run()
+        .await
+        .expect("re-run the production chain");
+    assert!(
+        report.newly_applied().is_empty(),
+        "the harness already applied the production chain"
+    );
+    assert_eq!(
+        report.already_applied(),
+        2,
+        "the production chain is exactly two migrations (isolation, audit log)"
+    );
+
+    // The ledger holds exactly versions 1 and 2.
+    assert_eq!(applied_versions(pool).await, vec![1_i64, 2]);
+    let phase_of = |version: i64| async move {
+        sqlx::query("SELECT phase FROM _schema_migrations WHERE version = $1")
+            .bind(version)
+            .fetch_one(pool)
+            .await
+            .expect("phase lookup")
+            .get::<String, _>("phase")
+    };
+    assert_eq!(phase_of(1).await, "expand");
+    assert_eq!(phase_of(2).await, "expand");
+
+    // The demo object never reaches a production database.
+    assert!(
+        !table_exists(pool, "migration_demo").await,
+        "the production migrate() must not create a demo table"
+    );
+    // The real tables and the audit log do exist.
+    assert!(table_exists(pool, "clients").await, "clients exists");
+    assert!(table_exists(pool, "audit_log").await, "audit_log exists");
+}
+
+#[tokio::test]
+async fn not_sorted_is_rejected_for_descending_and_duplicate_versions() {
+    let pool = TestDatabase::fresh_owner_pool().await;
+
+    // Descending: version 1 follows version 2.
+    let descending = MigrationRunner::from_migrations(
+        &pool,
+        vec![
+            step(2, Phase::Expand, "CREATE TABLE ns_desc_2 (id int);"),
+            step(1, Phase::Expand, "CREATE TABLE ns_desc_1 (id int);"),
+        ],
+    )
+    .run()
+    .await
+    .expect_err("a descending chain must be refused");
+    assert!(
+        matches!(descending, MigrationError::NotSorted { version: 1 }),
+        "expected NotSorted{{version:1}}, got: {descending:?}"
+    );
+
+    // Duplicate: version 1 appears twice (not strictly ascending).
+    let duplicate = MigrationRunner::from_migrations(
+        &pool,
+        vec![
+            step(1, Phase::Expand, "CREATE TABLE ns_dup_a (id int);"),
+            step(1, Phase::Expand, "CREATE TABLE ns_dup_b (id int);"),
+        ],
+    )
+    .run()
+    .await
+    .expect_err("a duplicate version must be refused");
+    assert!(
+        matches!(duplicate, MigrationError::NotSorted { version: 1 }),
+        "expected NotSorted{{version:1}}, got: {duplicate:?}"
+    );
+
+    // A refused sort check touches no connection: neither table was created.
+    assert!(!table_exists(&pool, "ns_desc_1").await);
+    assert!(!table_exists(&pool, "ns_dup_a").await);
+}
+
+#[tokio::test]
+async fn unknown_applied_version_is_rejected_and_nothing_is_applied() {
+    // The N/N-1 downgrade guard: a ledger migrated by a newer build (which knows
+    // version 3) presented to an older build whose registry stops at version 2.
+    let pool = TestDatabase::fresh_owner_pool().await;
+
+    // A "newer build" applies versions 1 to 3.
+    MigrationRunner::from_migrations(
+        &pool,
+        vec![
+            step(1, Phase::Expand, "CREATE TABLE dg_1 (id int);"),
+            step(2, Phase::Expand, "CREATE TABLE dg_2 (id int);"),
+            step(3, Phase::Expand, "CREATE TABLE dg_3 (id int);"),
+        ],
+    )
+    .run()
+    .await
+    .expect("newer build applies 1 to 3");
+
+    // The "older build" only knows versions 1 and 2, and adds an unapplied
+    // version 2b to prove nothing pending is applied either.
+    let older = MigrationRunner::from_migrations(
+        &pool,
+        vec![
+            step(1, Phase::Expand, "CREATE TABLE dg_1 (id int);"),
+            step(2, Phase::Expand, "CREATE TABLE dg_2 (id int);"),
+        ],
+    )
+    .run()
+    .await
+    .expect_err("a ledger version unknown to this build must be refused");
+    assert!(
+        matches!(older, MigrationError::UnknownApplied { version: 3 }),
+        "expected UnknownApplied{{version:3}}, got: {older:?}"
+    );
+
+    // Nothing changed: the ledger still holds exactly 1, 2, 3.
+    assert_eq!(applied_versions(&pool).await, vec![1_i64, 2, 3]);
+}
+
+#[tokio::test]
+async fn a_failed_migration_records_no_ledger_row_and_stops_the_chain() {
+    let pool = TestDatabase::fresh_owner_pool().await;
+
+    // Version 2's DDL is invalid (an undefined column type). It must roll back
+    // with no ledger row, and version 3 must never be attempted.
+    let err = MigrationRunner::from_migrations(
+        &pool,
+        vec![
+            step(1, Phase::Expand, "CREATE TABLE fdl_1 (id int);"),
+            step(
+                2,
+                Phase::Expand,
+                "CREATE TABLE fdl_2 (id int, broken nonexistent_type_xyz);",
+            ),
+            step(3, Phase::Expand, "CREATE TABLE fdl_3 (id int);"),
+        ],
+    )
+    .run()
+    .await
+    .expect_err("a migration with invalid DDL must fail");
+    assert!(
+        matches!(err, MigrationError::Database(_)),
+        "expected a Database error, got: {err:?}"
+    );
+
+    // Version 1 committed; version 2 rolled back (no table, no ledger row);
+    // version 3 was never attempted.
+    assert_eq!(
+        applied_versions(&pool).await,
+        vec![1_i64],
+        "only version 1 is recorded"
+    );
+    assert!(table_exists(&pool, "fdl_1").await, "version 1 committed");
+    assert!(
+        !table_exists(&pool, "fdl_2").await,
+        "the failed migration's DDL rolled back"
+    );
+    assert!(
+        !table_exists(&pool, "fdl_3").await,
+        "the chain stopped at the failure"
+    );
+}
+
+#[tokio::test]
+async fn concurrent_runners_serialize_cleanly_via_the_advisory_lock() {
+    // Two runners racing on one fresh database (the rolling-upgrade boot race).
+    // Without the advisory lock the loser would race to CREATE and fail with a
+    // raw "relation already exists" error; with it, the loser waits and finds
+    // nothing pending. Both must complete cleanly and the ledger must be [1, 2].
+    let pool = TestDatabase::fresh_owner_pool().await;
+    let chain = || {
+        vec![
+            step(1, Phase::Expand, "CREATE TABLE conc_a (id int);"),
+            step(2, Phase::Expand, "CREATE TABLE conc_b (id int);"),
+        ]
+    };
+
+    let runner_a = MigrationRunner::from_migrations(&pool, chain());
+    let runner_b = MigrationRunner::from_migrations(&pool, chain());
+    let (a, b) = tokio::join!(runner_a.run(), runner_b.run());
+
+    a.expect("runner A completes without a raw error");
+    b.expect("runner B completes without a raw error");
+
+    // Exactly one full apply happened; the final ledger is [1, 2].
+    assert_eq!(applied_versions(&pool).await, vec![1_i64, 2]);
+    assert!(table_exists(&pool, "conc_a").await);
+    assert!(table_exists(&pool, "conc_b").await);
+}
+
+/// The versions recorded in the ledger, ascending.
+async fn applied_versions(pool: &sqlx::PgPool) -> Vec<i64> {
+    sqlx::query("SELECT version FROM _schema_migrations ORDER BY version")
+        .fetch_all(pool)
+        .await
+        .expect("read ledger versions")
+        .iter()
+        .map(|row| row.get::<i64, _>("version"))
+        .collect()
 }

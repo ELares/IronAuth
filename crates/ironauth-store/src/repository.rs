@@ -27,13 +27,23 @@
 //! Every mutation routes through the single private [`write_audited`] function.
 //! It opens one scoped transaction, runs the caller's data change, writes
 //! exactly one [`audit_log`](crate::audit) row in that same transaction, and only
-//! then commits. There is no other committing write path: the public mutators
-//! ([`ActingClientRepo::create`], [`ActingClientRepo::delete`], and every future
-//! one) are thin wrappers over it. A mutation therefore cannot commit without its
-//! audit row, and a failed mutation commits neither. This is enforcement by
-//! construction, not handler discipline: nothing a caller can write bypasses the
-//! audited path, because the only place that commits a data change is the place
-//! that also writes the audit row.
+//! then commits. Every public mutator ([`ActingClientRepo::create`],
+//! [`ActingClientRepo::delete`], and every future one) is a thin wrapper over it,
+//! so a mutation cannot commit without its audit row and a failed mutation
+//! commits neither.
+//!
+//! This module is the enforcement boundary, and the enforcement is at the
+//! crate/API level rather than a language-level impossibility. Outside this
+//! module nothing can reach a scoped table at all: the pool is crate private,
+//! module visibility blocks other crates, `scripts/query-audit.sh` fails the
+//! build on scoped-table SQL anywhere else, and Postgres row-level security sits
+//! beneath all of it. So no caller can commit a scoped write off the audited
+//! path. Within this one module the discipline is a reviewed invariant: a future
+//! in-module mutator must route through [`write_audited`] rather than commit its
+//! own transaction. Keeping the committing write path a single private function
+//! is what makes that invariant a one-line review rather than a per-handler
+//! audit. This is enforcement by construction at the module boundary, not
+//! handler discipline spread across the codebase.
 
 use std::time::SystemTime;
 
@@ -373,6 +383,11 @@ impl AuditRepo<'_> {
     /// fails to decode into the typed envelope.
     pub async fn list(&self) -> Result<Vec<AuditRecord>, StoreError> {
         let mut tx = begin_scoped(self.store, self.scope).await?;
+        // Exact microsecond read-back requires PostgreSQL 14+, where
+        // EXTRACT(EPOCH FROM timestamptz) returns numeric (exact). On older
+        // versions it returns double precision and can round by +/- 1 us; the
+        // stored value is exact regardless (it is written as an integer
+        // microsecond interval), so this only affects the read-back precision.
         let rows = sqlx::query(
             "SELECT id, action, actor_kind, actor_id, target_kind, target_id, \
              correlation_id, \
@@ -455,9 +470,10 @@ struct AuditedWrite<'a, K: ScopedKind> {
 /// change; [`insert_audit_row`] appends exactly one audit row in the same
 /// transaction; only then does the transaction commit. If `mutate` fails, the
 /// audit row is never written and nothing commits; if the audit insert fails,
-/// the data change never commits. There is no code path that commits a data
-/// change without also committing its audit row, so "a mutation without an audit
-/// row" is unrepresentable rather than merely discouraged.
+/// the data change never commits. This is the single committing write path in
+/// the module, so a mutation without its audit row cannot be committed off it
+/// (the module boundary that protects that invariant is described on the module
+/// documentation).
 ///
 /// `poison_after_audit` is `false` on every production path; the testing
 /// atomicity probe sets it to force a guaranteed in-transaction failure after
