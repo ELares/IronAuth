@@ -55,12 +55,55 @@ precondition rather than refused; see issue #138 and the M14 milestone.
   consolidated on OID4VP plus the browser Digital Credentials API. Instead:
   the OID4VC exploratory track (issue #164). Revisit: spec revival with
   deployments.
-- **Excluded JOSE algorithms (detailed list lands with issue #8).** Why: the
-  hardened JOSE core ships with a documented exclusion list (Ed448, ES512,
-  RS1, alg none, RSA1_5, PBKDF2 JWE and peers): no ecosystem support, known
-  attack classes, or doubled test matrix for zero demand. Instead: the
-  supported matrix with EdDSA default (issue #9). Revisit: per-algorithm,
-  with evidence of demand and safety.
+## Refused: JOSE algorithms
+
+The hardened JOSE verification core (issue #8, `crates/ironauth-jose`, ADR 0004)
+verifies exactly EdDSA (Ed25519), ES256/ES384, RS256/RS384/RS512, and
+PS256/PS384/PS512, all backed by `ring`. Everything below is refused with cause.
+Instead of these, IronAuth ships the supported matrix above with the EdDSA
+default (issue #9). Each entry is revisitable only per-algorithm, with evidence
+of real demand AND safety.
+
+- **`alg: none` (unsecured JWS).** Why: an unauthenticated token is a forgery by
+  construction; acceptance is the single most repeated JOSE CVE, and
+  node-oidc-provider v9 removed it entirely with the ecosystem following.
+  Instead: always rejected, in every case and whitespace variant, with no
+  configuration to enable it, INCLUDING the OIDC Core code-flow-permitted
+  variant. Revisit: never.
+- **HMAC (`HS256`/`HS384`/`HS512`) in the verify core.** Why: a symmetric verify
+  path next to asymmetric keys is exactly what enables RS/HS key confusion
+  (verifying an `RS256` token as `HS256` with the RSA public key as the secret).
+  Omitting HMAC makes that confusion inexpressible, not merely blocked. Instead:
+  asymmetric verification only; the key-family check rejects any algorithm whose
+  type does not match the trusted key. Revisit: never for the public-token verify
+  core.
+- **Ed448.** Why: no WebCrypto, Tink, or .NET support; it doubles the curve and
+  test matrix for effectively zero relying-party demand. Instead: Ed25519 as the
+  EdDSA default. Revisit: broad platform support plus demonstrated demand.
+- **ES512 (ECDSA P-521).** Why: absent from `ring`; supporting it would force a
+  second crypto backend into the tree, widening the trusted surface for a rarely
+  used curve. Instead: ES256 and ES384. Revisit: a `ring` implementation, or
+  demand that justifies a second vetted backend.
+- **RS1 / RSA-SHA1 and any SHA-1 JWS.** Why: SHA-1 is a broken hash with
+  practical collisions; a signature over it is not a security control. Instead:
+  the SHA-256/384/512 RSA families. Revisit: never.
+- **RSA1_5 (RSAES-PKCS1-v1_5 key encryption).** Why: the Bleichenbacher padding-
+  oracle class, repeatedly re-exploited (ROBOT and successors); unsafe to offer
+  even with countermeasures. Instead: no JWE key-management via RSA1_5. Revisit:
+  never.
+- **PBES2 / PBKDF2-based JWE (`PBES2-HS256+A128KW` and peers).** Why: a password-
+  derived key-encryption whose iteration count (`p2c`) is an attacker-controlled
+  work multiplier (a decompression-bomb cousin); wrong primitive for machine-to-
+  machine tokens. Instead: rejected at the cap/parse stage before any derivation;
+  the iteration cap bounds the cheap rejection. Revisit: none planned.
+- **Compressed JWS/JWE (`zip`).** Why: the decompression-bomb class; a small
+  token can inflate to exhaust memory. Instead: `zip` is rejected at the header
+  stage before anything is inflated; a decompression-ratio cap is carried for any
+  future compression path. Revisit: a concrete need with a hard ratio cap.
+
+The exclusions are enforced by the core itself (unsupported algorithms never
+parse to a supported one; `none`, HMAC, `zip`, PBES2, and in-token key material
+are explicit rejects) and by property tests over the CVE regression corpus.
 
 ## Refused: architecture and scope
 

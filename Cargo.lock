@@ -804,6 +804,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "ironauth-jose"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "ironauth-env",
+ "ring",
+ "serde",
+ "serde_json",
+ "trybuild",
+]
+
+[[package]]
 name = "ironauth-server"
 version = "0.1.0"
 dependencies = [

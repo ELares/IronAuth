@@ -1,0 +1,5 @@
+error[E0616]: field `material` of struct `TrustedKey` is private
+  --> tests/compile-fail/trusted_key_material_is_private.rs:10:17
+   |
+10 |     let _ = key.material;
+   |                 ^^^^^^^^ private field

@@ -1,0 +1,39 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+[package]
+name = "ironauth-jose"
+version = "0.1.0"
+description = "IronAuth hardened JOSE verification core: the single allowlist-driven JWS/JWT verify choke point, built directly on ring, that never trusts token headers for key or algorithm selection and structurally closes the 2025-2026 JOSE CVE wave"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# Explicit test list. The compile-fail visibility proofs are database-free and
+# run on every lane; the adversarial and positive suites drive the one public
+# verify entry point. Auto-discovery stays on (no per-test required-features).
+
+[dependencies]
+# The crypto backend is ring's low-level signature primitives DIRECTLY (no
+# high-level JOSE crate: those carry the very CVE classes this core closes). ring
+# is already in the tree via rustls; this is a direct edge, no new crate, no
+# license change (Apache-2.0 AND ISC, both on the deny.toml allowlist). Default
+# features keep `alloc` on, which the RSA verification path (RsaPublicKeyComponents)
+# requires.
+ring.workspace = true
+# base64url (URL_SAFE_NO_PAD) decoding of the JWS segments.
+base64.workspace = true
+# JSON parsing of the protected header and the claims. serde derives the header
+# and claim shapes; a duplicate-key-rejecting deserializer hardens both.
+serde_json.workspace = true
+serde.workspace = true
+# The determinism seam: exp/nbf/iat are evaluated against env.clock().now_utc(),
+# never SystemTime::now, so claim-window logic is testable with a manual clock.
+ironauth-env.workspace = true
+
+[dev-dependencies]
+# trybuild drives the compile-fail proofs that the private primitives are
+# unreachable from outside the crate.
+trybuild.workspace = true
+
+[lints]
+workspace = true

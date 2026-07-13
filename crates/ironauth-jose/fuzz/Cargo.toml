@@ -1,0 +1,32 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+#
+# The cargo-fuzz harness for ironauth-jose. Deliberately NOT a workspace member
+# (the empty [workspace] table below detaches it): its libFuzzer dependency needs
+# a nightly toolchain and must not constrain the stable workspace or enter the
+# cargo-deny graph, mirroring the root fuzz/ crate, ironauth-fetch's fuzz/, and
+# the sibling Iron projects. Unlike ironauth-fetch, issue #8 asks for this target
+# to run in CI on a schedule; the exact scheduled-fuzz job the assembler should
+# add is in fuzz/README.md. The same input space also has stable, in-CI coverage
+# in the crate's cve_corpus.rs and property.rs suites.
+[package]
+name = "ironauth-jose-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+ironauth-jose = { path = ".." }
+ironauth-env = { path = "../../ironauth-env" }
+
+[[bin]]
+name = "verify_jws"
+path = "fuzz_targets/verify_jws.rs"
+test = false
+doc = false
+bench = false
