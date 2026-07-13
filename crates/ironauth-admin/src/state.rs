@@ -75,14 +75,19 @@ impl AdminState {
         let bootstrap_operator_token = match &config.bootstrap_operator_token {
             Some(secret) => {
                 let resolved = secret.resolve().map_err(StateError::Secret)?;
-                // Fail closed on an empty token: an empty configured token and an
-                // empty presented bearer token compare equal in constant time, so
-                // an empty configured token would authenticate anyone. Refuse to
-                // build the state at all rather than enable that.
-                if resolved.expose().is_empty() {
+                // Presented bearer tokens are trimmed before comparison, so trim
+                // the configured token to match, and fail closed if it is empty
+                // or only whitespace. An empty configured token and an empty
+                // presented bearer token compare equal in constant time, so an
+                // empty configured token would authenticate anyone. Refuse to
+                // build the state at all rather than enable that, and refuse
+                // loudly at startup rather than silently disabling the operator
+                // plane on a whitespace-only value.
+                let trimmed = resolved.expose().trim();
+                if trimmed.is_empty() {
                     return Err(StateError::EmptyToken);
                 }
-                Some(resolved)
+                Some(SecretString::new(trimmed))
             }
             None => None,
         };
@@ -270,16 +275,39 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn new_refuses_an_empty_bootstrap_token() {
+    async fn new_refuses_an_empty_or_whitespace_bootstrap_token() {
+        // An empty token, and a whitespace-only token (which trims to empty and
+        // could never match a trimmed presented token), must both fail closed at
+        // startup rather than silently disabling or opening the operator plane.
         // AdminState has no Debug, so match rather than expect_err (which would
         // need to format the Ok value).
-        match AdminState::new(lazy_store(), Env::system(), &config_with_token(Some(""))) {
-            Err(err @ StateError::EmptyToken) => {
-                assert!(err.to_string().contains("empty value"), "{err}");
+        for token in ["", "   ", "\t\n "] {
+            match AdminState::new(lazy_store(), Env::system(), &config_with_token(Some(token))) {
+                Err(err @ StateError::EmptyToken) => {
+                    assert!(err.to_string().contains("empty value"), "{err}");
+                }
+                Err(other) => panic!("expected EmptyToken for {token:?}, got: {other}"),
+                Ok(_) => panic!("an empty or whitespace-only bootstrap token must be refused"),
             }
-            Err(other) => panic!("expected EmptyToken, got: {other}"),
-            Ok(_) => panic!("an empty bootstrap token must be refused"),
         }
+    }
+
+    #[tokio::test]
+    async fn a_configured_token_is_trimmed_to_match_the_trimmed_presented_token() {
+        // Presented tokens are trimmed, so a configured token with incidental
+        // surrounding whitespace must still match its trimmed form (and must not
+        // match the untrimmed spelling).
+        let state = AdminState::new(
+            lazy_store(),
+            Env::system(),
+            &config_with_token(Some("  op-secret  ")),
+        )
+        .expect("a token with surrounding whitespace builds after trimming");
+        assert!(state.match_operator("op-secret").is_some(), "trimmed match");
+        assert!(
+            state.match_operator("  op-secret  ").is_none(),
+            "the untrimmed spelling must not match"
+        );
     }
 
     #[tokio::test]
