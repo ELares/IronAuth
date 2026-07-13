@@ -271,6 +271,35 @@ async fn a_malformed_scope_is_a_uniform_not_found_on_every_form() {
     }
 }
 
+#[tokio::test]
+async fn discovery_routes_coexist_with_a_sibling_well_known_route() {
+    // Guards the live composition: main.rs merges the discovery router onto a
+    // public plane that already serves /.well-known/security.txt. The host-inserted
+    // discovery forms share the /.well-known/ prefix, so this proves the merge does
+    // not panic on a route conflict and both siblings still answer.
+    async fn security_txt() -> &'static str {
+        "Contact: mailto:security@issuer.test\n"
+    }
+
+    let (discovery, scope) = router_and_scope(DiscoveryCapabilities::default());
+    let router = Router::new()
+        .route(
+            "/.well-known/security.txt",
+            axum::routing::get(security_txt),
+        )
+        .merge(discovery);
+
+    // The sibling static well-known route still answers.
+    let (status, _, body) = get(&router, "/.well-known/security.txt").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("security@issuer.test"));
+
+    // And every discovery form still resolves through the merged router.
+    for uri in well_known_urls(&scope) {
+        assert_eq!(get(&router, &uri).await.0, StatusCode::OK, "{uri}");
+    }
+}
+
 #[test]
 fn no_trailing_slash_drift_when_the_base_url_carries_one() {
     // The issuer value must exact-match regardless of a trailing slash on the
