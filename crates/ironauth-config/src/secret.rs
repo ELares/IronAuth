@@ -152,6 +152,34 @@ impl<'de> Visitor<'de> for SecretVisitor {
         Ok(Secret::Literal(SecretString::new(value)))
     }
 
+    // Non-string scalars are rejected by TYPE only. serde's default fallbacks
+    // would echo the value into the error (a bare numeric PIN or token would
+    // then land in startup logs), so each scalar form is handled explicitly
+    // and names the type without the value.
+    fn visit_bool<E: de::Error>(self, _value: bool) -> Result<Secret, E> {
+        Err(de::Error::custom(format!(
+            "a boolean is not a secret; expected {SECRET_FORMS}"
+        )))
+    }
+
+    fn visit_i64<E: de::Error>(self, _value: i64) -> Result<Secret, E> {
+        Err(de::Error::custom(format!(
+            "a number is not a secret; quote it to use a literal, or expected {SECRET_FORMS}"
+        )))
+    }
+
+    fn visit_u64<E: de::Error>(self, _value: u64) -> Result<Secret, E> {
+        Err(de::Error::custom(format!(
+            "a number is not a secret; quote it to use a literal, or expected {SECRET_FORMS}"
+        )))
+    }
+
+    fn visit_f64<E: de::Error>(self, _value: f64) -> Result<Secret, E> {
+        Err(de::Error::custom(format!(
+            "a number is not a secret; quote it to use a literal, or expected {SECRET_FORMS}"
+        )))
+    }
+
     fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Secret, A::Error> {
         let Some(key) = map.next_key::<String>()? else {
             return Err(de::Error::custom(format!(
@@ -377,6 +405,30 @@ mod tests {
         let resolved = secret.resolve().expect("literal resolves");
         assert!(!format!("{resolved:?}").contains("hunter2"));
         assert!(!format!("{resolved}").contains("hunter2"));
+    }
+
+    #[test]
+    fn non_string_secret_literal_is_rejected_by_type_without_echoing_value() {
+        // An unquoted numeric PIN or a bool must fail by type only. The
+        // surface that matters is `Error::message()`, which is exactly what
+        // the loader retains (see Config::from_str); toml's full-line source
+        // snippet is dropped there, and the visitor message must not add the
+        // value back. Asserting on `.message()` mirrors the real log surface.
+        for (toml_src, sentinel) in [
+            ("s = 314159265358979", "314159265358979"),
+            ("s = 3.14159265", "3.14159265"),
+            ("s = true", "true"),
+        ] {
+            let err = toml::from_str::<TestWrap>(toml_src).expect_err(toml_src);
+            let retained = err.message();
+            assert!(!retained.contains(sentinel), "value echoed: {retained}");
+            assert!(
+                retained.contains("secret")
+                    || retained.contains("number")
+                    || retained.contains("boolean"),
+                "unhelpful message: {retained}"
+            );
+        }
     }
 
     #[test]

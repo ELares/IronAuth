@@ -36,14 +36,60 @@ pub struct Dsn {
     raw: String,
     scheme: String,
     user: Option<String>,
-    /// Whether a password component was present. The password itself is only
-    /// reachable through `raw`; it is never stored separately, so no code
-    /// path can format it by accident.
-    has_password: bool,
+    /// Whether the userinfo component carried a password. Drives userinfo
+    /// rendering in [`Dsn::redacted`]. The password itself is only reachable
+    /// through `raw`; it is never stored separately, so no code path can
+    /// format it by accident.
+    userinfo_password: bool,
+    /// Whether the query string carried a credential parameter (`password` or
+    /// `sslpassword`, both valid libpq URI keywords). Rendered redacted by
+    /// [`Dsn::redacted`]; kept separate from `userinfo_password` so userinfo
+    /// rendering is unaffected.
+    query_password: bool,
     host: String,
     port: Option<u16>,
     /// Path plus query, including the leading separator; may be empty.
     tail: String,
+}
+
+/// Query-string keys whose values are credentials. Both are valid libpq
+/// connection URI parameters, so a password can arrive in the query string
+/// just as legitimately as in userinfo; both must redact.
+const SECRET_QUERY_KEYS: &[&str] = &["password", "sslpassword"];
+
+/// Redact credential-bearing query parameters in a `path[?query]` tail.
+///
+/// Returns the tail with any `password`/`sslpassword` value replaced by the
+/// placeholder, and whether such a parameter carried a non-empty value.
+fn redact_tail(tail: &str) -> (String, bool) {
+    let Some((path, query)) = tail.split_once('?') else {
+        return (tail.to_owned(), false);
+    };
+    let mut saw_secret = false;
+    let mut out = String::with_capacity(tail.len());
+    out.push_str(path);
+    out.push('?');
+    for (index, param) in query.split('&').enumerate() {
+        if index > 0 {
+            out.push('&');
+        }
+        match param.split_once('=') {
+            Some((key, value))
+                if SECRET_QUERY_KEYS
+                    .iter()
+                    .any(|k| k.eq_ignore_ascii_case(key)) =>
+            {
+                out.push_str(key);
+                out.push('=');
+                out.push_str(REDACTED);
+                if !value.is_empty() {
+                    saw_secret = true;
+                }
+            }
+            _ => out.push_str(param),
+        }
+    }
+    (out, saw_secret)
 }
 
 impl Dsn {
@@ -81,7 +127,7 @@ impl Dsn {
             Some((userinfo, hostport)) => (Some(userinfo), hostport),
             None => (None, authority),
         };
-        let (user, has_password) = match userinfo {
+        let (user, userinfo_password) = match userinfo {
             Some(userinfo) => match userinfo.split_once(':') {
                 Some((user, _password)) => (Some(user.to_owned()), true),
                 None => (Some(userinfo.to_owned()), false),
@@ -98,11 +144,14 @@ impl Dsn {
             None => None,
         };
 
+        let (_, query_password) = redact_tail(tail);
+
         Ok(Self {
             raw: input.to_owned(),
             scheme: scheme.to_owned(),
             user,
-            has_password,
+            userinfo_password,
+            query_password,
             host: host.to_owned(),
             port,
             tail: tail.to_owned(),
@@ -133,10 +182,10 @@ impl Dsn {
         self.port
     }
 
-    /// Whether the DSN embeds a password.
+    /// Whether the DSN embeds a password, in userinfo or the query string.
     #[must_use]
     pub fn has_password(&self) -> bool {
-        self.has_password
+        self.userinfo_password || self.query_password
     }
 
     /// The full connection string, password included. Every call site is a
@@ -152,11 +201,11 @@ impl Dsn {
         let mut out = String::with_capacity(self.raw.len());
         out.push_str(&self.scheme);
         out.push_str("://");
-        if self.user.is_some() || self.has_password {
+        if self.user.is_some() || self.userinfo_password {
             if let Some(user) = &self.user {
                 out.push_str(user);
             }
-            if self.has_password {
+            if self.userinfo_password {
                 out.push(':');
                 out.push_str(REDACTED);
             }
@@ -167,7 +216,7 @@ impl Dsn {
             out.push(':');
             out.push_str(&port.to_string());
         }
-        out.push_str(&self.tail);
+        out.push_str(&redact_tail(&self.tail).0);
         out
     }
 }
@@ -366,5 +415,38 @@ mod tests {
         let shown = dsn.to_string();
         assert!(!shown.contains("pw@"), "leak: {shown}");
         assert!(shown.contains(REDACTED), "{shown}");
+    }
+
+    #[test]
+    fn query_string_password_is_redacted_everywhere() {
+        // libpq accepts the password as a URI query parameter; it must redact
+        // exactly like a userinfo password (regression for the query-form leak).
+        let dsn =
+            Dsn::parse("postgres://app@db:5432/ironauth?sslmode=require&password=ZQXSENTINEL")
+                .expect("valid");
+        assert!(dsn.has_password(), "query password must count");
+        assert!(dsn.expose().contains("ZQXSENTINEL"), "expose keeps it");
+        let json = serde_json::to_string(&dsn).expect("serializes");
+        for rendered in [format!("{dsn:?}"), format!("{dsn}"), json] {
+            assert!(!rendered.contains("ZQXSENTINEL"), "leak: {rendered}");
+            assert!(rendered.contains(REDACTED), "no placeholder: {rendered}");
+            assert!(
+                rendered.contains("sslmode=require"),
+                "non-secret param survives: {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn sslpassword_query_param_and_case_insensitivity_redact() {
+        let dsn = Dsn::parse("postgres://db/x?SslPassword=ZQXSENTINEL").expect("valid");
+        assert!(dsn.has_password());
+        assert!(!dsn.to_string().contains("ZQXSENTINEL"), "leak: {dsn}");
+    }
+
+    #[test]
+    fn empty_query_password_does_not_claim_a_password() {
+        let dsn = Dsn::parse("postgres://db/x?password=").expect("valid");
+        assert!(!dsn.has_password(), "empty value is not a password");
     }
 }
