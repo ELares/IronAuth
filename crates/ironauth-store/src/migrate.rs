@@ -223,7 +223,10 @@ CREATE TABLE IF NOT EXISTS _schema_migrations ( \
 /// version 4; the per-environment `signing_keys` table (issue #19) is version 5;
 /// the bootstrap login, consent, session, and secret-based client-authentication
 /// tables (issue #20: `users`, `sessions`, `consents`, plus the additive `clients`
-/// expand) are version 6. That is the whole production chain: it deliberately
+/// expand) are version 6; the recorded authentication context for honest ID token
+/// claims (issue #14: the additive `sessions`, `authorization_codes`, and `clients`
+/// column expands carrying the login method and `auth_time`) is version 7. That is
+/// the whole production chain: it deliberately
 /// carries no throwaway objects, so a real database never gains a demo table or
 /// ledger rows beyond what the product needs. The worked expand-contract example
 /// (add a nullable column, backfill, drop the old column) lives entirely in the
@@ -268,6 +271,12 @@ fn registry() -> Vec<Migration> {
             name: "login_consent",
             phase: Phase::Expand,
             sql: include_str!("../migrations/0006_login_consent.sql"),
+        },
+        Migration {
+            version: 7,
+            name: "authentication_context",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0007_authentication_context.sql"),
         },
     ]
 }

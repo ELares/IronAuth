@@ -242,16 +242,16 @@ async fn expand_contract_example_chain_runs_all_three_phases_and_contract_remove
     );
 }
 
-/// The PRODUCTION chain (`MigrationRunner::new`) contains exactly the six real
+/// The PRODUCTION chain (`MigrationRunner::new`) contains exactly the seven real
 /// migrations and leaves no throwaway demo object in a real database.
 #[tokio::test]
-async fn production_chain_is_only_the_six_real_migrations_and_ships_no_demo_object() {
+async fn production_chain_is_only_the_seven_real_migrations_and_ships_no_demo_object() {
     // TestDatabase::start runs Store::migrate() (the production chain) on a
     // fresh, empty database.
     let db = TestDatabase::start().await;
     let pool = db.owner_pool();
 
-    // Re-running is idempotent and reports exactly six tracked migrations.
+    // Re-running is idempotent and reports exactly seven tracked migrations.
     let report = MigrationRunner::new(pool)
         .run()
         .await
@@ -262,13 +262,13 @@ async fn production_chain_is_only_the_six_real_migrations_and_ships_no_demo_obje
     );
     assert_eq!(
         report.already_applied(),
-        6,
-        "the production chain is exactly six migrations (isolation, audit log, management API, \
-         OIDC authorization, signing keys, login/consent)"
+        7,
+        "the production chain is exactly seven migrations (isolation, audit log, management API, \
+         OIDC authorization, signing keys, login/consent, authentication context)"
     );
 
-    // The ledger holds exactly versions 1, 2, 3, 4, 5, and 6.
-    assert_eq!(applied_versions(pool).await, vec![1_i64, 2, 3, 4, 5, 6]);
+    // The ledger holds exactly versions 1 through 7.
+    assert_eq!(applied_versions(pool).await, vec![1_i64, 2, 3, 4, 5, 6, 7]);
     let phase_of = |version: i64| async move {
         sqlx::query("SELECT phase FROM _schema_migrations WHERE version = $1")
             .bind(version)
@@ -283,6 +283,7 @@ async fn production_chain_is_only_the_six_real_migrations_and_ships_no_demo_obje
     assert_eq!(phase_of(4).await, "expand");
     assert_eq!(phase_of(5).await, "expand");
     assert_eq!(phase_of(6).await, "expand");
+    assert_eq!(phase_of(7).await, "expand");
 
     // The demo object never reaches a production database.
     assert!(
@@ -320,6 +321,25 @@ async fn production_chain_is_only_the_six_real_migrations_and_ships_no_demo_obje
     assert!(table_exists(pool, "users").await, "users exists");
     assert!(table_exists(pool, "sessions").await, "sessions exists");
     assert!(table_exists(pool, "consents").await, "consents exists");
+    // The authentication-context columns (issue #14) exist: the recorded login
+    // methods on sessions and codes, the frozen auth_time on codes, and the
+    // client's require_auth_time registration flag.
+    assert!(
+        column_exists(pool, "sessions", "auth_methods").await,
+        "sessions.auth_methods exists"
+    );
+    assert!(
+        column_exists(pool, "authorization_codes", "auth_methods").await,
+        "authorization_codes.auth_methods exists"
+    );
+    assert!(
+        column_exists(pool, "authorization_codes", "auth_time").await,
+        "authorization_codes.auth_time exists"
+    );
+    assert!(
+        column_exists(pool, "clients", "require_auth_time").await,
+        "clients.require_auth_time exists"
+    );
 }
 
 #[tokio::test]

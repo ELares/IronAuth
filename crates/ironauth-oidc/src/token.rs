@@ -355,6 +355,15 @@ fn mint_tokens(
             client_id: &bindings.client_id,
             nonce: bindings.nonce.as_deref(),
             oauth_scope: bindings.oauth_scope.as_deref(),
+            // acr/amr/auth_time derive from the authentication event frozen onto
+            // the code at issuance, never from the token request.
+            auth_methods: &bindings.auth_methods,
+            auth_time_unix_micros: bindings.auth_time_unix_micros,
+            // A token-endpoint ID token never carries at_hash, and the code flow
+            // never carries c_hash; the front-channel/hybrid path (#17) supplies
+            // them. Both are absent here by construction.
+            at_hash: None,
+            c_hash: None,
         },
     )
     .map_err(|()| TokenError::ServerError)

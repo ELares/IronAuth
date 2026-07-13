@@ -27,6 +27,7 @@ use ironauth_store::{
     ActorRef, ClientId, CorrelationId, HumanId, Scope, SessionId, StoreError, UserId,
 };
 
+use crate::authn::AuthenticationEvent;
 use crate::pages;
 use crate::session;
 use crate::state::OidcState;
@@ -84,12 +85,19 @@ pub fn cookie_header(headers: &HeaderMap) -> Option<&str> {
     headers.get(header::COOKIE)?.to_str().ok()
 }
 
-/// An authenticated bootstrap session: the session id and the subject it names.
+/// An authenticated bootstrap session: the session id, the subject it names, and
+/// the recorded authentication event (its time and methods), which the ID token's
+/// `auth_time`, `amr`, and `acr` derive from (issue #14).
 pub struct AuthenticatedSession {
     /// The resolved session identifier (also the cookie value).
     pub session_id: SessionId,
     /// The authenticated end-user subject.
     pub subject: String,
+    /// When the subject authenticated, in microseconds since the Unix epoch.
+    pub auth_time_unix_micros: i64,
+    /// The recorded authentication method tokens (space-separated RFC 8176
+    /// values), the single source `amr` and the achieved `acr` derive from.
+    pub auth_methods: String,
 }
 
 /// Resolve the session cookie to an authenticated session within `scope`, or
@@ -115,12 +123,16 @@ pub async fn resolve_session(
     Some(AuthenticatedSession {
         session_id,
         subject: record.subject,
+        auth_time_unix_micros: record.auth_time_unix_micros,
+        auth_methods: record.auth_methods,
     })
 }
 
-/// Create a session for `subject` in `scope` and return the `Set-Cookie` value to
-/// establish it, attributed to `actor`. `auth_time` and `expires_at` come from the
-/// clock seam and the configured session lifetime.
+/// Create a session for `subject` in `scope` recording the authentication `event`
+/// (its methods and time), and return the `Set-Cookie` value to establish it,
+/// attributed to `actor`. The session's `expires_at` comes from the clock seam
+/// and the configured session lifetime; the recorded `auth_time` and methods come
+/// from the `event`, so the ID token's claims trace back to the actual login.
 ///
 /// # Errors
 ///
@@ -129,11 +141,11 @@ pub async fn establish_session(
     state: &OidcState,
     scope: Scope,
     subject: &str,
+    event: &AuthenticationEvent,
     actor: ActorRef,
 ) -> Result<String, StoreError> {
     let now = state.now();
     let session_id = SessionId::generate(state.env(), &scope);
-    let auth_micros = epoch_micros(now);
     let expires_micros = epoch_micros(now.checked_add(state.session_ttl()).unwrap_or(now));
     state
         .store()
@@ -144,7 +156,8 @@ pub async fn establish_session(
             state.env(),
             &session_id,
             subject,
-            auth_micros,
+            &event.methods_token(),
+            event.auth_time_unix_micros(),
             expires_micros,
         )
         .await?;
