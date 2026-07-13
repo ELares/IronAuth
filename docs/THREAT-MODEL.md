@@ -53,6 +53,23 @@ the skeleton; later issues extend, never weaken, them.
 | Denial of service | Metric-label cardinality blow-up via crafted paths; unclean shutdown dropping in-flight work | Metric labels are route templates, never raw paths (unmatched requests collapse to one series); `SIGTERM`/`SIGINT` drains in-flight requests within `server.shutdown_grace_secs`; per-tenant rate limiting lands later (#50, M15) |
 | Elevation | Public probing of privileged management endpoints | Health, readiness, and metrics live only on the management plane (`server.management_bind`, loopback by default) and 404 on the public plane |
 
+## Surface: persistence and tenant isolation substrate (shipped)
+
+The store layer parses untrusted resource identifiers and mediates every access
+to tenant-scoped tables. It ships no network endpoint of its own, but every
+later data surface inherits its isolation, so its controls are structural. See
+docs/design/TENANCY.md. Cells without a citation are shipped by the substrate;
+the same-transaction audit log is owned by #7.
+
+| STRIDE | Threat | Control |
+|---|---|---|
+| Spoofing | Reaching another tenant's resource with a forged, guessed, or recycled identifier (the IDOR and recycled-identifier classes) | Typed scoped identifiers embed tenant and environment, are 128-bit non-guessable and random (never serial, never recycled), and parse cross-scope as a uniform not-found; a handler holding a scoped identifier cannot express a cross-tenant query |
+| Tampering | Writing or updating a row that claims another tenant or environment | Scope-only repositories apply the `(tenant, environment)` filter to every write; Postgres row-level security `WITH CHECK` rejects a mis-scoped write beneath the application |
+| Repudiation | Unattributable data changes | Same-transaction audit rows land with the relational primary store (#7) |
+| Information disclosure | Cross-tenant reads (IDOR) and existence or error-shape oracles | Deny-by-default `(tenant, environment)` scope on every query; row-level security ENABLED and FORCED on every scoped table, verified by a low-privilege-role test; malformed, absent, and cross-scope lookups all return the identical not-found, so there is no oracle; the reusable IDOR harness probes every scoped operation in CI |
+| Denial of service | Query and pagination abuse | Cursor pagination and per-tenant rate limits land with the surfaces that expose these repositories (#11, #50, M15) |
+| Elevation | A raw unscoped query bypassing the repository to read across tenants | The pool and scoped tables are crate-private (no cross-crate raw access); repositories are constructible only from a scope (compile-fail tested); `scripts/query-audit.sh` fails CI on any scoped-table SQL outside the repository module |
+
 ## Surface: authorization endpoint (planned; lands with issue #12)
 
 | STRIDE | Threat | Control (owning issue) |
@@ -62,7 +79,7 @@ the skeleton; later issues extend, never weaken, them.
 | Repudiation | Untraceable grants | Same-transaction audit rows on every issuance (#7) |
 | Information disclosure | Token leakage via URL, referrer, or history | No token-bearing response types; form_post mode; Referrer-Policy on code-bearing pages (#17, #38) |
 | Denial of service | Unauthenticated request floods and state exhaustion | Pre-auth artifact TTL plus quotas; per-tenant fairness (#50 quota substrate, M15 full limiter) |
-| Elevation | Cross-tenant issuance | Tenant and environment isolation enforced at the persistence layer with typed IDs and RLS (#6) |
+| Elevation | Cross-tenant issuance | Tenant and environment isolation enforced at the persistence layer with typed scoped IDs and forced row-level security (shipped; see the persistence and tenant isolation substrate above) |
 
 ## Surface: token endpoint (planned; lands with issues #12, #21, #22, #23)
 
@@ -82,7 +99,7 @@ the skeleton; later issues extend, never weaken, them.
 | Spoofing | Stolen or replayed admin credentials | Environment-scoped credentials; control-plane and data-plane keys separated (#11, #42) |
 | Tampering | Unaudited mutation | Audit events on every mutation, written in the same transaction (#7, #11) |
 | Repudiation | Untraceable admin actions | Admin-action audit stream separated from authn events (M11) |
-| Information disclosure | Cross-tenant reads (IDOR) | Deny-by-default repository scoping, typed IDs, RLS, and the dedicated IDOR harness every surface must plug into (#6) |
+| Information disclosure | Cross-tenant reads (IDOR) | Deny-by-default repository scoping, typed scoped IDs, forced row-level security, and the dedicated IDOR harness (all shipped; see the persistence and tenant isolation substrate above); the management API registers each of its endpoints with that harness |
 | Denial of service | Pagination and query abuse | Cursor pagination everywhere; structured rate limits with headers (#11) |
 | Elevation | Overbroad admin roles | Scoped admin roles and delegated administration (M10); every admin capability is a documented public API, so there are no hidden privileged paths (#11) |
 

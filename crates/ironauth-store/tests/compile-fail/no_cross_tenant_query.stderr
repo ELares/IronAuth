@@ -1,0 +1,11 @@
+error[E0599]: no method named `get_for_tenant` found for struct `ClientRepo<'a>` in the current scope
+  --> tests/compile-fail/no_cross_tenant_query.rs:12:18
+   |
+12 |     let _ = repo.get_for_tenant(other, "cli_whatever");
+   |                  ^^^^^^^^^^^^^^ method not found in `ClientRepo<'_>`
+
+error[E0616]: field `scope` of struct `ClientRepo` is private
+  --> tests/compile-fail/no_cross_tenant_query.rs:16:18
+   |
+16 |     let _ = repo.scope;
+   |                  ^^^^^ private field
