@@ -8,6 +8,7 @@ manifest:
 - [crates/ironauth-env/CHANGELOG.md](crates/ironauth-env/CHANGELOG.md): the environment seam library
 - [crates/ironauth-config/CHANGELOG.md](crates/ironauth-config/CHANGELOG.md): the strict configuration layer library
 - [crates/ironauth-server/CHANGELOG.md](crates/ironauth-server/CHANGELOG.md): the HTTP server skeleton library
+- [crates/ironauth-store/CHANGELOG.md](crates/ironauth-store/CHANGELOG.md): the persistence and tenant isolation layer library
 
 The authoritative artifact list with versions is the generated
 [docs/COMPATIBILITY.md](docs/COMPATIBILITY.md). The release process and the

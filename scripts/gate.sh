@@ -15,10 +15,16 @@ echo "==> clippy (pedantic, -D warnings)"
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 
 echo "==> test"
-cargo test --workspace --all-features
+# The ironauth-store isolation tests need a real Postgres via DATABASE_URL.
+# with-test-db.sh runs against DATABASE_URL if set (a CI service), else brings up
+# a throwaway local cluster and tears it down. All other tests are unaffected.
+scripts/with-test-db.sh cargo test --workspace --all-features
 
 echo "==> invariant lints"
 scripts/invariant-lints.sh
+
+echo "==> query audit (no scoped-table SQL outside the repository module)"
+scripts/query-audit.sh
 
 echo "==> dash scan"
 scripts/dash-scan.sh

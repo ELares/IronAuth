@@ -16,6 +16,7 @@ members = [
     "crates/ironauth-env",
     "crates/ironauth-config",
     "crates/ironauth-server",
+    "crates/ironauth-store",
     "crates/ironauth",
 ]
 
@@ -29,7 +30,28 @@ repository = "https://github.com/ELares/IronAuth"
 ironauth-env = { path = "crates/ironauth-env", version = "0.1.0" }
 ironauth-config = { path = "crates/ironauth-config", version = "0.1.0" }
 ironauth-server = { path = "crates/ironauth-server", version = "0.1.0" }
+ironauth-store = { path = "crates/ironauth-store", version = "0.1.0" }
 getrandom = "0.3"
+
+# Persistence and isolation layer (crates/ironauth-store). Runtime query API
+# only (sqlx::query / query_as / QueryBuilder), never the compile-time-checked
+# query! macros, so the DB-free CI lanes (clippy, msrv, musl, cargo check) stay
+# database-free; a live database is needed only to run the integration tests.
+# TLS: rustls with the ring provider and the OS trust store
+# (tls-rustls-ring-native-roots). The plain `tls-rustls` alias pulls
+# webpki-roots (CDLA-Permissive-2.0, not on the deny.toml allowlist); the
+# native-roots variant uses rustls-native-certs (MIT/Apache/ISC) instead. No
+# native-tls/openssl, no aws-lc, no webpki-roots, so the tree stays permissive
+# and the musl static lane holds (rustls-native-certs reads /etc/ssl at runtime,
+# no C dependency). Pinned to the 0.8 line: 0.9 floors above MSRV 1.85 (see the
+# crate's CHANGELOG and Cargo.lock pins).
+sqlx = { version = "0.8", default-features = false, features = [
+    "runtime-tokio",
+    "tls-rustls-ring-native-roots",
+    "postgres",
+] }
+base64 = "0.22"
+trybuild = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 toml = "0.9"
 schemars = { version = "1.0", features = ["derive"] }

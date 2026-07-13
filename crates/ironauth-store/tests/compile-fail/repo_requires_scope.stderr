@@ -1,0 +1,15 @@
+error[E0061]: this method takes 1 argument but 0 arguments were supplied
+  --> tests/compile-fail/repo_requires_scope.rs:12:25
+   |
+12 |     let _scoped = store.scoped();
+   |                         ^^^^^^-- argument #1 of type `ironauth_store::Scope` is missing
+   |
+note: method defined here
+  --> src/store.rs
+   |
+   |     pub fn scoped(&self, scope: Scope) -> ScopedStore<'_> {
+   |            ^^^^^^
+help: provide the argument
+   |
+12 |     let _scoped = store.scoped(/* ironauth_store::Scope */);
+   |                                +++++++++++++++++++++++++++

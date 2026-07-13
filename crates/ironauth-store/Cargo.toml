@@ -1,0 +1,74 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+[package]
+name = "ironauth-store"
+version = "0.1.0"
+description = "IronAuth persistence and tenant isolation layer: typed scoped identifiers, scope-only repositories, and Postgres row-level security"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# Explicit target list: the integration tests that need a real database are
+# gated behind `required-features = ["testing"]` so the DB-free lanes (clippy,
+# msrv, musl, cargo check) neither compile the embedded-Postgres dependency nor
+# try to run the DB tests. Auto-discovery is off so nothing slips past the gate.
+autotests = false
+
+[dependencies]
+ironauth-env.workspace = true
+
+# Runtime query API only (no `query!`/`query_as!`): keeps every compile-time
+# lane database-free. rustls + ring, no native-tls/openssl (musl static).
+sqlx.workspace = true
+# URL-safe, strict (canonical) base64 for opaque identifier rendering; rejects
+# non-canonical trailing bits on decode, so a malformed identifier cannot masquerade
+# as a valid one.
+base64.workspace = true
+
+[features]
+# Default build is lean: no test-support surface. Production only ever needs the
+# default feature set.
+default = []
+# Test-support surface: the real-database harness (`test_support`) and the
+# reusable cross-tenant IDOR harness (`idor_harness`). Enabled by
+# `cargo test --all-features` and by the integration tests' required-features.
+# It adds no dependency beyond sqlx (already present), so it stays MSRV-1.85 and
+# musl clean; the modules are gated only to keep the test surface out of a
+# production build.
+testing = []
+
+[dev-dependencies]
+# The integration and compile-fail tests. tokio drives the async tests; trybuild
+# proves the isolation types reject misuse at compile time.
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+trybuild.workspace = true
+
+# RLS integration test: a low-privilege session cannot read another tenant's
+# rows even with the app-layer filter bypassed. Needs a real database
+# (DATABASE_URL); see the crate docs and scripts/with-test-db.sh.
+[[test]]
+name = "rls"
+path = "tests/rls.rs"
+required-features = ["testing"]
+
+# Cross-tenant / cross-environment IDOR harness against every scoped repository
+# operation that exists today. Needs a real database (DATABASE_URL).
+[[test]]
+name = "idor"
+path = "tests/idor.rs"
+required-features = ["testing"]
+
+# End-to-end repository round-trip (create / get / list / delete, non-recycling)
+# against a real database (DATABASE_URL).
+[[test]]
+name = "repository"
+path = "tests/repository.rs"
+required-features = ["testing"]
+
+# Compile-fail proofs. Database-free, so it runs on every lane (including MSRV).
+[[test]]
+name = "compile_fail"
+path = "tests/compile_fail.rs"
+
+[lints]
+workspace = true
