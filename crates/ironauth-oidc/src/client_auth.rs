@@ -256,7 +256,13 @@ pub fn authenticate(
 
 /// Whether `value` is an `Authorization: Basic` header (case-insensitive scheme).
 fn is_basic(value: &str) -> bool {
-    value.len() >= 6 && value[..5].eq_ignore_ascii_case("basic") && value.as_bytes()[5] == b' '
+    // `get(..5)` (not `value[..5]`) so a non-ASCII byte straddling index 5 returns
+    // None instead of panicking on a char boundary; the len check keeps `[5]` valid.
+    value.len() >= 6
+        && value
+            .get(..5)
+            .is_some_and(|scheme| scheme.eq_ignore_ascii_case("basic"))
+        && value.as_bytes()[5] == b' '
 }
 
 /// Parse an `Authorization: Basic` value into its (`client_id`, secret), applying
@@ -354,17 +360,51 @@ mod tests {
         );
     }
 
+    /// An independent WHATWG `application/x-www-form-urlencoded` serializer, so the
+    /// coincidence test below does not reuse the `form_urldecode` it is checking
+    /// against. Leaves the form-unreserved set `*-._0-9A-Za-z` as-is, maps space to
+    /// `+`, and percent-encodes every other byte.
+    fn form_urlencode(bytes: &[u8]) -> String {
+        use std::fmt::Write as _;
+        let mut out = String::new();
+        for &b in bytes {
+            match b {
+                b'*' | b'-' | b'.' | b'_' | b'0'..=b'9' | b'A'..=b'Z' | b'a'..=b'z' => {
+                    out.push(b as char);
+                }
+                b' ' => out.push('+'),
+                _ => {
+                    let _ = write!(out, "%{b:02X}");
+                }
+            }
+        }
+        out
+    }
+
     #[test]
-    fn basic_raw_and_form_encoded_agree_for_url_safe_secrets() {
-        // The interop landmine: a client that percent-encodes and one that sends
-        // raw must BOTH authenticate, because the secret is URL-safe. Use a secret
-        // whose form-encoding is a no-op and confirm both spellings decode equal.
-        let secret = "abcXYZ-0_9";
+    fn url_safe_secrets_are_form_urlencode_invariant_so_raw_and_encoded_agree() {
+        // The RFC 6749 2.3.1 interop landmine: a client that form-urlencodes the
+        // credential before base64 and one that sends it raw must BOTH authenticate.
+        // IronAuth guarantees this by generating URL-safe secrets, whose form
+        // encoding is a no-op, so the two wire spellings are byte-identical. Prove
+        // that with an INDEPENDENT encoder (not our own form_urldecode), then
+        // confirm both spellings parse to the same secret.
+        let secret = "abcXYZ-0_9"; // the base64url alphabet generate_secret emits
+        let encoded = form_urlencode(secret.as_bytes());
+        assert_eq!(
+            encoded, secret,
+            "a url-safe secret is unchanged by form-urlencoding: raw == encoded on the wire"
+        );
+        // Negative control: a secret with reserved bytes genuinely transforms, so
+        // the encoder is not a vacuous no-op that would make the above trivially true.
+        assert_ne!(form_urlencode(b"a b/c"), "a b/c");
+        // Both spellings of the url-safe secret parse to the identical secret.
         let raw = parse_basic(&basic_header("cli_x", secret)).expect("raw parses");
-        // A client that (needlessly) form-encoded the same URL-safe secret.
-        let encoded_secret = "abcXYZ-0_9"; // no reserved chars, encodes to itself
-        let encoded = parse_basic(&basic_header("cli_x", encoded_secret)).expect("encoded parses");
-        assert_eq!(raw, encoded);
+        let enc = parse_basic(&basic_header("cli_x", &encoded)).expect("encoded parses");
+        assert_eq!(
+            raw, enc,
+            "raw and form-encoded Basic headers parse identically"
+        );
         assert_eq!(raw.1, secret);
     }
 

@@ -262,6 +262,10 @@ async fn resolve_gate(
     };
 
     let client_id_str = client_id.to_string();
+    // Bootstrap limitation tracked in #196 (a hard prerequisite for enabling OIDC,
+    // #13): consent is looked up per (subject, client_id) only, so a prior consent
+    // for a narrow scope auto-grants any later broader scope. Before enablement this
+    // must re-prompt when the requested scope is not a subset of the granted scope.
     match state
         .store()
         .scoped(scope)
