@@ -13,6 +13,7 @@
 
 #![allow(dead_code)]
 
+pub mod signing_keys;
 pub mod vectors;
 
 use std::time::{Duration, SystemTime};

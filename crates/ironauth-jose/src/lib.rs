@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! The IronAuth hardened JOSE verification core.
+//! The IronAuth hardened JOSE verification and signing core.
 //!
 //! Every token surface IronAuth will ever ship inherits its verification
 //! security from this one crate. There is a single public path to verify a
@@ -9,6 +9,9 @@
 //! outside this crate can assemble a second, subtly different verifier. That is
 //! the structural answer to the 2025-2026 JOSE CVE wave, whose recurring classes
 //! all come from letting attacker-controlled token headers influence trust.
+//!
+//! The same crate holds the mint side, so signing and verification share one
+//! backend and one algorithm vocabulary. See the signing section below.
 //!
 //! # Trust comes only from the policy
 //!
@@ -31,18 +34,43 @@
 //! - **`crit`** naming any extension is rejected: this core understands no
 //!   critical extensions, and a malformed or duplicate `crit` is rejected too.
 //!
-//! # No HMAC, by design
+//! # No HMAC in the verify core, by design
 //!
-//! The supported algorithms are all asymmetric: `EdDSA` (Ed25519), ES256/ES384
-//! (ECDSA P-256/P-384), RS256/RS384/RS512 (RSA PKCS1-v1_5), and PS256/PS384/PS512
-//! (RSA-PSS). HMAC (`HS*`) is intentionally absent. With no symmetric
-//! verification path in the core, the classic "present an `RS256` token as
-//! `HS256` and have it verified with the RSA public key as the HMAC secret"
-//! confusion is not merely blocked but inexpressible, and a claimed algorithm
-//! whose family does not match the trusted key is rejected before any signature
-//! check. The excluded algorithms and their reasons are in
+//! The supported VERIFY algorithms are all asymmetric: `EdDSA` (Ed25519),
+//! ES256/ES384 (ECDSA P-256/P-384), RS256/RS384/RS512 (RSA PKCS1-v1_5), and
+//! PS256/PS384/PS512 (RSA-PSS). HMAC (`HS*`) is intentionally absent from
+//! [`verify`]. With no symmetric verification path in the core, the classic
+//! "present an `RS256` token as `HS256` and have it verified with the RSA public
+//! key as the HMAC secret" confusion is not merely blocked but inexpressible, and
+//! a claimed algorithm whose family does not match the trusted key is rejected
+//! before any signature check. The excluded algorithms and their reasons are in
 //! `docs/WILL-NOT-IMPLEMENT.md`; the design rationale is in
 //! `docs/adr/0004-jose-verification.md`.
+//!
+//! # Signing
+//!
+//! The mint side signs the full asymmetric matrix through [`sign_jws`], with
+//! `EdDSA` the default for new environments and clients. A [`SigningKey`] carries
+//! secret material (never printed or serialized) and hands out its matching
+//! [`TrustedKey`] via [`SigningKey::verifying_key`], so every mint round-trips
+//! through this crate's one [`verify`] path. Keys live in an
+//! [`EnvironmentKeyStore`] scoped per environment; a fresh environment publishes
+//! its Ed25519, ES256, and RS256 public keys from day one through the [`JwkSet`]
+//! builder, so moving a client between them is a configuration flip with no key
+//! generation. `Ed25519` is accepted as a fully-specified alias of `EdDSA`, and
+//! [`EmissionOptions`] carries the fully-specified emission toggle (default off).
+//!
+//! Symmetric `HS*` signing exists ONLY through [`ClientSecretContext`], keyed
+//! from a [`ClientSecret`], for exactly the two OIDC client-secret cases. There
+//! is no HMAC signing-key type and no way to place an `HS*` algorithm into an
+//! environment default, so a tenant or environment can never be configured to
+//! sign `HS*`: the illegal state is unrepresentable.
+//!
+//! Token-to-key binding uses one generalized confirmation model
+//! ([`Confirmation`], RFC 7800), shared across issuance and verification, with
+//! `jkt` (`DPoP`) and `x5t#S256` (mTLS) as the initial binding types. The evolving
+//! protocol surfaces (client-auth methods, grant types, token-binding methods)
+//! are fixed as traits in [`seams`] so future drafts land as implementations.
 //!
 //! # Caps before crypto
 //!
@@ -91,17 +119,35 @@
 //! ```
 
 mod claims;
+mod cnf;
 mod crypto;
 mod error;
 mod header;
 mod json;
+mod jwks;
+mod keystore;
+mod mint;
 mod policy;
+mod redact;
+mod sign;
+mod signing_key;
 mod verify;
 
+pub mod seams;
+
 pub use claims::VerifiedClaims;
+pub use cnf::{CnfError, Confirmation};
 pub use error::{RejectReason, VerifyError};
+pub use jwks::{Jwk, JwkSet};
+pub use keystore::EnvironmentKeyStore;
+pub use mint::{
+    ClientSecret, ClientSecretContext, ClientSecretJws, EmissionOptions, MacAlgorithm, SignError,
+    sign_jws,
+};
 pub use policy::{
     JwsAlgorithm, KeyError, KeyFamily, PolicyError, TrustedKey, VerificationCaps,
     VerificationPolicy,
 };
+pub use redact::Redacted;
+pub use signing_key::{SigningKey, SigningKeyError};
 pub use verify::{VerifiedToken, verify};

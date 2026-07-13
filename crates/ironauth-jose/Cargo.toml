@@ -2,7 +2,7 @@
 [package]
 name = "ironauth-jose"
 version = "0.1.0"
-description = "IronAuth hardened JOSE verification core: the single allowlist-driven JWS/JWT verify choke point, built directly on ring, that never trusts token headers for key or algorithm selection and structurally closes the 2025-2026 JOSE CVE wave"
+description = "IronAuth hardened JOSE verification and signing core: the single allowlist-driven JWS/JWT verify choke point plus the matching mint (EdDSA default, full asymmetric matrix, restricted client-secret HMAC, per-environment key store and JWKS), built directly on ring, that never trusts token headers for key or algorithm selection and structurally closes the 2025-2026 JOSE CVE wave"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
