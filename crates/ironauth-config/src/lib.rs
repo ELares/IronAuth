@@ -253,6 +253,15 @@ impl Default for AdminConfig {
 /// long-lived code). The safe defaults are far below this ceiling.
 pub const OIDC_MAX_LIFETIME_SECS: u64 = 86_400;
 
+/// The minimum permitted JWKS `Cache-Control: max-age` (issue #19), in seconds.
+/// A shorter window would make relying parties refetch the key set too often and
+/// undercut the pre-publish lead the rotation choreography depends on.
+pub const OIDC_JWKS_CACHE_MIN_SECS: u64 = 300;
+
+/// The maximum permitted JWKS `Cache-Control: max-age` (issue #19), in seconds. A
+/// longer window would keep a rotated-out key trusted in caches for too long.
+pub const OIDC_JWKS_CACHE_MAX_SECS: u64 = 900;
+
 /// OIDC provider settings (issue #12).
 ///
 /// The public authorization and token endpoints. Lifetimes are configurable (the
@@ -289,6 +298,16 @@ pub struct OidcConfig {
     /// (10) tolerates realistic retry and clock jitter without a false revoke; set
     /// it to 0 to treat every reuse as genuine. At most `OIDC_MAX_LIFETIME_SECS`.
     pub reuse_grace_secs: u64,
+
+    /// The `Cache-Control: max-age` (in seconds) advertised on every JWKS
+    /// response (issue #19). A relying party may cache the published keys for this
+    /// long, so it bounds how quickly a rotated-in key propagates and feeds the
+    /// pre-publish lead. Operational discipline requires it to stay between
+    /// `OIDC_JWKS_CACHE_MIN_SECS` (300) and `OIDC_JWKS_CACHE_MAX_SECS` (900); the
+    /// default (600) is the midpoint. This is a promotable per-environment setting
+    /// in spirit; the process value is the deployment default until per-environment
+    /// overrides ride the M5 promotion pipeline.
+    pub jwks_cache_max_age_secs: u64,
 }
 
 impl Default for OidcConfig {
@@ -298,6 +317,7 @@ impl Default for OidcConfig {
             authorization_code_ttl_secs: 60,
             access_token_ttl_secs: 300,
             reuse_grace_secs: 10,
+            jwks_cache_max_age_secs: 600,
         }
     }
 }
@@ -463,6 +483,16 @@ impl Config {
                 message: format!(
                     "oidc.reuse_grace_secs ({}) must not exceed {OIDC_MAX_LIFETIME_SECS} seconds",
                     self.oidc.reuse_grace_secs
+                ),
+            });
+        }
+        // The JWKS cache window must stay in the operational-discipline range.
+        let cache = self.oidc.jwks_cache_max_age_secs;
+        if !(OIDC_JWKS_CACHE_MIN_SECS..=OIDC_JWKS_CACHE_MAX_SECS).contains(&cache) {
+            return Err(ConfigError::Invalid {
+                message: format!(
+                    "oidc.jwks_cache_max_age_secs ({cache}) must be between \
+                     {OIDC_JWKS_CACHE_MIN_SECS} and {OIDC_JWKS_CACHE_MAX_SECS} seconds"
                 ),
             });
         }
@@ -661,12 +691,33 @@ mod tests {
 
     #[test]
     fn oidc_section_defaults_and_rejects_bad_lifetimes_and_unknown_keys() {
-        // Defaults: not mounted, 60s code, 300s access token, 10s reuse grace.
+        // Defaults: not mounted, 60s code, 300s access token, 10s reuse grace,
+        // 600s JWKS cache window.
         let config = Config::from_toml_str("", "<inline>").expect("valid").config;
         assert!(!config.oidc.enabled);
         assert_eq!(config.oidc.authorization_code_ttl_secs, 60);
         assert_eq!(config.oidc.access_token_ttl_secs, 300);
         assert_eq!(config.oidc.reuse_grace_secs, 10);
+        assert_eq!(config.oidc.jwks_cache_max_age_secs, 600);
+
+        // The JWKS cache window is bounded to 300..=900; outside is rejected.
+        for bad in [OIDC_JWKS_CACHE_MIN_SECS - 1, OIDC_JWKS_CACHE_MAX_SECS + 1] {
+            let input = format!("[oidc]\njwks_cache_max_age_secs = {bad}\n");
+            let err = Config::from_toml_str(&input, "ironauth.toml").expect_err("out of range");
+            assert!(err.to_string().contains("jwks_cache_max_age_secs"), "{err}");
+        }
+        // The boundary values are accepted.
+        for ok in [OIDC_JWKS_CACHE_MIN_SECS, OIDC_JWKS_CACHE_MAX_SECS] {
+            let input = format!("[oidc]\njwks_cache_max_age_secs = {ok}\n");
+            assert_eq!(
+                Config::from_toml_str(&input, "<inline>")
+                    .expect("boundary valid")
+                    .config
+                    .oidc
+                    .jwks_cache_max_age_secs,
+                ok
+            );
+        }
 
         // A configured, in-bounds override parses.
         let input = "[oidc]\nenabled = true\nauthorization_code_ttl_secs = 30\n";

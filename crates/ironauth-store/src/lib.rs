@@ -73,17 +73,18 @@ pub use id::{
     EnvironmentId, EnvironmentKind, GrantId, GrantKind, HumanId, HumanKind, IdParseError,
     IssuedTokenId, IssuedTokenKind, LevelId, LevelKind, ManagementKeyId, ManagementKeyKind,
     NotInScope, OperatorId, OperatorKind, OrganizationId, OrganizationKind, ScopedId, ScopedKind,
-    ServiceId, ServiceKind, TenantId, TenantKind,
+    ServiceId, ServiceKind, SigningKeyId, SigningKeyKind, TenantId, TenantKind,
 };
 pub use migrate::{Migration, MigrationError, MigrationReport, MigrationRunner, Phase};
 pub use repository::{
     ActingAuthorizationRepo, ActingClientRepo, ActingEnvironmentRepo,
-    ActingManagementCredentialRepo, ActingManagementStore, ActingStore, ActingTenantRepo,
-    AuditRecord, AuditRepo, AuthorizationRepo, ClientRecord, ClientRepo, CodeBindings,
-    CursorPosition, EnvironmentRecord, EnvironmentRepo, IdempotencyRepo, IdempotencyWrite,
-    IssueCode, IssuedTokenRecord, MANAGEMENT_LIST_HARD_CAP, ManagementCredentialRecord,
-    ManagementCredentialRepo, ManagementStore, RedeemOutcome, ScopedStore,
-    StoredIdempotentResponse, TenantRecord, TenantRepo, TokenKind, TokenStatus,
+    ActingManagementCredentialRepo, ActingManagementStore, ActingSigningKeyRepo, ActingStore,
+    ActingTenantRepo, AuditRecord, AuditRepo, AuthorizationRepo, ClientRecord, ClientRepo,
+    CodeBindings, CursorPosition, EnvironmentRecord, EnvironmentRepo, IdempotencyRepo,
+    IdempotencyWrite, IssueCode, IssuedTokenRecord, MANAGEMENT_LIST_HARD_CAP,
+    ManagementCredentialRecord, ManagementCredentialRepo, ManagementStore, NewSigningKey,
+    RedeemOutcome, ScopedStore, SigningKeyMaterial, SigningKeyMaterialKind, SigningKeyRecord,
+    SigningKeyRepo, StoredIdempotentResponse, TenantRecord, TenantRepo, TokenKind, TokenStatus,
 };
 pub use scope::Scope;
 pub use store::Store;

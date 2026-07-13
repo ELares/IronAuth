@@ -22,6 +22,8 @@ use ironauth_env::Env;
 use ironauth_jose::{EnvironmentKeyStore, SigningKey};
 use ironauth_store::{EnvironmentId, Scope, Store};
 
+use crate::subject::{PairwiseSalt, SubjectCache, SubjectConfig};
+
 /// Cheaply cloneable state shared by every OIDC handler.
 #[derive(Clone)]
 pub struct OidcState {
@@ -36,6 +38,13 @@ struct Inner {
     code_ttl: Duration,
     access_token_ttl: Duration,
     reuse_grace: Duration,
+    // The one shared subject-derivation cache. The surface that emits a `sub` (the
+    // ID token today, and `UserInfo`/introspection once they land) resolves it
+    // through this cache; because it is a single shared derivation, any two
+    // surfaces that call it agree, so a pairwise subject cannot diverge between
+    // them. The cache partitions by the per-environment salt, keeping environments
+    // isolated.
+    subjects: SubjectCache,
 }
 
 impl OidcState {
@@ -64,8 +73,49 @@ impl OidcState {
                 code_ttl: Duration::from_secs(config.authorization_code_ttl_secs),
                 access_token_ttl: Duration::from_secs(config.access_token_ttl_secs),
                 reuse_grace: Duration::from_secs(config.reuse_grace_secs),
+                subjects: SubjectCache::new(),
             }),
         }
+    }
+
+    /// The shared subject-derivation cache.
+    #[must_use]
+    pub fn subjects(&self) -> &SubjectCache {
+        &self.inner.subjects
+    }
+
+    /// Resolve an end user's `sub` for a client through the ONE shared derivation
+    /// function ([`crate::resolve_subject`]), memoized.
+    ///
+    /// This is the single call every token surface uses, so the ID token,
+    /// `UserInfo`, and future introspection responses cannot return a different
+    /// `sub` for the same client and user. `config` selects public or pairwise;
+    /// `salt` is the environment's pairwise salt (ignored for a public subject).
+    #[must_use]
+    pub fn resolve_subject(
+        &self,
+        config: &SubjectConfig,
+        local_subject: &str,
+        salt: &PairwiseSalt,
+    ) -> String {
+        self.inner.subjects.resolve(config, local_subject, salt)
+    }
+
+    /// Resolve a PUBLIC `sub` (the local account identifier) through the shared
+    /// derivation. The per-client pairwise configuration (subject type, sector
+    /// identifier, and the environment salt) is client-registration state that a
+    /// later issue persists; until then the data-plane token path resolves public
+    /// subjects, still routed through the one shared function so the wiring cannot
+    /// diverge when pairwise registration lands.
+    #[must_use]
+    pub fn resolve_public_subject(&self, local_subject: &str) -> String {
+        // A public subject never consults the salt, so an empty one is correct
+        // here; the value flows through the same shared derivation regardless.
+        self.resolve_subject(
+            &SubjectConfig::public(),
+            local_subject,
+            &PairwiseSalt::new(Vec::new()),
+        )
     }
 
     /// The data-plane store.

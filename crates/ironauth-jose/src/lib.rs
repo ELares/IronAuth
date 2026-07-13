@@ -129,8 +129,10 @@ mod keystore;
 mod mint;
 mod policy;
 mod redact;
+mod rotation;
 mod sign;
 mod signing_key;
+mod signing_policy;
 mod verify;
 
 pub mod seams;
@@ -142,12 +144,14 @@ pub use jwks::{Jwk, JwkSet};
 pub use keystore::EnvironmentKeyStore;
 pub use mint::{
     ClientSecret, ClientSecretContext, ClientSecretJws, EmissionOptions, MacAlgorithm, SignError,
-    sign_jws,
+    sign_jws, sign_jws_with_policy,
 };
 pub use policy::{
     JwsAlgorithm, KeyError, KeyFamily, PolicyError, TrustedKey, VerificationCaps,
     VerificationPolicy,
 };
 pub use redact::Redacted;
+pub use rotation::{KeySet, RotationError, RotationParams, includes_downgrade_key};
 pub use signing_key::{SigningKey, SigningKeyError};
+pub use signing_policy::{SigningPolicy, SigningPolicyError};
 pub use verify::{VerifiedToken, verify};

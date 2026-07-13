@@ -164,6 +164,18 @@ impl ScopedKind for IssuedTokenKind {
     const REDACT_DEBUG: bool = true;
 }
 
+/// Marker for a signing key (`sik_`), an environment's per-issuer signing key
+/// (issue #19). A tenant-scoped resource: the identifier embeds its
+/// `(tenant, environment)`, so a key row can never be read across a tenant or
+/// environment boundary, and the identifier itself doubles as the JOSE `kid`. A
+/// `kid` minted from a non-recyclable 128-bit random component is therefore
+/// unique across an issuer's whole key history by construction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SigningKeyKind;
+impl ScopedKind for SigningKeyKind {
+    const PREFIX: &'static str = "sik";
+}
+
 /// Marker for a human actor (an interactive user). One of the three actor kinds
 /// an audit envelope can name (see [`crate::audit::ActorRef`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -334,6 +346,9 @@ pub type GrantId = ScopedId<GrantKind>;
 /// An issued-token identifier (`tok_...`), the `jti` recorded against a grant
 /// (issue #12).
 pub type IssuedTokenId = ScopedId<IssuedTokenKind>;
+/// A signing-key identifier (`sik_...`), which doubles as the JOSE `kid` of a
+/// per-environment signing key (issue #19).
+pub type SigningKeyId = ScopedId<SigningKeyKind>;
 
 impl<K: ScopedKind> ScopedId<K> {
     /// Mint a fresh scoped identifier under `scope`, drawing the unique

@@ -65,9 +65,13 @@
 
 mod authorize;
 mod error;
+mod issuer;
+mod jwks;
 mod pkce;
 mod registry;
+mod sector;
 mod state;
+mod subject;
 mod token;
 mod tokens;
 mod util;
@@ -76,8 +80,16 @@ use axum::Router;
 use axum::routing::{get, post};
 
 pub use error::{AuthorizeError, AuthzErrorCode, TokenError};
+pub use issuer::{
+    IssuerEntry, IssuerError, IssuerRegistry, JwksCacheError, JwksCacheWindow, load_signing_key,
+};
+pub use jwks::{IssuerState, issuer_router};
 pub use registry::{GrantType, PkceMethod, ResponseType};
+pub use sector::{
+    SectorError, check_sector_document, sector_uri_required, validate_sector_identifier,
+};
 pub use state::OidcState;
+pub use subject::{PairwiseSalt, SubjectCache, SubjectConfig, SubjectType, resolve_subject};
 
 /// Build the OIDC provider router.
 ///

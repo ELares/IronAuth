@@ -866,6 +866,7 @@ dependencies = [
  "http-body-util",
  "ironauth-config",
  "ironauth-env",
+ "ironauth-fetch",
  "ironauth-jose",
  "ironauth-store",
  "metrics",
