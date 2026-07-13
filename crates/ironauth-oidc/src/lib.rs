@@ -71,6 +71,7 @@ mod authn;
 mod authorize;
 mod client_auth;
 mod consent;
+mod discovery;
 mod error;
 mod interaction;
 mod issuer;
@@ -89,6 +90,7 @@ mod token;
 mod token_hash;
 mod tokens;
 mod util;
+mod wellknown;
 
 use axum::Router;
 use axum::routing::{get, post};
@@ -98,13 +100,18 @@ pub use authn::{
     parse_methods,
 };
 pub use client_auth::{ClientAuthMethod, generate_secret, hash_secret};
+pub use discovery::{
+    ADVERTISED_ENDPOINTS, DiscoveryCapabilities, DiscoveryEndpoint, DiscoveryState,
+    ID_TOKEN_CLAIMS_SUPPORTED, SCOPES_SUPPORTED, discovery_document, discovery_router,
+    id_token_signing_alg_values,
+};
 pub use error::{AuthorizeError, AuthzErrorCode, TokenError};
 pub use issuer::{
     IssuerEntry, IssuerError, IssuerRegistry, JwksCacheError, JwksCacheWindow, load_signing_key,
 };
 pub use jwks::{IssuerState, issuer_router};
 pub use password::{PasswordError, hash_password, verify_password};
-pub use registry::{GrantType, PkceMethod, ResponseType};
+pub use registry::{GrantType, PkceMethod, PromptValue, ResponseMode, ResponseType};
 pub use sector::{
     SectorError, check_sector_document, sector_uri_required, validate_sector_identifier,
 };

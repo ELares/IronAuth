@@ -14,7 +14,10 @@ use ironauth_admin::AdminState;
 use ironauth_config::{Config, Loaded, OidcConfig};
 use ironauth_env::Env;
 use ironauth_jose::EnvironmentKeyStore;
-use ironauth_oidc::{OidcState, oidc_router};
+use ironauth_oidc::{
+    DiscoveryCapabilities, DiscoveryState, JwksCacheWindow, OidcState, discovery_router,
+    oidc_router,
+};
 use ironauth_server::Server;
 use ironauth_store::{EnvironmentId, Store};
 
@@ -198,6 +201,13 @@ async fn build_management_router(config: &Config, env: &Env) -> Option<Router> {
 /// endpoint fails closed with a `server_error`, which is the correct behavior for
 /// a provider with no signing key. The authorization endpoint and every binding,
 /// single-use, and revocation guarantee work regardless.
+///
+/// Discovery (issue #18) is mounted alongside the protocol router. It is generated
+/// entirely from live config, the per-environment issuer string, and the algorithm
+/// policy, so it needs NONE of the loaded signing keys and serves live now. The
+/// JWKS surface DOES need the loaded keys and stays unmounted until issue #194
+/// loads them (which is the only remaining discovery-adjacent work: `jwks_uri` is
+/// advertised, pointing at where #194 will serve the key set).
 async fn build_oidc_router(
     oidc_config: &OidcConfig,
     data_plane_dsn: &str,
@@ -218,12 +228,25 @@ async fn build_oidc_router(
     tracing::warn!(
         "OIDC provider mounted with NO signing keys provisioned. Per-environment key \
          provisioning is a later milestone; until an environment has a signing key, its token \
-         endpoint fails closed. The authorization endpoint and the single-use, binding, and \
-         revocation guarantees are unaffected."
+         endpoint fails closed. The authorization endpoint, discovery, and the single-use, \
+         binding, and revocation guarantees are unaffected."
     );
+
+    // The discovery surface (both well-known forms) is config-only: it needs the
+    // issuer string and the per-environment algorithm policy, never the loaded
+    // keys. Its cache discipline mirrors the JWKS window (the config value is
+    // validated into the 300..=900s range, so `clamped` is a no-op here).
+    let cache = JwksCacheWindow::clamped(oidc_config.jwks_cache_max_age_secs);
+    let capabilities = DiscoveryCapabilities::from_config(oidc_config);
+    let discovery = discovery_router(DiscoveryState::new(
+        issuer_base.clone(),
+        cache,
+        capabilities,
+    ));
+
     let state = OidcState::new(store, env, keys, oidc_config, issuer_base);
-    tracing::info!("OIDC provider mounted on the public plane");
-    Some(oidc_router(state))
+    tracing::info!("OIDC provider and discovery surface mounted on the public plane");
+    Some(oidc_router(state).merge(discovery))
 }
 
 /// Choose the control-plane database DSN for the management store (D2).

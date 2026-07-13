@@ -1,12 +1,14 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! The per-issuer JWKS and discovery HTTP surface (issue #19).
+//! The per-issuer JWKS HTTP surface (issue #19).
 //!
 //! Database-free: builds an [`ironauth_oidc::IssuerRegistry`] directly over
 //! in-memory key sets and drives the router. Covers acceptance criterion 2 (JWKS
 //! responses carry explicit `Cache-Control` and `ETag`; a conditional request
 //! returns `304`) and acceptance criterion 1 at the serving layer (two
-//! environments have provably disjoint issuers and key sets).
+//! environments have provably disjoint issuers and key sets). Discovery serving
+//! moved to its own surface in issue #18 (see `tests/discovery.rs`); this binary
+//! now exercises only the key set.
 
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -129,50 +131,6 @@ async fn jwks_response_carries_cache_control_and_etag_and_honors_if_none_match()
     // A non-matching If-None-Match is served fresh (200).
     let (status, _, _) = get(&router, &jwks_uri, Some("\"stale\"")).await;
     assert_eq!(status, StatusCode::OK);
-}
-
-#[tokio::test]
-async fn discovery_advertises_issuer_jwks_uri_and_subject_types() {
-    let env = Env::system();
-    let (registry, scope, _) = registry_with_one_environment(&env, "kid-1", 0x11);
-    let router = issuer_router(IssuerState::new(Arc::new(registry), env));
-    let uri = format!(
-        "/t/{}/e/{}/.well-known/openid-configuration",
-        scope.tenant(),
-        scope.environment()
-    );
-
-    let (status, headers, body) = get(&router, &uri, None).await;
-    assert_eq!(status, StatusCode::OK);
-    assert!(headers.get(header::CACHE_CONTROL).is_some());
-    assert!(headers.get(header::ETAG).is_some());
-
-    let doc: serde_json::Value = serde_json::from_str(&body).expect("json");
-    let expected_issuer = format!(
-        "{ISSUER_BASE}/t/{}/e/{}",
-        scope.tenant(),
-        scope.environment()
-    );
-    assert_eq!(doc["issuer"], serde_json::json!(expected_issuer));
-    assert_eq!(
-        doc["jwks_uri"],
-        serde_json::json!(format!("{expected_issuer}/jwks.json"))
-    );
-    let subject_types: Vec<&str> = doc["subject_types_supported"]
-        .as_array()
-        .expect("array")
-        .iter()
-        .filter_map(|v| v.as_str())
-        .collect();
-    assert!(subject_types.contains(&"public"));
-    assert!(subject_types.contains(&"pairwise"));
-    let algs: Vec<&str> = doc["id_token_signing_alg_values_supported"]
-        .as_array()
-        .expect("array")
-        .iter()
-        .filter_map(|v| v.as_str())
-        .collect();
-    assert_eq!(algs, vec!["EdDSA"]);
 }
 
 #[tokio::test]
