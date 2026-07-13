@@ -38,6 +38,7 @@ struct Inner {
     code_ttl: Duration,
     access_token_ttl: Duration,
     reuse_grace: Duration,
+    session_ttl: Duration,
     // The one shared subject-derivation cache. The surface that emits a `sub` (the
     // ID token today, and `UserInfo`/introspection once they land) resolves it
     // through this cache; because it is a single shared derivation, any two
@@ -73,6 +74,7 @@ impl OidcState {
                 code_ttl: Duration::from_secs(config.authorization_code_ttl_secs),
                 access_token_ttl: Duration::from_secs(config.access_token_ttl_secs),
                 reuse_grace: Duration::from_secs(config.reuse_grace_secs),
+                session_ttl: Duration::from_secs(config.session_ttl_secs),
                 subjects: SubjectCache::new(),
             }),
         }
@@ -148,6 +150,12 @@ impl OidcState {
     #[must_use]
     pub fn reuse_grace(&self) -> Duration {
         self.inner.reuse_grace
+    }
+
+    /// The configured bootstrap session lifetime (issue #20).
+    #[must_use]
+    pub fn session_ttl(&self) -> Duration {
+        self.inner.session_ttl
     }
 
     /// The current wall-clock time from the environment clock seam.

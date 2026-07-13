@@ -72,6 +72,21 @@ sqlx = { version = "0.8", default-features = false, features = [
     "postgres",
 ] }
 base64 = "0.22"
+# Argon2id password hashing for the bootstrap login/registration surface
+# (issue #20), at the OWASP default parameters. Pure Rust (RustCrypto), permissive
+# (MIT OR Apache-2.0), no C dependency, so the tree stays musl-static clean and
+# MSRV 1.85 holds. Salt bytes are drawn from the ironauth-env entropy seam (never
+# the crate's own RNG), so hashing stays deterministic under test and the
+# invariant lints are satisfied.
+argon2 = "0.5"
+# The two OAuth2/OIDC client-secret authentication methods interoperate with a
+# real third-party Rust OAuth 2.0 client (issue #20 acceptance): the oauth2 crate
+# drives both client_secret_basic and client_secret_post against the token
+# endpoint in a DB-backed test. default-features off drops its bundled reqwest
+# client (the test drives the in-process router directly), keeping the dev-graph
+# lean and free of any advisory-flagged transitive crate. MIT OR Apache-2.0,
+# builds under MSRV 1.85.
+oauth2 = { version = "5", default-features = false }
 # Direct crypto primitives for the hardened JOSE verifier (crates/ironauth-jose;
 # see docs/adr/0004-jose-verification.md). ring is ALREADY in the tree via
 # rustls; this adds a direct edge, not a new crate, so the graph, licenses

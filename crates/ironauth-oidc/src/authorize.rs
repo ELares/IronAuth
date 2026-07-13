@@ -9,27 +9,32 @@
 //! is an open redirector that would leak the code or the error. Only once both
 //! are known good does any error travel back by redirect.
 //!
-//! # Authentication seam
+//! # Login and consent interaction (issue #20)
 //!
-//! A real authorization endpoint issues a code only for an authenticated end user
-//! who has consented. The login/session and consent surfaces are separate M2
-//! issues; they are not dependencies of this one. So this endpoint models the
-//! authenticated subject with a pseudonymous value drawn from the entropy seam and
-//! records it (with generated session and consent handles) on the grant. When the
-//! login and consent surfaces land, they populate these instead. The code-grant
-//! MECHANICS (single use, binding, revocation) this issue owns do not depend on
-//! how the subject was established.
+//! A code is issued only for an authenticated end user who has consented. After
+//! the request is validated, the endpoint resolves the bootstrap session cookie:
+//!
+//! - No session: it redirects to the login page (or, for `prompt=create`, the
+//!   registration page), carrying a `return_to` that resumes this exact request.
+//! - A session but no recorded consent for this client: it redirects to the
+//!   consent screen, again with a resuming `return_to`.
+//! - A session and recorded consent: it issues the code bound to the real subject,
+//!   recording the session and consent handles on the grant.
+//!
+//! The single-use, binding, and revocation mechanics the code grant owns (issue
+//! #12) are unchanged; only how the subject and consent are established is real
+//! now instead of a seam.
 
 use axum::extract::{Form, Query, State};
+use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
-use base64::Engine;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use ironauth_store::{
     AuthorizationCodeId, ClientId, CorrelationId, GrantId, IssueCode, Scope, StoreError,
 };
 use serde::Deserialize;
 
 use crate::error::{AuthorizeError, AuthzErrorCode, redirect_response};
+use crate::interaction;
 use crate::registry::{PkceMethod, ResponseType};
 use crate::state::OidcState;
 use crate::util::{append_query, client_service_actor, epoch_micros, redirect_uri_is_valid};
@@ -55,28 +60,35 @@ pub struct AuthorizeParams {
     pub code_challenge: Option<String>,
     /// The PKCE `code_challenge_method` (must be `S256` when a challenge is set).
     pub code_challenge_method: Option<String>,
+    /// The OIDC `prompt`. Only `create` (route to registration) is acted on in the
+    /// bootstrap; the rest of the `prompt`/`max_age` semantics build on the session
+    /// the bootstrap establishes and are a later milestone.
+    pub prompt: Option<String>,
 }
 
 /// `GET /authorize`.
 pub async fn authorize_get(
     State(state): State<OidcState>,
+    headers: HeaderMap,
     Query(params): Query<AuthorizeParams>,
 ) -> Response {
-    handle(&state, params).await
+    handle(&state, &headers, params).await
 }
 
 /// `POST /authorize`.
 pub async fn authorize_post(
     State(state): State<OidcState>,
+    headers: HeaderMap,
     Form(params): Form<AuthorizeParams>,
 ) -> Response {
-    handle(&state, params).await
+    handle(&state, &headers, params).await
 }
 
-/// Run the authorization request, returning the success redirect or an
-/// [`AuthorizeError`] (which renders either an error page or an error redirect).
-async fn handle(state: &OidcState, params: AuthorizeParams) -> Response {
-    match issue_code(state, params).await {
+/// Run the authorization request, returning the success redirect, an interaction
+/// redirect (login/registration/consent), or an [`AuthorizeError`] (an error page
+/// or an error redirect).
+async fn handle(state: &OidcState, headers: &HeaderMap, params: AuthorizeParams) -> Response {
+    match issue_code(state, headers, params).await {
         Ok(response) => response,
         Err(error) => error.into_response(),
     }
@@ -84,6 +96,7 @@ async fn handle(state: &OidcState, params: AuthorizeParams) -> Response {
 
 async fn issue_code(
     state: &OidcState,
+    headers: &HeaderMap,
     params: AuthorizeParams,
 ) -> Result<Response, AuthorizeError> {
     // 1. client_id: present and well formed. A cli_ id declares its own scope, so
@@ -174,7 +187,22 @@ async fn issue_code(
         _ => (None, None),
     };
 
-    // 6. Establish the subject and persist the code + grant, then redirect.
+    // 6. Establish the authenticated subject and their consent. A missing session
+    //    or missing consent short-circuits to a LOCAL interaction redirect (never
+    //    the client's redirect_uri), carrying a return_to that resumes this exact
+    //    request.
+    let (session, consent_ref) =
+        match resolve_gate(state, headers, scope, &client_id, &params, redirect_uri).await? {
+            Gate::Interaction(response) => return Ok(response),
+            Gate::Ready {
+                session,
+                consent_ref,
+            } => (session, consent_ref),
+        };
+
+    // 7. Persist the code + grant bound to every re-checkable parameter and the
+    //    real subject/session/consent, then redirect with the code.
+    let session_ref = session.session_id.to_string();
     let resolved = Resolved {
         nonce: params.nonce.as_deref().filter(|value| !value.is_empty()),
         oauth_scope: params
@@ -185,8 +213,104 @@ async fn issue_code(
         code_challenge,
         code_challenge_method,
         state_echo,
+        subject: &session.subject,
+        session_ref: &session_ref,
+        consent_ref: &consent_ref,
     };
     finalize_issue(state, scope, &client_id, redirect_uri, &resolved).await
+}
+
+/// The outcome of resolving the login/consent gate: either an interaction is
+/// needed (a local redirect to login, registration, or consent) or the request
+/// is ready to issue a code for an authenticated, consenting subject.
+enum Gate {
+    /// A local interaction redirect (never the client's `redirect_uri`).
+    Interaction(Response),
+    /// An authenticated session with recorded consent for this client.
+    Ready {
+        /// The resolved session (its subject is recorded on the grant).
+        session: interaction::AuthenticatedSession,
+        /// The recorded consent handle (referenced by the grant).
+        consent_ref: String,
+    },
+}
+
+/// Resolve the login/consent gate for a validated request. Redirects an
+/// unauthenticated user to login (or registration for `prompt=create`), and an
+/// authenticated user without consent to the consent screen; otherwise reports the
+/// request ready. A consent-store failure is a `server_error` redirect (the
+/// `redirect_uri` is already validated).
+async fn resolve_gate(
+    state: &OidcState,
+    headers: &HeaderMap,
+    scope: Scope,
+    client_id: &ClientId,
+    params: &AuthorizeParams,
+    redirect_uri: &str,
+) -> Result<Gate, AuthorizeError> {
+    let cookie = interaction::cookie_header(headers);
+    let Some(session) = interaction::resolve_session(state, scope, cookie).await else {
+        let return_to = build_authorize_url(params);
+        // prompt=create routes an UNAUTHENTICATED user to registration; once a
+        // session exists it is ignored, so registration never loops.
+        let redirect = if params.prompt.as_deref().map(str::trim) == Some("create") {
+            interaction::register_redirect(&return_to)
+        } else {
+            interaction::login_redirect(&return_to)
+        };
+        return Ok(Gate::Interaction(redirect));
+    };
+
+    let client_id_str = client_id.to_string();
+    // Bootstrap limitation tracked in #196 (a hard prerequisite for enabling OIDC,
+    // #13): consent is looked up per (subject, client_id) only, so a prior consent
+    // for a narrow scope auto-grants any later broader scope. Before enablement this
+    // must re-prompt when the requested scope is not a subset of the granted scope.
+    match state
+        .store()
+        .scoped(scope)
+        .consents()
+        .granted_ref(&session.subject, &client_id_str)
+        .await
+    {
+        Ok(Some(consent_ref)) => Ok(Gate::Ready {
+            session,
+            consent_ref,
+        }),
+        Ok(None) => Ok(Gate::Interaction(interaction::consent_redirect(
+            &build_authorize_url(params),
+        ))),
+        Err(_) => Err(AuthorizeError::Redirect {
+            redirect_uri: redirect_uri.to_owned(),
+            error: AuthzErrorCode::ServerError,
+            description: "the authorization request could not be processed".to_owned(),
+            state: params.state.as_deref().map(str::to_owned),
+        }),
+    }
+}
+
+/// Reconstruct the canonical `/authorize?...` URL from the request parameters, so
+/// an interaction redirect can resume this exact request after login or consent.
+/// Built from the raw parameters (percent-encoding each) so the resumed request is
+/// byte-for-byte equivalent whether the original arrived as a GET or a POST.
+fn build_authorize_url(params: &AuthorizeParams) -> String {
+    append_query(
+        "/authorize",
+        &[
+            ("response_type", params.response_type.as_deref()),
+            ("client_id", params.client_id.as_deref()),
+            ("redirect_uri", params.redirect_uri.as_deref()),
+            ("scope", params.scope.as_deref()),
+            ("state", params.state.as_deref()),
+            ("nonce", params.nonce.as_deref()),
+            ("code_challenge", params.code_challenge.as_deref()),
+            (
+                "code_challenge_method",
+                params.code_challenge_method.as_deref(),
+            ),
+            ("prompt", params.prompt.as_deref()),
+        ],
+    )
 }
 
 /// The request fields that survive validation, borrowed for the finalize step.
@@ -196,6 +320,12 @@ struct Resolved<'a> {
     code_challenge: Option<&'a str>,
     code_challenge_method: Option<&'a str>,
     state_echo: Option<&'a str>,
+    /// The authenticated end-user subject (a `usr_` id string).
+    subject: &'a str,
+    /// The authenticating session handle recorded on the grant.
+    session_ref: &'a str,
+    /// The recorded consent handle recorded on the grant.
+    consent_ref: &'a str,
 }
 
 /// Mint the code and its grant bound to every re-checkable parameter (with a
@@ -209,12 +339,6 @@ async fn finalize_issue(
     redirect_uri: &str,
     resolved: &Resolved<'_>,
 ) -> Result<Response, AuthorizeError> {
-    // The authenticated subject (a seam; see the module docs) plus the session
-    // and consent handles the grant records.
-    let subject = pseudonymous(state, "sub");
-    let session_ref = pseudonymous(state, "ses");
-    let consent_ref = pseudonymous(state, "con");
-
     let now = state.now();
     let code_id = AuthorizationCodeId::generate(state.env(), &scope);
     let grant_id = GrantId::generate(state.env(), &scope);
@@ -228,10 +352,10 @@ async fn finalize_issue(
         nonce: resolved.nonce,
         code_challenge: resolved.code_challenge,
         code_challenge_method: resolved.code_challenge_method,
-        subject: &subject,
+        subject: resolved.subject,
         oauth_scope: resolved.oauth_scope,
-        session_ref: Some(&session_ref),
-        consent_ref: Some(&consent_ref),
+        session_ref: Some(resolved.session_ref),
+        consent_ref: Some(resolved.consent_ref),
         expires_at_micros: epoch_micros(expires_at),
         created_at_micros: epoch_micros(now),
     };
@@ -266,12 +390,4 @@ async fn finalize_issue(
         ],
     );
     Ok(redirect_response(&location))
-}
-
-/// A pseudonymous, opaque identifier drawn from the entropy seam, prefixed with
-/// `prefix` for legibility. Deterministic under a fixed test entropy source.
-fn pseudonymous(state: &OidcState, prefix: &str) -> String {
-    let mut bytes = [0_u8; 16];
-    state.env().entropy().fill_bytes(&mut bytes);
-    format!("{prefix}-{}", URL_SAFE_NO_PAD.encode(bytes))
 }

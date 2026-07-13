@@ -9,11 +9,18 @@
 //!    are unrepresentable) and recover the `(tenant, environment)` scope from the
 //!    code.
 //! 2. READ the code's bindings WITHOUT consuming it.
-//! 3. Re-check EVERY binding (`client_id`, `redirect_uri`, PKCE `code_challenge`)
-//!    against the presented request.
-//! 4. Mint (sign) the ID and access tokens.
-//! 5. Only now atomically REDEEM the code (the single-use gate), recording the
+//! 3. AUTHENTICATE the client (issue #20): parse the presented `client_secret_basic`
+//!    or `client_secret_post` credentials, resolve the client's registered method,
+//!    and verify the secret. A failure is the spec-exact `invalid_client`.
+//! 4. Re-check EVERY binding (`client_id`, `redirect_uri`, PKCE `code_challenge`)
+//!    against the presented request; the `client_id` binding is re-checked against
+//!    the AUTHENTICATED client.
+//! 5. Mint (sign) the ID and access tokens.
+//! 6. Only now atomically REDEEM the code (the single-use gate), recording the
 //!    issued tokens and the redeem audit in the same transaction as the consume.
+//!
+//! Client authentication and the binding re-checks both run BEFORE the consume, so
+//! a failed authentication or a wrong binding never burns the one-time code.
 //!
 //! # Why read-then-sign-then-consume
 //!
@@ -41,8 +48,10 @@
 //! observable active state of every token issued from the code), the reuse is
 //! audited, and the caller gets the same `invalid_grant`.
 
+use std::fmt;
+
 use axum::extract::{Form, State};
-use axum::http::{StatusCode, header};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use ironauth_store::{
     ActorRef, AuthorizationCodeId, ClientId, CodeBindings, CorrelationId, IssuedTokenRecord,
@@ -50,6 +59,7 @@ use ironauth_store::{
 };
 use serde::Deserialize;
 
+use crate::client_auth::{self, ClientAuthParseError, PresentedClientAuth};
 use crate::error::TokenError;
 use crate::pkce::verify_s256;
 use crate::registry::GrantType;
@@ -65,7 +75,11 @@ const CODE_REUSE_TOTAL: &str = "ironauth_oidc_code_reuse_total";
 const REDEEM_ERROR_TOTAL: &str = "ironauth_oidc_redeem_error_total";
 
 /// The token-request parameters (form-encoded).
-#[derive(Debug, Deserialize)]
+///
+/// [`fmt::Debug`] is hand written and redacting: `code` is a single-use bearer
+/// credential and `client_secret` is a client credential, so a struct dump or a
+/// `tracing` field never spills either.
+#[derive(Deserialize)]
 pub struct TokenParams {
     /// The OAuth `grant_type` (must be `authorization_code`).
     pub grant_type: Option<String>,
@@ -75,19 +89,41 @@ pub struct TokenParams {
     pub redirect_uri: Option<String>,
     /// The client identifier, re-checked against the code's binding.
     pub client_id: Option<String>,
+    /// The client secret for `client_secret_post` authentication (issue #20).
+    pub client_secret: Option<String>,
     /// The PKCE `code_verifier`, checked against the bound `code_challenge`.
     pub code_verifier: Option<String>,
 }
 
+impl fmt::Debug for TokenParams {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TokenParams")
+            .field("grant_type", &self.grant_type)
+            .field("redirect_uri", &self.redirect_uri)
+            .field("client_id", &self.client_id)
+            .field("has_client_secret", &self.client_secret.is_some())
+            .field("has_code", &self.code.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
 /// `POST /token`.
-pub async fn token(State(state): State<OidcState>, Form(params): Form<TokenParams>) -> Response {
-    match exchange(&state, params).await {
+pub async fn token(
+    State(state): State<OidcState>,
+    headers: HeaderMap,
+    Form(params): Form<TokenParams>,
+) -> Response {
+    match exchange(&state, &headers, params).await {
         Ok(response) => response,
         Err(error) => error.into_response(),
     }
 }
 
-async fn exchange(state: &OidcState, params: TokenParams) -> Result<Response, TokenError> {
+async fn exchange(
+    state: &OidcState,
+    headers: &HeaderMap,
+    params: TokenParams,
+) -> Result<Response, TokenError> {
     // 1. grant_type: present and exactly authorization_code. ROPC (`password`)
     //    and every other grant are unrepresentable, so they land here as an
     //    unsupported grant type with no handler to route to.
@@ -124,13 +160,27 @@ async fn exchange(state: &OidcState, params: TokenParams) -> Result<Response, To
         .map_err(map_store_error)?
         .ok_or(TokenError::InvalidGrant)?;
 
-    // 4. Re-check EVERY binding BEFORE the code is burned. A mismatch is a uniform
-    //    invalid_grant and leaves the one-time code live for the real client.
+    // 4. Authenticate the client (issue #20). The presented credentials (Basic
+    //    header or post body) identify the client and prove possession of its
+    //    secret under its registered method; a failure is the spec-exact
+    //    invalid_client. This runs BEFORE the code is burned, so a client-auth
+    //    failure never consumes the one-time code.
+    let authenticated_client = authenticate_client(state, scope, headers, &params).await?;
+
+    // 5. The authenticated client MUST be the one the code was issued to (the
+    //    Zitadel advisory class: a code for client A is not redeemable by client
+    //    B). A mismatch is a uniform invalid_grant, kept separate from the
+    //    invalid_client above so an unauthenticated caller cannot probe which
+    //    binding failed. The remaining bindings (redirect_uri, PKCE) are re-checked
+    //    the same way.
+    if authenticated_client.client_id != bindings.client_id {
+        return Err(TokenError::InvalidGrant);
+    }
     if !bindings_match(&bindings, &params) {
         return Err(TokenError::InvalidGrant);
     }
 
-    // 5. Mint (sign) the tokens BEFORE the consume, so a missing key or a signing
+    // 6. Mint (sign) the tokens BEFORE the consume, so a missing key or a signing
     //    failure fails closed without burning the code.
     let minted = mint_tokens(state, scope, &bindings)?;
     let records: Vec<IssuedTokenRecord> = minted
@@ -139,7 +189,7 @@ async fn exchange(state: &OidcState, params: TokenParams) -> Result<Response, To
         .map(|(id, kind)| IssuedTokenRecord { id, kind })
         .collect();
 
-    // 6. Atomically redeem: the single-use gate. On the winning call it records
+    // 7. Atomically redeem: the single-use gate. On the winning call it records
     //    the issued tokens and the redeem audit in the same transaction as the
     //    consume; a miss is classified as a benign grace retry, a genuine reuse
     //    (which revokes the chain), or an expired/absent code. Attribute the audit
@@ -184,15 +234,13 @@ async fn exchange(state: &OidcState, params: TokenParams) -> Result<Response, To
     }
 }
 
-/// Re-check every binding the code carries against the presented request. All
-/// mismatches collapse to a single boolean, so the caller returns the uniform
-/// `invalid_grant` without revealing which binding failed. This runs BEFORE the
-/// code is consumed, so a mismatch does not burn the one-time code.
+/// Re-check the `redirect_uri` and PKCE bindings the code carries against the
+/// presented request. All mismatches collapse to a single boolean, so the caller
+/// returns the uniform `invalid_grant` without revealing which binding failed. The
+/// `client_id` binding is re-checked separately against the AUTHENTICATED client
+/// (see the exchange). This runs BEFORE the code is consumed, so a mismatch does
+/// not burn the one-time code.
 fn bindings_match(bindings: &CodeBindings, params: &TokenParams) -> bool {
-    let client_ok = params
-        .client_id
-        .as_deref()
-        .is_some_and(|presented| presented == bindings.client_id);
     let redirect_ok = params
         .redirect_uri
         .as_deref()
@@ -204,7 +252,79 @@ fn bindings_match(bindings: &CodeBindings, params: &TokenParams) -> bool {
             .is_some_and(|verifier| verify_s256(verifier, challenge)),
         None => true,
     };
-    client_ok && redirect_ok && pkce_ok
+    redirect_ok && pkce_ok
+}
+
+/// Authenticate the client for a token request (issue #20): parse the presented
+/// credentials (Basic header or post body), resolve the client's registered
+/// authentication record within the code's scope, and verify the credentials
+/// against the registered method. Returns the authenticated credentials (whose
+/// `client_id` the caller re-checks against the code's binding).
+///
+/// # Errors
+///
+/// A parse problem (multiple methods, malformed Basic, missing/conflicting client
+/// id) is an `invalid_request`; an unknown client or a credential that does not
+/// satisfy the registered method is the spec-exact `invalid_client` (401, with
+/// `WWW-Authenticate: Basic` when the client attempted Basic).
+async fn authenticate_client(
+    state: &OidcState,
+    scope: Scope,
+    headers: &HeaderMap,
+    params: &TokenParams,
+) -> Result<PresentedClientAuth, TokenError> {
+    let authorization = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok());
+    let presented = client_auth::parse_presented(
+        authorization,
+        params.client_id.as_deref(),
+        params.client_secret.as_deref(),
+    )
+    .map_err(map_parse_error)?;
+    let via_basic = presented.method == client_auth::ClientAuthMethod::Basic;
+
+    // Resolve the client's registered auth record within the code's scope. A
+    // malformed or unknown client is the uniform invalid_client (never an
+    // existence oracle across scopes).
+    let client_id = ClientId::parse_in_scope(&presented.client_id, &scope)
+        .map_err(|_| TokenError::InvalidClient { via_basic })?;
+    let record = match state
+        .store()
+        .scoped(scope)
+        .clients()
+        .auth_record(&client_id)
+        .await
+    {
+        Ok(record) => record,
+        Err(StoreError::NotFound) => return Err(TokenError::InvalidClient { via_basic }),
+        Err(other) => return Err(map_store_error(other)),
+    };
+
+    client_auth::authenticate(&record, &presented).map_err(|failure| {
+        TokenError::InvalidClient {
+            via_basic: failure.via_basic,
+        }
+    })?;
+    Ok(presented)
+}
+
+/// Map a client-auth parse error to a token-endpoint error. A malformed Basic
+/// credential is an authentication failure (`invalid_client` via Basic); the rest
+/// are request problems (`invalid_request`), never revealing the client's secret.
+fn map_parse_error(error: ClientAuthParseError) -> TokenError {
+    match error {
+        ClientAuthParseError::MalformedBasic => TokenError::InvalidClient { via_basic: true },
+        ClientAuthParseError::MultipleMethods => {
+            TokenError::InvalidRequest("more than one client authentication method".to_owned())
+        }
+        ClientAuthParseError::MissingClientId => {
+            TokenError::InvalidRequest("client_id is required".to_owned())
+        }
+        ClientAuthParseError::ClientIdMismatch => {
+            TokenError::InvalidRequest("conflicting client_id".to_owned())
+        }
+    }
 }
 
 /// Mint the ID and access tokens through the signing core. A missing signing key

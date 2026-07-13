@@ -69,22 +69,25 @@ pub use audit::{ActingContext, Action, ActorRef};
 pub use error::StoreError;
 pub use id::{
     AgentId, AgentKind, AuditId, AuditKind, AuditTarget, AuthorizationCodeId,
-    AuthorizationCodeKind, COMPONENT_BYTES, ClientId, ClientKind, CorrelationId, CorrelationKind,
-    EnvironmentId, EnvironmentKind, GrantId, GrantKind, HumanId, HumanKind, IdParseError,
-    IssuedTokenId, IssuedTokenKind, LevelId, LevelKind, ManagementKeyId, ManagementKeyKind,
-    NotInScope, OperatorId, OperatorKind, OrganizationId, OrganizationKind, ScopedId, ScopedKind,
-    ServiceId, ServiceKind, SigningKeyId, SigningKeyKind, TenantId, TenantKind,
+    AuthorizationCodeKind, COMPONENT_BYTES, ClientId, ClientKind, ConsentId, ConsentKind,
+    CorrelationId, CorrelationKind, EnvironmentId, EnvironmentKind, GrantId, GrantKind, HumanId,
+    HumanKind, IdParseError, IssuedTokenId, IssuedTokenKind, LevelId, LevelKind, ManagementKeyId,
+    ManagementKeyKind, NotInScope, OperatorId, OperatorKind, OrganizationId, OrganizationKind,
+    ScopedId, ScopedKind, ServiceId, ServiceKind, SessionId, SessionKind, SigningKeyId,
+    SigningKeyKind, TenantId, TenantKind, UserId, UserKind,
 };
 pub use migrate::{Migration, MigrationError, MigrationReport, MigrationRunner, Phase};
 pub use repository::{
-    ActingAuthorizationRepo, ActingClientRepo, ActingEnvironmentRepo,
-    ActingManagementCredentialRepo, ActingManagementStore, ActingSigningKeyRepo, ActingStore,
-    ActingTenantRepo, AuditRecord, AuditRepo, AuthorizationRepo, ClientRecord, ClientRepo,
-    CodeBindings, CursorPosition, EnvironmentRecord, EnvironmentRepo, IdempotencyRepo,
-    IdempotencyWrite, IssueCode, IssuedTokenRecord, MANAGEMENT_LIST_HARD_CAP,
-    ManagementCredentialRecord, ManagementCredentialRepo, ManagementStore, NewSigningKey,
-    RedeemOutcome, ScopedStore, SigningKeyMaterial, SigningKeyMaterialKind, SigningKeyRecord,
+    ActingAuthorizationRepo, ActingClientRepo, ActingConsentRepo, ActingEnvironmentRepo,
+    ActingManagementCredentialRepo, ActingManagementStore, ActingSessionRepo, ActingSigningKeyRepo,
+    ActingStore, ActingTenantRepo, ActingUserRepo, AuditRecord, AuditRepo, AuthorizationRepo,
+    ClientAuthRecord, ClientRecord, ClientRepo, CodeBindings, ConsentRepo, CursorPosition,
+    EnvironmentRecord, EnvironmentRepo, IdempotencyRepo, IdempotencyWrite, IssueCode,
+    IssuedTokenRecord, MANAGEMENT_LIST_HARD_CAP, ManagementCredentialRecord,
+    ManagementCredentialRepo, ManagementStore, NewSigningKey, RedeemOutcome, ScopedStore,
+    SessionRecord, SessionRepo, SigningKeyMaterial, SigningKeyMaterialKind, SigningKeyRecord,
     SigningKeyRepo, StoredIdempotentResponse, TenantRecord, TenantRepo, TokenKind, TokenStatus,
+    UserRecord, UserRepo,
 };
 pub use scope::Scope;
 pub use store::Store;

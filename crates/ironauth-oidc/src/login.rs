@@ -1,0 +1,105 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
+//! The minimal hosted login page (`GET`/`POST /login`, issue #20).
+//!
+//! It renders an identifier and password form and, on submit, verifies the
+//! password against the stored Argon2id hash. On success it establishes a
+//! bootstrap session (the `__Host-` cookie) and sends the user back to the
+//! authorization request they came from (`return_to`). A failed attempt re-renders
+//! the form with a GENERIC error (never distinguishing a wrong password from an
+//! unknown account), and an unknown account still spends a full Argon2id
+//! verification so the endpoint is not a user-enumeration oracle.
+
+use axum::extract::{Form, Query, State};
+use axum::http::StatusCode;
+use axum::response::Response;
+use serde::Deserialize;
+
+use crate::interaction::{self, parse_resume};
+use crate::pages;
+use crate::password;
+use crate::state::OidcState;
+
+/// The `return_to` carried on the `GET /login` query.
+#[derive(Deserialize)]
+pub struct ResumeQuery {
+    /// The authorization URL to resume at after a successful sign-in.
+    pub return_to: Option<String>,
+}
+
+/// The posted login form.
+#[derive(Deserialize)]
+pub struct LoginForm {
+    /// The login handle.
+    pub identifier: Option<String>,
+    /// The password (never logged or echoed).
+    pub password: Option<String>,
+    /// The authorization URL to resume at.
+    pub return_to: Option<String>,
+}
+
+/// `GET /login`: render the sign-in form for a valid resume target.
+pub async fn login_get(Query(query): Query<ResumeQuery>) -> Response {
+    match parse_resume(query.return_to.as_deref()) {
+        Some(resume) => pages::secure_html(
+            StatusCode::OK,
+            pages::login_page("", &resume.return_to, None),
+        ),
+        None => interaction::invalid_link_page(),
+    }
+}
+
+/// `POST /login`: verify the password and, on success, establish a session and
+/// resume the authorization request.
+pub async fn login_post(State(state): State<OidcState>, Form(form): Form<LoginForm>) -> Response {
+    let Some(resume) = parse_resume(form.return_to.as_deref()) else {
+        return interaction::invalid_link_page();
+    };
+    let identifier = form
+        .identifier
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or_default();
+    let password = form.password.as_deref().unwrap_or_default();
+
+    let lookup = state
+        .store()
+        .scoped(resume.scope)
+        .users()
+        .by_identifier(identifier)
+        .await;
+
+    match lookup {
+        Ok(Some(user)) if password::verify_password(password, &user.password_hash) => {
+            let actor = interaction::user_actor(&user.id);
+            let subject = user.id.to_string();
+            match interaction::establish_session(&state, resume.scope, &subject, actor).await {
+                Ok(cookie) => interaction::redirect_setting_cookie(&resume.return_to, &cookie),
+                Err(_) => interaction::server_error_page(),
+            }
+        }
+        // Present but wrong password: generic failure (no wrong-password oracle).
+        Ok(Some(_)) => failed_login_page(identifier, &resume.return_to),
+        // Absent account: spend comparable Argon2id time, then the SAME generic
+        // failure (no user-enumeration oracle).
+        Ok(None) => {
+            let _ = password::verify_absent(password);
+            failed_login_page(identifier, &resume.return_to)
+        }
+        Err(_) => interaction::server_error_page(),
+    }
+}
+
+/// Re-render the login form with a generic failure message, prefilling the
+/// identifier. The message never distinguishes a wrong password from an unknown
+/// account.
+fn failed_login_page(identifier: &str, return_to: &str) -> Response {
+    pages::secure_html(
+        StatusCode::OK,
+        pages::login_page(
+            identifier,
+            return_to,
+            Some("Incorrect identifier or password."),
+        ),
+    )
+}

@@ -55,8 +55,8 @@ use sqlx::{Postgres, Row, Transaction};
 use crate::audit::{ActingContext, Action, ActorRef};
 use crate::error::StoreError;
 use crate::id::{
-    AuditId, AuditTarget, AuthorizationCodeId, ClientId, CorrelationId, EnvironmentId, GrantId,
-    IssuedTokenId, ManagementKeyId, OperatorId, SigningKeyId, TenantId,
+    AuditId, AuditTarget, AuthorizationCodeId, ClientId, ConsentId, CorrelationId, EnvironmentId,
+    GrantId, IssuedTokenId, ManagementKeyId, OperatorId, SessionId, SigningKeyId, TenantId, UserId,
 };
 use crate::scope::Scope;
 use crate::store::Store;
@@ -102,6 +102,39 @@ impl<'a> ScopedStore<'a> {
     #[must_use]
     pub fn authorization(&self) -> AuthorizationRepo<'a> {
         AuthorizationRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
+    /// The read-only bootstrap user repository for this scope (issue #20).
+    /// Authenticates a login handle against its stored Argon2id hash; the
+    /// mutating registration lives on [`ActingStore::users`].
+    #[must_use]
+    pub fn users(&self) -> UserRepo<'a> {
+        UserRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
+    /// The read-only bootstrap session repository for this scope (issue #20).
+    /// Resolves a session cookie to its subject; the mutating create lives on
+    /// [`ActingStore::sessions`].
+    #[must_use]
+    pub fn sessions(&self) -> SessionRepo<'a> {
+        SessionRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
+    /// The read-only consent repository for this scope (issue #20). Reads whether
+    /// a subject has consented to a client; the mutating grant lives on
+    /// [`ActingStore::consents`].
+    #[must_use]
+    pub fn consents(&self) -> ConsentRepo<'a> {
+        ConsentRepo {
             store: self.store,
             scope: self.scope,
         }
@@ -164,6 +197,40 @@ impl<'a> ActingStore<'a> {
         }
     }
 
+    /// The mutating bootstrap user repository for this scope and actor (issue
+    /// #20): register a user with an Argon2id password hash, audited.
+    #[must_use]
+    pub fn users(&self) -> ActingUserRepo<'a> {
+        ActingUserRepo {
+            store: self.store,
+            scope: self.scope,
+            acting: self.acting,
+        }
+    }
+
+    /// The mutating bootstrap session repository for this scope and actor (issue
+    /// #20): create a session at login or registration, audited.
+    #[must_use]
+    pub fn sessions(&self) -> ActingSessionRepo<'a> {
+        ActingSessionRepo {
+            store: self.store,
+            scope: self.scope,
+            acting: self.acting,
+        }
+    }
+
+    /// The mutating consent repository for this scope and actor (issue #20):
+    /// record a subject's consent to a client, audited (idempotent per
+    /// (subject, client)).
+    #[must_use]
+    pub fn consents(&self) -> ActingConsentRepo<'a> {
+        ActingConsentRepo {
+            store: self.store,
+            scope: self.scope,
+            acting: self.acting,
+        }
+    }
+
     /// The mutating signing-key repository for this scope and actor (issue #19).
     /// Provisions a day-one key or a manually rotated-in successor; every
     /// provision writes its audit row in the same transaction.
@@ -184,6 +251,35 @@ pub struct ClientRecord {
     pub id: ClientId,
     /// The human-facing display name.
     pub display_name: String,
+}
+
+/// The client-authentication metadata for a client, read within scope (issue
+/// #20). The token endpoint uses it to enforce the client's registered
+/// authentication method and verify a presented secret against the stored hash.
+///
+/// [`fmt::Debug`] is hand written: the `secret_hash` is a stored credential
+/// hash, so a struct dump or a `tracing` field never spills it (its presence is
+/// reported as a bool instead).
+#[derive(Clone, PartialEq, Eq)]
+pub struct ClientAuthRecord {
+    /// The client's display name (shown on the consent screen).
+    pub display_name: String,
+    /// The registered `token_endpoint_auth_method` wire string
+    /// (`client_secret_basic`, `client_secret_post`, or `none`).
+    pub auth_method: String,
+    /// The SHA-256 hex hash of the client's secret, or `None` for a public
+    /// (method `none`) client that has no secret.
+    pub secret_hash: Option<String>,
+}
+
+impl fmt::Debug for ClientAuthRecord {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ClientAuthRecord")
+            .field("display_name", &self.display_name)
+            .field("auth_method", &self.auth_method)
+            .field("has_secret", &self.secret_hash.is_some())
+            .finish()
+    }
 }
 
 /// The read-only repository for tenant-scoped OAuth clients.
@@ -258,6 +354,40 @@ impl ClientRepo<'_> {
         rows.iter().map(|row| self.row_to_record(row)).collect()
     }
 
+    /// Read a client's authentication metadata within scope (issue #20): its
+    /// display name, its registered `token_endpoint_auth_method`, and the stored
+    /// SHA-256 hash of its secret (or `None` for a public client). The token
+    /// endpoint uses this to enforce the registered method and verify a presented
+    /// secret. A client absent in this scope is the uniform
+    /// [`StoreError::NotFound`].
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if no such client is visible in this scope;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn auth_record(&self, id: &ClientId) -> Result<ClientAuthRecord, StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT display_name, token_endpoint_auth_method, secret_hash FROM clients \
+             WHERE id = $1 AND tenant_id = $2 AND environment_id = $3",
+        )
+        .bind(id.to_string())
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        let row = row.ok_or(StoreError::NotFound)?;
+        Ok(ClientAuthRecord {
+            display_name: row.get("display_name"),
+            auth_method: row.get("token_endpoint_auth_method"),
+            secret_hash: row.get("secret_hash"),
+        })
+    }
+
     /// Turn a row into a [`ClientRecord`], reconstructing the typed identifier.
     fn row_to_record(&self, row: &PgRow) -> Result<ClientRecord, StoreError> {
         let id_text: String = row.get("id");
@@ -286,13 +416,67 @@ pub struct ActingClientRepo<'a> {
 
 impl ActingClientRepo<'_> {
     /// Create a client in this scope and return its fresh identifier. Writes a
-    /// `client.create` audit row in the same transaction.
+    /// `client.create` audit row in the same transaction. The client is PUBLIC
+    /// (its `token_endpoint_auth_method` defaults to `none`, no secret): a
+    /// confidential client is created with [`create_confidential`](Self::create_confidential).
     ///
     /// # Errors
     ///
     /// [`StoreError::Database`] on a persistence failure.
     pub async fn create(&self, env: &Env, display_name: &str) -> Result<ClientId, StoreError> {
         self.create_inner(env, display_name, false).await
+    }
+
+    /// Create a CONFIDENTIAL client that authenticates at the token endpoint with
+    /// a secret (issue #20). `auth_method` is the wire string
+    /// (`client_secret_basic` or `client_secret_post`) and `secret_hash` is the
+    /// SHA-256 hex of the generated secret; the plaintext secret is shown once at
+    /// creation by the caller and never reaches the database. Writes a
+    /// `client.create` audit row in the same transaction, returning the fresh
+    /// identifier.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn create_confidential(
+        &self,
+        env: &Env,
+        display_name: &str,
+        auth_method: &str,
+        secret_hash: &str,
+    ) -> Result<ClientId, StoreError> {
+        let id = ClientId::generate(env, &self.scope);
+        let scope = self.scope;
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::ClientCreate,
+                target: &id,
+            },
+            async move |tx| {
+                sqlx::query(
+                    "INSERT INTO clients \
+                     (id, tenant_id, environment_id, display_name, \
+                      token_endpoint_auth_method, secret_hash) \
+                     VALUES ($1, $2, $3, $4, $5, $6)",
+                )
+                .bind(id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(display_name)
+                .bind(auth_method)
+                .bind(secret_hash)
+                .execute(&mut **tx)
+                .await?;
+                Ok(())
+            },
+            false,
+        )
+        .await?;
+        Ok(id)
     }
 
     /// Delete a client by identifier, within scope. Writes a `client.delete`
@@ -1325,6 +1509,374 @@ fn bindings_from_row(row: &PgRow, scope: &Scope) -> Result<CodeBindings, StoreEr
         subject: row.get("subject"),
         oauth_scope: row.get("oauth_scope"),
     })
+}
+
+// ===========================================================================
+// Bootstrap login, consent, and session (issue #20).
+//
+// The tenant-scoped persistence behind the minimal in-process login,
+// registration, and consent surfaces: the bootstrap user directory (identifier +
+// Argon2id hash), the minimal server-side sessions, and the recorded consent
+// decisions. Everything below routes through the SAME scope filter and (for
+// writes) the SAME audited-write primitive as the rest of the data plane, so the
+// login/consent surface is isolated by construction like every other one.
+// ===========================================================================
+
+/// A bootstrap user read back within scope (issue #20): the account the login
+/// surface authenticates.
+///
+/// [`fmt::Debug`] is hand written and redacting: the `password_hash` is a
+/// one-way verifier but still sensitive, so a struct dump or a `tracing` field
+/// never spills it.
+#[derive(Clone, PartialEq, Eq)]
+pub struct UserRecord {
+    /// The user identifier (embeds its tenant and environment). Its string is the
+    /// stable pseudonymous subject the bootstrap mints tokens for.
+    pub id: UserId,
+    /// The login handle the user typed.
+    pub identifier: String,
+    /// The Argon2id PHC verifier string. One-way; never the plaintext password.
+    pub password_hash: String,
+}
+
+impl fmt::Debug for UserRecord {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("UserRecord")
+            .field("id", &self.id)
+            .field("identifier", &self.identifier)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The read-only bootstrap user repository (issue #20).
+pub struct UserRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl UserRepo<'_> {
+    /// Look up a user by login handle within scope. Returns [`None`] when no user
+    /// with that handle exists in this scope; the caller (the login surface) then
+    /// verifies the password against the returned Argon2id hash, and verifies
+    /// against a dummy hash when this is [`None`] so a present and an absent
+    /// account take indistinguishable time (user-enumeration hardening).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn by_identifier(&self, identifier: &str) -> Result<Option<UserRecord>, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT id, identifier, password_hash FROM users \
+             WHERE identifier = $1 AND tenant_id = $2 AND environment_id = $3",
+        )
+        .bind(identifier)
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        match row {
+            None => Ok(None),
+            Some(row) => {
+                let id_text: String = row.get("id");
+                let id = UserId::parse_in_scope(&id_text, &self.scope)?;
+                Ok(Some(UserRecord {
+                    id,
+                    identifier: row.get("identifier"),
+                    password_hash: row.get("password_hash"),
+                }))
+            }
+        }
+    }
+}
+
+/// The mutating bootstrap user repository (issue #20).
+pub struct ActingUserRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+    acting: ActingContext,
+}
+
+impl ActingUserRepo<'_> {
+    /// Register a bootstrap user with a precomputed Argon2id `password_hash`, and
+    /// return the fresh identifier. Writes a `user.register` audit row in the same
+    /// transaction. The hash is computed by the caller (the registration surface)
+    /// through the entropy seam; the plaintext password never reaches the store.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Conflict`] if the login handle is already registered in this
+    /// scope; [`StoreError::Database`] on a persistence failure.
+    pub async fn register(
+        &self,
+        env: &Env,
+        identifier: &str,
+        password_hash: &str,
+    ) -> Result<UserId, StoreError> {
+        let id = UserId::generate(env, &self.scope);
+        let scope = self.scope;
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::UserRegister,
+                target: &id,
+            },
+            async move |tx| {
+                let result = sqlx::query(
+                    "INSERT INTO users \
+                     (id, tenant_id, environment_id, identifier, password_hash) \
+                     VALUES ($1, $2, $3, $4, $5)",
+                )
+                .bind(id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(identifier)
+                .bind(password_hash)
+                .execute(&mut **tx)
+                .await;
+                match result {
+                    Ok(_) => Ok(()),
+                    // A duplicate login handle is a caller-facing conflict (the
+                    // handle is taken), not a persistence fault. Erroring here
+                    // rolls the audited write back, so a rejected registration
+                    // leaves neither a user row nor an audit row.
+                    Err(error) if is_unique_violation(&error) => Err(StoreError::Conflict),
+                    Err(error) => Err(error.into()),
+                }
+            },
+            false,
+        )
+        .await?;
+        Ok(id)
+    }
+}
+
+/// A bootstrap session read back within scope (issue #20).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionRecord {
+    /// The authenticated end-user subject the tokens are minted for.
+    pub subject: String,
+    /// When the subject authenticated, in microseconds since the Unix epoch (the
+    /// seam `auth_time`/`max_age` build on).
+    pub auth_time_unix_micros: i64,
+}
+
+/// The read-only bootstrap session repository (issue #20).
+pub struct SessionRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl SessionRepo<'_> {
+    /// Resolve a session by id within scope, returning [`None`] when it is absent,
+    /// out of scope, or expired at `now_micros`. Expiry is compared against the
+    /// application clock seam (bound as epoch microseconds), never the database
+    /// clock, so it is deterministic under a manual clock in tests.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn get(
+        &self,
+        id: &SessionId,
+        now_micros: i64,
+    ) -> Result<Option<SessionRecord>, StoreError> {
+        if id.scope() != self.scope {
+            return Ok(None);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT subject, \
+             (EXTRACT(EPOCH FROM auth_time) * 1000000)::bigint AS auth_us \
+             FROM sessions \
+             WHERE id = $1 AND tenant_id = $2 AND environment_id = $3 \
+             AND expires_at > TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval",
+        )
+        .bind(id.to_string())
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(now_micros)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(row.map(|row| SessionRecord {
+            subject: row.get("subject"),
+            auth_time_unix_micros: row.get("auth_us"),
+        }))
+    }
+}
+
+/// The mutating bootstrap session repository (issue #20).
+pub struct ActingSessionRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+    acting: ActingContext,
+}
+
+impl ActingSessionRepo<'_> {
+    /// Create a session for `subject`, with `auth_time` and `expires_at` from the
+    /// application clock seam (bound as epoch microseconds). Writes a
+    /// `session.create` audit row in the same transaction.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the session id is out of this scope;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn create(
+        &self,
+        env: &Env,
+        id: &SessionId,
+        subject: &str,
+        auth_time_micros: i64,
+        expires_at_micros: i64,
+    ) -> Result<(), StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::SessionCreate,
+                target: id,
+            },
+            async move |tx| {
+                sqlx::query(
+                    "INSERT INTO sessions \
+                     (id, tenant_id, environment_id, subject, auth_time, expires_at) \
+                     VALUES ($1, $2, $3, $4, \
+                             TIMESTAMPTZ 'epoch' + ($5::text || ' microseconds')::interval, \
+                             TIMESTAMPTZ 'epoch' + ($6::text || ' microseconds')::interval)",
+                )
+                .bind(id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(subject)
+                .bind(auth_time_micros)
+                .bind(expires_at_micros)
+                .execute(&mut **tx)
+                .await?;
+                Ok(())
+            },
+            false,
+        )
+        .await
+    }
+}
+
+/// The read-only consent repository (issue #20).
+pub struct ConsentRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl ConsentRepo<'_> {
+    /// The recorded consent id for `subject` and `client_id` in this scope, or
+    /// [`None`] when the subject has not consented to the client. The bootstrap
+    /// records consent per (subject, client), so a granted decision skips the
+    /// consent prompt on a later authorization for the same client, and the
+    /// returned `con_` id is what the grant references through its consent seam.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn granted_ref(
+        &self,
+        subject: &str,
+        client_id: &str,
+    ) -> Result<Option<String>, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT id FROM consents \
+             WHERE subject = $1 AND client_id = $2 \
+             AND tenant_id = $3 AND environment_id = $4",
+        )
+        .bind(subject)
+        .bind(client_id)
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(row.map(|row| row.get::<String, _>("id")))
+    }
+}
+
+/// The mutating consent repository (issue #20).
+pub struct ActingConsentRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+    acting: ActingContext,
+}
+
+impl ActingConsentRepo<'_> {
+    /// Record `subject`'s consent to `client_id` (idempotent per (subject,
+    /// client)), and return the fresh consent id so the grant can reference it.
+    /// Writes a `consent.grant` audit row in the same transaction. A repeat grant
+    /// for an already-consented (subject, client) inserts no second row (ON
+    /// CONFLICT DO NOTHING) but still returns a fresh id and audits the decision.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn grant(
+        &self,
+        env: &Env,
+        subject: &str,
+        client_id: &str,
+        granted_scope: Option<&str>,
+    ) -> Result<ConsentId, StoreError> {
+        let id = ConsentId::generate(env, &self.scope);
+        let scope = self.scope;
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::ConsentGrant,
+                target: &id,
+            },
+            async move |tx| {
+                sqlx::query(
+                    "INSERT INTO consents \
+                     (id, tenant_id, environment_id, subject, client_id, granted_scope) \
+                     VALUES ($1, $2, $3, $4, $5, $6) \
+                     ON CONFLICT (tenant_id, environment_id, subject, client_id) DO NOTHING",
+                )
+                .bind(id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(subject)
+                .bind(client_id)
+                .bind(granted_scope)
+                .execute(&mut **tx)
+                .await?;
+                Ok(())
+            },
+            false,
+        )
+        .await?;
+        Ok(id)
+    }
+}
+
+/// Whether a database error is a Postgres unique-violation (SQLSTATE 23505).
+/// Used to turn a duplicate bootstrap login handle into the caller-facing
+/// [`StoreError::Conflict`] rather than an opaque database fault.
+fn is_unique_violation(error: &sqlx::Error) -> bool {
+    error
+        .as_database_error()
+        .and_then(sqlx::error::DatabaseError::code)
+        .as_deref()
+        == Some("23505")
 }
 
 /// A record read back from the `audit_log` table, always within scope. The full

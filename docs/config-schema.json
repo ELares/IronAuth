@@ -149,6 +149,13 @@
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
+        },
+        "session_ttl_secs": {
+          "default": 3600,
+          "description": "Bootstrap session lifetime in seconds (issue #20). The opaque `__Host-`\nsession cookie established at login or registration is valid for this long;\na request presenting an expired session re-authenticates. The default\n(3600) is a conservative one hour. Must be at least 1 and at most\n`OIDC_MAX_SESSION_TTL_SECS`. The real two-tier session model (M4) replaces\nthis bootstrap session.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
         }
       },
       "type": "object"
@@ -302,7 +309,8 @@
         "authorization_code_ttl_secs": 60,
         "enabled": false,
         "jwks_cache_max_age_secs": 600,
-        "reuse_grace_secs": 10
+        "reuse_grace_secs": 10,
+        "session_ttl_secs": 3600
       },
       "description": "OIDC provider settings (issue #12)."
     },

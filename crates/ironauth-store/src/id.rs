@@ -164,6 +164,42 @@ impl ScopedKind for IssuedTokenKind {
     const REDACT_DEBUG: bool = true;
 }
 
+/// Marker for a bootstrap end user (`usr_`), the account the login and
+/// registration surfaces authenticate (issue #20). A tenant-scoped resource: the
+/// user id embeds its `(tenant, environment)`, and its string is the stable
+/// pseudonymous subject the tokens are minted for in the bootstrap slice. Not a
+/// bearer secret (the password is the secret, stored only as a one-way hash), so
+/// its debug form stays legible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct UserKind;
+impl ScopedKind for UserKind {
+    const PREFIX: &'static str = "usr";
+}
+
+/// Marker for a bootstrap session (`ses_`), the minimal server-side session the
+/// opaque `__Host-` cookie names (issue #20). A tenant-scoped resource: the
+/// session id embeds its `(tenant, environment)` in the clear, so the
+/// authorization endpoint recovers the scope from the presented cookie without a
+/// database lookup, and a session established in one scope parses as a uniform
+/// not-found under another.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SessionKind;
+impl ScopedKind for SessionKind {
+    const PREFIX: &'static str = "ses";
+    // The session id IS the opaque bearer cookie value; never render it in a
+    // debug or log line.
+    const REDACT_DEBUG: bool = true;
+}
+
+/// Marker for a recorded consent decision (`con_`), the row that means a subject
+/// authorized a client (issue #20). Tenant scoped like every other resource; the
+/// grant's `consent_ref` seam references it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ConsentKind;
+impl ScopedKind for ConsentKind {
+    const PREFIX: &'static str = "con";
+}
+
 /// Marker for a signing key (`sik_`), an environment's per-issuer signing key
 /// (issue #19). A tenant-scoped resource: the identifier embeds its
 /// `(tenant, environment)`, so a key row can never be read across a tenant or
@@ -346,6 +382,15 @@ pub type GrantId = ScopedId<GrantKind>;
 /// An issued-token identifier (`tok_...`), the `jti` recorded against a grant
 /// (issue #12).
 pub type IssuedTokenId = ScopedId<IssuedTokenKind>;
+/// A bootstrap end-user identifier (`usr_...`), the account the login and
+/// registration surfaces authenticate (issue #20).
+pub type UserId = ScopedId<UserKind>;
+/// A bootstrap session identifier (`ses_...`), the opaque `__Host-` cookie value
+/// (issue #20).
+pub type SessionId = ScopedId<SessionKind>;
+/// A recorded-consent identifier (`con_...`), the decision row a grant references
+/// (issue #20).
+pub type ConsentId = ScopedId<ConsentKind>;
 /// A signing-key identifier (`sik_...`), which doubles as the JOSE `kid` of a
 /// per-environment signing key (issue #19).
 pub type SigningKeyId = ScopedId<SigningKeyKind>;

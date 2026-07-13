@@ -21,9 +21,9 @@ use ironauth_env::{Env, ManualClock};
 use ironauth_jose::{
     EnvironmentKeyStore, JwsAlgorithm, SigningKey, TrustedKey, VerificationPolicy,
 };
-use ironauth_oidc::{OidcState, oidc_router};
+use ironauth_oidc::{ClientAuthMethod, OidcState, SESSION_COOKIE, oidc_router};
 use ironauth_store::test_support::TestDatabase;
-use ironauth_store::{ClientId, CorrelationId, Scope, Store};
+use ironauth_store::{ClientId, CorrelationId, Scope, SessionId, Store};
 use tower::ServiceExt;
 
 /// The RFC 7636 Appendix B PKCE verifier and its S256 challenge.
@@ -34,6 +34,11 @@ pub const PKCE_CHALLENGE: &str = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
 pub const REDIRECT_URI: &str = "https://client.test/cb";
 /// The issuer base the harness configures.
 pub const ISSUER_BASE: &str = "https://issuer.test";
+/// A far-future expiry (year 2100) in epoch microseconds, so a seeded session
+/// survives the clock advances the expiry and reuse tests perform.
+pub const FAR_FUTURE_MICROS: i64 = 4_102_444_800_000_000;
+/// The password the seeded harness users are created with.
+pub const SEED_PASSWORD: &str = "correct horse battery staple";
 
 /// A running OIDC provider over a fresh database.
 pub struct Harness {
@@ -178,13 +183,202 @@ impl Harness {
 
     /// `POST /token` with a pre-built form body (already encoded).
     pub async fn token(&self, form: &str) -> (StatusCode, HeaderMap, String) {
-        let request = Request::builder()
+        self.token_with_auth(form, None).await
+    }
+
+    /// `POST /token` with an optional `Authorization` header (for
+    /// `client_secret_basic`).
+    pub async fn token_with_auth(
+        &self,
+        form: &str,
+        authorization: Option<&str>,
+    ) -> (StatusCode, HeaderMap, String) {
+        let mut builder = Request::builder()
             .method("POST")
             .uri("/token")
-            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded");
+        if let Some(value) = authorization {
+            builder = builder.header(header::AUTHORIZATION, value);
+        }
+        let request = builder
             .body(Body::from(form.to_owned()))
             .expect("request builds");
         self.send(request).await
+    }
+
+    /// `GET /authorize` with a session cookie, so a request from an authenticated,
+    /// consenting subject proceeds straight to issuing the code.
+    pub async fn authorize_with_cookie(
+        &self,
+        query: &str,
+        cookie: &str,
+    ) -> (StatusCode, HeaderMap, String) {
+        let request = Request::builder()
+            .method("GET")
+            .uri(format!("/authorize?{query}"))
+            .header(header::COOKIE, cookie)
+            .body(Body::empty())
+            .expect("request builds");
+        self.send(request).await
+    }
+
+    /// `GET` any path with a session cookie (used to follow the interaction
+    /// redirects in the end-to-end test).
+    pub async fn get_with_cookie(
+        &self,
+        path: &str,
+        cookie: Option<&str>,
+    ) -> (StatusCode, HeaderMap, String) {
+        let mut builder = Request::builder().method("GET").uri(path);
+        if let Some(cookie) = cookie {
+            builder = builder.header(header::COOKIE, cookie);
+        }
+        self.send(builder.body(Body::empty()).expect("request builds"))
+            .await
+    }
+
+    /// `POST` a form to `path` with an optional session cookie (used to submit the
+    /// login, registration, and consent forms in the end-to-end test).
+    pub async fn post_form(
+        &self,
+        path: &str,
+        form: &str,
+        cookie: Option<&str>,
+    ) -> (StatusCode, HeaderMap, String) {
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri(path)
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded");
+        if let Some(cookie) = cookie {
+            builder = builder.header(header::COOKIE, cookie);
+        }
+        self.send(
+            builder
+                .body(Body::from(form.to_owned()))
+                .expect("request builds"),
+        )
+        .await
+    }
+
+    /// A throwaway acting context for direct store seeding.
+    fn seeding_actor(&self) -> (ironauth_store::ActorRef, CorrelationId) {
+        (
+            self.db.test_actor(&self.env),
+            CorrelationId::generate(&self.env),
+        )
+    }
+
+    /// Register a bootstrap user in the harness scope and return its subject (the
+    /// `usr_` id string).
+    pub async fn seed_user(&self, identifier: &str, password: &str) -> String {
+        let hash = ironauth_oidc::hash_password(&self.env, password).expect("hash password");
+        let (actor, corr) = self.seeding_actor();
+        self.store()
+            .scoped(self.scope)
+            .acting(actor, corr)
+            .users()
+            .register(&self.env, identifier, &hash)
+            .await
+            .expect("register user")
+            .to_string()
+    }
+
+    /// Seed a fresh user with a unique identifier (drawn from the deterministic
+    /// entropy stream, which advances per call) and return its subject.
+    pub async fn seed_unique_user(&self) -> String {
+        use std::fmt::Write as _;
+        let mut suffix = [0_u8; 8];
+        self.env.entropy().fill_bytes(&mut suffix);
+        let id = suffix.iter().fold(String::new(), |mut acc, byte| {
+            let _ = write!(acc, "{byte:02x}");
+            acc
+        });
+        self.seed_user(&format!("user-{id}@example.test"), SEED_PASSWORD)
+            .await
+    }
+
+    /// Record `subject`'s consent to `client_id` in the harness scope.
+    pub async fn grant_consent(&self, subject: &str, client_id: &str) {
+        let (actor, corr) = self.seeding_actor();
+        self.store()
+            .scoped(self.scope)
+            .acting(actor, corr)
+            .consents()
+            .grant(&self.env, subject, client_id, None)
+            .await
+            .expect("grant consent");
+    }
+
+    /// Create a session for `subject` and return the `Cookie` header value. The
+    /// session is far-future so it survives the clock advances in the expiry and
+    /// reuse tests.
+    pub async fn session_cookie(&self, subject: &str) -> String {
+        let session_id = SessionId::generate(&self.env, &self.scope);
+        let (actor, corr) = self.seeding_actor();
+        self.store()
+            .scoped(self.scope)
+            .acting(actor, corr)
+            .sessions()
+            .create(&self.env, &session_id, subject, 0, FAR_FUTURE_MICROS)
+            .await
+            .expect("create session");
+        format!("{SESSION_COOKIE}={session_id}")
+    }
+
+    /// A ready authenticated `Cookie` value for the harness client: seeds a fresh
+    /// user, records consent to the harness client, and returns the cookie. Each
+    /// call is independent (a distinct user), so it can be used per code issuance.
+    pub async fn authenticated_cookie(&self) -> String {
+        let subject = self.seed_unique_user().await;
+        self.grant_consent(&subject, &self.client_id.to_string())
+            .await;
+        self.session_cookie(&subject).await
+    }
+
+    /// Issue an `authorization_code` bound to `client_id` for a fresh consenting
+    /// subject (no PKCE, so the exchange only has to satisfy client
+    /// authentication and the `redirect_uri` binding), returning the raw code.
+    /// Used by the interop test to drive a mainstream OAuth client through the
+    /// token exchange.
+    pub async fn issue_authenticated_code(&self, client_id: &str) -> String {
+        let subject = self.seed_unique_user().await;
+        self.grant_consent(&subject, client_id).await;
+        let cookie = self.session_cookie(&subject).await;
+        let query = format!(
+            "response_type=code&client_id={client_id}&redirect_uri={}",
+            enc(REDIRECT_URI)
+        );
+        let (status, headers, body) = self.authorize_with_cookie(&query, &cookie).await;
+        assert_eq!(status, StatusCode::FOUND, "authorize: {body}");
+        location_param(&headers, "code").expect("code in redirect")
+    }
+
+    /// Create a CONFIDENTIAL client registered for `method`, returning its id and
+    /// the plaintext secret (shown once).
+    pub async fn create_confidential_client(&self, method: ClientAuthMethod) -> (ClientId, String) {
+        self.create_confidential_client_named(method, "confidential client")
+            .await
+    }
+
+    /// Like [`Harness::create_confidential_client`] but with an explicit display
+    /// name (used to prove the consent screen escapes a hostile client name).
+    pub async fn create_confidential_client_named(
+        &self,
+        method: ClientAuthMethod,
+        display_name: &str,
+    ) -> (ClientId, String) {
+        let secret = ironauth_oidc::generate_secret(&self.env);
+        let secret_hash = ironauth_oidc::hash_secret(&secret);
+        let (actor, corr) = self.seeding_actor();
+        let id = self
+            .store()
+            .scoped(self.scope)
+            .acting(actor, corr)
+            .clients()
+            .create_confidential(&self.env, display_name, method.as_str(), &secret_hash)
+            .await
+            .expect("create confidential client");
+        (id, secret)
     }
 }
 
@@ -279,4 +473,49 @@ pub fn percent_decode(value: &str) -> String {
 #[must_use]
 pub fn json(body: &str) -> serde_json::Value {
     serde_json::from_str(body).expect("response body is JSON")
+}
+
+/// The `Location` header value (a path or URL), if present.
+#[must_use]
+pub fn location(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(header::LOCATION)?
+        .to_str()
+        .ok()
+        .map(str::to_owned)
+}
+
+/// The `name=value` pair from a `Set-Cookie` header (dropping the attributes),
+/// ready to be echoed back as a `Cookie` header value.
+#[must_use]
+pub fn set_cookie_pair(headers: &HeaderMap) -> Option<String> {
+    let value = headers.get(header::SET_COOKIE)?.to_str().ok()?;
+    Some(value.split(';').next()?.trim().to_owned())
+}
+
+/// Extract the value of a form input by `name` from a rendered HTML page. Used by
+/// the end-to-end test to genuinely round-trip the hidden `return_to` field
+/// through the login/registration/consent forms rather than shortcutting it.
+#[must_use]
+pub fn form_field(html: &str, name: &str) -> Option<String> {
+    let needle = format!("name=\"{name}\"");
+    let start = html.find(&needle)?;
+    let value_marker = "value=\"";
+    let after = &html[start..];
+    let value_start = after.find(value_marker)? + value_marker.len();
+    let value = &after[value_start..];
+    let end = value.find('"')?;
+    Some(html_unescape(&value[..end]))
+}
+
+/// Reverse the small set of HTML entities the page escaper emits, so a value read
+/// back out of a rendered form matches what was put in.
+#[must_use]
+pub fn html_unescape(value: &str) -> String {
+    value
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#x27;", "'")
+        .replace("&amp;", "&")
 }

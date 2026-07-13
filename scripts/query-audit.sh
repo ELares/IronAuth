@@ -39,9 +39,13 @@ cd "$(git rev-parse --show-toplevel)"
 # authorization-code grant tables: all three are TENANT-SCOPED with forced
 # row-level security, so their SQL stays in the repository module too.
 #
+# users, sessions, and consents (#20) are the bootstrap login/consent/session
+# tables: all three are TENANT-SCOPED with forced row-level security, so their SQL
+# stays in the repository module too.
+#
 # signing_keys (#19) is the per-environment signing-key table: TENANT-SCOPED with
 # forced row-level security, so its SQL stays in the repository module too.
-SCOPED_TABLES='clients|organizations|audit_log|management_credentials|idempotency_keys|grants|authorization_codes|issued_tokens|signing_keys'
+SCOPED_TABLES='clients|organizations|audit_log|management_credentials|idempotency_keys|grants|authorization_codes|issued_tokens|signing_keys|users|sessions|consents'
 
 # The one module allowed to name a scoped table in SQL.
 REPO_MODULE='crates/ironauth-store/src/repository.rs'
