@@ -103,6 +103,53 @@ async fn same_key_different_request_is_unprocessable() {
 }
 
 #[tokio::test]
+async fn a_management_key_replay_never_repeats_or_stores_the_secret() {
+    let harness = Harness::start(50).await;
+    let (tenant, env) = harness.create_tenant("Acme", "mk-tenant").await;
+    let path = format!("/v1/tenants/{tenant}/environments/{env}/keys");
+    let body = serde_json::json!({ "display_name": "ci-terraform" }).to_string();
+
+    // First creation: 201 WITH the secret present exactly once.
+    let (status, _, first) = harness.post(&path, "mk-1", &body).await;
+    assert_eq!(status, StatusCode::CREATED, "{first}");
+    let first_value: Value = serde_json::from_str(&first).expect("json");
+    let secret = first_value["secret"]
+        .as_str()
+        .expect("the secret is present on the first creation")
+        .to_owned();
+    assert!(!secret.is_empty(), "the secret is a real token");
+    assert_eq!(
+        first_value["secret_already_issued"],
+        Value::Bool(false),
+        "first creation is not a replay"
+    );
+
+    // Replay: same key, same body. Returns 200 with the NO-SECRET view.
+    let (status, _, replay) = harness.post(&path, "mk-1", &body).await;
+    assert_eq!(status, StatusCode::OK, "a key replay is 200: {replay}");
+    let replay_value: Value = serde_json::from_str(&replay).expect("json");
+    assert!(
+        replay_value.get("secret").is_none(),
+        "the replay omits the secret: {replay}"
+    );
+    assert_eq!(
+        replay_value["secret_already_issued"],
+        Value::Bool(true),
+        "the replay marks the secret already issued"
+    );
+    assert_eq!(
+        replay_value["id"], first_value["id"],
+        "the replay names the same key id"
+    );
+    // The stored idempotency body IS what a replay returns verbatim, so the
+    // absence of the secret here proves the secret never touched the database.
+    assert!(
+        !replay.contains(&secret),
+        "the one-time secret must never appear in the stored replay body"
+    );
+}
+
+#[tokio::test]
 async fn post_without_idempotency_key_is_a_bad_request() {
     let harness = Harness::start(50).await;
     let request = axum::http::Request::builder()

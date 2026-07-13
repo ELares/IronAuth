@@ -11,19 +11,26 @@
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use ironauth_store::CursorPosition;
+use ironauth_store::{CursorPosition, MANAGEMENT_LIST_HARD_CAP};
 use serde::Deserialize;
 use utoipa::IntoParams;
 
 use crate::error::ApiError;
 
 /// The query parameters common to every list endpoint.
+///
+/// `limit` is deserialized as a raw string and parsed in [`Pagination::resolve`]
+/// (not as a typed `u32`) so a malformed value (`?limit=abc`, `?limit=-1`)
+/// surfaces as our structured [`ApiError::BadRequest`] JSON body rather than
+/// axum's plain-text query rejection. The OpenAPI schema still documents it as an
+/// integer via `#[param(value_type = Option<u32>)]`.
 #[derive(Debug, Clone, Default, Deserialize, IntoParams)]
 #[into_params(parameter_in = Query)]
 pub struct ListQuery {
-    /// The desired page size. Clamped to `[1, max_page_size]`; defaults to the
-    /// configured default when absent.
-    pub limit: Option<u32>,
+    /// The desired page size, a positive integer. Clamped to
+    /// `[1, max_page_size]`; defaults to the configured default when absent.
+    #[param(value_type = Option<u32>)]
+    pub limit: Option<String>,
     /// The opaque cursor from a previous page's `next_cursor`. Absent for the
     /// first page (keyset pagination; there is no offset).
     pub cursor: Option<String>,
@@ -42,17 +49,32 @@ pub struct Pagination {
 impl Pagination {
     /// Resolve query parameters against the configured default and cap.
     ///
+    /// The caller-facing page size is `min(requested_or_default, max, hard_cap)`:
+    /// the configured `default`/`max` bound it, and the store's
+    /// [`MANAGEMENT_LIST_HARD_CAP`] is a final ceiling (config load already
+    /// rejects a `max` above the cap; clamping here is defense in depth).
+    ///
     /// # Errors
     ///
-    /// [`ApiError::BadRequest`] if `limit` is zero or the cursor is malformed.
+    /// [`ApiError::BadRequest`] if `limit` is not a positive integer or the
+    /// cursor is malformed.
     pub fn resolve(query: &ListQuery, default: u32, max: u32) -> Result<Self, ApiError> {
-        let page_size = match query.limit {
-            None => default,
+        let requested = match &query.limit {
+            None => None,
+            Some(raw) => Some(raw.parse::<u32>().map_err(|_| {
+                ApiError::BadRequest("limit must be a positive integer".to_owned())
+            })?),
+        };
+        let page_size = match requested {
+            // Clamp the default to the max too (the config doc promises this).
+            None => default.min(max),
             Some(0) => {
                 return Err(ApiError::BadRequest("limit must be at least 1".to_owned()));
             }
-            Some(requested) => requested.min(max),
+            Some(value) => value.min(max),
         };
+        let hard_cap = u32::try_from(MANAGEMENT_LIST_HARD_CAP).unwrap_or(u32::MAX);
+        let page_size = page_size.min(hard_cap);
         let after = match &query.cursor {
             None => None,
             Some(raw) => Some(decode_cursor(raw)?),
@@ -145,17 +167,16 @@ mod tests {
         }
     }
 
+    fn query(limit: Option<&str>, cursor: Option<&str>) -> ListQuery {
+        ListQuery {
+            limit: limit.map(str::to_owned),
+            cursor: cursor.map(str::to_owned),
+        }
+    }
+
     #[test]
     fn resolve_clamps_and_defaults() {
-        let capped = Pagination::resolve(
-            &ListQuery {
-                limit: Some(10_000),
-                cursor: None,
-            },
-            50,
-            200,
-        )
-        .expect("valid");
+        let capped = Pagination::resolve(&query(Some("10000"), None), 50, 200).expect("valid");
         assert_eq!(capped.page_size, 200);
         assert_eq!(capped.fetch_limit(), 201);
 
@@ -163,16 +184,51 @@ mod tests {
         assert_eq!(defaulted.page_size, 50);
 
         assert!(matches!(
-            Pagination::resolve(
-                &ListQuery {
-                    limit: Some(0),
-                    cursor: None
-                },
-                50,
-                200
-            ),
+            Pagination::resolve(&query(Some("0"), None), 50, 200),
             Err(ApiError::BadRequest(_))
         ));
+    }
+
+    #[test]
+    fn a_default_above_the_max_is_clamped_to_the_max() {
+        // The config doc promises default_page_size is clamped to max_page_size;
+        // the None arm must honor that even if a caller passes an unclamped pair.
+        let resolved = Pagination::resolve(&ListQuery::default(), 500, 100).expect("valid");
+        assert_eq!(resolved.page_size, 100, "default clamped down to the max");
+    }
+
+    #[test]
+    fn a_malformed_limit_is_a_bad_request_not_a_plain_text_400() {
+        for raw in ["abc", "-1", "", "3.5", "99999999999999999999"] {
+            assert!(
+                matches!(
+                    Pagination::resolve(&query(Some(raw), None), 50, 200),
+                    Err(ApiError::BadRequest(_))
+                ),
+                "limit={raw:?} must be a structured bad request"
+            );
+        }
+    }
+
+    #[test]
+    fn the_page_size_never_exceeds_the_hard_cap() {
+        let hard_cap = u32::try_from(MANAGEMENT_LIST_HARD_CAP).unwrap();
+        // Even with an (out-of-policy) max above the cap, the returned page is
+        // bounded by the hard cap so the store's sentinel row is never dropped.
+        let resolved = Pagination::resolve(&query(Some("100000"), None), hard_cap, hard_cap + 5000)
+            .expect("valid");
+        assert_eq!(resolved.page_size, usize::try_from(hard_cap).expect("fits"));
+    }
+
+    #[test]
+    fn the_config_and_store_hard_caps_agree() {
+        // The store applies its own hard cap to every list fetch; config load
+        // validates max_page_size against its mirror of the same value. They must
+        // stay equal or config could permit a page the store then truncates.
+        assert_eq!(
+            i64::from(ironauth_config::MANAGEMENT_LIST_HARD_CAP),
+            MANAGEMENT_LIST_HARD_CAP
+        );
     }
 
     #[test]

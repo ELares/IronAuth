@@ -802,6 +802,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "sqlx",
  "tokio",
  "tower 0.5.3",
  "tracing",

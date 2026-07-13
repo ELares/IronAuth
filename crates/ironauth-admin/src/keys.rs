@@ -32,6 +32,7 @@ use crate::views::{
 };
 
 /// Bytes of secret entropy in a management-key token, beyond the public id.
+/// 32 bytes is 256 bits, matching the migration's `management_credentials` note.
 const SECRET_BYTES: usize = 32;
 
 /// Mint a fresh secret token for a management key, from the entropy seam.
@@ -75,7 +76,8 @@ fn scope_from_path(
     ),
     security(("bearer" = [])),
     responses(
-        (status = 201, description = "Created; the secret is shown once", body = ManagementKeyCreated),
+        (status = 201, description = "Created; the secret is present on this response ONCE", body = ManagementKeyCreated),
+        (status = 200, description = "Idempotent replay; the secret is omitted and secret_already_issued is true", body = ManagementKeyCreated),
         (status = 400, description = "Malformed request", body = ErrorBody),
         (status = 401, description = "Missing or invalid credential", body = ErrorBody),
         (status = 403, description = "Wrong plane or scope", body = ErrorBody),
@@ -93,23 +95,28 @@ pub async fn create_key(
 ) -> Result<Response, ApiError> {
     let actor = principal.require_operator()?;
     let (tenant, scope) = scope_from_path(&state, &tenant_id, &environment_id)?;
-    // The environment must exist; a clean 404 rather than a foreign-key error.
+
+    let key = idempotency::required_key(&headers)?;
+    let fingerprint = idempotency::fingerprint("POST", uri.path(), &body);
+    let credential_ref = principal.credential_ref();
+
+    // Replay BEFORE the parent-existence precondition, so a genuine replay
+    // returns the original (no-secret) response even if the environment was
+    // soft-deleted meanwhile.
+    if let Some(replay) =
+        idempotency::replay_if_stored(&state, &credential_ref, &key, &fingerprint).await?
+    {
+        return Ok(replay);
+    }
+
+    // The environment must exist and be live; a clean 404 rather than a
+    // foreign-key error (a soft-deleted environment reads as absent).
     state
         .store()
         .management()
         .environments(tenant)
         .get(&scope.environment())
         .await?;
-
-    let key = idempotency::required_key(&headers)?;
-    let fingerprint = idempotency::fingerprint("POST", uri.path(), &body);
-    let credential_ref = principal.credential_ref();
-
-    if let Some(replay) =
-        idempotency::replay_if_stored(&state, &credential_ref, &key, &fingerprint).await?
-    {
-        return Ok(replay);
-    }
 
     let request: CreateManagementKeyRequest = parse_json(&body)?;
     let display_name = require_non_empty(&request.display_name, "display_name")?;
@@ -119,21 +126,37 @@ pub async fn create_key(
     let secret = generate_secret(state.env());
     let token = format!("{id}.{secret}");
     let key_hash = crate::hash::sha256_hex(token.as_bytes());
+    let created_at_unix_ms = created_at_micros / 1000;
 
+    // The response returned ONCE, WITH the secret (HTTP 201).
     let created = ManagementKeyCreated {
         id: id.to_string(),
         display_name: display_name.clone(),
-        secret: token,
-        created_at_unix_ms: created_at_micros / 1000,
+        secret: Some(token),
+        secret_already_issued: false,
+        created_at_unix_ms,
     };
-    let body_string = serde_json::to_string(&created).map_err(|_| ApiError::Internal)?;
+    let created_body = serde_json::to_string(&created).map_err(|_| ApiError::Internal)?;
+
+    // The body STORED for idempotent replay carries NO secret (the secret must
+    // never touch the database) and replays as HTTP 200 with
+    // secret_already_issued = true. The `secret` field is never serialized into
+    // this stored row. Follow-up #186 tracks a TTL/reaper for idempotency rows.
+    let stored = ManagementKeyCreated {
+        id: id.to_string(),
+        display_name: display_name.clone(),
+        secret: None,
+        secret_already_issued: true,
+        created_at_unix_ms,
+    };
+    let stored_body = serde_json::to_string(&stored).map_err(|_| ApiError::Internal)?;
 
     let write = IdempotencyWrite {
         credential_ref: &credential_ref,
         key: &key,
         request_fingerprint: &fingerprint,
-        response_status: 201,
-        response_body: &body_string,
+        response_status: 200,
+        response_body: &stored_body,
     };
     let result = state
         .store()
@@ -151,7 +174,7 @@ pub async fn create_key(
         .await;
 
     match result {
-        Ok(()) => Ok(json(StatusCode::CREATED, body_string)),
+        Ok(()) => Ok(json(StatusCode::CREATED, created_body)),
         Err(StoreError::IdempotencyConflict) => {
             idempotency::replay_after_conflict(&state, &credential_ref, &key, &fingerprint).await
         }

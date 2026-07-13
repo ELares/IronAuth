@@ -5,8 +5,18 @@
 //! committed artifact matches the generated one (the drift check at test level,
 //! complementing scripts/openapi-check.sh).
 
-use ironauth_admin::{management_openapi, openapi_json};
+use std::collections::BTreeSet;
+
+use axum::Router;
+use axum::body::Body;
+use axum::http::{Request, StatusCode};
+use ironauth_admin::{AdminState, management_openapi, management_router, openapi_json};
+use ironauth_config::{AdminConfig, Secret, SecretString};
+use ironauth_env::Env;
+use ironauth_store::Store;
 use serde_json::Value;
+use sqlx::postgres::PgPoolOptions;
+use tower::ServiceExt;
 
 /// The committed artifact, embedded at compile time.
 const COMMITTED: &str = include_str!("../../../docs/openapi/management.json");
@@ -148,6 +158,121 @@ fn committed_artifact_matches_generated_spec() {
         COMMITTED,
         "docs/openapi/management.json is stale; run scripts/openapi-check.sh"
     );
+}
+
+/// The served routes match the documented routes, checked DB-FREE by driving
+/// requests through `management_router` itself (not just inspecting the spec).
+///
+/// A shared declarative route table (the ideal, so router and spec derive from
+/// one source) is impractical with axum's typed per-path handlers, so this uses
+/// the sanctioned fallback: for each documented `(method, path)` an unauthenticated
+/// probe with placeholder path params must reject at the `Principal` extractor
+/// with 401 (BEFORE any `Path` extraction or store access, which is why it stays
+/// database-free over a lazy, never-connected pool), and the count of served
+/// `(method, path)` pairs over the documented paths must equal the documented
+/// count.
+///
+/// Guarantees: every documented route is actually wired and auth-gated, and no
+/// documented path serves an undocumented method (that would be a served 401,
+/// bumping the count). NOT caught here: a brand-new served path outside the
+/// documented set (axum does not expose its route table to enumerate), and the
+/// deliberately-served-and-undocumented `GET /openapi.json`. Those are guarded by
+/// `documented_paths_are_the_expected_set`, `scripts/openapi-check.sh` (spec
+/// drift), and the fact that a new route needs a `#[utoipa::path]` to appear in
+/// the spec at all.
+#[tokio::test]
+async fn served_routes_match_documented_routes() {
+    let router = db_free_router();
+    let documented = documented_method_paths();
+    assert_eq!(documented.len(), 12, "the documented route count is pinned");
+
+    // 1. Every documented (method, path) is wired and auth-gated (401, not
+    //    404/405). The unauthenticated probe rejects before any DB access.
+    for (method, path) in &documented {
+        let status = probe(&router, method, &concrete_path(path)).await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "{method} {path} must be served and auth-gated (got {status})"
+        );
+    }
+
+    // 2. No documented path serves an extra method: probe every documented path
+    //    with every real method and count the ones that are served (not 404/405).
+    let paths: BTreeSet<&String> = documented.iter().map(|(_, path)| path).collect();
+    let mut served = 0_usize;
+    for path in &paths {
+        for method in ["GET", "POST", "PUT", "PATCH", "DELETE"] {
+            let status = probe(&router, method, &concrete_path(path)).await;
+            if status != StatusCode::NOT_FOUND && status != StatusCode::METHOD_NOT_ALLOWED {
+                served += 1;
+            }
+        }
+    }
+    assert_eq!(
+        served,
+        documented.len(),
+        "served (method, path) pairs over the documented paths must equal the documented count"
+    );
+}
+
+/// Build the management router over a LAZY pool: the URL is parsed but no
+/// connection is ever opened, and every probe below rejects at the extractor
+/// before touching the store, so the test is database-free.
+fn db_free_router() -> Router {
+    let pool = PgPoolOptions::new()
+        .connect_lazy("postgres://ironauth@localhost/ironauth")
+        .expect("lazy pool parses the URL");
+    let config = AdminConfig {
+        bootstrap_operator_token: Some(Secret::Literal(SecretString::new("t"))),
+        ..AdminConfig::default()
+    };
+    let state =
+        AdminState::new(Store::from_pool(pool), Env::system(), &config).expect("state builds");
+    management_router(state)
+}
+
+/// Every documented `(METHOD, path)` pair from the spec.
+fn documented_method_paths() -> Vec<(String, String)> {
+    let doc = spec();
+    let mut out = Vec::new();
+    for (path, methods) in doc["paths"].as_object().expect("paths") {
+        for method in methods.as_object().expect("methods").keys() {
+            out.push((method.to_uppercase(), path.clone()));
+        }
+    }
+    out
+}
+
+/// Substitute each `{param}` path segment with a concrete placeholder so the
+/// router matches (the value is irrelevant: auth rejects before `Path` parsing).
+fn concrete_path(path: &str) -> String {
+    path.split('/')
+        .map(|segment| {
+            if segment.starts_with('{') {
+                "x"
+            } else {
+                segment
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// Drive one unauthenticated request through a clone of the router and return its
+/// status. The router is `Clone`; oneshot consumes it, so each probe clones.
+async fn probe(router: &Router, method: &str, path: &str) -> StatusCode {
+    let request = Request::builder()
+        .method(method)
+        .uri(path)
+        .body(Body::empty())
+        .expect("request builds");
+    router
+        .clone()
+        .oneshot(request)
+        .await
+        .expect("router is infallible")
+        .status()
 }
 
 /// Find an operation object by its operationId across all paths and methods.

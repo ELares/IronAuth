@@ -38,6 +38,7 @@ impl Harness {
             bootstrap_operator_token: Some(Secret::Literal(SecretString::new(OPERATOR_TOKEN))),
             max_page_size: 200,
             default_page_size,
+            ..AdminConfig::default()
         };
         let state = AdminState::new(db.control_store().clone(), Env::system(), &config)
             .expect("admin state builds");

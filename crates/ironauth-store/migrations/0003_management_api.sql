@@ -77,8 +77,10 @@ ALTER TABLE environments ADD COLUMN deleted_at timestamptz;
 --
 -- The presented credential is `<mak_id>.<secret>`: the mak_ id embeds its
 -- (tenant, environment) in the clear (it is a scoped identifier, safe to log),
--- and the secret is 128 bits of entropy. Only the SHA-256 of the whole token is
--- stored (key_hash); the secret itself never touches the database. Because the
+-- and the secret is 256 bits of entropy (32 random bytes, URL-safe base64). Only
+-- the SHA-256 of the whole token is stored (key_hash); the secret itself never
+-- touches the database (the create path serializes a no-secret view into the
+-- idempotency replay row, so a replay repeats no secret either). Because the
 -- scope is recoverable from the id half of a presented token, the auth path can
 -- bind the row-level-security scope and then look the credential up WITHIN it --
 -- there is no unscoped lookup by hash.

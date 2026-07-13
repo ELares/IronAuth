@@ -33,9 +33,13 @@
 //! - **Audit on every mutation.** Every management mutation writes its audit row
 //!   in the same transaction, through the store's audited-write primitive.
 //!
-//! The management repositories connect as the control-plane database role
-//! (`ironauth_control`), a distinct credential class from the data-plane role;
-//! see `ironauth_store::Store::management` and `docs/adr/0005-management-api.md`.
+//! In production the management repositories connect as the control-plane
+//! database role (`ironauth_control`), a distinct credential class from the
+//! data-plane role, selected from `admin.control_database_url`. When that knob is
+//! unset the API fails closed in production and, only in `dev_mode`, falls back to
+//! `database.url` with the role separation and the `management_credentials`
+//! FORCE-RLS backstop not enforced (a startup warning says so). See
+//! `ironauth_store::Store::management` and `docs/adr/0005-management-api.md`.
 
 mod auth;
 mod environments;
@@ -67,10 +71,12 @@ pub use state::{AdminState, StateError};
 /// Build the management API router.
 ///
 /// Mount the returned router on the management plane (for example by merging it
-/// into `ironauth_server`'s management router). The `state` must carry a
-/// control-plane store (authenticated as `ironauth_control`). The router serves
-/// the resource endpoints plus `GET /openapi.json` (the served spec), and stamps
-/// the rate-limit headers on every response.
+/// into `ironauth_server`'s management router). The `state` carries a
+/// control-plane store, which in production authenticates as `ironauth_control`
+/// (a `dev_mode` fallback to `database.url` is possible, with the role separation
+/// not enforced). The router serves the resource endpoints plus
+/// `GET /openapi.json` (the served spec), and stamps the rate-limit headers on
+/// every response.
 ///
 /// Each route path here is the same string as the corresponding handler's
 /// `#[utoipa::path]`; the `documented_paths_are_the_expected_set` contract test

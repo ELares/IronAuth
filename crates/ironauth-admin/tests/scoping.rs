@@ -150,3 +150,94 @@ async fn cross_scope_resource_probes_are_uniform_not_found() {
         "not_found"
     );
 }
+
+#[tokio::test]
+async fn deleting_a_tenant_cascades_to_its_environments_and_keys() {
+    let harness = Harness::start(50).await;
+    let (tenant, env1) = harness.create_tenant("Acme", "t-1").await;
+    // A second environment with its own key, so the cascade must reach EVERY
+    // environment of the tenant, not just the audit scope's oldest one.
+    let env2 = harness.create_environment(&tenant, "staging", "t-2").await;
+    let key1 = harness.create_key(&tenant, &env1, "k1", "kk-1").await;
+    let key2 = harness.create_key(&tenant, &env2, "k2", "kk-2").await;
+
+    let (status, _, body) = harness.delete(&format!("/v1/tenants/{tenant}")).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+
+    // The tenant's environments no longer list.
+    let (status, _, list) = harness
+        .get(&format!("/v1/tenants/{tenant}/environments"))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{list}");
+    let value: Value = serde_json::from_str(&list).expect("json");
+    assert_eq!(
+        value["items"].as_array().expect("items").len(),
+        0,
+        "a deleted tenant lists no environments: {list}"
+    );
+
+    // Each environment is now a 404.
+    for env in [&env1, &env2] {
+        let (status, _, body) = harness
+            .get(&format!("/v1/tenants/{tenant}/environments/{env}"))
+            .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "env {env}: {body}");
+    }
+
+    // Both previously-minted keys fail authentication (401), in every environment.
+    for (key, env) in [(&key1, &env1), (&key2, &env2)] {
+        let (status, _, body) = harness
+            .get_as(&format!("/v1/tenants/{tenant}/environments/{env}"), key)
+            .await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "a deleted tenant's key must not authenticate: {body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn deleting_an_environment_cascades_to_its_keys() {
+    let harness = Harness::start(50).await;
+    let (tenant, env1) = harness.create_tenant("Acme", "e-1").await;
+    let env2 = harness.create_environment(&tenant, "staging", "e-2").await;
+    let key2 = harness.create_key(&tenant, &env2, "k2", "ek-2").await;
+
+    let (status, _, body) = harness
+        .delete(&format!("/v1/tenants/{tenant}/environments/{env2}"))
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+
+    // The deleted environment is a 404; its sibling stays live.
+    let (status, _, body) = harness
+        .get(&format!("/v1/tenants/{tenant}/environments/{env2}"))
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    let (status, _, body) = harness
+        .get(&format!("/v1/tenants/{tenant}/environments/{env1}"))
+        .await;
+    assert_eq!(status, StatusCode::OK, "the sibling stays live: {body}");
+
+    // The key minted in the deleted environment fails authentication.
+    let (status, _, body) = harness
+        .get_as(&format!("/v1/tenants/{tenant}/environments/{env2}"), &key2)
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "a deleted environment's key must not authenticate: {body}"
+    );
+
+    // The tenant is still live and still lists its remaining environment.
+    let (status, _, list) = harness
+        .get(&format!("/v1/tenants/{tenant}/environments"))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{list}");
+    let value: Value = serde_json::from_str(&list).expect("json");
+    assert_eq!(
+        value["items"].as_array().expect("items").len(),
+        1,
+        "the surviving environment still lists: {list}"
+    );
+}

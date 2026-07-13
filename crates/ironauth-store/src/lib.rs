@@ -79,8 +79,8 @@ pub use repository::{
     ActingClientRepo, ActingEnvironmentRepo, ActingManagementCredentialRepo, ActingManagementStore,
     ActingStore, ActingTenantRepo, AuditRecord, AuditRepo, ClientRecord, ClientRepo,
     CursorPosition, EnvironmentRecord, EnvironmentRepo, IdempotencyRepo, IdempotencyWrite,
-    ManagementCredentialRecord, ManagementCredentialRepo, ManagementStore, ScopedStore,
-    StoredIdempotentResponse, TenantRecord, TenantRepo,
+    MANAGEMENT_LIST_HARD_CAP, ManagementCredentialRecord, ManagementCredentialRepo,
+    ManagementStore, ScopedStore, StoredIdempotentResponse, TenantRecord, TenantRepo,
 };
 pub use scope::Scope;
 pub use store::Store;

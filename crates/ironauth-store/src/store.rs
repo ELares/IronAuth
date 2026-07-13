@@ -98,11 +98,16 @@ impl Store {
     /// operator, tenant, environment, and management-credential repositories the
     /// data-plane [`Store::scoped`] cannot reach.
     ///
-    /// The pool behind this store must authenticate as `ironauth_control`, NEVER
-    /// `ironauth_app`: control-plane credentials are a distinct class from
-    /// data-plane keys, and construct a SEPARATE [`Store`] (from a separate pool)
-    /// for each plane. Management mutations reuse the same audited-write
-    /// primitive, so every one writes its audit row in the same transaction.
+    /// In production the pool behind this store must authenticate as
+    /// `ironauth_control`, NOT `ironauth_app`: control-plane credentials are a
+    /// distinct class from data-plane keys, so construct a SEPARATE [`Store`]
+    /// (from a separate pool) for each plane, and the `management_credentials`
+    /// FORCE row-level-security backstop then applies to the control role too. The
+    /// binary selects that DSN from `admin.control_database_url`; a `dev_mode`
+    /// fallback to `database.url` is possible, in which case the role separation
+    /// and that backstop are not enforced. Management mutations reuse the same
+    /// audited-write primitive, so every one writes its audit row in the same
+    /// transaction.
     #[must_use]
     pub fn management(&self) -> ManagementStore<'_> {
         ManagementStore::new(self)

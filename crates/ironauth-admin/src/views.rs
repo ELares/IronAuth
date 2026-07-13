@@ -8,6 +8,8 @@
 //! milliseconds since the Unix epoch, which needs no date-library dependency and
 //! is unambiguous; identifiers are the typed-prefix wire strings.
 
+use std::fmt;
+
 use ironauth_store::{EnvironmentRecord, ManagementCredentialRecord, TenantRecord};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -119,19 +121,50 @@ pub struct CreateManagementKeyRequest {
     pub display_name: String,
 }
 
-/// The result of minting a management API key. The `secret` is returned exactly
-/// once and never stored in plaintext; store it now or mint a new key.
-#[derive(Debug, Clone, Serialize, ToSchema)]
+/// The result of minting a management API key.
+///
+/// On the genuine first creation (HTTP 201) `secret` carries the full bearer
+/// token, shown exactly ONCE, and `secret_already_issued` is false. The secret
+/// is never stored, so an idempotent replay of the same POST (HTTP 200) returns
+/// this same view with `secret` OMITTED and `secret_already_issued` true. Store
+/// the secret on first receipt; it is never retrievable again.
+///
+/// `Debug` is hand-written to redact the secret so a live token can never reach
+/// a log line through `{value:?}`.
+#[derive(Clone, Serialize, ToSchema)]
 pub struct ManagementKeyCreated {
     /// The key identifier (`mak_...`).
     pub id: String,
     /// The human-facing display name.
     pub display_name: String,
-    /// The full bearer token, shown ONCE. Present it as `Authorization: Bearer
-    /// <secret>`. It is never retrievable again.
-    pub secret: String,
+    /// The full bearer token, present ONLY on the first creation (HTTP 201) and
+    /// never stored. Present it as `Authorization: Bearer <secret>`. Absent on an
+    /// idempotent replay (HTTP 200); see `secret_already_issued`. Never
+    /// retrievable again.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub secret: Option<String>,
+    /// True on an idempotent replay, when the secret has already been issued and
+    /// is not repeated. False on the first creation.
+    pub secret_already_issued: bool,
     /// Creation time, milliseconds since the Unix epoch.
     pub created_at_unix_ms: i64,
+}
+
+impl fmt::Debug for ManagementKeyCreated {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Redact the secret: the struct must never print a live token, even when
+        // it is present on the first-creation view.
+        f.debug_struct("ManagementKeyCreated")
+            .field("id", &self.id)
+            .field("display_name", &self.display_name)
+            .field(
+                "secret",
+                &self.secret.as_ref().map(|_| ironauth_config::REDACTED),
+            )
+            .field("secret_already_issued", &self.secret_already_issued)
+            .field("created_at_unix_ms", &self.created_at_unix_ms)
+            .finish()
+    }
 }
 
 /// A page of tenants.

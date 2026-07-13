@@ -184,6 +184,14 @@ impl Default for DatabaseConfig {
     }
 }
 
+/// The ceiling any management list response is bounded by, no matter the
+/// configured `admin.max_page_size` or a caller-supplied `limit`. It is the
+/// last-resort bound so a single response can never trigger an unbounded scan.
+/// The store applies the same value to every list query; keep this equal to
+/// `ironauth_store`'s hard cap (a cross-crate test in `ironauth-admin` pins the
+/// two together). Config load rejects an `admin.max_page_size` above it.
+pub const MANAGEMENT_LIST_HARD_CAP: u32 = 1000;
+
 /// Management API settings (issue #11).
 ///
 /// The management API is the OpenAPI-first control plane on the management port.
@@ -202,9 +210,21 @@ pub struct AdminConfig {
     /// credential class lands in M5.
     pub bootstrap_operator_token: Option<Secret>,
 
+    /// The database connection string the management (control) plane connects
+    /// with. It MUST authenticate as the least-privilege `ironauth_control` role,
+    /// a distinct credential class from the data-plane role, so the
+    /// `management_credentials` FORCE row-level-security backstop applies beneath
+    /// the repository layer. Use the `file`/`env` secret indirection, never a
+    /// literal, outside dev mode. When unset and the management API is enabled:
+    /// in production (`dev_mode = false`) the API refuses to mount (fail closed);
+    /// in `dev_mode = true` it falls back to `database.url` with a warning that
+    /// the role separation and the FORCE-RLS backstop are NOT enforced.
+    pub control_database_url: Option<Secret>,
+
     /// The largest page a list endpoint will return, regardless of a larger
     /// caller-supplied `limit`. A ceiling that bounds any one response so a
-    /// caller cannot request an unbounded scan.
+    /// caller cannot request an unbounded scan. Config load rejects a value above
+    /// the management list hard cap (1000).
     pub max_page_size: u32,
 
     /// The page size a list endpoint uses when the caller supplies no `limit`.
@@ -216,6 +236,7 @@ impl Default for AdminConfig {
     fn default() -> Self {
         Self {
             bootstrap_operator_token: None,
+            control_database_url: None,
             max_page_size: 200,
             default_page_size: 50,
         }
@@ -303,6 +324,7 @@ impl Config {
                 message: error.message().to_owned(),
             }
         })?;
+        config.validate()?;
         let warnings = config.collect_warnings();
         Ok(Loaded { config, warnings })
     }
@@ -342,6 +364,29 @@ impl Config {
         if let Some(token) = &self.admin.bootstrap_operator_token {
             visit("admin.bootstrap_operator_token", token);
         }
+        if let Some(dsn) = &self.admin.control_database_url {
+            visit("admin.control_database_url", dsn);
+        }
+    }
+
+    /// Post-parse bound and cross-field checks the schema alone cannot express.
+    /// Fatal (unlike a [`Warning`]): a violation aborts startup.
+    ///
+    /// # Errors
+    ///
+    /// [`ConfigError::Invalid`] if `admin.max_page_size` exceeds the management
+    /// list hard cap (a larger cap would let the store's has-next sentinel be
+    /// clamped away, hiding the last page).
+    fn validate(&self) -> Result<(), ConfigError> {
+        if self.admin.max_page_size > MANAGEMENT_LIST_HARD_CAP {
+            return Err(ConfigError::Invalid {
+                message: format!(
+                    "admin.max_page_size ({}) must not exceed the management list hard cap ({MANAGEMENT_LIST_HARD_CAP})",
+                    self.admin.max_page_size
+                ),
+            });
+        }
+        Ok(())
     }
 }
 
@@ -381,6 +426,13 @@ pub enum ConfigError {
         /// key and lists the accepted fields.
         message: String,
     },
+    /// A parsed value violates a bound or cross-field constraint the schema
+    /// alone cannot express (for example `admin.max_page_size` above the
+    /// management list hard cap).
+    Invalid {
+        /// The human-readable constraint violation. Never carries a secret.
+        message: String,
+    },
 }
 
 impl fmt::Display for ConfigError {
@@ -399,6 +451,7 @@ impl fmt::Display for ConfigError {
                 }
                 None => write!(f, "invalid config {source_name}: {message}"),
             },
+            ConfigError::Invalid { message } => write!(f, "invalid config: {message}"),
         }
     }
 }
@@ -407,7 +460,7 @@ impl std::error::Error for ConfigError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             ConfigError::Io { source, .. } => Some(source),
-            ConfigError::Parse { .. } => None,
+            ConfigError::Parse { .. } | ConfigError::Invalid { .. } => None,
         }
     }
 }
@@ -439,9 +492,10 @@ mod tests {
 
     #[test]
     fn admin_section_defaults_parse_and_flag_a_literal_token() {
-        // Defaults: operator plane unauthorized, safe page-size caps.
+        // Defaults: operator plane unauthorized, control DSN unset, safe caps.
         let config = Config::from_toml_str("", "<inline>").expect("valid").config;
         assert!(config.admin.bootstrap_operator_token.is_none());
+        assert!(config.admin.control_database_url.is_none());
         assert_eq!(config.admin.max_page_size, 200);
         assert_eq!(config.admin.default_page_size, 50);
 
@@ -464,6 +518,49 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("max_pages"), "{msg}");
         assert!(msg.contains("max_page_size"), "{msg}");
+    }
+
+    #[test]
+    fn admin_control_database_url_parses_and_flags_a_literal() {
+        // The indirection form resolves and never warns.
+        let indirect = "[admin]\ncontrol_database_url = { env = \"IRONAUTH_CONTROL_DSN\" }\n";
+        let loaded = Config::from_toml_str(indirect, "<inline>").expect("valid");
+        assert!(loaded.config.admin.control_database_url.is_some());
+        assert!(loaded.warnings.is_empty());
+
+        // A literal control DSN is a secret: flagged outside dev mode, never echoed.
+        let literal =
+            "[admin]\ncontrol_database_url = \"postgres://ironauth_control:pw@db/ironauth\"\n";
+        let loaded = Config::from_toml_str(literal, "<inline>").expect("valid");
+        assert_eq!(
+            loaded.warnings,
+            vec![Warning::LiteralSecret {
+                key: "admin.control_database_url".to_owned()
+            }]
+        );
+        assert!(!loaded.warnings[0].to_string().contains("pw@db"), "leak");
+    }
+
+    #[test]
+    fn max_page_size_above_the_hard_cap_is_rejected() {
+        let ok = format!("[admin]\nmax_page_size = {MANAGEMENT_LIST_HARD_CAP}\n");
+        assert_eq!(
+            Config::from_toml_str(&ok, "<inline>")
+                .expect("at the cap is valid")
+                .config
+                .admin
+                .max_page_size,
+            MANAGEMENT_LIST_HARD_CAP
+        );
+
+        let over = format!(
+            "[admin]\nmax_page_size = {}\n",
+            MANAGEMENT_LIST_HARD_CAP + 1
+        );
+        let err = Config::from_toml_str(&over, "ironauth.toml").expect_err("over the cap");
+        let msg = err.to_string();
+        assert!(msg.contains("max_page_size"), "{msg}");
+        assert!(msg.contains(&MANAGEMENT_LIST_HARD_CAP.to_string()), "{msg}");
     }
 
     #[test]

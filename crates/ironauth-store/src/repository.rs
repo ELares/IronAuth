@@ -567,10 +567,24 @@ fn epoch_micros(at: SystemTime) -> i64 {
 // class from data-plane keys, made real at the pool boundary.
 // ===========================================================================
 
-/// The maximum number of rows any management list query returns in one call.
-/// The management API caps the caller-supplied page size below this; this is a
-/// last-resort ceiling so an internal caller cannot ask for an unbounded scan.
-const MANAGEMENT_LIST_HARD_CAP: i64 = 1000;
+/// The maximum number of rows a management list query returns to the caller in
+/// one page. The management API caps the caller-supplied page size below this;
+/// this is a last-resort ceiling so an internal caller cannot ask for an
+/// unbounded scan. Keep this equal to `ironauth_config::MANAGEMENT_LIST_HARD_CAP`
+/// (a cross-crate test in `ironauth-admin` pins the two together).
+///
+/// The list queries clamp the fetch to `HARD_CAP + 1`, not `HARD_CAP`: the
+/// pagination layer over-fetches one extra row as a has-next sentinel, so
+/// clamping to `HARD_CAP` exactly would drop that sentinel at a full page and
+/// hide the final page. The caller-facing page is still bounded to `HARD_CAP`
+/// because the admin layer trims the returned rows to the page size.
+///
+/// Pagination read-back note: the `(created_at, id)` keyset cursor round-trips
+/// `created_at` through `EXTRACT(EPOCH FROM created_at)`, which is exact only on
+/// PostgreSQL 14+ (there it returns `numeric`; older versions return `double
+/// precision` and can round by +/- 1 microsecond). CI runs PostgreSQL 16, so
+/// exact cursor pagination requires PostgreSQL 14+ at deployment.
+pub const MANAGEMENT_LIST_HARD_CAP: i64 = 1000;
 
 /// A cursor position for keyset pagination: the `(created_at, id)` of the last
 /// row of the previous page. Ordering is by `created_at` then `id`, both stable
@@ -810,7 +824,7 @@ impl TenantRepo<'_> {
         .bind(self.operator.to_string())
         .bind(after_micros)
         .bind(after_id)
-        .bind(limit.clamp(0, MANAGEMENT_LIST_HARD_CAP))
+        .bind(limit.clamp(0, MANAGEMENT_LIST_HARD_CAP + 1))
         .fetch_all(self.store.pool())
         .await?;
         rows.iter().map(tenant_from_row).collect()
@@ -880,7 +894,7 @@ impl EnvironmentRepo<'_> {
         .bind(self.tenant.to_string())
         .bind(after_micros)
         .bind(after_id)
-        .bind(limit.clamp(0, MANAGEMENT_LIST_HARD_CAP))
+        .bind(limit.clamp(0, MANAGEMENT_LIST_HARD_CAP + 1))
         .fetch_all(self.store.pool())
         .await?;
         rows.iter().map(environment_from_row).collect()
@@ -960,7 +974,7 @@ impl ManagementCredentialRepo<'_> {
         .bind(self.scope.environment().to_string())
         .bind(after_micros)
         .bind(after_id)
-        .bind(limit.clamp(0, MANAGEMENT_LIST_HARD_CAP))
+        .bind(limit.clamp(0, MANAGEMENT_LIST_HARD_CAP + 1))
         .fetch_all(&mut *tx)
         .await?;
         tx.commit().await?;
@@ -969,9 +983,17 @@ impl ManagementCredentialRepo<'_> {
             .collect()
     }
 
-    /// Whether a live key with `id` and this exact `key_hash` exists in scope.
-    /// The authentication primitive: the caller has already recovered the scope
-    /// from the presented token's id half, so this look-up runs within it.
+    /// Whether a live key with `id` and this exact `key_hash` exists in scope,
+    /// AND its environment and tenant are both live. The authentication
+    /// primitive: the caller has already recovered the scope from the presented
+    /// token's id half, so this look-up runs within it.
+    ///
+    /// The joins to `environments` and `tenants` are defense in depth on the
+    /// security-critical path: a soft-deleted tenant or environment cascades a
+    /// `deleted_at` onto its keys, but joining here additionally rejects a key
+    /// whose parent is soft-deleted regardless of the cascade, closing any
+    /// create-after-delete or ordering race. Both level tables are unscoped, so
+    /// the join sees them even under the credential's row-level-security scope.
     ///
     /// # Errors
     ///
@@ -986,9 +1008,12 @@ impl ManagementCredentialRepo<'_> {
         }
         let mut tx = begin_scoped(self.store, self.scope).await?;
         let row = sqlx::query(
-            "SELECT 1 AS ok FROM management_credentials \
-             WHERE id = $1 AND tenant_id = $2 AND environment_id = $3 \
-             AND key_hash = $4 AND deleted_at IS NULL",
+            "SELECT 1 AS ok FROM management_credentials mc \
+             JOIN environments e ON e.id = mc.environment_id AND e.tenant_id = mc.tenant_id \
+             JOIN tenants t ON t.id = mc.tenant_id \
+             WHERE mc.id = $1 AND mc.tenant_id = $2 AND mc.environment_id = $3 \
+             AND mc.key_hash = $4 AND mc.deleted_at IS NULL \
+             AND e.deleted_at IS NULL AND t.deleted_at IS NULL",
         )
         .bind(id.to_string())
         .bind(self.scope.tenant().to_string())
@@ -1137,9 +1162,15 @@ impl ActingTenantRepo<'_> {
         .await
     }
 
-    /// Deactivate a tenant (soft delete) and audit it scoped to the tenant and
-    /// its oldest environment (which is retained, so the audit foreign key
-    /// holds).
+    /// Deactivate a tenant (soft delete) and CASCADE the deactivation to its
+    /// child environments and their management credentials, all in the audited
+    /// transaction so it stays atomic. Audited scoped to the tenant and its
+    /// oldest environment (which is retained, so the audit foreign key holds).
+    ///
+    /// The cascade is what makes a deleted tenant's environments stop listing and
+    /// its keys stop authenticating; the join in
+    /// [`ManagementCredentialRepo::authenticate`] is the belt-and-suspenders
+    /// backstop for any create-after-delete race.
     ///
     /// # Errors
     ///
@@ -1171,12 +1202,15 @@ impl ActingTenantRepo<'_> {
                 target: id,
             },
             async move |tx| {
+                let deleted_micros = epoch_micros(env.clock().now_utc());
+                // 1. Soft-delete the tenant itself (a level table, no row-level
+                //    security).
                 let result = sqlx::query(
                     "UPDATE tenants SET deleted_at = \
                      TIMESTAMPTZ 'epoch' + ($1::text || ' microseconds')::interval \
                      WHERE id = $2 AND operator_id = $3 AND deleted_at IS NULL",
                 )
-                .bind(epoch_micros(env.clock().now_utc()))
+                .bind(deleted_micros)
                 .bind(id.to_string())
                 .bind(operator.to_string())
                 .execute(&mut **tx)
@@ -1184,6 +1218,57 @@ impl ActingTenantRepo<'_> {
                 if result.rows_affected() == 0 {
                     return Err(StoreError::NotFound);
                 }
+                // 2. Cascade to the tenant's management credentials. They carry
+                //    forced row-level security keyed on (tenant, environment), so
+                //    each environment's rows are visible (and updatable) only under
+                //    that environment's scope; a single tenant-wide UPDATE would
+                //    reach only the audit scope's environment. Re-scope per
+                //    environment to mark them all.
+                let env_rows = sqlx::query("SELECT id FROM environments WHERE tenant_id = $1")
+                    .bind(id.to_string())
+                    .fetch_all(&mut **tx)
+                    .await?;
+                for env_row in &env_rows {
+                    let env_id: String = env_row.get("id");
+                    sqlx::query("SELECT set_config('ironauth.environment_id', $1, true)")
+                        .bind(&env_id)
+                        .execute(&mut **tx)
+                        .await?;
+                    sqlx::query(
+                        "UPDATE management_credentials SET deleted_at = \
+                         TIMESTAMPTZ 'epoch' + ($1::text || ' microseconds')::interval \
+                         WHERE tenant_id = $2 AND environment_id = $3 AND deleted_at IS NULL",
+                    )
+                    .bind(deleted_micros)
+                    .bind(id.to_string())
+                    .bind(&env_id)
+                    .execute(&mut **tx)
+                    .await?;
+                }
+                // 3. Cascade to the tenant's environments (a level table, no
+                //    row-level security), so reads stop returning them and the
+                //    authenticate join rejects the child keys.
+                sqlx::query(
+                    "UPDATE environments SET deleted_at = \
+                     TIMESTAMPTZ 'epoch' + ($1::text || ' microseconds')::interval \
+                     WHERE tenant_id = $2 AND deleted_at IS NULL",
+                )
+                .bind(deleted_micros)
+                .bind(id.to_string())
+                .execute(&mut **tx)
+                .await?;
+                // 4. Restore the audit scope's row-level-security variables so the
+                //    audited-write's audit row inserts under (tenant, oldest
+                //    environment), exactly as it did before the per-environment
+                //    re-scoping above.
+                sqlx::query("SELECT set_config('ironauth.tenant_id', $1, true)")
+                    .bind(scope.tenant().to_string())
+                    .execute(&mut **tx)
+                    .await?;
+                sqlx::query("SELECT set_config('ironauth.environment_id', $1, true)")
+                    .bind(scope.environment().to_string())
+                    .execute(&mut **tx)
+                    .await?;
                 Ok(())
             },
             false,
@@ -1247,9 +1332,10 @@ impl ActingEnvironmentRepo<'_> {
         .await
     }
 
-    /// Deactivate an environment (soft delete) under this tenant, audited scoped
-    /// to `(tenant, environment)`. The row is retained, so the audit foreign key
-    /// holds.
+    /// Deactivate an environment (soft delete) under this tenant and CASCADE the
+    /// deactivation to its management credentials, in the audited transaction so
+    /// it stays atomic. Audited scoped to `(tenant, environment)`. The rows are
+    /// retained, so the audit foreign key holds.
     ///
     /// # Errors
     ///
@@ -1267,12 +1353,13 @@ impl ActingEnvironmentRepo<'_> {
                 target: id,
             },
             async move |tx| {
+                let deleted_micros = epoch_micros(env.clock().now_utc());
                 let result = sqlx::query(
                     "UPDATE environments SET deleted_at = \
                      TIMESTAMPTZ 'epoch' + ($1::text || ' microseconds')::interval \
                      WHERE id = $2 AND tenant_id = $3 AND deleted_at IS NULL",
                 )
-                .bind(epoch_micros(env.clock().now_utc()))
+                .bind(deleted_micros)
                 .bind(id.to_string())
                 .bind(tenant.to_string())
                 .execute(&mut **tx)
@@ -1280,6 +1367,21 @@ impl ActingEnvironmentRepo<'_> {
                 if result.rows_affected() == 0 {
                     return Err(StoreError::NotFound);
                 }
+                // Cascade to this environment's management credentials. The audit
+                // scope is exactly (tenant, environment), so the forced row-level
+                // security policy already permits a single tenant+environment
+                // UPDATE here (no per-environment re-scoping needed, unlike the
+                // tenant cascade).
+                sqlx::query(
+                    "UPDATE management_credentials SET deleted_at = \
+                     TIMESTAMPTZ 'epoch' + ($1::text || ' microseconds')::interval \
+                     WHERE tenant_id = $2 AND environment_id = $3 AND deleted_at IS NULL",
+                )
+                .bind(deleted_micros)
+                .bind(tenant.to_string())
+                .bind(id.to_string())
+                .execute(&mut **tx)
+                .await?;
                 Ok(())
             },
             false,

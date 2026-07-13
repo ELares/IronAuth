@@ -114,14 +114,18 @@ pub fn management_openapi() -> utoipa::openapi::OpenApi {
 /// served at `/openapi.json`. `scripts/openapi-check.sh` regenerates it and fails
 /// the build on any difference from the committed file.
 ///
-/// # Panics
-///
-/// Panics only if the generated document fails to serialize, which is a bug in
-/// the annotations, not a runtime condition.
+/// Serialization of the generated document never fails in practice (a failure
+/// would be a bug in the annotations, not a runtime condition), so rather than
+/// panic on the served path this falls back to a minimal valid document and logs
+/// the error, mirroring the error/response builders elsewhere in the crate.
 #[must_use]
 pub fn openapi_json() -> String {
-    let mut json =
-        serde_json::to_string_pretty(&management_openapi()).expect("openapi document serializes");
+    let mut json = serde_json::to_string_pretty(&management_openapi()).unwrap_or_else(|error| {
+        tracing::error!(%error, "failed to serialize the management OpenAPI document");
+        "{\"openapi\":\"3.1.0\",\"info\":{\"title\":\"IronAuth Management API\",\
+         \"version\":\"0.1.0\"},\"paths\":{}}"
+            .to_owned()
+    });
     json.push('\n');
     json
 }

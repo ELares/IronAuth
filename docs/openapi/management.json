@@ -21,7 +21,7 @@
           {
             "name": "limit",
             "in": "query",
-            "description": "The desired page size. Clamped to `[1, max_page_size]`; defaults to the\nconfigured default when absent.",
+            "description": "The desired page size, a positive integer. Clamped to\n`[1, max_page_size]`; defaults to the configured default when absent.",
             "required": false,
             "schema": {
               "type": "integer",
@@ -318,7 +318,7 @@
           {
             "name": "limit",
             "in": "query",
-            "description": "The desired page size. Clamped to `[1, max_page_size]`; defaults to the\nconfigured default when absent.",
+            "description": "The desired page size, a positive integer. Clamped to\n`[1, max_page_size]`; defaults to the configured default when absent.",
             "required": false,
             "schema": {
               "type": "integer",
@@ -661,7 +661,7 @@
           {
             "name": "limit",
             "in": "query",
-            "description": "The desired page size. Clamped to `[1, max_page_size]`; defaults to the\nconfigured default when absent.",
+            "description": "The desired page size, a positive integer. Clamped to\n`[1, max_page_size]`; defaults to the configured default when absent.",
             "required": false,
             "schema": {
               "type": "integer",
@@ -773,8 +773,18 @@
           "required": true
         },
         "responses": {
+          "200": {
+            "description": "Idempotent replay; the secret is omitted and secret_already_issued is true",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ManagementKeyCreated"
+                }
+              }
+            }
+          },
           "201": {
-            "description": "Created; the secret is shown once",
+            "description": "Created; the secret is present on this response ONCE",
             "content": {
               "application/json": {
                 "schema": {
@@ -1142,11 +1152,11 @@
       },
       "ManagementKeyCreated": {
         "type": "object",
-        "description": "The result of minting a management API key. The `secret` is returned exactly\nonce and never stored in plaintext; store it now or mint a new key.",
+        "description": "The result of minting a management API key.\n\nOn the genuine first creation (HTTP 201) `secret` carries the full bearer\ntoken, shown exactly ONCE, and `secret_already_issued` is false. The secret\nis never stored, so an idempotent replay of the same POST (HTTP 200) returns\nthis same view with `secret` OMITTED and `secret_already_issued` true. Store\nthe secret on first receipt; it is never retrievable again.\n\n`Debug` is hand-written to redact the secret so a live token can never reach\na log line through `{value:?}`.",
         "required": [
           "id",
           "display_name",
-          "secret",
+          "secret_already_issued",
           "created_at_unix_ms"
         ],
         "properties": {
@@ -1164,8 +1174,15 @@
             "description": "The key identifier (`mak_...`)."
           },
           "secret": {
-            "type": "string",
-            "description": "The full bearer token, shown ONCE. Present it as `Authorization: Bearer\n<secret>`. It is never retrievable again."
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The full bearer token, present ONLY on the first creation (HTTP 201) and\nnever stored. Present it as `Authorization: Bearer <secret>`. Absent on an\nidempotent replay (HTTP 200); see `secret_already_issued`. Never\nretrievable again."
+          },
+          "secret_already_issued": {
+            "type": "boolean",
+            "description": "True on an idempotent replay, when the secret has already been issued and\nis not repeated. False on the first creation."
           }
         }
       },

@@ -60,23 +60,27 @@ pub async fn create_environment(
         .management()
         .tenants(state.bootstrap_operator_id())
         .parse_id(&tenant_id)?;
-    // The tenant must exist; a clean 404 rather than a foreign-key error.
+
+    let key = idempotency::required_key(&headers)?;
+    let fingerprint = idempotency::fingerprint("POST", uri.path(), &body);
+    let credential_ref = principal.credential_ref();
+
+    // Replay BEFORE the parent-existence precondition, so a genuine replay
+    // returns the original response even if the tenant was soft-deleted meanwhile.
+    if let Some(replay) =
+        idempotency::replay_if_stored(&state, &credential_ref, &key, &fingerprint).await?
+    {
+        return Ok(replay);
+    }
+
+    // The tenant must exist and be live; a clean 404 rather than a foreign-key
+    // error (a soft-deleted tenant reads as absent).
     state
         .store()
         .management()
         .tenants(state.bootstrap_operator_id())
         .get(&tenant)
         .await?;
-
-    let key = idempotency::required_key(&headers)?;
-    let fingerprint = idempotency::fingerprint("POST", uri.path(), &body);
-    let credential_ref = principal.credential_ref();
-
-    if let Some(replay) =
-        idempotency::replay_if_stored(&state, &credential_ref, &key, &fingerprint).await?
-    {
-        return Ok(replay);
-    }
 
     let request: CreateEnvironmentRequest = parse_json(&body)?;
     let display_name = require_non_empty(&request.display_name, "display_name")?;

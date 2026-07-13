@@ -48,6 +48,11 @@ testing = ["ironauth-store/testing"]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 tower = { workspace = true, features = ["util"] }
 http-body-util.workspace = true
+# Database-FREE test support only: builds a LAZY pool (parses the URL, never
+# connects) so the unit tests and the router/spec contract test can construct an
+# AdminState without a database. No connection is ever opened (auth rejects at the
+# extractor before any store access), so the DB-free lanes stay database-free.
+sqlx = { workspace = true }
 
 # Database-free OpenAPI contract test: proves the served spec is OpenAPI 3.1 with
 # stable operation ids and that the committed artifact matches. Always runs.
