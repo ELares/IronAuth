@@ -148,6 +148,11 @@ async fn jwks_serving_is_the_remaining_issue_194_scope() {
     // advertised jwks_uri path 404s on today's merged router. When #194 loads keys
     // and mounts the JWKS surface, this endpoint starts answering; discovery does
     // not change (it already points at the right URL).
+    //
+    // This is the SECOND advertised-but-unobserved carve-out, alongside the
+    // RS256-floor entry in id_token_signing_alg_values_supported (asserted in
+    // tests/discovery.rs). Both are explicit and inert (no keys means no minted
+    // tokens to validate); every other advertised endpoint is observed as mounted.
     let harness = Harness::start().await;
     let (router, discovery_url) = live_router(&harness);
 

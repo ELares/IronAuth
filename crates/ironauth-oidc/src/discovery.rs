@@ -79,11 +79,23 @@ pub const SCOPES_SUPPORTED: &[&str] = &["openid"];
 
 /// The claim names IronAuth may supply in an ID token today. `iss`/`aud`/`exp`/
 /// `iat` are protocol claims and `sub` is the user identifier; `nonce` is echoed
-/// when the request carries it. The conditional claim expansion (`auth_time`,
-/// `acr`, `amr`, ...) is issue #14; when it centralizes the claim set this const
-/// tracks it, and the diff harness fails the build if a minted token carries a
-/// claim not advertised here.
-pub const ID_TOKEN_CLAIMS_SUPPORTED: &[&str] = &["sub", "iss", "aud", "exp", "iat", "nonce"];
+/// when the request carries it. `amr` and `acr` are emitted on every token-endpoint
+/// ID token (derived from the recorded authentication event, issue #14), and
+/// `auth_time` when `max_age` was requested or the client registered
+/// `require_auth_time`. The diff harness fails the build if a minted token carries
+/// a claim not advertised here (so when #17 adds front-channel `at_hash`/`c_hash`
+/// this const must grow to match).
+pub const ID_TOKEN_CLAIMS_SUPPORTED: &[&str] = &[
+    "sub",
+    "iss",
+    "aud",
+    "exp",
+    "iat",
+    "nonce",
+    "auth_time",
+    "acr",
+    "amr",
+];
 
 /// One endpoint advertised in the discovery document.
 ///
@@ -280,6 +292,12 @@ pub fn discovery_document(
     document.insert(
         "claims_supported".to_owned(),
         json!(ID_TOKEN_CLAIMS_SUPPORTED),
+    );
+    // The ACR values this OP can actually achieve, sourced from the authentication
+    // registry (issue #14) so discovery never advertises a level we cannot reach.
+    document.insert(
+        "acr_values_supported".to_owned(),
+        json!(crate::authn::acr_values_supported()),
     );
 
     // The defaults-if-omitted traps, published EXPLICITLY so a relying party never

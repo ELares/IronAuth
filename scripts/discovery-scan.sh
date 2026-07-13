@@ -30,7 +30,9 @@ fi
 
 # 2. The discovery document is assembled ONLY by the generator. No other LIBRARY
 #    source (src/**) may hand-build it; a second copy would drift. Reads and
-#    assertions in tests/** are fine and are not scanned.
+#    assertions in tests/** are fine and are not scanned. The pathspec wildcard
+#    crosses directory separators (git fnmatch without FNM_PATHNAME), so this also
+#    catches nested modules like crates/*/src/foo/bar.rs, not just top-level files.
 src_hits=$(
   {
     git ls-files -z 'crates/*/src/*.rs' \
