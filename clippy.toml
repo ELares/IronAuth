@@ -1,0 +1,1 @@
+doc-valid-idents = ["IronAuth", "IronCache", "IronBus", "OpenID", "OAuth", "GitHub", "PostgreSQL", "WebAuthn", "JavaScript", "TypeScript", ".."]
