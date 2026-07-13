@@ -23,17 +23,34 @@
 //!    transaction-local session variables the repository binds. Even a bug in
 //!    the application layer cannot read another tenant's rows.
 //!
+//! Postgres relations are the sole source of truth (normalized tables, foreign
+//! keys enforced, explicitly not event sourced; see
+//! `docs/adr/0002-relational-primary-store.md`). Two facilities build on the
+//! isolation substrate:
+//!
+//! - a **same-transaction audit log**: every repository mutation writes exactly
+//!   one [`audit`] row in the same transaction as the data change, through the
+//!   one audited-write primitive in the repository layer, so a mutation without
+//!   an audit row is structurally impossible and a failed mutation leaves no
+//!   trace;
+//! - an **expand-contract migration runner** ([`MigrationRunner`]): the tracked,
+//!   checksummed, in-order schema evolution that later makes zero-downtime
+//!   upgrades achievable.
+//!
 //! The four-level resource model (operator, tenant, environment, organization)
 //! and the reasoning behind the pooled shared-schema design are recorded in
 //! `docs/design/TENANCY.md`. Time and entropy flow through
-//! [`ironauth_env`]; identifiers draw randomness only from its entropy seam.
+//! [`ironauth_env`]; identifiers draw randomness only from its entropy seam, and
+//! audit timestamps from its clock seam.
 //!
 //! Only the runtime sqlx query API is used (never the compile-time-checked
 //! `query!` macros), so every database-free CI lane stays database-free; a live
 //! database is needed only to run the integration tests.
 
+pub mod audit;
 mod error;
 mod id;
+mod migrate;
 mod repository;
 mod scope;
 mod store;
@@ -48,12 +65,17 @@ pub mod idor_harness;
 #[cfg(feature = "testing")]
 pub mod test_support;
 
+pub use audit::{ActingContext, Action, ActorRef};
 pub use error::StoreError;
 pub use id::{
-    COMPONENT_BYTES, ClientId, ClientKind, EnvironmentId, EnvironmentKind, IdParseError, LevelId,
+    AgentId, AgentKind, AuditId, AuditKind, COMPONENT_BYTES, ClientId, ClientKind, CorrelationId,
+    CorrelationKind, EnvironmentId, EnvironmentKind, HumanId, HumanKind, IdParseError, LevelId,
     LevelKind, NotInScope, OperatorId, OperatorKind, OrganizationId, OrganizationKind, ScopedId,
-    ScopedKind, TenantId, TenantKind,
+    ScopedKind, ServiceId, ServiceKind, TenantId, TenantKind,
 };
-pub use repository::{ClientRecord, ClientRepo, ScopedStore};
+pub use migrate::{Migration, MigrationError, MigrationReport, MigrationRunner, Phase};
+pub use repository::{
+    ActingClientRepo, ActingStore, AuditRecord, AuditRepo, ClientRecord, ClientRepo, ScopedStore,
+};
 pub use scope::Scope;
 pub use store::Store;

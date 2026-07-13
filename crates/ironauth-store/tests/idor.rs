@@ -6,7 +6,7 @@
 use ironauth_env::Env;
 use ironauth_store::idor_harness::IdorHarness;
 use ironauth_store::test_support::TestDatabase;
-use ironauth_store::{ClientId, Scope, StoreError};
+use ironauth_store::{ClientId, CorrelationId, Scope, StoreError};
 
 #[tokio::test]
 async fn idor_harness_denies_cross_tenant_and_cross_environment_uniformly() {
@@ -20,10 +20,11 @@ async fn idor_harness_denies_cross_tenant_and_cross_environment_uniformly() {
     let env_a2 = db.seed_environment(&env, scope_a.tenant()).await;
     let scope_a2 = Scope::new(scope_a.tenant(), env_a2);
 
-    // Plant a victim client in each foreign scope.
+    // Plant a victim client in each foreign scope (writes need an acting context).
     let victim_b = db
         .store()
         .scoped(scope_b)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
         .clients()
         .create(&env, "victim in tenant B")
         .await
@@ -31,6 +32,7 @@ async fn idor_harness_denies_cross_tenant_and_cross_environment_uniformly() {
     let victim_a2 = db
         .store()
         .scoped(scope_a2)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
         .clients()
         .create(&env, "victim in environment A2")
         .await
