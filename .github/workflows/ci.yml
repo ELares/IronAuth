@@ -122,6 +122,29 @@ jobs:
         # The license and covenant files are trust infrastructure; this lint
         # ensures they cannot be silently removed or renamed.
         run: |
-          for f in LICENSE LICENSE-APACHE LICENSE-MIT COVENANTS.md; do
-            test -s "$f" || { echo "missing required root file: $f"; exit 1; }
+          for f in LICENSE LICENSE-APACHE LICENSE-MIT COVENANTS.md SECURITY.md CONTRIBUTING.md docs/THREAT-MODEL.md docs/WILL-NOT-IMPLEMENT.md; do
+            test -s "$f" || { echo "missing required governance file: $f"; exit 1; }
           done
+      - name: security.txt is valid and unexpired
+        run: |
+          python3 - <<'EOF'
+          import datetime, re, sys
+          text = open('docs/well-known/security.txt', encoding='utf-8').read()
+          fields = dict(
+              line.split(':', 1) for line in text.splitlines()
+              if line.strip() and not line.startswith('#')
+          )
+          for required in ('Contact', 'Expires'):
+              if required not in fields:
+                  sys.exit(f'security.txt missing required field: {required}')
+          expires = fields['Expires'].strip()
+          if not re.match(r'^\d{4}-\d{2}-\d{2}T', expires):
+              sys.exit(f'security.txt Expires is not ISO 8601: {expires}')
+          when = datetime.datetime.fromisoformat(expires.replace('Z', '+00:00'))
+          now = datetime.datetime.now(datetime.timezone.utc)
+          if when <= now:
+              sys.exit(f'security.txt is expired: {expires}')
+          if (when - now).days > 400:
+              sys.exit(f'security.txt Expires more than ~13 months out: {expires}')
+          print('security.txt: valid, expires', expires)
+          EOF

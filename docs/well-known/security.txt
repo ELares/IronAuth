@@ -1,0 +1,5 @@
+Contact: https://github.com/ELares/IronAuth/security/advisories/new
+Expires: 2027-07-01T00:00:00.000Z
+Policy: https://github.com/ELares/IronAuth/blob/main/SECURITY.md
+Preferred-Languages: en
+Canonical: https://github.com/ELares/IronAuth/blob/main/docs/well-known/security.txt
