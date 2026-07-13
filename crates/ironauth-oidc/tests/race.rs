@@ -24,12 +24,13 @@ async fn one_code_redeemed_concurrently_succeeds_exactly_once() {
     let harness = Harness::start().await;
     let client_id = harness.client_id().to_string();
 
-    // Issue one code.
+    // Issue one code (as an authenticated, consenting subject).
     let query = format!(
         "response_type=code&client_id={client_id}&redirect_uri={}",
         common::enc(REDIRECT_URI)
     );
-    let (status, headers, body) = harness.authorize(&query).await;
+    let cookie = harness.authenticated_cookie().await;
+    let (status, headers, body) = harness.authorize_with_cookie(&query, &cookie).await;
     assert_eq!(status, StatusCode::FOUND, "authorize: {body}");
     let code = common::location_param(&headers, "code").expect("code");
 

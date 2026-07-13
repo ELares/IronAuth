@@ -38,7 +38,11 @@ cd "$(git rev-parse --show-toplevel)"
 # grants, authorization_codes, and issued_tokens (#12) are the OIDC
 # authorization-code grant tables: all three are TENANT-SCOPED with forced
 # row-level security, so their SQL stays in the repository module too.
-SCOPED_TABLES='clients|organizations|audit_log|management_credentials|idempotency_keys|grants|authorization_codes|issued_tokens'
+#
+# users, sessions, and consents (#20) are the bootstrap login/consent/session
+# tables: all three are TENANT-SCOPED with forced row-level security, so their SQL
+# stays in the repository module too.
+SCOPED_TABLES='clients|organizations|audit_log|management_credentials|idempotency_keys|grants|authorization_codes|issued_tokens|users|sessions|consents'
 
 # The one module allowed to name a scoped table in SQL.
 REPO_MODULE='crates/ironauth-store/src/repository.rs'

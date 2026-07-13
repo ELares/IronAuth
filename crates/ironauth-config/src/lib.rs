@@ -253,6 +253,13 @@ impl Default for AdminConfig {
 /// long-lived code). The safe defaults are far below this ceiling.
 pub const OIDC_MAX_LIFETIME_SECS: u64 = 86_400;
 
+/// The largest a bootstrap session lifetime may be configured to, in seconds.
+/// A session is longer lived than a code or an access token (a user stays logged
+/// in across requests), but a bootstrap session beyond thirty days is almost
+/// always a misconfiguration, so config load rejects it. The real two-tier
+/// session model (M4) replaces this bootstrap session entirely.
+pub const OIDC_MAX_SESSION_TTL_SECS: u64 = 2_592_000;
+
 /// OIDC provider settings (issue #12).
 ///
 /// The public authorization and token endpoints. Lifetimes are configurable (the
@@ -289,6 +296,14 @@ pub struct OidcConfig {
     /// (10) tolerates realistic retry and clock jitter without a false revoke; set
     /// it to 0 to treat every reuse as genuine. At most `OIDC_MAX_LIFETIME_SECS`.
     pub reuse_grace_secs: u64,
+
+    /// Bootstrap session lifetime in seconds (issue #20). The opaque `__Host-`
+    /// session cookie established at login or registration is valid for this long;
+    /// a request presenting an expired session re-authenticates. The default
+    /// (3600) is a conservative one hour. Must be at least 1 and at most
+    /// `OIDC_MAX_SESSION_TTL_SECS`. The real two-tier session model (M4) replaces
+    /// this bootstrap session.
+    pub session_ttl_secs: u64,
 }
 
 impl Default for OidcConfig {
@@ -298,6 +313,7 @@ impl Default for OidcConfig {
             authorization_code_ttl_secs: 60,
             access_token_ttl_secs: 300,
             reuse_grace_secs: 10,
+            session_ttl_secs: 3600,
         }
     }
 }
@@ -463,6 +479,22 @@ impl Config {
                 message: format!(
                     "oidc.reuse_grace_secs ({}) must not exceed {OIDC_MAX_LIFETIME_SECS} seconds",
                     self.oidc.reuse_grace_secs
+                ),
+            });
+        }
+        // The session lifetime has its own, larger ceiling (a session is longer
+        // lived than a code or access token). A zero-second session is born
+        // expired, so the lower bound is one second like the token lifetimes.
+        if self.oidc.session_ttl_secs < 1 {
+            return Err(ConfigError::Invalid {
+                message: "oidc.session_ttl_secs must be at least 1 second".to_owned(),
+            });
+        }
+        if self.oidc.session_ttl_secs > OIDC_MAX_SESSION_TTL_SECS {
+            return Err(ConfigError::Invalid {
+                message: format!(
+                    "oidc.session_ttl_secs ({}) must not exceed {OIDC_MAX_SESSION_TTL_SECS} seconds",
+                    self.oidc.session_ttl_secs
                 ),
             });
         }
@@ -661,12 +693,26 @@ mod tests {
 
     #[test]
     fn oidc_section_defaults_and_rejects_bad_lifetimes_and_unknown_keys() {
-        // Defaults: not mounted, 60s code, 300s access token, 10s reuse grace.
+        // Defaults: not mounted, 60s code, 300s access token, 10s reuse grace,
+        // 3600s bootstrap session.
         let config = Config::from_toml_str("", "<inline>").expect("valid").config;
         assert!(!config.oidc.enabled);
         assert_eq!(config.oidc.authorization_code_ttl_secs, 60);
         assert_eq!(config.oidc.access_token_ttl_secs, 300);
         assert_eq!(config.oidc.reuse_grace_secs, 10);
+        assert_eq!(config.oidc.session_ttl_secs, 3600);
+
+        // A zero session lifetime (born expired) is rejected; a lifetime above the
+        // session ceiling is rejected too.
+        let err = Config::from_toml_str("[oidc]\nsession_ttl_secs = 0\n", "ironauth.toml")
+            .expect_err("zero session ttl");
+        assert!(err.to_string().contains("session_ttl_secs"), "{err}");
+        let over = format!(
+            "[oidc]\nsession_ttl_secs = {}\n",
+            OIDC_MAX_SESSION_TTL_SECS + 1
+        );
+        let err = Config::from_toml_str(&over, "ironauth.toml").expect_err("session over cap");
+        assert!(err.to_string().contains("session_ttl_secs"), "{err}");
 
         // A configured, in-bounds override parses.
         let input = "[oidc]\nenabled = true\nauthorization_code_ttl_secs = 30\n";

@@ -64,9 +64,17 @@
 //! build their router.
 
 mod authorize;
+mod client_auth;
+mod consent;
 mod error;
+mod interaction;
+mod login;
+mod pages;
+mod password;
 mod pkce;
+mod register;
 mod registry;
+mod session;
 mod state;
 mod token;
 mod tokens;
@@ -75,8 +83,11 @@ mod util;
 use axum::Router;
 use axum::routing::{get, post};
 
+pub use client_auth::{ClientAuthMethod, generate_secret, hash_secret};
 pub use error::{AuthorizeError, AuthzErrorCode, TokenError};
+pub use password::{PasswordError, hash_password, verify_password};
 pub use registry::{GrantType, PkceMethod, ResponseType};
+pub use session::SESSION_COOKIE;
 pub use state::OidcState;
 
 /// Build the OIDC provider router.
@@ -93,5 +104,17 @@ pub fn oidc_router(state: OidcState) -> Router {
             get(authorize::authorize_get).post(authorize::authorize_post),
         )
         .route("/token", post(token::token))
+        // The bootstrap login, registration, and consent interaction surfaces
+        // (issue #20). GET renders the minimal hardened page; POST records the
+        // decision and resumes the authorization request.
+        .route("/login", get(login::login_get).post(login::login_post))
+        .route(
+            "/register",
+            get(register::register_get).post(register::register_post),
+        )
+        .route(
+            "/consent",
+            get(consent::consent_get).post(consent::consent_post),
+        )
         .with_state(state)
 }

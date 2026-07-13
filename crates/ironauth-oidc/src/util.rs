@@ -52,6 +52,44 @@ pub fn percent_encode_query(value: &str) -> String {
     out
 }
 
+/// Percent-decode a query/form value (`%XX` becomes the byte). A malformed
+/// trailing escape is passed through verbatim. This is the inverse of
+/// [`percent_encode_query`] for the values IronAuth itself emits (which use `%20`
+/// for a space, never `+`).
+#[must_use]
+pub fn percent_decode(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 3 <= bytes.len() {
+            if let Ok(byte) = u8::from_str_radix(&value[i + 1..i + 3], 16) {
+                out.push(byte);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Read a single parameter from a raw query string (the part after `?`),
+/// percent-decoding its value. The first matching key wins; an absent key is
+/// [`None`].
+#[must_use]
+pub fn query_get(query: &str, name: &str) -> Option<String> {
+    for pair in query.split('&') {
+        if let Some((key, value)) = pair.split_once('=') {
+            if key == name {
+                return Some(percent_decode(value));
+            }
+        }
+    }
+    None
+}
+
 /// Append query parameters to a base URI, choosing `?` or `&` based on whether
 /// the base already has a query. Each value is percent-encoded. Parameters with a
 /// `None` value are skipped, so an absent `state` is simply omitted.

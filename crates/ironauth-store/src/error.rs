@@ -32,6 +32,14 @@ pub enum StoreError {
     /// now-committed original response and replays it; the mutation did not run
     /// a second time. Returned only by the management-plane create paths.
     IdempotencyConflict,
+    /// A create violated a uniqueness constraint that is NOT an anti-oracle
+    /// concern: for example registering a bootstrap user whose login identifier
+    /// already exists in the scope (issue #20). Distinct from [`NotFound`] because
+    /// the caller (the interactive registration surface) legitimately tells the
+    /// user the handle is taken; it is not a cross-scope existence probe.
+    ///
+    /// [`NotFound`]: StoreError::NotFound
+    Conflict,
 }
 
 impl fmt::Display for StoreError {
@@ -41,6 +49,7 @@ impl fmt::Display for StoreError {
             StoreError::Database(_) => f.write_str("database error"),
             StoreError::Migration(_) => f.write_str("migration error"),
             StoreError::IdempotencyConflict => f.write_str("idempotency-key conflict"),
+            StoreError::Conflict => f.write_str("uniqueness conflict"),
         }
     }
 }
@@ -48,7 +57,7 @@ impl fmt::Display for StoreError {
 impl std::error::Error for StoreError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            StoreError::NotFound | StoreError::IdempotencyConflict => None,
+            StoreError::NotFound | StoreError::IdempotencyConflict | StoreError::Conflict => None,
             StoreError::Database(source) => Some(source),
             StoreError::Migration(source) => Some(source),
         }

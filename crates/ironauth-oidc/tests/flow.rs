@@ -31,10 +31,14 @@ fn authorize_query(client_id: &str) -> String {
     )
 }
 
-/// Drive the authorization endpoint and return the issued code.
+/// Drive the authorization endpoint (as an authenticated, consenting subject) and
+/// return the issued code.
 async fn get_code(harness: &Harness) -> String {
     let client_id = harness.client_id().to_string();
-    let (status, headers, body) = harness.authorize(&authorize_query(&client_id)).await;
+    let cookie = harness.authenticated_cookie().await;
+    let (status, headers, body) = harness
+        .authorize_with_cookie(&authorize_query(&client_id), &cookie)
+        .await;
     assert_eq!(
         status,
         StatusCode::FOUND,

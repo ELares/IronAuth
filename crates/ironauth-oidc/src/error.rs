@@ -23,6 +23,7 @@
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 
+use crate::pages;
 use crate::util::append_query;
 
 /// The authorization-endpoint OAuth error codes this issue emits (RFC 6749
@@ -87,20 +88,15 @@ impl IntoResponse for AuthorizeError {
     fn into_response(self) -> Response {
         match self {
             AuthorizeError::Page { message } => {
-                // A minimal, self-contained HTML error page. The message is
-                // server-authored (never reflected untrusted input), so it needs
-                // no escaping; it names only why the request was refused.
-                let body = format!(
-                    "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
-                     <title>Authorization error</title></head><body>\
-                     <h1>Authorization request rejected</h1><p>{message}</p></body></html>"
-                );
-                (
+                // A minimal, self-contained HTML error page carrying the full page
+                // hardening headers (strict CSP, frame-ancestors none, X-Frame-
+                // Options DENY). The message is server-authored, but it is escaped
+                // regardless (defense in depth against the error-page injection
+                // class) so no reflected value can ever break out of the page.
+                pages::secure_html(
                     StatusCode::BAD_REQUEST,
-                    [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
-                    body,
+                    pages::notice_page("Authorization request rejected", &message),
                 )
-                    .into_response()
             }
             AuthorizeError::Redirect {
                 redirect_uri,
@@ -139,6 +135,15 @@ pub fn redirect_response(location: &str) -> Response {
 pub enum TokenError {
     /// A required parameter is missing or malformed.
     InvalidRequest(String),
+    /// Client authentication failed (issue #20): an unknown client, a credential
+    /// that did not satisfy the client's registered method, or a mismatched
+    /// method. The spec-exact `invalid_client`. `via_basic` records whether the
+    /// client attempted authentication via the `Authorization` header, which
+    /// mandates a 401 with `WWW-Authenticate` (RFC 6749 5.2).
+    InvalidClient {
+        /// Whether the client attempted Basic authentication.
+        via_basic: bool,
+    },
     /// The authorization code is invalid, expired, revoked, replayed, or one of
     /// its bindings did not match (including a wrong `client_id`). Uniform on
     /// purpose: it never says which.
@@ -156,25 +161,30 @@ impl TokenError {
     fn code(&self) -> &'static str {
         match self {
             TokenError::InvalidRequest(_) => "invalid_request",
+            TokenError::InvalidClient { .. } => "invalid_client",
             TokenError::InvalidGrant => "invalid_grant",
             TokenError::UnsupportedGrantType => "unsupported_grant_type",
             TokenError::ServerError => "server_error",
         }
     }
 
-    /// The HTTP status this error renders to.
+    /// The HTTP status this error renders to. `invalid_client` is 401
+    /// (Unauthorized), which RFC 6749 5.2 mandates when the client attempted an
+    /// `Authorization`-header credential and permits generally.
     fn status(&self) -> StatusCode {
         match self {
             TokenError::ServerError => StatusCode::INTERNAL_SERVER_ERROR,
+            TokenError::InvalidClient { .. } => StatusCode::UNAUTHORIZED,
             _ => StatusCode::BAD_REQUEST,
         }
     }
 
-    /// The `error_description`. For `invalid_grant` it is a fixed, generic string
-    /// so no binding-specific detail leaks.
+    /// The `error_description`. For `invalid_grant` and `invalid_client` it is a
+    /// fixed, generic string so no binding-specific or credential detail leaks.
     fn description(&self) -> &str {
         match self {
             TokenError::InvalidRequest(message) => message,
+            TokenError::InvalidClient { .. } => "client authentication failed",
             TokenError::InvalidGrant => {
                 "the authorization code is invalid, expired, or already used"
             }
@@ -191,7 +201,7 @@ impl IntoResponse for TokenError {
             "error_description": self.description(),
         })
         .to_string();
-        (
+        let mut response = (
             self.status(),
             [
                 (header::CONTENT_TYPE, "application/json"),
@@ -200,6 +210,16 @@ impl IntoResponse for TokenError {
             ],
             body,
         )
-            .into_response()
+            .into_response();
+        // A Basic authentication attempt that failed MUST carry WWW-Authenticate
+        // (RFC 6749 5.2). The value is a fixed server constant (no reflected
+        // input), so it is safe to set verbatim.
+        if let TokenError::InvalidClient { via_basic: true } = self {
+            response.headers_mut().insert(
+                header::WWW_AUTHENTICATE,
+                header::HeaderValue::from_static("Basic realm=\"ironauth\", charset=\"UTF-8\""),
+            );
+        }
+        response
     }
 }
