@@ -114,7 +114,13 @@ are enforced at compile time (proven by trybuild compile-fail tests):
 
 A CI lint (`scripts/query-audit.sh`) fails the build if scoped-table SQL appears
 anywhere but the repository module, closing the raw-pool bypass that module
-visibility already blocks across crates.
+visibility already blocks across crates. The lint is a best-effort grep and a
+*secondary* net: the primary enforcement is the crate-private pool, module
+visibility, and row-level security. It matches a fixed list of scoped table
+names, so adding a new tenant-scoped table is a checklist item that must also add
+the table to the lint's list (and to the CHECK-constraint and row-level-security
+stanzas of the migration); a concatenated or computed table name can also evade a
+grep. It catches the common accidental bypass, not a determined one.
 
 ### 3. Postgres row-level security
 
@@ -123,9 +129,14 @@ policies keyed on the transaction-local session variables
 `ironauth.tenant_id` and `ironauth.environment_id` that the repository binds
 with `set_config(.., true)` per transaction. Properties:
 
-- **Deny by default.** `current_setting(.., true)` is NULL when unset, and
-  `column = NULL` is never true, so a session that forgot to set its scope sees
-  nothing.
+- **Deny by default, enforced.** A session with no scope set sees nothing on
+  both connection states. On a pristine connection `current_setting(.., true)`
+  is NULL and `column = NULL` is never true; on a pooled connection that already
+  ran a scoped transaction, the transaction-local variable has reverted to the
+  empty string, so the check is `column = ''`. A CHECK constraint forbids any
+  scoped row from carrying an empty tenant or environment, so neither state can
+  match a real row. Deny by default is thus an enforced invariant, not an
+  artifact of NULL semantics.
 - **FORCED.** Row-level security applies even to the table owner, so isolation
   does not depend on which role owns the table. The application connects as a
   low-privilege role that is neither a superuser (superusers bypass row-level

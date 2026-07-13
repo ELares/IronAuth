@@ -21,7 +21,13 @@ range per docs/RELEASING.md.
     cannot query another tenant.
   - **Postgres row-level security**: every tenant-scoped table has RLS ENABLED
     and FORCED with policies keyed on the transaction-local `ironauth.tenant_id`
-    and `ironauth.environment_id`; deny-by-default when unset.
+    and `ironauth.environment_id`. Deny-by-default is an enforced invariant: a
+    CHECK constraint forbids any scoped row from carrying an empty scope, so an
+    unset session denies whether its scope variable is NULL (pristine connection)
+    or the empty string (pooled connection that reverted a scope). The shipped
+    migration never creates the low-privilege role or a password; the role is
+    provisioned out of band (production) or by the test harness (race-safely),
+    so no credential for the isolation-boundary role is committed.
   - The reusable cross-tenant `idor_harness` (feature `testing`) that every
     future surface registers with, plus the `test_support` real-database
     harness.

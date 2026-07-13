@@ -46,6 +46,26 @@ jobs:
     name: test (ubuntu-latest)
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    # The ironauth-store isolation tests (rls, idor, repository) require a real
+    # Postgres. The harness creates a fresh per-run database and provisions the
+    # low-privilege application role, so it needs a superuser/owner connection;
+    # this service provides one. Without DATABASE_URL those tests fail loudly
+    # (never silently skip), so this wiring is what proves isolation against a
+    # real database on every run.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -112,6 +132,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: invariant lints
         run: scripts/invariant-lints.sh
+      - name: query audit (no scoped-table SQL outside the repository module)
+        run: scripts/query-audit.sh
       - name: dash scan
         run: scripts/dash-scan.sh
       - name: compatibility matrix freshness

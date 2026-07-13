@@ -68,8 +68,15 @@ impl TestDatabase {
             .await
             .expect("connect as owner to fresh database");
 
+        // Provision the low-privilege application role BEFORE applying the schema:
+        // the migration GRANTs to this role but deliberately neither creates it
+        // nor ships a password (see the migration header). This is test-only -- a
+        // throwaway credential for a throwaway cluster -- and production
+        // provisions the role out of band instead.
+        provision_app_role(&owner_pool).await;
+
         // Apply the minimal isolation schema (tables, forced RLS, policies, and
-        // the low-privilege role) as the owner.
+        // the grants to the role provisioned above) as the owner.
         Store::from_pool(owner_pool.clone())
             .migrate()
             .await
@@ -170,6 +177,30 @@ fn unique_suffix() -> String {
         let _ = write!(out, "{byte:02x}");
     }
     out
+}
+
+/// Create the low-privilege application role the schema grants to.
+///
+/// The role is cluster-global, but the harness sets up many fresh per-run
+/// databases concurrently, so a plain check-then-`CREATE ROLE` loses the race:
+/// two setups both observe the role absent, and the second `CREATE ROLE` fails.
+/// Catching both the higher-level `duplicate_object` and the underlying catalog
+/// `unique_violation` (either can surface depending on timing) makes creation
+/// idempotent and race-safe. The password is a throwaway for the test cluster
+/// only; production provisions this role out of band (see the migration header).
+async fn provision_app_role(owner_pool: &PgPool) {
+    sqlx::raw_sql(
+        "DO $$ \
+         BEGIN \
+             CREATE ROLE ironauth_app LOGIN PASSWORD 'ironauth_app'; \
+         EXCEPTION WHEN duplicate_object OR unique_violation THEN \
+             NULL; \
+         END \
+         $$;",
+    )
+    .execute(owner_pool)
+    .await
+    .expect("provision low-privilege app role");
 }
 
 /// Create `db_name` via a transient connection to the maintenance database.

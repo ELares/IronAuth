@@ -17,24 +17,22 @@
 -- ---------------------------------------------------------------------------
 -- Low-privilege application role.
 --
--- The server connects as this role in production. It is NEVER a superuser and
--- NEVER a table owner, so FORCE ROW LEVEL SECURITY on the scoped tables always
--- applies to it (a superuser would bypass row-level security entirely, and a
--- table owner would bypass it without FORCE). The idempotent guard exists
--- because roles are cluster-global and shared across the fresh per-test
--- databases the integration harness creates.
+-- The server connects as this role: NEVER a superuser and NEVER a table owner,
+-- so FORCE ROW LEVEL SECURITY on the scoped tables always applies to it (a
+-- superuser bypasses row-level security entirely, and a table owner bypasses it
+-- without FORCE).
 --
--- The bootstrap password here is for the embedded test cluster only; a
--- production deployment provisions this role's credentials out of band (the
--- migration framework, #7, owns credential management).
-DO $$
-BEGIN
-    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'ironauth_app') THEN
-        CREATE ROLE ironauth_app LOGIN PASSWORD 'ironauth_app';
-    END IF;
-END
-$$;
-
+-- This migration does NOT create the role and NEVER sets a password. The role is
+-- provisioned out of band -- in production by the operator (credential management
+-- is owned by the migration framework, #7), and in tests by the integration
+-- harness (crates/ironauth-store/src/test_support.rs), which creates it
+-- race-safely with a throwaway credential before applying this schema. Shipping a
+-- CREATE ROLE ... PASSWORD literal in a public repository would hand every reader
+-- a working credential for the isolation-boundary role -- and that role can
+-- itself bind the scope session variables, so knowing its password defeats
+-- row-level security for every tenant. Provisioning is therefore always
+-- deliberate, never defaulted. If the role is absent when this runs, the GRANTs
+-- below fail loudly: that fail-closed behavior is intended.
 GRANT USAGE ON SCHEMA public TO ironauth_app;
 
 -- ---------------------------------------------------------------------------
@@ -75,6 +73,11 @@ CREATE TABLE organizations (
     environment_id text        NOT NULL,
     display_name   text        NOT NULL,
     created_at     timestamptz NOT NULL DEFAULT now(),
+    -- Deny-by-default depends on no scoped row ever carrying an empty scope (see
+    -- the row-level-security note below): a warmed pooled connection compares
+    -- against the empty string, not NULL. Make that an enforced invariant.
+    CONSTRAINT organizations_scope_nonempty
+        CHECK (tenant_id <> '' AND environment_id <> ''),
     FOREIGN KEY (tenant_id) REFERENCES tenants (id),
     FOREIGN KEY (environment_id, tenant_id) REFERENCES environments (id, tenant_id)
 );
@@ -88,6 +91,10 @@ CREATE TABLE clients (
     environment_id text        NOT NULL,
     display_name   text        NOT NULL,
     created_at     timestamptz NOT NULL DEFAULT now(),
+    -- See organizations above: an empty scope must never reach a row, so that a
+    -- warmed connection's empty-string scope variable can never match.
+    CONSTRAINT clients_scope_nonempty
+        CHECK (tenant_id <> '' AND environment_id <> ''),
     FOREIGN KEY (tenant_id) REFERENCES tenants (id),
     FOREIGN KEY (environment_id, tenant_id) REFERENCES environments (id, tenant_id)
 );
@@ -101,9 +108,16 @@ CREATE INDEX organizations_scope_idx ON organizations (tenant_id, environment_id
 -- ENABLE turns the policies on; FORCE makes them apply even to the table owner,
 -- so isolation does not depend on which role happens to own the table. The
 -- policy keys on the transaction-local session variables the repository binds
--- with set_config(.., true). current_setting(.., true) returns NULL when the
--- variable is unset, and `column = NULL` is never true, so a session that
--- forgot to set its scope sees NOTHING: deny by default.
+-- with set_config(.., true).
+--
+-- Deny by default holds regardless of connection state. On a PRISTINE connection
+-- the variable was never set, current_setting(.., true) returns NULL, and
+-- `tenant_id = NULL` is never true. On a POOLED connection that already ran a
+-- scoped transaction, set_config(.., true) has reverted the variable to the
+-- EMPTY STRING (not NULL) at commit, so the check becomes `tenant_id = ''`.
+-- Either way the session sees nothing, because the CHECK constraints above forbid
+-- any scoped row from carrying an empty tenant_id or environment_id. Deny by
+-- default is thus an enforced invariant, not an accident of NULL semantics.
 
 ALTER TABLE clients ENABLE ROW LEVEL SECURITY;
 ALTER TABLE clients FORCE ROW LEVEL SECURITY;

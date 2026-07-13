@@ -154,6 +154,97 @@ async fn rls_blocks_cross_tenant_reads_for_a_low_privilege_role() {
     }
 }
 
+/// Deny-by-default must hold on a POOLED connection that already carried a scope,
+/// not only on a pristine one. After a repository transaction commits, its
+/// transaction-local scope variables revert to the EMPTY STRING, not NULL, so the
+/// policy check becomes `tenant_id = ''`. This test reproduces that warmed state
+/// and proves the connection still sees nothing, because the CHECK constraints
+/// forbid any scoped row from carrying an empty scope. The main test above only
+/// exercises the pristine (NULL) path; this closes the reused-connection gap.
+#[tokio::test]
+async fn rls_denies_by_default_on_a_warmed_connection() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+
+    // A real client exists, owned by a real scope.
+    let scope = db.seed_scope(&env).await;
+    db.store()
+        .scoped(scope)
+        .clients()
+        .create(&env, "a real client")
+        .await
+        .expect("create");
+
+    // Hold one low-privilege connection and put it in exactly the state a pooled
+    // connection is in after a scoped transaction: the scope variables reverted
+    // to the empty string. (set_config with is_local=false leaves the value set
+    // at session scope, which is the observable end state of the commit revert.)
+    let mut conn = db.app_pool().acquire().await.expect("acquire connection");
+    sqlx::query("SELECT set_config('ironauth.tenant_id', '', false)")
+        .execute(&mut *conn)
+        .await
+        .expect("warm tenant variable");
+    sqlx::query("SELECT set_config('ironauth.environment_id', '', false)")
+        .execute(&mut *conn)
+        .await
+        .expect("warm environment variable");
+
+    // The scope variable is the empty string, NOT NULL: the exact condition the
+    // deny-by-default comment in the migration now documents.
+    let state = sqlx::query(
+        "SELECT current_setting('ironauth.tenant_id', true) IS NULL AS is_null, \
+         current_setting('ironauth.tenant_id', true) = '' AS is_empty",
+    )
+    .fetch_one(&mut *conn)
+    .await
+    .expect("read scope variable state");
+    assert!(
+        !state.get::<bool, _>("is_null") && state.get::<bool, _>("is_empty"),
+        "a warmed connection's scope variable is the empty string, not NULL"
+    );
+
+    // Deny by default still returns nothing on this warmed connection.
+    let warmed: i64 = sqlx::query("SELECT count(*) AS c FROM clients")
+        .fetch_one(&mut *conn)
+        .await
+        .expect("warmed count")
+        .get("c");
+    assert_eq!(
+        warmed, 0,
+        "a warmed (empty-scope) connection must still see no rows"
+    );
+}
+
+/// Deny-by-default on a warmed connection relies on the invariant that no scoped
+/// row ever carries an empty scope. Prove the database enforces that invariant
+/// below row-level security: insert as the superuser owner (which bypasses RLS
+/// entirely), so only the table constraints -- the CHECK and the foreign keys --
+/// can reject the row. A regression that dropped the CHECK would have to fall
+/// back on the foreign key alone; this test fails loudly either way if an
+/// empty-scope row can ever be stored.
+#[tokio::test]
+async fn empty_scope_rows_are_rejected() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+
+    let owner = db.owner_pool();
+    let result = sqlx::query(
+        "INSERT INTO clients (id, tenant_id, environment_id, display_name) \
+         VALUES ($1, $2, $3, $4)",
+    )
+    .bind(ClientId::generate(&env, &scope).to_string())
+    .bind(scope.tenant().to_string())
+    .bind("")
+    .bind("empty scope")
+    .execute(owner)
+    .await;
+    assert!(
+        result.is_err(),
+        "a row with an empty environment_id must be rejected"
+    );
+}
+
 /// Bind the transaction-local row-level-security scope variables, exactly as
 /// the repository does.
 async fn bind_scope(
