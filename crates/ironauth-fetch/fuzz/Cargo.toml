@@ -1,0 +1,30 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+#
+# The cargo-fuzz harness for ironauth-fetch. Deliberately NOT a workspace member
+# (the empty [workspace] table below detaches it): its libFuzzer dependency needs
+# a nightly toolchain and must not constrain the stable workspace or enter the
+# cargo-deny graph, mirroring the root fuzz/ crate and the sibling Iron projects.
+# There is no CI fuzz lane for this target; run it locally on nightly. See
+# fuzz/README.md.
+[package]
+name = "ironauth-fetch-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+ironauth-fetch = { path = ".." }
+
+[[bin]]
+name = "fetch_validation"
+path = "fuzz_targets/fetch_validation.rs"
+test = false
+doc = false
+bench = false
