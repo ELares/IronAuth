@@ -136,6 +136,13 @@
           "description": "Whether to mount the public OIDC endpoints (`/authorize`, `/token`). Off\nby default so the default boot serves only the skeleton and needs no\ndatabase. When on, the provider connects the data-plane store using\n`database.url`.",
           "type": "boolean"
         },
+        "jwks_cache_max_age_secs": {
+          "default": 600,
+          "description": "The `Cache-Control: max-age` (in seconds) advertised on every JWKS\nresponse (issue #19). A relying party may cache the published keys for this\nlong, so it bounds how quickly a rotated-in key propagates and feeds the\npre-publish lead. Operational discipline requires it to stay between\n`OIDC_JWKS_CACHE_MIN_SECS` (300) and `OIDC_JWKS_CACHE_MAX_SECS` (900); the\ndefault (600) is the midpoint. This is a promotable per-environment setting\nin spirit; the process value is the deployment default until per-environment\noverrides ride the M5 promotion pipeline.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
         "reuse_grace_secs": {
           "default": 10,
           "description": "Reuse grace window in seconds for an already-consumed authorization code.\nA second presentation of a consumed code within this window (a concurrent\ndouble-submit or an immediate client retry) is treated as a BENIGN retry:\nit fails with `invalid_grant` but does NOT revoke the grant chain and does\nNOT audit a reuse. A second presentation AFTER the window is a genuine\nreuse: it revokes the grant chain and audits it (RFC 9700). The default\n(10) tolerates realistic retry and clock jitter without a false revoke; set\nit to 0 to treat every reuse as genuine. At most `OIDC_MAX_LIFETIME_SECS`.",
@@ -301,6 +308,7 @@
         "access_token_ttl_secs": 300,
         "authorization_code_ttl_secs": 60,
         "enabled": false,
+        "jwks_cache_max_age_secs": 600,
         "reuse_grace_secs": 10,
         "session_ttl_secs": 3600
       },

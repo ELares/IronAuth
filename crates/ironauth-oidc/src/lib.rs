@@ -68,14 +68,18 @@ mod client_auth;
 mod consent;
 mod error;
 mod interaction;
+mod issuer;
+mod jwks;
 mod login;
 mod pages;
 mod password;
 mod pkce;
 mod register;
 mod registry;
+mod sector;
 mod session;
 mod state;
+mod subject;
 mod token;
 mod tokens;
 mod util;
@@ -85,10 +89,18 @@ use axum::routing::{get, post};
 
 pub use client_auth::{ClientAuthMethod, generate_secret, hash_secret};
 pub use error::{AuthorizeError, AuthzErrorCode, TokenError};
+pub use issuer::{
+    IssuerEntry, IssuerError, IssuerRegistry, JwksCacheError, JwksCacheWindow, load_signing_key,
+};
+pub use jwks::{IssuerState, issuer_router};
 pub use password::{PasswordError, hash_password, verify_password};
 pub use registry::{GrantType, PkceMethod, ResponseType};
+pub use sector::{
+    SectorError, check_sector_document, sector_uri_required, validate_sector_identifier,
+};
 pub use session::SESSION_COOKIE;
 pub use state::OidcState;
+pub use subject::{PairwiseSalt, SubjectCache, SubjectConfig, SubjectType, resolve_subject};
 
 /// Build the OIDC provider router.
 ///

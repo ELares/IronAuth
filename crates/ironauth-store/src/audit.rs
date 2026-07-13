@@ -151,6 +151,9 @@ pub enum Action {
     SessionCreate,
     /// A subject granted consent to a client (issue #20).
     ConsentGrant,
+    /// A per-environment signing key was provisioned (issue #19). Covers both a
+    /// day-one key and a manually rotated-in successor.
+    SigningKeyProvision,
 }
 
 impl Action {
@@ -173,6 +176,7 @@ impl Action {
             Action::UserRegister => "user.register",
             Action::SessionCreate => "session.create",
             Action::ConsentGrant => "consent.grant",
+            Action::SigningKeyProvision => "signing_key.provision",
         }
     }
 }

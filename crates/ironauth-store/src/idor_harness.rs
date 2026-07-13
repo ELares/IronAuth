@@ -44,7 +44,7 @@ use std::time::Duration;
 use ironauth_env::Env;
 
 use crate::audit::ActorRef;
-use crate::id::{CorrelationId, GrantId, IssuedTokenId, ServiceId};
+use crate::id::{CorrelationId, GrantId, IssuedTokenId, ServiceId, SigningKeyId};
 use crate::repository::{RedeemOutcome, TokenStatus};
 use crate::scope::Scope;
 use crate::store::Store;
@@ -146,6 +146,16 @@ impl IdorHarness {
     pub fn register_oidc_probes(&mut self) -> &mut Self {
         self.register(Box::new(AuthorizationCodeRedeemProbe));
         self.register(Box::new(IssuedTokenStatusProbe));
+        self
+    }
+
+    /// Register the signing-key probes (issue #19): a signing key provisioned in
+    /// another tenant or environment must never be readable under the caller's
+    /// scope. That is what makes "the signing core's key lookup cannot express a
+    /// cross-tenant read" a tested property, not just a design claim. Run these
+    /// with the data-plane store (`ironauth_app`).
+    pub fn register_signing_key_probes(&mut self) -> &mut Self {
+        self.register(Box::new(SigningKeyGetProbe));
         self
     }
 
@@ -392,6 +402,37 @@ impl IsolationProbe for IssuedTokenStatusProbe {
                 // Observing a foreign token's active state would be a leak.
                 Ok(TokenStatus::Active | TokenStatus::Revoked) => ProbeOutcome::Leaked,
                 Ok(TokenStatus::Unknown) | Err(_) => ProbeOutcome::Denied,
+            }
+        })
+    }
+}
+
+/// Built-in probe for `SigningKeyRepo::get` (issue #19). A signing key
+/// provisioned in another scope must never resolve under the caller's scope: a
+/// cross-tenant key read must be structurally unexpressable.
+struct SigningKeyGetProbe;
+
+impl IsolationProbe for SigningKeyGetProbe {
+    fn name(&self) -> &'static str {
+        "signing_keys.get"
+    }
+
+    fn probe<'a>(
+        &'a self,
+        store: &'a Store,
+        caller: Scope,
+        foreign_id: &'a str,
+    ) -> BoxProbeFuture<'a> {
+        Box::pin(async move {
+            // Parse the untrusted key id under the caller's OWN scope; a key minted
+            // in another scope fails here as a uniform not-found.
+            let Ok(id) = SigningKeyId::parse_in_scope(foreign_id, &caller) else {
+                return ProbeOutcome::Denied;
+            };
+            match store.scoped(caller).signing_keys().get(&id).await {
+                // Reading a foreign key's material or metadata would be a leak.
+                Ok(_) => ProbeOutcome::Leaked,
+                Err(_) => ProbeOutcome::Denied,
             }
         })
     }

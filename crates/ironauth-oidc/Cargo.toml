@@ -20,6 +20,10 @@ ironauth-env.workspace = true
 ironauth-config.workspace = true
 ironauth-store.workspace = true
 ironauth-jose.workspace = true
+# The SSRF-hardened outbound fetcher: the ONLY path sector_identifier_uri
+# validation reaches the network through. Depending on ironauth-fetch (not an
+# HTTP-client crate) keeps scripts/http-audit.sh satisfied.
+ironauth-fetch.workspace = true
 
 # Argon2id verification/hashing for the bootstrap login and registration surface
 # (issue #20), at OWASP defaults. Salt bytes come from the ironauth-env entropy
@@ -70,6 +74,10 @@ base64.workspace = true
 # acceptable. The literal openidconnect / JS / Python conformance is deferred to
 # the M4/M9 certification wave.
 oauth2 = { workspace = true }
+# The sector-identifier SSRF test drives the hardened fetcher through injected
+# resolver/dialer seams, which live behind ironauth-fetch's `test-harness`
+# feature.
+ironauth-fetch = { workspace = true, features = ["test-harness"] }
 
 # Structural exclusion of forbidden flows: the grant-type, response-type, and
 # PKCE-method registries cannot express ROPC, authorization-endpoint access
@@ -77,6 +85,27 @@ oauth2 = { workspace = true }
 [[test]]
 name = "structural"
 path = "tests/structural.rs"
+
+# Per-issuer JWKS and discovery HTTP surface (issue #19): explicit Cache-Control
+# and ETag, 304 on a matching If-None-Match, and disjoint issuers and key sets
+# across environments. Database-free.
+[[test]]
+name = "issuer_http"
+path = "tests/issuer_http.rs"
+
+# Pairwise subject derivation (issue #19): the one shared derivation returns an
+# identical sub across the ID token and UserInfo call sites, and memoization keeps
+# an already-derived sub stable. Database-free.
+[[test]]
+name = "pairwise"
+path = "tests/pairwise.rs"
+
+# sector_identifier_uri validation (issue #19): rejects http, rejects documents
+# missing a redirect_uri, and blocks SSRF targets through the hardened fetcher.
+# Database-free (drives the fetcher through injected resolver/dialer seams).
+[[test]]
+name = "sector"
+path = "tests/sector.rs"
 
 # Full authorization-code flow issuing tokens end to end, single-use, binding
 # re-checks, expiry, reuse revocation, and cross-scope denial, over a real
