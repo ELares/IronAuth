@@ -135,6 +135,16 @@ pub enum Action {
     ManagementKeyCreate,
     /// A management API key was revoked (management plane, issue #11).
     ManagementKeyDelete,
+    /// An authorization code and its grant were issued (issue #12).
+    AuthorizationCodeIssue,
+    /// An authorization code was redeemed at the token endpoint (issue #12).
+    AuthorizationCodeRedeem,
+    /// A consumed authorization code was replayed, revoking its grant chain
+    /// (issue #12). This is the reuse event: it is written only when a code that
+    /// was already redeemed is presented again.
+    AuthorizationCodeReuse,
+    /// Tokens (access and/or ID) were issued from a grant (issue #12).
+    TokenIssue,
 }
 
 impl Action {
@@ -150,6 +160,10 @@ impl Action {
             Action::EnvironmentDelete => "environment.delete",
             Action::ManagementKeyCreate => "management_key.create",
             Action::ManagementKeyDelete => "management_key.delete",
+            Action::AuthorizationCodeIssue => "authorization_code.issue",
+            Action::AuthorizationCodeRedeem => "authorization_code.redeem",
+            Action::AuthorizationCodeReuse => "authorization_code.reuse",
+            Action::TokenIssue => "token.issue",
         }
     }
 }

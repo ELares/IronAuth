@@ -43,7 +43,8 @@ use std::pin::Pin;
 use ironauth_env::Env;
 
 use crate::audit::ActorRef;
-use crate::id::{CorrelationId, ServiceId};
+use crate::id::{CorrelationId, IssuedTokenId, ServiceId};
+use crate::repository::{RedeemOutcome, TokenStatus};
 use crate::scope::Scope;
 use crate::store::Store;
 
@@ -133,6 +134,17 @@ impl IdorHarness {
     pub fn register_management_probes(&mut self) -> &mut Self {
         self.register(Box::new(ManagementCredentialGetProbe));
         self.register(Box::new(ManagementCredentialDeleteProbe));
+        self
+    }
+
+    /// Register the OIDC data-plane probes (issue #12): the scoped-resource
+    /// resolve-by-id operations of the authorization-code grant. Today that is
+    /// `authorization_codes.redeem` (a cross-scope code must never be consumable)
+    /// and `issued_tokens.token_status` (a cross-scope token's active state must
+    /// never be observable). Run these with the data-plane store (`ironauth_app`).
+    pub fn register_oidc_probes(&mut self) -> &mut Self {
+        self.register(Box::new(AuthorizationCodeRedeemProbe));
+        self.register(Box::new(IssuedTokenStatusProbe));
         self
     }
 
@@ -290,6 +302,85 @@ impl IsolationProbe for ManagementCredentialDeleteProbe {
             match credentials.delete(&env, &id).await {
                 Ok(()) => ProbeOutcome::Leaked,
                 Err(_) => ProbeOutcome::Denied,
+            }
+        })
+    }
+}
+
+/// Built-in probe for `ActingAuthorizationRepo::redeem` (issue #12). A code
+/// minted in another scope must never be consumable under the caller's scope.
+struct AuthorizationCodeRedeemProbe;
+
+impl IsolationProbe for AuthorizationCodeRedeemProbe {
+    fn name(&self) -> &'static str {
+        "authorization_codes.redeem"
+    }
+
+    fn probe<'a>(
+        &'a self,
+        store: &'a Store,
+        caller: Scope,
+        foreign_id: &'a str,
+    ) -> BoxProbeFuture<'a> {
+        Box::pin(async move {
+            let env = Env::system();
+            // Parse the untrusted code under the caller's OWN scope; a code minted
+            // in another scope fails here as a uniform not-found.
+            let Ok(code_id) = store
+                .scoped(caller)
+                .authorization()
+                .parse_code_id(foreign_id)
+            else {
+                return ProbeOutcome::Denied;
+            };
+            let actor = ActorRef::service(ServiceId::generate(&env));
+            let correlation = CorrelationId::generate(&env);
+            let authorization = store
+                .scoped(caller)
+                .acting(actor, correlation)
+                .authorization();
+            match authorization.redeem(&env, &code_id).await {
+                // Consuming or replaying a foreign code would be a leak.
+                Ok(RedeemOutcome::Consumed(_) | RedeemOutcome::Replayed { .. }) => {
+                    ProbeOutcome::Leaked
+                }
+                // Invalid (nothing matched in scope) or an error is the denial.
+                Ok(RedeemOutcome::Invalid) | Err(_) => ProbeOutcome::Denied,
+            }
+        })
+    }
+}
+
+/// Built-in probe for `AuthorizationRepo::token_status` (issue #12). A token
+/// issued in another scope must never resolve to an observable active state.
+struct IssuedTokenStatusProbe;
+
+impl IsolationProbe for IssuedTokenStatusProbe {
+    fn name(&self) -> &'static str {
+        "issued_tokens.token_status"
+    }
+
+    fn probe<'a>(
+        &'a self,
+        store: &'a Store,
+        caller: Scope,
+        foreign_id: &'a str,
+    ) -> BoxProbeFuture<'a> {
+        Box::pin(async move {
+            // Parse the untrusted token id under the caller's OWN scope; a token
+            // minted in another scope fails here as a uniform not-found.
+            let Ok(jti) = IssuedTokenId::parse_in_scope(foreign_id, &caller) else {
+                return ProbeOutcome::Denied;
+            };
+            match store
+                .scoped(caller)
+                .authorization()
+                .token_status(&jti)
+                .await
+            {
+                // Observing a foreign token's active state would be a leak.
+                Ok(TokenStatus::Active | TokenStatus::Revoked) => ProbeOutcome::Leaked,
+                Ok(TokenStatus::Unknown) | Err(_) => ProbeOutcome::Denied,
             }
         })
     }

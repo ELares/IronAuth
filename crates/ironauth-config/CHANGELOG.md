@@ -6,6 +6,11 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Add the `[oidc]` section (issue #12): `enabled` (opt-in mount, default off),
+  `authorization_code_ttl_secs` (default 60), and `access_token_ttl_secs`
+  (default 300). Lifetimes are validated non-zero and bounded by
+  `OIDC_MAX_LIFETIME_SECS`. Regenerates `docs/config-schema.json` and
+  `docs/CONFIG.md`.
 - Initial strict configuration layer: fail-fast TOML parsing (unknown keys
   abort with file, line, column, and the expected-field list), `Secret`
   indirection (literal, file, env forms) with redacted Debug/Display/serialize,

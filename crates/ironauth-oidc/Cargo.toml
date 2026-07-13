@@ -1,0 +1,81 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+[package]
+name = "ironauth-oidc"
+version = "0.1.0"
+description = "IronAuth OIDC core provider: the authorization endpoint and the authorization_code grant with single-use, binding-checked, revocable codes"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# Explicit test list: the DB-backed integration tests are gated behind
+# required-features = ["testing"] so the DB-free lanes (clippy, msrv, musl,
+# cargo check) neither enable the store's test harness nor try to run the DB
+# tests. Auto-discovery is off so nothing slips past the gate. The structural
+# registry test is database-free and runs on every lane.
+autotests = false
+
+[dependencies]
+ironauth-env.workspace = true
+ironauth-config.workspace = true
+ironauth-store.workspace = true
+ironauth-jose.workspace = true
+
+axum = { workspace = true, features = ["form", "query", "json"] }
+http.workspace = true
+serde = { workspace = true }
+serde_json.workspace = true
+# URL-safe, no-padding base64 for the PKCE S256 comparison and for decoding a
+# token's jti in tests. Already in the tree via ironauth-store; no new crate.
+base64.workspace = true
+# SHA-256 for the PKCE S256 code_challenge derivation. Pure Rust, permissive,
+# already in the tree via ironauth-store; no new crate.
+sha2.workspace = true
+tracing.workspace = true
+
+[features]
+default = []
+# Enables the ironauth-store real-database harness for the DB-backed integration
+# tests (mirrors ironauth-admin's `testing` gate). Adds no runtime surface.
+testing = ["ironauth-store/testing"]
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+tower = { workspace = true, features = ["util"] }
+http-body-util.workspace = true
+# Verify tokens end to end through the one hardened verify path.
+ironauth-jose = { workspace = true }
+# Database-free unit tests build an Env and a deterministic entropy source.
+ironauth-env = { workspace = true }
+
+# Structural exclusion of forbidden flows: the grant-type, response-type, and
+# PKCE-method registries cannot express ROPC, authorization-endpoint access
+# tokens, or plain PKCE. Database-free, so it runs on every lane (incl. MSRV).
+[[test]]
+name = "structural"
+path = "tests/structural.rs"
+
+# Full authorization-code flow issuing tokens end to end, single-use, binding
+# re-checks, expiry, reuse revocation, and cross-scope denial, over a real
+# database (DATABASE_URL); see scripts/with-test-db.sh.
+[[test]]
+name = "flow"
+path = "tests/flow.rs"
+required-features = ["testing"]
+
+# The single-use concurrency race: N concurrent exchanges of one code against one
+# shared Postgres, exactly one 200 and N-1 invalid_grant.
+[[test]]
+name = "race"
+path = "tests/race.rs"
+required-features = ["testing"]
+
+# The OIDC data-plane IDOR probes registered with the #6 harness, over a real
+# database.
+[[test]]
+name = "idor"
+path = "tests/idor.rs"
+required-features = ["testing"]
+
+[lints]
+workspace = true

@@ -6,6 +6,23 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- OIDC authorization-code grant persistence (issue #12). Adds the fourth
+  production migration and the scoped `authorization` repository, all under the
+  existing tenant-isolation model (RLS enabled and forced, nonempty-scope CHECK).
+  - **Three tenant-scoped tables:** `grants` (the revocation spine linking a code
+    to its session, consent, and issued tokens), `authorization_codes` (single
+    use, binding the `client_id`, `redirect_uri`, `nonce`, and PKCE
+    `code_challenge`), and `issued_tokens` (the `jti` of each token, so
+    grant-chain revocation is observable). Registered in
+    `scripts/query-audit.sh`; granted to the data-plane `ironauth_app` role.
+  - **Atomic single use.** `ActingAuthorizationRepo::redeem` consumes a code in
+    one `UPDATE ... WHERE consumed_at IS NULL RETURNING ...`; zero rows is a
+    replay, classified so the caller can revoke the grant chain. The consume
+    audits `authorization_code.redeem` in the same transaction. No in-memory
+    marker, so single use holds across N stateless nodes.
+  - **New scoped identifiers** (`ac_`, `grt_`, `tok_`), audit actions
+    (`authorization_code.issue`/`.redeem`/`.reuse`, `token.issue`), and the
+    `authorization_codes.redeem` / `issued_tokens.token_status` IDOR probes.
 - Management-plane control substrate (issue #11). Adds the control-plane role,
   the management repositories, and the third production migration; the #6 and #7
   isolation and audit tests stay green.

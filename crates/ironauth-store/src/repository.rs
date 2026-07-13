@@ -54,8 +54,8 @@ use sqlx::{Postgres, Row, Transaction};
 use crate::audit::{ActingContext, Action, ActorRef};
 use crate::error::StoreError;
 use crate::id::{
-    AuditId, AuditTarget, ClientId, CorrelationId, EnvironmentId, ManagementKeyId, OperatorId,
-    TenantId,
+    AuditId, AuditTarget, AuthorizationCodeId, ClientId, CorrelationId, EnvironmentId, GrantId,
+    IssuedTokenId, ManagementKeyId, OperatorId, TenantId,
 };
 use crate::scope::Scope;
 use crate::store::Store;
@@ -95,6 +95,17 @@ impl<'a> ScopedStore<'a> {
         }
     }
 
+    /// The read-only OIDC authorization repository for this scope (issue #12).
+    /// Reads a token's active state; the mutating operations (issue, redeem,
+    /// revoke) live on [`ActingStore::authorization`].
+    #[must_use]
+    pub fn authorization(&self) -> AuthorizationRepo<'a> {
+        AuthorizationRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
     /// Enter an acting context (who is acting, and under which correlation id).
     /// The returned store hands out the *mutating* repositories, so every write
     /// carries an actor and a correlation id into its audit row.
@@ -120,6 +131,19 @@ impl<'a> ActingStore<'a> {
     #[must_use]
     pub fn clients(&self) -> ActingClientRepo<'a> {
         ActingClientRepo {
+            store: self.store,
+            scope: self.scope,
+            acting: self.acting,
+        }
+    }
+
+    /// The mutating OIDC authorization repository for this scope and actor
+    /// (issue #12): issue a code and its grant, redeem a code (single use),
+    /// record issued tokens, and revoke a grant chain. Every mutation carries the
+    /// actor and correlation id into its audit row.
+    #[must_use]
+    pub fn authorization(&self) -> ActingAuthorizationRepo<'a> {
+        ActingAuthorizationRepo {
             store: self.store,
             scope: self.scope,
             acting: self.acting,
@@ -347,6 +371,489 @@ impl ActingClientRepo<'_> {
     ) -> Result<ClientId, StoreError> {
         self.create_inner(env, display_name, true).await
     }
+}
+
+// ===========================================================================
+// OIDC authorization-code grant (issue #12).
+//
+// The data-plane, tenant-scoped persistence behind the public authorization and
+// token endpoints: the single-use authorization codes, the grants that are the
+// revocation spine, and the issued-token records that make grant-chain
+// revocation observable. Everything below routes through the SAME scope filter
+// and (for writes) the SAME audited-write primitive as the rest of the data
+// plane, so the OIDC surface is isolated by construction like every other one.
+// ===========================================================================
+
+/// The kind of an issued token: an access token or an ID token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TokenKind {
+    /// An access token (`at+jwt`).
+    Access,
+    /// An ID token.
+    Id,
+}
+
+impl TokenKind {
+    /// The stable wire string recorded in `issued_tokens.token_kind`.
+    #[must_use]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            TokenKind::Access => "access",
+            TokenKind::Id => "id",
+        }
+    }
+}
+
+/// One token to record against a grant when it is issued.
+#[derive(Debug, Clone, Copy)]
+pub struct IssuedTokenRecord {
+    /// The token identifier (its `jti`), embedding its scope.
+    pub id: IssuedTokenId,
+    /// Whether it is an access or an ID token.
+    pub kind: TokenKind,
+}
+
+/// The active state of an issued token, derived from its grant's revocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TokenStatus {
+    /// The token's issued row exists and its grant is not revoked.
+    Active,
+    /// The token's issued row exists but its grant chain was revoked.
+    Revoked,
+    /// No issued token with this identifier is recorded in scope.
+    Unknown,
+}
+
+/// Everything the authorization endpoint binds into a freshly issued code and
+/// its grant. The `code_id`, `grant_id`, and `client_id` are all scoped
+/// identifiers minted (or resolved) under the caller's scope, so a mismatch is a
+/// uniform not-found.
+#[derive(Debug, Clone, Copy)]
+pub struct IssueCode<'a> {
+    /// The `ac_` code identifier (also the code value returned to the client).
+    pub code_id: &'a AuthorizationCodeId,
+    /// The `grt_` grant identifier this code belongs to.
+    pub grant_id: &'a GrantId,
+    /// The OAuth client the code is bound to.
+    pub client_id: &'a ClientId,
+    /// The redirect URI the code is bound to (re-checked at redemption).
+    pub redirect_uri: &'a str,
+    /// The bound OIDC `nonce`, if the authorization request carried one.
+    pub nonce: Option<&'a str>,
+    /// The bound PKCE `code_challenge`, if present.
+    pub code_challenge: Option<&'a str>,
+    /// The bound PKCE `code_challenge_method`, if present.
+    pub code_challenge_method: Option<&'a str>,
+    /// The authenticated end-user subject the tokens will be minted for.
+    pub subject: &'a str,
+    /// The requested OAuth `scope` value, if any.
+    pub oauth_scope: Option<&'a str>,
+    /// The authenticating session handle (a seam for later M2 issues).
+    pub session_ref: Option<&'a str>,
+    /// The recorded consent handle (a seam for later M2 issues).
+    pub consent_ref: Option<&'a str>,
+    /// The code's expiry, in microseconds since the Unix epoch (clock seam).
+    pub expires_at_micros: i64,
+    /// The code's creation time, in microseconds since the Unix epoch.
+    pub created_at_micros: i64,
+}
+
+/// The bindings read back when a code is atomically consumed. The token endpoint
+/// re-checks every one against the presented request before issuing tokens.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodeBindings {
+    /// The grant this code belongs to (the revocation spine).
+    pub grant_id: GrantId,
+    /// The client the code was bound to at authorization time.
+    pub client_id: String,
+    /// The redirect URI the code was bound to.
+    pub redirect_uri: String,
+    /// The bound OIDC `nonce`, if any.
+    pub nonce: Option<String>,
+    /// The bound PKCE `code_challenge`, if any.
+    pub code_challenge: Option<String>,
+    /// The bound PKCE `code_challenge_method`, if any.
+    pub code_challenge_method: Option<String>,
+    /// The authenticated subject.
+    pub subject: String,
+    /// The requested OAuth `scope` value, if any.
+    pub oauth_scope: Option<String>,
+}
+
+/// The outcome of redeeming an authorization code.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RedeemOutcome {
+    /// The code was live and is now consumed (this call won the single-use
+    /// race). The bindings are returned for the token endpoint to re-check.
+    Consumed(Box<CodeBindings>),
+    /// The code exists but was already consumed: a replay. The grant chain
+    /// identifier is returned so the caller can revoke it.
+    Replayed {
+        /// The grant whose chain must be revoked on this reuse.
+        grant_id: GrantId,
+    },
+    /// The code is absent or expired: a plain `invalid_grant` with no reuse.
+    Invalid,
+}
+
+/// The read-only OIDC authorization repository: derives a token's active state
+/// from its grant (issue #12).
+pub struct AuthorizationRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl AuthorizationRepo<'_> {
+    /// Parse an untrusted authorization-code identifier under this scope. A
+    /// malformed code and one minted in another scope both return the uniform
+    /// not-found.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if malformed or out of scope.
+    pub fn parse_code_id(&self, raw: &str) -> Result<AuthorizationCodeId, StoreError> {
+        Ok(AuthorizationCodeId::parse_in_scope(raw, &self.scope)?)
+    }
+
+    /// The active state of an issued token by its `jti`, within scope. A token is
+    /// [`TokenStatus::Active`] only while its issued row exists and its grant is
+    /// not revoked; a revoked grant flips every one of its tokens to
+    /// [`TokenStatus::Revoked`]. Unknown (absent or out of scope) is uniform.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn token_status(&self, jti: &IssuedTokenId) -> Result<TokenStatus, StoreError> {
+        if jti.scope() != self.scope {
+            return Ok(TokenStatus::Unknown);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT (g.revoked_at IS NULL) AS active \
+             FROM issued_tokens t \
+             JOIN grants g ON g.id = t.grant_id \
+             AND g.tenant_id = t.tenant_id AND g.environment_id = t.environment_id \
+             WHERE t.id = $1 AND t.tenant_id = $2 AND t.environment_id = $3",
+        )
+        .bind(jti.to_string())
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(match row {
+            None => TokenStatus::Unknown,
+            Some(row) if row.get::<bool, _>("active") => TokenStatus::Active,
+            Some(_) => TokenStatus::Revoked,
+        })
+    }
+}
+
+/// The mutating OIDC authorization repository (issue #12). Reachable only through
+/// [`ScopedStore::acting`], so every mutation carries an actor and correlation
+/// id. Issue, record, and revoke route through the module's single audited-write
+/// primitive; redeem is the one bespoke committing path (it audits only when the
+/// atomic single-use UPDATE actually consumes a code, and it must return the
+/// row it consumed), documented at its call site.
+pub struct ActingAuthorizationRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+    acting: ActingContext,
+}
+
+impl ActingAuthorizationRepo<'_> {
+    /// Issue an authorization code and its grant in one audited transaction.
+    ///
+    /// The grant row is inserted first (the code and any future token reference
+    /// it), then the code row, then exactly one `authorization_code.issue` audit
+    /// row, all in the same transaction: a code cannot exist without its grant or
+    /// its audit row.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if any supplied identifier is out of this scope;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn issue(&self, env: &Env, code: IssueCode<'_>) -> Result<(), StoreError> {
+        if code.code_id.scope() != self.scope
+            || code.grant_id.scope() != self.scope
+            || code.client_id.scope() != self.scope
+        {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::AuthorizationCodeIssue,
+                target: code.code_id,
+            },
+            async move |tx| {
+                sqlx::query(
+                    "INSERT INTO grants \
+                     (id, tenant_id, environment_id, client_id, subject, session_ref, \
+                      consent_ref, created_at) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, \
+                             TIMESTAMPTZ 'epoch' + ($8::text || ' microseconds')::interval)",
+                )
+                .bind(code.grant_id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(code.client_id.to_string())
+                .bind(code.subject)
+                .bind(code.session_ref)
+                .bind(code.consent_ref)
+                .bind(code.created_at_micros)
+                .execute(&mut **tx)
+                .await?;
+                sqlx::query(
+                    "INSERT INTO authorization_codes \
+                     (id, tenant_id, environment_id, grant_id, client_id, redirect_uri, nonce, \
+                      code_challenge, code_challenge_method, subject, oauth_scope, expires_at, \
+                      created_at) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, \
+                             TIMESTAMPTZ 'epoch' + ($12::text || ' microseconds')::interval, \
+                             TIMESTAMPTZ 'epoch' + ($13::text || ' microseconds')::interval)",
+                )
+                .bind(code.code_id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(code.grant_id.to_string())
+                .bind(code.client_id.to_string())
+                .bind(code.redirect_uri)
+                .bind(code.nonce)
+                .bind(code.code_challenge)
+                .bind(code.code_challenge_method)
+                .bind(code.subject)
+                .bind(code.oauth_scope)
+                .bind(code.expires_at_micros)
+                .bind(code.created_at_micros)
+                .execute(&mut **tx)
+                .await?;
+                Ok(())
+            },
+            false,
+        )
+        .await
+    }
+
+    /// Atomically redeem a code, enforcing single use in ONE statement.
+    ///
+    /// The consume is a single `UPDATE ... SET consumed_at = <now> WHERE id = $1
+    /// AND consumed_at IS NULL AND expires_at > <now> RETURNING ...`. Postgres
+    /// serializes concurrent updates of the one row, so exactly one caller sees
+    /// `consumed_at` NULL and gets [`RedeemOutcome::Consumed`]; every other
+    /// concurrent exchange affects zero rows. Zero rows is then classified: a
+    /// still-present but already-consumed code is a [`RedeemOutcome::Replayed`]
+    /// (the caller revokes its grant chain); anything else (absent or expired) is
+    /// [`RedeemOutcome::Invalid`]. No in-memory marker is used, so single use
+    /// holds across N stateless nodes.
+    ///
+    /// `now` flows from the application clock seam (bound as epoch microseconds),
+    /// never the database clock, so expiry is deterministic under a manual clock.
+    ///
+    /// This is the one committing write in the module that does not go through
+    /// [`write_audited`] as a thin wrapper: it audits `authorization_code.redeem`
+    /// only on the consuming branch (a missed or replayed redemption is not a
+    /// mutation and writes no audit row), and it must return the row it consumed.
+    /// It still writes its audit row in the SAME transaction as the consume, so
+    /// the same-transaction property holds.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the code identifier is out of this scope;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn redeem(
+        &self,
+        env: &Env,
+        code_id: &AuthorizationCodeId,
+    ) -> Result<RedeemOutcome, StoreError> {
+        if code_id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let now_micros = epoch_micros(env.clock().now_utc());
+
+        let mut tx = begin_scoped(self.store, scope).await?;
+        let consumed = sqlx::query(
+            "UPDATE authorization_codes \
+             SET consumed_at = TIMESTAMPTZ 'epoch' + ($1::text || ' microseconds')::interval \
+             WHERE id = $2 AND tenant_id = $3 AND environment_id = $4 \
+             AND consumed_at IS NULL \
+             AND expires_at > TIMESTAMPTZ 'epoch' + ($1::text || ' microseconds')::interval \
+             RETURNING grant_id, client_id, redirect_uri, nonce, code_challenge, \
+             code_challenge_method, subject, oauth_scope",
+        )
+        .bind(now_micros)
+        .bind(code_id.to_string())
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        if let Some(row) = consumed {
+            let bindings = bindings_from_row(&row, &scope)?;
+            // The redeem is a real mutation: write its audit row in the same
+            // transaction as the consume, then commit them together.
+            let spec = AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::AuthorizationCodeRedeem,
+                target: code_id,
+            };
+            insert_audit_row(&mut tx, &spec).await?;
+            tx.commit().await?;
+            return Ok(RedeemOutcome::Consumed(Box::new(bindings)));
+        }
+        // Zero rows: either the code never existed, it is expired, or it was
+        // already consumed (a replay). No mutation happened, so this branch is a
+        // read that writes no audit row.
+        let classify = sqlx::query(
+            "SELECT grant_id, (consumed_at IS NOT NULL) AS consumed \
+             FROM authorization_codes \
+             WHERE id = $1 AND tenant_id = $2 AND environment_id = $3",
+        )
+        .bind(code_id.to_string())
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(match classify {
+            Some(row) if row.get::<bool, _>("consumed") => {
+                let grant_text: String = row.get("grant_id");
+                let grant_id = GrantId::parse_in_scope(&grant_text, &scope)?;
+                RedeemOutcome::Replayed { grant_id }
+            }
+            // Present but unconsumed here means expired (the UPDATE's expiry
+            // guard is why it did not match); absent means never issued. Both are
+            // a plain invalid_grant with no reuse.
+            _ => RedeemOutcome::Invalid,
+        })
+    }
+
+    /// Record the tokens issued from a grant, in one audited transaction. Called
+    /// after the tokens are signed, so the recorded `jti`s match the tokens on
+    /// the wire and grant-chain revocation can reach them.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the grant or any token is out of this scope;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn record_issued_tokens(
+        &self,
+        env: &Env,
+        grant_id: &GrantId,
+        tokens: &[IssuedTokenRecord],
+    ) -> Result<(), StoreError> {
+        if grant_id.scope() != self.scope || tokens.iter().any(|t| t.id.scope() != self.scope) {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let tokens = tokens.to_vec();
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::TokenIssue,
+                target: grant_id,
+            },
+            async move |tx| {
+                for token in &tokens {
+                    sqlx::query(
+                        "INSERT INTO issued_tokens \
+                         (id, tenant_id, environment_id, grant_id, token_kind) \
+                         VALUES ($1, $2, $3, $4, $5)",
+                    )
+                    .bind(token.id.to_string())
+                    .bind(scope.tenant().to_string())
+                    .bind(scope.environment().to_string())
+                    .bind(grant_id.to_string())
+                    .bind(token.kind.as_str())
+                    .execute(&mut **tx)
+                    .await?;
+                }
+                Ok(())
+            },
+            false,
+        )
+        .await
+    }
+
+    /// Revoke a grant chain: mark the grant revoked so every token issued from it
+    /// becomes inactive. Audits `authorization_code.reuse` (this is only ever
+    /// called on a detected code replay). Idempotent: a second revoke of an
+    /// already-revoked chain is a no-op that writes no audit row.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the grant is out of scope or already revoked
+    /// (the caller treats that as a benign no-op); [`StoreError::Database`] on a
+    /// persistence failure.
+    pub async fn revoke_grant_chain(
+        &self,
+        env: &Env,
+        grant_id: &GrantId,
+    ) -> Result<(), StoreError> {
+        if grant_id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::AuthorizationCodeReuse,
+                target: grant_id,
+            },
+            async move |tx| {
+                let result = sqlx::query(
+                    "UPDATE grants SET revoked_at = \
+                     TIMESTAMPTZ 'epoch' + ($1::text || ' microseconds')::interval \
+                     WHERE id = $2 AND tenant_id = $3 AND environment_id = $4 \
+                     AND revoked_at IS NULL",
+                )
+                .bind(epoch_micros(env.clock().now_utc()))
+                .bind(grant_id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .execute(&mut **tx)
+                .await?;
+                // A no-op revoke (already revoked) writes no audit row: short
+                // circuit before the audit insert so only real revocations audit.
+                if result.rows_affected() == 0 {
+                    return Err(StoreError::NotFound);
+                }
+                Ok(())
+            },
+            false,
+        )
+        .await
+    }
+}
+
+/// Reconstruct [`CodeBindings`] from a consumed-code row.
+fn bindings_from_row(row: &PgRow, scope: &Scope) -> Result<CodeBindings, StoreError> {
+    let grant_text: String = row.get("grant_id");
+    let grant_id = GrantId::parse_in_scope(&grant_text, scope)?;
+    Ok(CodeBindings {
+        grant_id,
+        client_id: row.get("client_id"),
+        redirect_uri: row.get("redirect_uri"),
+        nonce: row.get("nonce"),
+        code_challenge: row.get("code_challenge"),
+        code_challenge_method: row.get("code_challenge_method"),
+        subject: row.get("subject"),
+        oauth_scope: row.get("oauth_scope"),
+    })
 }
 
 /// A record read back from the `audit_log` table, always within scope. The full

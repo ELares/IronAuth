@@ -116,6 +116,38 @@ impl ScopedKind for ManagementKeyKind {
     const PREFIX: &'static str = "mak";
 }
 
+/// Marker for an OIDC authorization code (`ac_`), the single-use code the
+/// authorization-code grant issues and the token endpoint redeems (issue #12).
+/// A tenant-scoped resource: the code embeds its `(tenant, environment)` in the
+/// clear, so the token endpoint recovers the scope from the presented code
+/// exactly as the management API recovers a key's scope, and a code minted in
+/// one scope parses as a uniform not-found under another.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct AuthorizationCodeKind;
+impl ScopedKind for AuthorizationCodeKind {
+    const PREFIX: &'static str = "ac";
+}
+
+/// Marker for an OIDC grant (`grt_`), the record linking a code, its session and
+/// consent, and every token issued from it (issue #12). The revocation spine:
+/// revoking the grant chain invalidates every token issued from it. Tenant
+/// scoped like every other resource.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct GrantKind;
+impl ScopedKind for GrantKind {
+    const PREFIX: &'static str = "grt";
+}
+
+/// Marker for an issued token (`tok_`), the `jti` of an access or ID token
+/// recorded against its grant (issue #12). Recording issued tokens is what makes
+/// grant-chain revocation observable: a token is active only while its issued
+/// row exists and its grant is not revoked. Tenant scoped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct IssuedTokenKind;
+impl ScopedKind for IssuedTokenKind {
+    const PREFIX: &'static str = "tok";
+}
+
 /// Marker for a human actor (an interactive user). One of the three actor kinds
 /// an audit envelope can name (see [`crate::audit::ActorRef`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -278,6 +310,14 @@ pub type OrganizationId = ScopedId<OrganizationKind>;
 pub type AuditId = ScopedId<AuditKind>;
 /// A management API key identifier (`mak_...`), environment-scoped (issue #11).
 pub type ManagementKeyId = ScopedId<ManagementKeyKind>;
+/// An OIDC authorization code identifier (`ac_...`), the single-use code the
+/// authorization-code grant issues and the token endpoint redeems (issue #12).
+pub type AuthorizationCodeId = ScopedId<AuthorizationCodeKind>;
+/// An OIDC grant identifier (`grt_...`), the revocation spine (issue #12).
+pub type GrantId = ScopedId<GrantKind>;
+/// An issued-token identifier (`tok_...`), the `jti` recorded against a grant
+/// (issue #12).
+pub type IssuedTokenId = ScopedId<IssuedTokenKind>;
 
 impl<K: ScopedKind> ScopedId<K> {
     /// Mint a fresh scoped identifier under `scope`, drawing the unique

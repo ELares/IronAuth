@@ -18,6 +18,11 @@ ironauth-server.workspace = true
 # static lane holds.
 ironauth-store.workspace = true
 ironauth-admin.workspace = true
+# The OIDC provider (issue #12) is mounted on the PUBLIC plane when
+# oidc.enabled is set; the store provides the data-plane connection. rustls/ring
+# only, so the musl static lane holds.
+ironauth-oidc.workspace = true
+ironauth-jose.workspace = true
 axum = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread"] }
 tracing.workspace = true
