@@ -233,6 +233,14 @@ const DENY_V6: &[Cidr6] = &[
         prefix: 96,
         class: BlockClass::EmbeddedIpv4,
     },
+    // 64:ff9b:1::/48: the RFC 8215 local-use NAT64 prefix; also embeds an IPv4
+    // address (for example 64:ff9b:1::a9fe:a9fe is the metadata service under
+    // the local NAT64 prefix), so it must be denied alongside the well-known one.
+    Cidr6 {
+        base: 0x0064_ff9b_0001_0000_0000_0000_0000_0000,
+        prefix: 48,
+        class: BlockClass::EmbeddedIpv4,
+    },
     // 100::/64: discard-only address block (RFC 6666).
     Cidr6 {
         base: 0x0100_0000_0000_0000_0000_0000_0000_0000,
@@ -258,6 +266,18 @@ const DENY_V6: &[Cidr6] = &[
         prefix: 16,
         class: BlockClass::EmbeddedIpv4,
     },
+    // 3fff::/20: documentation (RFC 9637), reserved for examples like 2001:db8.
+    Cidr6 {
+        base: 0x3fff_0000_0000_0000_0000_0000_0000_0000,
+        prefix: 20,
+        class: BlockClass::Documentation,
+    },
+    // Known limitation: the enumerated-wrapper approach denies the standard
+    // IPv4-in-IPv6 embeddings above (mapped, compatible, NAT64, 6to4), but does
+    // not decode ISATAP (`...::5efe:a.b.c.d`) or SRv6 uSID embeddings. Reaching
+    // an internal address through those requires nonstandard tunnel
+    // infrastructure between the OP and the target; on a normal deployment DNS
+    // never yields such an address and the direct forms are already denied.
     // fc00::/7: unique-local addresses (the IPv6 analogue of RFC 1918).
     Cidr6 {
         base: 0xfc00_0000_0000_0000_0000_0000_0000_0000,
@@ -387,6 +407,22 @@ mod tests {
             classify(v6("2001::1")),
             Some(BlockClass::ProtocolAssignment)
         );
+        // RFC 9637 documentation prefix.
+        assert_eq!(classify(v6("3fff::1")), Some(BlockClass::Documentation));
+        // Just outside 3fff::/20 is ordinary global unicast.
+        assert_eq!(classify(v6("3fff:1000::1")), None);
+    }
+
+    #[test]
+    fn local_nat64_prefix_cannot_smuggle_the_metadata_address() {
+        // 64:ff9b:1::/48 is the RFC 8215 local-use NAT64 prefix; without an
+        // explicit deny entry, 64:ff9b:1::a9fe:a9fe (the metadata service under
+        // the local NAT64 prefix) would classify as allowed.
+        assert_eq!(
+            classify(v6("64:ff9b:1::a9fe:a9fe")),
+            Some(BlockClass::EmbeddedIpv4)
+        );
+        assert_eq!(classify(v6("64:ff9b:1::1")), Some(BlockClass::EmbeddedIpv4));
     }
 
     #[test]

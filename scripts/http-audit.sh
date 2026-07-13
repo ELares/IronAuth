@@ -28,11 +28,17 @@ cd "$(git rev-parse --show-toplevel)"
 FETCH_CRATE='ironauth-fetch'
 
 # HTTP-client and client-TLS-stream crates. A direct dependency on any of these,
-# outside ironauth-fetch, is a second outbound path.
-CLIENT_DEPS='reqwest|isahc|ureq|surf|attohttpc|curl|hyper|hyper-util|tokio-rustls|native-tls'
+# outside ironauth-fetch, is a second outbound path. Bare `rustls` is included so
+# a crate cannot hand-roll an HTTPS client over a raw TcpStream and evade the
+# net; the anchored key match does not catch `rustls-native-certs`, `tokio-rustls`
+# and friends (they start with a different token), which are ironauth-fetch's own
+# excluded deps anyway.
+CLIENT_DEPS='reqwest|isahc|ureq|surf|attohttpc|curl|hyper|hyper-util|tokio-rustls|native-tls|rustls'
 
-# HTTP-client / TLS-client constructors in source.
-CLIENT_SYMBOLS='reqwest::|isahc::|ureq::|surf::|attohttpc::|hyper::client|hyper_util::client|client::conn::|TlsConnector'
+# HTTP-client / TLS-client constructors in source. The rustls client entry points
+# are named too, so a hand-rolled TLS client is caught; ironauth-fetch's own use
+# of tokio_rustls::rustls::ClientConfig is exempt (the fetch crate is excluded).
+CLIENT_SYMBOLS='reqwest::|isahc::|ureq::|surf::|attohttpc::|hyper::client|hyper_util::client|client::conn::|TlsConnector|rustls::(ClientConfig|ClientConnection|ClientConnectionData)'
 
 fail=0
 

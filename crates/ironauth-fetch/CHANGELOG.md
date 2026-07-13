@@ -23,11 +23,18 @@ range per docs/RELEASING.md.
     defense is proven in tests.
   - **Deny by resolved address.** Loopback, private, link-local (including the
     `169.254.169.254` cloud-metadata address), unique-local, shared-CGN,
-    multicast, unspecified, documentation, benchmarking, and other special-use
-    ranges are refused for IPv4, IPv6, and the IPv4-in-IPv6 forms (IPv4-mapped,
-    IPv4-compatible, NAT64, 6to4). The deny set is fixed, not configurable.
+    multicast, unspecified, documentation (`2001:db8::/32` and RFC 9637
+    `3fff::/20`), benchmarking, and other special-use ranges are refused for
+    IPv4, IPv6, and the IPv4-in-IPv6 forms (IPv4-mapped, IPv4-compatible, NAT64
+    `64:ff9b::/96` and the RFC 8215 local-use `64:ff9b:1::/48`, 6to4). ISATAP and
+    SRv6 embeddings are a documented known limitation. The deny set is fixed, not
+    configurable. Out-of-range, non-numeric, and zero ports are rejected as
+    malformed rather than silently defaulted.
   - **https by default**, plaintext http only on explicit per-request opt-in.
   - **Never follows redirects**: a 3xx with a `Location` is returned as an error.
+  - **The dispatcher owns request framing**: caller-supplied `Content-Length`,
+    `Transfer-Encoding`, `Connection`, and `Proxy-*` headers are stripped so
+    hyper derives the framing from the actual body (no request-smuggling desync).
   - **Response caps** enforced while streaming (size cap aborts mid-body, total
     deadline aborts mid-flight), with safe defaults (1 MiB, 10 s), configurable
     per the tunability principle.

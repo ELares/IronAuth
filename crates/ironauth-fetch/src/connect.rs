@@ -190,14 +190,36 @@ where
         .uri(path)
         .body(Full::new(body))
         .map_err(|_| DispatchFailure::Upstream)?;
-    // Headers are pre-validated typed values assembled by the caller (caller
-    // headers plus Host); install them verbatim.
-    *request.headers_mut() = headers.clone();
+    // The dispatcher owns request framing: install the assembled headers but drop
+    // any framing or hop-by-hop header a caller may have set, so hyper derives
+    // Content-Length from the actual Full body and a caller-supplied
+    // Content-Length/Transfer-Encoding can never desync the wire. Host is set by
+    // the dispatcher (not carried here) and legitimate headers pass through.
+    let dest = request.headers_mut();
+    for (name, value) in headers {
+        if is_connector_owned(name) {
+            continue;
+        }
+        dest.append(name.clone(), value.clone());
+    }
 
     sender
         .send_request(request)
         .await
         .map_err(|_| DispatchFailure::Upstream)
+}
+
+/// Whether a header is one the connector owns and must not accept from a caller:
+/// the framing headers (`Content-Length`, `Transfer-Encoding`), which hyper
+/// derives from the actual body, and the hop-by-hop headers (`Connection` and
+/// any `Proxy-*`, including `Proxy-Connection`), which have no place on an
+/// outbound request. `Host` is set by the dispatcher and never carried in the
+/// caller set, so it is not listed here.
+fn is_connector_owned(name: &http::HeaderName) -> bool {
+    *name == header::CONTENT_LENGTH
+        || *name == header::TRANSFER_ENCODING
+        || *name == header::CONNECTION
+        || name.as_str().starts_with("proxy-")
 }
 
 /// Apply the redirect rule and read the body under the size cap.

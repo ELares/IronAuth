@@ -153,7 +153,21 @@ pub fn parse_target(url: &str) -> Result<Target, TargetError> {
     }
 
     let literal_ip = IpAddr::from_str(host).ok();
-    let port = uri.port_u16().unwrap_or_else(|| scheme.default_port());
+    // A port component that is present must be a valid, non-zero u16. `http::Uri`
+    // silently drops an out-of-range port (it returns no port at all), which
+    // would otherwise fall back to the scheme default; parse the raw port from
+    // the authority so an out-of-range port, a non-numeric port, and port 0 are
+    // all rejected as malformed rather than silently defaulted.
+    let port = match raw_port(authority.as_str()) {
+        None => scheme.default_port(),
+        Some(raw) => {
+            let port: u16 = raw.parse().map_err(|_| TargetError::Malformed)?;
+            if port == 0 {
+                return Err(TargetError::Malformed);
+            }
+            port
+        }
+    };
 
     let path_and_query = match uri.path_and_query() {
         Some(pq) if !pq.as_str().is_empty() => {
@@ -174,6 +188,20 @@ pub fn parse_target(url: &str) -> Result<Target, TargetError> {
         path_and_query,
         literal_ip,
     })
+}
+
+/// The raw port substring of an authority (`None` when no port component is
+/// present). For an IPv6 literal the port follows the closing bracket; otherwise
+/// it follows the single colon. Userinfo has already been rejected, so the
+/// authority here is `host[:port]` with no credentials.
+fn raw_port(authority: &str) -> Option<&str> {
+    if let Some(rest) = authority.strip_prefix('[') {
+        // IPv6 literal: "[::1]:9000" or "[::1]". The port, if any, is after "]".
+        let close = rest.find(']')?;
+        return rest[close + 1..].strip_prefix(':');
+    }
+    // reg-name or IPv4 literal: the port follows the sole colon.
+    authority.split_once(':').map(|(_, port)| port)
 }
 
 #[cfg(test)]
@@ -197,6 +225,33 @@ mod tests {
         assert_eq!(target.port, 8443);
         assert_eq!(target.path_and_query, "/a?b=c&d=e");
         assert_eq!(target.host_header(), "example.com:8443");
+    }
+
+    #[test]
+    fn out_of_range_zero_and_junk_ports_are_malformed() {
+        // An out-of-range port must be rejected, not silently defaulted to the
+        // scheme port (which would fetch a different service than the URL named).
+        assert_eq!(
+            parse_target("https://h:99999/"),
+            Err(TargetError::Malformed)
+        );
+        // Port 0 is not a connectable destination.
+        assert_eq!(parse_target("https://h:0/"), Err(TargetError::Malformed));
+        // Non-numeric and empty port components.
+        assert_eq!(parse_target("https://h:abc/"), Err(TargetError::Malformed));
+        assert_eq!(parse_target("https://h:/"), Err(TargetError::Malformed));
+        // The IPv6-literal port path is validated the same way.
+        assert_eq!(
+            parse_target("https://[::1]:99999/"),
+            Err(TargetError::Malformed)
+        );
+        // Valid boundary ports still parse.
+        assert_eq!(parse_target("https://h:65535/").expect("valid").port, 65535);
+        assert_eq!(parse_target("https://h:1/").expect("valid").port, 1);
+        assert_eq!(
+            parse_target("https://[::1]:9000/").expect("valid").port,
+            9000
+        );
     }
 
     #[test]

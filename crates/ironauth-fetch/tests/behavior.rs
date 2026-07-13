@@ -135,6 +135,65 @@ async fn requests_carry_no_cookies_credentials_or_proxy_headers() {
 }
 
 #[tokio::test]
+async fn the_dispatcher_owns_framing_and_strips_caller_framing_headers() {
+    let server = common::start(Behavior::Body(b"ok".to_vec())).await;
+    let (fetcher, _dialer) = fetcher_for(server.addr, FetchLimits::default());
+
+    // A POST with a real 5-byte body, but a caller who tries to set a bogus
+    // Content-Length, a conflicting Transfer-Encoding, a hop-by-hop Connection,
+    // and a Proxy-* header. The dispatcher must strip all of those and let hyper
+    // derive the true framing; legitimate headers (Content-Type) pass through.
+    let request = FetchRequest::new(
+        FetchPurpose::WebhookDelivery,
+        http::Method::POST,
+        "http://hook.example/deliver",
+    )
+    .allow_plaintext_http()
+    .body("hello")
+    .header(
+        http::header::CONTENT_LENGTH,
+        http::HeaderValue::from_static("999"),
+    )
+    .header(
+        http::header::TRANSFER_ENCODING,
+        http::HeaderValue::from_static("chunked"),
+    )
+    .header(
+        http::header::CONNECTION,
+        http::HeaderValue::from_static("keep-alive"),
+    )
+    .header(
+        http::HeaderName::from_static("proxy-authorization"),
+        http::HeaderValue::from_static("Basic c2VjcmV0"),
+    )
+    .header(
+        http::header::CONTENT_TYPE,
+        http::HeaderValue::from_static("application/json"),
+    );
+    let response = fetcher.fetch(request).await.expect("fetch succeeds");
+    assert_eq!(response.status().as_u16(), 200);
+
+    let heads = server.requests();
+    assert_eq!(heads.len(), 1);
+    let head = heads[0].to_ascii_lowercase();
+    // hyper's framing matches the actual body length, and the bogus values are
+    // nowhere on the wire.
+    assert!(head.contains("content-length: 5"), "head: {head}");
+    assert!(!head.contains("999"), "bogus content-length leaked: {head}");
+    assert!(
+        !head.contains("chunked"),
+        "transfer-encoding leaked: {head}"
+    );
+    assert!(!head.contains("keep-alive"), "connection leaked: {head}");
+    assert!(!head.contains("proxy-"), "proxy header leaked: {head}");
+    // A legitimate caller header still passes through.
+    assert!(
+        head.contains("content-type: application/json"),
+        "head: {head}"
+    );
+}
+
+#[tokio::test]
 async fn caps_have_safe_defaults_and_are_configurable() {
     let defaults = FetchLimits::default();
     assert_eq!(

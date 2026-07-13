@@ -60,15 +60,23 @@ public address, never the private one.
 The policy denies (it does not allowlist hosts): loopback, private (RFC 1918 and
 IPv6 unique-local `fc00::/7`), link-local (`169.254.0.0/16` and `fe80::/10`,
 which is where cloud metadata lives), shared CGN (`100.64.0.0/10`), multicast,
-unspecified, documentation, benchmarking, and other special-use ranges, for IPv4
-AND IPv6. The IPv4-in-IPv6 forms (IPv4-mapped `::ffff:a.b.c.d`, IPv4-compatible
-`::a.b.c.d`, NAT64 `64:ff9b::/96`, 6to4 `2002::/16`) are peeled apart: the
-embedded IPv4 is extracted and classified, and the wrapping form is refused even
-for a public embedded address, because a normal DNS answer never produces one.
+unspecified, documentation (`2001:db8::/32` and the RFC 9637 `3fff::/20`),
+benchmarking, and other special-use ranges, for IPv4 AND IPv6. The IPv4-in-IPv6
+forms (IPv4-mapped `::ffff:a.b.c.d`, IPv4-compatible `::a.b.c.d`, NAT64
+`64:ff9b::/96` and the RFC 8215 local-use `64:ff9b:1::/48`, 6to4 `2002::/16`) are
+peeled apart: the embedded IPv4 is extracted and classified, and the wrapping
+form is refused even for a public embedded address, because a normal DNS answer
+never produces one. This enumerated-wrapper approach does NOT decode the exotic
+ISATAP (`...::5efe:a.b.c.d`) or SRv6-uSID embeddings, a documented limitation:
+reaching an internal host through those needs nonstandard tunnel infrastructure
+between the OP and the target, and the direct address forms are already denied.
 The ranges are enumerated explicitly with a comment per range, and the deny set
 is intentionally NOT configurable: loosening it reopens the SSRF class. Because
 validation is on the RESOLVED ADDRESS, textual bypasses (decimal, octal, or hex
-IP spellings that the OS resolver expands) are caught at the same gate.
+IP spellings that the OS resolver expands) are caught at the same gate. A URL
+whose port is out of range, non-numeric, or zero is rejected as malformed rather
+than silently defaulted, so the fetch cannot land on a different service than the
+URL named.
 
 ### The other controls
 
@@ -85,6 +93,10 @@ IP spellings that the OS resolver expands) are caught at the same gate.
 - **No ambient authority.** No cookie jar, no default credentials, no
   `HTTP_PROXY`/`NO_PROXY` trust; userinfo in a URL is rejected. A request carries
   only what the caller set, plus a `Host` header for the true destination.
+- **The dispatcher owns request framing.** The connector strips any caller
+  `Content-Length`, `Transfer-Encoding`, `Connection`, and `Proxy-*` header
+  before sending, so hyper derives the framing from the actual body and a
+  caller-supplied length cannot desync the wire (a request-smuggling seam).
 - **Caller identity and purpose in the API.** `fetch` takes a `FetchPurpose`
   (jwks_uri, sector-identifier, client-metadata, webhook-delivery, logo) so
   blocked and completed attempts are observable per purpose in metrics and logs
@@ -109,8 +121,9 @@ permissive and the musl static lane holding.
 - Single-dispatcher discipline is enforced two ways: module visibility (the
   connector is private; the seams are behind a test-only feature) and
   `scripts/http-audit.sh`, which fails the build if any other crate declares a
-  direct HTTP-client dependency or constructs an HTTP/TLS client in source. The
-  assembler wires that lint into CI.
+  direct HTTP-client or TLS-client dependency (reqwest, hyper, tokio-rustls, bare
+  `rustls`, and so on) or constructs an HTTP/TLS client in source. The assembler
+  wires that lint into CI.
 - The connector speaks HTTP/1.1 only. HTTP/2 for outbound fetches, if ever
   needed, is a separate opt-in decision recorded in a new ADR.
 - The deny policy is deliberately rigid. An environment that genuinely needs to
