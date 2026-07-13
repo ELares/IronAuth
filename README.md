@@ -32,9 +32,11 @@ organizations, SCIM, and agent-native OAuth.
 Three covenants, stated once and never moved: no paywalled security features,
 no mandatory first-party infrastructure, no unexportable data. The full
 covenant text, including the supporting commitments and the falsifiable
-commercial line, is in [COVENANTS.md](COVENANTS.md). The threat model and the
-"will not implement, and why" page land with the M1 security-program issue
-and will be linked here.
+commercial line, is in [COVENANTS.md](COVENANTS.md). The per-surface threat
+model is [docs/THREAT-MODEL.md](docs/THREAT-MODEL.md) (updated in the same PR
+as any new surface, by rule), deliberate refusals are documented in
+[docs/WILL-NOT-IMPLEMENT.md](docs/WILL-NOT-IMPLEMENT.md), and the security
+policy with safe harbor is [SECURITY.md](SECURITY.md).
 
 ## Repository layout
 
