@@ -132,7 +132,12 @@ impl AuthMethod {
 /// [`AuthMethod::Password`]: the only login path that has ever existed is the
 /// bootstrap password login, so a recorded event with no parseable method was,
 /// by construction, a password authentication. The fallback keeps the derived
-/// claims honest for any legacy row rather than emitting an empty `amr`.
+/// claims honest for any legacy row rather than emitting an empty `amr`. It can
+/// only ever under-claim (drop an unknown method), never over-claim, so it is the
+/// safe direction. When M7 adds a writer for non-password methods, the mint path
+/// must gain an achievability assertion so a stale or dormant elevated method
+/// (for example a passkey `phr`) cannot be derived into a claim the current
+/// authentication did not actually achieve.
 #[must_use]
 pub fn parse_methods(auth_methods: &str) -> Vec<AuthMethod> {
     let methods: Vec<AuthMethod> = auth_methods

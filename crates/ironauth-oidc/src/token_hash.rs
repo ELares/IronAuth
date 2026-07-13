@@ -203,6 +203,34 @@ mod tests {
     }
 
     #[test]
+    fn spec_known_answer_vectors_for_at_hash_and_c_hash() {
+        // OIDC Core 1.0 published known-answer vectors: the expected strings come
+        // from the spec text itself, so they are an INDEPENDENT reference that does
+        // not recompute with this module's own primitives. A systematic error (the
+        // right half instead of the left, or the wrong base64 alphabet) would pass
+        // reference_left_half but FAIL these fixed spec values.
+        // Appendix A.3: at_hash of the example access token under an RS256
+        // (SHA-256) ID token.
+        assert_eq!(
+            at_hash(
+                JwsAlgorithm::Rs256,
+                "jHkWEdUXMU1BwAsC4vtUsZwnNvTIxEl0z9K3vx5KF0Y"
+            ),
+            "77QmUPtjPfzWtF2AnpK9RQ",
+            "OIDC Core A.3 at_hash vector"
+        );
+        // Appendix A.4: c_hash of the example authorization code under RS256.
+        assert_eq!(
+            c_hash(
+                JwsAlgorithm::Rs256,
+                "Qcb0Orv1zh30vL1MPRsbm-diHiMwcLyZvn1arpZv-Jxf_11jnpEX3Tgfvk"
+            ),
+            "LDktKdoQak3Pk0cnXxCltA",
+            "OIDC Core A.4 c_hash vector"
+        );
+    }
+
+    #[test]
     fn eddsa_at_hash_is_32_bytes_and_rs256_is_16() {
         // A concrete SHA-512 (EdDSA) at_hash decodes to 32 bytes; SHA-256
         // (RS256) to 16. A regression here would mean the wrong digest was used.
