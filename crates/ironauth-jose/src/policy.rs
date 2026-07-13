@@ -64,10 +64,17 @@ impl JwsAlgorithm {
     /// Returns `None` for every unsupported or malformed name, including
     /// `none`, the HMAC names, and any casing or whitespace variant, so the
     /// caller cannot be tricked by a near-miss spelling.
+    ///
+    /// `Ed25519` is accepted as an alias of the polymorphic `EdDSA` identifier.
+    /// It is the fully-specified name (draft-ietf-jose-fully-specified-algorithms)
+    /// for the exact same primitive: `PureEdDSA` over Curve25519, verified with
+    /// the exact same `ring` Ed25519 path and key family. It introduces no new
+    /// trust and no new family, so accepting it cannot enable any downgrade or
+    /// confusion; the signer emits it only when its fully-specified toggle is on.
     #[must_use]
     pub fn from_jose_name(name: &str) -> Option<Self> {
         Some(match name {
-            "EdDSA" => JwsAlgorithm::EdDsa,
+            "EdDSA" | "Ed25519" => JwsAlgorithm::EdDsa,
             "ES256" => JwsAlgorithm::Es256,
             "ES384" => JwsAlgorithm::Es384,
             "RS256" => JwsAlgorithm::Rs256,
@@ -78,6 +85,21 @@ impl JwsAlgorithm {
             "PS512" => JwsAlgorithm::Ps512,
             _ => return None,
         })
+    }
+
+    /// The fully-specified JOSE `alg` name for this algorithm.
+    ///
+    /// Identical to [`JwsAlgorithm::as_jose_name`] for every algorithm except
+    /// `EdDSA`, whose fully-specified name is `Ed25519`
+    /// (draft-ietf-jose-fully-specified-algorithms). The rest of the matrix is
+    /// already fully specified. Used by the signer only when its emission toggle
+    /// is on; the polymorphic [`JwsAlgorithm::as_jose_name`] remains the default.
+    #[must_use]
+    pub fn fully_specified_name(self) -> &'static str {
+        match self {
+            JwsAlgorithm::EdDsa => "Ed25519",
+            other => other.as_jose_name(),
+        }
     }
 
     /// The key family this algorithm must be verified with.
@@ -542,3 +564,43 @@ impl std::fmt::Display for PolicyError {
 }
 
 impl std::error::Error for PolicyError {}
+
+#[cfg(test)]
+mod tests {
+    use super::JwsAlgorithm;
+
+    #[test]
+    fn ed25519_is_a_fully_specified_alias_of_eddsa() {
+        assert_eq!(
+            JwsAlgorithm::from_jose_name("Ed25519"),
+            Some(JwsAlgorithm::EdDsa)
+        );
+        assert_eq!(
+            JwsAlgorithm::from_jose_name("EdDSA"),
+            Some(JwsAlgorithm::EdDsa)
+        );
+    }
+
+    #[test]
+    fn hmac_none_and_unsupported_names_are_never_parsed() {
+        for name in [
+            "HS256", "HS384", "HS512", "none", "None", "", " ", "Ed448", "ES512", "ed25519",
+        ] {
+            assert!(JwsAlgorithm::from_jose_name(name).is_none(), "{name}");
+        }
+    }
+
+    #[test]
+    fn fully_specified_name_only_rewrites_eddsa() {
+        assert_eq!(JwsAlgorithm::EdDsa.fully_specified_name(), "Ed25519");
+        assert_eq!(JwsAlgorithm::EdDsa.as_jose_name(), "EdDSA");
+        for alg in [
+            JwsAlgorithm::Es256,
+            JwsAlgorithm::Es384,
+            JwsAlgorithm::Rs256,
+            JwsAlgorithm::Ps512,
+        ] {
+            assert_eq!(alg.fully_specified_name(), alg.as_jose_name());
+        }
+    }
+}
