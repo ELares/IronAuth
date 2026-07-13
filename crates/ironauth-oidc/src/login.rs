@@ -15,10 +15,12 @@ use axum::http::StatusCode;
 use axum::response::Response;
 use serde::Deserialize;
 
+use crate::authn::AuthenticationEvent;
 use crate::interaction::{self, parse_resume};
 use crate::pages;
 use crate::password;
 use crate::state::OidcState;
+use crate::util::epoch_micros;
 
 /// The `return_to` carried on the `GET /login` query.
 #[derive(Deserialize)]
@@ -73,7 +75,13 @@ pub async fn login_post(State(state): State<OidcState>, Form(form): Form<LoginFo
         Ok(Some(user)) if password::verify_password(password, &user.password_hash) => {
             let actor = interaction::user_actor(&user.id);
             let subject = user.id.to_string();
-            match interaction::establish_session(&state, resume.scope, &subject, actor).await {
+            // The recorded authentication event: a password login (RFC 8176
+            // `pwd`) at the current clock instant. The ID token's auth_time, amr,
+            // and acr all derive from it (issue #14).
+            let event = AuthenticationEvent::password(epoch_micros(state.now()));
+            match interaction::establish_session(&state, resume.scope, &subject, &event, actor)
+                .await
+            {
                 Ok(cookie) => interaction::redirect_setting_cookie(&resume.return_to, &cookie),
                 Err(_) => interaction::server_error_page(),
             }

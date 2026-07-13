@@ -64,6 +64,19 @@ pub struct AuthorizeParams {
     /// bootstrap; the rest of the `prompt`/`max_age` semantics build on the session
     /// the bootstrap establishes and are a later milestone.
     pub prompt: Option<String>,
+    /// The OIDC `max_age`. Its PRESENCE (including `max_age=0`) requires the ID
+    /// token to carry `auth_time` (issue #14). The re-authentication ENFORCEMENT
+    /// that `max_age` also implies (a stale session must re-authenticate) is
+    /// step-up policy, owned by #16 and M7; only the `auth_time` emission lands
+    /// here.
+    pub max_age: Option<String>,
+    /// The OIDC `acr_values`: the ACR values the client would prefer, most
+    /// preferred first. IronAuth attempts to satisfy them but the ID token's `acr`
+    /// always reflects the ACHIEVED level (derived from the authentication event),
+    /// never a copied-through requested value (issue #14). The
+    /// `unmet_authentication_requirements` error when a requested level cannot be
+    /// met is owned by #16.
+    pub acr_values: Option<String>,
 }
 
 /// `GET /authorize`.
@@ -114,9 +127,11 @@ async fn issue_code(
     // 2. The client must exist in its declared scope. This lookup is BEFORE any
     //    redirect, so an unknown client renders a page and never redirects. A
     //    store failure here also fails closed to a page (we cannot safely redirect
-    //    without a validated client).
-    match state.store().scoped(scope).clients().get(&client_id).await {
-        Ok(_) => {}
+    //    without a validated client). The record carries the client's
+    //    `require_auth_time` registration, which (with `max_age`) decides whether
+    //    the ID token must carry `auth_time` (issue #14).
+    let client = match state.store().scoped(scope).clients().get(&client_id).await {
+        Ok(record) => record,
         Err(StoreError::NotFound) => {
             return Err(AuthorizeError::page(
                 "the client_id is malformed or unknown",
@@ -127,7 +142,7 @@ async fn issue_code(
                 "the authorization request could not be processed",
             ));
         }
-    }
+    };
 
     // 3. redirect_uri: present and syntactically valid. Still BEFORE any redirect.
     //    Strict registered-match is #13; here it must be an absolute http(s) URI
@@ -200,7 +215,23 @@ async fn issue_code(
             } => (session, consent_ref),
         };
 
-    // 7. Persist the code + grant bound to every re-checkable parameter and the
+    // 7. Freeze the authentication context onto the code. auth_time is emitted in
+    //    the ID token when the request asked for max_age (present, including
+    //    max_age=0) OR the client registered require_auth_time; the value is
+    //    always the truthful recorded instant, so it is frozen only when it is
+    //    due. The recorded methods are always frozen so amr/acr can be derived.
+    //    acr_values is honored as a preference only: the achieved acr comes from
+    //    the event, never from the request, so nothing about acr_values is copied
+    //    onto the code.
+    let max_age_requested = params
+        .max_age
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty());
+    let auth_time_micros =
+        (max_age_requested || client.require_auth_time).then_some(session.auth_time_unix_micros);
+
+    // 8. Persist the code + grant bound to every re-checkable parameter and the
     //    real subject/session/consent, then redirect with the code.
     let session_ref = session.session_id.to_string();
     let resolved = Resolved {
@@ -214,6 +245,8 @@ async fn issue_code(
         code_challenge_method,
         state_echo,
         subject: &session.subject,
+        auth_methods: &session.auth_methods,
+        auth_time_micros,
         session_ref: &session_ref,
         consent_ref: &consent_ref,
     };
@@ -309,6 +342,8 @@ fn build_authorize_url(params: &AuthorizeParams) -> String {
                 params.code_challenge_method.as_deref(),
             ),
             ("prompt", params.prompt.as_deref()),
+            ("max_age", params.max_age.as_deref()),
+            ("acr_values", params.acr_values.as_deref()),
         ],
     )
 }
@@ -322,6 +357,12 @@ struct Resolved<'a> {
     state_echo: Option<&'a str>,
     /// The authenticated end-user subject (a `usr_` id string).
     subject: &'a str,
+    /// The recorded authentication method tokens (issue #14), frozen onto the
+    /// code so amr/acr derive from the actual login.
+    auth_methods: &'a str,
+    /// The recorded authentication instant frozen onto the code, present only
+    /// when the ID token must carry `auth_time` (issue #14).
+    auth_time_micros: Option<i64>,
     /// The authenticating session handle recorded on the grant.
     session_ref: &'a str,
     /// The recorded consent handle recorded on the grant.
@@ -354,6 +395,8 @@ async fn finalize_issue(
         code_challenge_method: resolved.code_challenge_method,
         subject: resolved.subject,
         oauth_scope: resolved.oauth_scope,
+        auth_methods: resolved.auth_methods,
+        auth_time_micros: resolved.auth_time_micros,
         session_ref: Some(resolved.session_ref),
         consent_ref: Some(resolved.consent_ref),
         expires_at_micros: epoch_micros(expires_at),

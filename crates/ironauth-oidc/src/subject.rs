@@ -37,6 +37,25 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use ironauth_env::Entropy;
 use sha2::{Digest, Sha256};
 
+/// The maximum length of a `sub` claim, in ASCII characters (OIDC Core 1.0
+/// errata set 2, section 2, caps `sub` at 255 ASCII characters).
+///
+/// IronAuth enforces this at ISSUANCE and fails closed: a subject over the cap
+/// is never truncated (truncation could collide two distinct users onto one
+/// `sub`), it is refused. Both derivations this module produces are far under
+/// it by construction (a `usr_` public id is ~68 characters, a base64url
+/// pairwise hash is 43), so the cap is a fail-closed backstop, not a routine
+/// limit.
+pub const MAX_SUBJECT_LEN: usize = 255;
+
+/// Whether `sub` is within the 255 ASCII-character cap: pure ASCII and at most
+/// [`MAX_SUBJECT_LEN`] characters. The issuance path checks this and refuses a
+/// violating subject rather than truncating it (OIDC Core errata set 2 §2).
+#[must_use]
+pub fn subject_within_cap(sub: &str) -> bool {
+    sub.is_ascii() && sub.len() <= MAX_SUBJECT_LEN
+}
+
 /// How an end user's `sub` is presented to a client.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SubjectType {
@@ -331,6 +350,21 @@ mod tests {
             cache.memo.lock().expect("lock").is_empty(),
             "public subjects leave no cache entry"
         );
+    }
+
+    #[test]
+    fn subject_cap_admits_both_derivations_and_refuses_overlength() {
+        // Both derivations this module produces are within the cap.
+        let public = resolve_subject(&SubjectConfig::public(), "usr_abc", &salt());
+        assert!(subject_within_cap(&public));
+        let pairwise = resolve_subject(&SubjectConfig::pairwise("a.test"), "usr_abc", &salt());
+        assert!(subject_within_cap(&pairwise));
+
+        // Exactly 255 ASCII characters is admitted; 256 is refused; non-ASCII is
+        // refused even under the length cap.
+        assert!(subject_within_cap(&"a".repeat(MAX_SUBJECT_LEN)));
+        assert!(!subject_within_cap(&"a".repeat(MAX_SUBJECT_LEN + 1)));
+        assert!(!subject_within_cap("café"));
     }
 
     #[test]

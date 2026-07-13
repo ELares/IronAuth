@@ -44,10 +44,14 @@
 //!
 //! # Scope of this issue
 //!
+//! The conditional ID-token claim rules (OIDC Core errata set 2: honest `acr`,
+//! `amr`, `auth_time`, the 255-ASCII `sub` cap, `nonce`, and the staged
+//! `at_hash`/`c_hash`) are #14 and land here (see [`tokens`] and [`authn`]).
 //! Out of scope, with clean seams left for them: PKCE S256-only ENFORCEMENT and
-//! exact redirect matching and RFC 9207 `iss` (#13); the conditional ID-token
-//! claim rules (#14); refresh rotation and families (M3); the legacy response
-//! types and `form_post` (#17); and the IronCache-backed replay accelerator.
+//! exact redirect matching and RFC 9207 `iss` (#13); refresh rotation and
+//! families (M3); the legacy response types and `form_post` and the front-channel
+//! emission of `at_hash`/`c_hash` (#17); and the IronCache-backed replay
+//! accelerator.
 //!
 //! Because the strict registered-redirect match and mandatory-S256 enforcement
 //! are #13, this provider MUST NOT be enabled in production before #13 lands:
@@ -63,6 +67,7 @@
 //! router directly with a populated key store, exactly as the management-API tests
 //! build their router.
 
+mod authn;
 mod authorize;
 mod client_auth;
 mod consent;
@@ -82,6 +87,7 @@ mod session;
 mod state;
 mod subject;
 mod token;
+mod token_hash;
 mod tokens;
 mod util;
 mod wellknown;
@@ -89,6 +95,10 @@ mod wellknown;
 use axum::Router;
 use axum::routing::{get, post};
 
+pub use authn::{
+    AuthMethod, AuthenticationEvent, achieved_acr, acr_values_supported, amr_values, methods_token,
+    parse_methods,
+};
 pub use client_auth::{ClientAuthMethod, generate_secret, hash_secret};
 pub use discovery::{
     ADVERTISED_ENDPOINTS, DiscoveryCapabilities, DiscoveryEndpoint, DiscoveryState,
@@ -107,7 +117,11 @@ pub use sector::{
 };
 pub use session::SESSION_COOKIE;
 pub use state::OidcState;
-pub use subject::{PairwiseSalt, SubjectCache, SubjectConfig, SubjectType, resolve_subject};
+pub use subject::{
+    MAX_SUBJECT_LEN, PairwiseSalt, SubjectCache, SubjectConfig, SubjectType, resolve_subject,
+    subject_within_cap,
+};
+pub use token_hash::{HashKind, at_hash, c_hash, left_half_hash};
 
 /// Build the OIDC provider router.
 ///
