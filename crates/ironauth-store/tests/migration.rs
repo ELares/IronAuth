@@ -242,13 +242,13 @@ async fn expand_contract_example_chain_runs_all_three_phases_and_contract_remove
     );
 }
 
-/// The PRODUCTION chain (`MigrationRunner::new`) contains exactly the thirteen
+/// The PRODUCTION chain (`MigrationRunner::new`) contains exactly the fourteen
 /// real migrations and leaves no throwaway demo object in a real database.
 // A long but linear ledger-and-table assertion sweep (one line per migration and
 // per real table); splitting it would not make it clearer.
 #[allow(clippy::too_many_lines)]
 #[tokio::test]
-async fn production_chain_is_only_the_thirteen_real_migrations_and_ships_no_demo_object() {
+async fn production_chain_is_only_the_fourteen_real_migrations_and_ships_no_demo_object() {
     // TestDatabase::start runs Store::migrate() (the production chain) on a
     // fresh, empty database.
     let db = TestDatabase::start().await;
@@ -265,17 +265,17 @@ async fn production_chain_is_only_the_thirteen_real_migrations_and_ships_no_demo
     );
     assert_eq!(
         report.already_applied(),
-        13,
-        "the production chain is exactly thirteen migrations (isolation, audit log, management \
+        14,
+        "the production chain is exactly fourteen migrations (isolation, audit log, management \
          API, OIDC authorization, signing keys, login/consent, authentication context, redirect \
          registration, UserInfo claims, consent scope upsert, resource servers, opaque access \
-         tokens, client auth suite)"
+         tokens, client auth suite, dynamic client registration)"
     );
 
-    // The ledger holds exactly versions 1 through 13.
+    // The ledger holds exactly versions 1 through 14.
     assert_eq!(
         applied_versions(pool).await,
-        vec![1_i64, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
+        vec![1_i64, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
     );
     let phase_of = |version: i64| async move {
         sqlx::query("SELECT phase FROM _schema_migrations WHERE version = $1")
@@ -300,6 +300,8 @@ async fn production_chain_is_only_the_thirteen_real_migrations_and_ships_no_demo
     assert_eq!(phase_of(12).await, "expand");
     // An ALTER TABLE ADD COLUMN and a CREATE TABLE are both additive expands (#25).
     assert_eq!(phase_of(13).await, "expand");
+    // The DCR clients-column expand is additive (#30).
+    assert_eq!(phase_of(14).await, "expand");
 
     // The demo object never reaches a production database.
     assert!(
@@ -410,6 +412,30 @@ async fn production_chain_is_only_the_thirteen_real_migrations_and_ships_no_demo
     assert!(
         table_exists(pool, "client_auth_diagnostics").await,
         "client_auth_diagnostics exists"
+    );
+    // The Dynamic Client Registration and configuration-management columns (issue
+    // #30): the RFC 7592 registration access token hash and client URI, the
+    // negotiated id_token signing algorithm, the RFC 8252 application type, and the
+    // DCR-origin flag.
+    assert!(
+        column_exists(pool, "clients", "registration_access_token_hash").await,
+        "clients.registration_access_token_hash exists"
+    );
+    assert!(
+        column_exists(pool, "clients", "registration_client_uri").await,
+        "clients.registration_client_uri exists"
+    );
+    assert!(
+        column_exists(pool, "clients", "id_token_signed_response_alg").await,
+        "clients.id_token_signed_response_alg exists"
+    );
+    assert!(
+        column_exists(pool, "clients", "application_type").await,
+        "clients.application_type exists"
+    );
+    assert!(
+        column_exists(pool, "clients", "dcr_registered").await,
+        "clients.dcr_registered exists"
     );
 }
 

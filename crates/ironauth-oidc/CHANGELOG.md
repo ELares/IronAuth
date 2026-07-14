@@ -6,6 +6,48 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Dynamic Client Registration and configuration management (issue #30).
+  - **RFC 7591 registration.** New `client_registration` module serving
+    `POST {issuer}/connect/register` (a distinct concept and path from the human
+    `/register` account surface). The metadata property set is validated with
+    per-spec defaults applied when omitted (`client_secret_basic`
+    `token_endpoint_auth_method`, `["code"]` `response_types`; an omitted
+    `id_token_signed_response_alg` records the environment's actual default signing
+    algorithm) and UNRECOGNIZED properties ignored per RFC 7591.
+    `token_endpoint_auth_method` and every algorithm are validated against the
+    implemented client-auth suite (issue #25), so the inert `client_secret_jwt`
+    and unknown methods are refused with `invalid_client_metadata`. `redirect_uris`
+    are RFC 8252 aware (web: https only; native: https, http loopback IP literals,
+    and reverse-domain private-use schemes; dangerous schemes rejected with
+    `invalid_redirect_uri`). `jwks` and `jwks_uri` are mutually exclusive, and a
+    `jwks_uri` is fetched THROUGH the SSRF-hardened fetcher (the issue #25
+    `ClientKeyResolver` path), so a private-address destination is rejected.
+  - **RP Metadata Choices 1.0 (recorded == signed).** `id_token_signed_response_alg`
+    may be an array of acceptable values (or the plural
+    `id_token_signed_response_alg_values`). The OP negotiates ONLY against the
+    algorithms the environment can ACTUALLY sign an ID token with (each permitted by
+    the environment policy AND backed by a loaded, active signing key), never the
+    advertised `id_token_signing_alg_values` (which carries the RS256 discovery floor
+    even where no RS256 key exists). Of the offered signable algorithms it prefers
+    `EdDSA`, else `RS256`, else the first mutual value; an offered set with nothing
+    the environment can sign is REJECTED with `invalid_client_metadata` (never
+    silently downgraded). The token endpoint then signs THAT client's ID token under
+    the recorded algorithm (an additive per-client override on the ID-token mint
+    path; the access token keeps the environment default), so the algorithm DCR
+    records and echoes is exactly the algorithm the ID token is signed under.
+  - **RFC 7592 management.** `GET`/`PUT`/`DELETE
+    {issuer}/connect/register/{client_id}` authenticated by the registration
+    access token (constant-time hash compare). Every successful update ROTATES the
+    token, so the superseded one is rejected on the next call. Credentials
+    (`client_secret`, `registration_access_token`) are stored SHA-256-hashed and
+    returned once.
+  - **Discovery + config.** Discovery advertises the per-environment
+    `registration_endpoint` (`{issuer}/connect/register`) only when enabled. The
+    endpoint ships behind a plain default-off `oidc.registration_enabled` flag; the
+    real abuse gating (quotas, quarantine, initial-access-token policy) is owned by
+    issue #31, with the enable gate and the single `register` funnel left as its
+    seam.
+
 - Complete the client authentication suite with JWT assertions and uniform
   failure hygiene (issue #25).
   - **`private_key_jwt` (RFC 7523).** A client authenticates the token endpoint

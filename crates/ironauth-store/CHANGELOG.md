@@ -6,6 +6,33 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Dynamic Client Registration persistence (issue #30, migration 0014, expand).
+  - **DCR clients columns.** `clients` gains `registration_access_token_hash`,
+    `registration_client_uri`, `id_token_signed_response_alg`, `application_type`,
+    and a `dcr_registered` origin flag (default false), all additive so every
+    pre-existing client is unaffected. Only the SHA-256 HASH of the RFC 7592
+    registration access token is stored; the plaintext is never persisted.
+  - **Repository surface.** `ClientRepo::dynamic_registration` reads a DCR client
+    within scope (a non-DCR or absent client is the uniform `NotFound`, so the RFC
+    7592 surface is no existence oracle). `ClientRepo::id_token_signing_alg` reads a
+    client's stored `id_token_signed_response_alg` within scope (or `None` for a
+    client with no per-client preference), so the token endpoint can sign that
+    client's ID token under the algorithm DCR recorded.
+    `ActingClientRepo::register_dynamic` creates a client from validated metadata
+    (auditing `client.registered`) and `ActingClientRepo::update_dynamic` applies an
+    RFC 7592 full-replacement update that ROTATES the registration access token in
+    the same transaction (auditing `client.updated`), so a superseded token stops
+    matching immediately; a `PUT` that transitions the client to a secretless method
+    (`none` / `private_key_jwt`) also NULLs any stored `secret_hash`, so no dead
+    credential material lingers. Both re-validate every redirect URI as an RFC 8252
+    registrable target and map the key-source CHECK (SQLSTATE 23514) to a `Conflict`.
+    New public types `DynamicClientRecord`, `NewDynamicClient`,
+    `DynamicClientUpdate`, and `DynamicClientRegistration`; the record's Debug
+    redacts the token hash.
+  - **Audit actions.** New `Action::ClientRegistered` (`client.registered`) and
+    `Action::ClientUpdated` (`client.updated`); the DCR delete reuses the existing
+    `client.delete`.
+
 - Client JWT-assertion authentication persistence (issue #25, migration 0013,
   expand).
   - **Client key registration.** `clients` gains `jwks`, `jwks_uri`, and

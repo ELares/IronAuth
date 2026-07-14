@@ -85,6 +85,11 @@ struct Inner {
     enable_response_type_code_id_token: bool,
     enable_response_type_none: bool,
     enable_response_mode_form_post: bool,
+    // Whether the Dynamic Client Registration endpoint is mounted and served
+    // (issue #30). Default OFF: open self-service registration is an abuse surface
+    // whose real gating (quotas, quarantine, initial-access-token policy) is owned
+    // by issue #31; this flag is the plain on/off switch #31 layers policy onto.
+    registration_enabled: bool,
     // The audience policy an inbound JWT client assertion must satisfy (issue #25),
     // shared with the JWT bearer grant (#26). Default: accept the token-endpoint
     // URL OR the issuer; strict: the issuer only.
@@ -174,6 +179,7 @@ impl OidcState {
                 enable_response_type_code_id_token: config.enable_response_type_code_id_token,
                 enable_response_type_none: config.enable_response_type_none,
                 enable_response_mode_form_post: config.enable_response_mode_form_post,
+                registration_enabled: config.registration_enabled,
                 subjects: SubjectCache::new(),
             }),
         }
@@ -353,6 +359,16 @@ impl OidcState {
     #[must_use]
     pub fn client_key_resolver(&self) -> Option<&Arc<ClientKeyResolver>> {
         self.inner.client_key_resolver.as_ref()
+    }
+
+    /// Whether the Dynamic Client Registration endpoint is enabled for this
+    /// deployment (issue #30). Default OFF: the endpoint is mounted and discovery
+    /// advertises `registration_endpoint` only when this is set. The real abuse
+    /// gating (quotas, quarantine, initial-access-token policy) is owned by issue
+    /// #31; this is the plain on/off switch it layers policy onto.
+    #[must_use]
+    pub fn registration_enabled(&self) -> bool {
+        self.inner.registration_enabled
     }
 
     /// Whether a CONFIDENTIAL client must use PKCE under this environment's policy
