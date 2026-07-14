@@ -6,6 +6,48 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Consent-hardening prerequisites for enabling OIDC (issue #196, blocking
+  issue #13). Two hard security gaps in the issue #20 bootstrap are closed; the
+  provider stays gated off by default (`oidc.enabled` unchanged).
+  - **Scope-aware consent.** `resolve_gate` (the authorize login/consent gate) now
+    treats a recorded consent as covering a request only when the request's scope is
+    a SUBSET of the scope the consent was granted against (new
+    `consent_covers_scope`, splitting on ASCII whitespace like the mint's own
+    `parse_scope_set`). A consent for a narrow scope (for example `openid`) no longer
+    silently auto-grants a later broader request (`openid profile email`): the
+    broader request re-prompts through the consent screen, and under `prompt=none`
+    returns `consent_required`, exactly as an absent consent does. A same-or-narrower
+    request still issues directly. Re-consent persists the broadened scope (the store
+    `grant` upsert), so it does not loop. Reads the granted scope through the store's
+    new `GrantedConsent`.
+  - **CSRF defense-in-depth on the login, consent, and registration POSTs.**
+    `login_post`, `consent_post`, and `register_post` now evaluate an Origin +
+    `Sec-Fetch-Site` allowlist (`interaction::same_origin_ok`) BEFORE any state change
+    (before verifying the password / recording consent / creating the account). A
+    conclusively cross-site POST (`Sec-Fetch-Site: cross-site`, or an `Origin` that
+    does not match the deployment's own origin, derived from `issuer_base` via
+    `OidcState::self_origin`) is refused with a generic `403` that creates no session,
+    records no consent, and creates no account. When neither header is conclusive the
+    existing `SameSite=Lax` cookie remains the backstop, so header-stripped and
+    non-browser clients are unaffected. This closes the Chromium "Lax+POST"
+    transitional window and the non-enforcing-legacy-client residual with no schema,
+    cookie, or token plumbing. `login_post` and `register_post` now take `HeaderMap`.
+    - **`register_post` was the load-bearing gap.** Unlike login and consent, the
+      registration POST needs NO pre-existing cookie and MINTS a session on success
+      (auto-login), so the `SameSite=Lax` backstop does not cover it at all: a
+      cross-site auto-submit with attacker-chosen credentials would sign the victim
+      into an attacker-known account (login-CSRF / session fixation). The check runs
+      before `hash_password` and before any account creation.
+    - **The Origin comparison is now normalized on both sides** so it never falsely
+      rejects a legitimate same-origin POST: `origin_of` lowercases the scheme and
+      host and drops the default port (`:443` for https, `:80` for http), matching the
+      `Origin` a browser normalizes and sends. A `public_url` configured with an
+      uppercase host or an explicit default port therefore still matches. This is
+      never a false ALLOW: a different scheme, host, or non-default port still differs.
+  - **Regression coverage.** A `prompt=none` request whose scope is NOT a subset of a
+    RECORDED consent now has an explicit test that it returns `consent_required`
+    through the negotiated response mode (an error redirect, never a consent page and
+    never a code), alongside the existing absent-consent and covered-consent cases.
 - Compose per-environment issuers, JWKS serving, and signing into the LIVE data
   plane (issue #194). The #19 primitives (per-environment `IssuerRegistry`, JWKS
   serving, algorithm policy, rotation `KeySet`) were inert; they now back the live

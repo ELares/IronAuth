@@ -235,6 +235,20 @@ impl OidcState {
         )
     }
 
+    /// This deployment's own web origin (`scheme://host[:port]`, no path), derived
+    /// from the configured `issuer_base` (`server.public_url`), or [`None`] when the
+    /// base URL has no parseable scheme+authority.
+    ///
+    /// Used as the CSRF Origin allowlist for the interactive login and consent POSTs
+    /// (issue #196): a browser sends `Origin` on every cross-origin POST, so an
+    /// `Origin` that does not match this value is a cross-site submission. The path,
+    /// query, and per-environment `/t/../e/..` suffix are intentionally dropped: an
+    /// `Origin` header is only ever `scheme://host[:port]`.
+    #[must_use]
+    pub fn self_origin(&self) -> Option<String> {
+        origin_of(&self.inner.issuer_base)
+    }
+
     /// The shared per-environment issuer registry: the ONE holder of every
     /// environment's signing keys, algorithm policy, and salt. The JWKS/discovery
     /// serving reads the SAME `Arc`, so a signed `kid` cannot diverge from the
@@ -376,5 +390,108 @@ impl std::fmt::Debug for OidcState {
             .field("access_token_ttl", &self.inner.access_token_ttl)
             .field("reuse_grace", &self.inner.reuse_grace)
             .finish_non_exhaustive()
+    }
+}
+
+/// The web origin (`scheme://host[:port]`) of a URL, in a canonical form, or
+/// [`None`] when it has no `scheme://authority`. The path, query, and fragment are
+/// dropped, so a base URL that carries a path (`https://host/base`) still yields the
+/// bare origin an `Origin` header would (`https://host`).
+///
+/// The result is NORMALIZED so it compares byte-exact against a browser-sent
+/// `Origin` (issue #196): the scheme and host are lowercased and the default port is
+/// dropped (`:443` for https, `:80` for http). A `public_url` configured with an
+/// uppercase host or an explicit default port therefore still matches the
+/// `Origin` a browser normalizes and sends, instead of falsely rejecting every
+/// legitimate same-origin login/consent/register POST. This normalization never
+/// produces a false ALLOW: a genuinely different scheme, host, or non-default port
+/// still differs after it. Used to derive this deployment's own origin from
+/// `issuer_base` for the CSRF Origin allowlist, and to canonicalize the incoming
+/// `Origin` before the comparison.
+pub(crate) fn origin_of(url: &str) -> Option<String> {
+    let (scheme, rest) = url.split_once("://")?;
+    if scheme.is_empty() {
+        return None;
+    }
+    // The authority ends at the first path/query/fragment delimiter.
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    if authority.is_empty() {
+        return None;
+    }
+    let scheme = scheme.to_ascii_lowercase();
+    // Lowercase the whole authority (host casing is insignificant); a port, if
+    // present, is decimal ASCII and unaffected by lowercasing.
+    let authority = authority.to_ascii_lowercase();
+    // Drop an explicit default port so `host:443`/`host:80` match the bare `host` a
+    // browser sends. `rsplit_once(':')` isolates the port even for a bracketed IPv6
+    // literal (`[::1]:443`); a portless IPv6 literal (`[::1]`) never has a trailing
+    // `:443`/`:80` tail, so nothing is stripped from it.
+    let authority = match authority.rsplit_once(':') {
+        Some((host, port)) if is_default_port(&scheme, port) => host,
+        _ => &authority,
+    };
+    Some(format!("{scheme}://{authority}"))
+}
+
+/// Whether `port` is the default port for `scheme` (both already lowercased), so it
+/// may be dropped from a canonical origin.
+fn is_default_port(scheme: &str, port: &str) -> bool {
+    matches!((scheme, port), ("https", "443") | ("http", "80"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::origin_of;
+
+    #[test]
+    fn origin_of_keeps_scheme_and_authority_and_drops_the_path() {
+        assert_eq!(
+            origin_of("https://issuer.test").as_deref(),
+            Some("https://issuer.test")
+        );
+        // A base URL with a path or a NON-default port still yields the bare origin,
+        // port preserved.
+        assert_eq!(
+            origin_of("https://issuer.test:8443/base/path").as_deref(),
+            Some("https://issuer.test:8443")
+        );
+        assert_eq!(
+            origin_of("http://127.0.0.1:9000/").as_deref(),
+            Some("http://127.0.0.1:9000")
+        );
+        // Malformed bases yield no origin (the caller then falls back to the
+        // Sec-Fetch-Site rule alone).
+        assert_eq!(origin_of("not-a-url"), None);
+        assert_eq!(origin_of("://no-scheme"), None);
+        assert_eq!(origin_of("https://"), None);
+    }
+
+    #[test]
+    fn origin_of_normalizes_case_and_the_default_port() {
+        // An uppercase scheme/host and an explicit DEFAULT port all normalize to the
+        // bare lowercase origin a browser sends, so the CSRF comparison does not
+        // falsely reject a legitimate same-origin POST (issue #196).
+        assert_eq!(
+            origin_of("https://Issuer.test:443").as_deref(),
+            Some("https://issuer.test")
+        );
+        assert_eq!(
+            origin_of("HTTPS://Issuer.Test/base").as_deref(),
+            Some("https://issuer.test")
+        );
+        assert_eq!(
+            origin_of("http://Host.test:80/").as_deref(),
+            Some("http://host.test")
+        );
+        // A NON-default port is significant and stays (never a false allow): a
+        // default port on the OTHER scheme is not a default and is kept too.
+        assert_eq!(
+            origin_of("https://issuer.test:8443").as_deref(),
+            Some("https://issuer.test:8443")
+        );
+        assert_eq!(
+            origin_of("https://issuer.test:80").as_deref(),
+            Some("https://issuer.test:80")
+        );
     }
 }

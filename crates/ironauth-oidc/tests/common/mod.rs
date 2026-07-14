@@ -46,6 +46,13 @@ pub const ISSUER_BASE: &str = "https://issuer.test";
 pub const FAR_FUTURE_MICROS: i64 = 4_102_444_800_000_000;
 /// The password the seeded harness users are created with.
 pub const SEED_PASSWORD: &str = "correct horse battery staple";
+/// The broad standard-OIDC scope the generic [`Harness::grant_consent`] shortcut
+/// records the consent against. Scope-aware consent (issue #196) only issues a code
+/// when the REQUESTED scope is a subset of the recorded granted scope, so the
+/// shortcut grants every standard scope a test might request; the mint still binds
+/// the REQUESTED scope, so a broad recorded consent is invisible to the claim and
+/// `UserInfo` assertions.
+pub const CONSENTED_SCOPE: &str = "openid profile email address phone";
 
 /// A committed throwaway ECDSA P-256 PKCS#8 key, for provisioning an ES256-only
 /// environment (AC #3). Generated offline by ring's `generate_pkcs8`, exactly like
@@ -583,14 +590,24 @@ impl Harness {
             .await
     }
 
-    /// Record `subject`'s consent to `client_id` in the harness scope.
+    /// Record `subject`'s consent to `client_id` in the harness scope for the broad
+    /// [`CONSENTED_SCOPE`], so the shortcut covers any standard-scope request under
+    /// the scope-aware consent check (issue #196).
     pub async fn grant_consent(&self, subject: &str, client_id: &str) {
+        self.grant_consent_scoped(subject, client_id, Some(CONSENTED_SCOPE))
+            .await;
+    }
+
+    /// Record `subject`'s consent to `client_id` against an EXPLICIT `scope` (issue
+    /// #196), for tests that pin the scope a consent was granted against (for example
+    /// a NARROW prior consent that must re-prompt on a broader request).
+    pub async fn grant_consent_scoped(&self, subject: &str, client_id: &str, scope: Option<&str>) {
         let (actor, corr) = self.seeding_actor();
         self.store()
             .scoped(self.scope)
             .acting(actor, corr)
             .consents()
-            .grant(&self.env, subject, client_id, None)
+            .grant(&self.env, subject, client_id, scope)
             .await
             .expect("grant consent");
     }

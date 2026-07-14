@@ -93,6 +93,77 @@ pub fn cookie_header(headers: &HeaderMap) -> Option<&str> {
     headers.get(header::COOKIE)?.to_str().ok()
 }
 
+/// The `Sec-Fetch-Site` fetch-metadata request header (no `http` constant exists
+/// for it, so the lowercase name is used directly; `HeaderMap` lookups are
+/// case-insensitive).
+const SEC_FETCH_SITE: &str = "sec-fetch-site";
+
+/// A CSRF defense-in-depth allowlist for the state-changing interactive POSTs
+/// (login, consent, and registration), evaluated BEFORE any state change (issue
+/// #196).
+///
+/// These POSTs rely on the `SameSite=Lax` session cookie to block the standard
+/// cross-site auto-submit (registration is the exception: it mints the session, so
+/// it has no cookie to lean on and this check is its primary CSRF defense). This
+/// closes the two named residuals a header allowlist can, with no schema, cookie,
+/// or token plumbing:
+///
+/// - the Chromium "Lax+POST" transitional window (a `Lax` cookie younger than two
+///   minutes is sent on a cross-site top-level POST), caught by `Sec-Fetch-Site`;
+/// - legacy clients that do not enforce `SameSite`, caught by `Origin` (browsers
+///   have sent it on every cross-origin POST since ~2016).
+///
+/// The rule is STRICTLY-STRONGER defense-in-depth, not a hard gate, so it fails
+/// CLOSED only on positive evidence of a cross-site request and otherwise defers to
+/// the cookie:
+///
+/// - reject when `Sec-Fetch-Site` is present AND `cross-site`;
+/// - reject when `Origin` is present AND does not match `expected_origin` (the
+///   deployment's own origin, derived from `issuer_base`);
+/// - allow when NEITHER is conclusive (header-stripped proxies and non-browser
+///   clients keep working; the `SameSite=Lax` cookie remains the backstop).
+///
+/// `expected_origin` is [`None`] only when the deployment's origin could not be
+/// derived; the `Origin` comparison is then skipped and the `Sec-Fetch-Site` rule
+/// alone applies.
+#[must_use]
+pub fn same_origin_ok(headers: &HeaderMap, expected_origin: Option<&str>) -> bool {
+    // Positive cross-site signal from fetch metadata: reject.
+    if let Some(site) = headers
+        .get(SEC_FETCH_SITE)
+        .and_then(|value| value.to_str().ok())
+    {
+        if site.eq_ignore_ascii_case("cross-site") {
+            return false;
+        }
+    }
+    // A present Origin that does not match our own is a cross-origin submission.
+    if let Some(origin) = headers
+        .get(header::ORIGIN)
+        .and_then(|value| value.to_str().ok())
+    {
+        if let Some(expected) = expected_origin {
+            // Compare CANONICAL origins (issue #196): a browser lowercases the host
+            // and drops the default port in the `Origin` it sends, so both sides are
+            // normalized the same way (crate::state::origin_of) before the byte
+            // comparison. Without this a `public_url` with an uppercase host or an
+            // explicit `:443`/`:80` would falsely reject every legitimate same-origin
+            // POST. A value that does not parse falls back to its raw form, so an
+            // opaque `Origin` (for example `null`) still fails the match and is
+            // rejected. This never produces a false ALLOW.
+            let origin_canon = crate::state::origin_of(origin);
+            let expected_canon = crate::state::origin_of(expected);
+            let origin_cmp = origin_canon.as_deref().unwrap_or(origin);
+            let expected_cmp = expected_canon.as_deref().unwrap_or(expected);
+            if origin_cmp != expected_cmp {
+                return false;
+            }
+        }
+    }
+    // Neither header is conclusively cross-site: defer to the SameSite cookie.
+    true
+}
+
 /// An authenticated bootstrap session: the session id, the subject it names, and
 /// the recorded authentication event (its time and methods), which the ID token's
 /// `auth_time`, `amr`, and `acr` derive from (issue #14).
@@ -266,6 +337,21 @@ pub fn server_error_page() -> Response {
     )
 }
 
+/// The `403` page shown when a state-changing POST is refused by the CSRF
+/// header allowlist ([`same_origin_ok`], issue #196). Generic on purpose: it never
+/// reveals WHICH signal (Origin or Sec-Fetch-Site) failed, and NO action is
+/// performed (no session created, no consent recorded).
+#[must_use]
+pub fn forbidden_page() -> Response {
+    pages::secure_html(
+        StatusCode::FORBIDDEN,
+        pages::notice_page(
+            "Request blocked",
+            "This request could not be verified. Start the sign-in from the application again.",
+        ),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -290,6 +376,86 @@ mod tests {
         assert_eq!(resume.hints.login_hint(), Some("ada@example.test"));
         assert_eq!(resume.hints.ui_locales(), Some("fr"));
         assert_eq!(resume.hints.display(), crate::hints::Display::Popup);
+    }
+
+    #[test]
+    fn same_origin_ok_rejects_cross_site_and_allows_same_origin_or_no_headers() {
+        use axum::http::HeaderValue;
+
+        let expected = Some("https://issuer.test");
+
+        // No headers at all: allowed (the SameSite cookie remains the backstop).
+        assert!(same_origin_ok(&HeaderMap::new(), expected));
+
+        // Sec-Fetch-Site: cross-site is rejected.
+        let mut cross_site = HeaderMap::new();
+        cross_site.insert(SEC_FETCH_SITE, HeaderValue::from_static("cross-site"));
+        assert!(!same_origin_ok(&cross_site, expected));
+
+        // A cross-origin Origin is rejected.
+        let mut cross_origin = HeaderMap::new();
+        cross_origin.insert(
+            header::ORIGIN,
+            HeaderValue::from_static("https://evil.test"),
+        );
+        assert!(!same_origin_ok(&cross_origin, expected));
+
+        // A matching Origin with same-origin fetch metadata is allowed.
+        let mut same = HeaderMap::new();
+        same.insert(
+            header::ORIGIN,
+            HeaderValue::from_static("https://issuer.test"),
+        );
+        same.insert(SEC_FETCH_SITE, HeaderValue::from_static("same-origin"));
+        assert!(same_origin_ok(&same, expected));
+
+        // same-site (a sibling subdomain) is not cross-site, so it is allowed.
+        let mut same_site = HeaderMap::new();
+        same_site.insert(SEC_FETCH_SITE, HeaderValue::from_static("same-site"));
+        assert!(same_origin_ok(&same_site, expected));
+
+        // With no derivable expected origin the Origin comparison is skipped, so a
+        // cross-origin Origin alone is allowed but a cross-site fetch is still
+        // rejected.
+        assert!(same_origin_ok(&cross_origin, None));
+        assert!(!same_origin_ok(&cross_site, None));
+    }
+
+    #[test]
+    fn same_origin_ok_normalizes_case_and_default_port_before_comparing() {
+        use axum::http::HeaderValue;
+
+        // A deployment whose expected origin carries an uppercase host and an
+        // explicit default port (as a `public_url` might) still matches the bare,
+        // lowercased `Origin` a browser sends: both sides normalize the same way, so
+        // a legitimate same-origin POST is not falsely 403-ed (issue #196).
+        let expected = Some("https://Issuer.test:443");
+        let mut browser = HeaderMap::new();
+        browser.insert(
+            header::ORIGIN,
+            HeaderValue::from_static("https://issuer.test"),
+        );
+        assert!(
+            same_origin_ok(&browser, expected),
+            "a normalized browser Origin matches an un-normalized expected origin"
+        );
+
+        // A genuinely different origin still mismatches after normalization (no false
+        // allow).
+        let mut evil = HeaderMap::new();
+        evil.insert(
+            header::ORIGIN,
+            HeaderValue::from_static("https://evil.test"),
+        );
+        assert!(!same_origin_ok(&evil, expected));
+
+        // A different NON-default port is a different origin and is rejected.
+        let mut other_port = HeaderMap::new();
+        other_port.insert(
+            header::ORIGIN,
+            HeaderValue::from_static("https://issuer.test:8443"),
+        );
+        assert!(!same_origin_ok(&other_port, expected));
     }
 
     #[test]

@@ -6,6 +6,40 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Scope-aware consent (issue #196), a hard prerequisite for enabling OIDC
+  (issue #13).
+  - **`ConsentRepo::granted_ref` now returns the granted scope.** Its return type
+    is a new `GrantedConsent { id, granted_scope }` (was a bare `con_` id string),
+    and the `SELECT` reads `granted_scope` alongside `id`. The authorization
+    endpoint checks a later request's scope against this granted scope, so a consent
+    recorded for a narrow scope never silently auto-grants a broader one.
+  - **`ActingConsentRepo::grant` is now an UPSERT that returns the ACTUAL row id and
+    audits AGAINST it.** The `ON CONFLICT (tenant_id, environment_id, subject,
+    client_id)` clause is `DO UPDATE SET granted_scope = EXCLUDED.granted_scope` (was
+    `DO NOTHING`) with a `RETURNING id`, so re-consenting to a broadened scope
+    PERSISTS it instead of dropping it (which previously re-prompted forever). A
+    re-consent's UPDATE branch keeps the row's ORIGINAL id, so `grant` now PRE-READS
+    the existing consent row's id for `(subject, client)` in the same scope and uses
+    it as BOTH the INSERT candidate id AND the `consent.grant` audit target. The audit
+    row's `target_id` therefore equals the persisted consents row id on a first insert
+    AND on a re-consent, so an investigator can always pivot from the audit row (or the
+    returned id) to the real consent row; the earlier code targeted a freshly
+    generated id the UPDATE branch discarded, which left a scope-broadening event's
+    audit row pointing at a phantom, never-persisted id. Two truly concurrent FIRST
+    grants can still leave the loser's audit target naming its own discarded candidate
+    (the unique constraint admits exactly one row, so no duplicate is created); a
+    scope-BROADENING re-consent always finds the row in the pre-read and is never
+    subject to it, so the security-relevant event's linkage is always intact. The
+    audit write stays in the same transaction. Runtime `sqlx::query` only.
+  - **The tenth production migration** (`0010_consent_scope_upsert`, Expand) is a
+    single `GRANT UPDATE (granted_scope) ON consents TO ironauth_app`: PostgreSQL
+    requires the UPDATE privilege for any `INSERT ... ON CONFLICT DO UPDATE`, and the
+    upsert only ever sets `granted_scope`, so the grant is COLUMN-SCOPED to that one
+    column (strictly least-privilege: the role cannot UPDATE
+    id/subject/client_id/tenant_id/environment_id even within a tenant). It adds no
+    table, column, index, constraint, or policy (the `granted_scope` column and the
+    row-level-security policy already exist from `0006`), and is additive and safe
+    for the old binary (which only ever runs `ON CONFLICT DO NOTHING`).
 - UserInfo standard-claim persistence and the frozen `claims` request parameter
   (issue #15).
   - **The ninth production migration** (`0009_userinfo_claims`, Expand) adds the

@@ -10,7 +10,7 @@
 //! re-renders the form with a generic "already registered" message.
 
 use axum::extract::{Form, Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
 use ironauth_store::{ActorRef, CorrelationId, HumanId, StoreError};
 use serde::Deserialize;
@@ -60,11 +60,25 @@ pub async fn register_get(Query(query): Query<ResumeQuery>) -> Response {
 /// `POST /register`: create the account, then auto-establish a session and resume.
 pub async fn register_post(
     State(state): State<OidcState>,
+    headers: HeaderMap,
     Form(form): Form<RegisterForm>,
 ) -> Response {
     let Some(resume) = parse_resume(form.return_to.as_deref()) else {
         return interaction::invalid_link_page();
     };
+
+    // CSRF defense-in-depth (issue #196), BEFORE creating the account, spending an
+    // Argon2 hash, or establishing a session: unlike a later interaction, this POST
+    // needs NO pre-existing cookie and MINTS the session on success, so the
+    // SameSite=Lax backstop does not protect it and a cross-site auto-submit would
+    // otherwise sign the victim into an attacker-known account (login-CSRF / session
+    // fixation). The same Origin + Sec-Fetch-Site allowlist the login and consent
+    // POSTs use refuses a conclusively cross-site POST with a generic 403; no
+    // account is created and no password work is spent.
+    if !interaction::same_origin_ok(&headers, state.self_origin().as_deref()) {
+        return interaction::forbidden_page();
+    }
+
     let identifier = form
         .identifier
         .as_deref()

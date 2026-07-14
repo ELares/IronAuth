@@ -11,7 +11,7 @@
 //! verification so the endpoint is not a user-enumeration oracle.
 
 use axum::extract::{Form, Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
 use serde::Deserialize;
 
@@ -61,10 +61,26 @@ pub async fn login_get(Query(query): Query<ResumeQuery>) -> Response {
 
 /// `POST /login`: verify the password and, on success, establish a session and
 /// resume the authorization request.
-pub async fn login_post(State(state): State<OidcState>, Form(form): Form<LoginForm>) -> Response {
+pub async fn login_post(
+    State(state): State<OidcState>,
+    headers: HeaderMap,
+    Form(form): Form<LoginForm>,
+) -> Response {
     let Some(resume) = parse_resume(form.return_to.as_deref()) else {
         return interaction::invalid_link_page();
     };
+
+    // CSRF defense-in-depth (issue #196), BEFORE verifying the password or creating
+    // a session: the SameSite=Lax session cookie the login establishes blocks the
+    // standard cross-site auto-submit on later POSTs, and this Origin +
+    // Sec-Fetch-Site allowlist closes the two residuals it leaves (the Chromium
+    // Lax+POST window and non-enforcing legacy clients) on the login POST itself. A
+    // conclusively cross-site POST is refused with a generic 403; no session is
+    // created and no password work is spent.
+    if !interaction::same_origin_ok(&headers, state.self_origin().as_deref()) {
+        return interaction::forbidden_page();
+    }
+
     let identifier = form
         .identifier
         .as_deref()

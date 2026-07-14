@@ -136,3 +136,156 @@ async fn management_list_at_the_hard_cap_keeps_the_has_next_sentinel() {
         "the has-next sentinel survives at a page size equal to the hard cap"
     );
 }
+
+/// Scope-aware consent (issue #196): `granted_ref` returns the granted scope, and a
+/// re-consent to a BROADER scope UPSERTs the scope in place, keeping the row's
+/// ORIGINAL id rather than inserting a second row or dropping the broadened scope.
+#[tokio::test]
+async fn consent_grant_upserts_the_scope_and_keeps_the_original_id() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+
+    // The consents table keys on (subject, client_id) text with no FK to users or
+    // clients, so literal ids exercise the grant/read contract directly.
+    let subject = "usr_example-subject";
+    let client_id = "cli_example-client";
+
+    // A first consent for a NARROW scope records the granted scope and returns its id.
+    let first = db
+        .store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .consents()
+        .grant(&env, subject, client_id, Some("openid"))
+        .await
+        .expect("first grant");
+    let recorded = db
+        .store()
+        .scoped(scope)
+        .consents()
+        .granted_ref(subject, client_id)
+        .await
+        .expect("granted_ref read")
+        .expect("a consent is recorded");
+    assert_eq!(recorded.id, first.to_string(), "granted_ref returns the id");
+    assert_eq!(
+        recorded.granted_scope.as_deref(),
+        Some("openid"),
+        "granted_ref returns the granted scope"
+    );
+
+    // Re-consent to a BROADER scope UPDATEs granted_scope in place and returns the
+    // ORIGINAL row id (the upsert keeps it), not a fresh id or a second row.
+    let second = db
+        .store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .consents()
+        .grant(&env, subject, client_id, Some("openid profile email"))
+        .await
+        .expect("re-grant");
+    assert_eq!(
+        second, first,
+        "the upsert returns the original consent id on re-consent"
+    );
+    let updated = db
+        .store()
+        .scoped(scope)
+        .consents()
+        .granted_ref(subject, client_id)
+        .await
+        .expect("granted_ref read")
+        .expect("a consent is recorded");
+    assert_eq!(
+        updated.id,
+        first.to_string(),
+        "the row keeps its original id"
+    );
+    assert_eq!(
+        updated.granted_scope.as_deref(),
+        Some("openid profile email"),
+        "the broadened scope is persisted rather than dropped"
+    );
+}
+
+/// Re-consent audit attribution (issue #196): the `consent.grant` audit row's
+/// `target_id` joins to the ACTUAL `consents` row on BOTH a first insert and a
+/// scope-broadening re-consent. The upsert's UPDATE branch keeps the row's ORIGINAL
+/// id, so a freshly generated (never-persisted) audit target would be a phantom an
+/// investigator could not pivot from; this proves the audit target is the real id.
+#[tokio::test]
+async fn consent_grant_audit_target_joins_the_persisted_consent_row() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+
+    let subject = "usr_example-subject";
+    let client_id = "cli_example-client";
+
+    // A first consent (narrow), then a scope-BROADENING re-consent (the
+    // security-relevant event): the second takes the upsert's UPDATE branch and keeps
+    // the original id, which is exactly where a phantom audit target would show up.
+    db.store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .consents()
+        .grant(&env, subject, client_id, Some("openid"))
+        .await
+        .expect("first grant");
+    db.store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .consents()
+        .grant(&env, subject, client_id, Some("openid profile email"))
+        .await
+        .expect("re-grant");
+
+    // Exactly two consent.grant audit rows, and EACH one's target_id must join to a
+    // real consents row (the broaden's target is NOT a phantom fresh id).
+    let audit = db
+        .store()
+        .scoped(scope)
+        .audit()
+        .list()
+        .await
+        .expect("audit");
+    let grants: Vec<_> = audit
+        .iter()
+        .filter(|row| row.action == "consent.grant")
+        .collect();
+    assert_eq!(
+        grants.len(),
+        2,
+        "each grant writes exactly one consent.grant audit row"
+    );
+    for row in grants {
+        assert_eq!(row.target_kind, "con", "the audit target is a consent id");
+        let joined: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM consents \
+             WHERE id = $1 AND tenant_id = $2 AND environment_id = $3",
+        )
+        .bind(&row.target_id)
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .fetch_one(db.owner_pool())
+        .await
+        .expect("count consents by audit target id");
+        assert_eq!(
+            joined, 1,
+            "the consent.grant audit target_id ({}) joins to exactly one consents row",
+            row.target_id
+        );
+    }
+
+    // And the upsert updated in place: exactly ONE consents row exists, so the
+    // broaden's audit target is the same row the first grant's target named.
+    let consent_rows: i64 = sqlx::query_scalar("SELECT count(*) FROM consents")
+        .fetch_one(db.owner_pool())
+        .await
+        .expect("count consents");
+    assert_eq!(
+        consent_rows, 1,
+        "the re-consent updated in place rather than inserting a second row"
+    );
+}
