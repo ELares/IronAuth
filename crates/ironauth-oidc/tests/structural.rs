@@ -6,8 +6,10 @@
 //!
 //! - ROPC (the `password` grant): there is no `GrantType` variant for it, so it
 //!   has no value and no handler.
-//! - an access token (or ID token) from the authorization endpoint (the implicit
-//!   flow): there is no `ResponseType` variant other than `code`.
+//! - an ACCESS TOKEN from the authorization endpoint (the implicit/hybrid
+//!   token-bearing flows): there is no access-token component anywhere in
+//!   `ResponseType`, so `token`, `code token`, `id_token token`, and
+//!   `code id_token token` are all unrepresentable, in every order.
 //! - plain PKCE (`code_challenge_method=plain`): there is no `PkceMethod` variant
 //!   other than `S256`.
 //!
@@ -16,7 +18,7 @@
 //! forbidden variant would fail the build. This is database-free and runs on
 //! every lane.
 
-use ironauth_oidc::{GrantType, PkceMethod, ResponseType};
+use ironauth_oidc::{GrantType, PkceMethod, ResponseMode, ResponseType};
 
 #[test]
 fn grant_type_registry_only_expresses_authorization_code() {
@@ -49,22 +51,61 @@ fn grant_type_registry_only_expresses_authorization_code() {
 }
 
 #[test]
-fn response_type_registry_only_expresses_code() {
-    // The whole registry is exactly one variant: code. No token, no id_token, no
-    // hybrid: the authorization endpoint can never emit an access or ID token
-    // directly (the implicit flow is structurally absent).
-    assert_eq!(ResponseType::ALL, &[ResponseType::Code]);
-    assert_eq!(ResponseType::ALL.len(), 1);
+fn response_type_registry_is_the_four_token_free_members_only() {
+    // The whole registry is EXACTLY these four members, in this order (issue #17):
+    // code, code id_token, id_token, none. There is NO access-token component
+    // anywhere, so no token-bearing response type can be expressed. A future edit
+    // that added `token`, `code token`, `id_token token`, or `code id_token token`
+    // would have to grow ALL and fail this exact-set assertion.
+    assert_eq!(
+        ResponseType::ALL,
+        &[
+            ResponseType::Code,
+            ResponseType::CodeIdToken,
+            ResponseType::IdToken,
+            ResponseType::None,
+        ]
+    );
+    assert_eq!(ResponseType::ALL.len(), 4);
+    // The always-on base is only `code`; the rest are per-environment legacy types.
+    assert_eq!(ResponseType::DEFAULT, &[ResponseType::Code]);
 
-    assert_eq!(ResponseType::parse("code"), Some(ResponseType::Code));
+    // Every representable member decomposes into ONLY the token-free components
+    // {code, id_token, none}: the access-token component `token` is in none of
+    // them, and each round-trips through its own wire spelling.
+    for rt in ResponseType::ALL {
+        for component in rt.as_str().split(' ') {
+            assert!(
+                matches!(component, "code" | "id_token" | "none"),
+                "{rt:?} decomposes into a forbidden component {component:?}"
+            );
+        }
+        assert_eq!(ResponseType::parse(rt.as_str()), Some(*rt));
+    }
 
+    // response_type is an order-insensitive SET: the hybrid parses either way.
+    assert_eq!(
+        ResponseType::parse("code id_token"),
+        Some(ResponseType::CodeIdToken)
+    );
+    assert_eq!(
+        ResponseType::parse("id_token code"),
+        Some(ResponseType::CodeIdToken)
+    );
+
+    // Every token-bearing spelling, in every order, is unrepresentable: it has no
+    // variant and parses to None, so it can never resolve to a handler. `none`
+    // combined with anything, and the empty value, are invalid too.
     for forbidden in [
-        "token",          // implicit: access token from /authorize.
-        "id_token",       // ID token from /authorize.
-        "id_token token", // hybrid.
-        "code token",     // hybrid.
-        "code id_token",  // hybrid.
-        "none",           // #17, not this issue.
+        "token",      // implicit: access token from /authorize.
+        "code token", // hybrid with an access token.
+        "token code",
+        "id_token token", // implicit id_token + access token.
+        "token id_token",
+        "code id_token token", // full hybrid with an access token.
+        "token code id_token",
+        "none code", // none does not combine.
+        "code none",
         "",
     ] {
         assert!(
@@ -72,6 +113,27 @@ fn response_type_registry_only_expresses_code() {
             "response_type {forbidden:?} must be unrepresentable"
         );
     }
+}
+
+#[test]
+fn response_mode_registry_has_no_token_leaking_mode_and_parses_its_three() {
+    // The three modes: query, fragment, form_post. Each round-trips; the always-on
+    // base is query only (fragment and form_post are per-environment, issue #17).
+    assert_eq!(
+        ResponseMode::ALL,
+        &[
+            ResponseMode::Query,
+            ResponseMode::Fragment,
+            ResponseMode::FormPost,
+        ]
+    );
+    assert_eq!(ResponseMode::DEFAULT, &[ResponseMode::Query]);
+    for mode in ResponseMode::ALL {
+        assert_eq!(ResponseMode::parse(mode.as_str()), Some(*mode));
+    }
+    // The JARM `jwt` response mode is M16, not representable here.
+    assert!(ResponseMode::parse("jwt").is_none());
+    assert!(ResponseMode::parse("").is_none());
 }
 
 #[test]

@@ -136,6 +136,26 @@
           "description": "Copy the scope-derived standard claims into the ID token (issue #15). The\nspec-conform default (`false`) places scope-derived claims (`profile`,\n`email`, `address`, `phone`) at the `UserInfo` endpoint and keeps the ID\ntoken lean, per OIDC Core 5.4. Setting this `true` additionally copies those\nclaims into the ID token for legacy relying parties that never call\n`UserInfo`; that placement is explicitly NON-conform (it is the\nnode-oidc-provider `conformIdTokenClaims = false` behavior) and is documented\nas such. This is a promotable per-environment setting: it appears in config\nsnapshots and rides the M5 promotion pipeline; the process value is the\ndeployment default until per-environment overrides land.",
           "type": "boolean"
         },
+        "enable_response_mode_form_post": {
+          "default": false,
+          "description": "Enable the `response_mode=form_post` encoding for this environment (issue\n#17, OAuth 2.0 Form Post Response Mode 1.0). The safe default (`false`)\nleaves it DISABLED: the authorization endpoint returns results only by\n`query` (and, when a front-channel response type is enabled, `fragment`).\nWhen `true`, a client may request `response_mode=form_post` and the endpoint\nreturns an auto-submitting HTML form that POSTs the authorization-response\nparameters to the `redirect_uri`, and discovery advertises `form_post`.\nIntended for certification runs. This is a promotable per-environment\nsetting: it appears in config snapshots and rides the M5 promotion pipeline;\nthe process value is the deployment default until per-environment overrides\nland.",
+          "type": "boolean"
+        },
+        "enable_response_type_code_id_token": {
+          "default": false,
+          "description": "Enable the legacy hybrid `response_type=code id_token` flow for this\nenvironment (issue #17). The safe default (`false`) leaves it DISABLED. When\n`true`, the authorization endpoint also serves the hybrid flow (a `code` AND\na front-channel ID token carrying `nonce` and `c_hash`, but never an access\ntoken and never `at_hash`), and discovery advertises `code id_token` and the\n`fragment` response mode. Intended for certification runs. This is a\npromotable per-environment setting: it appears in config snapshots and rides\nthe M5 promotion pipeline; the process value is the deployment default until\nper-environment overrides land.",
+          "type": "boolean"
+        },
+        "enable_response_type_id_token": {
+          "default": false,
+          "description": "Enable the legacy implicit `response_type=id_token` flow for this\nenvironment (issue #17). The spec-conform, safe default (`false`) leaves it\nDISABLED: the authorization endpoint accepts only `code` unless a legacy\ntype is explicitly turned on. When `true`, the endpoint also serves the\nimplicit ID-token-only flow (an ID token, carrying `nonce`, returned in the\nfront channel; never an access token, which is a permanent non-goal), and\ndiscovery advertises `id_token` and the `fragment` response mode. Intended\nfor certification runs. This is a promotable per-environment setting: it\nappears in config snapshots and rides the M5 promotion pipeline; the process\nvalue is the deployment default until per-environment overrides land.",
+          "type": "boolean"
+        },
+        "enable_response_type_none": {
+          "default": false,
+          "description": "Enable the legacy `response_type=none` flow for this environment (issue\n#17). The safe default (`false`) leaves it DISABLED. When `true`, the\nauthorization endpoint also serves `none` (a redirect echoing `state` and\nthe RFC 9207 `iss`, issuing no code and no token), and discovery advertises\n`none`. Intended for certification runs. This is a promotable per-environment\nsetting: it appears in config snapshots and rides the M5 promotion pipeline;\nthe process value is the deployment default until per-environment overrides\nland.",
+          "type": "boolean"
+        },
         "enabled": {
           "default": false,
           "description": "Whether to mount the public OIDC endpoints (`/authorize`, `/token`). Off\nby default so the default boot serves only the skeleton and needs no\ndatabase. When on, the provider connects the data-plane store using\n`database.url`.",
@@ -326,6 +346,10 @@
         "access_token_ttl_secs": 300,
         "authorization_code_ttl_secs": 60,
         "conform_id_token_claims": false,
+        "enable_response_mode_form_post": false,
+        "enable_response_type_code_id_token": false,
+        "enable_response_type_id_token": false,
+        "enable_response_type_none": false,
         "enabled": false,
         "jwks_cache_max_age_secs": 600,
         "require_pkce_for_confidential_clients": true,

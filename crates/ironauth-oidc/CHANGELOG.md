@@ -6,6 +6,39 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Legacy response types (`id_token`, `code id_token`, `none`), `form_post`, and
+  per-mode response negotiation, DISABLED by default (issue #17). Extends the
+  #12/#13 authorization endpoint; the provider stays gated off.
+  - **Token-bearing response types are unrepresentable, not merely disabled.** The
+    `ResponseType` registry is a closed set of exactly `code`, `code id_token`,
+    `id_token`, `none`, with NO access-token component anywhere in the type, and
+    `parse` maps every `token`-bearing spelling (in any order) to a rejected value.
+    A structural test locks the set, so a token-bearing variant fails the build.
+    The authorization endpoint therefore can never issue an access token, in any
+    spelling (the permanent OAuth 2.1 / RFC 9700 2.1.2 non-goal).
+  - **Front-channel ID tokens** for the implicit (`id_token`) and hybrid
+    (`code id_token`) flows are minted through the token endpoint's EXACT claim and
+    signing path (never a second signer, never an access token). `nonce` is
+    REQUIRED for both. The hybrid ID token carries `c_hash` of the issued code; the
+    pure implicit ID token carries neither `c_hash` nor `at_hash`. Per OIDC Core
+    5.4, the pure `id_token` flow (which issues NO access token, so `UserInfo` is
+    unreachable) emits the granted scope's claims AND the `claims` parameter's
+    `id_token` member INTO the ID token, through the same shared `assemble_claims`;
+    the hybrid flow stays lean (its code yields an access token, so `UserInfo`
+    serves the authoritative claims).
+  - **Response-mode negotiation** (OAuth 2.0 Multiple Response Type Encoding
+    Practices): default `query` for `code`/`none`, `fragment` for the front-channel
+    types; `query` is REFUSED for a front-channel type (it would leak an ID token
+    into the logged, `Referer`-exposed query string); an illegal or disabled mode
+    is `invalid_request`. `form_post` (Form Post Response Mode 1.0) returns an
+    auto-submitting form with the response parameters as HTML-escaped hidden fields,
+    a hash-pinned `script-src` CSP (no `unsafe-inline`), `form-action` scoped to the
+    validated redirect origin, and `Cache-Control: no-store` / `Referrer-Policy:
+    no-referrer`, so the code never lands in a URL, `Location`, or `Referer`.
+  - **RFC 9207 `iss`** rides EVERY mode: query, fragment, and `form_post` all
+    serialize the SAME mode-independent parameter list. Discovery advertises exactly
+    the per-environment enabled set (`response_types_supported`,
+    `response_modes_supported`), with `code`/`query` always on.
 - UserInfo endpoint, scope-to-claims mapping, and the `claims` request parameter
   (issue #15). Builds on the #12/#13 authorization and token endpoints; the
   provider stays gated off (`oidc.enabled` unchanged).

@@ -264,6 +264,60 @@ async fn a_disabled_feature_is_absent_and_an_enabled_one_appears() {
 }
 
 #[tokio::test]
+async fn legacy_response_types_and_form_post_are_advertised_only_when_enabled() {
+    // Acceptance criterion 3 (issue #17): discovery reflects ONLY the enabled set.
+    // Off by default: just the code flow with the query mode.
+    let (router, scope) =
+        router_and_scope(DiscoveryCapabilities::from_config(&OidcConfig::default()));
+    let uri = format!(
+        "/t/{}/e/{}/.well-known/openid-configuration",
+        scope.tenant(),
+        scope.environment()
+    );
+    let (_, _, body) = get(&router, &uri).await;
+    let doc: Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(doc["response_types_supported"], json!(["code"]));
+    assert_eq!(doc["response_modes_supported"], json!(["query"]));
+
+    // Enable every legacy type and form_post: each is advertised, alongside the
+    // structurally guaranteed code/query, and fragment appears for the front-channel
+    // types.
+    let config = OidcConfig {
+        enable_response_type_id_token: true,
+        enable_response_type_code_id_token: true,
+        enable_response_type_none: true,
+        enable_response_mode_form_post: true,
+        ..OidcConfig::default()
+    };
+    let (router, scope) = router_and_scope(DiscoveryCapabilities::from_config(&config));
+    let uri = format!(
+        "/t/{}/e/{}/.well-known/openid-configuration",
+        scope.tenant(),
+        scope.environment()
+    );
+    let (_, _, body) = get(&router, &uri).await;
+    let doc: Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(
+        doc["response_types_supported"],
+        json!(["code", "id_token", "code id_token", "none"])
+    );
+    assert_eq!(
+        doc["response_modes_supported"],
+        json!(["query", "fragment", "form_post"])
+    );
+    // Every advertised legacy response type still parses back through the registry
+    // (advertised == representable), and none is token-bearing.
+    for value in string_array(&doc, "response_types_supported") {
+        let parsed = ResponseType::parse(&value).expect("advertised type parses");
+        assert!(
+            !value.split(' ').any(|c| c == "token"),
+            "no token-bearing type is ever advertised: {value}"
+        );
+        assert_eq!(parsed.as_str(), value, "canonical round-trip");
+    }
+}
+
+#[tokio::test]
 async fn a_malformed_scope_is_a_uniform_not_found_on_every_form() {
     let (router, _) = router_and_scope(DiscoveryCapabilities::default());
     let env = Env::system();
@@ -347,11 +401,14 @@ fn every_supported_array_equals_the_registry_its_subsystem_exposes() {
         &DiscoveryCapabilities::default(),
     );
 
-    // response_types: ResponseType::ALL, each parses back.
+    // response_types: with no legacy type enabled, discovery advertises exactly the
+    // always-on registry base (ResponseType::DEFAULT = [code]); each parses back.
+    // The legacy members of the registry are advertised only when enabled (see the
+    // config-driven test below).
     let response_types = string_array(&doc, "response_types_supported");
     assert_eq!(
         response_types,
-        as_strs(ResponseType::ALL, ResponseType::as_str)
+        as_strs(ResponseType::DEFAULT, ResponseType::as_str)
     );
     for value in &response_types {
         assert!(ResponseType::parse(value).is_some(), "{value} is served");
@@ -371,11 +428,14 @@ fn every_supported_array_equals_the_registry_its_subsystem_exposes() {
         assert!(PkceMethod::parse(value).is_some(), "{value} is served");
     }
 
-    // response_modes: ResponseMode::ALL, each parses back.
+    // response_modes: with no legacy mode enabled, discovery advertises exactly the
+    // always-on registry base (ResponseMode::DEFAULT = [query]); each parses back.
+    // fragment and form_post are advertised only when enabled (see the config-driven
+    // test below).
     let response_modes = string_array(&doc, "response_modes_supported");
     assert_eq!(
         response_modes,
-        as_strs(ResponseMode::ALL, ResponseMode::as_str)
+        as_strs(ResponseMode::DEFAULT, ResponseMode::as_str)
     );
     for value in &response_modes {
         assert!(ResponseMode::parse(value).is_some(), "{value} is served");

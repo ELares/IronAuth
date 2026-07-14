@@ -24,8 +24,8 @@ use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 
 use crate::pages;
+use crate::registry::ResponseMode;
 use crate::response;
-use crate::util::append_query;
 
 /// The authorization-endpoint OAuth error codes this issue emits (RFC 6749
 /// 4.1.2.1). The set is intentionally small; more codes land with the surfaces
@@ -34,7 +34,9 @@ use crate::util::append_query;
 pub enum AuthzErrorCode {
     /// The request is missing a parameter, or includes an invalid one.
     InvalidRequest,
-    /// The `response_type` is not one this server supports (only `code`).
+    /// The `response_type` is not one this server supports: it is token-bearing
+    /// (structurally unrepresentable), otherwise unknown, or a legacy type not
+    /// enabled in this environment (issue #17).
     UnsupportedResponseType,
     /// The authorization server denied the request. Used for the fail-closed
     /// essential-`acr` binding (issue #15): a requested authentication context the
@@ -86,6 +88,13 @@ pub enum AuthorizeError {
         /// redirect, since the `client_id` that fixes the scope is validated
         /// first).
         iss: String,
+        /// The negotiated response mode the error is delivered by (issue #17): the
+        /// same `query`/`fragment`/`form_post` encoder the success response would
+        /// have used, so an error travels back the way the client asked for a
+        /// result (and `iss` rides it uniformly). Errors raised before a mode can
+        /// be negotiated use the safe `query` (or the response type's default)
+        /// mode.
+        mode: ResponseMode,
     },
 }
 
@@ -119,21 +128,19 @@ impl IntoResponse for AuthorizeError {
                 description,
                 state,
                 iss,
+                mode,
             } => {
                 // The error-response parameter set ALWAYS carries the RFC 9207
-                // `iss` (issue #13); the same assembler feeds the fragment and
-                // form_post encoders #17 adds, so iss is emitted uniformly on every
-                // mode.
-                let location = append_query(
-                    &redirect_uri,
-                    &response::error_params(
-                        error.as_str(),
-                        description.as_str(),
-                        state.as_deref(),
-                        &iss,
-                    ),
+                // `iss` (issue #13); the SAME assembler feeds the query, fragment,
+                // and form_post encoders (issue #17), so iss is emitted uniformly
+                // on whatever negotiated mode runs.
+                let params = response::error_params(
+                    error.as_str(),
+                    description.as_str(),
+                    state.as_deref(),
+                    &iss,
                 );
-                redirect_response(&location)
+                response::render(mode, &redirect_uri, &params)
             }
         }
     }

@@ -250,6 +250,49 @@ pub fn mint(
     })
 }
 
+/// Mint ONLY an ID token, for the front-channel `id_token` and `code id_token`
+/// flows (issue #17). It reuses the EXACT same claim assembly
+/// ([`build_id_token_claims`]) and signing path as [`mint`]; it never mints an
+/// access token, because the authorization endpoint never issues one (RFC 9700
+/// 2.1.2, a permanent non-goal). The ID token's lifetime matches a token-endpoint
+/// ID token (the configured access-token lifetime), and its `jti` is drawn from
+/// the entropy seam and returned so the caller can record it against the grant (or
+/// simply meter it, for the stateless implicit flow).
+///
+/// The hybrid flow supplies [`MintRequest::c_hash`] (the hash of the issued
+/// `code`); the pure implicit flow leaves it `None`. Both leave
+/// [`MintRequest::at_hash`] `None`: no access token exists to hash.
+///
+/// # Errors
+///
+/// `Err(())` if the ID token claims are refused (an out-of-bounds `sub`) or the
+/// signing backend fails; the caller maps that to a `server_error` returned via
+/// the negotiated response mode, so the front channel fails closed.
+pub fn mint_id_token(
+    state: &OidcState,
+    signer: &SigningKey,
+    request: &MintRequest<'_>,
+) -> Result<(String, IssuedTokenId), ()> {
+    let now = state.now();
+    let iat = epoch_secs(now);
+    let exp = iat.saturating_add(secs(state.access_token_ttl()));
+    let id_jti = IssuedTokenId::generate(state.env(), &request.scope);
+    let id_claims =
+        build_id_token_claims(request, iat, exp, &id_jti.to_string()).map_err(|error| {
+            tracing::error!(
+                ?error,
+                "refusing to issue a front-channel ID token with an invalid subject"
+            );
+        })?;
+    let id_token = sign_jws(
+        signer,
+        &serde_json::to_vec(&id_claims).map_err(|_| ())?,
+        &EmissionOptions::new().with_typ("JWT"),
+    )
+    .map_err(|_| ())?;
+    Ok((id_token, id_jti))
+}
+
 impl IssuedTokens {
     /// The two tokens as `(id, kind)` records for the store.
     #[must_use]
