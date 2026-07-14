@@ -652,6 +652,83 @@ impl Harness {
             .expect("grant consent");
     }
 
+    /// Record `subject`'s consent to `client_id` against `scope` with an explicit
+    /// `expires_at_unix_micros` (issue #21), for the remembered-consent TTL tests: a
+    /// consent recorded with a finite expiry is honored until the clock passes it,
+    /// then re-prompts.
+    pub async fn grant_consent_with_expiry(
+        &self,
+        subject: &str,
+        client_id: &str,
+        scope: Option<&str>,
+        expires_at_unix_micros: Option<i64>,
+    ) {
+        let (actor, corr) = self.seeding_actor();
+        self.store()
+            .scoped(self.scope)
+            .acting(actor, corr)
+            .consents()
+            .grant_with_expiry(&self.env, subject, client_id, scope, expires_at_unix_micros)
+            .await
+            .expect("grant consent with expiry");
+    }
+
+    /// Configure a client's consent mode and refresh-rotation policy (issue #21):
+    /// the consent mode (`explicit`/`implicit`/`remembered`), the skip and no-store
+    /// consent knobs, and the optional rotation override (`always`/`threshold`).
+    pub async fn configure_client_policy(
+        &self,
+        client_id: &ClientId,
+        consent_mode: &str,
+        skip_consent: bool,
+        store_skipped_consent: bool,
+        refresh_rotation: Option<&str>,
+    ) {
+        let (actor, corr) = self.seeding_actor();
+        self.store()
+            .scoped(self.scope)
+            .acting(actor, corr)
+            .clients()
+            .configure_policy(
+                &self.env,
+                client_id,
+                consent_mode,
+                skip_consent,
+                store_skipped_consent,
+                refresh_rotation,
+            )
+            .await
+            .expect("configure client policy");
+    }
+
+    /// Count the audit rows in the harness scope whose action equals `action` (issue
+    /// #21): used to prove the typed reuse event is emitted EXACTLY once per incident.
+    pub async fn count_audit_action(&self, action: &str) -> usize {
+        self.store()
+            .scoped(self.scope)
+            .audit()
+            .list()
+            .await
+            .expect("list audit")
+            .into_iter()
+            .filter(|row| row.action == action)
+            .count()
+    }
+
+    /// Resolve a presented refresh token's live state in the harness scope (issue
+    /// #21), for asserting rotation, supersession, and family revocation.
+    pub async fn resolve_refresh(
+        &self,
+        token: &str,
+    ) -> Option<ironauth_store::RefreshTokenResolution> {
+        self.store()
+            .scoped(self.scope)
+            .refresh()
+            .load(token)
+            .await
+            .expect("load refresh token")
+    }
+
     /// Create a session for `subject` (a bootstrap `pwd` authentication event at
     /// the epoch) and return the `Cookie` header value. The session is far-future
     /// so it survives the clock advances in the expiry and reuse tests.

@@ -104,6 +104,19 @@ struct Inner {
     // them. The cache partitions by the per-environment salt, keeping environments
     // isolated.
     subjects: SubjectCache,
+    // Refresh-token rotation, families, and offline_access (issue #21). Lifetimes
+    // are converted to Duration here at the single config boundary. The idle/max
+    // pair differ for a session-bound versus an offline family; the rotation grace
+    // and threshold govern reuse detection and the graduated rotation policy.
+    issue_refresh_tokens: bool,
+    refresh_idle_ttl: Duration,
+    refresh_max_lifetime: Duration,
+    offline_idle_ttl: Duration,
+    offline_max_lifetime: Duration,
+    refresh_rotation_grace: Duration,
+    refresh_rotation_threshold_percent: u64,
+    offline_access_requires_consent: bool,
+    remembered_consent_ttl: Duration,
 }
 
 impl OidcState {
@@ -175,6 +188,15 @@ impl OidcState {
                 enable_response_type_none: config.enable_response_type_none,
                 enable_response_mode_form_post: config.enable_response_mode_form_post,
                 subjects: SubjectCache::new(),
+                issue_refresh_tokens: config.issue_refresh_tokens,
+                refresh_idle_ttl: Duration::from_secs(config.refresh_idle_ttl_secs),
+                refresh_max_lifetime: Duration::from_secs(config.refresh_max_lifetime_secs),
+                offline_idle_ttl: Duration::from_secs(config.offline_idle_ttl_secs),
+                offline_max_lifetime: Duration::from_secs(config.offline_max_lifetime_secs),
+                refresh_rotation_grace: Duration::from_secs(config.refresh_rotation_grace_secs),
+                refresh_rotation_threshold_percent: config.refresh_rotation_threshold_percent,
+                offline_access_requires_consent: config.offline_access_requires_consent,
+                remembered_consent_ttl: Duration::from_secs(config.remembered_consent_ttl_secs),
             }),
         }
     }
@@ -309,6 +331,66 @@ impl OidcState {
     #[must_use]
     pub fn reuse_grace(&self) -> Duration {
         self.inner.reuse_grace
+    }
+
+    /// Whether the authorization-code grant issues a refresh token (issue #21).
+    #[must_use]
+    pub fn issue_refresh_tokens(&self) -> bool {
+        self.inner.issue_refresh_tokens
+    }
+
+    /// The idle timeout of a refresh token, by whether its family is offline
+    /// (issue #21). An `offline_access` family gets the longer offline idle timeout;
+    /// a session-bound family the shorter one.
+    #[must_use]
+    pub fn refresh_idle_ttl(&self, offline: bool) -> Duration {
+        if offline {
+            self.inner.offline_idle_ttl
+        } else {
+            self.inner.refresh_idle_ttl
+        }
+    }
+
+    /// The absolute (hard-cap) lifetime of a refresh-token family, by whether it is
+    /// offline (issue #21). This bounds the family's total rotated lifetime.
+    #[must_use]
+    pub fn refresh_max_lifetime(&self, offline: bool) -> Duration {
+        if offline {
+            self.inner.offline_max_lifetime
+        } else {
+            self.inner.refresh_max_lifetime
+        }
+    }
+
+    /// The configured refresh-token rotation grace window (issue #21). Within this
+    /// of a token's rotation a duplicate presentation is a benign concurrent
+    /// refresh; beyond it, a genuine reuse that revokes the whole family.
+    #[must_use]
+    pub fn refresh_rotation_grace(&self) -> Duration {
+        self.inner.refresh_rotation_grace
+    }
+
+    /// The configured rotation threshold as a whole percent of a refresh token's
+    /// idle TTL (issue #21). A confidential or otherwise sender-bound client rotates
+    /// only once its token has passed this fraction of its lifetime; a public,
+    /// sender-unbound client always rotates.
+    #[must_use]
+    pub fn refresh_rotation_threshold_percent(&self) -> u64 {
+        self.inner.refresh_rotation_threshold_percent
+    }
+
+    /// Whether `offline_access` requires explicit consent for a web client (issue
+    /// #21, OIDC Core 11), subject to the trusted first-party carve-out.
+    #[must_use]
+    pub fn offline_access_requires_consent(&self) -> bool {
+        self.inner.offline_access_requires_consent
+    }
+
+    /// The configured lifetime of a remembered consent (issue #21): the TTL applied
+    /// to a recorded consent for a client whose consent mode is `remembered`.
+    #[must_use]
+    pub fn remembered_consent_ttl(&self) -> Duration {
+        self.inner.remembered_consent_ttl
     }
 
     /// The configured bootstrap session lifetime (issue #20).

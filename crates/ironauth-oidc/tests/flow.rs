@@ -502,7 +502,7 @@ async fn ropc_and_unknown_grant_types_are_unsupported() {
     let code = get_code(&harness).await;
     let client_id = harness.client_id().to_string();
 
-    for grant in ["password", "client_credentials", "refresh_token"] {
+    for grant in ["password", "client_credentials"] {
         let body = form(&[
             ("grant_type", grant),
             ("username", "alice"),

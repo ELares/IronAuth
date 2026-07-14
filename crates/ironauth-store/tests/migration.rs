@@ -242,13 +242,13 @@ async fn expand_contract_example_chain_runs_all_three_phases_and_contract_remove
     );
 }
 
-/// The PRODUCTION chain (`MigrationRunner::new`) contains exactly the thirteen
+/// The PRODUCTION chain (`MigrationRunner::new`) contains exactly the fourteen
 /// real migrations and leaves no throwaway demo object in a real database.
 // A long but linear ledger-and-table assertion sweep (one line per migration and
 // per real table); splitting it would not make it clearer.
 #[allow(clippy::too_many_lines)]
 #[tokio::test]
-async fn production_chain_is_only_the_thirteen_real_migrations_and_ships_no_demo_object() {
+async fn production_chain_is_only_the_fourteen_real_migrations_and_ships_no_demo_object() {
     // TestDatabase::start runs Store::migrate() (the production chain) on a
     // fresh, empty database.
     let db = TestDatabase::start().await;
@@ -265,17 +265,17 @@ async fn production_chain_is_only_the_thirteen_real_migrations_and_ships_no_demo
     );
     assert_eq!(
         report.already_applied(),
-        13,
-        "the production chain is exactly thirteen migrations (isolation, audit log, management \
+        14,
+        "the production chain is exactly fourteen migrations (isolation, audit log, management \
          API, OIDC authorization, signing keys, login/consent, authentication context, redirect \
          registration, UserInfo claims, consent scope upsert, resource servers, opaque access \
-         tokens, client auth suite)"
+         tokens, client auth suite, refresh tokens)"
     );
 
-    // The ledger holds exactly versions 1 through 13.
+    // The ledger holds exactly versions 1 through 14.
     assert_eq!(
         applied_versions(pool).await,
-        vec![1_i64, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
+        vec![1_i64, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
     );
     let phase_of = |version: i64| async move {
         sqlx::query("SELECT phase FROM _schema_migrations WHERE version = $1")
@@ -300,6 +300,8 @@ async fn production_chain_is_only_the_thirteen_real_migrations_and_ships_no_demo
     assert_eq!(phase_of(12).await, "expand");
     // An ALTER TABLE ADD COLUMN and a CREATE TABLE are both additive expands (#25).
     assert_eq!(phase_of(13).await, "expand");
+    // Two CREATE TABLEs and two additive ALTERs are all expands (issue #21).
+    assert_eq!(phase_of(14).await, "expand");
 
     // The demo object never reaches a production database.
     assert!(
@@ -411,6 +413,49 @@ async fn production_chain_is_only_the_thirteen_real_migrations_and_ships_no_demo
         table_exists(pool, "client_auth_diagnostics").await,
         "client_auth_diagnostics exists"
     );
+    // The refresh-token rotation suite (issue #21): the family spine, the
+    // digest-only token store, the additive clients consent-mode / rotation-override
+    // columns, and the additive consents.expires_at.
+    assert!(
+        table_exists(pool, "refresh_families").await,
+        "refresh_families exists"
+    );
+    assert!(
+        table_exists(pool, "refresh_tokens").await,
+        "refresh_tokens exists"
+    );
+    assert!(
+        column_exists(pool, "clients", "consent_mode").await,
+        "clients.consent_mode exists"
+    );
+    assert!(
+        column_exists(pool, "clients", "skip_consent").await,
+        "clients.skip_consent exists"
+    );
+    assert!(
+        column_exists(pool, "clients", "store_skipped_consent").await,
+        "clients.store_skipped_consent exists"
+    );
+    assert!(
+        column_exists(pool, "clients", "refresh_rotation").await,
+        "clients.refresh_rotation exists"
+    );
+    assert!(
+        column_exists(pool, "consents", "expires_at").await,
+        "consents.expires_at exists"
+    );
+    // The digest-only invariant (issue #21, acceptance criterion 7): the
+    // refresh_tokens table has NO plaintext-token column, only a digest.
+    assert!(
+        column_exists(pool, "refresh_tokens", "token_digest").await,
+        "refresh_tokens stores a digest"
+    );
+    for forbidden in ["token", "secret", "plaintext", "refresh_token"] {
+        assert!(
+            !column_exists(pool, "refresh_tokens", forbidden).await,
+            "refresh_tokens must have no plaintext-token column ({forbidden})"
+        );
+    }
 }
 
 #[tokio::test]

@@ -21,15 +21,23 @@
 use ironauth_oidc::{GrantType, PkceMethod, ResponseMode, ResponseType};
 
 #[test]
-fn grant_type_registry_only_expresses_authorization_code() {
-    // The whole registry is exactly one variant: the authorization-code grant.
-    assert_eq!(GrantType::ALL, &[GrantType::AuthorizationCode]);
-    assert_eq!(GrantType::ALL.len(), 1);
+fn grant_type_registry_expresses_authorization_code_and_refresh_token() {
+    // The whole registry is exactly two variants: the authorization-code grant and
+    // the refresh-token grant (issue #21). No other grant type is representable.
+    assert_eq!(
+        GrantType::ALL,
+        &[GrantType::AuthorizationCode, GrantType::RefreshToken]
+    );
+    assert_eq!(GrantType::ALL.len(), 2);
 
-    // The authorization-code grant round-trips.
+    // Both offered grants round-trip.
     assert_eq!(
         GrantType::parse("authorization_code"),
         Some(GrantType::AuthorizationCode)
+    );
+    assert_eq!(
+        GrantType::parse("refresh_token"),
+        Some(GrantType::RefreshToken)
     );
 
     // Every forbidden or unknown grant type is unrepresentable: it parses to
@@ -38,10 +46,10 @@ fn grant_type_registry_only_expresses_authorization_code() {
         "password",           // ROPC: structurally excluded.
         "client_credentials", // not offered here.
         "implicit",
-        "refresh_token", // M3, not this issue.
         "urn:ietf:params:oauth:grant-type:device_code",
         "",
         "Authorization_Code", // casing is exact.
+        "Refresh_Token",      // casing is exact.
     ] {
         assert!(
             GrantType::parse(forbidden).is_none(),

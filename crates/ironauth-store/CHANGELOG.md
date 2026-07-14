@@ -6,6 +6,36 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Refresh-token rotation, families, `offline_access`, and consent-mode persistence
+  (issue #21, migration 0014, expand).
+  - **Token families and digest-only tokens.** New `refresh_families` (the
+    revocation spine: one family per original grant, carrying the hard-cap expiry,
+    the `session_ref`, the `offline` flag, and the exactly-once `reuse_detected_at`
+    marker) and `refresh_tokens` (one row per generation, storing ONLY the SHA-256
+    digest of the whole `ira_rt_<jti>~<secret>` wire token, never the plaintext).
+    Both tables ENABLE + FORCE row-level security with the `(tenant, environment)`
+    isolation policy and are registered in `scripts/query-audit.sh`; a
+    schema-level migration test asserts no plaintext-token column exists.
+  - **Rotation and reuse gate.** `RefreshRepo::load` resolves a presented token's
+    live state; `ActingRefreshRepo::issue` opens a family at first issuance;
+    `ActingRefreshRepo::redeem` is the authoritative single-use, rotation, and
+    reuse gate (a bespoke committing path): it rotates a live token, classifies a
+    superseded-token presentation as a benign within-grace concurrent refresh or a
+    genuine reuse that revokes the WHOLE family and emits the typed reuse event
+    exactly once, and returns `invalid_grant` for an expired or revoked
+    family/grant. `ActingRefreshRepo::revoke_session_bound` revokes a session's
+    session-bound families at RP logout while leaving `offline_access` families
+    intact.
+  - **Consent modes and offline expiry.** `clients` gains `consent_mode`,
+    `skip_consent`, `store_skipped_consent`, and an optional `refresh_rotation`
+    override (all defaulted to today's behavior), surfaced on `ClientRecord` /
+    `ClientAuthRecord` and set through `ActingClientRepo::configure_policy`
+    (audited as `client.configure`). `consents` gains a nullable `expires_at`
+    (with a column-level UPDATE grant), surfaced on `GrantedConsent` and written
+    through `ActingConsentRepo::grant_with_expiry` so a `remembered` consent lapses
+    after its TTL.
+  - **Audit actions.** New `refresh_token.issue`, `refresh_token.rotate`,
+    `refresh_token.reuse`, `refresh_family.revoke`, and `client.configure`.
 - Client JWT-assertion authentication persistence (issue #25, migration 0013,
   expand).
   - **Client key registration.** `clients` gains `jwks`, `jwks_uri`, and

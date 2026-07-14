@@ -239,7 +239,11 @@ CREATE TABLE IF NOT EXISTS _schema_migrations ( \
 /// is version 12; the JWT-assertion client-authentication suite (issue #25: the
 /// additive `clients` key/alg registration columns, the cross-node single-use
 /// `client_assertion_jtis` replay cache, and the out-of-band
-/// `client_auth_diagnostics` sink) is version 13. That is
+/// `client_auth_diagnostics` sink) is version 13; the refresh-token rotation
+/// suite (issue #21: the `refresh_families` revocation spine and the digest-only
+/// `refresh_tokens` generation store, plus the additive `clients` consent-mode and
+/// rotation-override columns and the additive `consents.expires_at` for remembered
+/// consent) is version 14. That is
 /// the whole production chain: it deliberately
 /// carries no throwaway objects, so a real database never gains a demo table or
 /// ledger rows beyond what the product needs. The worked expand-contract example
@@ -327,6 +331,12 @@ fn registry() -> Vec<Migration> {
             name: "client_auth_suite",
             phase: Phase::Expand,
             sql: include_str!("../migrations/0013_client_auth_suite.sql"),
+        },
+        Migration {
+            version: 14,
+            name: "refresh_tokens",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0014_refresh_tokens.sql"),
         },
     ]
 }

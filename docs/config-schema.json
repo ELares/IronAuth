@@ -193,9 +193,68 @@
           "description": "Whether to mount the public OIDC endpoints (`/authorize`, `/token`). Off\nby default so the default boot serves only the skeleton and needs no\ndatabase. When on, the provider connects the data-plane store using\n`database.url`.",
           "type": "boolean"
         },
+        "issue_refresh_tokens": {
+          "default": true,
+          "description": "Whether the authorization-code grant issues a refresh token (issue #21).\nDefault `true`: a successful code exchange returns a rotating refresh token\nalongside the access token. A refresh token issued WITHOUT the\n`offline_access` scope is session-bound (it is revoked when the end user's\nRP session is logged out); one issued WITH `offline_access` survives RP\nlogout and gets the separate offline lifecycle. Set it to `false` for an\nenvironment that mints access tokens only.",
+          "type": "boolean"
+        },
         "jwks_cache_max_age_secs": {
           "default": 600,
           "description": "The `Cache-Control: max-age` (in seconds) advertised on every JWKS\nresponse (issue #19). A relying party may cache the published keys for this\nlong, so it bounds how quickly a rotated-in key propagates and feeds the\npre-publish lead. Operational discipline requires it to stay between\n`OIDC_JWKS_CACHE_MIN_SECS` (300) and `OIDC_JWKS_CACHE_MAX_SECS` (900); the\ndefault (600) is the midpoint. This is a promotable per-environment setting\nin spirit; the process value is the deployment default until per-environment\noverrides ride the M5 promotion pipeline.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "offline_access_requires_consent": {
+          "default": true,
+          "description": "Whether the `offline_access` scope requires explicit consent for a web\nclient (issue #21, OIDC Core 11). Default `true`: a confidential/web client\nrequesting `offline_access` must obtain explicit consent that covers it,\nUNLESS the trusted first-party carve-out applies (the client's consent mode\nis `implicit` or its `skip_consent` flag is set). Set it to `false` to grant\n`offline_access` without a dedicated consent prompt for every client.",
+          "type": "boolean"
+        },
+        "offline_idle_ttl_secs": {
+          "default": 2592000,
+          "description": "The IDLE timeout in seconds of an OFFLINE refresh token (issue #21): one\nissued WITH the `offline_access` scope, which survives RP logout (OIDC\nBack-Channel Logout 2.7). The default (2592000) is thirty days. There is NO\nnever-expires option: an offline token still expires when unused this long.\nMust be at least 1 and at most `OIDC_MAX_REFRESH_IDLE_TTL_SECS`.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "offline_max_lifetime_secs": {
+          "default": 7776000,
+          "description": "The hard cap in seconds on the total lifetime of an OFFLINE refresh token\nFAMILY (issue #21), measured from the original grant. Once the family passes\nthis age no rotation renews it. There is NO never-expires option. The\ndefault (7776000) is ninety days. Must be at least 1, at most\n`OIDC_MAX_REFRESH_MAX_LIFETIME_SECS`, and at least `offline_idle_ttl_secs`.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "refresh_idle_ttl_secs": {
+          "default": 1209600,
+          "description": "The IDLE timeout in seconds of a SESSION-bound refresh token (issue #21):\none issued without `offline_access`. A refresh token unused for longer than\nthis expires. The default (1209600) is fourteen days. Must be at least 1 and\nat most `OIDC_MAX_REFRESH_IDLE_TTL_SECS`.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "refresh_max_lifetime_secs": {
+          "default": 2592000,
+          "description": "The hard cap in seconds on the total lifetime of a SESSION-bound refresh\ntoken FAMILY (issue #21), measured from the original grant however many\ntimes the family rotates. Once the family passes this age no rotation\nrenews it and a refresh attempt fails with `invalid_grant`. The default\n(2592000) is thirty days. Must be at least 1, at most\n`OIDC_MAX_REFRESH_MAX_LIFETIME_SECS`, and at least `refresh_idle_ttl_secs`.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "refresh_rotation_grace_secs": {
+          "default": 10,
+          "description": "The grace window in seconds during which a superseded (rotated) refresh\ntoken may still be presented as a benign concurrent refresh (issue #21).\nWithin this window of the rotation, a duplicate presentation (multi-tab, a\nretry, a flaky network) succeeds with a fresh successor and does NOT revoke\nthe family. A presentation AFTER the window is a genuine reuse: it revokes\nthe whole family and emits one typed reuse event (RFC 9700 2.2.2). The\ndefault (10) tolerates realistic retry and clock jitter; set it to 0 to\ntreat every superseded-token presentation as reuse. At most\n`OIDC_MAX_LIFETIME_SECS`.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "refresh_rotation_threshold_percent": {
+          "default": 70,
+          "description": "The fraction (as a whole percent, 0 to 100) of a refresh token's idle TTL a\nconfidential or otherwise sender-bound client's token must reach before it\nrotates (issue #21). A PUBLIC, sender-unbound client always rotates on every\nrefresh; a confidential or bound client rotates only once the presented\ntoken has passed this fraction of its lifetime, so a well-behaved\nconfidential client rotates less often. The default (70) rotates past 70% of\nTTL. A per-client override may force always-rotate or threshold-rotate.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "remembered_consent_ttl_secs": {
+          "default": 2592000,
+          "description": "The lifetime in seconds of a REMEMBERED consent (issue #21): the TTL applied\nto a recorded consent for a client whose consent mode is `remembered`. After\nthis long the recorded consent expires and the next authorization re-prompts.\nThe default (2592000) is thirty days. Must be at least 1 and at most\n`OIDC_MAX_REMEMBERED_CONSENT_TTL_SECS`. It has no effect on `explicit` mode\n(whose consent never expires) or `implicit` mode (which never prompts).",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
@@ -401,7 +460,16 @@
         "enable_response_type_id_token": false,
         "enable_response_type_none": false,
         "enabled": false,
+        "issue_refresh_tokens": true,
         "jwks_cache_max_age_secs": 600,
+        "offline_access_requires_consent": true,
+        "offline_idle_ttl_secs": 2592000,
+        "offline_max_lifetime_secs": 7776000,
+        "refresh_idle_ttl_secs": 1209600,
+        "refresh_max_lifetime_secs": 2592000,
+        "refresh_rotation_grace_secs": 10,
+        "refresh_rotation_threshold_percent": 70,
+        "remembered_consent_ttl_secs": 2592000,
         "require_pkce_for_confidential_clients": true,
         "reuse_grace_secs": 10,
         "session_ttl_secs": 3600,

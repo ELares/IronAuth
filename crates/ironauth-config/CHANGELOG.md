@@ -6,6 +6,27 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Add the refresh-token rotation and consent knobs (issue #21):
+  - `oidc.issue_refresh_tokens` (default `true`): whether a code exchange issues a
+    refresh token at all.
+  - `oidc.refresh_idle_ttl_secs` / `oidc.refresh_max_lifetime_secs` (defaults 14 /
+    30 days) and `oidc.offline_idle_ttl_secs` / `oidc.offline_max_lifetime_secs`
+    (defaults 30 / 90 days): the idle timeout and family hard cap for a
+    session-bound and an `offline_access` family respectively. Each idle timeout has
+    a one-second floor and its own ceiling (`OIDC_MAX_REFRESH_IDLE_TTL_SECS`,
+    `OIDC_MAX_REFRESH_MAX_LIFETIME_SECS`), and a hard cap must be at least its idle
+    timeout.
+  - `oidc.refresh_rotation_grace_secs` (default `10`): the window within which a
+    duplicate presentation of a rotated token is a benign concurrent refresh rather
+    than a reuse; `0` treats every superseded-token presentation as reuse.
+  - `oidc.refresh_rotation_threshold_percent` (default `70`, bounded 0..=100): the
+    fraction of idle TTL past which a confidential/bound client rotates.
+  - `oidc.offline_access_requires_consent` (default `true`): whether a web client
+    must consent to `offline_access` (OIDC Core 11), subject to the trusted
+    first-party carve-out.
+  - `oidc.remembered_consent_ttl_secs` (default 30 days, ceiling
+    `OIDC_MAX_REMEMBERED_CONSENT_TTL_SECS`): how long a `remembered`-mode consent is
+    honored before re-prompting.
 - Add the JWT client-assertion authentication knobs (issue #25), shared with the
   JWT bearer grant (#26):
   - `oidc.client_assertion_audience`, a `ClientAssertionAudience` enum selecting

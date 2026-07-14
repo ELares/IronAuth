@@ -125,6 +125,10 @@ pub enum Action {
     ClientDelete,
     /// A client's registered redirect URIs were set (issue #13).
     ClientRedirectUrisRegister,
+    /// A client's consent mode and refresh-rotation policy were configured (issue
+    /// #21): the consent mode, the skip and no-store consent knobs, and the optional
+    /// per-client rotation override.
+    ClientConfigure,
     /// A tenant was created (management plane, issue #11).
     TenantCreate,
     /// A tenant was deactivated (management plane, issue #11).
@@ -159,6 +163,20 @@ pub enum Action {
     /// A resource server was registered (issue #29). Records the audience and the
     /// access-token format a registered protected API receives.
     ResourceServerRegister,
+    /// A refresh-token family was opened at first issuance (issue #21). The
+    /// generation-0 refresh token and its family were recorded against the grant.
+    RefreshTokenIssue,
+    /// A refresh token was rotated (issue #21): a presented token was superseded by
+    /// a fresh successor generation and a new access token was issued.
+    RefreshTokenRotate,
+    /// A refresh token was reused outside the grace window (issue #21), revoking the
+    /// whole family. This is the typed reuse event: it is written only when a
+    /// superseded refresh token is presented beyond the grace window, and exactly
+    /// once per incident (only the revocation that flips the family emits it).
+    RefreshTokenReuse,
+    /// A session's session-bound refresh-token families were revoked at RP logout
+    /// (issue #21). The `offline_access` families are left intact by construction.
+    RefreshFamilyRevoke,
 }
 
 impl Action {
@@ -169,6 +187,7 @@ impl Action {
             Action::ClientCreate => "client.create",
             Action::ClientDelete => "client.delete",
             Action::ClientRedirectUrisRegister => "client.redirect_uris.register",
+            Action::ClientConfigure => "client.configure",
             Action::TenantCreate => "tenant.create",
             Action::TenantDelete => "tenant.delete",
             Action::EnvironmentCreate => "environment.create",
@@ -184,6 +203,10 @@ impl Action {
             Action::ConsentGrant => "consent.grant",
             Action::SigningKeyProvision => "signing_key.provision",
             Action::ResourceServerRegister => "resource_server.register",
+            Action::RefreshTokenIssue => "refresh_token.issue",
+            Action::RefreshTokenRotate => "refresh_token.rotate",
+            Action::RefreshTokenReuse => "refresh_token.reuse",
+            Action::RefreshFamilyRevoke => "refresh_family.revoke",
         }
     }
 }

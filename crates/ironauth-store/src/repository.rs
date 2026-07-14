@@ -56,8 +56,8 @@ use crate::audit::{ActingContext, Action, ActorRef};
 use crate::error::StoreError;
 use crate::id::{
     AuditId, AuditTarget, AuthorizationCodeId, ClientId, ConsentId, CorrelationId, EnvironmentId,
-    GrantId, IssuedTokenId, ManagementKeyId, OperatorId, ResourceServerId, SessionId, SigningKeyId,
-    TenantId, UserId,
+    GrantId, IssuedTokenId, ManagementKeyId, OperatorId, RefreshFamilyId, RefreshTokenId,
+    ResourceServerId, SessionId, SigningKeyId, TenantId, UserId,
 };
 use crate::scope::Scope;
 use crate::store::Store;
@@ -159,6 +159,18 @@ impl<'a> ScopedStore<'a> {
     #[must_use]
     pub fn resource_servers(&self) -> ResourceServerRepo<'a> {
         ResourceServerRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
+    /// The read-only refresh-token repository for this scope (issue #21). Resolves
+    /// a presented refresh token's live state by its digest; the mutating
+    /// operations (issue a family, rotate/redeem, revoke on logout) live on
+    /// [`ActingStore::refresh`].
+    #[must_use]
+    pub fn refresh(&self) -> RefreshRepo<'a> {
+        RefreshRepo {
             store: self.store,
             scope: self.scope,
         }
@@ -293,6 +305,20 @@ impl<'a> ActingStore<'a> {
             acting: self.acting,
         }
     }
+
+    /// The mutating refresh-token repository for this scope and actor (issue #21):
+    /// open a family at first issuance, rotate/redeem a presented refresh token
+    /// (with reuse detection), and revoke a session's session-bound families at RP
+    /// logout. Every mutation carries the actor and correlation id into its audit
+    /// row.
+    #[must_use]
+    pub fn refresh(&self) -> ActingRefreshRepo<'a> {
+        ActingRefreshRepo {
+            store: self.store,
+            scope: self.scope,
+            acting: self.acting,
+        }
+    }
 }
 
 /// A record read back from the `clients` table, always within scope.
@@ -315,6 +341,18 @@ pub struct ClientRecord {
     /// Empty for a client that registered none (which therefore cannot complete an
     /// authorization request until it registers one).
     pub redirect_uris: Vec<String>,
+    /// The client's consent mode (issue #21): the stored `consent_mode` string
+    /// (`explicit`, `implicit`, or `remembered`). Drives whether the authorization
+    /// endpoint prompts for consent, skips it (first-party), or honors a remembered
+    /// decision for a TTL. An unrecognized stored value is treated as `explicit`.
+    pub consent_mode: String,
+    /// Whether the client skips the consent screen entirely (issue #21): an
+    /// orthogonal quick knob that auto-grants like the `implicit` mode.
+    pub skip_consent: bool,
+    /// Whether a SKIPPED consent (implicit or `skip_consent`) is persisted as a
+    /// consent row (issue #21). `false` is the performance knob: skip the screen
+    /// AND write no consent row.
+    pub store_skipped_consent: bool,
 }
 
 /// The client-authentication metadata for a client, read within scope (issue
@@ -348,6 +386,12 @@ pub struct ClientAuthRecord {
     /// algorithm its assertions must be signed with (a per-client allowlist), or
     /// `None` to allow the supported asymmetric set.
     pub token_endpoint_auth_signing_alg: Option<String>,
+    /// The client's refresh-token rotation override (issue #21): `Some("always")`
+    /// to rotate on every refresh, `Some("threshold")` to rotate only past the
+    /// configured fraction of TTL, or `None` to derive the policy from the client's
+    /// posture (a public client always rotates; a confidential one rotates past the
+    /// threshold). An unrecognized stored value is treated as `None` by the reader.
+    pub refresh_rotation: Option<String>,
 }
 
 impl fmt::Debug for ClientAuthRecord {
@@ -362,6 +406,7 @@ impl fmt::Debug for ClientAuthRecord {
                 "token_endpoint_auth_signing_alg",
                 &self.token_endpoint_auth_signing_alg,
             )
+            .field("refresh_rotation", &self.refresh_rotation)
             .finish()
     }
 }
@@ -426,7 +471,7 @@ impl ClientRepo<'_> {
         let mut tx = begin_scoped(self.store, self.scope).await?;
         let row = sqlx::query(
             "SELECT id, display_name, require_auth_time, token_endpoint_auth_method, \
-             redirect_uris FROM clients \
+             redirect_uris, consent_mode, skip_consent, store_skipped_consent FROM clients \
              WHERE id = $1 AND tenant_id = $2 AND environment_id = $3",
         )
         .bind(id.to_string())
@@ -448,7 +493,7 @@ impl ClientRepo<'_> {
         let mut tx = begin_scoped(self.store, self.scope).await?;
         let rows = sqlx::query(
             "SELECT id, display_name, require_auth_time, token_endpoint_auth_method, \
-             redirect_uris FROM clients \
+             redirect_uris, consent_mode, skip_consent, store_skipped_consent FROM clients \
              WHERE tenant_id = $1 AND environment_id = $2 ORDER BY created_at, id",
         )
         .bind(self.scope.tenant().to_string())
@@ -477,7 +522,7 @@ impl ClientRepo<'_> {
         let mut tx = begin_scoped(self.store, self.scope).await?;
         let row = sqlx::query(
             "SELECT display_name, token_endpoint_auth_method, secret_hash, \
-             jwks, jwks_uri, token_endpoint_auth_signing_alg FROM clients \
+             jwks, jwks_uri, token_endpoint_auth_signing_alg, refresh_rotation FROM clients \
              WHERE id = $1 AND tenant_id = $2 AND environment_id = $3",
         )
         .bind(id.to_string())
@@ -494,6 +539,7 @@ impl ClientRepo<'_> {
             jwks: row.get("jwks"),
             jwks_uri: row.get("jwks_uri"),
             token_endpoint_auth_signing_alg: row.get("token_endpoint_auth_signing_alg"),
+            refresh_rotation: row.get("refresh_rotation"),
         })
     }
 
@@ -509,6 +555,9 @@ impl ClientRepo<'_> {
             require_auth_time: row.get("require_auth_time"),
             auth_method: row.get("token_endpoint_auth_method"),
             redirect_uris: row.get("redirect_uris"),
+            consent_mode: row.get("consent_mode"),
+            skip_consent: row.get("skip_consent"),
+            store_skipped_consent: row.get("store_skipped_consent"),
         })
     }
 }
@@ -816,6 +865,73 @@ impl ActingClientRepo<'_> {
                 // A no-op update (nothing in scope matched) is a uniform not-found;
                 // erroring here short-circuits before the audit insert, so it
                 // leaves no audit row (we audit real mutations only).
+                if result.rows_affected() == 0 {
+                    return Err(StoreError::NotFound);
+                }
+                Ok(())
+            },
+            false,
+        )
+        .await
+    }
+
+    /// Configure a client's consent mode and refresh-rotation policy (issue #21) in
+    /// one audited update.
+    ///
+    /// `consent_mode` is `explicit` (always prompt unless a covering consent
+    /// exists), `implicit` (trusted first-party: never prompt, auto-grant), or
+    /// `remembered` (prompt, then honor the recorded consent for the TTL).
+    /// `skip_consent` is the orthogonal quick knob (skip the screen like
+    /// `implicit`); `store_skipped_consent` is whether a skipped consent still
+    /// persists a row (the Ory Hydra performance knob). `refresh_rotation` overrides
+    /// the rotation policy: `Some("always")`, `Some("threshold")`, or `None` to
+    /// derive it from the client's posture. Writes one `client.configure` audit row
+    /// in the same transaction.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the id is out of scope or no client matches;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn configure_policy(
+        &self,
+        env: &Env,
+        id: &ClientId,
+        consent_mode: &str,
+        skip_consent: bool,
+        store_skipped_consent: bool,
+        refresh_rotation: Option<&str>,
+    ) -> Result<(), StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let consent_mode = consent_mode.to_owned();
+        let refresh_rotation = refresh_rotation.map(str::to_owned);
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::ClientConfigure,
+                target: id,
+            },
+            async move |tx| {
+                let result = sqlx::query(
+                    "UPDATE clients \
+                     SET consent_mode = $1, skip_consent = $2, \
+                         store_skipped_consent = $3, refresh_rotation = $4 \
+                     WHERE id = $5 AND tenant_id = $6 AND environment_id = $7",
+                )
+                .bind(&consent_mode)
+                .bind(skip_consent)
+                .bind(store_skipped_consent)
+                .bind(refresh_rotation.as_deref())
+                .bind(id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .execute(&mut **tx)
+                .await?;
                 if result.rows_affected() == 0 {
                     return Err(StoreError::NotFound);
                 }
@@ -2634,6 +2750,839 @@ fn bindings_from_row(row: &PgRow, scope: &Scope) -> Result<CodeBindings, StoreEr
 }
 
 // ===========================================================================
+// Refresh token rotation, families, and reuse detection (issue #21).
+//
+// A refresh token is a scope-declaring reference credential of the form
+// `ira_rt_<jti>~<secret>` (mirroring the opaque access token): only the SHA-256
+// DIGEST of the whole token is stored, so a database dump yields nothing
+// replayable. Every refresh token belongs to a FAMILY rooted at one authorization
+// grant; the family is the revocation spine. Rotation supersedes a presented token
+// with a fresh successor; presenting a superseded token OUTSIDE the grace window
+// is a genuine reuse that revokes the whole family and emits one typed reuse event.
+// Everything below routes through the SAME scope filter as the rest of the data
+// plane; the redeem is a bespoke committing path (like the code redeem) that folds
+// the consume, the successor, the access token, and the audit into one
+// transaction.
+// ===========================================================================
+
+/// The SHA-256 hex digest of a refresh token, the lookup key stored in
+/// `refresh_tokens.token_digest` (issue #21).
+///
+/// The one canonical digest for the format: the mint hashes the whole
+/// `ira_rt_<jti>~<secret>` token with this to store it, and
+/// [`RefreshRepo::load`]/[`ActingRefreshRepo::redeem`] hash the presented token
+/// with this to look it up, so the two can never disagree. The plaintext token
+/// never reaches the database; only this one-way digest does.
+#[must_use]
+pub fn refresh_token_digest(token: &str) -> String {
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write as _;
+    let digest = Sha256::digest(token.as_bytes());
+    let mut out = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
+}
+
+/// The live state of a presented refresh token, resolved from its digest (issue
+/// #21). The token endpoint reads this to decide the rotation policy and to mint
+/// the refreshed access token; the authoritative single-use and reuse decision is
+/// made later by [`ActingRefreshRepo::redeem`], not here.
+///
+/// [`fmt::Debug`] is hand written and redacting: `subject` is end-user detail.
+#[derive(Clone, PartialEq, Eq)]
+pub struct RefreshTokenResolution {
+    /// The family this token belongs to (the revocation spine).
+    pub family_id: RefreshFamilyId,
+    /// The grant the family is rooted at.
+    pub grant_id: GrantId,
+    /// The generation counter of this token within the family.
+    pub generation: i64,
+    /// The local end-user subject the refreshed tokens are minted for.
+    pub subject: String,
+    /// The OAuth client the family belongs to.
+    pub client_id: String,
+    /// The granted OAuth scope value the family was issued against, if any.
+    pub scope: Option<String>,
+    /// The recorded authentication method tokens the refreshed access token's
+    /// `acr`/`amr` derive from.
+    pub auth_methods: String,
+    /// Whether this is an `offline_access` family (survives RP logout) or a
+    /// session-bound one.
+    pub offline: bool,
+    /// When this generation was issued, in epoch microseconds.
+    pub issued_at_unix_micros: i64,
+    /// The idle expiry of this generation, in epoch microseconds.
+    pub idle_expires_at_unix_micros: i64,
+    /// The family's absolute (hard-cap) expiry, in epoch microseconds.
+    pub family_absolute_expires_at_unix_micros: i64,
+    /// Whether this token has already been rotated away from (superseded).
+    pub rotated: bool,
+    /// Whether the family and its grant are both live (not revoked). A revoked
+    /// family or grant makes every token in it inactive.
+    pub active: bool,
+}
+
+impl fmt::Debug for RefreshTokenResolution {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RefreshTokenResolution")
+            .field("family_id", &self.family_id)
+            .field("client_id", &self.client_id)
+            .field("generation", &self.generation)
+            .field("offline", &self.offline)
+            .field("rotated", &self.rotated)
+            .field("active", &self.active)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The first-issued refresh token opening a new family (issue #21). Recorded by
+/// [`ActingRefreshRepo::issue`] after a successful code exchange. Only the digest
+/// is carried, never the plaintext token.
+#[derive(Clone, Copy)]
+pub struct NewRefreshFamily<'a> {
+    /// The `rff_` family identifier, minted under this scope.
+    pub family_id: &'a RefreshFamilyId,
+    /// The generation-0 token's `rft_` identifier (the embedded routing handle).
+    pub token_jti: &'a RefreshTokenId,
+    /// The SHA-256 hex digest of the generation-0 token. NEVER the plaintext.
+    pub token_digest: &'a str,
+    /// The grant the family is rooted at.
+    pub grant_id: &'a GrantId,
+    /// The authenticated end-user subject.
+    pub subject: &'a str,
+    /// The OAuth client the family belongs to.
+    pub client_id: &'a str,
+    /// The granted OAuth scope value, if any.
+    pub scope: Option<&'a str>,
+    /// The recorded authentication method tokens frozen onto the family.
+    pub auth_methods: &'a str,
+    /// Whether this is an `offline_access` family (survives RP logout).
+    pub offline: bool,
+    /// When the family was created, in epoch microseconds (clock seam).
+    pub created_at_unix_micros: i64,
+    /// The generation-0 token's idle expiry, in epoch microseconds.
+    pub idle_expires_at_unix_micros: i64,
+    /// The family's absolute (hard-cap) expiry, in epoch microseconds.
+    pub absolute_expires_at_unix_micros: i64,
+}
+
+impl fmt::Debug for NewRefreshFamily<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("NewRefreshFamily")
+            .field("family_id", &self.family_id)
+            .field("token_jti", &self.token_jti)
+            .field("client_id", &self.client_id)
+            .field("offline", &self.offline)
+            .finish_non_exhaustive()
+    }
+}
+
+/// A rotated successor refresh token to record when a presented token rotates
+/// (issue #21). Only the digest is carried, never the plaintext.
+#[derive(Clone, Copy)]
+pub struct RotatedRefreshToken<'a> {
+    /// The successor's `rft_` identifier.
+    pub jti: &'a RefreshTokenId,
+    /// The SHA-256 hex digest of the successor token. NEVER the plaintext.
+    pub token_digest: &'a str,
+    /// The successor's generation counter (the predecessor's generation plus one),
+    /// matching the `integer` generation column.
+    pub generation: i32,
+    /// The successor's idle expiry, in epoch microseconds (clock seam).
+    pub idle_expires_at_unix_micros: i64,
+}
+
+/// The inputs to redeeming (refreshing) a presented refresh token (issue #21).
+///
+/// The caller has already resolved the token's state ([`RefreshRepo::load`]),
+/// decided the rotation policy (`rotate`), pre-signed the access token, and
+/// pre-generated the successor refresh token; this is the authoritative single-use
+/// gate that decides whether those are handed out. A `successor` is ALWAYS supplied
+/// (even when `rotate` is false) because a superseded-token presentation within the
+/// grace window mints a fresh successor regardless of the policy.
+#[derive(Clone, Copy)]
+pub struct RefreshRedeem<'a> {
+    /// The presented refresh token, hashed to its digest for the lookup.
+    pub presented_token: &'a str,
+    /// Whether the rotation policy says to rotate a LIVE (non-superseded) token:
+    /// `true` for a public/unbound client always, `true` for a confidential/bound
+    /// client only past the TTL threshold. When `false`, a live token is left in
+    /// place and only a fresh access token is recorded.
+    pub rotate: bool,
+    /// The pre-generated successor refresh token, recorded when the token rotates
+    /// (a policy rotation, or a within-grace concurrent refresh).
+    pub successor: RotatedRefreshToken<'a>,
+    /// The refreshed access (and optional ID) token records to write against the
+    /// grant, so grant-chain revocation reaches them.
+    pub access_records: &'a [IssuedTokenRecord],
+    /// The refreshed opaque access token to record, when the format is opaque.
+    pub opaque: Option<NewOpaqueAccessToken<'a>>,
+    /// The rotation grace window: within this of a token's rotation, a duplicate
+    /// presentation is a benign concurrent refresh; beyond it, a genuine reuse.
+    pub grace: Duration,
+}
+
+/// The outcome of redeeming a refresh token (issue #21).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefreshRedeemOutcome {
+    /// The presented (live) token was consumed and a successor plus a fresh access
+    /// token recorded. The token endpoint returns the new refresh and access tokens.
+    Rotated,
+    /// The presented token was already superseded but within the grace window: a
+    /// benign concurrent refresh (multi-tab, retry). A fresh successor and access
+    /// token were recorded WITHOUT revoking the family; the token endpoint returns
+    /// them, so the user is not locked out.
+    RotatedWithinGrace,
+    /// The presented (live) token was NOT rotated (a confidential/bound client
+    /// under the TTL threshold): a fresh access token was recorded and the SAME
+    /// refresh token is returned.
+    NotRotated,
+    /// The presented token was superseded OUTSIDE the grace window: a genuine reuse.
+    /// The whole family was revoked and the typed reuse event emitted EXACTLY once
+    /// (only the revocation that flipped the family emits it). `invalid_grant`.
+    Reused,
+    /// The token is absent, expired (idle or family hard cap), or its family/grant
+    /// is already revoked. `invalid_grant`, with no reuse event.
+    Invalid,
+}
+
+/// The read-only refresh-token repository (issue #21).
+pub struct RefreshRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl RefreshRepo<'_> {
+    /// Resolve a presented refresh token's live state by its digest, within scope,
+    /// or [`None`] when no such token is recorded in this scope. Does NOT filter on
+    /// expiry or rotation: it returns the raw state (idle/absolute expiry instants,
+    /// `rotated`, `active`) so the token endpoint can decide the rotation policy and
+    /// mint the refreshed access token; the authoritative single-use and reuse
+    /// decision is made by [`ActingRefreshRepo::redeem`].
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure, or if a stored id fails to
+    /// parse back in scope.
+    pub async fn load(
+        &self,
+        presented_token: &str,
+    ) -> Result<Option<RefreshTokenResolution>, StoreError> {
+        let digest = refresh_token_digest(presented_token);
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT rt.family_id AS family_id, rt.generation AS generation, \
+             (rt.rotated_at IS NOT NULL) AS rotated, \
+             (EXTRACT(EPOCH FROM rt.issued_at) * 1000000)::bigint AS issued_us, \
+             (EXTRACT(EPOCH FROM rt.idle_expires_at) * 1000000)::bigint AS idle_us, \
+             f.grant_id AS grant_id, f.subject AS subject, f.client_id AS client_id, \
+             f.scope AS scope, f.auth_methods AS auth_methods, f.offline AS offline, \
+             (EXTRACT(EPOCH FROM f.absolute_expires_at) * 1000000)::bigint AS abs_us, \
+             (f.revoked_at IS NULL) AS family_live, (g.revoked_at IS NULL) AS grant_live \
+             FROM refresh_tokens rt \
+             JOIN refresh_families f ON f.id = rt.family_id \
+             AND f.tenant_id = rt.tenant_id AND f.environment_id = rt.environment_id \
+             JOIN grants g ON g.id = f.grant_id \
+             AND g.tenant_id = f.tenant_id AND g.environment_id = f.environment_id \
+             WHERE rt.token_digest = $1 AND rt.tenant_id = $2 AND rt.environment_id = $3",
+        )
+        .bind(&digest)
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        match row {
+            None => Ok(None),
+            Some(row) => Ok(Some(refresh_resolution_from_row(&row, &self.scope)?)),
+        }
+    }
+}
+
+/// The mutating refresh-token repository (issue #21). Reachable only through
+/// [`ScopedStore::acting`], so every mutation carries an actor and correlation id.
+/// [`issue`](Self::issue) and [`revoke_session_bound`](Self::revoke_session_bound)
+/// route through the module's audited-write primitive; [`redeem`](Self::redeem) is
+/// the one bespoke committing path (it folds the consume, the successor, the access
+/// token, and the audit into one transaction and classifies a superseded-token
+/// presentation as a benign within-grace refresh or a genuine reuse), like the code
+/// redeem, and still writes every audit row in the SAME transaction as its mutation.
+pub struct ActingRefreshRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+    acting: ActingContext,
+}
+
+impl ActingRefreshRepo<'_> {
+    /// Open a refresh-token family at first issuance: record the family and its
+    /// generation-0 token, plus a `refresh_token.issue` audit row, in one
+    /// transaction. Reads the grant's `session_ref` (so an RP logout can later
+    /// revoke a session-bound family) inside the same transaction. Called after a
+    /// successful code exchange.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if any supplied identifier is out of scope;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn issue(&self, env: &Env, family: NewRefreshFamily<'_>) -> Result<(), StoreError> {
+        if family.family_id.scope() != self.scope
+            || family.token_jti.scope() != self.scope
+            || family.grant_id.scope() != self.scope
+        {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::RefreshTokenIssue,
+                target: family.family_id,
+            },
+            async move |tx| {
+                // Read the grant's session_ref so a session-bound family can be
+                // revoked at RP logout. NULL when no session backed the grant.
+                let session_ref: Option<String> = sqlx::query(
+                    "SELECT session_ref FROM grants \
+                     WHERE id = $1 AND tenant_id = $2 AND environment_id = $3",
+                )
+                .bind(family.grant_id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .fetch_optional(&mut **tx)
+                .await?
+                .and_then(|row| row.get::<Option<String>, _>("session_ref"));
+                sqlx::query(
+                    "INSERT INTO refresh_families \
+                     (id, tenant_id, environment_id, grant_id, subject, client_id, scope, \
+                      auth_methods, session_ref, offline, created_at, absolute_expires_at) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, \
+                             TIMESTAMPTZ 'epoch' + ($11::text || ' microseconds')::interval, \
+                             TIMESTAMPTZ 'epoch' + ($12::text || ' microseconds')::interval)",
+                )
+                .bind(family.family_id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(family.grant_id.to_string())
+                .bind(family.subject)
+                .bind(family.client_id)
+                .bind(family.scope)
+                .bind(family.auth_methods)
+                .bind(session_ref)
+                .bind(family.offline)
+                .bind(family.created_at_unix_micros)
+                .bind(family.absolute_expires_at_unix_micros)
+                .execute(&mut **tx)
+                .await?;
+                sqlx::query(
+                    "INSERT INTO refresh_tokens \
+                     (token_digest, tenant_id, environment_id, family_id, jti, generation, \
+                      predecessor_jti, issued_at, idle_expires_at) \
+                     VALUES ($1, $2, $3, $4, $5, 0, NULL, \
+                             TIMESTAMPTZ 'epoch' + ($6::text || ' microseconds')::interval, \
+                             TIMESTAMPTZ 'epoch' + ($7::text || ' microseconds')::interval)",
+                )
+                .bind(family.token_digest)
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(family.family_id.to_string())
+                .bind(family.token_jti.to_string())
+                .bind(family.created_at_unix_micros)
+                .bind(family.idle_expires_at_unix_micros)
+                .execute(&mut **tx)
+                .await?;
+                Ok(())
+            },
+            false,
+        )
+        .await
+    }
+
+    /// Atomically redeem (refresh) a presented refresh token, with reuse detection.
+    ///
+    /// In one transaction the presented token's family, grant, expiry, and rotation
+    /// state are read, and then:
+    ///
+    /// - a token whose family or grant is already revoked, or whose idle timeout or
+    ///   family hard cap has passed, is [`RefreshRedeemOutcome::Invalid`];
+    /// - a token that is ALREADY superseded is classified against the grace window:
+    ///   within it, a fresh successor is minted without revoking
+    ///   ([`RefreshRedeemOutcome::RotatedWithinGrace`]); beyond it, the whole family
+    ///   is revoked and the reuse event emitted EXACTLY once
+    ///   ([`RefreshRedeemOutcome::Reused`]);
+    /// - a LIVE token with `rotate` set is atomically consumed (superseded) and a
+    ///   successor plus access token recorded ([`RefreshRedeemOutcome::Rotated`]); a
+    ///   concurrent loser that misses the single-row consume re-reads and classifies
+    ///   against the grace window exactly as an already-superseded token does, so N
+    ///   parallel refreshes all succeed within the window;
+    /// - a LIVE token with `rotate` unset records only a fresh access token and
+    ///   leaves the token in place ([`RefreshRedeemOutcome::NotRotated`]).
+    ///
+    /// `now` flows from the application clock seam (never the database clock). This
+    /// is a bespoke committing path (like the code redeem) that still writes every
+    /// audit row in the SAME transaction as its mutation.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the successor or any access-token identifier is
+    /// out of scope; [`StoreError::Database`] on a persistence failure.
+    pub async fn redeem(
+        &self,
+        env: &Env,
+        redeem: RefreshRedeem<'_>,
+    ) -> Result<RefreshRedeemOutcome, StoreError> {
+        if redeem.successor.jti.scope() != self.scope
+            || redeem
+                .access_records
+                .iter()
+                .any(|t| t.id.scope() != self.scope)
+            || redeem
+                .opaque
+                .as_ref()
+                .is_some_and(|opaque| opaque.jti.scope() != self.scope)
+        {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let now_micros = epoch_micros(env.clock().now_utc());
+        let grace_micros = i64::try_from(redeem.grace.as_micros()).unwrap_or(i64::MAX);
+        let digest = refresh_token_digest(redeem.presented_token);
+
+        let mut tx = begin_scoped(self.store, scope).await?;
+        let Some(row) = sqlx::query(
+            "SELECT rt.jti AS jti, rt.family_id AS family_id, f.grant_id AS grant_id, \
+             (rt.rotated_at IS NOT NULL) AS rotated, \
+             (EXTRACT(EPOCH FROM rt.rotated_at) * 1000000)::bigint AS rotated_us, \
+             (EXTRACT(EPOCH FROM rt.idle_expires_at) * 1000000)::bigint AS idle_us, \
+             (EXTRACT(EPOCH FROM f.absolute_expires_at) * 1000000)::bigint AS abs_us, \
+             (f.revoked_at IS NULL) AS family_live, (g.revoked_at IS NULL) AS grant_live \
+             FROM refresh_tokens rt \
+             JOIN refresh_families f ON f.id = rt.family_id \
+             AND f.tenant_id = rt.tenant_id AND f.environment_id = rt.environment_id \
+             JOIN grants g ON g.id = f.grant_id \
+             AND g.tenant_id = f.tenant_id AND g.environment_id = f.environment_id \
+             WHERE rt.token_digest = $1 AND rt.tenant_id = $2 AND rt.environment_id = $3",
+        )
+        .bind(&digest)
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .fetch_optional(&mut *tx)
+        .await?
+        else {
+            // Absent (or out of scope): a plain invalid_grant with no reuse.
+            tx.commit().await?;
+            return Ok(RefreshRedeemOutcome::Invalid);
+        };
+
+        let family_text: String = row.get("family_id");
+        let grant_text: String = row.get("grant_id");
+        let jti_text: String = row.get("jti");
+        // A revoked family or grant (a prior reuse, an RP logout, or a code-reuse
+        // grant revoke) makes the token inactive: invalid_grant, and NO reuse event
+        // (the event, if any, was already emitted when the family was revoked).
+        if !row.get::<bool, _>("family_live") || !row.get::<bool, _>("grant_live") {
+            tx.commit().await?;
+            return Ok(RefreshRedeemOutcome::Invalid);
+        }
+        // Idle timeout or family hard cap passed: invalid_grant.
+        if row.get::<i64, _>("idle_us") <= now_micros || row.get::<i64, _>("abs_us") <= now_micros {
+            tx.commit().await?;
+            return Ok(RefreshRedeemOutcome::Invalid);
+        }
+
+        // Already superseded: classify against the grace window regardless of the
+        // rotation policy (a superseded token is being reused).
+        if row.get::<bool, _>("rotated") {
+            let rotated_us: i64 = row.get("rotated_us");
+            return self
+                .classify_superseded(
+                    env,
+                    tx,
+                    &family_text,
+                    &jti_text,
+                    &grant_text,
+                    rotated_us,
+                    now_micros,
+                    grace_micros,
+                    &redeem,
+                )
+                .await;
+        }
+
+        // A live (non-superseded) leaf token: apply the rotation policy.
+        self.redeem_live_leaf(
+            env,
+            tx,
+            &family_text,
+            &jti_text,
+            &grant_text,
+            &digest,
+            now_micros,
+            grace_micros,
+            &redeem,
+        )
+        .await
+    }
+
+    /// Redeem a LIVE (non-superseded) leaf refresh token in the open transaction
+    /// (issue #21), committing it. With `rotate` unset a confidential/bound client
+    /// under the TTL threshold records only a fresh access token and leaves the token
+    /// in place ([`RefreshRedeemOutcome::NotRotated`]). With `rotate` set the token is
+    /// atomically consumed: the single winner records the successor and access token
+    /// ([`RefreshRedeemOutcome::Rotated`]); a concurrent loser that missed the
+    /// single-row consume re-reads the rotation instant and classifies against the
+    /// grace window exactly as an already-superseded token does.
+    #[allow(clippy::too_many_arguments)]
+    async fn redeem_live_leaf(
+        &self,
+        env: &Env,
+        mut tx: Transaction<'_, Postgres>,
+        family_text: &str,
+        jti_text: &str,
+        grant_text: &str,
+        digest: &str,
+        now_micros: i64,
+        grace_micros: i64,
+        redeem: &RefreshRedeem<'_>,
+    ) -> Result<RefreshRedeemOutcome, StoreError> {
+        let scope = self.scope;
+        if !redeem.rotate {
+            // No rotation (a confidential/bound client under the threshold): record
+            // only a fresh access token against the grant, leave the token in place.
+            record_refresh_access(&mut tx, scope, grant_text, redeem).await?;
+            let spec = AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::TokenIssue,
+                target: &GrantId::parse_in_scope(grant_text, &scope)?,
+            };
+            insert_audit_row(&mut tx, &spec).await?;
+            tx.commit().await?;
+            return Ok(RefreshRedeemOutcome::NotRotated);
+        }
+
+        // Rotate: atomically consume this live token. Postgres serializes the
+        // single-row UPDATE, so exactly one concurrent caller sets rotated_at.
+        let won = sqlx::query(
+            "UPDATE refresh_tokens \
+             SET rotated_at = TIMESTAMPTZ 'epoch' + ($1::text || ' microseconds')::interval, \
+                 successor_jti = $2 \
+             WHERE token_digest = $3 AND tenant_id = $4 AND environment_id = $5 \
+             AND rotated_at IS NULL",
+        )
+        .bind(now_micros)
+        .bind(redeem.successor.jti.to_string())
+        .bind(digest)
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .execute(&mut *tx)
+        .await?;
+
+        if won.rows_affected() > 0 {
+            // Won the single-use race: record the successor and the access token in
+            // this same transaction.
+            insert_refresh_generation(
+                &mut tx,
+                scope,
+                family_text,
+                &redeem.successor,
+                Some(jti_text),
+                now_micros,
+            )
+            .await?;
+            record_refresh_access(&mut tx, scope, grant_text, redeem).await?;
+            let spec = AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::RefreshTokenRotate,
+                target: &RefreshFamilyId::parse_in_scope(family_text, &scope)?,
+            };
+            insert_audit_row(&mut tx, &spec).await?;
+            tx.commit().await?;
+            return Ok(RefreshRedeemOutcome::Rotated);
+        }
+
+        // Missed the consume: a concurrent refresh rotated this token first. Re-read
+        // its rotated_at and classify against the grace window, so a within-window
+        // concurrent refresh still succeeds and a beyond-window reuse revokes.
+        let rotated_us: i64 = sqlx::query(
+            "SELECT (EXTRACT(EPOCH FROM rotated_at) * 1000000)::bigint AS rotated_us \
+             FROM refresh_tokens \
+             WHERE token_digest = $1 AND tenant_id = $2 AND environment_id = $3 \
+             AND rotated_at IS NOT NULL",
+        )
+        .bind(digest)
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .fetch_optional(&mut *tx)
+        .await?
+        .map_or(now_micros, |r| r.get("rotated_us"));
+        self.classify_superseded(
+            env,
+            tx,
+            family_text,
+            jti_text,
+            grant_text,
+            rotated_us,
+            now_micros,
+            grace_micros,
+            redeem,
+        )
+        .await
+    }
+
+    /// Classify a presentation of an ALREADY-superseded refresh token (issue #21),
+    /// and commit its transaction. Within the grace window of `rotated_us` it is a
+    /// benign concurrent refresh: a fresh successor and access token are recorded
+    /// without revoking, so the user is not locked out. Beyond the window it is a
+    /// genuine reuse: the whole family is revoked and the reuse audit written in this
+    /// transaction, EXACTLY once (only the revoke that flips `revoked_at` emits it).
+    #[allow(clippy::too_many_arguments)]
+    async fn classify_superseded(
+        &self,
+        env: &Env,
+        mut tx: Transaction<'_, Postgres>,
+        family_text: &str,
+        predecessor_jti: &str,
+        grant_text: &str,
+        rotated_us: i64,
+        now_micros: i64,
+        grace_micros: i64,
+        redeem: &RefreshRedeem<'_>,
+    ) -> Result<RefreshRedeemOutcome, StoreError> {
+        let scope = self.scope;
+        if now_micros.saturating_sub(rotated_us) <= grace_micros {
+            // Within the grace window: a benign concurrent refresh. Mint a fresh
+            // successor (a second live leaf) and a fresh access token WITHOUT
+            // revoking, so multi-tab / retry all succeed.
+            insert_refresh_generation(
+                &mut tx,
+                scope,
+                family_text,
+                &redeem.successor,
+                Some(predecessor_jti),
+                now_micros,
+            )
+            .await?;
+            record_refresh_access(&mut tx, scope, grant_text, redeem).await?;
+            let spec = AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::RefreshTokenRotate,
+                target: &RefreshFamilyId::parse_in_scope(family_text, &scope)?,
+            };
+            insert_audit_row(&mut tx, &spec).await?;
+            tx.commit().await?;
+            return Ok(RefreshRedeemOutcome::RotatedWithinGrace);
+        }
+
+        // Beyond the grace window: a genuine reuse. Revoke the whole family (and
+        // record that the revocation was a reuse) so every generation is inactive.
+        let revoked = sqlx::query(
+            "UPDATE refresh_families \
+             SET revoked_at = TIMESTAMPTZ 'epoch' + ($1::text || ' microseconds')::interval, \
+                 reuse_detected_at = \
+                     TIMESTAMPTZ 'epoch' + ($1::text || ' microseconds')::interval \
+             WHERE id = $2 AND tenant_id = $3 AND environment_id = $4 \
+             AND revoked_at IS NULL",
+        )
+        .bind(now_micros)
+        .bind(family_text)
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .execute(&mut *tx)
+        .await?;
+        // Only the revoke that actually flipped the family emits the typed reuse
+        // event, so it is written EXACTLY once per incident even under concurrent
+        // reuse presentations.
+        if revoked.rows_affected() > 0 {
+            let spec = AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::RefreshTokenReuse,
+                target: &RefreshFamilyId::parse_in_scope(family_text, &scope)?,
+            };
+            insert_audit_row(&mut tx, &spec).await?;
+        }
+        tx.commit().await?;
+        Ok(RefreshRedeemOutcome::Reused)
+    }
+
+    /// Revoke a session's SESSION-BOUND refresh-token families at RP logout (issue
+    /// #21), returning how many families were revoked. The `offline_access` families
+    /// are left intact by construction (`offline = false` filter), so a token issued
+    /// with `offline_access` survives RP logout (OIDC Back-Channel Logout 2.7) while
+    /// one issued without it is invalidated with the session. Writes one
+    /// `refresh_family.revoke` audit row in the same transaction. This is NOT a
+    /// reuse, so `reuse_detected_at` is left unset and no reuse event is emitted.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the session id is out of scope;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn revoke_session_bound(
+        &self,
+        env: &Env,
+        session: &SessionId,
+    ) -> Result<u64, StoreError> {
+        if session.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let now_micros = epoch_micros(env.clock().now_utc());
+        let mut revoked_count: u64 = 0;
+        let count_out = &mut revoked_count;
+        let session_text = session.to_string();
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::RefreshFamilyRevoke,
+                target: session,
+            },
+            async move |tx| {
+                let result = sqlx::query(
+                    "UPDATE refresh_families \
+                     SET revoked_at = \
+                         TIMESTAMPTZ 'epoch' + ($1::text || ' microseconds')::interval \
+                     WHERE session_ref = $2 AND tenant_id = $3 AND environment_id = $4 \
+                     AND offline = false AND revoked_at IS NULL",
+                )
+                .bind(now_micros)
+                .bind(&session_text)
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .execute(&mut **tx)
+                .await?;
+                *count_out = result.rows_affected();
+                Ok(())
+            },
+            false,
+        )
+        .await?;
+        Ok(revoked_count)
+    }
+}
+
+/// Insert one refresh-token generation row (a rotated successor) in the current
+/// transaction (issue #21). Digest only; the plaintext token is never stored.
+async fn insert_refresh_generation(
+    tx: &mut Transaction<'_, Postgres>,
+    scope: Scope,
+    family_text: &str,
+    successor: &RotatedRefreshToken<'_>,
+    predecessor_jti: Option<&str>,
+    now_micros: i64,
+) -> Result<(), StoreError> {
+    sqlx::query(
+        "INSERT INTO refresh_tokens \
+         (token_digest, tenant_id, environment_id, family_id, jti, generation, \
+          predecessor_jti, issued_at, idle_expires_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, \
+                 TIMESTAMPTZ 'epoch' + ($8::text || ' microseconds')::interval, \
+                 TIMESTAMPTZ 'epoch' + ($9::text || ' microseconds')::interval)",
+    )
+    .bind(successor.token_digest)
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .bind(family_text)
+    .bind(successor.jti.to_string())
+    .bind(successor.generation)
+    .bind(predecessor_jti)
+    .bind(now_micros)
+    .bind(successor.idle_expires_at_unix_micros)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+/// Record the refreshed access (and optional ID) token against the grant in the
+/// current transaction (issue #21), so grant-chain revocation reaches it. Mirrors
+/// the code redeem's token recording: an `at+jwt` is an `issued_tokens` row, an
+/// opaque token an `opaque_access_tokens` row.
+async fn record_refresh_access(
+    tx: &mut Transaction<'_, Postgres>,
+    scope: Scope,
+    grant_text: &str,
+    redeem: &RefreshRedeem<'_>,
+) -> Result<(), StoreError> {
+    for token in redeem.access_records {
+        sqlx::query(
+            "INSERT INTO issued_tokens \
+             (id, tenant_id, environment_id, grant_id, token_kind) \
+             VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind(token.id.to_string())
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(grant_text)
+        .bind(token.kind.as_str())
+        .execute(&mut **tx)
+        .await?;
+    }
+    if let Some(opaque) = &redeem.opaque {
+        sqlx::query(
+            "INSERT INTO opaque_access_tokens \
+             (token_digest, tenant_id, environment_id, grant_id, subject, \
+              client_id, audience, scope, jti, expires_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, \
+                     TIMESTAMPTZ 'epoch' + ($10::text || ' microseconds')::interval)",
+        )
+        .bind(opaque.token_digest)
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(grant_text)
+        .bind(opaque.subject)
+        .bind(opaque.client_id)
+        .bind(opaque.audience)
+        .bind(opaque.scope)
+        .bind(opaque.jti.to_string())
+        .bind(opaque.expires_at_unix_micros)
+        .execute(&mut **tx)
+        .await?;
+    }
+    Ok(())
+}
+
+/// Reconstruct a [`RefreshTokenResolution`] from a joined row read within scope.
+fn refresh_resolution_from_row(
+    row: &PgRow,
+    scope: &Scope,
+) -> Result<RefreshTokenResolution, StoreError> {
+    let family_id = RefreshFamilyId::parse_in_scope(&row.get::<String, _>("family_id"), scope)?;
+    let grant_id = GrantId::parse_in_scope(&row.get::<String, _>("grant_id"), scope)?;
+    Ok(RefreshTokenResolution {
+        family_id,
+        grant_id,
+        generation: i64::from(row.get::<i32, _>("generation")),
+        subject: row.get("subject"),
+        client_id: row.get("client_id"),
+        scope: row.get("scope"),
+        auth_methods: row.get("auth_methods"),
+        offline: row.get("offline"),
+        issued_at_unix_micros: row.get("issued_us"),
+        idle_expires_at_unix_micros: row.get("idle_us"),
+        family_absolute_expires_at_unix_micros: row.get("abs_us"),
+        rotated: row.get("rotated"),
+        active: row.get::<bool, _>("family_live") && row.get::<bool, _>("grant_live"),
+    })
+}
+
+// ===========================================================================
 // Bootstrap login, consent, and session (issue #20).
 //
 // The tenant-scoped persistence behind the minimal in-process login,
@@ -2992,6 +3941,12 @@ pub struct GrantedConsent {
     /// The space-separated `scope` value the decision was recorded against, or
     /// [`None`] when the consented request carried no scope.
     pub granted_scope: Option<String>,
+    /// The consent's expiry in microseconds since the Unix epoch (issue #21), or
+    /// [`None`] when the consent never expires (the `explicit` mode default). A
+    /// `remembered`-mode consent stores an expiry; the authorization endpoint
+    /// treats a consent past its expiry as absent and re-prompts. The value is read
+    /// straight through so the caller compares it against the application clock.
+    pub expires_at_unix_micros: Option<i64>,
 }
 
 /// The read-only consent repository (issue #20).
@@ -3021,7 +3976,8 @@ impl ConsentRepo<'_> {
     ) -> Result<Option<GrantedConsent>, StoreError> {
         let mut tx = begin_scoped(self.store, self.scope).await?;
         let row = sqlx::query(
-            "SELECT id, granted_scope FROM consents \
+            "SELECT id, granted_scope, \
+             (EXTRACT(EPOCH FROM expires_at) * 1000000)::bigint AS expires_us FROM consents \
              WHERE subject = $1 AND client_id = $2 \
              AND tenant_id = $3 AND environment_id = $4",
         )
@@ -3035,6 +3991,7 @@ impl ConsentRepo<'_> {
         Ok(row.map(|row| GrantedConsent {
             id: row.get::<String, _>("id"),
             granted_scope: row.get::<Option<String>, _>("granted_scope"),
+            expires_at_unix_micros: row.get::<Option<i64>, _>("expires_us"),
         }))
     }
 }
@@ -3089,6 +4046,41 @@ impl ActingConsentRepo<'_> {
         client_id: &str,
         granted_scope: Option<&str>,
     ) -> Result<ConsentId, StoreError> {
+        self.grant_inner(env, subject, client_id, granted_scope, None)
+            .await
+    }
+
+    /// Record consent with an EXPIRY (issue #21): the `remembered` consent mode.
+    /// `expires_at_micros` is when the recorded consent lapses, in microseconds
+    /// since the Unix epoch (the clock seam); `None` records a never-expiring
+    /// consent, identical to [`grant`](Self::grant). The authorization endpoint
+    /// treats a consent past its expiry as absent and re-prompts, and a re-consent
+    /// refreshes the expiry. All the audit and upsert semantics of
+    /// [`grant`](Self::grant) hold.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn grant_with_expiry(
+        &self,
+        env: &Env,
+        subject: &str,
+        client_id: &str,
+        granted_scope: Option<&str>,
+        expires_at_micros: Option<i64>,
+    ) -> Result<ConsentId, StoreError> {
+        self.grant_inner(env, subject, client_id, granted_scope, expires_at_micros)
+            .await
+    }
+
+    async fn grant_inner(
+        &self,
+        env: &Env,
+        subject: &str,
+        client_id: &str,
+        granted_scope: Option<&str>,
+        expires_at_micros: Option<i64>,
+    ) -> Result<ConsentId, StoreError> {
         let scope = self.scope;
         // Pre-read the existing consent row's id for (subject, client) so the INSERT
         // candidate id and the audit target are the row's REAL id, not a fresh id the
@@ -3126,10 +4118,15 @@ impl ActingConsentRepo<'_> {
             async move |tx| {
                 let row = sqlx::query(
                     "INSERT INTO consents \
-                     (id, tenant_id, environment_id, subject, client_id, granted_scope) \
-                     VALUES ($1, $2, $3, $4, $5, $6) \
+                     (id, tenant_id, environment_id, subject, client_id, granted_scope, \
+                      expires_at) \
+                     VALUES ($1, $2, $3, $4, $5, $6, \
+                             CASE WHEN $7::bigint IS NULL THEN NULL \
+                                  ELSE TIMESTAMPTZ 'epoch' \
+                                       + ($7::text || ' microseconds')::interval END) \
                      ON CONFLICT (tenant_id, environment_id, subject, client_id) \
-                     DO UPDATE SET granted_scope = EXCLUDED.granted_scope \
+                     DO UPDATE SET granted_scope = EXCLUDED.granted_scope, \
+                                   expires_at = EXCLUDED.expires_at \
                      RETURNING id",
                 )
                 .bind(candidate.to_string())
@@ -3138,6 +4135,7 @@ impl ActingConsentRepo<'_> {
                 .bind(subject)
                 .bind(client_id)
                 .bind(granted_scope)
+                .bind(expires_at_micros)
                 .fetch_one(&mut **tx)
                 .await?;
                 *stored_id_out = Some(row.get::<String, _>("id"));

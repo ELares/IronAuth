@@ -136,7 +136,9 @@ pub use subject::{
     subject_within_cap,
 };
 pub use token_hash::{HashKind, at_hash, c_hash, left_half_hash};
-pub use tokens::{AccessTokenTarget, MintedAccessToken, OPAQUE_ACCESS_TOKEN_PREFIX};
+pub use tokens::{
+    AccessTokenTarget, MintedAccessToken, OPAQUE_ACCESS_TOKEN_PREFIX, OPAQUE_REFRESH_TOKEN_PREFIX,
+};
 
 /// Build the OIDC provider router.
 ///

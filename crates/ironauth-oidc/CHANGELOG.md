@@ -6,6 +6,31 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Refresh-token rotation, families, `offline_access`, and consent modes (issue #21).
+  - **The `refresh_token` grant.** The token endpoint exchanges a rotating refresh
+    token for a fresh access token. The refresh token is an opaque reference mirroring
+    the #29 access token, `ira_rt_<jti>~<secret>` (a scope-declaring `rft_` handle
+    plus 256 bits from the entropy seam), stored only as a SHA-256 digest; the
+    presented token declares its own `(tenant, environment)` scope, so the global
+    endpoint recovers the scope and runs the RLS-scoped resolve. `refresh_token` is
+    now an advertised `grant_type`.
+  - **Graduated rotation policy.** A public (sender-unbound) client rotates on every
+    refresh; a confidential client rotates only once past the configured fraction of
+    idle TTL (default 70%), with an optional per-client `always`/`threshold` override.
+    A family hard cap bounds the total rotated lifetime.
+  - **Reuse detection.** A superseded token presented outside the grace window is
+    `invalid_grant`, revokes the entire family, and emits the typed reuse event
+    exactly once per incident; benign concurrent refreshes within the grace window all
+    succeed without revoking. A revoked-family refresh is `invalid_grant`.
+  - **`offline_access` (OIDC Core 11).** Ignored on a flow that returns no
+    authorization code; a web client must consent to it, with a trusted first-party
+    carve-out (`implicit` mode or `skip_consent`). An `offline_access` family survives
+    RP logout (Back-Channel Logout 2.7) with its own finite idle and max lifetimes,
+    while a session-bound family is invalidated with the session.
+  - **Consent modes per client.** `explicit` (always prompt unless a covering consent
+    exists), `implicit` (first-party auto-grant), and `remembered` (honor the recorded
+    consent until its TTL, then re-prompt), plus `skip_consent` and a
+    `store_skipped_consent` no-store knob.
 - Complete the client authentication suite with JWT assertions and uniform
   failure hygiene (issue #25).
   - **`private_key_jwt` (RFC 7523).** A client authenticates the token endpoint

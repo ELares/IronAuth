@@ -61,7 +61,10 @@ use std::time::{Duration, SystemTime};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use ironauth_jose::{EmissionOptions, SigningKey, SigningPolicy, sign_jws_with_policy};
-use ironauth_store::{IssuedTokenId, Scope, TokenFormat, opaque_access_token_digest};
+use ironauth_store::{
+    IssuedTokenId, RefreshTokenId, Scope, TokenFormat, opaque_access_token_digest,
+    refresh_token_digest,
+};
 use serde_json::json;
 
 use crate::authn;
@@ -74,6 +77,16 @@ use crate::subject;
 /// sibling refresh-token prefix `ira_rt_` is reserved there for consistency;
 /// refresh tokens are issue #21.
 pub const OPAQUE_ACCESS_TOKEN_PREFIX: &str = "ira_at_";
+
+/// The scannable prefix on every REFRESH token (issue #21): `ira` (the product
+/// namespace), `rt` (refresh token). Documented alongside its detection regex in
+/// `docs/design/TOKEN-FORMATS.md` for secret-scanner registration. A refresh token
+/// is a scope-declaring reference credential exactly like an opaque access token:
+/// `ira_rt_<jti>~<secret>`, where `<jti>` is a `rft_` scoped id embedding its
+/// `(tenant, environment)` (so the GLOBAL `/token` endpoint recovers the scope and
+/// runs the RLS-scoped digest resolve) and `<secret>` is 256 bits from the entropy
+/// seam. Only the SHA-256 digest of the WHOLE token is stored.
+pub const OPAQUE_REFRESH_TOKEN_PREFIX: &str = "ira_rt_";
 
 /// The delimiter between an opaque access token's scope-declaring routing handle
 /// and its secret random suffix (issue #29). Chosen because it is a valid RFC 7235
@@ -386,7 +399,6 @@ pub fn mint(
     // access token uses the target lifetime (a resource server may shorten it).
     let id_exp = iat.saturating_add(secs(state.access_token_ttl()));
     let access_ttl_secs = secs(target.ttl);
-    let access_exp = iat.saturating_add(access_ttl_secs);
 
     let id_jti = IssuedTokenId::generate(state.env(), &request.scope);
 
@@ -407,7 +419,55 @@ pub fn mint(
     )
     .map_err(|_| ())?;
 
-    let access = match target.format {
+    let access = mint_access(state, signer, policy, request, target, now)?;
+
+    Ok(IssuedTokens {
+        access,
+        id_token,
+        id_jti,
+        expires_in_secs: access_ttl_secs,
+    })
+}
+
+/// Mint ONLY an access token (the refresh-token grant, issue #21). It reuses the
+/// EXACT same access-token claim assembly and signing path as [`mint`] and returns
+/// the token plus its lifetime in seconds. A refreshed exchange never re-mints an
+/// ID token (no new authentication happened), so this is the lean minter the
+/// refresh grant uses; the ID token and its `auth_time`/`nonce` stay with the
+/// original code exchange.
+///
+/// # Errors
+///
+/// Returns `Err(())` if `signer`'s algorithm is not permitted by `policy` or the
+/// signing backend fails; the caller maps that to a token-endpoint `server_error`,
+/// so a signing failure fails the refresh closed. The opaque path is infallible.
+pub fn mint_access_token(
+    state: &OidcState,
+    signer: &SigningKey,
+    policy: &SigningPolicy,
+    request: &MintRequest<'_>,
+    target: &AccessTokenTarget,
+) -> Result<(MintedAccessToken, i64), ()> {
+    let now = state.now();
+    let access = mint_access(state, signer, policy, request, target, now)?;
+    Ok((access, secs(target.ttl)))
+}
+
+/// Mint the access token for `target`, in whichever format it selects (issue #29,
+/// #21). Shared by the code exchange ([`mint`]) and the refresh grant
+/// ([`mint_access_token`]), so a refreshed access token is byte-shaped identically
+/// to a freshly issued one.
+fn mint_access(
+    state: &OidcState,
+    signer: &SigningKey,
+    policy: &SigningPolicy,
+    request: &MintRequest<'_>,
+    target: &AccessTokenTarget,
+    now: SystemTime,
+) -> Result<MintedAccessToken, ()> {
+    let iat = epoch_secs(now);
+    let access_exp = iat.saturating_add(secs(target.ttl));
+    match target.format {
         // RFC 9068 at+jwt: the header typ is `at+jwt` and the claims carry the
         // section 2.2 set, signed through the same policy-enforced core as the ID
         // token, so an algorithm the policy forbids is refused before signing.
@@ -427,7 +487,7 @@ pub fn mint(
                 &EmissionOptions::new().with_typ("at+jwt"),
             )
             .map_err(|_| ())?;
-            MintedAccessToken::Jwt { token, jti }
+            Ok(MintedAccessToken::Jwt { token, jti })
         }
         // Opaque: a scope-declaring reference token; only its digest and metadata
         // are stored (the caller records them in the redeem transaction). The token
@@ -438,22 +498,46 @@ pub fn mint(
             let token = generate_opaque_access_token(state, &jti);
             let digest = opaque_access_token_digest(&token);
             let expires_at_unix_micros = epoch_micros(now).saturating_add(micros(target.ttl));
-            MintedAccessToken::Opaque {
+            Ok(MintedAccessToken::Opaque {
                 token,
                 digest,
                 jti,
                 audience: target.audience.clone(),
                 expires_at_unix_micros,
-            }
+            })
         }
-    };
+    }
+}
 
-    Ok(IssuedTokens {
-        access,
-        id_token,
-        id_jti,
-        expires_in_secs: access_ttl_secs,
-    })
+/// A freshly minted refresh token (issue #21): the plaintext handed to the client
+/// (NEVER stored) plus the digest-only material the store records.
+pub struct MintedRefreshToken {
+    /// The `ira_rt_...` plaintext token, returned to the client and never persisted.
+    pub token: String,
+    /// The SHA-256 hex digest of `token`, the only token material stored.
+    pub digest: String,
+    /// The token's logical `rft_` identifier (its embedded routing handle).
+    pub jti: RefreshTokenId,
+}
+
+/// Mint a refresh token under `scope` (issue #21): a fresh `rft_` routing handle,
+/// the [`OPAQUE_REFRESH_TOKEN_PREFIX`], the [`OPAQUE_ACCESS_TOKEN_DELIMITER`], and
+/// 256 bits of entropy from the ironauth-env seam, exactly mirroring the opaque
+/// access token. The whole-token SHA-256 digest is what the store persists; a
+/// forged handle resolves to nothing (the digest binds the handle to the secret,
+/// so a token cannot be relocated to another scope), and a database dump yields
+/// nothing replayable.
+#[must_use]
+pub fn mint_refresh_token(state: &OidcState, scope: &Scope) -> MintedRefreshToken {
+    let jti = RefreshTokenId::generate(state.env(), scope);
+    let mut bytes = [0_u8; OPAQUE_ACCESS_TOKEN_BYTES];
+    state.env().entropy().fill_bytes(&mut bytes);
+    let token = format!(
+        "{OPAQUE_REFRESH_TOKEN_PREFIX}{jti}{OPAQUE_ACCESS_TOKEN_DELIMITER}{}",
+        URL_SAFE_NO_PAD.encode(bytes)
+    );
+    let digest = refresh_token_digest(&token);
+    MintedRefreshToken { token, digest, jti }
 }
 
 /// Mint ONLY an ID token, for the front-channel `id_token` and `code id_token`
