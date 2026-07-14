@@ -17,7 +17,10 @@ range per docs/RELEASING.md.
     reverse-domain private-use scheme) and rejects everything else. A permanent CVE
     regression corpus (wildcard, substring, case-fold, normalization, encoding, and
     homograph classes) and a cargo-fuzz target (`fuzz/`, `redirect_match`) guard
-    against any accepted bypass.
+    against any accepted bypass. The loopback port exception range-checks the port
+    (`1..=65535`, so `:0`/`:99999` are not port variants), and a registrable `https`
+    redirect carrying userinfo (`https://good@evil/cb`, a host-confusion vector) is
+    refused rather than stored and later matched byte-for-byte.
   - **The eighth production migration** adds the additive `clients.redirect_uris`
     (`text[]`) column, the registered set; `ClientRecord` now carries
     `redirect_uris` and `auth_method`, and `ActingClientRepo::register_redirect_uris`

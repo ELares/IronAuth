@@ -28,6 +28,16 @@ range per docs/RELEASING.md.
     fragment and `form_post` modes issue #17 enables; discovery now advertises
     `authorization_response_iss_parameter_supported = true` via
     `DiscoveryCapabilities::from_config`.
+  - **PKCE format is validated, not just the transform** (RFC 7636 4.1/4.2). The
+    `code_challenge` must be a 43-character unpadded base64url SHA-256 digest at
+    `/authorize` (a truncated or low-entropy binding is rejected up front as
+    `invalid_request`, not deferred to a guaranteed token failure), and the
+    `code_verifier` must be 43 to 128 unreserved characters at redemption, so a
+    client cannot slip below the RFC's entropy floor even with a self-consistent
+    challenge. The exact-string redirect comparator's loopback port exception now
+    range-checks the port (`1..=65535`), and a registered `https` redirect carrying
+    userinfo (`https://good@evil/cb`, a host-confusion vector) is refused at
+    registration.
 - Initial OIDC core provider: the authorization endpoint and the
   `authorization_code` grant (issue #12), mounted on the PUBLIC listener.
   - **Authorization endpoint** (`GET`/`POST /authorize`) and the token endpoint's

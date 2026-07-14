@@ -320,6 +320,15 @@ fn resolve_pkce(
             if named_method != Some(PkceMethod::S256.as_str()) {
                 return Err("code_challenge_method must be S256");
             }
+            // An S256 challenge is BASE64URL(SHA256(v)): exactly 43 unpadded
+            // base64url chars (RFC 7636 4.2). Rejecting a malformed challenge here
+            // turns a guaranteed-to-fail redemption into an honest, immediate
+            // `invalid_request` and refuses a truncated/low-entropy binding.
+            if !crate::pkce::code_challenge_is_well_formed(challenge) {
+                return Err(
+                    "code_challenge must be a 43-character base64url SHA-256 digest (S256)",
+                );
+            }
             Some(challenge)
         }
         _ => {

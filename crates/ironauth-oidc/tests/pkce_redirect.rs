@@ -71,6 +71,39 @@ async fn code_challenge_method_plain_is_invalid_request_with_iss() {
 }
 
 #[tokio::test]
+async fn a_malformed_s256_code_challenge_is_invalid_request_with_iss() {
+    let harness = Harness::start().await;
+    let client_id = harness.client_id().to_string();
+    // A syntactically valid S256 request whose challenge is NOT a 43-char base64url
+    // SHA-256 digest (here it is truncated). An S256 challenge is always exactly 43
+    // unpadded base64url chars, so a short/low-entropy binding is rejected up front
+    // with invalid_request (by redirect, carrying iss) rather than deferred to a
+    // guaranteed token failure.
+    let truncated = &PKCE_CHALLENGE[..20];
+    let query = format!(
+        "response_type=code&client_id={client_id}&redirect_uri={}&state=s&\
+         code_challenge={truncated}&code_challenge_method=S256",
+        enc(REDIRECT_URI),
+    );
+    let (status, headers, body) = harness.authorize(&query).await;
+    assert_eq!(status, StatusCode::FOUND, "error redirect: {body}");
+    assert_eq!(
+        location_param(&headers, "error").as_deref(),
+        Some("invalid_request"),
+        "a malformed S256 challenge is invalid_request"
+    );
+    assert_eq!(
+        location_param(&headers, "iss").as_deref(),
+        Some(harness.issuer()),
+        "the error response carries iss"
+    );
+    assert!(
+        location_param(&headers, "code").is_none(),
+        "no code is issued"
+    );
+}
+
+#[tokio::test]
 async fn a_public_client_without_a_code_challenge_is_rejected() {
     let harness = Harness::start().await;
     let client_id = harness.client_id().to_string();

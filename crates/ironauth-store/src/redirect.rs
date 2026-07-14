@@ -71,8 +71,12 @@ pub fn redirect_uri_is_registrable(uri: &str) -> bool {
     };
     let scheme_lower = scheme.to_ascii_lowercase();
     match scheme_lower.as_str() {
-        // A claimed https URL: any non-empty authority.
-        "https" => hier_authority(rest).is_some_and(|authority| !authority.is_empty()),
+        // A claimed https URL: any non-empty authority that carries NO userinfo. A
+        // `user@host` authority is a host-confusion vector (`https://good@evil/cb`
+        // targets `evil`, not `good`), so it is refused at registration rather than
+        // stored and matched byte-for-byte later.
+        "https" => hier_authority(rest)
+            .is_some_and(|authority| !authority.is_empty() && !authority.contains('@')),
         // http is permitted ONLY for a loopback IP literal (never a remote host,
         // never localhost).
         "http" => hier_authority(rest).is_some_and(loopback_ip_literal_authority),
@@ -198,11 +202,17 @@ fn split_loopback_host_and_port(authority: &str) -> Option<(&'static str, &str)>
     Some(("127.0.0.1", port))
 }
 
-/// Whether an authority port component is absent (`""`) or a 1..=5 digit port.
-/// (The upper numeric bound is not re-checked here; the shape is what matters for
-/// the loopback exception.)
+/// Whether an authority port component is absent (`""`) or a valid TCP port
+/// (`1..=65535`). The value must parse as a `u16` and be non-zero, so a numeric
+/// but out-of-range authority like `:99999` or `:0` is not treated as a loopback
+/// port variant.
 fn port_is_valid(port: &str) -> bool {
-    port.is_empty() || (port.len() <= 5 && port.bytes().all(|b| b.is_ascii_digit()))
+    if port.is_empty() {
+        return true;
+    }
+    // A leading `+`/`-`/whitespace is rejected by `u16::from_str`, and `0` is not a
+    // usable listening port, so require a non-zero in-range value.
+    port.parse::<u16>().is_ok_and(|value| value != 0)
 }
 
 /// The loopback deviation of [`redirect_uri_matches`]: `true` iff both URIs are
@@ -327,6 +337,35 @@ mod tests {
         // A scheme with an empty label is not a valid reverse-domain scheme.
         assert!(!redirect_uri_is_registrable("com..app:/cb"));
         assert!(!redirect_uri_is_registrable(".com.app:/cb"));
+    }
+
+    #[test]
+    fn rejects_userinfo_in_a_registrable_https_uri() {
+        // A `user@host` authority is refused at registration: the effective host is
+        // what follows the `@`, so storing one would enshrine a host-confusion
+        // ambiguity even though the later match is byte-exact.
+        assert!(!redirect_uri_is_registrable(
+            "https://client.example@evil.example/cb"
+        ));
+        assert!(!redirect_uri_is_registrable(
+            "https://user:pass@client.example/cb"
+        ));
+        assert!(!redirect_uri_is_registrable("https://@client.example/cb"));
+        // The benign form (no userinfo) still registers.
+        assert!(redirect_uri_is_registrable("https://client.example/cb"));
+    }
+
+    #[test]
+    fn loopback_port_variant_rejects_an_out_of_range_port() {
+        // The loopback exception varies ONLY a valid TCP port. A numeric but
+        // out-of-range or zero port is not a port, so it does not match.
+        let reg = "http://127.0.0.1:8080/cb";
+        assert!(redirect_uri_matches(reg, "http://127.0.0.1:52000/cb"));
+        assert!(!redirect_uri_matches(reg, "http://127.0.0.1:99999/cb"));
+        assert!(!redirect_uri_matches(reg, "http://127.0.0.1:0/cb"));
+        assert!(!redirect_uri_matches(reg, "http://127.0.0.1:65536/cb"));
+        // 65535 is the max valid port and still matches as a variant.
+        assert!(redirect_uri_matches(reg, "http://127.0.0.1:65535/cb"));
     }
 
     // ---------------------------------------------------------------------
