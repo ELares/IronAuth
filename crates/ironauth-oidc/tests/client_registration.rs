@@ -23,7 +23,7 @@ use axum::http::{Request, StatusCode, header};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use common::{Harness, ISSUER_BASE, REDIRECT_URI, form, json as json_body};
-use ironauth_config::OidcConfig;
+use ironauth_config::{OidcConfig, RegistrationMode};
 use ironauth_fetch::{FetchLimits, Fetcher, RecordingDialer, StaticResolver};
 use ironauth_jose::{JwkSet, SigningKey};
 use ironauth_oidc::ClientKeyResolver;
@@ -33,9 +33,18 @@ use tokio::net::TcpListener;
 
 /// A config with the DCR endpoint enabled and confidential PKCE relaxed (the
 /// harness default), so the tests drive registration directly.
+///
+/// The exposure switch is set to `open` because these tests exercise the #30
+/// registration MECHANICS (metadata defaults, RFC 7592 update/read/delete, redirect
+/// validation, algorithm negotiation, jwks fetching), which predate the #31 gating
+/// and register anonymously. The #31 abuse controls (the `closed`/`token_gated`
+/// exposure switch, initial access tokens, policies, quotas, quarantine) are covered
+/// by the dedicated `dcr_abuse` test. An anonymous open registration still starts the
+/// client quarantined, which is invisible to these mechanics assertions.
 fn dcr_config() -> OidcConfig {
     OidcConfig {
         registration_enabled: true,
+        registration_mode: RegistrationMode::Open,
         require_pkce_for_confidential_clients: false,
         ..OidcConfig::default()
     }
@@ -428,6 +437,18 @@ async fn a_negotiated_id_token_alg_is_the_alg_the_mint_actually_signs_with() {
     );
     let client_id = reg["client_id"].as_str().expect("client_id").to_owned();
     let secret = reg["client_secret"].as_str().expect("secret").to_owned();
+
+    // An open-registered client starts QUARANTINED, which forces consent on EVERY
+    // authorization (issue #31, FIX 4) and would divert the recorded-consent code flow
+    // below to the consent screen. Verify it to lift the quarantine; this test is about
+    // the negotiated id_token algorithm, not the quarantine behavior.
+    let id = h
+        .store()
+        .scoped(h.scope())
+        .clients()
+        .parse_id(&client_id)
+        .expect("client id parses");
+    h.verify_client(&id).await;
 
     // Drive a real code exchange for this DCR client (no PKCE: confidential PKCE is
     // relaxed in the harness config), so the ID token is minted through the token

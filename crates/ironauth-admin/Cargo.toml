@@ -18,6 +18,12 @@ autotests = false
 ironauth-env.workspace = true
 ironauth-config.workspace = true
 ironauth-store.workspace = true
+# The DCR abuse controls (issue #31) mint initial access tokens carrying named,
+# reusable policy chains. The policy-primitive type and its parse/serialize helpers
+# are owned by the OIDC policy engine, so the management API reuses them to validate
+# and canonicalize a policy at create time (one source of truth for the primitive
+# shape, no drift between what the admin stores and what the engine applies).
+ironauth-oidc.workspace = true
 
 axum = { workspace = true, features = ["matched-path", "query", "json"] }
 tower = { workspace = true }
@@ -90,6 +96,16 @@ required-features = ["testing"]
 [[test]]
 name = "idor"
 path = "tests/idor.rs"
+required-features = ["testing"]
+
+# DCR abuse-control management surface (issue #31): authoring a reusable policy
+# (create/list/replay/conflict/invalid-primitive), minting an initial access token
+# carrying a policy-chain snapshot (plaintext once, idempotent replay, unknown policy
+# and out-of-range lifetime rejected), and reading/verifying a dynamically registered
+# client's quarantine state (verify lifts it idempotently; not-found is anti-oracle).
+[[test]]
+name = "dcr"
+path = "tests/dcr.rs"
 required-features = ["testing"]
 
 [lints]

@@ -193,6 +193,32 @@ pub enum ClientAssertionAudience {
     IssuerOnly,
 }
 
+/// The Dynamic Client Registration exposure switch (issue #31): who may register
+/// a client through the public `/connect/register` endpoint. Layered under
+/// `oidc.registration_enabled` (which mounts the endpoint at all): when the
+/// endpoint is mounted, this decides whether a request is allowed and how.
+///
+/// The SAFE default is `token_gated`: a valid initial access token is required,
+/// so open self-service registration is opt-in, never on by accident. `closed`
+/// refuses every public registration (clients are then created only through the
+/// management API). `open` allows anonymous registration but the resulting client
+/// starts QUARANTINED (consent always shown, redirect set restricted) until an
+/// admin verifies it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RegistrationMode {
+    /// The public endpoint refuses every registration; clients are created only
+    /// through the management API. The most restrictive posture.
+    Closed,
+    /// A valid initial access token (RFC 7591 section 1.2) is required; a request
+    /// without one is refused. The safe default.
+    #[default]
+    TokenGated,
+    /// Anonymous registration is allowed, but the resulting client starts
+    /// quarantined until an admin verifies it. Requires explicit opt-in.
+    Open,
+}
+
 /// The default audience a client-credentials access token carries when the request
 /// targets NO resource server (issue #23).
 ///
@@ -654,6 +680,38 @@ pub struct OidcConfig {
     /// overrides ride the M5 promotion pipeline.
     pub registration_enabled: bool,
 
+    /// The Dynamic Client Registration exposure switch (issue #31): `closed`
+    /// (management API only), `token_gated` (a valid initial access token is
+    /// required), or `open` (anonymous registration allowed, but the resulting
+    /// client starts quarantined). The SAFE default (`token_gated`) makes open
+    /// self-service registration opt-in. This only takes effect when
+    /// `registration_enabled` mounts the endpoint. This is a promotable
+    /// per-environment setting in spirit; the process value is the deployment
+    /// default until per-environment overrides ride the M5 promotion pipeline.
+    pub registration_mode: RegistrationMode,
+
+    /// The maximum number of dynamically registered clients allowed per environment
+    /// (issue #31). A registration that would exceed this cap is refused with a
+    /// typed error and a `dcr.quota_hit` audit event. The default (100) bounds the
+    /// self-service abuse surface; only DCR-origin clients count toward it (clients
+    /// created through the management API do not). Raise it for an environment that
+    /// legitimately hosts many self-service clients.
+    pub registration_max_clients: u32,
+
+    /// The maximum number of registration requests one source (or one initial
+    /// access token) may make within `registration_rate_window_secs` (issue #31). A
+    /// request beyond the limit is refused with a typed error and a
+    /// `dcr.rate_limited` audit event. The default (20) is a conservative
+    /// endpoint-local guard; set it to 0 to disable rate limiting (relying on the
+    /// quota alone). This ships endpoint-local controls that later delegate to the
+    /// M15 layered rate limiter.
+    pub registration_rate_limit: u32,
+
+    /// The fixed rate-limit window in seconds for `registration_rate_limit` (issue
+    /// #31). The default (60) is one minute. Must be at least 1 and at most
+    /// `OIDC_MAX_LIFETIME_SECS`.
+    pub registration_rate_window_secs: u64,
+
     /// The default audience a client-credentials access token (RFC 6749 4.4, issue
     /// #23) carries when the request targets NO resource server. The default
     /// (`client_id`) makes the token's `aud` the OAuth client id, preserving the
@@ -697,6 +755,10 @@ impl Default for OidcConfig {
             require_pushed_authorization_requests: false,
             par_ttl_secs: 60,
             registration_enabled: false,
+            registration_mode: RegistrationMode::TokenGated,
+            registration_max_clients: 100,
+            registration_rate_limit: 20,
+            registration_rate_window_secs: 60,
             client_credentials_default_audience: ClientCredentialsAudience::ClientId,
         }
     }
@@ -918,6 +980,23 @@ impl Config {
                 message: format!(
                     "oidc.par_ttl_secs ({}) must not exceed {OIDC_MAX_PAR_TTL_SECS} seconds",
                     self.oidc.par_ttl_secs
+                ),
+            });
+        }
+        // The DCR registration rate-limit window (issue #31) is bounded like the
+        // other windows: a zero-second window is meaningless, and a window beyond
+        // the ceiling would let a source accumulate an unbounded burst.
+        if self.oidc.registration_rate_window_secs < 1 {
+            return Err(ConfigError::Invalid {
+                message: "oidc.registration_rate_window_secs must be at least 1 second".to_owned(),
+            });
+        }
+        if self.oidc.registration_rate_window_secs > OIDC_MAX_LIFETIME_SECS {
+            return Err(ConfigError::Invalid {
+                message: format!(
+                    "oidc.registration_rate_window_secs ({}) must not exceed \
+                     {OIDC_MAX_LIFETIME_SECS} seconds",
+                    self.oidc.registration_rate_window_secs
                 ),
             });
         }

@@ -6,6 +6,51 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Dynamic Client Registration abuse controls (issue #31, migration 0018, expand).
+  - **New scoped tables.** `dcr_policies` (named, reusable policy-primitive chains),
+    `dcr_initial_access_tokens` (SHA-256-hashed initial access tokens carrying a
+    resolved policy-chain snapshot, an expiry, and a usage limit; the plaintext is
+    never stored), and `dcr_rate_counters` (the endpoint's fixed-window rate counter).
+    All three ENABLE + FORCE row-level security with the `(tenant, environment)`
+    isolation policy (USING + WITH CHECK) and are registered in
+    `scripts/query-audit.sh`; the schema-level migration test asserts the token table
+    holds no plaintext/secret column.
+  - **Two-role separation across the DCR lifecycle, column-scoped.** A token is MINTED
+    by the control plane and CONSUMED by the data plane, so the grants are deliberately
+    narrow and column-scoped where it matters. `ironauth_control` gets INSERT/SELECT on
+    policies and tokens (mint) plus SELECT + `UPDATE(quarantined, verified_at)` on
+    `clients` (verify). `ironauth_app` gets SELECT + `UPDATE(use_count)` ONLY on tokens
+    (the atomic consume bumps only `use_count`, so a data-plane path can never rewrite a
+    token's `max_uses`/`policy_chain`/`token_hash`/`expires_at` to lift its own cap or
+    swap the bound policy), and SELECT/INSERT/UPDATE on the rate counters. Migration
+    0001 had granted `ironauth_app` a TABLE-WIDE `UPDATE` on `clients`, which a
+    table-level privilege auto-extends to columns added later; 0018 now REVOKEs it and
+    re-grants a COLUMN-SCOPED `UPDATE` over every `clients` column EXCEPT `quarantined`
+    and `verified_at`, so the two quarantine columns are control-plane-only and a
+    data-plane path can no longer self-verify a quarantined client. Neither role is a
+    superset of the other, verified by new grant-restriction tests in `tests/rls.rs`.
+  - **Unverified-client quarantine columns.** `clients` gains `quarantined`,
+    `verified_at`, and `dcr_policy_chain` (the policy snapshot that bound the
+    registration, persisted so RFC 7592 updates re-apply the SAME chain for the
+    client's lifetime).
+  - **Operator-safe audit detail dimension.** `audit_log` gains a nullable `detail`
+    column (NULL for every existing write) and `AuditRecord` a matching `detail` field.
+    A `dcr.policy_rejected` event now records the OFFENDING policy property there
+    (operator-authored, never attacker text), so an operator working from the audit
+    table alone gets the actionable reason; the wire response stays opaque.
+  - **Deferred.** The `dcr_rate_counters` table has no reaper: pruning rolled-over
+    windows is the M15 layered rate limiter's job, tracked with that work. The
+    endpoint rate limit is best-effort; the per-environment quota is the hard cap.
+  - **Repositories.** `DcrPolicyRepo`/`ActingDcrPolicyRepo` (by-name resolve, create),
+    `InitialAccessTokenRepo::consume` (one atomic UPDATE that increments the use count
+    only when unexpired and under its limit, so a usage limit cannot be raced past),
+    `ActingInitialAccessTokenRepo::mint`, `DcrRateLimiterRepo::check_and_increment`
+    (an atomic window-rollover upsert), `ActingClientRepo::verify_dynamic_client`, and
+    `record_dcr_event` (the one audited no-op-mutation event for a policy rejection,
+    quota hit, or rate-limit hit). `register_dynamic` now enforces the per-environment
+    client quota ATOMICALLY inside its transaction under a per-scope advisory lock, so
+    two concurrent registrations cannot both slip past the cap. New typed
+    `StoreError::QuotaExceeded`.
 - Token revocation store support (issue #22, no migration).
   - **Grant-chain and family revocation.** `ActingAuthorizationRepo::revoke_grant`
     revokes a grant chain (the RFC 7009 access-token revoke: the append-only issued/opaque
@@ -59,7 +104,7 @@ range per docs/RELEASING.md.
     the SAME grant chain the #22 endpoints consume. NO refresh-token family is
     opened (RFC 6749 4.4.3). New `IssueClientCredentials` / `ClientCredentialsAccess`
     types; two new audit actions (`service_account.create`, `client.custom_claims.set`).
-  - The migration guard test now pins the production chain at SEVENTEEN migrations.
+  - The migration guard test now pins the production chain at EIGHTEEN migrations.
 - Refresh-token rotation, families, `offline_access`, and consent-mode persistence
   (issue #21, migration 0016, expand).
   - **Token families and digest-only tokens.** New `refresh_families` (the

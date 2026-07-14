@@ -29,8 +29,8 @@ use ironauth_oidc::{
 };
 use ironauth_store::test_support::TestDatabase;
 use ironauth_store::{
-    ClientId, CorrelationId, NewJwtAuthClient, NewSigningKey, Scope, SessionId, SigningKeyId,
-    SigningKeyMaterialKind, Store,
+    ClientId, CorrelationId, InitialAccessTokenId, NewInitialAccessToken, NewJwtAuthClient,
+    NewSigningKey, Scope, SessionId, SigningKeyId, SigningKeyMaterialKind, Store,
 };
 use tower::ServiceExt;
 
@@ -1228,6 +1228,77 @@ impl Harness {
         let (status, headers, body) = self.authorize_with_cookie(&query, &cookie).await;
         assert_eq!(status, StatusCode::FOUND, "authorize: {body}");
         location_param(&headers, "code").expect("code in redirect")
+    }
+
+    /// Mint a DCR initial access token (issue #31) exactly as the management API does:
+    /// only the SHA-256 of `plaintext` is stored, alongside the `chain_text` policy
+    /// snapshot (`"[]"` for unconstrained). A later registration that presents
+    /// `plaintext` as a bearer token consumes THIS token. `max_uses` bounds how many
+    /// registrations it may authorize (None = unlimited within the expiry).
+    ///
+    /// Minting is a CONTROL-plane operation, so it runs through the control-plane
+    /// store: the data-plane (app) role holds no INSERT on the token table (it only
+    /// SELECT/UPDATEs to consume), which is exactly the two-role separation the #31
+    /// migration enforces.
+    pub async fn mint_iat(
+        &self,
+        plaintext: &str,
+        chain_text: &str,
+        expires_at_micros: i64,
+        max_uses: Option<i32>,
+    ) {
+        let id = InitialAccessTokenId::generate(&self.env, &self.scope);
+        self.db
+            .control_store()
+            .scoped(self.scope)
+            .acting(
+                self.db.test_actor(&self.env),
+                CorrelationId::generate(&self.env),
+            )
+            .initial_access_tokens()
+            .mint(
+                &self.env,
+                &id,
+                0,
+                NewInitialAccessToken {
+                    token_hash: &ironauth_oidc::hash_secret(plaintext),
+                    policy_chain: chain_text,
+                    expires_at_unix_micros: expires_at_micros,
+                    max_uses,
+                },
+                None,
+            )
+            .await
+            .expect("mint initial access token");
+    }
+
+    /// Verify a dynamically registered client (issue #31), lifting its quarantine,
+    /// exactly as the management verify action does. Runs through the CONTROL-plane
+    /// store (verification is a control operation, permitted by the narrow
+    /// `UPDATE(quarantined, verified_at)` grant on `clients`).
+    pub async fn verify_client(&self, client_id: &ClientId) {
+        self.db
+            .control_store()
+            .scoped(self.scope)
+            .acting(
+                self.db.test_actor(&self.env),
+                CorrelationId::generate(&self.env),
+            )
+            .clients()
+            .verify_dynamic_client(&self.env, client_id, None)
+            .await
+            .expect("verify dynamic client");
+    }
+
+    /// Whether a client is currently quarantined (issue #31), read from the store.
+    pub async fn client_quarantined(&self, client_id: &ClientId) -> bool {
+        self.store()
+            .scoped(self.scope)
+            .clients()
+            .get(client_id)
+            .await
+            .expect("get client")
+            .quarantined
     }
 }
 

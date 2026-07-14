@@ -55,9 +55,10 @@ use sqlx::{Postgres, Row, Transaction};
 use crate::audit::{ActingContext, Action, ActorRef};
 use crate::error::StoreError;
 use crate::id::{
-    AuditId, AuditTarget, AuthorizationCodeId, ClientId, ConsentId, CorrelationId, EnvironmentId,
-    GrantId, IssuedTokenId, ManagementKeyId, OperatorId, PushedRequestId, RefreshFamilyId,
-    RefreshTokenId, ResourceServerId, ServiceAccountId, SessionId, SigningKeyId, TenantId, UserId,
+    AuditId, AuditTarget, AuthorizationCodeId, ClientId, ConsentId, CorrelationId, DcrPolicyId,
+    EnvironmentId, GrantId, InitialAccessTokenId, IssuedTokenId, ManagementKeyId, OperatorId,
+    PushedRequestId, RefreshFamilyId, RefreshTokenId, ResourceServerId, ServiceAccountId,
+    SessionId, SigningKeyId, TenantId, UserId,
 };
 use crate::scope::Scope;
 use crate::store::Store;
@@ -227,6 +228,46 @@ impl<'a> ScopedStore<'a> {
         }
     }
 
+    /// The read-only DCR policy repository for this scope (issue #31). Resolves a
+    /// named, reusable policy object to its primitives (at initial-access-token
+    /// mint time) and lists policies for the management API; authoring lives on
+    /// [`ActingStore::dcr_policies`].
+    #[must_use]
+    pub fn dcr_policies(&self) -> DcrPolicyRepo<'a> {
+        DcrPolicyRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
+    /// The DCR initial-access-token repository for this scope (issue #31). CONSUMES
+    /// a presented token (validating expiry and usage limit and incrementing the
+    /// use count atomically), returning its policy-chain snapshot; minting lives on
+    /// [`ActingStore::initial_access_tokens`]. The consume is a credential-use
+    /// counter, not a business mutation, so (like the jti replay cache) it is
+    /// deliberately off the audited-write path and commits its own transaction.
+    #[must_use]
+    pub fn initial_access_tokens(&self) -> InitialAccessTokenRepo<'a> {
+        InitialAccessTokenRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
+    /// The endpoint-local DCR registration rate limiter for this scope (issue #31).
+    /// A fixed-window counter keyed by source and by initial access token, using
+    /// the application clock seam for the window. A counter cache, not a business
+    /// mutation, so (like `idempotency_keys`) it is off the audited-write path and
+    /// commits its own transaction. Later delegates to the M15 layered limiter (out
+    /// of scope here).
+    #[must_use]
+    pub fn dcr_rate_limiter(&self) -> DcrRateLimiterRepo<'a> {
+        DcrRateLimiterRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
     /// Enter an acting context (who is acting, and under which correlation id).
     /// The returned store hands out the *mutating* repositories, so every write
     /// carries an actor and a correlation id into its audit row.
@@ -369,6 +410,30 @@ impl<'a> ActingStore<'a> {
             acting: self.acting,
         }
     }
+
+    /// The mutating DCR policy repository for this scope and actor (issue #31):
+    /// create a named, reusable policy object, audited (`dcr.policy_created`) in the
+    /// same transaction.
+    #[must_use]
+    pub fn dcr_policies(&self) -> ActingDcrPolicyRepo<'a> {
+        ActingDcrPolicyRepo {
+            store: self.store,
+            scope: self.scope,
+            acting: self.acting,
+        }
+    }
+
+    /// The mutating DCR initial-access-token repository for this scope and actor
+    /// (issue #31): mint a token (its plaintext returned once, only the hash
+    /// stored), audited (`dcr.iat_minted`) in the same transaction.
+    #[must_use]
+    pub fn initial_access_tokens(&self) -> ActingInitialAccessTokenRepo<'a> {
+        ActingInitialAccessTokenRepo {
+            store: self.store,
+            scope: self.scope,
+            acting: self.acting,
+        }
+    }
 }
 
 /// A record read back from the `clients` table, always within scope.
@@ -412,6 +477,13 @@ pub struct ClientRecord {
     /// from this client is rejected with `invalid_request`. The environment-wide
     /// switch (config) applies on top of this per-client flag.
     pub require_pushed_authorization_requests: bool,
+    /// Whether this client is under the unverified-client quarantine (issue #31):
+    /// a client from open (or low-trust) self-service registration starts
+    /// quarantined. While quarantined, the authorization/consent path IGNORES the
+    /// client's `implicit`/`skip_consent` first-party carve-outs (consent is ALWAYS
+    /// shown) and RESTRICTS its effective redirect-URI set to the https subset,
+    /// until an admin verifies it. Defaults to false for every non-DCR client.
+    pub quarantined: bool,
 }
 
 /// The client-authentication metadata for a client, read within scope (issue
@@ -529,6 +601,16 @@ pub struct DynamicClientRecord {
     /// Creation time in microseconds since the Unix epoch (the DCR response's
     /// `client_id_issued_at`).
     pub created_at_unix_micros: i64,
+    /// Whether the client is under the unverified-client quarantine (issue #31).
+    pub quarantined: bool,
+    /// When an admin verified the client (lifted the quarantine), in microseconds
+    /// since the Unix epoch, or `None` while unverified.
+    pub verified_at_unix_micros: Option<i64>,
+    /// The resolved policy-chain snapshot (JSON primitive list as text) that bound
+    /// this client's registration, re-applied to every RFC 7592 update so the SAME
+    /// policy constrains the client for its lifetime (issue #31); `None` for a
+    /// client registered without a policy.
+    pub dcr_policy_chain: Option<String>,
 }
 
 impl fmt::Debug for DynamicClientRecord {
@@ -555,6 +637,9 @@ impl fmt::Debug for DynamicClientRecord {
                 &self.registration_access_token_hash.is_some(),
             )
             .field("created_at_unix_micros", &self.created_at_unix_micros)
+            .field("quarantined", &self.quarantined)
+            .field("verified_at_unix_micros", &self.verified_at_unix_micros)
+            .field("has_dcr_policy_chain", &self.dcr_policy_chain.is_some())
             .finish()
     }
 }
@@ -593,6 +678,14 @@ pub struct NewDynamicClient<'a> {
     /// (`{issuer}/connect/register`); the repository appends `/{client_id}` once
     /// the identifier is minted.
     pub registration_uri_base: &'a str,
+    /// Whether the client starts under the unverified-client quarantine (issue
+    /// #31): true for an open (or low-trust) self-service registration, false for
+    /// one an admin policy or verification pre-clears.
+    pub quarantined: bool,
+    /// The resolved policy-chain snapshot (JSON primitive list as text) that bound
+    /// this registration, persisted so RFC 7592 updates re-apply the SAME policy
+    /// (issue #31); `None` when no policy applied.
+    pub dcr_policy_chain: Option<&'a str>,
 }
 
 /// The result of a Dynamic Client Registration: the minted identifier and the RFC
@@ -676,7 +769,7 @@ impl ClientRepo<'_> {
         let row = sqlx::query(
             "SELECT id, display_name, require_auth_time, token_endpoint_auth_method, \
              redirect_uris, consent_mode, skip_consent, store_skipped_consent, \
-             require_pushed_authorization_requests FROM clients \
+             require_pushed_authorization_requests, quarantined FROM clients \
              WHERE id = $1 AND tenant_id = $2 AND environment_id = $3",
         )
         .bind(id.to_string())
@@ -699,7 +792,7 @@ impl ClientRepo<'_> {
         let rows = sqlx::query(
             "SELECT id, display_name, require_auth_time, token_endpoint_auth_method, \
              redirect_uris, consent_mode, skip_consent, store_skipped_consent, \
-             require_pushed_authorization_requests FROM clients \
+             require_pushed_authorization_requests, quarantined FROM clients \
              WHERE tenant_id = $1 AND environment_id = $2 ORDER BY created_at, id",
         )
         .bind(self.scope.tenant().to_string())
@@ -708,6 +801,29 @@ impl ClientRepo<'_> {
         .await?;
         tx.commit().await?;
         rows.iter().map(|row| self.row_to_record(row)).collect()
+    }
+
+    /// Count the dynamically registered (`dcr_registered`) clients in this scope
+    /// (issue #31), for the per-environment registration quota. Counts only
+    /// self-service DCR clients (the abuse surface the quota bounds), not clients
+    /// created through the management API or the seeding paths.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn count_dynamic(&self) -> Result<i64, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let count: i64 = sqlx::query(
+            "SELECT COUNT(*) AS n FROM clients \
+             WHERE tenant_id = $1 AND environment_id = $2 AND dcr_registered = true",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .fetch_one(&mut *tx)
+        .await?
+        .get("n");
+        tx.commit().await?;
+        Ok(count)
     }
 
     /// Read a client's authentication metadata within scope (issue #20): its
@@ -843,7 +959,9 @@ impl ClientRepo<'_> {
              application_type, id_token_signed_response_alg, jwks, jwks_uri, \
              token_endpoint_auth_signing_alg, registration_client_uri, \
              registration_access_token_hash, dcr_registered, \
-             (EXTRACT(EPOCH FROM created_at) * 1000000)::bigint AS created_us \
+             quarantined, dcr_policy_chain, \
+             (EXTRACT(EPOCH FROM created_at) * 1000000)::bigint AS created_us, \
+             (EXTRACT(EPOCH FROM verified_at) * 1000000)::bigint AS verified_us \
              FROM clients \
              WHERE id = $1 AND tenant_id = $2 AND environment_id = $3",
         )
@@ -873,6 +991,9 @@ impl ClientRepo<'_> {
             registration_client_uri: row.get("registration_client_uri"),
             registration_access_token_hash: row.get("registration_access_token_hash"),
             created_at_unix_micros: row.get("created_us"),
+            quarantined: row.get("quarantined"),
+            verified_at_unix_micros: row.get("verified_us"),
+            dcr_policy_chain: row.get("dcr_policy_chain"),
         })
     }
 
@@ -892,6 +1013,7 @@ impl ClientRepo<'_> {
             skip_consent: row.get("skip_consent"),
             store_skipped_consent: row.get("store_skipped_consent"),
             require_pushed_authorization_requests: row.get("require_pushed_authorization_requests"),
+            quarantined: row.get("quarantined"),
         })
     }
 }
@@ -1403,16 +1525,24 @@ impl ActingClientRepo<'_> {
     /// hashes (never a plaintext credential), marks the row `dcr_registered`, and
     /// builds `registration_client_uri` from the freshly minted identifier.
     ///
+    /// `max_clients` is the per-environment registered-client quota (issue #31):
+    /// `Some(n)` enforces it ATOMICALLY inside this transaction under a per-scope
+    /// advisory lock, so two concurrent registrations cannot both slip past the cap
+    /// (only DCR registrations take the lock, so it serializes register-vs-register
+    /// only, per scope). `None` skips the quota (unbounded).
+    ///
     /// # Errors
     ///
     /// [`StoreError::InvalidRedirectUri`] if any redirect URI is not registrable
-    /// (nothing is written); [`StoreError::Conflict`] if a `private_key_jwt`
-    /// registration violates the key-source CHECK (both or neither of
-    /// `jwks`/`jwks_uri`); [`StoreError::Database`] on a persistence failure.
+    /// (nothing is written); [`StoreError::QuotaExceeded`] if the environment is at
+    /// its registered-client cap (nothing is written); [`StoreError::Conflict`] if a
+    /// `private_key_jwt` registration violates the key-source CHECK (both or neither
+    /// of `jwks`/`jwks_uri`); [`StoreError::Database`] on a persistence failure.
     pub async fn register_dynamic(
         &self,
         env: &Env,
         params: NewDynamicClient<'_>,
+        max_clients: Option<i64>,
     ) -> Result<DynamicClientRegistration, StoreError> {
         for uri in params.redirect_uris {
             if !crate::redirect::redirect_uri_is_registrable(uri) {
@@ -1438,14 +1568,41 @@ impl ActingClientRepo<'_> {
                 target: &id,
             },
             async move |tx| {
+                // Enforce the quota atomically: take a per-scope advisory lock (held
+                // until this transaction commits or rolls back) so a concurrent pair
+                // of registrations serialize, then count and compare inside the same
+                // transaction as the INSERT. Only DCR registration takes this lock,
+                // so it never contends with any other operation.
+                if let Some(max) = max_clients {
+                    sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))")
+                        .bind(scope.tenant().to_string())
+                        .bind(scope.environment().to_string())
+                        .execute(&mut **tx)
+                        .await?;
+                    let count: i64 = sqlx::query(
+                        "SELECT COUNT(*) AS n FROM clients \
+                         WHERE tenant_id = $1 AND environment_id = $2 \
+                         AND dcr_registered = true",
+                    )
+                    .bind(scope.tenant().to_string())
+                    .bind(scope.environment().to_string())
+                    .fetch_one(&mut **tx)
+                    .await?
+                    .get("n");
+                    if count >= max {
+                        return Err(StoreError::QuotaExceeded);
+                    }
+                }
                 let result = sqlx::query(
                     "INSERT INTO clients \
                      (id, tenant_id, environment_id, display_name, \
                       token_endpoint_auth_method, secret_hash, redirect_uris, \
                       application_type, id_token_signed_response_alg, jwks, jwks_uri, \
                       token_endpoint_auth_signing_alg, registration_client_uri, \
-                      registration_access_token_hash, dcr_registered) \
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, true)",
+                      registration_access_token_hash, quarantined, dcr_policy_chain, \
+                      dcr_registered) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, \
+                             $15, $16, true)",
                 )
                 .bind(id.to_string())
                 .bind(scope.tenant().to_string())
@@ -1461,6 +1618,8 @@ impl ActingClientRepo<'_> {
                 .bind(params.token_endpoint_auth_signing_alg)
                 .bind(&client_uri)
                 .bind(params.registration_access_token_hash)
+                .bind(params.quarantined)
+                .bind(params.dcr_policy_chain)
                 .execute(&mut **tx)
                 .await;
                 match result {
@@ -1570,6 +1729,106 @@ impl ActingClientRepo<'_> {
         .await
     }
 
+    /// Verify a dynamically registered client (issue #31), lifting its
+    /// unverified-client quarantine: sets `quarantined = false` and stamps
+    /// `verified_at` from the application clock seam, in one audited update
+    /// (`dcr.client_verified`). Idempotent: verifying an already-verified client
+    /// re-stamps `verified_at`. Filters on `dcr_registered`, so only a DCR-origin
+    /// client is verifiable through this path.
+    ///
+    /// `idempotency` writes the caller's Idempotency-Key replay row in the SAME
+    /// transaction as the verify and its audit row.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if no DCR client with this identifier is visible in
+    /// this scope; [`StoreError::IdempotencyConflict`] if a concurrent request
+    /// already stored this Idempotency-Key; [`StoreError::Database`] on a persistence
+    /// failure.
+    pub async fn verify_dynamic_client(
+        &self,
+        env: &Env,
+        id: &ClientId,
+        idempotency: Option<IdempotencyWrite<'_>>,
+    ) -> Result<(), StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let verified_micros = epoch_micros(env.clock().now_utc());
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::DcrClientVerified,
+                target: id,
+            },
+            async move |tx| {
+                let result = sqlx::query(
+                    "UPDATE clients \
+                     SET quarantined = false, \
+                         verified_at = TIMESTAMPTZ 'epoch' + ($1::text || ' microseconds')::interval \
+                     WHERE id = $2 AND tenant_id = $3 AND environment_id = $4 \
+                     AND dcr_registered = true",
+                )
+                .bind(verified_micros)
+                .bind(id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .execute(&mut **tx)
+                .await?;
+                if result.rows_affected() == 0 {
+                    return Err(StoreError::NotFound);
+                }
+                insert_idempotency(tx, idempotency).await?;
+                Ok(())
+            },
+            false,
+        )
+        .await
+    }
+
+    /// Record a DCR abuse-control audit event (issue #31) that has no data change
+    /// of its own: a policy rejection, a quota hit, or a rate-limit hit. These are
+    /// security events the SIEM stream must see even though no row is mutated, so
+    /// they route through the audited-write primitive with a no-op mutation and a
+    /// typed `action` and `target` (the offending initial access token, or the
+    /// environment). This is the ONE deliberate exception to "audit real mutations
+    /// only": an abuse refusal is itself the event of record.
+    ///
+    /// `detail` is an OPTIONAL operator-safe dimension recorded on the row (a policy
+    /// rejection passes the offending property name so an operator reading the audit
+    /// table alone gets the actionable reason). It is never attacker-controlled free
+    /// text; the wire response stays opaque regardless.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn record_dcr_event<T: AuditTarget>(
+        &self,
+        env: &Env,
+        action: Action,
+        target: &T,
+        detail: Option<&str>,
+    ) -> Result<(), StoreError> {
+        write_audited_detailed(
+            AuditedWrite {
+                store: self.store,
+                scope: self.scope,
+                acting: &self.acting,
+                env,
+                action,
+                target,
+            },
+            async move |_tx| Ok(()),
+            false,
+            detail,
+        )
+        .await
+    }
+
     /// Shared body of the client-create path. `poison_after_audit` is always
     /// `false` for the public mutator; the testing-only atomicity probe passes
     /// `true` to force a rollback after the data and audit inserts.
@@ -1627,6 +1886,454 @@ impl ActingClientRepo<'_> {
         display_name: &str,
     ) -> Result<ClientId, StoreError> {
         self.create_inner(env, display_name, true).await
+    }
+}
+
+// ===========================================================================
+// Dynamic Client Registration abuse controls (issue #31).
+//
+// The named, reusable policy objects, the SHA-256-hashed initial access tokens,
+// and the endpoint-local rate counters that WRAP the issue-#30 registration
+// endpoint. All three tables are tenant-scoped with forced row-level security and
+// route through the SAME scope filter as the rest of the data plane. Policy
+// authoring and token minting are audited business mutations; token consume and
+// the rate counter are credential/counter caches off the audited-write path.
+// ===========================================================================
+
+/// A named, reusable DCR policy object read back within scope (issue #31).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DcrPolicyRecord {
+    /// The policy identifier (`pol_...`, embeds its scope).
+    pub id: DcrPolicyId,
+    /// The operator-facing policy name, unique per scope.
+    pub name: String,
+    /// The ordered primitive list as JSON text (parsed by the OIDC policy engine).
+    pub primitives: String,
+    /// Creation time in microseconds since the Unix epoch (the pagination key).
+    pub created_at_unix_micros: i64,
+}
+
+/// The parameters to create a DCR policy (issue #31).
+#[derive(Debug, Clone, Copy)]
+pub struct NewDcrPolicy<'a> {
+    /// The policy name (unique per scope).
+    pub name: &'a str,
+    /// The ordered primitive list as JSON text (already validated by the caller).
+    pub primitives: &'a str,
+}
+
+/// The result of consuming a DCR initial access token (issue #31): the token's
+/// identifier and its resolved policy-chain snapshot (JSON primitive list as text).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConsumedInitialAccessToken {
+    /// The consumed token's identifier.
+    pub id: InitialAccessTokenId,
+    /// The token's policy-chain snapshot (JSON primitive list as text; `"[]"` for
+    /// an unconstrained token).
+    pub policy_chain: String,
+}
+
+/// The parameters to mint a DCR initial access token (issue #31). The OIDC/admin
+/// layer has already generated the plaintext token, hashed it, and resolved the
+/// attached policy chain to its primitive snapshot; the repository stores the hash
+/// (never the plaintext) and mints the identifier.
+#[derive(Debug, Clone, Copy)]
+pub struct NewInitialAccessToken<'a> {
+    /// The SHA-256 (hex) of the plaintext token. The plaintext is NEVER stored.
+    pub token_hash: &'a str,
+    /// The resolved policy-chain snapshot as JSON text (`"[]"` for unconstrained).
+    pub policy_chain: &'a str,
+    /// The token's expiry in microseconds since the Unix epoch (from the clock seam).
+    pub expires_at_unix_micros: i64,
+    /// The maximum number of registrations the token may authorize, or `None` for
+    /// unlimited (within the expiry).
+    pub max_uses: Option<i32>,
+}
+
+/// The read-only DCR policy repository (issue #31), scope-fixed at construction.
+pub struct DcrPolicyRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl DcrPolicyRepo<'_> {
+    /// Parse an untrusted policy identifier under this scope (the oracle-free
+    /// boundary: a malformed or cross-scope id is the uniform not-found).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the identifier is malformed or out of scope.
+    pub fn parse_id(&self, raw: &str) -> Result<DcrPolicyId, StoreError> {
+        Ok(DcrPolicyId::parse_in_scope(raw, &self.scope)?)
+    }
+
+    /// Resolve a policy by NAME within scope (issue #31), returning its primitive
+    /// list. Used when minting an initial access token to resolve an attached
+    /// policy chain to its snapshot. A name absent in this scope is
+    /// [`StoreError::NotFound`].
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if no policy of that name is visible in this scope;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn by_name(&self, name: &str) -> Result<DcrPolicyRecord, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT id, name, primitives, \
+             (EXTRACT(EPOCH FROM created_at) * 1000000)::bigint AS created_us \
+             FROM dcr_policies \
+             WHERE name = $1 AND tenant_id = $2 AND environment_id = $3",
+        )
+        .bind(name)
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        let row = row.ok_or(StoreError::NotFound)?;
+        self.row_to_record(&row)
+    }
+
+    /// List the policies in this scope, oldest first, for keyset pagination (issue
+    /// #31): `limit` rows after the optional `after` cursor.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn list(
+        &self,
+        limit: i64,
+        after: Option<&CursorPosition>,
+    ) -> Result<Vec<DcrPolicyRecord>, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let capped = limit.clamp(1, MANAGEMENT_LIST_HARD_CAP + 1);
+        let rows = match after {
+            Some(cursor) => {
+                sqlx::query(
+                    "SELECT id, name, primitives, \
+                     (EXTRACT(EPOCH FROM created_at) * 1000000)::bigint AS created_us \
+                     FROM dcr_policies \
+                     WHERE tenant_id = $1 AND environment_id = $2 \
+                     AND (created_at, id) > \
+                         (TIMESTAMPTZ 'epoch' + ($3::text || ' microseconds')::interval, $4) \
+                     ORDER BY created_at, id LIMIT $5",
+                )
+                .bind(self.scope.tenant().to_string())
+                .bind(self.scope.environment().to_string())
+                .bind(cursor.created_at_unix_micros)
+                .bind(&cursor.id)
+                .bind(capped)
+                .fetch_all(&mut *tx)
+                .await?
+            }
+            None => {
+                sqlx::query(
+                    "SELECT id, name, primitives, \
+                     (EXTRACT(EPOCH FROM created_at) * 1000000)::bigint AS created_us \
+                     FROM dcr_policies \
+                     WHERE tenant_id = $1 AND environment_id = $2 \
+                     ORDER BY created_at, id LIMIT $3",
+                )
+                .bind(self.scope.tenant().to_string())
+                .bind(self.scope.environment().to_string())
+                .bind(capped)
+                .fetch_all(&mut *tx)
+                .await?
+            }
+        };
+        tx.commit().await?;
+        rows.iter().map(|row| self.row_to_record(row)).collect()
+    }
+
+    fn row_to_record(&self, row: &PgRow) -> Result<DcrPolicyRecord, StoreError> {
+        Ok(DcrPolicyRecord {
+            id: DcrPolicyId::parse_in_scope(&row.get::<String, _>("id"), &self.scope)?,
+            name: row.get("name"),
+            primitives: row.get("primitives"),
+            created_at_unix_micros: row.get("created_us"),
+        })
+    }
+}
+
+/// The mutating DCR policy repository (issue #31), reachable only with an acting
+/// context so every create carries an actor and correlation id into its audit row.
+pub struct ActingDcrPolicyRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+    acting: ActingContext,
+}
+
+impl ActingDcrPolicyRepo<'_> {
+    /// Create a named, reusable DCR policy object (issue #31), auditing
+    /// `dcr.policy_created` in the same transaction. Returns the minted identifier.
+    ///
+    /// `idempotency` writes the caller's Idempotency-Key replay row in the SAME
+    /// transaction as the create and its audit row.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Conflict`] if a policy of the same name already exists in this
+    /// scope; [`StoreError::IdempotencyConflict`] if a concurrent request already
+    /// stored this Idempotency-Key; [`StoreError::Database`] on a persistence failure.
+    /// The `id` and `created_at_micros` are supplied by the caller (minted from the
+    /// entropy seam and the clock seam), so the HTTP response can be built before the
+    /// write and stored verbatim for idempotent replay, exactly like the management
+    /// create paths.
+    pub async fn create(
+        &self,
+        env: &Env,
+        id: &DcrPolicyId,
+        created_at_micros: i64,
+        params: NewDcrPolicy<'_>,
+        idempotency: Option<IdempotencyWrite<'_>>,
+    ) -> Result<(), StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let id = *id;
+        let scope = self.scope;
+        let created_micros = created_at_micros;
+        let name = params.name.to_owned();
+        let primitives = params.primitives.to_owned();
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::DcrPolicyCreate,
+                target: &id,
+            },
+            async move |tx| {
+                let result = sqlx::query(
+                    "INSERT INTO dcr_policies \
+                     (id, tenant_id, environment_id, name, primitives, created_at) \
+                     VALUES ($1, $2, $3, $4, $5, \
+                             TIMESTAMPTZ 'epoch' + ($6::text || ' microseconds')::interval)",
+                )
+                .bind(id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(&name)
+                .bind(&primitives)
+                .bind(created_micros)
+                .execute(&mut **tx)
+                .await;
+                match result {
+                    Ok(_) => {}
+                    Err(error) if is_unique_violation(&error) => return Err(StoreError::Conflict),
+                    Err(error) => return Err(error.into()),
+                }
+                insert_idempotency(tx, idempotency).await?;
+                Ok(())
+            },
+            false,
+        )
+        .await
+    }
+}
+
+/// The DCR initial-access-token repository (issue #31): CONSUME only. Minting is
+/// the audited [`ActingInitialAccessTokenRepo`]. Consume is a credential-use
+/// counter (not a business mutation), so it commits its own transaction off the
+/// audited-write path, exactly like the jti replay cache.
+pub struct InitialAccessTokenRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl InitialAccessTokenRepo<'_> {
+    /// Atomically consume a presented initial access token by its hash (issue #31):
+    /// increment its use count IF it is unexpired and under its usage limit, all in
+    /// one UPDATE so a usage limit cannot be raced past. Returns the consumed
+    /// token's id and policy-chain snapshot on success, or [`StoreError::NotFound`]
+    /// when the hash matches no token, the token is expired, or its usage limit is
+    /// already reached (all indistinguishable, so the endpoint is never an oracle).
+    ///
+    /// `now_micros` comes from the application clock seam, so expiry is deterministic
+    /// under a manual clock in tests.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if no usable token matches; [`StoreError::Database`]
+    /// on a persistence failure.
+    pub async fn consume(
+        &self,
+        token_hash: &str,
+        now_micros: i64,
+    ) -> Result<ConsumedInitialAccessToken, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "UPDATE dcr_initial_access_tokens \
+             SET use_count = use_count + 1 \
+             WHERE token_hash = $1 AND tenant_id = $2 AND environment_id = $3 \
+             AND expires_at > TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval \
+             AND (max_uses IS NULL OR use_count < max_uses) \
+             RETURNING id, policy_chain",
+        )
+        .bind(token_hash)
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(now_micros)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        let row = row.ok_or(StoreError::NotFound)?;
+        Ok(ConsumedInitialAccessToken {
+            id: InitialAccessTokenId::parse_in_scope(&row.get::<String, _>("id"), &self.scope)?,
+            policy_chain: row.get("policy_chain"),
+        })
+    }
+}
+
+/// The mutating DCR initial-access-token repository (issue #31): MINT only, audited.
+pub struct ActingInitialAccessTokenRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+    acting: ActingContext,
+}
+
+impl ActingInitialAccessTokenRepo<'_> {
+    /// Mint an initial access token (issue #31), storing only its hash and its
+    /// resolved policy-chain snapshot, and auditing `dcr.iat_minted` in the same
+    /// transaction. Returns the minted identifier. The plaintext token is generated
+    /// and returned by the caller; it never touches the database.
+    ///
+    /// `idempotency` writes the caller's Idempotency-Key replay row in the SAME
+    /// transaction as the mint and its audit row, so a retried mint returns the
+    /// original (no-plaintext) response and mints no second token.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Conflict`] on a token-hash collision (a 256-bit-entropy token
+    /// makes this effectively impossible); [`StoreError::IdempotencyConflict`] if a
+    /// concurrent request already stored this Idempotency-Key;
+    /// [`StoreError::Database`] on a persistence failure.
+    /// The `id` and `created_at_micros` are supplied by the caller (minted from the
+    /// entropy and clock seams), so the HTTP response can be built before the write
+    /// and stored verbatim for idempotent replay, exactly like the management create
+    /// paths.
+    pub async fn mint(
+        &self,
+        env: &Env,
+        id: &InitialAccessTokenId,
+        created_at_micros: i64,
+        params: NewInitialAccessToken<'_>,
+        idempotency: Option<IdempotencyWrite<'_>>,
+    ) -> Result<(), StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let id = *id;
+        let scope = self.scope;
+        let created_micros = created_at_micros;
+        let token_hash = params.token_hash.to_owned();
+        let policy_chain = params.policy_chain.to_owned();
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::DcrInitialAccessTokenMint,
+                target: &id,
+            },
+            async move |tx| {
+                let result = sqlx::query(
+                    "INSERT INTO dcr_initial_access_tokens \
+                     (id, tenant_id, environment_id, token_hash, policy_chain, \
+                      expires_at, max_uses, use_count, created_at) \
+                     VALUES ($1, $2, $3, $4, $5, \
+                             TIMESTAMPTZ 'epoch' + ($6::text || ' microseconds')::interval, \
+                             $7, 0, \
+                             TIMESTAMPTZ 'epoch' + ($8::text || ' microseconds')::interval)",
+                )
+                .bind(id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(&token_hash)
+                .bind(&policy_chain)
+                .bind(params.expires_at_unix_micros)
+                .bind(params.max_uses)
+                .bind(created_micros)
+                .execute(&mut **tx)
+                .await;
+                match result {
+                    Ok(_) => {}
+                    Err(error) if is_unique_violation(&error) => return Err(StoreError::Conflict),
+                    Err(error) => return Err(error.into()),
+                }
+                insert_idempotency(tx, idempotency).await?;
+                Ok(())
+            },
+            false,
+        )
+        .await
+    }
+}
+
+/// The endpoint-local DCR registration rate limiter (issue #31): a fixed-window
+/// counter per (scope, key). A counter cache, not a business mutation, so it
+/// commits its own transaction off the audited-write path (like `idempotency_keys`).
+pub struct DcrRateLimiterRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl DcrRateLimiterRepo<'_> {
+    /// Record one hit against `rate_key` in the current fixed window and report
+    /// whether it is WITHIN `limit` (issue #31). The upsert either starts a fresh
+    /// window (when the stored window has rolled over) or increments the current
+    /// one, atomically, so concurrent registrations cannot race past the limit. The
+    /// window is `window_secs` seconds long and both the now-instant and the rollover
+    /// comparison use the application clock seam (`now_micros`), so it is
+    /// deterministic under a manual clock in tests.
+    ///
+    /// Returns `true` when the post-increment count is at or below `limit` (the
+    /// request is allowed) and `false` when it exceeds it (rate limited). A
+    /// `limit` of 0 disables the check (always allowed).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn check_and_increment(
+        &self,
+        rate_key: &str,
+        limit: i64,
+        window_secs: i64,
+        now_micros: i64,
+    ) -> Result<bool, StoreError> {
+        if limit <= 0 {
+            return Ok(true);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let count: i32 = sqlx::query(
+            "INSERT INTO dcr_rate_counters \
+             (tenant_id, environment_id, rate_key, window_start, count) \
+             VALUES ($1, $2, $3, \
+                     TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval, 1) \
+             ON CONFLICT (tenant_id, environment_id, rate_key) DO UPDATE SET \
+                 count = CASE \
+                     WHEN dcr_rate_counters.window_start + ($5::text || ' seconds')::interval \
+                          <= TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval \
+                     THEN 1 ELSE dcr_rate_counters.count + 1 END, \
+                 window_start = CASE \
+                     WHEN dcr_rate_counters.window_start + ($5::text || ' seconds')::interval \
+                          <= TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval \
+                     THEN TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval \
+                     ELSE dcr_rate_counters.window_start END \
+             RETURNING count",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(rate_key)
+        .bind(now_micros)
+        .bind(window_secs)
+        .fetch_one(&mut *tx)
+        .await?
+        .get("count");
+        tx.commit().await?;
+        Ok(i64::from(count) <= limit)
     }
 }
 
@@ -2430,7 +3137,7 @@ impl ActingAuthorizationRepo<'_> {
                 action: Action::AuthorizationCodeRedeem,
                 target: code_id,
             };
-            insert_audit_row(&mut tx, &spec).await?;
+            insert_audit_row(&mut tx, &spec, None).await?;
             tx.commit().await?;
             return Ok(RedeemOutcome::Consumed);
         }
@@ -2513,7 +3220,7 @@ impl ActingAuthorizationRepo<'_> {
                 action: Action::AuthorizationCodeReuse,
                 target: &grant_id,
             };
-            insert_audit_row(&mut tx, &spec).await?;
+            insert_audit_row(&mut tx, &spec, None).await?;
         }
         tx.commit().await?;
         Ok(RedeemOutcome::Reused)
@@ -2733,7 +3440,7 @@ impl ActingAuthorizationRepo<'_> {
                 action: Action::TokenRevoke,
                 target: grant_id,
             };
-            insert_audit_row(&mut tx, &spec).await?;
+            insert_audit_row(&mut tx, &spec, None).await?;
         }
         tx.commit().await?;
         Ok(flipped)
@@ -3211,7 +3918,7 @@ impl ActingPushedRequestRepo<'_> {
             action: Action::PushedAuthorizationRequestConsume,
             target: id,
         };
-        insert_audit_row(&mut tx, &spec).await?;
+        insert_audit_row(&mut tx, &spec, None).await?;
         tx.commit().await?;
         Ok(ConsumePushedRequest::Consumed { request_params })
     }
@@ -4724,7 +5431,7 @@ impl ActingRefreshRepo<'_> {
                 action: Action::TokenIssue,
                 target: &GrantId::parse_in_scope(grant_text, &scope)?,
             };
-            insert_audit_row(&mut tx, &spec).await?;
+            insert_audit_row(&mut tx, &spec, None).await?;
             tx.commit().await?;
             return Ok(RefreshRedeemOutcome::NotRotated);
         }
@@ -4767,7 +5474,7 @@ impl ActingRefreshRepo<'_> {
                 action: Action::RefreshTokenRotate,
                 target: &RefreshFamilyId::parse_in_scope(family_text, &scope)?,
             };
-            insert_audit_row(&mut tx, &spec).await?;
+            insert_audit_row(&mut tx, &spec, None).await?;
             tx.commit().await?;
             return Ok(RefreshRedeemOutcome::Rotated);
         }
@@ -4848,7 +5555,7 @@ impl ActingRefreshRepo<'_> {
                 action: Action::TokenIssue,
                 target: &GrantId::parse_in_scope(grant_text, &scope)?,
             };
-            insert_audit_row(&mut tx, &spec).await?;
+            insert_audit_row(&mut tx, &spec, None).await?;
             tx.commit().await?;
             return Ok(RefreshRedeemOutcome::RefreshedWithinGrace);
         }
@@ -4881,7 +5588,7 @@ impl ActingRefreshRepo<'_> {
                 action: Action::RefreshTokenReuse,
                 target: &RefreshFamilyId::parse_in_scope(family_text, &scope)?,
             };
-            insert_audit_row(&mut tx, &spec).await?;
+            insert_audit_row(&mut tx, &spec, None).await?;
         }
         tx.commit().await?;
         Ok(RefreshRedeemOutcome::Reused)
@@ -5016,7 +5723,7 @@ impl ActingRefreshRepo<'_> {
                 action: Action::RefreshFamilyRevoke,
                 target: family_id,
             };
-            insert_audit_row(&mut tx, &spec).await?;
+            insert_audit_row(&mut tx, &spec, None).await?;
         }
         tx.commit().await?;
         Ok(flipped)
@@ -5742,6 +6449,10 @@ pub struct AuditRecord {
     /// The event time in microseconds since the Unix epoch, as recorded from the
     /// application clock seam at mutation time.
     pub occurred_at_unix_micros: i64,
+    /// An optional operator-safe detail dimension (issue #31): the offending policy
+    /// property on a `dcr.policy_rejected` event, `None` for a write that named no
+    /// detail. Never attacker-controlled free text.
+    pub detail: Option<String>,
 }
 
 /// The read-only repository for the append-only audit log.
@@ -5766,7 +6477,7 @@ impl AuditRepo<'_> {
         // microsecond interval), so this only affects the read-back precision.
         let rows = sqlx::query(
             "SELECT id, action, actor_kind, actor_id, target_kind, target_id, \
-             correlation_id, \
+             correlation_id, detail, \
              (EXTRACT(EPOCH FROM occurred_at) * 1000000)::bigint AS occurred_us \
              FROM audit_log \
              WHERE tenant_id = $1 AND environment_id = $2 \
@@ -5801,6 +6512,7 @@ impl AuditRepo<'_> {
             target_id: row.get("target_id"),
             correlation_id,
             occurred_at_unix_micros: row.get("occurred_us"),
+            detail: row.get("detail"),
         })
     }
 }
@@ -5876,10 +6588,29 @@ where
     T: AuditTarget,
     M: AsyncFnOnce(&mut Transaction<'_, Postgres>) -> Result<(), StoreError>,
 {
+    // The overwhelming majority of audited writes carry no detail dimension.
+    write_audited_detailed(spec, mutate, poison_after_audit, None).await
+}
+
+/// Like [`write_audited`] but records an OPERATOR-SAFE `detail` dimension on the
+/// audit row (issue #31): the offending policy property on a DCR abuse event, so an
+/// operator working from the audit table alone gets the actionable reason. `detail`
+/// is never attacker-controlled free text. Every other audited write goes through
+/// [`write_audited`] with no detail, so this is the only path that sets it.
+async fn write_audited_detailed<T, M>(
+    spec: AuditedWrite<'_, T>,
+    mutate: M,
+    poison_after_audit: bool,
+    detail: Option<&str>,
+) -> Result<(), StoreError>
+where
+    T: AuditTarget,
+    M: AsyncFnOnce(&mut Transaction<'_, Postgres>) -> Result<(), StoreError>,
+{
     let mut tx = begin_scoped(spec.store, spec.scope).await?;
     // The data change and the audit row share this one transaction.
     mutate(&mut tx).await?;
-    insert_audit_row(&mut tx, &spec).await?;
+    insert_audit_row(&mut tx, &spec, detail).await?;
     if poison_after_audit {
         // Testing seam only (production callers pass false): force a guaranteed
         // error after both inserts are staged, so their joint rollback proves
@@ -5890,11 +6621,17 @@ where
     Ok(())
 }
 
-/// Insert exactly one audit row into the current transaction. Called only by
-/// [`write_audited`], after the data change and before the commit.
+/// Insert exactly one audit row into the current transaction, after the data change
+/// and before the commit. Called by [`write_audited_detailed`] and by the few custom
+/// write paths that inline their own audited transaction.
+///
+/// `detail` is an OPTIONAL, operator-safe dimension (NULL for almost every write):
+/// the offending policy property on a DCR abuse event (issue #31). It is never
+/// attacker-controlled free text, so it is safe to persist and read back.
 async fn insert_audit_row<T: AuditTarget>(
     tx: &mut Transaction<'_, Postgres>,
     spec: &AuditedWrite<'_, T>,
+    detail: Option<&str>,
 ) -> Result<(), StoreError> {
     let audit_id = AuditId::generate(spec.env, &spec.scope);
     // Event time from the application clock seam, never the database clock, so
@@ -5905,9 +6642,9 @@ async fn insert_audit_row<T: AuditTarget>(
     sqlx::query(
         "INSERT INTO audit_log \
          (id, tenant_id, environment_id, action, actor_kind, actor_id, \
-          target_kind, target_id, correlation_id, occurred_at) \
+          target_kind, target_id, correlation_id, occurred_at, detail) \
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, \
-                 TIMESTAMPTZ 'epoch' + ($10::text || ' microseconds')::interval)",
+                 TIMESTAMPTZ 'epoch' + ($10::text || ' microseconds')::interval, $11)",
     )
     .bind(audit_id.to_string())
     .bind(spec.scope.tenant().to_string())
@@ -5919,6 +6656,7 @@ async fn insert_audit_row<T: AuditTarget>(
     .bind(spec.target.audit_target_id())
     .bind(spec.acting.correlation().to_string())
     .bind(occurred_micros)
+    .bind(detail)
     .execute(&mut **tx)
     .await?;
     Ok(())

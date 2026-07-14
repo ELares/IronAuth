@@ -47,6 +47,13 @@ pub enum StoreError {
     /// value that could never be a safe redirect target never reaches the
     /// registered set. Carries no tenant data.
     InvalidRedirectUri,
+    /// A dynamic client registration would exceed the environment's configured
+    /// registered-client quota (issue #31). Enforced atomically inside the
+    /// registration transaction (under a per-scope advisory lock, so a concurrent
+    /// pair of registrations cannot both slip past the cap), so nothing is written
+    /// when it fires. The registration endpoint maps it to a typed refusal and a
+    /// `dcr.quota_hit` audit event.
+    QuotaExceeded,
 }
 
 impl fmt::Display for StoreError {
@@ -58,6 +65,7 @@ impl fmt::Display for StoreError {
             StoreError::IdempotencyConflict => f.write_str("idempotency-key conflict"),
             StoreError::Conflict => f.write_str("uniqueness conflict"),
             StoreError::InvalidRedirectUri => f.write_str("invalid redirect uri"),
+            StoreError::QuotaExceeded => f.write_str("registration quota exceeded"),
         }
     }
 }
@@ -68,7 +76,8 @@ impl std::error::Error for StoreError {
             StoreError::NotFound
             | StoreError::IdempotencyConflict
             | StoreError::Conflict
-            | StoreError::InvalidRedirectUri => None,
+            | StoreError::InvalidRedirectUri
+            | StoreError::QuotaExceeded => None,
             StoreError::Database(source) => Some(source),
             StoreError::Migration(source) => Some(source),
         }

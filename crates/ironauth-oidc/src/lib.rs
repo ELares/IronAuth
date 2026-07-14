@@ -75,6 +75,7 @@ mod client_credentials;
 mod client_keys;
 mod client_registration;
 mod consent;
+mod dcr_policy;
 mod discovery;
 mod error;
 mod hints;
@@ -117,6 +118,9 @@ pub use client_auth::{
     authenticate_client_self_scoped, generate_secret, hash_secret, parse_presented,
 };
 pub use client_keys::ClientKeyResolver;
+pub use dcr_policy::{
+    PolicyPrimitive, PolicyRejectReason, PolicyRejection, apply_chain, parse_chain, serialize_chain,
+};
 pub use discovery::{
     ADVERTISED_ENDPOINTS, CLAIMS_LOCALES_SUPPORTED, DiscoveryCapabilities, DiscoveryEndpoint,
     DiscoveryState, ID_TOKEN_CLAIMS_SUPPORTED, SCOPES_SUPPORTED, UI_LOCALES_SUPPORTED,

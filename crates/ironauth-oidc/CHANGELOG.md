@@ -6,6 +6,51 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Dynamic Client Registration abuse controls (issue #31), wrapping the #30 create.
+  - **Exposure switch.** A per-environment `closed` / `token_gated` / `open` mode
+    (default `token_gated`) governs who may register: `closed` refuses every public
+    registration, `token_gated` requires a valid initial access token, and `open`
+    allows anonymous registration but starts the client quarantined. An unauthorized
+    request is a uniform 403 `access_denied` (no oracle for an unknown vs expired vs
+    exhausted token).
+  - **Initial access tokens with reusable policy chains.** A presented token is
+    consumed atomically (its usage limit cannot be raced past), and the policy chain
+    it carries (force / restrict / reject / default primitives, a pure engine in
+    `dcr_policy`) is applied to the submitted metadata BEFORE validation. The chain
+    snapshot is persisted on the client, so an RFC 7592 update re-applies the SAME
+    chain for the client's lifetime, even if the source policy is later edited or
+    deleted.
+  - **Opaque-but-diagnosable rejections.** A policy rejection is the generic
+    `invalid_client_metadata` on the wire (it never names the property or the
+    operator's policy), while the actionable diagnostic is recorded out of band as a
+    `dcr.policy_rejected` audit event plus a structured log line.
+  - **Quota and rate limit.** The per-environment registered-client quota is enforced
+    atomically inside the create transaction; over it, the request is a typed 403 plus
+    a `dcr.quota_hit` audit event. The endpoint's fixed-window rate limit (keyed by
+    source and by presented token) yields a 429 `temporarily_unavailable` plus a
+    `dcr.rate_limited` audit event.
+  - **Unverified-client quarantine.** A quarantined client NEVER gets the first-party
+    consent carve-out (consent is always shown, ignoring `skip_consent` / implicit
+    mode) AND its recorded-consent fast path is disabled: a quarantined client
+    re-prompts consent on EVERY authorization even with a PRE-RECORDED consent, until an
+    admin verifies it. Its effective redirect set is restricted to its https targets (a
+    native/loopback redirect is refused with a page error, never an open redirect).
+    Verification lifts all of these. Exports the `dcr_policy` engine (`PolicyPrimitive`,
+    `apply_chain`, `parse_chain`, `serialize_chain`) for reuse by the management API.
+  - **Abuse-control hardening.** The endpoint rate-limit source key is now the
+    non-forgeable transport peer address (from the server's `ConnectInfo`), never a
+    caller-controlled `X-Forwarded-For` hop, so a direct caller can no longer rotate a
+    header to mint a fresh bucket per request or poison a victim's bucket; the endpoint
+    limit is documented as best-effort/advisory (the per-environment quota is the real
+    hard cap; the robust trusted-proxy-aware limiter is deferred to M15). The exposure
+    switch is now evaluated BEFORE the request body is parsed, so an unauthorized
+    request is the uniform 403 regardless of body validity (no 400-vs-403 oracle). A
+    stored policy-chain snapshot that fails to parse now fails CLOSED (a `server_error`
+    at registration and at RFC 7592 update), never proceeding with an unconstrained
+    chain. A `dcr.policy_rejected` audit event now carries the offending property as an
+    operator-safe detail dimension (the wire stays opaque). The `Restrict` primitive's
+    omission footgun (an omitted property is unconstrained, then takes the spec default)
+    is documented on the primitive and in the management API policy-create schema.
 - Token revocation (RFC 7009) and introspection (RFC 7662) endpoints (issue #22).
   - **`POST /revoke`.** An authenticated client revokes one of its OWN tokens, in any
     format IronAuth issues (a refresh token, an opaque access token, or an at+jwt), told

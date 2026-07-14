@@ -6,6 +6,17 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Add the DCR abuse-control knobs (issue #31):
+  - `oidc.registration_mode` (`closed` / `token_gated` / `open`, default
+    `token_gated`): the per-environment exposure switch for Dynamic Client
+    Registration. The safe default requires an initial access token; `open` (anonymous
+    self-service registration) is an explicit opt-in. Takes effect only when
+    `oidc.registration_enabled` mounts the endpoint.
+  - `oidc.registration_max_clients` (default 100): the per-environment cap on
+    dynamically registered clients.
+  - `oidc.registration_rate_limit` (default 20) and `oidc.registration_rate_window_secs`
+    (default 60, validated to `1..=OIDC_MAX_LIFETIME_SECS`): the endpoint's
+    fixed-window rate limit; a limit of 0 disables it.
 - Add `oidc.client_credentials_default_audience` (issue #23): the default audience a
   client-credentials access token carries when the request targets no resource
   server. A snake_case enum (`ClientCredentialsAudience`) with two members:
@@ -15,6 +26,7 @@ range per docs/RELEASING.md.
   RFC 8707 `resource` parameter, issue #28), that resource server's audience wins and
   this default does not apply. The regenerated `docs/config-schema.json` and
   `docs/CONFIG.md` document it.
+
 - Add the refresh-token rotation and consent knobs (issue #21):
   - `oidc.issue_refresh_tokens` (default `true`): whether a code exchange issues a
     refresh token at all.

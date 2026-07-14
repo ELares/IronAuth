@@ -30,7 +30,9 @@ ironauth-fetch.workspace = true
 # seam, never the crate's own RNG.
 argon2.workspace = true
 
-axum = { workspace = true, features = ["form", "query", "json"] }
+# `tokio` gates axum's `ConnectInfo<SocketAddr>` extractor, which the DCR registration
+# endpoint reads for its non-forgeable rate-limit source key (issue #31, FIX 3).
+axum = { workspace = true, features = ["form", "query", "json", "tokio"] }
 http.workspace = true
 serde = { workspace = true }
 serde_json.workspace = true
@@ -270,6 +272,18 @@ required-features = ["testing"]
 [[test]]
 name = "client_registration"
 path = "tests/client_registration.rs"
+required-features = ["testing"]
+
+# Dynamic Client Registration abuse controls (issue #31): the exposure switch
+# (closed/token_gated/open) refuses unauthorized registration; an initial access
+# token's reusable policy chain binds registration AND RFC 7592 updates; a rejected
+# policy is opaque on the wire but recorded as a dcr.policy_rejected audit event; the
+# per-environment quota and the endpoint rate limit are typed refusals with audit
+# events; and an unverified-client quarantine forces consent and restricts redirects
+# to https until an admin verify lifts both. Over a real database.
+[[test]]
+name = "dcr_abuse"
+path = "tests/dcr_abuse.rs"
 required-features = ["testing"]
 
 # Pushed authorization requests (issue #27, RFC 9126) end to end through the live

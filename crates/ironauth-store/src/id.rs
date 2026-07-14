@@ -284,6 +284,30 @@ impl ScopedKind for PushedRequestKind {
     const REDACT_DEBUG: bool = true;
 }
 
+/// Marker for a DCR initial access token (`iat_`), the RFC 7591 section 1.2
+/// registration authorization the abuse-controls work mints through the
+/// management API (issue #31). A tenant-scoped resource: the identifier embeds its
+/// `(tenant, environment)`, so a token minted in one scope parses as a uniform
+/// not-found under another. The identifier is NOT the credential (the credential
+/// is a separate high-entropy secret stored only as a SHA-256 hash); it is the
+/// audit/reference handle, so its debug form stays legible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct InitialAccessTokenKind;
+impl ScopedKind for InitialAccessTokenKind {
+    const PREFIX: &'static str = "iat";
+}
+
+/// Marker for a DCR policy object (`pol_`), the named, reusable set of
+/// registration-metadata primitives (force / restrict / reject / default) the
+/// abuse-controls work attaches to an initial access token (issue #31). A
+/// tenant-scoped resource: the identifier embeds its `(tenant, environment)`, so a
+/// policy authored in one scope is never reachable from another. Not a secret.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct DcrPolicyKind;
+impl ScopedKind for DcrPolicyKind {
+    const PREFIX: &'static str = "pol";
+}
+
 /// Marker for a human actor (an interactive user). One of the three actor kinds
 /// an audit envelope can name (see [`crate::audit::ActorRef`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -480,6 +504,13 @@ pub type ResourceServerId = ScopedId<ResourceServerKind>;
 /// the PAR endpoint returns and `/authorize` consumes (RFC 9126, issue #27). It is
 /// the reference portion of the `urn:ietf:params:oauth:request_uri:<id>` value.
 pub type PushedRequestId = ScopedId<PushedRequestKind>;
+/// A DCR initial-access-token identifier (`iat_...`), the RFC 7591 registration
+/// authorization minted through the management API (issue #31). The token itself
+/// is a separate secret stored only as a hash; this is its reference handle.
+pub type InitialAccessTokenId = ScopedId<InitialAccessTokenKind>;
+/// A DCR policy identifier (`pol_...`), a named, reusable set of
+/// registration-metadata primitives (issue #31).
+pub type DcrPolicyId = ScopedId<DcrPolicyKind>;
 /// A service-account principal identifier (`sva_...`), the stable machine `sub` a
 /// client-credentials access token carries (issue #23). Distinct from the client's
 /// `cli_` id and consistent across issuances.

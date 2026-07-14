@@ -242,19 +242,19 @@ async fn expand_contract_example_chain_runs_all_three_phases_and_contract_remove
     );
 }
 
-/// The PRODUCTION chain (`MigrationRunner::new`) contains exactly the seventeen
+/// The PRODUCTION chain (`MigrationRunner::new`) contains exactly the eighteen
 /// real migrations and leaves no throwaway demo object in a real database.
 // A long but linear ledger-and-table assertion sweep (one line per migration and
 // per real table); splitting it would not make it clearer.
 #[allow(clippy::too_many_lines)]
 #[tokio::test]
-async fn production_chain_is_only_the_seventeen_real_migrations_and_ships_no_demo_object() {
+async fn production_chain_is_only_the_eighteen_real_migrations_and_ships_no_demo_object() {
     // TestDatabase::start runs Store::migrate() (the production chain) on a
     // fresh, empty database.
     let db = TestDatabase::start().await;
     let pool = db.owner_pool();
 
-    // Re-running is idempotent and reports exactly seventeen tracked migrations.
+    // Re-running is idempotent and reports exactly eighteen tracked migrations.
     let report = MigrationRunner::new(pool)
         .run()
         .await
@@ -265,19 +265,19 @@ async fn production_chain_is_only_the_seventeen_real_migrations_and_ships_no_dem
     );
     assert_eq!(
         report.already_applied(),
-        17,
-        "the production chain is exactly seventeen migrations (isolation, audit log, management \
+        18,
+        "the production chain is exactly eighteen migrations (isolation, audit log, management \
          API, OIDC authorization, signing keys, login/consent, authentication context, redirect \
          registration, UserInfo claims, consent scope upsert, resource servers, opaque access \
          tokens, client auth suite, dynamic client registration, pushed authorization requests, \
-         refresh tokens, client-credentials service accounts)"
+         refresh tokens, client-credentials service accounts, DCR abuse controls)"
     );
 
-    // The ledger holds exactly versions 1 through 17.
+    // The ledger holds exactly versions 1 through 18.
     assert_eq!(
         applied_versions(pool).await,
         vec![
-            1_i64, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17
+            1_i64, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18
         ]
     );
     let phase_of = |version: i64| async move {
@@ -309,8 +309,11 @@ async fn production_chain_is_only_the_seventeen_real_migrations_and_ships_no_dem
     assert_eq!(phase_of(15).await, "expand");
     // Two CREATE TABLEs and two additive ALTERs are all expands (issue #21).
     assert_eq!(phase_of(16).await, "expand");
-    // A CREATE TABLE plus two additive clients ALTERs are all expands (issue #23).
+    // A CREATE TABLE plus two additive clients ALTERs are all expands (issue #23),
+    // and three CREATE TABLEs plus additive clients and audit_log ALTERs are all
+    // expands (issue #31).
     assert_eq!(phase_of(17).await, "expand");
+    assert_eq!(phase_of(18).await, "expand");
 
     // The demo object never reaches a production database.
     assert!(
@@ -509,6 +512,53 @@ async fn production_chain_is_only_the_seventeen_real_migrations_and_ships_no_dem
     assert!(
         column_exists(pool, "clients", "custom_token_claims").await,
         "clients.custom_token_claims exists"
+    );
+    // The Dynamic Client Registration abuse-control tables (issue #31): the
+    // reusable named policy objects, the SHA-256-hashed initial-access-token store,
+    // and the endpoint-local rate counters.
+    assert!(
+        table_exists(pool, "dcr_policies").await,
+        "dcr_policies exists"
+    );
+    assert!(
+        table_exists(pool, "dcr_initial_access_tokens").await,
+        "dcr_initial_access_tokens exists"
+    );
+    assert!(
+        table_exists(pool, "dcr_rate_counters").await,
+        "dcr_rate_counters exists"
+    );
+    // The initial-access-token store keeps only the token's HASH, never the
+    // plaintext (the credential-at-rest invariant, issue #31).
+    assert!(
+        column_exists(pool, "dcr_initial_access_tokens", "token_hash").await,
+        "dcr_initial_access_tokens stores a hash"
+    );
+    for forbidden in ["token", "secret", "plaintext"] {
+        assert!(
+            !column_exists(pool, "dcr_initial_access_tokens", forbidden).await,
+            "dcr_initial_access_tokens must have no plaintext-token column ({forbidden})"
+        );
+    }
+    // The unverified-client quarantine columns (issue #31): the quarantine flag,
+    // the admin verification timestamp, and the policy-chain snapshot that binds
+    // RFC 7592 updates for the client's lifetime.
+    assert!(
+        column_exists(pool, "clients", "quarantined").await,
+        "clients.quarantined exists"
+    );
+    assert!(
+        column_exists(pool, "clients", "verified_at").await,
+        "clients.verified_at exists"
+    );
+    assert!(
+        column_exists(pool, "clients", "dcr_policy_chain").await,
+        "clients.dcr_policy_chain exists"
+    );
+    // The out-of-band actionable audit detail dimension (issue #31).
+    assert!(
+        column_exists(pool, "audit_log", "detail").await,
+        "audit_log.detail exists"
     );
 }
 

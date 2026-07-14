@@ -14,8 +14,8 @@ use http_body_util::BodyExt;
 use ironauth_admin::{AdminState, management_router};
 use ironauth_config::{AdminConfig, Secret, SecretString};
 use ironauth_env::Env;
-use ironauth_store::Store;
 use ironauth_store::test_support::TestDatabase;
+use ironauth_store::{ClientId, CorrelationId, NewDynamicClient, Scope, Store};
 use tower::ServiceExt;
 
 /// The bootstrap operator token the harness configures.
@@ -50,6 +50,57 @@ impl Harness {
     #[must_use]
     pub fn control_store(&self) -> &Store {
         self.db.control_store()
+    }
+
+    /// A fresh data-plane scope (tenant + environment), for seeding a data-plane row
+    /// (a DCR client) the management plane then reads or verifies.
+    pub async fn seed_scope(&self) -> Scope {
+        self.db.seed_scope(&Env::system()).await
+    }
+
+    /// Seed a QUARANTINED dynamically-registered client in `scope` via the app-role
+    /// store and return its id (issue #31). The management plane cannot itself register
+    /// a client (the control role holds no INSERT on `clients`), so a verify/get test
+    /// seeds one through the app role exactly as the OIDC data plane would, then drives
+    /// the management verify/get against it.
+    pub async fn seed_quarantined_dcr_client(&self, scope: Scope) -> ClientId {
+        let env = Env::system();
+        let redirects = vec!["https://rp.example/cb".to_owned()];
+        let token_hash = "0".repeat(64);
+        self.db
+            .store()
+            .scoped(scope)
+            .acting(self.db.test_actor(&env), CorrelationId::generate(&env))
+            .clients()
+            .register_dynamic(
+                &env,
+                NewDynamicClient {
+                    display_name: "seeded dcr client",
+                    auth_method: "none",
+                    secret_hash: None,
+                    redirect_uris: &redirects,
+                    application_type: "web",
+                    id_token_signed_response_alg: "EdDSA",
+                    jwks: None,
+                    jwks_uri: None,
+                    token_endpoint_auth_signing_alg: None,
+                    registration_access_token_hash: &token_hash,
+                    registration_uri_base: "https://issuer.test/connect/register",
+                    quarantined: true,
+                    dcr_policy_chain: None,
+                },
+                None,
+            )
+            .await
+            .expect("seed dcr client")
+            .id
+    }
+
+    /// A freshly generated, in-scope client id that is NOT inserted, for the
+    /// anti-oracle not-found probes (it parses in scope but resolves to no client).
+    #[must_use]
+    pub fn fresh_client_id(scope: Scope) -> String {
+        ClientId::generate(&Env::system(), &scope).to_string()
     }
 
     /// Drive one request through the router, returning status, headers, and body.
