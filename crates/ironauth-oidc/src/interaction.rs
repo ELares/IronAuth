@@ -99,11 +99,14 @@ pub fn cookie_header(headers: &HeaderMap) -> Option<&str> {
 const SEC_FETCH_SITE: &str = "sec-fetch-site";
 
 /// A CSRF defense-in-depth allowlist for the state-changing interactive POSTs
-/// (login and consent), evaluated BEFORE any state change (issue #196).
+/// (login, consent, and registration), evaluated BEFORE any state change (issue
+/// #196).
 ///
-/// Both POSTs already rely on the `SameSite=Lax` session cookie, which blocks the
-/// standard cross-site auto-submit. This closes the two named residuals a header
-/// allowlist can, with no schema, cookie, or token plumbing:
+/// These POSTs rely on the `SameSite=Lax` session cookie to block the standard
+/// cross-site auto-submit (registration is the exception: it mints the session, so
+/// it has no cookie to lean on and this check is its primary CSRF defense). This
+/// closes the two named residuals a header allowlist can, with no schema, cookie,
+/// or token plumbing:
 ///
 /// - the Chromium "Lax+POST" transitional window (a `Lax` cookie younger than two
 ///   minutes is sent on a cross-site top-level POST), caught by `Sec-Fetch-Site`;
@@ -140,7 +143,19 @@ pub fn same_origin_ok(headers: &HeaderMap, expected_origin: Option<&str>) -> boo
         .and_then(|value| value.to_str().ok())
     {
         if let Some(expected) = expected_origin {
-            if origin != expected {
+            // Compare CANONICAL origins (issue #196): a browser lowercases the host
+            // and drops the default port in the `Origin` it sends, so both sides are
+            // normalized the same way (crate::state::origin_of) before the byte
+            // comparison. Without this a `public_url` with an uppercase host or an
+            // explicit `:443`/`:80` would falsely reject every legitimate same-origin
+            // POST. A value that does not parse falls back to its raw form, so an
+            // opaque `Origin` (for example `null`) still fails the match and is
+            // rejected. This never produces a false ALLOW.
+            let origin_canon = crate::state::origin_of(origin);
+            let expected_canon = crate::state::origin_of(expected);
+            let origin_cmp = origin_canon.as_deref().unwrap_or(origin);
+            let expected_cmp = expected_canon.as_deref().unwrap_or(expected);
+            if origin_cmp != expected_cmp {
                 return false;
             }
         }
@@ -404,6 +419,43 @@ mod tests {
         // rejected.
         assert!(same_origin_ok(&cross_origin, None));
         assert!(!same_origin_ok(&cross_site, None));
+    }
+
+    #[test]
+    fn same_origin_ok_normalizes_case_and_default_port_before_comparing() {
+        use axum::http::HeaderValue;
+
+        // A deployment whose expected origin carries an uppercase host and an
+        // explicit default port (as a `public_url` might) still matches the bare,
+        // lowercased `Origin` a browser sends: both sides normalize the same way, so
+        // a legitimate same-origin POST is not falsely 403-ed (issue #196).
+        let expected = Some("https://Issuer.test:443");
+        let mut browser = HeaderMap::new();
+        browser.insert(
+            header::ORIGIN,
+            HeaderValue::from_static("https://issuer.test"),
+        );
+        assert!(
+            same_origin_ok(&browser, expected),
+            "a normalized browser Origin matches an un-normalized expected origin"
+        );
+
+        // A genuinely different origin still mismatches after normalization (no false
+        // allow).
+        let mut evil = HeaderMap::new();
+        evil.insert(
+            header::ORIGIN,
+            HeaderValue::from_static("https://evil.test"),
+        );
+        assert!(!same_origin_ok(&evil, expected));
+
+        // A different NON-default port is a different origin and is rejected.
+        let mut other_port = HeaderMap::new();
+        other_port.insert(
+            header::ORIGIN,
+            HeaderValue::from_static("https://issuer.test:8443"),
+        );
+        assert!(!same_origin_ok(&other_port, expected));
     }
 
     #[test]

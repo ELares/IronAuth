@@ -703,3 +703,115 @@ async fn login_post_rejects_cross_site_submissions() {
         "the same-origin login establishes a session"
     );
 }
+
+/// Whether a bootstrap user with `identifier` exists in `scope`.
+async fn user_is_registered(
+    harness: &Harness,
+    scope: ironauth_store::Scope,
+    identifier: &str,
+) -> bool {
+    harness
+        .store()
+        .scoped(scope)
+        .users()
+        .by_identifier(identifier)
+        .await
+        .expect("by_identifier read")
+        .is_some()
+}
+
+#[tokio::test]
+async fn register_post_rejects_cross_site_submissions() {
+    // FIX for issue #196: register_post auto-establishes a session on success and
+    // needs NO pre-existing cookie, so the SameSite=Lax backstop cannot protect it;
+    // a cross-site POST would sign the victim into an attacker-known account
+    // (login-CSRF / session fixation). The same Origin + Sec-Fetch-Site allowlist as
+    // login/consent must refuse a conclusively cross-site POST BEFORE any account is
+    // created, any Argon2 hash is spent, or any session is established.
+    let harness = Harness::start().await;
+    let client_id = harness.client_id().to_string();
+    let scope = harness.scope();
+    let identifier = "csrf-register@example.test";
+
+    // A valid register resume target (as the authorize -> register redirect carries).
+    let return_to = format!(
+        "/authorize?response_type=code&client_id={client_id}&redirect_uri={}&scope=openid",
+        enc(REDIRECT_URI)
+    );
+    let register_body = form(&[
+        ("identifier", identifier),
+        ("password", "s3cr3t-passphrase"),
+        ("return_to", &return_to),
+    ]);
+
+    // (a) Sec-Fetch-Site: cross-site is refused with a 403, creates NO session, and
+    // creates NO account (rejected before any account create/hash).
+    let (status, headers, _b) = post_form_with(
+        &harness,
+        "/register",
+        &register_body,
+        None,
+        &[("sec-fetch-site", "cross-site")],
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "cross-site registration is blocked"
+    );
+    assert!(
+        headers.get(header::SET_COOKIE).is_none(),
+        "no session on a blocked registration"
+    );
+    assert!(
+        !user_is_registered(&harness, scope, identifier).await,
+        "a blocked registration creates no account (refused before account create)"
+    );
+
+    // (b) A cross-origin Origin is refused too, still with no account and no session.
+    let (status, headers, _b) = post_form_with(
+        &harness,
+        "/register",
+        &register_body,
+        None,
+        &[("origin", "https://evil.test")],
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "cross-origin registration is blocked"
+    );
+    assert!(
+        headers.get(header::SET_COOKIE).is_none(),
+        "still no session on a blocked registration"
+    );
+    assert!(
+        !user_is_registered(&harness, scope, identifier).await,
+        "a blocked registration still creates no account"
+    );
+
+    // (c) A same-origin POST SUCCEEDS: the account is created and the auto-session's
+    // Set-Cookie rides the resume redirect.
+    let (status, headers, body) = post_form_with(
+        &harness,
+        "/register",
+        &register_body,
+        None,
+        &[("origin", ISSUER_BASE)],
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FOUND,
+        "same-origin registration succeeds: {body}"
+    );
+    assert!(
+        set_cookie_pair(&headers).is_some(),
+        "the same-origin registration establishes a session"
+    );
+    assert!(
+        user_is_registered(&harness, scope, identifier).await,
+        "the same-origin registration creates the account"
+    );
+}

@@ -14,12 +14,16 @@
 --
 -- PostgreSQL requires the UPDATE privilege on the target table for any
 -- INSERT ... ON CONFLICT DO UPDATE (checked whether or not a conflict fires), so
--- the data-plane role needs UPDATE on `consents`. This is the ONLY change: the
--- column (`granted_scope`) and the row-level-security policy (whose USING and
--- WITH CHECK clauses already cover UPDATE) both already exist from 0006, so no
--- table, column, index, constraint, or policy is added or altered.
+-- the data-plane role needs UPDATE on `consents`. The upsert only ever sets
+-- `granted_scope`, so the grant is COLUMN-SCOPED to that one column
+-- (`GRANT UPDATE (granted_scope)`): strictly least-privilege, the role cannot
+-- UPDATE id/subject/client_id/tenant_id/environment_id even within a tenant. This
+-- is the ONLY change: the column (`granted_scope`) and the row-level-security
+-- policy (whose USING and WITH CHECK clauses already cover UPDATE) both already
+-- exist from 0006, so no table, column, index, constraint, or policy is added or
+-- altered.
 --
 -- Additive and safe for the old binary: the old code path only ever runs
 -- INSERT ... ON CONFLICT DO NOTHING, which an extra privilege never affects.
 
-GRANT UPDATE ON consents TO ironauth_app;
+GRANT UPDATE (granted_scope) ON consents TO ironauth_app;

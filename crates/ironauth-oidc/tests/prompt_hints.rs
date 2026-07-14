@@ -92,6 +92,44 @@ async fn prompt_none_without_consent_returns_consent_required() {
 }
 
 #[tokio::test]
+async fn prompt_none_with_a_narrower_recorded_consent_returns_consent_required() {
+    // Scope-aware consent under prompt=none (issue #196): a recorded consent whose
+    // granted scope is NOT a superset of the requested scope does NOT silently
+    // auto-grant. The request asks for `openid profile`, but only `openid` was
+    // consented, so prompt=none returns consent_required through the negotiated
+    // response mode (an error redirect to the validated redirect_uri), never a
+    // consent page and never a code.
+    let harness = Harness::start().await;
+    let client_id = harness.client_id().to_string();
+    let subject = harness.seed_unique_user().await;
+    // A NARROW prior consent (openid only) and a session, but the request wants the
+    // broader `openid profile`.
+    harness
+        .grant_consent_scoped(&subject, &client_id, Some("openid"))
+        .await;
+    let cookie = harness.session_cookie(&subject).await;
+
+    let (status, headers, body) = harness
+        .authorize_with_cookie(&authorize_query(&client_id, &["prompt=none"]), &cookie)
+        .await;
+    assert_eq!(status, StatusCode::FOUND, "error redirect: {body}");
+    let loc = location(&headers).expect("location");
+    assert!(
+        loc.starts_with(REDIRECT_URI),
+        "delivered to the redirect_uri, never a consent page: {loc}"
+    );
+    assert_eq!(
+        location_param(&headers, "error").as_deref(),
+        Some("consent_required"),
+        "a broader request than the recorded consent is consent_required under prompt=none"
+    );
+    assert!(
+        location_param(&headers, "code").is_none(),
+        "no code is issued when consent does not cover the request"
+    );
+}
+
+#[tokio::test]
 async fn prompt_none_with_session_and_consent_issues_the_code() {
     // Acceptance 1: with a usable session AND recorded consent, prompt=none issues
     // the code silently (no interaction was needed).

@@ -2181,17 +2181,35 @@ pub struct ActingConsentRepo<'a> {
 impl ActingConsentRepo<'_> {
     /// Record `subject`'s consent to `client_id` against `granted_scope`, and
     /// return the ACTUAL consent id the grant references. Writes a `consent.grant`
-    /// audit row in the same transaction.
+    /// audit row in the same transaction, whose `target_id` is that same ACTUAL id.
     ///
     /// The write is an UPSERT keyed on (subject, client): a first consent INSERTs a
-    /// row with the freshly generated id; a RE-consent for an already-consented
-    /// (subject, client) UPDATEs the stored `granted_scope` in place (issue #196),
-    /// so broadening a previously narrow consent is PERSISTED rather than dropped
-    /// (the old `ON CONFLICT DO NOTHING` silently kept the narrow scope, which then
-    /// re-prompted forever). Because a re-consent keeps the row's ORIGINAL id, the
-    /// freshly generated id is only the INSERT candidate (and the audit target);
-    /// `RETURNING id` yields the real stored id, which is what is returned to the
-    /// caller. The audit is attributed to the ATTEMPTED id.
+    /// row; a RE-consent for an already-consented (subject, client) UPDATEs the
+    /// stored `granted_scope` in place (issue #196), so broadening a previously
+    /// narrow consent is PERSISTED rather than dropped (the old `ON CONFLICT DO
+    /// NOTHING` silently kept the narrow scope, which then re-prompted forever).
+    ///
+    /// A re-consent's UPDATE branch keeps the row's ORIGINAL id, so a freshly
+    /// generated id would be a phantom audit target: it is never persisted, and an
+    /// investigator pivoting from the real consent row (or from the returned id)
+    /// could not find the scope-broadening event. To keep the audit `target_id`
+    /// equal to the persisted row id on BOTH a first insert and a re-consent, this
+    /// PRE-READS the existing consent row's id for (subject, client) in scope and
+    /// uses it as BOTH the INSERT candidate id and the audit target: on a re-consent
+    /// `ON CONFLICT` keeps that same id, so `RETURNING id` and the audit target
+    /// agree; on a first consent there is no row, so a fresh id is the candidate the
+    /// INSERT persists.
+    ///
+    /// Concurrency note: two TRULY concurrent FIRST grants for the same (subject,
+    /// client) both pre-read no row and generate distinct candidate ids; the unique
+    /// constraint (tenant, environment, subject, client) still admits exactly one
+    /// row (the loser falls to the `DO UPDATE` branch), so no duplicate is created,
+    /// but the loser's audit `target_id` names its own discarded candidate rather
+    /// than the surviving row. This window is confined to the concurrent
+    /// FIRST-consent (both record the same initial scope); a scope-BROADENING
+    /// re-consent always finds the existing row in the pre-read and is never subject
+    /// to it, so the security-relevant broaden event's audit linkage is always
+    /// intact.
     ///
     /// # Errors
     ///
@@ -2203,8 +2221,25 @@ impl ActingConsentRepo<'_> {
         client_id: &str,
         granted_scope: Option<&str>,
     ) -> Result<ConsentId, StoreError> {
-        let id = ConsentId::generate(env, &self.scope);
         let scope = self.scope;
+        // Pre-read the existing consent row's id for (subject, client) so the INSERT
+        // candidate id and the audit target are the row's REAL id, not a fresh id the
+        // upsert's UPDATE branch would discard. This read is a separate scoped
+        // transaction (the concurrency window is documented on this method); a
+        // BROADENING re-consent always finds the row here, so its audit linkage never
+        // drifts.
+        let candidate = match (ConsentRepo {
+            store: self.store,
+            scope,
+        })
+        .granted_ref(subject, client_id)
+        .await?
+        {
+            // A row this scope already wrote parses back in scope by construction; it
+            // is checked anyway for defense in depth (the anti-oracle boundary).
+            Some(existing) => ConsentId::parse_in_scope(&existing.id, &scope)?,
+            None => ConsentId::generate(env, &scope),
+        };
         // The upsert's RETURNING id is read out through this slot: the closure runs
         // inside the audited transaction, so it cannot return a value directly.
         let mut stored_id: Option<String> = None;
@@ -2216,7 +2251,9 @@ impl ActingConsentRepo<'_> {
                 acting: &self.acting,
                 env,
                 action: Action::ConsentGrant,
-                target: &id,
+                // The pre-read candidate is the persisted row id on a first consent
+                // and on a re-consent, so the audit row joins to the real consent row.
+                target: &candidate,
             },
             async move |tx| {
                 let row = sqlx::query(
@@ -2227,7 +2264,7 @@ impl ActingConsentRepo<'_> {
                      DO UPDATE SET granted_scope = EXCLUDED.granted_scope \
                      RETURNING id",
                 )
-                .bind(id.to_string())
+                .bind(candidate.to_string())
                 .bind(scope.tenant().to_string())
                 .bind(scope.environment().to_string())
                 .bind(subject)
@@ -2241,13 +2278,12 @@ impl ActingConsentRepo<'_> {
             false,
         )
         .await?;
-        // The actual stored id: the freshly generated id on a first consent, or the
-        // row's ORIGINAL id on a re-consent (the upsert keeps it). `fetch_one`
-        // guarantees exactly one RETURNING row, so `stored_id` is always set here;
-        // the fallback to the generated id is unreachable and only keeps this
-        // panic-free. Parsing it back in scope cannot fail for a row this scope just
-        // wrote; it is checked anyway for defense in depth (the anti-oracle boundary).
-        let stored_id = stored_id.unwrap_or_else(|| id.to_string());
+        // The actual persisted id: the candidate on a first consent or a re-consent
+        // (equal to the audit target), or the surviving row's id only in the rare
+        // concurrent first-grant window documented above. `fetch_one` guarantees one
+        // RETURNING row, so the fallback to the candidate is unreachable and only
+        // keeps this panic-free.
+        let stored_id = stored_id.unwrap_or_else(|| candidate.to_string());
         let consent_id = ConsentId::parse_in_scope(&stored_id, &self.scope)?;
         Ok(consent_id)
     }
