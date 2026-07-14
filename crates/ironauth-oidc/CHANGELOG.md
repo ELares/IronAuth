@@ -25,6 +25,14 @@ range per docs/RELEASING.md.
     `max_age=0`) is checked EXPLICITLY, never by truthiness, so `max_age=0` is
     distinguished from an absent `max_age` (the classic integer-falsy conformance
     trap); a non-integer value is `invalid_request`.
+  - **A forced interaction is CONSUMED on the resume**, so the flow completes after
+    one round-trip instead of looping forever. The `/authorize` URL an interaction
+    redirects back to drops the `prompt` token it just satisfied (`login` and
+    `select_account` for a login, `consent` for a consent) and removes a consumed
+    `max_age` (the fresh authentication satisfies any `max_age`, including
+    `max_age=0`), while a marker preserves the `auth_time` emission that `max_age`
+    required. Because a resume can only ever DROP a trigger, never inject a bypass,
+    this cannot be used to skip a demanded re-authentication or consent.
   - **Interaction-hint seam** (`InteractionHints`): `login_hint` prefills the login
     form (reflected through the HTML escaper); `ui_locales`, `claims_locales`, and
     `display` (`page`/`popup`/`touch`/`wap`) reach a typed page-rendering context

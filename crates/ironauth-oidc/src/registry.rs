@@ -418,6 +418,51 @@ impl PromptSet {
     pub fn is_empty(self) -> bool {
         !(self.none || self.login || self.consent || self.select_account || self.create)
     }
+
+    /// This set with `value` removed (issue #16). The interaction that SATISFIES a
+    /// forcing prompt token (a login satisfies `login`/`select_account`, a consent
+    /// satisfies `consent`) rebuilds the resume URL without it, so the resumed
+    /// request does not re-force the same interaction and loop forever.
+    #[must_use]
+    pub fn without(mut self, value: PromptValue) -> Self {
+        match value {
+            PromptValue::None => self.none = false,
+            PromptValue::Login => self.login = false,
+            PromptValue::Consent => self.consent = false,
+            PromptValue::SelectAccount => self.select_account = false,
+            PromptValue::Create => self.create = false,
+        }
+        self
+    }
+
+    /// Serialize back to a space-separated `prompt` value in canonical order, or
+    /// [`None`] when the set is empty (so a resume URL omits the parameter). Only
+    /// ever emits recognized tokens, so a round-trip through [`Self::parse`] is
+    /// stable.
+    #[must_use]
+    pub fn to_param(self) -> Option<String> {
+        let mut out = Vec::new();
+        if self.none {
+            out.push("none");
+        }
+        if self.login {
+            out.push("login");
+        }
+        if self.consent {
+            out.push("consent");
+        }
+        if self.select_account {
+            out.push("select_account");
+        }
+        if self.create {
+            out.push("create");
+        }
+        if out.is_empty() {
+            None
+        } else {
+            Some(out.join(" "))
+        }
+    }
 }
 
 /// Why a `prompt` request was rejected. Both map to `invalid_request`; neither

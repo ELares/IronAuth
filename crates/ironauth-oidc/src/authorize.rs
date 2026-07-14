@@ -121,6 +121,13 @@ pub struct AuthorizeParams {
     /// The OIDC `display` (`page`/`popup`/`touch`/`wap`): the UI presentation hint
     /// (issue #16), threaded into the page-rendering context.
     pub display: Option<String>,
+    /// An INTERNAL resume marker (issue #16), NOT a client-facing parameter. When a
+    /// login interaction CONSUMES a `max_age` to break the re-auth loop (dropping it
+    /// from the resume URL so the fresh authentication is not re-flagged as stale),
+    /// it sets this so the resumed request still emits the ID token's `auth_time`
+    /// that `max_age` implied. It only ever ADDS the honest `auth_time` claim, so a
+    /// forged value is harmless (it can never suppress an interaction or a claim).
+    pub emit_auth_time: Option<String>,
 }
 
 /// `GET /authorize`.
@@ -355,7 +362,7 @@ async fn issue_code(
         redirect_uri,
         &iss,
         mode,
-        &prompt,
+        prompt,
         max_age_secs,
         &hints,
     )
@@ -386,14 +393,16 @@ async fn issue_code(
 
     // 7. Freeze the authentication context. auth_time is emitted in the ID token
     //    when the request asked for max_age (present, including max_age=0) OR the
-    //    client registered require_auth_time; the value is always the truthful
-    //    recorded instant, so it is frozen only when it is due. The recorded
-    //    methods are always frozen so amr/acr can be derived. acr_values is honored
-    //    as a preference only: the achieved acr comes from the event, never the
-    //    request.
-    let max_age_requested = max_age_secs.is_some();
-    let auth_time_micros =
-        (max_age_requested || client.require_auth_time).then_some(session.auth_time_unix_micros);
+    //    client registered require_auth_time OR a login interaction CONSUMED a
+    //    max_age to break the re-auth loop (the emit_auth_time resume marker, issue
+    //    #16), so a max_age request still yields auth_time even after the max_age
+    //    itself was dropped from the resumed URL. The value is always the truthful
+    //    recorded instant, so it is frozen only when it is due. The recorded methods
+    //    are always frozen so amr/acr can be derived. acr_values is honored as a
+    //    preference only: the achieved acr comes from the event, never the request.
+    let auth_time_required =
+        max_age_secs.is_some() || client.require_auth_time || params.emit_auth_time.is_some();
+    let auth_time_micros = auth_time_required.then_some(session.auth_time_unix_micros);
 
     let session_ref = session.session_id.to_string();
     let resolved = Resolved {
@@ -769,7 +778,7 @@ async fn resolve_gate(
     redirect_uri: &str,
     iss: &str,
     mode: ResponseMode,
-    prompt: &PromptSet,
+    prompt: PromptSet,
     max_age_secs: Option<u64>,
     hints: &InteractionHints,
 ) -> Result<Gate, AuthorizeError> {
@@ -796,13 +805,15 @@ async fn resolve_gate(
                 "authentication is required but prompt=none forbids interaction",
             ));
         }
-        let return_to = build_authorize_url(params, hints);
         // prompt=create routes an UNAUTHENTICATED user to registration; once a
-        // session exists it is ignored, so registration never loops.
+        // session exists it is ignored, so registration never loops (its request is
+        // preserved verbatim). The login path CONSUMES the re-auth forcing tokens
+        // (login/select_account/max_age) so the fresh login does not re-force and
+        // loop.
         let redirect = if prompt.contains(PromptValue::Create) {
-            interaction::register_redirect(&return_to)
+            interaction::register_redirect(&preserve_resume_url(params, hints))
         } else {
-            interaction::login_redirect(&return_to)
+            interaction::login_redirect(&login_resume_url(params, hints, prompt))
         };
         return Ok(Gate::Interaction(redirect));
     };
@@ -825,7 +836,7 @@ async fn resolve_gate(
             ));
         }
         return Ok(Gate::Interaction(interaction::login_redirect(
-            &build_authorize_url(params, hints),
+            &login_resume_url(params, hints, prompt),
         )));
     }
 
@@ -847,7 +858,7 @@ async fn resolve_gate(
         Ok(Some(consent_ref)) => {
             if force_consent {
                 Ok(Gate::Interaction(interaction::consent_redirect(
-                    &build_authorize_url(params, hints),
+                    &consent_resume_url(params, hints, prompt),
                 )))
             } else {
                 Ok(Gate::Ready {
@@ -865,7 +876,7 @@ async fn resolve_gate(
                 ));
             }
             Ok(Gate::Interaction(interaction::consent_redirect(
-                &build_authorize_url(params, hints),
+                &consent_resume_url(params, hints, prompt),
             )))
         }
         Err(_) => Err(gate_error(
@@ -936,7 +947,13 @@ fn max_age_forces_reauth(
 /// typed [`InteractionHints`] seam (issue #16), which is their single source of
 /// truth across the round-trip, so the interaction pages reconstruct them and a
 /// malformed one (an unknown `display`) is simply not carried.
-fn build_authorize_url(params: &AuthorizeParams, hints: &InteractionHints) -> String {
+fn build_authorize_url(
+    params: &AuthorizeParams,
+    hints: &InteractionHints,
+    prompt: Option<&str>,
+    max_age: Option<&str>,
+    emit_auth_time: bool,
+) -> String {
     append_query(
         "/authorize",
         &[
@@ -952,8 +969,8 @@ fn build_authorize_url(params: &AuthorizeParams, hints: &InteractionHints) -> St
                 "code_challenge_method",
                 params.code_challenge_method.as_deref(),
             ),
-            ("prompt", params.prompt.as_deref()),
-            ("max_age", params.max_age.as_deref()),
+            ("prompt", prompt),
+            ("max_age", max_age),
             ("acr_values", params.acr_values.as_deref()),
             ("claims", params.claims.as_deref()),
             ("login_hint", hints.login_hint()),
@@ -961,7 +978,66 @@ fn build_authorize_url(params: &AuthorizeParams, hints: &InteractionHints) -> St
             ("ui_locales", hints.ui_locales()),
             ("claims_locales", hints.claims_locales()),
             ("display", hints.display_param()),
+            ("emit_auth_time", emit_auth_time.then_some("1")),
         ],
+    )
+}
+
+/// The `/authorize` resume URL to send the user back to AFTER an interaction,
+/// preserving the whole request verbatim (`prompt` and `max_age` unchanged). Used
+/// where nothing is consumed (the registration deep-link, whose `prompt=create` is
+/// already ignored once a session exists).
+fn preserve_resume_url(params: &AuthorizeParams, hints: &InteractionHints) -> String {
+    build_authorize_url(
+        params,
+        hints,
+        params.prompt.as_deref(),
+        params.max_age.as_deref(),
+        false,
+    )
+}
+
+/// The `/authorize` resume URL for a LOGIN interaction, with the re-auth forcing
+/// conditions CONSUMED (issue #16): the `login` and `select_account` prompt tokens
+/// are dropped and any `max_age` is removed, because the fresh authentication the
+/// login performs satisfies every one of them, so the resumed request is not caught
+/// in an infinite redirect loop. When a `max_age` is consumed the `emit_auth_time`
+/// marker is set so the resumed request still carries the ID token's `auth_time`
+/// that `max_age` required.
+fn login_resume_url(
+    params: &AuthorizeParams,
+    hints: &InteractionHints,
+    prompt: PromptSet,
+) -> String {
+    let residual = prompt
+        .without(PromptValue::Login)
+        .without(PromptValue::SelectAccount)
+        .to_param();
+    build_authorize_url(
+        params,
+        hints,
+        residual.as_deref(),
+        None,
+        params.max_age.is_some(),
+    )
+}
+
+/// The `/authorize` resume URL for a CONSENT interaction, with the `consent` prompt
+/// token CONSUMED (issue #16) so the consent just recorded does not re-trigger a
+/// consent loop. `max_age` is preserved (a consent step performs no
+/// authentication, and a stale `max_age` would already have forced login first).
+fn consent_resume_url(
+    params: &AuthorizeParams,
+    hints: &InteractionHints,
+    prompt: PromptSet,
+) -> String {
+    let residual = prompt.without(PromptValue::Consent).to_param();
+    build_authorize_url(
+        params,
+        hints,
+        residual.as_deref(),
+        params.max_age.as_deref(),
+        false,
     )
 }
 

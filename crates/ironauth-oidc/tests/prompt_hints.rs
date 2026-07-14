@@ -21,7 +21,11 @@ mod common;
 use std::time::Duration;
 
 use axum::http::StatusCode;
-use common::{Harness, PKCE_CHALLENGE, REDIRECT_URI, enc, form_field, location, location_param};
+use base64::Engine as _;
+use common::{
+    Harness, PKCE_CHALLENGE, PKCE_VERIFIER, REDIRECT_URI, SEED_PASSWORD, enc, form, form_field,
+    json, location, location_param, set_cookie_pair,
+};
 
 /// Build the authorization query for the harness public client (PKCE is mandatory,
 /// so the S256 challenge rides every request), appending any extra pre-encoded
@@ -143,6 +147,184 @@ async fn prompt_consent_re_prompts_even_when_consent_is_recorded() {
     assert!(
         loc.starts_with("/consent?return_to="),
         "prompt=consent re-prompts consent: {loc}"
+    );
+}
+
+#[tokio::test]
+async fn prompt_login_round_trip_issues_a_code_and_does_not_loop() {
+    // Regression for the forced-interaction loop: prompt=login must force ONE fresh
+    // login and then COMPLETE, not redirect to /login again forever. The login
+    // consumes the login token on the resume URL, so the resumed request issues the
+    // code rather than re-forcing the interaction.
+    let harness = Harness::start().await;
+    let client_id = harness.client_id().to_string();
+    let subject = harness
+        .seed_user("relogin@example.test", SEED_PASSWORD)
+        .await;
+    harness.grant_consent(&subject, &client_id).await;
+    let cookie = harness.session_cookie(&subject).await;
+
+    // 1. prompt=login with a valid, consented session still forces a login redirect.
+    let (status, headers, _) = harness
+        .authorize_with_cookie(&authorize_query(&client_id, &["prompt=login"]), &cookie)
+        .await;
+    assert_eq!(status, StatusCode::FOUND);
+    let login_location = location(&headers).expect("login redirect");
+    assert!(
+        login_location.starts_with("/login?return_to="),
+        "{login_location}"
+    );
+
+    // 2. GET /login, round-trip its return_to, POST the credentials.
+    let (_s, _h, login_html) = harness.get_with_cookie(&login_location, None).await;
+    let return_to = form_field(&login_html, "return_to").expect("login return_to");
+    let login_body = form(&[
+        ("identifier", "relogin@example.test"),
+        ("password", SEED_PASSWORD),
+        ("return_to", &return_to),
+    ]);
+    let (status, headers, body) = harness.post_form("/login", &login_body, None).await;
+    assert_eq!(status, StatusCode::FOUND, "login post: {body}");
+    let fresh_cookie = set_cookie_pair(&headers).expect("fresh session cookie");
+    let resume = location(&headers).expect("resume after login");
+
+    // 3. The resumed authorize ISSUES THE CODE (it does not loop back to /login).
+    let (status, headers, _) = harness.get_with_cookie(&resume, Some(&fresh_cookie)).await;
+    assert_eq!(status, StatusCode::FOUND);
+    let final_location = location(&headers).expect("final redirect");
+    assert!(
+        final_location.starts_with(REDIRECT_URI) && location_param(&headers, "code").is_some(),
+        "prompt=login completes after one re-auth, not a loop: {final_location}"
+    );
+}
+
+#[tokio::test]
+async fn prompt_consent_round_trip_issues_a_code_and_does_not_loop() {
+    // Regression: prompt=consent must force ONE fresh consent and then COMPLETE, not
+    // redirect to /consent again forever after the user allows.
+    let harness = Harness::start().await;
+    let client_id = harness.client_id().to_string();
+    let subject = harness
+        .seed_user("reconsent@example.test", SEED_PASSWORD)
+        .await;
+    harness.grant_consent(&subject, &client_id).await;
+    let cookie = harness.session_cookie(&subject).await;
+
+    // 1. prompt=consent forces a consent redirect even though consent is recorded.
+    let (status, headers, _) = harness
+        .authorize_with_cookie(&authorize_query(&client_id, &["prompt=consent"]), &cookie)
+        .await;
+    assert_eq!(status, StatusCode::FOUND);
+    let consent_location = location(&headers).expect("consent redirect");
+    assert!(
+        consent_location.starts_with("/consent?return_to="),
+        "{consent_location}"
+    );
+
+    // 2. GET /consent, allow, resume.
+    let (_s, _h, consent_html) = harness
+        .get_with_cookie(&consent_location, Some(&cookie))
+        .await;
+    let return_to = form_field(&consent_html, "return_to").expect("consent return_to");
+    let consent_body = form(&[("decision", "allow"), ("return_to", &return_to)]);
+    let (status, headers, body) = harness
+        .post_form("/consent", &consent_body, Some(&cookie))
+        .await;
+    assert_eq!(status, StatusCode::FOUND, "consent post: {body}");
+    let resume = location(&headers).expect("resume after consent");
+
+    // 3. The resumed authorize ISSUES THE CODE (no loop back to /consent).
+    let (status, headers, _) = harness.get_with_cookie(&resume, Some(&cookie)).await;
+    assert_eq!(status, StatusCode::FOUND);
+    assert!(
+        location_param(&headers, "code").is_some(),
+        "prompt=consent completes after one re-consent, not a loop: {:?}",
+        location(&headers)
+    );
+}
+
+#[tokio::test]
+async fn max_age_zero_round_trip_completes_under_an_advancing_clock() {
+    // Regression for the production loop the frozen test clock hid: with a real,
+    // ADVANCING clock, max_age=0 forces ONE re-auth and then COMPLETES, and the ID
+    // token still carries auth_time even though max_age is consumed on the resume.
+    let harness = Harness::start().await;
+    let client_id = harness.client_id().to_string();
+    let subject = harness
+        .seed_user("maxage0@example.test", SEED_PASSWORD)
+        .await;
+    harness.grant_consent(&subject, &client_id).await;
+    let cookie = harness.session_cookie(&subject).await;
+
+    // Advance so the existing session is not authenticated at this very instant.
+    harness.clock().advance(Duration::from_secs(30));
+
+    // 1. max_age=0 forces a login redirect.
+    let (status, headers, _) = harness
+        .authorize_with_cookie(&authorize_query(&client_id, &["max_age=0"]), &cookie)
+        .await;
+    assert_eq!(status, StatusCode::FOUND);
+    let login_location = location(&headers).expect("login redirect");
+    assert!(
+        login_location.starts_with("/login?return_to="),
+        "{login_location}"
+    );
+
+    // 2. Log in, with real request latency modeled by advancing the clock.
+    let (_s, _h, login_html) = harness.get_with_cookie(&login_location, None).await;
+    let return_to = form_field(&login_html, "return_to").expect("login return_to");
+    harness.clock().advance(Duration::from_secs(1));
+    let login_body = form(&[
+        ("identifier", "maxage0@example.test"),
+        ("password", SEED_PASSWORD),
+        ("return_to", &return_to),
+    ]);
+    let (status, headers, body) = harness.post_form("/login", &login_body, None).await;
+    assert_eq!(status, StatusCode::FOUND, "login post: {body}");
+    let fresh_cookie = set_cookie_pair(&headers).expect("fresh session cookie");
+    let resume = location(&headers).expect("resume after login");
+    // The resume consumed max_age and carries the emit_auth_time marker.
+    assert!(
+        !resume.contains("max_age"),
+        "max_age is consumed on the resume: {resume}"
+    );
+    assert!(
+        resume.contains("emit_auth_time"),
+        "auth_time emission is preserved on the resume: {resume}"
+    );
+
+    // 3. The resume arrives a moment after the login (clock advances again) and
+    //    ISSUES THE CODE rather than looping back to /login.
+    harness.clock().advance(Duration::from_secs(1));
+    let (status, headers, _) = harness.get_with_cookie(&resume, Some(&fresh_cookie)).await;
+    assert_eq!(status, StatusCode::FOUND);
+    let code = location_param(&headers, "code").expect("code issued, not a loop");
+
+    // 4. The ID token still carries auth_time (max_age required it).
+    let token_body = form(&[
+        ("grant_type", "authorization_code"),
+        ("code", &code),
+        ("redirect_uri", REDIRECT_URI),
+        ("client_id", &client_id),
+        ("code_verifier", PKCE_VERIFIER),
+    ]);
+    let (status, _h, body) = harness.token(&token_body).await;
+    assert_eq!(status, StatusCode::OK, "token exchange: {body}");
+    let id_token = json(&body)["id_token"]
+        .as_str()
+        .expect("id_token")
+        .to_owned();
+    let payload = id_token
+        .split('.')
+        .nth(1)
+        .expect("id_token payload segment");
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload)
+        .expect("base64url payload");
+    let claims: serde_json::Value = serde_json::from_slice(&bytes).expect("claims json");
+    assert!(
+        claims.get("auth_time").is_some(),
+        "auth_time is emitted for a consumed max_age=0: {claims}"
     );
 }
 
