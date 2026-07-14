@@ -109,6 +109,28 @@ async fn authorize_public(
         .await
 }
 
+/// Authorize a fresh consenting subject for the PUBLIC harness client with the given
+/// resources, asserting a code is issued and returning it.
+async fn authorize_public_code(harness: &Harness, resources: &[&str]) -> String {
+    let (status, headers, body) = authorize_public(harness, resources).await;
+    assert_eq!(status, StatusCode::FOUND, "authorize: {body}");
+    location_param(&headers, "code").expect("code")
+}
+
+/// Like [`authorize_public_code`] but adds `scope=openid`, so the ensuing code
+/// exchange also opens a refresh-token family (issue #21). Returns the code.
+async fn authorize_public_code_with_scope(harness: &Harness, resources: &[&str]) -> String {
+    let client = harness.client_id().to_string();
+    let subject = harness.seed_unique_user().await;
+    harness.grant_consent(&subject, &client).await;
+    let cookie = harness.session_cookie(&subject).await;
+    let mut query = authorize_query(&client, resources);
+    query.push_str("&scope=openid");
+    let (status, headers, body) = harness.authorize_with_cookie(&query, &cookie).await;
+    assert_eq!(status, StatusCode::FOUND, "authorize: {body}");
+    location_param(&headers, "code").expect("code")
+}
+
 /// The token-endpoint form for a PKCE public-client code exchange with the given
 /// resource indicators.
 fn token_form(code: &str, client: &str, resources: &[&str]) -> String {
@@ -524,5 +546,314 @@ async fn no_resource_yields_the_client_audience_by_default() {
         verified.claims().get("aud").and_then(Value::as_str),
         Some(client.as_str()),
         "no resource keeps the client-id audience"
+    );
+}
+
+/// Gap-case (a): a no-resource authorization freezes an EMPTY granted ceiling, which a
+/// later refresh cannot expand. A refresh naming a REGISTERED resource is `invalid_target`
+/// (not merely rejected for being unregistered): the empty grant admits no resource.
+#[tokio::test]
+async fn a_refresh_cannot_expand_an_empty_granted_ceiling() {
+    let harness = Harness::start().await;
+    register_rs(&harness, RS_A, TokenFormat::AtJwt).await;
+    let client = harness.client_id().to_string();
+
+    // Authorize with NO resource (empty ceiling); scope=openid opens a refresh family.
+    let code = authorize_public_code_with_scope(&harness, &[]).await;
+    let (status, _, body) = harness.token(&token_form(&code, &client, &[])).await;
+    assert_eq!(status, StatusCode::OK, "token: {body}");
+    let refresh = json(&body)["refresh_token"]
+        .as_str()
+        .expect("refresh_token")
+        .to_owned();
+
+    // A refresh naming RS_A (a REGISTERED, allowlisted, valid resource) is still an
+    // EXPANSION of the empty granted set, so it is rejected with invalid_target. This
+    // would succeed if the subset ceiling were not enforced.
+    let (status, _, body) = harness
+        .token(&refresh_form(&refresh, &client, &[RS_A]))
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "refresh expansion: {body}");
+    assert_eq!(
+        json(&body)["error"],
+        "invalid_target",
+        "the empty granted ceiling cannot be expanded on refresh: {body}"
+    );
+}
+
+/// Gap-case (b): expansion is blocked at the CODE-EXCHANGE path (not only refresh). A
+/// code that approved one resource cannot be exchanged for a token naming a different
+/// one, even though it is registered and allowlisted: it was never approved at
+/// authorization.
+#[tokio::test]
+async fn a_code_exchange_cannot_name_a_resource_outside_the_approved_set() {
+    let harness = Harness::start().await;
+    register_rs(&harness, RS_A, TokenFormat::AtJwt).await;
+    register_rs(&harness, RS_B, TokenFormat::AtJwt).await;
+    let client = harness.client_id().to_string();
+
+    // Approve ONLY RS_A at authorization; RS_B is registered but never approved.
+    let code = authorize_public_code(&harness, &[RS_A]).await;
+    let (status, _, body) = harness.token(&token_form(&code, &client, &[RS_B])).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "code-exchange expansion: {body}"
+    );
+    assert_eq!(
+        json(&body)["error"],
+        "invalid_target",
+        "expansion is blocked at the code-exchange path, not only on refresh: {body}"
+    );
+}
+
+/// Gap-case (c): a rejected expansion refresh does NOT burn the token. The subset check
+/// runs BEFORE the atomic redeem, so the SAME refresh token still succeeds on a valid
+/// downscope after an expansion attempt was rejected.
+#[tokio::test]
+async fn a_rejected_expansion_refresh_does_not_burn_the_token() {
+    let harness = Harness::start().await;
+    register_rs(&harness, RS_A, TokenFormat::AtJwt).await;
+    register_rs(&harness, RS_B, TokenFormat::AtJwt).await;
+    // RS_C is registered but NEVER approved, so naming it is an expansion.
+    register_rs(&harness, RS_C, TokenFormat::AtJwt).await;
+    let client = harness.client_id().to_string();
+
+    // Approve A and B, redeem for both, and keep the refresh token.
+    let code = authorize_public_code_with_scope(&harness, &[RS_A, RS_B]).await;
+    let (status, _, body) = harness
+        .token(&token_form(&code, &client, &[RS_A, RS_B]))
+        .await;
+    assert_eq!(status, StatusCode::OK, "token: {body}");
+    let refresh = json(&body)["refresh_token"]
+        .as_str()
+        .expect("refresh_token")
+        .to_owned();
+
+    // A refresh that tries to EXPAND to C is rejected with invalid_target.
+    let (status, _, body) = harness
+        .token(&refresh_form(&refresh, &client, &[RS_C]))
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "refresh expansion: {body}");
+    assert_eq!(
+        json(&body)["error"],
+        "invalid_target",
+        "expansion rejected: {body}"
+    );
+
+    // The SAME refresh token is NOT burned by the rejected expansion: a valid downscope
+    // to A still succeeds. If the subset check ran AFTER the atomic redeem (or the failed
+    // refresh consumed the token) this would be a uniform invalid_grant instead.
+    let (status, _, body) = harness
+        .token(&refresh_form(&refresh, &client, &[RS_A]))
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a valid downscope after a rejected expansion still succeeds: {body}"
+    );
+    let refreshed = json(&body);
+    let access = refreshed["access_token"].as_str().expect("access_token");
+    verify(access, &harness.policy(RS_A), &verify_clock()).expect("scoped to A");
+}
+
+/// Gap-case (d): targeting resource servers of DIFFERENT token formats in one token
+/// request is `invalid_target`. Authorization approves both (it does not enforce format
+/// agreement), but a single token cannot satisfy an at+jwt AND an opaque resource server.
+#[tokio::test]
+async fn mixed_format_target_resources_are_invalid_target() {
+    let harness = Harness::start().await;
+    register_rs(&harness, RS_A, TokenFormat::AtJwt).await;
+    register_rs(&harness, RS_B, TokenFormat::Opaque).await;
+    let client = harness.client_id().to_string();
+
+    // Both are approved at authorization; the token request that names both cannot be
+    // satisfied by one format, so it is invalid_target (would mint a token without the
+    // all-must-agree-on-format guard).
+    let code = authorize_public_code(&harness, &[RS_A, RS_B]).await;
+    let (status, _, body) = harness
+        .token(&token_form(&code, &client, &[RS_A, RS_B]))
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "mixed formats: {body}");
+    assert_eq!(
+        json(&body)["error"],
+        "invalid_target",
+        "resource servers disagreeing on token format is invalid_target: {body}"
+    );
+}
+
+/// Gap-case (e): a DUPLICATE `resource` value dedups to a single-string aud (never a
+/// two-element array of the same audience), and a CASE-VARIANT of a registered audience
+/// is `invalid_target` (exact-match, no normalization-into-match).
+#[tokio::test]
+async fn a_duplicate_resource_dedups_and_a_case_variant_is_invalid_target() {
+    let harness = Harness::start().await;
+    register_rs(&harness, RS_A, TokenFormat::AtJwt).await;
+    let client = harness.client_id().to_string();
+
+    // A duplicated resource collapses to a SINGLE-string aud (dedup), not [RS_A, RS_A].
+    let code = authorize_public_code(&harness, &[RS_A]).await;
+    let (status, _, body) = harness
+        .token(&token_form(&code, &client, &[RS_A, RS_A]))
+        .await;
+    assert_eq!(status, StatusCode::OK, "duplicate resource: {body}");
+    let access = json(&body)["access_token"]
+        .as_str()
+        .expect("access_token")
+        .to_owned();
+    let verified = verify(&access, &harness.policy(RS_A), &verify_clock()).expect("verifies for A");
+    let aud = verified.claims().get("aud").expect("aud");
+    assert!(
+        aud.is_string(),
+        "a duplicated resource dedups to a single-string aud: {aud}"
+    );
+    assert_eq!(aud_members(aud), vec![RS_A.to_owned()]);
+
+    // A case-variant of the registered audience (RS_A is ".../a") does NOT match: the
+    // registry compares audiences EXACTLY, so it is invalid_target rather than being
+    // normalized into a match.
+    let variant = "https://api.example/A";
+    let (status, headers, body) = authorize_public(&harness, &[variant]).await;
+    assert_eq!(status, StatusCode::FOUND, "authorize: {body}");
+    assert_eq!(
+        location_param(&headers, "error").as_deref(),
+        Some("invalid_target"),
+        "a case-variant audience is not normalized into a registered match"
+    );
+}
+
+/// Gap-case (f): odd URI shapes are each `invalid_target` at the token endpoint: a
+/// relative reference, a fragment, a scheme not starting with a letter, an empty
+/// hier-part, and a zero-width-unicode variant of a registered audience (which must NOT
+/// be folded into a match).
+#[tokio::test]
+async fn odd_resource_uri_shapes_are_invalid_target_at_the_token_endpoint() {
+    let harness = Harness::start().await;
+    register_rs(&harness, RS_A, TokenFormat::AtJwt).await;
+    let client = harness.client_id().to_string();
+
+    // A zero-width space smuggled onto the registered audience: a well-formed URI that is
+    // NOT byte-equal to RS_A, so it can never narrow to (or be folded into) the approved
+    // resource.
+    let zero_width_variant = format!("{RS_A}\u{200b}");
+    let odd_shapes: [&str; 5] = [
+        "/orders",                    // a relative reference (no scheme)
+        "https://api.example/a#frag", // a forbidden fragment (RFC 8707 section 2)
+        "1https://api.example/a",     // a scheme not starting with a letter
+        "https:",                     // an empty hier-part
+        zero_width_variant.as_str(),  // a zero-width-unicode smuggling attempt
+    ];
+    for odd in odd_shapes {
+        // A fresh code approves the real RS_A each time (codes are single use); presenting
+        // the odd shape at exchange is invalid_target.
+        let code = authorize_public_code(&harness, &[RS_A]).await;
+        let (status, _, body) = harness.token(&token_form(&code, &client, &[odd])).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "odd resource {odd:?}: {body}"
+        );
+        assert_eq!(
+            json(&body)["error"],
+            "invalid_target",
+            "the odd resource {odd:?} is invalid_target at the token endpoint: {body}"
+        );
+    }
+}
+
+/// FIX 3 (RFC 9126 section 2.3): the `/par` endpoint validates resource indicators at
+/// push time. A valid pushed `resource` round-trips through `/authorize` and narrows the
+/// issued token; a malformed or unregistered pushed `resource` is rejected AT `/par` with
+/// `invalid_target`, rather than being deferred to `/authorize`.
+#[tokio::test]
+async fn par_validates_resources_at_push_and_round_trips_a_valid_one() {
+    let harness = Harness::start().await;
+    register_rs(&harness, RS_A, TokenFormat::AtJwt).await;
+    let client = harness.client_id().to_string();
+
+    // A PAR push carrying a VALID resource is accepted and returns a request_uri.
+    let good = form(&[
+        ("client_id", client.as_str()),
+        ("response_type", "code"),
+        ("redirect_uri", REDIRECT_URI),
+        ("scope", "openid"),
+        ("code_challenge", PKCE_CHALLENGE),
+        ("code_challenge_method", "S256"),
+        ("resource", RS_A),
+    ]);
+    let (status, _, body) = harness.par(&good, None).await;
+    assert_eq!(status, StatusCode::CREATED, "par push (valid): {body}");
+    let request_uri = json(&body)["request_uri"]
+        .as_str()
+        .expect("request_uri")
+        .to_owned();
+
+    // The pushed resource is frozen onto the grant/code: a code exchange naming no
+    // resource narrows to the approved RS_A (proving the resource round-tripped).
+    let subject = harness.seed_unique_user().await;
+    harness.grant_consent(&subject, &client).await;
+    let cookie = harness.session_cookie(&subject).await;
+    let query = format!("client_id={client}&request_uri={}", enc(&request_uri));
+    let (status, headers, body) = harness.authorize_with_cookie(&query, &cookie).await;
+    assert_eq!(status, StatusCode::FOUND, "authorize via PAR: {body}");
+    let code = location_param(&headers, "code").expect("code");
+    let (status, _, body) = harness.token(&token_form(&code, &client, &[])).await;
+    assert_eq!(status, StatusCode::OK, "token: {body}");
+    let access = json(&body)["access_token"]
+        .as_str()
+        .expect("access_token")
+        .to_owned();
+    let verified =
+        verify(&access, &harness.policy(RS_A), &verify_clock()).expect("scoped to the pushed RS");
+    assert_eq!(
+        verified.claims().get("aud").and_then(Value::as_str),
+        Some(RS_A),
+        "the PAR-pushed resource froze onto the grant and narrowed the token"
+    );
+
+    // A PAR push carrying an UNREGISTERED resource (RS_B is registered nowhere here) is
+    // rejected AT /par with invalid_target: without push-time validation this would be a
+    // 201 Created deferring the error to /authorize.
+    let unregistered = form(&[
+        ("client_id", client.as_str()),
+        ("response_type", "code"),
+        ("redirect_uri", REDIRECT_URI),
+        ("scope", "openid"),
+        ("code_challenge", PKCE_CHALLENGE),
+        ("code_challenge_method", "S256"),
+        ("resource", RS_B),
+    ]);
+    let (status, _, body) = harness.par(&unregistered, None).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "par push (unregistered resource): {body}"
+    );
+    assert_eq!(
+        json(&body)["error"],
+        "invalid_target",
+        "an unregistered pushed resource is invalid_target at /par: {body}"
+    );
+
+    // A MALFORMED resource (a relative reference) is likewise rejected at /par.
+    let malformed = form(&[
+        ("client_id", client.as_str()),
+        ("response_type", "code"),
+        ("redirect_uri", REDIRECT_URI),
+        ("scope", "openid"),
+        ("code_challenge", PKCE_CHALLENGE),
+        ("code_challenge_method", "S256"),
+        ("resource", "not-a-uri"),
+    ]);
+    let (status, _, body) = harness.par(&malformed, None).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "par push (malformed resource): {body}"
+    );
+    assert_eq!(
+        json(&body)["error"],
+        "invalid_target",
+        "a malformed pushed resource is invalid_target at /par: {body}"
     );
 }

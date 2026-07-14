@@ -1901,7 +1901,11 @@ struct Resolved<'a> {
 /// [`AuthzErrorCode`] to deliver on failure (`invalid_target` for a policy violation,
 /// `server_error` for a store fault); the caller renders it through the negotiated
 /// response mode.
-async fn validate_authorize_resources(
+///
+/// The PAR endpoint (RFC 9126 section 2.3, issue #28) runs this SAME helper at push
+/// time so a malformed, unregistered, or disallowed `resource` surfaces `invalid_target`
+/// on the back channel, identically to `/authorize`; the two paths cannot diverge.
+pub(crate) async fn validate_authorize_resources(
     state: &OidcState,
     scope: Scope,
     client_id: &ClientId,

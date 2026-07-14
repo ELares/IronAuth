@@ -351,11 +351,14 @@ async fn resolve_jwt(state: &OidcState, scope: Scope, token: &str) -> Option<Int
         token_type: Some(BEARER_TOKEN_TYPE.to_owned()),
         exp: claims.expiration(),
         iat: claims.issued_at(),
-        // Report the token's FIRST signed audience (issue #22 established this for a
-        // multi-aud at+jwt; the audience array as a whole is what the token itself
-        // carries and was signature-confirmed). The opaque path reports its full
-        // recorded set below.
-        aud: claims.audiences().first().cloned().into_iter().collect(),
+        // Report the token's FULL signed audience set (RFC 7662 section 2.2: the `aud`
+        // is the token's intended audience, so under-reporting it could make an RS that
+        // relies on introspection wrongly reject a valid multi-resource token). The
+        // audiences were signature-confirmed (a member of them is what `verify_any_
+        // audience` bound), and the serializer collapses a one-element vec to a bare
+        // string (byte-identical to the pre-#28 single-audience wire form) and emits an
+        // array for several, exactly the shape the opaque path reports.
+        aud: claims.audiences().to_vec(),
     })
 }
 
