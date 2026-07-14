@@ -146,6 +146,20 @@ impl ClientAuthMethod {
         ClientAuthMethod::None,
     ];
 
+    /// The CONFIDENTIAL subset of [`ALL`](Self::ALL): every advertised method that
+    /// requires a real credential (a secret or an asymmetric assertion), i.e. `ALL`
+    /// minus `none`. The RFC 7662 introspection endpoint requires a confidential
+    /// client (a `client_id` is not secret, so a public `none` client proves nothing
+    /// by presenting it), so it advertises EXACTLY this set, while `/token` and
+    /// `/revoke` (which accept a public `none` client) advertise the full
+    /// [`ALL`](Self::ALL). Kept as a subset of the one live list so the advertised set
+    /// can never drift from the served behavior.
+    pub const CONFIDENTIAL: &'static [ClientAuthMethod] = &[
+        ClientAuthMethod::Basic,
+        ClientAuthMethod::Post,
+        ClientAuthMethod::PrivateKeyJwt,
+    ];
+
     /// The wire / stored string for this method.
     #[must_use]
     pub fn as_str(self) -> &'static str {
@@ -273,6 +287,13 @@ pub struct AuthenticatedClient {
     /// The authenticated client identifier (the caller re-checks it against any
     /// binding, for example the authorization code's `client_id`).
     pub client_id: String,
+    /// The client's registered `token_endpoint_auth_method`, the method it just
+    /// authenticated under. A caller that must distinguish a confidential client from
+    /// a public `none` client reads this: `/introspect` (RFC 7662) requires a
+    /// confidential client and rejects `none`, while `/token` and `/revoke` accept a
+    /// public client. A confidential method here means a real secret / assertion was
+    /// verified (a `none` client proves only possession of its non-secret id).
+    pub auth_method: ClientAuthMethod,
 }
 
 /// Why the reusable client-authentication seam rejected a request. The caller maps
@@ -479,6 +500,7 @@ async fn authenticate_presented(
         ) => match authenticate_secret(&record, registered, *method, secret.as_deref()) {
             Ok(()) => Ok(AuthenticatedClient {
                 client_id: client_id_str,
+                auth_method: registered,
             }),
             Err(SecretAuthError::MethodMismatch) => {
                 fail!(&method_str, ClientAuthDiagnosticReason::MethodMismatch)
@@ -495,6 +517,7 @@ async fn authenticate_presented(
             {
                 Ok(()) => Ok(AuthenticatedClient {
                     client_id: client_id_str,
+                    auth_method: registered,
                 }),
                 Err(AssertionAuthError::Invalid) => {
                     fail!(&method_str, ClientAuthDiagnosticReason::AssertionInvalid)

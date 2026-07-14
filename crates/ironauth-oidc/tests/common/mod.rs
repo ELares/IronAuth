@@ -19,7 +19,8 @@ use http_body_util::BodyExt;
 use ironauth_config::OidcConfig;
 use ironauth_env::{Env, ManualClock};
 use ironauth_jose::{
-    JwsAlgorithm, KeySet, SigningKey, SigningPolicy, TrustedKey, VerificationPolicy,
+    EmissionOptions, JwsAlgorithm, KeySet, SigningKey, SigningPolicy, TrustedKey,
+    VerificationPolicy, sign_jws_with_policy,
 };
 use ironauth_oidc::{
     ClientAuthMethod, ClientKeyResolver, DiscoveryCapabilities, DiscoveryState, IssuerEntry,
@@ -207,6 +208,10 @@ pub struct Harness {
     client_id: ClientId,
     verifying_key: TrustedKey,
     issuer: String,
+    // The issuer registry the state was built over, so a test can reach the live
+    // environment signer to mint a token shape the mint does not produce today (a
+    // JSON-array `aud`, issue #22 introspection hardening / #28).
+    registry: Arc<IssuerRegistry>,
     // A clone of the OidcState the router was built from, so a test can call the
     // state directly (for example the access-token target resolution, issue #29).
     state: OidcState,
@@ -269,12 +274,13 @@ impl Harness {
                 PairwiseSalt::new(Vec::new()),
             ),
         );
+        let registry = Arc::new(registry);
 
         let state = match resolver {
             Some(resolver) => OidcState::with_client_key_resolver(
                 db.store().clone(),
                 env.clone(),
-                Arc::new(registry),
+                Arc::clone(&registry),
                 &config,
                 ISSUER_BASE,
                 resolver,
@@ -282,7 +288,7 @@ impl Harness {
             None => OidcState::new(
                 db.store().clone(),
                 env.clone(),
-                Arc::new(registry),
+                Arc::clone(&registry),
                 &config,
                 ISSUER_BASE,
             ),
@@ -298,6 +304,7 @@ impl Harness {
             client_id,
             verifying_key,
             issuer,
+            registry,
             state,
             router,
         }
@@ -338,11 +345,12 @@ impl Harness {
             scope,
             IssuerEntry::new(keyset, policy, PairwiseSalt::new(Vec::new())),
         );
+        let registry = Arc::new(registry);
 
         let state = OidcState::new(
             db.store().clone(),
             env.clone(),
-            Arc::new(registry),
+            Arc::clone(&registry),
             &config,
             ISSUER_BASE,
         );
@@ -357,6 +365,7 @@ impl Harness {
             client_id,
             verifying_key,
             issuer,
+            registry,
             state,
             router,
         }
@@ -470,6 +479,7 @@ impl Harness {
             client_id,
             verifying_key: provisioned.verifying_key,
             issuer,
+            registry,
             state,
             router,
         }
@@ -585,6 +595,31 @@ impl Harness {
     #[must_use]
     pub fn clock(&self) -> &Arc<ManualClock> {
         &self.clock
+    }
+
+    /// Sign a synthetic `at+jwt` access token over `claims` with the environment's
+    /// LIVE signing key and policy (the same key/policy the mint signs with, resolved
+    /// through the issuer registry), for a test that needs a token shape the mint does
+    /// not produce today. Used by the issue #22 introspection guard test to forge a
+    /// JSON-array `aud` (RFC 7519 / #28), reusing a real token's `jti` so its store row
+    /// still resolves.
+    pub async fn sign_at_jwt(&self, claims: &serde_json::Value) -> String {
+        let entry = self
+            .registry
+            .entry_for(&self.scope)
+            .await
+            .expect("issuer entry for scope");
+        let signer = entry
+            .signer(self.state.now())
+            .expect("an active signer at now");
+        let bytes = serde_json::to_vec(claims).expect("claims serialize");
+        sign_jws_with_policy(
+            entry.policy(),
+            signer,
+            &bytes,
+            &EmissionOptions::new().with_typ("at+jwt"),
+        )
+        .expect("sign at+jwt")
     }
 
     /// The per-environment issuer the tokens carry.

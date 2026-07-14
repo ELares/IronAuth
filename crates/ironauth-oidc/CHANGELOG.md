@@ -19,14 +19,26 @@ range per docs/RELEASING.md.
     public `none` client authenticates by presenting its `client_id`; a confidential
     client must present its secret. `revocation_endpoint` is now advertised in discovery.
   - **`POST /introspect`.** An authorized caller reads a token's active state and standard
-    metadata (`scope`, `client_id`, `sub`, `exp`, `iat`, `aud`, `token_type`). Client
-    authentication is REQUIRED: an unauthenticated or badly-authenticated call is a
-    uniform `401` that leaks nothing about any token (RFC 7662 section 4, the
-    token-scanning-oracle defense). Every not-active cause (unknown, expired, revoked,
-    cross-tenant, wrong format) returns the same `200 {"active":false}`. An at+jwt's
-    metadata comes from the VERIFIED token, so a tampered payload reads as not-active; a
-    revoked grant flips `active` to `false` even while the signature still verifies.
-    `introspection_endpoint` is now advertised in discovery.
+    metadata (`scope`, `client_id`, `sub`, `exp`, `iat`, `aud`, `token_type`). A
+    CONFIDENTIAL client is REQUIRED: introspection accepts only a real
+    `client_secret_basic`/`client_secret_post`/`private_key_jwt` credential and REJECTS
+    the public `none` method, because a `client_id` is not secret (it appears in
+    front-channel authorize URLs), so a public client presenting only its id has proven
+    nothing (RFC 7662 section 2.1). A public `none` client (or a caller presenting only a
+    `client_id`), an unauthenticated call, and a badly-authenticated call all return the
+    SAME uniform `401` that leaks nothing about any token (RFC 7662 section 4, the
+    token-scanning-oracle defense). The resource-server model is otherwise intact: any
+    authenticated confidential client may introspect any token in its own scope. Every
+    not-active cause (unknown, expired, revoked, cross-tenant, wrong format, and a
+    transient store fault, which fails closed) returns the same `200 {"active":false}`.
+    An at+jwt's metadata comes from the VERIFIED token, so a tampered payload reads as
+    not-active; a revoked grant flips `active` to `false` even while the signature still
+    verifies. The at+jwt resolve accepts an `aud` that is EITHER a single string OR a
+    JSON array (RFC 7519), verifying the token against any member, so a multi-audience
+    token (forthcoming with issue #28 resource indicators, RFC 8707) introspects
+    correctly rather than reading as not-active. `introspection_endpoint` is now
+    advertised in discovery. (`/revoke` continues to accept a public `none` client, which
+    RFC 7009 explicitly permits: it is owner-scoped and returns no data.)
   - **Revocation cascades through the grant.** The append-only issued/opaque token rows
     derive their active state only from `grants.revoked_at`, so revoking a token revokes
     its grant chain. Revoking a REFRESH token additionally revokes its whole family (the
@@ -50,10 +62,26 @@ range per docs/RELEASING.md.
     `*_auth_methods_supported` (and RFC 8414 section 2 `*_auth_signing_alg_values_supported`)
     arrays are emitted by the single live-config generator on every well-known form,
     sourced from the shared client-auth suite so they cannot drift from what the endpoints
-    accept.
+    accept. The two advertised method sets DIFFER by exactly `none`:
+    `revocation_endpoint_auth_methods_supported` (and `token_endpoint_auth_methods_supported`)
+    advertise the full `ClientAuthMethod::ALL` including `none`, while
+    `introspection_endpoint_auth_methods_supported` advertises only the CONFIDENTIAL
+    methods (`ALL` minus `none`), matching the endpoint's confidential-client requirement.
   - The revocation and introspection endpoints REUSE the token-endpoint client-auth suite
     through a new `authenticate_client_self_scoped` seam (it recovers the scope from the
-    presented `client_id`, since these endpoints are global like `/token`).
+    presented `client_id`, since these endpoints are global like `/token`). The
+    authenticated client now also carries its registered `auth_method`, so `/introspect`
+    can require a confidential one.
+  - **Test coverage** added for the introspection hardening: a public `none` client (and
+    a caller presenting only a `client_id`) is rejected at `/introspect` with a uniform
+    `401` while a confidential client still introspects; advancing-clock expiry for both
+    an at+jwt access token (past its TTL) and a refresh token (past its idle lifetime);
+    the access-token-revoke to refresh cascade (the whole grant chain); a foreign and a
+    double revoke publish no second event and write no second audit row (exactly-once on
+    a real state flip); the full active-refresh introspection body shape; a synthetic
+    multi-audience at+jwt introspecting active; a swapped `IntrospectionSerializer` being
+    honored by the endpoint; and the discovery unit test now asserts the revocation,
+    introspection, and PAR endpoints and their (differing) auth-method arrays.
 
 - Refresh-token rotation, families, `offline_access`, and consent modes (issue #21).
   - **The `refresh_token` grant.** The token endpoint exchanges a rotating refresh

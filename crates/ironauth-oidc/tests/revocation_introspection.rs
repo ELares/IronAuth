@@ -15,6 +15,7 @@
 mod common;
 
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use axum::body::Body;
 use axum::http::{HeaderMap, Request, StatusCode, header};
@@ -23,7 +24,8 @@ use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use common::{Harness, REDIRECT_URI, enc, form, json, location_param, send_through};
 use ironauth_config::{OidcConfig, TokenFormat as ConfigTokenFormat};
 use ironauth_oidc::{
-    ClientAuthMethod, RevocationEvent, RevocationEventSink, RevokedTokenType, oidc_router,
+    ClientAuthMethod, IntrospectionClaims, IntrospectionSerializer, RevocationEvent,
+    RevocationEventSink, RevokedTokenType, SerializedIntrospection, oidc_router,
 };
 use ironauth_store::ClientId;
 use serde_json::Value;
@@ -424,16 +426,22 @@ async fn a_public_client_revokes_its_own_token_without_a_secret() {
     .await;
     assert_eq!(status, StatusCode::OK, "public revoke: {revoke_body}");
 
-    // Introspect (as the same public client, client_id in the body) reads inactive.
-    let (status, _, introspect_body) = post_form(
-        &harness,
-        "/introspect",
-        &form(&[("token", &access), ("client_id", &public_id)]),
-        None,
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(json(&introspect_body), json(r#"{"active":false}"#));
+    // Confirm the public revoke actually took effect. `/introspect` requires a
+    // CONFIDENTIAL client (a `client_id` is not secret), so the resource-server model
+    // is exercised through a confidential client in the SAME scope reading the public
+    // client's now-revoked token: it reads `active:false`.
+    let (confidential, secret) = harness
+        .create_confidential_client(ClientAuthMethod::Basic)
+        .await;
+    let confidential_auth = basic(&confidential.to_string(), &secret);
+    assert_eq!(
+        introspect(&harness, &access, &confidential_auth).await.1,
+        json(r#"{"active":false}"#),
+        "the public client's token is inactive after its own revoke"
+    );
+    // Exactly one revocation committed (the public revoke), so it was not a silent
+    // no-op despite carrying no secret.
+    assert_eq!(harness.count_audit_action("token.revoke").await, 1);
 }
 
 #[tokio::test]
@@ -490,8 +498,14 @@ async fn discovery_advertises_both_endpoints_and_their_auth_methods_on_both_form
     let harness = Harness::start_store_backed().await;
     let scope = harness.scope();
     let base = "https://issuer.test";
-    let expected_methods =
+    // The two endpoints DIFFER by exactly `none`: `/revoke` accepts a public client
+    // (RFC 7009), so it advertises the full method set; `/introspect` requires a
+    // confidential client (RFC 7662 section 2.1, since a `client_id` is not secret), so
+    // its advertised set excludes `none`.
+    let revocation_methods =
         json(r#"["client_secret_basic","client_secret_post","private_key_jwt","none"]"#);
+    let introspection_methods =
+        json(r#"["client_secret_basic","client_secret_post","private_key_jwt"]"#);
 
     for uri in [
         format!(
@@ -524,12 +538,12 @@ async fn discovery_advertises_both_endpoints_and_their_auth_methods_on_both_form
             "{uri}"
         );
         assert_eq!(
-            doc["revocation_endpoint_auth_methods_supported"], expected_methods,
+            doc["revocation_endpoint_auth_methods_supported"], revocation_methods,
             "{uri}"
         );
         assert_eq!(
-            doc["introspection_endpoint_auth_methods_supported"], expected_methods,
-            "{uri}"
+            doc["introspection_endpoint_auth_methods_supported"], introspection_methods,
+            "introspection excludes none: {uri}"
         );
         // RFC 8414 section 2: the signing-alg arrays accompany private_key_jwt.
         assert!(
@@ -625,5 +639,383 @@ async fn every_successful_revocation_publishes_an_internal_event() {
     assert_eq!(
         serde_json::to_value(&events[0]).expect("serialize")["token_type"],
         "access_token"
+    );
+}
+
+/// Build a `POST /revoke` request for `token` with an `Authorization` header, to send
+/// through a sink-wired router.
+fn revoke_request(token: &str, authorization: &str) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri("/revoke")
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .header(header::AUTHORIZATION, authorization)
+        .body(Body::from(form(&[("token", token)])))
+        .expect("request builds")
+}
+
+#[tokio::test]
+async fn a_public_none_client_cannot_introspect() {
+    // FIX 1 (issue #22 hardening): RFC 7662 section 2.1 REQUIRES a confidential client.
+    // A `client_id` is NOT a secret (it appears in front-channel authorize URLs), so a
+    // public `none` client presenting only its id must NOT be able to introspect a
+    // token: it gets the SAME uniform 401 a missing/bad credential returns, leaking no
+    // metadata. A confidential client CAN still introspect the same token (the
+    // resource-server model is intact).
+    let harness = Harness::start().await;
+    let (owner, owner_secret) = harness
+        .create_confidential_client(ClientAuthMethod::Basic)
+        .await;
+    let owner_auth = basic(&owner.to_string(), &owner_secret);
+    let tokens = issue_confidential(&harness, &owner, &owner_secret, "openid profile").await;
+    let access = tokens["access_token"]
+        .as_str()
+        .expect("access_token")
+        .to_owned();
+
+    // The public harness client (method none) presents ONLY its client_id in the body:
+    // a uniform 401 that leaks nothing about the token.
+    let public_id = harness.client_id().to_string();
+    let (status, _, body) = post_form(
+        &harness,
+        "/introspect",
+        &form(&[("token", &access), ("client_id", &public_id)]),
+        None,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "a public none client is rejected: {body}"
+    );
+    assert!(
+        !body.contains("\"active\""),
+        "no token state leaked to the none client: {body}"
+    );
+    assert!(
+        !body.contains(&owner.to_string()) && !body.contains("openid profile"),
+        "no token metadata leaked to the none client: {body}"
+    );
+
+    // A confidential client in the SAME scope still introspects the same token: the
+    // resource-server model is unchanged, only `none` is now barred.
+    assert_eq!(
+        introspect(&harness, &access, &owner_auth).await.1["active"],
+        Value::Bool(true),
+        "a confidential client can still introspect"
+    );
+}
+
+#[tokio::test]
+async fn an_access_token_introspects_active_then_inactive_after_its_ttl() {
+    // FIX 2a (issue #22 test rigor): advancing-clock expiry, so a regression dropping
+    // the `exp > now` clause would not ship green. An at+jwt access token introspects
+    // active:true; after the ManualClock advances well past its TTL, the signature's
+    // exp check fails and it introspects active:false.
+    let harness = Harness::start().await;
+    let (client_id, secret) = harness
+        .create_confidential_client(ClientAuthMethod::Basic)
+        .await;
+    let auth = basic(&client_id.to_string(), &secret);
+    let tokens = issue_confidential(&harness, &client_id, &secret, "openid").await;
+    let access = tokens["access_token"]
+        .as_str()
+        .expect("access_token")
+        .to_owned();
+
+    assert_eq!(
+        introspect(&harness, &access, &auth).await.1["active"],
+        Value::Bool(true),
+        "active before the TTL passes"
+    );
+
+    // Advance the clock a full day, well past the default 300s access-token TTL and any
+    // verification skew: the token's exp is now in the past, so it reads active:false.
+    harness.clock().advance(Duration::from_secs(86_400));
+    assert_eq!(
+        introspect(&harness, &access, &auth).await.1,
+        json(r#"{"active":false}"#),
+        "inactive after the TTL passes (exp is enforced end to end)"
+    );
+}
+
+#[tokio::test]
+async fn a_refresh_token_introspects_active_then_inactive_after_its_idle_lifetime() {
+    // FIX 2b (issue #22 test rigor): a refresh token introspects active:true; after the
+    // ManualClock advances past its idle lifetime, it introspects active:false (the
+    // store resolve compares the idle expiry against the clock seam).
+    let harness = Harness::start().await;
+    let (client_id, secret) = harness
+        .create_confidential_client(ClientAuthMethod::Basic)
+        .await;
+    let auth = basic(&client_id.to_string(), &secret);
+    let tokens = issue_confidential(&harness, &client_id, &secret, "openid").await;
+    let refresh = tokens["refresh_token"]
+        .as_str()
+        .expect("refresh_token")
+        .to_owned();
+
+    assert_eq!(
+        introspect(&harness, &refresh, &auth).await.1["active"],
+        Value::Bool(true),
+        "active before the idle lifetime passes"
+    );
+
+    // Advance past the default refresh idle TTL (1_209_600s = 14 days).
+    harness.clock().advance(Duration::from_secs(1_209_600 + 60));
+    assert_eq!(
+        introspect(&harness, &refresh, &auth).await.1,
+        json(r#"{"active":false}"#),
+        "inactive after the idle lifetime passes"
+    );
+}
+
+#[tokio::test]
+async fn revoking_the_access_token_cascades_to_the_refresh_token() {
+    // FIX 3 (issue #22 test rigor): the OTHER cascade direction. Revoking the ACCESS
+    // token revokes the whole grant chain, so the REFRESH token from the same grant
+    // introspects active:false. This pins the deliberate least-astonishment choice that
+    // revoking any token in a grant revokes the chain.
+    let harness = Harness::start().await;
+    let (client_id, secret) = harness
+        .create_confidential_client(ClientAuthMethod::Basic)
+        .await;
+    let auth = basic(&client_id.to_string(), &secret);
+    let tokens = issue_confidential(&harness, &client_id, &secret, "openid").await;
+    let access = tokens["access_token"]
+        .as_str()
+        .expect("access_token")
+        .to_owned();
+    let refresh = tokens["refresh_token"]
+        .as_str()
+        .expect("refresh_token")
+        .to_owned();
+
+    assert_eq!(
+        introspect(&harness, &refresh, &auth).await.1["active"],
+        Value::Bool(true),
+        "the refresh token is active before the revoke"
+    );
+
+    // Revoke the ACCESS token.
+    let (status, _) = revoke(&harness, &access, &auth, None).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // The refresh token derived from the SAME grant cascaded to inactive.
+    assert_eq!(
+        introspect(&harness, &refresh, &auth).await.1,
+        json(r#"{"active":false}"#),
+        "revoking the access token revoked the whole grant chain, including the refresh token"
+    );
+}
+
+#[tokio::test]
+async fn a_foreign_or_double_revocation_is_exactly_once_on_the_sink_and_audit() {
+    // FIX 4 (issue #22 test rigor): exactly-once on a real state flip (`if flipped`). A
+    // foreign-client revoke and a double revoke both flip NO state, so they publish NO
+    // event on the sink and write NO (second) audit row.
+    let harness = Harness::start().await;
+    let (owner, owner_secret) = harness
+        .create_confidential_client_named(ClientAuthMethod::Basic, "owner")
+        .await;
+    let (other, other_secret) = harness
+        .create_confidential_client_named(ClientAuthMethod::Basic, "other")
+        .await;
+    let owner_auth = basic(&owner.to_string(), &owner_secret);
+    let other_auth = basic(&other.to_string(), &other_secret);
+    let tokens = issue_confidential(&harness, &owner, &owner_secret, "openid").await;
+    let access = tokens["access_token"]
+        .as_str()
+        .expect("access_token")
+        .to_owned();
+
+    // A recording sink over the SAME state, exactly how the M4 fan-out will wire one.
+    let sink = Arc::new(RecordingSink::default());
+    let router = oidc_router(harness.state().clone().with_revocation_sink(sink.clone()));
+    let event_count = || sink.events.lock().expect("lock").len();
+
+    // A FOREIGN-client revoke flips nothing: 200, no event, no audit row.
+    let (status, _, _) = send_through(router.clone(), revoke_request(&access, &other_auth)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(event_count(), 0, "a foreign revoke publishes no event");
+    assert_eq!(
+        harness.count_audit_action("token.revoke").await,
+        0,
+        "a foreign revoke writes no audit row"
+    );
+
+    // The owner's FIRST revoke flips state: exactly one event, one audit row.
+    let (status, _, _) = send_through(router.clone(), revoke_request(&access, &owner_auth)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(event_count(), 1, "one event on the real state flip");
+    assert_eq!(harness.count_audit_action("token.revoke").await, 1);
+
+    // A DOUBLE revoke (already revoked) flips nothing: NO second event, NO second row.
+    let (status, _, _) = send_through(router.clone(), revoke_request(&access, &owner_auth)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(event_count(), 1, "no second event on the double revoke");
+    assert_eq!(
+        harness.count_audit_action("token.revoke").await,
+        1,
+        "no second audit row on the double revoke"
+    );
+}
+
+#[tokio::test]
+async fn an_active_refresh_token_introspection_body_has_the_full_shape() {
+    // FIX 5 (issue #22 test rigor): the FULL active-refresh introspection body, not
+    // just active==true. A refresh token carries scope/sub/client_id/exp/iat and, per
+    // the serializer's refresh mapping, OMITS token_type and aud (a refresh token has
+    // no RFC 6749 5.1 token type and no audience), never emitted as null.
+    let harness = Harness::start().await;
+    let (client_id, secret) = harness
+        .create_confidential_client(ClientAuthMethod::Basic)
+        .await;
+    let auth = basic(&client_id.to_string(), &secret);
+    let tokens = issue_confidential(&harness, &client_id, &secret, "openid profile").await;
+    let refresh = tokens["refresh_token"]
+        .as_str()
+        .expect("refresh_token")
+        .to_owned();
+    let id_sub = payload_claims(tokens["id_token"].as_str().expect("id_token"))["sub"]
+        .as_str()
+        .expect("id sub")
+        .to_owned();
+
+    let (status, doc) = introspect(&harness, &refresh, &auth).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(doc["active"], Value::Bool(true), "active: {doc}");
+    assert_eq!(doc["scope"], "openid profile");
+    assert_eq!(doc["client_id"], client_id.to_string());
+    assert_eq!(
+        doc["sub"].as_str(),
+        Some(id_sub.as_str()),
+        "sub matches the ID token"
+    );
+    assert!(doc["exp"].is_number(), "exp present: {doc}");
+    assert!(doc["iat"].is_number(), "iat present: {doc}");
+    // The refresh mapping OMITS token_type and aud entirely (never emitted as null).
+    assert!(
+        doc.get("token_type").is_none(),
+        "a refresh token has no token_type: {doc}"
+    );
+    assert!(
+        doc.get("aud").is_none(),
+        "a refresh token has no aud: {doc}"
+    );
+}
+
+#[tokio::test]
+async fn a_multi_audience_at_jwt_introspects_active() {
+    // FIX 6 (issue #22, forward-looking for #28 resource indicators): RFC 7519 permits
+    // `aud` to be a JSON array. IronAuth mints only single-string `aud` today, so this
+    // SYNTHESIZES a multi-aud at+jwt: it takes a real minted token's claims (its `jti`
+    // keys a live store row) and RE-SIGNS them with the SAME signing key and `jti` but
+    // an `aud` ARRAY, then introspects it. It reads active:true, proving `resolve_jwt`
+    // accepts an array `aud` and verifies against a member (it would read active:false
+    // if `aud` were peeked only as a string).
+    let harness = Harness::start().await;
+    let (client_id, secret) = harness
+        .create_confidential_client(ClientAuthMethod::Basic)
+        .await;
+    let auth = basic(&client_id.to_string(), &secret);
+    let tokens = issue_confidential(&harness, &client_id, &secret, "openid").await;
+    let access = tokens["access_token"].as_str().expect("access_token");
+
+    // Re-sign the real token's claims with a multi-audience `aud` array: the client_id
+    // it already targets PLUS a second resource (as #28 resource indicators will mint).
+    let mut claims = payload_claims(access);
+    claims.insert(
+        "aud".to_owned(),
+        Value::Array(vec![
+            Value::String(client_id.to_string()),
+            Value::String("https://api.example/resource".to_owned()),
+        ]),
+    );
+    let multi_aud = harness.sign_at_jwt(&Value::Object(claims)).await;
+
+    let (status, doc) = introspect(&harness, &multi_aud, &auth).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        doc["active"],
+        Value::Bool(true),
+        "a multi-aud at+jwt with a live store row introspects active: {doc}"
+    );
+    // The reported `aud` is the token's FIRST audience (its client_id), per the
+    // serializer's single-string aud mapping.
+    assert_eq!(
+        doc["aud"],
+        client_id.to_string(),
+        "first aud reported: {doc}"
+    );
+}
+
+/// A custom introspection serializer that emits a sentinel body under a distinctive
+/// content type, to prove the endpoint dispatches through the installed serializer.
+struct SentinelSerializer;
+
+impl IntrospectionSerializer for SentinelSerializer {
+    fn serialize(&self, claims: &IntrospectionClaims) -> SerializedIntrospection {
+        SerializedIntrospection {
+            content_type: "application/sentinel+json",
+            body: format!(r#"{{"sentinel":true,"active":{}}}"#, claims.active),
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_swapped_introspection_serializer_is_honored() {
+    // FIX 7 (issue #22 test rigor): the RFC 9701 serializer seam is real. Installing a
+    // custom serializer via `with_introspection_serializer` changes the endpoint's wire
+    // output (content type and body), proving the endpoint dispatches through the
+    // state's serializer, mirroring the revocation-sink swap test.
+    let harness = Harness::start().await;
+    let (client_id, secret) = harness
+        .create_confidential_client(ClientAuthMethod::Basic)
+        .await;
+    let auth = basic(&client_id.to_string(), &secret);
+    let tokens = issue_confidential(&harness, &client_id, &secret, "openid").await;
+    let access = tokens["access_token"]
+        .as_str()
+        .expect("access_token")
+        .to_owned();
+
+    // Rebuild the router over the same state with the custom serializer installed.
+    let router = oidc_router(
+        harness
+            .state()
+            .clone()
+            .with_introspection_serializer(Arc::new(SentinelSerializer)),
+    );
+    let request = Request::builder()
+        .method("POST")
+        .uri("/introspect")
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .header(header::AUTHORIZATION, &auth)
+        .body(Body::from(form(&[("token", &access)])))
+        .expect("request builds");
+    let (status, headers, body) = send_through(router, request).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "introspect through custom serializer"
+    );
+    assert_eq!(
+        headers
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("application/sentinel+json"),
+        "the custom serializer's content type is served"
+    );
+    let doc = json(&body);
+    assert_eq!(
+        doc["sentinel"],
+        Value::Bool(true),
+        "the custom serializer's body is served: {body}"
+    );
+    assert_eq!(
+        doc["active"],
+        Value::Bool(true),
+        "the active token flows through the custom serializer: {body}"
     );
 }

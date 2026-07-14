@@ -44,11 +44,12 @@ use axum::extract::{Form, State};
 use axum::http::HeaderMap;
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
+use ironauth_jose::VerifiedToken;
 use ironauth_store::{IssuedTokenId, RefreshTokenId, Scope};
 use serde::Deserialize;
 use serde_json::{Map, Value};
 
-use crate::client_auth::{ClientAuthInputs, authenticate_client_self_scoped};
+use crate::client_auth::{ClientAuthInputs, ClientAuthMethod, authenticate_client_self_scoped};
 use crate::state::OidcState;
 use crate::token_credential::{self, PresentedTokenKind, opaque_handle, peek_claim, peek_jti};
 use crate::tokens::{OPAQUE_ACCESS_TOKEN_PREFIX, OPAQUE_REFRESH_TOKEN_PREFIX};
@@ -211,9 +212,24 @@ pub async fn introspect(
     // (section 4, the token-scanning-oracle defense), stricter than the token
     // endpoint's invalid_request/invalid_client split so an unauthenticated probe never
     // even reaches the token lookup.
-    let Ok((_client, scope)) = authenticate_client_self_scoped(&state, inputs).await else {
+    let Ok((client, scope)) = authenticate_client_self_scoped(&state, inputs).await else {
         return unauthorized();
     };
+
+    // A CONFIDENTIAL client is required (RFC 7662 section 2.1). A `client_id` is NOT a
+    // secret: it appears in the clear in front-channel authorize URLs, so a public
+    // `none` client presenting only its id has proven nothing, and letting it read a
+    // token's active state and metadata would make section 4's "client authentication
+    // REQUIRED" a non-barrier for any tenant that has a public client. A public `none`
+    // client (or a caller presenting only a `client_id`) therefore gets the SAME
+    // uniform 401 a missing/bad credential returns, leaking nothing, leaving only a
+    // client that verified a real secret / assertion able to introspect. (Contrast
+    // `/revoke`, which RFC 7009 explicitly allows public clients to call: it is
+    // owner-scoped via the foreign-client no-op and returns no data, so it keeps
+    // accepting `none`.)
+    if client.auth_method == ClientAuthMethod::None {
+        return unauthorized();
+    }
 
     // 2. token is REQUIRED. Its absence is a plain request error (not a token oracle).
     let Some(token) = params
@@ -227,7 +243,14 @@ pub async fn introspect(
     };
 
     // 3. Resolve the token within the authenticated client's scope. Any not-active
-    //    cause collapses to the uniform inactive response.
+    //    cause collapses to the uniform inactive response. This is DELIBERATELY
+    //    fail-closed: a genuine transient STORE ERROR in a resolve also reads as
+    //    `active:false` (the resolves swallow it with `.ok()?`), asymmetric with
+    //    `/revoke` (which surfaces a 500 on a store fault). Never AUTHORIZE a token on
+    //    a database blip, and every not-active cause staying byte-identical preserves
+    //    the RFC 7662 section 4 anti-oracle uniformity: routing a store error to a
+    //    distinguishable status would itself be an oracle. Intentional; see the
+    //    per-resolve `.ok()?` notes.
     let claims = resolve(&state, scope, token)
         .await
         .unwrap_or_else(IntrospectionClaims::inactive);
@@ -281,11 +304,15 @@ async fn resolve_jwt(state: &OidcState, scope: Scope, token: &str) -> Option<Int
 
     // Verify the signature/exp/iss against the token's OWN audience (peeked, then
     // signature-confirmed): a tampered aud fails the signature and reads not-active.
-    let audience = peek_claim(token, "aud").and_then(|value| value.as_str().map(str::to_owned))?;
-    let verified = state
-        .verify_access_token(&scope, &audience, token)
-        .await
-        .ok()?;
+    // RFC 7519 permits `aud` to be EITHER a single string OR an array of strings, and
+    // issue #28 (resource indicators, RFC 8707) will mint multi-audience tokens, so
+    // accept both shapes and verify against ANY member. `verify_access_token` binds a
+    // single `&str` audience (the JOSE policy already enforces exact array membership),
+    // so a multi-aud token is verified member by member; this never weakens the
+    // binding, since the token verifies only if one of its real, signed audiences is
+    // the expected one.
+    let audiences = peek_audiences(token)?;
+    let verified = verify_any_audience(state, &scope, &audiences, token).await?;
     let claims = verified.claims();
     Some(IntrospectionClaims {
         active: true,
@@ -303,6 +330,49 @@ async fn resolve_jwt(state: &OidcState, scope: Scope, token: &str) -> Option<Int
         iat: claims.issued_at(),
         aud: claims.audiences().first().cloned(),
     })
+}
+
+/// The token's peeked (unverified) `aud` claim as the list of candidate audiences to
+/// verify against. RFC 7519 permits `aud` to be a single string OR an array of
+/// strings, so this returns a one-element list for a string, the string members for
+/// an array, and [`None`] when `aud` is absent, is neither a string nor an array, or
+/// is an array with no string member (each of which reads as not-active). The values
+/// are only lookup candidates: the signature re-checks whichever one verifies, so a
+/// tampered `aud` still fails and reads not-active.
+fn peek_audiences(token: &str) -> Option<Vec<String>> {
+    match peek_claim(token, "aud")? {
+        Value::String(single) => Some(vec![single]),
+        Value::Array(members) => {
+            let auds: Vec<String> = members
+                .into_iter()
+                .filter_map(|value| match value {
+                    Value::String(member) => Some(member),
+                    _ => None,
+                })
+                .collect();
+            (!auds.is_empty()).then_some(auds)
+        }
+        _ => None,
+    }
+}
+
+/// Verify the token against ANY of its candidate audiences, returning the first that
+/// verifies. `verify_access_token` binds a single `&str` audience, so a multi-audience
+/// token (RFC 7519 / RFC 8707) is verified member by member; [`None`] if none verify.
+/// This does not weaken the binding: the token still has to carry the presented
+/// audience among its signed `aud` members for the JOSE policy to accept it.
+async fn verify_any_audience(
+    state: &OidcState,
+    scope: &Scope,
+    audiences: &[String],
+    token: &str,
+) -> Option<VerifiedToken> {
+    for audience in audiences {
+        if let Ok(verified) = state.verify_access_token(scope, audience, token).await {
+            return Some(verified);
+        }
+    }
+    None
 }
 
 /// Resolve an opaque `ira_at_` access token (issue #29) through the digest-only store

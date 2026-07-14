@@ -455,11 +455,15 @@ pub fn discovery_document(
         json!(crate::client_auth::assertion_signing_alg_values()),
     );
     // The RFC 7009 revocation and RFC 7662 introspection endpoints authenticate the
-    // client through the SAME token-endpoint client-auth suite (issue #22), so their
-    // advertised methods are exactly `ClientAuthMethod::ALL`, sourced from the one
-    // client-auth module so they can never drift from what the endpoints accept. RFC
-    // 8414 section 2 then REQUIRES the matching `*_endpoint_auth_signing_alg_values_supported`
-    // whenever `private_key_jwt` is advertised, which it is; the values are the same
+    // client through the SAME token-endpoint client-auth suite (issue #22), sourced
+    // from the one client-auth module so the advertised set can never drift from what
+    // the endpoints accept. They differ in ONE method: `/revoke` accepts a public
+    // `none` client (RFC 7009 allows public clients), so it advertises the full
+    // `ClientAuthMethod::ALL`; `/introspect` REQUIRES a confidential client (RFC 7662
+    // section 2.1, and a `client_id` is not secret), so it advertises exactly
+    // `ClientAuthMethod::CONFIDENTIAL` (ALL minus `none`). RFC 8414 section 2 then
+    // REQUIRES the matching `*_endpoint_auth_signing_alg_values_supported` whenever
+    // `private_key_jwt` is advertised, which it is on both; the values are the same
     // asymmetric assertion matrix the token endpoint verifies against.
     document.insert(
         "revocation_endpoint_auth_methods_supported".to_owned(),
@@ -474,7 +478,9 @@ pub fn discovery_document(
     document.insert(
         "introspection_endpoint_auth_methods_supported".to_owned(),
         json!(to_strings(
-            ClientAuthMethod::ALL.iter().map(|value| value.as_str())
+            ClientAuthMethod::CONFIDENTIAL
+                .iter()
+                .map(|value| value.as_str())
         )),
     );
     document.insert(
@@ -775,6 +781,44 @@ mod tests {
             json!("https://issuer.test/authorize")
         );
         assert_eq!(doc["token_endpoint"], json!("https://issuer.test/token"));
+        // The issue #22 revocation and introspection endpoints (and #27's PAR
+        // endpoint) this test is named for: each is advertised at its path.
+        assert_eq!(
+            doc["pushed_authorization_request_endpoint"],
+            json!("https://issuer.test/par")
+        );
+        assert_eq!(
+            doc["revocation_endpoint"],
+            json!("https://issuer.test/revoke")
+        );
+        assert_eq!(
+            doc["introspection_endpoint"],
+            json!("https://issuer.test/introspect")
+        );
+        // Their auth-method arrays DIFFER by exactly `none`: `/revoke` accepts a public
+        // client (RFC 7009), `/introspect` requires a confidential one (RFC 7662).
+        assert_eq!(
+            doc["revocation_endpoint_auth_methods_supported"],
+            json!([
+                "client_secret_basic",
+                "client_secret_post",
+                "private_key_jwt",
+                "none"
+            ]),
+            "revocation advertises the full method set including none"
+        );
+        assert_eq!(
+            doc["introspection_endpoint_auth_methods_supported"],
+            json!([
+                "client_secret_basic",
+                "client_secret_post",
+                "private_key_jwt"
+            ]),
+            "introspection advertises the confidential methods, excluding none"
+        );
+        // RFC 8414 section 2: the signing-alg arrays accompany private_key_jwt on both.
+        assert!(doc["revocation_endpoint_auth_signing_alg_values_supported"].is_array());
+        assert!(doc["introspection_endpoint_auth_signing_alg_values_supported"].is_array());
         // The explicit defaults-if-omitted traps.
         assert_eq!(doc["request_uri_parameter_supported"], json!(false));
         assert_eq!(doc["request_parameter_supported"], json!(false));
