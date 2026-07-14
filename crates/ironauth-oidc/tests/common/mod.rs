@@ -22,14 +22,14 @@ use ironauth_jose::{
     JwsAlgorithm, KeySet, SigningKey, SigningPolicy, TrustedKey, VerificationPolicy,
 };
 use ironauth_oidc::{
-    ClientAuthMethod, DiscoveryCapabilities, DiscoveryState, IssuerEntry, IssuerRegistry,
-    IssuerState, JwksCacheWindow, OidcState, PairwiseSalt, SESSION_COOKIE, discovery_router,
-    issuer_router, oidc_router,
+    ClientAuthMethod, ClientKeyResolver, DiscoveryCapabilities, DiscoveryState, IssuerEntry,
+    IssuerRegistry, IssuerState, JwksCacheWindow, OidcState, PairwiseSalt, SESSION_COOKIE,
+    discovery_router, issuer_router, oidc_router,
 };
 use ironauth_store::test_support::TestDatabase;
 use ironauth_store::{
-    ClientId, CorrelationId, NewSigningKey, Scope, SessionId, SigningKeyId, SigningKeyMaterialKind,
-    Store,
+    ClientId, CorrelationId, NewJwtAuthClient, NewSigningKey, Scope, SessionId, SigningKeyId,
+    SigningKeyMaterialKind, Store,
 };
 use tower::ServiceExt;
 
@@ -155,6 +155,17 @@ impl Harness {
     /// Like [`Harness::start`] but with explicit OIDC settings (for the expiry
     /// test, which wants a short code lifetime).
     pub async fn start_with(config: OidcConfig) -> Self {
+        Self::start_inner(config, None).await
+    }
+
+    /// Like [`Harness::start_with`] but wiring a `private_key_jwt` client-key
+    /// resolver (issue #25), so a `jwks_uri` client's keys resolve through the
+    /// fetcher. Confidential PKCE is relaxed via the passed config.
+    pub async fn start_with_resolver(config: OidcConfig, resolver: Arc<ClientKeyResolver>) -> Self {
+        Self::start_inner(config, Some(resolver)).await
+    }
+
+    async fn start_inner(config: OidcConfig, resolver: Option<Arc<ClientKeyResolver>>) -> Self {
         let (db, env, clock, scope, client_id) = Self::seed_common().await;
 
         // One Ed25519 signing key for the environment, held in a PRE-POPULATED
@@ -177,13 +188,23 @@ impl Harness {
             ),
         );
 
-        let state = OidcState::new(
-            db.store().clone(),
-            env.clone(),
-            Arc::new(registry),
-            &config,
-            ISSUER_BASE,
-        );
+        let state = match resolver {
+            Some(resolver) => OidcState::with_client_key_resolver(
+                db.store().clone(),
+                env.clone(),
+                Arc::new(registry),
+                &config,
+                ISSUER_BASE,
+                resolver,
+            ),
+            None => OidcState::new(
+                db.store().clone(),
+                env.clone(),
+                Arc::new(registry),
+                &config,
+                ISSUER_BASE,
+            ),
+        };
         let issuer = state.issuer_for(&scope);
         let router = oidc_router(state.clone());
 
@@ -788,6 +809,53 @@ impl Harness {
             .expect("create confidential client");
         self.register_default_redirect(&id).await;
         (id, secret)
+    }
+
+    /// Create a client that authenticates with a JWT assertion (issue #25):
+    /// `private_key_jwt` (inline `jwks` or a `jwks_uri`) or `client_secret_jwt`,
+    /// with an optional pinned `token_endpoint_auth_signing_alg`. Registers the
+    /// harness redirect URI and returns the id.
+    pub async fn create_jwt_auth_client(
+        &self,
+        auth_method: ClientAuthMethod,
+        jwks: Option<&str>,
+        jwks_uri: Option<&str>,
+        signing_alg: Option<&str>,
+    ) -> ClientId {
+        let (actor, corr) = self.seeding_actor();
+        let id = self
+            .store()
+            .scoped(self.scope)
+            .acting(actor, corr)
+            .clients()
+            .create_jwt_auth(
+                &self.env,
+                NewJwtAuthClient {
+                    display_name: "jwt-auth client",
+                    auth_method: auth_method.as_str(),
+                    jwks,
+                    jwks_uri,
+                    signing_alg,
+                },
+            )
+            .await
+            .expect("create jwt-auth client");
+        self.register_default_redirect(&id).await;
+        id
+    }
+
+    /// Read the recorded out-of-band client-authentication diagnostics for
+    /// `client_id` in the harness scope (issue #25).
+    pub async fn client_auth_diagnostics(
+        &self,
+        client_id: &str,
+    ) -> Vec<ironauth_store::ClientAuthDiagnosticRecord> {
+        self.store()
+            .scoped(self.scope)
+            .client_auth_diagnostics()
+            .for_client(client_id)
+            .await
+            .expect("read client-auth diagnostics")
     }
 
     /// Issue an `authorization_code` bound to `client_id` WITH PKCE (the RFC 7636

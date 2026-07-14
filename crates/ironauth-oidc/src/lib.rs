@@ -71,6 +71,7 @@ mod authn;
 mod authorize;
 mod claims_request;
 mod client_auth;
+mod client_keys;
 mod consent;
 mod discovery;
 mod error;
@@ -104,7 +105,12 @@ pub use authn::{
     AuthMethod, AuthenticationEvent, achieved_acr, acr_values_supported, amr_values, methods_token,
     parse_methods,
 };
-pub use client_auth::{ClientAuthMethod, generate_secret, hash_secret};
+pub use client_auth::{
+    AuthenticatedClient, ClientAuthError, ClientAuthInputs, ClientAuthMethod, ClientAuthParseError,
+    JWT_BEARER_ASSERTION_TYPE, PresentedClientAuth, authenticate_client, generate_secret,
+    hash_secret, parse_presented,
+};
+pub use client_keys::ClientKeyResolver;
 pub use discovery::{
     ADVERTISED_ENDPOINTS, CLAIMS_LOCALES_SUPPORTED, DiscoveryCapabilities, DiscoveryEndpoint,
     DiscoveryState, ID_TOKEN_CLAIMS_SUPPORTED, SCOPES_SUPPORTED, UI_LOCALES_SUPPORTED,

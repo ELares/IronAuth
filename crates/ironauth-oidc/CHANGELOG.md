@@ -6,6 +6,42 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Complete the client authentication suite with JWT assertions and uniform
+  failure hygiene (issue #25).
+  - **`private_key_jwt` (RFC 7523).** A client authenticates the token endpoint
+    with a JWS assertion signed by a key it registered (`jwks` inline or a
+    `jwks_uri` fetched through the SSRF-hardened `ironauth-fetch`, cached with a
+    TTL). Every asymmetric algorithm the verify core represents is accepted
+    (`EdDSA`, `RS256/384/512`, `ES256/384`, `PS256/384/512`); an `ES512`
+    assertion is rejected, matching the M1 exclusion. The assertion is validated
+    through the one hardened `verify` path: `iss` and `sub` must equal the client
+    id, `exp` is enforced with the configured skew through the `Clock` seam, and
+    `aud` must be an accepted audience per the `oidc.client_assertion_audience`
+    policy (the token-endpoint URL or the issuer by default, issuer-only in the
+    strict mode). `jti` is required and spent through the cross-node
+    single-use store, so a replayed assertion is refused on every node.
+  - **`client_secret_jwt` fails closed, by decision.** The method is recognized,
+    parsed, and routed, but authentication is refused with a diagnostic rather
+    than verified. HMAC verification would require the raw client secret at
+    verify time, and IronAuth stores only a one-way hash of client secrets;
+    implementing it would have weakened the `basic`/`post` hashed-secret posture
+    or pulled in retrievable-secret key management, both out of scope for #25.
+    The method is therefore NOT advertised in discovery's
+    `token_endpoint_auth_methods_supported`, and the tradeoff is documented at
+    the top of `client_auth.rs`.
+  - **Uniform failure hygiene.** Presenting more than one authentication method
+    is an `invalid_request`; every other authentication failure is an opaque
+    `invalid_client` (HTTP 401 with the correct `WWW-Authenticate` challenge only
+    when the client used HTTP Basic, per RFC 6749 5.2), with no oracle
+    distinguishing an unknown client from a bad signature from a replayed `jti`.
+    The rich reason is written out of band to `client_auth_diagnostics`, never to
+    the wire. Exactly one registered method is honored per client.
+  - **Reusable `authenticate_client` seam.** The token endpoint's client
+    authentication is now the crate-public `client_auth::authenticate_client`
+    (over `ClientAuthInputs`), so #22 introspection/revocation and #26's JWT
+    bearer grant inherit the same parsing, routing, verification, single-use, and
+    diagnostics without reimplementing them. `ClientKeyResolver` centralizes
+    `jwks`/`jwks_uri` key resolution and caching.
 - JWT (RFC 9068) and opaque access tokens with per-resource-server format
   selection (issue #29).
   - **RFC 9068 `at+jwt` conformance.** The access token now carries the RFC 9068

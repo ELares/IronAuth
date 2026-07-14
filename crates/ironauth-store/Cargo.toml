@@ -124,6 +124,15 @@ name = "opaque_access_tokens"
 path = "tests/opaque_access_tokens.rs"
 required-features = ["testing"]
 
+# The JWT-assertion client-authentication store surfaces (issue #25): the
+# cross-node single-use jti replay cache (two store handles, one database), the
+# safe TTL prune, cross-scope isolation, and the out-of-band diagnostics sink.
+# Needs a real database (DATABASE_URL).
+[[test]]
+name = "client_auth_suite"
+path = "tests/client_auth_suite.rs"
+required-features = ["testing"]
+
 # Compile-fail proofs. Database-free, so it runs on every lane (including MSRV).
 [[test]]
 name = "compile_fail"

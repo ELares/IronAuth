@@ -6,6 +6,19 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Add the JWT client-assertion authentication knobs (issue #25), shared with the
+  JWT bearer grant (#26):
+  - `oidc.client_assertion_audience`, a `ClientAssertionAudience` enum selecting
+    which `aud` values a client assertion may carry. The default
+    (`token_endpoint_or_issuer`) accepts either the token-endpoint URL (the
+    RFC 7523 recommendation) or the issuer identifier, so a client that targets
+    either is interoperable out of the box; `issuer_only` is the strict posture
+    that accepts the issuer identifier alone. A promotable per-environment
+    setting.
+  - `oidc.client_assertion_max_skew_secs` (default `60`), the clock-skew
+    allowance applied to a client assertion's `exp` through the verify core's
+    skew parameter, bounded above by `OIDC_MAX_CLIENT_ASSERTION_SKEW_SECS` (300).
+  - The generated `docs/config-schema.json` and `docs/CONFIG.md` are regenerated.
 - Add `oidc.default_access_token_format` (issue #29), a `TokenFormat` enum
   (`at_jwt` or `opaque`) selecting the access-token format an environment mints
   when no resource server is targeted. The spec-conform default (`at_jwt`) mints a

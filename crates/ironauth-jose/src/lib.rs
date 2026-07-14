@@ -140,7 +140,7 @@ pub mod seams;
 pub use claims::VerifiedClaims;
 pub use cnf::{CnfError, Confirmation};
 pub use error::{RejectReason, VerifyError};
-pub use jwks::{Jwk, JwkSet};
+pub use jwks::{Jwk, JwkSet, trusted_keys_from_jwks};
 pub use keystore::EnvironmentKeyStore;
 pub use mint::{
     ClientSecret, ClientSecretContext, ClientSecretJws, EmissionOptions, MacAlgorithm, SignError,

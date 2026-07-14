@@ -6,6 +6,14 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- `trusted_keys_from_jwks(json)` (issue #25): parse a JWK Set document into the
+  `TrustedKey`s the verify core accepts, for authenticating a client's
+  `private_key_jwt` assertion against its registered `jwks`/`jwks_uri`. Fails
+  closed by construction: a key of a type the verify core cannot represent (an
+  OKP curve other than Ed25519, an EC P-521 key -- the `ES512` family M1
+  excludes, an `oct` symmetric key) or a malformed member is skipped rather than
+  guessed, so an unparsable or all-unrepresentable document yields an empty set
+  and the caller rejects. Public keys only; no secret material crosses this seam.
 - `KeySet::published_signing_keys(now)` (issue #194): the private signing keys
   published at `now` (publish window open, not yet expired), for a caller that
   needs the trusted VERIFYING projection of an issuer's own currently-valid keys

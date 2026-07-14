@@ -60,7 +60,7 @@ use ironauth_store::{
 use serde::Deserialize;
 
 use crate::claims_request::ClaimsRequest;
-use crate::client_auth::{self, ClientAuthParseError, PresentedClientAuth};
+use crate::client_auth::{self, AuthenticatedClient, ClientAuthError, ClientAuthInputs};
 use crate::error::TokenError;
 use crate::pkce::verify_s256;
 use crate::registry::GrantType;
@@ -93,6 +93,11 @@ pub struct TokenParams {
     pub client_id: Option<String>,
     /// The client secret for `client_secret_post` authentication (issue #20).
     pub client_secret: Option<String>,
+    /// The JWT client assertion for `private_key_jwt` / `client_secret_jwt`
+    /// authentication (issue #25).
+    pub client_assertion: Option<String>,
+    /// The RFC 7521 `client_assertion_type` accompanying `client_assertion`.
+    pub client_assertion_type: Option<String>,
     /// The PKCE `code_verifier`, checked against the bound `code_challenge`.
     pub code_verifier: Option<String>,
 }
@@ -104,6 +109,8 @@ impl fmt::Debug for TokenParams {
             .field("redirect_uri", &self.redirect_uri)
             .field("client_id", &self.client_id)
             .field("has_client_secret", &self.client_secret.is_some())
+            .field("has_client_assertion", &self.client_assertion.is_some())
+            .field("client_assertion_type", &self.client_assertion_type)
             .field("has_code", &self.code.is_some())
             .finish_non_exhaustive()
     }
@@ -312,76 +319,44 @@ fn bindings_match(bindings: &CodeBindings, params: &TokenParams) -> bool {
     redirect_ok && pkce_ok
 }
 
-/// Authenticate the client for a token request (issue #20): parse the presented
-/// credentials (Basic header or post body), resolve the client's registered
-/// authentication record within the code's scope, and verify the credentials
-/// against the registered method. Returns the authenticated credentials (whose
-/// `client_id` the caller re-checks against the code's binding).
+/// Authenticate the client for a token request through the ONE reusable seam
+/// ([`client_auth::authenticate_client`], issues #20 and #25): it parses the
+/// presented credentials (Basic header, post body, or a JWT assertion), resolves
+/// the client's single registered method within the code's scope, verifies the
+/// credentials against it, records any failure out of band, and returns the
+/// authenticated client (whose `client_id` the caller re-checks against the code).
+/// The introspection and revocation endpoints (#22) will call the same seam, so
+/// enforcement is identical across all three.
 ///
 /// # Errors
 ///
-/// A parse problem (multiple methods, malformed Basic, missing/conflicting client
-/// id) is an `invalid_request`; an unknown client or a credential that does not
-/// satisfy the registered method is the spec-exact `invalid_client` (401, with
-/// `WWW-Authenticate: Basic` when the client attempted Basic).
+/// A parse problem is an `invalid_request`; an unknown client or a credential that
+/// does not satisfy the registered method is the spec-exact, opaque `invalid_client`
+/// (401, with `WWW-Authenticate: Basic` when the client attempted Basic).
 async fn authenticate_client(
     state: &OidcState,
     scope: Scope,
     headers: &HeaderMap,
     params: &TokenParams,
-) -> Result<PresentedClientAuth, TokenError> {
+) -> Result<AuthenticatedClient, TokenError> {
     let authorization = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok());
-    let presented = client_auth::parse_presented(
+    let inputs = ClientAuthInputs {
         authorization,
-        params.client_id.as_deref(),
-        params.client_secret.as_deref(),
-    )
-    .map_err(map_parse_error)?;
-    let via_basic = presented.method == client_auth::ClientAuthMethod::Basic;
-
-    // Resolve the client's registered auth record within the code's scope. A
-    // malformed or unknown client is the uniform invalid_client (never an
-    // existence oracle across scopes).
-    let client_id = ClientId::parse_in_scope(&presented.client_id, &scope)
-        .map_err(|_| TokenError::InvalidClient { via_basic })?;
-    let record = match state
-        .store()
-        .scoped(scope)
-        .clients()
-        .auth_record(&client_id)
-        .await
-    {
-        Ok(record) => record,
-        Err(StoreError::NotFound) => return Err(TokenError::InvalidClient { via_basic }),
-        Err(other) => return Err(map_store_error(other)),
+        client_id: params.client_id.as_deref(),
+        client_secret: params.client_secret.as_deref(),
+        client_assertion: params.client_assertion.as_deref(),
+        client_assertion_type: params.client_assertion_type.as_deref(),
     };
-
-    client_auth::authenticate(&record, &presented).map_err(|failure| {
-        TokenError::InvalidClient {
-            via_basic: failure.via_basic,
-        }
-    })?;
-    Ok(presented)
-}
-
-/// Map a client-auth parse error to a token-endpoint error. A malformed Basic
-/// credential is an authentication failure (`invalid_client` via Basic); the rest
-/// are request problems (`invalid_request`), never revealing the client's secret.
-fn map_parse_error(error: ClientAuthParseError) -> TokenError {
-    match error {
-        ClientAuthParseError::MalformedBasic => TokenError::InvalidClient { via_basic: true },
-        ClientAuthParseError::MultipleMethods => {
-            TokenError::InvalidRequest("more than one client authentication method".to_owned())
-        }
-        ClientAuthParseError::MissingClientId => {
-            TokenError::InvalidRequest("client_id is required".to_owned())
-        }
-        ClientAuthParseError::ClientIdMismatch => {
-            TokenError::InvalidRequest("conflicting client_id".to_owned())
-        }
-    }
+    client_auth::authenticate_client(state, scope, inputs)
+        .await
+        .map_err(|error| match error {
+            ClientAuthError::InvalidRequest(message) => {
+                TokenError::InvalidRequest(message.to_owned())
+            }
+            ClientAuthError::InvalidClient { via_basic } => TokenError::InvalidClient { via_basic },
+        })
 }
 
 /// Mint the ID and access tokens through the signing core. A missing signing key

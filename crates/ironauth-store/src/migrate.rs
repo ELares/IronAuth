@@ -236,7 +236,10 @@ CREATE TABLE IF NOT EXISTS _schema_migrations ( \
 /// audience-to-token-format table the mint reads to select a registered resource
 /// server's access-token format) is version 11; the `opaque_access_tokens` store
 /// (issue #29: the digest-only reference-token table the internal resolve reads)
-/// is version 12. That is
+/// is version 12; the JWT-assertion client-authentication suite (issue #25: the
+/// additive `clients` key/alg registration columns, the cross-node single-use
+/// `client_assertion_jtis` replay cache, and the out-of-band
+/// `client_auth_diagnostics` sink) is version 13. That is
 /// the whole production chain: it deliberately
 /// carries no throwaway objects, so a real database never gains a demo table or
 /// ledger rows beyond what the product needs. The worked expand-contract example
@@ -318,6 +321,12 @@ fn registry() -> Vec<Migration> {
             name: "opaque_access_tokens",
             phase: Phase::Expand,
             sql: include_str!("../migrations/0012_opaque_access_tokens.sql"),
+        },
+        Migration {
+            version: 13,
+            name: "client_auth_suite",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0013_client_auth_suite.sql"),
         },
     ]
 }

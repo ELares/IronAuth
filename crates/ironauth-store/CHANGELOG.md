@@ -6,6 +6,35 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Client JWT-assertion authentication persistence (issue #25, migration 0013,
+  expand).
+  - **Client key registration.** `clients` gains `jwks`, `jwks_uri`, and
+    `token_endpoint_auth_signing_alg`, with a `clients_client_keys_exclusive`
+    CHECK forbidding both an inline `jwks` and a `jwks_uri` on one client.
+    `ClientAuthRecord` carries the three columns and
+    `ActingClientRepo::create_jwt_auth` registers a `private_key_jwt` client
+    (mapping the CHECK violation, SQLSTATE 23514, to a `Conflict`).
+  - **Cross-node single-use `jti` cache.** New tenant-scoped
+    `client_assertion_jtis` table keyed on the assertion `jti`, with a unique
+    constraint that makes replay a database-level conflict every node observes,
+    not a per-process guess. `ClientAssertionJtiRepo::record` prunes rows already
+    past their stored `expires_at` and then inserts, returning `Replayed` on the
+    unique violation and `Recorded` otherwise; `expires_at` is the assertion
+    `exp` plus the configured skew, so pruning never removes a still-valid
+    assertion's `jti` and never opens a replay window.
+  - **Out-of-band failure diagnostics.** New tenant-scoped
+    `client_auth_diagnostics` table records a structured reason (`unparsable`,
+    `unknown_client`, `method_mismatch`, `bad_secret`, `assertion_invalid`,
+    `replayed_jti`, `client_secret_jwt_unsupported`) with the offending client,
+    method, key id, and signing alg, for operators -- never on the wire, so the
+    HTTP response stays an opaque `invalid_client`. `ClientAuthDiagnosticsRepo`
+    records and reads within scope.
+  - Both new tables get ENABLE + FORCE row-level security, the
+    `(tenant, environment)` isolation policy (USING + WITH CHECK), the
+    nonempty-scope CHECK, and least-privilege grants (`SELECT, INSERT, DELETE` for
+    the `jti` cache, `SELECT, INSERT` for diagnostics). Like `idempotency_keys`
+    they sit off the audited-write path (an authentication attempt is not a
+    tenant data mutation). Migration guard bumped to thirteen.
 - Access-token formats: resource-server registry and opaque, digest-only access
   tokens (issue #29).
   - **New `resource_servers` table (migration 0011, expand).** A tenant-scoped
