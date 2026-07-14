@@ -94,6 +94,25 @@ settings, so they are owner actions and are NOT done in the repo:
    token, or auto-verify DCR clients in the cert environment. Validate on the
    first live run.
 
+9. Pin the OP-under-test image's base tags. The `ironauth-cert` service builds
+   from [`deploy/Dockerfile`](../../deploy/Dockerfile), whose bases are mutable
+   tags (`FROM rust:1.97-bookworm` and `FROM debian:bookworm-slim`). That file is
+   outside `deploy/conformance`, so the always-on digest scan in
+   `scripts/conformance-check.sh` (which now also covers `Dockerfile` `FROM`
+   bases inside the harness directory) does not reach it, yet the determinism
+   rule (a rerun months later resolving the identical bits) applies to the whole
+   cert stack. Pin each base by digest the same way as the suite images in step 1:
+
+   ```
+   docker pull debian:bookworm-slim
+   docker image inspect debian:bookworm-slim --format '{{index .RepoDigests 0}}'
+   ```
+
+   Paste each `image@sha256:...` back into `deploy/Dockerfile`. This touches the
+   product image, not just the conformance harness, so it carries build-lane risk
+   and is deliberately kept as an owner/infra decision separate from the #37
+   harness work.
+
 The badge job's `contents:write` token is already scoped to that single job in
 `conformance-nightly.yml`; there is nothing for an owner to add beyond enabling
 the workflow. The PR pipeline never holds a write token.

@@ -11,8 +11,11 @@
 #   1. the results gate's own unit tests (parse_results.py / normalize),
 #   2. the JSON files (waivers, fixtures) are well formed,
 #   3. the profile matrix and compose YAML parse and have the expected shape,
-#   4. EVERY image reference anywhere under deploy/conformance is pinned BY
-#      DIGEST, never a mutable tag (compose files AND shell scripts),
+#   4. EVERY image reference under deploy/conformance is pinned BY DIGEST, never
+#      a mutable tag: compose `image:` keys, `docker run` invocations, AND
+#      `Dockerfile` `FROM` bases. (The ironauth-cert service builds from
+#      deploy/Dockerfile, which is OUTSIDE this directory; its base tags are an
+#      owner/infra pin, tracked in docs/conformance/RUNBOOK.md, not enforced here.)
 #   5. the runner's plan config can actually be GENERATED from the matrix and has
 #      the right shape (its absence used to be a latent run-time failure),
 #   6. the cert-only downgrades are present in the cert config and ABSENT from
@@ -71,6 +74,15 @@ print(f"matrix ok: {len(enabled)} enabled, {len(gated)} deferred, {len(mg)} on m
 PY
 else
     note "PyYAML absent: structural fallback (deep YAML parse skipped)"
+    echo "conformance-check: ##########################################################"
+    echo "conformance-check: DEGRADED: install PyYAML for the full check. This local"
+    echo "conformance-check: run has NO PyYAML, so it does the weak structural fallback"
+    echo "conformance-check: only: it does NOT assert the >=4-enabled-merge-gate-profiles"
+    echo "conformance-check: rule and does NOT render the plan config. A pass here is"
+    echo "conformance-check: NOT the real gate. CI installs PyYAML hash-pinned and runs"
+    echo "conformance-check: the full check; reproduce it locally with 'pip install"
+    echo "conformance-check: --require-hashes -r $conf/requirements.txt'."
+    echo "conformance-check: ##########################################################"
     grep -q '^profiles:' "$conf/profile-matrix.yaml" \
         || { echo "conformance-check: profile-matrix.yaml missing 'profiles:'"; fail=1; }
     grep -Eq 'issuer:[[:space:]]*"[^"]*[^/]"' "$conf/profile-matrix.yaml" \
@@ -85,8 +97,11 @@ fi
 #    pinned by digest, never a mutable tag" claim BLIND to the rest of the
 #    harness: seed.sh ran `docker run alpine:3.20` (a mutable tag, plus a package
 #    installed from the network at run time) and nothing noticed. The scan now
-#    covers every file in the directory, shell scripts included, so the claim is
-#    true of the whole harness rather than of one file.
+#    covers every file in the directory, shell scripts AND Dockerfile FROM bases
+#    included, so the claim is true of the whole harness rather than of one file.
+#    The one image it cannot reach is the ironauth-cert service's own base, built
+#    from deploy/Dockerfile (outside this directory); that is an owner/infra pin,
+#    recorded in docs/conformance/RUNBOOK.md's owner-action list.
 note "image digest pinning (every file under $conf)"
 
 # 4a. Every compose image var resolves to a digest pin in SUITE_VERSION.
@@ -119,6 +134,43 @@ if [ -n "$docker_runs" ]; then
     echo "conformance-check: a 'docker run' uses an un-pinned (non-digest) image:"
     printf '%s\n' "$docker_runs"
     echo "conformance-check: pin it by digest, or do not run a container here."
+    fail=1
+fi
+
+# 4d. No `Dockerfile` `FROM <ref>` anywhere under the harness may use a mutable
+#     tag. The image:/docker-run scans above never look inside a Dockerfile, so a
+#     `FROM alpine:3.20` would escape the "every image is pinned by digest" claim
+#     entirely. A base image the gate builds on is trusted exactly like a pulled
+#     one, so it is pinned by digest too. Multi-stage `FROM <ref> AS <stage>` is
+#     covered: the ref is the token after FROM (past an optional --platform=
+#     flag), and a `FROM <stage>` that names an earlier build stage is skipped
+#     because a bare stage name carries no registry ref (no ':' '/' or '@').
+note "Dockerfile FROM digest pinning (every Dockerfile under $conf)"
+# A helper (not an inline command substitution): stock macOS bash is 3.2, and 3.2
+# mis-parses a `case` that sits directly inside a multi-line $( ... ), so the scan
+# lives in a function that the substitution then calls.
+_scan_dockerfile_froms() {
+    find "$conf" -type f \
+        \( -name 'Dockerfile' -o -name 'Dockerfile.*' -o -name '*.Dockerfile' \) -print 2>/dev/null \
+    | while IFS= read -r df; do
+        grep -Eni '^[[:space:]]*from[[:space:]]' "$df" | while IFS= read -r hit; do
+            lineno="${hit%%:*}"
+            rest="${hit#*:}"
+            ref="$(printf '%s\n' "$rest" \
+                | sed -E 's/^[[:space:]]*[Ff][Rr][Oo][Mm][[:space:]]+//; s/^--[^[:space:]]+[[:space:]]+//; s/[[:space:]].*$//')"
+            case "$ref" in
+                *@sha256:*) : ;;                                                  # pinned by digest, ok
+                *:*|*/*|*@*) printf '%s:%s: FROM %s\n' "$df" "$lineno" "$ref" ;;  # registry ref, unpinned
+                *) : ;;                                                           # bare stage name, not an image
+            esac
+        done
+    done
+}
+from_unpinned="$(_scan_dockerfile_froms)"
+if [ -n "$from_unpinned" ]; then
+    echo "conformance-check: a Dockerfile FROM uses an un-pinned (non-digest) base image:"
+    printf '%s\n' "$from_unpinned"
+    echo "conformance-check: pin the base by digest (FROM image@sha256:...)."
     fail=1
 fi
 

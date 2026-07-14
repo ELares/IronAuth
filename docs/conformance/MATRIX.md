@@ -65,8 +65,11 @@ claim, mechanically:
   (`scripts/conformance-check.sh`, in the `invariants` job), which no repository
   variable gates. It runs the results-gate unit tests, validates the matrix,
   renders every enabled profile's runner config, verifies every image reference
-  under `deploy/conformance` is digest-pinned, and re-checks downgrade
-  confinement, on every PR.
+  under `deploy/conformance` (compose images, `docker run`, and `Dockerfile`
+  `FROM` bases) is digest-pinned, and re-checks downgrade confinement, on every
+  PR. The one image outside that scope is the `ironauth-cert` service's own base,
+  built from `deploy/Dockerfile`; pinning it is an owner/infra item tracked in
+  the RUNBOOK.
 
 When a logout dependency merges, flip that profile to `enabled: true` in the
 SAME PR, so the gate starts holding it exactly when the surface becomes real.

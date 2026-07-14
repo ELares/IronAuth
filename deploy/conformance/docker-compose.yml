@@ -17,8 +17,11 @@
 #   conformance-httpd  The suite's own TLS front proxy, published to the host so
 #                   a developer can open the suite UI and one-command reproduce.
 #
-# Every image is pinned BY DIGEST via the SUITE_VERSION env-file (never a mutable
-# tag). Bring it up with the helper, which loads the pins and seeds:
+# Every pulled image is pinned BY DIGEST via the SUITE_VERSION env-file (never a
+# mutable tag). The ironauth-cert service is the exception: it BUILDS from
+# deploy/Dockerfile rather than pulling, and that file's base tags are an
+# owner/infra pin recorded in docs/conformance/RUNBOOK.md. Bring it up with the
+# helper, which loads the pins and seeds:
 #
 #     docker compose --env-file SUITE_VERSION -f docker-compose.yml up -d
 #

@@ -7,19 +7,25 @@
 #
 #     docker compose --env-file SUITE_VERSION -f docker-compose.yml <cmd>
 #
-# Determinism rule: every image is pinned BY DIGEST (sha256), never by a mutable
-# tag, so a rerun months later resolves the identical bits. The *_VERSION values
-# are informational (which upstream release the digest was taken from); the
-# *_IMAGE values in digest form are what compose actually resolves.
+# Determinism rule: every image pinned in THIS file is pinned BY DIGEST (sha256),
+# never by a mutable tag, so a rerun months later resolves the identical bits. The
+# *_VERSION values are informational (which upstream release the digest was taken
+# from); the *_IMAGE values in digest form are what compose actually resolves.
 #
 # That rule is ENFORCED, and enforced over the whole harness, not just this file:
 # scripts/conformance-check.sh scans EVERY file under deploy/conformance (shell
-# scripts included) and fails on any `image:` key or `docker run` that is not
-# pinned by @sha256:. It previously scanned only docker-compose.yml, which is how
-# seed.sh came to run a mutable `alpine:3.20` inside the gate lane, with a package
-# installed from the network at run time, while this file claimed otherwise. The
-# seed now installs a COMMITTED Argon2id hash (cert-user-password.phc) and pulls
-# no image at all.
+# scripts and Dockerfile FROM bases included) and fails on any `image:` key,
+# `docker run`, or `Dockerfile` `FROM` that is not pinned by @sha256:. It
+# previously scanned only docker-compose.yml, which is how seed.sh came to run a
+# mutable `alpine:3.20` inside the gate lane, with a package installed from the
+# network at run time, while this file claimed otherwise. The seed now installs a
+# COMMITTED Argon2id hash (cert-user-password.phc) and pulls no image at all.
+#
+# ONE image is out of both this file's and the check's scope: the ironauth-cert
+# service builds from deploy/Dockerfile (outside deploy/conformance), whose base
+# tags (rust, debian) are NOT pinned here. The determinism rule still applies to
+# the whole cert stack, so pinning them by digest is an owner/infra action,
+# recorded on the docs/conformance/RUNBOOK.md owner-action list.
 #
 # HOW TO RESOLVE OR BUMP A DIGEST (owner/infra step; needs registry network):
 #     docker pull <image>:<tag>

@@ -70,7 +70,11 @@ cargo test -p ironauth-oidc  --test conformance_seed           # the committed s
   string; `conformance-check.sh` rejects a trailing slash.
 - Images: every image reference in this directory is pinned by sha256 digest,
   never a mutable tag. `conformance-check.sh` enforces that across EVERY file
-  here, shell scripts included, not just `docker-compose.yml`.
+  here, shell scripts and `Dockerfile` `FROM` bases included, not just
+  `docker-compose.yml`. The one image it cannot reach is the `ironauth-cert`
+  service's own base: it builds from `deploy/Dockerfile` (outside this
+  directory), whose base tags are an owner/infra pin recorded on the RUNBOOK
+  owner-action list.
 - Python: exact- and hash-pinned in `requirements.txt`; CI installs with
   `--require-hashes` against a pinned CPython 3.12.
 - Seed: one fixed operator/tenant/environment/user, so login and consent are

@@ -56,9 +56,14 @@ Verified locally, on every PR, with no external suite:
   password, through the product's own verifier:
   `crates/ironauth-oidc/tests/conformance_seed.rs`;
 - the profile matrix and compose file are well formed, every enabled profile
-  renders a valid runner plan config, every image reference anywhere under
-  `deploy/conformance` is pinned by digest, the harness cannot fail open, and no
-  downgrade has leaked into the default: `scripts/conformance-check.sh`.
+  renders a valid runner plan config, every image reference under
+  `deploy/conformance` (compose `image:` keys, `docker run` invocations, and
+  `Dockerfile` `FROM` bases) is pinned by digest, the harness cannot fail open,
+  and no downgrade has leaked into the default: `scripts/conformance-check.sh`.
+  One image is outside that scope: the `ironauth-cert` service builds from
+  `deploy/Dockerfile`, whose base tags (`rust`, `debian`) live outside
+  `deploy/conformance`; pinning them is an owner/infra item on the RUNBOOK
+  owner-action list, not something this check enforces.
 
 Needs the provisioned runner (owner/infra; the complete list is in the RUNBOOK):
 
