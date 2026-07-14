@@ -55,7 +55,15 @@ cd "$(git rev-parse --show-toplevel)"
 # client-authentication tables: the cross-node single-use jti replay cache and the
 # out-of-band client-authentication diagnostics sink. Both are TENANT-SCOPED with
 # forced row-level security, so their SQL stays in the repository module too.
-SCOPED_TABLES='clients|organizations|audit_log|management_credentials|idempotency_keys|grants|authorization_codes|issued_tokens|signing_keys|users|sessions|consents|resource_servers|opaque_access_tokens|client_assertion_jtis|client_auth_diagnostics|refresh_families|refresh_tokens'
+#
+# pushed_authorization_requests (#27) is the PAR store (RFC 9126): the single-use
+# request_uri table the authorization endpoint consumes. TENANT-SCOPED with forced
+# row-level security, so its SQL stays in the repository module too.
+#
+# refresh_families and refresh_tokens (#21) are the refresh-token rotation tables:
+# the revocation spine and the digest-only generation store. Both are TENANT-SCOPED
+# with forced row-level security, so their SQL stays in the repository module too.
+SCOPED_TABLES='clients|organizations|audit_log|management_credentials|idempotency_keys|grants|authorization_codes|issued_tokens|signing_keys|users|sessions|consents|resource_servers|opaque_access_tokens|client_assertion_jtis|client_auth_diagnostics|pushed_authorization_requests|refresh_families|refresh_tokens'
 
 # The one module allowed to name a scoped table in SQL.
 REPO_MODULE='crates/ironauth-store/src/repository.rs'

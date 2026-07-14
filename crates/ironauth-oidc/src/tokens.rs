@@ -210,6 +210,16 @@ pub struct MintRequest<'a> {
     /// win: an entry whose name is already set (for example `sub`) is never
     /// overwritten.
     pub extra_claims: &'a serde_json::Map<String, serde_json::Value>,
+    /// The per-client ID-token signing key (issue #30): the environment key of the
+    /// algorithm this client negotiated as its `id_token_signed_response_alg` at
+    /// dynamic registration. When [`Some`], the ID token (ONLY the ID token, never
+    /// the access token) is signed with this key, so the algorithm DCR recorded and
+    /// echoed at registration is the algorithm the ID token is actually signed
+    /// under. [`None`] signs the ID token with the environment default `signer`,
+    /// exactly as before DCR (every non-DCR client, and any DCR client whose
+    /// negotiated algorithm IS the environment default). The caller resolves it from
+    /// the environment key set, so it is always a key the policy permits.
+    pub id_token_signer: Option<&'a SigningKey>,
 }
 
 /// Why building the ID token claims failed. Every variant is fail-closed at
@@ -411,9 +421,14 @@ pub fn mint(
                 "refusing to issue an ID token with an invalid subject"
             );
         })?;
+    // The ID token is signed with the per-client key when the client negotiated a
+    // non-default `id_token_signed_response_alg` at registration (issue #30), else
+    // the environment default. The access token below always uses the environment
+    // default `signer`.
+    let id_signer = request.id_token_signer.unwrap_or(signer);
     let id_token = sign_jws_with_policy(
         policy,
-        signer,
+        id_signer,
         &serde_json::to_vec(&id_claims).map_err(|_| ())?,
         &EmissionOptions::new().with_typ("JWT"),
     )
@@ -576,9 +591,14 @@ pub fn mint_id_token(
                 "refusing to issue a front-channel ID token with an invalid subject"
             );
         })?;
+    // Honor a per-client ID-token signing key when supplied (issue #30), else the
+    // environment default. The front-channel caller passes [`None`]: a DCR client
+    // registers `response_types = ["code"]` only, so it can never reach this path,
+    // and the front-channel `c_hash` algorithm is derived from the same `signer`.
+    let id_signer = request.id_token_signer.unwrap_or(signer);
     let id_token = sign_jws_with_policy(
         policy,
-        signer,
+        id_signer,
         &serde_json::to_vec(&id_claims).map_err(|_| ())?,
         &EmissionOptions::new().with_typ("JWT"),
     )
@@ -643,6 +663,7 @@ mod tests {
             at_hash: None,
             c_hash: None,
             extra_claims: empty_extra(),
+            id_token_signer: None,
         }
     }
 

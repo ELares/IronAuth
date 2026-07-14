@@ -56,8 +56,8 @@ use crate::audit::{ActingContext, Action, ActorRef};
 use crate::error::StoreError;
 use crate::id::{
     AuditId, AuditTarget, AuthorizationCodeId, ClientId, ConsentId, CorrelationId, EnvironmentId,
-    GrantId, IssuedTokenId, ManagementKeyId, OperatorId, RefreshFamilyId, RefreshTokenId,
-    ResourceServerId, SessionId, SigningKeyId, TenantId, UserId,
+    GrantId, IssuedTokenId, ManagementKeyId, OperatorId, PushedRequestId, RefreshFamilyId,
+    RefreshTokenId, ResourceServerId, SessionId, SigningKeyId, TenantId, UserId,
 };
 use crate::scope::Scope;
 use crate::store::Store;
@@ -203,6 +203,19 @@ impl<'a> ScopedStore<'a> {
         }
     }
 
+    /// The read-only pushed-authorization-request repository for this scope (RFC
+    /// 9126, issue #27). PEEKS a `request_uri`'s stored parameters WITHOUT consuming
+    /// them, so the authorization endpoint can resolve a PAR reference across the
+    /// login/consent interaction round-trip; the single-use consume lives on
+    /// [`ActingStore::pushed_authorization_requests`].
+    #[must_use]
+    pub fn pushed_authorization_requests(&self) -> PushedRequestRepo<'a> {
+        PushedRequestRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
     /// Enter an acting context (who is acting, and under which correlation id).
     /// The returned store hands out the *mutating* repositories, so every write
     /// carries an actor and a correlation id into its audit row.
@@ -319,9 +332,27 @@ impl<'a> ActingStore<'a> {
             acting: self.acting,
         }
     }
+
+    /// The mutating pushed-authorization-request repository for this scope and actor
+    /// (RFC 9126, issue #27): push a validated authorization request behind a
+    /// one-time `request_uri`, and atomically consume it exactly once at the
+    /// authorization endpoint. Both the push and the consume audit in the same
+    /// transaction as the state change.
+    #[must_use]
+    pub fn pushed_authorization_requests(&self) -> ActingPushedRequestRepo<'a> {
+        ActingPushedRequestRepo {
+            store: self.store,
+            scope: self.scope,
+            acting: self.acting,
+        }
+    }
 }
 
 /// A record read back from the `clients` table, always within scope.
+// The registration flags crossed clippy's `struct_excessive_bools` threshold when
+// the #21 consent-mode knobs and the #27 require-PAR flag landed together; each is
+// an independent per-client registration attribute, not a state machine.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientRecord {
     /// The client identifier (embeds its tenant and environment).
@@ -353,6 +384,11 @@ pub struct ClientRecord {
     /// consent row (issue #21). `false` is the performance knob: skip the screen
     /// AND write no consent row.
     pub store_skipped_consent: bool,
+    /// Whether this client requires a pushed authorization request (RFC 9126
+    /// section 5, issue #27): when true, a plain (non-PAR) authorization request
+    /// from this client is rejected with `invalid_request`. The environment-wide
+    /// switch (config) applies on top of this per-client flag.
+    pub require_pushed_authorization_requests: bool,
 }
 
 /// The client-authentication metadata for a client, read within scope (issue
@@ -430,6 +466,151 @@ pub struct NewJwtAuthClient<'a> {
     pub signing_alg: Option<&'a str>,
 }
 
+/// A dynamically registered client's stored configuration (issue #30), read
+/// within scope for the RFC 7592 read/update/delete surface and for
+/// authenticating a presented registration access token.
+///
+/// [`fmt::Debug`] is hand written: `registration_access_token_hash` is a stored
+/// credential hash, so a struct dump or a `tracing` field never spills it (its
+/// presence is reported as a bool instead), exactly like [`ClientAuthRecord`].
+#[derive(Clone, PartialEq, Eq)]
+pub struct DynamicClientRecord {
+    /// The client identifier (embeds its tenant and environment).
+    pub id: ClientId,
+    /// The human-facing display name (`client_name`).
+    pub display_name: String,
+    /// The registered `token_endpoint_auth_method` wire string.
+    pub auth_method: String,
+    /// The registered redirect URI set.
+    pub redirect_uris: Vec<String>,
+    /// The RFC 8252 `application_type` (`web` or `native`), or `None` for a client
+    /// that predates DCR.
+    pub application_type: Option<String>,
+    /// The negotiated `id_token_signed_response_alg`, or `None` for a pre-DCR
+    /// client.
+    pub id_token_signed_response_alg: Option<String>,
+    /// The client's inline `jwks` (a JWK Set JSON document), or `None`.
+    pub jwks: Option<String>,
+    /// The client's `jwks_uri`, or `None`.
+    pub jwks_uri: Option<String>,
+    /// The pinned `token_endpoint_auth_signing_alg` for `private_key_jwt`, or
+    /// `None`.
+    pub token_endpoint_auth_signing_alg: Option<String>,
+    /// The RFC 7592 client configuration endpoint URL, or `None` for a pre-DCR
+    /// client.
+    pub registration_client_uri: Option<String>,
+    /// The SHA-256 (hex) hash of the RFC 7592 registration access token. The
+    /// management surface compares a presented token's hash against this in
+    /// constant time; `None` means the client is not a DCR registration.
+    pub registration_access_token_hash: Option<String>,
+    /// Creation time in microseconds since the Unix epoch (the DCR response's
+    /// `client_id_issued_at`).
+    pub created_at_unix_micros: i64,
+}
+
+impl fmt::Debug for DynamicClientRecord {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DynamicClientRecord")
+            .field("id", &self.id)
+            .field("display_name", &self.display_name)
+            .field("auth_method", &self.auth_method)
+            .field("redirect_uris", &self.redirect_uris)
+            .field("application_type", &self.application_type)
+            .field(
+                "id_token_signed_response_alg",
+                &self.id_token_signed_response_alg,
+            )
+            .field("has_jwks", &self.jwks.is_some())
+            .field("jwks_uri", &self.jwks_uri)
+            .field(
+                "token_endpoint_auth_signing_alg",
+                &self.token_endpoint_auth_signing_alg,
+            )
+            .field("registration_client_uri", &self.registration_client_uri)
+            .field(
+                "has_registration_access_token",
+                &self.registration_access_token_hash.is_some(),
+            )
+            .field("created_at_unix_micros", &self.created_at_unix_micros)
+            .finish()
+    }
+}
+
+/// The parameters for a Dynamic Client Registration (issue #30, RFC 7591),
+/// created through [`ActingClientRepo::register_dynamic`]. The OIDC layer has
+/// already validated the metadata, negotiated the algorithm, and hashed the
+/// secret and the registration access token; the repository stores them and mints
+/// the identifier.
+#[derive(Debug, Clone, Copy)]
+pub struct NewDynamicClient<'a> {
+    /// The `client_name` / display name (non-empty).
+    pub display_name: &'a str,
+    /// The validated `token_endpoint_auth_method` wire string
+    /// (`client_secret_basic`, `client_secret_post`, `private_key_jwt`, or `none`).
+    pub auth_method: &'a str,
+    /// The SHA-256 (hex) of the generated client secret, for a confidential
+    /// (`basic`/`post`) client; `None` for a public or `private_key_jwt` client.
+    pub secret_hash: Option<&'a str>,
+    /// The validated redirect URI set (already RFC 8252 / application-type
+    /// checked by the OIDC layer; the repository re-checks registrability).
+    pub redirect_uris: &'a [String],
+    /// The RFC 8252 `application_type` (`web` or `native`).
+    pub application_type: &'a str,
+    /// The negotiated `id_token_signed_response_alg`.
+    pub id_token_signed_response_alg: &'a str,
+    /// The inline `jwks`, or `None` (mutually exclusive with `jwks_uri`).
+    pub jwks: Option<&'a str>,
+    /// The `jwks_uri`, or `None`.
+    pub jwks_uri: Option<&'a str>,
+    /// The pinned `token_endpoint_auth_signing_alg`, or `None`.
+    pub token_endpoint_auth_signing_alg: Option<&'a str>,
+    /// The SHA-256 (hex) of the freshly minted registration access token.
+    pub registration_access_token_hash: &'a str,
+    /// The base of the RFC 7592 client configuration endpoint
+    /// (`{issuer}/connect/register`); the repository appends `/{client_id}` once
+    /// the identifier is minted.
+    pub registration_uri_base: &'a str,
+}
+
+/// The result of a Dynamic Client Registration: the minted identifier and the RFC
+/// 7592 client configuration endpoint URL built from it.
+#[derive(Debug, Clone)]
+pub struct DynamicClientRegistration {
+    /// The freshly minted client identifier.
+    pub id: ClientId,
+    /// The RFC 7592 client configuration endpoint URL
+    /// (`{issuer}/connect/register/{client_id}`).
+    pub registration_client_uri: String,
+}
+
+/// The full-replacement parameters for an RFC 7592 update (issue #30), applied
+/// through [`ActingClientRepo::update_dynamic`]. Every update ROTATES the
+/// registration access token: the new hash is stored and the old hash no longer
+/// matches. The client secret is deliberately NOT rotated by an update (it is kept
+/// as registered), so this struct carries no secret.
+#[derive(Debug, Clone, Copy)]
+pub struct DynamicClientUpdate<'a> {
+    /// The replacement `client_name` / display name (non-empty).
+    pub display_name: &'a str,
+    /// The replacement `token_endpoint_auth_method` wire string.
+    pub auth_method: &'a str,
+    /// The replacement redirect URI set (already validated by the OIDC layer; the
+    /// repository re-checks registrability).
+    pub redirect_uris: &'a [String],
+    /// The replacement `application_type`.
+    pub application_type: &'a str,
+    /// The re-negotiated `id_token_signed_response_alg`.
+    pub id_token_signed_response_alg: &'a str,
+    /// The replacement inline `jwks`, or `None`.
+    pub jwks: Option<&'a str>,
+    /// The replacement `jwks_uri`, or `None`.
+    pub jwks_uri: Option<&'a str>,
+    /// The replacement pinned `token_endpoint_auth_signing_alg`, or `None`.
+    pub token_endpoint_auth_signing_alg: Option<&'a str>,
+    /// The SHA-256 (hex) of the NEWLY ROTATED registration access token.
+    pub registration_access_token_hash: &'a str,
+}
+
 /// The read-only repository for tenant-scoped OAuth clients.
 ///
 /// The scope is fixed at construction and applied to every statement; there is
@@ -471,7 +652,8 @@ impl ClientRepo<'_> {
         let mut tx = begin_scoped(self.store, self.scope).await?;
         let row = sqlx::query(
             "SELECT id, display_name, require_auth_time, token_endpoint_auth_method, \
-             redirect_uris, consent_mode, skip_consent, store_skipped_consent FROM clients \
+             redirect_uris, consent_mode, skip_consent, store_skipped_consent, \
+             require_pushed_authorization_requests FROM clients \
              WHERE id = $1 AND tenant_id = $2 AND environment_id = $3",
         )
         .bind(id.to_string())
@@ -493,7 +675,8 @@ impl ClientRepo<'_> {
         let mut tx = begin_scoped(self.store, self.scope).await?;
         let rows = sqlx::query(
             "SELECT id, display_name, require_auth_time, token_endpoint_auth_method, \
-             redirect_uris, consent_mode, skip_consent, store_skipped_consent FROM clients \
+             redirect_uris, consent_mode, skip_consent, store_skipped_consent, \
+             require_pushed_authorization_requests FROM clients \
              WHERE tenant_id = $1 AND environment_id = $2 ORDER BY created_at, id",
         )
         .bind(self.scope.tenant().to_string())
@@ -543,6 +726,98 @@ impl ClientRepo<'_> {
         })
     }
 
+    /// The client's stored `id_token_signed_response_alg` within scope (issue #30),
+    /// or `None` when the client expressed no per-client preference (a client that
+    /// predates DCR, whose column is NULL) or is absent in this scope.
+    ///
+    /// The token endpoint reads this to sign THAT client's ID token with the
+    /// algorithm the client negotiated at registration, so the algorithm DCR
+    /// recorded and echoed is the algorithm the ID token is actually signed under.
+    /// A `None` (absent or no preference) leaves the mint on the environment default
+    /// signer, exactly as before DCR.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the identifier is out of this scope;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn id_token_signing_alg(&self, id: &ClientId) -> Result<Option<String>, StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT id_token_signed_response_alg FROM clients \
+             WHERE id = $1 AND tenant_id = $2 AND environment_id = $3",
+        )
+        .bind(id.to_string())
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(row.and_then(|row| row.get::<Option<String>, _>("id_token_signed_response_alg")))
+    }
+
+    /// Read a dynamically registered client's stored configuration within scope
+    /// (issue #30), for the RFC 7592 read/update/delete surface and for
+    /// authenticating a presented registration access token.
+    ///
+    /// ONLY a DCR-origin client (`dcr_registered`) is a dynamic registration: a
+    /// client created by any other path is the uniform [`StoreError::NotFound`]
+    /// here, so the RFC 7592 endpoint cannot be turned into an oracle for the
+    /// existence of a non-DCR client. A client absent in this scope (or minted in
+    /// another) is likewise the uniform not-found.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if no DCR client with this identifier is visible in
+    /// this scope; [`StoreError::Database`] on a persistence failure.
+    pub async fn dynamic_registration(
+        &self,
+        id: &ClientId,
+    ) -> Result<DynamicClientRecord, StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT id, display_name, token_endpoint_auth_method, redirect_uris, \
+             application_type, id_token_signed_response_alg, jwks, jwks_uri, \
+             token_endpoint_auth_signing_alg, registration_client_uri, \
+             registration_access_token_hash, dcr_registered, \
+             (EXTRACT(EPOCH FROM created_at) * 1000000)::bigint AS created_us \
+             FROM clients \
+             WHERE id = $1 AND tenant_id = $2 AND environment_id = $3",
+        )
+        .bind(id.to_string())
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        let row = row.ok_or(StoreError::NotFound)?;
+        // A client not created through dynamic registration is not manageable
+        // through the RFC 7592 surface: report it as not found, uniformly.
+        let dcr_registered: bool = row.get("dcr_registered");
+        if !dcr_registered {
+            return Err(StoreError::NotFound);
+        }
+        Ok(DynamicClientRecord {
+            id: ClientId::parse_in_scope(&row.get::<String, _>("id"), &self.scope)?,
+            display_name: row.get("display_name"),
+            auth_method: row.get("token_endpoint_auth_method"),
+            redirect_uris: row.get("redirect_uris"),
+            application_type: row.get("application_type"),
+            id_token_signed_response_alg: row.get("id_token_signed_response_alg"),
+            jwks: row.get("jwks"),
+            jwks_uri: row.get("jwks_uri"),
+            token_endpoint_auth_signing_alg: row.get("token_endpoint_auth_signing_alg"),
+            registration_client_uri: row.get("registration_client_uri"),
+            registration_access_token_hash: row.get("registration_access_token_hash"),
+            created_at_unix_micros: row.get("created_us"),
+        })
+    }
+
     /// Turn a row into a [`ClientRecord`], reconstructing the typed identifier.
     fn row_to_record(&self, row: &PgRow) -> Result<ClientRecord, StoreError> {
         let id_text: String = row.get("id");
@@ -558,6 +833,7 @@ impl ClientRepo<'_> {
             consent_mode: row.get("consent_mode"),
             skip_consent: row.get("skip_consent"),
             store_skipped_consent: row.get("store_skipped_consent"),
+            require_pushed_authorization_requests: row.get("require_pushed_authorization_requests"),
         })
     }
 }
@@ -936,6 +1212,237 @@ impl ActingClientRepo<'_> {
                     return Err(StoreError::NotFound);
                 }
                 Ok(())
+            },
+            false,
+        )
+        .await
+    }
+
+    /// Set (or clear) a client's `require_pushed_authorization_requests` flag (RFC
+    /// 9126 section 5, issue #27), auditing
+    /// `client.require_pushed_authorization_requests.set` in the same transaction.
+    /// When set, the authorization endpoint rejects a plain (non-PAR) request from
+    /// this client. Dynamic Client Registration (#30) and the management surface
+    /// reuse this; today it is the one path that toggles the per-client requirement.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if no such client is visible in this scope;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn set_require_pushed_authorization_requests(
+        &self,
+        env: &Env,
+        id: &ClientId,
+        required: bool,
+    ) -> Result<(), StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::ClientRequirePushedAuthorizationSet,
+                target: id,
+            },
+            async move |tx| {
+                let result = sqlx::query(
+                    "UPDATE clients SET require_pushed_authorization_requests = $1 \
+                     WHERE id = $2 AND tenant_id = $3 AND environment_id = $4",
+                )
+                .bind(required)
+                .bind(id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .execute(&mut **tx)
+                .await?;
+                if result.rows_affected() == 0 {
+                    return Err(StoreError::NotFound);
+                }
+                Ok(())
+            },
+            false,
+        )
+        .await
+    }
+
+    /// Register a client through Dynamic Client Registration (issue #30, RFC
+    /// 7591), returning the minted identifier and the RFC 7592 client
+    /// configuration endpoint URL. Writes a `client.registered` audit row in the
+    /// same transaction.
+    ///
+    /// The OIDC layer has already validated the metadata, negotiated the
+    /// `id_token_signed_response_alg`, generated and hashed the client secret and
+    /// the registration access token, and fetched any `jwks_uri` through the
+    /// SSRF-hardened fetcher. The repository re-validates every redirect URI as an
+    /// RFC 8252 registrable target (defense in depth) BEFORE any write, stores the
+    /// hashes (never a plaintext credential), marks the row `dcr_registered`, and
+    /// builds `registration_client_uri` from the freshly minted identifier.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::InvalidRedirectUri`] if any redirect URI is not registrable
+    /// (nothing is written); [`StoreError::Conflict`] if a `private_key_jwt`
+    /// registration violates the key-source CHECK (both or neither of
+    /// `jwks`/`jwks_uri`); [`StoreError::Database`] on a persistence failure.
+    pub async fn register_dynamic(
+        &self,
+        env: &Env,
+        params: NewDynamicClient<'_>,
+    ) -> Result<DynamicClientRegistration, StoreError> {
+        for uri in params.redirect_uris {
+            if !crate::redirect::redirect_uri_is_registrable(uri) {
+                return Err(StoreError::InvalidRedirectUri);
+            }
+        }
+        let id = ClientId::generate(env, &self.scope);
+        let registration_client_uri = format!(
+            "{}/{}",
+            params.registration_uri_base.trim_end_matches('/'),
+            id
+        );
+        let scope = self.scope;
+        let redirect_uris: Vec<String> = params.redirect_uris.to_vec();
+        let client_uri = registration_client_uri.clone();
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::ClientRegistered,
+                target: &id,
+            },
+            async move |tx| {
+                let result = sqlx::query(
+                    "INSERT INTO clients \
+                     (id, tenant_id, environment_id, display_name, \
+                      token_endpoint_auth_method, secret_hash, redirect_uris, \
+                      application_type, id_token_signed_response_alg, jwks, jwks_uri, \
+                      token_endpoint_auth_signing_alg, registration_client_uri, \
+                      registration_access_token_hash, dcr_registered) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, true)",
+                )
+                .bind(id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(params.display_name)
+                .bind(params.auth_method)
+                .bind(params.secret_hash)
+                .bind(&redirect_uris)
+                .bind(params.application_type)
+                .bind(params.id_token_signed_response_alg)
+                .bind(params.jwks)
+                .bind(params.jwks_uri)
+                .bind(params.token_endpoint_auth_signing_alg)
+                .bind(&client_uri)
+                .bind(params.registration_access_token_hash)
+                .execute(&mut **tx)
+                .await;
+                match result {
+                    Ok(_) => Ok(()),
+                    // A key-source CHECK violation (both jwks and jwks_uri, or a
+                    // keyless private_key_jwt) is a caller-facing conflict.
+                    Err(error) if is_check_violation(&error) => Err(StoreError::Conflict),
+                    Err(error) => Err(error.into()),
+                }
+            },
+            false,
+        )
+        .await?;
+        Ok(DynamicClientRegistration {
+            id,
+            registration_client_uri,
+        })
+    }
+
+    /// Apply an RFC 7592 update to a dynamically registered client (issue #30),
+    /// ROTATING its registration access token in the same transaction. Writes a
+    /// `client.updated` audit row.
+    ///
+    /// This is a full replacement of the DCR-managed metadata (display name, auth
+    /// method, redirect URIs, application type, negotiated algorithm, and the
+    /// `jwks`/`jwks_uri` pair) PLUS a mandatory registration-access-token rotation:
+    /// `registration_access_token_hash` becomes the new hash, so the superseded
+    /// token stops matching immediately. The client SECRET is deliberately left
+    /// unchanged. The `WHERE` clause filters on `dcr_registered`, so only a
+    /// DCR-origin client is updatable through this path.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::InvalidRedirectUri`] if any redirect URI is not registrable
+    /// (nothing is written); [`StoreError::NotFound`] if no DCR client with this
+    /// identifier is visible in this scope; [`StoreError::Conflict`] on a key-source
+    /// CHECK violation; [`StoreError::Database`] on a persistence failure.
+    pub async fn update_dynamic(
+        &self,
+        env: &Env,
+        id: &ClientId,
+        update: DynamicClientUpdate<'_>,
+    ) -> Result<(), StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        for uri in update.redirect_uris {
+            if !crate::redirect::redirect_uri_is_registrable(uri) {
+                return Err(StoreError::InvalidRedirectUri);
+            }
+        }
+        let scope = self.scope;
+        let redirect_uris: Vec<String> = update.redirect_uris.to_vec();
+        // When the update transitions the client to a method that carries no
+        // secret (`none` / `private_key_jwt`), NULL out any stored `secret_hash`
+        // so no dead credential material lingers. Only the two secret-based methods
+        // keep the existing hash (an update never mints a new secret, and the
+        // validation layer already refuses a transition INTO a secret method for a
+        // client that has none).
+        let keep_secret = matches!(
+            update.auth_method,
+            "client_secret_basic" | "client_secret_post"
+        );
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::ClientUpdated,
+                target: id,
+            },
+            async move |tx| {
+                let result = sqlx::query(
+                    "UPDATE clients SET display_name = $1, token_endpoint_auth_method = $2, \
+                     redirect_uris = $3, application_type = $4, \
+                     id_token_signed_response_alg = $5, jwks = $6, jwks_uri = $7, \
+                     token_endpoint_auth_signing_alg = $8, registration_access_token_hash = $9, \
+                     secret_hash = CASE WHEN $13 THEN secret_hash ELSE NULL END \
+                     WHERE id = $10 AND tenant_id = $11 AND environment_id = $12 \
+                     AND dcr_registered = true",
+                )
+                .bind(update.display_name)
+                .bind(update.auth_method)
+                .bind(&redirect_uris)
+                .bind(update.application_type)
+                .bind(update.id_token_signed_response_alg)
+                .bind(update.jwks)
+                .bind(update.jwks_uri)
+                .bind(update.token_endpoint_auth_signing_alg)
+                .bind(update.registration_access_token_hash)
+                .bind(id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(keep_secret)
+                .execute(&mut **tx)
+                .await;
+                match result {
+                    Ok(outcome) if outcome.rows_affected() == 0 => Err(StoreError::NotFound),
+                    Ok(_) => Ok(()),
+                    Err(error) if is_check_violation(&error) => Err(StoreError::Conflict),
+                    Err(error) => Err(error.into()),
+                }
             },
             false,
         )
@@ -1819,6 +2326,280 @@ impl ActingAuthorizationRepo<'_> {
             false,
         )
         .await
+    }
+}
+
+/// A pushed authorization request to store behind a one-time `request_uri` (RFC
+/// 9126, issue #27). The `id` is the `par_` reference minted under the caller's
+/// scope; the `request_params` is the serialized authorization request the PAR
+/// endpoint validated (opaque to the store), and `client_id` is the AUTHENTICATED
+/// pushing client the request is bound to.
+///
+/// [`fmt::Debug`] is hand written and redacting: `request_params` may carry
+/// end-user request detail and must not reach a log line.
+#[derive(Clone, Copy)]
+pub struct PushRequest<'a> {
+    /// The `par_` reference identifier, minted under this scope.
+    pub id: &'a PushedRequestId,
+    /// The AUTHENTICATED pushing client the request is bound to. A `request_uri`
+    /// presented under a different `client_id` at `/authorize` is rejected.
+    pub client_id: &'a str,
+    /// The serialized authorization-request parameters (an application-owned JSON
+    /// document), replayed verbatim when the `request_uri` is consumed.
+    pub request_params: &'a str,
+    /// The `request_uri` expiry in epoch microseconds, from the application clock
+    /// seam (never the database clock).
+    pub expires_at_micros: i64,
+    /// The push instant in epoch microseconds, from the application clock seam.
+    pub created_at_micros: i64,
+}
+
+impl fmt::Debug for PushRequest<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PushRequest")
+            .field("id", &self.id)
+            .field("client_id", &self.client_id)
+            .field("expires_at_micros", &self.expires_at_micros)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The outcome of consuming a pushed-authorization-request `request_uri` (RFC 9126,
+/// issue #27).
+///
+/// The store owns the whole single-use decision (the atomic UPDATE under the clock
+/// seam), so the authorization endpoint only maps an outcome to behavior. A
+/// mismatched presenting client, an expired request, and an already-consumed request
+/// all collapse to [`Invalid`](ConsumePushedRequest::Invalid): the caller returns a
+/// uniform `invalid_request`, and none of those misses burns the pending request.
+///
+/// [`fmt::Debug`] is hand written and redacting: the replayed `request_params` may
+/// carry end-user request detail.
+#[derive(Clone, PartialEq, Eq)]
+pub enum ConsumePushedRequest {
+    /// This call won the single-use race: the request is now consumed and its
+    /// serialized parameters are returned for replay. The consume audit row was
+    /// written in the SAME transaction as the consume.
+    Consumed {
+        /// The serialized authorization-request parameters to replay verbatim.
+        request_params: String,
+    },
+    /// The `request_uri` was absent, expired, already consumed, or presented under a
+    /// different `client_id` than it was bound to. A uniform miss with no state
+    /// change; the caller returns `invalid_request`.
+    Invalid,
+}
+
+impl fmt::Debug for ConsumePushedRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ConsumePushedRequest::Consumed { .. } => {
+                f.debug_struct("Consumed").finish_non_exhaustive()
+            }
+            ConsumePushedRequest::Invalid => f.write_str("Invalid"),
+        }
+    }
+}
+
+/// The read-only pushed-authorization-request repository (RFC 9126, issue #27).
+///
+/// It PEEKS a `request_uri`'s stored parameters WITHOUT consuming them, so the
+/// authorization endpoint can resolve a PAR reference at EVERY interaction hop (the
+/// login and consent resume round-trips) while deferring the single-use consume to
+/// the moment of code issuance ([`ActingPushedRequestRepo::consume`]). A peek proves
+/// only that the reference resolves; it changes no state and writes no audit row.
+pub struct PushedRequestRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl PushedRequestRepo<'_> {
+    /// Read the stored authorization-request parameters for a LIVE (unconsumed,
+    /// unexpired) `request_uri` bound to `presenting_client_id`, or [`None`] on any
+    /// miss (absent, expired, already consumed, or presented under a different
+    /// client). This does NOT consume the reference: single use is enforced only by
+    /// [`ActingPushedRequestRepo::consume`] at issuance, so a login or consent
+    /// interaction can re-present the same `request_uri` across the round-trip
+    /// without burning it before an authenticated, consenting subject receives a code.
+    ///
+    /// The `client_id` filter is IN the query, so a reference presented under a
+    /// different client resolves to [`None`] (RFC 9126 client binding), exactly like
+    /// the consume, and a peek never reveals or burns another client's request. A
+    /// forged or expired reference is likewise a uniform [`None`].
+    ///
+    /// `now` flows from the application clock seam (bound as epoch microseconds),
+    /// never the database clock, so expiry is deterministic under a manual clock,
+    /// consistent with the consume.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the reference identifier is out of this scope;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn read(
+        &self,
+        env: &Env,
+        id: &PushedRequestId,
+        presenting_client_id: &str,
+    ) -> Result<Option<String>, StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let now_micros = epoch_micros(env.clock().now_utc());
+        let mut tx = begin_scoped(self.store, scope).await?;
+        let row = sqlx::query(
+            "SELECT request_params FROM pushed_authorization_requests \
+             WHERE id = $1 AND tenant_id = $2 AND environment_id = $3 \
+             AND client_id = $4 \
+             AND consumed_at IS NULL \
+             AND expires_at > TIMESTAMPTZ 'epoch' + ($5::text || ' microseconds')::interval",
+        )
+        .bind(id.to_string())
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(presenting_client_id)
+        .bind(now_micros)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(row.map(|row| row.get::<String, _>("request_params")))
+    }
+}
+
+/// The mutating pushed-authorization-request repository (RFC 9126, issue #27).
+/// Reachable only through [`ScopedStore::acting`], so every push and consume carries
+/// an actor and correlation id. The push routes through the module's single audited
+/// write primitive; the consume is a bespoke committing path (it folds the atomic
+/// single-use consume and its audit row into one transaction, exactly as the
+/// authorization-code redeem does), documented at its call site.
+pub struct ActingPushedRequestRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+    acting: ActingContext,
+}
+
+impl ActingPushedRequestRepo<'_> {
+    /// Store a validated authorization request behind a one-time `request_uri`,
+    /// auditing `pushed_authorization_request.push` in the same transaction.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the reference identifier is out of this scope;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn push(&self, env: &Env, request: PushRequest<'_>) -> Result<(), StoreError> {
+        if request.id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::PushedAuthorizationRequestPush,
+                target: request.id,
+            },
+            async move |tx| {
+                sqlx::query(
+                    "INSERT INTO pushed_authorization_requests \
+                     (id, tenant_id, environment_id, client_id, request_params, expires_at, \
+                      created_at) \
+                     VALUES ($1, $2, $3, $4, $5, \
+                             TIMESTAMPTZ 'epoch' + ($6::text || ' microseconds')::interval, \
+                             TIMESTAMPTZ 'epoch' + ($7::text || ' microseconds')::interval)",
+                )
+                .bind(request.id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(request.client_id)
+                .bind(request.request_params)
+                .bind(request.expires_at_micros)
+                .bind(request.created_at_micros)
+                .execute(&mut **tx)
+                .await?;
+                Ok(())
+            },
+            false,
+        )
+        .await
+    }
+
+    /// Atomically consume a `request_uri` exactly once, enforcing single use, expiry,
+    /// AND the client binding in ONE statement, returning the stored parameters on
+    /// the winning call.
+    ///
+    /// The consume is a single `UPDATE ... SET consumed_at = <now> WHERE id = $1 AND
+    /// consumed_at IS NULL AND expires_at > <now> AND client_id = <presenter>
+    /// RETURNING request_params`. Postgres serializes concurrent updates of the one
+    /// row (READ COMMITTED, pinned in [`begin_scoped`]), so exactly one caller sees
+    /// `consumed_at` NULL and gets [`ConsumePushedRequest::Consumed`]; every other
+    /// concurrent presentation affects zero rows. Because the `client_id` filter is
+    /// IN the statement, a request presented under a DIFFERENT `client_id` matches
+    /// zero rows: it is a uniform miss AND it never burns the pending request, so the
+    /// legitimate client's `request_uri` stays live (RFC 9126 client binding). Reuse
+    /// and expiry likewise miss.
+    ///
+    /// On the winning branch exactly one `pushed_authorization_request.consume` audit
+    /// row is written in this same transaction. A zero-row miss (reuse, expiry,
+    /// absent, or client mismatch) writes no audit row and returns
+    /// [`ConsumePushedRequest::Invalid`].
+    ///
+    /// `now` flows from the application clock seam (bound as epoch microseconds),
+    /// never the database clock, so expiry is deterministic under a manual clock.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the reference identifier is out of this scope;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn consume(
+        &self,
+        env: &Env,
+        id: &PushedRequestId,
+        presenting_client_id: &str,
+    ) -> Result<ConsumePushedRequest, StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let now_micros = epoch_micros(env.clock().now_utc());
+
+        let mut tx = begin_scoped(self.store, scope).await?;
+        let won = sqlx::query(
+            "UPDATE pushed_authorization_requests \
+             SET consumed_at = TIMESTAMPTZ 'epoch' + ($1::text || ' microseconds')::interval \
+             WHERE id = $2 AND tenant_id = $3 AND environment_id = $4 \
+             AND client_id = $5 \
+             AND consumed_at IS NULL \
+             AND expires_at > TIMESTAMPTZ 'epoch' + ($1::text || ' microseconds')::interval \
+             RETURNING request_params",
+        )
+        .bind(now_micros)
+        .bind(id.to_string())
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(presenting_client_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        let Some(row) = won else {
+            // Zero rows: absent, expired, already consumed, or presented under a
+            // different client_id. A uniform miss with no state change and no audit.
+            tx.commit().await?;
+            return Ok(ConsumePushedRequest::Invalid);
+        };
+        let request_params: String = row.get("request_params");
+        let spec = AuditedWrite {
+            store: self.store,
+            scope,
+            acting: &self.acting,
+            env,
+            action: Action::PushedAuthorizationRequestConsume,
+            target: id,
+        };
+        insert_audit_row(&mut tx, &spec).await?;
+        tx.commit().await?;
+        Ok(ConsumePushedRequest::Consumed { request_params })
     }
 }
 

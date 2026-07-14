@@ -143,6 +143,15 @@ name = "refresh_tokens"
 path = "tests/refresh_tokens.rs"
 required-features = ["testing"]
 
+# Pushed-authorization-request store surfaces (issue #27, RFC 9126): the single-use
+# atomic consume (works exactly once), the client-binding filter that rejects and
+# does not burn a mismatched presenter, expiry, cross-scope isolation, the push and
+# consume audit rows, and the per-client require-PAR flag. Needs a real database.
+[[test]]
+name = "pushed_authorization_requests"
+path = "tests/pushed_authorization_requests.rs"
+required-features = ["testing"]
+
 # Compile-fail proofs. Database-free, so it runs on every lane (including MSRV).
 [[test]]
 name = "compile_fail"

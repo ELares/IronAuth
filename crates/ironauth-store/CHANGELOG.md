@@ -7,7 +7,7 @@ range per docs/RELEASING.md.
 ## Unreleased
 
 - Refresh-token rotation, families, `offline_access`, and consent-mode persistence
-  (issue #21, migration 0014, expand).
+  (issue #21, migration 0016, expand).
   - **Token families and digest-only tokens.** New `refresh_families` (the
     revocation spine: one family per original grant, carrying the hard-cap expiry,
     the `session_ref`, the `offline` flag, and the exactly-once `reuse_detected_at`
@@ -55,6 +55,63 @@ range per docs/RELEASING.md.
     after its TTL.
   - **Audit actions.** New `refresh_token.issue`, `refresh_token.rotate`,
     `refresh_token.reuse`, `refresh_family.revoke`, and `client.configure`.
+- Dynamic Client Registration persistence (issue #30, migration 0014, expand).
+  - **DCR clients columns.** `clients` gains `registration_access_token_hash`,
+    `registration_client_uri`, `id_token_signed_response_alg`, `application_type`,
+    and a `dcr_registered` origin flag (default false), all additive so every
+    pre-existing client is unaffected. Only the SHA-256 HASH of the RFC 7592
+    registration access token is stored; the plaintext is never persisted.
+  - **Repository surface.** `ClientRepo::dynamic_registration` reads a DCR client
+    within scope (a non-DCR or absent client is the uniform `NotFound`, so the RFC
+    7592 surface is no existence oracle). `ClientRepo::id_token_signing_alg` reads a
+    client's stored `id_token_signed_response_alg` within scope (or `None` for a
+    client with no per-client preference), so the token endpoint can sign that
+    client's ID token under the algorithm DCR recorded.
+    `ActingClientRepo::register_dynamic` creates a client from validated metadata
+    (auditing `client.registered`) and `ActingClientRepo::update_dynamic` applies an
+    RFC 7592 full-replacement update that ROTATES the registration access token in
+    the same transaction (auditing `client.updated`), so a superseded token stops
+    matching immediately; a `PUT` that transitions the client to a secretless method
+    (`none` / `private_key_jwt`) also NULLs any stored `secret_hash`, so no dead
+    credential material lingers. Both re-validate every redirect URI as an RFC 8252
+    registrable target and map the key-source CHECK (SQLSTATE 23514) to a `Conflict`.
+    New public types `DynamicClientRecord`, `NewDynamicClient`,
+    `DynamicClientUpdate`, and `DynamicClientRegistration`; the record's Debug
+    redacts the token hash.
+  - **Audit actions.** New `Action::ClientRegistered` (`client.registered`) and
+    `Action::ClientUpdated` (`client.updated`); the DCR delete reuses the existing
+    `client.delete`.
+- Pushed authorization request persistence (PAR, RFC 9126, issue #27, migration
+  0015, expand).
+  - **Single-use pushed requests.** New tenant-scoped
+    `pushed_authorization_requests` table (`id`, `client_id`, the serialized
+    request parameters, `expires_at`, and a nullable `consumed_at`), with RLS
+    enable, force, and a scope policy, plus a nonempty-scope CHECK.
+    `ActingPushedRequestRepo::push` writes the row through `write_audited`;
+    `consume` runs the atomic
+    `UPDATE ... SET consumed_at = now WHERE ... AND consumed_at IS NULL AND
+    expires_at > now RETURNING request_params` under READ COMMITTED (mirroring the
+    authorization-code redeem), so a `request_uri` is redeemable exactly once. The
+    presenting `client_id` is a filter INSIDE that UPDATE, so a request pushed by
+    client A and presented by client B matches zero rows: it is rejected AND not
+    burned. Only the winning consume writes an audit row.
+  - **Non-consuming peek.** A read-only `PushedRequestRepo::read`
+    (`ScopedStore::pushed_authorization_requests`) returns a live (unconsumed,
+    unexpired, client-bound) request's stored parameters WITHOUT consuming it, using
+    the same `client_id` filter and clock-seam expiry as the consume. It lets the
+    authorization endpoint resolve a `request_uri` at every login/consent
+    interaction hop while deferring the single-use consume to the moment of code
+    issuance, so a fresh-login user's request survives the round-trip; it changes no
+    state and writes no audit row.
+  - **Per-client require-PAR flag.** `clients` gains
+    `require_pushed_authorization_requests`; `ClientRecord` carries it and
+    `ActingClientRepo::set_require_pushed_authorization_requests` sets it (audited),
+    so PAR can be required per client independent of the environment switch.
+  - **New identifier and actions.** `PushedRequestId` (`par_` prefix, redacted
+    Debug); audit actions `pushed_authorization_request.push`,
+    `pushed_authorization_request.consume`, and
+    `client.require_pushed_authorization_requests.set`.
+
 - Client JWT-assertion authentication persistence (issue #25, migration 0013,
   expand).
   - **Client key registration.** `clients` gains `jwks`, `jwks_uri`, and

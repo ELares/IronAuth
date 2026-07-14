@@ -60,6 +60,15 @@ struct Inner {
     default_access_token_format: TokenFormat,
     reuse_grace: Duration,
     session_ttl: Duration,
+    // The pushed-authorization-request `request_uri` lifetime (RFC 9126, issue #27).
+    // A pushed request is short-lived and single-use; validated non-zero and bounded
+    // by config (oidc.par_ttl_secs).
+    par_ttl: Duration,
+    // Whether EVERY client in this environment must use a pushed authorization
+    // request (RFC 9126 section 5, issue #27). Layered with the per-client flag: a
+    // request must be pushed when either this OR the client's own flag is set. A
+    // promotable per-environment setting sourced from OidcConfig; default false.
+    require_pushed_authorization_requests: bool,
     // The per-environment PKCE policy for CONFIDENTIAL clients (issue #13). A
     // public client always requires PKCE (RFC 9700 2.1.1, enforced structurally in
     // the authorize path); this only governs confidential clients, and defaults to
@@ -85,6 +94,11 @@ struct Inner {
     enable_response_type_code_id_token: bool,
     enable_response_type_none: bool,
     enable_response_mode_form_post: bool,
+    // Whether the Dynamic Client Registration endpoint is mounted and served
+    // (issue #30). Default OFF: open self-service registration is an abuse surface
+    // whose real gating (quotas, quarantine, initial-access-token policy) is owned
+    // by issue #31; this flag is the plain on/off switch #31 layers policy onto.
+    registration_enabled: bool,
     // The audience policy an inbound JWT client assertion must satisfy (issue #25),
     // shared with the JWT bearer grant (#26). Default: accept the token-endpoint
     // URL OR the issuer; strict: the issuer only.
@@ -177,6 +191,8 @@ impl OidcState {
                 default_access_token_format: map_token_format(config.default_access_token_format),
                 reuse_grace: Duration::from_secs(config.reuse_grace_secs),
                 session_ttl: Duration::from_secs(config.session_ttl_secs),
+                par_ttl: Duration::from_secs(config.par_ttl_secs),
+                require_pushed_authorization_requests: config.require_pushed_authorization_requests,
                 require_pkce_for_confidential: config.require_pkce_for_confidential_clients,
                 conform_id_token_claims: config.conform_id_token_claims,
                 client_assertion_audience: config.client_assertion_audience,
@@ -187,6 +203,7 @@ impl OidcState {
                 enable_response_type_code_id_token: config.enable_response_type_code_id_token,
                 enable_response_type_none: config.enable_response_type_none,
                 enable_response_mode_form_post: config.enable_response_mode_form_post,
+                registration_enabled: config.registration_enabled,
                 subjects: SubjectCache::new(),
                 issue_refresh_tokens: config.issue_refresh_tokens,
                 refresh_idle_ttl: Duration::from_secs(config.refresh_idle_ttl_secs),
@@ -399,6 +416,24 @@ impl OidcState {
         self.inner.session_ttl
     }
 
+    /// The configured pushed-authorization-request `request_uri` lifetime (RFC 9126,
+    /// issue #27). A pushed request expires this long after it is pushed; validated
+    /// non-zero and bounded by config.
+    #[must_use]
+    pub fn par_ttl(&self) -> Duration {
+        self.inner.par_ttl
+    }
+
+    /// Whether EVERY client in this environment must use a pushed authorization
+    /// request (RFC 9126 section 5, issue #27). When true, the authorization endpoint
+    /// rejects a plain (non-PAR) request. The per-client
+    /// `require_pushed_authorization_requests` registration flag applies ON TOP of
+    /// this: PAR is required when either is set.
+    #[must_use]
+    pub fn require_pushed_authorization_requests(&self) -> bool {
+        self.inner.require_pushed_authorization_requests
+    }
+
     /// The token endpoint's absolute URL (`{issuer_base}/token`). The token
     /// endpoint is mounted at the deployment root (shared across environments), so
     /// it is derived from `issuer_base`, not the per-environment issuer. One of the
@@ -435,6 +470,16 @@ impl OidcState {
     #[must_use]
     pub fn client_key_resolver(&self) -> Option<&Arc<ClientKeyResolver>> {
         self.inner.client_key_resolver.as_ref()
+    }
+
+    /// Whether the Dynamic Client Registration endpoint is enabled for this
+    /// deployment (issue #30). Default OFF: the endpoint is mounted and discovery
+    /// advertises `registration_endpoint` only when this is set. The real abuse
+    /// gating (quotas, quarantine, initial-access-token policy) is owned by issue
+    /// #31; this is the plain on/off switch it layers policy onto.
+    #[must_use]
+    pub fn registration_enabled(&self) -> bool {
+        self.inner.registration_enabled
     }
 
     /// Whether a CONFIDENTIAL client must use PKCE under this environment's policy

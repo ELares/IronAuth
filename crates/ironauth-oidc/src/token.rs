@@ -53,6 +53,7 @@ use std::fmt;
 use axum::extract::{Form, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
+use ironauth_jose::JwsAlgorithm;
 use ironauth_store::{
     ActorRef, AuthorizationCodeId, ClientAuthRecord, ClientId, CodeBindings, CorrelationId,
     IssuedTokenRecord, NewOpaqueAccessToken, NewRefreshFamily, RedeemOutcome, RefreshFamilyId,
@@ -420,6 +421,18 @@ async fn mint_tokens(
         .await
         .ok_or(TokenError::ServerError)?;
     let signer = entry.signer(state.now()).ok_or(TokenError::ServerError)?;
+    // Honor the client's negotiated `id_token_signed_response_alg` (issue #30): sign
+    // THIS client's ID token with the environment key of the algorithm DCR recorded
+    // and echoed at registration, so the recorded algorithm is the algorithm the ID
+    // token is actually signed under. A client with no per-client preference (every
+    // non-DCR client) resolves to `None` and keeps the environment default signer.
+    // The negotiation constrained the recorded algorithm to the environment's
+    // actually-signable set, so a key is normally present; if one is unexpectedly
+    // gone the ID token falls back to the environment default (which still verifies
+    // against the published JWKS), never failing the exchange.
+    let id_token_signer = client_id_token_alg(state, scope, &bindings.client_id)
+        .await
+        .and_then(|alg| entry.keyset().active_signer_for(state.now(), alg));
     let issuer = state.issuer_for(&scope);
     // Resolve the `sub` through the ONE shared subject-derivation function, so the
     // ID token's subject can never diverge from what `UserInfo`/introspection would
@@ -456,10 +469,37 @@ async fn mint_tokens(
             at_hash: None,
             c_hash: None,
             extra_claims,
+            id_token_signer,
         },
         &target,
     )
     .map_err(|()| TokenError::ServerError)
+}
+
+/// The `JwsAlgorithm` the client `client_id` negotiated as its
+/// `id_token_signed_response_alg` at dynamic registration (issue #30), or `None`
+/// when it expressed no per-client preference (every non-DCR client, whose column
+/// is NULL), the stored value is not a representable algorithm, or the client is
+/// absent. `None` leaves the mint on the environment default signer.
+async fn client_id_token_alg(
+    state: &OidcState,
+    scope: Scope,
+    client_id: &str,
+) -> Option<JwsAlgorithm> {
+    let id = state
+        .store()
+        .scoped(scope)
+        .clients()
+        .parse_id(client_id)
+        .ok()?;
+    let name = state
+        .store()
+        .scoped(scope)
+        .clients()
+        .id_token_signing_alg(&id)
+        .await
+        .ok()??;
+    JwsAlgorithm::from_jose_name(&name)
 }
 
 /// Build the extra standard claims to place in the ID token (issue #15).
@@ -896,6 +936,10 @@ async fn mint_refresh_access(
             at_hash: None,
             c_hash: None,
             extra_claims: &extra_claims,
+            // The refresh path mints only an access token (no ID token), so the
+            // per-client id_token signer (#30) is inert here; mint_access_token
+            // never reads it.
+            id_token_signer: None,
         },
         &target,
     )

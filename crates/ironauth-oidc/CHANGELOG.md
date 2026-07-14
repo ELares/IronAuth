@@ -47,6 +47,84 @@ range per docs/RELEASING.md.
     exists), `implicit` (first-party auto-grant), and `remembered` (honor the recorded
     consent until its TTL, then re-prompt), plus `skip_consent` and a
     `store_skipped_consent` no-store knob.
+- Pushed authorization requests (PAR, RFC 9126, issue #27).
+  - **`POST /par`.** A new back-channel endpoint that authenticates the client
+    with the SAME suite as the token endpoint (the shared `authenticate_client`
+    seam: public `none`, secret, or `private_key_jwt`) and validates the COMPLETE
+    authorization request at push time, then returns a single-use
+    `urn:ietf:params:oauth:request_uri:<par_id>` reference and its `expires_in`. A
+    bad `redirect_uri`, missing PKCE, a disabled response type, or a malformed
+    `claims`/`prompt`/`max_age` is rejected HERE on the back channel, not later at
+    `/authorize`. A `request_uri` in the pushed request is refused (RFC 9126
+    section 2.1).
+  - **One shared request validator.** The authorization-request validation is
+    factored into a single `validate_request` function that BOTH `/authorize` and
+    `/par` run, so the two paths cannot diverge; `/authorize` renders a page or a
+    redirect and `/par` renders JSON from the same neutral error.
+  - **`request_uri` at `/authorize`.** A `request_uri` is accepted ONLY as a PAR
+    reference. It is PEEKED (read, not consumed) at every authorization hop, so it
+    survives the login and consent interaction round-trip, and the single-use
+    consume happens ATOMICALLY at the moment of code issuance: exactly one code per
+    `request_uri`, and a concurrent or prior issuance, a reuse, or an expiry is
+    rejected (single use holds end to end across stateless nodes). The reference is
+    bound to the pushing client (a reference presented by a different `client_id`
+    resolves to nothing, and is never revealed or burned), the pushed values are
+    authoritative and any conflicting inline query parameters are ignored (RFC 9126
+    section 4), and no code path ever dereferences an external `request_uri` over
+    the network (there is no outbound fetch on this path, test-enforced).
+  - **Require-PAR enforcement.** When the environment switch
+    (`oidc.require_pushed_authorization_requests`) OR the per-client registration
+    flag is set, a plain (non-PAR) authorization request is rejected with
+    `invalid_request`. A request that arrived through PAR satisfies the requirement
+    at the first hop AND at every login/consent resume hop: the gate keys off the
+    unforgeable `request_uri`, which is re-presented on the minimal resume link (not
+    the expanded parameters), so a fresh-login user of a require-PAR client resumes
+    through the interaction to a real code rather than a 400.
+  - **Discovery.** `pushed_authorization_request_endpoint` and
+    `require_pushed_authorization_requests` are advertised from live config on both
+    well-known forms.
+- Dynamic Client Registration and configuration management (issue #30).
+  - **RFC 7591 registration.** New `client_registration` module serving
+    `POST {issuer}/connect/register` (a distinct concept and path from the human
+    `/register` account surface). The metadata property set is validated with
+    per-spec defaults applied when omitted (`client_secret_basic`
+    `token_endpoint_auth_method`, `["code"]` `response_types`; an omitted
+    `id_token_signed_response_alg` records the environment's actual default signing
+    algorithm) and UNRECOGNIZED properties ignored per RFC 7591.
+    `token_endpoint_auth_method` and every algorithm are validated against the
+    implemented client-auth suite (issue #25), so the inert `client_secret_jwt`
+    and unknown methods are refused with `invalid_client_metadata`. `redirect_uris`
+    are RFC 8252 aware (web: https only; native: https, http loopback IP literals,
+    and reverse-domain private-use schemes; dangerous schemes rejected with
+    `invalid_redirect_uri`). `jwks` and `jwks_uri` are mutually exclusive, and a
+    `jwks_uri` is fetched THROUGH the SSRF-hardened fetcher (the issue #25
+    `ClientKeyResolver` path), so a private-address destination is rejected.
+  - **RP Metadata Choices 1.0 (recorded == signed).** `id_token_signed_response_alg`
+    may be an array of acceptable values (or the plural
+    `id_token_signed_response_alg_values`). The OP negotiates ONLY against the
+    algorithms the environment can ACTUALLY sign an ID token with (each permitted by
+    the environment policy AND backed by a loaded, active signing key), never the
+    advertised `id_token_signing_alg_values` (which carries the RS256 discovery floor
+    even where no RS256 key exists). Of the offered signable algorithms it prefers
+    `EdDSA`, else `RS256`, else the first mutual value; an offered set with nothing
+    the environment can sign is REJECTED with `invalid_client_metadata` (never
+    silently downgraded). The token endpoint then signs THAT client's ID token under
+    the recorded algorithm (an additive per-client override on the ID-token mint
+    path; the access token keeps the environment default), so the algorithm DCR
+    records and echoes is exactly the algorithm the ID token is signed under.
+  - **RFC 7592 management.** `GET`/`PUT`/`DELETE
+    {issuer}/connect/register/{client_id}` authenticated by the registration
+    access token (constant-time hash compare). Every successful update ROTATES the
+    token, so the superseded one is rejected on the next call. Credentials
+    (`client_secret`, `registration_access_token`) are stored SHA-256-hashed and
+    returned once.
+  - **Discovery + config.** Discovery advertises the per-environment
+    `registration_endpoint` (`{issuer}/connect/register`) only when enabled. The
+    endpoint ships behind a plain default-off `oidc.registration_enabled` flag; the
+    real abuse gating (quotas, quarantine, initial-access-token policy) is owned by
+    issue #31, with the enable gate and the single `register` funnel left as its
+    seam.
+
 - Complete the client authentication suite with JWT assertions and uniform
   failure hygiene (issue #25).
   - **`private_key_jwt` (RFC 7523).** A client authenticates the token endpoint

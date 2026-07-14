@@ -72,6 +72,7 @@ mod authorize;
 mod claims_request;
 mod client_auth;
 mod client_keys;
+mod client_registration;
 mod consent;
 mod discovery;
 mod error;
@@ -81,6 +82,7 @@ mod issuer;
 mod jwks;
 mod login;
 mod pages;
+mod par;
 mod password;
 mod pkce;
 mod register;
@@ -148,12 +150,17 @@ pub use tokens::{
 /// seam, the per-environment signing keys, the issuer base, and the configured
 /// code and access-token lifetimes.
 pub fn oidc_router(state: OidcState) -> Router {
-    Router::new()
+    let mut router = Router::new()
         .route(
             "/authorize",
             get(authorize::authorize_get).post(authorize::authorize_post),
         )
         .route("/token", post(token::token))
+        // Pushed authorization requests (PAR, RFC 9126, issue #27): an authenticated
+        // back-channel POST that validates a complete authorization request and
+        // returns a one-time request_uri. Advertised in discovery as
+        // pushed_authorization_request_endpoint at this exact path.
+        .route("/par", post(par::par))
         // UserInfo (OIDC Core 5.3): GET and POST with header Bearer auth, plus the
         // OPTIONS preflight for the CORS SPA origins (issue #15). CORS is applied on
         // this endpoint ONLY; the authorization endpoint above never gets it.
@@ -165,7 +172,9 @@ pub fn oidc_router(state: OidcState) -> Router {
         )
         // The bootstrap login, registration, and consent interaction surfaces
         // (issue #20). GET renders the minimal hardened page; POST records the
-        // decision and resumes the authorization request.
+        // decision and resumes the authorization request. This `/register` is
+        // HUMAN account registration; the DCR CLIENT registration below is a
+        // distinct concept mounted at a distinct `/connect/register` path.
         .route("/login", get(login::login_get).post(login::login_post))
         .route(
             "/register",
@@ -174,6 +183,26 @@ pub fn oidc_router(state: OidcState) -> Router {
         .route(
             "/consent",
             get(consent::consent_get).post(consent::consent_post),
-        )
-        .with_state(state)
+        );
+
+    // Dynamic Client Registration (issue #30, RFC 7591 + RFC 7592), mounted ONLY
+    // when enabled (default off; issue #31 owns the real abuse gating). The routes
+    // live under the per-environment issuer path (`{issuer}/connect/register`), so
+    // a registration lands in the (tenant, environment) the client will operate in,
+    // and never shadow the human `/register` route above.
+    if state.registration_enabled() {
+        router = router
+            .route(
+                "/t/{tenant_id}/e/{environment_id}/connect/register",
+                post(client_registration::register),
+            )
+            .route(
+                "/t/{tenant_id}/e/{environment_id}/connect/register/{client_id}",
+                get(client_registration::read)
+                    .put(client_registration::update)
+                    .delete(client_registration::delete),
+            );
+    }
+
+    router.with_state(state)
 }
