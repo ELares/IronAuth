@@ -276,6 +276,11 @@ pub const OIDC_JWKS_CACHE_MAX_SECS: u64 = 900;
 /// authorization code is short-lived and single-use, the access token a little
 /// longer. Mounting is opt-in so the default (and database-free) boot is
 /// unchanged.
+// Each bool is an INDEPENDENT, individually documented TOML toggle keyed by its
+// field name in the published schema; the excessive-bools refactor (a state
+// machine or two-variant enums) would corrupt the config contract and the
+// generated docs/config-schema.json, so it is deliberately not applied here.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields, default)]
 pub struct OidcConfig {
@@ -360,6 +365,52 @@ pub struct OidcConfig {
     /// appears in config snapshots and rides the M5 promotion pipeline; the process
     /// value is the deployment default until per-environment overrides land.
     pub userinfo_cors_origins: Vec<String>,
+
+    /// Enable the legacy implicit `response_type=id_token` flow for this
+    /// environment (issue #17). The spec-conform, safe default (`false`) leaves it
+    /// DISABLED: the authorization endpoint accepts only `code` unless a legacy
+    /// type is explicitly turned on. When `true`, the endpoint also serves the
+    /// implicit ID-token-only flow (an ID token, carrying `nonce`, returned in the
+    /// front channel; never an access token, which is a permanent non-goal), and
+    /// discovery advertises `id_token` and the `fragment` response mode. Intended
+    /// for certification runs. This is a promotable per-environment setting: it
+    /// appears in config snapshots and rides the M5 promotion pipeline; the process
+    /// value is the deployment default until per-environment overrides land.
+    pub enable_response_type_id_token: bool,
+
+    /// Enable the legacy hybrid `response_type=code id_token` flow for this
+    /// environment (issue #17). The safe default (`false`) leaves it DISABLED. When
+    /// `true`, the authorization endpoint also serves the hybrid flow (a `code` AND
+    /// a front-channel ID token carrying `nonce` and `c_hash`, but never an access
+    /// token and never `at_hash`), and discovery advertises `code id_token` and the
+    /// `fragment` response mode. Intended for certification runs. This is a
+    /// promotable per-environment setting: it appears in config snapshots and rides
+    /// the M5 promotion pipeline; the process value is the deployment default until
+    /// per-environment overrides land.
+    pub enable_response_type_code_id_token: bool,
+
+    /// Enable the legacy `response_type=none` flow for this environment (issue
+    /// #17). The safe default (`false`) leaves it DISABLED. When `true`, the
+    /// authorization endpoint also serves `none` (a redirect echoing `state` and
+    /// the RFC 9207 `iss`, issuing no code and no token), and discovery advertises
+    /// `none`. Intended for certification runs. This is a promotable per-environment
+    /// setting: it appears in config snapshots and rides the M5 promotion pipeline;
+    /// the process value is the deployment default until per-environment overrides
+    /// land.
+    pub enable_response_type_none: bool,
+
+    /// Enable the `response_mode=form_post` encoding for this environment (issue
+    /// #17, OAuth 2.0 Form Post Response Mode 1.0). The safe default (`false`)
+    /// leaves it DISABLED: the authorization endpoint returns results only by
+    /// `query` (and, when a front-channel response type is enabled, `fragment`).
+    /// When `true`, a client may request `response_mode=form_post` and the endpoint
+    /// returns an auto-submitting HTML form that POSTs the authorization-response
+    /// parameters to the `redirect_uri`, and discovery advertises `form_post`.
+    /// Intended for certification runs. This is a promotable per-environment
+    /// setting: it appears in config snapshots and rides the M5 promotion pipeline;
+    /// the process value is the deployment default until per-environment overrides
+    /// land.
+    pub enable_response_mode_form_post: bool,
 }
 
 impl Default for OidcConfig {
@@ -374,6 +425,10 @@ impl Default for OidcConfig {
             require_pkce_for_confidential_clients: true,
             conform_id_token_claims: false,
             userinfo_cors_origins: Vec::new(),
+            enable_response_type_id_token: false,
+            enable_response_type_code_id_token: false,
+            enable_response_type_none: false,
+            enable_response_mode_form_post: false,
         }
     }
 }
@@ -779,6 +834,12 @@ mod tests {
         // ID token) and no SPA origins are registered for CORS by default.
         assert!(!config.oidc.conform_id_token_claims);
         assert!(config.oidc.userinfo_cors_origins.is_empty());
+        // Every legacy response type and form_post is DISABLED by default (issue
+        // #17): only the code flow with the query response mode is served.
+        assert!(!config.oidc.enable_response_type_id_token);
+        assert!(!config.oidc.enable_response_type_code_id_token);
+        assert!(!config.oidc.enable_response_type_none);
+        assert!(!config.oidc.enable_response_mode_form_post);
 
         // A zero session lifetime (born expired) is rejected; a lifetime above the
         // session ceiling is rejected too.
@@ -857,6 +918,34 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("ttl"), "{msg}");
         assert!(msg.contains("authorization_code_ttl_secs"), "{msg}");
+    }
+
+    #[test]
+    fn oidc_legacy_response_types_and_form_post_parse_and_default_off() {
+        // Issue #17: the legacy response types and form_post are opt-in per
+        // environment. Enabling each is an explicit boolean, mirroring the other
+        // promotable OIDC toggles.
+        let input = "[oidc]\nenable_response_type_id_token = true\n\
+                     enable_response_type_code_id_token = true\n\
+                     enable_response_type_none = true\n\
+                     enable_response_mode_form_post = true\n";
+        let config = Config::from_toml_str(input, "<inline>")
+            .expect("valid")
+            .config;
+        assert!(config.oidc.enable_response_type_id_token);
+        assert!(config.oidc.enable_response_type_code_id_token);
+        assert!(config.oidc.enable_response_type_none);
+        assert!(config.oidc.enable_response_mode_form_post);
+
+        // A misspelled toggle aborts with the accepted fields (strict parsing).
+        let err = Config::from_toml_str(
+            "[oidc]\nenable_response_type_idtoken = true\n",
+            "ironauth.toml",
+        )
+        .expect_err("unknown oidc key");
+        let msg = err.to_string();
+        assert!(msg.contains("enable_response_type_idtoken"), "{msg}");
+        assert!(msg.contains("enable_response_type_id_token"), "{msg}");
     }
 
     #[test]

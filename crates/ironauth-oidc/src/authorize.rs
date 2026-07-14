@@ -37,11 +37,13 @@ use serde::Deserialize;
 use crate::authn;
 use crate::claims_request::{ClaimsRequest, ClaimsRequestError};
 use crate::client_auth::ClientAuthMethod;
-use crate::error::{AuthorizeError, AuthzErrorCode, redirect_response};
+use crate::error::{AuthorizeError, AuthzErrorCode};
 use crate::interaction;
-use crate::registry::{PkceMethod, ResponseType};
+use crate::registry::{PkceMethod, ResponseMode, ResponseType};
 use crate::response;
 use crate::state::OidcState;
+use crate::token_hash;
+use crate::tokens::{self, MintRequest};
 use crate::util::{append_query, client_service_actor, epoch_micros};
 
 /// The authorization-request parameters. Every field is optional at
@@ -49,8 +51,16 @@ use crate::util::{append_query, client_service_actor, epoch_micros};
 /// error behavior) rather than a deserialization failure.
 #[derive(Debug, Deserialize)]
 pub struct AuthorizeParams {
-    /// The OAuth `response_type` (must be `code`).
+    /// The OAuth `response_type`: `code` always, plus the per-environment legacy
+    /// types (`id_token`, `code id_token`, `none`) when enabled (issue #17). It is
+    /// an ORDER-INSENSITIVE space-separated set; token-bearing values are
+    /// structurally unrepresentable.
     pub response_type: Option<String>,
+    /// The OAuth `response_mode` (issue #17): `query`, `fragment`, or `form_post`.
+    /// Absent means the response type's default (`query` for `code`/`none`,
+    /// `fragment` for the front-channel types). An explicit value is honored only
+    /// where spec-legal and enabled in this environment.
+    pub response_mode: Option<String>,
     /// The client identifier (a `cli_` scoped id declaring its scope).
     pub client_id: Option<String>,
     /// The redirect URI the code is returned to.
@@ -173,40 +183,105 @@ async fn issue_code(
     // #13); the scope (and thus the issuer) was fixed by the validated client_id.
     let iss = state.issuer_for(&scope);
     let state_echo = params.state.as_deref();
-    let redirect_error = |code: AuthzErrorCode, description: &str| AuthorizeError::Redirect {
-        redirect_uri: redirect_uri.to_owned(),
-        error: code,
-        description: description.to_owned(),
-        state: state_echo.map(str::to_owned),
-        iss: iss.clone(),
-    };
+    // Build a mode-parameterized redirect error. Errors raised BEFORE a response
+    // mode can be negotiated (an unknown response_type, an illegal response_mode)
+    // pass a safe explicit mode; once the mode is negotiated, the rest of the
+    // pipeline reuses it so an error travels back the way a result would have.
+    let redirect_error_mode =
+        |mode: ResponseMode, code: AuthzErrorCode, description: &str| AuthorizeError::Redirect {
+            redirect_uri: redirect_uri.to_owned(),
+            error: code,
+            description: description.to_owned(),
+            state: state_echo.map(str::to_owned),
+            iss: iss.clone(),
+            mode,
+        };
 
-    // 4. response_type: present and exactly `code`. A `token`/`id_token` response
-    //    type is unrepresentable in the registry, so the implicit flow (an access
-    //    token straight from the authorization endpoint) is refused here.
-    let response_type = params
+    // 4. response_type: present, representable, and enabled. A token-bearing value
+    //    is structurally unrepresentable (parse returns None), so the implicit
+    //    access-token flow is refused here; the legacy id_token/code id_token/none
+    //    types are representable but DISABLED per environment by default.
+    let response_type_raw = params
         .response_type
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| {
-            redirect_error(AuthzErrorCode::InvalidRequest, "response_type is required")
+            // No type at all: we cannot know a front-channel default, so the error
+            // goes back by the safe query mode.
+            redirect_error_mode(
+                ResponseMode::Query,
+                AuthzErrorCode::InvalidRequest,
+                "response_type is required",
+            )
         })?;
-    if ResponseType::parse(response_type).is_none() {
-        return Err(redirect_error(
+    let Some(response_type) = ResponseType::parse(response_type_raw) else {
+        // Unknown or token-bearing: unsupported, delivered by the safe query mode
+        // (no front-channel default is known for an unrepresentable type).
+        return Err(redirect_error_mode(
+            ResponseMode::Query,
             AuthzErrorCode::UnsupportedResponseType,
-            "only the code response_type is supported",
+            "the response_type is not supported",
+        ));
+    };
+
+    // 4b. Negotiate the response mode (issue #17). The default is the type's
+    //     (query for code/none, fragment for the front-channel types); an explicit
+    //     response_mode is honored only where spec-legal AND enabled. An illegal or
+    //     disabled mode is invalid_request, delivered by the type's DEFAULT mode
+    //     (never form_post, so there is no circular dependency on an enabled mode).
+    let default_mode = response_type.default_response_mode();
+    let mode = match resolve_mode(state, response_type, params.response_mode.as_deref()) {
+        Ok(mode) => mode,
+        Err(description) => {
+            return Err(redirect_error_mode(
+                default_mode,
+                AuthzErrorCode::InvalidRequest,
+                description,
+            ));
+        }
+    };
+
+    // 4c. Enablement: `code` is always enabled; a legacy type not enabled in this
+    //     environment is unsupported_response_type, delivered by the negotiated
+    //     mode.
+    if !state.response_type_enabled(response_type) {
+        return Err(redirect_error_mode(
+            mode,
+            AuthzErrorCode::UnsupportedResponseType,
+            "the response_type is not enabled in this environment",
         ));
     }
+
+    // 4d. nonce is REQUIRED for a front-channel ID token (OIDC Core 3.2.2.1 /
+    //     3.3.2.1): it binds the ID token to this request and defends replay.
+    let nonce = params
+        .nonce
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if response_type.is_front_channel() && nonce.is_none() {
+        return Err(redirect_error_mode(
+            mode,
+            AuthzErrorCode::InvalidRequest,
+            "nonce is required for this response_type",
+        ));
+    }
+
+    // The negotiated-mode error helper the rest of the pipeline uses.
+    let redirect_error =
+        |code: AuthzErrorCode, description: &str| redirect_error_mode(mode, code, description);
 
     // 5. PKCE (S256-only, mandatory; see resolve_pkce). A PUBLIC client
     //    (token_endpoint_auth_method = none) always requires PKCE (RFC 9700 2.1.1);
     //    a CONFIDENTIAL client follows the per-environment policy, required by
-    //    default. `plain` and a defaulted method are invalid_request. The other
-    //    downgrade direction (a no-challenge code redeemed WITH a verifier) is the
-    //    token endpoint's to refuse.
+    //    default. `plain` and a defaulted method are invalid_request. PKCE binds a
+    //    code, so it is enforced for the flows that issue one (`code`,
+    //    `code id_token`); a pure `id_token` or `none` request issues no code, so a
+    //    code_challenge is simply unused there.
     let is_public = client.auth_method == ClientAuthMethod::None.as_str();
-    let pkce_required = is_public || state.require_pkce_for_confidential();
+    let pkce_required =
+        response_type.issues_code() && (is_public || state.require_pkce_for_confidential());
     let code_challenge = resolve_pkce(&params, pkce_required)
         .map_err(|description| redirect_error(AuthzErrorCode::InvalidRequest, description))?;
     let code_challenge_method = code_challenge.map(|_| PkceMethod::S256.as_str());
@@ -226,11 +301,11 @@ async fn issue_code(
     let (session, consent_ref) = match resolve_gate(
         state,
         headers,
-        scope,
         &client_id,
         &params,
         redirect_uri,
         &iss,
+        mode,
     )
     .await?
     {
@@ -257,14 +332,13 @@ async fn issue_code(
         ));
     }
 
-    // 7. Freeze the authentication context onto the code. auth_time is emitted in
-    //    the ID token when the request asked for max_age (present, including
-    //    max_age=0) OR the client registered require_auth_time; the value is
-    //    always the truthful recorded instant, so it is frozen only when it is
-    //    due. The recorded methods are always frozen so amr/acr can be derived.
-    //    acr_values is honored as a preference only: the achieved acr comes from
-    //    the event, never from the request, so nothing about acr_values is copied
-    //    onto the code.
+    // 7. Freeze the authentication context. auth_time is emitted in the ID token
+    //    when the request asked for max_age (present, including max_age=0) OR the
+    //    client registered require_auth_time; the value is always the truthful
+    //    recorded instant, so it is frozen only when it is due. The recorded
+    //    methods are always frozen so amr/acr can be derived. acr_values is honored
+    //    as a preference only: the achieved acr comes from the event, never the
+    //    request.
     let max_age_requested = params
         .max_age
         .as_deref()
@@ -273,11 +347,9 @@ async fn issue_code(
     let auth_time_micros =
         (max_age_requested || client.require_auth_time).then_some(session.auth_time_unix_micros);
 
-    // 8. Persist the code + grant bound to every re-checkable parameter and the
-    //    real subject/session/consent, then redirect with the code.
     let session_ref = session.session_id.to_string();
     let resolved = Resolved {
-        nonce: params.nonce.as_deref().filter(|value| !value.is_empty()),
+        nonce,
         oauth_scope: params
             .scope
             .as_deref()
@@ -293,7 +365,135 @@ async fn issue_code(
         consent_ref: &consent_ref,
         claims_request: claims_canonical.as_deref(),
     };
-    finalize_issue(state, scope, &client_id, redirect_uri, &iss, &resolved).await
+
+    // 8. Dispatch by response type, consuming the SAME success parameter list
+    //    through the negotiated mode encoder (issue #17):
+    //    - issues_code (`code`, `code id_token`): persist the code + grant bound to
+    //      every re-checkable parameter and the real subject/session/consent;
+    //    - front-channel (`id_token`, `code id_token`): mint an ID token through
+    //      the token endpoint's exact claim + signing path, carrying `nonce`, and
+    //      (hybrid only) `c_hash` of the issued code, never an access token;
+    //    - `none`: issue nothing.
+    let code = if response_type.issues_code() {
+        Some(
+            persist_code(
+                state,
+                scope,
+                &client_id,
+                redirect_uri,
+                &iss,
+                mode,
+                &resolved,
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+    let id_token = if response_type.is_front_channel() {
+        let minted = mint_front_channel_id_token(
+            state,
+            scope,
+            &client_id,
+            &iss,
+            response_type,
+            &resolved,
+            code.as_deref(),
+        )
+        .map_err(|()| {
+            redirect_error(
+                AuthzErrorCode::ServerError,
+                "the authorization request could not be processed",
+            )
+        })?;
+        Some(minted)
+    } else {
+        None
+    };
+
+    let params = response::success_params(code.as_deref(), id_token.as_deref(), state_echo, &iss);
+    Ok(response::render(mode, redirect_uri, &params))
+}
+
+/// Resolve the response mode for a request (issue #17). Absent means the response
+/// type's default (`query` for `code`/`none`, `fragment` for the front-channel
+/// types). An explicit value is honored only where BOTH spec-legal and enabled in
+/// this environment; otherwise it returns the `invalid_request` description the
+/// caller sends by the type's default mode.
+///
+/// Spec legality (OAuth 2.0 Multiple Response Type Encoding Practices): `query` is
+/// forbidden for a front-channel type (it would place an ID token in the logged,
+/// `Referer`-leaked query string); `fragment` and `form_post` are legal for any
+/// type. Enablement: `query` is always available, `fragment` rides the
+/// front-channel feature, and `form_post` rides its own per-environment toggle.
+fn resolve_mode(
+    state: &OidcState,
+    response_type: ResponseType,
+    requested: Option<&str>,
+) -> Result<ResponseMode, &'static str> {
+    let Some(requested) = requested.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(response_type.default_response_mode());
+    };
+    let Some(mode) = ResponseMode::parse(requested) else {
+        return Err("the requested response_mode is not supported");
+    };
+    // query would leak a front-channel ID token through the query string.
+    if mode == ResponseMode::Query && response_type.is_front_channel() {
+        return Err("the query response_mode is not permitted for this response_type");
+    }
+    if !state.response_mode_enabled(mode) {
+        return Err("the requested response_mode is not enabled in this environment");
+    }
+    Ok(mode)
+}
+
+/// Mint the front-channel ID token for the implicit and hybrid flows (issue #17),
+/// reusing the token endpoint's EXACT claim assembly and signing path
+/// ([`tokens::mint_id_token`]); it never mints an access token. The hybrid flow
+/// supplies `c_hash` of the issued `code`; the pure implicit flow has no code and
+/// no `c_hash`. A missing signing key or a signing failure is `Err(())`, which the
+/// caller maps to a `server_error` returned by the negotiated mode. (Live key
+/// serving is inert until issue #194; the logic is fully exercised by tests that
+/// provision a key.)
+fn mint_front_channel_id_token(
+    state: &OidcState,
+    scope: Scope,
+    client_id: &ClientId,
+    iss: &str,
+    response_type: ResponseType,
+    resolved: &Resolved<'_>,
+    code: Option<&str>,
+) -> Result<String, ()> {
+    let signer = state.signer_for(&scope.environment()).ok_or(())?;
+    let alg = signer.algorithm();
+    // The `sub` is resolved through the ONE shared derivation, so a front-channel
+    // ID token's subject can never diverge from what the token endpoint or UserInfo
+    // returns for the same client and user.
+    let subject = state.resolve_public_subject(resolved.subject);
+    let client_id_str = client_id.to_string();
+    // c_hash binds the issued code to the hybrid ID token; a pure id_token carries
+    // none, and neither ever carries at_hash (no access token is issued here).
+    let c_hash = match (response_type, code) {
+        (ResponseType::CodeIdToken, Some(code)) => Some(token_hash::c_hash(alg, code)),
+        _ => None,
+    };
+    // The front-channel ID token stays lean (no scope/claims-parameter copy-in);
+    // the authoritative claims are served from UserInfo.
+    let extra_claims = serde_json::Map::new();
+    let request = MintRequest {
+        scope,
+        issuer: iss,
+        subject: &subject,
+        client_id: &client_id_str,
+        nonce: resolved.nonce,
+        oauth_scope: resolved.oauth_scope,
+        auth_methods: resolved.auth_methods,
+        auth_time_unix_micros: resolved.auth_time_micros,
+        at_hash: None,
+        c_hash: c_hash.as_deref(),
+        extra_claims: &extra_claims,
+    };
+    tokens::mint_id_token(state, signer, &request).map(|(id_token, _jti)| id_token)
 }
 
 /// Validate the request's `redirect_uri` against the client's registered set
@@ -432,12 +632,14 @@ enum Gate {
 async fn resolve_gate(
     state: &OidcState,
     headers: &HeaderMap,
-    scope: Scope,
     client_id: &ClientId,
     params: &AuthorizeParams,
     redirect_uri: &str,
     iss: &str,
+    mode: ResponseMode,
 ) -> Result<Gate, AuthorizeError> {
+    // The scope is the one the client_id declares (fixed at validation).
+    let scope = client_id.scope();
     let cookie = interaction::cookie_header(headers);
     let Some(session) = interaction::resolve_session(state, scope, cookie).await else {
         let return_to = build_authorize_url(params);
@@ -476,6 +678,7 @@ async fn resolve_gate(
             description: "the authorization request could not be processed".to_owned(),
             state: params.state.as_deref().map(str::to_owned),
             iss: iss.to_owned(),
+            mode,
         }),
     }
 }
@@ -489,6 +692,7 @@ fn build_authorize_url(params: &AuthorizeParams) -> String {
         "/authorize",
         &[
             ("response_type", params.response_type.as_deref()),
+            ("response_mode", params.response_mode.as_deref()),
             ("client_id", params.client_id.as_deref()),
             ("redirect_uri", params.redirect_uri.as_deref()),
             ("scope", params.scope.as_deref()),
@@ -532,17 +736,19 @@ struct Resolved<'a> {
 }
 
 /// Mint the code and its grant bound to every re-checkable parameter (with a
-/// fresh expiry from the clock seam), persist them in one audited transaction,
-/// and redirect to the validated `redirect_uri` with the code and echoed state. A
-/// store failure here redirects a `server_error` (the `redirect_uri` is valid).
-async fn finalize_issue(
+/// fresh expiry from the clock seam), persist them in one audited transaction, and
+/// return the issued code string (the hybrid flow also hashes it into `c_hash`). A
+/// store failure is a `server_error` returned by the negotiated `mode` (the
+/// `redirect_uri` is valid).
+async fn persist_code(
     state: &OidcState,
     scope: Scope,
     client_id: &ClientId,
     redirect_uri: &str,
     iss: &str,
+    mode: ResponseMode,
     resolved: &Resolved<'_>,
-) -> Result<Response, AuthorizeError> {
+) -> Result<String, AuthorizeError> {
     let now = state.now();
     let code_id = AuthorizationCodeId::generate(state.env(), &scope);
     let grant_id = GrantId::generate(state.env(), &scope);
@@ -586,16 +792,9 @@ async fn finalize_issue(
             description: "the authorization request could not be processed".to_owned(),
             state: resolved.state_echo.map(str::to_owned),
             iss: iss.to_owned(),
+            mode,
         });
     }
 
-    // The success response carries the code, the echoed state, and the RFC 9207
-    // `iss` (issue #13); the same parameter assembler feeds the fragment and
-    // form_post encoders #17 adds, so iss is emitted uniformly on every mode.
-    let code = code_id.to_string();
-    let location = append_query(
-        redirect_uri,
-        &response::success_params(&code, resolved.state_echo, iss),
-    );
-    Ok(redirect_response(&location))
+    Ok(code_id.to_string())
 }

@@ -12,10 +12,14 @@
 //!   There is no `Password` variant, so the resource-owner-password-credentials
 //!   (ROPC) grant has no value to match and no handler to route to: it is absent,
 //!   not disabled.
-//! - [`ResponseType`] has exactly one variant, [`ResponseType::Code`]. There is
-//!   no `Token` or `IdToken` variant, so the implicit flow (an access token, or
-//!   an ID token, issued straight from the authorization endpoint) cannot be
-//!   expressed. The authorization endpoint can only ever mint a code.
+//! - [`ResponseType`] is closed around a SET of exactly four members: `code`,
+//!   `code id_token`, `id_token`, and `none`. There is NO component for an
+//!   access token anywhere in the type, so NONE of the token-bearing response
+//!   types (`token`, `code token`, `id_token token`, `code id_token token`) can
+//!   be represented: the implicit access-token flow is designed OUT, not
+//!   configured off. The authorization endpoint can never emit an access token,
+//!   in any spelling. The three non-`code` members are legacy types disabled per
+//!   environment by default (issue #17).
 //! - [`PkceMethod`] has exactly one variant, [`PkceMethod::S256`]. There is no
 //!   `Plain` variant, so `code_challenge_method=plain` can never be represented.
 //!
@@ -23,10 +27,11 @@
 //! kept here so discovery sources them from the owning subsystem rather than
 //! hand-listing them:
 //!
-//! - [`ResponseMode`] has exactly one variant, [`ResponseMode::Query`]: the
-//!   authorization endpoint returns the code in the redirect query, never a
-//!   fragment. `form_post` is issue #17 and appears only when enabled per
-//!   environment.
+//! - [`ResponseMode`] has three members: `query` (always available, the code
+//!   flow's default), `fragment` (the front-channel default), and `form_post`
+//!   (OAuth 2.0 Form Post Response Mode 1.0). `fragment` and `form_post` are
+//!   enabled per environment alongside the legacy response types they serve
+//!   (issue #17), so discovery advertises them only where enabled.
 //! - [`PromptValue`] has exactly one variant, [`PromptValue::Create`]: the only
 //!   `prompt` value the bootstrap acts on (route an unauthenticated user to
 //!   registration). The rest of the `prompt` semantics build on the session model
@@ -73,36 +78,123 @@ impl GrantType {
 
 /// The OAuth response types the authorization endpoint can service.
 ///
-/// Closed on purpose: the only member is `code`. The implicit-flow response types
-/// (`token`, `id_token`, and their combinations) are absent, so the authorization
-/// endpoint cannot return an access token or an ID token directly: it can only
-/// ever issue a code to be exchanged at the token endpoint.
+/// Closed around a SET, not a scalar: a `response_type` value is a
+/// space-delimited, order-insensitive set of tokens (OAuth 2.0 Multiple Response
+/// Type Encoding Practices), so `code id_token` and `id_token code` name the same
+/// member. The representable members are exactly `code`, `code id_token`,
+/// `id_token`, and `none`.
+///
+/// The dangerous legacy is designed OUT, not configured off: there is NO
+/// component for an access token anywhere in this type, so NONE of the
+/// token-bearing response types (`token`, `code token`, `id_token token`,
+/// `code id_token token`) can be represented. The authorization endpoint can
+/// therefore never emit an access token, in any spelling, by construction (the
+/// permanent OAuth 2.1 / RFC 9700 2.1.2 non-goal). [`ResponseType::parse`]
+/// additionally maps every token-bearing spelling to `None`, so a forbidden
+/// value cannot even resolve to a handler.
+///
+/// `code` is always available; the other three members are legacy types DISABLED
+/// per environment by default and enabled only by explicit configuration (issue
+/// #17), so they appear in discovery only where enabled.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResponseType {
-    /// The `code` response type (the authorization-code flow).
+    /// `code`: the authorization-code flow (the default, always available).
     Code,
+    /// `code id_token`: the hybrid flow. The authorization endpoint returns a
+    /// code AND a front-channel ID token carrying `c_hash` (never an access
+    /// token, and never `at_hash`, since no token is issued here).
+    CodeIdToken,
+    /// `id_token`: the implicit ID-token-only flow. The authorization endpoint
+    /// returns a front-channel ID token with no code and no access token (so no
+    /// `c_hash` and no `at_hash`).
+    IdToken,
+    /// `none`: the endpoint returns no code and no token, only `state` and the
+    /// RFC 9207 `iss`; used to exercise a redirect without issuing anything.
+    None,
 }
 
 impl ResponseType {
-    /// Every response type this build can express. Exactly one, by design.
-    pub const ALL: &'static [ResponseType] = &[ResponseType::Code];
+    /// Every response type this build can express. Exactly these four, by
+    /// design: no token-bearing member exists, so the implicit access-token flow
+    /// is unrepresentable.
+    pub const ALL: &'static [ResponseType] = &[
+        ResponseType::Code,
+        ResponseType::CodeIdToken,
+        ResponseType::IdToken,
+        ResponseType::None,
+    ];
 
-    /// The wire `response_type` value.
+    /// The response types available in EVERY environment without configuration:
+    /// exactly `code`. The other members are legacy types enabled per
+    /// environment, so discovery advertises them only where enabled (issue #17).
+    pub const DEFAULT: &'static [ResponseType] = &[ResponseType::Code];
+
+    /// The wire `response_type` value. For the hybrid flow this is the registered
+    /// `code id_token` spelling (space-separated, in that canonical order).
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
             ResponseType::Code => "code",
+            ResponseType::CodeIdToken => "code id_token",
+            ResponseType::IdToken => "id_token",
+            ResponseType::None => "none",
         }
     }
 
-    /// Parse a wire `response_type`. Returns `None` for every value that is not
-    /// `code`, so `token`, `id_token`, and the hybrid combinations never resolve
-    /// to an authorization-endpoint response.
+    /// Parse a wire `response_type` as an ORDER-INSENSITIVE SET of tokens. The
+    /// only recognized components are `code` and `id_token` (plus the standalone
+    /// `none`); every other token, in particular the access-token component
+    /// `token`, makes the whole value unrepresentable (returns `None`), so no
+    /// token-bearing response type ever resolves. Duplicates collapse (it is a
+    /// set); an empty value, or `none` combined with any other token, is invalid.
     #[must_use]
     pub fn parse(raw: &str) -> Option<Self> {
-        match raw {
-            "code" => Some(ResponseType::Code),
+        let (mut code, mut id_token, mut none) = (false, false, false);
+        for token in raw.split_ascii_whitespace() {
+            match token {
+                "code" => code = true,
+                "id_token" => id_token = true,
+                "none" => none = true,
+                // The access-token component `token` (and anything unknown) is
+                // unrepresentable: the whole set is rejected.
+                _ => return None,
+            }
+        }
+        match (code, id_token, none) {
+            (true, false, false) => Some(ResponseType::Code),
+            (true, true, false) => Some(ResponseType::CodeIdToken),
+            (false, true, false) => Some(ResponseType::IdToken),
+            (false, false, true) => Some(ResponseType::None),
+            // Empty, or `none` combined with another token, is not a valid set.
             _ => None,
+        }
+    }
+
+    /// Whether this response type delivers a front-channel ID token (`id_token`
+    /// and `code id_token`). A front-channel type fixes the default response mode
+    /// to `fragment`, forbids `query`, mints an ID token at the authorization
+    /// endpoint, and therefore REQUIRES `nonce`.
+    #[must_use]
+    pub fn is_front_channel(self) -> bool {
+        matches!(self, ResponseType::CodeIdToken | ResponseType::IdToken)
+    }
+
+    /// Whether the flow issues an authorization `code` (`code` and
+    /// `code id_token`), persisted for later redemption at the token endpoint.
+    #[must_use]
+    pub fn issues_code(self) -> bool {
+        matches!(self, ResponseType::Code | ResponseType::CodeIdToken)
+    }
+
+    /// The default response mode (OAuth 2.0 Multiple Response Type Encoding
+    /// Practices): `query` for `code` and `none`, `fragment` for the
+    /// front-channel types.
+    #[must_use]
+    pub fn default_response_mode(self) -> ResponseMode {
+        if self.is_front_channel() {
+            ResponseMode::Fragment
+        } else {
+            ResponseMode::Query
         }
     }
 }
@@ -144,34 +236,54 @@ impl PkceMethod {
 
 /// The OAuth response modes the authorization endpoint can return a result by.
 ///
-/// Closed on purpose: the only member is `query` (the code is returned in the
-/// redirect query string; the endpoint never uses a fragment). `form_post` is
-/// issue #17 and, when it lands, appears in discovery only for environments that
-/// enable it, so it is a per-environment capability rather than a variant here.
+/// `query` (the code flow's default) is always available. `fragment` (the
+/// front-channel default) and `form_post` (OAuth 2.0 Form Post Response Mode 1.0)
+/// are enabled per environment alongside the legacy response types they serve
+/// (issue #17), so discovery advertises them only where enabled. The negotiator
+/// forbids the one dangerous combination: a front-channel response type may never
+/// use `query`, which would place an ID token in the (logged, Referer-leaked)
+/// query string.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResponseMode {
-    /// `query`: the authorization response parameters are in the redirect query.
+    /// `query`: the response parameters are in the redirect query string.
     Query,
+    /// `fragment`: the response parameters are in the redirect URL fragment.
+    Fragment,
+    /// `form_post`: the response parameters are posted to the redirect URI by an
+    /// auto-submitting HTML form, so they never appear in a URL.
+    FormPost,
 }
 
 impl ResponseMode {
-    /// Every response mode this build serves. Exactly one, by design.
-    pub const ALL: &'static [ResponseMode] = &[ResponseMode::Query];
+    /// Every response mode this build can express.
+    pub const ALL: &'static [ResponseMode] = &[
+        ResponseMode::Query,
+        ResponseMode::Fragment,
+        ResponseMode::FormPost,
+    ];
+
+    /// The response modes available in EVERY environment without configuration:
+    /// exactly `query`. `fragment` and `form_post` are enabled per environment,
+    /// so discovery advertises them only where enabled (issue #17).
+    pub const DEFAULT: &'static [ResponseMode] = &[ResponseMode::Query];
 
     /// The wire / metadata `response_mode` value.
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
             ResponseMode::Query => "query",
+            ResponseMode::Fragment => "fragment",
+            ResponseMode::FormPost => "form_post",
         }
     }
 
-    /// Parse a wire `response_mode`. Returns `None` for every value that is not
-    /// `query`, so `fragment` and `form_post` never resolve to a served mode.
+    /// Parse a wire `response_mode`. Returns `None` for every unknown value.
     #[must_use]
     pub fn parse(raw: &str) -> Option<Self> {
         match raw {
             "query" => Some(ResponseMode::Query),
+            "fragment" => Some(ResponseMode::Fragment),
+            "form_post" => Some(ResponseMode::FormPost),
             _ => None,
         }
     }
@@ -209,6 +321,158 @@ impl PromptValue {
         match raw {
             "create" => Some(PromptValue::Create),
             _ => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn response_type_registry_is_exactly_the_four_token_free_members() {
+        // The structural lock (issue #17): the registry is EXACTLY these four
+        // members, in this order. No token-bearing member exists, so a future edit
+        // that added `token`, `code token`, `id_token token`, or
+        // `code id_token token` would fail this exact-set assertion (it would have
+        // to grow ALL) and the build would break.
+        assert_eq!(
+            ResponseType::ALL,
+            &[
+                ResponseType::Code,
+                ResponseType::CodeIdToken,
+                ResponseType::IdToken,
+                ResponseType::None,
+            ]
+        );
+        assert_eq!(ResponseType::ALL.len(), 4);
+        // Every representable member decomposes into ONLY the token-free
+        // components {code, id_token, none}; the access-token component `token`
+        // appears in none of them, so it cannot be expressed.
+        for rt in ResponseType::ALL {
+            for component in rt.as_str().split(' ') {
+                assert!(
+                    matches!(component, "code" | "id_token" | "none"),
+                    "{rt:?} decomposes into a forbidden component {component:?}"
+                );
+            }
+            // Each member round-trips through its own wire spelling.
+            assert_eq!(ResponseType::parse(rt.as_str()), Some(*rt));
+        }
+    }
+
+    #[test]
+    fn response_type_parses_as_an_order_insensitive_set() {
+        assert_eq!(ResponseType::parse("code"), Some(ResponseType::Code));
+        assert_eq!(ResponseType::parse("id_token"), Some(ResponseType::IdToken));
+        assert_eq!(ResponseType::parse("none"), Some(ResponseType::None));
+        // A set: order does not matter, and duplicates collapse.
+        assert_eq!(
+            ResponseType::parse("code id_token"),
+            Some(ResponseType::CodeIdToken)
+        );
+        assert_eq!(
+            ResponseType::parse("id_token code"),
+            Some(ResponseType::CodeIdToken),
+            "response_type is an order-insensitive set"
+        );
+        assert_eq!(
+            ResponseType::parse("code   id_token"),
+            Some(ResponseType::CodeIdToken),
+            "extra internal whitespace is tolerated"
+        );
+        assert_eq!(
+            ResponseType::parse("code code"),
+            Some(ResponseType::Code),
+            "a duplicated component collapses (it is a set)"
+        );
+    }
+
+    #[test]
+    fn every_token_bearing_or_invalid_spelling_is_unrepresentable() {
+        // The access-token flow, in every spelling and order, parses to None: it
+        // has no variant and never resolves to a handler.
+        for forbidden in [
+            "token",
+            "code token",
+            "token code",
+            "id_token token",
+            "token id_token",
+            "code id_token token",
+            "token code id_token",
+            // none does not combine with any other token.
+            "none code",
+            "code none",
+            "none id_token",
+            // empty / whitespace-only is not a valid set.
+            "",
+            "   ",
+            // unknown members.
+            "unknown",
+            "code unknown",
+        ] {
+            assert!(
+                ResponseType::parse(forbidden).is_none(),
+                "response_type {forbidden:?} must be unrepresentable"
+            );
+        }
+    }
+
+    #[test]
+    fn response_type_front_channel_and_code_predicates() {
+        // code: a code, not front-channel.
+        assert!(ResponseType::Code.issues_code());
+        assert!(!ResponseType::Code.is_front_channel());
+        // code id_token: both a code and a front-channel ID token.
+        assert!(ResponseType::CodeIdToken.issues_code());
+        assert!(ResponseType::CodeIdToken.is_front_channel());
+        // id_token: a front-channel ID token, no code.
+        assert!(!ResponseType::IdToken.issues_code());
+        assert!(ResponseType::IdToken.is_front_channel());
+        // none: neither.
+        assert!(!ResponseType::None.issues_code());
+        assert!(!ResponseType::None.is_front_channel());
+    }
+
+    #[test]
+    fn default_response_modes_match_the_spec() {
+        // OAuth 2.0 Multiple Response Type Encoding Practices: query for code and
+        // none, fragment for the front-channel types.
+        assert_eq!(
+            ResponseType::Code.default_response_mode(),
+            ResponseMode::Query
+        );
+        assert_eq!(
+            ResponseType::None.default_response_mode(),
+            ResponseMode::Query
+        );
+        assert_eq!(
+            ResponseType::IdToken.default_response_mode(),
+            ResponseMode::Fragment
+        );
+        assert_eq!(
+            ResponseType::CodeIdToken.default_response_mode(),
+            ResponseMode::Fragment
+        );
+    }
+
+    #[test]
+    fn response_mode_registry_and_parsing() {
+        assert_eq!(
+            ResponseMode::ALL,
+            &[
+                ResponseMode::Query,
+                ResponseMode::Fragment,
+                ResponseMode::FormPost,
+            ]
+        );
+        assert_eq!(ResponseMode::DEFAULT, &[ResponseMode::Query]);
+        for mode in ResponseMode::ALL {
+            assert_eq!(ResponseMode::parse(mode.as_str()), Some(*mode));
+        }
+        // Unknown modes (including the JARM `jwt`, deferred to M16) do not resolve.
+        for unknown in ["", "jwt", "web_message", "Query"] {
+            assert!(ResponseMode::parse(unknown).is_none(), "{unknown:?}");
         }
     }
 }

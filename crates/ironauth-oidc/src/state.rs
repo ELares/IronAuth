@@ -26,6 +26,7 @@ use ironauth_jose::{
 };
 use ironauth_store::{EnvironmentId, Scope, Store};
 
+use crate::registry::{ResponseMode, ResponseType};
 use crate::subject::{PairwiseSalt, SubjectCache, SubjectConfig};
 
 /// Cheaply cloneable state shared by every OIDC handler.
@@ -34,6 +35,11 @@ pub struct OidcState {
     inner: Arc<Inner>,
 }
 
+// The per-environment policy flags each mirror an independent, individually
+// documented OidcConfig toggle; folding them into a state machine or enums (the
+// excessive-bools remedy) would obscure that one-to-one mapping to config for no
+// gain, so the lint is allowed here.
+#[allow(clippy::struct_excessive_bools)]
 struct Inner {
     store: Store,
     env: Env,
@@ -58,6 +64,16 @@ struct Inner {
     // is offered on UserInfo ONLY, never on the authorization endpoint. A promotable
     // per-environment setting sourced from OidcConfig.
     userinfo_cors_origins: BTreeSet<String>,
+    // The per-environment legacy-flow enablement (issue #17). Each is a promotable
+    // per-environment setting sourced from OidcConfig; all default to false, so the
+    // safe default serves only the `code` flow with the `query` response mode. The
+    // token-bearing response types are not represented here at all: they are
+    // structurally unrepresentable in ResponseType, designed OUT rather than
+    // configured off.
+    enable_response_type_id_token: bool,
+    enable_response_type_code_id_token: bool,
+    enable_response_type_none: bool,
+    enable_response_mode_form_post: bool,
     // The one shared subject-derivation cache. The surface that emits a `sub` (the
     // ID token today, and `UserInfo`/introspection once they land) resolves it
     // through this cache; because it is a single shared derivation, any two
@@ -97,6 +113,10 @@ impl OidcState {
                 require_pkce_for_confidential: config.require_pkce_for_confidential_clients,
                 conform_id_token_claims: config.conform_id_token_claims,
                 userinfo_cors_origins: config.userinfo_cors_origins.iter().cloned().collect(),
+                enable_response_type_id_token: config.enable_response_type_id_token,
+                enable_response_type_code_id_token: config.enable_response_type_code_id_token,
+                enable_response_type_none: config.enable_response_type_none,
+                enable_response_mode_form_post: config.enable_response_mode_form_post,
                 subjects: SubjectCache::new(),
             }),
         }
@@ -231,6 +251,48 @@ impl OidcState {
     #[must_use]
     pub fn is_registered_spa_origin(&self, origin: &str) -> bool {
         self.inner.userinfo_cors_origins.contains(origin)
+    }
+
+    /// Whether `response_type` is enabled in this environment (issue #17). `code`
+    /// is always enabled; the legacy types (`id_token`, `code id_token`, `none`)
+    /// are DISABLED by default and turned on only by explicit per-environment
+    /// config. A requested legacy type that is not enabled is
+    /// `unsupported_response_type`. The token-bearing types cannot even be passed
+    /// here: they are unrepresentable in [`ResponseType`].
+    #[must_use]
+    pub fn response_type_enabled(&self, response_type: ResponseType) -> bool {
+        match response_type {
+            ResponseType::Code => true,
+            ResponseType::IdToken => self.inner.enable_response_type_id_token,
+            ResponseType::CodeIdToken => self.inner.enable_response_type_code_id_token,
+            ResponseType::None => self.inner.enable_response_type_none,
+        }
+    }
+
+    /// Whether the `form_post` response mode is enabled in this environment (issue
+    /// #17). Disabled by default; a client may request `response_mode=form_post`
+    /// only where an operator has explicitly enabled it.
+    #[must_use]
+    pub fn form_post_enabled(&self) -> bool {
+        self.inner.enable_response_mode_form_post
+    }
+
+    /// Whether `mode` is enabled for a client to REQUEST explicitly in this
+    /// environment (issue #17). `query` is always available; `fragment` becomes
+    /// available when a front-channel response type is enabled (it is that
+    /// feature's default and only-useful mode); `form_post` is gated on its own
+    /// toggle. This governs what a client may ask for and what discovery
+    /// advertises; the error path may still ENCODE a redirect in any mode.
+    #[must_use]
+    pub fn response_mode_enabled(&self, mode: ResponseMode) -> bool {
+        match mode {
+            ResponseMode::Query => true,
+            ResponseMode::Fragment => {
+                self.inner.enable_response_type_id_token
+                    || self.inner.enable_response_type_code_id_token
+            }
+            ResponseMode::FormPost => self.inner.enable_response_mode_form_post,
+        }
     }
 
     /// Verify a presented access token (a compact `at+jwt` JWS) against the

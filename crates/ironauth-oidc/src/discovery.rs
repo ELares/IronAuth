@@ -23,12 +23,12 @@
 //! subsystem exposes, never hand-listed here, so a subsystem change flows into
 //! discovery with no edit to the generator:
 //!
-//! - `response_types_supported`   <- [`ResponseType::ALL`] (+ per-env legacy, #17)
+//! - `response_types_supported`   <- [`ResponseType::DEFAULT`] (+ per-env legacy, #17)
 //! - `grant_types_supported`      <- [`GrantType::ALL`]
 //! - `code_challenge_methods_supported` <- [`PkceMethod::ALL`]
 //! - `token_endpoint_auth_methods_supported` <- [`ClientAuthMethod::ALL`]
 //! - `subject_types_supported`    <- [`SubjectType::ALL`]
-//! - `response_modes_supported`   <- [`ResponseMode::ALL`] (+ per-env `form_post`, #17)
+//! - `response_modes_supported`   <- [`ResponseMode::DEFAULT`] (+ per-env `fragment`/`form_post`, #17)
 //! - `prompt_values_supported`    <- [`PromptValue::ALL`]
 //! - `id_token_signing_alg_values_supported` <- the environment policy, with the
 //!   Discovery section 3 RS256 FLOOR (see [`id_token_signing_alg_values`]).
@@ -190,14 +190,34 @@ impl DiscoveryCapabilities {
     /// The `claims` request parameter is supported (issue #15) and the
     /// authorization endpoint emits the RFC 9207 `iss` on every authorization
     /// response, success and error, on every response mode (issue #13); discovery
-    /// advertises both. The remaining per-environment features (legacy response
-    /// types, `form_post`) stay off until their owning issue (#17) wires their flags
-    /// in here; discovery reflects each with no change to the generator.
+    /// advertises both. The per-environment legacy response types and modes (issue
+    /// #17) are advertised ONLY where enabled: each enabled legacy type is added,
+    /// `fragment` is advertised when any front-channel type is enabled (it is that
+    /// feature's default and only-useful mode), and `form_post` when its own toggle
+    /// is set. Discovery therefore reflects exactly what the authorization endpoint
+    /// will accept.
     #[must_use]
-    pub fn from_config(_config: &OidcConfig) -> Self {
-        Self::default()
+    pub fn from_config(config: &OidcConfig) -> Self {
+        let mut caps = Self::default()
             .with_claims_parameter(true)
-            .with_authorization_response_iss(true)
+            .with_authorization_response_iss(true);
+        if config.enable_response_type_id_token {
+            caps = caps.with_additional_response_type(ResponseType::IdToken.as_str());
+        }
+        if config.enable_response_type_code_id_token {
+            caps = caps.with_additional_response_type(ResponseType::CodeIdToken.as_str());
+        }
+        if config.enable_response_type_none {
+            caps = caps.with_additional_response_type(ResponseType::None.as_str());
+        }
+        // fragment is usable exactly when a front-channel type is enabled.
+        if config.enable_response_type_id_token || config.enable_response_type_code_id_token {
+            caps = caps.with_additional_response_mode(ResponseMode::Fragment.as_str());
+        }
+        if config.enable_response_mode_form_post {
+            caps = caps.with_additional_response_mode(ResponseMode::FormPost.as_str());
+        }
+        caps
     }
 
     /// Declare whether the `claims` request parameter is supported (issue #15).
@@ -270,10 +290,14 @@ pub fn discovery_document(
     policy: &SigningPolicy,
     capabilities: &DiscoveryCapabilities,
 ) -> Value {
-    let mut response_types = to_strings(ResponseType::ALL.iter().map(|value| value.as_str()));
+    // The always-on registry base (`code`, `query`) plus the per-environment
+    // legacy types and modes enabled by config (issue #17). The base is the
+    // DEFAULT registry subset, NOT ALL: the legacy members of the registry are
+    // advertised only where explicitly enabled.
+    let mut response_types = to_strings(ResponseType::DEFAULT.iter().map(|value| value.as_str()));
     response_types.extend(capabilities.additional_response_types.iter().cloned());
 
-    let mut response_modes = to_strings(ResponseMode::ALL.iter().map(|value| value.as_str()));
+    let mut response_modes = to_strings(ResponseMode::DEFAULT.iter().map(|value| value.as_str()));
     response_modes.extend(capabilities.additional_response_modes.iter().cloned());
 
     let mut document = serde_json::Map::new();
@@ -610,6 +634,71 @@ mod tests {
         // PKCE is S256-only: plain is structurally absent from the registry, so it
         // can never be advertised.
         assert_eq!(doc["code_challenge_methods_supported"], json!(["S256"]));
+    }
+
+    #[test]
+    fn from_config_advertises_only_the_enabled_legacy_types_and_modes() {
+        // Issue #17: with everything off (the default), discovery advertises only
+        // the always-on code flow with the query mode.
+        let off = DiscoveryCapabilities::from_config(&OidcConfig::default());
+        let policy = SigningPolicy::eddsa_default();
+        let doc = |caps: &DiscoveryCapabilities| {
+            discovery_document(
+                "https://i.test/t/a/e/b",
+                "https://i.test",
+                "https://i.test/t/a/e/b/jwks.json",
+                &policy,
+                caps,
+            )
+        };
+        let base = doc(&off);
+        assert_eq!(base["response_types_supported"], json!(["code"]));
+        assert_eq!(base["response_modes_supported"], json!(["query"]));
+
+        // Enabling the hybrid flow adds `code id_token` and the `fragment` mode
+        // (its default), and nothing else.
+        let hybrid = DiscoveryCapabilities::from_config(&OidcConfig {
+            enable_response_type_code_id_token: true,
+            ..OidcConfig::default()
+        });
+        let doc_h = doc(&hybrid);
+        assert_eq!(
+            doc_h["response_types_supported"],
+            json!(["code", "code id_token"])
+        );
+        assert_eq!(
+            doc_h["response_modes_supported"],
+            json!(["query", "fragment"])
+        );
+
+        // Enabling every legacy type plus form_post advertises the full set.
+        let all = DiscoveryCapabilities::from_config(&OidcConfig {
+            enable_response_type_id_token: true,
+            enable_response_type_code_id_token: true,
+            enable_response_type_none: true,
+            enable_response_mode_form_post: true,
+            ..OidcConfig::default()
+        });
+        let doc_a = doc(&all);
+        assert_eq!(
+            doc_a["response_types_supported"],
+            json!(["code", "id_token", "code id_token", "none"])
+        );
+        assert_eq!(
+            doc_a["response_modes_supported"],
+            json!(["query", "fragment", "form_post"])
+        );
+
+        // form_post alone (no front-channel type) advertises form_post but NOT
+        // fragment: fragment rides the front-channel feature.
+        let fp = DiscoveryCapabilities::from_config(&OidcConfig {
+            enable_response_mode_form_post: true,
+            ..OidcConfig::default()
+        });
+        assert_eq!(
+            doc(&fp)["response_modes_supported"],
+            json!(["query", "form_post"])
+        );
     }
 
     #[test]

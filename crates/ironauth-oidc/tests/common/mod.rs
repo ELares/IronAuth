@@ -599,6 +599,23 @@ pub fn location_param(headers: &HeaderMap, name: &str) -> Option<String> {
     None
 }
 
+/// Read a parameter from the FRAGMENT of a `Location` header value (the part after
+/// `#`), percent-decoding it. Used by the front-channel (`id_token` /
+/// `code id_token`) tests, whose default response mode is `fragment` (issue #17).
+#[must_use]
+pub fn location_fragment_param(headers: &HeaderMap, name: &str) -> Option<String> {
+    let location = headers.get(header::LOCATION)?.to_str().ok()?;
+    let fragment = location.split_once('#').map_or("", |(_, f)| f);
+    for pair in fragment.split('&') {
+        if let Some((key, value)) = pair.split_once('=') {
+            if key == name {
+                return Some(percent_decode(value));
+            }
+        }
+    }
+    None
+}
+
 /// Minimal percent-decoding for reading redirect query values back.
 #[must_use]
 pub fn percent_decode(value: &str) -> String {

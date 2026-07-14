@@ -187,5 +187,16 @@ name = "pkce_redirect"
 path = "tests/pkce_redirect.rs"
 required-features = ["testing"]
 
+# Legacy response types (id_token, code id_token, none), form_post, and the
+# response-mode negotiation, disabled by default and enabled per environment
+# (issue #17): spec-exact fragment responses with nonce and c_hash, the
+# auto-submitting form_post whose code never enters a URL, and the
+# unsupported/invalid_request rejections through the negotiated mode. Over a real
+# database with a provisioned signing key.
+[[test]]
+name = "response_types"
+path = "tests/response_types.rs"
+required-features = ["testing"]
+
 [lints]
 workspace = true
