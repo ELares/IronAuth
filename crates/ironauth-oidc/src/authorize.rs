@@ -38,6 +38,7 @@ use serde::{Deserialize, Serialize};
 use crate::authn;
 use crate::claims_request::{ClaimsRequest, ClaimsRequestError};
 use crate::client_auth::ClientAuthMethod;
+use crate::consent::ConsentMode;
 use crate::error::{AuthorizeError, AuthzErrorCode};
 use crate::hints::InteractionHints;
 use crate::interaction;
@@ -470,6 +471,19 @@ async fn issue_code(
         mode,
     };
 
+    // The effective granted scope (issue #21): offline_access is IGNORED on a flow
+    // that does not return an authorization code (only the code flow reaches the
+    // token endpoint to redeem a refresh token), so it is stripped there and never
+    // treated as granted, echoed as granted, or requiring consent. The rest of the
+    // request (redirect_uri, response_type, mode, nonce, PKCE, claims, prompt,
+    // max_age, hints) was validated by the shared validate_request above (issue #27).
+    let requested_scope = params
+        .scope
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let effective_scope = effective_granted_scope(requested_scope, response_type.issues_code());
+
     // 6. Establish the authenticated subject and their consent, applying prompt and
     //    max_age. A missing session, missing consent, or a forced (re-)authentication
     //    short-circuits to a LOCAL interaction redirect (never the client's
@@ -479,8 +493,10 @@ async fn issue_code(
     let (session, consent_ref) = match resolve_gate(
         state,
         headers,
+        &client,
         &client_id,
         &params,
+        effective_scope.as_deref(),
         redirect_uri,
         &iss,
         mode,
@@ -530,11 +546,7 @@ async fn issue_code(
     let session_ref = session.session_id.to_string();
     let resolved = Resolved {
         nonce,
-        oauth_scope: params
-            .scope
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty()),
+        oauth_scope: effective_scope.as_deref(),
         code_challenge,
         code_challenge_method,
         state_echo,
@@ -542,7 +554,7 @@ async fn issue_code(
         auth_methods: &session.auth_methods,
         auth_time_micros,
         session_ref: &session_ref,
-        consent_ref: &consent_ref,
+        consent_ref: consent_ref.as_deref(),
         claims_request: claims_canonical.as_deref(),
     };
 
@@ -1171,8 +1183,10 @@ enum Gate {
     Ready {
         /// The resolved session (its subject is recorded on the grant).
         session: interaction::AuthenticatedSession,
-        /// The recorded consent handle (referenced by the grant).
-        consent_ref: String,
+        /// The recorded consent handle (referenced by the grant), or [`None`] when
+        /// a skipped consent was NOT stored (the no-store performance knob, issue
+        /// #21), in which case the grant records no consent reference.
+        consent_ref: Option<String>,
     },
 }
 
@@ -1193,8 +1207,10 @@ enum Gate {
 async fn resolve_gate(
     state: &OidcState,
     headers: &HeaderMap,
+    client: &ClientRecord,
     client_id: &ClientId,
     params: &AuthorizeParams,
+    effective_scope: Option<&str>,
     redirect_uri: &str,
     iss: &str,
     mode: ResponseMode,
@@ -1261,15 +1277,100 @@ async fn resolve_gate(
         )));
     }
 
+    // The session is fresh enough; the remaining gate is consent (issue #21 folds
+    // the first-party carve-out, the remembered TTL, and the offline_access rule in).
+    resolve_consent_gate(
+        state,
+        client,
+        client_id,
+        params,
+        effective_scope,
+        session,
+        prompt,
+        hints,
+        redirect_uri,
+        iss,
+        mode,
+        pushed,
+    )
+    .await
+}
+
+/// Resolve the consent gate for an authenticated, fresh-enough session (issue #21).
+///
+/// A trusted first-party client (`implicit` mode or `skip_consent`) is auto-granted,
+/// which also satisfies the `offline_access` consent requirement; the skipped consent
+/// is recorded unless the no-store knob is off. Otherwise a recorded consent
+/// authorizes the request only when it is unexpired (a `remembered` consent lapses
+/// after its TTL) AND covers the requested scope as a subset (issue #196), where
+/// `offline_access` is part of the check for a web client unless the environment
+/// disables it. `prompt=consent` forces a fresh screen; `prompt=none` turns an
+/// interaction need into the matching negotiated-mode error.
+#[allow(clippy::too_many_arguments)]
+async fn resolve_consent_gate(
+    state: &OidcState,
+    client: &ClientRecord,
+    client_id: &ClientId,
+    params: &AuthorizeParams,
+    effective_scope: Option<&str>,
+    session: interaction::AuthenticatedSession,
+    prompt: PromptSet,
+    hints: &InteractionHints,
+    redirect_uri: &str,
+    iss: &str,
+    mode: ResponseMode,
+    pushed: Option<&PushedContext>,
+) -> Result<Gate, AuthorizeError> {
+    let scope = client_id.scope();
+    let prompt_none = prompt.contains(PromptValue::None);
+    let gate_error = |code: AuthzErrorCode, description: &str| AuthorizeError::Redirect {
+        redirect_uri: redirect_uri.to_owned(),
+        error: code,
+        description: description.to_owned(),
+        state: params.state.as_deref().map(str::to_owned),
+        iss: iss.to_owned(),
+        mode,
+    };
     let client_id_str = client_id.to_string();
     let force_consent = prompt.contains(PromptValue::Consent);
-    // Consent is recorded per (subject, client) TOGETHER with the scope it was
-    // granted against (issue #196). A recorded consent authorizes a later request
-    // only when that request's scope is a SUBSET of the granted scope (see
-    // [`consent_covers_scope`]), so a consent for a narrow scope never silently
-    // auto-grants a broader (or disjoint) one: an uncovered request is treated as
-    // un-consented and re-prompts, exactly as a missing consent does.
-    // prompt=consent forces a fresh screen regardless.
+    let consent_mode = ConsentMode::parse(&client.consent_mode);
+    // The trusted first-party carve-out: an `implicit`-mode client, or one whose
+    // `skip_consent` flag is set, never sees the consent screen and is auto-granted.
+    // `prompt=consent` still forces a fresh screen, so it wins over the carve-out.
+    let first_party = matches!(consent_mode, ConsentMode::Implicit) || client.skip_consent;
+    if first_party && !force_consent {
+        // Record the skipped consent so an offline grant stays enumerable and
+        // revocable per app, UNLESS the no-store performance knob is off.
+        let consent_ref = if client.store_skipped_consent {
+            match record_skipped_consent(
+                state,
+                scope,
+                &session.subject,
+                &client_id_str,
+                effective_scope,
+                consent_mode,
+            )
+            .await
+            {
+                Ok(id) => Some(id),
+                Err(()) => {
+                    return Err(gate_error(
+                        AuthzErrorCode::ServerError,
+                        "the authorization request could not be processed",
+                    ));
+                }
+            }
+        } else {
+            None
+        };
+        return Ok(Gate::Ready {
+            session,
+            consent_ref,
+        });
+    }
+
+    // A recorded consent authorizes a later request only when that request's scope is
+    // a SUBSET of the granted scope (issue #196) and it has not lapsed (issue #21).
     let Ok(recorded) = state
         .store()
         .scoped(scope)
@@ -1277,28 +1378,30 @@ async fn resolve_gate(
         .granted_ref(&session.subject, &client_id_str)
         .await
     else {
-        // A consent-store failure fails closed to a server_error redirect (the
-        // redirect_uri is already validated).
         return Err(gate_error(
             AuthzErrorCode::ServerError,
             "the authorization request could not be processed",
         ));
     };
-
-    if consent_covers_scope(recorded.as_ref(), params.scope.as_deref()) && !force_consent {
-        // A recorded consent covers the requested scope and none is forced: ready.
+    let now_micros = epoch_micros(state.now());
+    let consent_scope =
+        consent_check_scope(effective_scope, state.offline_access_requires_consent());
+    let covered = recorded
+        .as_ref()
+        .is_some_and(|consent| !consent_expired(consent, now_micros))
+        && consent_covers_scope(recorded.as_ref(), consent_scope.as_deref());
+    if covered && !force_consent {
         let consent_ref = recorded.expect("a covering consent is recorded").id;
         return Ok(Gate::Ready {
             session,
-            consent_ref,
+            consent_ref: Some(consent_ref),
         });
     }
 
-    // Consent is required: none recorded, the recorded one does not cover the
-    // requested scope, or prompt=consent forced a fresh screen. Under prompt=none no
-    // UI is rendered: the consent_required error goes back through the negotiated
-    // mode instead (prompt=none cannot combine with prompt=consent, so a forced
-    // screen never reaches here under it).
+    // Consent is required: none recorded, the recorded one is expired or does not
+    // cover the requested scope, or prompt=consent forced a fresh screen. Under
+    // prompt=none no UI is rendered: the consent_required error goes back through the
+    // negotiated mode instead.
     if prompt_none {
         return Err(gate_error(
             AuthzErrorCode::ConsentRequired,
@@ -1308,6 +1411,95 @@ async fn resolve_gate(
     Ok(Gate::Interaction(interaction::consent_redirect(
         &consent_resume_url(params, hints, prompt, pushed),
     )))
+}
+
+/// Record a SKIPPED consent for a trusted first-party client (issue #21) and
+/// return its `con_` id. A `remembered`-mode client's skipped consent carries the
+/// remembered TTL; an `explicit`/`implicit` one never expires. Returns `Err(())` on
+/// a store failure so the caller fails closed to a `server_error`.
+async fn record_skipped_consent(
+    state: &OidcState,
+    scope: Scope,
+    subject: &str,
+    client_id: &str,
+    effective_scope: Option<&str>,
+    consent_mode: ConsentMode,
+) -> Result<String, ()> {
+    let expires_at = if consent_mode == ConsentMode::Remembered {
+        let now = state.now();
+        Some(epoch_micros(
+            now.checked_add(state.remembered_consent_ttl())
+                .unwrap_or(now),
+        ))
+    } else {
+        None
+    };
+    let actor = interaction::subject_actor(state, scope, subject);
+    state
+        .store()
+        .scoped(scope)
+        .acting(actor, CorrelationId::generate(state.env()))
+        .consents()
+        .grant_with_expiry(state.env(), subject, client_id, effective_scope, expires_at)
+        .await
+        .map(|id| id.to_string())
+        .map_err(|error| {
+            tracing::error!(%error, "could not record a skipped first-party consent");
+        })
+}
+
+/// Whether a recorded consent has passed its expiry at `now_micros` (issue #21). A
+/// consent with no expiry (explicit/implicit) never lapses; a `remembered` consent
+/// past its TTL is treated as absent so the next authorization re-prompts.
+fn consent_expired(consent: &GrantedConsent, now_micros: i64) -> bool {
+    consent
+        .expires_at_unix_micros
+        .is_some_and(|expiry| expiry <= now_micros)
+}
+
+/// The scope set to check a recorded consent against (issue #21). Normally the
+/// whole effective scope, but when `offline_access` does NOT require consent it is
+/// removed from the check so its presence never forces a prompt (the token is still
+/// granted offline). Returns the space-separated value, or [`None`] for the empty
+/// set.
+fn consent_check_scope(
+    effective_scope: Option<&str>,
+    requires_offline_consent: bool,
+) -> Option<String> {
+    if requires_offline_consent {
+        return effective_scope.map(str::to_owned);
+    }
+    let filtered: Vec<&str> = effective_scope
+        .unwrap_or_default()
+        .split_whitespace()
+        .filter(|token| *token != "offline_access")
+        .collect();
+    if filtered.is_empty() {
+        None
+    } else {
+        Some(filtered.join(" "))
+    }
+}
+
+/// The effective granted scope (issue #21): the requested scope unchanged when the
+/// flow issues an authorization code, or with `offline_access` removed when it does
+/// not (only the code flow reaches the token endpoint to redeem a refresh token, so
+/// `offline_access` is meaningless and IGNORED on a front-channel flow). Returns the
+/// space-separated value, or [`None`] for the empty set.
+fn effective_granted_scope(requested_scope: Option<&str>, issues_code: bool) -> Option<String> {
+    if issues_code {
+        return requested_scope.map(str::to_owned);
+    }
+    let filtered: Vec<&str> = requested_scope
+        .unwrap_or_default()
+        .split_whitespace()
+        .filter(|token| *token != "offline_access")
+        .collect();
+    if filtered.is_empty() {
+        None
+    } else {
+        Some(filtered.join(" "))
+    }
 }
 
 /// Whether a recorded consent covers a request's `scope` (issue #196).
@@ -1612,8 +1804,9 @@ struct Resolved<'a> {
     auth_time_micros: Option<i64>,
     /// The authenticating session handle recorded on the grant.
     session_ref: &'a str,
-    /// The recorded consent handle recorded on the grant.
-    consent_ref: &'a str,
+    /// The recorded consent handle recorded on the grant, or [`None`] when a
+    /// skipped consent was not stored (issue #21).
+    consent_ref: Option<&'a str>,
     /// The canonical JSON of the `claims` request parameter (issue #15), frozen
     /// onto the code and grant, or [`None`] when the request carried none.
     claims_request: Option<&'a str>,
@@ -1651,7 +1844,7 @@ async fn persist_code(
         auth_methods: resolved.auth_methods,
         auth_time_micros: resolved.auth_time_micros,
         session_ref: Some(resolved.session_ref),
-        consent_ref: Some(resolved.consent_ref),
+        consent_ref: resolved.consent_ref,
         claims_request: resolved.claims_request,
         expires_at_micros: epoch_micros(expires_at),
         created_at_micros: epoch_micros(now),
@@ -1784,6 +1977,7 @@ mod tests {
         let narrow = GrantedConsent {
             id: "con_x".to_owned(),
             granted_scope: Some("openid".to_owned()),
+            expires_at_unix_micros: None,
         };
         assert!(!consent_covers_scope(
             Some(&narrow),
@@ -1798,6 +1992,7 @@ mod tests {
         let broad = GrantedConsent {
             id: "con_y".to_owned(),
             granted_scope: Some("openid  profile   email".to_owned()),
+            expires_at_unix_micros: None,
         };
         assert!(consent_covers_scope(Some(&broad), Some("email openid")));
         assert!(!consent_covers_scope(Some(&broad), Some("openid address")));
@@ -1808,8 +2003,71 @@ mod tests {
         let unscoped = GrantedConsent {
             id: "con_z".to_owned(),
             granted_scope: None,
+            expires_at_unix_micros: None,
         };
         assert!(!consent_covers_scope(Some(&unscoped), Some("openid")));
         assert!(consent_covers_scope(Some(&unscoped), None));
+    }
+
+    #[test]
+    fn offline_access_is_stripped_on_a_non_code_flow() {
+        // Acceptance criterion 5: offline_access is IGNORED unless the flow returns
+        // an authorization code (only the code flow reaches the token endpoint to
+        // redeem a refresh token). It stays on a code flow and is removed otherwise.
+        assert_eq!(
+            effective_granted_scope(Some("openid offline_access"), true).as_deref(),
+            Some("openid offline_access"),
+            "a code flow keeps offline_access"
+        );
+        assert_eq!(
+            effective_granted_scope(Some("openid offline_access"), false).as_deref(),
+            Some("openid"),
+            "a non-code (front-channel) flow strips offline_access"
+        );
+        // Stripping the only token yields the empty set (None), never an empty
+        // string.
+        assert_eq!(effective_granted_scope(Some("offline_access"), false), None);
+        assert_eq!(effective_granted_scope(None, false), None);
+    }
+
+    #[test]
+    fn consent_check_scope_honors_the_offline_consent_switch() {
+        // With offline_access requiring consent (the default), it stays in the check.
+        assert_eq!(
+            consent_check_scope(Some("openid offline_access"), true).as_deref(),
+            Some("openid offline_access"),
+        );
+        // With the requirement disabled, offline_access is dropped from the check so
+        // its presence never forces a prompt.
+        assert_eq!(
+            consent_check_scope(Some("openid offline_access"), false).as_deref(),
+            Some("openid"),
+        );
+        assert_eq!(consent_check_scope(Some("offline_access"), false), None);
+    }
+
+    #[test]
+    fn consent_expiry_is_treated_as_absent_past_the_ttl() {
+        // A consent with no expiry never lapses; one whose expiry has passed is
+        // expired; one still in the future is not (issue #21).
+        let never = GrantedConsent {
+            id: "con_a".to_owned(),
+            granted_scope: Some("openid".to_owned()),
+            expires_at_unix_micros: None,
+        };
+        assert!(!consent_expired(&never, 1_000));
+        let lapsed = GrantedConsent {
+            id: "con_b".to_owned(),
+            granted_scope: Some("openid".to_owned()),
+            expires_at_unix_micros: Some(500),
+        };
+        assert!(
+            consent_expired(&lapsed, 1_000),
+            "past the expiry it is absent"
+        );
+        assert!(
+            !consent_expired(&lapsed, 400),
+            "before the expiry it is live"
+        );
     }
 }

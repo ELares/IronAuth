@@ -247,8 +247,12 @@ CREATE TABLE IF NOT EXISTS _schema_migrations ( \
 /// pushed-authorization-request store (issue #27: the single-use
 /// `pushed_authorization_requests` table RFC 9126 stores a validated request behind
 /// a one-time `request_uri`, plus the additive per-client
-/// `clients.require_pushed_authorization_requests` flag) is version 15. That is the
-/// whole production chain: it deliberately
+/// `clients.require_pushed_authorization_requests` flag) is version 15; the
+/// refresh-token rotation suite (issue #21: the `refresh_families` revocation spine
+/// and the digest-only `refresh_tokens` generation store, plus the additive
+/// `clients` consent-mode and rotation-override columns and the additive
+/// `consents.expires_at` for remembered consent) is version 16. That is
+/// the whole production chain: it deliberately
 /// carries no throwaway objects, so a real database never gains a demo table or
 /// ledger rows beyond what the product needs. The worked expand-contract example
 /// (add a nullable column, backfill, drop the old column) lives entirely in the
@@ -347,6 +351,12 @@ fn registry() -> Vec<Migration> {
             name: "pushed_authorization_requests",
             phase: Phase::Expand,
             sql: include_str!("../migrations/0015_pushed_authorization_requests.sql"),
+        },
+        Migration {
+            version: 16,
+            name: "refresh_tokens",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0016_refresh_tokens.sql"),
         },
     ]
 }

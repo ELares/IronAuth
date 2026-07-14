@@ -136,6 +136,16 @@ name = "flow"
 path = "tests/flow.rs"
 required-features = ["testing"]
 
+# The refresh-token grant end to end (issue #21): the graduated rotation policy
+# (public rotate every refresh, confidential only past the TTL threshold), HTTP-layer
+# reuse detection and family revocation, the offline_access consent rule for web
+# clients with the first-party carve-out, and the three per-client consent modes.
+# Over a real database (DATABASE_URL).
+[[test]]
+name = "refresh"
+path = "tests/refresh.rs"
+required-features = ["testing"]
+
 # The conditional ID-token claims end to end (issue #14): the REQUIRED claims,
 # exact nonce echo, honest acr/amr, auth_time emitted only when due and always
 # truthful (incl max_age=0 and require_auth_time), and no at_hash/c_hash/azp from

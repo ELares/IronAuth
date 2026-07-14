@@ -133,6 +133,16 @@ name = "client_auth_suite"
 path = "tests/client_auth_suite.rs"
 required-features = ["testing"]
 
+# Refresh-token rotation, families, reuse detection, offline_access, and the
+# digest-only storage guarantee (issue #21): the authoritative single-use and reuse
+# gate, grace-window classification, exactly-once reuse event, offline-vs
+# session-bound revocation, hard-cap/idle expiry, and a database-dump proof that no
+# plaintext refresh token is stored. Needs a real database (DATABASE_URL).
+[[test]]
+name = "refresh_tokens"
+path = "tests/refresh_tokens.rs"
+required-features = ["testing"]
+
 # Pushed-authorization-request store surfaces (issue #27, RFC 9126): the single-use
 # atomic consume (works exactly once), the client-binding filter that rejects and
 # does not burn a mismatched presenter, expiry, cross-scope isolation, the push and

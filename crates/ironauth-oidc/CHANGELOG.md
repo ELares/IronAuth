@@ -6,6 +6,47 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Refresh-token rotation, families, `offline_access`, and consent modes (issue #21).
+  - **The `refresh_token` grant.** The token endpoint exchanges a rotating refresh
+    token for a fresh access token. The refresh token is an opaque reference mirroring
+    the #29 access token, `ira_rt_<jti>~<secret>` (a scope-declaring `rft_` handle
+    plus 256 bits from the entropy seam), stored only as a SHA-256 digest; the
+    presented token declares its own `(tenant, environment)` scope, so the global
+    endpoint recovers the scope and runs the RLS-scoped resolve. `refresh_token` is
+    now an advertised `grant_type`.
+  - **Graduated rotation policy.** A public (sender-unbound) client rotates on every
+    refresh; a confidential client rotates only once past the configured fraction of
+    idle TTL (default 70%), with an optional per-client `always`/`threshold` override.
+    A family hard cap bounds the total rotated lifetime.
+  - **Reuse detection.** A superseded token presented outside the grace window is
+    `invalid_grant`, revokes the entire family, and emits the typed reuse event
+    exactly once per incident; benign concurrent refreshes within the grace window all
+    succeed without revoking. A revoked-family refresh is `invalid_grant`. An event
+    shape-lock test pins the SIEM-facing `refresh_token.reuse` audit row so it cannot
+    drift silently.
+  - **Concurrent within-grace refreshes converge on one live leaf.** A within-grace
+    refresh that is NOT the atomic-rotate winner (a concurrent loser, a multi-tab
+    retry, or a lost rotation response) now returns ONLY a fresh access token and
+    OMITS the `refresh_token` (optional per RFC 6749 5.1): it mints no new refresh
+    leaf, so N concurrent refreshes CONVERGE on the winner's single live leaf instead
+    of forking the family into independent, never-detected chains. Accepted,
+    documented limitation: a client that ENTIRELY loses the winner's rotation response
+    never receives the new refresh token and must re-authenticate; no plaintext token
+    is cached and replayed (that would forfeit the no-replayable-material-at-rest
+    guarantee). Regression is guarded by an HTTP-layer test that fires 8 true-parallel
+    refreshes and asserts exactly one live leaf and zero reuse events.
+  - **`offline_access` advertised in discovery.** `scopes_supported` now lists
+    `offline_access` (OIDC Core 11), so an RP can learn the provider issues refresh
+    tokens.
+  - **`offline_access` (OIDC Core 11).** Ignored on a flow that returns no
+    authorization code; a web client must consent to it, with a trusted first-party
+    carve-out (`implicit` mode or `skip_consent`). An `offline_access` family survives
+    RP logout (Back-Channel Logout 2.7) with its own finite idle and max lifetimes,
+    while a session-bound family is invalidated with the session.
+  - **Consent modes per client.** `explicit` (always prompt unless a covering consent
+    exists), `implicit` (first-party auto-grant), and `remembered` (honor the recorded
+    consent until its TTL, then re-prompt), plus `skip_consent` and a
+    `store_skipped_consent` no-store knob.
 - Pushed authorization requests (PAR, RFC 9126, issue #27).
   - **`POST /par`.** A new back-channel endpoint that authenticates the client
     with the SAME suite as the token endpoint (the shared `authenticate_client`

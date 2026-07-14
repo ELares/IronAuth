@@ -319,6 +319,27 @@ pub const OIDC_JWKS_CACHE_MAX_SECS: u64 = 900;
 /// ceiling. The default is one minute.
 pub const OIDC_MAX_CLIENT_ASSERTION_SKEW_SECS: u64 = 300;
 
+/// The largest a refresh-token IDLE timeout may be configured to, in seconds
+/// (issue #21). A refresh token that goes unused for longer than its idle timeout
+/// expires; the cap (ninety days) bounds how long an unused, session-bound or
+/// offline refresh token stays live. A value beyond this is almost always a
+/// misconfiguration, so config load rejects it.
+pub const OIDC_MAX_REFRESH_IDLE_TTL_SECS: u64 = 7_776_000;
+
+/// The largest a rotated refresh-token FAMILY lifetime may be configured to, in
+/// seconds (issue #21). This is the hard cap on the total lifetime of a family
+/// rooted at one authorization grant, however many times its tokens rotate; the
+/// ceiling (one year) bounds an offline grant's maximum lifetime. A value beyond
+/// this is almost always a misconfiguration, so config load rejects it.
+pub const OIDC_MAX_REFRESH_MAX_LIFETIME_SECS: u64 = 31_536_000;
+
+/// The largest a remembered-consent TTL may be configured to, in seconds (issue
+/// #21). A client whose consent mode is `remembered` keeps a recorded consent
+/// valid for this long before re-prompting; the ceiling (one year) bounds how
+/// long a remembered decision is honored. A value beyond this is almost always a
+/// misconfiguration, so config load rejects it.
+pub const OIDC_MAX_REMEMBERED_CONSENT_TTL_SECS: u64 = 31_536_000;
+
 /// The largest a pushed-authorization-request `request_uri` lifetime may be
 /// configured to, in seconds (RFC 9126, issue #27). A pushed request is a
 /// short-lived, single-use reference the client redeems immediately at the
@@ -501,6 +522,79 @@ pub struct OidcConfig {
     /// land.
     pub enable_response_mode_form_post: bool,
 
+    /// Whether the authorization-code grant issues a refresh token (issue #21).
+    /// Default `true`: a successful code exchange returns a rotating refresh token
+    /// alongside the access token. A refresh token issued WITHOUT the
+    /// `offline_access` scope is session-bound (it is revoked when the end user's
+    /// RP session is logged out); one issued WITH `offline_access` survives RP
+    /// logout and gets the separate offline lifecycle. Set it to `false` for an
+    /// environment that mints access tokens only.
+    pub issue_refresh_tokens: bool,
+
+    /// The IDLE timeout in seconds of a SESSION-bound refresh token (issue #21):
+    /// one issued without `offline_access`. A refresh token unused for longer than
+    /// this expires. The default (1209600) is fourteen days. Must be at least 1 and
+    /// at most `OIDC_MAX_REFRESH_IDLE_TTL_SECS`.
+    pub refresh_idle_ttl_secs: u64,
+
+    /// The hard cap in seconds on the total lifetime of a SESSION-bound refresh
+    /// token FAMILY (issue #21), measured from the original grant however many
+    /// times the family rotates. Once the family passes this age no rotation
+    /// renews it and a refresh attempt fails with `invalid_grant`. The default
+    /// (2592000) is thirty days. Must be at least 1, at most
+    /// `OIDC_MAX_REFRESH_MAX_LIFETIME_SECS`, and at least `refresh_idle_ttl_secs`.
+    pub refresh_max_lifetime_secs: u64,
+
+    /// The IDLE timeout in seconds of an OFFLINE refresh token (issue #21): one
+    /// issued WITH the `offline_access` scope, which survives RP logout (OIDC
+    /// Back-Channel Logout 2.7). The default (2592000) is thirty days. There is NO
+    /// never-expires option: an offline token still expires when unused this long.
+    /// Must be at least 1 and at most `OIDC_MAX_REFRESH_IDLE_TTL_SECS`.
+    pub offline_idle_ttl_secs: u64,
+
+    /// The hard cap in seconds on the total lifetime of an OFFLINE refresh token
+    /// FAMILY (issue #21), measured from the original grant. Once the family passes
+    /// this age no rotation renews it. There is NO never-expires option. The
+    /// default (7776000) is ninety days. Must be at least 1, at most
+    /// `OIDC_MAX_REFRESH_MAX_LIFETIME_SECS`, and at least `offline_idle_ttl_secs`.
+    pub offline_max_lifetime_secs: u64,
+
+    /// The grace window in seconds during which a superseded (rotated) refresh
+    /// token may still be presented as a benign concurrent refresh (issue #21).
+    /// Within this window of the rotation, a duplicate presentation (multi-tab, a
+    /// retry, a flaky network) succeeds with a fresh successor and does NOT revoke
+    /// the family. A presentation AFTER the window is a genuine reuse: it revokes
+    /// the whole family and emits one typed reuse event (RFC 9700 2.2.2). The
+    /// default (10) tolerates realistic retry and clock jitter; set it to 0 to
+    /// treat every superseded-token presentation as reuse. At most
+    /// `OIDC_MAX_LIFETIME_SECS`.
+    pub refresh_rotation_grace_secs: u64,
+
+    /// The fraction (as a whole percent, 0 to 100) of a refresh token's idle TTL a
+    /// confidential or otherwise sender-bound client's token must reach before it
+    /// rotates (issue #21). A PUBLIC, sender-unbound client always rotates on every
+    /// refresh; a confidential or bound client rotates only once the presented
+    /// token has passed this fraction of its lifetime, so a well-behaved
+    /// confidential client rotates less often. The default (70) rotates past 70% of
+    /// TTL. A per-client override may force always-rotate or threshold-rotate.
+    pub refresh_rotation_threshold_percent: u64,
+
+    /// Whether the `offline_access` scope requires explicit consent for a web
+    /// client (issue #21, OIDC Core 11). Default `true`: a confidential/web client
+    /// requesting `offline_access` must obtain explicit consent that covers it,
+    /// UNLESS the trusted first-party carve-out applies (the client's consent mode
+    /// is `implicit` or its `skip_consent` flag is set). Set it to `false` to grant
+    /// `offline_access` without a dedicated consent prompt for every client.
+    pub offline_access_requires_consent: bool,
+
+    /// The lifetime in seconds of a REMEMBERED consent (issue #21): the TTL applied
+    /// to a recorded consent for a client whose consent mode is `remembered`. After
+    /// this long the recorded consent expires and the next authorization re-prompts.
+    /// The default (2592000) is thirty days. Must be at least 1 and at most
+    /// `OIDC_MAX_REMEMBERED_CONSENT_TTL_SECS`. It has no effect on `explicit` mode
+    /// (whose consent never expires) or `implicit` mode (which never prompts).
+    pub remembered_consent_ttl_secs: u64,
+
     /// Require a pushed authorization request (PAR, RFC 9126 section 5) for EVERY
     /// client in this environment. The safe default (`false`) leaves PAR optional:
     /// a client may still push a request, but a plain authorization request is also
@@ -557,6 +651,15 @@ impl Default for OidcConfig {
             enable_response_type_code_id_token: false,
             enable_response_type_none: false,
             enable_response_mode_form_post: false,
+            issue_refresh_tokens: true,
+            refresh_idle_ttl_secs: 1_209_600,
+            refresh_max_lifetime_secs: 2_592_000,
+            offline_idle_ttl_secs: 2_592_000,
+            offline_max_lifetime_secs: 7_776_000,
+            refresh_rotation_grace_secs: 10,
+            refresh_rotation_threshold_percent: 70,
+            offline_access_requires_consent: true,
+            remembered_consent_ttl_secs: 2_592_000,
             require_pushed_authorization_requests: false,
             par_ttl_secs: 60,
             registration_enabled: false,
@@ -765,6 +868,7 @@ impl Config {
                 ),
             });
         }
+        validate_refresh_and_consent(&self.oidc)?;
         // The PAR request_uri lifetime is bounded like the other credential
         // lifetimes: a zero-second request_uri is born expired, and a lifetime beyond
         // the ceiling would keep a pushed request usable for too long (RFC 9126
@@ -784,6 +888,111 @@ impl Config {
         }
         Ok(())
     }
+}
+
+/// Validate the refresh-token lifecycle and consent settings (issue #21), kept out
+/// of [`Config::validate`] so each stays within the readable-length lint.
+///
+/// Idle timeouts and family hard caps each have a one-second lower bound (a
+/// zero-second window is born expired) and their own, larger ceilings, and a hard
+/// cap must be at least its idle timeout (a family cannot expire before an unused
+/// token). The rotation grace window, like `reuse_grace`, permits 0 (treat every
+/// superseded-token presentation as reuse) and only bounds the upper end. The
+/// rotation threshold is a percent, bounded 0..=100. The remembered-consent TTL is a
+/// lifetime: at least one second, at most its own ceiling.
+fn validate_refresh_and_consent(oidc: &OidcConfig) -> Result<(), ConfigError> {
+    check_refresh_idle("oidc.refresh_idle_ttl_secs", oidc.refresh_idle_ttl_secs)?;
+    check_refresh_max(
+        "oidc.refresh_max_lifetime_secs",
+        oidc.refresh_max_lifetime_secs,
+        "oidc.refresh_idle_ttl_secs",
+        oidc.refresh_idle_ttl_secs,
+    )?;
+    check_refresh_idle("oidc.offline_idle_ttl_secs", oidc.offline_idle_ttl_secs)?;
+    check_refresh_max(
+        "oidc.offline_max_lifetime_secs",
+        oidc.offline_max_lifetime_secs,
+        "oidc.offline_idle_ttl_secs",
+        oidc.offline_idle_ttl_secs,
+    )?;
+    if oidc.refresh_rotation_grace_secs > OIDC_MAX_LIFETIME_SECS {
+        return Err(ConfigError::Invalid {
+            message: format!(
+                "oidc.refresh_rotation_grace_secs ({}) must not exceed {OIDC_MAX_LIFETIME_SECS} seconds",
+                oidc.refresh_rotation_grace_secs
+            ),
+        });
+    }
+    if oidc.refresh_rotation_threshold_percent > 100 {
+        return Err(ConfigError::Invalid {
+            message: format!(
+                "oidc.refresh_rotation_threshold_percent ({}) must be between 0 and 100",
+                oidc.refresh_rotation_threshold_percent
+            ),
+        });
+    }
+    if oidc.remembered_consent_ttl_secs < 1 {
+        return Err(ConfigError::Invalid {
+            message: "oidc.remembered_consent_ttl_secs must be at least 1 second".to_owned(),
+        });
+    }
+    if oidc.remembered_consent_ttl_secs > OIDC_MAX_REMEMBERED_CONSENT_TTL_SECS {
+        return Err(ConfigError::Invalid {
+            message: format!(
+                "oidc.remembered_consent_ttl_secs ({}) must not exceed \
+                 {OIDC_MAX_REMEMBERED_CONSENT_TTL_SECS} seconds",
+                oidc.remembered_consent_ttl_secs
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// Validate a refresh-token idle timeout: at least one second (a zero-second idle
+/// window is born expired) and no more than [`OIDC_MAX_REFRESH_IDLE_TTL_SECS`].
+fn check_refresh_idle(key: &str, value: u64) -> Result<(), ConfigError> {
+    if value < 1 {
+        return Err(ConfigError::Invalid {
+            message: format!("{key} must be at least 1 second"),
+        });
+    }
+    if value > OIDC_MAX_REFRESH_IDLE_TTL_SECS {
+        return Err(ConfigError::Invalid {
+            message: format!(
+                "{key} ({value}) must not exceed {OIDC_MAX_REFRESH_IDLE_TTL_SECS} seconds"
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// Validate a refresh-token family hard cap: at least one second, no more than
+/// [`OIDC_MAX_REFRESH_MAX_LIFETIME_SECS`], and at least the paired idle timeout (a
+/// family must not expire before an unused token would).
+fn check_refresh_max(
+    key: &str,
+    value: u64,
+    idle_key: &str,
+    idle_value: u64,
+) -> Result<(), ConfigError> {
+    if value < 1 {
+        return Err(ConfigError::Invalid {
+            message: format!("{key} must be at least 1 second"),
+        });
+    }
+    if value > OIDC_MAX_REFRESH_MAX_LIFETIME_SECS {
+        return Err(ConfigError::Invalid {
+            message: format!(
+                "{key} ({value}) must not exceed {OIDC_MAX_REFRESH_MAX_LIFETIME_SECS} seconds"
+            ),
+        });
+    }
+    if value < idle_value {
+        return Err(ConfigError::Invalid {
+            message: format!("{key} ({value}) must be at least {idle_key} ({idle_value}) seconds"),
+        });
+    }
+    Ok(())
 }
 
 /// Validate one OIDC lifetime: at least one second (a zero-second credential is
@@ -1002,6 +1211,16 @@ mod tests {
         assert!(!config.oidc.enable_response_type_code_id_token);
         assert!(!config.oidc.enable_response_type_none);
         assert!(!config.oidc.enable_response_mode_form_post);
+        // Refresh-token rotation and offline_access defaults (issue #21).
+        assert!(config.oidc.issue_refresh_tokens);
+        assert_eq!(config.oidc.refresh_idle_ttl_secs, 1_209_600);
+        assert_eq!(config.oidc.refresh_max_lifetime_secs, 2_592_000);
+        assert_eq!(config.oidc.offline_idle_ttl_secs, 2_592_000);
+        assert_eq!(config.oidc.offline_max_lifetime_secs, 7_776_000);
+        assert_eq!(config.oidc.refresh_rotation_grace_secs, 10);
+        assert_eq!(config.oidc.refresh_rotation_threshold_percent, 70);
+        assert!(config.oidc.offline_access_requires_consent);
+        assert_eq!(config.oidc.remembered_consent_ttl_secs, 2_592_000);
 
         // A zero session lifetime (born expired) is rejected; a lifetime above the
         // session ceiling is rejected too.
@@ -1080,6 +1299,91 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("ttl"), "{msg}");
         assert!(msg.contains("authorization_code_ttl_secs"), "{msg}");
+    }
+
+    #[test]
+    fn oidc_refresh_and_consent_settings_parse_and_validate() {
+        // Issue #21: the refresh-token lifecycles, rotation policy, and consent
+        // knobs parse in bounds and reject bad values.
+        let input = "[oidc]\n\
+             issue_refresh_tokens = false\n\
+             refresh_idle_ttl_secs = 3600\n\
+             refresh_max_lifetime_secs = 7200\n\
+             offline_idle_ttl_secs = 86400\n\
+             offline_max_lifetime_secs = 172800\n\
+             refresh_rotation_grace_secs = 0\n\
+             refresh_rotation_threshold_percent = 100\n\
+             offline_access_requires_consent = false\n\
+             remembered_consent_ttl_secs = 604800\n";
+        let oidc = Config::from_toml_str(input, "<inline>")
+            .expect("valid refresh config")
+            .config
+            .oidc;
+        assert!(!oidc.issue_refresh_tokens);
+        assert_eq!(oidc.refresh_idle_ttl_secs, 3600);
+        assert_eq!(oidc.refresh_max_lifetime_secs, 7200);
+        assert_eq!(oidc.refresh_rotation_grace_secs, 0);
+        assert_eq!(oidc.refresh_rotation_threshold_percent, 100);
+        assert!(!oidc.offline_access_requires_consent);
+
+        // A zero idle TTL is born expired and rejected.
+        let err = Config::from_toml_str("[oidc]\nrefresh_idle_ttl_secs = 0\n", "ironauth.toml")
+            .expect_err("zero idle");
+        assert!(err.to_string().contains("refresh_idle_ttl_secs"), "{err}");
+
+        // An idle TTL above the idle ceiling is rejected.
+        let over = format!(
+            "[oidc]\noffline_idle_ttl_secs = {}\n",
+            OIDC_MAX_REFRESH_IDLE_TTL_SECS + 1
+        );
+        let err = Config::from_toml_str(&over, "ironauth.toml").expect_err("idle over cap");
+        assert!(err.to_string().contains("offline_idle_ttl_secs"), "{err}");
+
+        // A family hard cap below its idle timeout is rejected (a family must not
+        // expire before an unused token would).
+        let err = Config::from_toml_str(
+            "[oidc]\nrefresh_idle_ttl_secs = 7200\nrefresh_max_lifetime_secs = 3600\n",
+            "ironauth.toml",
+        )
+        .expect_err("cap below idle");
+        assert!(
+            err.to_string().contains("refresh_max_lifetime_secs"),
+            "{err}"
+        );
+
+        // A rotation threshold above 100 percent is rejected.
+        let err = Config::from_toml_str(
+            "[oidc]\nrefresh_rotation_threshold_percent = 101\n",
+            "ironauth.toml",
+        )
+        .expect_err("threshold over 100");
+        assert!(
+            err.to_string()
+                .contains("refresh_rotation_threshold_percent"),
+            "{err}"
+        );
+
+        // A rotation grace above the lifetime ceiling is rejected.
+        let over = format!(
+            "[oidc]\nrefresh_rotation_grace_secs = {}\n",
+            OIDC_MAX_LIFETIME_SECS + 1
+        );
+        let err = Config::from_toml_str(&over, "ironauth.toml").expect_err("grace over cap");
+        assert!(
+            err.to_string().contains("refresh_rotation_grace_secs"),
+            "{err}"
+        );
+
+        // A remembered-consent TTL above its ceiling is rejected.
+        let over = format!(
+            "[oidc]\nremembered_consent_ttl_secs = {}\n",
+            OIDC_MAX_REMEMBERED_CONSENT_TTL_SECS + 1
+        );
+        let err = Config::from_toml_str(&over, "ironauth.toml").expect_err("remembered over cap");
+        assert!(
+            err.to_string().contains("remembered_consent_ttl_secs"),
+            "{err}"
+        );
     }
 
     #[test]

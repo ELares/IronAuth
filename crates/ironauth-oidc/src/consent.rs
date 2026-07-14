@@ -19,6 +19,35 @@ use crate::interaction::{self, parse_resume};
 use crate::login::ResumeQuery;
 use crate::pages;
 use crate::state::OidcState;
+use crate::util::epoch_micros;
+
+/// A client's consent mode (issue #21): how the authorization endpoint decides
+/// whether to prompt for consent, skip it, or honor a remembered decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConsentMode {
+    /// Always prompt unless a covering consent is recorded (the default, and the
+    /// value an unrecognized stored `consent_mode` degrades to).
+    Explicit,
+    /// Trusted first-party: never prompt, auto-grant. This is the `offline_access`
+    /// consent carve-out.
+    Implicit,
+    /// Prompt, then honor the recorded consent for the remembered-consent TTL
+    /// before re-prompting.
+    Remembered,
+}
+
+impl ConsentMode {
+    /// Parse a stored `consent_mode` string. An unrecognized value degrades to
+    /// [`ConsentMode::Explicit`] (the safe default: always prompt).
+    #[must_use]
+    pub fn parse(raw: &str) -> Self {
+        match raw {
+            "implicit" => ConsentMode::Implicit,
+            "remembered" => ConsentMode::Remembered,
+            _ => ConsentMode::Explicit,
+        }
+    }
+}
 
 /// The posted consent decision.
 #[derive(Deserialize)]
@@ -99,19 +128,25 @@ pub async fn consent_post(
     if form.decision.as_deref() == Some("allow") {
         let actor = interaction::subject_actor(&state, resume.scope, &auth.subject);
         let client_id = resume.client_id.to_string();
-        match state
+        // A remembered-mode client's consent lapses after the configured TTL, so it
+        // re-prompts on a later authorization (issue #21). Explicit and implicit
+        // clients record a never-expiring consent. An unreadable client degrades to
+        // a never-expiring consent (the safe default).
+        let expires_at = remembered_expiry(&state, resume.scope, &resume.client_id).await;
+        let result = state
             .store()
             .scoped(resume.scope)
             .acting(actor, CorrelationId::generate(state.env()))
             .consents()
-            .grant(
+            .grant_with_expiry(
                 state.env(),
                 &auth.subject,
                 &client_id,
                 resume.oauth_scope.as_deref(),
+                expires_at,
             )
-            .await
-        {
+            .await;
+        match result {
             Ok(_) => interaction::redirect(&resume.return_to),
             Err(_) => interaction::server_error_page(),
         }
@@ -124,5 +159,32 @@ pub async fn consent_post(
                 "You did not grant the application access.",
             ),
         )
+    }
+}
+
+/// The expiry (epoch microseconds) to record for a consent, by the client's mode
+/// (issue #21): a `remembered` client's consent expires after the configured TTL;
+/// an `explicit` or `implicit` client's consent never expires. An unreadable
+/// client (a race, or a deletion) degrades to a never-expiring consent.
+async fn remembered_expiry(
+    state: &OidcState,
+    scope: ironauth_store::Scope,
+    client_id: &ironauth_store::ClientId,
+) -> Option<i64> {
+    let record = state
+        .store()
+        .scoped(scope)
+        .clients()
+        .get(client_id)
+        .await
+        .ok()?;
+    if ConsentMode::parse(&record.consent_mode) == ConsentMode::Remembered {
+        let now = state.now();
+        let expiry = now
+            .checked_add(state.remembered_consent_ttl())
+            .unwrap_or(now);
+        Some(epoch_micros(expiry))
+    } else {
+        None
     }
 }

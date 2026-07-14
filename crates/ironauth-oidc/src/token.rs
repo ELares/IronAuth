@@ -55,20 +55,24 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use ironauth_jose::JwsAlgorithm;
 use ironauth_store::{
-    ActorRef, AuthorizationCodeId, ClientId, CodeBindings, CorrelationId, IssuedTokenRecord,
-    NewOpaqueAccessToken, RedeemOutcome, Scope, ServiceId, StoreError, TokenKind,
+    ActorRef, AuthorizationCodeId, ClientAuthRecord, ClientId, CodeBindings, CorrelationId,
+    IssuedTokenRecord, NewOpaqueAccessToken, NewRefreshFamily, RedeemOutcome, RefreshFamilyId,
+    RefreshRedeem, RefreshRedeemOutcome, RefreshTokenId, RefreshTokenResolution,
+    RotatedRefreshToken, Scope, ServiceId, StoreError, TokenKind,
 };
 use serde::Deserialize;
 
 use crate::claims_request::ClaimsRequest;
-use crate::client_auth::{self, AuthenticatedClient, ClientAuthError, ClientAuthInputs};
+use crate::client_auth::{
+    self, AuthenticatedClient, ClientAuthError, ClientAuthInputs, ClientAuthMethod,
+};
 use crate::error::TokenError;
 use crate::pkce::verify_s256;
 use crate::registry::GrantType;
 use crate::scope_claims::{assemble_claims, parse_scope_set};
 use crate::state::OidcState;
 use crate::tokens::{self, IssuedTokens, MintRequest, MintedAccessToken};
-use crate::util::client_service_actor;
+use crate::util::{client_service_actor, epoch_micros};
 
 /// Counter: authorization codes presented again after they were already consumed
 /// beyond the grace window (a genuine reuse that revoked the grant chain).
@@ -76,6 +80,14 @@ const CODE_REUSE_TOTAL: &str = "ironauth_oidc_code_reuse_total";
 /// Counter: redeem attempts that failed with a store error (so the revoke, if
 /// one was due, did not commit) rather than resolving to a clean outcome.
 const REDEEM_ERROR_TOTAL: &str = "ironauth_oidc_redeem_error_total";
+/// Counter: refresh tokens presented again after they were rotated, beyond the
+/// grace window (a genuine reuse that revoked the whole family, issue #21).
+const REFRESH_REUSE_TOTAL: &str = "ironauth_oidc_refresh_reuse_total";
+
+/// The OAuth scope value that requests a refresh token surviving RP logout (OIDC
+/// Core 11). Its presence in the granted scope makes the issued refresh-token
+/// family an OFFLINE family (issue #21).
+const OFFLINE_ACCESS_SCOPE: &str = "offline_access";
 
 /// The token-request parameters (form-encoded).
 ///
@@ -101,6 +113,9 @@ pub struct TokenParams {
     pub client_assertion_type: Option<String>,
     /// The PKCE `code_verifier`, checked against the bound `code_challenge`.
     pub code_verifier: Option<String>,
+    /// The refresh token to redeem for the `refresh_token` grant (issue #21). A
+    /// single-use rotating bearer credential, so it is redacted from `Debug`.
+    pub refresh_token: Option<String>,
 }
 
 impl fmt::Debug for TokenParams {
@@ -113,6 +128,7 @@ impl fmt::Debug for TokenParams {
             .field("has_client_assertion", &self.client_assertion.is_some())
             .field("client_assertion_type", &self.client_assertion_type)
             .field("has_code", &self.code.is_some())
+            .field("has_refresh_token", &self.refresh_token.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -134,19 +150,31 @@ async fn exchange(
     headers: &HeaderMap,
     params: TokenParams,
 ) -> Result<Response, TokenError> {
-    // 1. grant_type: present and exactly authorization_code. ROPC (`password`)
-    //    and every other grant are unrepresentable, so they land here as an
-    //    unsupported grant type with no handler to route to.
+    // grant_type: present and a serviced grant. ROPC (`password`) and every other
+    // grant are unrepresentable, so they land as an unsupported grant type with no
+    // handler to route to.
     let grant_type = params
         .grant_type
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| TokenError::InvalidRequest("grant_type is required".to_owned()))?;
-    if GrantType::parse(grant_type) != Some(GrantType::AuthorizationCode) {
-        return Err(TokenError::UnsupportedGrantType);
+    match GrantType::parse(grant_type) {
+        Some(GrantType::AuthorizationCode) => {
+            authorization_code_grant(state, headers, params).await
+        }
+        Some(GrantType::RefreshToken) => refresh_token_grant(state, headers, params).await,
+        None => Err(TokenError::UnsupportedGrantType),
     }
+}
 
+/// The `authorization_code` grant (issue #12): redeem a single-use code for the ID
+/// and access tokens, and (issue #21) open a refresh-token family alongside them.
+async fn authorization_code_grant(
+    state: &OidcState,
+    headers: &HeaderMap,
+    params: TokenParams,
+) -> Result<Response, TokenError> {
     // 2. code: present, and it declares its own (tenant, environment) scope. A
     //    malformed code is a uniform invalid_grant.
     let code_raw = params
@@ -269,8 +297,15 @@ async fn exchange(
         .await;
 
     match outcome {
-        // Won the race: hand out the tokens we pre-signed.
-        Ok(RedeemOutcome::Consumed) => Ok(token_response(&minted, &bindings)),
+        // Won the race: open a refresh-token family (issue #21) and hand out the
+        // tokens we pre-signed plus the refresh token. Refresh issuance runs AFTER
+        // the code is consumed, so it never affects single use; a failure to open
+        // the family degrades to an access+ID response without a refresh token
+        // (logged), rather than failing an otherwise-successful exchange.
+        Ok(RedeemOutcome::Consumed) => {
+            let refresh = issue_refresh_for_code(state, scope, &bindings).await;
+            Ok(token_response(&minted, &bindings, refresh.as_deref()))
+        }
         // A benign within-grace retry or an expired/absent code: plain
         // invalid_grant, no revoke.
         Ok(RedeemOutcome::RetryWithinGrace | RedeemOutcome::Invalid) => {
@@ -529,8 +564,13 @@ async fn id_token_extra_claims(
     assemble_claims(&bag, &granted, claims_request.id_token())
 }
 
-/// Build the `200 OK` token response (RFC 6749 5.1) from the pre-minted tokens.
-fn token_response(minted: &IssuedTokens, bindings: &CodeBindings) -> Response {
+/// Build the `200 OK` token response (RFC 6749 5.1) from the pre-minted tokens,
+/// including the refresh token (issue #21) when one was issued.
+fn token_response(
+    minted: &IssuedTokens,
+    bindings: &CodeBindings,
+    refresh_token: Option<&str>,
+) -> Response {
     let mut body = serde_json::json!({
         "access_token": minted.access.token(),
         "token_type": "Bearer",
@@ -539,6 +579,9 @@ fn token_response(minted: &IssuedTokens, bindings: &CodeBindings) -> Response {
     });
     if let Some(oauth_scope) = &bindings.oauth_scope {
         body["scope"] = serde_json::json!(oauth_scope);
+    }
+    if let Some(refresh_token) = refresh_token {
+        body["refresh_token"] = serde_json::json!(refresh_token);
     }
     token_ok(&body.to_string())
 }
@@ -578,4 +621,398 @@ fn map_store_error(error: StoreError) -> TokenError {
             TokenError::ServerError
         }
     }
+}
+
+// ===========================================================================
+// The refresh-token grant (RFC 6749 6, RFC 9700 2.2.2, OAuth 2.1, issue #21).
+// ===========================================================================
+
+/// Open a refresh-token family for a just-consumed code (issue #21), returning the
+/// plaintext refresh token to hand to the client. Returns [`None`] when the
+/// environment does not issue refresh tokens, or (fail-soft) when opening the
+/// family failed: a failure only costs the client a refresh token on this
+/// exchange, never the whole exchange, so it is logged and swallowed.
+///
+/// The family is OFFLINE when the granted scope carried `offline_access` (so it
+/// survives RP logout, OIDC Back-Channel Logout 2.7); otherwise it is
+/// session-bound (revoked when the RP session is logged out). `offline_access` is
+/// honored here because the code grant IS the flow that returns an authorization
+/// code; the consent for it was enforced at the authorization endpoint.
+async fn issue_refresh_for_code(
+    state: &OidcState,
+    scope: Scope,
+    bindings: &CodeBindings,
+) -> Option<String> {
+    if !state.issue_refresh_tokens() {
+        return None;
+    }
+    let offline = scope_contains(bindings.oauth_scope.as_deref(), OFFLINE_ACCESS_SCOPE);
+    let minted = tokens::mint_refresh_token(state, &scope);
+    let family_id = RefreshFamilyId::generate(state.env(), &scope);
+    let now = state.now();
+    let created = epoch_micros(now);
+    let idle_expires = epoch_micros(
+        now.checked_add(state.refresh_idle_ttl(offline))
+            .unwrap_or(now),
+    );
+    let absolute_expires = epoch_micros(
+        now.checked_add(state.refresh_max_lifetime(offline))
+            .unwrap_or(now),
+    );
+    let actor = client_actor(state, scope, &bindings.client_id);
+    let correlation = CorrelationId::generate(state.env());
+    let result = state
+        .store()
+        .scoped(scope)
+        .acting(actor, correlation)
+        .refresh()
+        .issue(
+            state.env(),
+            NewRefreshFamily {
+                family_id: &family_id,
+                token_jti: &minted.jti,
+                token_digest: &minted.digest,
+                grant_id: &bindings.grant_id,
+                subject: &bindings.subject,
+                client_id: &bindings.client_id,
+                scope: bindings.oauth_scope.as_deref(),
+                auth_methods: &bindings.auth_methods,
+                offline,
+                created_at_unix_micros: created,
+                idle_expires_at_unix_micros: idle_expires,
+                absolute_expires_at_unix_micros: absolute_expires,
+            },
+        )
+        .await;
+    match result {
+        Ok(()) => Some(minted.token),
+        Err(error) => {
+            tracing::warn!(%error, "could not open a refresh-token family; issuing without a refresh token");
+            None
+        }
+    }
+}
+
+/// The `refresh_token` grant (RFC 6749 6, issue #21): exchange a rotating refresh
+/// token for a fresh access token, applying the graduated rotation policy and
+/// reuse detection.
+///
+/// The refresh token declares its own `(tenant, environment)` scope through its
+/// embedded `rft_` routing handle, so the GLOBAL `/token` endpoint recovers the
+/// scope and runs the RLS-scoped resolve. The client is authenticated the same way
+/// as the code grant and MUST be the family's client. A narrowing `scope` request
+/// parameter is not honored: the original granted scope is refreshed (RFC 6749 6
+/// permits refreshing the originally granted scope). The single-use, rotation, and
+/// reuse decision is the store's atomic [`ActingRefreshRepo::redeem`]; this handler
+/// only pre-mints the access token and the successor, then maps the outcome.
+async fn refresh_token_grant(
+    state: &OidcState,
+    headers: &HeaderMap,
+    params: TokenParams,
+) -> Result<Response, TokenError> {
+    // 1. refresh_token: present, and it declares its own scope through its handle.
+    let presented = params
+        .refresh_token
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| TokenError::InvalidRequest("refresh_token is required".to_owned()))?;
+    let scope = parse_refresh_scope(presented).ok_or(TokenError::InvalidGrant)?;
+
+    // 2. Authenticate the client through the shared seam.
+    let authenticated_client = authenticate_client(state, scope, headers, &params).await?;
+
+    // 3. Resolve the presented token's live state (read only). Absent is a uniform
+    //    invalid_grant.
+    let resolution = state
+        .store()
+        .scoped(scope)
+        .refresh()
+        .load(presented)
+        .await
+        .map_err(map_store_error)?
+        .ok_or(TokenError::InvalidGrant)?;
+
+    // 4. The authenticated client MUST be the family's client, and the family and
+    //    its grant must be live. A revoked family (a prior reuse, an RP logout, or a
+    //    grant revoke) is a uniform invalid_grant; the reuse event, if one was due,
+    //    was already emitted when the family was revoked.
+    if authenticated_client.client_id != resolution.client_id || !resolution.active {
+        return Err(TokenError::InvalidGrant);
+    }
+
+    // 5. Resolve the client's posture and rotation override to decide whether a live
+    //    token rotates (public/unbound: always; confidential/bound: past the TTL
+    //    threshold).
+    let client_id = ClientId::parse_in_scope(&resolution.client_id, &scope)
+        .map_err(|_| TokenError::InvalidGrant)?;
+    let record = state
+        .store()
+        .scoped(scope)
+        .clients()
+        .auth_record(&client_id)
+        .await
+        .map_err(map_store_error)?;
+    let now_micros = epoch_micros(state.now());
+    let rotate = decide_rotate(state, &record, &resolution, now_micros);
+
+    // 6. Mint the refreshed access token. No ID token is re-minted: no new
+    //    authentication happened, so the ID token stays with the code exchange.
+    let (minted, expires_in) = mint_refresh_access(state, scope, &resolution).await?;
+
+    // 7. Pre-generate the successor refresh token, used when rotating or on a
+    //    within-grace concurrent refresh.
+    let successor = tokens::mint_refresh_token(state, &scope);
+    let now = state.now();
+    let successor_idle = epoch_micros(
+        now.checked_add(state.refresh_idle_ttl(resolution.offline))
+            .unwrap_or(now),
+    );
+    let next_gen = i32::try_from(resolution.generation.saturating_add(1)).unwrap_or(i32::MAX);
+
+    // 8. Build the access-token records to persist against the grant.
+    let (access_records, opaque) = refresh_access_records(&minted, &resolution);
+
+    // 9. Atomically redeem: the authoritative single-use, rotation, and reuse gate.
+    let actor = client_actor(state, scope, &resolution.client_id);
+    let correlation = CorrelationId::generate(state.env());
+    let outcome = state
+        .store()
+        .scoped(scope)
+        .acting(actor, correlation)
+        .refresh()
+        .redeem(
+            state.env(),
+            RefreshRedeem {
+                presented_token: presented,
+                rotate,
+                successor: RotatedRefreshToken {
+                    jti: &successor.jti,
+                    token_digest: &successor.digest,
+                    generation: next_gen,
+                    idle_expires_at_unix_micros: successor_idle,
+                },
+                access_records: &access_records,
+                opaque,
+                grace: state.refresh_rotation_grace(),
+            },
+        )
+        .await;
+
+    match outcome {
+        // Rotated (policy): the atomic-rotate winner. Return the fresh access token
+        // AND the newly minted successor refresh token.
+        Ok(RefreshRedeemOutcome::Rotated) => Ok(refresh_response(
+            &minted,
+            expires_in,
+            resolution.scope.as_deref(),
+            Some(&successor.token),
+        )),
+        // A within-grace benign concurrent refresh (a loser of the atomic rotate, a
+        // multi-tab retry, or a lost rotation response): return ONLY a fresh access
+        // token. No new refresh leaf was minted (the family's single live leaf is the
+        // winner's successor A, which the well-behaved client already holds or reads
+        // from shared storage), so per RFC 6749 5.1 the OPTIONAL refresh_token field
+        // is OMITTED rather than forking the family. A client that ENTIRELY lost the
+        // winner's response never receives A and must re-authenticate: an accepted,
+        // documented limitation of an AC7-respecting design (no replayable material at
+        // rest, so no cache-and-replay).
+        Ok(RefreshRedeemOutcome::RefreshedWithinGrace) => Ok(refresh_response(
+            &minted,
+            expires_in,
+            resolution.scope.as_deref(),
+            None,
+        )),
+        // Not rotated (a confidential/bound client under the threshold): a fresh
+        // access token and the SAME refresh token.
+        Ok(RefreshRedeemOutcome::NotRotated) => Ok(refresh_response(
+            &minted,
+            expires_in,
+            resolution.scope.as_deref(),
+            Some(presented),
+        )),
+        // A genuine reuse revoked the whole family (audited once in the redeem
+        // transaction). Meter it and return the uniform invalid_grant.
+        Ok(RefreshRedeemOutcome::Reused) => {
+            metrics::counter!(REFRESH_REUSE_TOTAL).increment(1);
+            tracing::warn!("refresh token reuse detected; family revoked");
+            Err(TokenError::InvalidGrant)
+        }
+        // Absent, expired, or a revoked family/grant: plain invalid_grant.
+        Ok(RefreshRedeemOutcome::Invalid) => Err(TokenError::InvalidGrant),
+        // The redeem itself faulted, so a revoke that was due did NOT commit. Meter
+        // it and fail closed.
+        Err(error) => {
+            metrics::counter!(REDEEM_ERROR_TOTAL).increment(1);
+            Err(map_store_error(error))
+        }
+    }
+}
+
+/// Recover the `(tenant, environment)` scope a refresh token declares through its
+/// embedded `rft_` routing handle (issue #21). The wire form is
+/// `ira_rt_<rft_...>~<secret>`: strip the product prefix, take the handle up to the
+/// delimiter, and parse its declared scope. A malformed token yields [`None`],
+/// which the caller maps to a uniform `invalid_grant`. A forged handle recovers
+/// nothing usable: the whole-token digest still binds the handle to the secret, so
+/// a token cannot be relocated to another scope.
+fn parse_refresh_scope(token: &str) -> Option<Scope> {
+    let rest = token.strip_prefix(tokens::OPAQUE_REFRESH_TOKEN_PREFIX)?;
+    let handle = rest.split(tokens::OPAQUE_ACCESS_TOKEN_DELIMITER).next()?;
+    RefreshTokenId::parse_declared_scope(handle)
+        .ok()
+        .map(|id| id.scope())
+}
+
+/// Decide whether a LIVE (non-superseded) refresh token rotates (issue #21).
+///
+/// A per-client override wins: `always` rotates on every refresh, `threshold`
+/// rotates only past the configured fraction of TTL. With no override the policy is
+/// derived from the client's posture: a PUBLIC (sender-unbound) client always
+/// rotates; a CONFIDENTIAL client rotates only once the token has passed the
+/// threshold fraction of its idle TTL. There is no sender-constrained (DPoP/mTLS)
+/// binding in this build, so every client is sender-unbound and the posture split
+/// is public-versus-confidential.
+fn decide_rotate(
+    state: &OidcState,
+    record: &ClientAuthRecord,
+    resolution: &RefreshTokenResolution,
+    now_micros: i64,
+) -> bool {
+    let use_threshold = match record.refresh_rotation.as_deref() {
+        // An explicit override.
+        Some("always") => false,
+        Some("threshold") => true,
+        // Derived from posture: a public client always rotates; a confidential one
+        // uses the threshold. An unrecognized stored value derives the same way.
+        _ => record.auth_method != ClientAuthMethod::None.as_str(),
+    };
+    if !use_threshold {
+        return true;
+    }
+    // Rotate once the token has passed the threshold fraction of its idle TTL.
+    let span = resolution
+        .idle_expires_at_unix_micros
+        .saturating_sub(resolution.issued_at_unix_micros);
+    let percent = i64::try_from(state.refresh_rotation_threshold_percent()).unwrap_or(70);
+    let advance = span.saturating_mul(percent) / 100;
+    let threshold_instant = resolution.issued_at_unix_micros.saturating_add(advance);
+    now_micros >= threshold_instant
+}
+
+/// Mint the refreshed access token (issue #21) through the same signing core and
+/// format selection as the code exchange, so a refreshed access token is shaped
+/// identically to a freshly issued one. The `acr`/`auth_methods` derive from the
+/// authentication event frozen onto the family at issuance (never re-derived).
+async fn mint_refresh_access(
+    state: &OidcState,
+    scope: Scope,
+    resolution: &RefreshTokenResolution,
+) -> Result<(MintedAccessToken, i64), TokenError> {
+    let entry = state
+        .issuer_entry(&scope)
+        .await
+        .ok_or(TokenError::ServerError)?;
+    let signer = entry.signer(state.now()).ok_or(TokenError::ServerError)?;
+    let issuer = state.issuer_for(&scope);
+    let subject = state.resolve_public_subject(&resolution.subject);
+    let target = state
+        .resolve_access_token_target(&scope, None, &resolution.client_id)
+        .await;
+    let extra_claims = serde_json::Map::new();
+    tokens::mint_access_token(
+        state,
+        signer,
+        entry.policy(),
+        &MintRequest {
+            scope,
+            issuer: &issuer,
+            subject: &subject,
+            client_id: &resolution.client_id,
+            nonce: None,
+            oauth_scope: resolution.scope.as_deref(),
+            auth_methods: &resolution.auth_methods,
+            auth_time_unix_micros: None,
+            at_hash: None,
+            c_hash: None,
+            extra_claims: &extra_claims,
+            // The refresh path mints only an access token (no ID token), so the
+            // per-client id_token signer (#30) is inert here; mint_access_token
+            // never reads it.
+            id_token_signer: None,
+        },
+        &target,
+    )
+    .map_err(|()| TokenError::ServerError)
+}
+
+/// Build what the redeem transaction records for the refreshed access token: an
+/// `at+jwt` is an `issued_tokens` row (its `jti`), an opaque token an
+/// `opaque_access_tokens` row (digest and metadata), exactly as the code exchange
+/// does, so grant-chain revocation reaches a refreshed access token too (issue #21).
+fn refresh_access_records<'a>(
+    minted: &'a MintedAccessToken,
+    resolution: &'a RefreshTokenResolution,
+) -> (Vec<IssuedTokenRecord>, Option<NewOpaqueAccessToken<'a>>) {
+    match minted {
+        MintedAccessToken::Jwt { jti, .. } => (
+            vec![IssuedTokenRecord {
+                id: *jti,
+                kind: TokenKind::Access,
+            }],
+            None,
+        ),
+        MintedAccessToken::Opaque {
+            digest,
+            jti,
+            audience,
+            expires_at_unix_micros,
+            ..
+        } => (
+            Vec::new(),
+            Some(NewOpaqueAccessToken {
+                token_digest: digest,
+                // Bound to the family's grant inside redeem (grant_text), so this is
+                // left None, exactly as the code exchange does.
+                grant_id: None,
+                subject: &resolution.subject,
+                client_id: &resolution.client_id,
+                audience,
+                scope: resolution.scope.as_deref(),
+                jti,
+                expires_at_unix_micros: *expires_at_unix_micros,
+            }),
+        ),
+    }
+}
+
+/// Build the `200 OK` refresh-response (RFC 6749 5.1) for the refresh grant (issue
+/// #21): the fresh access token, its lifetime, an OPTIONAL refresh token, and the
+/// granted scope. `refresh_token` is [`Some`] for a policy rotation (the new
+/// successor) or an unchanged confidential-under-threshold token, and [`None`] for a
+/// within-grace benign concurrent refresh, which mints no new leaf and so omits the
+/// optional field rather than forking the family.
+fn refresh_response(
+    minted: &MintedAccessToken,
+    expires_in: i64,
+    scope: Option<&str>,
+    refresh_token: Option<&str>,
+) -> Response {
+    let mut body = serde_json::json!({
+        "access_token": minted.token(),
+        "token_type": "Bearer",
+        "expires_in": expires_in,
+    });
+    if let Some(refresh_token) = refresh_token {
+        body["refresh_token"] = serde_json::json!(refresh_token);
+    }
+    if let Some(scope) = scope {
+        body["scope"] = serde_json::json!(scope);
+    }
+    token_ok(&body.to_string())
+}
+
+/// Whether a space-separated OAuth scope value contains `needle`.
+fn scope_contains(scope: Option<&str>, needle: &str) -> bool {
+    scope.is_some_and(|value| value.split_whitespace().any(|token| token == needle))
 }

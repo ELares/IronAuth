@@ -74,29 +74,32 @@ pub use id::{
     CorrelationId, CorrelationKind, EnvironmentId, EnvironmentKind, GrantId, GrantKind, HumanId,
     HumanKind, IdParseError, IssuedTokenId, IssuedTokenKind, LevelId, LevelKind, ManagementKeyId,
     ManagementKeyKind, NotInScope, OperatorId, OperatorKind, OrganizationId, OrganizationKind,
-    PushedRequestId, PushedRequestKind, ResourceServerId, ResourceServerKind, ScopedId, ScopedKind,
-    ServiceId, ServiceKind, SessionId, SessionKind, SigningKeyId, SigningKeyKind, TenantId,
-    TenantKind, UserId, UserKind,
+    PushedRequestId, PushedRequestKind, RefreshFamilyId, RefreshFamilyKind, RefreshTokenId,
+    RefreshTokenKind, ResourceServerId, ResourceServerKind, ScopedId, ScopedKind, ServiceId,
+    ServiceKind, SessionId, SessionKind, SigningKeyId, SigningKeyKind, TenantId, TenantKind,
+    UserId, UserKind,
 };
 pub use migrate::{Migration, MigrationError, MigrationReport, MigrationRunner, Phase};
 pub use redirect::{redirect_uri_is_registrable, redirect_uri_matches};
 pub use repository::{
     AccessTokenResolution, ActingAuthorizationRepo, ActingClientRepo, ActingConsentRepo,
     ActingEnvironmentRepo, ActingManagementCredentialRepo, ActingManagementStore,
-    ActingPushedRequestRepo, ActingResourceServerRepo, ActingSessionRepo, ActingSigningKeyRepo,
-    ActingStore, ActingTenantRepo, ActingUserRepo, ActiveOpaqueToken, AuditRecord, AuditRepo,
-    AuthorizationRepo, ClientAssertionJtiRepo, ClientAuthDiagnosticReason,
+    ActingPushedRequestRepo, ActingRefreshRepo, ActingResourceServerRepo, ActingSessionRepo,
+    ActingSigningKeyRepo, ActingStore, ActingTenantRepo, ActingUserRepo, ActiveOpaqueToken,
+    AuditRecord, AuditRepo, AuthorizationRepo, ClientAssertionJtiRepo, ClientAuthDiagnosticReason,
     ClientAuthDiagnosticRecord, ClientAuthDiagnosticsRepo, ClientAuthRecord, ClientRecord,
     ClientRepo, CodeBindings, ConsentRepo, ConsumePushedRequest, CursorPosition,
     DynamicClientRecord, DynamicClientRegistration, DynamicClientUpdate, EnvironmentRecord,
     EnvironmentRepo, GrantedConsent, IdempotencyRepo, IdempotencyWrite, IssueCode,
     IssuedTokenRecord, JtiOutcome, MANAGEMENT_LIST_HARD_CAP, ManagementCredentialRecord,
     ManagementCredentialRepo, ManagementStore, NewClientAuthDiagnostic, NewDynamicClient,
-    NewJwtAuthClient, NewOpaqueAccessToken, NewResourceServer, NewSigningKey, PushRequest,
-    PushedRequestRepo, RedeemOutcome, ResourceServerRecord, ResourceServerRepo, ScopedStore,
-    SessionRecord, SessionRepo, SigningKeyMaterial, SigningKeyMaterialKind, SigningKeyRecord,
-    SigningKeyRepo, StoredIdempotentResponse, TenantRecord, TenantRepo, TokenFormat, TokenKind,
-    TokenStatus, UserRecord, UserRepo, opaque_access_token_digest,
+    NewJwtAuthClient, NewOpaqueAccessToken, NewRefreshFamily, NewResourceServer, NewSigningKey,
+    PushRequest, PushedRequestRepo, RedeemOutcome, RefreshRedeem, RefreshRedeemOutcome,
+    RefreshRepo, RefreshTokenResolution, ResourceServerRecord, ResourceServerRepo,
+    RotatedRefreshToken, ScopedStore, SessionRecord, SessionRepo, SigningKeyMaterial,
+    SigningKeyMaterialKind, SigningKeyRecord, SigningKeyRepo, StoredIdempotentResponse,
+    TenantRecord, TenantRepo, TokenFormat, TokenKind, TokenStatus, UserRecord, UserRepo,
+    opaque_access_token_digest, refresh_token_digest,
 };
 pub use scope::Scope;
 pub use store::Store;

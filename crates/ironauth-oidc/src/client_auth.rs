@@ -1001,6 +1001,7 @@ mod tests {
             jwks: None,
             jwks_uri: None,
             token_endpoint_auth_signing_alg: None,
+            refresh_rotation: None,
         }
     }
 

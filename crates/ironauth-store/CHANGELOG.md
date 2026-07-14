@@ -6,6 +6,55 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Refresh-token rotation, families, `offline_access`, and consent-mode persistence
+  (issue #21, migration 0016, expand).
+  - **Token families and digest-only tokens.** New `refresh_families` (the
+    revocation spine: one family per original grant, carrying the hard-cap expiry,
+    the `session_ref`, the `offline` flag, and the exactly-once `reuse_detected_at`
+    marker) and `refresh_tokens` (one row per generation, storing ONLY the SHA-256
+    digest of the whole `ira_rt_<jti>~<secret>` wire token, never the plaintext).
+    Both tables ENABLE + FORCE row-level security with the `(tenant, environment)`
+    isolation policy and are registered in `scripts/query-audit.sh`; a
+    schema-level migration test asserts no plaintext-token column exists.
+  - **Rotation and reuse gate.** `RefreshRepo::load` resolves a presented token's
+    live state; `ActingRefreshRepo::issue` opens a family at first issuance;
+    `ActingRefreshRepo::redeem` is the authoritative single-use, rotation, and
+    reuse gate (a bespoke committing path): it rotates a live token, classifies a
+    superseded-token presentation as a benign within-grace concurrent refresh or a
+    genuine reuse that revokes the WHOLE family and emits the typed reuse event
+    exactly once, and returns `invalid_grant` for an expired or revoked
+    family/grant. `ActingRefreshRepo::revoke_session_bound` revokes a session's
+    session-bound families at RP logout while leaving `offline_access` families
+    intact.
+  - **Within-grace refreshes CONVERGE, they do not fork.** A within-grace
+    duplicate presentation (the loser of the atomic rotate, a multi-tab retry, or a
+    lost rotation response) now records ONLY a fresh access token against the
+    family's grant (audited as `token.issue`) and mints NO second successor leaf, so
+    a family always holds EXACTLY ONE live (unrotated, unrevoked) leaf: the winner's
+    successor. Previously each within-grace duplicate minted its own successor,
+    forking the family into independent chains that never presented each other's
+    tokens, so reuse detection could never fire (a stolen token replayed within the
+    grace window yielded a persistent undetected parallel chain). The new outcome is
+    `RefreshRedeemOutcome::RefreshedWithinGrace` (was `RotatedWithinGrace`). The
+    strict benign window is `[0, grace)`. `RefreshRepo::live_leaf_count` reads a
+    family's live-leaf count, the ground truth a concurrency test asserts is always
+    at most one. Accepted, documented limitation: a client that ENTIRELY loses the
+    winner's rotation response never receives the new refresh token and must
+    re-authenticate; no plaintext token is cached for replay (that would violate the
+    no-replayable-material-at-rest guarantee).
+  - **`refresh_tokens.created_at` dropped.** The generation's creation instant is
+    already recorded by the clock-seam `issued_at`; a `DEFAULT now()` DB-clock column
+    would only diverge from the seam and be invisible to a deterministic-clock test.
+  - **Consent modes and offline expiry.** `clients` gains `consent_mode`,
+    `skip_consent`, `store_skipped_consent`, and an optional `refresh_rotation`
+    override (all defaulted to today's behavior), surfaced on `ClientRecord` /
+    `ClientAuthRecord` and set through `ActingClientRepo::configure_policy`
+    (audited as `client.configure`). `consents` gains a nullable `expires_at`
+    (with a column-level UPDATE grant), surfaced on `GrantedConsent` and written
+    through `ActingConsentRepo::grant_with_expiry` so a `remembered` consent lapses
+    after its TTL.
+  - **Audit actions.** New `refresh_token.issue`, `refresh_token.rotate`,
+    `refresh_token.reuse`, `refresh_family.revoke`, and `client.configure`.
 - Dynamic Client Registration persistence (issue #30, migration 0014, expand).
   - **DCR clients columns.** `clients` gains `registration_access_token_hash`,
     `registration_client_uri`, `id_token_signed_response_alg`, `application_type`,

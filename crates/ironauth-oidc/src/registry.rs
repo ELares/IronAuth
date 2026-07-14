@@ -44,34 +44,42 @@
 
 /// The OAuth grant types IronAuth's token endpoint can service.
 ///
-/// Closed on purpose: the only member is the authorization-code grant. ROPC
-/// (`password`), the client-credentials grant, and every other grant are simply
-/// absent, so there is no way to name one at this layer.
+/// Closed on purpose: the members are the authorization-code grant (RFC 6749
+/// 4.1.3) and the refresh-token grant (RFC 6749 6, with the RFC 9700 2.2.2 /
+/// OAuth 2.1 rotation and reuse-detection rules, issue #21). ROPC (`password`),
+/// the client-credentials grant, and every other grant are simply absent, so
+/// there is no way to name one at this layer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GrantType {
     /// The `authorization_code` grant (RFC 6749 4.1.3).
     AuthorizationCode,
+    /// The `refresh_token` grant (RFC 6749 6, issue #21): exchanging a rotating
+    /// refresh token for a fresh access token (and, per the graduated policy, a
+    /// rotated refresh token).
+    RefreshToken,
 }
 
 impl GrantType {
-    /// Every grant type this build can express. Exactly one, by design.
-    pub const ALL: &'static [GrantType] = &[GrantType::AuthorizationCode];
+    /// Every grant type this build can express.
+    pub const ALL: &'static [GrantType] = &[GrantType::AuthorizationCode, GrantType::RefreshToken];
 
     /// The wire `grant_type` value.
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
             GrantType::AuthorizationCode => "authorization_code",
+            GrantType::RefreshToken => "refresh_token",
         }
     }
 
-    /// Parse a wire `grant_type`. Returns `None` for every value that is not the
-    /// authorization-code grant, so `password` (ROPC) and the rest never resolve
-    /// to a handler.
+    /// Parse a wire `grant_type`. Returns `None` for every value that is not a
+    /// serviced grant, so `password` (ROPC) and the rest never resolve to a
+    /// handler.
     #[must_use]
     pub fn parse(raw: &str) -> Option<Self> {
         match raw {
             "authorization_code" => Some(GrantType::AuthorizationCode),
+            "refresh_token" => Some(GrantType::RefreshToken),
             _ => None,
         }
     }

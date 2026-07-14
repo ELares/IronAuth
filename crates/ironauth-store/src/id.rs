@@ -164,6 +164,33 @@ impl ScopedKind for IssuedTokenKind {
     const REDACT_DEBUG: bool = true;
 }
 
+/// Marker for a refresh-token FAMILY (`rff_`), the spine rooted at one original
+/// authorization grant that every rotated refresh token in the chain belongs to
+/// (issue #21). Revoking the family invalidates every generation of refresh token
+/// in it (RFC 9700 2.2.2 reuse detection). Tenant scoped like every other
+/// resource; not a bearer secret (it is the family's audit/correlation handle,
+/// like a grant id), so its debug form stays legible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RefreshFamilyKind;
+impl ScopedKind for RefreshFamilyKind {
+    const PREFIX: &'static str = "rff";
+}
+
+/// Marker for a single refresh token's logical id (`rft_`), the routing handle
+/// embedded in the `ira_rt_<jti>~<secret>` wire token (issue #21), exactly as an
+/// opaque access token embeds its `tok_` id. It declares the token's
+/// `(tenant, environment)` in the clear so a GLOBAL `/token` endpoint recovers the
+/// scope and runs the RLS-scoped digest resolve; the secret suffix and the
+/// whole-token digest are what bind it. Because it is one segment of a live bearer
+/// credential, its debug form REDACTS the payload (like an issued token's `jti`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RefreshTokenKind;
+impl ScopedKind for RefreshTokenKind {
+    const PREFIX: &'static str = "rft";
+    // The `rft_` id is embedded in the presented refresh token; keep it out of logs.
+    const REDACT_DEBUG: bool = true;
+}
+
 /// Marker for a bootstrap end user (`usr_`), the account the login and
 /// registration surfaces authenticate (issue #20). A tenant-scoped resource: the
 /// user id embeds its `(tenant, environment)`, and its string is the stable
@@ -410,6 +437,12 @@ pub type GrantId = ScopedId<GrantKind>;
 /// An issued-token identifier (`tok_...`), the `jti` recorded against a grant
 /// (issue #12).
 pub type IssuedTokenId = ScopedId<IssuedTokenKind>;
+/// A refresh-token family identifier (`rff_...`), the revocation spine every
+/// rotated refresh token in one grant's chain belongs to (issue #21).
+pub type RefreshFamilyId = ScopedId<RefreshFamilyKind>;
+/// A refresh token's logical identifier (`rft_...`), the scope-declaring routing
+/// handle embedded in the `ira_rt_<jti>~<secret>` wire token (issue #21).
+pub type RefreshTokenId = ScopedId<RefreshTokenKind>;
 /// A bootstrap end-user identifier (`usr_...`), the account the login and
 /// registration surfaces authenticate (issue #20).
 pub type UserId = ScopedId<UserKind>;
