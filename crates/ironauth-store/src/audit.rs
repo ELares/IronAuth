@@ -123,6 +123,8 @@ pub enum Action {
     ClientCreate,
     /// A client was deleted.
     ClientDelete,
+    /// A client's registered redirect URIs were set (issue #13).
+    ClientRedirectUrisRegister,
     /// A tenant was created (management plane, issue #11).
     TenantCreate,
     /// A tenant was deactivated (management plane, issue #11).
@@ -163,6 +165,7 @@ impl Action {
         match self {
             Action::ClientCreate => "client.create",
             Action::ClientDelete => "client.delete",
+            Action::ClientRedirectUrisRegister => "client.redirect_uris.register",
             Action::TenantCreate => "tenant.create",
             Action::TenantDelete => "tenant.delete",
             Action::EnvironmentCreate => "environment.create",

@@ -29,15 +29,18 @@ use axum::extract::{Form, Query, State};
 use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
 use ironauth_store::{
-    AuthorizationCodeId, ClientId, CorrelationId, GrantId, IssueCode, Scope, StoreError,
+    AuthorizationCodeId, ClientId, ClientRecord, CorrelationId, GrantId, IssueCode, Scope,
+    StoreError, redirect_uri_is_registrable, redirect_uri_matches,
 };
 use serde::Deserialize;
 
+use crate::client_auth::ClientAuthMethod;
 use crate::error::{AuthorizeError, AuthzErrorCode, redirect_response};
 use crate::interaction;
 use crate::registry::{PkceMethod, ResponseType};
+use crate::response;
 use crate::state::OidcState;
-use crate::util::{append_query, client_service_actor, epoch_micros, redirect_uri_is_valid};
+use crate::util::{append_query, client_service_actor, epoch_micros};
 
 /// The authorization-request parameters. Every field is optional at
 /// deserialization so a missing parameter is a validated error (with the correct
@@ -144,27 +147,25 @@ async fn issue_code(
         }
     };
 
-    // 3. redirect_uri: present and syntactically valid. Still BEFORE any redirect.
-    //    Strict registered-match is #13; here it must be an absolute http(s) URI
-    //    with no fragment so it is safe to redirect to.
-    let redirect_uri = params
-        .redirect_uri
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| AuthorizeError::page("the redirect_uri parameter is required"))?;
-    if !redirect_uri_is_valid(redirect_uri) {
-        return Err(AuthorizeError::page("the redirect_uri is invalid"));
-    }
+    // 3. redirect_uri: present, a registrable RFC 8252 target, and an EXACT match
+    //    against the client's registered set. Still BEFORE any redirect (see
+    //    validate_registered_redirect): an unregistered or malformed redirect target
+    //    renders an error PAGE and never receives a redirect, so it can never be
+    //    turned into an open redirector (RFC 6749 4.1.2.1, RFC 9700 2.1).
+    let redirect_uri = validate_registered_redirect(&client, &params)?;
 
     // From here on, client_id and redirect_uri are validated, so every error is
-    // returned to the client by redirecting to redirect_uri.
+    // returned to the client by redirecting to redirect_uri. RFC 9207 requires the
+    // issuer identifier `iss` on every such response, success and error (issue
+    // #13); the scope (and thus the issuer) was fixed by the validated client_id.
+    let iss = state.issuer_for(&scope);
     let state_echo = params.state.as_deref();
     let redirect_error = |code: AuthzErrorCode, description: &str| AuthorizeError::Redirect {
         redirect_uri: redirect_uri.to_owned(),
         error: code,
         description: description.to_owned(),
         state: state_echo.map(str::to_owned),
+        iss: iss.clone(),
     };
 
     // 4. response_type: present and exactly `code`. A `token`/`id_token` response
@@ -185,35 +186,39 @@ async fn issue_code(
         ));
     }
 
-    // 5. PKCE binding. When a challenge is present, the method must be present and
-    //    S256 (plain is unrepresentable). Making PKCE mandatory and S256-only for
-    //    every client is #13; here it is a minimal correct binding.
-    let (code_challenge, code_challenge_method) = match params.code_challenge.as_deref() {
-        Some(challenge) if !challenge.is_empty() => {
-            let method = params.code_challenge_method.as_deref().unwrap_or("");
-            if PkceMethod::parse(method).is_none() {
-                return Err(redirect_error(
-                    AuthzErrorCode::InvalidRequest,
-                    "code_challenge_method must be S256",
-                ));
-            }
-            (Some(challenge), Some(PkceMethod::S256.as_str()))
-        }
-        _ => (None, None),
-    };
+    // 5. PKCE (S256-only, mandatory; see resolve_pkce). A PUBLIC client
+    //    (token_endpoint_auth_method = none) always requires PKCE (RFC 9700 2.1.1);
+    //    a CONFIDENTIAL client follows the per-environment policy, required by
+    //    default. `plain` and a defaulted method are invalid_request. The other
+    //    downgrade direction (a no-challenge code redeemed WITH a verifier) is the
+    //    token endpoint's to refuse.
+    let is_public = client.auth_method == ClientAuthMethod::None.as_str();
+    let pkce_required = is_public || state.require_pkce_for_confidential();
+    let code_challenge = resolve_pkce(&params, pkce_required)
+        .map_err(|description| redirect_error(AuthzErrorCode::InvalidRequest, description))?;
+    let code_challenge_method = code_challenge.map(|_| PkceMethod::S256.as_str());
 
     // 6. Establish the authenticated subject and their consent. A missing session
     //    or missing consent short-circuits to a LOCAL interaction redirect (never
     //    the client's redirect_uri), carrying a return_to that resumes this exact
     //    request.
-    let (session, consent_ref) =
-        match resolve_gate(state, headers, scope, &client_id, &params, redirect_uri).await? {
-            Gate::Interaction(response) => return Ok(response),
-            Gate::Ready {
-                session,
-                consent_ref,
-            } => (session, consent_ref),
-        };
+    let (session, consent_ref) = match resolve_gate(
+        state,
+        headers,
+        scope,
+        &client_id,
+        &params,
+        redirect_uri,
+        &iss,
+    )
+    .await?
+    {
+        Gate::Interaction(response) => return Ok(response),
+        Gate::Ready {
+            session,
+            consent_ref,
+        } => (session, consent_ref),
+    };
 
     // 7. Freeze the authentication context onto the code. auth_time is emitted in
     //    the ID token when the request asked for max_age (present, including
@@ -250,7 +255,93 @@ async fn issue_code(
         session_ref: &session_ref,
         consent_ref: &consent_ref,
     };
-    finalize_issue(state, scope, &client_id, redirect_uri, &resolved).await
+    finalize_issue(state, scope, &client_id, redirect_uri, &iss, &resolved).await
+}
+
+/// Validate the request's `redirect_uri` against the client's registered set
+/// (issue #13), BEFORE any redirect. It must be present, a registrable RFC 8252
+/// target (a claimed https URL, an http loopback IP literal, or a reverse-domain
+/// private-use scheme), and an EXACT-string match of a registered value (the only
+/// deviation being the RFC 8252 loopback port exception, inside
+/// [`redirect_uri_matches`]). Every failure is an error PAGE, never a redirect, so
+/// an unvalidated or unregistered URI can never be turned into an open redirector.
+fn validate_registered_redirect<'a>(
+    client: &ClientRecord,
+    params: &'a AuthorizeParams,
+) -> Result<&'a str, AuthorizeError> {
+    let redirect_uri = params
+        .redirect_uri
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| AuthorizeError::page("the redirect_uri parameter is required"))?;
+    if !redirect_uri_is_registrable(redirect_uri) {
+        return Err(AuthorizeError::page("the redirect_uri is invalid"));
+    }
+    if !client
+        .redirect_uris
+        .iter()
+        .any(|registered| redirect_uri_matches(registered, redirect_uri))
+    {
+        return Err(AuthorizeError::page(
+            "the redirect_uri is not registered for this client",
+        ));
+    }
+    Ok(redirect_uri)
+}
+
+/// Validate and enforce the PKCE parameters (issue #13, RFC 7636 / RFC 9700),
+/// returning the bound `code_challenge` (S256) or `None`.
+///
+/// S256 is the ONLY accepted method: `plain` is structurally unrepresentable, so
+/// any other method (including `plain`) is rejected, and a challenge presented
+/// without an explicit S256 method is refused too (RFC 7636 4.3 would default it
+/// to the forbidden `plain`). A lone method with no challenge is malformed. When
+/// `pkce_required` a missing challenge is refused. On any violation returns the
+/// `invalid_request` description the caller sends by redirect.
+fn resolve_pkce(
+    params: &AuthorizeParams,
+    pkce_required: bool,
+) -> Result<Option<&str>, &'static str> {
+    let named_method = params
+        .code_challenge_method
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if let Some(method) = named_method {
+        if PkceMethod::parse(method).is_none() {
+            return Err("code_challenge_method must be S256");
+        }
+    }
+    let code_challenge = match params.code_challenge.as_deref() {
+        Some(challenge) if !challenge.is_empty() => {
+            // A challenge requires an EXPLICIT S256 method (a defaulted `plain` is
+            // forbidden).
+            if named_method != Some(PkceMethod::S256.as_str()) {
+                return Err("code_challenge_method must be S256");
+            }
+            // An S256 challenge is BASE64URL(SHA256(v)): exactly 43 unpadded
+            // base64url chars (RFC 7636 4.2). Rejecting a malformed challenge here
+            // turns a guaranteed-to-fail redemption into an honest, immediate
+            // `invalid_request` and refuses a truncated/low-entropy binding.
+            if !crate::pkce::code_challenge_is_well_formed(challenge) {
+                return Err(
+                    "code_challenge must be a 43-character base64url SHA-256 digest (S256)",
+                );
+            }
+            Some(challenge)
+        }
+        _ => {
+            if named_method.is_some() {
+                return Err("code_challenge is required with code_challenge_method");
+            }
+            None
+        }
+    };
+    if pkce_required && code_challenge.is_none() {
+        return Err("PKCE is required: a code_challenge (S256) must be provided");
+    }
+    Ok(code_challenge)
 }
 
 /// The outcome of resolving the login/consent gate: either an interaction is
@@ -280,6 +371,7 @@ async fn resolve_gate(
     client_id: &ClientId,
     params: &AuthorizeParams,
     redirect_uri: &str,
+    iss: &str,
 ) -> Result<Gate, AuthorizeError> {
     let cookie = interaction::cookie_header(headers);
     let Some(session) = interaction::resolve_session(state, scope, cookie).await else {
@@ -318,6 +410,7 @@ async fn resolve_gate(
             error: AuthzErrorCode::ServerError,
             description: "the authorization request could not be processed".to_owned(),
             state: params.state.as_deref().map(str::to_owned),
+            iss: iss.to_owned(),
         }),
     }
 }
@@ -378,6 +471,7 @@ async fn finalize_issue(
     scope: Scope,
     client_id: &ClientId,
     redirect_uri: &str,
+    iss: &str,
     resolved: &Resolved<'_>,
 ) -> Result<Response, AuthorizeError> {
     let now = state.now();
@@ -421,16 +515,17 @@ async fn finalize_issue(
             error: AuthzErrorCode::ServerError,
             description: "the authorization request could not be processed".to_owned(),
             state: resolved.state_echo.map(str::to_owned),
+            iss: iss.to_owned(),
         });
     }
 
+    // The success response carries the code, the echoed state, and the RFC 9207
+    // `iss` (issue #13); the same parameter assembler feeds the fragment and
+    // form_post encoders #17 adds, so iss is emitted uniformly on every mode.
     let code = code_id.to_string();
     let location = append_query(
         redirect_uri,
-        &[
-            ("code", Some(code.as_str())),
-            ("state", resolved.state_echo),
-        ],
+        &response::success_params(&code, resolved.state_echo, iss),
     );
     Ok(redirect_response(&location))
 }

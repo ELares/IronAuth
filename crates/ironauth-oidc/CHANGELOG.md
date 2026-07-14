@@ -6,6 +6,38 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- PKCE enforcement, exact redirect matching, native-app redirect rules, and the
+  RFC 9207 `iss` (issue #13). Hardens the #12 authorization and token endpoints;
+  the provider stays gated off (`oidc.enabled` unchanged).
+  - **PKCE is S256-only and mandatory.** `plain` is structurally absent (no
+    registry variant, no config), so any method but `S256` (and a challenge with a
+    defaulted method) is `invalid_request`. A PUBLIC client
+    (`token_endpoint_auth_method` = none) MUST use PKCE (RFC 9700 2.1.1); a
+    CONFIDENTIAL client follows the per-environment policy
+    `oidc.require_pkce_for_confidential_clients` (default required). Downgrade
+    prevention holds BOTH ways: a challenge-bound code needs the matching verifier,
+    and a no-challenge code is never redeemable WITH one.
+  - **redirect_uri is matched by EXACT string** against the client's registered set
+    (via `ironauth_store`), with only the RFC 8252 loopback port exception; native
+    private-use-scheme and claimed-`https` redirects are accepted, and a malformed
+    scheme is rejected at authorization time as it is at registration. An
+    unregistered or malformed redirect NEVER receives a redirect (an error page),
+    so it cannot become an open redirector, and this holds on error paths too.
+  - **RFC 9207 `iss`** is emitted on EVERY authorization response, success and
+    error, assembled mode-independently (`src/response.rs`) so it covers the
+    fragment and `form_post` modes issue #17 enables; discovery now advertises
+    `authorization_response_iss_parameter_supported = true` via
+    `DiscoveryCapabilities::from_config`.
+  - **PKCE format is validated, not just the transform** (RFC 7636 4.1/4.2). The
+    `code_challenge` must be a 43-character unpadded base64url SHA-256 digest at
+    `/authorize` (a truncated or low-entropy binding is rejected up front as
+    `invalid_request`, not deferred to a guaranteed token failure), and the
+    `code_verifier` must be 43 to 128 unreserved characters at redemption, so a
+    client cannot slip below the RFC's entropy floor even with a self-consistent
+    challenge. The exact-string redirect comparator's loopback port exception now
+    range-checks the port (`1..=65535`), and a registered `https` redirect carrying
+    userinfo (`https://good@evil/cb`, a host-confusion vector) is refused at
+    registration.
 - Initial OIDC core provider: the authorization endpoint and the
   `authorization_code` grant (issue #12), mounted on the PUBLIC listener.
   - **Authorization endpoint** (`GET`/`POST /authorize`) and the token endpoint's

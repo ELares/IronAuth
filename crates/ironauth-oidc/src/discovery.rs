@@ -160,13 +160,16 @@ pub struct DiscoveryCapabilities {
 impl DiscoveryCapabilities {
     /// The capabilities implied by live configuration.
     ///
-    /// Today no config knob toggles a discovery capability, so this is the default
-    /// set (legacy response types off, `form_post` off, RFC 9207 `iss` off). The
-    /// issues that own those features (#13, #17) wire their flags in here, and
-    /// discovery reflects them with no change to the generator.
+    /// The authorization endpoint now emits the RFC 9207 `iss` on every
+    /// authorization response, success and error, on every response mode (issue
+    /// #13), so discovery advertises
+    /// `authorization_response_iss_parameter_supported = true`. The remaining
+    /// per-environment features (legacy response types, `form_post`) stay off until
+    /// their owning issue (#17) wires their flags in here; discovery reflects each
+    /// with no change to the generator.
     #[must_use]
     pub fn from_config(_config: &OidcConfig) -> Self {
-        Self::default()
+        Self::default().with_authorization_response_iss(true)
     }
 
     /// Enable a legacy response type for this environment (issue #17).
@@ -550,6 +553,28 @@ mod tests {
             doc["authorization_response_iss_parameter_supported"],
             json!(false)
         );
+    }
+
+    #[test]
+    fn from_config_advertises_iss_and_only_s256_pkce() {
+        // Issue #13 flips the RFC 9207 capability on: the authorization endpoint
+        // now emits iss on every response, so discovery advertises it.
+        let caps = DiscoveryCapabilities::from_config(&OidcConfig::default());
+        let policy = SigningPolicy::eddsa_default();
+        let doc = discovery_document(
+            "https://i.test/t/a/e/b",
+            "https://i.test",
+            "https://i.test/t/a/e/b/jwks.json",
+            &policy,
+            &caps,
+        );
+        assert_eq!(
+            doc["authorization_response_iss_parameter_supported"],
+            json!(true)
+        );
+        // PKCE is S256-only: plain is structurally absent from the registry, so it
+        // can never be advertised.
+        assert_eq!(doc["code_challenge_methods_supported"], json!(["S256"]));
     }
 
     #[test]

@@ -143,6 +143,11 @@
           "minimum": 0,
           "type": "integer"
         },
+        "require_pkce_for_confidential_clients": {
+          "default": true,
+          "description": "Whether a CONFIDENTIAL client (one that authenticates at the token endpoint\nwith a secret) must use PKCE (issue #13, RFC 9700 2.1). Default `true`: PKCE\nis required for every client. A PUBLIC client (`token_endpoint_auth_method`\n= `none`) ALWAYS requires PKCE regardless of this setting, because RFC 9700\n2.1.1 makes it structural for public clients; this knob only governs the\nper-environment policy for confidential clients, whose default is `required`.\nSet it to `false` only for an environment whose confidential clients cannot\nyet send a `code_challenge` (a migration aid); a code issued without a\nchallenge is still never redeemable with a verifier (downgrade prevention\nholds in both directions). This is a promotable per-environment setting in\nspirit, like `jwks_cache_max_age_secs`; the process value is the deployment\ndefault until per-environment overrides ride the M5 promotion pipeline.",
+          "type": "boolean"
+        },
         "reuse_grace_secs": {
           "default": 10,
           "description": "Reuse grace window in seconds for an already-consumed authorization code.\nA second presentation of a consumed code within this window (a concurrent\ndouble-submit or an immediate client retry) is treated as a BENIGN retry:\nit fails with `invalid_grant` but does NOT revoke the grant chain and does\nNOT audit a reuse. A second presentation AFTER the window is a genuine\nreuse: it revokes the grant chain and audits it (RFC 9700). The default\n(10) tolerates realistic retry and clock jitter without a false revoke; set\nit to 0 to treat every reuse as genuine. At most `OIDC_MAX_LIFETIME_SECS`.",
@@ -309,6 +314,7 @@
         "authorization_code_ttl_secs": 60,
         "enabled": false,
         "jwks_cache_max_age_secs": 600,
+        "require_pkce_for_confidential_clients": true,
         "reuse_grace_secs": 10,
         "session_ttl_secs": 3600
       },

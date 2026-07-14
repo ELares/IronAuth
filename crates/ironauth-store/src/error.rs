@@ -40,6 +40,13 @@ pub enum StoreError {
     ///
     /// [`NotFound`]: StoreError::NotFound
     Conflict,
+    /// A client tried to register a redirect URI that is not a valid RFC 8252
+    /// redirect target (issue #13): not a claimed `https` URL, an `http` loopback
+    /// IP-literal URL, or a reverse-domain private-use scheme. Malformed schemes
+    /// are rejected at registration time (as they are at authorization time), so a
+    /// value that could never be a safe redirect target never reaches the
+    /// registered set. Carries no tenant data.
+    InvalidRedirectUri,
 }
 
 impl fmt::Display for StoreError {
@@ -50,6 +57,7 @@ impl fmt::Display for StoreError {
             StoreError::Migration(_) => f.write_str("migration error"),
             StoreError::IdempotencyConflict => f.write_str("idempotency-key conflict"),
             StoreError::Conflict => f.write_str("uniqueness conflict"),
+            StoreError::InvalidRedirectUri => f.write_str("invalid redirect uri"),
         }
     }
 }
@@ -57,7 +65,10 @@ impl fmt::Display for StoreError {
 impl std::error::Error for StoreError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            StoreError::NotFound | StoreError::IdempotencyConflict | StoreError::Conflict => None,
+            StoreError::NotFound
+            | StoreError::IdempotencyConflict
+            | StoreError::Conflict
+            | StoreError::InvalidRedirectUri => None,
             StoreError::Database(source) => Some(source),
             StoreError::Migration(source) => Some(source),
         }

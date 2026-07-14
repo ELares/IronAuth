@@ -242,10 +242,10 @@ async fn expand_contract_example_chain_runs_all_three_phases_and_contract_remove
     );
 }
 
-/// The PRODUCTION chain (`MigrationRunner::new`) contains exactly the seven real
+/// The PRODUCTION chain (`MigrationRunner::new`) contains exactly the eight real
 /// migrations and leaves no throwaway demo object in a real database.
 #[tokio::test]
-async fn production_chain_is_only_the_seven_real_migrations_and_ships_no_demo_object() {
+async fn production_chain_is_only_the_eight_real_migrations_and_ships_no_demo_object() {
     // TestDatabase::start runs Store::migrate() (the production chain) on a
     // fresh, empty database.
     let db = TestDatabase::start().await;
@@ -262,13 +262,17 @@ async fn production_chain_is_only_the_seven_real_migrations_and_ships_no_demo_ob
     );
     assert_eq!(
         report.already_applied(),
-        7,
-        "the production chain is exactly seven migrations (isolation, audit log, management API, \
-         OIDC authorization, signing keys, login/consent, authentication context)"
+        8,
+        "the production chain is exactly eight migrations (isolation, audit log, management API, \
+         OIDC authorization, signing keys, login/consent, authentication context, redirect \
+         registration)"
     );
 
-    // The ledger holds exactly versions 1 through 7.
-    assert_eq!(applied_versions(pool).await, vec![1_i64, 2, 3, 4, 5, 6, 7]);
+    // The ledger holds exactly versions 1 through 8.
+    assert_eq!(
+        applied_versions(pool).await,
+        vec![1_i64, 2, 3, 4, 5, 6, 7, 8]
+    );
     let phase_of = |version: i64| async move {
         sqlx::query("SELECT phase FROM _schema_migrations WHERE version = $1")
             .bind(version)
@@ -284,6 +288,7 @@ async fn production_chain_is_only_the_seven_real_migrations_and_ships_no_demo_ob
     assert_eq!(phase_of(5).await, "expand");
     assert_eq!(phase_of(6).await, "expand");
     assert_eq!(phase_of(7).await, "expand");
+    assert_eq!(phase_of(8).await, "expand");
 
     // The demo object never reaches a production database.
     assert!(
@@ -339,6 +344,11 @@ async fn production_chain_is_only_the_seven_real_migrations_and_ships_no_demo_ob
     assert!(
         column_exists(pool, "clients", "require_auth_time").await,
         "clients.require_auth_time exists"
+    );
+    // The registered redirect URIs for the exact-string redirect match (issue #13).
+    assert!(
+        column_exists(pool, "clients", "redirect_uris").await,
+        "clients.redirect_uris exists"
     );
 }
 

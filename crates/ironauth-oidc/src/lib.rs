@@ -82,6 +82,7 @@ mod password;
 mod pkce;
 mod register;
 mod registry;
+mod response;
 mod sector;
 mod session;
 mod state;
