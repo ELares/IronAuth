@@ -105,6 +105,11 @@ serde = { version = "1.0", features = ["derive"] }
 toml = "0.9"
 schemars = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+# Parse the (possibly repeated) RFC 8707 `resource` request parameter (issue #28)
+# from a raw query/form body, which a typed serde struct cannot capture. This is the
+# SAME crate axum already uses for form/query extraction, so no new crate enters the
+# graph; permissive, MSRV 1.85 and musl clean.
+serde_urlencoded = "0.7"
 
 # HTTP runtime and middleware (see docs/adr/0001-http-runtime.md). Pure Rust,
 # musl-static friendly; no TLS crate on the default path (a terminating proxy

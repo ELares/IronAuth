@@ -83,8 +83,12 @@ pub struct IntrospectionClaims {
     pub exp: Option<i64>,
     /// Issuance, in seconds since the Unix epoch.
     pub iat: Option<i64>,
-    /// The audience the token targets (a resource server, or the client id).
-    pub aud: Option<String>,
+    /// The audience(s) the token targets (issue #28): a resource server (or several,
+    /// RFC 8707), or the client id for the no-resource case. EMPTY means no audience
+    /// (a refresh token). Serialized as a single JSON STRING for one audience (the
+    /// common case, byte-identical to the pre-#28 wire form) or a JSON ARRAY for
+    /// several (RFC 7662 permits either).
+    pub aud: Vec<String>,
 }
 
 impl IntrospectionClaims {
@@ -132,7 +136,7 @@ impl IntrospectionSerializer for JsonIntrospectionSerializer {
         insert_str(&mut object, "token_type", claims.token_type.as_deref());
         insert_i64(&mut object, "exp", claims.exp);
         insert_i64(&mut object, "iat", claims.iat);
-        insert_str(&mut object, "aud", claims.aud.as_deref());
+        insert_aud(&mut object, &claims.aud);
         SerializedIntrospection {
             content_type: "application/json",
             body: Value::Object(object).to_string(),
@@ -152,6 +156,25 @@ fn insert_str(object: &mut Map<String, Value>, name: &str, value: Option<&str>) 
 fn insert_i64(object: &mut Map<String, Value>, name: &str, value: Option<i64>) {
     if let Some(value) = value {
         object.insert(name.to_owned(), Value::from(value));
+    }
+}
+
+/// Insert the `aud` claim in its RFC 7662 shape (issue #28): OMITTED when empty, a
+/// single JSON STRING for exactly one audience (byte-identical to the pre-#28 wire
+/// form, so a single-audience token still reports `"aud":"..."`), or a JSON ARRAY for
+/// several (a multi-resource token per RFC 8707 / RFC 9068).
+fn insert_aud(object: &mut Map<String, Value>, audiences: &[String]) {
+    match audiences {
+        [] => {}
+        [single] => {
+            object.insert("aud".to_owned(), Value::String(single.clone()));
+        }
+        many => {
+            object.insert(
+                "aud".to_owned(),
+                Value::Array(many.iter().cloned().map(Value::String).collect()),
+            );
+        }
     }
 }
 
@@ -328,7 +351,14 @@ async fn resolve_jwt(state: &OidcState, scope: Scope, token: &str) -> Option<Int
         token_type: Some(BEARER_TOKEN_TYPE.to_owned()),
         exp: claims.expiration(),
         iat: claims.issued_at(),
-        aud: claims.audiences().first().cloned(),
+        // Report the token's FULL signed audience set (RFC 7662 section 2.2: the `aud`
+        // is the token's intended audience, so under-reporting it could make an RS that
+        // relies on introspection wrongly reject a valid multi-resource token). The
+        // audiences were signature-confirmed (a member of them is what `verify_any_
+        // audience` bound), and the serializer collapses a one-element vec to a bare
+        // string (byte-identical to the pre-#28 single-audience wire form) and emits an
+        // array for several, exactly the shape the opaque path reports.
+        aud: claims.audiences().to_vec(),
     })
 }
 
@@ -406,7 +436,10 @@ async fn resolve_opaque(
         token_type: Some(BEARER_TOKEN_TYPE.to_owned()),
         exp: Some(active.expires_at_unix_micros.div_euclid(1_000_000)),
         iat: Some(active.issued_at_unix_micros.div_euclid(1_000_000)),
-        aud: Some(active.audience),
+        // The FULL recorded audience set (issue #28): an opaque token carries no
+        // self-contained claims, so its audiences are recorded on the row and
+        // reported here exactly as minted (a single string, or an array).
+        aud: active.audiences,
     })
 }
 
@@ -445,7 +478,7 @@ async fn resolve_refresh(
         token_type: None,
         exp: Some(resolution.idle_expires_at_unix_micros.div_euclid(1_000_000)),
         iat: Some(resolution.issued_at_unix_micros.div_euclid(1_000_000)),
-        aud: None,
+        aud: Vec::new(),
     })
 }
 
@@ -509,7 +542,7 @@ mod tests {
             token_type: Some("Bearer".to_owned()),
             exp: Some(1_300),
             iat: Some(1_000),
-            aud: Some("cli_x".to_owned()),
+            aud: vec!["cli_x".to_owned()],
         };
         let value: Value =
             serde_json::from_str(&JsonIntrospectionSerializer.serialize(&claims).body).unwrap();
@@ -532,7 +565,7 @@ mod tests {
             token_type: None,
             exp: Some(9),
             iat: Some(1),
-            aud: None,
+            aud: Vec::new(),
         };
         let value: Value =
             serde_json::from_str(&JsonIntrospectionSerializer.serialize(&refresh).body).unwrap();

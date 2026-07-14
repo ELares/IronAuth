@@ -28,6 +28,13 @@ base64.workspace = true
 # and tamper detection). Pure Rust, permissive, already present transitively via
 # sqlx, so no new crate enters the graph; keeps MSRV 1.85 and musl clean.
 sha2.workspace = true
+# JSON (de)serialization for the small string-array columns the store owns the
+# encoding of (issue #28): the per-client resource allowlist, the frozen granted
+# resources on a grant/code, and an opaque token's recorded audience array. Keeping
+# the encoding in the store keeps the array shape one canonical representation and
+# the OIDC layer free of ad-hoc JSON handling for these columns. Already present
+# transitively, so no new crate enters the graph.
+serde_json.workspace = true
 
 [features]
 # Default build is lean: no test-support surface. Production only ever needs the

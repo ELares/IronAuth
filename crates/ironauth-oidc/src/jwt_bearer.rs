@@ -31,8 +31,9 @@
 //!    auto-provisioned.
 //! 5. Mint a SHORT-LIVED access token under the mapped principal (its `sub`),
 //!    audienced to the presenting client (the #29 `resolve_access_token_target`
-//!    seam with `resource = None`), through the SAME signing core and grant chain
-//!    the other grants use, so it is revocable and introspectable by construction.
+//!    seam with no resource, an empty resource set), through the SAME signing core
+//!    and grant chain the other grants use, so it is revocable and introspectable by
+//!    construction.
 //!    NO refresh token is issued (RFC 7521 4.1: re-present the assertion instead).
 //!
 //! # What is REUSED from the client authentication suite (#25)
@@ -458,9 +459,9 @@ async fn resolve_issuer_keys(
 /// Resolve the mapped principal, mint the short-lived access token under it, record
 /// it against a fresh grant (audited as `jwt_bearer_assertion.issue`), and build the
 /// `200 OK` response. The token is audienced to the presenting `client_id` (the #29
-/// `resolve_access_token_target` seam with `resource = None`), so its `aud` is the
-/// client and it stays revocable/introspectable by the #22 endpoints. There is NO
-/// ID token and NO refresh token (RFC 7521 4.1).
+/// `resolve_access_token_target` seam with no resource, an empty resource set), so
+/// its `aud` is the client and it stays revocable/introspectable by the #22
+/// endpoints. There is NO ID token and NO refresh token (RFC 7521 4.1).
 async fn mint_and_persist(
     state: &OidcState,
     scope: Scope,
@@ -468,11 +469,13 @@ async fn mint_and_persist(
     principal: &str,
     requested_scope: Option<&str>,
 ) -> Result<Response, TokenError> {
-    // The token audience: the presenting client (resource = None), exactly as the
-    // client-credentials default resolves.
+    // The token audience: the presenting client with no resource (an empty resource
+    // set), exactly as the client-credentials default resolves. The empty-resource
+    // branch is infallible, so a failure here can only be an internal error.
     let target = state
-        .resolve_access_token_target(&scope, None, client_id_str)
-        .await;
+        .resolve_access_token_target(&scope, &[], client_id_str)
+        .await
+        .map_err(|_| TokenError::ServerError)?;
     let entry = state
         .issuer_entry(&scope)
         .await
@@ -516,7 +519,7 @@ async fn mint_and_persist(
         MintedAccessToken::Opaque {
             digest,
             jti,
-            audience,
+            audiences,
             expires_at_unix_micros,
             ..
         } => ClientCredentialsAccess::Opaque(NewOpaqueAccessToken {
@@ -525,7 +528,8 @@ async fn mint_and_persist(
             grant_id: None,
             subject: principal,
             client_id: client_id_str,
-            audience: audience.as_str(),
+            audience: audiences.first().map_or("", String::as_str),
+            audiences,
             scope: requested_scope,
             jti,
             expires_at_unix_micros: *expires_at_unix_micros,

@@ -242,19 +242,19 @@ async fn expand_contract_example_chain_runs_all_three_phases_and_contract_remove
     );
 }
 
-/// The PRODUCTION chain (`MigrationRunner::new`) contains exactly the nineteen
+/// The PRODUCTION chain (`MigrationRunner::new`) contains exactly the twenty
 /// real migrations and leaves no throwaway demo object in a real database.
 // A long but linear ledger-and-table assertion sweep (one line per migration and
 // per real table); splitting it would not make it clearer.
 #[allow(clippy::too_many_lines)]
 #[tokio::test]
-async fn production_chain_is_only_the_nineteen_real_migrations_and_ships_no_demo_object() {
+async fn production_chain_is_only_the_twenty_real_migrations_and_ships_no_demo_object() {
     // TestDatabase::start runs Store::migrate() (the production chain) on a
     // fresh, empty database.
     let db = TestDatabase::start().await;
     let pool = db.owner_pool();
 
-    // Re-running is idempotent and reports exactly eighteen tracked migrations.
+    // Re-running is idempotent and reports exactly twenty tracked migrations.
     let report = MigrationRunner::new(pool)
         .run()
         .await
@@ -265,20 +265,20 @@ async fn production_chain_is_only_the_nineteen_real_migrations_and_ships_no_demo
     );
     assert_eq!(
         report.already_applied(),
-        19,
-        "the production chain is exactly nineteen migrations (isolation, audit log, management \
+        20,
+        "the production chain is exactly twenty migrations (isolation, audit log, management \
          API, OIDC authorization, signing keys, login/consent, authentication context, redirect \
          registration, UserInfo claims, consent scope upsert, resource servers, opaque access \
          tokens, client auth suite, dynamic client registration, pushed authorization requests, \
-         refresh tokens, client-credentials service accounts, DCR abuse controls, JWT bearer \
-         assertion grant)"
+         refresh tokens, client-credentials service accounts, DCR abuse controls, resource \
+         indicators, JWT bearer assertion grant)"
     );
 
-    // The ledger holds exactly versions 1 through 19.
+    // The ledger holds exactly versions 1 through 20.
     assert_eq!(
         applied_versions(pool).await,
         vec![
-            1_i64, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19
+            1_i64, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20
         ]
     );
     let phase_of = |version: i64| async move {
@@ -315,9 +315,12 @@ async fn production_chain_is_only_the_nineteen_real_migrations_and_ships_no_demo
     // expands (issue #31).
     assert_eq!(phase_of(17).await, "expand");
     assert_eq!(phase_of(18).await, "expand");
+    // The resource-indicator columns are all additive ALTER TABLE ADD COLUMNs plus a
+    // CHECK and a column-scoped grant, so this is an expand too (issue #28).
+    assert_eq!(phase_of(19).await, "expand");
     // Three CREATE TABLEs (the trust anchors, the subject-mapping rules, and the
     // external-issuer jti replay cache) are all additive expands (issue #26).
-    assert_eq!(phase_of(19).await, "expand");
+    assert_eq!(phase_of(20).await, "expand");
 
     // The demo object never reaches a production database.
     assert!(
@@ -564,6 +567,29 @@ async fn production_chain_is_only_the_nineteen_real_migrations_and_ships_no_demo
         column_exists(pool, "audit_log", "detail").await,
         "audit_log.detail exists"
     );
+    // The RFC 8707 resource-indicator columns (issue #28): the per-client allowlist
+    // and no-resource policy, the frozen granted-resource ceiling on the grant and
+    // the code, and the recorded audience array on an opaque token.
+    assert!(
+        column_exists(pool, "clients", "allowed_resources").await,
+        "clients.allowed_resources exists"
+    );
+    assert!(
+        column_exists(pool, "clients", "resource_indicator_policy").await,
+        "clients.resource_indicator_policy exists"
+    );
+    assert!(
+        column_exists(pool, "grants", "granted_resources").await,
+        "grants.granted_resources exists"
+    );
+    assert!(
+        column_exists(pool, "authorization_codes", "granted_resources").await,
+        "authorization_codes.granted_resources exists"
+    );
+    assert!(
+        column_exists(pool, "opaque_access_tokens", "audiences").await,
+        "opaque_access_tokens.audiences exists"
+    );
     // The JWT bearer assertion grant trust and mapping stores (issue #26): the
     // registered external assertion issuers, the explicit subject-mapping rules, and
     // the external-issuer single-use jti replay cache (distinct from the #25 client
@@ -600,7 +626,7 @@ async fn production_chain_is_only_the_nineteen_real_migrations_and_ships_no_demo
     // Both trust-config tables carry an `enabled` switch, so a compromised issuer or
     // a mis-authored mapping can be REVOKED through the column-scoped data-plane
     // grant (issue #26 revocability fix). The issuer switch shipped with the table;
-    // the mapping switch is the additive column this fix added within migration 19.
+    // the mapping switch is the additive column this fix added within migration 20.
     assert!(
         column_exists(pool, "external_assertion_subject_mappings", "enabled").await,
         "external_assertion_subject_mappings.enabled exists"

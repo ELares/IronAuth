@@ -257,6 +257,10 @@ pub enum Action {
     /// (issue #26): a validated external assertion was exchanged for a token under
     /// the mapped identity. No refresh token accompanies it (RFC 7521 4.1).
     JwtBearerAssertionIssue,
+    /// A client's RFC 8707 resource-indicator policy was set (issue #28): the
+    /// per-client allowed-resource allowlist and the no-resource behavior
+    /// (default audience or refusal).
+    ClientResourceIndicatorPolicySet,
 }
 
 impl Action {
@@ -312,6 +316,7 @@ impl Action {
                 "external_assertion_subject_mapping.set_enabled"
             }
             Action::JwtBearerAssertionIssue => "jwt_bearer_assertion.issue",
+            Action::ClientResourceIndicatorPolicySet => "client.resource_indicator_policy.set",
         }
     }
 }

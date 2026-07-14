@@ -19,7 +19,10 @@
 //!    as `/authorize`, through the ONE shared [`validate_request`] the authorization
 //!    endpoint also runs. So a bad `redirect_uri`, a missing PKCE `code_challenge`, a
 //!    disabled response type, or a malformed `claims`/`prompt`/`max_age` is rejected
-//!    HERE, on the back channel, not later at `/authorize` (RFC 9126 section 2.3).
+//!    HERE, on the back channel, not later at `/authorize` (RFC 9126 section 2.3). The
+//!    RFC 8707 `resource` indicators (issue #28) are validated at push time too, through
+//!    the SAME [`validate_authorize_resources`] helper `/authorize` uses, so a
+//!    malformed, unregistered, or disallowed `resource` is `invalid_target` HERE.
 //! 3. **Stores the validated request** behind a one-time `par_` reference bound to
 //!    the authenticated client, and returns the `request_uri` and a short `expires_in`.
 //!
@@ -31,13 +34,15 @@
 //! is only ever the stored PAR row, looked up by reference. The by-reference JAR
 //! request object (RFC 9101) is a documented non-goal for this issue.
 
-use axum::extract::{Form, State};
+use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use ironauth_store::{ClientId, CorrelationId, PushRequest, PushedRequestId, Scope};
 use serde::Deserialize;
 
-use crate::authorize::{AuthRequestError, AuthorizeParams, validate_request};
+use crate::authorize::{
+    AuthRequestError, AuthorizeParams, validate_authorize_resources, validate_request,
+};
 use crate::client_auth::{
     self, ClientAuthError, ClientAuthInputs, ClientAuthParseError, parse_presented,
 };
@@ -120,7 +125,11 @@ impl ParParams {
     /// `request_uri` and the internal `emit_auth_time`/`par_resume` markers are always
     /// cleared: a pushed request never references another, and the resume markers are
     /// internal to the interaction round-trip.
-    fn into_authorize_params(self, authenticated_client_id: String) -> AuthorizeParams {
+    fn into_authorize_params(
+        self,
+        authenticated_client_id: String,
+        resources: Vec<String>,
+    ) -> AuthorizeParams {
         AuthorizeParams {
             request_uri: None,
             response_type: self.response_type,
@@ -143,17 +152,29 @@ impl ParParams {
             display: self.display,
             emit_auth_time: None,
             par_resume: None,
+            // The RFC 8707 `resource` indicators (issue #28) parsed from the pushed
+            // form, carried through PAR storage so a replayed request approves the
+            // same resources as an inline request.
+            resources,
         }
     }
 }
 
 /// `POST /par` (RFC 9126, issue #27).
-pub async fn par(
-    State(state): State<OidcState>,
-    headers: HeaderMap,
-    Form(params): Form<ParParams>,
-) -> Response {
-    match push(&state, &headers, params).await {
+///
+/// The raw body is taken (rather than `Form<ParParams>`) so the RFC 8707 `resource`
+/// parameter, which MAY repeat (issue #28), is parsed alongside the typed fields and
+/// stored with the pushed request.
+pub async fn par(State(state): State<OidcState>, headers: HeaderMap, body: String) -> Response {
+    let params: ParParams = match serde_urlencoded::from_str(&body) {
+        Ok(params) => params,
+        Err(_) => {
+            return PushedAuthError::InvalidRequest("the request body is malformed".to_owned())
+                .into_response();
+        }
+    };
+    let resources = crate::resource::resources_from_encoded(&body);
+    match push(&state, &headers, params, resources).await {
         Ok(response) => response,
         Err(error) => error.into_response(),
     }
@@ -163,6 +184,7 @@ async fn push(
     state: &OidcState,
     headers: &HeaderMap,
     params: ParParams,
+    resources: Vec<String>,
 ) -> Result<Response, PushedAuthError> {
     // 1. A pushed request MUST NOT itself carry a request_uri (RFC 9126 section 2.1).
     if params
@@ -188,14 +210,33 @@ async fn push(
         return Err(PushedAuthError::ServerError);
     };
 
-    // 4. Validate the COMPLETE authorization request with EXACTLY the same rules as
+    // 4. Validate the RFC 8707 `resource` indicators at PUSH time (RFC 9126 section
+    //    2.3, issue #28) through the SAME `validate_authorize_resources` helper the
+    //    authorization endpoint runs: each must be a valid absolute URI, on the
+    //    client's allowlist, and a registered resource server, and the no-resource
+    //    policy is honored. A violation surfaces `invalid_target` HERE on the back
+    //    channel rather than being deferred to `/authorize`, and reusing the one helper
+    //    means the PAR and authorize checks cannot diverge. A store fault stays an
+    //    opaque 500 `server_error` (fail closed), never a 400 mislabeled invalid_target.
+    validate_authorize_resources(state, scope, &client_id, &resources)
+        .await
+        .map_err(|code| match code {
+            AuthzErrorCode::ServerError => PushedAuthError::ServerError,
+            code => PushedAuthError::Validation {
+                code,
+                description: "the requested resource is invalid, unknown, or not allowed"
+                    .to_owned(),
+            },
+        })?;
+
+    // 5. Validate the COMPLETE authorization request with EXACTLY the same rules as
     //    `/authorize`, through the ONE shared validator. An error surfaces HERE on the
     //    back channel (RFC 9126 section 2.3), not later at `/authorize`.
-    let authorize_params = params.into_authorize_params(authenticated_client_id.clone());
+    let authorize_params = params.into_authorize_params(authenticated_client_id.clone(), resources);
     validate_request(state, &client, &authorize_params)
         .map_err(PushedAuthError::from_validation)?;
 
-    // 5. Persist the validated request behind a one-time reference bound to the
+    // 6. Persist the validated request behind a one-time reference bound to the
     //    authenticated client, with a short, bounded expiry from the clock seam.
     let par_id = PushedRequestId::generate(state.env(), &scope);
     let now = state.now();
@@ -226,7 +267,7 @@ async fn push(
         return Err(PushedAuthError::ServerError);
     }
 
-    // 6. RFC 9126 section 2.2: 201 Created with the request_uri and its lifetime.
+    // 7. RFC 9126 section 2.2: 201 Created with the request_uri and its lifetime.
     let request_uri = format!("{PAR_REQUEST_URI_PREFIX}{par_id}");
     let body = serde_json::json!({
         "request_uri": request_uri,

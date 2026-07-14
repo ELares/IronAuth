@@ -6,7 +6,7 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
-- JWT bearer assertion grant trust and mapping stores (issue #26, migration 0019, expand).
+- JWT bearer assertion grant trust and mapping stores (issue #26, migration 0020, expand).
   - **New scoped tables.** `external_assertion_issuers` (the registered external
     trust anchors the RFC 7521 / RFC 7523 jwt-bearer grant accepts assertions from,
     each with an inline `jwks` XOR a `jwks_uri`, an optional signing-alg allowlist,
@@ -43,7 +43,7 @@ range per docs/RELEASING.md.
   - **Revocable trust config (column-scoped, the #31 lesson applied correctly).** The
     trust anchor and mapping must be DISABLE-able so a compromised or decommissioned
     issuer, or a mis-authored mapping, can be turned off through the data plane (the
-    HTTP management surface for it is M13). Migration 0019 now adds an `enabled` column
+    HTTP management surface for it is M13). Migration 0020 now adds an `enabled` column
     to `external_assertion_subject_mappings` (the issuers table already had one) and a
     COLUMN-SCOPED `GRANT UPDATE (enabled)` on BOTH trust tables to `ironauth_app` -
     only `enabled`, never a table-wide UPDATE and never the app-immutable
@@ -55,6 +55,24 @@ range per docs/RELEASING.md.
     on `enabled = true` so a disabled mapping resolves to no rule. New `tests/rls.rs`
     coverage proves the app role can flip `enabled` on both tables but is refused
     (42501) on every other column.
+- RFC 8707 Resource Indicators storage (issue #28, migration 0019, expand).
+  - **New columns.** `clients` gains `allowed_resources` (a JSON array; NULL means no
+    per-client allowlist, `[]` means allow nothing) and `resource_indicator_policy`
+    (a CHECK-constrained `default_audience` / `refuse` string for the no-resource
+    case). `grants` and `authorization_codes` gain `granted_resources` (the JSON array
+    of resources approved at authorization, frozen for the downscope-not-expand check).
+    `opaque_access_tokens` gains `audiences` (the JSON array of recorded audiences so
+    introspection can report them).
+  - **Column-scoped grant.** `ironauth_app` receives `UPDATE (allowed_resources,
+    resource_indicator_policy)` on `clients` only (never a table-wide UPDATE), so the
+    policy write cannot touch any other client column.
+  - **New store surface.** `ClientRepo::resource_policy` reads a client's
+    `ClientResourcePolicy`; `ActingClientRepo::set_resource_indicator_policy` is an
+    audited write (new `client.resource_indicator_policy.set` action). `IssueCode` and
+    `NewOpaqueAccessToken` carry the resources/audiences; the code, grant, refresh, and
+    opaque-token resolutions surface them. Encoding empty to NULL keeps the pre-#28
+    single-audience behavior byte-identical.
+
 - Dynamic Client Registration abuse controls (issue #31, migration 0018, expand).
   - **New scoped tables.** `dcr_policies` (named, reusable policy-primitive chains),
     `dcr_initial_access_tokens` (SHA-256-hashed initial access tokens carrying a
