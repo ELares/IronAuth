@@ -110,6 +110,56 @@ async fn id_token_flow_returns_a_fragment_id_token_with_nonce_and_no_hashes() {
 }
 
 #[tokio::test]
+async fn pure_id_token_emits_scope_and_claims_parameter_claims_into_the_id_token() {
+    // OIDC Core 5.4: the pure implicit `id_token` flow issues NO access token, so
+    // UserInfo is unreachable and the scope-derived claims (and the claims-parameter
+    // `id_token` member) MUST be carried IN the ID token itself. A lean ID token
+    // here would strand a client that requested `email`/`profile`.
+    let harness = Harness::start_with(legacy_enabled()).await;
+    let client_id = harness.client_id().to_string();
+
+    // Seed a user WITH standard claims, consent it to the client, and authenticate
+    // as that user (compose the claims-bearing subject the generic cookie helper
+    // does not seed).
+    let claims_json = r#"{"email":"ada@example.test","email_verified":true,"name":"Ada Lovelace","address":{"country":"UK"}}"#;
+    let subject = harness
+        .seed_user_with_claims("ada@example.test", common::SEED_PASSWORD, claims_json)
+        .await;
+    harness.grant_consent(&subject, &client_id).await;
+    let cookie = harness.session_cookie(&subject).await;
+
+    // Grant `email` and `profile` but NOT `address`.
+    let query = format!(
+        "response_type=id_token&client_id={client_id}&redirect_uri={}&nonce=n-claims&state=s&\
+         scope={}",
+        enc(REDIRECT_URI),
+        enc("openid email profile"),
+    );
+    let (status, headers, body) = harness.authorize_with_cookie(&query, &cookie).await;
+    assert_eq!(status, StatusCode::FOUND, "fragment redirect: {body}");
+
+    let id_token = location_fragment_param(&headers, "id_token").expect("id_token in fragment");
+    let claims = verified_claims(&harness, &client_id, &id_token);
+    // The granted scopes' claims are IN the ID token (no UserInfo to fall back to).
+    assert_eq!(
+        claims["email"],
+        Value::String("ada@example.test".to_owned()),
+        "email (granted) must be in the pure id_token: {claims}"
+    );
+    assert_eq!(claims["email_verified"], Value::Bool(true));
+    assert_eq!(
+        claims["name"],
+        Value::String("Ada Lovelace".to_owned()),
+        "a profile claim (granted) must be in the pure id_token: {claims}"
+    );
+    // A claim whose scope was NOT granted stays out (allowlist release).
+    assert!(
+        claims.get("address").is_none(),
+        "address (scope not granted) must not appear: {claims}"
+    );
+}
+
+#[tokio::test]
 async fn hybrid_code_id_token_carries_a_correct_c_hash_and_a_redeemable_code() {
     // Acceptance 1: the hybrid flow returns a code AND a front-channel ID token
     // carrying c_hash(code) but NO at_hash, in the fragment. The code is a real,

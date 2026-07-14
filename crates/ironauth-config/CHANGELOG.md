@@ -6,6 +6,13 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Add the legacy response-type toggles (issue #17, all default `false`):
+  `oidc.enable_response_type_id_token`, `oidc.enable_response_type_code_id_token`,
+  `oidc.enable_response_type_none`, and `oidc.enable_response_mode_form_post`. Each
+  is an independent per-environment switch that opts a certification-run
+  environment into a legacy response type or the `form_post` mode; the `code`
+  response type and `query` mode are always available. Regenerates
+  `docs/config-schema.json` and `docs/CONFIG.md`.
 - Add `oidc.require_pkce_for_confidential_clients` (issue #13, default `true`):
   the per-environment PKCE policy for confidential clients. Public clients always
   require PKCE regardless. Regenerates `docs/config-schema.json` and

@@ -41,6 +41,7 @@ use crate::error::{AuthorizeError, AuthzErrorCode};
 use crate::interaction;
 use crate::registry::{PkceMethod, ResponseMode, ResponseType};
 use crate::response;
+use crate::scope_claims::{assemble_claims, parse_scope_set};
 use crate::state::OidcState;
 use crate::token_hash;
 use crate::tokens::{self, MintRequest};
@@ -400,6 +401,7 @@ async fn issue_code(
             &resolved,
             code.as_deref(),
         )
+        .await
         .map_err(|()| {
             redirect_error(
                 AuthzErrorCode::ServerError,
@@ -455,7 +457,7 @@ fn resolve_mode(
 /// caller maps to a `server_error` returned by the negotiated mode. (Live key
 /// serving is inert until issue #194; the logic is fully exercised by tests that
 /// provision a key.)
-fn mint_front_channel_id_token(
+async fn mint_front_channel_id_token(
     state: &OidcState,
     scope: Scope,
     client_id: &ClientId,
@@ -477,9 +479,16 @@ fn mint_front_channel_id_token(
         (ResponseType::CodeIdToken, Some(code)) => Some(token_hash::c_hash(alg, code)),
         _ => None,
     };
-    // The front-channel ID token stays lean (no scope/claims-parameter copy-in);
-    // the authoritative claims are served from UserInfo.
-    let extra_claims = serde_json::Map::new();
+    // OIDC Core 5.4: when NO access token is issued (the pure `id_token` flow), the
+    // scope-derived and claims-parameter claims have no `UserInfo` retrieval path,
+    // so they MUST be emitted into the ID token itself. The HYBRID flow issues a
+    // code (hence an access token at redemption), so its front-channel ID token
+    // stays lean with the authoritative claims served from `UserInfo`.
+    let extra_claims = if response_type.issues_code() {
+        serde_json::Map::new()
+    } else {
+        front_channel_id_token_claims(state, scope, resolved).await
+    };
     let request = MintRequest {
         scope,
         issuer: iss,
@@ -494,6 +503,45 @@ fn mint_front_channel_id_token(
         extra_claims: &extra_claims,
     };
     tokens::mint_id_token(state, signer, &request).map(|(id_token, _jti)| id_token)
+}
+
+/// The claims to embed in a PURE front-channel ID token (`response_type=id_token`),
+/// per OIDC Core 5.4. Because that flow issues no access token, `UserInfo` is
+/// unreachable, so the granted scope's standard claims (`profile`/`email`/…) AND
+/// the `claims` request parameter's `id_token` member are released into the ID
+/// token itself, through the ONE shared [`assemble_claims`] function so the set can
+/// never differ from what `UserInfo` would return elsewhere. Unlike the token
+/// endpoint's lean default, the scope-derived claims are ALWAYS included here (not
+/// only under `conform_id_token_claims`), since there is no other retrieval path. A
+/// store read failure fail-opens to an empty set (logged): the ID token
+/// under-claims rather than failing issuance.
+async fn front_channel_id_token_claims(
+    state: &OidcState,
+    scope: Scope,
+    resolved: &Resolved<'_>,
+) -> serde_json::Map<String, serde_json::Value> {
+    let claims_request = resolved
+        .claims_request
+        .and_then(|raw| ClaimsRequest::parse(raw).ok())
+        .unwrap_or_default();
+    let bag = match state
+        .store()
+        .scoped(scope)
+        .users()
+        .claims_for_subject(resolved.subject)
+        .await
+    {
+        Ok(Some(raw)) => serde_json::from_str(&raw).unwrap_or_default(),
+        // No user record, or an unreadable/malformed claim document: under-claim
+        // rather than fail issuance.
+        Ok(None) => serde_json::Map::new(),
+        Err(error) => {
+            tracing::warn!(%error, "could not read user claims for the front-channel ID token; omitting them");
+            serde_json::Map::new()
+        }
+    };
+    let granted = parse_scope_set(resolved.oauth_scope);
+    assemble_claims(&bag, &granted, claims_request.id_token())
 }
 
 /// Validate the request's `redirect_uri` against the client's registered set
