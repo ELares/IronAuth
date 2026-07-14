@@ -17,17 +17,23 @@
 //!   start (the anti-phishing cue);
 //! - approval is a distinct, explicit step (never implicit): tokens are issued only
 //!   after the human clicks Approve;
+//! - the GET is PREFILL-ONLY (RFC 8628 section 3.3): opening the page with a
+//!   `user_code` query parameter (a QR scan of `verification_uri_complete`) renders
+//!   the code into the entry field WITHOUT resolving it, so a GET returns identical
+//!   bytes for a live and a dead code and can never be an existence oracle. A code is
+//!   resolved ONLY by the rate-limited POST, so a prefilled code still requires the
+//!   explicit user action the cross-device BCP demands;
 //! - an unknown or expired user code shows a NON-oracular error (identical to a code
 //!   that never existed), so the page is not an existence oracle;
-//! - user-code entry is rate limited per source, and a flow dies after a bounded
-//!   number of failed matches, so the code space cannot be brute forced (RFC 8628
-//!   section 5.1);
+//! - user-code entry is rate limited per source at the ONE resolving path (the POST),
+//!   and a flow dies after a bounded number of failed matches, so the code space
+//!   cannot be brute forced (RFC 8628 section 5.1);
 //! - the device code and user code are NEVER logged in plaintext.
 
 use std::net::IpAddr;
 
 use axum::extract::{Form, Path, Query, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::Response;
 use ironauth_store::{
     ActiveDeviceFlow, ConsentId, CorrelationId, DeviceApproval, DeviceApproveOutcome,
@@ -41,7 +47,7 @@ use crate::interaction::{self, AuthenticatedSession};
 use crate::pages::{self, DeviceConfirmPage};
 use crate::password;
 use crate::state::OidcState;
-use crate::util::{epoch_micros, percent_encode_query};
+use crate::util::epoch_micros;
 use crate::wellknown::parse_scope;
 
 /// A generic, non-oracular message for any unrecognized, expired, or exhausted user
@@ -76,11 +82,19 @@ pub struct DeviceForm {
 }
 
 /// `GET /t/{tenant}/e/{environment}/device`: the verification page (issue #24).
+///
+/// PREFILL-ONLY (RFC 8628 section 3.3, cross-device BCP). When the page is opened via
+/// `verification_uri_complete` (a QR scan), the `user_code` query parameter is rendered
+/// into the entry field WITHOUT being resolved: the GET returns byte-identical output
+/// whether or not the code names a live flow, so it can never be a user-code existence
+/// oracle and needs no rate limit of its own. Resolving a code, and every step that
+/// follows (login, confirmation, approval), happens ONLY through the rate-limited POST
+/// ([`device_enter`]), so a prefilled code still requires the explicit user action the
+/// cross-device BCP demands (RFC 8628 section 3.3: "taken directly to the verification
+/// page with the `user_code` already entered").
 pub async fn device_get(
-    State(state): State<OidcState>,
     Path((tenant_id, environment_id)): Path<(String, String)>,
     Query(query): Query<DeviceQuery>,
-    headers: HeaderMap,
 ) -> Response {
     let Some(scope) = parse_scope(&tenant_id, &environment_id) else {
         return safe_notice(
@@ -90,32 +104,17 @@ pub async fn device_get(
         );
     };
     let action = device_path(&scope);
-    let raw_code = query
+    // Prefill the (trimmed) code into the entry field, never resolving it. An absent or
+    // whitespace-only value simply renders the empty entry form.
+    let prefill = query
         .user_code
         .as_deref()
         .map(str::trim)
-        .filter(|value| !value.is_empty());
-    let Some(raw_code) = raw_code else {
-        // No code yet: show the entry form.
-        return pages::secure_html(StatusCode::OK, pages::device_enter_page(&action, "", None));
-    };
-
-    match resolve_flow(&state, scope, raw_code).await {
-        FlowLookup::Active(flow) => {
-            // Require an authenticated session; escalate into the M2 login otherwise.
-            match interaction::resolve_session(&state, scope, interaction::cookie_header(&headers))
-                .await
-            {
-                Some(_) => render_confirm(&state, scope, &action, raw_code, &flow).await,
-                None => pages::secure_html(
-                    StatusCode::OK,
-                    pages::device_login_page(&action, raw_code, None),
-                ),
-            }
-        }
-        FlowLookup::NotRecognized => not_recognized(&action),
-        FlowLookup::ServerError => server_error(),
-    }
+        .unwrap_or_default();
+    pages::secure_html(
+        StatusCode::OK,
+        pages::device_enter_page(&action, prefill, None),
+    )
 }
 
 /// `POST /t/{tenant}/e/{environment}/device`: advance the verification flow (issue
@@ -146,18 +145,21 @@ pub async fn device_post(
     } else if form.identifier.is_some() || form.password.is_some() {
         device_login(&state, scope, &action, &form).await
     } else {
-        device_enter(&state, scope, &action, peer, &form).await
+        device_enter(&state, scope, &action, peer, &headers, &form).await
     }
 }
 
 /// The code-entry step: rate limit per source, look up the code, and (on a match)
-/// redirect to the sign-in-or-confirm view. A non-matching code is the same
-/// non-oracular error as a code that never existed.
+/// advance to the sign-in-or-confirm view. This is the SOLE path that resolves a
+/// submitted user code (the GET is prefill-only), so the per-source rate limit here is
+/// the RFC 8628 section 5.1 brute-force defense for the WHOLE verification surface. A
+/// non-matching code is the same non-oracular error as a code that never existed.
 async fn device_enter(
     state: &OidcState,
     scope: Scope,
     action: &str,
     peer: Option<IpAddr>,
+    headers: &HeaderMap,
     form: &DeviceForm,
 ) -> Response {
     let now = epoch_micros(state.now());
@@ -199,9 +201,19 @@ async fn device_enter(
         );
     };
     match resolve_flow(state, scope, raw_code).await {
-        FlowLookup::Active(_) => {
-            let location = format!("{action}?user_code={}", percent_encode_query(raw_code));
-            interaction::redirect(&location)
+        FlowLookup::Active(flow) => {
+            // Require an authenticated session; escalate into the M2 login otherwise.
+            // The GET is prefill-only, so this handler (not a bounced GET) renders the
+            // next step directly.
+            match interaction::resolve_session(state, scope, interaction::cookie_header(headers))
+                .await
+            {
+                Some(_) => render_confirm(state, scope, action, raw_code, &flow).await,
+                None => pages::secure_html(
+                    StatusCode::OK,
+                    pages::device_login_page(action, raw_code, None),
+                ),
+            }
         }
         FlowLookup::NotRecognized => not_recognized(action),
         FlowLookup::ServerError => server_error(),
@@ -241,9 +253,12 @@ async fn device_login(
             let subject = user.id.to_string();
             let event = AuthenticationEvent::password(epoch_micros(state.now()));
             match interaction::establish_session(state, scope, &subject, &event, actor).await {
+                // The GET is prefill-only, so we cannot bounce through it to render the
+                // next step; render the confirmation directly and set the freshly
+                // established session cookie on that same response.
                 Ok(cookie) => {
-                    let location = format!("{action}?user_code={}", percent_encode_query(raw_code));
-                    interaction::redirect_setting_cookie(&location, &cookie)
+                    let response = render_after_login(state, scope, action, raw_code).await;
+                    with_set_cookie(response, &cookie)
                 }
                 Err(_) => server_error(),
             }
@@ -445,6 +460,35 @@ async fn render_confirm(
             device_code_id: &device_code_id,
         }),
     )
+}
+
+/// Render the step that follows a successful sign-in (issue #24): re-resolve the
+/// carried code and render the confirmation for the now-authenticated human. The code
+/// was Active moments ago at the entry step; if it changed under us (expired or decided
+/// between steps) this is the same non-oracular error the rest of the flow shows.
+async fn render_after_login(
+    state: &OidcState,
+    scope: Scope,
+    action: &str,
+    raw_code: &str,
+) -> Response {
+    match resolve_flow(state, scope, raw_code).await {
+        FlowLookup::Active(flow) => render_confirm(state, scope, action, raw_code, &flow).await,
+        FlowLookup::NotRecognized => not_recognized(action),
+        FlowLookup::ServerError => server_error(),
+    }
+}
+
+/// Attach a `Set-Cookie` header to an already-built response (issue #24), so the
+/// confirmation page rendered right after sign-in also establishes the session cookie
+/// (the prefill-only GET cannot carry it forward through a redirect). A cookie value
+/// that is not a valid header value is dropped rather than panicking (unreachable for a
+/// server-built session cookie; defense in depth).
+fn with_set_cookie(mut response: Response, set_cookie: &str) -> Response {
+    if let Ok(value) = HeaderValue::from_str(set_cookie) {
+        response.headers_mut().insert(header::SET_COOKIE, value);
+    }
+    response
 }
 
 /// The outcome of resolving a submitted user code to a flow (issue #24). `NotRecognized`

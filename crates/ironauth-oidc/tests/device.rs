@@ -23,7 +23,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::http::StatusCode;
-use common::{Harness, enc, form, form_field, json};
+use common::{Harness, REDIRECT_URI, enc, form, form_field, json};
 use ironauth_store::{
     DeviceAttemptOutcome, DevicePollOutcome, DeviceUserCodeLookup, device_code_digest,
     user_code_hash,
@@ -84,19 +84,36 @@ fn device_code_id_of(device_code: &str) -> String {
         .to_owned()
 }
 
-/// Sign in a fresh user, open the confirmation page via `verification_uri_complete`,
+/// Sign in a fresh user, reach the confirmation page via `verification_uri_complete`,
 /// assert it renders the client identity and an explicit control, and click Approve.
+///
+/// The GET of `verification_uri_complete` is PREFILL-ONLY (it never resolves the code),
+/// so the confirmation is reached by SUBMITTING the prefilled code (the rate-limited
+/// POST), exactly as a human clicking through the QR-prefilled page would.
 async fn approve_via_page(harness: &Harness, user_code: &str) {
     let subject = harness.seed_unique_user().await;
     let cookie = harness.session_cookie(&subject).await;
     let path = device_path(harness);
-    // verification_uri_complete: the confirmation renders directly for a signed-in user.
+    // verification_uri_complete (QR): the GET prefills the code WITHOUT resolving it.
     let (status, _headers, html) = harness
         .get_with_cookie(
             &format!("{path}?user_code={}", enc(user_code)),
             Some(&cookie),
         )
         .await;
+    assert_eq!(status, StatusCode::OK, "prefill page: {html}");
+    assert!(
+        html.contains(user_code),
+        "the GET prefills the user code into the entry field: {html}"
+    );
+    assert!(
+        !html.contains("Approve"),
+        "the prefill GET never resolves to the confirmation: {html}"
+    );
+    // Submitting the prefilled code (the rate-limited POST) resolves it and, for a
+    // signed-in user, renders the confirmation with the client identity and controls.
+    let enter = form(&[("user_code", user_code)]);
+    let (status, _headers, html) = harness.post_form(&path, &enter, Some(&cookie)).await;
     assert_eq!(status, StatusCode::OK, "confirm page: {html}");
     assert!(
         html.contains(TEST_LOGO),
@@ -234,16 +251,14 @@ async fn denied_flow_polls_access_denied() {
     let device_code = start["device_code"].as_str().unwrap().to_owned();
     let user_code = start["user_code"].as_str().unwrap().to_owned();
 
-    // A signed-in human explicitly denies on the verification page.
+    // A signed-in human explicitly denies on the verification page. The confirmation is
+    // reached by SUBMITTING the code (the GET is prefill-only), so the code is resolved
+    // only through the rate-limited POST.
     let subject = harness.seed_unique_user().await;
     let cookie = harness.session_cookie(&subject).await;
     let path = device_path(&harness);
-    let (_s, _h, html) = harness
-        .get_with_cookie(
-            &format!("{path}?user_code={}", enc(&user_code)),
-            Some(&cookie),
-        )
-        .await;
+    let enter = form(&[("user_code", &user_code)]);
+    let (_s, _h, html) = harness.post_form(&path, &enter, Some(&cookie)).await;
     let device_code_id = form_field(&html, "device_code_id").unwrap();
     let body = form(&[
         ("decision", "deny"),
@@ -277,11 +292,11 @@ async fn expired_flow_polls_expired_token_and_page_shows_safe_error() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(body["error"], "expired_token");
 
-    // The verification page shows a safe (non-oracular) error, not a confirmation.
+    // Submitting the expired code (the resolving POST) shows a safe (non-oracular)
+    // error, not a confirmation. The GET only prefills, so the error surfaces here.
     let path = device_path(&harness);
-    let (status, _h, html) = harness
-        .get_with_cookie(&format!("{path}?user_code={}", enc(&user_code)), None)
-        .await;
+    let enter = form(&[("user_code", &user_code)]);
+    let (status, _h, html) = harness.post_form(&path, &enter, None).await;
     assert_eq!(status, StatusCode::OK);
     assert!(
         !html.contains("Approve"),
@@ -310,14 +325,173 @@ async fn client_without_device_grant_is_unauthorized_client() {
 async fn unknown_user_code_is_non_oracular() {
     let harness = Harness::start().await;
     let path = device_path(&harness);
-    // A code that was never issued yields the same safe error as an expired one, so the
-    // page is not an existence oracle.
-    let (status, _h, html) = harness
-        .get_with_cookie(&format!("{path}?user_code=BCDF-GHJK"), None)
-        .await;
+    // A code that was never issued yields the same safe error as an expired one when it
+    // is SUBMITTED (the resolving POST), so the page is not an existence oracle.
+    let enter = form(&[("user_code", "BCDF-GHJK")]);
+    let (status, _h, html) = harness.post_form(&path, &enter, None).await;
     assert_eq!(status, StatusCode::OK);
     assert!(!html.contains("Approve"));
     assert!(html.contains("not recognized"), "non-oracular: {html}");
+}
+
+#[tokio::test]
+async fn get_user_code_is_prefill_only_and_not_an_oracle() {
+    // The GET of the verification page (verification_uri_complete / a QR scan) is
+    // PREFILL-ONLY: it renders the submitted code into the entry field WITHOUT resolving
+    // it, so a live and a dead code produce byte-identical output. This closes the
+    // user-code enumeration oracle that a resolving GET would be (RFC 8628 sections 3.3
+    // and 5.1): a code is resolved ONLY through the rate-limited POST.
+    let harness = Harness::start().await;
+    let client = *harness.client_id();
+    harness
+        .enable_device_grant(&client, DEVICE_GRANTS, Some(TEST_LOGO))
+        .await;
+    let start = start_flow(&harness, &client.to_string(), None).await;
+    let valid = start["user_code"].as_str().unwrap().to_owned();
+    let invalid = "BCDF-GHJK".to_owned();
+    assert_ne!(
+        ironauth_oidc::normalize_user_code(&valid),
+        ironauth_oidc::normalize_user_code(&invalid),
+        "the fixed invalid code must not equal the live code"
+    );
+    let path = device_path(&harness);
+
+    // A signed-in session is exactly the case that a resolving GET would have rendered
+    // the confirmation for (and so leaked validity). It must reveal nothing now.
+    let subject = harness.seed_unique_user().await;
+    let cookie = harness.session_cookie(&subject).await;
+    let (s_valid, _h, valid_html) = harness
+        .get_with_cookie(&format!("{path}?user_code={}", enc(&valid)), Some(&cookie))
+        .await;
+    let (s_invalid, _h, invalid_html) = harness
+        .get_with_cookie(
+            &format!("{path}?user_code={}", enc(&invalid)),
+            Some(&cookie),
+        )
+        .await;
+    assert_eq!(s_valid, StatusCode::OK);
+    assert_eq!(s_invalid, StatusCode::OK);
+
+    for html in [&valid_html, &invalid_html] {
+        assert!(
+            !html.contains("Approve"),
+            "the GET never renders the confirmation: {html}"
+        );
+        assert!(
+            !html.contains("not recognized"),
+            "the GET never renders a resolution outcome: {html}"
+        );
+        assert!(
+            html.contains("Enter the code shown on your device"),
+            "the GET renders the code-entry page: {html}"
+        );
+    }
+    assert!(valid_html.contains(&valid), "the valid code is prefilled");
+    assert!(
+        invalid_html.contains(&invalid),
+        "the invalid code is prefilled"
+    );
+    // The ONLY difference between the two renders is the prefilled code itself: replace
+    // each code with a placeholder and the pages are byte-identical, so the GET carries
+    // no signal about whether a code is live.
+    assert_eq!(
+        valid_html.replace(&valid, "USER-CODE"),
+        invalid_html.replace(&invalid, "USER-CODE"),
+        "a valid and an invalid code render identically over the GET (no oracle)"
+    );
+
+    // The rate-limited POST remains the SOLE resolving path: submitting the valid code
+    // (with the session) advances to the confirmation.
+    let enter = form(&[("user_code", &valid)]);
+    let (status, _h, html) = harness.post_form(&path, &enter, Some(&cookie)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        html.contains("Approve"),
+        "the POST resolver reaches the confirmation: {html}"
+    );
+}
+
+#[tokio::test]
+async fn get_verification_uri_complete_does_not_auto_approve() {
+    // The cross-device BCP no-auto-approve requirement: merely OPENING
+    // verification_uri_complete (the prefilled GET), even as a signed-in human, must not
+    // approve the flow. A token is issued only after the explicit decision=allow POST.
+    let harness = Harness::start().await;
+    let client = *harness.client_id();
+    harness
+        .enable_device_grant(&client, DEVICE_GRANTS, Some(TEST_LOGO))
+        .await;
+    let client_str = client.to_string();
+    let start = start_flow(&harness, &client_str, Some("openid")).await;
+    let device_code = start["device_code"].as_str().unwrap().to_owned();
+    let user_code = start["user_code"].as_str().unwrap().to_owned();
+
+    // A signed-in human opens the prefilled verification link.
+    let subject = harness.seed_unique_user().await;
+    let cookie = harness.session_cookie(&subject).await;
+    let path = device_path(&harness);
+    let (status, _h, _html) = harness
+        .get_with_cookie(
+            &format!("{path}?user_code={}", enc(&user_code)),
+            Some(&cookie),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // The device still polls authorization_pending: opening the link approved nothing.
+    harness
+        .clock()
+        .advance(Duration::from_secs(INTERVAL_SECS + 1));
+    let (status, body) = poll(&harness, &device_code, &client_str).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        body["error"], "authorization_pending",
+        "opening the prefilled link must not approve the flow: {body}"
+    );
+}
+
+#[tokio::test]
+async fn a_different_client_cannot_redeem_an_approved_device_code() {
+    // RFC 8628 client binding: a device_code is bound to the client it was issued to. A
+    // DIFFERENT authenticated client polling an approved device_code is invalid_grant
+    // (device.rs client-binding check), and its failed poll does NOT burn the flow.
+    let harness = Harness::start().await;
+    let client_a = *harness.client_id();
+    harness
+        .enable_device_grant(&client_a, DEVICE_GRANTS, Some(TEST_LOGO))
+        .await;
+    let a = client_a.to_string();
+
+    // An independent public client B that did NOT initiate the flow.
+    let client_b = harness
+        .create_public_client_with_redirects("client B", &[REDIRECT_URI])
+        .await;
+    let b = client_b.to_string();
+
+    let start = start_flow(&harness, &a, Some("openid")).await;
+    let device_code = start["device_code"].as_str().unwrap().to_owned();
+    let user_code = start["user_code"].as_str().unwrap().to_owned();
+
+    // The flow is approved for client A.
+    approve_via_page(&harness, &user_code).await;
+    harness
+        .clock()
+        .advance(Duration::from_secs(INTERVAL_SECS + 1));
+
+    // Client B polls A's approved device_code: refused as invalid_grant.
+    let (status, body) = poll(&harness, &device_code, &b).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "B is refused: {body}");
+    assert_eq!(body["error"], "invalid_grant");
+
+    // The legitimate client A still redeems it (B's rejection did not burn the flow).
+    // Pace past the interval first, since B's poll advanced the poll bookkeeping.
+    harness
+        .clock()
+        .advance(Duration::from_secs(INTERVAL_SECS + 1));
+    let (status, body) = poll(&harness, &device_code, &a).await;
+    assert_eq!(status, StatusCode::OK, "A still redeems: {body}");
+    assert!(body["access_token"].is_string());
+    assert!(body["id_token"].is_string());
 }
 
 #[tokio::test]

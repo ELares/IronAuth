@@ -496,6 +496,16 @@ async fn mint_device_tokens(
 /// Open a refresh-token family for an approved device flow, if the environment issues
 /// refresh tokens (issue #24, #21). A failure only costs this exchange its refresh
 /// token (logged), never the whole exchange, exactly like the code grant.
+///
+/// DELIBERATE decision (issue #24): the device grant issues a refresh token whenever
+/// the environment issues them AT ALL, regardless of whether `offline_access` was
+/// requested. This DIVERGES from the authorization-code grant, which gates a web
+/// client's refresh token on an explicit `offline_access` consent. RFC 8628 does not
+/// forbid it, and it matches the device-flow UX: a CLI, a TV, or another constrained
+/// device that just completed a one-time cross-device human approval expects a durable
+/// session and cannot cheaply re-run that approval. `offline_access` still governs the
+/// refresh LIFETIME here (the idle and absolute TTLs below, and whether the family
+/// survives RP logout), just not WHETHER a refresh token is issued.
 async fn issue_device_refresh(
     state: &OidcState,
     scope: Scope,

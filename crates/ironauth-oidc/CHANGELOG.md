@@ -33,6 +33,26 @@ range per docs/RELEASING.md.
     (redacted from every `Debug`; a test captures a full flow's trace output and asserts
     their absence). Discovery advertises the endpoint and the grant on both well-known
     forms.
+  - **Verification GET is prefill-only (user-code enumeration oracle closed).** Opening
+    `GET /t/{tenant}/e/{environment}/device?user_code=<code>` (a QR scan of
+    `verification_uri_complete`) now renders the code into the entry field WITHOUT
+    resolving it, so the GET returns byte-identical output whether or not the code names
+    a live flow: it can never be a user-code existence oracle and needs no rate limit of
+    its own (RFC 8628 sections 3.3 and 5.1). A code is resolved ONLY through the
+    rate-limited POST, which remains the sole path to sign-in, confirmation, and
+    approval, so a prefilled code still requires the explicit user action the
+    cross-device BCP demands. Previously the GET resolved the code and returned a
+    distinguishable page (the sign-in/confirm view for a live code, the non-oracular
+    error otherwise) with no per-source rate limit, making a live code enumerable at
+    HTTP speed over the primary (QR) entry path. Tests assert the GET renders identically
+    for a valid and an invalid code, that opening the prefilled link approves nothing
+    (the device still polls `authorization_pending`), and that a device_code is bound to
+    its issuing client (a different client polling an approved code is `invalid_grant`
+    and does not burn the flow). The device grant issues a refresh token whenever the
+    environment issues them, independent of `offline_access` (a deliberate divergence
+    from the authorization-code grant, documented in `issue_device_refresh`): a
+    constrained device that completed a one-time cross-device approval expects a durable
+    session; `offline_access` still governs the refresh lifetime.
 - Dynamic Client Registration abuse controls (issue #31), wrapping the #30 create.
   - **Exposure switch.** A per-environment `closed` / `token_gated` / `open` mode
     (default `token_gated`) governs who may register: `closed` refuses every public
