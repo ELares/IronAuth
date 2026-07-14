@@ -261,6 +261,20 @@ pub enum Action {
     /// per-client allowed-resource allowlist and the no-resource behavior
     /// (default audience or refusal).
     ClientResourceIndicatorPolicySet,
+    /// A device-authorization device code and user code were issued (issue #24, RFC
+    /// 8628 section 3.2). The back-channel row a constrained device polls against and
+    /// a human approves through the verification page.
+    DeviceCodeIssue,
+    /// A device-authorization request was APPROVED by an authenticated human at the
+    /// verification page (issue #24, RFC 8628 section 3.3): the explicit
+    /// confirmation that binds the flow to a subject and opens its grant, so the
+    /// next poll at the token endpoint issues tokens.
+    DeviceCodeApprove,
+    /// A device-authorization request was DENIED (issue #24, RFC 8628 section 3.5):
+    /// the human explicitly rejected it at the verification page, or the user code
+    /// was invalidated after exhausting its bounded failed-match budget (RFC 8628
+    /// section 5.1). A subsequent poll at the token endpoint yields `access_denied`.
+    DeviceCodeDeny,
 }
 
 impl Action {
@@ -317,6 +331,9 @@ impl Action {
             }
             Action::JwtBearerAssertionIssue => "jwt_bearer_assertion.issue",
             Action::ClientResourceIndicatorPolicySet => "client.resource_indicator_policy.set",
+            Action::DeviceCodeIssue => "device_code.issue",
+            Action::DeviceCodeApprove => "device_code.approve",
+            Action::DeviceCodeDeny => "device_code.deny",
         }
     }
 }

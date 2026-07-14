@@ -222,6 +222,22 @@ pub enum TokenError {
     /// The `grant_type` is not one this server supports (only
     /// `authorization_code`). This is where ROPC and every other grant land.
     UnsupportedGrantType,
+    /// The device-authorization request is still pending human approval (RFC 8628
+    /// section 3.5, issue #24): the device code is valid but the user has not yet
+    /// approved (or denied) the flow at the verification page. The device keeps
+    /// polling at its interval.
+    AuthorizationPending,
+    /// The device is polling faster than the current interval (RFC 8628 section 3.5,
+    /// issue #24): the server has increased the enforced interval for this device
+    /// code, and the device must slow its polling.
+    SlowDown,
+    /// The device-authorization request was denied (RFC 8628 section 3.5, issue #24):
+    /// the human explicitly rejected it at the verification page, or the user code was
+    /// invalidated after exhausting its failed-match budget.
+    AccessDenied,
+    /// The device code has expired (RFC 8628 section 3.5, issue #24): its TTL passed
+    /// before the flow was approved and redeemed. The device must start a new flow.
+    ExpiredToken,
     /// An unexpected server-side condition (for example no signing key for the
     /// target environment). Renders 500.
     ServerError,
@@ -237,6 +253,10 @@ impl TokenError {
             TokenError::InvalidScope => "invalid_scope",
             TokenError::InvalidTarget => "invalid_target",
             TokenError::UnsupportedGrantType => "unsupported_grant_type",
+            TokenError::AuthorizationPending => "authorization_pending",
+            TokenError::SlowDown => "slow_down",
+            TokenError::AccessDenied => "access_denied",
+            TokenError::ExpiredToken => "expired_token",
             TokenError::ServerError => "server_error",
         }
     }
@@ -266,6 +286,12 @@ impl TokenError {
                 "the requested resource is invalid, unknown, or not allowed for this client"
             }
             TokenError::UnsupportedGrantType => "the grant type is not supported",
+            TokenError::AuthorizationPending => {
+                "the authorization request is still pending user approval"
+            }
+            TokenError::SlowDown => "polling too frequently; increase the polling interval",
+            TokenError::AccessDenied => "the authorization request was denied",
+            TokenError::ExpiredToken => "the device code has expired; start a new device flow",
             TokenError::ServerError => "the request could not be processed",
         }
     }

@@ -200,6 +200,14 @@ pub const ADVERTISED_ENDPOINTS: &[DiscoveryEndpoint] = &[
         metadata_key: "introspection_endpoint",
         path: "/introspect",
     },
+    // RFC 8628 device-authorization endpoint (issue #24). A deployment-root endpoint
+    // like /par and /token; the constrained device POSTs here to start a flow. This
+    // metadata key must live ONLY in this generator module (scripts/discovery-scan.sh
+    // forbids the literal `authorization_endpoint` substring elsewhere).
+    DiscoveryEndpoint {
+        metadata_key: "device_authorization_endpoint",
+        path: "/device_authorization",
+    },
 ];
 
 /// The per-environment, config-driven capability toggles the generator layers on

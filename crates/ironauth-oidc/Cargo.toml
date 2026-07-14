@@ -86,6 +86,10 @@ oauth2 = { workspace = true }
 # resolver/dialer seams, which live behind ironauth-fetch's `test-harness`
 # feature.
 ironauth-fetch = { workspace = true, features = ["test-harness"] }
+# The device-grant no-plaintext-in-logs acceptance test (issue #24) captures the
+# tracing output of a full device flow to a buffer and asserts the device_code and
+# user_code never appear in it.
+tracing-subscriber = { workspace = true, features = ["fmt", "std"] }
 
 # Structural exclusion of forbidden flows: the grant-type, response-type, and
 # PKCE-method registries cannot express ROPC, authorization-endpoint access
@@ -352,6 +356,20 @@ required-features = ["testing"]
 [[test]]
 name = "resource_indicators"
 path = "tests/resource_indicators.rs"
+required-features = ["testing"]
+
+# The RFC 8628 device authorization grant with cross-device BCP mitigations (issue
+# #24): a simulated CLI through the happy path and every RFC 8628 error state
+# (authorization_pending, slow_down with an enforced interval increase, access_denied,
+# expired_token); user-code entry rate limited per source with the flow dying after N
+# failed matches; tokens issued ONLY after explicit approval on the verification page;
+# expired codes yield expired_token and a safe page error; verification_uri_complete;
+# an adversarial user-code brute-force showing entropy plus rate limiting hold; and the
+# no-plaintext-device_code/user_code-in-logs acceptance check. Over a real database
+# with a provisioned signing key.
+[[test]]
+name = "device"
+path = "tests/device.rs"
 required-features = ["testing"]
 
 [lints]

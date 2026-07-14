@@ -70,15 +70,26 @@ pub enum GrantType {
     /// under a REGISTERED mapped IronAuth identity. No refresh token (RFC 7521 4.1
     /// says re-present the assertion).
     JwtBearer,
+    /// The `urn:ietf:params:oauth:grant-type:device_code` grant (RFC 8628, issue
+    /// #24): a constrained device polls the token endpoint with a device code it was
+    /// issued at the device-authorization endpoint, and receives tokens once a human
+    /// approved the paired user code at the verification page. Enabled per client via
+    /// a grant allowlist.
+    DeviceCode,
 }
 
 impl GrantType {
+    /// The wire `grant_type` value of the RFC 8628 device grant (issue #24). Named
+    /// once so the parser, the serializer, and discovery cannot drift.
+    pub const DEVICE_CODE_URN: &'static str = "urn:ietf:params:oauth:grant-type:device_code";
+
     /// Every grant type this build can express.
     pub const ALL: &'static [GrantType] = &[
         GrantType::AuthorizationCode,
         GrantType::RefreshToken,
         GrantType::ClientCredentials,
         GrantType::JwtBearer,
+        GrantType::DeviceCode,
     ];
 
     /// The wire `grant_type` value.
@@ -89,6 +100,7 @@ impl GrantType {
             GrantType::RefreshToken => "refresh_token",
             GrantType::ClientCredentials => "client_credentials",
             GrantType::JwtBearer => "urn:ietf:params:oauth:grant-type:jwt-bearer",
+            GrantType::DeviceCode => Self::DEVICE_CODE_URN,
         }
     }
 
@@ -102,6 +114,7 @@ impl GrantType {
             "refresh_token" => Some(GrantType::RefreshToken),
             "client_credentials" => Some(GrantType::ClientCredentials),
             "urn:ietf:params:oauth:grant-type:jwt-bearer" => Some(GrantType::JwtBearer),
+            other if other == Self::DEVICE_CODE_URN => Some(GrantType::DeviceCode),
             _ => None,
         }
     }

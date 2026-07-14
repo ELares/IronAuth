@@ -56,9 +56,10 @@ use crate::audit::{ActingContext, Action, ActorRef};
 use crate::error::StoreError;
 use crate::id::{
     AssertionMappingId, AuditId, AuditTarget, AuthorizationCodeId, ClientId, ConsentId,
-    CorrelationId, DcrPolicyId, EnvironmentId, ExternalIssuerId, GrantId, InitialAccessTokenId,
-    IssuedTokenId, ManagementKeyId, OperatorId, PushedRequestId, RefreshFamilyId, RefreshTokenId,
-    ResourceServerId, ServiceAccountId, SessionId, SigningKeyId, TenantId, UserId,
+    CorrelationId, DcrPolicyId, DeviceCodeId, EnvironmentId, ExternalIssuerId, GrantId,
+    InitialAccessTokenId, IssuedTokenId, ManagementKeyId, OperatorId, PushedRequestId,
+    RefreshFamilyId, RefreshTokenId, ResourceServerId, ServiceAccountId, SessionId, SigningKeyId,
+    TenantId, UserId,
 };
 use crate::scope::Scope;
 use crate::store::Store;
@@ -307,6 +308,22 @@ impl<'a> ScopedStore<'a> {
         }
     }
 
+    /// The read-and-bookkeeping device-authorization repository for this scope (issue
+    /// #24, RFC 8628). Resolves a presented device code at the token-endpoint poll,
+    /// looks up a flow by a submitted user code on the verification page, records a
+    /// failed user-code match, and reads a client's device-grant profile. The
+    /// approval and denial mutations (the audited business events) live on
+    /// [`ActingStore::device_codes`]; polling and failed-attempt bookkeeping are
+    /// high-frequency counter mutations kept off the audited-write path (like the DCR
+    /// rate counters), so they live here.
+    #[must_use]
+    pub fn device_codes(&self) -> DeviceCodeRepo<'a> {
+        DeviceCodeRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
     /// Enter an acting context (who is acting, and under which correlation id).
     /// The returned store hands out the *mutating* repositories, so every write
     /// carries an actor and a correlation id into its audit row.
@@ -468,6 +485,22 @@ impl<'a> ActingStore<'a> {
     #[must_use]
     pub fn initial_access_tokens(&self) -> ActingInitialAccessTokenRepo<'a> {
         ActingInitialAccessTokenRepo {
+            store: self.store,
+            scope: self.scope,
+            acting: self.acting,
+        }
+    }
+
+    /// The mutating device-authorization repository for this scope and actor (issue
+    /// #24, RFC 8628): issue a flow (`device_code.issue`), approve one after an
+    /// authenticated human's explicit confirmation (`device_code.approve`, which
+    /// opens the grant in the same transaction), deny one (`device_code.deny`), and
+    /// atomically redeem an approved flow at the token endpoint (recording the issued
+    /// tokens). Every business mutation carries the actor and correlation id into its
+    /// audit row.
+    #[must_use]
+    pub fn device_codes(&self) -> ActingDeviceCodeRepo<'a> {
+        ActingDeviceCodeRepo {
             store: self.store,
             scope: self.scope,
             acting: self.acting,
@@ -1220,6 +1253,59 @@ impl ActingClientRepo<'_> {
         )
         .await?;
         Ok(id)
+    }
+
+    /// Set a client's device-authorization grant allowlist and display logo (issue
+    /// #24). `grant_types` is the space-separated OAuth grant-type list (the device
+    /// endpoint permits a client only when this contains the `device_code` URN, so the
+    /// device grant is opt-in per client); `logo_uri` is the client's registered logo
+    /// rendered on the verification page (the browser loads it), or [`None`] for no
+    /// logo. Writes a `client.configure` audit row in the same transaction. Both
+    /// columns are data-plane configuration, covered by the 0019 column-scoped grant.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the client id is out of this scope;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn set_device_grant(
+        &self,
+        env: &Env,
+        client_id: &ClientId,
+        grant_types: &str,
+        logo_uri: Option<&str>,
+    ) -> Result<(), StoreError> {
+        if client_id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let grant_types = grant_types.to_owned();
+        let logo_uri = logo_uri.map(ToOwned::to_owned);
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::ClientConfigure,
+                target: client_id,
+            },
+            async move |tx| {
+                sqlx::query(
+                    "UPDATE clients SET grant_types = $1, logo_uri = $2 \
+                     WHERE id = $3 AND tenant_id = $4 AND environment_id = $5",
+                )
+                .bind(&grant_types)
+                .bind(logo_uri.as_deref())
+                .bind(client_id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .execute(&mut **tx)
+                .await?;
+                Ok(())
+            },
+            false,
+        )
+        .await
     }
 
     /// Create a client that authenticates at the token endpoint with a JWT
@@ -5723,6 +5809,46 @@ pub fn refresh_token_digest(token: &str) -> String {
     out
 }
 
+/// The SHA-256 hex digest of a device code (issue #24, RFC 8628), the poll lookup
+/// key stored in `device_codes.device_code_digest`.
+///
+/// The one canonical digest for the format: the device-authorization endpoint hashes
+/// the whole `ira_dc_<jti>~<secret>` device code with this to store it, and
+/// [`DeviceCodeRepo::poll`] hashes the presented device code with this to look it up,
+/// so the two can never disagree. The plaintext device code never reaches the
+/// database; only this one-way digest does, so a database dump yields nothing
+/// replayable.
+#[must_use]
+pub fn device_code_digest(token: &str) -> String {
+    sha256_hex(token)
+}
+
+/// The SHA-256 hex hash of a NORMALIZED user code (issue #24, RFC 8628), the match
+/// key stored in `device_codes.user_code_hash`.
+///
+/// The caller MUST normalize the user code first (uppercase, separators stripped;
+/// see the OIDC layer's `normalize_user_code`), so a user who types the code with or
+/// without its display hyphen, in any case, matches the same row. The plaintext user
+/// code is never stored; only this one-way hash is, so a database dump cannot recover
+/// an enterable code.
+#[must_use]
+pub fn user_code_hash(normalized_user_code: &str) -> String {
+    sha256_hex(normalized_user_code)
+}
+
+/// The lowercase hex SHA-256 of a string. Shared by the device-code digest and the
+/// user-code hash (issue #24), matching the encoding of the other digest helpers.
+fn sha256_hex(value: &str) -> String {
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write as _;
+    let digest = Sha256::digest(value.as_bytes());
+    let mut out = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
+}
+
 /// The live state of a presented refresh token, resolved from its digest (issue
 /// #21). The token endpoint reads this to decide the rotation policy and to mint
 /// the refreshed access token; the authoritative single-use and reuse decision is
@@ -7360,6 +7486,797 @@ impl AuditRepo<'_> {
             occurred_at_unix_micros: row.get("occurred_us"),
             detail: row.get("detail"),
         })
+    }
+}
+
+// ===========================================================================
+// Device authorization grant (issue #24, RFC 8628).
+//
+// The data-plane, tenant-scoped persistence behind the device-authorization
+// endpoint (which issues a flow), the verification page (which a human approves or
+// denies), and the token endpoint (which the constrained device polls). The device
+// code is a digest-only bearer credential exactly like an opaque access token; the
+// user code is stored only as a hash. Polling and failed-user-code bookkeeping are
+// high-frequency counter mutations kept off the audited-write path (like the DCR
+// rate counters and the jti replay cache), so they live on the read repo; the
+// issue/approve/deny/redeem business events audit through the standard primitive.
+// ===========================================================================
+
+/// Fields to INSERT for a freshly issued device-authorization flow (issue #24). All
+/// stored material is a digest or a hash; no plaintext device code or user code is
+/// carried. `Debug` shows only the non-secret handle and metadata.
+#[derive(Clone, Copy)]
+pub struct NewDeviceCode<'a> {
+    /// The flow's `dc_` routing handle (the non-secret id embedded in the device
+    /// code), stored as the `id` column and used as the audit target.
+    pub device_code_id: &'a DeviceCodeId,
+    /// The SHA-256 hex digest of the WHOLE device code (the poll lookup key). NEVER
+    /// the plaintext device code.
+    pub device_code_digest: &'a str,
+    /// The SHA-256 hex hash of the NORMALIZED user code (the verification-page match
+    /// key). NEVER the plaintext user code.
+    pub user_code_hash: &'a str,
+    /// The OAuth client the flow belongs to.
+    pub client_id: &'a ClientId,
+    /// The OAuth scope requested, if any (echoed into the issued tokens).
+    pub requested_scope: Option<&'a str>,
+    /// The initial minimum polling interval, in seconds.
+    pub interval_secs: i32,
+    /// A coarse, operator-safe hint of where the flow was initiated (the initiating
+    /// request's network source), shown on the verification page.
+    pub initiation_hint: Option<&'a str>,
+    /// The flow's expiry, in microseconds since the Unix epoch (clock seam).
+    pub expires_at_unix_micros: i64,
+    /// The flow's creation instant, in microseconds since the Unix epoch (clock seam).
+    pub created_at_unix_micros: i64,
+}
+
+impl fmt::Debug for NewDeviceCode<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("NewDeviceCode")
+            .field("device_code_id", &self.device_code_id)
+            .field("client_id", &self.client_id)
+            .field("expires_at_unix_micros", &self.expires_at_unix_micros)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The outcome of looking up a submitted user code on the verification page (issue
+/// #24). Deliberately coarse so the page stays non-oracular: `Dead` and `NotFound`
+/// are both rendered as the same safe error, revealing nothing about whether a
+/// (possibly other-scope) code exists.
+#[derive(Debug)]
+pub enum DeviceUserCodeLookup {
+    /// A pending, unexpired flow with attempts remaining: proceed to confirmation.
+    Active(ActiveDeviceFlow),
+    /// A flow exists but is not approvable (approved, denied, expired, or its failed
+    /// -match budget is exhausted): render the same safe error as an absent code.
+    Dead,
+    /// No flow matches this user code hash in scope.
+    NotFound,
+}
+
+/// A pending device-authorization flow matched by its user code (issue #24), for the
+/// verification page to render the confirmation and bind the human's approval to it.
+#[derive(Debug)]
+pub struct ActiveDeviceFlow {
+    /// The flow's non-secret `dc_` handle, carried through the confirmation.
+    pub device_code_id: DeviceCodeId,
+    /// The client id string the flow is for (to load the display profile).
+    pub client_id: String,
+    /// The OAuth scope the device requested, if any (shown to the human).
+    pub requested_scope: Option<String>,
+    /// The coarse initiation-location hint (shown to the human).
+    pub initiation_hint: Option<String>,
+}
+
+/// Whether a failed user-code match left the flow alive or invalidated it (issue #24).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceAttemptOutcome {
+    /// The flow is still pending; more attempts remain.
+    Alive,
+    /// The flow's failed-match budget is exhausted (or it was already terminal): it
+    /// is now invalidated (`denied`).
+    Died,
+}
+
+/// A client's device-verification display profile and grant allowlist (issue #24).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceClientProfile {
+    /// The client's human-facing display name.
+    pub display_name: String,
+    /// The space-separated OAuth grant-type allowlist (the device endpoint requires
+    /// this to contain the `device_code` URN).
+    pub grant_types: String,
+    /// The client's registered logo URI (rendered on the verification page), if any.
+    pub logo_uri: Option<String>,
+}
+
+/// The outcome of a device-code poll at the token endpoint (issue #24, RFC 8628 3.5).
+#[derive(Debug)]
+pub enum DevicePollOutcome {
+    /// The flow is still awaiting human approval (`authorization_pending`).
+    Pending,
+    /// The device polled faster than the current interval; the interval was increased
+    /// in place and this is the new value (`slow_down`).
+    SlowDown {
+        /// The new (increased) minimum polling interval, in seconds.
+        interval_secs: i64,
+    },
+    /// The flow was approved: the pre-signing caller now mints tokens and calls
+    /// [`ActingDeviceCodeRepo::redeem_approved`] to atomically consume it.
+    Approved(ApprovedDeviceGrant),
+    /// The flow was denied by the human or invalidated (`access_denied`).
+    Denied,
+    /// The flow's TTL has passed (`expired_token`).
+    Expired,
+    /// No such flow, or it was already redeemed (`invalid_grant`).
+    Unknown,
+}
+
+/// The linkage an approved device flow hands the token endpoint to mint tokens
+/// (issue #24). `Debug` redacts the end-user subject.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ApprovedDeviceGrant {
+    /// The flow's non-secret handle, for the atomic redeem.
+    pub device_code_id: DeviceCodeId,
+    /// The grant opened at approval (the revocation spine the tokens hang off).
+    pub grant_id: GrantId,
+    /// The authenticated end-user subject (a `usr_` id string).
+    pub subject: String,
+    /// The client the flow belongs to (re-checked against the authenticated caller).
+    pub client_id: String,
+    /// The granted OAuth scope, if any.
+    pub requested_scope: Option<String>,
+    /// The authentication methods frozen at approval (the amr/acr source).
+    pub auth_methods: String,
+    /// The approving human's authentication instant, in epoch microseconds, if present.
+    pub auth_time_unix_micros: Option<i64>,
+}
+
+impl fmt::Debug for ApprovedDeviceGrant {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ApprovedDeviceGrant")
+            .field("device_code_id", &self.device_code_id)
+            .field("grant_id", &self.grant_id)
+            .field("client_id", &self.client_id)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The fields the verification page supplies to approve a flow (issue #24).
+#[derive(Clone, Copy)]
+pub struct DeviceApproval<'a> {
+    /// The flow to approve (its non-secret handle).
+    pub device_code_id: &'a DeviceCodeId,
+    /// The grant to open for it (the revocation spine).
+    pub grant_id: &'a GrantId,
+    /// The authenticated end-user subject.
+    pub subject: &'a str,
+    /// The recorded consent decision (a `con_` id string), if any.
+    pub consent_ref: Option<&'a str>,
+    /// The authentication methods (space-separated RFC 8176 values) from the session.
+    pub auth_methods: &'a str,
+    /// The approving human's authentication instant, in epoch microseconds, if any.
+    pub auth_time_unix_micros: Option<i64>,
+    /// The grant's creation instant, in epoch microseconds (clock seam).
+    pub created_at_unix_micros: i64,
+    /// The current instant, in epoch microseconds, for the pending/expiry re-check.
+    pub now_unix_micros: i64,
+}
+
+/// Whether an approval attempt confirmed the flow or found it no longer approvable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceApproveOutcome {
+    /// The flow was pending and unexpired: it is now approved with its grant opened.
+    Approved,
+    /// The flow was already approved, denied, expired, or absent: nothing changed.
+    NotApprovable,
+}
+
+/// Whether the atomic redeem consumed the approved flow or found it already spent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceRedeemOutcome {
+    /// The flow was approved and is now redeemed; the issued tokens were recorded.
+    Redeemed,
+    /// The flow was no longer approved (already redeemed, or a concurrent poll won):
+    /// the pre-signed tokens are dropped and the exchange fails `invalid_grant`.
+    NotApprovable,
+}
+
+/// The read-and-bookkeeping device-authorization repository (issue #24). Polling and
+/// failed-attempt tracking are counter mutations off the audited-write path (like the
+/// DCR rate counters), so they commit their own scoped transactions here.
+pub struct DeviceCodeRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl DeviceCodeRepo<'_> {
+    /// Parse an untrusted device-code id under this scope. A malformed id and one
+    /// minted in another scope both return the uniform not-found.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if malformed or out of scope.
+    pub fn parse_device_code_id(&self, raw: &str) -> Result<DeviceCodeId, StoreError> {
+        Ok(DeviceCodeId::parse_in_scope(raw, &self.scope)?)
+    }
+
+    /// Look up the flow a submitted user code names, within scope (issue #24). Returns
+    /// [`DeviceUserCodeLookup::Active`] only when the flow is pending, unexpired, and
+    /// under its failed-match bound; a flow that exists but is not approvable is a
+    /// [`DeviceUserCodeLookup::Dead`], and no matching flow is
+    /// [`DeviceUserCodeLookup::NotFound`]. The page renders `Dead` and `NotFound`
+    /// identically, so there is no existence oracle. `now_micros` is the application
+    /// clock seam.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn lookup_user_code(
+        &self,
+        submitted_user_code_hash: &str,
+        now_micros: i64,
+        max_attempts: i64,
+    ) -> Result<DeviceUserCodeLookup, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT id, client_id, requested_scope, initiation_hint, status, failed_attempts, \
+             (EXTRACT(EPOCH FROM expires_at) * 1000000)::bigint AS expires_us \
+             FROM device_codes \
+             WHERE user_code_hash = $1 AND tenant_id = $2 AND environment_id = $3",
+        )
+        .bind(submitted_user_code_hash)
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        let Some(row) = row else {
+            return Ok(DeviceUserCodeLookup::NotFound);
+        };
+        let status: String = row.get("status");
+        let expires_us: i64 = row.get("expires_us");
+        let failed: i32 = row.get("failed_attempts");
+        let approvable =
+            status == "pending" && expires_us > now_micros && i64::from(failed) < max_attempts;
+        if !approvable {
+            return Ok(DeviceUserCodeLookup::Dead);
+        }
+        let id_text: String = row.get("id");
+        let device_code_id = DeviceCodeId::parse_in_scope(&id_text, &self.scope)?;
+        Ok(DeviceUserCodeLookup::Active(ActiveDeviceFlow {
+            device_code_id,
+            client_id: row.get("client_id"),
+            requested_scope: row.get("requested_scope"),
+            initiation_hint: row.get("initiation_hint"),
+        }))
+    }
+
+    /// The client's device-verification display profile and grant allowlist, within
+    /// scope (issue #24), or [`None`] when the client is absent or out of scope.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn client_device_profile(
+        &self,
+        client_id: &ClientId,
+    ) -> Result<Option<DeviceClientProfile>, StoreError> {
+        if client_id.scope() != self.scope {
+            return Ok(None);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT display_name, grant_types, logo_uri FROM clients \
+             WHERE id = $1 AND tenant_id = $2 AND environment_id = $3",
+        )
+        .bind(client_id.to_string())
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(row.map(|row| DeviceClientProfile {
+            display_name: row.get("display_name"),
+            grant_types: row.get("grant_types"),
+            logo_uri: row.get("logo_uri"),
+        }))
+    }
+
+    /// Record one failed user-code match against a specific flow (issue #24, RFC 8628
+    /// section 5.1) and report whether it survived. Increments `failed_attempts`
+    /// atomically and, once it reaches `max_attempts`, invalidates the flow (status ->
+    /// `denied`) in the same statement, so a user code cannot be brute forced past the
+    /// bound. Only a pending, unexpired flow accrues attempts; anything else is already
+    /// [`DeviceAttemptOutcome::Died`]. An out-of-scope id is a uniform `Died` (no
+    /// oracle). `now_micros` is the application clock seam.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn record_failed_user_code(
+        &self,
+        device_code_id: &DeviceCodeId,
+        max_attempts: i64,
+        now_micros: i64,
+    ) -> Result<DeviceAttemptOutcome, StoreError> {
+        if device_code_id.scope() != self.scope {
+            return Ok(DeviceAttemptOutcome::Died);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "UPDATE device_codes \
+             SET failed_attempts = failed_attempts + 1, \
+                 status = CASE WHEN failed_attempts + 1 >= $1 THEN 'denied' ELSE status END \
+             WHERE id = $2 AND tenant_id = $3 AND environment_id = $4 AND status = 'pending' \
+               AND expires_at > TIMESTAMPTZ 'epoch' + ($5::text || ' microseconds')::interval \
+             RETURNING status",
+        )
+        .bind(max_attempts)
+        .bind(device_code_id.to_string())
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(now_micros)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(match row {
+            Some(row) if row.get::<String, _>("status") == "denied" => DeviceAttemptOutcome::Died,
+            Some(_) => DeviceAttemptOutcome::Alive,
+            None => DeviceAttemptOutcome::Died,
+        })
+    }
+
+    /// Resolve a presented device code at the token-endpoint poll and advance its poll
+    /// state atomically (issue #24, RFC 8628 sections 3.4 and 3.5).
+    ///
+    /// The presented device code is hashed with [`device_code_digest`] and matched
+    /// within scope (the device code embeds its own scope, checked by the caller, and
+    /// forced row-level security sits beneath), so a device code minted in one
+    /// environment never resolves under another. The row is taken `FOR UPDATE`, so the
+    /// state machine runs without a race:
+    ///
+    /// - expired flow (past its TTL): [`DevicePollOutcome::Expired`];
+    /// - a poll faster than the current interval: the interval is INCREASED in place
+    ///   and [`DevicePollOutcome::SlowDown`] is returned (`slow_down` is enforced, not
+    ///   merely advised);
+    /// - pending: [`DevicePollOutcome::Pending`]; denied: [`DevicePollOutcome::Denied`];
+    /// - approved: [`DevicePollOutcome::Approved`] with the grant linkage (the caller
+    ///   pre-signs the tokens then calls [`ActingDeviceCodeRepo::redeem_approved`] to
+    ///   consume it, so a signing failure never burns the flow);
+    /// - absent or already redeemed: [`DevicePollOutcome::Unknown`].
+    ///
+    /// Every well-paced poll records `last_poll_at` from the application clock seam
+    /// (`now_micros`), so `slow_down` bookkeeping is deterministic under a manual clock.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn poll(
+        &self,
+        presented_device_code: &str,
+        now_micros: i64,
+        slow_down_increment_secs: i64,
+    ) -> Result<DevicePollOutcome, StoreError> {
+        let digest = device_code_digest(presented_device_code);
+        let tenant = self.scope.tenant().to_string();
+        let environment = self.scope.environment().to_string();
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let Some(row) = sqlx::query(
+            "SELECT id, client_id, subject, grant_id, requested_scope, auth_methods, status, \
+             interval_secs, \
+             (EXTRACT(EPOCH FROM auth_time) * 1000000)::bigint AS auth_time_us, \
+             (EXTRACT(EPOCH FROM expires_at) * 1000000)::bigint AS expires_us, \
+             (EXTRACT(EPOCH FROM last_poll_at) * 1000000)::bigint AS last_poll_us \
+             FROM device_codes \
+             WHERE device_code_digest = $1 AND tenant_id = $2 AND environment_id = $3 \
+             FOR UPDATE",
+        )
+        .bind(&digest)
+        .bind(&tenant)
+        .bind(&environment)
+        .fetch_optional(&mut *tx)
+        .await?
+        else {
+            tx.commit().await?;
+            return Ok(DevicePollOutcome::Unknown);
+        };
+
+        let status: String = row.get("status");
+        let expires_us: i64 = row.get("expires_us");
+        let interval_secs: i32 = row.get("interval_secs");
+        let last_poll_us: Option<i64> = row.get("last_poll_us");
+
+        // Expiry first (RFC 8628 3.5 expired_token). Mark it expired for hygiene
+        // unless tokens were already issued (redeemed stays a plain invalid_grant).
+        if expires_us <= now_micros {
+            if status != "redeemed" && status != "expired" {
+                sqlx::query(
+                    "UPDATE device_codes SET status = 'expired' \
+                     WHERE device_code_digest = $1 AND tenant_id = $2 AND environment_id = $3",
+                )
+                .bind(&digest)
+                .bind(&tenant)
+                .bind(&environment)
+                .execute(&mut *tx)
+                .await?;
+            }
+            tx.commit().await?;
+            return Ok(if status == "redeemed" {
+                DevicePollOutcome::Unknown
+            } else {
+                DevicePollOutcome::Expired
+            });
+        }
+
+        // slow_down enforcement (RFC 8628 3.5): a poll sooner than the current interval
+        // increases the interval in place and returns slow_down, tracked per device_code.
+        let interval_micros = i64::from(interval_secs).saturating_mul(1_000_000);
+        let too_fast =
+            last_poll_us.is_some_and(|last| now_micros.saturating_sub(last) < interval_micros);
+        if too_fast {
+            let new_interval = i64::from(interval_secs).saturating_add(slow_down_increment_secs);
+            let new_interval_i32 = i32::try_from(new_interval).unwrap_or(i32::MAX);
+            sqlx::query(
+                "UPDATE device_codes SET interval_secs = $1, \
+                 last_poll_at = TIMESTAMPTZ 'epoch' + ($2::text || ' microseconds')::interval \
+                 WHERE device_code_digest = $3 AND tenant_id = $4 AND environment_id = $5",
+            )
+            .bind(new_interval_i32)
+            .bind(now_micros)
+            .bind(&digest)
+            .bind(&tenant)
+            .bind(&environment)
+            .execute(&mut *tx)
+            .await?;
+            tx.commit().await?;
+            return Ok(DevicePollOutcome::SlowDown {
+                interval_secs: new_interval,
+            });
+        }
+
+        // A well-paced poll: record it, then classify on status.
+        sqlx::query(
+            "UPDATE device_codes \
+             SET last_poll_at = TIMESTAMPTZ 'epoch' + ($1::text || ' microseconds')::interval \
+             WHERE device_code_digest = $2 AND tenant_id = $3 AND environment_id = $4",
+        )
+        .bind(now_micros)
+        .bind(&digest)
+        .bind(&tenant)
+        .bind(&environment)
+        .execute(&mut *tx)
+        .await?;
+
+        let outcome = match status.as_str() {
+            "pending" => DevicePollOutcome::Pending,
+            "denied" => DevicePollOutcome::Denied,
+            "expired" => DevicePollOutcome::Expired,
+            "approved" => approved_device_outcome(&row, &self.scope)?,
+            // "redeemed" and anything unexpected: already spent or invalid.
+            _ => DevicePollOutcome::Unknown,
+        };
+        tx.commit().await?;
+        Ok(outcome)
+    }
+}
+
+/// Build the [`DevicePollOutcome::Approved`] linkage from a polled `device_codes` row
+/// (issue #24). An approved row missing its grant id is an inconsistent state, so it
+/// fails closed to [`DevicePollOutcome::Unknown`] rather than minting against no grant.
+fn approved_device_outcome(row: &PgRow, scope: &Scope) -> Result<DevicePollOutcome, StoreError> {
+    let Some(grant_text) = row.get::<Option<String>, _>("grant_id") else {
+        return Ok(DevicePollOutcome::Unknown);
+    };
+    let id_text: String = row.get("id");
+    Ok(DevicePollOutcome::Approved(ApprovedDeviceGrant {
+        device_code_id: DeviceCodeId::parse_in_scope(&id_text, scope)?,
+        grant_id: GrantId::parse_in_scope(&grant_text, scope)?,
+        subject: row.get::<Option<String>, _>("subject").unwrap_or_default(),
+        client_id: row.get("client_id"),
+        requested_scope: row.get("requested_scope"),
+        auth_methods: row
+            .get::<Option<String>, _>("auth_methods")
+            .unwrap_or_default(),
+        auth_time_unix_micros: row.get("auth_time_us"),
+    }))
+}
+
+/// The mutating device-authorization repository (issue #24). Reachable only through
+/// [`ScopedStore::acting`], so every business mutation carries an actor and
+/// correlation id. Issue and deny route through the module's audited-write primitive;
+/// approve and redeem are bespoke committing paths (they fold a status flip, the grant
+/// or the issued-token rows, and their audit row into one transaction), documented at
+/// their call sites.
+pub struct ActingDeviceCodeRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+    acting: ActingContext,
+}
+
+impl ActingDeviceCodeRepo<'_> {
+    /// Issue a device-authorization flow: INSERT the digest-only row and exactly one
+    /// `device_code.issue` audit row in one transaction (issue #24).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if any supplied identifier is out of this scope;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn issue(&self, env: &Env, new: NewDeviceCode<'_>) -> Result<(), StoreError> {
+        if new.device_code_id.scope() != self.scope || new.client_id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::DeviceCodeIssue,
+                target: new.device_code_id,
+            },
+            async move |tx| {
+                sqlx::query(
+                    "INSERT INTO device_codes \
+                     (device_code_digest, tenant_id, environment_id, id, user_code_hash, \
+                      client_id, requested_scope, status, interval_secs, failed_attempts, \
+                      initiation_hint, expires_at, created_at) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending', $8, 0, $9, \
+                             TIMESTAMPTZ 'epoch' + ($10::text || ' microseconds')::interval, \
+                             TIMESTAMPTZ 'epoch' + ($11::text || ' microseconds')::interval)",
+                )
+                .bind(new.device_code_digest)
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(new.device_code_id.to_string())
+                .bind(new.user_code_hash)
+                .bind(new.client_id.to_string())
+                .bind(new.requested_scope)
+                .bind(new.interval_secs)
+                .bind(new.initiation_hint)
+                .bind(new.expires_at_unix_micros)
+                .bind(new.created_at_unix_micros)
+                .execute(&mut **tx)
+                .await?;
+                Ok(())
+            },
+            false,
+        )
+        .await
+    }
+
+    /// Approve a flow after an authenticated human's explicit confirmation (issue #24,
+    /// RFC 8628 3.3). Atomically confirms the flow is still pending and unexpired, opens
+    /// its grant (the revocation spine the tokens hang off), flips it to `approved` with
+    /// the subject / grant / consent / auth-context linkage, and writes exactly one
+    /// `device_code.approve` audit row, all in one transaction. A flow that is no longer
+    /// pending is a clean [`DeviceApproveOutcome::NotApprovable`] (nothing is written).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the flow or the grant id is out of this scope;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn approve(
+        &self,
+        env: &Env,
+        approval: DeviceApproval<'_>,
+    ) -> Result<DeviceApproveOutcome, StoreError> {
+        if approval.device_code_id.scope() != self.scope || approval.grant_id.scope() != self.scope
+        {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let tenant = scope.tenant().to_string();
+        let environment = scope.environment().to_string();
+        let mut tx = begin_scoped(self.store, scope).await?;
+        // Lock the row and confirm it is still approvable.
+        let Some(row) = sqlx::query(
+            "SELECT client_id, status, \
+             (EXTRACT(EPOCH FROM expires_at) * 1000000)::bigint AS expires_us \
+             FROM device_codes \
+             WHERE id = $1 AND tenant_id = $2 AND environment_id = $3 FOR UPDATE",
+        )
+        .bind(approval.device_code_id.to_string())
+        .bind(&tenant)
+        .bind(&environment)
+        .fetch_optional(&mut *tx)
+        .await?
+        else {
+            tx.commit().await?;
+            return Ok(DeviceApproveOutcome::NotApprovable);
+        };
+        let status: String = row.get("status");
+        let expires_us: i64 = row.get("expires_us");
+        if status != "pending" || expires_us <= approval.now_unix_micros {
+            tx.commit().await?;
+            return Ok(DeviceApproveOutcome::NotApprovable);
+        }
+        let client_id: String = row.get("client_id");
+        // Open the grant BEFORE the device_codes.grant_id write (the composite FK
+        // requires the grant to exist first).
+        sqlx::query(
+            "INSERT INTO grants \
+             (id, tenant_id, environment_id, client_id, subject, session_ref, consent_ref, \
+              claims_request, created_at) \
+             VALUES ($1, $2, $3, $4, $5, NULL, $6, NULL, \
+                     TIMESTAMPTZ 'epoch' + ($7::text || ' microseconds')::interval)",
+        )
+        .bind(approval.grant_id.to_string())
+        .bind(&tenant)
+        .bind(&environment)
+        .bind(&client_id)
+        .bind(approval.subject)
+        .bind(approval.consent_ref)
+        .bind(approval.created_at_unix_micros)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE device_codes \
+             SET status = 'approved', subject = $1, grant_id = $2, consent_ref = $3, \
+                 auth_methods = $4, \
+                 auth_time = CASE WHEN $5::bigint IS NULL THEN NULL \
+                                  ELSE TIMESTAMPTZ 'epoch' \
+                                       + ($5::text || ' microseconds')::interval END \
+             WHERE id = $6 AND tenant_id = $7 AND environment_id = $8",
+        )
+        .bind(approval.subject)
+        .bind(approval.grant_id.to_string())
+        .bind(approval.consent_ref)
+        .bind(approval.auth_methods)
+        .bind(approval.auth_time_unix_micros)
+        .bind(approval.device_code_id.to_string())
+        .bind(&tenant)
+        .bind(&environment)
+        .execute(&mut *tx)
+        .await?;
+        let spec = AuditedWrite {
+            store: self.store,
+            scope,
+            acting: &self.acting,
+            env,
+            action: Action::DeviceCodeApprove,
+            target: approval.device_code_id,
+        };
+        insert_audit_row(&mut tx, &spec, None).await?;
+        tx.commit().await?;
+        Ok(DeviceApproveOutcome::Approved)
+    }
+
+    /// Deny a pending flow (issue #24, RFC 8628 3.5): flip it to `denied` and write one
+    /// `device_code.deny` audit row in the same transaction. Idempotent (a non-pending
+    /// flow is left as is), so a double-deny is a benign no-op.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the flow id is out of this scope;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn deny(&self, env: &Env, device_code_id: &DeviceCodeId) -> Result<(), StoreError> {
+        if device_code_id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::DeviceCodeDeny,
+                target: device_code_id,
+            },
+            async move |tx| {
+                sqlx::query(
+                    "UPDATE device_codes SET status = 'denied' \
+                     WHERE id = $1 AND tenant_id = $2 AND environment_id = $3 AND status = 'pending'",
+                )
+                .bind(device_code_id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .execute(&mut **tx)
+                .await?;
+                Ok(())
+            },
+            false,
+        )
+        .await
+    }
+
+    /// Atomically redeem an approved flow at the token endpoint (issue #24), the
+    /// single-use gate. The caller has already PRE-SIGNED `tokens` (and, for an opaque
+    /// access token, `opaque`) against the approved flow, exactly as the code grant
+    /// pre-signs before its consume, so a signing failure never burns the flow. This
+    /// flips `approved -> redeemed` in one statement: the winner records the issued
+    /// tokens (and the opaque row) plus one `token.issue` audit row in the SAME
+    /// transaction and returns [`DeviceRedeemOutcome::Redeemed`]; a zero-row flip
+    /// (already redeemed, or a concurrent poll won) drops the pre-signed tokens and
+    /// returns [`DeviceRedeemOutcome::NotApprovable`], so a device code issues tokens at
+    /// most once.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if any identifier is out of this scope;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn redeem_approved(
+        &self,
+        env: &Env,
+        device_code_id: &DeviceCodeId,
+        grant_id: &GrantId,
+        tokens: &[IssuedTokenRecord],
+        opaque: Option<NewOpaqueAccessToken<'_>>,
+    ) -> Result<DeviceRedeemOutcome, StoreError> {
+        if device_code_id.scope() != self.scope
+            || grant_id.scope() != self.scope
+            || tokens.iter().any(|token| token.id.scope() != self.scope)
+        {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let tenant = scope.tenant().to_string();
+        let environment = scope.environment().to_string();
+        let mut tx = begin_scoped(self.store, scope).await?;
+        let flipped = sqlx::query(
+            "UPDATE device_codes SET status = 'redeemed' \
+             WHERE id = $1 AND tenant_id = $2 AND environment_id = $3 AND status = 'approved' \
+             RETURNING id",
+        )
+        .bind(device_code_id.to_string())
+        .bind(&tenant)
+        .bind(&environment)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if flipped.is_none() {
+            tx.commit().await?;
+            return Ok(DeviceRedeemOutcome::NotApprovable);
+        }
+        for token in tokens {
+            sqlx::query(
+                "INSERT INTO issued_tokens \
+                 (id, tenant_id, environment_id, grant_id, token_kind) \
+                 VALUES ($1, $2, $3, $4, $5)",
+            )
+            .bind(token.id.to_string())
+            .bind(&tenant)
+            .bind(&environment)
+            .bind(grant_id.to_string())
+            .bind(token.kind.as_str())
+            .execute(&mut *tx)
+            .await?;
+        }
+        if let Some(op) = opaque {
+            sqlx::query(
+                "INSERT INTO opaque_access_tokens \
+                 (token_digest, tenant_id, environment_id, grant_id, subject, client_id, \
+                  audience, scope, jti, expires_at) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, \
+                         TIMESTAMPTZ 'epoch' + ($10::text || ' microseconds')::interval)",
+            )
+            .bind(op.token_digest)
+            .bind(&tenant)
+            .bind(&environment)
+            .bind(grant_id.to_string())
+            .bind(op.subject)
+            .bind(op.client_id)
+            .bind(op.audience)
+            .bind(op.scope)
+            .bind(op.jti.to_string())
+            .bind(op.expires_at_unix_micros)
+            .execute(&mut *tx)
+            .await?;
+        }
+        let spec = AuditedWrite {
+            store: self.store,
+            scope,
+            acting: &self.acting,
+            env,
+            action: Action::TokenIssue,
+            target: grant_id,
+        };
+        insert_audit_row(&mut tx, &spec, None).await?;
+        tx.commit().await?;
+        Ok(DeviceRedeemOutcome::Redeemed)
     }
 }
 

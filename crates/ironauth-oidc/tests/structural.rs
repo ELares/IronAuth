@@ -22,11 +22,12 @@
 use ironauth_oidc::{GrantType, PkceMethod, ResponseMode, ResponseType};
 
 #[test]
-fn grant_type_registry_expresses_the_four_serviced_grants_and_no_ropc() {
-    // The whole registry is exactly four variants: the authorization-code grant,
-    // the refresh-token grant (issue #21), the client-credentials grant (issue #23),
-    // and the JWT bearer assertion grant (issue #26). No other grant type is
-    // representable (ROPC has no variant at all).
+fn grant_type_registry_expresses_the_five_serviced_grants_and_no_ropc() {
+    // The whole registry is exactly five variants: the authorization-code grant, the
+    // refresh-token grant (issue #21), the client-credentials grant (issue #23), the
+    // JWT bearer assertion grant (issue #26), and the RFC 8628 device-code grant
+    // (issue #24). No other grant type is representable (ROPC has no variant at all,
+    // and RFC 8693 token exchange is a separate M13 grant).
     assert_eq!(
         GrantType::ALL,
         &[
@@ -34,9 +35,10 @@ fn grant_type_registry_expresses_the_four_serviced_grants_and_no_ropc() {
             GrantType::RefreshToken,
             GrantType::ClientCredentials,
             GrantType::JwtBearer,
+            GrantType::DeviceCode,
         ]
     );
-    assert_eq!(GrantType::ALL.len(), 4);
+    assert_eq!(GrantType::ALL.len(), 5);
 
     // Every offered grant round-trips through its exact wire spelling.
     assert_eq!(
@@ -51,9 +53,19 @@ fn grant_type_registry_expresses_the_four_serviced_grants_and_no_ropc() {
         GrantType::parse("client_credentials"),
         Some(GrantType::ClientCredentials)
     );
+    // The JWT bearer assertion grant uses its long URN wire spelling (RFC 7521 / 7523).
     assert_eq!(
         GrantType::parse("urn:ietf:params:oauth:grant-type:jwt-bearer"),
         Some(GrantType::JwtBearer)
+    );
+    // The device grant uses its long URN wire spelling (RFC 8628).
+    assert_eq!(
+        GrantType::parse("urn:ietf:params:oauth:grant-type:device_code"),
+        Some(GrantType::DeviceCode)
+    );
+    assert_eq!(
+        GrantType::DeviceCode.as_str(),
+        "urn:ietf:params:oauth:grant-type:device_code"
     );
 
     // Every forbidden or unknown grant type is unrepresentable: it parses to
@@ -61,9 +73,9 @@ fn grant_type_registry_expresses_the_four_serviced_grants_and_no_ropc() {
     for forbidden in [
         "password", // ROPC: structurally excluded.
         "implicit",
-        "urn:ietf:params:oauth:grant-type:device_code",
         // RFC 8693 token exchange is a separate M13 grant, not serviced here.
         "urn:ietf:params:oauth:grant-type:token-exchange",
+        "device_code", // the bare spelling is NOT the serviced URN.
         "",
         "Authorization_Code", // casing is exact.
         "Refresh_Token",      // casing is exact.

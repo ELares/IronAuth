@@ -242,19 +242,19 @@ async fn expand_contract_example_chain_runs_all_three_phases_and_contract_remove
     );
 }
 
-/// The PRODUCTION chain (`MigrationRunner::new`) contains exactly the twenty
+/// The PRODUCTION chain (`MigrationRunner::new`) contains exactly the twenty-one
 /// real migrations and leaves no throwaway demo object in a real database.
 // A long but linear ledger-and-table assertion sweep (one line per migration and
 // per real table); splitting it would not make it clearer.
 #[allow(clippy::too_many_lines)]
 #[tokio::test]
-async fn production_chain_is_only_the_twenty_real_migrations_and_ships_no_demo_object() {
+async fn production_chain_is_only_the_twenty_one_real_migrations_and_ships_no_demo_object() {
     // TestDatabase::start runs Store::migrate() (the production chain) on a
     // fresh, empty database.
     let db = TestDatabase::start().await;
     let pool = db.owner_pool();
 
-    // Re-running is idempotent and reports exactly twenty tracked migrations.
+    // Re-running is idempotent and reports exactly twenty-one tracked migrations.
     let report = MigrationRunner::new(pool)
         .run()
         .await
@@ -265,20 +265,20 @@ async fn production_chain_is_only_the_twenty_real_migrations_and_ships_no_demo_o
     );
     assert_eq!(
         report.already_applied(),
-        20,
-        "the production chain is exactly twenty migrations (isolation, audit log, management \
+        21,
+        "the production chain is exactly twenty-one migrations (isolation, audit log, management \
          API, OIDC authorization, signing keys, login/consent, authentication context, redirect \
          registration, UserInfo claims, consent scope upsert, resource servers, opaque access \
          tokens, client auth suite, dynamic client registration, pushed authorization requests, \
          refresh tokens, client-credentials service accounts, DCR abuse controls, resource \
-         indicators, JWT bearer assertion grant)"
+         indicators, JWT bearer assertion grant, device authorization)"
     );
 
-    // The ledger holds exactly versions 1 through 20.
+    // The ledger holds exactly versions 1 through 21.
     assert_eq!(
         applied_versions(pool).await,
         vec![
-            1_i64, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20
+            1_i64, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21
         ]
     );
     let phase_of = |version: i64| async move {
@@ -321,6 +321,8 @@ async fn production_chain_is_only_the_twenty_real_migrations_and_ships_no_demo_o
     // Three CREATE TABLEs (the trust anchors, the subject-mapping rules, and the
     // external-issuer jti replay cache) are all additive expands (issue #26).
     assert_eq!(phase_of(20).await, "expand");
+    // A CREATE TABLE plus two additive clients ALTERs are all expands (issue #24).
+    assert_eq!(phase_of(21).await, "expand");
 
     // The demo object never reaches a production database.
     assert!(
@@ -566,6 +568,54 @@ async fn production_chain_is_only_the_twenty_real_migrations_and_ships_no_demo_o
     assert!(
         column_exists(pool, "audit_log", "detail").await,
         "audit_log.detail exists"
+    );
+    // The device-authorization grant table (issue #24, RFC 8628): the digest-only
+    // device-code and hashed user-code store, plus the two additive clients columns
+    // (the grant allowlist and the display logo).
+    assert!(
+        table_exists(pool, "device_codes").await,
+        "device_codes exists"
+    );
+    // The device-authorization credential-at-rest invariant (RFC 8628 5.1/6.1): the
+    // table stores only a digest of the device code and a hash of the user code,
+    // never a plaintext of either.
+    assert!(
+        column_exists(pool, "device_codes", "device_code_digest").await,
+        "device_codes stores a device-code digest"
+    );
+    assert!(
+        column_exists(pool, "device_codes", "user_code_hash").await,
+        "device_codes stores a user-code hash"
+    );
+    for forbidden in ["device_code", "user_code", "secret", "plaintext"] {
+        assert!(
+            !column_exists(pool, "device_codes", forbidden).await,
+            "device_codes must have no plaintext device_code/user_code column ({forbidden})"
+        );
+    }
+    // The polling and cross-device-BCP bookkeeping columns (issue #24): the enforced
+    // slow_down interval and last-poll instant, the failed-match death counter, and
+    // the initiation-location hint.
+    for column in [
+        "interval_secs",
+        "last_poll_at",
+        "failed_attempts",
+        "initiation_hint",
+        "status",
+    ] {
+        assert!(
+            column_exists(pool, "device_codes", column).await,
+            "device_codes.{column} exists"
+        );
+    }
+    // The per-client device-grant allowlist and display logo (issue #24).
+    assert!(
+        column_exists(pool, "clients", "grant_types").await,
+        "clients.grant_types exists"
+    );
+    assert!(
+        column_exists(pool, "clients", "logo_uri").await,
+        "clients.logo_uri exists"
     );
     // The RFC 8707 resource-indicator columns (issue #28): the per-client allowlist
     // and no-resource policy, the frozen granted-resource ceiling on the grant and

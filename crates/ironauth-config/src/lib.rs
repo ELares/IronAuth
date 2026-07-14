@@ -396,6 +396,20 @@ pub const OIDC_MAX_REMEMBERED_CONSENT_TTL_SECS: u64 = 31_536_000;
 /// load rejects a value above this ceiling (ten minutes). The default is one minute.
 pub const OIDC_MAX_PAR_TTL_SECS: u64 = 600;
 
+/// The largest a device-authorization flow lifetime may be configured to, in
+/// seconds (RFC 8628, issue #24). A device code and user code are short-lived by
+/// design (a short TTL is a core brute-force mitigation, RFC 8628 section 5.1), so
+/// config load rejects a value above this ceiling (thirty minutes). The default is
+/// ten minutes.
+pub const OIDC_MAX_DEVICE_CODE_TTL_SECS: u64 = 1_800;
+
+/// The largest a device-authorization polling interval (base or `slow_down` increment)
+/// may be configured to, in seconds (RFC 8628 section 3.5, issue #24). The polling
+/// interval governs how often a constrained device may poll the token endpoint; it is
+/// bounded so a misconfiguration cannot make a device wait unreasonably long. Five
+/// minutes is a generous ceiling; the default interval is five seconds.
+pub const OIDC_MAX_DEVICE_POLL_INTERVAL_SECS: u64 = 300;
+
 /// OIDC provider settings (issue #12).
 ///
 /// The public authorization and token endpoints. Lifetimes are configurable (the
@@ -722,6 +736,50 @@ pub struct OidcConfig {
     /// per-environment setting in spirit; the process value is the deployment default
     /// until per-environment overrides ride the M5 promotion pipeline.
     pub client_credentials_default_audience: ClientCredentialsAudience,
+
+    /// The device-authorization flow lifetime in seconds (RFC 8628 section 3.2, issue
+    /// #24). Both the device code and the user code expire after this; a poll after it
+    /// yields `expired_token` and the verification page shows a safe error. A short TTL
+    /// is a core user-code brute-force mitigation (RFC 8628 section 5.1), so the
+    /// default (600) is a conservative ten minutes. Must be at least 1 and at most
+    /// `OIDC_MAX_DEVICE_CODE_TTL_SECS` (1800).
+    pub device_code_ttl_secs: u64,
+
+    /// The base minimum polling interval a device-authorization response advertises,
+    /// in seconds (RFC 8628 section 3.2 `interval`, issue #24). A constrained device
+    /// waits this long between polls; a poll sooner than the current interval is
+    /// answered with `slow_down` and the interval is increased server-side. The default
+    /// (5) follows RFC 8628's recommended default. Must be at least 1 and at most
+    /// `OIDC_MAX_DEVICE_POLL_INTERVAL_SECS`.
+    pub device_poll_interval_secs: u64,
+
+    /// The number of seconds the enforced polling interval grows by each time a device
+    /// polls too fast (RFC 8628 section 3.5 `slow_down`, issue #24). Tracked per device
+    /// code, so a device that keeps polling early is throttled progressively. The
+    /// default (5) matches RFC 8628's guidance; 0 answers `slow_down` without growing
+    /// the interval. At most `OIDC_MAX_DEVICE_POLL_INTERVAL_SECS`.
+    pub device_slow_down_increment_secs: u64,
+
+    /// The number of failed user-code match attempts a single device-authorization
+    /// flow tolerates before it is invalidated (RFC 8628 section 5.1, issue #24). Once
+    /// a flow reaches this bound it is denied, so a user code cannot be brute forced by
+    /// repeated guessing against a known flow. The default (5) is conservative. Must be
+    /// at least 1.
+    pub device_user_code_max_attempts: u32,
+
+    /// The maximum number of user-code submissions one source may make against the
+    /// verification page within `device_verification_rate_window_secs` (RFC 8628
+    /// section 5.1, issue #24). A submission beyond the limit is refused with a safe
+    /// rate-limited page, the primary defense against brute forcing the user-code space
+    /// across many flows. The default (10) is a conservative endpoint-local guard; 0
+    /// disables per-source rate limiting (relying on entropy, the short TTL, and the
+    /// per-flow attempt bound alone).
+    pub device_verification_rate_limit: u32,
+
+    /// The fixed rate-limit window in seconds for `device_verification_rate_limit`
+    /// (issue #24). The default (60) is one minute. Must be at least 1 and at most
+    /// `OIDC_MAX_LIFETIME_SECS`.
+    pub device_verification_rate_window_secs: u64,
 }
 
 impl Default for OidcConfig {
@@ -760,6 +818,12 @@ impl Default for OidcConfig {
             registration_rate_limit: 20,
             registration_rate_window_secs: 60,
             client_credentials_default_audience: ClientCredentialsAudience::ClientId,
+            device_code_ttl_secs: 600,
+            device_poll_interval_secs: 5,
+            device_slow_down_increment_secs: 5,
+            device_user_code_max_attempts: 5,
+            device_verification_rate_limit: 10,
+            device_verification_rate_window_secs: 60,
         }
     }
 }
@@ -1000,8 +1064,83 @@ impl Config {
                 ),
             });
         }
+        validate_device_authorization(&self.oidc)?;
         Ok(())
     }
+}
+
+/// Validate the device-authorization grant settings (issue #24, RFC 8628), kept out
+/// of [`Config::validate`] so each stays within the readable-length lint.
+///
+/// The flow TTL and the polling intervals are bounded like the other credential
+/// lifetimes: a zero-second value is meaningless (a code born expired, or a
+/// zero-second poll interval), and a value beyond the ceiling would blunt a core
+/// brute-force mitigation (a long-lived user code) or make a device wait
+/// unreasonably. The failed-attempt bound must admit at least one attempt.
+fn validate_device_authorization(oidc: &OidcConfig) -> Result<(), ConfigError> {
+    if oidc.device_code_ttl_secs < 1 {
+        return Err(ConfigError::Invalid {
+            message: "oidc.device_code_ttl_secs must be at least 1 second".to_owned(),
+        });
+    }
+    if oidc.device_code_ttl_secs > OIDC_MAX_DEVICE_CODE_TTL_SECS {
+        return Err(ConfigError::Invalid {
+            message: format!(
+                "oidc.device_code_ttl_secs ({}) must not exceed \
+                 {OIDC_MAX_DEVICE_CODE_TTL_SECS} seconds",
+                oidc.device_code_ttl_secs
+            ),
+        });
+    }
+    if oidc.device_poll_interval_secs < 1 {
+        return Err(ConfigError::Invalid {
+            message: "oidc.device_poll_interval_secs must be at least 1 second".to_owned(),
+        });
+    }
+    if oidc.device_poll_interval_secs > OIDC_MAX_DEVICE_POLL_INTERVAL_SECS {
+        return Err(ConfigError::Invalid {
+            message: format!(
+                "oidc.device_poll_interval_secs ({}) must not exceed \
+                 {OIDC_MAX_DEVICE_POLL_INTERVAL_SECS} seconds",
+                oidc.device_poll_interval_secs
+            ),
+        });
+    }
+    // The slow_down increment may be 0 (answer slow_down without growing the interval),
+    // but is bounded by the same ceiling as the interval.
+    if oidc.device_slow_down_increment_secs > OIDC_MAX_DEVICE_POLL_INTERVAL_SECS {
+        return Err(ConfigError::Invalid {
+            message: format!(
+                "oidc.device_slow_down_increment_secs ({}) must not exceed \
+                 {OIDC_MAX_DEVICE_POLL_INTERVAL_SECS} seconds",
+                oidc.device_slow_down_increment_secs
+            ),
+        });
+    }
+    if oidc.device_user_code_max_attempts < 1 {
+        return Err(ConfigError::Invalid {
+            message: "oidc.device_user_code_max_attempts must be at least 1".to_owned(),
+        });
+    }
+    // The verification rate-limit window is bounded like the other windows: a
+    // zero-second window is meaningless, and a window beyond the ceiling would let a
+    // source accumulate an unbounded burst.
+    if oidc.device_verification_rate_window_secs < 1 {
+        return Err(ConfigError::Invalid {
+            message: "oidc.device_verification_rate_window_secs must be at least 1 second"
+                .to_owned(),
+        });
+    }
+    if oidc.device_verification_rate_window_secs > OIDC_MAX_LIFETIME_SECS {
+        return Err(ConfigError::Invalid {
+            message: format!(
+                "oidc.device_verification_rate_window_secs ({}) must not exceed \
+                 {OIDC_MAX_LIFETIME_SECS} seconds",
+                oidc.device_verification_rate_window_secs
+            ),
+        });
+    }
+    Ok(())
 }
 
 /// Validate the refresh-token lifecycle and consent settings (issue #21), kept out

@@ -714,6 +714,26 @@ impl Harness {
         self.send(request).await
     }
 
+    /// Enable the RFC 8628 device grant on `client_id` and register a display logo
+    /// (issue #24), so the client may start a device-authorization flow. `grant_types`
+    /// is the space-separated allowlist (it must contain the `device_code` URN for the
+    /// device endpoint to admit the client).
+    pub async fn enable_device_grant(
+        &self,
+        client_id: &ClientId,
+        grant_types: &str,
+        logo_uri: Option<&str>,
+    ) {
+        let (actor, corr) = self.seeding_actor();
+        self.store()
+            .scoped(self.scope)
+            .acting(actor, corr)
+            .clients()
+            .set_device_grant(&self.env, client_id, grant_types, logo_uri)
+            .await
+            .expect("enable device grant");
+    }
+
     /// Set the per-client `require_pushed_authorization_requests` flag (issue #27) for
     /// `client_id`, so a plain (non-PAR) authorization request from it is rejected.
     pub async fn require_par_for_client(&self, client_id: &ClientId) {

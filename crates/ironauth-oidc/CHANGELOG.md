@@ -6,6 +6,53 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- RFC 8628 device authorization grant with cross-device BCP mitigations (issue #24).
+  - **Device-authorization endpoint.** `POST /device_authorization` authenticates the
+    client (self-scoped, exactly like the token endpoint), gates on the per-client
+    grant allowlist (the device grant is opt-in), and returns `device_code`,
+    `user_code`, `verification_uri`, `verification_uri_complete`, `expires_in`, and
+    `interval`. The device code is the scope-declaring opaque credential
+    `ira_dc_<scoped-handle>~<256-bit-secret>` (only its whole-token digest is stored),
+    so the GLOBAL token endpoint recovers its `(tenant, environment)` scope. The
+    `user_code` is drawn by unbiased rejection sampling from the RFC 8628 restricted,
+    transcription-friendly alphabet (`BCDFGHJKLMNPQRSTVWXZ`) and stored only as a hash.
+  - **Token-endpoint poll.** A new `grant_type=urn:ietf:params:oauth:grant-type:device_code`
+    arm returns the RFC 8628 section 3.5 set: `authorization_pending`, an ENFORCED
+    `slow_down` (a poll faster than the per-device_code interval increases that interval
+    in place), `access_denied`, and `expired_token`. Tokens are pre-signed then the flow
+    is atomically redeemed, so a signing failure never burns it and the device code is
+    single use.
+  - **Verification page** at `/t/{tenant}/e/{environment}/device`, built on the M2
+    login/consent bootstrap: it shows the client name, its registered logo (rendered as
+    a browser-fetched `<img>` under a narrowed CSP, never fetched server-side), and a
+    coarse initiation-location hint, and requires an EXPLICIT approval before any consent
+    is recorded or any token is issued. `verification_uri_complete` prefills the code for
+    a QR scan. An unknown, expired, or exhausted code shows one NON-oracular error;
+    user-code entry is rate limited per source and a flow dies after a bounded number of
+    failed matches. The device code and user code are never logged in plaintext
+    (redacted from every `Debug`; a test captures a full flow's trace output and asserts
+    their absence). Discovery advertises the endpoint and the grant on both well-known
+    forms.
+  - **Verification GET is prefill-only (user-code enumeration oracle closed).** Opening
+    `GET /t/{tenant}/e/{environment}/device?user_code=<code>` (a QR scan of
+    `verification_uri_complete`) now renders the code into the entry field WITHOUT
+    resolving it, so the GET returns byte-identical output whether or not the code names
+    a live flow: it can never be a user-code existence oracle and needs no rate limit of
+    its own (RFC 8628 sections 3.3 and 5.1). A code is resolved ONLY through the
+    rate-limited POST, which remains the sole path to sign-in, confirmation, and
+    approval, so a prefilled code still requires the explicit user action the
+    cross-device BCP demands. Previously the GET resolved the code and returned a
+    distinguishable page (the sign-in/confirm view for a live code, the non-oracular
+    error otherwise) with no per-source rate limit, making a live code enumerable at
+    HTTP speed over the primary (QR) entry path. Tests assert the GET renders identically
+    for a valid and an invalid code, that opening the prefilled link approves nothing
+    (the device still polls `authorization_pending`), and that a device_code is bound to
+    its issuing client (a different client polling an approved code is `invalid_grant`
+    and does not burn the flow). The device grant issues a refresh token whenever the
+    environment issues them, independent of `offline_access` (a deliberate divergence
+    from the authorization-code grant, documented in `issue_device_refresh`): a
+    constrained device that completed a one-time cross-device approval expects a durable
+    session; `offline_access` still governs the refresh lifetime.
 - JWT bearer assertion grant (issue #26, RFC 7521 4.1 / RFC 7523 2.1, 3):
   `urn:ietf:params:oauth:grant-type:jwt-bearer` at the token endpoint.
   - **Trust configuration.** Per-tenant, per-environment REGISTERED external

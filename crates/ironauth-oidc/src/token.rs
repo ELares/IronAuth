@@ -128,6 +128,10 @@ pub struct TokenParams {
     /// Optional; when present it is validated/normalized and echoed into the issued
     /// token.
     pub scope: Option<String>,
+    /// The device code to poll for the RFC 8628 device grant (issue #24). A bearer
+    /// credential the constrained device presents on every poll, so it is redacted
+    /// from `Debug` and never logged in plaintext.
+    pub device_code: Option<String>,
 }
 
 impl fmt::Debug for TokenParams {
@@ -142,6 +146,7 @@ impl fmt::Debug for TokenParams {
             .field("has_code", &self.code.is_some())
             .field("has_refresh_token", &self.refresh_token.is_some())
             .field("has_assertion", &self.assertion.is_some())
+            .field("has_device_code", &self.device_code.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -198,6 +203,9 @@ async fn exchange(
         }
         Some(GrantType::JwtBearer) => {
             crate::jwt_bearer::jwt_bearer_grant(state, headers, params).await
+        }
+        Some(GrantType::DeviceCode) => {
+            crate::device::device_code_grant(state, headers, params).await
         }
         None => Err(TokenError::UnsupportedGrantType),
     }
