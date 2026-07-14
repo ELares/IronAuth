@@ -25,12 +25,13 @@ use sqlx::Row;
 /// A far-future expiry (year 2100) in epoch microseconds.
 const FAR_FUTURE_MICROS: i64 = 4_102_444_800_000_000;
 
-/// Generate an opaque access token exactly as the mint does (the `ira_at_` prefix
-/// over 256 bits from the entropy seam) plus its canonical digest.
-fn make_opaque_token(env: &Env) -> (String, String) {
+/// Generate an opaque access token exactly as the mint does (issue #29): the
+/// `ira_at_` prefix, the scope-declaring routing handle (`jti`), a `~` delimiter,
+/// and 256 bits from the entropy seam, plus the digest of the WHOLE token.
+fn make_opaque_token(env: &Env, jti: &IssuedTokenId) -> (String, String) {
     let mut bytes = [0_u8; 32];
     env.entropy().fill_bytes(&mut bytes);
-    let token = format!("ira_at_{}", URL_SAFE_NO_PAD.encode(bytes));
+    let token = format!("ira_at_{jti}~{}", URL_SAFE_NO_PAD.encode(bytes));
     let digest = opaque_access_token_digest(&token);
     (token, digest)
 }
@@ -84,8 +85,8 @@ async fn an_opaque_token_records_digest_only_and_resolves_to_its_live_claims() {
     let (code_id, grant_id, client_id) =
         issue_code(&db, &env, scope, "usr_opaque", Some("openid profile")).await;
 
-    let (token, digest) = make_opaque_token(&env);
     let jti = IssuedTokenId::generate(&env, &scope);
+    let (token, digest) = make_opaque_token(&env, &jti);
     let client = client_id.to_string();
     let outcome = db
         .store()
@@ -127,6 +128,14 @@ async fn an_opaque_token_records_digest_only_and_resolves_to_its_live_claims() {
     assert_eq!(active.audience, "https://api.example/orders");
     assert_eq!(active.scope.as_deref(), Some("openid profile"));
     assert_eq!(active.jti, jti.to_string());
+    // The exp seam issue #22's introspection response consumes: the recorded expiry,
+    // read back exactly (an integer microsecond interval on PostgreSQL 14+); iat is
+    // the row's created_at, a real instant.
+    assert_eq!(active.expires_at_unix_micros, FAR_FUTURE_MICROS);
+    assert!(
+        active.issued_at_unix_micros > 0,
+        "iat is read from the row's created_at"
+    );
 
     // A simulated DATABASE DUMP: read every stored row as the superuser (bypassing
     // row-level security exactly as a backup would). The stored material is the
@@ -195,8 +204,8 @@ async fn grant_chain_revocation_flips_an_opaque_token_inactive() {
     let scope = db.seed_scope(&env).await;
     let (code_id, grant_id, client_id) = issue_code(&db, &env, scope, "usr_rev", None).await;
 
-    let (token, digest) = make_opaque_token(&env);
     let jti = IssuedTokenId::generate(&env, &scope);
+    let (token, digest) = make_opaque_token(&env, &jti);
     let client = client_id.to_string();
     let authorization = || {
         db.store()
@@ -264,8 +273,8 @@ async fn an_expired_opaque_token_does_not_resolve() {
     let scope = db.seed_scope(&env).await;
     let (code_id, grant_id, client_id) = issue_code(&db, &env, scope, "usr_exp", None).await;
 
-    let (token, digest) = make_opaque_token(&env);
     let jti = IssuedTokenId::generate(&env, &scope);
+    let (token, digest) = make_opaque_token(&env, &jti);
     let client = client_id.to_string();
     // Record the token expiring at 1_000_000 us (one second past the epoch).
     db.store()
@@ -324,8 +333,8 @@ async fn an_opaque_token_never_resolves_across_scopes() {
     let scope_b = db.seed_scope(&env).await;
     let (code_id, grant_id, client_id) = issue_code(&db, &env, scope_a, "usr_a", None).await;
 
-    let (token, digest) = make_opaque_token(&env);
     let jti = IssuedTokenId::generate(&env, &scope_a);
+    let (token, digest) = make_opaque_token(&env, &jti);
     let client = client_id.to_string();
     db.store()
         .scoped(scope_a)

@@ -42,9 +42,15 @@
 //!   authentication event. Its `aud` is the client id when no resource server is
 //!   targeted, so [`crate::userinfo`]'s `aud == client` check keeps working, or the
 //!   resource server's audience when one is. No PII beyond these protocol claims.
-//! - **opaque** (a resource server, or an environment, may select it): a random
+//! - **opaque** (a resource server, or an environment, may select it): an
 //!   `ira_at_` reference token whose state lives only in the store as a digest;
-//!   there is no offline validation, only the internal store resolve (issue #22).
+//!   there is no offline validation, only the internal store resolve (the
+//!   `UserInfo` consumer, and the RFC 7662 introspection endpoint in issue #22).
+//!   The token SELF-DECLARES its `(tenant, environment)` scope through an embedded
+//!   routing handle (its own `jti`, a scoped id), exactly as an at+jwt's `jti`
+//!   does, so a GLOBAL consumer can recover the scope and run the scoped,
+//!   RLS-bound resolve; the 256-bit random suffix is the secret, and only the
+//!   digest of the WHOLE token is ever stored.
 //!
 //! The format selection is resolved in the async handler
 //! ([`OidcState::resolve_access_token_target`]) and handed into the pure [`mint`],
@@ -68,6 +74,14 @@ use crate::subject;
 /// sibling refresh-token prefix `ira_rt_` is reserved there for consistency;
 /// refresh tokens are issue #21.
 pub const OPAQUE_ACCESS_TOKEN_PREFIX: &str = "ira_at_";
+
+/// The delimiter between an opaque access token's scope-declaring routing handle
+/// and its secret random suffix (issue #29). Chosen because it is a valid RFC 7235
+/// Bearer `token68` character yet appears in NEITHER the base64url alphabet
+/// (`[A-Za-z0-9_-]`) NOR a scoped identifier's wire form, so the two segments can
+/// never collide and the split is unambiguous. It is not `.`, so an opaque token
+/// still carries no dots and can never be mistaken for a compact JWS.
+pub const OPAQUE_ACCESS_TOKEN_DELIMITER: char = '~';
 
 /// The number of random bytes in an opaque access token: 32 bytes = 256 bits of
 /// entropy, drawn from the ironauth-env seam (never raw `getrandom`), so an
@@ -319,14 +333,25 @@ pub(crate) fn build_access_token_claims(
     claims
 }
 
-/// Generate an opaque access token: the scannable `ira_at_` prefix over 256 bits
-/// of entropy from the ironauth-env seam (issue #29). The plaintext is returned to
-/// the client and never stored; only its digest is persisted.
-fn generate_opaque_access_token(state: &OidcState) -> String {
+/// Generate an opaque access token (issue #29): the scannable `ira_at_` prefix, a
+/// SCOPE-DECLARING routing handle (`jti`, a `tok_` scoped id embedding its
+/// `(tenant, environment)`), the [`OPAQUE_ACCESS_TOKEN_DELIMITER`], and 256 bits of
+/// entropy from the ironauth-env seam.
+///
+/// The routing handle lets a GLOBAL consumer (the `UserInfo` endpoint, and the RFC
+/// 7662 introspection endpoint in issue #22) recover the token's scope and run the
+/// scoped, RLS-bound store resolve, exactly as an at+jwt's `jti` carries its scope;
+/// the endpoints are global and every other bearer credential IronAuth issues is a
+/// scoped identifier, so the opaque token declares its scope the same way. The
+/// handle is a NON-secret id (it is also the stored `jti` and the introspection
+/// handle); the 256-bit random suffix is the secret. The plaintext is returned to
+/// the client and never stored; only the digest of the WHOLE token is persisted, so
+/// a database dump still yields nothing replayable.
+fn generate_opaque_access_token(state: &OidcState, jti: &IssuedTokenId) -> String {
     let mut bytes = [0_u8; OPAQUE_ACCESS_TOKEN_BYTES];
     state.env().entropy().fill_bytes(&mut bytes);
     format!(
-        "{OPAQUE_ACCESS_TOKEN_PREFIX}{}",
+        "{OPAQUE_ACCESS_TOKEN_PREFIX}{jti}{OPAQUE_ACCESS_TOKEN_DELIMITER}{}",
         URL_SAFE_NO_PAD.encode(bytes)
     )
 }
@@ -404,11 +429,13 @@ pub fn mint(
             .map_err(|_| ())?;
             MintedAccessToken::Jwt { token, jti }
         }
-        // Opaque: a random reference token; only its digest and metadata are
-        // stored (the caller records them in the redeem transaction).
+        // Opaque: a scope-declaring reference token; only its digest and metadata
+        // are stored (the caller records them in the redeem transaction). The token
+        // embeds its own `jti` as the routing handle, so the digest is over the
+        // WHOLE token (handle + secret) the client presents.
         TokenFormat::Opaque => {
             let jti = IssuedTokenId::generate(state.env(), &request.scope);
-            let token = generate_opaque_access_token(state);
+            let token = generate_opaque_access_token(state, &jti);
             let digest = opaque_access_token_digest(&token);
             let expires_at_unix_micros = epoch_micros(now).saturating_add(micros(target.ttl));
             MintedAccessToken::Opaque {

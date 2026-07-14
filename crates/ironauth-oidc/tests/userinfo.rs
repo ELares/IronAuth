@@ -16,10 +16,14 @@ use axum::http::{Request, StatusCode, header};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use common::{
-    Harness, PKCE_CHALLENGE, PKCE_VERIFIER, REDIRECT_URI, SEED_PASSWORD, enc, form, json,
-    location_param,
+    FAR_FUTURE_MICROS, Harness, PKCE_CHALLENGE, PKCE_VERIFIER, REDIRECT_URI, SEED_PASSWORD, enc,
+    form, json, location_param,
 };
-use ironauth_config::OidcConfig;
+use ironauth_config::{OidcConfig, TokenFormat as ConfigTokenFormat};
+use ironauth_store::{
+    ActorRef, AuthorizationCodeId, ClientId, CorrelationId, GrantId, IssueCode, IssuedTokenId,
+    NewOpaqueAccessToken, ServiceId, opaque_access_token_digest,
+};
 use serde_json::Value;
 use std::time::Duration;
 
@@ -460,4 +464,267 @@ async fn cors_is_present_for_a_registered_origin_and_absent_otherwise() {
         userinfo(&harness, "GET", Some(&access), Some(UNREGISTERED), None).await;
     assert_eq!(status, StatusCode::OK);
     assert!(headers.get(header::ACCESS_CONTROL_ALLOW_ORIGIN).is_none());
+}
+
+// --- Opaque access tokens at UserInfo (issue #29) ---
+//
+// An environment whose default access-token format is `opaque` mints digest-only
+// `ira_at_` reference tokens. UserInfo consumes them exactly as it consumes an
+// at+jwt: the token self-declares its scope through its embedded routing handle, the
+// scope-bound store resolve is the sole authority (honoring expiry and grant-chain
+// revocation), and the confused-deputy `aud == client` and `openid` scope checks are
+// the same. Every failure is the uniform invalid_token, with no oracle distinguishing
+// an opaque-but-unknown token from a malformed one.
+
+/// An OIDC config whose environment default access-token format is opaque (issue
+/// #29), so the code flow mints opaque `ira_at_` access tokens.
+fn opaque_config() -> OidcConfig {
+    OidcConfig {
+        default_access_token_format: ConfigTokenFormat::Opaque,
+        ..OidcConfig::default()
+    }
+}
+
+#[tokio::test]
+async fn an_opaque_access_token_resolves_at_userinfo_end_to_end() {
+    let harness = Harness::start_with(opaque_config()).await;
+    let (_subject, access, id_token) = issue_tokens(&harness, "openid profile email", None).await;
+    // The environment default minted an OPAQUE access token (not a JWS).
+    assert!(
+        access.starts_with("ira_at_"),
+        "the opaque environment default mints an ira_at_ token: {access}"
+    );
+    assert_eq!(
+        access.matches('.').count(),
+        0,
+        "an opaque token is not a JWS"
+    );
+
+    let id_sub = payload_claims(&id_token)["sub"]
+        .as_str()
+        .expect("id sub")
+        .to_owned();
+
+    for method in ["GET", "POST"] {
+        let (status, _, body) = userinfo(&harness, method, Some(&access), None, None).await;
+        assert_eq!(status, StatusCode::OK, "{method} opaque userinfo: {body}");
+        let claims = json(&body);
+        // sub is the PUBLIC sub, byte-identical to the ID token's (shared derivation).
+        assert_eq!(claims["sub"].as_str(), Some(id_sub.as_str()), "{method}");
+        // The openid-scoped profile + email claim sets release; ungranted scopes do not.
+        assert_eq!(claims["name"], "Ada Lovelace", "{method}");
+        assert_eq!(claims["given_name"], "Ada", "{method}");
+        assert_eq!(claims["email"], "ada@example.test", "{method}");
+        assert_eq!(claims["email_verified"], true, "{method}");
+        assert!(
+            claims.get("address").is_none(),
+            "address not granted: {method}"
+        );
+        assert!(
+            claims.get("phone_number").is_none(),
+            "phone not granted: {method}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_opaque_token_without_the_openid_scope_is_403_insufficient_scope() {
+    // Granted profile but NOT openid: the opaque token is not a UserInfo credential,
+    // the same insufficient_scope the at+jwt path returns.
+    let harness = Harness::start_with(opaque_config()).await;
+    let (_subject, access, _) = issue_tokens(&harness, "profile", None).await;
+    assert!(access.starts_with("ira_at_"));
+    let (status, headers, _) = userinfo(&harness, "GET", Some(&access), None, None).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let www = challenge(&headers).expect("challenge");
+    assert!(www.contains("error=\"insufficient_scope\""));
+    assert!(www.contains("scope=\"openid\""));
+}
+
+#[tokio::test]
+async fn an_expired_opaque_access_token_is_401_invalid_token() {
+    let harness = Harness::start_with(opaque_config()).await;
+    let (_subject, access, _) = issue_tokens(&harness, "openid profile", None).await;
+    assert!(access.starts_with("ira_at_"));
+    // The default opaque access token lives 300s; advance well past its expiry.
+    harness.clock().advance(Duration::from_secs(600));
+    let (status, headers, _) = userinfo(&harness, "GET", Some(&access), None, None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert!(
+        challenge(&headers)
+            .unwrap()
+            .contains("error=\"invalid_token\""),
+        "an expired opaque token is the uniform invalid_token"
+    );
+}
+
+#[tokio::test]
+async fn an_opaque_token_whose_grant_was_revoked_is_401_invalid_token() {
+    // Grant-chain revocation (a code reuse past the grace window) flips the opaque
+    // access token inactive at UserInfo, exactly as it does an at+jwt.
+    let harness = Harness::start_with(opaque_config()).await;
+    let client_id = harness.client_id().to_string();
+    let subject = harness
+        .seed_user_with_claims(&unique_identifier(&harness), SEED_PASSWORD, CLAIMS_JSON)
+        .await;
+    harness.grant_consent(&subject, &client_id).await;
+    let cookie = harness.session_cookie(&subject).await;
+    let query = format!(
+        "response_type=code&client_id={client_id}&redirect_uri={}&scope=openid&\
+         code_challenge={PKCE_CHALLENGE}&code_challenge_method=S256",
+        enc(REDIRECT_URI),
+    );
+    let (_, headers, _) = harness.authorize_with_cookie(&query, &cookie).await;
+    let code = location_param(&headers, "code").expect("code");
+    let exchange = form(&[
+        ("grant_type", "authorization_code"),
+        ("code", &code),
+        ("redirect_uri", REDIRECT_URI),
+        ("client_id", &client_id),
+        ("code_verifier", PKCE_VERIFIER),
+    ]);
+    let (status, _, body) = harness.token(&exchange).await;
+    assert_eq!(status, StatusCode::OK, "first exchange: {body}");
+    let access = json(&body)["access_token"]
+        .as_str()
+        .expect("access")
+        .to_owned();
+    assert!(access.starts_with("ira_at_"));
+
+    // The opaque token works before revocation.
+    let (status, _, _) = userinfo(&harness, "GET", Some(&access), None, None).await;
+    assert_eq!(status, StatusCode::OK, "opaque token valid before revoke");
+
+    // Reuse the code past the 10s grace window: revokes the grant chain.
+    harness.clock().advance(Duration::from_secs(30));
+    let (status, _, _) = harness.token(&exchange).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "reuse is invalid_grant");
+
+    // The opaque token, bound to that grant, is now inactive at UserInfo.
+    let (status, headers, _) = userinfo(&harness, "GET", Some(&access), None, None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert!(
+        challenge(&headers)
+            .unwrap()
+            .contains("error=\"invalid_token\"")
+    );
+}
+
+#[tokio::test]
+async fn an_opaque_token_whose_audience_is_not_the_client_is_401_invalid_token() {
+    // The confused-deputy gate: an opaque token minted for a RESOURCE SERVER (audience
+    // != client) is not a UserInfo credential. The code flow only mints audience ==
+    // client until issue #28, so the resource-server token is recorded directly, with a
+    // REAL subject so the ONLY reason UserInfo rejects it is the audience check.
+    let harness = Harness::start_with(opaque_config()).await;
+    let subject = harness
+        .seed_user_with_claims(&unique_identifier(&harness), SEED_PASSWORD, CLAIMS_JSON)
+        .await;
+    let client_id = harness.client_id().to_string();
+    let token = seed_opaque_token_with_audience(
+        &harness,
+        &subject,
+        &client_id,
+        "https://api.example/orders",
+        "openid profile",
+    )
+    .await;
+
+    let (status, headers, body) = userinfo(&harness, "GET", Some(&token), None, None).await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "confused-deputy rejected: {body}"
+    );
+    assert!(
+        challenge(&headers)
+            .unwrap()
+            .contains("error=\"invalid_token\""),
+        "an audience != client opaque token is the uniform invalid_token"
+    );
+}
+
+/// Directly record a scope-declaring opaque access token in the harness scope with an
+/// explicit `client_id` and `audience` (the code flow only mints audience == client
+/// until issue #28), returning the plaintext token. Mirrors the mint: the token embeds
+/// its `jti` routing handle and 256 bits of entropy, and only the digest of the whole
+/// token is stored, recorded in the same redeem transaction as a throwaway code.
+async fn seed_opaque_token_with_audience(
+    harness: &Harness,
+    subject: &str,
+    client_id: &str,
+    audience: &str,
+    scope: &str,
+) -> String {
+    let env = harness.env();
+    let scope_id = harness.scope();
+    let code_id = AuthorizationCodeId::generate(env, &scope_id);
+    let grant_id = GrantId::generate(env, &scope_id);
+    let code_client = ClientId::generate(env, &scope_id);
+    harness
+        .store()
+        .scoped(scope_id)
+        .acting(
+            ActorRef::service(ServiceId::generate(env)),
+            CorrelationId::generate(env),
+        )
+        .authorization()
+        .issue(
+            env,
+            IssueCode {
+                code_id: &code_id,
+                grant_id: &grant_id,
+                client_id: &code_client,
+                redirect_uri: REDIRECT_URI,
+                nonce: None,
+                code_challenge: None,
+                code_challenge_method: None,
+                subject,
+                oauth_scope: Some(scope),
+                auth_methods: "pwd",
+                auth_time_micros: None,
+                session_ref: None,
+                consent_ref: None,
+                claims_request: None,
+                expires_at_micros: FAR_FUTURE_MICROS,
+                created_at_micros: 0,
+            },
+        )
+        .await
+        .expect("issue throwaway code");
+
+    let jti = IssuedTokenId::generate(env, &scope_id);
+    let mut bytes = [0_u8; 32];
+    env.entropy().fill_bytes(&mut bytes);
+    let token = format!("ira_at_{jti}~{}", URL_SAFE_NO_PAD.encode(bytes));
+    let digest = opaque_access_token_digest(&token);
+    let outcome = harness
+        .store()
+        .scoped(scope_id)
+        .acting(
+            ActorRef::service(ServiceId::generate(env)),
+            CorrelationId::generate(env),
+        )
+        .authorization()
+        .redeem(
+            env,
+            &code_id,
+            &grant_id,
+            &[],
+            Some(NewOpaqueAccessToken {
+                token_digest: &digest,
+                grant_id: None,
+                subject,
+                client_id,
+                audience,
+                scope: Some(scope),
+                jti: &jti,
+                expires_at_unix_micros: FAR_FUTURE_MICROS,
+            }),
+            Duration::ZERO,
+        )
+        .await
+        .expect("record opaque token");
+    assert!(matches!(outcome, ironauth_store::RedeemOutcome::Consumed));
+    token
 }

@@ -1137,9 +1137,14 @@ impl AuthorizationRepo<'_> {
         // LEFT JOIN grants so a token with no grant (grant_id NULL) still resolves,
         // while a token whose grant chain was revoked comes back inactive. Expiry is
         // compared against the application clock (bound as epoch microseconds).
+        // expires_at/created_at are read back as epoch microseconds (an exact bigint
+        // on PostgreSQL 14+, where EXTRACT(EPOCH ...) is numeric), so the seam issue
+        // #22's introspection response consumes carries the token's `exp` and `iat`.
         let row = sqlx::query(
             "SELECT t.subject AS subject, t.client_id AS client_id, t.audience AS audience, \
-             t.scope AS scope, t.jti AS jti \
+             t.scope AS scope, t.jti AS jti, \
+             (EXTRACT(EPOCH FROM t.expires_at) * 1000000)::bigint AS expires_us, \
+             (EXTRACT(EPOCH FROM t.created_at) * 1000000)::bigint AS issued_us \
              FROM opaque_access_tokens t \
              LEFT JOIN grants g ON g.id = t.grant_id \
              AND g.tenant_id = t.tenant_id AND g.environment_id = t.environment_id \
@@ -1160,6 +1165,8 @@ impl AuthorizationRepo<'_> {
             audience: row.get("audience"),
             scope: row.get("scope"),
             jti: row.get("jti"),
+            expires_at_unix_micros: row.get("expires_us"),
+            issued_at_unix_micros: row.get("issued_us"),
         }))
     }
 }
@@ -2115,6 +2122,17 @@ pub struct ActiveOpaqueToken {
     pub scope: Option<String>,
     /// The token's logical identifier (a `tok_` id string).
     pub jti: String,
+    /// The token's expiry, in microseconds since the Unix epoch (the clock seam
+    /// value the row was written with). The RFC 7662 introspection response (issue
+    /// #22) reports this as `exp`. Reading it does NOT change the resolve semantics:
+    /// an expired token still resolves to [`None`] (the query filters on `expires_at`
+    /// against the caller's `now_micros`), so this field is always in the future of
+    /// the `now_micros` that resolved the token.
+    pub expires_at_unix_micros: i64,
+    /// The token's issuance time, in microseconds since the Unix epoch, read from the
+    /// row's `created_at`. The introspection response (issue #22) reports this as
+    /// `iat`.
+    pub issued_at_unix_micros: i64,
 }
 
 impl fmt::Debug for ActiveOpaqueToken {

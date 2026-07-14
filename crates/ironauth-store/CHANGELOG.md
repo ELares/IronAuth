@@ -28,6 +28,11 @@ range per docs/RELEASING.md.
     (`SELECT, INSERT`) discipline. New `NewOpaqueAccessToken` write input,
     `ActiveOpaqueToken` result, and the exported `opaque_access_token_digest` helper
     (the ONE canonical digest so the mint and the resolve can never disagree).
+    `ActiveOpaqueToken` now also returns `expires_at_unix_micros` (the token's `exp`)
+    and `issued_at_unix_micros` (its `iat`, from the row's `created_at`), read back as
+    exact epoch microseconds, so the RFC 7662 introspection response (issue #22) the
+    resolve seam feeds is complete; the resolve semantics are unchanged (an expired
+    token still resolves to `None`).
   - **`AuthorizationRepo::resolve_opaque_access_token`.** The INTERNAL resolve the
     RFC 7662 introspection endpoint (issue #22) will expose: it hashes the presented
     token and matches it against `token_digest` within scope, returning the live

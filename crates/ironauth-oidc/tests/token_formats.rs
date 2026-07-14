@@ -17,7 +17,10 @@ use std::time::Duration;
 use axum::http::StatusCode;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use common::{Harness, PKCE_VERIFIER, REDIRECT_URI, form, json, verify_clock};
+use common::{
+    Harness, PKCE_CHALLENGE, PKCE_VERIFIER, REDIRECT_URI, enc, form, json, location_param,
+    verify_clock,
+};
 use ironauth_config::{OidcConfig, TokenFormat as ConfigTokenFormat};
 use ironauth_jose::{JwsAlgorithm, VerificationPolicy, verify};
 use ironauth_oidc::OPAQUE_ACCESS_TOKEN_PREFIX;
@@ -52,15 +55,25 @@ fn jose_header_field(token: &str, field: &str) -> String {
 }
 
 /// Whether `token` matches the documented opaque-access-token scanner regex
-/// `ira_at_[A-Za-z0-9_-]{43}` (docs/design/TOKEN-FORMATS.md).
+/// `ira_at_tok_[A-Za-z0-9_-]{64}~[A-Za-z0-9_-]{43}` (docs/design/TOKEN-FORMATS.md):
+/// the `ira_at_` prefix, the scope-declaring routing handle (a `tok_` scoped id, 48
+/// bytes = 64 base64url chars), the `~` delimiter, and 256 bits (43 base64url chars)
+/// of secret entropy.
 fn matches_opaque_access_regex(token: &str) -> bool {
-    let Some(body) = token.strip_prefix("ira_at_") else {
+    let is_b64url = |s: &str| {
+        s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    };
+    let Some(rest) = token.strip_prefix("ira_at_") else {
         return false;
     };
-    body.len() == 43
-        && body
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    let Some((handle, secret)) = rest.split_once('~') else {
+        return false;
+    };
+    let Some(scope_payload) = handle.strip_prefix("tok_") else {
+        return false;
+    };
+    scope_payload.len() == 64 && is_b64url(scope_payload) && secret.len() == 43 && is_b64url(secret)
 }
 
 /// Register a resource server in the harness scope.
@@ -218,16 +231,47 @@ async fn at_jwt_access_token_conforms_to_rfc9068_and_verifies_under_eddsa() {
 }
 
 /// AC #3: `acr` and `auth_time` appear in the at+jwt from an authenticated user
-/// flow (here a client that registered `require_auth_time`, so the authentication
-/// instant is frozen onto the code as due).
+/// flow (a client that registered `require_auth_time`, so the authentication instant
+/// is frozen onto the code as due), and `auth_time` is the value TRUTHFULLY threaded
+/// from the session, not a hardcoded 0 nor the mint-time clock.
+///
+/// The session records its authentication at a known NONZERO instant; the harness
+/// clock is then advanced strictly PAST it before the exchange, so the minted token's
+/// `iat` is strictly greater than `auth_time`. Asserting the exact recorded value
+/// therefore fails both a hardcoded-0 bug and a re-read-the-clock-at-mint bug.
 #[tokio::test]
 async fn at_jwt_carries_acr_and_auth_time_from_an_authenticated_flow() {
+    // A known nonzero authentication instant, and a strictly-later mint instant.
+    const AUTH_TIME_SECS: i64 = 1_234;
+    const AUTH_TIME_MICROS: i64 = AUTH_TIME_SECS * 1_000_000;
+
     let harness = Harness::start().await;
     let client = harness
         .create_client_requiring_auth_time()
         .await
         .to_string();
-    let code = harness.issue_authenticated_code_pkce(&client).await;
+
+    // The session records its authentication at AUTH_TIME_MICROS.
+    let subject = harness.seed_unique_user().await;
+    harness.grant_consent(&subject, &client).await;
+    let cookie = harness
+        .session_cookie_at(&subject, "pwd", AUTH_TIME_MICROS)
+        .await;
+
+    // Advance the clock strictly PAST the recorded auth instant before the exchange,
+    // so the token is minted (its iat) later than auth_time. require_auth_time (with
+    // no max_age) freezes the session's recorded instant onto the code WITHOUT forcing
+    // re-authentication, so the advanced clock never re-derives auth_time.
+    harness.clock().advance(Duration::from_secs(2_000));
+
+    let query = format!(
+        "response_type=code&client_id={client}&redirect_uri={}&\
+         code_challenge={PKCE_CHALLENGE}&code_challenge_method=S256",
+        enc(REDIRECT_URI),
+    );
+    let (status, headers, body) = harness.authorize_with_cookie(&query, &cookie).await;
+    assert_eq!(status, StatusCode::FOUND, "authorize: {body}");
+    let code = location_param(&headers, "code").expect("code in redirect");
 
     let (status, _, body) = harness.token(&token_form(&code, &client)).await;
     assert_eq!(status, StatusCode::OK, "token exchange: {body}");
@@ -236,19 +280,31 @@ async fn at_jwt_carries_acr_and_auth_time_from_an_authenticated_flow() {
         .expect("access_token")
         .to_owned();
 
-    let verified =
-        verify(&access_token, &harness.policy(&client), &verify_clock()).expect("at+jwt verifies");
+    // Verify against the harness clock at the ADVANCED mint instant, so the token's
+    // (later-than-epoch) iat/exp fall within the verify window.
+    let verified = verify(&access_token, &harness.policy(&client), &**harness.clock())
+        .expect("at+jwt verifies");
     let claims = verified.claims();
     assert!(
         claims.get("acr").and_then(|v| v.as_str()).is_some(),
         "acr appears from the authenticated flow"
     );
-    // The harness session records auth_time at the epoch, and require_auth_time
-    // freezes it onto the code, so it is emitted truthfully (0 seconds).
+    // auth_time is the session's RECORDED instant (epoch seconds), threaded onto the
+    // code and into the token, not a hardcoded 0 and not the mint-time clock.
     assert_eq!(
         claims.get("auth_time").and_then(serde_json::Value::as_i64),
-        Some(0),
-        "auth_time appears from the authenticated flow"
+        Some(AUTH_TIME_SECS),
+        "auth_time is the truthfully recorded value"
+    );
+    // The mint instant (iat) is strictly later than auth_time, so the assertion above
+    // could not have passed by re-reading the clock at mint time.
+    let iat = claims
+        .get("iat")
+        .and_then(serde_json::Value::as_i64)
+        .expect("iat");
+    assert!(
+        iat > AUTH_TIME_SECS,
+        "the token was minted strictly after the recorded auth_time (iat {iat})"
     );
 }
 

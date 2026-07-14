@@ -20,13 +20,28 @@ range per docs/RELEASING.md.
     client` check keeps working); when a registered resource server is targeted it is
     that resource server's audience. `client_id` is always the OAuth client.
   - **Opaque access tokens (Hydra digest-only pattern).** A new opaque format mints
-    a random `ira_at_` token (>= 256 bits from the ironauth-env entropy seam) and
-    stores ONLY its SHA-256 digest plus metadata (`opaque_access_tokens`), never the
-    token. There is no offline validation; the internal
-    `AuthorizationRepo::resolve_opaque_access_token` (the seam issue #22 exposes over
-    HTTP) is the only verification path. The `ira_at_` prefix scheme and its scanner
-    regex, plus the reserved `ira_rt_` refresh prefix (issue #21), are documented in
+    a SCOPE-DECLARING `ira_at_` token and stores ONLY its SHA-256 digest plus metadata
+    (`opaque_access_tokens`), never the token. The token is
+    `ira_at_<jti>~<256-bit secret>`: the `jti` is a `tok_` scoped id that embeds the
+    token's `(tenant, environment)` as a NON-secret routing handle (so a global
+    consumer can recover the scope and run the scope-bound store resolve, exactly as
+    an `at+jwt`'s `jti` does), and the 256-bit suffix from the ironauth-env entropy
+    seam is the secret; only the digest of the WHOLE token is stored. There is no
+    offline validation; the internal `AuthorizationRepo::resolve_opaque_access_token`
+    is the only verification path. The `ira_at_` prefix scheme and its scanner regex,
+    plus the reserved `ira_rt_` refresh prefix (issue #21), are documented in
     `docs/design/TOKEN-FORMATS.md`.
+  - **`UserInfo` consumes BOTH access-token formats.** The `UserInfo` endpoint now
+    validates an opaque `ira_at_` token, not just an `at+jwt`: it recovers the scope
+    from the token's routing handle and runs the scope-bound, row-level-security
+    `resolve_opaque_access_token`, then enforces the SAME checks it enforces for an
+    `at+jwt` -- `aud == client` (the confused-deputy gate, so a resource-server token
+    is refused), the `openid` scope, and the PUBLIC `sub` through the one shared
+    subject derivation from the resolved LOCAL subject. Every failure (absent,
+    expired, revoked-grant, cross-scope, wrong audience) is the uniform RFC 6750
+    `invalid_token` `401`, with no oracle distinguishing an opaque-but-unknown token
+    from a malformed one. Without this an environment defaulted to `opaque` minted
+    access tokens `UserInfo` rejected, so the opaque format was inert until issue #22.
   - **Per-resource-server format selection.** `OidcState::resolve_access_token_target`
     resolves the access-token format, audience, and lifetime: a targeted resource
     server (matched by audience) supplies its `token_format` and
