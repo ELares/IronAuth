@@ -139,7 +139,7 @@
         "default_access_token_format": {
           "$ref": "#/$defs/TokenFormat",
           "default": "at_jwt",
-          "description": "The access-token format this environment mints when no resource server is\ntargeted (issue #29). The spec-conform default (`at_jwt`) mints a\nself-contained RFC 9068 signed JWT whose audience is the client id, so\n`UserInfo` and offline verification keep working. Setting it to `opaque`\nmints a random, digest-only reference token instead (validated only by\nintrospection, #22). A registered resource server overrides this per\naudience. This is a promotable per-environment setting: it appears in config\nsnapshots and rides the M5 promotion pipeline; the process value is the\ndeployment default until per-environment overrides land."
+          "description": "The access-token format this environment mints when no resource server is\ntargeted (issue #29). The spec-conform default (`at_jwt`) mints a\nself-contained RFC 9068 signed JWT whose audience is the client id, so\n`UserInfo` and offline verification keep working. Setting it to `opaque`\nmints a random, digest-only reference token instead, validated by a scoped\nstore lookup (`UserInfo` resolves it directly; the RFC 7662 introspection\nendpoint, #22, exposes the same lookup). A registered resource server overrides this per\naudience. This is a promotable per-environment setting: it appears in config\nsnapshots and rides the M5 promotion pipeline; the process value is the\ndeployment default until per-environment overrides land."
         },
         "enable_response_mode_form_post": {
           "default": false,
@@ -319,7 +319,7 @@
         },
         {
           "const": "opaque",
-          "description": "An opaque, digest-only reference access token (`ira_at_` prefix). Not\noffline-verifiable; state lives only in the store (introspection, #22).",
+          "description": "An opaque, digest-only reference access token (`ira_at_` prefix). Not\noffline-verifiable; state lives only in the store and is validated by a\nscoped store lookup. `UserInfo` resolves it directly; the RFC 7662\nintrospection endpoint (#22) exposes the same lookup over HTTP.",
           "type": "string"
         }
       ]

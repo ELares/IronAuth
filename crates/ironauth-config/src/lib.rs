@@ -166,7 +166,9 @@ pub enum TokenFormat {
     #[default]
     AtJwt,
     /// An opaque, digest-only reference access token (`ira_at_` prefix). Not
-    /// offline-verifiable; state lives only in the store (introspection, #22).
+    /// offline-verifiable; state lives only in the store and is validated by a
+    /// scoped store lookup. `UserInfo` resolves it directly; the RFC 7662
+    /// introspection endpoint (#22) exposes the same lookup over HTTP.
     Opaque,
 }
 
@@ -326,8 +328,9 @@ pub struct OidcConfig {
     /// targeted (issue #29). The spec-conform default (`at_jwt`) mints a
     /// self-contained RFC 9068 signed JWT whose audience is the client id, so
     /// `UserInfo` and offline verification keep working. Setting it to `opaque`
-    /// mints a random, digest-only reference token instead (validated only by
-    /// introspection, #22). A registered resource server overrides this per
+    /// mints a random, digest-only reference token instead, validated by a scoped
+    /// store lookup (`UserInfo` resolves it directly; the RFC 7662 introspection
+    /// endpoint, #22, exposes the same lookup). A registered resource server overrides this per
     /// audience. This is a promotable per-environment setting: it appears in config
     /// snapshots and rides the M5 promotion pipeline; the process value is the
     /// deployment default until per-environment overrides land.
