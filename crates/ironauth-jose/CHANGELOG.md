@@ -6,6 +6,11 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- `KeySet::published_signing_keys(now)` (issue #194): the private signing keys
+  published at `now` (publish window open, not yet expired), for a caller that
+  needs the trusted VERIFYING projection of an issuer's own currently-valid keys
+  (the OIDC provider's `verify_access_token`). Mirrors `published_kids` but hands
+  back the `SigningKey`s rather than the serialized public JWK Set.
 - Initial hardened JOSE verification core (issue #8): the single, allowlist-
   driven JWS/JWT verify choke point every IronAuth token surface inherits its
   security from. Verify-only; signing/key-storage/JWKS are issue #9. See

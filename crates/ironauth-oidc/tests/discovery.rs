@@ -3,9 +3,11 @@
 //! Discovery generated from live config, served on both well-known forms (issue
 //! #18).
 //!
-//! Database-free and key-free: the discovery surface needs only the issuer string,
-//! the endpoint/capability registries, and the algorithm policy, so it is driven
-//! directly through the [`ironauth_oidc::discovery_router`]. Covers acceptance
+//! Database-free: the discovery surface resolves each environment's signing policy
+//! from a registry entry, so these tests pre-populate an in-memory
+//! [`ironauth_oidc::IssuerRegistry`] with an Ed25519 key for the tested scope (no
+//! database, no store) and drive it through the [`ironauth_oidc::discovery_router`].
+//! Covers acceptance
 //! criteria 3 (explicit `request_uri_parameter_supported: false`; RS256 alongside
 //! `EdDSA` in a default-policy environment), 4 (policy-filtered algorithm arrays with
 //! the RS256 floor), 5 (both well-known forms resolve with the exact issuer
@@ -14,18 +16,21 @@
 //! criterion 2 (every advertised `*_supported` array equals the registry the
 //! owning subsystem exposes).
 
+use std::sync::Arc;
+use std::time::SystemTime;
+
 use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
 use http_body_util::BodyExt;
 use ironauth_config::OidcConfig;
 use ironauth_env::Env;
-use ironauth_jose::{JwsAlgorithm, SigningPolicy};
+use ironauth_jose::{JwsAlgorithm, KeySet, SigningKey, SigningPolicy};
 use ironauth_oidc::{
     ADVERTISED_ENDPOINTS, ClientAuthMethod, DiscoveryCapabilities, DiscoveryState, GrantType,
-    ID_TOKEN_CLAIMS_SUPPORTED, JwksCacheWindow, PkceMethod, PromptValue, ResponseMode,
-    ResponseType, SCOPES_SUPPORTED, SubjectType, discovery_document, discovery_router,
-    id_token_signing_alg_values,
+    ID_TOKEN_CLAIMS_SUPPORTED, IssuerEntry, IssuerRegistry, JwksCacheWindow, PairwiseSalt,
+    PkceMethod, PromptValue, ResponseMode, ResponseType, SCOPES_SUPPORTED, SubjectType,
+    discovery_document, discovery_router, id_token_signing_alg_values,
 };
 use ironauth_store::{EnvironmentId, Scope, TenantId};
 use serde_json::{Value, json};
@@ -33,12 +38,33 @@ use tower::ServiceExt;
 
 const ISSUER_BASE: &str = "https://issuer.test";
 
-/// A discovery router over `ISSUER_BASE` with the given capabilities and a default
-/// (`EdDSA`) policy, plus a freshly generated scope.
+/// A discovery router over `ISSUER_BASE` with the given capabilities and a freshly
+/// generated scope, PROVISIONED in a pre-populated (database-free) registry with an
+/// Ed25519 key so its resolved policy is the default (`EdDSA`).
+///
+/// Discovery now resolves the per-environment policy from a registry entry (issue
+/// #194), so an unprovisioned scope 404s; provisioning the tested scope keeps the
+/// document rendering while preserving every existing assertion.
 fn router_and_scope(capabilities: DiscoveryCapabilities) -> (Router, Scope) {
     let env = Env::system();
     let scope = Scope::new(TenantId::generate(&env), EnvironmentId::generate(&env));
-    let state = DiscoveryState::new(ISSUER_BASE, JwksCacheWindow::clamped(600), capabilities);
+    let registry = IssuerRegistry::new(ISSUER_BASE, JwksCacheWindow::clamped(600));
+    let key =
+        SigningKey::ed25519_from_seed(Some("disco-kid".to_owned()), &[0x11; 32]).expect("key");
+    registry.insert(
+        scope,
+        IssuerEntry::new(
+            KeySet::bootstrap(key, SystemTime::UNIX_EPOCH),
+            SigningPolicy::eddsa_default(),
+            PairwiseSalt::new(Vec::new()),
+        ),
+    );
+    let state = DiscoveryState::new(
+        ISSUER_BASE,
+        JwksCacheWindow::clamped(600),
+        capabilities,
+        Arc::new(registry),
+    );
     (discovery_router(state), scope)
 }
 

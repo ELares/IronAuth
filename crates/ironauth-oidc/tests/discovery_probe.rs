@@ -16,6 +16,8 @@
 mod common;
 
 use std::collections::HashSet;
+use std::sync::Arc;
+use std::time::SystemTime;
 
 use axum::Router;
 use axum::body::Body;
@@ -23,9 +25,10 @@ use axum::http::{Request, StatusCode};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use http_body_util::BodyExt;
+use ironauth_jose::{KeySet, SigningKey, SigningPolicy};
 use ironauth_oidc::{
     ADVERTISED_ENDPOINTS, DiscoveryCapabilities, DiscoveryState, ID_TOKEN_CLAIMS_SUPPORTED,
-    JwksCacheWindow, discovery_router,
+    IssuerEntry, IssuerRegistry, JwksCacheWindow, PairwiseSalt, discovery_router,
 };
 use serde_json::Value;
 use tower::ServiceExt;
@@ -34,13 +37,30 @@ use crate::common::{Harness, ISSUER_BASE, PKCE_VERIFIER, REDIRECT_URI, form, jso
 
 /// The merged live router (protocol + discovery) and the appended-form discovery
 /// URL for the harness scope.
+///
+/// Discovery now resolves the per-environment policy from a registry entry (issue
+/// #194), so the harness scope is PROVISIONED in a pre-populated (database-free)
+/// registry with an Ed25519 key; an unprovisioned scope would 404. This probe
+/// exercises the config-driven advertised-vs-mounted diff, not the store path.
 fn live_router(harness: &Harness) -> (Router, String) {
+    let scope = harness.scope();
+    let registry = IssuerRegistry::new(ISSUER_BASE, JwksCacheWindow::clamped(600));
+    let key =
+        SigningKey::ed25519_from_seed(Some("probe-kid".to_owned()), &[0x11; 32]).expect("key");
+    registry.insert(
+        scope,
+        IssuerEntry::new(
+            KeySet::bootstrap(key, SystemTime::UNIX_EPOCH),
+            SigningPolicy::eddsa_default(),
+            PairwiseSalt::new(Vec::new()),
+        ),
+    );
     let discovery = discovery_router(DiscoveryState::new(
         ISSUER_BASE,
         JwksCacheWindow::clamped(600),
         DiscoveryCapabilities::default(),
+        Arc::new(registry),
     ));
-    let scope = harness.scope();
     let discovery_url = format!(
         "/t/{}/e/{}/.well-known/openid-configuration",
         scope.tenant(),

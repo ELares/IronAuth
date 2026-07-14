@@ -522,7 +522,8 @@ async fn mint_front_channel_id_token(
     resolved: &Resolved<'_>,
     code: Option<&str>,
 ) -> Result<String, ()> {
-    let signer = state.signer_for(&scope.environment()).ok_or(())?;
+    let entry = state.issuer_entry(&scope).await.ok_or(())?;
+    let signer = entry.signer(state.now()).ok_or(())?;
     let alg = signer.algorithm();
     // The `sub` is resolved through the ONE shared derivation, so a front-channel
     // ID token's subject can never diverge from what the token endpoint or UserInfo
@@ -558,7 +559,7 @@ async fn mint_front_channel_id_token(
         c_hash: c_hash.as_deref(),
         extra_claims: &extra_claims,
     };
-    tokens::mint_id_token(state, signer, &request).map(|(id_token, _jti)| id_token)
+    tokens::mint_id_token(state, signer, entry.policy(), &request).map(|(id_token, _jti)| id_token)
 }
 
 /// The claims to embed in a PURE front-channel ID token (`response_type=id_token`),

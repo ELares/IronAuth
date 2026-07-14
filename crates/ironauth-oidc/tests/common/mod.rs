@@ -19,11 +19,18 @@ use http_body_util::BodyExt;
 use ironauth_config::OidcConfig;
 use ironauth_env::{Env, ManualClock};
 use ironauth_jose::{
-    EnvironmentKeyStore, JwsAlgorithm, SigningKey, TrustedKey, VerificationPolicy,
+    JwsAlgorithm, KeySet, SigningKey, SigningPolicy, TrustedKey, VerificationPolicy,
 };
-use ironauth_oidc::{ClientAuthMethod, OidcState, SESSION_COOKIE, oidc_router};
+use ironauth_oidc::{
+    ClientAuthMethod, DiscoveryCapabilities, DiscoveryState, IssuerEntry, IssuerRegistry,
+    IssuerState, JwksCacheWindow, OidcState, PairwiseSalt, SESSION_COOKIE, discovery_router,
+    issuer_router, oidc_router,
+};
 use ironauth_store::test_support::TestDatabase;
-use ironauth_store::{ClientId, CorrelationId, Scope, SessionId, Store};
+use ironauth_store::{
+    ClientId, CorrelationId, NewSigningKey, Scope, SessionId, SigningKeyId, SigningKeyMaterialKind,
+    Store,
+};
 use tower::ServiceExt;
 
 /// The RFC 7636 Appendix B PKCE verifier and its S256 challenge.
@@ -39,6 +46,67 @@ pub const ISSUER_BASE: &str = "https://issuer.test";
 pub const FAR_FUTURE_MICROS: i64 = 4_102_444_800_000_000;
 /// The password the seeded harness users are created with.
 pub const SEED_PASSWORD: &str = "correct horse battery staple";
+
+/// A committed throwaway ECDSA P-256 PKCS#8 key, for provisioning an ES256-only
+/// environment (AC #3). Generated offline by ring's `generate_pkcs8`, exactly like
+/// the ironauth-jose signing fixtures; secret only in the technical sense.
+const ES256_PKCS8: &[u8] = &[
+    0x30, 0x81, 0x87, 0x02, 0x01, 0x00, 0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02,
+    0x01, 0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07, 0x04, 0x6d, 0x30, 0x6b, 0x02,
+    0x01, 0x01, 0x04, 0x20, 0xfc, 0x76, 0xdf, 0x7c, 0x3d, 0x9f, 0xef, 0x33, 0x39, 0x20, 0x6f, 0x02,
+    0xe9, 0xec, 0xb3, 0x30, 0x0b, 0xcd, 0x3b, 0x01, 0xf4, 0x09, 0x91, 0x10, 0x23, 0x75, 0x80, 0xd2,
+    0xda, 0x1b, 0x3e, 0xf9, 0xa1, 0x44, 0x03, 0x42, 0x00, 0x04, 0x85, 0xd1, 0x32, 0xad, 0x68, 0xc7,
+    0x5b, 0x7e, 0xd4, 0x5c, 0x7e, 0xef, 0x46, 0x5e, 0x98, 0xa3, 0x30, 0xb6, 0x71, 0x4b, 0x9a, 0xfb,
+    0x29, 0xc9, 0xbd, 0xdf, 0xaa, 0x2a, 0xe6, 0xf8, 0xdf, 0x63, 0xc4, 0x97, 0x49, 0x4b, 0x76, 0xcc,
+    0x05, 0xbe, 0xdc, 0x5f, 0xb9, 0xb8, 0xe7, 0x1c, 0x9c, 0x86, 0x4e, 0x47, 0xde, 0x6f, 0xf4, 0x08,
+    0xf2, 0x34, 0x12, 0x9d, 0xb0, 0x02, 0x94, 0xe0, 0xc7, 0x4d,
+];
+
+/// The signing-key algorithm a store-backed harness provisions its environment
+/// with.
+enum HarnessKey {
+    Ed25519,
+    Es256,
+}
+
+/// The provisioned key material plus the public verifying key derived from it.
+struct ProvisionedKey {
+    algorithm: &'static str,
+    material_kind: SigningKeyMaterialKind,
+    material: Vec<u8>,
+    verifying_key: TrustedKey,
+}
+
+impl HarnessKey {
+    /// Build the signing key for `key_id` and return the material to persist and the
+    /// public verifying key derived from the SAME material.
+    fn provision(&self, env: &Env, key_id: &SigningKeyId) -> ProvisionedKey {
+        let kid = Some(key_id.to_string());
+        match self {
+            HarnessKey::Ed25519 => {
+                let mut seed = [0_u8; 32];
+                env.entropy().fill_bytes(&mut seed);
+                let signing_key = SigningKey::ed25519_from_seed(kid, &seed).expect("ed25519 key");
+                ProvisionedKey {
+                    algorithm: "EdDSA",
+                    material_kind: SigningKeyMaterialKind::Ed25519Seed,
+                    material: seed.to_vec(),
+                    verifying_key: signing_key.verifying_key().expect("verifying key"),
+                }
+            }
+            HarnessKey::Es256 => {
+                let signing_key =
+                    SigningKey::ecdsa_p256_from_pkcs8(kid, ES256_PKCS8).expect("es256 key");
+                ProvisionedKey {
+                    algorithm: "ES256",
+                    material_kind: SigningKeyMaterialKind::EcdsaPkcs8,
+                    material: ES256_PKCS8.to_vec(),
+                    verifying_key: signing_key.verifying_key().expect("verifying key"),
+                }
+            }
+        }
+    }
+}
 
 /// A running OIDC provider over a fresh database.
 pub struct Harness {
@@ -77,13 +145,171 @@ impl Harness {
     /// Like [`Harness::start`] but with explicit OIDC settings (for the expiry
     /// test, which wants a short code lifetime).
     pub async fn start_with(config: OidcConfig) -> Self {
+        let (db, env, clock, scope, client_id) = Self::seed_common().await;
+
+        // One Ed25519 signing key for the environment, held in a PRE-POPULATED
+        // registry: the database-free key path the non-#194 tests rely on. The
+        // registry is the single key holder (issue #194); OidcState no longer holds
+        // a separate key store.
+        let signing_key =
+            SigningKey::generate_ed25519(Some("k1".to_owned()), env.entropy()).expect("gen key");
+        let verifying_key = signing_key.verifying_key().expect("verifying key");
+        let registry = IssuerRegistry::new(
+            ISSUER_BASE,
+            JwksCacheWindow::clamped(config.jwks_cache_max_age_secs),
+        );
+        registry.insert(
+            scope,
+            IssuerEntry::new(
+                KeySet::bootstrap(signing_key, SystemTime::UNIX_EPOCH),
+                SigningPolicy::eddsa_default(),
+                PairwiseSalt::new(Vec::new()),
+            ),
+        );
+
+        let state = OidcState::new(
+            db.store().clone(),
+            env.clone(),
+            Arc::new(registry),
+            &config,
+            ISSUER_BASE,
+        );
+        let issuer = state.issuer_for(&scope);
+        let router = oidc_router(state);
+
+        Self {
+            db,
+            env,
+            clock,
+            scope,
+            client_id,
+            verifying_key,
+            issuer,
+            router,
+        }
+    }
+
+    /// Like [`Harness::start`] but the registry is STORE-BACKED (issue #194): the
+    /// environment's Ed25519 signing key is PROVISIONED into the database, and the
+    /// live registry loads it lazily through the RLS-forced scoped store on first
+    /// use. The per-environment JWKS surface is mounted alongside the protocol
+    /// router, so a test can fetch the published key set the mint actually signs
+    /// with. Confidential PKCE is relaxed, exactly like [`Harness::start`].
+    pub async fn start_store_backed() -> Self {
+        Self::start_store_backed_with(OidcConfig {
+            require_pkce_for_confidential_clients: false,
+            ..OidcConfig::default()
+        })
+        .await
+    }
+
+    /// Like [`Harness::start_store_backed`] but with explicit OIDC settings (for
+    /// example a non-default `jwks_cache_max_age_secs`, so the served JWKS
+    /// `Cache-Control` can be asserted against the configured window). Provisions an
+    /// Ed25519 environment key.
+    pub async fn start_store_backed_with(config: OidcConfig) -> Self {
+        Self::build_store_backed(config, HarnessKey::Ed25519).await
+    }
+
+    /// Like [`Harness::start_store_backed`] but the environment is provisioned with
+    /// an ES256-ONLY signing key. Because the live registry derives the algorithm
+    /// policy from exactly the keys it loads (issue #194), this environment's policy
+    /// is `{ES256}`, so it can emit nothing but ES256 tokens: proving that an
+    /// ES256-only environment never emits a non-ES256 token on the live mint path
+    /// (AC #3). Confidential PKCE is relaxed, exactly like [`Harness::start`].
+    pub async fn start_store_backed_es256() -> Self {
+        Self::build_store_backed(
+            OidcConfig {
+                require_pkce_for_confidential_clients: false,
+                ..OidcConfig::default()
+            },
+            HarnessKey::Es256,
+        )
+        .await
+    }
+
+    /// Build a store-backed harness whose environment is provisioned with `key`,
+    /// mounting the protocol, per-environment JWKS, and discovery routers over the
+    /// one lazy registry (exactly as `main.rs` mounts all three), so a test can
+    /// fetch the LIVE discovery document whose per-environment policy is derived from
+    /// the loaded key set.
+    async fn build_store_backed(config: OidcConfig, key: HarnessKey) -> Self {
+        let (db, env, clock, scope, client_id) = Self::seed_common().await;
+
+        // Build the key with its `sik_` id as the kid and PROVISION the SAME
+        // material into the store, so the lazily loaded key rebuilds identically and
+        // a minted token's kid matches the provisioned (and published) key.
+        let key_id = SigningKeyId::generate(&env, &scope);
+        let provisioned = key.provision(&env, &key_id);
+        db.store()
+            .scoped(scope)
+            .acting(db.test_actor(&env), CorrelationId::generate(&env))
+            .signing_keys()
+            .provision(
+                &env,
+                NewSigningKey {
+                    id: &key_id,
+                    algorithm: provisioned.algorithm,
+                    material_kind: provisioned.material_kind,
+                    material: &provisioned.material,
+                    // A day-one key is published and active from the epoch (the
+                    // harness clock), so it signs and appears in the JWKS at once.
+                    publish_at_micros: 0,
+                    activate_at_micros: 0,
+                    retire_at_micros: None,
+                    expire_at_micros: None,
+                },
+            )
+            .await
+            .expect("provision signing key");
+
+        let registry = Arc::new(IssuerRegistry::store_backed(
+            ISSUER_BASE,
+            JwksCacheWindow::clamped(config.jwks_cache_max_age_secs),
+            db.store().clone(),
+        ));
+        let issuer_state = IssuerState::new(Arc::clone(&registry), env.clone());
+        // Discovery over the SAME store-backed registry (issue #194), so the served
+        // discovery document derives its per-environment policy from the loaded keys.
+        let discovery_state = DiscoveryState::new(
+            ISSUER_BASE,
+            JwksCacheWindow::clamped(config.jwks_cache_max_age_secs),
+            DiscoveryCapabilities::from_config(&config),
+            Arc::clone(&registry),
+        );
+        let state = OidcState::new(
+            db.store().clone(),
+            env.clone(),
+            Arc::clone(&registry),
+            &config,
+            ISSUER_BASE,
+        );
+        let issuer = state.issuer_for(&scope);
+        let router = oidc_router(state)
+            .merge(issuer_router(issuer_state))
+            .merge(discovery_router(discovery_state));
+
+        Self {
+            db,
+            env,
+            clock,
+            scope,
+            client_id,
+            verifying_key: provisioned.verifying_key,
+            issuer,
+            router,
+        }
+    }
+
+    /// Seed the shared fixtures both constructors build on: a fresh database, a
+    /// deterministic clock frozen at the Unix epoch, a `(tenant, environment)`
+    /// scope, and one OAuth client with the harness redirect URI registered (so the
+    /// exact-string redirect match, issue #13, accepts it).
+    async fn seed_common() -> (TestDatabase, Env, Arc<ManualClock>, Scope, ClientId) {
         let db = TestDatabase::start().await;
         let (env, clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0x0D1C_5EED);
         let scope = db.seed_scope(&env).await;
 
-        // One OAuth client in scope (the authorization endpoint validates it),
-        // with the harness redirect URI registered so the exact-string redirect
-        // match (issue #13) accepts it.
         let client_id = db
             .store()
             .scoped(scope)
@@ -100,27 +326,7 @@ impl Harness {
             .await
             .expect("register redirect uri");
 
-        // One Ed25519 signing key for the environment.
-        let signing_key =
-            SigningKey::generate_ed25519(Some("k1".to_owned()), env.entropy()).expect("gen key");
-        let verifying_key = signing_key.verifying_key().expect("verifying key");
-        let mut keys = EnvironmentKeyStore::new();
-        keys.insert(scope.environment(), signing_key);
-
-        let state = OidcState::new(db.store().clone(), env.clone(), keys, &config, ISSUER_BASE);
-        let issuer = state.issuer_for(&scope);
-        let router = oidc_router(state);
-
-        Self {
-            db,
-            env,
-            clock,
-            scope,
-            client_id,
-            verifying_key,
-            issuer,
-            router,
-        }
+        (db, env, clock, scope, client_id)
     }
 
     /// The data-plane store behind the router, for verifying audit rows and token
@@ -156,6 +362,42 @@ impl Harness {
             .seed_environment(&self.env, self.scope.tenant())
             .await;
         Scope::new(self.scope.tenant(), environment)
+    }
+
+    /// Seed a SEPARATE tenant and environment (a foreign scope, owned by a
+    /// DIFFERENT tenant) and provision its own Ed25519 signing key. Returns the
+    /// foreign scope.
+    ///
+    /// Used to prove env-to-tenant binding (issue #194 AC #5): this environment
+    /// resolves 200 under its OWN tenant, but a request that names it under the
+    /// harness's different tenant must fail closed (RLS finds no rows), never
+    /// serving this scope's key set as a self-consistent bogus 200.
+    pub async fn provision_foreign_scope(&self) -> Scope {
+        let scope = self.db.seed_scope(&self.env).await;
+        let key_id = SigningKeyId::generate(&self.env, &scope);
+        let mut seed = [0_u8; 32];
+        self.env.entropy().fill_bytes(&mut seed);
+        let (actor, corr) = self.seeding_actor();
+        self.store()
+            .scoped(scope)
+            .acting(actor, corr)
+            .signing_keys()
+            .provision(
+                &self.env,
+                NewSigningKey {
+                    id: &key_id,
+                    algorithm: "EdDSA",
+                    material_kind: SigningKeyMaterialKind::Ed25519Seed,
+                    material: &seed,
+                    publish_at_micros: 0,
+                    activate_at_micros: 0,
+                    retire_at_micros: None,
+                    expire_at_micros: None,
+                },
+            )
+            .await
+            .expect("provision foreign signing key");
+        scope
     }
 
     /// The manual clock handle, for advancing time in the expiry test.

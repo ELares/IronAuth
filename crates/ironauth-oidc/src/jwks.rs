@@ -23,10 +23,11 @@
 //! Discovery (both well-known forms) is served independently by
 //! [`crate::discovery`], which needs only live config, the issuer string, and the
 //! per-environment algorithm policy: NOT the loaded signing keys. This JWKS
-//! surface DOES need the loaded keys, so it is mounted on the live data plane only
-//! once per-environment key loading lands (issue #194). The [`IssuerRegistry`]
-//! that backs it is built at composition time from the persisted keys and
-//! policies.
+//! surface DOES need the loaded keys, and is now mounted on the live data plane
+//! (issue #194). The [`IssuerRegistry`] that backs it is store-backed and LAZY: it
+//! reads a scope's keys through the RLS-forced [`ironauth_store::Store::scoped`] on
+//! the first request for that issuer and caches the result, so an unprovisioned or
+//! cross-tenant environment loads zero rows and yields a uniform 404.
 
 use std::sync::Arc;
 
@@ -91,7 +92,7 @@ async fn jwks(
         return not_found();
     };
     let now = state.env.clock().now_utc();
-    let body = match state.registry.jwks_json(&scope, now) {
+    let body = match state.registry.jwks_json(&scope, now).await {
         Some(Ok(body)) => body,
         // Unregistered environment: a uniform not-found.
         None => return not_found(),

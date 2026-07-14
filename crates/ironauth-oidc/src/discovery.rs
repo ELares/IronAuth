@@ -11,11 +11,14 @@
 //! - the per-tenant/per-environment signing-algorithm [`SigningPolicy`] (issue
 //!   #19).
 //!
-//! It needs NONE of the loaded signing keys, so per-request discovery serving is
-//! achievable without the operator-plane key enumeration issue #194 defers: the
-//! [`discovery_router`] resolves the scope from the URL path and generates from
-//! config. (The JWKS surface in [`crate::jwks`] does need the loaded keys and is
-//! mounted by #194.)
+//! The [`discovery_router`] resolves the `(tenant, environment)` scope from the URL
+//! path and renders from that environment's loaded key set: it consults the SAME
+//! store-backed [`IssuerRegistry`](crate::issuer::IssuerRegistry) the mint and the
+//! JWKS surface read (issue #194), deriving the per-environment signing policy from
+//! exactly the keys that environment signs with. Discovery, JWKS, and the minted
+//! tokens therefore cannot advertise divergent algorithms. An unprovisioned or
+//! cross-tenant scope resolves to no entry and returns a uniform `404`, exactly
+//! like the JWKS surface in [`crate::jwks`].
 //!
 //! # What is advertised, and where it comes from
 //!
@@ -55,6 +58,8 @@
 //!   `{host}/.well-known/oauth-authorization-server/{issuer-path}`
 //!   `{host}/.well-known/openid-configuration/{issuer-path}`
 
+use std::sync::Arc;
+
 use axum::Router;
 use axum::extract::{Path, State};
 use axum::http::HeaderMap;
@@ -67,7 +72,7 @@ use serde_json::{Value, json};
 
 use crate::client_auth::ClientAuthMethod;
 use crate::hints::Display;
-use crate::issuer::JwksCacheWindow;
+use crate::issuer::{IssuerRegistry, JwksCacheWindow};
 use crate::registry::{GrantType, PkceMethod, PromptValue, ResponseMode, ResponseType};
 use crate::subject::SubjectType;
 use crate::wellknown::{cacheable_response, not_found, parse_scope};
@@ -419,40 +424,40 @@ fn to_strings<'a>(values: impl Iterator<Item = &'a str>) -> Vec<String> {
 
 /// The shared state for the discovery surface.
 ///
-/// Holds only what discovery needs: the deployment base URL, the JWKS/discovery
-/// cache window, the per-environment capabilities, and the algorithm policy
-/// source. It deliberately carries NO signing keys and NO store handle, which is
-/// why it mounts on the live data plane today (issue #18) ahead of the key loading
-/// issue #194 defers.
+/// Holds the deployment base URL, the JWKS/discovery cache window, the
+/// per-environment capabilities, and the shared [`IssuerRegistry`]: the SAME
+/// store-backed registry the mint and the JWKS surface read (issue #194). Discovery
+/// resolves each environment's signing policy from that registry, so it can never
+/// advertise an algorithm the served JWKS and the minted tokens do not use.
 #[derive(Clone)]
 pub struct DiscoveryState {
     issuer_base: String,
     cache: JwksCacheWindow,
     capabilities: DiscoveryCapabilities,
-    default_policy: SigningPolicy,
+    registry: Arc<IssuerRegistry>,
 }
 
 impl DiscoveryState {
     /// Build the discovery state from the deployment base URL, the cache window,
-    /// and the per-environment capabilities.
+    /// the per-environment capabilities, and the shared [`IssuerRegistry`].
     ///
-    /// The algorithm policy defaults to [`SigningPolicy::eddsa_default`] for every
-    /// scope. Per-environment policy resolution ([`SigningPolicy::resolve`]) is the
-    /// generator's input and is fully unit-tested; the LIVE mount feeds it the
-    /// deployment default until per-environment policy sources load (alongside the
-    /// keys, issue #194). Swapping in a per-scope policy source is a change to
-    /// [`DiscoveryState::policy_for`] only.
+    /// Discovery resolves the per-environment signing policy from the loaded key set
+    /// (the SAME registry the mint and the JWKS surface read, issue #194), so
+    /// discovery, JWKS, and the minted tokens can never advertise divergent
+    /// algorithms. An unprovisioned or cross-tenant scope resolves to no entry and
+    /// returns a uniform `404`, exactly like the JWKS surface.
     #[must_use]
     pub fn new(
         issuer_base: impl Into<String>,
         cache: JwksCacheWindow,
         capabilities: DiscoveryCapabilities,
+        registry: Arc<IssuerRegistry>,
     ) -> Self {
         Self {
             issuer_base: issuer_base.into(),
             cache,
             capabilities,
-            default_policy: SigningPolicy::eddsa_default(),
+            registry,
         }
     }
 
@@ -473,24 +478,24 @@ impl DiscoveryState {
         )
     }
 
-    /// The signing-algorithm policy for `scope`.
-    ///
-    /// Today the deployment default for every scope (see [`DiscoveryState::new`]);
-    /// the seam a per-environment policy source plugs into.
-    fn policy_for(&self, _scope: &Scope) -> &SigningPolicy {
-        &self.default_policy
-    }
-
     /// Render the discovery document for an already-parsed `scope` as a cacheable
-    /// response (the malformed-scope `404` is handled by the caller before this).
-    fn respond(&self, scope: &Scope, headers: &HeaderMap) -> Response {
+    /// response, resolving the environment's policy from the shared registry.
+    ///
+    /// Returns a uniform `404` when the scope has no entry (unprovisioned or
+    /// cross-tenant, which loads zero rows under row-level security), the SAME
+    /// not-found the caller returns for a malformed scope, so the two are
+    /// indistinguishable and match the JWKS surface.
+    async fn respond(&self, scope: &Scope, headers: &HeaderMap) -> Response {
+        let Some(entry) = self.registry.entry_for(scope).await else {
+            return not_found();
+        };
         let issuer = self.issuer_for(scope);
         let jwks_uri = format!("{issuer}/jwks.json");
         let document = discovery_document(
             &issuer,
             self.base(),
             &jwks_uri,
-            self.policy_for(scope),
+            entry.policy(),
             &self.capabilities,
         );
         cacheable_response(
@@ -512,9 +517,11 @@ impl std::fmt::Debug for DiscoveryState {
 
 /// Build the per-issuer discovery router, serving both well-known forms.
 ///
-/// Mount it on the PUBLIC data plane alongside the protocol router. Every route
-/// resolves the `(tenant, environment)` scope from the URL path and generates the
-/// document from live config; a malformed scope is a uniform `404`.
+/// Mount it on the PUBLIC data plane alongside the protocol and JWKS routers. Every
+/// route resolves the `(tenant, environment)` scope from the URL path and renders
+/// the document from that environment's loaded key set (via the shared
+/// [`IssuerRegistry`](crate::issuer::IssuerRegistry)); a malformed, unprovisioned,
+/// or cross-tenant scope is a uniform `404`.
 pub fn discovery_router(state: DiscoveryState) -> Router {
     Router::new()
         // OIDC Discovery 1.0 section 4: the well-known suffix is APPENDED to the
@@ -544,7 +551,7 @@ async fn appended_openid_configuration(
     Path((tenant_id, environment_id)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> Response {
-    serve(&state, &tenant_id, &environment_id, &headers)
+    serve(&state, &tenant_id, &environment_id, &headers).await
 }
 
 /// `GET {host}/.well-known/oauth-authorization-server/{issuer-path}` (RFC 8414,
@@ -554,7 +561,7 @@ async fn inserted_oauth_authorization_server(
     Path((tenant_id, environment_id)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> Response {
-    serve(&state, &tenant_id, &environment_id, &headers)
+    serve(&state, &tenant_id, &environment_id, &headers).await
 }
 
 /// `GET {host}/.well-known/openid-configuration/{issuer-path}` (host-inserted
@@ -564,13 +571,14 @@ async fn inserted_openid_configuration(
     Path((tenant_id, environment_id)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> Response {
-    serve(&state, &tenant_id, &environment_id, &headers)
+    serve(&state, &tenant_id, &environment_id, &headers).await
 }
 
-/// Resolve the scope and render, or a uniform `404` for a malformed scope. All
-/// three well-known forms funnel through here, so every one returns the identical
-/// document for a given issuer.
-fn serve(
+/// Resolve the scope and render from the environment's registry entry, or a uniform
+/// `404` for a malformed, unprovisioned, or cross-tenant scope. All three
+/// well-known forms funnel through here, so every one returns the identical document
+/// for a given issuer.
+async fn serve(
     state: &DiscoveryState,
     tenant_id: &str,
     environment_id: &str,
@@ -579,7 +587,7 @@ fn serve(
     let Some(scope) = parse_scope(tenant_id, environment_id) else {
         return not_found();
     };
-    state.respond(&scope, headers)
+    state.respond(&scope, headers).await
 }
 
 #[cfg(test)]

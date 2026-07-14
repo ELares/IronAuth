@@ -173,6 +173,7 @@ async fn resolve(
     //    is where an expired, tampered, or forged token is rejected.
     let verified = state
         .verify_access_token(&scope, &resolution.client_id, &token)
+        .await
         .map_err(|()| UserInfoError::InvalidToken)?;
 
     // The granted scope drives which claim sets are released (Core 5.4). UserInfo

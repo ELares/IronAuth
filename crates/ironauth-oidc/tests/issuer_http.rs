@@ -37,9 +37,9 @@ fn registry_with_one_environment(
     let scope = Scope::new(TenantId::generate(env), EnvironmentId::generate(env));
     let key = SigningKey::ed25519_from_seed(Some(kid.to_owned()), &[seed_byte; 32]).expect("key");
     let keyset = KeySet::bootstrap(key, SystemTime::UNIX_EPOCH);
-    let mut registry = IssuerRegistry::new(ISSUER_BASE, JwksCacheWindow::clamped(600));
+    let registry = IssuerRegistry::new(ISSUER_BASE, JwksCacheWindow::clamped(600));
     registry.insert(
-        scope.environment(),
+        scope,
         IssuerEntry::new(
             keyset,
             SigningPolicy::eddsa_default(),
@@ -159,11 +159,11 @@ async fn two_environments_have_disjoint_issuers_and_key_sets() {
     // Two environments, each with its own key, in one registry.
     let scope_a = Scope::new(TenantId::generate(&env), EnvironmentId::generate(&env));
     let scope_b = Scope::new(TenantId::generate(&env), EnvironmentId::generate(&env));
-    let mut registry = IssuerRegistry::new(ISSUER_BASE, JwksCacheWindow::clamped(600));
+    let registry = IssuerRegistry::new(ISSUER_BASE, JwksCacheWindow::clamped(600));
     for (scope, kid, seed) in [(&scope_a, "kid-a", 0xAA_u8), (&scope_b, "kid-b", 0xBB_u8)] {
         let key = SigningKey::ed25519_from_seed(Some(kid.to_owned()), &[seed; 32]).expect("key");
         registry.insert(
-            scope.environment(),
+            *scope,
             IssuerEntry::new(
                 KeySet::bootstrap(key, SystemTime::UNIX_EPOCH),
                 SigningPolicy::eddsa_default(),

@@ -4,22 +4,31 @@
 //! keys, its algorithm policy, its JWKS, and its discovery document.
 //!
 //! Every tenant and environment gets its OWN issuer URL and `jwks_uri` with an
-//! independent key set (issue #19). This module holds the in-memory view a
-//! request handler consults: an [`IssuerRegistry`] maps an [`EnvironmentId`] to an
+//! independent key set (issue #19). This module holds the view a request handler
+//! consults: an [`IssuerRegistry`] maps a `(tenant, environment)` [`Scope`] to an
 //! [`IssuerEntry`] (its [`KeySet`], its [`SigningPolicy`], and its pairwise salt),
 //! and derives the per-scope issuer string, the published JWKS (rotation-aware and
 //! policy-filtered), and the discovery metadata.
 //!
 //! Keys are LOADED from the persistence layer's per-environment `signing_keys`
-//! rows (see [`load_signing_key`]) into the [`KeySet`]s here, so the isolation the
-//! store enforces (a key row is reachable only within its own scope) carries
-//! straight into the serving path.
+//! rows (see [`load_signing_key`]) into the [`KeySet`]s here. The live registry is
+//! LAZY and STORE-BACKED (issue #194): on the first access for a scope it reads
+//! that scope's keys through [`Store::scoped`], which is row-level-security forced,
+//! and caches the resulting entry. Because every load is scoped to
+//! `(tenant, environment)`, the isolation the store enforces (a key row is
+//! reachable only within its own scope) carries straight into the serving path,
+//! and a request that names an environment under the WRONG tenant loads zero rows
+//! and fails closed. Both the mint (through [`crate::OidcState`]) and the
+//! JWKS/discovery serving (through [`crate::IssuerState`]) share the SAME
+//! `Arc<IssuerRegistry>` and the SAME cached [`IssuerEntry`], so a signed `kid` is
+//! in the published JWKS by construction.
 
 use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime};
 
 use ironauth_jose::{JwsAlgorithm, KeyFamily, KeySet, SigningKey, SigningKeyError, SigningPolicy};
-use ironauth_store::{EnvironmentId, Scope, SigningKeyMaterialKind, SigningKeyRecord};
+use ironauth_store::{Scope, SigningKeyMaterialKind, SigningKeyRecord, Store};
 
 use crate::subject::PairwiseSalt;
 
@@ -156,30 +165,78 @@ impl IssuerEntry {
 
 /// The registry of per-environment issuers.
 ///
-/// Keyed by [`EnvironmentId`]; every lookup is by environment, so an entry can
-/// never be reached for the wrong tenant/environment pair. Build it at
-/// composition time from the persisted keys and policies.
+/// Keyed by the FULL `(tenant, environment)` [`Scope`], so an entry can never be
+/// reached for the wrong tenant/environment pair: a request naming an environment
+/// under a foreign tenant gets its own cache slot, which loads zero rows under
+/// row-level security and stays absent (fail closed).
+///
+/// Two construction paths:
+///
+/// - [`IssuerRegistry::store_backed`] is the LIVE path: entries load LAZILY from
+///   the data-plane [`Store`], scoped (RLS-forced) to `(tenant, environment)` on
+///   first access, then cache.
+/// - [`IssuerRegistry::new`] is an empty registry with NO loader, pre-populated by
+///   [`IssuerRegistry::insert`]; it never touches a store. Used by the tests.
 pub struct IssuerRegistry {
     issuer_base: String,
     cache: JwksCacheWindow,
-    entries: HashMap<EnvironmentId, IssuerEntry>,
+    // Interior-mutable so the store-backed registry fills entries lazily behind a
+    // shared `Arc`. The async store read happens OUTSIDE this lock; the lock is
+    // taken only for the fast map lookup and the insert.
+    entries: RwLock<HashMap<Scope, Arc<IssuerEntry>>>,
+    // The data-plane store the lazy loader reads per-environment signing keys
+    // through. `None` for a pre-populated registry, which never loads from a store.
+    loader: Option<Store>,
 }
 
 impl IssuerRegistry {
     /// An empty registry over `issuer_base` (the deployment's externally visible
-    /// base URL) with the given JWKS cache window.
+    /// base URL) with the given JWKS cache window and NO store loader.
+    ///
+    /// Entries are supplied by [`IssuerRegistry::insert`]; a scope with no inserted
+    /// entry resolves to `None`. This is the pre-populated path the tests use.
     #[must_use]
     pub fn new(issuer_base: impl Into<String>, cache: JwksCacheWindow) -> Self {
         Self {
             issuer_base: issuer_base.into(),
             cache,
-            entries: HashMap::new(),
+            entries: RwLock::new(HashMap::new()),
+            loader: None,
         }
     }
 
-    /// Register an environment's issuer entry.
-    pub fn insert(&mut self, environment: EnvironmentId, entry: IssuerEntry) {
-        self.entries.insert(environment, entry);
+    /// A registry over `issuer_base` that loads each environment's keys LAZILY from
+    /// `store`, scoped (RLS-forced) to `(tenant, environment)` on first access.
+    ///
+    /// This is the live composition path (issue #194): the SAME `store` the mint
+    /// authenticates as `ironauth_app` through, so every key load is beneath the
+    /// forced row-level-security backstop.
+    #[must_use]
+    pub fn store_backed(
+        issuer_base: impl Into<String>,
+        cache: JwksCacheWindow,
+        store: Store,
+    ) -> Self {
+        Self {
+            issuer_base: issuer_base.into(),
+            cache,
+            entries: RwLock::new(HashMap::new()),
+            loader: Some(store),
+        }
+    }
+
+    /// Pre-populate `scope`'s issuer entry (the pre-populated path). Takes `&self`
+    /// through the interior lock, so a registry can be filled after it is shared.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if the internal lock is poisoned, which happens after a panic
+    /// while another thread held it (never in normal operation).
+    pub fn insert(&self, scope: Scope, entry: IssuerEntry) {
+        self.entries
+            .write()
+            .expect("issuer registry lock is not poisoned")
+            .insert(scope, Arc::new(entry));
     }
 
     /// The JWKS cache window.
@@ -188,10 +245,41 @@ impl IssuerRegistry {
         self.cache
     }
 
-    /// The entry for `environment`, if registered.
-    #[must_use]
-    pub fn entry(&self, environment: &EnvironmentId) -> Option<&IssuerEntry> {
-        self.entries.get(environment)
+    /// The issuer entry for `scope`, loading and caching it on the first access
+    /// when this registry is store-backed. `None` when the environment has no
+    /// provisioned signing key (fail closed) or names a cross-tenant environment
+    /// (RLS yields no rows), or when this registry has no loader and the scope was
+    /// never pre-populated.
+    ///
+    /// A cache miss reads the store OUTSIDE the lock; two concurrent misses for the
+    /// same scope may both load, which is idempotent (both build from the same
+    /// RLS-scoped rows) and the first insert wins.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if the internal lock is poisoned, which happens after a panic
+    /// while another thread held it (never in normal operation).
+    pub async fn entry_for(&self, scope: &Scope) -> Option<Arc<IssuerEntry>> {
+        // Fast path: an already-cached entry (pre-populated or previously loaded).
+        if let Some(entry) = self
+            .entries
+            .read()
+            .expect("issuer registry lock is not poisoned")
+            .get(scope)
+        {
+            return Some(Arc::clone(entry));
+        }
+        // Slow path: load from the store, scoped to this exact (tenant, environment).
+        let store = self.loader.as_ref()?;
+        let entry = Arc::new(load_issuer_entry(store, scope).await?);
+        let mut guard = self
+            .entries
+            .write()
+            .expect("issuer registry lock is not poisoned");
+        // A concurrent load may have inserted first; keep whichever is present.
+        Some(Arc::clone(
+            guard.entry(*scope).or_insert_with(|| Arc::clone(&entry)),
+        ))
     }
 
     /// The per-environment issuer string for `scope`. Two environments never share
@@ -213,51 +301,87 @@ impl IssuerRegistry {
     }
 
     /// The published JWKS JSON for `scope`'s environment at `now`, filtered by the
-    /// environment's policy. `None` if the environment is not registered.
+    /// environment's policy. `None` if the environment resolves to no entry (an
+    /// unprovisioned or cross-tenant environment, which fails closed as a 404).
+    ///
+    /// Loads and caches the entry on the first access (see
+    /// [`IssuerRegistry::entry_for`]).
     ///
     /// # Errors
     ///
     /// [`SigningKeyError`] if a published key's public projection cannot be formed.
-    #[must_use]
-    pub fn jwks_json(
+    pub async fn jwks_json(
         &self,
         scope: &Scope,
         now: SystemTime,
     ) -> Option<Result<String, SigningKeyError>> {
-        let entry = self.entry(&scope.environment())?;
+        let entry = self.entry_for(scope).await?;
         Some(
             entry
-                .keyset
-                .published_jwks(now, &entry.policy)
+                .keyset()
+                .published_jwks(now, entry.policy())
                 .and_then(|jwks| jwks.to_json()),
         )
     }
+}
 
-    /// The OIDC discovery document JSON for `scope`. `None` if the environment is
-    /// not registered.
-    ///
-    /// Generated by [`crate::discovery::discovery_document`] from the environment's
-    /// resolved algorithm policy and the shared registries: the SAME generator the
-    /// live (config-only) discovery surface uses, so a registry-backed issuer
-    /// (issue #194, keys loaded) and the config-only discovery serving (issue #18)
-    /// can never advertise a different document for the same issuer. Because it is
-    /// the registry-backed path, the policy here is the environment's REAL policy,
-    /// so the advertised `id_token_signing_alg_values_supported` reflects the keys
-    /// this environment actually signs with (plus the RS256 floor).
-    #[must_use]
-    pub fn discovery_json(&self, scope: &Scope) -> Option<String> {
-        let entry = self.entry(&scope.environment())?;
-        let issuer = self.issuer_for(scope);
-        let jwks_uri = self.jwks_uri_for(scope);
-        let base = self.issuer_base.trim_end_matches('/');
-        let document = crate::discovery::discovery_document(
-            &issuer,
-            base,
-            &jwks_uri,
-            entry.policy(),
-            &crate::discovery::DiscoveryCapabilities::default(),
-        );
-        Some(document.to_string())
+/// Load one environment's live issuer entry from the store, scoped (RLS-forced) to
+/// `scope`.
+///
+/// Returns `None` when the environment has no provisioned signing key (the empty
+/// key set is the fail-closed 404 / `server_error`), when a stored key cannot be
+/// reconstructed, or when the derived policy is empty. A request that names an
+/// environment under the wrong tenant loads zero rows here (RLS), so it too
+/// resolves to `None`: a self-consistent bogus issuer can never resolve.
+async fn load_issuer_entry(store: &Store, scope: &Scope) -> Option<IssuerEntry> {
+    let records = store.scoped(*scope).signing_keys().list().await.ok()?;
+    if records.is_empty() {
+        return None;
+    }
+    let mut keyset: Option<KeySet> = None;
+    let mut algorithms: Vec<JwsAlgorithm> = Vec::new();
+    for record in &records {
+        let key = load_signing_key(record).ok()?;
+        let algorithm = key.algorithm();
+        if !algorithms.contains(&algorithm) {
+            algorithms.push(algorithm);
+        }
+        // The stored activation instant governs the key's lifecycle; a day-one
+        // key (the only kind this issue wires) is published and active together.
+        let activate_at = system_time_from_micros(record.activate_at_unix_micros);
+        match keyset.as_mut() {
+            None => keyset = Some(KeySet::bootstrap(key, activate_at)),
+            Some(set) => set.add(key, activate_at),
+        }
+    }
+    // Non-empty by construction (records is non-empty and every record yielded a
+    // key), so both the keyset and the policy are present.
+    let keyset = keyset?;
+    // The policy is exactly the algorithms the loaded keys sign with, so an
+    // ES256-only environment yields policy {ES256} and can emit nothing else
+    // (AC #3): signing needs both a key of the algorithm and a policy that permits
+    // it, and for a non-ES256 algorithm neither is present.
+    let policy = SigningPolicy::new(algorithms).ok()?;
+    // PLACEHOLDER salt: per-environment salt persistence and the pairwise wiring
+    // are a later milestone; nothing live reads this salt yet (the data-plane token
+    // path resolves PUBLIC subjects, which never consult a salt, see
+    // OidcState::resolve_public_subject). An empty salt is the honest placeholder.
+    let salt = PairwiseSalt::new(Vec::new());
+    Some(IssuerEntry::new(keyset, policy, salt))
+}
+
+/// Convert an epoch-microseconds instant (as stored on a signing-key row) to a
+/// [`SystemTime`]. Pure arithmetic over [`SystemTime::UNIX_EPOCH`], not a clock
+/// read, so it does not touch the time seam.
+fn system_time_from_micros(micros: i64) -> SystemTime {
+    if let Ok(micros) = u64::try_from(micros) {
+        SystemTime::UNIX_EPOCH
+            .checked_add(Duration::from_micros(micros))
+            .unwrap_or(SystemTime::UNIX_EPOCH)
+    } else {
+        SystemTime::UNIX_EPOCH
+            .checked_sub(Duration::from_micros(micros.unsigned_abs()))
+            .unwrap_or(SystemTime::UNIX_EPOCH)
     }
 }
 
