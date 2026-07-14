@@ -240,13 +240,14 @@ fn es256_only_policy_bans_eddsa_everywhere_but_keeps_the_rs256_floor() {
     assert_eq!(algs, vec!["ES256".to_owned(), "RS256".to_owned()]);
 
     // No *_supported array anywhere mentions EdDSA under an ES256-only policy,
-    // EXCEPT token_endpoint_auth_signing_alg_values_supported: that is the token
-    // endpoint's fixed `private_key_jwt` assertion-VERIFY matrix (issue #25), which
-    // is independent of the environment's id-token signing policy, so it advertises
-    // the whole asymmetric family (EdDSA included) even here.
+    // EXCEPT the `*_endpoint_auth_signing_alg_values_supported` fields: those are the
+    // fixed `private_key_jwt` assertion-VERIFY matrix (issue #25) the token, revocation,
+    // and introspection endpoints (issue #22) share, which is independent of the
+    // environment's id-token signing policy, so they advertise the whole asymmetric
+    // family (EdDSA included) even here.
     let object = doc.as_object().expect("object");
     for (key, value) in object {
-        if key == "token_endpoint_auth_signing_alg_values_supported" {
+        if key.ends_with("_endpoint_auth_signing_alg_values_supported") {
             continue;
         }
         if key.ends_with("_supported") {
