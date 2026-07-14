@@ -62,6 +62,17 @@ pub enum PolicyPrimitive {
     },
     /// Restrict `property` to the `allowed` value set. A present scalar value must be
     /// in the set; a present array value must have every element in the set.
+    ///
+    /// FOOTGUN: an ABSENT (or null) property is UNCONSTRAINED by `Restrict` (it can
+    /// only reject a value that is actually present). `validate_metadata` then applies
+    /// the SPEC DEFAULT for the omitted property AFTER the chain runs, so a `Restrict`
+    /// whose `allowed` set excludes that spec default can be DODGED by simply omitting
+    /// the property: the client ends up registered with the default value the restrict
+    /// meant to forbid. This is intended and consistent at register AND update time.
+    /// To make a property MANDATORY and pinned, pair the `Restrict` with a `Default`
+    /// (fills the omitted value, so the restrict then validates a present value) or a
+    /// `Force` (overrides it outright). A lone `Restrict` narrows a present value; it
+    /// never makes the property required.
     Restrict {
         /// The metadata property to constrain.
         property: String,
@@ -351,5 +362,55 @@ mod tests {
         // An empty snapshot is an unconstrained chain.
         assert!(parse_chain("[]").expect("empty").is_empty());
         assert!(parse_chain("").expect("blank").is_empty());
+    }
+
+    #[test]
+    fn conflicting_primitives_on_one_property_resolve_in_strict_list_order() {
+        // Two CONFLICTING primitives on the SAME property have a WELL-DEFINED outcome:
+        // each applies in list order to the running metadata map, so the result is
+        // deterministic and order-sensitive (there is no "merge" or precedence beyond
+        // list order). This documents that contract.
+        let property = "token_endpoint_auth_method";
+
+        // Force THEN Reject: the Force sets the value, so the later Reject sees the
+        // property PRESENT and rejects. The reject wins because it runs last.
+        let force_then_reject = vec![
+            PolicyPrimitive::Force {
+                property: property.to_owned(),
+                value: json!("private_key_jwt"),
+            },
+            PolicyPrimitive::Reject {
+                property: property.to_owned(),
+            },
+        ];
+        let mut forced = meta(&json!({}));
+        let rejection =
+            apply_chain(&force_then_reject, &mut forced).expect_err("reject after force fires");
+        assert_eq!(rejection.property, property);
+        assert_eq!(rejection.reason, PolicyRejectReason::PropertyRejected);
+
+        // The SAME two primitives in the OPPOSITE order, with the property OMITTED:
+        // the Reject passes (nothing present), then the Force sets the value. Opposite
+        // order, opposite outcome, which is exactly the strict-list-order contract.
+        let reject_then_force = vec![
+            PolicyPrimitive::Reject {
+                property: property.to_owned(),
+            },
+            PolicyPrimitive::Force {
+                property: property.to_owned(),
+                value: json!("private_key_jwt"),
+            },
+        ];
+        let mut omitted = meta(&json!({}));
+        apply_chain(&reject_then_force, &mut omitted)
+            .expect("reject passes when absent, then force sets");
+        assert_eq!(omitted[property], json!("private_key_jwt"));
+
+        // Reject THEN Force, but the client SUPPLIED the property: the Reject fires
+        // first on the present value, so the Force is never reached.
+        let mut present = meta(&json!({ property: "client_secret_basic" }));
+        let rejection = apply_chain(&reject_then_force, &mut present)
+            .expect_err("reject fires on a present value before the later force");
+        assert_eq!(rejection.reason, PolicyRejectReason::PropertyRejected);
     }
 }

@@ -31,11 +31,26 @@ range per docs/RELEASING.md.
     `dcr.rate_limited` audit event.
   - **Unverified-client quarantine.** A quarantined client NEVER gets the first-party
     consent carve-out (consent is always shown, ignoring `skip_consent` / implicit
-    mode) and its effective redirect set is restricted to its https targets (a
-    native/loopback redirect is refused with a page error, never an open redirect),
-    until an admin verifies it (which lifts both). Exports the `dcr_policy` engine
-    (`PolicyPrimitive`, `apply_chain`, `parse_chain`, `serialize_chain`) for reuse by
-    the management API.
+    mode) AND its recorded-consent fast path is disabled: a quarantined client
+    re-prompts consent on EVERY authorization even with a PRE-RECORDED consent, until an
+    admin verifies it. Its effective redirect set is restricted to its https targets (a
+    native/loopback redirect is refused with a page error, never an open redirect).
+    Verification lifts all of these. Exports the `dcr_policy` engine (`PolicyPrimitive`,
+    `apply_chain`, `parse_chain`, `serialize_chain`) for reuse by the management API.
+  - **Abuse-control hardening.** The endpoint rate-limit source key is now the
+    non-forgeable transport peer address (from the server's `ConnectInfo`), never a
+    caller-controlled `X-Forwarded-For` hop, so a direct caller can no longer rotate a
+    header to mint a fresh bucket per request or poison a victim's bucket; the endpoint
+    limit is documented as best-effort/advisory (the per-environment quota is the real
+    hard cap; the robust trusted-proxy-aware limiter is deferred to M15). The exposure
+    switch is now evaluated BEFORE the request body is parsed, so an unauthorized
+    request is the uniform 403 regardless of body validity (no 400-vs-403 oracle). A
+    stored policy-chain snapshot that fails to parse now fails CLOSED (a `server_error`
+    at registration and at RFC 7592 update), never proceeding with an unconstrained
+    chain. A `dcr.policy_rejected` audit event now carries the offending property as an
+    operator-safe detail dimension (the wire stays opaque). The `Restrict` primitive's
+    omission footgun (an omitted property is unconstrained, then takes the spec default)
+    is documented on the primitive and in the management API policy-create schema.
 
 - Refresh-token rotation, families, `offline_access`, and consent modes (issue #21).
   - **The `refresh_token` grant.** The token endpoint exchanges a rotating refresh

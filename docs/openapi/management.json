@@ -1591,7 +1591,7 @@
       },
       "CreateDcrPolicyRequest": {
         "type": "object",
-        "description": "The body to create a named, reusable DCR policy (issue #31).\n\n`primitives` is the ordered list of policy primitives, each a JSON object with a\n`kind` of `force`, `restrict`, `reject`, or `default` plus its fields (a `force`\nor `default` carries `property` and `value`; a `restrict` carries `property` and\n`allowed`; a `reject` carries `property`). The management API validates the shape\nat create time against the OIDC policy engine.",
+        "description": "The body to create a named, reusable DCR policy (issue #31).\n\n`primitives` is the ordered list of policy primitives, each a JSON object with a\n`kind` of `force`, `restrict`, `reject`, or `default` plus its fields (a `force`\nor `default` carries `property` and `value`; a `restrict` carries `property` and\n`allowed`; a `reject` carries `property`). The management API validates the shape\nat create time against the OIDC policy engine.\n\nFOOTGUN: `restrict` only narrows a property that is PRESENT; an OMITTED property is\nunconstrained by it, and the endpoint then applies the spec default for the omitted\nproperty. So a `restrict` whose `allowed` set excludes the spec default can be\ndodged by simply omitting the property (the client ends up with the default the\nrestrict meant to forbid). To make a property mandatory and pinned, pair the\n`restrict` with a `default` (fills the omitted value so the restrict validates a\npresent one) or a `force` (overrides it outright). This holds at registration AND\nat RFC 7592 update time.",
         "required": [
           "name",
           "primitives"

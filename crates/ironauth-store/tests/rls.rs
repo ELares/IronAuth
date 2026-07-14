@@ -10,7 +10,7 @@
 
 use ironauth_env::Env;
 use ironauth_store::test_support::TestDatabase;
-use ironauth_store::{ClientId, CorrelationId, ManagementKeyId};
+use ironauth_store::{ClientId, CorrelationId, InitialAccessTokenId, ManagementKeyId};
 use sqlx::Row;
 
 // The test walks four distinct scenarios (deny-by-default, mis-scoped read,
@@ -449,6 +449,175 @@ async fn management_credentials_deny_by_default_on_a_warmed_connection() {
         warmed, 0,
         "a warmed (empty-scope) control connection must still see no credentials"
     );
+}
+
+/// The two clients-quarantine columns are CONTROL-plane-only (issue #31, FIX 1):
+/// migration 0001 gave `ironauth_app` a TABLE-WIDE UPDATE on clients, and a Postgres
+/// table-level UPDATE auto-covers columns added later, so without the 0017 narrowing
+/// the data-plane role could self-verify a quarantined client. This proves the app
+/// role is REFUSED (permission denied, 42501) on `quarantined`/`verified_at` while it
+/// can still update a normal data-plane column, and that the control role CAN write
+/// the quarantine columns (a real split, not a lockout).
+#[tokio::test]
+async fn app_role_cannot_write_the_control_plane_only_quarantine_columns() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+
+    // A client exists in scope, created through the data-plane repository.
+    let id = db
+        .store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .clients()
+        .create(&env, "grant-narrowing client")
+        .await
+        .expect("create client");
+    let id = id.to_string();
+    let tenant = scope.tenant().to_string();
+    let environment = scope.environment().to_string();
+
+    // As the low-privilege APP role, scoped so the row is visible: writing either
+    // quarantine column is refused with permission denied, even though the app role
+    // can see and otherwise update the row.
+    {
+        let mut tx = db.app_pool().begin().await.expect("begin app tx");
+        bind_scope(&mut tx, &tenant, &environment).await;
+        let denied = sqlx::query("UPDATE clients SET quarantined = false WHERE id = $1")
+            .bind(&id)
+            .execute(&mut *tx)
+            .await;
+        assert_permission_denied(denied, "app UPDATE clients.quarantined");
+        let _ = tx.rollback().await;
+    }
+    {
+        let mut tx = db.app_pool().begin().await.expect("begin app tx");
+        bind_scope(&mut tx, &tenant, &environment).await;
+        let denied = sqlx::query(
+            "UPDATE clients \
+             SET verified_at = TIMESTAMPTZ 'epoch' WHERE id = $1",
+        )
+        .bind(&id)
+        .execute(&mut *tx)
+        .await;
+        assert_permission_denied(denied, "app UPDATE clients.verified_at");
+        let _ = tx.rollback().await;
+    }
+
+    // Positive control: the app role CAN still update a data-plane column, so the
+    // narrowed grant is not an over-revoke.
+    {
+        let mut tx = db.app_pool().begin().await.expect("begin app tx");
+        bind_scope(&mut tx, &tenant, &environment).await;
+        let affected = sqlx::query("UPDATE clients SET display_name = $1 WHERE id = $2")
+            .bind("renamed by app")
+            .bind(&id)
+            .execute(&mut *tx)
+            .await
+            .expect("app updates a data-plane column")
+            .rows_affected();
+        assert_eq!(affected, 1, "the app role can update a data-plane column");
+        tx.commit().await.expect("commit app update");
+    }
+
+    // The CONTROL role CAN write both quarantine columns (its narrow
+    // UPDATE(quarantined, verified_at) grant), proving the split is a real separation.
+    {
+        let mut tx = db.control_pool().begin().await.expect("begin control tx");
+        bind_scope(&mut tx, &tenant, &environment).await;
+        let affected = sqlx::query(
+            "UPDATE clients \
+             SET quarantined = true, verified_at = TIMESTAMPTZ 'epoch' WHERE id = $1",
+        )
+        .bind(&id)
+        .execute(&mut *tx)
+        .await
+        .expect("control lifts quarantine")
+        .rows_affected();
+        assert_eq!(
+            affected, 1,
+            "the control role can write the quarantine columns"
+        );
+        tx.commit().await.expect("commit control update");
+    }
+}
+
+/// The data plane's ONLY mutation of an initial access token is the atomic consume,
+/// which bumps `use_count` and nothing else (issue #31, FIX 2). Migration 0017 grants
+/// `ironauth_app` SELECT plus a COLUMN-SCOPED `UPDATE(use_count)`, so a data-plane path
+/// cannot rewrite a token's security-bearing fields (`max_uses`, `policy_chain`,
+/// `token_hash`, `expires_at`) to lift its own cap or swap the bound policy. This
+/// proves the app role CAN bump `use_count` but is REFUSED (42501) on every other
+/// column.
+#[tokio::test]
+async fn app_role_iat_update_is_scoped_to_use_count() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+
+    // Seed a token row as the OWNER (bypasses RLS), so the grant test does not depend
+    // on the control-plane mint path.
+    let iat_id = InitialAccessTokenId::generate(&env, &scope).to_string();
+    let tenant = scope.tenant().to_string();
+    let environment = scope.environment().to_string();
+    sqlx::query(
+        "INSERT INTO dcr_initial_access_tokens \
+         (id, tenant_id, environment_id, token_hash, policy_chain, expires_at, \
+          max_uses, use_count, created_at) \
+         VALUES ($1, $2, $3, $4, '[]', now() + interval '1 hour', 5, 0, now())",
+    )
+    .bind(&iat_id)
+    .bind(&tenant)
+    .bind(&environment)
+    .bind("deadbeefdeadbeef")
+    .execute(db.owner_pool())
+    .await
+    .expect("seed initial access token");
+
+    // The app role CAN bump use_count (the consume path).
+    {
+        let mut tx = db.app_pool().begin().await.expect("begin app tx");
+        bind_scope(&mut tx, &tenant, &environment).await;
+        let affected = sqlx::query(
+            "UPDATE dcr_initial_access_tokens SET use_count = use_count + 1 WHERE id = $1",
+        )
+        .bind(&iat_id)
+        .execute(&mut *tx)
+        .await
+        .expect("app bumps use_count")
+        .rows_affected();
+        assert_eq!(affected, 1, "the app role can bump use_count (consume)");
+        tx.commit().await.expect("commit use_count bump");
+    }
+
+    // The app role CANNOT rewrite any security-bearing column: each is column-scoped
+    // away, so the write is refused with permission denied.
+    let forbidden: [&str; 4] = [
+        "UPDATE dcr_initial_access_tokens SET max_uses = 999999 WHERE id = $1",
+        "UPDATE dcr_initial_access_tokens SET policy_chain = '[]' WHERE id = $1",
+        "UPDATE dcr_initial_access_tokens \
+         SET expires_at = now() + interval '100 years' WHERE id = $1",
+        "UPDATE dcr_initial_access_tokens SET token_hash = 'attacker' WHERE id = $1",
+    ];
+    for statement in forbidden {
+        let mut tx = db.app_pool().begin().await.expect("begin app tx");
+        bind_scope(&mut tx, &tenant, &environment).await;
+        let denied = sqlx::query(statement).bind(&iat_id).execute(&mut *tx).await;
+        assert_permission_denied(denied, statement);
+        let _ = tx.rollback().await;
+    }
+}
+
+/// Assert a statement was refused with the PostgreSQL insufficient-privilege error
+/// (SQLSTATE 42501), the signal that a column-level grant blocked the write.
+fn assert_permission_denied(
+    result: Result<sqlx::postgres::PgQueryResult, sqlx::Error>,
+    what: &str,
+) {
+    match result {
+        Err(sqlx::Error::Database(error)) if error.code().as_deref() == Some("42501") => {}
+        other => panic!("expected permission denied (42501) for `{what}`, got: {other:?}"),
+    }
 }
 
 /// Bind the transaction-local row-level-security scope variables, exactly as

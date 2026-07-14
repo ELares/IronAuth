@@ -23,7 +23,9 @@ range per docs/RELEASING.md.
   - The DCR resources are DATA-plane scoped, so these control-plane endpoints route
     through the control role's narrow grants (mint/verify), never a second data-plane
     store. New `ApiError::Conflict` (409). Now depends on `ironauth-oidc` for the
-    shared policy-primitive type.
+    shared policy-primitive type. The policy-create schema documents the `restrict`
+    omission footgun (an omitted property is unconstrained and then takes the spec
+    default; pair `restrict` with `default` or `force` to make a property mandatory).
 
 - Initial OpenAPI-first management API skeleton (issue #11). Establishes the
   management API contract and discipline once, so the later admin SPA, CLI,

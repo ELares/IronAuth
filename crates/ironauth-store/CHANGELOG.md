@@ -15,16 +15,32 @@ range per docs/RELEASING.md.
     isolation policy (USING + WITH CHECK) and are registered in
     `scripts/query-audit.sh`; the schema-level migration test asserts the token table
     holds no plaintext/secret column.
-  - **Two-role separation across the DCR lifecycle.** A token is MINTED by the control
-    plane and CONSUMED by the data plane, so the grants are deliberately narrow:
-    `ironauth_control` gets INSERT/SELECT on policies and tokens (mint) plus
-    SELECT + `UPDATE(quarantined, verified_at)` on `clients` (verify), while
-    `ironauth_app` gets SELECT/UPDATE on tokens (atomic consume) and SELECT/INSERT/
-    UPDATE on the rate counters. Neither role is a superset of the other.
+  - **Two-role separation across the DCR lifecycle, column-scoped.** A token is MINTED
+    by the control plane and CONSUMED by the data plane, so the grants are deliberately
+    narrow and column-scoped where it matters. `ironauth_control` gets INSERT/SELECT on
+    policies and tokens (mint) plus SELECT + `UPDATE(quarantined, verified_at)` on
+    `clients` (verify). `ironauth_app` gets SELECT + `UPDATE(use_count)` ONLY on tokens
+    (the atomic consume bumps only `use_count`, so a data-plane path can never rewrite a
+    token's `max_uses`/`policy_chain`/`token_hash`/`expires_at` to lift its own cap or
+    swap the bound policy), and SELECT/INSERT/UPDATE on the rate counters. Migration
+    0001 had granted `ironauth_app` a TABLE-WIDE `UPDATE` on `clients`, which a
+    table-level privilege auto-extends to columns added later; 0017 now REVOKEs it and
+    re-grants a COLUMN-SCOPED `UPDATE` over every `clients` column EXCEPT `quarantined`
+    and `verified_at`, so the two quarantine columns are control-plane-only and a
+    data-plane path can no longer self-verify a quarantined client. Neither role is a
+    superset of the other, verified by new grant-restriction tests in `tests/rls.rs`.
   - **Unverified-client quarantine columns.** `clients` gains `quarantined`,
     `verified_at`, and `dcr_policy_chain` (the policy snapshot that bound the
     registration, persisted so RFC 7592 updates re-apply the SAME chain for the
     client's lifetime).
+  - **Operator-safe audit detail dimension.** `audit_log` gains a nullable `detail`
+    column (NULL for every existing write) and `AuditRecord` a matching `detail` field.
+    A `dcr.policy_rejected` event now records the OFFENDING policy property there
+    (operator-authored, never attacker text), so an operator working from the audit
+    table alone gets the actionable reason; the wire response stays opaque.
+  - **Deferred.** The `dcr_rate_counters` table has no reaper: pruning rolled-over
+    windows is the M15 layered rate limiter's job, tracked with that work. The
+    endpoint rate limit is best-effort; the per-environment quota is the hard cap.
   - **Repositories.** `DcrPolicyRepo`/`ActingDcrPolicyRepo` (by-name resolve, create),
     `InitialAccessTokenRepo::consume` (one atomic UPDATE that increments the use count
     only when unexpired and under its limit, so a usage limit cannot be raced past),

@@ -208,6 +208,15 @@ pub struct ManagementKeyList {
 /// or `default` carries `property` and `value`; a `restrict` carries `property` and
 /// `allowed`; a `reject` carries `property`). The management API validates the shape
 /// at create time against the OIDC policy engine.
+///
+/// FOOTGUN: `restrict` only narrows a property that is PRESENT; an OMITTED property is
+/// unconstrained by it, and the endpoint then applies the spec default for the omitted
+/// property. So a `restrict` whose `allowed` set excludes the spec default can be
+/// dodged by simply omitting the property (the client ends up with the default the
+/// restrict meant to forbid). To make a property mandatory and pinned, pair the
+/// `restrict` with a `default` (fills the omitted value so the restrict validates a
+/// present one) or a `force` (overrides it outright). This holds at registration AND
+/// at RFC 7592 update time.
 #[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct CreateDcrPolicyRequest {
     /// The policy name, unique per environment (referenced by name at token mint).

@@ -1348,7 +1348,14 @@ async fn resolve_consent_gate(
         mode,
     };
     let client_id_str = client_id.to_string();
-    let force_consent = prompt.contains(PromptValue::Consent);
+    // `prompt=consent` forces a fresh consent screen. A QUARANTINED (unverified,
+    // possibly phishing) client ALWAYS re-prompts too (issue #31, FIX 4): consent is
+    // shown on EVERY authorization until an admin verifies it. This is what disables
+    // the recorded-consent fast path below (`covered && !force_consent`) for a
+    // quarantined client, so a PRE-RECORDED consent can never silently auto-authorize
+    // it; the first-party carve-out block already refuses its implicit/skip_consent
+    // auto-grant. Verification flips `quarantined` off and restores both.
+    let force_consent = prompt.contains(PromptValue::Consent) || client.quarantined;
     let consent_mode = ConsentMode::parse(&client.consent_mode);
     // The trusted first-party carve-out: an `implicit`-mode client, or one whose
     // `skip_consent` flag is set, never sees the consent screen and is auto-granted.

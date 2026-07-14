@@ -19,10 +19,13 @@
 
 mod common;
 
+use std::time::Duration;
+
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
 use common::{
     FAR_FUTURE_MICROS, Harness, PKCE_CHALLENGE, REDIRECT_URI, enc, location, location_param,
+    send_through,
 };
 use ironauth_config::{OidcConfig, RegistrationMode};
 use ironauth_oidc::{PolicyPrimitive, serialize_chain};
@@ -300,6 +303,26 @@ async fn a_rejected_policy_is_opaque_on_the_wire_but_audited() {
         1,
         "a dcr.policy_rejected audit event records the rejection"
     );
+
+    // FIX 11: the offending property is recorded as the audit event's DETAIL dimension,
+    // so an operator reading the audit table alone (not the structured log) gets the
+    // actionable property. It is operator-authored, so it is safe there; the wire
+    // response stayed opaque above.
+    let rejected = h
+        .store()
+        .scoped(h.scope())
+        .audit()
+        .list()
+        .await
+        .expect("audit list")
+        .into_iter()
+        .find(|row| row.action == "dcr.policy_rejected")
+        .expect("a dcr.policy_rejected audit row");
+    assert_eq!(
+        rejected.detail.as_deref(),
+        Some("jwks_uri"),
+        "the audit detail names the offending property"
+    );
 }
 
 #[tokio::test]
@@ -459,15 +482,27 @@ async fn quarantine_restricts_redirects_to_https_until_verified() {
         h.authorize_with_cookie(&query, cookie).await
     };
 
-    // https redirect, while quarantined: allowed (the restricted set includes https).
+    // https redirect, while quarantined: PASSES the redirect restriction (the
+    // restricted set includes https), so it reaches the consent gate rather than the
+    // redirect-refusal page error the loopback case gets below. A quarantined client
+    // still re-prompts consent (FIX 4), so no code is issued yet even with a recorded
+    // consent; the point here is that the https redirect was NOT refused.
     let subject = h.seed_unique_user().await;
     h.grant_consent(&subject, &client_id).await;
     let cookie = h.session_cookie(&subject).await;
     let (status, headers, body) = authorize(https, &cookie).await;
-    assert_eq!(status, StatusCode::FOUND, "https while quarantined: {body}");
+    assert_eq!(
+        status,
+        StatusCode::FOUND,
+        "an https redirect passes the quarantine restriction and reaches consent: {body}"
+    );
     assert!(
-        location_param(&headers, "code").is_some(),
-        "an https redirect is permitted for a quarantined client"
+        location(&headers).is_some(),
+        "the https redirect was accepted (a redirect to consent), not refused with a page error"
+    );
+    assert!(
+        location_param(&headers, "code").is_none(),
+        "a quarantined client re-prompts consent even for an allowed https redirect (FIX 4)"
     );
 
     // http loopback redirect, while quarantined: refused with a page error (never a
@@ -530,4 +565,262 @@ async fn a_registration_is_not_reachable_under_another_tenants_scope() {
         "a token is not usable under another tenant's scope: {body}"
     );
     assert_eq!(body["error"], "access_denied");
+}
+
+#[tokio::test]
+async fn a_quarantined_client_reprompts_consent_even_with_a_prior_recorded_consent() {
+    // AC2 / FIX 4: a quarantined client's RECORDED-consent fast path is disabled too.
+    // The prior test proves it never SKIPS consent (implicit/skip_consent carve-out);
+    // this proves a PRE-RECORDED consent does not auto-authorize it either. Consent is
+    // shown on EVERY authorization until an admin verifies it, which then restores the
+    // recorded-consent fast path.
+    let h = Harness::start_with(config(RegistrationMode::Open)).await;
+    let (status, reg) = register(&h, None, json!({ "redirect_uris": [REDIRECT_URI] })).await;
+    assert_eq!(status, StatusCode::CREATED, "{reg}");
+    let client_id = reg["client_id"].as_str().expect("client_id").to_owned();
+    let id = client_id_of(&h, &reg);
+    assert!(
+        h.client_quarantined(&id).await,
+        "an anonymous open registration starts quarantined"
+    );
+
+    // Record a consent for a subject, then authorize as that subject WHILE quarantined:
+    // the recorded consent is IGNORED, so no code is issued (the flow diverts to
+    // consent). The confidential (client_secret_basic) client needs no PKCE here (the
+    // harness relaxes confidential PKCE), so a plain authorize reaches the consent gate.
+    let subject = h.seed_unique_user().await;
+    h.grant_consent(&subject, &client_id).await;
+    let query = format!(
+        "response_type=code&client_id={client_id}&redirect_uri={}",
+        enc(REDIRECT_URI)
+    );
+    let cookie = h.session_cookie(&subject).await;
+    let (status, headers, body) = h.authorize_with_cookie(&query, &cookie).await;
+    assert_eq!(status, StatusCode::FOUND, "{body}");
+    assert!(
+        location_param(&headers, "code").is_none(),
+        "a quarantined client re-prompts consent even with a prior recorded consent"
+    );
+
+    // Verify lifts the quarantine; the SAME recorded consent now authorizes the request.
+    h.verify_client(&id).await;
+    assert!(
+        !h.client_quarantined(&id).await,
+        "verification lifts quarantine"
+    );
+    let cookie2 = h.session_cookie(&subject).await;
+    let (status, headers, body) = h.authorize_with_cookie(&query, &cookie2).await;
+    assert_eq!(status, StatusCode::FOUND, "{body}");
+    assert!(
+        location_param(&headers, "code").is_some(),
+        "after verify, the recorded consent authorizes the request (fast path restored)"
+    );
+}
+
+#[tokio::test]
+async fn an_unauthorized_request_is_a_uniform_403_even_with_a_malformed_body() {
+    // FIX 6: the exposure switch is evaluated BEFORE the body is parsed, so a closed
+    // environment refuses with the uniform 403 access_denied regardless of body
+    // validity. A malformed body must never downgrade the authorization refusal to a
+    // 400 that reveals the request got past the exposure check.
+    let h = Harness::start_with(config(RegistrationMode::Closed)).await;
+    let request = Request::builder()
+        .method("POST")
+        .uri(register_path(&h))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from("this is not json"))
+        .expect("request builds");
+    let (status, _headers, text) = h.send(request).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a closed environment refuses a malformed-body request with 403, not 400: {text}"
+    );
+    let body = parse_or_null(&text);
+    assert_eq!(body["error"], "access_denied");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_registrations_cannot_race_past_the_quota() {
+    // AC3 (race proof): with a per-environment quota of K and M > K concurrent
+    // registrations fired at once through routers sharing one store pool, EXACTLY K
+    // commit (201) and the rest get the typed QuotaExceeded 403. The count+INSERT under
+    // the per-scope advisory lock is the only serialization, so this is a faithful
+    // stand-in for M stateless nodes racing on the same database.
+    const QUOTA: usize = 3;
+    const RACERS: usize = 8;
+
+    let h = Harness::start_with(OidcConfig {
+        registration_max_clients: u32::try_from(QUOTA).expect("quota fits"),
+        ..config(RegistrationMode::Open)
+    })
+    .await;
+    let path = register_path(&h);
+    let body = json!({ "redirect_uris": ["https://rp.example/cb"] }).to_string();
+
+    let mut tasks = Vec::with_capacity(RACERS);
+    for _ in 0..RACERS {
+        let router = h.router();
+        let path = path.clone();
+        let body = body.clone();
+        tasks.push(tokio::spawn(async move {
+            let request = Request::builder()
+                .method("POST")
+                .uri(&path)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body))
+                .expect("request builds");
+            send_through(router, request).await
+        }));
+    }
+
+    let mut created = 0_usize;
+    let mut refused = 0_usize;
+    for task in tasks {
+        let (status, _headers, text) = task.await.expect("task joins");
+        match status {
+            StatusCode::CREATED => created += 1,
+            StatusCode::FORBIDDEN => {
+                let body = parse_or_null(&text);
+                assert_eq!(
+                    body["error"], "access_denied",
+                    "a quota refusal is a typed access_denied: {text}"
+                );
+                refused += 1;
+            }
+            other => panic!("unexpected status {other}: {text}"),
+        }
+    }
+    assert_eq!(
+        created, QUOTA,
+        "exactly the quota's worth of concurrent registrations commit"
+    );
+    assert_eq!(
+        refused,
+        RACERS - QUOTA,
+        "every concurrent registration past the cap is a typed QuotaExceeded 403"
+    );
+}
+
+#[tokio::test]
+async fn the_rate_limit_window_resets_after_it_elapses() {
+    // FIX 8: the fixed-window rate-limit RESET branch. At limit 1 the first
+    // registration is allowed and the second (same window, frozen clock) is a 429.
+    // Advancing the manual clock PAST the window starts a fresh window, so the next
+    // registration is allowed again.
+    let h = Harness::start_with(OidcConfig {
+        registration_rate_limit: 1,
+        ..config(RegistrationMode::Open)
+    })
+    .await;
+
+    let (status, reg) = register(
+        &h,
+        None,
+        json!({ "redirect_uris": ["https://rp.example/cb"] }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{reg}");
+
+    // Second registration within the same window: rate limited.
+    let (status, body) = register(
+        &h,
+        None,
+        json!({ "redirect_uris": ["https://rp.example/cb2"] }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+
+    // Advance the clock past the default 60s window; the next registration opens a
+    // FRESH window and is allowed again (the reset branch of the counter upsert).
+    h.clock().advance(Duration::from_secs(61));
+
+    let (status, body) = register(
+        &h,
+        None,
+        json!({ "redirect_uris": ["https://rp.example/cb3"] }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "the window reset allows a fresh registration: {body}"
+    );
+}
+
+#[tokio::test]
+async fn a_restrict_policy_rejects_an_out_of_policy_7592_update() {
+    // AC1 (rejection side) / FIX 9: a `Restrict` policy binds the 7592 update, and it
+    // REJECTS an out-of-policy value rather than silently transforming it. A token
+    // whose chain restricts id_token_signed_response_alg to {EdDSA} registers fine with
+    // EdDSA; a later 7592 PUT trying to move it to a value OUTSIDE the allowed set is
+    // refused with the opaque invalid_client_metadata, and the rejection is audited.
+    let h = Harness::start_with(config(RegistrationMode::TokenGated)).await;
+    let chain = serialize_chain(&[PolicyPrimitive::Restrict {
+        property: "id_token_signed_response_alg".to_owned(),
+        allowed: vec![json!("EdDSA")],
+    }])
+    .expect("serialize chain");
+    h.mint_iat("ira_iat_restrict", &chain, FAR_FUTURE_MICROS, None)
+        .await;
+
+    // Register with the allowed value: accepted (the EdDSA-only environment signs it).
+    let (status, reg) = register(
+        &h,
+        Some("ira_iat_restrict"),
+        json!({
+            "redirect_uris": [REDIRECT_URI],
+            "id_token_signed_response_alg": "EdDSA"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{reg}");
+    assert_eq!(reg["id_token_signed_response_alg"], "EdDSA");
+    let uri = to_path(reg["registration_client_uri"].as_str().expect("uri"));
+    let token = reg["registration_access_token"]
+        .as_str()
+        .expect("token")
+        .to_owned();
+
+    // A 7592 PUT moving the property OUTSIDE the allowed set: REJECTED (not transformed).
+    let (status, body) = send_json(
+        &h,
+        "PUT",
+        &uri,
+        Some(&token),
+        Some(json!({
+            "redirect_uris": [REDIRECT_URI],
+            "id_token_signed_response_alg": "RS256"
+        })),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "an out-of-policy 7592 update is rejected: {body}"
+    );
+    assert_eq!(body["error"], "invalid_client_metadata");
+    let wire = body.to_string();
+    assert!(
+        !wire.contains("id_token_signed_response_alg") && !wire.contains("policy"),
+        "the wire response stays opaque (no property, no policy): {wire}"
+    );
+
+    // The rejection is recorded out of band, with the offending property as the audit
+    // detail (FIX 11) so the update rejection is diagnosable from the audit table.
+    let rejected = h
+        .store()
+        .scoped(h.scope())
+        .audit()
+        .list()
+        .await
+        .expect("audit list")
+        .into_iter()
+        .find(|row| row.action == "dcr.policy_rejected")
+        .expect("a dcr.policy_rejected audit row for the update");
+    assert_eq!(
+        rejected.detail.as_deref(),
+        Some("id_token_signed_response_alg"),
+        "the update rejection audits the offending property"
+    );
 }

@@ -1677,6 +1677,11 @@ impl ActingClientRepo<'_> {
     /// environment). This is the ONE deliberate exception to "audit real mutations
     /// only": an abuse refusal is itself the event of record.
     ///
+    /// `detail` is an OPTIONAL operator-safe dimension recorded on the row (a policy
+    /// rejection passes the offending property name so an operator reading the audit
+    /// table alone gets the actionable reason). It is never attacker-controlled free
+    /// text; the wire response stays opaque regardless.
+    ///
     /// # Errors
     ///
     /// [`StoreError::Database`] on a persistence failure.
@@ -1685,8 +1690,9 @@ impl ActingClientRepo<'_> {
         env: &Env,
         action: Action,
         target: &T,
+        detail: Option<&str>,
     ) -> Result<(), StoreError> {
-        write_audited(
+        write_audited_detailed(
             AuditedWrite {
                 store: self.store,
                 scope: self.scope,
@@ -1697,6 +1703,7 @@ impl ActingClientRepo<'_> {
             },
             async move |_tx| Ok(()),
             false,
+            detail,
         )
         .await
     }
@@ -2889,7 +2896,7 @@ impl ActingAuthorizationRepo<'_> {
                 action: Action::AuthorizationCodeRedeem,
                 target: code_id,
             };
-            insert_audit_row(&mut tx, &spec).await?;
+            insert_audit_row(&mut tx, &spec, None).await?;
             tx.commit().await?;
             return Ok(RedeemOutcome::Consumed);
         }
@@ -2972,7 +2979,7 @@ impl ActingAuthorizationRepo<'_> {
                 action: Action::AuthorizationCodeReuse,
                 target: &grant_id,
             };
-            insert_audit_row(&mut tx, &spec).await?;
+            insert_audit_row(&mut tx, &spec, None).await?;
         }
         tx.commit().await?;
         Ok(RedeemOutcome::Reused)
@@ -3297,7 +3304,7 @@ impl ActingPushedRequestRepo<'_> {
             action: Action::PushedAuthorizationRequestConsume,
             target: id,
         };
-        insert_audit_row(&mut tx, &spec).await?;
+        insert_audit_row(&mut tx, &spec, None).await?;
         tx.commit().await?;
         Ok(ConsumePushedRequest::Consumed { request_params })
     }
@@ -4781,7 +4788,7 @@ impl ActingRefreshRepo<'_> {
                 action: Action::TokenIssue,
                 target: &GrantId::parse_in_scope(grant_text, &scope)?,
             };
-            insert_audit_row(&mut tx, &spec).await?;
+            insert_audit_row(&mut tx, &spec, None).await?;
             tx.commit().await?;
             return Ok(RefreshRedeemOutcome::NotRotated);
         }
@@ -4824,7 +4831,7 @@ impl ActingRefreshRepo<'_> {
                 action: Action::RefreshTokenRotate,
                 target: &RefreshFamilyId::parse_in_scope(family_text, &scope)?,
             };
-            insert_audit_row(&mut tx, &spec).await?;
+            insert_audit_row(&mut tx, &spec, None).await?;
             tx.commit().await?;
             return Ok(RefreshRedeemOutcome::Rotated);
         }
@@ -4905,7 +4912,7 @@ impl ActingRefreshRepo<'_> {
                 action: Action::TokenIssue,
                 target: &GrantId::parse_in_scope(grant_text, &scope)?,
             };
-            insert_audit_row(&mut tx, &spec).await?;
+            insert_audit_row(&mut tx, &spec, None).await?;
             tx.commit().await?;
             return Ok(RefreshRedeemOutcome::RefreshedWithinGrace);
         }
@@ -4938,7 +4945,7 @@ impl ActingRefreshRepo<'_> {
                 action: Action::RefreshTokenReuse,
                 target: &RefreshFamilyId::parse_in_scope(family_text, &scope)?,
             };
-            insert_audit_row(&mut tx, &spec).await?;
+            insert_audit_row(&mut tx, &spec, None).await?;
         }
         tx.commit().await?;
         Ok(RefreshRedeemOutcome::Reused)
@@ -5721,6 +5728,10 @@ pub struct AuditRecord {
     /// The event time in microseconds since the Unix epoch, as recorded from the
     /// application clock seam at mutation time.
     pub occurred_at_unix_micros: i64,
+    /// An optional operator-safe detail dimension (issue #31): the offending policy
+    /// property on a `dcr.policy_rejected` event, `None` for a write that named no
+    /// detail. Never attacker-controlled free text.
+    pub detail: Option<String>,
 }
 
 /// The read-only repository for the append-only audit log.
@@ -5745,7 +5756,7 @@ impl AuditRepo<'_> {
         // microsecond interval), so this only affects the read-back precision.
         let rows = sqlx::query(
             "SELECT id, action, actor_kind, actor_id, target_kind, target_id, \
-             correlation_id, \
+             correlation_id, detail, \
              (EXTRACT(EPOCH FROM occurred_at) * 1000000)::bigint AS occurred_us \
              FROM audit_log \
              WHERE tenant_id = $1 AND environment_id = $2 \
@@ -5780,6 +5791,7 @@ impl AuditRepo<'_> {
             target_id: row.get("target_id"),
             correlation_id,
             occurred_at_unix_micros: row.get("occurred_us"),
+            detail: row.get("detail"),
         })
     }
 }
@@ -5855,10 +5867,29 @@ where
     T: AuditTarget,
     M: AsyncFnOnce(&mut Transaction<'_, Postgres>) -> Result<(), StoreError>,
 {
+    // The overwhelming majority of audited writes carry no detail dimension.
+    write_audited_detailed(spec, mutate, poison_after_audit, None).await
+}
+
+/// Like [`write_audited`] but records an OPERATOR-SAFE `detail` dimension on the
+/// audit row (issue #31): the offending policy property on a DCR abuse event, so an
+/// operator working from the audit table alone gets the actionable reason. `detail`
+/// is never attacker-controlled free text. Every other audited write goes through
+/// [`write_audited`] with no detail, so this is the only path that sets it.
+async fn write_audited_detailed<T, M>(
+    spec: AuditedWrite<'_, T>,
+    mutate: M,
+    poison_after_audit: bool,
+    detail: Option<&str>,
+) -> Result<(), StoreError>
+where
+    T: AuditTarget,
+    M: AsyncFnOnce(&mut Transaction<'_, Postgres>) -> Result<(), StoreError>,
+{
     let mut tx = begin_scoped(spec.store, spec.scope).await?;
     // The data change and the audit row share this one transaction.
     mutate(&mut tx).await?;
-    insert_audit_row(&mut tx, &spec).await?;
+    insert_audit_row(&mut tx, &spec, detail).await?;
     if poison_after_audit {
         // Testing seam only (production callers pass false): force a guaranteed
         // error after both inserts are staged, so their joint rollback proves
@@ -5869,11 +5900,17 @@ where
     Ok(())
 }
 
-/// Insert exactly one audit row into the current transaction. Called only by
-/// [`write_audited`], after the data change and before the commit.
+/// Insert exactly one audit row into the current transaction, after the data change
+/// and before the commit. Called by [`write_audited_detailed`] and by the few custom
+/// write paths that inline their own audited transaction.
+///
+/// `detail` is an OPTIONAL, operator-safe dimension (NULL for almost every write):
+/// the offending policy property on a DCR abuse event (issue #31). It is never
+/// attacker-controlled free text, so it is safe to persist and read back.
 async fn insert_audit_row<T: AuditTarget>(
     tx: &mut Transaction<'_, Postgres>,
     spec: &AuditedWrite<'_, T>,
+    detail: Option<&str>,
 ) -> Result<(), StoreError> {
     let audit_id = AuditId::generate(spec.env, &spec.scope);
     // Event time from the application clock seam, never the database clock, so
@@ -5884,9 +5921,9 @@ async fn insert_audit_row<T: AuditTarget>(
     sqlx::query(
         "INSERT INTO audit_log \
          (id, tenant_id, environment_id, action, actor_kind, actor_id, \
-          target_kind, target_id, correlation_id, occurred_at) \
+          target_kind, target_id, correlation_id, occurred_at, detail) \
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, \
-                 TIMESTAMPTZ 'epoch' + ($10::text || ' microseconds')::interval)",
+                 TIMESTAMPTZ 'epoch' + ($10::text || ' microseconds')::interval, $11)",
     )
     .bind(audit_id.to_string())
     .bind(spec.scope.tenant().to_string())
@@ -5898,6 +5935,7 @@ async fn insert_audit_row<T: AuditTarget>(
     .bind(spec.target.audit_target_id())
     .bind(spec.acting.correlation().to_string())
     .bind(occurred_micros)
+    .bind(detail)
     .execute(&mut **tx)
     .await?;
     Ok(())

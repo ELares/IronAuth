@@ -438,6 +438,18 @@ async fn a_negotiated_id_token_alg_is_the_alg_the_mint_actually_signs_with() {
     let client_id = reg["client_id"].as_str().expect("client_id").to_owned();
     let secret = reg["client_secret"].as_str().expect("secret").to_owned();
 
+    // An open-registered client starts QUARANTINED, which forces consent on EVERY
+    // authorization (issue #31, FIX 4) and would divert the recorded-consent code flow
+    // below to the consent screen. Verify it to lift the quarantine; this test is about
+    // the negotiated id_token algorithm, not the quarantine behavior.
+    let id = h
+        .store()
+        .scoped(h.scope())
+        .clients()
+        .parse_id(&client_id)
+        .expect("client id parses");
+    h.verify_client(&id).await;
+
     // Drive a real code exchange for this DCR client (no PKCE: confidential PKCE is
     // relaxed in the harness config), so the ID token is minted through the token
     // endpoint's real mint path.

@@ -24,12 +24,17 @@
 --      snapshot that rides onto the client (and thus its RFC 7592 registration
 --      access token) for the client's lifetime, so 7592 updates stay constrained
 --      by the SAME policy that bound the original registration.
+--   5. An audit_log ALTER (additive) adding a nullable `detail` dimension, so the
+--      abuse events can carry an operator-safe reason (the offending policy property)
+--      readable from the audit table alone, and a re-scoping of the two clients-touch
+--      roles' UPDATE grants so the quarantine columns are control-plane-only.
 --
 -- Migration safety obligation (see migrate.rs): each NEW tenant-scoped table
 -- ENABLEs and FORCEs row-level security, adds the (tenant, environment) isolation
 -- policy, adds the nonempty-scope CHECK, and is registered in
--- scripts/query-audit.sh. All three new tables do all four. The clients ALTER is a
--- pure additive column expand (defaulted or nullable), safe for the old binary.
+-- scripts/query-audit.sh. All three new tables do all four. The clients and
+-- audit_log ALTERs are pure additive column expands (defaulted or nullable), safe
+-- for the old binary; the GRANT re-scoping only narrows an existing privilege.
 --
 -- Role note (issue #11 peer separation): the DCR abuse-control surface is an
 -- OPERATOR function (mint tokens, author policies, verify clients) over DATA-PLANE
@@ -141,11 +146,19 @@ CREATE POLICY dcr_initial_access_tokens_tenant_isolation ON dcr_initial_access_t
 
 -- A token is MINTED on the control plane (management API) and CONSUMED on the data
 -- plane (the registration endpoint increments use_count), so both roles need
--- rights: control INSERT + SELECT (mint and list), app SELECT + UPDATE (consume).
--- No DELETE: an expired or exhausted token is left in place (a future reaper may
--- prune, tracked with the M15 limiter work).
+-- rights: control INSERT + SELECT (mint and list), app SELECT + column-scoped
+-- UPDATE (consume). No DELETE: an expired or exhausted token is left in place (a
+-- future reaper may prune, tracked with the M15 limiter work).
 GRANT SELECT, INSERT ON dcr_initial_access_tokens TO ironauth_control;
-GRANT SELECT, UPDATE ON dcr_initial_access_tokens TO ironauth_app;
+-- The data plane's ONLY mutation of a token is the atomic consume, which bumps
+-- use_count and nothing else. Grant it SELECT plus a COLUMN-SCOPED UPDATE of exactly
+-- use_count, so a compromised or buggy data-plane path cannot rewrite a token's
+-- security-bearing fields (max_uses, policy_chain, token_hash, expires_at): a
+-- table-wide UPDATE would have let it lift its own usage cap or swap the bound
+-- policy. Column-level UPDATE is the enforcement; the control plane remains the only
+-- writer of everything else on the row.
+GRANT SELECT ON dcr_initial_access_tokens TO ironauth_app;
+GRANT UPDATE (use_count) ON dcr_initial_access_tokens TO ironauth_app;
 
 -- ---------------------------------------------------------------------------
 -- 3. Endpoint-local registration rate counters (issue #31).
@@ -219,3 +232,66 @@ ALTER TABLE clients
 -- OTHER clients column read-only to the control plane.
 GRANT SELECT ON clients TO ironauth_control;
 GRANT UPDATE (quarantined, verified_at) ON clients TO ironauth_control;
+
+-- Column-scope the DATA plane's UPDATE on clients to EVERYTHING EXCEPT the two
+-- control-plane-only quarantine columns.
+--
+-- Migration 0001 granted ironauth_app a TABLE-WIDE UPDATE on clients. A Postgres
+-- table-level UPDATE privilege auto-covers every column added later, so without this
+-- narrowing the data-plane role could write the control-plane-only quarantined /
+-- verified_at columns this feature added: as ironauth_app,
+-- `UPDATE clients SET quarantined = false, verified_at = now()` would succeed,
+-- letting a compromised or buggy data-plane path self-verify an unverified client
+-- and defeat the two-role separation the quarantine headlines. Revoke the table-wide
+-- UPDATE and re-grant a COLUMN-SCOPED UPDATE over exactly the data-plane-owned
+-- columns (every clients column through this migration EXCEPT quarantined and
+-- verified_at). Column-level UPDATE is the enforcement: quarantine can only ever be
+-- lifted by the control plane's verify grant above.
+--
+-- The column list is the full clients schema (0001 create plus every additive ALTER
+-- through 0017) minus the two quarantine columns. Missing a column here would break a
+-- real data-plane UPDATE (the store DB suite exercises them), so it is enumerated in
+-- full; a FUTURE clients column stays app-unwritable until deliberately granted,
+-- which is the whole point (a new control-plane column is never silently data-plane
+-- writable).
+REVOKE UPDATE ON clients FROM ironauth_app;
+GRANT UPDATE (
+    id,
+    tenant_id,
+    environment_id,
+    display_name,
+    created_at,
+    token_endpoint_auth_method,
+    secret_hash,
+    require_auth_time,
+    redirect_uris,
+    jwks,
+    jwks_uri,
+    token_endpoint_auth_signing_alg,
+    registration_access_token_hash,
+    registration_client_uri,
+    id_token_signed_response_alg,
+    application_type,
+    dcr_registered,
+    require_pushed_authorization_requests,
+    consent_mode,
+    skip_consent,
+    store_skipped_consent,
+    refresh_rotation,
+    dcr_policy_chain
+) ON clients TO ironauth_app;
+
+-- ---------------------------------------------------------------------------
+-- 5. Actionable-out-of-band audit detail (issue #31, AC5 observability).
+--
+-- The append-only audit envelope (migration 0002) carries the WHO/WHAT/WHERE/WHEN of
+-- a mutation but no free-form dimension. A `dcr.policy_rejected` event needs to name
+-- the OFFENDING METADATA PROPERTY so an operator working from the audit table alone
+-- (not the structured log) can act on it. The property name is OPERATOR-AUTHORED (it
+-- comes from the policy the operator wrote, never from attacker-controlled request
+-- text), so it is safe as an audit dimension and never an oracle. Add a nullable
+-- `detail` column: NULL for every existing audited write (they name no detail), set
+-- only by the DCR abuse events that carry an operator-safe reason. Additive and safe
+-- for the old binary (the column defaults to NULL and no existing write names it).
+-- The table-level INSERT/SELECT grants already cover the new column for both roles.
+ALTER TABLE audit_log ADD COLUMN detail text;

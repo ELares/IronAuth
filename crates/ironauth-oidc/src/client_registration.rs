@@ -75,10 +75,13 @@
 //! id, the secret, the registration access token) is drawn from the environment
 //! entropy seam.
 
+use std::convert::Infallible;
+use std::net::{IpAddr, SocketAddr};
 use std::time::SystemTime;
 
 use axum::body::Bytes;
-use axum::extract::{Path, State};
+use axum::extract::{ConnectInfo, FromRequestParts, Path, State};
+use axum::http::request::Parts;
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use base64::Engine;
@@ -108,6 +111,43 @@ const REGISTRATION_TOKEN_BYTES: usize = 32;
 /// The spec-default `token_endpoint_auth_method` when omitted (RFC 7591 section 2).
 const DEFAULT_AUTH_METHOD: &str = "client_secret_basic";
 
+/// The TRANSPORT PEER IP of the request, for the endpoint's best-effort rate-limit
+/// source key (issue #31, FIX 3).
+///
+/// This is the address the server's `ConnectInfo<SocketAddr>` reports (installed by
+/// `into_make_service_with_connect_info`), NOT a request header: a raw
+/// `X-Forwarded-For` hop is fully caller-controlled, so keying the rate limit on it
+/// let a direct caller mint a fresh bucket per request (bypassing the limit) or poison
+/// a victim's bucket. The peer address cannot be forged at the application layer, so
+/// it closes that bypass.
+///
+/// Behind a trusted proxy the peer is the proxy, so the source bucket collapses to one
+/// per proxy: the endpoint rate limit is therefore BEST-EFFORT / advisory, and the
+/// real hard cap is the per-environment QUOTA (proven un-raceable) plus the per-token
+/// (`iat:`) counter. The robust, topology-aware limiter is deferred to the M15 layered
+/// rate limiter, which resolves the true client IP under the configured trusted-proxy
+/// policy. `None` when the server installed no `ConnectInfo` (for example an in-process
+/// test router), in which case the source collapses to a single shared bucket.
+///
+/// The extractor never fails: an absent `ConnectInfo` is `None`, not a rejection.
+pub(crate) struct PeerIp(Option<IpAddr>);
+
+impl<S> FromRequestParts<S> for PeerIp
+where
+    S: Send + Sync,
+{
+    type Rejection = Infallible;
+
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Infallible> {
+        Ok(PeerIp(
+            parts
+                .extensions
+                .get::<ConnectInfo<SocketAddr>>()
+                .map(|info| info.0.ip()),
+        ))
+    }
+}
+
 /// `POST {issuer}/connect/register`: register a client from an RFC 7591 metadata
 /// document, returning the created client and its credentials (201 Created).
 ///
@@ -125,6 +165,7 @@ const DEFAULT_AUTH_METHOD: &str = "client_secret_basic";
 pub async fn register(
     State(state): State<OidcState>,
     Path((tenant_id, environment_id)): Path<(String, String)>,
+    peer: PeerIp,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
@@ -139,21 +180,37 @@ pub async fn register(
     let correlation = CorrelationId::generate(state.env());
     let presented = bearer_token(&headers);
 
-    // Endpoint-local rate limiting (issue #31), keyed by source and by presented
-    // token, using the clock seam for the window. Checked before any store write, so
-    // a flood never reaches the create path.
+    // Endpoint-local rate limiting (issue #31), keyed by the transport peer (a
+    // non-forgeable source, FIX 3) and by presented token, using the clock seam for
+    // the window. Checked before any store write, so a flood never reaches the create
+    // path.
     if let Some(refusal) = enforce_rate_limits(
         &state,
         scope,
         actor,
         correlation,
-        &headers,
+        peer.0,
         presented.as_deref(),
     )
     .await
     {
         return refusal;
     }
+
+    // The exposure switch + initial access token (issue #31): decide whether this
+    // request is authorized, resolve the policy chain it must satisfy, and whether
+    // the resulting client starts quarantined. A `token_gated` environment CONSUMES
+    // the presented token here (atomically), so an exhausted or expired token is
+    // refused before the client is created.
+    //
+    // This runs BEFORE the body is parsed (FIX 6), so an UNauthorized request is the
+    // uniform 403 `access_denied` regardless of whether the body is valid JSON: a
+    // malformed body must never turn the authorization refusal into a 400 that leaks
+    // whether the environment is closed / token-gated.
+    let authz = match resolve_registration(&state, scope, presented.as_deref()).await {
+        Ok(authz) => authz,
+        Err(refusal) => return refusal,
+    };
 
     let Ok(metadata) = serde_json::from_slice::<Value>(&body) else {
         return metadata_error("the request body must be a JSON object");
@@ -162,16 +219,6 @@ pub async fn register(
         return metadata_error("the request body must be a JSON object");
     };
     let mut metadata = metadata.clone();
-
-    // The exposure switch + initial access token (issue #31): decide whether this
-    // request is authorized, resolve the policy chain it must satisfy, and whether
-    // the resulting client starts quarantined. A `token_gated` environment CONSUMES
-    // the presented token here (atomically), so an exhausted or expired token is
-    // refused before the client is created.
-    let authz = match resolve_registration(&state, scope, presented.as_deref()).await {
-        Ok(authz) => authz,
-        Err(refusal) => return refusal,
-    };
 
     // Apply the policy chain to the submitted metadata BEFORE validation (force /
     // default / restrict / reject). A rejection stays a GENERIC
@@ -329,7 +376,17 @@ pub async fn update(
     // loosens the constraint. A rejection is opaque on the wire but recorded out of
     // band, exactly as at registration (AC5).
     if let Some(chain_text) = &record.dcr_policy_chain {
-        let chain = parse_chain(chain_text).unwrap_or_default();
+        // Fail CLOSED on a corrupt stored snapshot (FIX 5): a policy-chain snapshot
+        // that will not parse is a broken security control, so refuse the update
+        // rather than proceed with an empty (unconstrained) chain that would silently
+        // drop every constraint. Unreachable today (snapshots are server-serialized
+        // canonical JSON), but the failure mode must be closed, not open.
+        let Ok(chain) = parse_chain(chain_text) else {
+            tracing::error!(
+                "stored dcr policy-chain snapshot failed to parse; refusing the 7592 update"
+            );
+            return server_error();
+        };
         if let Err(rejection) = apply_chain(&chain, &mut metadata) {
             record_policy_rejection_for_client(&state, scope, &record.id, &rejection).await;
             return metadata_error("the request metadata is not acceptable");
@@ -508,7 +565,17 @@ async fn consume_iat_authz(
         .await
     {
         Ok(consumed) => {
-            let chain = parse_chain(&consumed.policy_chain).unwrap_or_default();
+            // Fail CLOSED on a corrupt stored snapshot (FIX 5): a policy-chain snapshot
+            // that will not parse is a broken security control, so refuse the
+            // registration rather than proceed with an empty (unconstrained) chain that
+            // would silently drop every constraint the operator's policy imposed.
+            // Unreachable today (snapshots are server-serialized canonical JSON).
+            let Ok(chain) = parse_chain(&consumed.policy_chain) else {
+                tracing::error!(
+                    "stored dcr policy-chain snapshot failed to parse; refusing the registration"
+                );
+                return Err(server_error());
+            };
             // Persist the token's snapshot verbatim (so a 7592 update re-applies the
             // exact chain); a token that carried no constraints leaves the column NULL.
             let chain_text = (!chain.is_empty()).then(|| consumed.policy_chain.clone());
@@ -536,7 +603,7 @@ async fn enforce_rate_limits(
     scope: Scope,
     actor: ActorRef,
     correlation: CorrelationId,
-    headers: &HeaderMap,
+    peer: Option<IpAddr>,
     presented: Option<&str>,
 ) -> Option<Response> {
     let limit = i64::from(state.registration_rate_limit());
@@ -547,9 +614,9 @@ async fn enforce_rate_limits(
     let now = epoch_micros(state.now());
     let limiter = state.store().scoped(scope).dcr_rate_limiter();
 
-    // The source key is best-effort (a forwarded-for hop) and the token key is the
-    // robust one; a request is refused if EITHER is over its limit.
-    let source_key = format!("src:{}", request_source(headers));
+    // The source key is best-effort (the non-forgeable transport peer, FIX 3) and the
+    // token key is the robust one; a request is refused if EITHER is over its limit.
+    let source_key = format!("src:{}", request_source(peer));
     match limiter
         .check_and_increment(&source_key, limit, window, now)
         .await
@@ -578,19 +645,23 @@ async fn enforce_rate_limits(
     None
 }
 
-/// A best-effort source identifier for rate limiting (issue #31): the first
-/// `X-Forwarded-For` hop when present, else a fixed `unknown` bucket. Endpoint-local
-/// and best-effort; the robust keying is by initial access token. A later issue
-/// delegates this to the M15 layered rate limiter.
-fn request_source(headers: &HeaderMap) -> String {
-    headers
-        .get("x-forwarded-for")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.split(',').next())
-        .map(str::trim)
-        .filter(|hop| !hop.is_empty())
-        .unwrap_or("unknown")
-        .to_owned()
+/// A best-effort source identifier for rate limiting (issue #31, FIX 3): the request's
+/// TRANSPORT PEER address, or a fixed `unknown` bucket when none was resolved.
+///
+/// This deliberately does NOT consult `X-Forwarded-For` (or any forwarding header): a
+/// raw forwarded hop is fully caller-controlled, so keying on it let a direct caller
+/// rotate the header to mint a fresh bucket per request (bypassing the limit entirely)
+/// or forge a victim's address to poison their bucket. The transport peer cannot be
+/// forged at the application layer, which closes both.
+///
+/// The peer is best-effort by design: behind a trusted proxy every request shares the
+/// proxy's address, so this counter is ADVISORY. The real, un-raceable hard cap is the
+/// per-environment quota (proven in `register_dynamic`), backed by the per-token
+/// (`iat:`) counter; the robust, trusted-proxy-aware limiter is deferred to the M15
+/// layered rate limiter (which resolves the true client IP under the configured proxy
+/// policy). `None` (no `ConnectInfo` installed) collapses to one shared bucket.
+fn request_source(peer: Option<IpAddr>) -> String {
+    peer.map_or_else(|| "unknown".to_owned(), |ip| ip.to_string())
 }
 
 /// Record a `dcr.policy_rejected` event out of band (issue #31, AC5): a structured
@@ -605,12 +676,17 @@ async fn record_policy_rejection(
     rejection: &PolicyRejection,
 ) {
     tracing::warn!(diagnostic = %rejection.diagnostic(), "dcr registration policy rejection");
+    // The offending property is OPERATOR-authored (it names a property the operator's
+    // policy constrains, never attacker-supplied text), so it is safe to record as the
+    // audit event's detail dimension (FIX 11): an operator reading the audit table
+    // alone gets the actionable property, while the wire response stays opaque.
+    let detail = Some(rejection.property.as_str());
     let acting = state.store().scoped(scope).acting(actor, correlation);
     let result = match iat_id {
         Some(iat) => {
             acting
                 .clients()
-                .record_dcr_event(state.env(), Action::DcrPolicyRejected, iat)
+                .record_dcr_event(state.env(), Action::DcrPolicyRejected, iat, detail)
                 .await
         }
         // A policy chain only exists when a token was consumed, so this branch is
@@ -618,7 +694,12 @@ async fn record_policy_rejection(
         None => {
             acting
                 .clients()
-                .record_dcr_event(state.env(), Action::DcrPolicyRejected, &scope.environment())
+                .record_dcr_event(
+                    state.env(),
+                    Action::DcrPolicyRejected,
+                    &scope.environment(),
+                    detail,
+                )
                 .await
         }
     };
@@ -636,6 +717,9 @@ async fn record_policy_rejection_for_client(
     rejection: &PolicyRejection,
 ) {
     tracing::warn!(diagnostic = %rejection.diagnostic(), "dcr update policy rejection");
+    // Operator-safe detail dimension (FIX 11): the offending property, so the update
+    // rejection is diagnosable from the audit table alone. The wire stays opaque.
+    let detail = Some(rejection.property.as_str());
     let actor = client_service_actor(client_id);
     let correlation = CorrelationId::generate(state.env());
     if let Err(error) = state
@@ -643,7 +727,7 @@ async fn record_policy_rejection_for_client(
         .scoped(scope)
         .acting(actor, correlation)
         .clients()
-        .record_dcr_event(state.env(), Action::DcrPolicyRejected, client_id)
+        .record_dcr_event(state.env(), Action::DcrPolicyRejected, client_id, detail)
         .await
     {
         tracing::error!(%error, "failed to record dcr.policy_rejected (update)");
@@ -662,7 +746,7 @@ async fn record_quota_hit(
         .scoped(scope)
         .acting(actor, correlation)
         .clients()
-        .record_dcr_event(state.env(), Action::DcrQuotaHit, &scope.environment())
+        .record_dcr_event(state.env(), Action::DcrQuotaHit, &scope.environment(), None)
         .await
     {
         tracing::error!(%error, "failed to record dcr.quota_hit");
@@ -681,7 +765,12 @@ async fn record_rate_limited(
         .scoped(scope)
         .acting(actor, correlation)
         .clients()
-        .record_dcr_event(state.env(), Action::DcrRateLimited, &scope.environment())
+        .record_dcr_event(
+            state.env(),
+            Action::DcrRateLimited,
+            &scope.environment(),
+            None,
+        )
         .await
     {
         tracing::error!(%error, "failed to record dcr.rate_limited");
