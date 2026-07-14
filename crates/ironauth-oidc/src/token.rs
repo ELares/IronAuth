@@ -55,7 +55,7 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use ironauth_store::{
     ActorRef, AuthorizationCodeId, ClientId, CodeBindings, CorrelationId, IssuedTokenRecord,
-    RedeemOutcome, Scope, ServiceId, StoreError,
+    NewOpaqueAccessToken, RedeemOutcome, Scope, ServiceId, StoreError, TokenKind,
 };
 use serde::Deserialize;
 
@@ -66,7 +66,7 @@ use crate::pkce::verify_s256;
 use crate::registry::GrantType;
 use crate::scope_claims::{assemble_claims, parse_scope_set};
 use crate::state::OidcState;
-use crate::tokens::{self, IssuedTokens, MintRequest};
+use crate::tokens::{self, IssuedTokens, MintRequest, MintedAccessToken};
 use crate::util::client_service_actor;
 
 /// Counter: authorization codes presented again after they were already consumed
@@ -189,17 +189,53 @@ async fn exchange(
     //    conformIdTokenClaims override, the scope-derived claims (issue #15).
     let extra_claims = id_token_extra_claims(state, scope, &bindings).await;
     let minted = mint_tokens(state, scope, &bindings, &extra_claims).await?;
-    let records: Vec<IssuedTokenRecord> = minted
-        .records()
-        .into_iter()
-        .map(|(id, kind)| IssuedTokenRecord { id, kind })
-        .collect();
+
+    // Build what the redeem transaction records for the minted tokens (issue #29).
+    // The ID token is always an issued_tokens row; the access token is an
+    // issued_tokens row when it is an at+jwt, or an opaque_access_tokens row (in
+    // the SAME redeem transaction as the consume) when it is opaque. So the access
+    // token can no more be handed out without its stored row than before.
+    let mut records: Vec<IssuedTokenRecord> = vec![IssuedTokenRecord {
+        id: minted.id_jti,
+        kind: TokenKind::Id,
+    }];
+    let opaque = match &minted.access {
+        MintedAccessToken::Jwt { jti, .. } => {
+            records.push(IssuedTokenRecord {
+                id: *jti,
+                kind: TokenKind::Access,
+            });
+            None
+        }
+        MintedAccessToken::Opaque {
+            digest,
+            jti,
+            audience,
+            expires_at_unix_micros,
+            ..
+        } => Some(NewOpaqueAccessToken {
+            token_digest: digest,
+            // The grant is the consumed code's grant, bound authoritatively inside
+            // redeem (from the atomic consume's RETURNING), so it is left None here.
+            grant_id: None,
+            // The LOCAL subject (a usr_ id), exactly as issued_tokens carries it via
+            // the grant, so introspection (#22) derives the public sub the same way
+            // UserInfo does; the opaque token itself carries no sub.
+            subject: &bindings.subject,
+            client_id: &bindings.client_id,
+            audience,
+            scope: bindings.oauth_scope.as_deref(),
+            jti,
+            expires_at_unix_micros: *expires_at_unix_micros,
+        }),
+    };
 
     // 7. Atomically redeem: the single-use gate. On the winning call it records
-    //    the issued tokens and the redeem audit in the same transaction as the
-    //    consume; a miss is classified as a benign grace retry, a genuine reuse
-    //    (which revokes the chain), or an expired/absent code. Attribute the audit
-    //    to the client the code is for, under a fresh per-request correlation id.
+    //    the issued tokens (and the opaque access-token row, when opaque) and the
+    //    redeem audit in the same transaction as the consume; a miss is classified
+    //    as a benign grace retry, a genuine reuse (which revokes the chain), or an
+    //    expired/absent code. Attribute the audit to the client the code is for,
+    //    under a fresh per-request correlation id.
     let actor = client_actor(state, scope, &bindings.client_id);
     let correlation = CorrelationId::generate(state.env());
     let outcome = state
@@ -212,6 +248,7 @@ async fn exchange(
             &code_id,
             &bindings.grant_id,
             &records,
+            opaque,
             state.reuse_grace(),
         )
         .await;
@@ -373,6 +410,14 @@ async fn mint_tokens(
     // per-client pairwise configuration is client-registration state a later issue
     // persists (see OidcState::resolve_public_subject).
     let subject = state.resolve_public_subject(&bindings.subject);
+    // Resolve the access-token target: format, audience, and lifetime (issue #29).
+    // The RFC 8707 `resource` request parameter that would target a specific
+    // resource server is issue #28; today no resource is threaded, so this resolves
+    // to the environment default (the client id as audience, the environment
+    // default format), which keeps the existing at+jwt/UserInfo behavior intact.
+    let target = state
+        .resolve_access_token_target(&scope, None, &bindings.client_id)
+        .await;
     tokens::mint(
         state,
         signer,
@@ -395,6 +440,7 @@ async fn mint_tokens(
             c_hash: None,
             extra_claims,
         },
+        &target,
     )
     .map_err(|()| TokenError::ServerError)
 }
@@ -461,10 +507,10 @@ async fn id_token_extra_claims(
     assemble_claims(&bag, &granted, claims_request.id_token())
 }
 
-/// Build the `200 OK` token response (RFC 6749 5.1) from the pre-signed tokens.
+/// Build the `200 OK` token response (RFC 6749 5.1) from the pre-minted tokens.
 fn token_response(minted: &IssuedTokens, bindings: &CodeBindings) -> Response {
     let mut body = serde_json::json!({
-        "access_token": minted.access_token,
+        "access_token": minted.access.token(),
         "token_type": "Bearer",
         "expires_in": minted.expires_in_secs,
         "id_token": minted.id_token,

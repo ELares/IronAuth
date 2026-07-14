@@ -113,7 +113,7 @@ async fn oidc_probes_deny_cross_scope_redeem_and_token_status() {
         .scoped(scope_b)
         .acting(actor(), corr())
         .authorization()
-        .redeem(&env, &code_b, &grant_b, &[], Duration::ZERO)
+        .redeem(&env, &code_b, &grant_b, &[], None, Duration::ZERO)
         .await
         .expect("redeem victim in its own scope");
     assert!(

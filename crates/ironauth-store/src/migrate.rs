@@ -232,7 +232,11 @@ CREATE TABLE IF NOT EXISTS _schema_migrations ( \
 /// scope-derived and claims-parameter-selected claim sets) is version 9; the
 /// scope-aware-consent grant (issue #196: `GRANT UPDATE ON consents` so a
 /// broadened consent is `UPSERTed` rather than dropped, a privilege grant with NO
-/// schema change) is version 10. That is
+/// schema change) is version 10; the `resource_servers` registry (issue #29: the
+/// audience-to-token-format table the mint reads to select a registered resource
+/// server's access-token format) is version 11; the `opaque_access_tokens` store
+/// (issue #29: the digest-only reference-token table the internal resolve reads)
+/// is version 12. That is
 /// the whole production chain: it deliberately
 /// carries no throwaway objects, so a real database never gains a demo table or
 /// ledger rows beyond what the product needs. The worked expand-contract example
@@ -302,6 +306,18 @@ fn registry() -> Vec<Migration> {
             name: "consent_scope_upsert",
             phase: Phase::Expand,
             sql: include_str!("../migrations/0010_consent_scope_upsert.sql"),
+        },
+        Migration {
+            version: 11,
+            name: "resource_servers",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0011_resource_servers.sql"),
+        },
+        Migration {
+            version: 12,
+            name: "opaque_access_tokens",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0012_opaque_access_tokens.sql"),
         },
     ]
 }

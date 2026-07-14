@@ -125,6 +125,9 @@ pub struct Harness {
     client_id: ClientId,
     verifying_key: TrustedKey,
     issuer: String,
+    // A clone of the OidcState the router was built from, so a test can call the
+    // state directly (for example the access-token target resolution, issue #29).
+    state: OidcState,
     router: Router,
 }
 
@@ -182,7 +185,7 @@ impl Harness {
             ISSUER_BASE,
         );
         let issuer = state.issuer_for(&scope);
-        let router = oidc_router(state);
+        let router = oidc_router(state.clone());
 
         Self {
             db,
@@ -192,6 +195,7 @@ impl Harness {
             client_id,
             verifying_key,
             issuer,
+            state,
             router,
         }
     }
@@ -292,7 +296,7 @@ impl Harness {
             ISSUER_BASE,
         );
         let issuer = state.issuer_for(&scope);
-        let router = oidc_router(state)
+        let router = oidc_router(state.clone())
             .merge(issuer_router(issuer_state))
             .merge(discovery_router(discovery_state));
 
@@ -304,6 +308,7 @@ impl Harness {
             client_id,
             verifying_key: provisioned.verifying_key,
             issuer,
+            state,
             router,
         }
     }
@@ -341,6 +346,13 @@ impl Harness {
     #[must_use]
     pub fn store(&self) -> &Store {
         self.db.store()
+    }
+
+    /// The OIDC state the router was built from, for tests that call the state
+    /// directly (for example `resolve_access_token_target`, issue #29).
+    #[must_use]
+    pub fn state(&self) -> &OidcState {
+        &self.state
     }
 
     /// The seeded scope.
@@ -422,6 +434,13 @@ impl Harness {
     /// A clone of the router (concurrent race test clones it per task).
     pub fn router(&self) -> Router {
         self.router.clone()
+    }
+
+    /// The environment's public verifying key, for building a verification policy
+    /// under a non-EdDSA algorithm (for example the ES256 environment, issue #29).
+    #[must_use]
+    pub fn verifying_key(&self) -> TrustedKey {
+        self.verifying_key.clone()
     }
 
     /// A verification policy that trusts the environment's public key and expects

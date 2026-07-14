@@ -45,7 +45,12 @@ cd "$(git rev-parse --show-toplevel)"
 #
 # signing_keys (#19) is the per-environment signing-key table: TENANT-SCOPED with
 # forced row-level security, so its SQL stays in the repository module too.
-SCOPED_TABLES='clients|organizations|audit_log|management_credentials|idempotency_keys|grants|authorization_codes|issued_tokens|signing_keys|users|sessions|consents'
+#
+# resource_servers and opaque_access_tokens (#29) are the access-token-format
+# tables: the audience-to-format registry and the digest-only opaque-token store.
+# Both are TENANT-SCOPED with forced row-level security, so their SQL stays in the
+# repository module too.
+SCOPED_TABLES='clients|organizations|audit_log|management_credentials|idempotency_keys|grants|authorization_codes|issued_tokens|signing_keys|users|sessions|consents|resource_servers|opaque_access_tokens'
 
 # The one module allowed to name a scoped table in SQL.
 REPO_MODULE='crates/ironauth-store/src/repository.rs'

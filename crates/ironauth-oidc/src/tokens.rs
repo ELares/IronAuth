@@ -30,26 +30,117 @@
 //!   the front-channel/hybrid path (issue #17); a token-endpoint ID token never
 //!   carries `at_hash`, and the code flow never carries `c_hash`. They are wired
 //!   as optional inputs here so #17 can supply them without a second minter.
+//!
+//! # The access token's format and claims (issue #29)
+//!
+//! The access token takes the format the resolved [`AccessTokenTarget`] selects:
+//!
+//! - **`at+jwt`** (the default, and what the OIDC/`UserInfo` flow uses): a signed
+//!   JWT with the header `typ = at+jwt` and the RFC 9068 section 2.2 claims
+//!   (`iss`, `exp`, `aud`, `sub`, `client_id`, `iat`, `jti`, `scope` when granted),
+//!   plus `acr` and (when frozen onto the code as due) `auth_time` from the
+//!   authentication event. Its `aud` is the client id when no resource server is
+//!   targeted, so [`crate::userinfo`]'s `aud == client` check keeps working, or the
+//!   resource server's audience when one is. No PII beyond these protocol claims.
+//! - **opaque** (a resource server, or an environment, may select it): a random
+//!   `ira_at_` reference token whose state lives only in the store as a digest;
+//!   there is no offline validation, only the internal store resolve (issue #22).
+//!
+//! The format selection is resolved in the async handler
+//! ([`OidcState::resolve_access_token_target`]) and handed into the pure [`mint`],
+//! so the crypto stays pure and testable while the resource-server lookup awaits.
 
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use ironauth_jose::{EmissionOptions, SigningKey, SigningPolicy, sign_jws_with_policy};
-use ironauth_store::{IssuedTokenId, Scope, TokenKind};
+use ironauth_store::{IssuedTokenId, Scope, TokenFormat, opaque_access_token_digest};
 use serde_json::json;
 
 use crate::authn;
 use crate::state::OidcState;
 use crate::subject;
 
+/// The scannable prefix on every opaque ACCESS token (issue #29): `ira` (the
+/// product namespace), `at` (access token). Documented alongside its detection
+/// regex in `docs/design/TOKEN-FORMATS.md` for secret-scanner registration. The
+/// sibling refresh-token prefix `ira_rt_` is reserved there for consistency;
+/// refresh tokens are issue #21.
+pub const OPAQUE_ACCESS_TOKEN_PREFIX: &str = "ira_at_";
+
+/// The number of random bytes in an opaque access token: 32 bytes = 256 bits of
+/// entropy, drawn from the ironauth-env seam (never raw `getrandom`), so an
+/// opaque token cannot be guessed or enumerated.
+const OPAQUE_ACCESS_TOKEN_BYTES: usize = 32;
+
+/// The resolved target for an access token: the audience it is minted for, the
+/// format it takes, and its lifetime (issue #29).
+///
+/// Resolved by the async handler from the targeted resource server (or the
+/// environment default) via [`OidcState::resolve_access_token_target`], then
+/// handed into the pure [`mint`]. This is the seam issue #28 feeds: it will
+/// resolve the audience from the RFC 8707 `resource` request parameter and pass
+/// it here without reshaping the mint. Today the token endpoint passes the
+/// default (the client id as audience, the environment default format).
+#[derive(Debug, Clone)]
+pub struct AccessTokenTarget {
+    /// The `aud` of the minted access token. The client id for the no-resource
+    /// case (so `UserInfo`'s `aud == client` check keeps working), or the resource
+    /// server's audience when one is targeted.
+    pub audience: String,
+    /// The format to emit (an RFC 9068 `at+jwt` or an opaque reference token).
+    pub format: TokenFormat,
+    /// The access-token lifetime.
+    pub ttl: Duration,
+}
+
+/// A minted access token: the string handed to the client plus what the store
+/// records for it (issue #29). An `at+jwt` records its `jti` in `issued_tokens`;
+/// an opaque token records its digest and metadata in `opaque_access_tokens`.
+pub enum MintedAccessToken {
+    /// An RFC 9068 `at+jwt`: the compact JWS and its `jti` (recorded in
+    /// `issued_tokens` for grant-chain status, exactly as before issue #29).
+    Jwt {
+        /// The compact access-token JWS.
+        token: String,
+        /// The access token's `jti`, recorded against the grant.
+        jti: IssuedTokenId,
+    },
+    /// An opaque reference token: the plaintext handed to the client (NEVER
+    /// stored) plus the digest-only record fields for `opaque_access_tokens`.
+    Opaque {
+        /// The `ira_at_...` plaintext token, returned to the client and never
+        /// persisted.
+        token: String,
+        /// The SHA-256 hex digest of `token`, the only token material stored.
+        digest: String,
+        /// The token's logical `jti` (a `tok_` id), recorded in the row.
+        jti: IssuedTokenId,
+        /// The audience the token targets, recorded in the row.
+        audience: String,
+        /// The token's expiry, in microseconds since the Unix epoch (clock seam).
+        expires_at_unix_micros: i64,
+    },
+}
+
+impl MintedAccessToken {
+    /// The token string to return in the token response, whichever format it is.
+    #[must_use]
+    pub fn token(&self) -> &str {
+        match self {
+            MintedAccessToken::Jwt { token, .. } | MintedAccessToken::Opaque { token, .. } => token,
+        }
+    }
+}
+
 /// The tokens minted for one successful code exchange, plus the recorded `jti`s
 /// so the caller can persist them against the grant.
 pub struct IssuedTokens {
-    /// The compact access-token JWS.
-    pub access_token: String,
+    /// The minted access token (an `at+jwt` or an opaque reference token).
+    pub access: MintedAccessToken,
     /// The compact ID-token JWS.
     pub id_token: String,
-    /// The access token's `jti` (recorded against the grant).
-    pub access_jti: IssuedTokenId,
     /// The ID token's `jti` (recorded against the grant).
     pub id_jti: IssuedTokenId,
     /// The access-token lifetime in seconds (the `expires_in` of the response).
@@ -183,35 +274,101 @@ pub(crate) fn build_id_token_claims(
     Ok(claims)
 }
 
-/// Mint the ID token and access token for a successful exchange.
+/// Build the RFC 9068 access-token claim set for an `at+jwt` (issue #29). Pure,
+/// so it is exercised without a store or a signer.
 ///
-/// The `jti`s are drawn from the entropy seam (via [`IssuedTokenId::generate`]),
-/// embedded in each token, and returned so the caller records them against the
-/// grant. Both tokens are signed with the environment's default key.
+/// Carries the RFC 9068 section 2.2 claims: `iss`, `exp`, `aud`, `sub`,
+/// `client_id`, `iat`, `jti`, and `scope` when a scope was granted. `aud` is the
+/// resolved `audience` (the client id for the no-resource case, so `UserInfo`'s
+/// `aud == client` check keeps working; a resource server's audience when one is
+/// targeted). `client_id` is ALWAYS the OAuth client. Because this token results
+/// from a user-authentication (code) flow, it also carries `acr` (the achieved
+/// authentication context, derived from the recorded authentication event, never
+/// a request parameter) and, when the authentication instant was frozen onto the
+/// code as due, `auth_time`. Claims hygiene: no PII beyond these protocol claims
+/// (no `email`/`name`/`address`/`phone`); scope-derived claims stay at `UserInfo`.
+pub(crate) fn build_access_token_claims(
+    request: &MintRequest<'_>,
+    iat: i64,
+    exp: i64,
+    jti: &str,
+    audience: &str,
+) -> serde_json::Value {
+    let mut claims = json!({
+        "iss": request.issuer,
+        "sub": request.subject,
+        "aud": audience,
+        "client_id": request.client_id,
+        "iat": iat,
+        "exp": exp,
+        "jti": jti,
+    });
+    if let Some(scope) = request.oauth_scope {
+        claims["scope"] = json!(scope);
+    }
+    // acr: the achieved authentication context of the code flow, derived from the
+    // recorded authentication event (issue #14's `authn`), never a request value.
+    let methods = authn::parse_methods(request.auth_methods);
+    claims["acr"] = json!(authn::achieved_acr(&methods));
+    // auth_time: present iff frozen onto the code as due (max_age requested or the
+    // client registered require_auth_time), always the truthful recorded instant
+    // in epoch SECONDS, exactly as the ID token emits it.
+    if let Some(auth_micros) = request.auth_time_unix_micros {
+        claims["auth_time"] = json!(auth_micros.div_euclid(1_000_000));
+    }
+    claims
+}
+
+/// Generate an opaque access token: the scannable `ira_at_` prefix over 256 bits
+/// of entropy from the ironauth-env seam (issue #29). The plaintext is returned to
+/// the client and never stored; only its digest is persisted.
+fn generate_opaque_access_token(state: &OidcState) -> String {
+    let mut bytes = [0_u8; OPAQUE_ACCESS_TOKEN_BYTES];
+    state.env().entropy().fill_bytes(&mut bytes);
+    format!(
+        "{OPAQUE_ACCESS_TOKEN_PREFIX}{}",
+        URL_SAFE_NO_PAD.encode(bytes)
+    )
+}
+
+/// Mint the ID token and the access token for a successful exchange (issue #29).
+///
+/// The ID token is ALWAYS a signed `at+jwt`-adjacent JWT (OIDC Core), signed with
+/// the environment key; its lifetime is the environment access-token lifetime, as
+/// before. The access token takes the resolved `target`'s format: an RFC 9068
+/// `at+jwt` (signed, `jti` recorded in `issued_tokens`) or an opaque reference
+/// token (random + digest, recorded in `opaque_access_tokens`), with the target's
+/// audience and lifetime. The `jti`s are drawn from the entropy seam.
 ///
 /// # Errors
 ///
 /// Returns `Err(())` if the environment has no signing key, `signer`'s algorithm
 /// is not permitted by `policy`, the signing backend fails, or the ID token claims
 /// are refused (an out-of-bounds `sub`); the caller maps that to a token-endpoint
-/// `server_error`, so issuance fails closed.
+/// `server_error`, so issuance fails closed. The opaque path cannot fail (entropy
+/// draw and hashing are infallible), but the ID token is always signed, so a
+/// signing failure still fails the whole exchange closed.
 pub fn mint(
     state: &OidcState,
     signer: &SigningKey,
     policy: &SigningPolicy,
     request: &MintRequest<'_>,
+    target: &AccessTokenTarget,
 ) -> Result<IssuedTokens, ()> {
     let now = state.now();
     let iat = epoch_secs(now);
-    let access_exp = iat.saturating_add(secs(state.access_token_ttl()));
+    // The ID token keeps the environment access-token lifetime (unchanged); the
+    // access token uses the target lifetime (a resource server may shorten it).
+    let id_exp = iat.saturating_add(secs(state.access_token_ttl()));
+    let access_ttl_secs = secs(target.ttl);
+    let access_exp = iat.saturating_add(access_ttl_secs);
 
-    let access_jti = IssuedTokenId::generate(state.env(), &request.scope);
     let id_jti = IssuedTokenId::generate(state.env(), &request.scope);
 
     // ID token (OIDC Core errata set 2): the REQUIRED claims plus the conditional
     // rules, built and cap-checked before signing so a refused sub fails closed.
     let id_claims =
-        build_id_token_claims(request, iat, access_exp, &id_jti.to_string()).map_err(|error| {
+        build_id_token_claims(request, iat, id_exp, &id_jti.to_string()).map_err(|error| {
             tracing::error!(
                 ?error,
                 "refusing to issue an ID token with an invalid subject"
@@ -225,34 +382,50 @@ pub fn mint(
     )
     .map_err(|_| ())?;
 
-    // Access token as a signed JWT (RFC 9068 at+jwt): issuer, subject, audience,
-    // client_id, iat, exp, jti, and the granted scope when present.
-    let mut access_claims = json!({
-        "iss": request.issuer,
-        "sub": request.subject,
-        "aud": request.client_id,
-        "client_id": request.client_id,
-        "iat": iat,
-        "exp": access_exp,
-        "jti": access_jti.to_string(),
-    });
-    if let Some(scope) = request.oauth_scope {
-        access_claims["scope"] = json!(scope);
-    }
-    let access_token = sign_jws_with_policy(
-        policy,
-        signer,
-        &serde_json::to_vec(&access_claims).map_err(|_| ())?,
-        &EmissionOptions::new().with_typ("at+jwt"),
-    )
-    .map_err(|_| ())?;
+    let access = match target.format {
+        // RFC 9068 at+jwt: the header typ is `at+jwt` and the claims carry the
+        // section 2.2 set, signed through the same policy-enforced core as the ID
+        // token, so an algorithm the policy forbids is refused before signing.
+        TokenFormat::AtJwt => {
+            let jti = IssuedTokenId::generate(state.env(), &request.scope);
+            let claims = build_access_token_claims(
+                request,
+                iat,
+                access_exp,
+                &jti.to_string(),
+                &target.audience,
+            );
+            let token = sign_jws_with_policy(
+                policy,
+                signer,
+                &serde_json::to_vec(&claims).map_err(|_| ())?,
+                &EmissionOptions::new().with_typ("at+jwt"),
+            )
+            .map_err(|_| ())?;
+            MintedAccessToken::Jwt { token, jti }
+        }
+        // Opaque: a random reference token; only its digest and metadata are
+        // stored (the caller records them in the redeem transaction).
+        TokenFormat::Opaque => {
+            let jti = IssuedTokenId::generate(state.env(), &request.scope);
+            let token = generate_opaque_access_token(state);
+            let digest = opaque_access_token_digest(&token);
+            let expires_at_unix_micros = epoch_micros(now).saturating_add(micros(target.ttl));
+            MintedAccessToken::Opaque {
+                token,
+                digest,
+                jti,
+                audience: target.audience.clone(),
+                expires_at_unix_micros,
+            }
+        }
+    };
 
     Ok(IssuedTokens {
-        access_token,
+        access,
         id_token,
-        access_jti,
         id_jti,
-        expires_in_secs: secs(state.access_token_ttl()),
+        expires_in_secs: access_ttl_secs,
     })
 }
 
@@ -302,26 +475,29 @@ pub fn mint_id_token(
     Ok((id_token, id_jti))
 }
 
-impl IssuedTokens {
-    /// The two tokens as `(id, kind)` records for the store.
-    #[must_use]
-    pub fn records(&self) -> [(IssuedTokenId, TokenKind); 2] {
-        [
-            (self.access_jti, TokenKind::Access),
-            (self.id_jti, TokenKind::Id),
-        ]
-    }
+/// Whole seconds of a duration as an `i64` (saturating).
+fn secs(duration: Duration) -> i64 {
+    i64::try_from(duration.as_secs()).unwrap_or(i64::MAX)
 }
 
-/// Whole seconds of a duration as an `i64` (saturating).
-fn secs(duration: std::time::Duration) -> i64 {
-    i64::try_from(duration.as_secs()).unwrap_or(i64::MAX)
+/// Whole microseconds of a duration as an `i64` (saturating).
+fn micros(duration: Duration) -> i64 {
+    i64::try_from(duration.as_micros()).unwrap_or(i64::MAX)
 }
 
 /// Seconds since the Unix epoch for a wall-clock instant.
 fn epoch_secs(at: SystemTime) -> i64 {
     match at.duration_since(SystemTime::UNIX_EPOCH) {
         Ok(delta) => i64::try_from(delta.as_secs()).unwrap_or(i64::MAX),
+        Err(_) => 0,
+    }
+}
+
+/// Microseconds since the Unix epoch for a wall-clock instant (the opaque token's
+/// expiry is stored in this unit, matching the store's clock-seam convention).
+fn epoch_micros(at: SystemTime) -> i64 {
+    match at.duration_since(SystemTime::UNIX_EPOCH) {
+        Ok(delta) => i64::try_from(delta.as_micros()).unwrap_or(i64::MAX),
         Err(_) => 0,
     }
 }
@@ -460,5 +636,95 @@ mod tests {
         let claims = build_id_token_claims(&req, 1, 2, "tok").expect("claims");
         assert_eq!(claims["at_hash"], "at-hash-value");
         assert_eq!(claims["c_hash"], "c-hash-value");
+    }
+
+    #[test]
+    fn access_token_carries_the_rfc9068_required_claims() {
+        // Issue #29: the at+jwt access token carries every RFC 9068 section 2.2
+        // required claim, well formed, plus scope and the derived acr.
+        let mut req = request("usr_abc", "pwd");
+        req.oauth_scope = Some("openid profile");
+        let claims = build_access_token_claims(&req, 1000, 1300, "tok_at", "cli_example");
+        assert_eq!(claims["iss"], "https://issuer.test/t/x/e/y");
+        assert_eq!(claims["exp"], 1300);
+        assert_eq!(claims["sub"], "usr_abc");
+        assert_eq!(claims["client_id"], "cli_example");
+        assert_eq!(claims["iat"], 1000);
+        assert_eq!(claims["jti"], "tok_at");
+        assert_eq!(claims["scope"], "openid profile");
+        // acr is derived from the authentication event, never a request parameter.
+        assert_eq!(claims["acr"], "urn:ironauth:acr:pwd");
+        // Every RFC 9068 required claim is present and a well-formed type.
+        for name in ["iss", "exp", "aud", "sub", "client_id", "iat", "jti"] {
+            assert!(claims.get(name).is_some(), "{name} must be present");
+        }
+        assert!(claims["exp"].is_number() && claims["iat"].is_number());
+    }
+
+    #[test]
+    fn access_token_aud_is_the_resolved_audience_not_always_the_client() {
+        // The no-resource case passes the client id (so UserInfo keeps working);
+        // a resource server passes its own audience. client_id is ALWAYS the OAuth
+        // client, whatever the audience is.
+        let req = request("usr_abc", "pwd");
+        let default = build_access_token_claims(&req, 1, 2, "tok", "cli_example");
+        assert_eq!(default["aud"], "cli_example");
+        assert_eq!(default["client_id"], "cli_example");
+
+        let rs = build_access_token_claims(&req, 1, 2, "tok", "https://api.example/orders");
+        assert_eq!(rs["aud"], "https://api.example/orders");
+        assert_eq!(rs["client_id"], "cli_example", "client_id stays the client");
+    }
+
+    #[test]
+    fn access_token_auth_time_is_present_only_when_frozen_onto_the_code() {
+        // auth_time appears (in epoch seconds) only when the authentication instant
+        // was frozen onto the code as due, exactly like the ID token.
+        let mut req = request("usr_abc", "pwd");
+        assert!(
+            build_access_token_claims(&req, 1, 2, "tok", "cli_example")
+                .get("auth_time")
+                .is_none(),
+            "auth_time is absent when not frozen onto the code"
+        );
+        req.auth_time_unix_micros = Some(1_700_000_123_456_789);
+        let claims = build_access_token_claims(&req, 1, 2, "tok", "cli_example");
+        assert_eq!(claims["auth_time"], 1_700_000_123_i64);
+    }
+
+    #[test]
+    fn access_token_payload_carries_no_pii_beyond_the_protocol_claims() {
+        // Claims hygiene: even when the granted scope names PII scopes, the access
+        // token payload never carries the PII itself (it stays at UserInfo).
+        let mut req = request("usr_abc", "pwd");
+        req.oauth_scope = Some("openid profile email address phone");
+        req.auth_time_unix_micros = Some(1_700_000_000_000_000);
+        let claims = build_access_token_claims(&req, 1, 2, "tok", "cli_example");
+        let object = claims.as_object().expect("object");
+        // The payload is exactly the protocol claim set, nothing else.
+        let mut names: Vec<&str> = object.keys().map(String::as_str).collect();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            vec![
+                "acr",
+                "aud",
+                "auth_time",
+                "client_id",
+                "exp",
+                "iat",
+                "iss",
+                "jti",
+                "scope",
+                "sub"
+            ],
+            "the access token payload is exactly the protocol claims"
+        );
+        for pii in ["email", "name", "given_name", "phone_number", "address"] {
+            assert!(
+                object.get(pii).is_none(),
+                "{pii} must not be in the payload"
+            );
+        }
     }
 }

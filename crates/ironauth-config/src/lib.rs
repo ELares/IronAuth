@@ -150,6 +150,26 @@ pub struct TelemetryConfig {
     pub otlp_endpoint: Option<String>,
 }
 
+/// The access-token format an environment mints by default (issue #29).
+///
+/// A registered resource server can override this per audience; when no resource
+/// server is targeted, the environment default applies. The default is the
+/// self-contained RFC 9068 `at+jwt`, which preserves the existing `UserInfo` and
+/// offline-verification behavior; `opaque` mints a random, digest-only reference
+/// token that can only be validated by a store lookup (introspection).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum TokenFormat {
+    /// An RFC 9068 `at+jwt` signed access token (the default). Self-contained and
+    /// offline-verifiable; the audience is the client id when no resource server
+    /// is targeted, so `UserInfo` keeps working.
+    #[default]
+    AtJwt,
+    /// An opaque, digest-only reference access token (`ira_at_` prefix). Not
+    /// offline-verifiable; state lives only in the store (introspection, #22).
+    Opaque,
+}
+
 /// Structured-log output format.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -298,8 +318,20 @@ pub struct OidcConfig {
 
     /// Access-token lifetime in seconds. The default (300) is a conservative five
     /// minutes; refresh handling (rotation, families) lands in M3. Must be at
-    /// least 1 and at most `OIDC_MAX_LIFETIME_SECS`.
+    /// least 1 and at most `OIDC_MAX_LIFETIME_SECS`. A registered resource server
+    /// (issue #29) may override this per audience.
     pub access_token_ttl_secs: u64,
+
+    /// The access-token format this environment mints when no resource server is
+    /// targeted (issue #29). The spec-conform default (`at_jwt`) mints a
+    /// self-contained RFC 9068 signed JWT whose audience is the client id, so
+    /// `UserInfo` and offline verification keep working. Setting it to `opaque`
+    /// mints a random, digest-only reference token instead (validated only by
+    /// introspection, #22). A registered resource server overrides this per
+    /// audience. This is a promotable per-environment setting: it appears in config
+    /// snapshots and rides the M5 promotion pipeline; the process value is the
+    /// deployment default until per-environment overrides land.
+    pub default_access_token_format: TokenFormat,
 
     /// Reuse grace window in seconds for an already-consumed authorization code.
     /// A second presentation of a consumed code within this window (a concurrent
@@ -419,6 +451,7 @@ impl Default for OidcConfig {
             enabled: false,
             authorization_code_ttl_secs: 60,
             access_token_ttl_secs: 300,
+            default_access_token_format: TokenFormat::AtJwt,
             reuse_grace_secs: 10,
             session_ttl_secs: 3600,
             jwks_cache_max_age_secs: 600,
@@ -824,6 +857,9 @@ mod tests {
         assert!(!config.oidc.enabled);
         assert_eq!(config.oidc.authorization_code_ttl_secs, 60);
         assert_eq!(config.oidc.access_token_ttl_secs, 300);
+        // The environment default access-token format is the spec-conform at+jwt
+        // (issue #29), so UserInfo and offline verification keep working.
+        assert_eq!(config.oidc.default_access_token_format, TokenFormat::AtJwt);
         assert_eq!(config.oidc.reuse_grace_secs, 10);
         assert_eq!(config.oidc.session_ttl_secs, 3600);
         assert_eq!(config.oidc.jwks_cache_max_age_secs, 600);
@@ -946,6 +982,36 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("enable_response_type_idtoken"), "{msg}");
         assert!(msg.contains("enable_response_type_id_token"), "{msg}");
+    }
+
+    #[test]
+    fn oidc_default_access_token_format_parses_both_values_and_rejects_unknown() {
+        // Issue #29: the environment default access-token format is a snake_case
+        // enum with two members. Both parse; an unknown value is a strict error.
+        let opaque = Config::from_toml_str(
+            "[oidc]\ndefault_access_token_format = \"opaque\"\n",
+            "<inline>",
+        )
+        .expect("valid")
+        .config;
+        assert_eq!(opaque.oidc.default_access_token_format, TokenFormat::Opaque);
+
+        let at_jwt = Config::from_toml_str(
+            "[oidc]\ndefault_access_token_format = \"at_jwt\"\n",
+            "<inline>",
+        )
+        .expect("valid")
+        .config;
+        assert_eq!(at_jwt.oidc.default_access_token_format, TokenFormat::AtJwt);
+
+        // A misspelled or unsupported value aborts with the accepted alternatives.
+        let err = Config::from_toml_str(
+            "[oidc]\ndefault_access_token_format = \"jwt\"\n",
+            "ironauth.toml",
+        )
+        .expect_err("unknown token format");
+        let msg = err.to_string();
+        assert!(msg.contains("at_jwt") && msg.contains("opaque"), "{msg}");
     }
 
     #[test]

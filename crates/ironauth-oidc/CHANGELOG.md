@@ -6,6 +6,43 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- JWT (RFC 9068) and opaque access tokens with per-resource-server format
+  selection (issue #29).
+  - **RFC 9068 `at+jwt` conformance.** The access token now carries the RFC 9068
+    section 2.2 claims (`iss`, `exp`, `aud`, `sub`, `client_id`, `iat`, `jti`,
+    `scope` when granted) plus `acr` (the achieved authentication context, derived
+    from the recorded authentication event, never a request parameter) and, when the
+    authentication instant was frozen onto the code as due, `auth_time` -- threaded
+    from the authenticated session exactly as the ID token's `auth_time` is. The
+    header `typ` stays `at+jwt`. Claims hygiene: no PII beyond these protocol claims.
+  - **`aud` preserves `UserInfo`.** When no resource server is targeted the access
+    token's `aud` is the client id (so `userinfo::verify_access_token`'s `aud ==
+    client` check keeps working); when a registered resource server is targeted it is
+    that resource server's audience. `client_id` is always the OAuth client.
+  - **Opaque access tokens (Hydra digest-only pattern).** A new opaque format mints
+    a random `ira_at_` token (>= 256 bits from the ironauth-env entropy seam) and
+    stores ONLY its SHA-256 digest plus metadata (`opaque_access_tokens`), never the
+    token. There is no offline validation; the internal
+    `AuthorizationRepo::resolve_opaque_access_token` (the seam issue #22 exposes over
+    HTTP) is the only verification path. The `ira_at_` prefix scheme and its scanner
+    regex, plus the reserved `ira_rt_` refresh prefix (issue #21), are documented in
+    `docs/design/TOKEN-FORMATS.md`.
+  - **Per-resource-server format selection.** `OidcState::resolve_access_token_target`
+    resolves the access-token format, audience, and lifetime: a targeted resource
+    server (matched by audience) supplies its `token_format` and
+    `access_token_ttl_secs`, otherwise the environment default
+    (`oidc.default_access_token_format`) and the environment access-token lifetime
+    apply. The pure `tokens::mint` now takes the resolved `AccessTokenTarget`, so the
+    crypto stays pure while the resource-server lookup awaits in the handler. The RFC
+    8707 `resource` request-parameter wiring is issue #28; the token endpoint passes
+    `resource = None` today, so the default (at+jwt) behavior is unchanged. The
+    selection function takes the resolved audience, so #28 can feed the `resource`
+    parameter without reshaping the mint.
+  - **Recording.** An at+jwt keeps recording its `jti` in `issued_tokens`; an opaque
+    token records its digest-only row in `opaque_access_tokens`, in the SAME redeem
+    transaction as the code consume, so it is as unbypassable and as
+    revocation-reachable as an at+jwt.
+
 - Consent-hardening prerequisites for enabling OIDC (issue #196, blocking
   issue #13). Two hard security gaps in the issue #20 bootstrap are closed; the
   provider stays gated off by default (`oidc.enabled` unchanged).
