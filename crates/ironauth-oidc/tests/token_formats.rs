@@ -23,7 +23,7 @@ use common::{
 };
 use ironauth_config::{OidcConfig, TokenFormat as ConfigTokenFormat};
 use ironauth_jose::{JwsAlgorithm, VerificationPolicy, verify};
-use ironauth_oidc::OPAQUE_ACCESS_TOKEN_PREFIX;
+use ironauth_oidc::{OPAQUE_ACCESS_TOKEN_PREFIX, ResourceTargetError};
 use ironauth_store::{
     ActorRef, CorrelationId, NewResourceServer, ResourceServerId, ServiceId, TokenFormat,
 };
@@ -108,8 +108,10 @@ async fn register_resource_server(
 }
 
 /// AC #1: one registered resource server receives at+jwt, another receives
-/// opaque, from the SAME environment; no resource server falls back to the
-/// environment default with the client id as the audience.
+/// opaque, from the SAME environment; no resource server resolves to the
+/// environment default with the client id as the audience. Under RFC 8707 (issue
+/// #28) an UNREGISTERED resource is now `invalid_target` rather than a silent
+/// fallback (the #29 fallback was explicitly scoped for #28 to replace).
 #[tokio::test]
 async fn per_resource_server_format_choice_from_one_environment() {
     let harness = Harness::start().await;
@@ -135,38 +137,53 @@ async fn per_resource_server_format_choice_from_one_environment() {
     // environment access-token lifetime.
     let jwt = harness
         .state()
-        .resolve_access_token_target(&scope, Some("https://api.example/reports"), &client)
-        .await;
+        .resolve_access_token_target(&scope, &["https://api.example/reports".to_owned()], &client)
+        .await
+        .expect("known resource resolves");
     assert_eq!(jwt.format, TokenFormat::AtJwt);
-    assert_eq!(jwt.audience, "https://api.example/reports");
+    assert_eq!(
+        jwt.audiences,
+        vec!["https://api.example/reports".to_owned()]
+    );
     assert_eq!(jwt.ttl, harness.state().access_token_ttl());
 
     // The opaque resource server: its audience, opaque, and its own 120s lifetime.
     let opaque = harness
         .state()
-        .resolve_access_token_target(&scope, Some("https://api.example/orders"), &client)
-        .await;
+        .resolve_access_token_target(&scope, &["https://api.example/orders".to_owned()], &client)
+        .await
+        .expect("known resource resolves");
     assert_eq!(opaque.format, TokenFormat::Opaque);
-    assert_eq!(opaque.audience, "https://api.example/orders");
+    assert_eq!(
+        opaque.audiences,
+        vec!["https://api.example/orders".to_owned()]
+    );
     assert_eq!(opaque.ttl, Duration::from_secs(120));
 
-    // No resource server targeted: the environment default (at+jwt) with the client
-    // id as the audience, so UserInfo keeps working.
+    // No resource server targeted (empty resource set): the environment default
+    // (at+jwt) with the client id as the SINGLE audience, so UserInfo keeps working.
     let default = harness
         .state()
-        .resolve_access_token_target(&scope, None, &client)
-        .await;
+        .resolve_access_token_target(&scope, &[], &client)
+        .await
+        .expect("no resource resolves to the default");
     assert_eq!(default.format, TokenFormat::AtJwt);
-    assert_eq!(default.audience, client);
+    assert_eq!(default.audiences, vec![client.clone()]);
 
-    // An unregistered resource likewise falls back to the environment default (the
-    // #29 behavior; RFC 8707 resource semantics are #28).
+    // An unregistered resource is invalid_target under RFC 8707 (issue #28), never a
+    // silent fallback (which would broaden the audience).
     let unknown = harness
         .state()
-        .resolve_access_token_target(&scope, Some("https://api.example/unregistered"), &client)
+        .resolve_access_token_target(
+            &scope,
+            &["https://api.example/unregistered".to_owned()],
+            &client,
+        )
         .await;
-    assert_eq!(unknown.format, TokenFormat::AtJwt);
-    assert_eq!(unknown.audience, client);
+    assert!(
+        matches!(unknown, Err(ResourceTargetError::InvalidTarget)),
+        "an unregistered resource is invalid_target, not a fallback"
+    );
 }
 
 /// AC #2 and (`EdDSA` half of) AC #6: the issued at+jwt validates against RFC 9068

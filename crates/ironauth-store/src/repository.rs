@@ -486,6 +486,26 @@ pub struct ClientRecord {
     pub quarantined: bool,
 }
 
+/// A client's RFC 8707 resource-indicator policy, read within scope (issue #28).
+///
+/// The authorization and token endpoints read this to decide which resources a
+/// client may request and how a request with NO `resource` parameter is treated.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientResourcePolicy {
+    /// The per-client allowed-resource allowlist: the resource URIs this client may
+    /// request. [`None`] means NO per-client allowlist is configured, in which case
+    /// the client may request any resource that is a registered resource server in
+    /// its environment (the resource-server registry is itself the allowlist); a
+    /// [`Some`] set further RESTRICTS the client to exactly its entries. An empty
+    /// [`Some`] set means the client may request NO resource at all.
+    pub allowed_resources: Option<Vec<String>>,
+    /// Whether the client REFUSES a request that carries no `resource` parameter
+    /// (the stored `resource_indicator_policy` is `refuse`). `false` (the default,
+    /// for a `default_audience` or unset policy) keeps the existing no-resource
+    /// behavior: the token's audience is the client id.
+    pub require_resource_indicator: bool,
+}
+
 /// The client-authentication metadata for a client, read within scope (issue
 /// #20). The token endpoint uses it to enforce the client's registered
 /// authentication method and verify a presented secret against the stored hash.
@@ -930,6 +950,47 @@ impl ClientRepo<'_> {
         .await?;
         tx.commit().await?;
         Ok(row.and_then(|row| row.get::<Option<String>, _>("custom_token_claims")))
+    }
+
+    /// Read a client's RFC 8707 resource-indicator policy within scope (issue #28):
+    /// its per-client allowed-resource allowlist and whether it refuses a
+    /// no-`resource` request. A client absent in this scope (or minted in another) is
+    /// the uniform [`StoreError::NotFound`].
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the identifier is out of this scope or no client
+    /// matches; [`StoreError::Database`] on a persistence failure.
+    pub async fn resource_policy(&self, id: &ClientId) -> Result<ClientResourcePolicy, StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT allowed_resources, resource_indicator_policy FROM clients \
+             WHERE id = $1 AND tenant_id = $2 AND environment_id = $3",
+        )
+        .bind(id.to_string())
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        let row = row.ok_or(StoreError::NotFound)?;
+        // A NULL allowlist column is "no per-client allowlist"; a present one parses
+        // to the exact (possibly empty) set. A parse failure falls SAFE to an empty
+        // allowlist (the most restrictive reading), never to "no restriction".
+        let allowed_resources = row
+            .get::<Option<String>, _>("allowed_resources")
+            .map(|text| serde_json::from_str::<Vec<String>>(&text).unwrap_or_default());
+        let require_resource_indicator = row
+            .get::<Option<String>, _>("resource_indicator_policy")
+            .as_deref()
+            == Some("refuse");
+        Ok(ClientResourcePolicy {
+            allowed_resources,
+            require_resource_indicator,
+        })
     }
 
     /// Read a dynamically registered client's stored configuration within scope
@@ -1383,6 +1444,75 @@ impl ActingClientRepo<'_> {
                 .bind(skip_consent)
                 .bind(store_skipped_consent)
                 .bind(refresh_rotation.as_deref())
+                .bind(id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .execute(&mut **tx)
+                .await?;
+                if result.rows_affected() == 0 {
+                    return Err(StoreError::NotFound);
+                }
+                Ok(())
+            },
+            false,
+        )
+        .await
+    }
+
+    /// Set a client's RFC 8707 resource-indicator policy (issue #28): its per-client
+    /// allowed-resource allowlist and whether it refuses a no-`resource` request.
+    /// Writes a `client.resource_indicator_policy.set` audit row in the same
+    /// transaction.
+    ///
+    /// `allowed_resources` is [`None`] to CLEAR the per-client allowlist (the client
+    /// may then request any registered resource server), or [`Some`] to set the exact
+    /// allowlist (an empty slice means the client may request NO resource).
+    /// `require_resource_indicator` maps to the stored `refuse` / `default_audience`
+    /// policy string. Only the two resource-indicator columns are touched, under the
+    /// migration's column-scoped `UPDATE` grant.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the id is out of scope or no client matches;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn set_resource_indicator_policy(
+        &self,
+        env: &Env,
+        id: &ClientId,
+        allowed_resources: Option<&[String]>,
+        require_resource_indicator: bool,
+    ) -> Result<(), StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        // The store owns the JSON encoding of the allowlist (a Some(empty) allowlist
+        // is a real, restrictive value, so it is stored as `[]`, distinct from a NULL
+        // "no allowlist"). The policy column is the wire string the CHECK permits.
+        let allowed_json = allowed_resources
+            .map(|values| serde_json::to_string(values).unwrap_or_else(|_| "[]".to_owned()));
+        let policy = if require_resource_indicator {
+            "refuse"
+        } else {
+            "default_audience"
+        };
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::ClientResourceIndicatorPolicySet,
+                target: id,
+            },
+            async move |tx| {
+                let result = sqlx::query(
+                    "UPDATE clients \
+                     SET allowed_resources = $1, resource_indicator_policy = $2 \
+                     WHERE id = $3 AND tenant_id = $4 AND environment_id = $5",
+                )
+                .bind(allowed_json.as_deref())
+                .bind(policy)
                 .bind(id.to_string())
                 .bind(scope.tenant().to_string())
                 .bind(scope.environment().to_string())
@@ -2495,6 +2625,13 @@ pub struct IssueCode<'a> {
     /// code so the ID token (`id_token` member) and `UserInfo` (`userinfo` member)
     /// can honor it after the request itself is gone (issue #15).
     pub claims_request: Option<&'a str>,
+    /// The RFC 8707 resource audiences APPROVED at authorization (issue #28), the
+    /// ceiling a later code exchange or refresh may downscope from but never expand
+    /// beyond. Frozen onto BOTH the grant (read by the refresh path) and the code
+    /// (read by the code-exchange path), exactly as `claims_request` is. An empty
+    /// slice means no resource was approved (the default-audience case) and is
+    /// stored as NULL.
+    pub granted_resources: &'a [String],
     /// The code's expiry, in microseconds since the Unix epoch (clock seam).
     pub expires_at_micros: i64,
     /// The code's creation time, in microseconds since the Unix epoch.
@@ -2552,6 +2689,12 @@ pub struct CodeBindings {
     /// code (OIDC Core 5.5), or [`None`] when the request carried none. The token
     /// endpoint applies its `id_token` member to the ID token at mint (issue #15).
     pub claims_request: Option<String>,
+    /// The RFC 8707 resource audiences APPROVED at authorization (issue #28),
+    /// frozen onto the code. The token endpoint narrows the issued access token to
+    /// a requested subset of these; a requested resource outside this set is an
+    /// expansion beyond the grant and is rejected. Empty when no resource was
+    /// approved (the default-audience case).
+    pub granted_resources: Vec<String>,
 }
 
 impl fmt::Debug for CodeBindings {
@@ -2635,6 +2778,7 @@ impl AuthorizationRepo<'_> {
         let row = sqlx::query(
             "SELECT grant_id, client_id, redirect_uri, nonce, code_challenge, \
              code_challenge_method, subject, oauth_scope, auth_methods, claims_request, \
+             granted_resources, \
              (EXTRACT(EPOCH FROM auth_time) * 1000000)::bigint AS auth_time_us \
              FROM authorization_codes \
              WHERE id = $1 AND tenant_id = $2 AND environment_id = $3",
@@ -2767,7 +2911,7 @@ impl AuthorizationRepo<'_> {
         // #22's introspection response consumes carries the token's `exp` and `iat`.
         let row = sqlx::query(
             "SELECT t.subject AS subject, t.client_id AS client_id, t.audience AS audience, \
-             t.scope AS scope, t.jti AS jti, \
+             t.audiences AS audiences, t.scope AS scope, t.jti AS jti, \
              (EXTRACT(EPOCH FROM t.expires_at) * 1000000)::bigint AS expires_us, \
              (EXTRACT(EPOCH FROM t.created_at) * 1000000)::bigint AS issued_us \
              FROM opaque_access_tokens t \
@@ -2784,14 +2928,26 @@ impl AuthorizationRepo<'_> {
         .fetch_optional(&mut *tx)
         .await?;
         tx.commit().await?;
-        Ok(row.map(|row| ActiveOpaqueToken {
-            subject: row.get("subject"),
-            client_id: row.get("client_id"),
-            audience: row.get("audience"),
-            scope: row.get("scope"),
-            jti: row.get("jti"),
-            expires_at_unix_micros: row.get("expires_us"),
-            issued_at_unix_micros: row.get("issued_us"),
+        Ok(row.map(|row| {
+            let audience: String = row.get("audience");
+            // The recorded audience array, or a single-element fallback to the
+            // primary audience for a single-resource / no-resource token (whose
+            // `audiences` column is NULL). Always non-empty.
+            let mut audiences =
+                resource_array_from_json(row.get::<Option<String>, _>("audiences").as_deref());
+            if audiences.is_empty() {
+                audiences.push(audience.clone());
+            }
+            ActiveOpaqueToken {
+                subject: row.get("subject"),
+                client_id: row.get("client_id"),
+                audience,
+                audiences,
+                scope: row.get("scope"),
+                jti: row.get("jti"),
+                expires_at_unix_micros: row.get("expires_us"),
+                issued_at_unix_micros: row.get("issued_us"),
+            }
         }))
     }
 
@@ -2935,12 +3091,13 @@ impl ActingAuthorizationRepo<'_> {
                 target: code.code_id,
             },
             async move |tx| {
+                let granted_resources = resource_array_to_json(code.granted_resources);
                 sqlx::query(
                     "INSERT INTO grants \
                      (id, tenant_id, environment_id, client_id, subject, session_ref, \
-                      consent_ref, claims_request, created_at) \
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, \
-                             TIMESTAMPTZ 'epoch' + ($9::text || ' microseconds')::interval)",
+                      consent_ref, claims_request, granted_resources, created_at) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, \
+                             TIMESTAMPTZ 'epoch' + ($10::text || ' microseconds')::interval)",
                 )
                 .bind(code.grant_id.to_string())
                 .bind(scope.tenant().to_string())
@@ -2950,6 +3107,7 @@ impl ActingAuthorizationRepo<'_> {
                 .bind(code.session_ref)
                 .bind(code.consent_ref)
                 .bind(code.claims_request)
+                .bind(granted_resources.as_deref())
                 .bind(code.created_at_micros)
                 .execute(&mut **tx)
                 .await?;
@@ -2957,13 +3115,13 @@ impl ActingAuthorizationRepo<'_> {
                     "INSERT INTO authorization_codes \
                      (id, tenant_id, environment_id, grant_id, client_id, redirect_uri, nonce, \
                       code_challenge, code_challenge_method, subject, oauth_scope, auth_methods, \
-                      claims_request, auth_time, expires_at, created_at) \
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, \
-                             CASE WHEN $14::bigint IS NULL THEN NULL \
+                      claims_request, granted_resources, auth_time, expires_at, created_at) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, \
+                             CASE WHEN $15::bigint IS NULL THEN NULL \
                                   ELSE TIMESTAMPTZ 'epoch' \
-                                       + ($14::text || ' microseconds')::interval END, \
-                             TIMESTAMPTZ 'epoch' + ($15::text || ' microseconds')::interval, \
-                             TIMESTAMPTZ 'epoch' + ($16::text || ' microseconds')::interval)",
+                                       + ($15::text || ' microseconds')::interval END, \
+                             TIMESTAMPTZ 'epoch' + ($16::text || ' microseconds')::interval, \
+                             TIMESTAMPTZ 'epoch' + ($17::text || ' microseconds')::interval)",
                 )
                 .bind(code.code_id.to_string())
                 .bind(scope.tenant().to_string())
@@ -2978,6 +3136,7 @@ impl ActingAuthorizationRepo<'_> {
                 .bind(code.oauth_scope)
                 .bind(code.auth_methods)
                 .bind(code.claims_request)
+                .bind(granted_resources.as_deref())
                 .bind(code.auth_time_micros)
                 .bind(code.expires_at_micros)
                 .bind(code.created_at_micros)
@@ -3112,9 +3271,9 @@ impl ActingAuthorizationRepo<'_> {
                 sqlx::query(
                     "INSERT INTO opaque_access_tokens \
                      (token_digest, tenant_id, environment_id, grant_id, subject, \
-                      client_id, audience, scope, jti, expires_at) \
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, \
-                             TIMESTAMPTZ 'epoch' + ($10::text || ' microseconds')::interval)",
+                      client_id, audience, audiences, scope, jti, expires_at) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, \
+                             TIMESTAMPTZ 'epoch' + ($11::text || ' microseconds')::interval)",
                 )
                 .bind(opaque.token_digest)
                 .bind(scope.tenant().to_string())
@@ -3123,6 +3282,7 @@ impl ActingAuthorizationRepo<'_> {
                 .bind(opaque.subject)
                 .bind(opaque.client_id)
                 .bind(opaque.audience)
+                .bind(resource_array_to_json(opaque.audiences))
                 .bind(opaque.scope)
                 .bind(opaque.jti.to_string())
                 .bind(opaque.expires_at_unix_micros)
@@ -3364,9 +3524,9 @@ impl ActingAuthorizationRepo<'_> {
                         sqlx::query(
                             "INSERT INTO opaque_access_tokens \
                              (token_digest, tenant_id, environment_id, grant_id, subject, \
-                              client_id, audience, scope, jti, expires_at) \
-                             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, \
-                                     TIMESTAMPTZ 'epoch' + ($10::text || ' microseconds')::interval)",
+                              client_id, audience, audiences, scope, jti, expires_at) \
+                             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, \
+                                     TIMESTAMPTZ 'epoch' + ($11::text || ' microseconds')::interval)",
                         )
                         .bind(opaque.token_digest)
                         .bind(scope.tenant().to_string())
@@ -3375,6 +3535,7 @@ impl ActingAuthorizationRepo<'_> {
                         .bind(opaque.subject)
                         .bind(opaque.client_id)
                         .bind(opaque.audience)
+                        .bind(resource_array_to_json(opaque.audiences))
                         .bind(opaque.scope)
                         .bind(opaque.jti.to_string())
                         .bind(opaque.expires_at_unix_micros)
@@ -4752,9 +4913,18 @@ pub struct NewOpaqueAccessToken<'a> {
     pub subject: &'a str,
     /// The OAuth client the token belongs to.
     pub client_id: &'a str,
-    /// The audience the token targets (a resource server's audience or the client
-    /// id).
+    /// The PRIMARY audience the token targets (a resource server's audience or the
+    /// client id): the first requested-and-allowlisted resource, or the client id
+    /// for the no-resource case. Kept for backward compatibility with the existing
+    /// single-audience introspection reporting.
     pub audience: &'a str,
+    /// The FULL requested-and-allowlisted audience set (issue #28, RFC 8707). An
+    /// empty slice means "no explicit multi-audience set" (a single-resource or
+    /// no-resource token), which the store records as SQL NULL and introspection
+    /// falls back to `[audience]`; a non-empty slice records the whole array so
+    /// introspection reports it (RFC 7662 permits an `aud` array). The store owns
+    /// the JSON encoding.
+    pub audiences: &'a [String],
     /// The granted OAuth scope value, if any.
     pub scope: Option<&'a str>,
     /// The token's logical identifier (a `tok_` scoped id).
@@ -4784,8 +4954,14 @@ pub struct ActiveOpaqueToken {
     pub subject: String,
     /// The OAuth client the token belongs to.
     pub client_id: String,
-    /// The audience the token targets.
+    /// The PRIMARY audience the token targets (the first recorded audience, or the
+    /// client id for the no-resource case).
     pub audience: String,
+    /// The FULL recorded audience set (issue #28, RFC 8707), for the RFC 7662
+    /// introspection response. A single-resource or no-resource token has exactly
+    /// one entry (`[audience]`); a multi-resource token has the whole array. Always
+    /// non-empty (it falls back to `[audience]` when no explicit array was stored).
+    pub audiences: Vec<String>,
     /// The granted OAuth scope value, if any.
     pub scope: Option<String>,
     /// The token's logical identifier (a `tok_` id string).
@@ -4848,7 +5024,33 @@ fn bindings_from_row(row: &PgRow, scope: &Scope) -> Result<CodeBindings, StoreEr
         auth_methods: row.get("auth_methods"),
         auth_time_unix_micros: row.get("auth_time_us"),
         claims_request: row.get("claims_request"),
+        granted_resources: resource_array_from_json(
+            row.get::<Option<String>, _>("granted_resources").as_deref(),
+        ),
     })
+}
+
+/// Serialize a resource/audience string array to the canonical JSON text stored in
+/// the RFC 8707 resource-indicator columns (issue #28). An EMPTY slice serializes to
+/// [`None`] (the store binds SQL NULL), so a no-resource grant/code/token carries no
+/// array and reads back as empty. This is the ONE place the array shape is encoded,
+/// so the write and the [`resource_array_from_json`] read cannot disagree.
+fn resource_array_to_json(values: &[String]) -> Option<String> {
+    if values.is_empty() {
+        None
+    } else {
+        serde_json::to_string(values).ok()
+    }
+}
+
+/// Parse a stored JSON resource/audience array back to a vector (issue #28). A NULL
+/// column, an empty string, or malformed JSON all read as an EMPTY vector: a pre-#28
+/// row (NULL) and a decode failure both fail SAFE to "no resources recorded" (the
+/// most restrictive reading: an empty granted set is a ceiling nothing can expand
+/// past), never erroring an otherwise-valid resolve.
+fn resource_array_from_json(raw: Option<&str>) -> Vec<String> {
+    raw.and_then(|text| serde_json::from_str::<Vec<String>>(text).ok())
+        .unwrap_or_default()
 }
 
 // ===========================================================================
@@ -4907,6 +5109,11 @@ pub struct RefreshTokenResolution {
     pub client_id: String,
     /// The granted OAuth scope value the family was issued against, if any.
     pub scope: Option<String>,
+    /// The RFC 8707 resource audiences approved at the original authorization
+    /// (issue #28), read from the family's grant. A refresh may downscope to a
+    /// subset of these but can NEVER expand beyond them; empty means no resource
+    /// was approved (the default-audience case).
+    pub granted_resources: Vec<String>,
     /// The recorded authentication method tokens the refreshed access token's
     /// `acr`/`amr` derive from.
     pub auth_methods: String,
@@ -5085,6 +5292,7 @@ impl RefreshRepo<'_> {
              (EXTRACT(EPOCH FROM rt.idle_expires_at) * 1000000)::bigint AS idle_us, \
              f.grant_id AS grant_id, f.subject AS subject, f.client_id AS client_id, \
              f.scope AS scope, f.auth_methods AS auth_methods, f.offline AS offline, \
+             g.granted_resources AS granted_resources, \
              (EXTRACT(EPOCH FROM f.absolute_expires_at) * 1000000)::bigint AS abs_us, \
              (f.revoked_at IS NULL) AS family_live, (g.revoked_at IS NULL) AS grant_live \
              FROM refresh_tokens rt \
@@ -5790,9 +5998,9 @@ async fn record_refresh_access(
         sqlx::query(
             "INSERT INTO opaque_access_tokens \
              (token_digest, tenant_id, environment_id, grant_id, subject, \
-              client_id, audience, scope, jti, expires_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, \
-                     TIMESTAMPTZ 'epoch' + ($10::text || ' microseconds')::interval)",
+              client_id, audience, audiences, scope, jti, expires_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, \
+                     TIMESTAMPTZ 'epoch' + ($11::text || ' microseconds')::interval)",
         )
         .bind(opaque.token_digest)
         .bind(scope.tenant().to_string())
@@ -5801,6 +6009,7 @@ async fn record_refresh_access(
         .bind(opaque.subject)
         .bind(opaque.client_id)
         .bind(opaque.audience)
+        .bind(resource_array_to_json(opaque.audiences))
         .bind(opaque.scope)
         .bind(opaque.jti.to_string())
         .bind(opaque.expires_at_unix_micros)
@@ -5824,6 +6033,9 @@ fn refresh_resolution_from_row(
         subject: row.get("subject"),
         client_id: row.get("client_id"),
         scope: row.get("scope"),
+        granted_resources: resource_array_from_json(
+            row.get::<Option<String>, _>("granted_resources").as_deref(),
+        ),
         auth_methods: row.get("auth_methods"),
         offline: row.get("offline"),
         issued_at_unix_micros: row.get("issued_us"),

@@ -25,7 +25,7 @@
 //! #12) are unchanged; only how the subject and consent are established is real
 //! now instead of a seam.
 
-use axum::extract::{Form, Query, State};
+use axum::extract::{RawQuery, State};
 use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
 use ironauth_store::{
@@ -44,9 +44,10 @@ use crate::hints::InteractionHints;
 use crate::interaction;
 use crate::par::PAR_REQUEST_URI_PREFIX;
 use crate::registry::{PkceMethod, PromptSet, PromptValue, ResponseMode, ResponseType};
+use crate::resource;
 use crate::response;
 use crate::scope_claims::{assemble_claims, parse_scope_set};
-use crate::state::OidcState;
+use crate::state::{OidcState, ResourceTargetError};
 use crate::token_hash;
 use crate::tokens::{self, MintRequest};
 use crate::util::{append_query, client_service_actor, epoch_micros};
@@ -159,23 +160,49 @@ pub struct AuthorizeParams {
     /// value is harmless. It is cleared before storage (a pushed request never
     /// carries it), so it is always [`None`] on a replayed request.
     pub par_resume: Option<String>,
+    /// The RFC 8707 `resource` indicators (issue #28): the resource server(s) the
+    /// eventual access token is for. The wire parameter `resource` MAY appear
+    /// multiple times, which a scalar serde field cannot capture, so it is NOT
+    /// deserialized from the query/form here (it stays `#[serde(default)]` empty on
+    /// that path); the endpoint parses every `resource` value from the raw body and
+    /// sets this field. It round-trips through PAR storage as a JSON array (`serde_json`
+    /// handles the sequence), so a pushed request replays its resources verbatim.
+    #[serde(default)]
+    pub resources: Vec<String>,
 }
 
 /// `GET /authorize`.
+///
+/// The raw query is taken (via [`RawQuery`]) rather than a typed
+/// `Query<AuthorizeParams>` so the RFC 8707 `resource` parameter, which MAY repeat
+/// (issue #28) and cannot be captured by a scalar serde field, is parsed alongside
+/// the typed fields from the SAME query string.
 pub async fn authorize_get(
     State(state): State<OidcState>,
     headers: HeaderMap,
-    Query(params): Query<AuthorizeParams>,
+    RawQuery(query): RawQuery,
 ) -> Response {
+    let raw = query.unwrap_or_default();
+    let Ok(mut params) = serde_urlencoded::from_str::<AuthorizeParams>(&raw) else {
+        return AuthorizeError::page("the authorization request could not be processed")
+            .into_response();
+    };
+    params.resources = resource::resources_from_encoded(&raw);
     handle(&state, &headers, params).await
 }
 
-/// `POST /authorize`.
+/// `POST /authorize`. Parses the raw form body the same way as [`authorize_get`],
+/// so a repeated `resource` parameter (issue #28) is captured on the POST path too.
 pub async fn authorize_post(
     State(state): State<OidcState>,
     headers: HeaderMap,
-    Form(params): Form<AuthorizeParams>,
+    body: String,
 ) -> Response {
+    let Ok(mut params) = serde_urlencoded::from_str::<AuthorizeParams>(&body) else {
+        return AuthorizeError::page("the authorization request could not be processed")
+            .into_response();
+    };
+    params.resources = resource::resources_from_encoded(&body);
     handle(&state, &headers, params).await
 }
 
@@ -484,6 +511,23 @@ async fn issue_code(
         .filter(|value| !value.is_empty());
     let effective_scope = effective_granted_scope(requested_scope, response_type.issues_code());
 
+    // 5e. RFC 8707 resource indicators (issue #28): validate the requested resources
+    //     and freeze the APPROVED set onto the grant and code as the downscope ceiling
+    //     the token/refresh endpoints enforce. Each resource must be a valid absolute
+    //     URI (no fragment), on the client's allowlist, and a registered resource
+    //     server; a client whose policy REFUSES a no-resource request must name at
+    //     least one. Every violation is `invalid_target`, delivered through the
+    //     negotiated mode (the redirect_uri is validated by now). This runs before the
+    //     login/consent gate so a rejection never triggers an interaction.
+    validate_authorize_resources(state, scope, &client_id, &params.resources)
+        .await
+        .map_err(|code| {
+            redirect_error(
+                code,
+                "the requested resource is invalid, unknown, or not allowed",
+            )
+        })?;
+
     // 6. Establish the authenticated subject and their consent, applying prompt and
     //    max_age. A missing session, missing consent, or a forced (re-)authentication
     //    short-circuits to a LOCAL interaction redirect (never the client's
@@ -556,6 +600,7 @@ async fn issue_code(
         session_ref: &session_ref,
         consent_ref: consent_ref.as_deref(),
         claims_request: claims_canonical.as_deref(),
+        granted_resources: &params.resources,
     };
 
     // 7b. Single-use PAR consume at the moment of issuance (RFC 9126, issue #27).
@@ -1839,6 +1884,54 @@ struct Resolved<'a> {
     /// The canonical JSON of the `claims` request parameter (issue #15), frozen
     /// onto the code and grant, or [`None`] when the request carried none.
     claims_request: Option<&'a str>,
+    /// The RFC 8707 resource audiences approved at this authorization (issue #28),
+    /// frozen onto the grant and code as the downscope ceiling. Empty when no
+    /// resource was requested.
+    granted_resources: &'a [String],
+}
+
+/// Validate the RFC 8707 resource indicators on an authorization request (issue #28).
+///
+/// Each requested resource must be a valid absolute URI (no fragment), on the
+/// client's allowlist, AND a registered resource server in scope; a client whose
+/// no-resource policy is `refuse` must name at least one resource. Unlike the token
+/// endpoint, this does NOT enforce token-format agreement across the requested
+/// resources: the authorization step APPROVES resources (which a later token request
+/// narrows to one format-consistent subset), it does not mint a token. Returns the
+/// [`AuthzErrorCode`] to deliver on failure (`invalid_target` for a policy violation,
+/// `server_error` for a store fault); the caller renders it through the negotiated
+/// response mode.
+async fn validate_authorize_resources(
+    state: &OidcState,
+    scope: Scope,
+    client_id: &ClientId,
+    resources: &[String],
+) -> Result<(), AuthzErrorCode> {
+    let policy = state
+        .store()
+        .scoped(scope)
+        .clients()
+        .resource_policy(client_id)
+        .await
+        .map_err(|_| AuthzErrorCode::ServerError)?;
+    // Every NAMED resource: a valid indicator, on the client's allowlist.
+    if !resource::resources_permitted(resources, &policy) {
+        return Err(AuthzErrorCode::InvalidTarget);
+    }
+    // No resource named: honor the client's no-resource policy (refuse vs default).
+    if resources.is_empty() {
+        return if policy.require_resource_indicator {
+            Err(AuthzErrorCode::InvalidTarget)
+        } else {
+            Ok(())
+        };
+    }
+    // Every named resource must resolve to a registered resource server.
+    match state.validate_resources_registered(&scope, resources).await {
+        Ok(()) => Ok(()),
+        Err(ResourceTargetError::InvalidTarget) => Err(AuthzErrorCode::InvalidTarget),
+        Err(ResourceTargetError::ServerError) => Err(AuthzErrorCode::ServerError),
+    }
 }
 
 /// Mint the code and its grant bound to every re-checkable parameter (with a
@@ -1875,6 +1968,7 @@ async fn persist_code(
         session_ref: Some(resolved.session_ref),
         consent_ref: resolved.consent_ref,
         claims_request: resolved.claims_request,
+        granted_resources: resolved.granted_resources,
         expires_at_micros: epoch_micros(expires_at),
         created_at_micros: epoch_micros(now),
     };

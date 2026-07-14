@@ -6,6 +6,35 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- RFC 8707 Resource Indicators (issue #28) at the authorization, PAR, and token
+  endpoints.
+  - **The `resource` parameter, possibly repeated.** The authorization request, the
+    PAR request, and the token request (on both the `authorization_code` and the
+    `refresh_token` grant) accept one or more `resource` values. Each must be an
+    absolute URI with no fragment (RFC 8707 section 2); a malformed, unregistered, or
+    disallowed value is rejected with the `invalid_target` error (rendered on the
+    token error body and on the authorization redirect).
+  - **Audience-restricted access tokens (RFC 9068, RFC 9700).** An at+jwt carries
+    ONLY the requested, allowlisted audiences: a single resource yields a string
+    `aud` (byte-identical to the pre-#28 wire form), multiple resources yield a JSON
+    array `aud`. An opaque token records its audiences so introspection reports them
+    (a string for one, an array for many). There is no default-everything audience;
+    a token minted for resource A fails audience validation at resource B.
+  - **Per-client policy.** An optional allowlist restricts which registered resources
+    a client may target; a per-client knob decides the no-resource case (fall back to
+    the client-id audience, the additive default, or refuse the request). Resources
+    resolve against the environment `resource_servers` registry for their audience,
+    token format, and lifetime; all targeted resource servers must agree on a format
+    (else `invalid_target`) and the token takes the shortest of their lifetimes.
+  - **Downscope, never expand.** The resources approved at authorization are frozen on
+    the code and the grant. A code exchange or a refresh may name a SUBSET of them
+    (narrowing the token), but naming a resource outside the approved set is
+    `invalid_target`, so a refresh can never broaden a grant.
+  - `OidcState::resolve_access_token_target` now takes a `&[String]` of resources and
+    returns a `Result<AccessTokenTarget, ResourceTargetError>` carrying an audience
+    vector; the no-resource path is unchanged, so the device (#24), jwt-bearer (#26),
+    and client-credentials grants keep their single client-id audience.
+
 - Dynamic Client Registration abuse controls (issue #31), wrapping the #30 create.
   - **Exposure switch.** A per-environment `closed` / `token_gated` / `open` mode
     (default `token_gated`) governs who may register: `closed` refuses every public

@@ -242,13 +242,13 @@ async fn expand_contract_example_chain_runs_all_three_phases_and_contract_remove
     );
 }
 
-/// The PRODUCTION chain (`MigrationRunner::new`) contains exactly the eighteen
+/// The PRODUCTION chain (`MigrationRunner::new`) contains exactly the nineteen
 /// real migrations and leaves no throwaway demo object in a real database.
 // A long but linear ledger-and-table assertion sweep (one line per migration and
 // per real table); splitting it would not make it clearer.
 #[allow(clippy::too_many_lines)]
 #[tokio::test]
-async fn production_chain_is_only_the_eighteen_real_migrations_and_ships_no_demo_object() {
+async fn production_chain_is_only_the_nineteen_real_migrations_and_ships_no_demo_object() {
     // TestDatabase::start runs Store::migrate() (the production chain) on a
     // fresh, empty database.
     let db = TestDatabase::start().await;
@@ -265,19 +265,20 @@ async fn production_chain_is_only_the_eighteen_real_migrations_and_ships_no_demo
     );
     assert_eq!(
         report.already_applied(),
-        18,
-        "the production chain is exactly eighteen migrations (isolation, audit log, management \
+        19,
+        "the production chain is exactly nineteen migrations (isolation, audit log, management \
          API, OIDC authorization, signing keys, login/consent, authentication context, redirect \
          registration, UserInfo claims, consent scope upsert, resource servers, opaque access \
          tokens, client auth suite, dynamic client registration, pushed authorization requests, \
-         refresh tokens, client-credentials service accounts, DCR abuse controls)"
+         refresh tokens, client-credentials service accounts, DCR abuse controls, resource \
+         indicators)"
     );
 
-    // The ledger holds exactly versions 1 through 18.
+    // The ledger holds exactly versions 1 through 19.
     assert_eq!(
         applied_versions(pool).await,
         vec![
-            1_i64, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18
+            1_i64, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19
         ]
     );
     let phase_of = |version: i64| async move {
@@ -314,6 +315,9 @@ async fn production_chain_is_only_the_eighteen_real_migrations_and_ships_no_demo
     // expands (issue #31).
     assert_eq!(phase_of(17).await, "expand");
     assert_eq!(phase_of(18).await, "expand");
+    // The resource-indicator columns are all additive ALTER TABLE ADD COLUMNs plus a
+    // CHECK and a column-scoped grant, so this is an expand too (issue #28).
+    assert_eq!(phase_of(19).await, "expand");
 
     // The demo object never reaches a production database.
     assert!(
@@ -559,6 +563,29 @@ async fn production_chain_is_only_the_eighteen_real_migrations_and_ships_no_demo
     assert!(
         column_exists(pool, "audit_log", "detail").await,
         "audit_log.detail exists"
+    );
+    // The RFC 8707 resource-indicator columns (issue #28): the per-client allowlist
+    // and no-resource policy, the frozen granted-resource ceiling on the grant and
+    // the code, and the recorded audience array on an opaque token.
+    assert!(
+        column_exists(pool, "clients", "allowed_resources").await,
+        "clients.allowed_resources exists"
+    );
+    assert!(
+        column_exists(pool, "clients", "resource_indicator_policy").await,
+        "clients.resource_indicator_policy exists"
+    );
+    assert!(
+        column_exists(pool, "grants", "granted_resources").await,
+        "grants.granted_resources exists"
+    );
+    assert!(
+        column_exists(pool, "authorization_codes", "granted_resources").await,
+        "authorization_codes.granted_resources exists"
+    );
+    assert!(
+        column_exists(pool, "opaque_access_tokens", "audiences").await,
+        "opaque_access_tokens.audiences exists"
     );
 }
 

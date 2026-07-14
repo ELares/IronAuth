@@ -90,6 +90,7 @@ mod password;
 mod pkce;
 mod register;
 mod registry;
+mod resource;
 mod response;
 mod revocation;
 mod scope_claims;
@@ -145,7 +146,7 @@ pub use sector::{
     SectorError, check_sector_document, sector_uri_required, validate_sector_identifier,
 };
 pub use session::SESSION_COOKIE;
-pub use state::OidcState;
+pub use state::{OidcState, ResourceTargetError};
 pub use subject::{
     MAX_SUBJECT_LEN, PairwiseSalt, SubjectCache, SubjectConfig, SubjectType, resolve_subject,
     subject_within_cap,

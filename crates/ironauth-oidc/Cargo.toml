@@ -36,6 +36,10 @@ axum = { workspace = true, features = ["form", "query", "json", "tokio"] }
 http.workspace = true
 serde = { workspace = true }
 serde_json.workspace = true
+# Parse the (possibly repeated) RFC 8707 `resource` request parameter (issue #28)
+# from a raw query/form body: the same crate axum uses for form/query extraction,
+# so no new crate enters the graph.
+serde_urlencoded.workspace = true
 # URL-safe, no-padding base64 for the PKCE S256 comparison and for decoding a
 # token's jti in tests. Already in the tree via ironauth-store; no new crate.
 base64.workspace = true
@@ -324,6 +328,16 @@ required-features = ["testing"]
 [[test]]
 name = "client_credentials"
 path = "tests/client_credentials.rs"
+required-features = ["testing"]
+
+# RFC 8707 resource indicators (issue #28): URI validation, per-client allowlist
+# rejection with invalid_target, multi-resource authorization narrowed at the token
+# endpoint, refresh downscoping (and expansion rejection), cross-resource replay
+# rejection via audience enforcement, and opaque-token audiences reported through
+# introspection. Needs a real database (DATABASE_URL).
+[[test]]
+name = "resource_indicators"
+path = "tests/resource_indicators.rs"
 required-features = ["testing"]
 
 [lints]

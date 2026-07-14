@@ -31,7 +31,7 @@
 //! is only ever the stored PAR row, looked up by reference. The by-reference JAR
 //! request object (RFC 9101) is a documented non-goal for this issue.
 
-use axum::extract::{Form, State};
+use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use ironauth_store::{ClientId, CorrelationId, PushRequest, PushedRequestId, Scope};
@@ -120,7 +120,11 @@ impl ParParams {
     /// `request_uri` and the internal `emit_auth_time`/`par_resume` markers are always
     /// cleared: a pushed request never references another, and the resume markers are
     /// internal to the interaction round-trip.
-    fn into_authorize_params(self, authenticated_client_id: String) -> AuthorizeParams {
+    fn into_authorize_params(
+        self,
+        authenticated_client_id: String,
+        resources: Vec<String>,
+    ) -> AuthorizeParams {
         AuthorizeParams {
             request_uri: None,
             response_type: self.response_type,
@@ -143,17 +147,29 @@ impl ParParams {
             display: self.display,
             emit_auth_time: None,
             par_resume: None,
+            // The RFC 8707 `resource` indicators (issue #28) parsed from the pushed
+            // form, carried through PAR storage so a replayed request approves the
+            // same resources as an inline request.
+            resources,
         }
     }
 }
 
 /// `POST /par` (RFC 9126, issue #27).
-pub async fn par(
-    State(state): State<OidcState>,
-    headers: HeaderMap,
-    Form(params): Form<ParParams>,
-) -> Response {
-    match push(&state, &headers, params).await {
+///
+/// The raw body is taken (rather than `Form<ParParams>`) so the RFC 8707 `resource`
+/// parameter, which MAY repeat (issue #28), is parsed alongside the typed fields and
+/// stored with the pushed request.
+pub async fn par(State(state): State<OidcState>, headers: HeaderMap, body: String) -> Response {
+    let params: ParParams = match serde_urlencoded::from_str(&body) {
+        Ok(params) => params,
+        Err(_) => {
+            return PushedAuthError::InvalidRequest("the request body is malformed".to_owned())
+                .into_response();
+        }
+    };
+    let resources = crate::resource::resources_from_encoded(&body);
+    match push(&state, &headers, params, resources).await {
         Ok(response) => response,
         Err(error) => error.into_response(),
     }
@@ -163,6 +179,7 @@ async fn push(
     state: &OidcState,
     headers: &HeaderMap,
     params: ParParams,
+    resources: Vec<String>,
 ) -> Result<Response, PushedAuthError> {
     // 1. A pushed request MUST NOT itself carry a request_uri (RFC 9126 section 2.1).
     if params
@@ -191,7 +208,7 @@ async fn push(
     // 4. Validate the COMPLETE authorization request with EXACTLY the same rules as
     //    `/authorize`, through the ONE shared validator. An error surfaces HERE on the
     //    back channel (RFC 9126 section 2.3), not later at `/authorize`.
-    let authorize_params = params.into_authorize_params(authenticated_client_id.clone());
+    let authorize_params = params.into_authorize_params(authenticated_client_id.clone(), resources);
     validate_request(state, &client, &authorize_params)
         .map_err(PushedAuthError::from_validation)?;
 
