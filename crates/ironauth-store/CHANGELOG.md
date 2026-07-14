@@ -6,6 +6,25 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Token revocation store support (issue #22, no migration).
+  - **Grant-chain and family revocation.** `ActingAuthorizationRepo::revoke_grant`
+    revokes a grant chain (the RFC 7009 access-token revoke: the append-only issued/opaque
+    token rows derive their active state from `grants.revoked_at`, so this flips every
+    derived token inactive), and `ActingRefreshRepo::revoke_family` revokes a refresh-token
+    family AND its grant in one transaction (the refresh-token revoke: the #21 family spine
+    plus the RFC 7009 cascade to the derived access tokens). Both are bespoke committing
+    paths that write their audit row (`token.revoke` / the reused `refresh_family.revoke`)
+    only when the revocation actually flipped a live grant/family, so a repeat revocation
+    is a benign idempotent no-op. No new columns or tables were needed: revocation operates
+    entirely on the existing `revoked_at` spines.
+  - **Revocation locators.** `AuthorizationRepo::grant_for_access_token` and
+    `grant_for_opaque_token` locate a presented access token's grant and owning client
+    (the new `GrantOwner`) for the revocation endpoint's foreign-client check, WITHOUT
+    filtering on expiry or revoked state, so revoking an already-invalid token is a benign
+    no-op rather than a false "unknown".
+  - **New audit action** `token.revoke` (`Action::TokenRevoke`) for an endpoint-driven
+    access-token revocation; a refresh-token revoke reuses `refresh_family.revoke`.
+
 - Refresh-token rotation, families, `offline_access`, and consent-mode persistence
   (issue #21, migration 0016, expand).
   - **Token families and digest-only tokens.** New `refresh_families` (the

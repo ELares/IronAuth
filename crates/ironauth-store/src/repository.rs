@@ -1598,6 +1598,30 @@ impl fmt::Debug for AccessTokenResolution {
     }
 }
 
+/// The revocation-relevant locator for a presented access token (issue #22): the
+/// GRANT it hangs off (the revocation spine) and the CLIENT that owns it.
+///
+/// The RFC 7009 revocation endpoint reads this to decide two things WITHOUT an
+/// existence oracle: whether the presented token belongs to the CLIENT that
+/// authenticated (a token owned by a different client is treated as unknown), and
+/// which grant to revoke. Because the append-only `issued_tokens` /
+/// `opaque_access_tokens` rows derive their active state ONLY from
+/// `grants.revoked_at`, revoking a token is revoking its grant chain, so the
+/// `grant_id` here is the revocation target. `grant_id` is [`None`] only for an
+/// opaque token minted outside the authorization-code flow (a `grant_id`-NULL row,
+/// which the current mint never produces); such a token has no grant spine to
+/// revoke.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrantOwner {
+    /// The grant the token hangs off, when one is recorded. Revoking it flips the
+    /// active state of every token derived from it (RFC 7009 cascade).
+    pub grant_id: Option<GrantId>,
+    /// The client the grant (and thus the token) belongs to. The revocation
+    /// endpoint compares it against the authenticated client for the foreign-client
+    /// check.
+    pub client_id: String,
+}
+
 /// Everything the authorization endpoint binds into a freshly issued code and
 /// its grant. The `code_id`, `grant_id`, and `client_id` are all scoped
 /// identifiers minted (or resolved) under the caller's scope, so a mismatch is a
@@ -1941,6 +1965,102 @@ impl AuthorizationRepo<'_> {
             expires_at_unix_micros: row.get("expires_us"),
             issued_at_unix_micros: row.get("issued_us"),
         }))
+    }
+
+    /// Locate the grant and owning client of an `at+jwt` access token by its `jti`,
+    /// within scope, for revocation (issue #22). Returns [`None`] when no access
+    /// token with this identifier is recorded in scope (absent, out of scope, or an
+    /// ID-token `jti`).
+    ///
+    /// Unlike [`resolve_access_token`](Self::resolve_access_token), this does NOT
+    /// filter on the grant's revoked state: a token whose grant is ALREADY revoked
+    /// still locates, so a second revocation of it is a benign idempotent no-op (RFC
+    /// 7009 returns 200 for an already-invalid token) rather than a false "unknown".
+    /// The scope isolation is the same three-layer guarantee as
+    /// [`resolve_access_token`](Self::resolve_access_token).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn grant_for_access_token(
+        &self,
+        jti: &IssuedTokenId,
+    ) -> Result<Option<GrantOwner>, StoreError> {
+        if jti.scope() != self.scope {
+            return Ok(None);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT g.id AS grant_id, g.client_id AS client_id \
+             FROM issued_tokens t \
+             JOIN grants g ON g.id = t.grant_id \
+             AND g.tenant_id = t.tenant_id AND g.environment_id = t.environment_id \
+             WHERE t.id = $1 AND t.token_kind = 'access' \
+             AND t.tenant_id = $2 AND t.environment_id = $3",
+        )
+        .bind(jti.to_string())
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        match row {
+            None => Ok(None),
+            Some(row) => Ok(Some(GrantOwner {
+                grant_id: Some(GrantId::parse_in_scope(
+                    &row.get::<String, _>("grant_id"),
+                    &self.scope,
+                )?),
+                client_id: row.get("client_id"),
+            })),
+        }
+    }
+
+    /// Locate the grant and owning client of an OPAQUE access token by the presented
+    /// token, within scope, for revocation (issue #22). Returns [`None`] when no such
+    /// token is recorded in scope.
+    ///
+    /// Like [`grant_for_access_token`](Self::grant_for_access_token) this does NOT
+    /// filter on expiry or grant-revoked state, so a second revocation, or a revoke
+    /// of an already-expired token, locates and is a benign idempotent no-op rather
+    /// than a false "unknown". The presented token is hashed with
+    /// [`opaque_access_token_digest`] and matched within scope, so a token minted in
+    /// one environment never locates under another. `grant_id` is [`None`] for a
+    /// `grant_id`-NULL row (a token minted outside the authorization-code flow),
+    /// which has no grant spine to revoke.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn grant_for_opaque_token(
+        &self,
+        presented_token: &str,
+    ) -> Result<Option<GrantOwner>, StoreError> {
+        let digest = opaque_access_token_digest(presented_token);
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT grant_id, client_id FROM opaque_access_tokens \
+             WHERE token_digest = $1 AND tenant_id = $2 AND environment_id = $3",
+        )
+        .bind(&digest)
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        match row {
+            None => Ok(None),
+            Some(row) => {
+                let grant_id = match row.get::<Option<String>, _>("grant_id") {
+                    Some(text) => Some(GrantId::parse_in_scope(&text, &self.scope)?),
+                    None => None,
+                };
+                Ok(Some(GrantOwner {
+                    grant_id,
+                    client_id: row.get("client_id"),
+                }))
+            }
+        }
     }
 }
 
@@ -2326,6 +2446,63 @@ impl ActingAuthorizationRepo<'_> {
             false,
         )
         .await
+    }
+
+    /// Revoke a grant chain at the RFC 7009 revocation endpoint (issue #22),
+    /// returning whether this call is the one that flipped it.
+    ///
+    /// The append-only `issued_tokens` / `opaque_access_tokens` rows derive their
+    /// active state ONLY from `grants.revoked_at`, so revoking a token IS revoking
+    /// its grant: every access token minted from this grant (an at+jwt, an opaque
+    /// reference token, or a refreshed one) immediately resolves as inactive, and so
+    /// does any refresh family rooted at it. This is the RFC 7009 access-token
+    /// revoke, and the cascade for a refresh-token revoke reaches the derived access
+    /// tokens the same way (through [`ActingRefreshRepo::revoke_family`], which calls
+    /// the same `grants` UPDATE alongside the family spine).
+    ///
+    /// The revoke is a bespoke committing path (like the code redeem): the `revoked_at`
+    /// UPDATE and its `token.revoke` audit row share one transaction, and the audit
+    /// row is written ONLY when this call actually flipped a live grant (`revoked_at
+    /// IS NULL`), so a second revocation of an already-revoked token is a benign
+    /// idempotent no-op with no spurious audit row. `now` flows from the application
+    /// clock seam, never the database clock.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if `grant_id` is out of this scope;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn revoke_grant(&self, env: &Env, grant_id: &GrantId) -> Result<bool, StoreError> {
+        if grant_id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let now_micros = epoch_micros(env.clock().now_utc());
+        let mut tx = begin_scoped(self.store, scope).await?;
+        let revoked = sqlx::query(
+            "UPDATE grants \
+             SET revoked_at = TIMESTAMPTZ 'epoch' + ($1::text || ' microseconds')::interval \
+             WHERE id = $2 AND tenant_id = $3 AND environment_id = $4 AND revoked_at IS NULL",
+        )
+        .bind(now_micros)
+        .bind(grant_id.to_string())
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .execute(&mut *tx)
+        .await?;
+        let flipped = revoked.rows_affected() > 0;
+        if flipped {
+            let spec = AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::TokenRevoke,
+                target: grant_id,
+            };
+            insert_audit_row(&mut tx, &spec).await?;
+        }
+        tx.commit().await?;
+        Ok(flipped)
     }
 }
 
@@ -4299,6 +4476,84 @@ impl ActingRefreshRepo<'_> {
         )
         .await?;
         Ok(revoked_count)
+    }
+
+    /// Revoke a single refresh-token FAMILY and its grant chain at the RFC 7009
+    /// revocation endpoint (issue #22), returning whether this call flipped anything.
+    ///
+    /// Revoking a refresh token does two things (RFC 7009 section 2.1): it
+    /// invalidates the refresh token, and it SHOULD invalidate the access tokens
+    /// issued from the same authorization grant. Both happen here in ONE transaction:
+    /// the family's `revoked_at` is set (invalidating every generation of the refresh
+    /// token, reusing the #21 family spine) AND the grant's `revoked_at` is set
+    /// (cascading to every derived access token, which resolve their active state
+    /// from `grants.revoked_at`). This is NOT a reuse, so `reuse_detected_at` is left
+    /// unset. One `refresh_family.revoke` audit row is written in the same
+    /// transaction when either spine actually flipped (idempotent: a second
+    /// revocation writes nothing). `now` flows from the application clock seam.
+    ///
+    /// Both `WHERE ... IS NULL` guards make the two updates independent and
+    /// idempotent, so this correctly finishes a partial revocation too (for example
+    /// a family a #21 reuse already revoked WITHOUT revoking its grant): the grant is
+    /// still revoked here, so the derived access tokens are invalidated as RFC 7009
+    /// requires.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if `family_id` or `grant_id` is out of this scope;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn revoke_family(
+        &self,
+        env: &Env,
+        family_id: &RefreshFamilyId,
+        grant_id: &GrantId,
+    ) -> Result<bool, StoreError> {
+        if family_id.scope() != self.scope || grant_id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let now_micros = epoch_micros(env.clock().now_utc());
+        let mut tx = begin_scoped(self.store, scope).await?;
+        // Revoke the family spine (every refresh generation), reusing the #21 model.
+        let family_revoked = sqlx::query(
+            "UPDATE refresh_families \
+             SET revoked_at = TIMESTAMPTZ 'epoch' + ($1::text || ' microseconds')::interval \
+             WHERE id = $2 AND tenant_id = $3 AND environment_id = $4 AND revoked_at IS NULL",
+        )
+        .bind(now_micros)
+        .bind(family_id.to_string())
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .execute(&mut *tx)
+        .await?;
+        // Cascade to the derived access tokens by revoking the grant chain (RFC 7009
+        // section 2.1: revoking a refresh token SHOULD invalidate the access tokens
+        // issued from the same grant).
+        let grant_revoked = sqlx::query(
+            "UPDATE grants \
+             SET revoked_at = TIMESTAMPTZ 'epoch' + ($1::text || ' microseconds')::interval \
+             WHERE id = $2 AND tenant_id = $3 AND environment_id = $4 AND revoked_at IS NULL",
+        )
+        .bind(now_micros)
+        .bind(grant_id.to_string())
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .execute(&mut *tx)
+        .await?;
+        let flipped = family_revoked.rows_affected() > 0 || grant_revoked.rows_affected() > 0;
+        if flipped {
+            let spec = AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::RefreshFamilyRevoke,
+                target: family_id,
+            };
+            insert_audit_row(&mut tx, &spec).await?;
+        }
+        tx.commit().await?;
+        Ok(flipped)
     }
 }
 

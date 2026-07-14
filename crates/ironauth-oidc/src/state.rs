@@ -27,8 +27,10 @@ use ironauth_jose::{JwsAlgorithm, TrustedKey, VerificationPolicy, VerifiedToken,
 use ironauth_store::{Scope, Store, TokenFormat};
 
 use crate::client_keys::ClientKeyResolver;
+use crate::introspection::{IntrospectionSerializer, default_serializer};
 use crate::issuer::{IssuerEntry, IssuerRegistry};
 use crate::registry::{ResponseMode, ResponseType};
+use crate::revocation::{RevocationEventSink, default_sink};
 use crate::subject::{PairwiseSalt, SubjectCache, SubjectConfig};
 use crate::tokens::AccessTokenTarget;
 
@@ -36,6 +38,16 @@ use crate::tokens::AccessTokenTarget;
 #[derive(Clone)]
 pub struct OidcState {
     inner: Arc<Inner>,
+    // The internal revocation-event sink (issue #22): every successful revocation is
+    // published here. Kept OUTSIDE `Inner` so it is swappable with a cheap builder
+    // (the M4 external fan-out installs its own sink) while the rest of the state
+    // stays a shared, immutable `Arc<Inner>`. Default: the no-op sink.
+    revocation_sink: Arc<dyn RevocationEventSink>,
+    // The pluggable introspection-response serializer (issue #22): the endpoint hands
+    // it the typed claims and it renders the wire body, so the RFC 9701 signed-JWT
+    // response (M16) slots in as a new serializer without touching the endpoint.
+    // Default: the RFC 7662 plain-JSON serializer.
+    introspection_serializer: Arc<dyn IntrospectionSerializer>,
 }
 
 // The per-environment policy flags each mirror an independent, individually
@@ -215,7 +227,42 @@ impl OidcState {
                 offline_access_requires_consent: config.offline_access_requires_consent,
                 remembered_consent_ttl: Duration::from_secs(config.remembered_consent_ttl_secs),
             }),
+            revocation_sink: default_sink(),
+            introspection_serializer: default_serializer(),
         }
+    }
+
+    /// Install a custom internal revocation-event sink (issue #22), replacing the
+    /// default no-op sink. The M4 external fan-out wires its sink here; a test can
+    /// wire a recording sink to assert an event is published on every revocation.
+    #[must_use]
+    pub fn with_revocation_sink(mut self, sink: Arc<dyn RevocationEventSink>) -> Self {
+        self.revocation_sink = sink;
+        self
+    }
+
+    /// Install a custom introspection-response serializer (issue #22), replacing the
+    /// default RFC 7662 plain-JSON serializer. The M16 RFC 9701 signed-JWT response
+    /// wires its serializer here without touching the introspection endpoint.
+    #[must_use]
+    pub fn with_introspection_serializer(
+        mut self,
+        serializer: Arc<dyn IntrospectionSerializer>,
+    ) -> Self {
+        self.introspection_serializer = serializer;
+        self
+    }
+
+    /// The internal revocation-event sink every successful revocation is published on.
+    #[must_use]
+    pub(crate) fn revocation_sink(&self) -> &Arc<dyn RevocationEventSink> {
+        &self.revocation_sink
+    }
+
+    /// The pluggable introspection-response serializer.
+    #[must_use]
+    pub(crate) fn introspection_serializer(&self) -> &Arc<dyn IntrospectionSerializer> {
+        &self.introspection_serializer
     }
 
     /// The shared subject-derivation cache.

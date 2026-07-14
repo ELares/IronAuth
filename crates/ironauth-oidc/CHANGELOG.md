@@ -6,6 +6,55 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Token revocation (RFC 7009) and introspection (RFC 7662) endpoints (issue #22).
+  - **`POST /revoke`.** An authenticated client revokes one of its OWN tokens, in any
+    format IronAuth issues (a refresh token, an opaque access token, or an at+jwt), told
+    apart by the token's own self-describing shape rather than the advisory
+    `token_type_hint` (so a wrong hint still revokes). The token declares its own
+    `(tenant, environment)` scope, exactly as the opaque `UserInfo` path does, and the
+    endpoint fixes the scope from the AUTHENTICATED client's id, so a cross-tenant token
+    can never be revoked. Once the client is authenticated, EVERY token outcome (unknown,
+    malformed, expired, already-revoked, or belonging to a different client) returns a
+    uniform `200` empty body, so there is no existence oracle (RFC 7009 section 2.2). A
+    public `none` client authenticates by presenting its `client_id`; a confidential
+    client must present its secret. `revocation_endpoint` is now advertised in discovery.
+  - **`POST /introspect`.** An authorized caller reads a token's active state and standard
+    metadata (`scope`, `client_id`, `sub`, `exp`, `iat`, `aud`, `token_type`). Client
+    authentication is REQUIRED: an unauthenticated or badly-authenticated call is a
+    uniform `401` that leaks nothing about any token (RFC 7662 section 4, the
+    token-scanning-oracle defense). Every not-active cause (unknown, expired, revoked,
+    cross-tenant, wrong format) returns the same `200 {"active":false}`. An at+jwt's
+    metadata comes from the VERIFIED token, so a tampered payload reads as not-active; a
+    revoked grant flips `active` to `false` even while the signature still verifies.
+    `introspection_endpoint` is now advertised in discovery.
+  - **Revocation cascades through the grant.** The append-only issued/opaque token rows
+    derive their active state only from `grants.revoked_at`, so revoking a token revokes
+    its grant chain. Revoking a REFRESH token additionally revokes its whole family (the
+    #21 spine) AND the grant, so every access token derived from it introspects as
+    `active:false` immediately (RFC 7009 section 2.1). Because the token tables are
+    append-only, revoking any access token from a grant revokes the whole grant chain (a
+    deliberate consequence of the digest-only, no-per-token-mutation storage model; RFC
+    7009 permits revoking the associated tokens).
+  - **Pluggable introspection serializer.** Response construction goes through the
+    `IntrospectionSerializer` seam so the RFC 9701 signed-JWT introspection response (M16)
+    slots in as a new serializer without touching the endpoint; only the RFC 7662
+    plain-JSON serializer ships now. Wire a custom one with
+    `OidcState::with_introspection_serializer`.
+  - **Internal revocation-event seam.** Every successful revocation publishes a typed,
+    shape-locked `RevocationEvent` on the internal `RevocationEventSink`, so an in-process
+    cache or resource-server bridge can react; only the no-op sink ships (the EXTERNAL
+    fan-out is M4, wired later through `OidcState::with_revocation_sink`). The durable
+    record is the store audit row (`token.revoke` / `refresh_family.revoke`) written in
+    the same transaction as the state change.
+  - **Discovery.** `revocation_endpoint`, `introspection_endpoint`, and their
+    `*_auth_methods_supported` (and RFC 8414 section 2 `*_auth_signing_alg_values_supported`)
+    arrays are emitted by the single live-config generator on every well-known form,
+    sourced from the shared client-auth suite so they cannot drift from what the endpoints
+    accept.
+  - The revocation and introspection endpoints REUSE the token-endpoint client-auth suite
+    through a new `authenticate_client_self_scoped` seam (it recovers the scope from the
+    presented `client_id`, since these endpoints are global like `/token`).
+
 - Refresh-token rotation, families, `offline_access`, and consent modes (issue #21).
   - **The `refresh_token` grant.** The token endpoint exchanges a rotating refresh
     token for a fresh access token. The refresh token is an opaque reference mirroring

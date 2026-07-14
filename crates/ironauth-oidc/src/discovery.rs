@@ -168,12 +168,13 @@ pub struct DiscoveryEndpoint {
 /// required top-level field handled directly by the generator, and its serving
 /// (the JWKS surface) is mounted by issue #194 once keys load.
 ///
-/// The remaining M3/M4 endpoints (`end_session_endpoint`, `revocation_endpoint`,
-/// `introspection_endpoint`) join this list when their issues land;
-/// `userinfo_endpoint` landed with issue #15. `registration_endpoint` (issue #30)
-/// is NOT here: it is PER ENVIRONMENT (served under the issuer path, like
-/// `jwks_uri`), so the generator emits it directly as `{issuer}/connect/register`
-/// and only when [`DiscoveryCapabilities::registration_endpoint_enabled`] is set.
+/// The remaining M3/M4 endpoint (`end_session_endpoint`) joins this list when its
+/// issue lands; `userinfo_endpoint` landed with issue #15, and the RFC 7009
+/// `revocation_endpoint` and RFC 7662 `introspection_endpoint` with issue #22.
+/// `registration_endpoint` (issue #30) is NOT here: it is PER ENVIRONMENT (served
+/// under the issuer path, like `jwks_uri`), so the generator emits it directly as
+/// `{issuer}/connect/register` and only when
+/// [`DiscoveryCapabilities::registration_endpoint_enabled`] is set.
 pub const ADVERTISED_ENDPOINTS: &[DiscoveryEndpoint] = &[
     DiscoveryEndpoint {
         metadata_key: "authorization_endpoint",
@@ -190,6 +191,14 @@ pub const ADVERTISED_ENDPOINTS: &[DiscoveryEndpoint] = &[
     DiscoveryEndpoint {
         metadata_key: "pushed_authorization_request_endpoint",
         path: "/par",
+    },
+    DiscoveryEndpoint {
+        metadata_key: "revocation_endpoint",
+        path: "/revoke",
+    },
+    DiscoveryEndpoint {
+        metadata_key: "introspection_endpoint",
+        path: "/introspect",
     },
 ];
 
@@ -360,7 +369,13 @@ pub fn id_token_signing_alg_values(policy: &SigningPolicy) -> Vec<String> {
 /// `policy`, and the per-environment `capabilities`. The `issuer` value in the
 /// returned document is `issuer` verbatim, so it exact-string-matches whatever URL
 /// it was derived from.
+//
+// The generator is one long, flat sequence of `document.insert(...)` statements, one
+// per advertised metadata field; it grew past the line threshold as endpoints and
+// their auth-method arrays landed (issue #22). Splitting it would only scatter the
+// single source of truth across helpers for no clarity gain, so the lint is allowed.
 #[must_use]
+#[allow(clippy::too_many_lines)]
 pub fn discovery_document(
     issuer: &str,
     base: &str,
@@ -437,6 +452,33 @@ pub fn discovery_document(
     // from what verification accepts; `none` and ES512 are excluded by construction.
     document.insert(
         "token_endpoint_auth_signing_alg_values_supported".to_owned(),
+        json!(crate::client_auth::assertion_signing_alg_values()),
+    );
+    // The RFC 7009 revocation and RFC 7662 introspection endpoints authenticate the
+    // client through the SAME token-endpoint client-auth suite (issue #22), so their
+    // advertised methods are exactly `ClientAuthMethod::ALL`, sourced from the one
+    // client-auth module so they can never drift from what the endpoints accept. RFC
+    // 8414 section 2 then REQUIRES the matching `*_endpoint_auth_signing_alg_values_supported`
+    // whenever `private_key_jwt` is advertised, which it is; the values are the same
+    // asymmetric assertion matrix the token endpoint verifies against.
+    document.insert(
+        "revocation_endpoint_auth_methods_supported".to_owned(),
+        json!(to_strings(
+            ClientAuthMethod::ALL.iter().map(|value| value.as_str())
+        )),
+    );
+    document.insert(
+        "revocation_endpoint_auth_signing_alg_values_supported".to_owned(),
+        json!(crate::client_auth::assertion_signing_alg_values()),
+    );
+    document.insert(
+        "introspection_endpoint_auth_methods_supported".to_owned(),
+        json!(to_strings(
+            ClientAuthMethod::ALL.iter().map(|value| value.as_str())
+        )),
+    );
+    document.insert(
+        "introspection_endpoint_auth_signing_alg_values_supported".to_owned(),
         json!(crate::client_auth::assertion_signing_alg_values()),
     );
     document.insert(

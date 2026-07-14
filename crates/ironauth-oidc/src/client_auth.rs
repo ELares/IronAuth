@@ -368,6 +368,49 @@ pub async fn authenticate_client(
     authenticate_presented(state, scope, &presented).await
 }
 
+/// Authenticate a client for the GLOBAL revocation and introspection endpoints
+/// (RFC 7009 / RFC 7662, issue #22), recovering the `(tenant, environment)` scope
+/// from the presented `client_id`'s OWN scoped identifier.
+///
+/// `/revoke` and `/introspect` are deployment-root endpoints like `/token`, so there
+/// is no scope in the URL: the credential must carry its own scope. A `cli_`
+/// identifier embeds its `(tenant, environment)` in the clear, so this recovers the
+/// scope from it and then delegates to the SAME [`authenticate_presented`] the token
+/// endpoint uses, returning the authenticated client together with the scope both
+/// endpoints then bind their token lookup to. Recovering the declared scope leaks
+/// nothing: the caller still has to prove possession of the client's secret (or be a
+/// public `none` client) within that scope, exactly as at the token endpoint. A
+/// malformed or absent `client_id` is the uniform opaque `invalid_client`, never an
+/// oracle for whether the client exists.
+///
+/// # Errors
+///
+/// [`ClientAuthError::InvalidRequest`] if the credentials cannot be parsed into one
+/// coherent attempt; [`ClientAuthError::InvalidClient`] for a malformed `client_id`
+/// or any authentication failure.
+pub async fn authenticate_client_self_scoped(
+    state: &OidcState,
+    inputs: ClientAuthInputs<'_>,
+) -> Result<(AuthenticatedClient, Scope), ClientAuthError> {
+    let presented = parse_presented(
+        inputs.authorization,
+        inputs.client_id,
+        inputs.client_secret,
+        inputs.client_assertion,
+        inputs.client_assertion_type,
+    )
+    .map_err(map_parse_error)?;
+    // Recover the scope the client id declares. A malformed client id is the uniform
+    // invalid_client (never an existence oracle), with the Basic-driven 401 preserved.
+    let scope = ClientId::parse_declared_scope(presented.client_id())
+        .map(|id| id.scope())
+        .map_err(|_| ClientAuthError::InvalidClient {
+            via_basic: presented.via_basic(),
+        })?;
+    let client = authenticate_presented(state, scope, &presented).await?;
+    Ok((client, scope))
+}
+
 /// The post-parse half of [`authenticate_client`]: resolve the client and verify
 /// the presented credentials against its registered method.
 async fn authenticate_presented(

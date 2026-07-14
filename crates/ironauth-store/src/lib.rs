@@ -90,7 +90,7 @@ pub use repository::{
     ClientAuthDiagnosticRecord, ClientAuthDiagnosticsRepo, ClientAuthRecord, ClientRecord,
     ClientRepo, CodeBindings, ConsentRepo, ConsumePushedRequest, CursorPosition,
     DynamicClientRecord, DynamicClientRegistration, DynamicClientUpdate, EnvironmentRecord,
-    EnvironmentRepo, GrantedConsent, IdempotencyRepo, IdempotencyWrite, IssueCode,
+    EnvironmentRepo, GrantOwner, GrantedConsent, IdempotencyRepo, IdempotencyWrite, IssueCode,
     IssuedTokenRecord, JtiOutcome, MANAGEMENT_LIST_HARD_CAP, ManagementCredentialRecord,
     ManagementCredentialRepo, ManagementStore, NewClientAuthDiagnostic, NewDynamicClient,
     NewJwtAuthClient, NewOpaqueAccessToken, NewRefreshFamily, NewResourceServer, NewSigningKey,

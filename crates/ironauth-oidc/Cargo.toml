@@ -285,5 +285,19 @@ name = "par"
 path = "tests/par.rs"
 required-features = ["testing"]
 
+# Token revocation (RFC 7009) and introspection (RFC 7662) end to end through the live
+# router (issue #22): an access token and a refresh token are revocable and then
+# introspect as active:false; revoking a refresh token cascades to its derived access
+# tokens; an unknown, malformed, or foreign-client token revocation returns a uniform
+# 200 with no existence oracle; unauthenticated introspection is 401 and leaks nothing;
+# a wrong token_type_hint still revokes; a cross-tenant token is inactive and not
+# revocable; both endpoints and their auth methods appear in generated discovery on
+# both well-known forms; and the internal revocation event is published on every
+# successful revocation. Over a real database with a provisioned signing key.
+[[test]]
+name = "revocation_introspection"
+path = "tests/revocation_introspection.rs"
+required-features = ["testing"]
+
 [lints]
 workspace = true

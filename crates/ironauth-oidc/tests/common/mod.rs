@@ -1075,6 +1075,31 @@ impl Harness {
         (id, secret)
     }
 
+    /// Create a CONFIDENTIAL client registered for `method` in an ARBITRARY `scope`
+    /// (not necessarily the harness scope), returning its id and plaintext secret.
+    /// Used by the cross-tenant isolation tests (issue #22) to stand up a client in a
+    /// foreign scope that then attempts to revoke/introspect a token from another
+    /// scope.
+    pub async fn create_confidential_client_in(
+        &self,
+        scope: Scope,
+        method: ClientAuthMethod,
+        display_name: &str,
+    ) -> (ClientId, String) {
+        let secret = ironauth_oidc::generate_secret(&self.env);
+        let secret_hash = ironauth_oidc::hash_secret(&secret);
+        let (actor, corr) = self.seeding_actor();
+        let id = self
+            .store()
+            .scoped(scope)
+            .acting(actor, corr)
+            .clients()
+            .create_confidential(&self.env, display_name, method.as_str(), &secret_hash)
+            .await
+            .expect("create confidential client in scope");
+        (id, secret)
+    }
+
     /// Create a client that authenticates with a JWT assertion (issue #25):
     /// `private_key_jwt` (inline `jwks` or a `jwks_uri`) or `client_secret_jwt`,
     /// with an optional pinned `token_endpoint_auth_signing_alg`. Registers the
