@@ -6,6 +6,54 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- JWT bearer assertion grant (issue #26, RFC 7521 4.1 / RFC 7523 2.1, 3):
+  `urn:ietf:params:oauth:grant-type:jwt-bearer` at the token endpoint.
+  - **Trust configuration.** Per-tenant, per-environment REGISTERED external
+    assertion issuers, each with a key source (an inline pinned `jwks`, OR a
+    `jwks_uri` fetched through the SAME SSRF-hardened resolver a `private_key_jwt`
+    client's keys use), an optional per-issuer signing-alg allowlist, and an enable
+    switch. Assertions from an unregistered or disabled issuer are rejected.
+  - **Assertion validation (RFC 7523 3).** The signature is verified against the
+    trusted issuer's keys THROUGH the same allowlist JOSE `verify` path #8/#25 use
+    (EdDSA + ES256/384 + RS256/384/512 + PS256/384/512; ES512 unrepresentable), so
+    the assertion's own `alg` header is never trusted. `iss`/`sub`/`aud`/`exp` are
+    required, clock-skew bounds run via `env.clock()`, and an OPTIONAL single-use
+    `jti` is spent in a DISTINCT `external_assertion_jtis` cache keyed by the
+    external ISSUER, so an external jti can never collide with a #25
+    client-assertion jti.
+  - **Shared audience policy.** The set of audiences an assertion may be addressed
+    to REUSES the one `OidcState::client_assertion_audiences` knob #25 introduced
+    (issuer-or-token-endpoint by default, issuer-only under the strict switch), so a
+    FAPI-shaped deployment flips ONE config switch for both client assertions and
+    this grant; the clock-skew bound is the same `client_assertion_skew`.
+  - **Subject mapping, reject by default.** A REGISTERED, explicit rule maps a
+    verified (external issuer + `sub`, plus an optional claim gate) to an IronAuth
+    principal; the token is issued under that mapped identity as its `sub`. An
+    unmapped subject is REJECTED, never auto-provisioned.
+  - **Normal token lifecycle, no refresh.** The issued access token is short-lived,
+    audienced to the presenting client via the #29 `resolve_access_token_target`
+    seam (`resource = None`), minted through the same signing core, and recorded
+    against a fresh grant (audited `jwt_bearer_assertion.issue`), so it is revocable
+    and introspectable by construction. NO refresh token and NO ID token are issued
+    (RFC 7521 4.1: re-present the assertion).
+  - **Errors and diagnostics.** Every assertion-validation or mapping failure is the
+    uniform, opaque `invalid_grant` on the wire, with the specific reason recorded
+    OUT OF BAND in the SAME `client_auth_diagnostics` sink client authentication
+    uses; the presenting client's authentication fails INDEPENDENTLY as
+    `invalid_client`. `urn:ietf:params:oauth:grant-type:jwt-bearer` joins
+    `grant_types_supported` in generated discovery (from live config).
+  - **Machine-grant scope policy (shared with client-credentials).** The requested
+    `scope` is validated through the SAME `validate_m2m_scope` helper the #23
+    client-credentials grant uses, so a mapped-identity assertion-grant token can
+    never carry `openid` (an OIDC/user concept) or `offline_access` (a refresh token,
+    which this grant never issues): either is `invalid_scope`, rejected BEFORE the
+    assertion's single-use jti is spent.
+  - **Revocable trust config.** A registered issuer OR mapping can be DISABLED through
+    the data plane, after which the grant rejects its assertions exactly as an
+    unregistered/unmapped one (uniform `invalid_grant`, existing diagnostic reason).
+    The issuer resolve already required `enabled`; the mapping resolve now filters on
+    `enabled = true` too, so a mis-authored mapping is revocable now (the HTTP
+    management surface is M13).
 - RFC 8707 Resource Indicators (issue #28) at the authorization, PAR, and token
   endpoints.
   - **The `resource` parameter, possibly repeated.** The authorization request, the

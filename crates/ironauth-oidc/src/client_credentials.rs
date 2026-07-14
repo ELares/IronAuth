@@ -266,15 +266,20 @@ fn is_basic_scheme(authorization: Option<&str>) -> bool {
     })
 }
 
-/// Validate a requested client-credentials `scope` against the M2M policy (issue
-/// #23), returning the normalized granted scope (whitespace-collapsed) or [`None`]
-/// when none was requested.
+/// Validate a requested machine-grant `scope` against the M2M policy (issue #23),
+/// returning the normalized granted scope (whitespace-collapsed) or [`None`] when
+/// none was requested.
+///
+/// Shared with the jwt-bearer assertion grant (issue #26): a mapped-identity
+/// assertion-grant token is a machine token with no interactive user, so it is
+/// governed by the SAME policy (no `openid`, no `offline_access`), reusing this one
+/// helper rather than duplicating the check.
 ///
 /// # Errors
 ///
 /// [`TokenError::InvalidScope`] if any requested token is out of policy (see
 /// [`DISALLOWED_M2M_SCOPES`]).
-fn validate_m2m_scope(raw: Option<&str>) -> Result<Option<String>, TokenError> {
+pub(crate) fn validate_m2m_scope(raw: Option<&str>) -> Result<Option<String>, TokenError> {
     let Some(raw) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
         return Ok(None);
     };

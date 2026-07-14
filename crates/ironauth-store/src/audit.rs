@@ -234,6 +234,29 @@ pub enum Action {
     /// A client's static custom-claims configuration was set (issue #23): the
     /// declarative claims embedded in its client-credentials access tokens.
     ClientCustomClaimsSet,
+    /// An external assertion issuer was registered as a trust anchor for the RFC
+    /// 7521 / RFC 7523 JWT bearer assertion grant (issue #26). Records the `xai_`
+    /// issuer registration (its key source and enable switch).
+    ExternalAssertionIssuerRegister,
+    /// A subject-mapping rule was created for the JWT bearer assertion grant (issue
+    /// #26): the explicit rule mapping an external (issuer + `sub`) to an IronAuth
+    /// principal. Unmapped subjects are rejected, never auto-provisioned.
+    ExternalAssertionSubjectMappingCreate,
+    /// An external assertion issuer's enable switch was toggled (issue #26): a
+    /// compromised or decommissioned trust anchor was DISABLED (or re-enabled)
+    /// through the column-scoped data-plane grant, so its assertions are rejected
+    /// exactly as an unregistered issuer's are. The data-plane revocation capability
+    /// (the HTTP management surface for it is M13).
+    ExternalAssertionIssuerSetEnabled,
+    /// A subject-mapping rule's enable switch was toggled (issue #26): a mis-authored
+    /// or decommissioned mapping was DISABLED (or re-enabled) through the
+    /// column-scoped data-plane grant, so it resolves to no rule and the grant
+    /// rejects the subject exactly as an unmapped one.
+    ExternalAssertionSubjectMappingSetEnabled,
+    /// A short-lived access token was issued under the JWT bearer assertion grant
+    /// (issue #26): a validated external assertion was exchanged for a token under
+    /// the mapped identity. No refresh token accompanies it (RFC 7521 4.1).
+    JwtBearerAssertionIssue,
     /// A client's RFC 8707 resource-indicator policy was set (issue #28): the
     /// per-client allowed-resource allowlist and the no-resource behavior
     /// (default audience or refusal).
@@ -284,6 +307,15 @@ impl Action {
             Action::DcrClientVerified => "dcr.client_verified",
             Action::ServiceAccountCreate => "service_account.create",
             Action::ClientCustomClaimsSet => "client.custom_claims.set",
+            Action::ExternalAssertionIssuerRegister => "external_assertion_issuer.register",
+            Action::ExternalAssertionSubjectMappingCreate => {
+                "external_assertion_subject_mapping.create"
+            }
+            Action::ExternalAssertionIssuerSetEnabled => "external_assertion_issuer.set_enabled",
+            Action::ExternalAssertionSubjectMappingSetEnabled => {
+                "external_assertion_subject_mapping.set_enabled"
+            }
+            Action::JwtBearerAssertionIssue => "jwt_bearer_assertion.issue",
             Action::ClientResourceIndicatorPolicySet => "client.resource_indicator_policy.set",
         }
     }

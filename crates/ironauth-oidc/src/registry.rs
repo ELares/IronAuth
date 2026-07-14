@@ -46,9 +46,11 @@
 ///
 /// Closed on purpose: the members are the authorization-code grant (RFC 6749
 /// 4.1.3), the refresh-token grant (RFC 6749 6, with the RFC 9700 2.2.2 / OAuth
-/// 2.1 rotation and reuse-detection rules, issue #21), and the client-credentials
-/// grant (RFC 6749 4.4, machine-to-machine, issue #23). ROPC (`password`) and every
-/// other grant are simply absent, so there is no way to name one at this layer.
+/// 2.1 rotation and reuse-detection rules, issue #21), the client-credentials
+/// grant (RFC 6749 4.4, machine-to-machine, issue #23), and the JWT bearer
+/// assertion grant (RFC 7521 4.1 / RFC 7523 2.1, issue #26). ROPC (`password`) and
+/// every other grant are simply absent, so there is no way to name one at this
+/// layer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GrantType {
     /// The `authorization_code` grant (RFC 6749 4.1.3).
@@ -62,6 +64,12 @@ pub enum GrantType {
     /// service-account principal. No user, no ID token, and no refresh token (RFC
     /// 6749 4.4.3).
     ClientCredentials,
+    /// The JWT bearer assertion grant (RFC 7521 4.1 / RFC 7523 2.1, issue #26):
+    /// `urn:ietf:params:oauth:grant-type:jwt-bearer`. An assertion signed by a
+    /// REGISTERED external issuer is exchanged for a short-lived access token issued
+    /// under a REGISTERED mapped IronAuth identity. No refresh token (RFC 7521 4.1
+    /// says re-present the assertion).
+    JwtBearer,
 }
 
 impl GrantType {
@@ -70,6 +78,7 @@ impl GrantType {
         GrantType::AuthorizationCode,
         GrantType::RefreshToken,
         GrantType::ClientCredentials,
+        GrantType::JwtBearer,
     ];
 
     /// The wire `grant_type` value.
@@ -79,6 +88,7 @@ impl GrantType {
             GrantType::AuthorizationCode => "authorization_code",
             GrantType::RefreshToken => "refresh_token",
             GrantType::ClientCredentials => "client_credentials",
+            GrantType::JwtBearer => "urn:ietf:params:oauth:grant-type:jwt-bearer",
         }
     }
 
@@ -91,6 +101,7 @@ impl GrantType {
             "authorization_code" => Some(GrantType::AuthorizationCode),
             "refresh_token" => Some(GrantType::RefreshToken),
             "client_credentials" => Some(GrantType::ClientCredentials),
+            "urn:ietf:params:oauth:grant-type:jwt-bearer" => Some(GrantType::JwtBearer),
             _ => None,
         }
     }

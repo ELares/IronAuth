@@ -386,6 +386,12 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0019_resource_indicators.sql"),
         },
+        Migration {
+            version: 20,
+            name: "jwt_bearer_assertion",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0020_jwt_bearer_assertion.sql"),
+        },
     ]
 }
 

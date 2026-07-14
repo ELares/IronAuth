@@ -73,7 +73,15 @@ cd "$(git rev-parse --show-toplevel)"
 # objects, the SHA-256-hashed initial-access-token store, and the endpoint-local
 # rate counters. All three are TENANT-SCOPED with forced row-level security, so
 # their SQL stays in the repository module too.
-SCOPED_TABLES='clients|organizations|audit_log|management_credentials|idempotency_keys|grants|authorization_codes|issued_tokens|signing_keys|users|sessions|consents|resource_servers|opaque_access_tokens|client_assertion_jtis|client_auth_diagnostics|pushed_authorization_requests|refresh_families|refresh_tokens|service_accounts|dcr_policies|dcr_initial_access_tokens|dcr_rate_counters'
+#
+# external_assertion_issuers, external_assertion_subject_mappings, and
+# external_assertion_jtis (#26) are the JWT bearer assertion grant tables: the
+# registered external trust anchors, the explicit subject-mapping rules, and the
+# external-issuer single-use jti replay cache (distinct from client_assertion_jtis
+# so an external jti cannot collide with a client-assertion jti). All three are
+# TENANT-SCOPED with forced row-level security, so their SQL stays in the
+# repository module too.
+SCOPED_TABLES='clients|organizations|audit_log|management_credentials|idempotency_keys|grants|authorization_codes|issued_tokens|signing_keys|users|sessions|consents|resource_servers|opaque_access_tokens|client_assertion_jtis|client_auth_diagnostics|pushed_authorization_requests|refresh_families|refresh_tokens|service_accounts|dcr_policies|dcr_initial_access_tokens|dcr_rate_counters|external_assertion_issuers|external_assertion_subject_mappings|external_assertion_jtis'
 
 # The one module allowed to name a scoped table in SQL.
 REPO_MODULE='crates/ironauth-store/src/repository.rs'

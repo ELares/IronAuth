@@ -117,9 +117,16 @@ pub struct TokenParams {
     /// The refresh token to redeem for the `refresh_token` grant (issue #21). A
     /// single-use rotating bearer credential, so it is redacted from `Debug`.
     pub refresh_token: Option<String>,
+    /// The RFC 7521 `assertion` carrying the authorization grant for the JWT bearer
+    /// assertion grant (issue #26): the external issuer's JWT. DISTINCT from
+    /// `client_assertion` (which authenticates the CLIENT); this one carries the
+    /// external SUBJECT the token is mapped to. A bearer credential, so it is
+    /// redacted from `Debug`.
+    pub assertion: Option<String>,
     /// The requested OAuth `scope` for the `client_credentials` grant (RFC 6749
-    /// 4.4.2, issue #23). Optional; when present it is validated against the M2M
-    /// scope policy and echoed into the issued token.
+    /// 4.4.2, issue #23) and the JWT bearer assertion grant (RFC 7521, issue #26).
+    /// Optional; when present it is validated/normalized and echoed into the issued
+    /// token.
     pub scope: Option<String>,
 }
 
@@ -134,6 +141,7 @@ impl fmt::Debug for TokenParams {
             .field("client_assertion_type", &self.client_assertion_type)
             .field("has_code", &self.code.is_some())
             .field("has_refresh_token", &self.refresh_token.is_some())
+            .field("has_assertion", &self.assertion.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -187,6 +195,9 @@ async fn exchange(
         // audience is the configured default. Any `resource` parameter is ignored.
         Some(GrantType::ClientCredentials) => {
             crate::client_credentials::client_credentials_grant(state, headers, params).await
+        }
+        Some(GrantType::JwtBearer) => {
+            crate::jwt_bearer::jwt_bearer_grant(state, headers, params).await
         }
         None => Err(TokenError::UnsupportedGrantType),
     }
