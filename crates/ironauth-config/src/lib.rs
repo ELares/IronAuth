@@ -193,6 +193,29 @@ pub enum ClientAssertionAudience {
     IssuerOnly,
 }
 
+/// The default audience a client-credentials access token carries when the request
+/// targets NO resource server (issue #23).
+///
+/// The client-credentials grant (RFC 6749 4.4) mints machine-to-machine tokens. RFC
+/// 8707 lets a request target a specific resource server via the `resource`
+/// parameter (issue #28), whose registered audience then wins; when none is
+/// targeted, this configurable default applies. The default (`client_id`) preserves
+/// the environment's existing no-resource behavior (the token's `aud` is the OAuth
+/// client id). `issuer` sets the per-environment issuer as the audience instead, for
+/// deployments that treat the provider itself as the default M2M audience. This is a
+/// promotable per-environment setting in spirit; the process value is the deployment
+/// default until per-environment overrides ride the M5 promotion pipeline.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ClientCredentialsAudience {
+    /// The token's `aud` is the OAuth client id (the default; preserves the existing
+    /// no-resource behavior).
+    #[default]
+    ClientId,
+    /// The token's `aud` is the per-environment issuer.
+    Issuer,
+}
+
 /// Structured-log output format.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -630,6 +653,17 @@ pub struct OidcConfig {
     /// spirit; the process value is the deployment default until per-environment
     /// overrides ride the M5 promotion pipeline.
     pub registration_enabled: bool,
+
+    /// The default audience a client-credentials access token (RFC 6749 4.4, issue
+    /// #23) carries when the request targets NO resource server. The default
+    /// (`client_id`) makes the token's `aud` the OAuth client id, preserving the
+    /// environment's existing no-resource behavior; `issuer` makes it the
+    /// per-environment issuer. When a request DOES target a registered resource
+    /// server (the RFC 8707 `resource` parameter, issue #28), that resource server's
+    /// audience wins and this default does not apply. This is a promotable
+    /// per-environment setting in spirit; the process value is the deployment default
+    /// until per-environment overrides ride the M5 promotion pipeline.
+    pub client_credentials_default_audience: ClientCredentialsAudience,
 }
 
 impl Default for OidcConfig {
@@ -663,6 +697,7 @@ impl Default for OidcConfig {
             require_pushed_authorization_requests: false,
             par_ttl_secs: 60,
             registration_enabled: false,
+            client_credentials_default_audience: ClientCredentialsAudience::ClientId,
         }
     }
 }
@@ -1442,6 +1477,43 @@ mod tests {
         .expect_err("unknown token format");
         let msg = err.to_string();
         assert!(msg.contains("at_jwt") && msg.contains("opaque"), "{msg}");
+    }
+
+    #[test]
+    fn oidc_client_credentials_default_audience_parses_both_values_and_rejects_unknown() {
+        // Issue #23: the client-credentials default audience is a snake_case enum
+        // with two members; the default is client_id. Both parse; unknown is strict.
+        assert_eq!(
+            OidcConfig::default().client_credentials_default_audience,
+            ClientCredentialsAudience::ClientId,
+        );
+        let issuer = Config::from_toml_str(
+            "[oidc]\nclient_credentials_default_audience = \"issuer\"\n",
+            "<inline>",
+        )
+        .expect("valid")
+        .config;
+        assert_eq!(
+            issuer.oidc.client_credentials_default_audience,
+            ClientCredentialsAudience::Issuer,
+        );
+        let client_id = Config::from_toml_str(
+            "[oidc]\nclient_credentials_default_audience = \"client_id\"\n",
+            "<inline>",
+        )
+        .expect("valid")
+        .config;
+        assert_eq!(
+            client_id.oidc.client_credentials_default_audience,
+            ClientCredentialsAudience::ClientId,
+        );
+        // A misspelled value aborts with a strict error.
+        let err = Config::from_toml_str(
+            "[oidc]\nclient_credentials_default_audience = \"aud\"\n",
+            "ironauth.toml",
+        )
+        .expect_err("unknown audience mode");
+        assert!(err.to_string().contains("client_id"), "{err}");
     }
 
     #[test]

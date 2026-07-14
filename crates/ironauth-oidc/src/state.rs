@@ -21,7 +21,7 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use ironauth_config::{ClientAssertionAudience, OidcConfig};
+use ironauth_config::{ClientAssertionAudience, ClientCredentialsAudience, OidcConfig};
 use ironauth_env::Env;
 use ironauth_jose::{JwsAlgorithm, TrustedKey, VerificationPolicy, VerifiedToken, verify};
 use ironauth_store::{Scope, Store, TokenFormat};
@@ -143,6 +143,11 @@ struct Inner {
     refresh_rotation_threshold_percent: u64,
     offline_access_requires_consent: bool,
     remembered_consent_ttl: Duration,
+    // The default audience a client-credentials access token carries when no
+    // resource server is targeted (issue #23): the client id or the per-environment
+    // issuer. A registered resource server (the RFC 8707 `resource` parameter, #28)
+    // overrides it. A promotable per-environment setting sourced from OidcConfig.
+    client_credentials_default_audience: ClientCredentialsAudience,
 }
 
 impl OidcState {
@@ -226,6 +231,7 @@ impl OidcState {
                 refresh_rotation_threshold_percent: config.refresh_rotation_threshold_percent,
                 offline_access_requires_consent: config.offline_access_requires_consent,
                 remembered_consent_ttl: Duration::from_secs(config.remembered_consent_ttl_secs),
+                client_credentials_default_audience: config.client_credentials_default_audience,
             }),
             revocation_sink: default_sink(),
             introspection_serializer: default_serializer(),
@@ -386,6 +392,23 @@ impl OidcState {
             audience: client_id.to_owned(),
             format: self.inner.default_access_token_format,
             ttl: self.inner.access_token_ttl,
+        }
+    }
+
+    /// The default audience a client-credentials access token (issue #23) carries
+    /// when NO resource server is targeted, resolved for `client_id` in `scope`.
+    ///
+    /// Per the environment's `client_credentials_default_audience` policy: the OAuth
+    /// client id (the default), or the per-environment issuer. This is the fallback
+    /// audience the M2M mint passes into [`Self::resolve_access_token_target`]; when
+    /// a request targets a registered resource server (the RFC 8707 `resource`
+    /// parameter, issue #28), that resource server's audience wins instead and this
+    /// default does not apply.
+    #[must_use]
+    pub fn client_credentials_default_audience(&self, scope: &Scope, client_id: &str) -> String {
+        match self.inner.client_credentials_default_audience {
+            ClientCredentialsAudience::ClientId => client_id.to_owned(),
+            ClientCredentialsAudience::Issuer => self.issuer_for(scope),
         }
     }
 

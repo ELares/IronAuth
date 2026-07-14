@@ -82,7 +82,61 @@ range per docs/RELEASING.md.
     multi-audience at+jwt introspecting active; a swapped `IntrospectionSerializer` being
     honored by the endpoint; and the discovery unit test now asserts the revocation,
     introspection, and PAR endpoints and their (differing) auth-method arrays.
-
+- The `client_credentials` grant with service-account principals (issue #23, RFC
+  6749 4.4, RFC 9068).
+  - **The grant.** The token endpoint services `grant_type=client_credentials`: an
+    authenticated CONFIDENTIAL client obtains a machine-to-machine access token for
+    its own service-account principal. Client authentication is REQUIRED and delegates
+    to the shared `authenticate_client` seam, so a public client (auth method `none`,
+    which proves nothing) is refused as `invalid_client`. The `(tenant, environment)`
+    scope is recovered from the presented `cli_` client id, then the secret is proven
+    within it. `client_credentials` is now an advertised `grant_type`.
+  - **Stable service-account `sub`.** Every M2M-capable client maps to a first-class
+    service-account principal (a `sva_` id), minted lazily on first issuance and read
+    back thereafter. The issued token's `sub` is that principal id (RFC 9068:
+    DISTINCT from `client_id`, consistent across issuances); `client_id` is the OAuth
+    client. RBAC (M10) will attach to the principal.
+  - **Custom claims.** Per-client STATIC claims (the `clients.custom_token_claims`
+    JSON object) are embedded in the token. A custom claim can NEVER set a RESERVED
+    claim name: the guard is a comprehensive denylist enforced in the mint, so it
+    holds even for a value written straight into the store. The reserved set covers
+    the protocol claims (`iss`/`sub`/`aud`/`exp`/`iat`/`nbf`/`jti`/`client_id`/`scope`
+    plus `typ`/`token_type`), the authentication-context claims
+    (`acr`/`amr`/`auth_time`/`nonce`/`azp`), the binding claim `cnf`, and the
+    hash/session claims (`at_hash`/`c_hash`/`sid`): a static business claim can never
+    forge an authentication context a machine token must not carry, nor a
+    self-asserted confirmation key that would undermine sender-constrained (DPoP /
+    mTLS) token binding. Custom claims are an at+jwt feature ONLY: an opaque access
+    token carries no embedded claims by design, so when the resolved format is opaque
+    the configured custom claims are dropped and the mint WARNS (without the claim
+    values), their metadata surfacing instead through #22 introspection.
+  - **No auth context, no refresh token.** A machine token carries NO `acr` and NO
+    `auth_time` (there is no user authentication event), via a dedicated M2M claim
+    builder that reuses the same signing core and opaque mint as every other access
+    token. NO refresh token is returned (RFC 6749 4.4.3) and no ID token (no user);
+    this is asserted at the DATABASE too (a client-credentials issuance opens no
+    `refresh_families` row and mints no `refresh_tokens` row), not only in the
+    response body.
+  - **Revocable/introspectable by construction.** The token is minted in the same #29
+    formats (at+jwt with `jti`, opaque `ira_at_`) and recorded against a fresh grant
+    in one transaction, so the #22 revoke/introspect endpoints consume it through the
+    SAME grant chain the code/refresh tokens use.
+  - **Audience.** The token is audience-restricted; the default audience when no
+    resource server is targeted is configurable
+    (`oidc.client_credentials_default_audience`: `client_id` or `issuer`), and the
+    existing `resolve_access_token_target(scope, resource, ...)` seam (#29) is consumed
+    so issue #28's `resource` parameter feeds it without reshaping the mint.
+  - **Errors.** `invalid_client` (401, with `WWW-Authenticate: Basic` on a Basic
+    attempt) for a failed authentication; `invalid_scope` for an out-of-policy scope
+    request (`openid`/`offline_access` are not valid for a machine principal; the full
+    per-client scope allowlist is M10 RBAC).
+  - **Covenant.** NO metering, counting-for-billing, or quota hook exists on the M2M
+    issuance path; `scripts/no-m2m-metering.sh` asserts it in CI over the WHOLE
+    issuance path (the request handler in full, plus the CC-specific mint helpers
+    `mint_client_credentials_access_token` /
+    `build_client_credentials_access_token_claims` and the persistence helper
+    `issue_client_credentials`, scoped to those function regions), and SDK-facing
+    token-caching guidance is published at `docs/design/M2M-TOKEN-CACHING.md`.
 - Refresh-token rotation, families, `offline_access`, and consent modes (issue #21).
   - **The `refresh_token` grant.** The token endpoint exchanges a rotating refresh
     token for a fresh access token. The refresh token is an opaque reference mirroring

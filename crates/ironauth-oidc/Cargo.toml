@@ -299,5 +299,18 @@ name = "revocation_introspection"
 path = "tests/revocation_introspection.rs"
 required-features = ["testing"]
 
+# The client-credentials grant with service-account principals (issue #23, RFC 6749
+# 4.4 / RFC 9068): an audience-restricted at+jwt carrying per-client custom claims, a
+# STABLE service-account sub distinct from client_id and consistent across issuances,
+# no refresh token, the #22-consumable formats with grant linkage (revocable and
+# introspectable by construction), invalid_client on a failed authentication, a
+# public client refused, invalid_scope out of policy, the configurable default
+# audience, the opaque format resolved through the internal store lookup, and
+# scope-bound principal isolation. Over a real database with a provisioned signing key.
+[[test]]
+name = "client_credentials"
+path = "tests/client_credentials.rs"
+required-features = ["testing"]
+
 [lints]
 workspace = true

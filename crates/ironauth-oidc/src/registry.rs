@@ -45,10 +45,10 @@
 /// The OAuth grant types IronAuth's token endpoint can service.
 ///
 /// Closed on purpose: the members are the authorization-code grant (RFC 6749
-/// 4.1.3) and the refresh-token grant (RFC 6749 6, with the RFC 9700 2.2.2 /
-/// OAuth 2.1 rotation and reuse-detection rules, issue #21). ROPC (`password`),
-/// the client-credentials grant, and every other grant are simply absent, so
-/// there is no way to name one at this layer.
+/// 4.1.3), the refresh-token grant (RFC 6749 6, with the RFC 9700 2.2.2 / OAuth
+/// 2.1 rotation and reuse-detection rules, issue #21), and the client-credentials
+/// grant (RFC 6749 4.4, machine-to-machine, issue #23). ROPC (`password`) and every
+/// other grant are simply absent, so there is no way to name one at this layer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GrantType {
     /// The `authorization_code` grant (RFC 6749 4.1.3).
@@ -57,11 +57,20 @@ pub enum GrantType {
     /// refresh token for a fresh access token (and, per the graduated policy, a
     /// rotated refresh token).
     RefreshToken,
+    /// The `client_credentials` grant (RFC 6749 4.4, issue #23): an authenticated
+    /// confidential client obtains a machine-to-machine access token for its own
+    /// service-account principal. No user, no ID token, and no refresh token (RFC
+    /// 6749 4.4.3).
+    ClientCredentials,
 }
 
 impl GrantType {
     /// Every grant type this build can express.
-    pub const ALL: &'static [GrantType] = &[GrantType::AuthorizationCode, GrantType::RefreshToken];
+    pub const ALL: &'static [GrantType] = &[
+        GrantType::AuthorizationCode,
+        GrantType::RefreshToken,
+        GrantType::ClientCredentials,
+    ];
 
     /// The wire `grant_type` value.
     #[must_use]
@@ -69,6 +78,7 @@ impl GrantType {
         match self {
             GrantType::AuthorizationCode => "authorization_code",
             GrantType::RefreshToken => "refresh_token",
+            GrantType::ClientCredentials => "client_credentials",
         }
     }
 
@@ -80,6 +90,7 @@ impl GrantType {
         match raw {
             "authorization_code" => Some(GrantType::AuthorizationCode),
             "refresh_token" => Some(GrantType::RefreshToken),
+            "client_credentials" => Some(GrantType::ClientCredentials),
             _ => None,
         }
     }

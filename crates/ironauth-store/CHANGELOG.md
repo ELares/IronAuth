@@ -24,7 +24,42 @@ range per docs/RELEASING.md.
     no-op rather than a false "unknown".
   - **New audit action** `token.revoke` (`Action::TokenRevoke`) for an endpoint-driven
     access-token revocation; a refresh-token revoke reuses `refresh_family.revoke`.
-
+- Client-credentials service-account principals and per-client custom claims
+  (issue #23, migration 0017, expand).
+  - **The service-account principal.** New `service_accounts` table: the
+    `(client -> stable machine-sub)` mapping, one principal per client
+    (`UNIQUE (tenant, environment, client_id)`), keyed by a new `sva_` scoped
+    identifier (`ServiceAccountId`). The principal is minted lazily at the client's
+    FIRST client-credentials issuance and read back on every subsequent one, so a
+    client's `sub` is stable and DISTINCT from its `cli_` id. The table ENABLEs +
+    FORCEs row-level security with the `(tenant, environment)` isolation policy, an
+    isolation-preserving composite FK to `clients` (a new
+    `clients_scope_identity_unique` anchors it), and is registered in
+    `scripts/query-audit.sh`; it holds SELECT + INSERT only (a principal, once
+    minted, is never mutated or deleted). `ServiceAccountRepo::principal_for` reads
+    it; `ActingServiceAccountRepo::ensure` mints-or-reads it (audited
+    `service_account.create`, idempotent under a first-issuance race via the
+    unique-violation re-read).
+  - **Per-client custom claims.** Additive nullable `clients.custom_token_claims`
+    JSONB column: the declarative static claims embedded in a client's
+    client-credentials tokens (opaque JSON to the store; the MINT is the single
+    enforcement point for the reserved-claim guard, so the store persists the
+    configuration verbatim and does not itself filter claim names).
+    `ClientRepo::custom_token_claims` reads it; `ActingClientRepo::set_custom_token_claims`
+    sets it (audited `client.custom_claims.set`, validated as JSON by the `::jsonb`
+    cast). `RefreshRepo::count_in_scope` returns the scope's
+    `(refresh_families, refresh_tokens)` row counts for the client-credentials
+    no-refresh database negative (RFC 6749 4.4.3).
+  - **Client-credentials issuance persistence.**
+    `ActingAuthorizationRepo::issue_client_credentials` opens a fresh machine GRANT
+    (subject = the `sva_` principal, no session/consent/claims) and records the
+    access token against it (an `issued_tokens` row for an at+jwt, an
+    `opaque_access_tokens` row for an opaque token) in ONE audited `token.issue`
+    transaction, so a client-credentials token is revocable and introspectable by
+    the SAME grant chain the #22 endpoints consume. NO refresh-token family is
+    opened (RFC 6749 4.4.3). New `IssueClientCredentials` / `ClientCredentialsAccess`
+    types; two new audit actions (`service_account.create`, `client.custom_claims.set`).
+  - The migration guard test now pins the production chain at SEVENTEEN migrations.
 - Refresh-token rotation, families, `offline_access`, and consent-mode persistence
   (issue #21, migration 0016, expand).
   - **Token families and digest-only tokens.** New `refresh_families` (the

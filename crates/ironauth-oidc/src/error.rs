@@ -201,6 +201,11 @@ pub enum TokenError {
     /// its bindings did not match (including a wrong `client_id`). Uniform on
     /// purpose: it never says which.
     InvalidGrant,
+    /// The requested `scope` is out of policy for this grant (RFC 6749 5.2, issue
+    /// #23): for the client-credentials grant, a scope a machine principal may not
+    /// request (for example `openid` or `offline_access`). Carries a fixed, generic
+    /// description.
+    InvalidScope,
     /// The `grant_type` is not one this server supports (only
     /// `authorization_code`). This is where ROPC and every other grant land.
     UnsupportedGrantType,
@@ -216,6 +221,7 @@ impl TokenError {
             TokenError::InvalidRequest(_) => "invalid_request",
             TokenError::InvalidClient { .. } => "invalid_client",
             TokenError::InvalidGrant => "invalid_grant",
+            TokenError::InvalidScope => "invalid_scope",
             TokenError::UnsupportedGrantType => "unsupported_grant_type",
             TokenError::ServerError => "server_error",
         }
@@ -241,6 +247,7 @@ impl TokenError {
             TokenError::InvalidGrant => {
                 "the authorization code is invalid, expired, or already used"
             }
+            TokenError::InvalidScope => "the requested scope is invalid for this grant",
             TokenError::UnsupportedGrantType => "the grant type is not supported",
             TokenError::ServerError => "the request could not be processed",
         }

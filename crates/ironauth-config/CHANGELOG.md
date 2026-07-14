@@ -6,6 +6,15 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Add `oidc.client_credentials_default_audience` (issue #23): the default audience a
+  client-credentials access token carries when the request targets no resource
+  server. A snake_case enum (`ClientCredentialsAudience`) with two members:
+  `client_id` (the default; the token's `aud` is the OAuth client id, preserving the
+  existing no-resource behavior) and `issuer` (the token's `aud` is the
+  per-environment issuer). When a request targets a registered resource server (the
+  RFC 8707 `resource` parameter, issue #28), that resource server's audience wins and
+  this default does not apply. The regenerated `docs/config-schema.json` and
+  `docs/CONFIG.md` document it.
 - Add the refresh-token rotation and consent knobs (issue #21):
   - `oidc.issue_refresh_tokens` (default `true`): whether a code exchange issues a
     refresh token at all.
