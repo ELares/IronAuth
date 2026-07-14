@@ -64,6 +64,12 @@ pub enum AuthzErrorCode {
     /// registered `unmet_authentication_requirements`). Returned through the
     /// negotiated response mode.
     UnmetAuthenticationRequirements,
+    /// A requested `resource` (RFC 8707 resource indicator, issue #28) is
+    /// malformed (not an absolute URI, or carries a fragment), unknown (no
+    /// registered resource server), or disallowed (outside the client's
+    /// allowlist, or a no-resource request when the client requires one). RFC 8707
+    /// section 2.2. Returned through the negotiated response mode.
+    InvalidTarget,
     /// The server encountered an unexpected condition.
     ServerError,
 }
@@ -81,6 +87,7 @@ impl AuthzErrorCode {
             AuthzErrorCode::InteractionRequired => "interaction_required",
             AuthzErrorCode::AccountSelectionRequired => "account_selection_required",
             AuthzErrorCode::UnmetAuthenticationRequirements => "unmet_authentication_requirements",
+            AuthzErrorCode::InvalidTarget => "invalid_target",
             AuthzErrorCode::ServerError => "server_error",
         }
     }
@@ -206,6 +213,12 @@ pub enum TokenError {
     /// request (for example `openid` or `offline_access`). Carries a fixed, generic
     /// description.
     InvalidScope,
+    /// A requested `resource` (RFC 8707 resource indicator, issue #28) is
+    /// malformed (not an absolute URI, or carries a fragment), unknown (no
+    /// registered resource server), or disallowed (outside the client's allowlist,
+    /// outside the resources approved at authorization, or a no-resource request
+    /// when the client requires one). RFC 8707 section 2.2.
+    InvalidTarget,
     /// The `grant_type` is not one this server supports (only
     /// `authorization_code`). This is where ROPC and every other grant land.
     UnsupportedGrantType,
@@ -238,6 +251,7 @@ impl TokenError {
             TokenError::InvalidClient { .. } => "invalid_client",
             TokenError::InvalidGrant => "invalid_grant",
             TokenError::InvalidScope => "invalid_scope",
+            TokenError::InvalidTarget => "invalid_target",
             TokenError::UnsupportedGrantType => "unsupported_grant_type",
             TokenError::AuthorizationPending => "authorization_pending",
             TokenError::SlowDown => "slow_down",
@@ -268,6 +282,9 @@ impl TokenError {
                 "the authorization code is invalid, expired, or already used"
             }
             TokenError::InvalidScope => "the requested scope is invalid for this grant",
+            TokenError::InvalidTarget => {
+                "the requested resource is invalid, unknown, or not allowed for this client"
+            }
             TokenError::UnsupportedGrantType => "the grant type is not supported",
             TokenError::AuthorizationPending => {
                 "the authorization request is still pending user approval"
@@ -338,6 +355,7 @@ mod tests {
             AuthzErrorCode::UnmetAuthenticationRequirements.as_str(),
             "unmet_authentication_requirements"
         );
+        assert_eq!(AuthzErrorCode::InvalidTarget.as_str(), "invalid_target");
         assert_eq!(AuthzErrorCode::ServerError.as_str(), "server_error");
     }
 }

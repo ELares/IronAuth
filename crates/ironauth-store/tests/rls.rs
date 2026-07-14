@@ -10,7 +10,10 @@
 
 use ironauth_env::Env;
 use ironauth_store::test_support::TestDatabase;
-use ironauth_store::{ClientId, CorrelationId, InitialAccessTokenId, ManagementKeyId};
+use ironauth_store::{
+    AssertionMappingId, ClientId, CorrelationId, ExternalIssuerId, InitialAccessTokenId,
+    ManagementKeyId, NewAssertionSubjectMapping, NewExternalAssertionIssuer,
+};
 use sqlx::Row;
 
 // The test walks four distinct scenarios (deny-by-default, mis-scoped read,
@@ -603,6 +606,130 @@ async fn app_role_iat_update_is_scoped_to_use_count() {
         let mut tx = db.app_pool().begin().await.expect("begin app tx");
         bind_scope(&mut tx, &tenant, &environment).await;
         let denied = sqlx::query(statement).bind(&iat_id).execute(&mut *tx).await;
+        assert_permission_denied(denied, statement);
+        let _ = tx.rollback().await;
+    }
+}
+
+/// The `enabled` switch is the ONLY column the DATA plane may write on the two
+/// jwt-bearer trust-config tables (issue #26 revocability fix): migration 0019 grants
+/// `ironauth_app` a COLUMN-SCOPED `UPDATE (enabled)` on each, so a compromised or
+/// decommissioned issuer can be DISABLED and a mis-authored mapping REVOKED, while
+/// every identity / key / principal / match column stays app-immutable. This proves
+/// the app role CAN flip `enabled` (`rows_affected` == 1) on both tables but is REFUSED
+/// (permission denied, 42501) on every other column of both. Mirrors
+/// `app_role_iat_update_is_scoped_to_use_count`.
+#[tokio::test]
+async fn app_role_can_only_update_the_enabled_switch_on_external_assertion_trust() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let tenant = scope.tenant().to_string();
+    let environment = scope.environment().to_string();
+
+    // Register an issuer and a mapping through the data-plane acting store.
+    let issuer_id = ExternalIssuerId::generate(&env, &scope);
+    db.store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .external_assertion_issuers()
+        .register(
+            &env,
+            NewExternalAssertionIssuer {
+                id: &issuer_id,
+                issuer: "https://issuer.test",
+                jwks: Some("{}"),
+                jwks_uri: None,
+                signing_alg_allow: None,
+                enabled: true,
+            },
+        )
+        .await
+        .expect("register external assertion issuer");
+    let issuer_id = issuer_id.to_string();
+
+    let mapping_id = AssertionMappingId::generate(&env, &scope);
+    db.store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .external_assertion_subject_mappings()
+        .create(
+            &env,
+            NewAssertionSubjectMapping {
+                id: &mapping_id,
+                issuer: "https://issuer.test",
+                external_subject: "wl-1",
+                match_claim: None,
+                match_value: None,
+                principal: "usr_wl",
+            },
+        )
+        .await
+        .expect("create subject mapping");
+    let mapping_id = mapping_id.to_string();
+
+    // The app role CAN flip `enabled` on the issuer (the revocation write).
+    {
+        let mut tx = db.app_pool().begin().await.expect("begin app tx");
+        bind_scope(&mut tx, &tenant, &environment).await;
+        let affected =
+            sqlx::query("UPDATE external_assertion_issuers SET enabled = false WHERE id = $1")
+                .bind(&issuer_id)
+                .execute(&mut *tx)
+                .await
+                .expect("app disables the issuer")
+                .rows_affected();
+        assert_eq!(affected, 1, "the app role can disable an issuer");
+        tx.commit().await.expect("commit issuer disable");
+    }
+
+    // The app role CAN flip `enabled` on the mapping (the revocation write).
+    {
+        let mut tx = db.app_pool().begin().await.expect("begin app tx");
+        bind_scope(&mut tx, &tenant, &environment).await;
+        let affected = sqlx::query(
+            "UPDATE external_assertion_subject_mappings SET enabled = false WHERE id = $1",
+        )
+        .bind(&mapping_id)
+        .execute(&mut *tx)
+        .await
+        .expect("app disables the mapping")
+        .rows_affected();
+        assert_eq!(affected, 1, "the app role can disable a mapping");
+        tx.commit().await.expect("commit mapping disable");
+    }
+
+    // The app role CANNOT rewrite any app-immutable column on the issuer: each is
+    // column-scoped away, so the write is refused with permission denied.
+    let forbidden_issuer: [&str; 3] = [
+        "UPDATE external_assertion_issuers SET issuer = 'https://evil.test' WHERE id = $1",
+        "UPDATE external_assertion_issuers SET jwks_uri = 'http://evil.test/jwks' WHERE id = $1",
+        "UPDATE external_assertion_issuers SET signing_alg_allow = 'ES512' WHERE id = $1",
+    ];
+    for statement in forbidden_issuer {
+        let mut tx = db.app_pool().begin().await.expect("begin app tx");
+        bind_scope(&mut tx, &tenant, &environment).await;
+        let denied = sqlx::query(statement)
+            .bind(&issuer_id)
+            .execute(&mut *tx)
+            .await;
+        assert_permission_denied(denied, statement);
+        let _ = tx.rollback().await;
+    }
+
+    // The app role CANNOT rewrite any app-immutable column on the mapping.
+    let forbidden_mapping: [&str; 3] = [
+        "UPDATE external_assertion_subject_mappings SET principal = 'usr_attacker' WHERE id = $1",
+        "UPDATE external_assertion_subject_mappings SET issuer = 'https://evil.test' WHERE id = $1",
+        "UPDATE external_assertion_subject_mappings SET external_subject = 'wl-evil' WHERE id = $1",
+    ];
+    for statement in forbidden_mapping {
+        let mut tx = db.app_pool().begin().await.expect("begin app tx");
+        bind_scope(&mut tx, &tenant, &environment).await;
+        let denied = sqlx::query(statement)
+            .bind(&mapping_id)
+            .execute(&mut *tx)
+            .await;
         assert_permission_denied(denied, statement);
         let _ = tx.rollback().await;
     }

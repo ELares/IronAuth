@@ -170,13 +170,16 @@ async fn mint_and_persist(
     let custom_claims = load_custom_claims(state, scope, client_id).await;
 
     // Resolve the access-token target: format (per resource-server config / env
-    // default) and the default M2M audience (per config). The RFC 8707 `resource`
-    // parameter is issue #28; today no resource is threaded, so this resolves to the
-    // configurable default audience.
+    // default) and the default M2M audience (per config). The client-credentials
+    // grant does not compose with RFC 8707 resource indicators in issue #28 (there is
+    // no prior authorization to downscope from), so it always resolves the no-resource
+    // target: the configurable default audience. The empty-resource branch is
+    // infallible, so a failure here can only be an internal error.
     let default_audience = state.client_credentials_default_audience(&scope, &client_id_str);
     let target = state
-        .resolve_access_token_target(&scope, None, &default_audience)
-        .await;
+        .resolve_access_token_target(&scope, &[], &default_audience)
+        .await
+        .map_err(|_| TokenError::ServerError)?;
 
     // Mint ONLY the access token: no ID token, and NO refresh token (RFC 6749 4.4.3).
     let entry = state
@@ -209,7 +212,7 @@ async fn mint_and_persist(
         MintedAccessToken::Opaque {
             digest,
             jti,
-            audience,
+            audiences,
             expires_at_unix_micros,
             ..
         } => ClientCredentialsAccess::Opaque(NewOpaqueAccessToken {
@@ -218,7 +221,8 @@ async fn mint_and_persist(
             grant_id: None,
             subject: subject.as_str(),
             client_id: client_id_str.as_str(),
-            audience: audience.as_str(),
+            audience: audiences.first().map_or("", String::as_str),
+            audiences,
             scope: requested_scope,
             jti,
             expires_at_unix_micros: *expires_at_unix_micros,
@@ -262,15 +266,20 @@ fn is_basic_scheme(authorization: Option<&str>) -> bool {
     })
 }
 
-/// Validate a requested client-credentials `scope` against the M2M policy (issue
-/// #23), returning the normalized granted scope (whitespace-collapsed) or [`None`]
-/// when none was requested.
+/// Validate a requested machine-grant `scope` against the M2M policy (issue #23),
+/// returning the normalized granted scope (whitespace-collapsed) or [`None`] when
+/// none was requested.
+///
+/// Shared with the jwt-bearer assertion grant (issue #26): a mapped-identity
+/// assertion-grant token is a machine token with no interactive user, so it is
+/// governed by the SAME policy (no `openid`, no `offline_access`), reusing this one
+/// helper rather than duplicating the check.
 ///
 /// # Errors
 ///
 /// [`TokenError::InvalidScope`] if any requested token is out of policy (see
 /// [`DISALLOWED_M2M_SCOPES`]).
-fn validate_m2m_scope(raw: Option<&str>) -> Result<Option<String>, TokenError> {
+pub(crate) fn validate_m2m_scope(raw: Option<&str>) -> Result<Option<String>, TokenError> {
     let Some(raw) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
         return Ok(None);
     };

@@ -55,10 +55,11 @@ use sqlx::{Postgres, Row, Transaction};
 use crate::audit::{ActingContext, Action, ActorRef};
 use crate::error::StoreError;
 use crate::id::{
-    AuditId, AuditTarget, AuthorizationCodeId, ClientId, ConsentId, CorrelationId, DcrPolicyId,
-    DeviceCodeId, EnvironmentId, GrantId, InitialAccessTokenId, IssuedTokenId, ManagementKeyId,
-    OperatorId, PushedRequestId, RefreshFamilyId, RefreshTokenId, ResourceServerId,
-    ServiceAccountId, SessionId, SigningKeyId, TenantId, UserId,
+    AssertionMappingId, AuditId, AuditTarget, AuthorizationCodeId, ClientId, ConsentId,
+    CorrelationId, DcrPolicyId, DeviceCodeId, EnvironmentId, ExternalIssuerId, GrantId,
+    InitialAccessTokenId, IssuedTokenId, ManagementKeyId, OperatorId, PushedRequestId,
+    RefreshFamilyId, RefreshTokenId, ResourceServerId, ServiceAccountId, SessionId, SigningKeyId,
+    TenantId, UserId,
 };
 use crate::scope::Scope;
 use crate::store::Store;
@@ -210,6 +211,45 @@ impl<'a> ScopedStore<'a> {
     #[must_use]
     pub fn client_auth_diagnostics(&self) -> ClientAuthDiagnosticsRepo<'a> {
         ClientAuthDiagnosticsRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
+    /// The read-only registered external assertion issuer repository for this scope
+    /// (issue #26). Resolves the trust anchor an inbound JWT bearer assertion's `iss`
+    /// names, so the grant can verify the assertion against the issuer's keys;
+    /// registration lives on [`ActingStore::external_assertion_issuers`].
+    #[must_use]
+    pub fn external_assertion_issuers(&self) -> ExternalAssertionIssuerRepo<'a> {
+        ExternalAssertionIssuerRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
+    /// The read-only subject-mapping repository for the JWT bearer assertion grant in
+    /// this scope (issue #26). Resolves the explicit rule that maps a verified
+    /// external (issuer + `sub`) to an IronAuth principal; authoring lives on
+    /// [`ActingStore::external_assertion_subject_mappings`]. An unmapped subject
+    /// resolves to `None`, and the grant rejects it (never auto-provisions).
+    #[must_use]
+    pub fn external_assertion_subject_mappings(&self) -> AssertionSubjectMappingRepo<'a> {
+        AssertionSubjectMappingRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
+    /// The single-use external-issuer JWT-assertion `jti` replay cache for this scope
+    /// (issue #26). Records an accepted assertion's `jti` keyed by the EXTERNAL
+    /// issuer, so an external issuer's `jti` can never collide with a client
+    /// assertion's `jti` (they live in distinct tables). Like the #25 client cache it
+    /// is a replay-prevention cache, not a business mutation, so it is deliberately
+    /// off the audited-write path and needs no acting context.
+    #[must_use]
+    pub fn external_assertion_jtis(&self) -> ExternalAssertionJtiRepo<'a> {
+        ExternalAssertionJtiRepo {
             store: self.store,
             scope: self.scope,
         }
@@ -466,6 +506,32 @@ impl<'a> ActingStore<'a> {
             acting: self.acting,
         }
     }
+
+    /// The mutating external assertion issuer repository for this scope and actor
+    /// (issue #26): register a trust anchor (its key source, signing-alg allowlist,
+    /// and enable switch) for the JWT bearer assertion grant, audited
+    /// (`external_assertion_issuer.register`) in the same transaction.
+    #[must_use]
+    pub fn external_assertion_issuers(&self) -> ActingExternalAssertionIssuerRepo<'a> {
+        ActingExternalAssertionIssuerRepo {
+            store: self.store,
+            scope: self.scope,
+            acting: self.acting,
+        }
+    }
+
+    /// The mutating subject-mapping repository for the JWT bearer assertion grant in
+    /// this scope and actor (issue #26): author an explicit rule mapping an external
+    /// (issuer + `sub`) to an IronAuth principal, audited
+    /// (`external_assertion_subject_mapping.create`) in the same transaction.
+    #[must_use]
+    pub fn external_assertion_subject_mappings(&self) -> ActingAssertionSubjectMappingRepo<'a> {
+        ActingAssertionSubjectMappingRepo {
+            store: self.store,
+            scope: self.scope,
+            acting: self.acting,
+        }
+    }
 }
 
 /// A record read back from the `clients` table, always within scope.
@@ -516,6 +582,26 @@ pub struct ClientRecord {
     /// shown) and RESTRICTS its effective redirect-URI set to the https subset,
     /// until an admin verifies it. Defaults to false for every non-DCR client.
     pub quarantined: bool,
+}
+
+/// A client's RFC 8707 resource-indicator policy, read within scope (issue #28).
+///
+/// The authorization and token endpoints read this to decide which resources a
+/// client may request and how a request with NO `resource` parameter is treated.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientResourcePolicy {
+    /// The per-client allowed-resource allowlist: the resource URIs this client may
+    /// request. [`None`] means NO per-client allowlist is configured, in which case
+    /// the client may request any resource that is a registered resource server in
+    /// its environment (the resource-server registry is itself the allowlist); a
+    /// [`Some`] set further RESTRICTS the client to exactly its entries. An empty
+    /// [`Some`] set means the client may request NO resource at all.
+    pub allowed_resources: Option<Vec<String>>,
+    /// Whether the client REFUSES a request that carries no `resource` parameter
+    /// (the stored `resource_indicator_policy` is `refuse`). `false` (the default,
+    /// for a `default_audience` or unset policy) keeps the existing no-resource
+    /// behavior: the token's audience is the client id.
+    pub require_resource_indicator: bool,
 }
 
 /// The client-authentication metadata for a client, read within scope (issue
@@ -962,6 +1048,47 @@ impl ClientRepo<'_> {
         .await?;
         tx.commit().await?;
         Ok(row.and_then(|row| row.get::<Option<String>, _>("custom_token_claims")))
+    }
+
+    /// Read a client's RFC 8707 resource-indicator policy within scope (issue #28):
+    /// its per-client allowed-resource allowlist and whether it refuses a
+    /// no-`resource` request. A client absent in this scope (or minted in another) is
+    /// the uniform [`StoreError::NotFound`].
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the identifier is out of this scope or no client
+    /// matches; [`StoreError::Database`] on a persistence failure.
+    pub async fn resource_policy(&self, id: &ClientId) -> Result<ClientResourcePolicy, StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT allowed_resources, resource_indicator_policy FROM clients \
+             WHERE id = $1 AND tenant_id = $2 AND environment_id = $3",
+        )
+        .bind(id.to_string())
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        let row = row.ok_or(StoreError::NotFound)?;
+        // A NULL allowlist column is "no per-client allowlist"; a present one parses
+        // to the exact (possibly empty) set. A parse failure falls SAFE to an empty
+        // allowlist (the most restrictive reading), never to "no restriction".
+        let allowed_resources = row
+            .get::<Option<String>, _>("allowed_resources")
+            .map(|text| serde_json::from_str::<Vec<String>>(&text).unwrap_or_default());
+        let require_resource_indicator = row
+            .get::<Option<String>, _>("resource_indicator_policy")
+            .as_deref()
+            == Some("refuse");
+        Ok(ClientResourcePolicy {
+            allowed_resources,
+            require_resource_indicator,
+        })
     }
 
     /// Read a dynamically registered client's stored configuration within scope
@@ -1468,6 +1595,75 @@ impl ActingClientRepo<'_> {
                 .bind(skip_consent)
                 .bind(store_skipped_consent)
                 .bind(refresh_rotation.as_deref())
+                .bind(id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .execute(&mut **tx)
+                .await?;
+                if result.rows_affected() == 0 {
+                    return Err(StoreError::NotFound);
+                }
+                Ok(())
+            },
+            false,
+        )
+        .await
+    }
+
+    /// Set a client's RFC 8707 resource-indicator policy (issue #28): its per-client
+    /// allowed-resource allowlist and whether it refuses a no-`resource` request.
+    /// Writes a `client.resource_indicator_policy.set` audit row in the same
+    /// transaction.
+    ///
+    /// `allowed_resources` is [`None`] to CLEAR the per-client allowlist (the client
+    /// may then request any registered resource server), or [`Some`] to set the exact
+    /// allowlist (an empty slice means the client may request NO resource).
+    /// `require_resource_indicator` maps to the stored `refuse` / `default_audience`
+    /// policy string. Only the two resource-indicator columns are touched, under the
+    /// migration's column-scoped `UPDATE` grant.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the id is out of scope or no client matches;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn set_resource_indicator_policy(
+        &self,
+        env: &Env,
+        id: &ClientId,
+        allowed_resources: Option<&[String]>,
+        require_resource_indicator: bool,
+    ) -> Result<(), StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        // The store owns the JSON encoding of the allowlist (a Some(empty) allowlist
+        // is a real, restrictive value, so it is stored as `[]`, distinct from a NULL
+        // "no allowlist"). The policy column is the wire string the CHECK permits.
+        let allowed_json = allowed_resources
+            .map(|values| serde_json::to_string(values).unwrap_or_else(|_| "[]".to_owned()));
+        let policy = if require_resource_indicator {
+            "refuse"
+        } else {
+            "default_audience"
+        };
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::ClientResourceIndicatorPolicySet,
+                target: id,
+            },
+            async move |tx| {
+                let result = sqlx::query(
+                    "UPDATE clients \
+                     SET allowed_resources = $1, resource_indicator_policy = $2 \
+                     WHERE id = $3 AND tenant_id = $4 AND environment_id = $5",
+                )
+                .bind(allowed_json.as_deref())
+                .bind(policy)
                 .bind(id.to_string())
                 .bind(scope.tenant().to_string())
                 .bind(scope.environment().to_string())
@@ -2580,6 +2776,13 @@ pub struct IssueCode<'a> {
     /// code so the ID token (`id_token` member) and `UserInfo` (`userinfo` member)
     /// can honor it after the request itself is gone (issue #15).
     pub claims_request: Option<&'a str>,
+    /// The RFC 8707 resource audiences APPROVED at authorization (issue #28), the
+    /// ceiling a later code exchange or refresh may downscope from but never expand
+    /// beyond. Frozen onto BOTH the grant (read by the refresh path) and the code
+    /// (read by the code-exchange path), exactly as `claims_request` is. An empty
+    /// slice means no resource was approved (the default-audience case) and is
+    /// stored as NULL.
+    pub granted_resources: &'a [String],
     /// The code's expiry, in microseconds since the Unix epoch (clock seam).
     pub expires_at_micros: i64,
     /// The code's creation time, in microseconds since the Unix epoch.
@@ -2637,6 +2840,12 @@ pub struct CodeBindings {
     /// code (OIDC Core 5.5), or [`None`] when the request carried none. The token
     /// endpoint applies its `id_token` member to the ID token at mint (issue #15).
     pub claims_request: Option<String>,
+    /// The RFC 8707 resource audiences APPROVED at authorization (issue #28),
+    /// frozen onto the code. The token endpoint narrows the issued access token to
+    /// a requested subset of these; a requested resource outside this set is an
+    /// expansion beyond the grant and is rejected. Empty when no resource was
+    /// approved (the default-audience case).
+    pub granted_resources: Vec<String>,
 }
 
 impl fmt::Debug for CodeBindings {
@@ -2720,6 +2929,7 @@ impl AuthorizationRepo<'_> {
         let row = sqlx::query(
             "SELECT grant_id, client_id, redirect_uri, nonce, code_challenge, \
              code_challenge_method, subject, oauth_scope, auth_methods, claims_request, \
+             granted_resources, \
              (EXTRACT(EPOCH FROM auth_time) * 1000000)::bigint AS auth_time_us \
              FROM authorization_codes \
              WHERE id = $1 AND tenant_id = $2 AND environment_id = $3",
@@ -2852,7 +3062,7 @@ impl AuthorizationRepo<'_> {
         // #22's introspection response consumes carries the token's `exp` and `iat`.
         let row = sqlx::query(
             "SELECT t.subject AS subject, t.client_id AS client_id, t.audience AS audience, \
-             t.scope AS scope, t.jti AS jti, \
+             t.audiences AS audiences, t.scope AS scope, t.jti AS jti, \
              (EXTRACT(EPOCH FROM t.expires_at) * 1000000)::bigint AS expires_us, \
              (EXTRACT(EPOCH FROM t.created_at) * 1000000)::bigint AS issued_us \
              FROM opaque_access_tokens t \
@@ -2869,14 +3079,26 @@ impl AuthorizationRepo<'_> {
         .fetch_optional(&mut *tx)
         .await?;
         tx.commit().await?;
-        Ok(row.map(|row| ActiveOpaqueToken {
-            subject: row.get("subject"),
-            client_id: row.get("client_id"),
-            audience: row.get("audience"),
-            scope: row.get("scope"),
-            jti: row.get("jti"),
-            expires_at_unix_micros: row.get("expires_us"),
-            issued_at_unix_micros: row.get("issued_us"),
+        Ok(row.map(|row| {
+            let audience: String = row.get("audience");
+            // The recorded audience array, or a single-element fallback to the
+            // primary audience for a single-resource / no-resource token (whose
+            // `audiences` column is NULL). Always non-empty.
+            let mut audiences =
+                resource_array_from_json(row.get::<Option<String>, _>("audiences").as_deref());
+            if audiences.is_empty() {
+                audiences.push(audience.clone());
+            }
+            ActiveOpaqueToken {
+                subject: row.get("subject"),
+                client_id: row.get("client_id"),
+                audience,
+                audiences,
+                scope: row.get("scope"),
+                jti: row.get("jti"),
+                expires_at_unix_micros: row.get("expires_us"),
+                issued_at_unix_micros: row.get("issued_us"),
+            }
         }))
     }
 
@@ -3020,12 +3242,13 @@ impl ActingAuthorizationRepo<'_> {
                 target: code.code_id,
             },
             async move |tx| {
+                let granted_resources = resource_array_to_json(code.granted_resources);
                 sqlx::query(
                     "INSERT INTO grants \
                      (id, tenant_id, environment_id, client_id, subject, session_ref, \
-                      consent_ref, claims_request, created_at) \
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, \
-                             TIMESTAMPTZ 'epoch' + ($9::text || ' microseconds')::interval)",
+                      consent_ref, claims_request, granted_resources, created_at) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, \
+                             TIMESTAMPTZ 'epoch' + ($10::text || ' microseconds')::interval)",
                 )
                 .bind(code.grant_id.to_string())
                 .bind(scope.tenant().to_string())
@@ -3035,6 +3258,7 @@ impl ActingAuthorizationRepo<'_> {
                 .bind(code.session_ref)
                 .bind(code.consent_ref)
                 .bind(code.claims_request)
+                .bind(granted_resources.as_deref())
                 .bind(code.created_at_micros)
                 .execute(&mut **tx)
                 .await?;
@@ -3042,13 +3266,13 @@ impl ActingAuthorizationRepo<'_> {
                     "INSERT INTO authorization_codes \
                      (id, tenant_id, environment_id, grant_id, client_id, redirect_uri, nonce, \
                       code_challenge, code_challenge_method, subject, oauth_scope, auth_methods, \
-                      claims_request, auth_time, expires_at, created_at) \
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, \
-                             CASE WHEN $14::bigint IS NULL THEN NULL \
+                      claims_request, granted_resources, auth_time, expires_at, created_at) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, \
+                             CASE WHEN $15::bigint IS NULL THEN NULL \
                                   ELSE TIMESTAMPTZ 'epoch' \
-                                       + ($14::text || ' microseconds')::interval END, \
-                             TIMESTAMPTZ 'epoch' + ($15::text || ' microseconds')::interval, \
-                             TIMESTAMPTZ 'epoch' + ($16::text || ' microseconds')::interval)",
+                                       + ($15::text || ' microseconds')::interval END, \
+                             TIMESTAMPTZ 'epoch' + ($16::text || ' microseconds')::interval, \
+                             TIMESTAMPTZ 'epoch' + ($17::text || ' microseconds')::interval)",
                 )
                 .bind(code.code_id.to_string())
                 .bind(scope.tenant().to_string())
@@ -3063,6 +3287,7 @@ impl ActingAuthorizationRepo<'_> {
                 .bind(code.oauth_scope)
                 .bind(code.auth_methods)
                 .bind(code.claims_request)
+                .bind(granted_resources.as_deref())
                 .bind(code.auth_time_micros)
                 .bind(code.expires_at_micros)
                 .bind(code.created_at_micros)
@@ -3197,9 +3422,9 @@ impl ActingAuthorizationRepo<'_> {
                 sqlx::query(
                     "INSERT INTO opaque_access_tokens \
                      (token_digest, tenant_id, environment_id, grant_id, subject, \
-                      client_id, audience, scope, jti, expires_at) \
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, \
-                             TIMESTAMPTZ 'epoch' + ($10::text || ' microseconds')::interval)",
+                      client_id, audience, audiences, scope, jti, expires_at) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, \
+                             TIMESTAMPTZ 'epoch' + ($11::text || ' microseconds')::interval)",
                 )
                 .bind(opaque.token_digest)
                 .bind(scope.tenant().to_string())
@@ -3208,6 +3433,7 @@ impl ActingAuthorizationRepo<'_> {
                 .bind(opaque.subject)
                 .bind(opaque.client_id)
                 .bind(opaque.audience)
+                .bind(resource_array_to_json(opaque.audiences))
                 .bind(opaque.scope)
                 .bind(opaque.jti.to_string())
                 .bind(opaque.expires_at_unix_micros)
@@ -3389,6 +3615,44 @@ impl ActingAuthorizationRepo<'_> {
         env: &Env,
         request: IssueClientCredentials<'_>,
     ) -> Result<(), StoreError> {
+        self.issue_machine_grant(env, request, Action::TokenIssue)
+            .await
+    }
+
+    /// Persist a JWT bearer assertion grant's short-lived access token against a
+    /// fresh grant (issue #26), audited as [`Action::JwtBearerAssertionIssue`] in the
+    /// same transaction, so the mapped-identity token is revocable and
+    /// introspectable by the #22 endpoints by construction (the SAME grant chain the
+    /// code/refresh/client-credentials tokens use). It REUSES the machine-grant
+    /// persistence shape ([`IssueClientCredentials`]): `subject` is the MAPPED
+    /// principal (the token's `sub`), `client_id` is the presenting OAuth client, and
+    /// there is NO refresh token (RFC 7521 4.1). The audit action is distinct so a
+    /// federation issuance is legible in the trail as such, not as an M2M issuance.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if any identifier is out of this scope;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn issue_jwt_bearer_assertion(
+        &self,
+        env: &Env,
+        request: IssueClientCredentials<'_>,
+    ) -> Result<(), StoreError> {
+        self.issue_machine_grant(env, request, Action::JwtBearerAssertionIssue)
+            .await
+    }
+
+    /// The shared body behind [`Self::issue_client_credentials`] and
+    /// [`Self::issue_jwt_bearer_assertion`]: open a subject-bearing grant (no
+    /// session, no consent, no user flow) and record the minted access token against
+    /// it, auditing `action` in the same transaction. Both callers persist an
+    /// identical grant + access-token shape; only the audit verb differs.
+    async fn issue_machine_grant(
+        &self,
+        env: &Env,
+        request: IssueClientCredentials<'_>,
+        action: Action,
+    ) -> Result<(), StoreError> {
         let in_scope = request.grant_id.scope() == self.scope
             && request.client_id.scope() == self.scope
             && match &request.access {
@@ -3405,7 +3669,7 @@ impl ActingAuthorizationRepo<'_> {
                 scope,
                 acting: &self.acting,
                 env,
-                action: Action::TokenIssue,
+                action,
                 target: request.grant_id,
             },
             async move |tx| {
@@ -3449,9 +3713,9 @@ impl ActingAuthorizationRepo<'_> {
                         sqlx::query(
                             "INSERT INTO opaque_access_tokens \
                              (token_digest, tenant_id, environment_id, grant_id, subject, \
-                              client_id, audience, scope, jti, expires_at) \
-                             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, \
-                                     TIMESTAMPTZ 'epoch' + ($10::text || ' microseconds')::interval)",
+                              client_id, audience, audiences, scope, jti, expires_at) \
+                             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, \
+                                     TIMESTAMPTZ 'epoch' + ($11::text || ' microseconds')::interval)",
                         )
                         .bind(opaque.token_digest)
                         .bind(scope.tenant().to_string())
@@ -3460,6 +3724,7 @@ impl ActingAuthorizationRepo<'_> {
                         .bind(opaque.subject)
                         .bind(opaque.client_id)
                         .bind(opaque.audience)
+                        .bind(resource_array_to_json(opaque.audiences))
                         .bind(opaque.scope)
                         .bind(opaque.jti.to_string())
                         .bind(opaque.expires_at_unix_micros)
@@ -4615,9 +4880,10 @@ impl ClientAssertionJtiRepo<'_> {
     }
 }
 
-/// A bounded-cardinality reason a client authentication failed (issue #25),
-/// recorded in the diagnostics sink. No attacker-controlled free text, so it is
-/// safe as a metric-like dimension and never an oracle on the wire.
+/// A bounded-cardinality reason a client authentication OR a JWT bearer assertion
+/// grant validation failed (issues #25 and #26), recorded in the diagnostics sink.
+/// No attacker-controlled free text, so it is safe as a metric-like dimension and
+/// never an oracle on the wire.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClientAuthDiagnosticReason {
     /// The presented credentials could not be parsed into one coherent attempt
@@ -4637,6 +4903,13 @@ pub enum ClientAuthDiagnosticReason {
     /// The `client_secret_jwt` method is registered but unsupported: IronAuth
     /// stores no retrievable secret to key its HMAC, so it fails closed.
     ClientSecretJwtUnsupported,
+    /// A JWT bearer assertion grant assertion named an `iss` that is not a
+    /// registered, ENABLED external issuer in this scope (issue #26).
+    AssertionIssuerUntrusted,
+    /// A JWT bearer assertion grant assertion verified, but its (issuer, `sub`)
+    /// names no registered subject-mapping rule (or the rule's optional claim gate
+    /// did not match): the subject is rejected, never auto-provisioned (issue #26).
+    AssertionSubjectUnmapped,
 }
 
 impl ClientAuthDiagnosticReason {
@@ -4653,6 +4926,8 @@ impl ClientAuthDiagnosticReason {
             ClientAuthDiagnosticReason::ClientSecretJwtUnsupported => {
                 "client_secret_jwt_unsupported"
             }
+            ClientAuthDiagnosticReason::AssertionIssuerUntrusted => "assertion_issuer_untrusted",
+            ClientAuthDiagnosticReason::AssertionSubjectUnmapped => "assertion_subject_unmapped",
         }
     }
 }
@@ -4807,6 +5082,527 @@ impl ClientAuthDiagnosticsRepo<'_> {
     }
 }
 
+// ===========================================================================
+// The JWT bearer assertion grant trust and mapping stores (issue #26).
+// ===========================================================================
+
+/// A registered external assertion issuer read back within scope (issue #26): the
+/// trust anchor an inbound JWT bearer assertion's `iss` names, plus its key source,
+/// signing-alg allowlist, and enable switch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalAssertionIssuerRecord {
+    /// The `xai_` identifier (embeds its tenant and environment).
+    pub id: ExternalIssuerId,
+    /// The external issuer's `iss` claim value.
+    pub issuer: String,
+    /// The inline pinned JWK Set JSON, or [`None`] when keys are at `jwks_uri`.
+    pub jwks: Option<String>,
+    /// The issuer's JWKS URL (fetched through the SSRF-hardened fetcher), or [`None`]
+    /// when keys are pinned inline. At most one of `jwks`/`jwks_uri` is set.
+    pub jwks_uri: Option<String>,
+    /// An OPTIONAL space-separated JOSE algorithm allowlist for this issuer's
+    /// assertions; [`None`] means the supported asymmetric set applies.
+    pub signing_alg_allow: Option<String>,
+    /// The enable switch. A disabled issuer's assertions are rejected exactly as an
+    /// unregistered issuer's are.
+    pub enabled: bool,
+}
+
+/// An external assertion issuer to register (issue #26). The `id` is minted under
+/// the caller's scope; the `issuer` is unique per environment. Exactly one of
+/// `jwks`/`jwks_uri` must be set (a database CHECK enforces it).
+#[derive(Debug, Clone, Copy)]
+pub struct NewExternalAssertionIssuer<'a> {
+    /// The `xai_` identifier, minted under this scope.
+    pub id: &'a ExternalIssuerId,
+    /// The external issuer's `iss` claim value.
+    pub issuer: &'a str,
+    /// The inline pinned JWK Set JSON, or [`None`] to register a `jwks_uri` instead.
+    pub jwks: Option<&'a str>,
+    /// The issuer's JWKS URL, or [`None`] to register inline `jwks` instead.
+    pub jwks_uri: Option<&'a str>,
+    /// The OPTIONAL space-separated JOSE algorithm allowlist, or [`None`].
+    pub signing_alg_allow: Option<&'a str>,
+    /// The enable switch to register the issuer with.
+    pub enabled: bool,
+}
+
+/// The read-only registered external assertion issuer repository (issue #26).
+pub struct ExternalAssertionIssuerRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl ExternalAssertionIssuerRepo<'_> {
+    /// Fetch a registered external assertion issuer by its `issuer` string within
+    /// scope, or [`None`] when none is registered (absent, or belonging to another
+    /// tenant or environment: indistinguishable). The JWT bearer grant calls this to
+    /// resolve the trust anchor an assertion's `iss` names before verifying it.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure, or if a stored row fails to
+    /// decode (an out-of-scope identifier).
+    pub async fn by_issuer(
+        &self,
+        issuer: &str,
+    ) -> Result<Option<ExternalAssertionIssuerRecord>, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT id, issuer, jwks, jwks_uri, signing_alg_allow, enabled \
+             FROM external_assertion_issuers \
+             WHERE issuer = $1 AND tenant_id = $2 AND environment_id = $3",
+        )
+        .bind(issuer)
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        match row {
+            None => Ok(None),
+            Some(row) => {
+                let id_text: String = row.get("id");
+                let id = ExternalIssuerId::parse_in_scope(&id_text, &self.scope)?;
+                Ok(Some(ExternalAssertionIssuerRecord {
+                    id,
+                    issuer: row.get("issuer"),
+                    jwks: row.get("jwks"),
+                    jwks_uri: row.get("jwks_uri"),
+                    signing_alg_allow: row.get("signing_alg_allow"),
+                    enabled: row.get("enabled"),
+                }))
+            }
+        }
+    }
+}
+
+/// The mutating external assertion issuer repository (issue #26). Reachable only
+/// through [`ScopedStore::acting`], so every registration carries an actor and
+/// correlation id and routes through the audited-write primitive.
+pub struct ActingExternalAssertionIssuerRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+    acting: ActingContext,
+}
+
+impl ActingExternalAssertionIssuerRepo<'_> {
+    /// Register an external assertion issuer and audit
+    /// `external_assertion_issuer.register` in the same transaction.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the identifier is out of this scope;
+    /// [`StoreError::Conflict`] if the issuer is already registered in this
+    /// environment, or the key source is not exactly one of `jwks`/`jwks_uri` (the
+    /// database CHECK); [`StoreError::Database`] on a persistence failure.
+    pub async fn register(
+        &self,
+        env: &Env,
+        issuer: NewExternalAssertionIssuer<'_>,
+    ) -> Result<(), StoreError> {
+        if issuer.id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::ExternalAssertionIssuerRegister,
+                target: issuer.id,
+            },
+            async move |tx| {
+                let result = sqlx::query(
+                    "INSERT INTO external_assertion_issuers \
+                     (id, tenant_id, environment_id, issuer, jwks, jwks_uri, \
+                      signing_alg_allow, enabled) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+                )
+                .bind(issuer.id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(issuer.issuer)
+                .bind(issuer.jwks)
+                .bind(issuer.jwks_uri)
+                .bind(issuer.signing_alg_allow)
+                .bind(issuer.enabled)
+                .execute(&mut **tx)
+                .await;
+                match result {
+                    Ok(_) => Ok(()),
+                    // A duplicate issuer OR a CHECK violation (not exactly one key
+                    // source) is a caller-facing conflict, not a persistence fault:
+                    // erroring here rolls the audited write back, so a rejected
+                    // registration leaves neither an issuer row nor an audit row.
+                    Err(error) if is_unique_violation(&error) || is_check_violation(&error) => {
+                        Err(StoreError::Conflict)
+                    }
+                    Err(error) => Err(error.into()),
+                }
+            },
+            false,
+        )
+        .await
+    }
+
+    /// Toggle a registered external assertion issuer's enable switch (issue #26),
+    /// auditing `external_assertion_issuer.set_enabled` in the same transaction.
+    ///
+    /// This is the data-plane REVOCATION capability: DISABLING a compromised or
+    /// decommissioned issuer makes the grant reject its assertions exactly as an
+    /// unregistered issuer's are (the grant filters on `enabled`). The COLUMN-SCOPED
+    /// `GRANT UPDATE (enabled)` is the enforcement: this path can flip only `enabled`,
+    /// never the issuer's identity, key source, or signing-alg allowlist. Idempotent:
+    /// re-setting the same value still updates the one row.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the identifier is out of this scope or names no
+    /// issuer visible here; [`StoreError::Database`] on a persistence failure.
+    pub async fn set_enabled(
+        &self,
+        env: &Env,
+        id: &ExternalIssuerId,
+        enabled: bool,
+    ) -> Result<(), StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::ExternalAssertionIssuerSetEnabled,
+                target: id,
+            },
+            async move |tx| {
+                let result = sqlx::query(
+                    "UPDATE external_assertion_issuers SET enabled = $1 \
+                     WHERE id = $2 AND tenant_id = $3 AND environment_id = $4",
+                )
+                .bind(enabled)
+                .bind(id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .execute(&mut **tx)
+                .await?;
+                if result.rows_affected() == 0 {
+                    return Err(StoreError::NotFound);
+                }
+                Ok(())
+            },
+            false,
+        )
+        .await
+    }
+}
+
+/// A registered subject-mapping rule read back within scope (issue #26): the
+/// explicit rule that maps an external (issuer + `sub`), optionally gated on an
+/// additional claim, to an IronAuth principal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AssertionSubjectMappingRecord {
+    /// The `asm_` identifier (embeds its tenant and environment).
+    pub id: AssertionMappingId,
+    /// The external issuer this rule maps from.
+    pub issuer: String,
+    /// The external `sub` this rule maps from.
+    pub external_subject: String,
+    /// An OPTIONAL additional claim NAME the assertion must carry with
+    /// `match_value` for the rule to fire; [`None`] when the (issuer, sub) match
+    /// alone suffices.
+    pub match_claim: Option<String>,
+    /// The value the OPTIONAL `match_claim` must equal; [`None`] when `match_claim`
+    /// is [`None`].
+    pub match_value: Option<String>,
+    /// The IronAuth principal the mapped token is issued under (the token's `sub`).
+    pub principal: String,
+}
+
+/// A subject-mapping rule to author (issue #26). The `id` is minted under the
+/// caller's scope; one rule per (issuer, `external_subject`) per environment. The
+/// optional claim gate is all-or-nothing (both `match_claim`/`match_value` set, or
+/// both [`None`]); a database CHECK enforces it.
+#[derive(Debug, Clone, Copy)]
+pub struct NewAssertionSubjectMapping<'a> {
+    /// The `asm_` identifier, minted under this scope.
+    pub id: &'a AssertionMappingId,
+    /// The external issuer this rule maps from.
+    pub issuer: &'a str,
+    /// The external `sub` this rule maps from.
+    pub external_subject: &'a str,
+    /// The OPTIONAL additional claim NAME, or [`None`].
+    pub match_claim: Option<&'a str>,
+    /// The OPTIONAL additional claim VALUE, or [`None`] (paired with `match_claim`).
+    pub match_value: Option<&'a str>,
+    /// The IronAuth principal the mapped token is issued under.
+    pub principal: &'a str,
+}
+
+/// The read-only subject-mapping repository for the JWT bearer assertion grant
+/// (issue #26).
+pub struct AssertionSubjectMappingRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl AssertionSubjectMappingRepo<'_> {
+    /// Resolve the ENABLED mapping rule for a verified external (`issuer`,
+    /// `external_subject`) within scope, or [`None`] when no enabled rule is
+    /// registered. The lookup FILTERS on `enabled = true`, so a DISABLED (revoked)
+    /// mapping resolves to [`None`] and the grant rejects the subject exactly as an
+    /// absent one. The grant applies the rule's OPTIONAL claim gate itself against the
+    /// verified claims, then issues the token under `principal`. A [`None`] here is the
+    /// reject-by-default posture: an unmapped subject is rejected, never
+    /// auto-provisioned.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure, or if a stored row fails to
+    /// decode (an out-of-scope identifier).
+    pub async fn resolve(
+        &self,
+        issuer: &str,
+        external_subject: &str,
+    ) -> Result<Option<AssertionSubjectMappingRecord>, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT id, issuer, external_subject, match_claim, match_value, principal \
+             FROM external_assertion_subject_mappings \
+             WHERE issuer = $1 AND external_subject = $2 \
+             AND tenant_id = $3 AND environment_id = $4 AND enabled = true",
+        )
+        .bind(issuer)
+        .bind(external_subject)
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        match row {
+            None => Ok(None),
+            Some(row) => {
+                let id_text: String = row.get("id");
+                let id = AssertionMappingId::parse_in_scope(&id_text, &self.scope)?;
+                Ok(Some(AssertionSubjectMappingRecord {
+                    id,
+                    issuer: row.get("issuer"),
+                    external_subject: row.get("external_subject"),
+                    match_claim: row.get("match_claim"),
+                    match_value: row.get("match_value"),
+                    principal: row.get("principal"),
+                }))
+            }
+        }
+    }
+}
+
+/// The mutating subject-mapping repository for the JWT bearer assertion grant (issue
+/// #26). Reachable only through [`ScopedStore::acting`], so every mapping carries an
+/// actor and correlation id and routes through the audited-write primitive.
+pub struct ActingAssertionSubjectMappingRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+    acting: ActingContext,
+}
+
+impl ActingAssertionSubjectMappingRepo<'_> {
+    /// Author a subject-mapping rule and audit
+    /// `external_assertion_subject_mapping.create` in the same transaction.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the identifier is out of this scope;
+    /// [`StoreError::Conflict`] if a rule for the same (issuer, `external_subject`) is
+    /// already registered, or the claim gate is half-configured (the database CHECK);
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn create(
+        &self,
+        env: &Env,
+        mapping: NewAssertionSubjectMapping<'_>,
+    ) -> Result<(), StoreError> {
+        if mapping.id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::ExternalAssertionSubjectMappingCreate,
+                target: mapping.id,
+            },
+            async move |tx| {
+                let result = sqlx::query(
+                    "INSERT INTO external_assertion_subject_mappings \
+                     (id, tenant_id, environment_id, issuer, external_subject, \
+                      match_claim, match_value, principal) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+                )
+                .bind(mapping.id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(mapping.issuer)
+                .bind(mapping.external_subject)
+                .bind(mapping.match_claim)
+                .bind(mapping.match_value)
+                .bind(mapping.principal)
+                .execute(&mut **tx)
+                .await;
+                match result {
+                    Ok(_) => Ok(()),
+                    Err(error) if is_unique_violation(&error) || is_check_violation(&error) => {
+                        Err(StoreError::Conflict)
+                    }
+                    Err(error) => Err(error.into()),
+                }
+            },
+            false,
+        )
+        .await
+    }
+
+    /// Toggle a subject-mapping rule's enable switch (issue #26), auditing
+    /// `external_assertion_subject_mapping.set_enabled` in the same transaction.
+    ///
+    /// This is the data-plane REVOCATION capability: DISABLING a mis-authored or
+    /// decommissioned mapping makes the resolve return no rule, so the grant rejects
+    /// the subject exactly as an unmapped one (never auto-provisions). The
+    /// COLUMN-SCOPED `GRANT UPDATE (enabled)` is the enforcement: this path can flip
+    /// only `enabled`, never the rule's issuer, subject, claim gate, or principal.
+    /// Idempotent: re-setting the same value still updates the one row.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the identifier is out of this scope or names no
+    /// mapping visible here; [`StoreError::Database`] on a persistence failure.
+    pub async fn set_enabled(
+        &self,
+        env: &Env,
+        id: &AssertionMappingId,
+        enabled: bool,
+    ) -> Result<(), StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::ExternalAssertionSubjectMappingSetEnabled,
+                target: id,
+            },
+            async move |tx| {
+                let result = sqlx::query(
+                    "UPDATE external_assertion_subject_mappings SET enabled = $1 \
+                     WHERE id = $2 AND tenant_id = $3 AND environment_id = $4",
+                )
+                .bind(enabled)
+                .bind(id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .execute(&mut **tx)
+                .await?;
+                if result.rows_affected() == 0 {
+                    return Err(StoreError::NotFound);
+                }
+                Ok(())
+            },
+            false,
+        )
+        .await
+    }
+}
+
+/// The single-use external-issuer JWT-assertion `jti` replay cache (issue #26).
+///
+/// REUSES the #25 client-assertion prune-then-insert single-use mechanism (a
+/// primary-key conflict on insert is a REPLAY, enforced across nodes because every
+/// node inserts into one shared table), but keyed by the EXTERNAL ISSUER rather than
+/// the OAuth client id, in a DISTINCT table, so an external issuer's `jti` can never
+/// collide with a client-assertion `jti`. Deliberately off the audited-write path (a
+/// security cache, not a business mutation), like the #25 cache and
+/// `idempotency_keys`, but still RLS-scoped.
+pub struct ExternalAssertionJtiRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl ExternalAssertionJtiRepo<'_> {
+    /// Record `jti` for external `issuer` as single-use in this scope, first pruning
+    /// any already-expired rows.
+    ///
+    /// `expires_at_micros` is the last instant the assertion could still be replayed
+    /// (its `exp` plus the configured skew plus one second; see the migration note),
+    /// so a pruned row can never remove a `jti` whose assertion is still acceptable.
+    /// The prune uses the application clock seam (`env`), never the database clock, so
+    /// it is deterministic under a manual clock in tests. Returns
+    /// [`JtiOutcome::Recorded`] on the first use and [`JtiOutcome::Replayed`] when the
+    /// `jti` was already present (a second use, from this or any other node).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn record(
+        &self,
+        env: &Env,
+        issuer: &str,
+        jti: &str,
+        expires_at_micros: i64,
+    ) -> Result<JtiOutcome, StoreError> {
+        let now_micros = epoch_micros(env.clock().now_utc());
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        // Prune rows whose last-replayable instant has passed. Only these are removed,
+        // so a still-valid assertion's jti is never dropped.
+        sqlx::query(
+            "DELETE FROM external_assertion_jtis \
+             WHERE tenant_id = $1 AND environment_id = $2 \
+             AND expires_at <= TIMESTAMPTZ 'epoch' + ($3::text || ' microseconds')::interval",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(now_micros)
+        .execute(&mut *tx)
+        .await?;
+        let result = sqlx::query(
+            "INSERT INTO external_assertion_jtis \
+             (tenant_id, environment_id, issuer, jti, expires_at) \
+             VALUES ($1, $2, $3, $4, \
+                     TIMESTAMPTZ 'epoch' + ($5::text || ' microseconds')::interval)",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(issuer)
+        .bind(jti)
+        .bind(expires_at_micros)
+        .execute(&mut *tx)
+        .await;
+        match result {
+            Ok(_) => {
+                tx.commit().await?;
+                Ok(JtiOutcome::Recorded)
+            }
+            // A primary-key conflict is a replay: the (issuer, jti) was already used.
+            Err(error) if is_unique_violation(&error) => {
+                tx.rollback().await?;
+                Ok(JtiOutcome::Replayed)
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+}
+
 /// A random 128-bit hex identifier for a diagnostics row, drawn from the
 /// application entropy seam (never the crate's own RNG), so it is deterministic
 /// under a seeded stream in tests and leaks no ordering or count.
@@ -4837,9 +5633,18 @@ pub struct NewOpaqueAccessToken<'a> {
     pub subject: &'a str,
     /// The OAuth client the token belongs to.
     pub client_id: &'a str,
-    /// The audience the token targets (a resource server's audience or the client
-    /// id).
+    /// The PRIMARY audience the token targets (a resource server's audience or the
+    /// client id): the first requested-and-allowlisted resource, or the client id
+    /// for the no-resource case. Kept for backward compatibility with the existing
+    /// single-audience introspection reporting.
     pub audience: &'a str,
+    /// The FULL requested-and-allowlisted audience set (issue #28, RFC 8707). An
+    /// empty slice means "no explicit multi-audience set" (a single-resource or
+    /// no-resource token), which the store records as SQL NULL and introspection
+    /// falls back to `[audience]`; a non-empty slice records the whole array so
+    /// introspection reports it (RFC 7662 permits an `aud` array). The store owns
+    /// the JSON encoding.
+    pub audiences: &'a [String],
     /// The granted OAuth scope value, if any.
     pub scope: Option<&'a str>,
     /// The token's logical identifier (a `tok_` scoped id).
@@ -4869,8 +5674,14 @@ pub struct ActiveOpaqueToken {
     pub subject: String,
     /// The OAuth client the token belongs to.
     pub client_id: String,
-    /// The audience the token targets.
+    /// The PRIMARY audience the token targets (the first recorded audience, or the
+    /// client id for the no-resource case).
     pub audience: String,
+    /// The FULL recorded audience set (issue #28, RFC 8707), for the RFC 7662
+    /// introspection response. A single-resource or no-resource token has exactly
+    /// one entry (`[audience]`); a multi-resource token has the whole array. Always
+    /// non-empty (it falls back to `[audience]` when no explicit array was stored).
+    pub audiences: Vec<String>,
     /// The granted OAuth scope value, if any.
     pub scope: Option<String>,
     /// The token's logical identifier (a `tok_` id string).
@@ -4933,7 +5744,33 @@ fn bindings_from_row(row: &PgRow, scope: &Scope) -> Result<CodeBindings, StoreEr
         auth_methods: row.get("auth_methods"),
         auth_time_unix_micros: row.get("auth_time_us"),
         claims_request: row.get("claims_request"),
+        granted_resources: resource_array_from_json(
+            row.get::<Option<String>, _>("granted_resources").as_deref(),
+        ),
     })
+}
+
+/// Serialize a resource/audience string array to the canonical JSON text stored in
+/// the RFC 8707 resource-indicator columns (issue #28). An EMPTY slice serializes to
+/// [`None`] (the store binds SQL NULL), so a no-resource grant/code/token carries no
+/// array and reads back as empty. This is the ONE place the array shape is encoded,
+/// so the write and the [`resource_array_from_json`] read cannot disagree.
+fn resource_array_to_json(values: &[String]) -> Option<String> {
+    if values.is_empty() {
+        None
+    } else {
+        serde_json::to_string(values).ok()
+    }
+}
+
+/// Parse a stored JSON resource/audience array back to a vector (issue #28). A NULL
+/// column, an empty string, or malformed JSON all read as an EMPTY vector: a pre-#28
+/// row (NULL) and a decode failure both fail SAFE to "no resources recorded" (the
+/// most restrictive reading: an empty granted set is a ceiling nothing can expand
+/// past), never erroring an otherwise-valid resolve.
+fn resource_array_from_json(raw: Option<&str>) -> Vec<String> {
+    raw.and_then(|text| serde_json::from_str::<Vec<String>>(text).ok())
+        .unwrap_or_default()
 }
 
 // ===========================================================================
@@ -5032,6 +5869,11 @@ pub struct RefreshTokenResolution {
     pub client_id: String,
     /// The granted OAuth scope value the family was issued against, if any.
     pub scope: Option<String>,
+    /// The RFC 8707 resource audiences approved at the original authorization
+    /// (issue #28), read from the family's grant. A refresh may downscope to a
+    /// subset of these but can NEVER expand beyond them; empty means no resource
+    /// was approved (the default-audience case).
+    pub granted_resources: Vec<String>,
     /// The recorded authentication method tokens the refreshed access token's
     /// `acr`/`amr` derive from.
     pub auth_methods: String,
@@ -5210,6 +6052,7 @@ impl RefreshRepo<'_> {
              (EXTRACT(EPOCH FROM rt.idle_expires_at) * 1000000)::bigint AS idle_us, \
              f.grant_id AS grant_id, f.subject AS subject, f.client_id AS client_id, \
              f.scope AS scope, f.auth_methods AS auth_methods, f.offline AS offline, \
+             g.granted_resources AS granted_resources, \
              (EXTRACT(EPOCH FROM f.absolute_expires_at) * 1000000)::bigint AS abs_us, \
              (f.revoked_at IS NULL) AS family_live, (g.revoked_at IS NULL) AS grant_live \
              FROM refresh_tokens rt \
@@ -5915,9 +6758,9 @@ async fn record_refresh_access(
         sqlx::query(
             "INSERT INTO opaque_access_tokens \
              (token_digest, tenant_id, environment_id, grant_id, subject, \
-              client_id, audience, scope, jti, expires_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, \
-                     TIMESTAMPTZ 'epoch' + ($10::text || ' microseconds')::interval)",
+              client_id, audience, audiences, scope, jti, expires_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, \
+                     TIMESTAMPTZ 'epoch' + ($11::text || ' microseconds')::interval)",
         )
         .bind(opaque.token_digest)
         .bind(scope.tenant().to_string())
@@ -5926,6 +6769,7 @@ async fn record_refresh_access(
         .bind(opaque.subject)
         .bind(opaque.client_id)
         .bind(opaque.audience)
+        .bind(resource_array_to_json(opaque.audiences))
         .bind(opaque.scope)
         .bind(opaque.jti.to_string())
         .bind(opaque.expires_at_unix_micros)
@@ -5949,6 +6793,9 @@ fn refresh_resolution_from_row(
         subject: row.get("subject"),
         client_id: row.get("client_id"),
         scope: row.get("scope"),
+        granted_resources: resource_array_from_json(
+            row.get::<Option<String>, _>("granted_resources").as_deref(),
+        ),
         auth_methods: row.get("auth_methods"),
         offline: row.get("offline"),
         issued_at_unix_micros: row.get("issued_us"),

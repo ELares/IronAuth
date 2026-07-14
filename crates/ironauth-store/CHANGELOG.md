@@ -6,7 +6,7 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
-- Device authorization grant persistence (issue #24, migration 0019, expand).
+- Device authorization grant persistence (issue #24, migration 0021, expand).
   - **New scoped table.** `device_codes` holds a device-authorization flow keyed by the
     SHA-256 digest of the WHOLE device code (never the code itself): the non-secret
     `dc_` handle, the SHA-256 `user_code_hash` (unique per environment), the client,
@@ -34,6 +34,73 @@ range per docs/RELEASING.md.
     `DeviceCodeId` (`ira_dc_` opaque-credential id kind, redacted from `Debug`),
     `device_code_digest` / `user_code_hash`, and the `device_code.issue` /
     `device_code.approve` / `device_code.deny` audit actions.
+- JWT bearer assertion grant trust and mapping stores (issue #26, migration 0020, expand).
+  - **New scoped tables.** `external_assertion_issuers` (the registered external
+    trust anchors the RFC 7521 / RFC 7523 jwt-bearer grant accepts assertions from,
+    each with an inline `jwks` XOR a `jwks_uri`, an optional signing-alg allowlist,
+    and an enable switch), `external_assertion_subject_mappings` (the explicit rules
+    mapping an external (issuer + `sub`), optionally gated on a claim, to an IronAuth
+    principal; reject-by-default, never auto-provisioned), and
+    `external_assertion_jtis` (the external-issuer single-use jti replay cache). All
+    three ENABLE + FORCE row-level security with the `(tenant, environment)`
+    isolation policy (USING + WITH CHECK) and are registered in
+    `scripts/query-audit.sh`.
+  - **Distinct external jti cache.** `external_assertion_jtis` REUSES the #25
+    client-assertion prune-then-insert single-use mechanism but is a DISTINCT table
+    keyed by the external ISSUER (not the OAuth client id), so an external issuer's
+    `jti` can never collide with a client-assertion `jti` (they live in separate
+    tables). It retains a jti to `exp + skew + 1s`, the same +1s margin the #25 cache
+    documents, so a prune never reopens a replay window.
+  - **Least-privilege grants (the #31 lesson).** The two configuration tables take
+    `GRANT SELECT, INSERT` (no table-wide UPDATE, which auto-extends to later
+    columns; no DELETE), and the jti cache takes `GRANT SELECT, INSERT, DELETE` (the
+    DELETE is the on-insert prune only), all to `ironauth_app`.
+  - **Repositories and audited writes.** `ExternalAssertionIssuerRepo` /
+    `AssertionSubjectMappingRepo` read the trust anchor and mapping at grant time;
+    the mutating `ActingExternalAssertionIssuerRepo::register` and
+    `ActingAssertionSubjectMappingRepo::create` route through the one audited-write
+    primitive (`external_assertion_issuer.register` /
+    `external_assertion_subject_mapping.create`). `ActingAuthorizationRepo` gains
+    `issue_jwt_bearer_assertion`, which shares the machine-grant + access-token
+    persistence with the client-credentials path but audits the distinct
+    `jwt_bearer_assertion.issue` verb, so a federated issuance is legible in the
+    trail as such. New `Action` variants back all three verbs.
+  - **New identifier kinds.** `xai_` (a registered external assertion issuer) and
+    `asm_` (a subject-mapping rule), both tenant-scoped and used as the row primary
+    key and the audit target.
+  - **Revocable trust config (column-scoped, the #31 lesson applied correctly).** The
+    trust anchor and mapping must be DISABLE-able so a compromised or decommissioned
+    issuer, or a mis-authored mapping, can be turned off through the data plane (the
+    HTTP management surface for it is M13). Migration 0020 now adds an `enabled` column
+    to `external_assertion_subject_mappings` (the issuers table already had one) and a
+    COLUMN-SCOPED `GRANT UPDATE (enabled)` on BOTH trust tables to `ironauth_app` -
+    only `enabled`, never a table-wide UPDATE and never the app-immutable
+    id/issuer/keys/principal/match columns. New audited acting methods
+    `ActingExternalAssertionIssuerRepo::set_enabled` and
+    `ActingAssertionSubjectMappingRepo::set_enabled` toggle the switch (audited
+    `external_assertion_issuer.set_enabled` / `external_assertion_subject_mapping.set_enabled`,
+    two new `Action` variants), and `AssertionSubjectMappingRepo::resolve` now FILTERS
+    on `enabled = true` so a disabled mapping resolves to no rule. New `tests/rls.rs`
+    coverage proves the app role can flip `enabled` on both tables but is refused
+    (42501) on every other column.
+- RFC 8707 Resource Indicators storage (issue #28, migration 0019, expand).
+  - **New columns.** `clients` gains `allowed_resources` (a JSON array; NULL means no
+    per-client allowlist, `[]` means allow nothing) and `resource_indicator_policy`
+    (a CHECK-constrained `default_audience` / `refuse` string for the no-resource
+    case). `grants` and `authorization_codes` gain `granted_resources` (the JSON array
+    of resources approved at authorization, frozen for the downscope-not-expand check).
+    `opaque_access_tokens` gains `audiences` (the JSON array of recorded audiences so
+    introspection can report them).
+  - **Column-scoped grant.** `ironauth_app` receives `UPDATE (allowed_resources,
+    resource_indicator_policy)` on `clients` only (never a table-wide UPDATE), so the
+    policy write cannot touch any other client column.
+  - **New store surface.** `ClientRepo::resource_policy` reads a client's
+    `ClientResourcePolicy`; `ActingClientRepo::set_resource_indicator_policy` is an
+    audited write (new `client.resource_indicator_policy.set` action). `IssueCode` and
+    `NewOpaqueAccessToken` carry the resources/audiences; the code, grant, refresh, and
+    opaque-token resolutions surface them. Encoding empty to NULL keeps the pre-#28
+    single-audience behavior byte-identical.
+
 - Dynamic Client Registration abuse controls (issue #31, migration 0018, expand).
   - **New scoped tables.** `dcr_policies` (named, reusable policy-primitive chains),
     `dcr_initial_access_tokens` (SHA-256-hashed initial access tokens carrying a

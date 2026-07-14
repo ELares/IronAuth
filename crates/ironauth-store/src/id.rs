@@ -324,6 +324,30 @@ impl ScopedKind for DcrPolicyKind {
     const PREFIX: &'static str = "pol";
 }
 
+/// Marker for a registered external assertion issuer (`xai_`), a trust anchor the
+/// RFC 7521 / RFC 7523 JWT bearer assertion grant accepts assertions from (issue
+/// #26). A tenant-scoped resource: the identifier embeds its
+/// `(tenant, environment)`, so an issuer registered in one scope is never reachable
+/// from another. The row's external `issuer` string is the lookup key; this id is
+/// the row's primary key and the audit target of a registration. Not a secret.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ExternalIssuerKind;
+impl ScopedKind for ExternalIssuerKind {
+    const PREFIX: &'static str = "xai";
+}
+
+/// Marker for a subject-mapping rule (`asm_`), the explicit rule that maps an
+/// external assertion's (issuer + `sub`) to an IronAuth principal for the JWT
+/// bearer assertion grant (issue #26). A tenant-scoped resource: the identifier
+/// embeds its `(tenant, environment)`, so a mapping authored in one scope is never
+/// reachable from another. This id is the row's primary key and the audit target of
+/// a mapping creation. Not a secret.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct AssertionMappingKind;
+impl ScopedKind for AssertionMappingKind {
+    const PREFIX: &'static str = "asm";
+}
+
 /// Marker for a human actor (an interactive user). One of the three actor kinds
 /// an audit envelope can name (see [`crate::audit::ActorRef`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -536,6 +560,12 @@ pub type DcrPolicyId = ScopedId<DcrPolicyKind>;
 /// client-credentials access token carries (issue #23). Distinct from the client's
 /// `cli_` id and consistent across issuances.
 pub type ServiceAccountId = ScopedId<ServiceAccountKind>;
+/// A registered external assertion issuer identifier (`xai_...`), a trust anchor
+/// the JWT bearer assertion grant accepts assertions from (issue #26).
+pub type ExternalIssuerId = ScopedId<ExternalIssuerKind>;
+/// A subject-mapping rule identifier (`asm_...`), the explicit rule mapping an
+/// external assertion's (issuer + `sub`) to an IronAuth principal (issue #26).
+pub type AssertionMappingId = ScopedId<AssertionMappingKind>;
 
 impl<K: ScopedKind> ScopedId<K> {
     /// Mint a fresh scoped identifier under `scope`, drawing the unique

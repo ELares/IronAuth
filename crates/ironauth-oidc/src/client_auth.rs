@@ -85,7 +85,9 @@ pub const JWT_BEARER_ASSERTION_TYPE: &str =
 /// when the client registered no explicit `token_endpoint_auth_signing_alg`. This
 /// is exactly the JOSE verify matrix, which EXCLUDES ES512 by construction (it is
 /// unrepresentable in [`JwsAlgorithm`]), so an ES512 assertion is always rejected.
-const ASYMMETRIC_ALGS: &[JwsAlgorithm] = &[
+/// The JWT bearer assertion grant (#26) reuses this SAME matrix, so a client
+/// assertion and an external-issuer assertion accept exactly the same algorithms.
+pub(crate) const ASYMMETRIC_ALGS: &[JwsAlgorithm] = &[
     JwsAlgorithm::EdDsa,
     JwsAlgorithm::Es256,
     JwsAlgorithm::Es384,
@@ -935,8 +937,9 @@ fn assertion_subject(assertion: &str) -> Option<String> {
 }
 
 /// The `(alg, kid)` of a compact JWS assertion's (unverified) protected header,
-/// for the out-of-band diagnostic only (never for trust).
-fn peek_assertion_header(assertion: &str) -> (Option<String>, Option<String>) {
+/// for the out-of-band diagnostic only (never for trust). Shared with the JWT
+/// bearer assertion grant (#26), which records the same header fields on a failure.
+pub(crate) fn peek_assertion_header(assertion: &str) -> (Option<String>, Option<String>) {
     let Some(header_b64) = assertion.split('.').next() else {
         return (None, None);
     };

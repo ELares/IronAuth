@@ -29,8 +29,9 @@ use ironauth_oidc::{
 };
 use ironauth_store::test_support::TestDatabase;
 use ironauth_store::{
-    ClientId, CorrelationId, InitialAccessTokenId, NewInitialAccessToken, NewJwtAuthClient,
-    NewSigningKey, Scope, SessionId, SigningKeyId, SigningKeyMaterialKind, Store,
+    AssertionMappingId, ClientId, CorrelationId, ExternalIssuerId, InitialAccessTokenId,
+    NewAssertionSubjectMapping, NewExternalAssertionIssuer, NewInitialAccessToken,
+    NewJwtAuthClient, NewSigningKey, Scope, SessionId, SigningKeyId, SigningKeyMaterialKind, Store,
 };
 use tower::ServiceExt;
 
@@ -1218,7 +1219,9 @@ impl Harness {
     }
 
     /// Read the recorded out-of-band client-authentication diagnostics for
-    /// `client_id` in the harness scope (issue #25).
+    /// `client_id` in the harness scope (issue #25). The JWT bearer assertion grant
+    /// (#26) records its failures in the SAME sink under the presenting client's id,
+    /// so this reads those too.
     pub async fn client_auth_diagnostics(
         &self,
         client_id: &str,
@@ -1229,6 +1232,133 @@ impl Harness {
             .for_client(client_id)
             .await
             .expect("read client-auth diagnostics")
+    }
+
+    /// Register an external assertion issuer as a trust anchor for the JWT bearer
+    /// assertion grant (issue #26), returning its `xai_` identifier so a test can later
+    /// toggle its enable switch. Exactly one of `jwks`/`jwks_uri` must be set.
+    /// `enabled` registers the enable switch, so a test can register a disabled issuer
+    /// to prove disabled issuers are rejected.
+    pub async fn register_external_issuer(
+        &self,
+        issuer: &str,
+        jwks: Option<&str>,
+        jwks_uri: Option<&str>,
+        signing_alg_allow: Option<&str>,
+        enabled: bool,
+    ) -> ExternalIssuerId {
+        let id = ExternalIssuerId::generate(&self.env, &self.scope);
+        let (actor, corr) = self.seeding_actor();
+        self.store()
+            .scoped(self.scope)
+            .acting(actor, corr)
+            .external_assertion_issuers()
+            .register(
+                &self.env,
+                NewExternalAssertionIssuer {
+                    id: &id,
+                    issuer,
+                    jwks,
+                    jwks_uri,
+                    signing_alg_allow,
+                    enabled,
+                },
+            )
+            .await
+            .expect("register external assertion issuer");
+        id
+    }
+
+    /// Toggle a registered external issuer's enable switch (issue #26) through the
+    /// column-scoped data-plane grant, exactly as the (M13) management surface will.
+    /// Proves the revocability capability end to end: disabling a live issuer makes
+    /// the grant reject its assertions.
+    pub async fn set_external_issuer_enabled(&self, id: &ExternalIssuerId, enabled: bool) {
+        let (actor, corr) = self.seeding_actor();
+        self.store()
+            .scoped(self.scope)
+            .acting(actor, corr)
+            .external_assertion_issuers()
+            .set_enabled(&self.env, id, enabled)
+            .await
+            .expect("set external issuer enabled");
+    }
+
+    /// Like [`Harness::register_external_issuer`] but RETURNS the store result, so a
+    /// test can assert a rejected registration (a keyless or dual-source issuer).
+    pub async fn try_register_external_issuer(
+        &self,
+        issuer: &str,
+        jwks: Option<&str>,
+        jwks_uri: Option<&str>,
+    ) -> Result<(), ironauth_store::StoreError> {
+        let id = ExternalIssuerId::generate(&self.env, &self.scope);
+        let (actor, corr) = self.seeding_actor();
+        self.store()
+            .scoped(self.scope)
+            .acting(actor, corr)
+            .external_assertion_issuers()
+            .register(
+                &self.env,
+                NewExternalAssertionIssuer {
+                    id: &id,
+                    issuer,
+                    jwks,
+                    jwks_uri,
+                    signing_alg_allow: None,
+                    enabled: true,
+                },
+            )
+            .await
+    }
+
+    /// Author a subject-mapping rule for the JWT bearer assertion grant (issue #26):
+    /// map an external (`issuer` + `external_subject`), optionally gated on a claim,
+    /// to `principal` (the issued token's `sub`). Unmapped subjects are rejected.
+    /// Returns the rule's `asm_` identifier so a test can later toggle its enable
+    /// switch.
+    pub async fn create_subject_mapping(
+        &self,
+        issuer: &str,
+        external_subject: &str,
+        match_claim: Option<&str>,
+        match_value: Option<&str>,
+        principal: &str,
+    ) -> AssertionMappingId {
+        let id = AssertionMappingId::generate(&self.env, &self.scope);
+        let (actor, corr) = self.seeding_actor();
+        self.store()
+            .scoped(self.scope)
+            .acting(actor, corr)
+            .external_assertion_subject_mappings()
+            .create(
+                &self.env,
+                NewAssertionSubjectMapping {
+                    id: &id,
+                    issuer,
+                    external_subject,
+                    match_claim,
+                    match_value,
+                    principal,
+                },
+            )
+            .await
+            .expect("create subject mapping");
+        id
+    }
+
+    /// Toggle a subject-mapping rule's enable switch (issue #26) through the
+    /// column-scoped data-plane grant. Proves the revocability capability end to end:
+    /// disabling a live mapping makes the grant reject the subject as unmapped.
+    pub async fn set_subject_mapping_enabled(&self, id: &AssertionMappingId, enabled: bool) {
+        let (actor, corr) = self.seeding_actor();
+        self.store()
+            .scoped(self.scope)
+            .acting(actor, corr)
+            .external_assertion_subject_mappings()
+            .set_enabled(&self.env, id, enabled)
+            .await
+            .expect("set subject mapping enabled");
     }
 
     /// Issue an `authorization_code` bound to `client_id` WITH PKCE (the RFC 7636

@@ -382,9 +382,21 @@ fn registry() -> Vec<Migration> {
         },
         Migration {
             version: 19,
+            name: "resource_indicators",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0019_resource_indicators.sql"),
+        },
+        Migration {
+            version: 20,
+            name: "jwt_bearer_assertion",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0020_jwt_bearer_assertion.sql"),
+        },
+        Migration {
+            version: 21,
             name: "device_authorization",
             phase: Phase::Expand,
-            sql: include_str!("../migrations/0019_device_authorization.sql"),
+            sql: include_str!("../migrations/0021_device_authorization.sql"),
         },
     ]
 }

@@ -62,6 +62,7 @@ async fn oidc_probes_deny_cross_scope_redeem_and_token_status() {
                 session_ref: None,
                 consent_ref: None,
                 claims_request: None,
+                granted_resources: &[],
                 expires_at_micros: FAR_FUTURE_MICROS,
                 created_at_micros: 0,
             },

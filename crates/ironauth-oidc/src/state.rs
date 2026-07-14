@@ -36,6 +36,20 @@ use crate::revocation::{RevocationEventSink, default_sink};
 use crate::subject::{PairwiseSalt, SubjectCache, SubjectConfig};
 use crate::tokens::AccessTokenTarget;
 
+/// Why resolving a set of RFC 8707 resource indicators to an access-token target
+/// failed (issue #28). The token/authorization endpoints map [`InvalidTarget`] to
+/// the `invalid_target` error (RFC 8707 section 2.2) and [`ServerError`] to an
+/// opaque server error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResourceTargetError {
+    /// A requested resource is unknown (no registered resource server in scope), or
+    /// the targeted resource servers disagree on token format.
+    InvalidTarget,
+    /// A store fault prevented resolution. Fail closed rather than silently dropping
+    /// the audience restriction (which would broaden the token).
+    ServerError,
+}
+
 /// Cheaply cloneable state shared by every OIDC handler.
 #[derive(Clone)]
 pub struct OidcState {
@@ -374,57 +388,136 @@ impl OidcState {
         self.inner.default_access_token_format
     }
 
-    /// Resolve the access-token target (audience, format, lifetime) for an exchange
-    /// (issue #29): the SELECTION seam issue #28 feeds.
+    /// Resolve the access-token target (audience(s), format, lifetime) for an
+    /// exchange from a set of RFC 8707 resource indicators (issue #29 seam, extended
+    /// for issue #28).
     ///
-    /// When `resource` names a registered resource server's `audience` in this
-    /// scope, its `token_format` and `access_token_ttl_secs` (falling back to the
-    /// environment default lifetime when the resource server left it unset) apply,
-    /// and the token's `aud` becomes that resource server's audience. Otherwise the
-    /// environment default applies: the token's `aud` is the `client_id` (so
-    /// `UserInfo`'s `aud == client` check keeps working), the format is the
-    /// environment default, and the lifetime is the environment access-token
-    /// lifetime.
+    /// This is ADDITIVE over the issue #29 single-resource seam:
     ///
-    /// The full RFC 8707 `resource` REQUEST-parameter wiring is issue #28; today
-    /// the token endpoint passes `resource = None`, so this resolves to the
-    /// environment default. Taking the resolved audience here (rather than the
-    /// request) is what lets #28 feed the `resource` parameter without reshaping
-    /// the pure mint. A store read failure while looking up a resource server is
-    /// treated as "no matching resource server" (the environment default applies),
-    /// so a transient database blip never fails an otherwise-valid exchange or
-    /// silently changes the audience.
+    /// - **Empty `resources`** (the no-resource case, and every caller that mints
+    ///   without a resource, for example the client-credentials, device, and
+    ///   jwt-bearer grants): the ENVIRONMENT DEFAULT applies, EXACTLY as before #28.
+    ///   The token's `aud` is a SINGLE audience, the `client_id` (so `UserInfo`'s
+    ///   `aud == client` check keeps working), the format is the environment default,
+    ///   and the lifetime is the environment access-token lifetime. This branch is
+    ///   infallible.
+    /// - **One or more `resources`**: EACH resource MUST name a registered resource
+    ///   server's `audience` in this scope; an unknown resource is
+    ///   [`ResourceTargetError::InvalidTarget`] (RFC 8707 section 2.2), never a silent
+    ///   fallback (which would broaden the audience). The token's `aud` becomes the
+    ///   full set of the targeted resource servers' audiences (a JSON array when more
+    ///   than one). When multiple resource servers are targeted they MUST agree on
+    ///   `token_format` (all-must-share-format-or-`invalid_target`: two servers that
+    ///   disagree cannot be satisfied by one token, and picking one silently would be
+    ///   surprising); the lifetime is the SHORTEST of the targeted servers'
+    ///   `access_token_ttl_secs` (each falling back to the environment default when
+    ///   unset), so bundling resources never LENGTHENS a token past what any one
+    ///   resource server asked for.
+    ///
+    /// The caller (the token/authorization endpoints) validates the resource URIs,
+    /// the per-client allowlist, and the downscope-not-expand rule BEFORE calling
+    /// this; this method only maps already-authorized resources to their registered
+    /// audiences/format/lifetime.
+    ///
+    /// # Errors
+    ///
+    /// [`ResourceTargetError::InvalidTarget`] if a requested resource is unknown or
+    /// the targeted resource servers disagree on token format;
+    /// [`ResourceTargetError::ServerError`] on a store fault (fail closed rather than
+    /// silently dropping the audience restriction).
     pub async fn resolve_access_token_target(
         &self,
         scope: &Scope,
-        resource: Option<&str>,
+        resources: &[String],
         client_id: &str,
-    ) -> AccessTokenTarget {
-        if let Some(audience) = resource {
-            if let Ok(Some(server)) = self
+    ) -> Result<AccessTokenTarget, ResourceTargetError> {
+        // The no-resource case: the environment default, a single client-id audience.
+        // Identical to the pre-#28 behavior, so every mint that passes no resource
+        // (client-credentials, device, jwt-bearer) is unchanged.
+        if resources.is_empty() {
+            return Ok(AccessTokenTarget {
+                audiences: vec![client_id.to_owned()],
+                format: self.inner.default_access_token_format,
+                ttl: self.inner.access_token_ttl,
+            });
+        }
+
+        let mut audiences: Vec<String> = Vec::with_capacity(resources.len());
+        let mut format: Option<TokenFormat> = None;
+        let mut ttl: Option<Duration> = None;
+        for resource in resources {
+            let server = match self
                 .inner
                 .store
                 .scoped(*scope)
                 .resource_servers()
-                .by_audience(audience)
+                .by_audience(resource)
                 .await
             {
-                let ttl = server
-                    .access_token_ttl_secs
-                    .and_then(|secs| u64::try_from(secs).ok())
-                    .map_or(self.inner.access_token_ttl, Duration::from_secs);
-                return AccessTokenTarget {
-                    audience: server.audience,
-                    format: server.token_format,
-                    ttl,
-                };
+                Ok(Some(server)) => server,
+                // Unknown resource: RFC 8707 invalid_target, never a silent fallback.
+                Ok(None) => return Err(ResourceTargetError::InvalidTarget),
+                // Fail closed: a store blip must not drop the audience restriction.
+                Err(_) => return Err(ResourceTargetError::ServerError),
+            };
+            // All targeted resource servers must agree on the token format.
+            match format {
+                None => format = Some(server.token_format),
+                Some(existing) if existing != server.token_format => {
+                    return Err(ResourceTargetError::InvalidTarget);
+                }
+                Some(_) => {}
+            }
+            // The lifetime is the SHORTEST of the targeted servers' TTLs (each
+            // falling back to the environment default when unset).
+            let rs_ttl = server
+                .access_token_ttl_secs
+                .and_then(|secs| u64::try_from(secs).ok())
+                .map_or(self.inner.access_token_ttl, Duration::from_secs);
+            ttl = Some(ttl.map_or(rs_ttl, |current| current.min(rs_ttl)));
+            if !audiences.contains(&server.audience) {
+                audiences.push(server.audience);
             }
         }
-        AccessTokenTarget {
-            audience: client_id.to_owned(),
-            format: self.inner.default_access_token_format,
-            ttl: self.inner.access_token_ttl,
+        Ok(AccessTokenTarget {
+            audiences,
+            format: format.unwrap_or(self.inner.default_access_token_format),
+            ttl: ttl.unwrap_or(self.inner.access_token_ttl),
+        })
+    }
+
+    /// Validate that EVERY requested resource names a registered resource server in
+    /// scope (issue #28), for the AUTHORIZATION endpoint. Unlike
+    /// [`Self::resolve_access_token_target`], this approves resources without minting
+    /// a token, so it does NOT enforce token-format agreement: a client may have
+    /// several resources of differing formats approved at once and later obtain a
+    /// separate, format-consistent token for a subset of them at the token endpoint.
+    ///
+    /// # Errors
+    ///
+    /// [`ResourceTargetError::InvalidTarget`] if any resource is unknown (no
+    /// registered resource server); [`ResourceTargetError::ServerError`] on a store
+    /// fault (fail closed).
+    pub(crate) async fn validate_resources_registered(
+        &self,
+        scope: &Scope,
+        resources: &[String],
+    ) -> Result<(), ResourceTargetError> {
+        for resource in resources {
+            match self
+                .inner
+                .store
+                .scoped(*scope)
+                .resource_servers()
+                .by_audience(resource)
+                .await
+            {
+                Ok(Some(_)) => {}
+                Ok(None) => return Err(ResourceTargetError::InvalidTarget),
+                Err(_) => return Err(ResourceTargetError::ServerError),
+            }
         }
+        Ok(())
     }
 
     /// The default audience a client-credentials access token (issue #23) carries

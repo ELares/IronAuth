@@ -50,7 +50,7 @@
 
 use std::fmt;
 
-use axum::extract::{Form, State};
+use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use ironauth_jose::JwsAlgorithm;
@@ -69,9 +69,10 @@ use crate::client_auth::{
 use crate::error::TokenError;
 use crate::pkce::verify_s256;
 use crate::registry::GrantType;
+use crate::resource;
 use crate::scope_claims::{assemble_claims, parse_scope_set};
-use crate::state::OidcState;
-use crate::tokens::{self, IssuedTokens, MintRequest, MintedAccessToken};
+use crate::state::{OidcState, ResourceTargetError};
+use crate::tokens::{self, AccessTokenTarget, IssuedTokens, MintRequest, MintedAccessToken};
 use crate::util::{client_service_actor, epoch_micros};
 
 /// Counter: authorization codes presented again after they were already consumed
@@ -116,9 +117,16 @@ pub struct TokenParams {
     /// The refresh token to redeem for the `refresh_token` grant (issue #21). A
     /// single-use rotating bearer credential, so it is redacted from `Debug`.
     pub refresh_token: Option<String>,
+    /// The RFC 7521 `assertion` carrying the authorization grant for the JWT bearer
+    /// assertion grant (issue #26): the external issuer's JWT. DISTINCT from
+    /// `client_assertion` (which authenticates the CLIENT); this one carries the
+    /// external SUBJECT the token is mapped to. A bearer credential, so it is
+    /// redacted from `Debug`.
+    pub assertion: Option<String>,
     /// The requested OAuth `scope` for the `client_credentials` grant (RFC 6749
-    /// 4.4.2, issue #23). Optional; when present it is validated against the M2M
-    /// scope policy and echoed into the issued token.
+    /// 4.4.2, issue #23) and the JWT bearer assertion grant (RFC 7521, issue #26).
+    /// Optional; when present it is validated/normalized and echoed into the issued
+    /// token.
     pub scope: Option<String>,
     /// The device code to poll for the RFC 8628 device grant (issue #24). A bearer
     /// credential the constrained device presents on every poll, so it is redacted
@@ -137,18 +145,29 @@ impl fmt::Debug for TokenParams {
             .field("client_assertion_type", &self.client_assertion_type)
             .field("has_code", &self.code.is_some())
             .field("has_refresh_token", &self.refresh_token.is_some())
+            .field("has_assertion", &self.assertion.is_some())
             .field("has_device_code", &self.device_code.is_some())
             .finish_non_exhaustive()
     }
 }
 
 /// `POST /token`.
-pub async fn token(
-    State(state): State<OidcState>,
-    headers: HeaderMap,
-    Form(params): Form<TokenParams>,
-) -> Response {
-    match exchange(&state, &headers, params).await {
+///
+/// The raw body is taken (rather than a typed `Form<TokenParams>`) so the RFC 8707
+/// `resource` parameter, which MAY appear multiple times (issue #28) and cannot be
+/// captured by a scalar serde field, is parsed alongside the typed fields from the
+/// SAME body: the scalar fields deserialize normally, and every `resource` value is
+/// collected separately.
+pub async fn token(State(state): State<OidcState>, headers: HeaderMap, body: String) -> Response {
+    let params: TokenParams = match serde_urlencoded::from_str(&body) {
+        Ok(params) => params,
+        Err(_) => {
+            return TokenError::InvalidRequest("the request body is malformed".to_owned())
+                .into_response();
+        }
+    };
+    let resources = resource::resources_from_encoded(&body);
+    match exchange(&state, &headers, params, resources).await {
         Ok(response) => response,
         Err(error) => error.into_response(),
     }
@@ -158,6 +177,7 @@ async fn exchange(
     state: &OidcState,
     headers: &HeaderMap,
     params: TokenParams,
+    resources: Vec<String>,
 ) -> Result<Response, TokenError> {
     // grant_type: present and a serviced grant. ROPC (`password`) and every other
     // grant are unrepresentable, so they land as an unsupported grant type with no
@@ -170,11 +190,19 @@ async fn exchange(
         .ok_or_else(|| TokenError::InvalidRequest("grant_type is required".to_owned()))?;
     match GrantType::parse(grant_type) {
         Some(GrantType::AuthorizationCode) => {
-            authorization_code_grant(state, headers, params).await
+            authorization_code_grant(state, headers, params, &resources).await
         }
-        Some(GrantType::RefreshToken) => refresh_token_grant(state, headers, params).await,
+        Some(GrantType::RefreshToken) => {
+            refresh_token_grant(state, headers, params, &resources).await
+        }
+        // The client-credentials grant does not compose with resource indicators in
+        // this issue (there is no prior authorization to downscope from); its
+        // audience is the configured default. Any `resource` parameter is ignored.
         Some(GrantType::ClientCredentials) => {
             crate::client_credentials::client_credentials_grant(state, headers, params).await
+        }
+        Some(GrantType::JwtBearer) => {
+            crate::jwt_bearer::jwt_bearer_grant(state, headers, params).await
         }
         Some(GrantType::DeviceCode) => {
             crate::device::device_code_grant(state, headers, params).await
@@ -189,6 +217,7 @@ async fn authorization_code_grant(
     state: &OidcState,
     headers: &HeaderMap,
     params: TokenParams,
+    resources: &[String],
 ) -> Result<Response, TokenError> {
     // 2. code: present, and it declares its own (tenant, environment) scope. A
     //    malformed code is a uniform invalid_grant.
@@ -240,13 +269,21 @@ async fn authorization_code_grant(
         return Err(TokenError::InvalidGrant);
     }
 
+    // 5b. Resolve the RFC 8707 resource indicators (issue #28) into the access-token
+    //     target (its audience set, format, and lifetime). The requested resources
+    //     must be valid, allowlisted, and a SUBSET of what was approved at
+    //     authorization (a downscope, never an expansion); omitting `resource`
+    //     defaults to the full approved set, or to the per-client no-resource policy
+    //     when none was approved. A violation is a uniform `invalid_target`.
+    let target = resolve_code_exchange_target(state, scope, &bindings, resources).await?;
+
     // 6. Mint (sign) the tokens BEFORE the consume, so a missing key or a signing
     //    failure fails closed without burning the code. The ID token stays lean by
     //    default (scope claims are served from UserInfo); the extra claims are the
     //    `claims`-parameter id_token member and, only under the non-conform
     //    conformIdTokenClaims override, the scope-derived claims (issue #15).
     let extra_claims = id_token_extra_claims(state, scope, &bindings).await;
-    let minted = mint_tokens(state, scope, &bindings, &extra_claims).await?;
+    let minted = mint_tokens(state, scope, &bindings, &extra_claims, &target).await?;
 
     // Build what the redeem transaction records for the minted tokens (issue #29).
     // The ID token is always an issued_tokens row; the access token is an
@@ -268,7 +305,7 @@ async fn authorization_code_grant(
         MintedAccessToken::Opaque {
             digest,
             jti,
-            audience,
+            audiences,
             expires_at_unix_micros,
             ..
         } => Some(NewOpaqueAccessToken {
@@ -281,7 +318,11 @@ async fn authorization_code_grant(
             // UserInfo does; the opaque token itself carries no sub.
             subject: &bindings.subject,
             client_id: &bindings.client_id,
-            audience,
+            // The primary audience (backward-compatible single column) and the full
+            // requested-and-allowlisted set (issue #28), so introspection reports the
+            // exact audiences the opaque token was minted for.
+            audience: audiences.first().map_or("", String::as_str),
+            audiences,
             scope: bindings.oauth_scope.as_deref(),
             jti,
             expires_at_unix_micros: *expires_at_unix_micros,
@@ -430,6 +471,7 @@ async fn mint_tokens(
     scope: Scope,
     bindings: &CodeBindings,
     extra_claims: &serde_json::Map<String, serde_json::Value>,
+    target: &AccessTokenTarget,
 ) -> Result<IssuedTokens, TokenError> {
     let entry = state
         .issuer_entry(&scope)
@@ -455,14 +497,10 @@ async fn mint_tokens(
     // per-client pairwise configuration is client-registration state a later issue
     // persists (see OidcState::resolve_public_subject).
     let subject = state.resolve_public_subject(&bindings.subject);
-    // Resolve the access-token target: format, audience, and lifetime (issue #29).
-    // The RFC 8707 `resource` request parameter that would target a specific
-    // resource server is issue #28; today no resource is threaded, so this resolves
-    // to the environment default (the client id as audience, the environment
-    // default format), which keeps the existing at+jwt/UserInfo behavior intact.
-    let target = state
-        .resolve_access_token_target(&scope, None, &bindings.client_id)
-        .await;
+    // The access-token target (format, audience set, and lifetime) was resolved from
+    // the RFC 8707 resource indicators by the caller (issue #28/#29). No resource
+    // resolves to the environment default (the client id as audience), keeping the
+    // existing at+jwt/UserInfo behavior intact.
     tokens::mint(
         state,
         signer,
@@ -486,9 +524,87 @@ async fn mint_tokens(
             extra_claims,
             id_token_signer,
         },
-        &target,
+        target,
     )
     .map_err(|()| TokenError::ServerError)
+}
+
+/// Resolve the RFC 8707 access-token target for a code exchange (issue #28) from the
+/// resources named on the token request and the resources approved at authorization
+/// (frozen onto the code as `bindings.granted_resources`).
+///
+/// The rules (RFC 8707 section 2, RFC 9700): a named resource must be a valid
+/// absolute URI, on the client's allowlist, and a SUBSET of the approved set (a
+/// downscope, never an expansion); omitting `resource` uses the FULL approved set,
+/// or, when NONE was approved, the per-client no-resource policy (the default
+/// client-id audience, or a `refuse` that requires an explicit resource). Every
+/// violation is a uniform `invalid_target`.
+async fn resolve_code_exchange_target(
+    state: &OidcState,
+    scope: Scope,
+    bindings: &CodeBindings,
+    resources: &[String],
+) -> Result<AccessTokenTarget, TokenError> {
+    let client_id = state
+        .store()
+        .scoped(scope)
+        .clients()
+        .parse_id(&bindings.client_id)
+        .map_err(map_store_error)?;
+    let policy = state
+        .store()
+        .scoped(scope)
+        .clients()
+        .resource_policy(&client_id)
+        .await
+        .map_err(map_store_error)?;
+    // Every NAMED resource must be a valid indicator and on the client's allowlist.
+    if !resource::resources_permitted(resources, &policy) {
+        return Err(TokenError::InvalidTarget);
+    }
+    let effective = effective_exchange_resources(resources, &bindings.granted_resources, &policy)?;
+    state
+        .resolve_access_token_target(&scope, &effective, &bindings.client_id)
+        .await
+        .map_err(map_resource_error)
+}
+
+/// Compute the effective resource set for a code exchange or refresh (issue #28)
+/// from the requested resources, the resources granted at authorization, and the
+/// client's no-resource policy.
+///
+/// A NAMED set must be a subset of the granted set (downscope, never expansion). An
+/// EMPTY named set defaults to the full granted set; if NOTHING was granted, a
+/// `refuse` policy rejects (a resource is required) and otherwise it resolves to the
+/// default (client-id) audience. Every violation is `invalid_target`.
+fn effective_exchange_resources(
+    requested: &[String],
+    granted: &[String],
+    policy: &ironauth_store::ClientResourcePolicy,
+) -> Result<Vec<String>, TokenError> {
+    if requested.is_empty() {
+        if granted.is_empty() {
+            if policy.require_resource_indicator {
+                return Err(TokenError::InvalidTarget);
+            }
+            return Ok(Vec::new());
+        }
+        return Ok(granted.to_vec());
+    }
+    if !resource::is_subset(requested, granted) {
+        return Err(TokenError::InvalidTarget);
+    }
+    Ok(requested.to_vec())
+}
+
+/// Map a resource-target resolution failure (issue #28) to the token-endpoint error:
+/// an unknown/format-conflicting resource is the RFC 8707 `invalid_target`; a store
+/// fault is an opaque `server_error` (fail closed).
+fn map_resource_error(error: ResourceTargetError) -> TokenError {
+    match error {
+        ResourceTargetError::InvalidTarget => TokenError::InvalidTarget,
+        ResourceTargetError::ServerError => TokenError::ServerError,
+    }
 }
 
 /// The `JwsAlgorithm` the client `client_id` negotiated as its
@@ -724,6 +840,7 @@ async fn refresh_token_grant(
     state: &OidcState,
     headers: &HeaderMap,
     params: TokenParams,
+    resources: &[String],
 ) -> Result<Response, TokenError> {
     // 1. refresh_token: present, and it declares its own scope through its handle.
     let presented = params
@@ -771,9 +888,15 @@ async fn refresh_token_grant(
     let now_micros = epoch_micros(state.now());
     let rotate = decide_rotate(state, &record, &resolution, now_micros);
 
+    // 5c. Resolve the RFC 8707 resource indicators for this refresh (issue #28). A
+    //     refresh may DOWNSCOPE to a subset of the resources approved at the original
+    //     authorization but can NEVER expand beyond them; omitting `resource` keeps
+    //     the full approved set. A violation is a uniform `invalid_target`.
+    let target = resolve_refresh_target(state, scope, &client_id, &resolution, resources).await?;
+
     // 6. Mint the refreshed access token. No ID token is re-minted: no new
     //    authentication happened, so the ID token stays with the code exchange.
-    let (minted, expires_in) = mint_refresh_access(state, scope, &resolution).await?;
+    let (minted, expires_in) = mint_refresh_access(state, scope, &resolution, &target).await?;
 
     // 7. Pre-generate the successor refresh token, used when rotating or on a
     //    within-grace concurrent refresh.
@@ -923,6 +1046,7 @@ async fn mint_refresh_access(
     state: &OidcState,
     scope: Scope,
     resolution: &RefreshTokenResolution,
+    target: &AccessTokenTarget,
 ) -> Result<(MintedAccessToken, i64), TokenError> {
     let entry = state
         .issuer_entry(&scope)
@@ -931,9 +1055,6 @@ async fn mint_refresh_access(
     let signer = entry.signer(state.now()).ok_or(TokenError::ServerError)?;
     let issuer = state.issuer_for(&scope);
     let subject = state.resolve_public_subject(&resolution.subject);
-    let target = state
-        .resolve_access_token_target(&scope, None, &resolution.client_id)
-        .await;
     let extra_claims = serde_json::Map::new();
     tokens::mint_access_token(
         state,
@@ -956,9 +1077,42 @@ async fn mint_refresh_access(
             // never reads it.
             id_token_signer: None,
         },
-        &target,
+        target,
     )
     .map_err(|()| TokenError::ServerError)
+}
+
+/// Resolve the RFC 8707 access-token target for a refresh (issue #28) from the
+/// resources named on the refresh request and the resources approved at the original
+/// authorization (read from the family's grant as `resolution.granted_resources`).
+///
+/// A refresh may DOWNSCOPE to a subset of the approved resources but can NEVER expand
+/// beyond them (RFC 8707 / RFC 9700); omitting `resource` keeps the full approved
+/// set, or falls to the per-client no-resource policy when none was approved. Every
+/// violation is a uniform `invalid_target`.
+async fn resolve_refresh_target(
+    state: &OidcState,
+    scope: Scope,
+    client_id: &ClientId,
+    resolution: &RefreshTokenResolution,
+    resources: &[String],
+) -> Result<AccessTokenTarget, TokenError> {
+    let policy = state
+        .store()
+        .scoped(scope)
+        .clients()
+        .resource_policy(client_id)
+        .await
+        .map_err(map_store_error)?;
+    if !resource::resources_permitted(resources, &policy) {
+        return Err(TokenError::InvalidTarget);
+    }
+    let effective =
+        effective_exchange_resources(resources, &resolution.granted_resources, &policy)?;
+    state
+        .resolve_access_token_target(&scope, &effective, &resolution.client_id)
+        .await
+        .map_err(map_resource_error)
 }
 
 /// Build what the redeem transaction records for the refreshed access token: an
@@ -980,7 +1134,7 @@ fn refresh_access_records<'a>(
         MintedAccessToken::Opaque {
             digest,
             jti,
-            audience,
+            audiences,
             expires_at_unix_micros,
             ..
         } => (
@@ -992,7 +1146,8 @@ fn refresh_access_records<'a>(
                 grant_id: None,
                 subject: &resolution.subject,
                 client_id: &resolution.client_id,
-                audience,
+                audience: audiences.first().map_or("", String::as_str),
+                audiences,
                 scope: resolution.scope.as_deref(),
                 jti,
                 expires_at_unix_micros: *expires_at_unix_micros,

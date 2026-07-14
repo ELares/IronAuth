@@ -401,7 +401,7 @@ async fn issue_device_tokens(
         MintedAccessToken::Opaque {
             digest,
             jti,
-            audience,
+            audiences,
             expires_at_unix_micros,
             ..
         } => Some(NewOpaqueAccessToken {
@@ -409,7 +409,8 @@ async fn issue_device_tokens(
             grant_id: None,
             subject: &grant.subject,
             client_id: &grant.client_id,
-            audience,
+            audience: audiences.first().map_or("", String::as_str),
+            audiences,
             scope: grant.requested_scope.as_deref(),
             jti,
             expires_at_unix_micros: *expires_at_unix_micros,
@@ -467,8 +468,9 @@ async fn mint_device_tokens(
     let issuer = state.issuer_for(&scope);
     let subject = state.resolve_public_subject(&grant.subject);
     let target = state
-        .resolve_access_token_target(&scope, None, &grant.client_id)
-        .await;
+        .resolve_access_token_target(&scope, &[], &grant.client_id)
+        .await
+        .map_err(|_| TokenError::ServerError)?;
     let extra_claims = serde_json::Map::new();
     tokens::mint(
         state,

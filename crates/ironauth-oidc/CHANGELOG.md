@@ -53,6 +53,93 @@ range per docs/RELEASING.md.
     from the authorization-code grant, documented in `issue_device_refresh`): a
     constrained device that completed a one-time cross-device approval expects a durable
     session; `offline_access` still governs the refresh lifetime.
+- JWT bearer assertion grant (issue #26, RFC 7521 4.1 / RFC 7523 2.1, 3):
+  `urn:ietf:params:oauth:grant-type:jwt-bearer` at the token endpoint.
+  - **Trust configuration.** Per-tenant, per-environment REGISTERED external
+    assertion issuers, each with a key source (an inline pinned `jwks`, OR a
+    `jwks_uri` fetched through the SAME SSRF-hardened resolver a `private_key_jwt`
+    client's keys use), an optional per-issuer signing-alg allowlist, and an enable
+    switch. Assertions from an unregistered or disabled issuer are rejected.
+  - **Assertion validation (RFC 7523 3).** The signature is verified against the
+    trusted issuer's keys THROUGH the same allowlist JOSE `verify` path #8/#25 use
+    (EdDSA + ES256/384 + RS256/384/512 + PS256/384/512; ES512 unrepresentable), so
+    the assertion's own `alg` header is never trusted. `iss`/`sub`/`aud`/`exp` are
+    required, clock-skew bounds run via `env.clock()`, and an OPTIONAL single-use
+    `jti` is spent in a DISTINCT `external_assertion_jtis` cache keyed by the
+    external ISSUER, so an external jti can never collide with a #25
+    client-assertion jti.
+  - **Shared audience policy.** The set of audiences an assertion may be addressed
+    to REUSES the one `OidcState::client_assertion_audiences` knob #25 introduced
+    (issuer-or-token-endpoint by default, issuer-only under the strict switch), so a
+    FAPI-shaped deployment flips ONE config switch for both client assertions and
+    this grant; the clock-skew bound is the same `client_assertion_skew`.
+  - **Subject mapping, reject by default.** A REGISTERED, explicit rule maps a
+    verified (external issuer + `sub`, plus an optional claim gate) to an IronAuth
+    principal; the token is issued under that mapped identity as its `sub`. An
+    unmapped subject is REJECTED, never auto-provisioned.
+  - **Normal token lifecycle, no refresh.** The issued access token is short-lived,
+    audienced to the presenting client via the #29 `resolve_access_token_target`
+    seam (`resource = None`), minted through the same signing core, and recorded
+    against a fresh grant (audited `jwt_bearer_assertion.issue`), so it is revocable
+    and introspectable by construction. NO refresh token and NO ID token are issued
+    (RFC 7521 4.1: re-present the assertion).
+  - **Errors and diagnostics.** Every assertion-validation or mapping failure is the
+    uniform, opaque `invalid_grant` on the wire, with the specific reason recorded
+    OUT OF BAND in the SAME `client_auth_diagnostics` sink client authentication
+    uses; the presenting client's authentication fails INDEPENDENTLY as
+    `invalid_client`. `urn:ietf:params:oauth:grant-type:jwt-bearer` joins
+    `grant_types_supported` in generated discovery (from live config).
+  - **Machine-grant scope policy (shared with client-credentials).** The requested
+    `scope` is validated through the SAME `validate_m2m_scope` helper the #23
+    client-credentials grant uses, so a mapped-identity assertion-grant token can
+    never carry `openid` (an OIDC/user concept) or `offline_access` (a refresh token,
+    which this grant never issues): either is `invalid_scope`, rejected BEFORE the
+    assertion's single-use jti is spent.
+  - **Revocable trust config.** A registered issuer OR mapping can be DISABLED through
+    the data plane, after which the grant rejects its assertions exactly as an
+    unregistered/unmapped one (uniform `invalid_grant`, existing diagnostic reason).
+    The issuer resolve already required `enabled`; the mapping resolve now filters on
+    `enabled = true` too, so a mis-authored mapping is revocable now (the HTTP
+    management surface is M13).
+- RFC 8707 Resource Indicators (issue #28) at the authorization, PAR, and token
+  endpoints.
+  - **The `resource` parameter, possibly repeated.** The authorization request, the
+    PAR request, and the token request (on both the `authorization_code` and the
+    `refresh_token` grant) accept one or more `resource` values. Each must be an
+    absolute URI with no fragment (RFC 8707 section 2); a malformed, unregistered, or
+    disallowed value is rejected with the `invalid_target` error (rendered on the
+    token error body and on the authorization redirect). The `/par` endpoint validates
+    the pushed `resource` indicators at PUSH time (RFC 9126 section 2.3), through the
+    SAME per-client allowlist, URI-shape, and registered-resource-server check the
+    authorization endpoint applies, so a bad `resource` surfaces `invalid_target` on
+    the back channel rather than being deferred to `/authorize`; the two paths reuse
+    one helper and cannot diverge.
+  - **Audience-restricted access tokens (RFC 9068, RFC 9700).** An at+jwt carries
+    ONLY the requested, allowlisted audiences: a single resource yields a string
+    `aud` (byte-identical to the pre-#28 wire form), multiple resources yield a JSON
+    array `aud`. An opaque token records its audiences so introspection reports them
+    (a string for one, an array for many). There is no default-everything audience;
+    a token minted for resource A fails audience validation at resource B.
+    Introspection (RFC 7662 section 2.2) reports the FULL audience set for BOTH token
+    formats: an at+jwt now reports EVERY signed `aud` member (not just the first),
+    matching the opaque path, so a resource server that relies on introspection sees
+    the token's true intended audience and never wrongly rejects a valid
+    multi-resource token (a single-audience token still reports a bare string).
+  - **Per-client policy.** An optional allowlist restricts which registered resources
+    a client may target; a per-client knob decides the no-resource case (fall back to
+    the client-id audience, the additive default, or refuse the request). Resources
+    resolve against the environment `resource_servers` registry for their audience,
+    token format, and lifetime; all targeted resource servers must agree on a format
+    (else `invalid_target`) and the token takes the shortest of their lifetimes.
+  - **Downscope, never expand.** The resources approved at authorization are frozen on
+    the code and the grant. A code exchange or a refresh may name a SUBSET of them
+    (narrowing the token), but naming a resource outside the approved set is
+    `invalid_target`, so a refresh can never broaden a grant.
+  - `OidcState::resolve_access_token_target` now takes a `&[String]` of resources and
+    returns a `Result<AccessTokenTarget, ResourceTargetError>` carrying an audience
+    vector; the no-resource path is unchanged, so the device (#24), jwt-bearer (#26),
+    and client-credentials grants keep their single client-id audience.
+
 - Dynamic Client Registration abuse controls (issue #31), wrapping the #30 create.
   - **Exposure switch.** A per-environment `closed` / `token_gated` / `open` mode
     (default `token_gated`) governs who may register: `closed` refuses every public

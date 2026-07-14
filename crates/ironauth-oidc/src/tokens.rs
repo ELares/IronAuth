@@ -156,25 +156,49 @@ pub(crate) const PROTECTED_ACCESS_TOKEN_CLAIMS: &[&str] = &[
     "sid",
 ];
 
-/// The resolved target for an access token: the audience it is minted for, the
-/// format it takes, and its lifetime (issue #29).
+/// The resolved target for an access token: the audience(s) it is minted for, the
+/// format it takes, and its lifetime (issue #29, extended for RFC 8707 resource
+/// indicators in issue #28).
 ///
-/// Resolved by the async handler from the targeted resource server (or the
-/// environment default) via [`OidcState::resolve_access_token_target`], then
-/// handed into the pure [`mint`]. This is the seam issue #28 feeds: it will
-/// resolve the audience from the RFC 8707 `resource` request parameter and pass
-/// it here without reshaping the mint. Today the token endpoint passes the
-/// default (the client id as audience, the environment default format).
+/// Resolved by the async handler from the targeted resource server(s) (or the
+/// environment default) via [`OidcState::resolve_access_token_target`], then handed
+/// into the pure [`mint`]. This is the seam issue #28 feeds: it resolves the
+/// audience(s) from the RFC 8707 `resource` request parameter and passes them here
+/// without reshaping the mint. The no-resource case passes a single audience (the
+/// client id), preserving `UserInfo`'s `aud == client` check.
 #[derive(Debug, Clone)]
 pub struct AccessTokenTarget {
-    /// The `aud` of the minted access token. The client id for the no-resource
-    /// case (so `UserInfo`'s `aud == client` check keeps working), or the resource
-    /// server's audience when one is targeted.
-    pub audience: String,
+    /// The `aud` of the minted access token: ALWAYS non-empty. One entry for the
+    /// no-resource case (the client id, so `UserInfo`'s `aud == client` check keeps
+    /// working) or a single targeted resource server; multiple entries when several
+    /// resources are requested (RFC 8707 / RFC 9068 permit an `aud` array).
+    pub audiences: Vec<String>,
     /// The format to emit (an RFC 9068 `at+jwt` or an opaque reference token).
     pub format: TokenFormat,
     /// The access-token lifetime.
     pub ttl: Duration,
+}
+
+impl AccessTokenTarget {
+    /// The `aud` claim value for this target (issue #28): a JSON STRING for a single
+    /// audience (the common no-resource / single-resource case, keeping the wire form
+    /// identical to before #28), or a JSON ARRAY for multiple (RFC 9068 permits
+    /// either). Never empty by construction.
+    #[must_use]
+    pub fn aud_claim(&self) -> serde_json::Value {
+        match self.audiences.as_slice() {
+            [single] => json!(single),
+            many => json!(many),
+        }
+    }
+
+    /// The PRIMARY audience (the first): the value recorded as an opaque token's
+    /// `audience` column, and the fallback single audience. Never panics: the
+    /// audience set is non-empty by construction.
+    #[must_use]
+    pub fn primary_audience(&self) -> &str {
+        self.audiences.first().map_or("", String::as_str)
+    }
 }
 
 /// A minted access token: the string handed to the client plus what the store
@@ -199,8 +223,11 @@ pub enum MintedAccessToken {
         digest: String,
         /// The token's logical `jti` (a `tok_` id), recorded in the row.
         jti: IssuedTokenId,
-        /// The audience the token targets, recorded in the row.
-        audience: String,
+        /// The full audience set the token targets (issue #28): recorded on the row
+        /// so introspection reports it. Always non-empty; its first entry is the
+        /// primary `audience` column, and the whole array is recorded when it has
+        /// more than one member.
+        audiences: Vec<String>,
         /// The token's expiry, in microseconds since the Unix epoch (clock seam).
         expires_at_unix_micros: i64,
     },
@@ -384,7 +411,7 @@ pub(crate) fn build_access_token_claims(
     iat: i64,
     exp: i64,
     jti: &str,
-    audience: &str,
+    audience: &serde_json::Value,
 ) -> serde_json::Value {
     let mut claims = json!({
         "iss": request.issuer,
@@ -456,7 +483,7 @@ pub(crate) fn build_client_credentials_access_token_claims(
     iat: i64,
     exp: i64,
     jti: &str,
-    audience: &str,
+    audience: &serde_json::Value,
 ) -> serde_json::Value {
     let mut claims = json!({
         "iss": request.issuer,
@@ -515,7 +542,7 @@ pub fn mint_client_credentials_access_token(
                 iat,
                 access_exp,
                 &jti.to_string(),
-                &target.audience,
+                &target.aud_claim(),
             );
             let token = sign_jws_with_policy(
                 policy,
@@ -688,7 +715,7 @@ fn mint_access(
                 iat,
                 access_exp,
                 &jti.to_string(),
-                &target.audience,
+                &target.aud_claim(),
             );
             let token = sign_jws_with_policy(
                 policy,
@@ -727,7 +754,7 @@ fn mint_opaque_access(
         token,
         digest,
         jti,
-        audience: target.audience.clone(),
+        audiences: target.audiences.clone(),
         expires_at_unix_micros,
     }
 }
@@ -984,7 +1011,7 @@ mod tests {
         // required claim, well formed, plus scope and the derived acr.
         let mut req = request("usr_abc", "pwd");
         req.oauth_scope = Some("openid profile");
-        let claims = build_access_token_claims(&req, 1000, 1300, "tok_at", "cli_example");
+        let claims = build_access_token_claims(&req, 1000, 1300, "tok_at", &json!("cli_example"));
         assert_eq!(claims["iss"], "https://issuer.test/t/x/e/y");
         assert_eq!(claims["exp"], 1300);
         assert_eq!(claims["sub"], "usr_abc");
@@ -1007,11 +1034,11 @@ mod tests {
         // a resource server passes its own audience. client_id is ALWAYS the OAuth
         // client, whatever the audience is.
         let req = request("usr_abc", "pwd");
-        let default = build_access_token_claims(&req, 1, 2, "tok", "cli_example");
+        let default = build_access_token_claims(&req, 1, 2, "tok", &json!("cli_example"));
         assert_eq!(default["aud"], "cli_example");
         assert_eq!(default["client_id"], "cli_example");
 
-        let rs = build_access_token_claims(&req, 1, 2, "tok", "https://api.example/orders");
+        let rs = build_access_token_claims(&req, 1, 2, "tok", &json!("https://api.example/orders"));
         assert_eq!(rs["aud"], "https://api.example/orders");
         assert_eq!(rs["client_id"], "cli_example", "client_id stays the client");
     }
@@ -1022,13 +1049,13 @@ mod tests {
         // was frozen onto the code as due, exactly like the ID token.
         let mut req = request("usr_abc", "pwd");
         assert!(
-            build_access_token_claims(&req, 1, 2, "tok", "cli_example")
+            build_access_token_claims(&req, 1, 2, "tok", &json!("cli_example"))
                 .get("auth_time")
                 .is_none(),
             "auth_time is absent when not frozen onto the code"
         );
         req.auth_time_unix_micros = Some(1_700_000_123_456_789);
-        let claims = build_access_token_claims(&req, 1, 2, "tok", "cli_example");
+        let claims = build_access_token_claims(&req, 1, 2, "tok", &json!("cli_example"));
         assert_eq!(claims["auth_time"], 1_700_000_123_i64);
     }
 
@@ -1039,7 +1066,7 @@ mod tests {
         let mut req = request("usr_abc", "pwd");
         req.oauth_scope = Some("openid profile email address phone");
         req.auth_time_unix_micros = Some(1_700_000_000_000_000);
-        let claims = build_access_token_claims(&req, 1, 2, "tok", "cli_example");
+        let claims = build_access_token_claims(&req, 1, 2, "tok", &json!("cli_example"));
         let object = claims.as_object().expect("object");
         // The payload is exactly the protocol claim set, nothing else.
         let mut names: Vec<&str> = object.keys().map(String::as_str).collect();
@@ -1093,8 +1120,13 @@ mod tests {
         let empty = serde_json::Map::new();
         let mut req = cc_request("sva_principal", &empty);
         req.oauth_scope = Some("read write");
-        let claims =
-            build_client_credentials_access_token_claims(&req, 1000, 1300, "tok_at", "cli_example");
+        let claims = build_client_credentials_access_token_claims(
+            &req,
+            1000,
+            1300,
+            "tok_at",
+            &json!("cli_example"),
+        );
         assert_eq!(claims["iss"], "https://issuer.test/t/x/e/y");
         assert_eq!(claims["sub"], "sva_principal");
         assert_ne!(
@@ -1159,7 +1191,7 @@ mod tests {
             1000,
             1300,
             "tok_real",
-            "cli_example",
+            &json!("cli_example"),
         );
         // The emitted protocol claims keep their real minted values.
         assert_eq!(claims["sub"], "sva_real", "protected sub is never shadowed");
