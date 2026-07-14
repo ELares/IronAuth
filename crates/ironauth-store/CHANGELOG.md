@@ -6,6 +6,19 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- UserInfo standard-claim persistence and the frozen `claims` request parameter
+  (issue #15).
+  - **The ninth production migration** (`0009_userinfo_claims`, Expand) adds the
+    additive `users.claims` (`text NOT NULL DEFAULT '{}'`) column backing the
+    scope-derived and claims-parameter-selected claim sets, plus the nullable
+    `grants.claims_request` and `authorization_codes.claims_request` columns holding
+    the canonicalized `claims` parameter frozen at authorization (read by UserInfo
+    and at the token endpoint). All are additive columns on already-RLS-forced
+    tables, so they inherit the existing tenant/environment isolation.
+  - **Access-token resolution** (`resolve_access_token`) is scope-bound and
+    registered in the cross-scope IDOR harness, so a token minted in one
+    environment yields a uniform not-found in another; the repository reads and
+    writes the claim columns through the runtime query API only.
 - Registered redirect URIs and the exact-string redirect comparator (issue #13).
   - **The redirect-matching policy** lives here as two pure functions,
     `redirect_uri_matches` and `redirect_uri_is_registrable` (`src/redirect.rs`),

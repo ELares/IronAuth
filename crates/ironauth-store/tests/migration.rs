@@ -251,7 +251,7 @@ async fn production_chain_is_only_the_eight_real_migrations_and_ships_no_demo_ob
     let db = TestDatabase::start().await;
     let pool = db.owner_pool();
 
-    // Re-running is idempotent and reports exactly seven tracked migrations.
+    // Re-running is idempotent and reports exactly eight tracked migrations.
     let report = MigrationRunner::new(pool)
         .run()
         .await
@@ -262,16 +262,16 @@ async fn production_chain_is_only_the_eight_real_migrations_and_ships_no_demo_ob
     );
     assert_eq!(
         report.already_applied(),
-        8,
-        "the production chain is exactly eight migrations (isolation, audit log, management API, \
+        9,
+        "the production chain is exactly nine migrations (isolation, audit log, management API, \
          OIDC authorization, signing keys, login/consent, authentication context, redirect \
-         registration)"
+         registration, UserInfo claims)"
     );
 
-    // The ledger holds exactly versions 1 through 8.
+    // The ledger holds exactly versions 1 through 9.
     assert_eq!(
         applied_versions(pool).await,
-        vec![1_i64, 2, 3, 4, 5, 6, 7, 8]
+        vec![1_i64, 2, 3, 4, 5, 6, 7, 8, 9]
     );
     let phase_of = |version: i64| async move {
         sqlx::query("SELECT phase FROM _schema_migrations WHERE version = $1")
@@ -289,6 +289,7 @@ async fn production_chain_is_only_the_eight_real_migrations_and_ships_no_demo_ob
     assert_eq!(phase_of(6).await, "expand");
     assert_eq!(phase_of(7).await, "expand");
     assert_eq!(phase_of(8).await, "expand");
+    assert_eq!(phase_of(9).await, "expand");
 
     // The demo object never reaches a production database.
     assert!(
@@ -349,6 +350,22 @@ async fn production_chain_is_only_the_eight_real_migrations_and_ships_no_demo_ob
     assert!(
         column_exists(pool, "clients", "redirect_uris").await,
         "clients.redirect_uris exists"
+    );
+    // The UserInfo standard-claim store (issue #15): the additive users.claims
+    // column backing the scope-derived and claims-parameter-selected claim sets,
+    // plus the persisted `claims` request parameter frozen onto the grant (read by
+    // UserInfo) and the code (read at the token endpoint).
+    assert!(
+        column_exists(pool, "users", "claims").await,
+        "users.claims exists"
+    );
+    assert!(
+        column_exists(pool, "grants", "claims_request").await,
+        "grants.claims_request exists"
+    );
+    assert!(
+        column_exists(pool, "authorization_codes", "claims_request").await,
+        "authorization_codes.claims_request exists"
     );
 }
 

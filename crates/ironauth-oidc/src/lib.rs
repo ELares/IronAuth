@@ -69,6 +69,7 @@
 
 mod authn;
 mod authorize;
+mod claims_request;
 mod client_auth;
 mod consent;
 mod discovery;
@@ -83,6 +84,7 @@ mod pkce;
 mod register;
 mod registry;
 mod response;
+mod scope_claims;
 mod sector;
 mod session;
 mod state;
@@ -90,6 +92,7 @@ mod subject;
 mod token;
 mod token_hash;
 mod tokens;
+mod userinfo;
 mod util;
 mod wellknown;
 
@@ -103,8 +106,8 @@ pub use authn::{
 pub use client_auth::{ClientAuthMethod, generate_secret, hash_secret};
 pub use discovery::{
     ADVERTISED_ENDPOINTS, DiscoveryCapabilities, DiscoveryEndpoint, DiscoveryState,
-    ID_TOKEN_CLAIMS_SUPPORTED, SCOPES_SUPPORTED, discovery_document, discovery_router,
-    id_token_signing_alg_values,
+    ID_TOKEN_CLAIMS_SUPPORTED, SCOPES_SUPPORTED, claims_supported, discovery_document,
+    discovery_router, id_token_signing_alg_values,
 };
 pub use error::{AuthorizeError, AuthzErrorCode, TokenError};
 pub use issuer::{
@@ -138,6 +141,15 @@ pub fn oidc_router(state: OidcState) -> Router {
             get(authorize::authorize_get).post(authorize::authorize_post),
         )
         .route("/token", post(token::token))
+        // UserInfo (OIDC Core 5.3): GET and POST with header Bearer auth, plus the
+        // OPTIONS preflight for the CORS SPA origins (issue #15). CORS is applied on
+        // this endpoint ONLY; the authorization endpoint above never gets it.
+        .route(
+            "/userinfo",
+            get(userinfo::userinfo_get)
+                .post(userinfo::userinfo_post)
+                .options(userinfo::userinfo_preflight),
+        )
         // The bootstrap login, registration, and consent interaction surfaces
         // (issue #20). GET renders the minimal hardened page; POST records the
         // decision and resumes the authorization request.

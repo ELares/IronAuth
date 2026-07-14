@@ -34,6 +34,8 @@ use ironauth_store::{
 };
 use serde::Deserialize;
 
+use crate::authn;
+use crate::claims_request::{ClaimsRequest, ClaimsRequestError};
 use crate::client_auth::ClientAuthMethod;
 use crate::error::{AuthorizeError, AuthzErrorCode, redirect_response};
 use crate::interaction;
@@ -80,6 +82,12 @@ pub struct AuthorizeParams {
     /// `unmet_authentication_requirements` error when a requested level cannot be
     /// met is owned by #16.
     pub acr_values: Option<String>,
+    /// The OIDC `claims` request parameter (issue #15): a JSON object requesting
+    /// individual claims for the `id_token` and/or `userinfo` (OIDC Core 5.5). It
+    /// is parsed and validated here, frozen onto the code and grant, and applied
+    /// later at the token endpoint (`id_token` member) and `UserInfo` (`userinfo`
+    /// member). A malformed value is a redirect `invalid_request`.
+    pub claims: Option<String>,
 }
 
 /// `GET /authorize`.
@@ -110,6 +118,11 @@ async fn handle(state: &OidcState, headers: &HeaderMap, params: AuthorizeParams)
     }
 }
 
+// A linear, numbered validation pipeline (client, redirect, response_type, PKCE,
+// claims, gate, acr, issue): each step is short but heavily commented for the
+// security rationale, so the whole reads over the line budget. Kept as one
+// sequence deliberately, since the ORDER is the security property.
+#[allow(clippy::too_many_lines)]
 async fn issue_code(
     state: &OidcState,
     headers: &HeaderMap,
@@ -198,6 +211,14 @@ async fn issue_code(
         .map_err(|description| redirect_error(AuthzErrorCode::InvalidRequest, description))?;
     let code_challenge_method = code_challenge.map(|_| PkceMethod::S256.as_str());
 
+    // 5b. The OIDC `claims` request parameter (Core 5.5): parse and validate. A
+    //     malformed value is a redirect invalid_request. It is frozen onto the code
+    //     and grant (canonical form) below, so the token endpoint can honor its
+    //     `id_token` member at mint and UserInfo its `userinfo` member later
+    //     (issue #15).
+    let (claims_request, claims_canonical) = parse_claims_request(params.claims.as_deref())
+        .map_err(|description| redirect_error(AuthzErrorCode::InvalidRequest, description))?;
+
     // 6. Establish the authenticated subject and their consent. A missing session
     //    or missing consent short-circuits to a LOCAL interaction redirect (never
     //    the client's redirect_uri), carrying a return_to that resumes this exact
@@ -219,6 +240,22 @@ async fn issue_code(
             consent_ref,
         } => (session, consent_ref),
     };
+
+    // 6b. Essential acr binding (OIDC Core 5.5.1.1): if the `claims` parameter pins
+    //     an essential acr to specific values, the request MUST NOT be silently
+    //     downgraded to a lower level. The achieved acr is DERIVED from the recorded
+    //     authentication event (issue #14), never from the request; if it is not
+    //     among the requested values, the authentication requirement is unmet and
+    //     the request fails closed. The full `unmet_authentication_requirements`
+    //     surface (and any step-up re-authentication) is issue #16; this fails
+    //     closed through today's redirect error path rather than silently
+    //     succeeding, leaving a clean seam for #16 to refine the error.
+    if !essential_acr_met(&claims_request, &session) {
+        return Err(redirect_error(
+            AuthzErrorCode::AccessDenied,
+            "the requested authentication context (essential acr) cannot be satisfied",
+        ));
+    }
 
     // 7. Freeze the authentication context onto the code. auth_time is emitted in
     //    the ID token when the request asked for max_age (present, including
@@ -254,6 +291,7 @@ async fn issue_code(
         auth_time_micros,
         session_ref: &session_ref,
         consent_ref: &consent_ref,
+        claims_request: claims_canonical.as_deref(),
     };
     finalize_issue(state, scope, &client_id, redirect_uri, &iss, &resolved).await
 }
@@ -342,6 +380,33 @@ fn resolve_pkce(
         return Err("PKCE is required: a code_challenge (S256) must be provided");
     }
     Ok(code_challenge)
+}
+
+/// Parse the OIDC `claims` request parameter (Core 5.5), returning the parsed
+/// request and its canonical JSON form (both empty/[`None`] when the request
+/// carried none). A malformed value yields a short, non-secret description the
+/// caller maps to a redirect `invalid_request` (issue #15).
+fn parse_claims_request(
+    raw: Option<&str>,
+) -> Result<(ClaimsRequest, Option<String>), &'static str> {
+    let Some(raw) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok((ClaimsRequest::default(), None));
+    };
+    let request = ClaimsRequest::parse(raw).map_err(ClaimsRequestError::as_description)?;
+    let canonical = (!request.is_empty()).then(|| request.to_json());
+    Ok((request, canonical))
+}
+
+/// Whether the request's essential-`acr` binding (Core 5.5.1.1) is met by the
+/// session's ACHIEVED authentication context. The achieved `acr` is derived from
+/// the recorded authentication event (issue #14), never the request; a voluntary
+/// or absent `acr` request is always met (issue #15).
+fn essential_acr_met(
+    claims_request: &ClaimsRequest,
+    session: &interaction::AuthenticatedSession,
+) -> bool {
+    let achieved = authn::achieved_acr(&authn::parse_methods(&session.auth_methods));
+    claims_request.acr_satisfied(achieved)
 }
 
 /// The outcome of resolving the login/consent gate: either an interaction is
@@ -437,6 +502,7 @@ fn build_authorize_url(params: &AuthorizeParams) -> String {
             ("prompt", params.prompt.as_deref()),
             ("max_age", params.max_age.as_deref()),
             ("acr_values", params.acr_values.as_deref()),
+            ("claims", params.claims.as_deref()),
         ],
     )
 }
@@ -460,6 +526,9 @@ struct Resolved<'a> {
     session_ref: &'a str,
     /// The recorded consent handle recorded on the grant.
     consent_ref: &'a str,
+    /// The canonical JSON of the `claims` request parameter (issue #15), frozen
+    /// onto the code and grant, or [`None`] when the request carried none.
+    claims_request: Option<&'a str>,
 }
 
 /// Mint the code and its grant bound to every re-checkable parameter (with a
@@ -493,6 +562,7 @@ async fn finalize_issue(
         auth_time_micros: resolved.auth_time_micros,
         session_ref: Some(resolved.session_ref),
         consent_ref: Some(resolved.consent_ref),
+        claims_request: resolved.claims_request,
         expires_at_micros: epoch_micros(expires_at),
         created_at_micros: epoch_micros(now),
     };

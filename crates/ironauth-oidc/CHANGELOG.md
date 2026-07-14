@@ -6,6 +6,38 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- UserInfo endpoint, scope-to-claims mapping, and the `claims` request parameter
+  (issue #15). Builds on the #12/#13 authorization and token endpoints; the
+  provider stays gated off (`oidc.enabled` unchanged).
+  - **UserInfo endpoint** (`GET`/`POST`/`OPTIONS /userinfo`) that authenticates a
+    Bearer access token from the `Authorization` header ONLY (a query-string token
+    is `invalid_request`; a POST body token is unsupported by design). The token is
+    resolved by an UNTRUSTED `jti` peek, then a scope-bound store lookup (the
+    IDOR/revocation gate), then the one hardened JWS verify (signature BEFORE
+    claims, `aud` bound to the resolved grant's client, `exp`/`iss`/revocation
+    enforced): no claim is released before a valid signature. A missing token or an
+    unsupported/empty `Authorization` scheme gets the bare `401 Bearer` challenge
+    with no error code (RFC 6750 3); invalid/expired/revoked collapse to a uniform
+    `401 invalid_token`; a token lacking `openid` is `403 insufficient_scope`.
+  - **Scope-to-claims** (OIDC Core 5.4): the `profile`, `email`, `address`, and
+    `phone` scopes map to their standard claim sets, served from UserInfo. `sub` is
+    always derived through the ONE shared subject function (so the ID token and
+    UserInfo agree) and can never be shadowed by stored claim data.
+  - **The `claims` request parameter** (OIDC Core 5.5): voluntary and essential
+    members, `value`/`values`, and both the `userinfo` and `id_token` targets. It
+    is parsed and canonicalized at `/authorize` and FROZEN onto the grant and the
+    code, so a client cannot widen its release at call time. Unsatisfiable
+    voluntary/essential claims are omitted rather than erroring; an essential `acr`
+    fails CLOSED at `/authorize`. Discovery advertises
+    `claims_parameter_supported = true` via `DiscoveryCapabilities::from_config`.
+  - **`oidc.conform_id_token_claims`** (default `false`, spec-conform) keeps the ID
+    token lean with scope claims at UserInfo; `true` additionally copies them into
+    the ID token for legacy relying parties (the node-oidc-provider
+    `conformIdTokenClaims = false` behavior), documented as NON-conform.
+    **`oidc.userinfo_cors_origins`** lists SPA web origins allowed to call UserInfo
+    cross-origin: each is matched EXACTLY and echoed back (never a wildcard, no
+    credentials), and CORS is offered on UserInfo ONLY. Both are promotable
+    per-environment settings.
 - PKCE enforcement, exact redirect matching, native-app redirect rules, and the
   RFC 9207 `iss` (issue #13). Hardens the #12 authorization and token endpoints;
   the provider stays gated off (`oidc.enabled` unchanged).

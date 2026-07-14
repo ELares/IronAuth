@@ -763,6 +763,44 @@ pub enum TokenStatus {
     Unknown,
 }
 
+/// An access token resolved from its `jti` back to the grant it was issued from
+/// (issue #15). The `UserInfo` endpoint resolves the presented Bearer token's
+/// `jti` through this so it can build the response from the AUTHORITATIVE grant
+/// state (the local subject and the client), and honor grant-chain revocation.
+///
+/// The lookup is scope-bound (the `jti` embeds its own scope, the query filters
+/// on it, and row-level security sits beneath), so an access token minted in one
+/// environment never resolves under another. It matches ONLY the access-token
+/// row (`token_kind = 'access'`), so an ID token's `jti` never resolves here.
+///
+/// [`fmt::Debug`] is hand written and redacting: `subject` is end-user detail
+/// that must not reach a log line.
+#[derive(Clone, PartialEq, Eq)]
+pub struct AccessTokenResolution {
+    /// The local end-user subject the grant was issued for (a `usr_` id string).
+    /// This is the input to the SHARED subject-derivation function, so `UserInfo`
+    /// derives a `sub` byte-identical to the one the ID token carried.
+    pub subject: String,
+    /// The OAuth client the grant (and thus the token) belongs to.
+    pub client_id: String,
+    /// The canonical JSON form of the `claims` request parameter frozen onto the
+    /// grant (OIDC Core 5.5), or [`None`] when the request carried none. `UserInfo`
+    /// applies its `userinfo` member to the response (issue #15).
+    pub claims_request: Option<String>,
+    /// Whether the grant chain is live (not revoked): a revoked grant flips every
+    /// one of its tokens inactive, so `UserInfo` must reject the token.
+    pub active: bool,
+}
+
+impl fmt::Debug for AccessTokenResolution {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AccessTokenResolution")
+            .field("client_id", &self.client_id)
+            .field("active", &self.active)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Everything the authorization endpoint binds into a freshly issued code and
 /// its grant. The `code_id`, `grant_id`, and `client_id` are all scoped
 /// identifiers minted (or resolved) under the caller's scope, so a mismatch is a
@@ -803,6 +841,11 @@ pub struct IssueCode<'a> {
     pub session_ref: Option<&'a str>,
     /// The recorded consent handle (a seam for later M2 issues).
     pub consent_ref: Option<&'a str>,
+    /// The canonical JSON form of the `claims` request parameter (OIDC Core 5.5),
+    /// or [`None`] when the request carried none. Frozen onto the grant and the
+    /// code so the ID token (`id_token` member) and `UserInfo` (`userinfo` member)
+    /// can honor it after the request itself is gone (issue #15).
+    pub claims_request: Option<&'a str>,
     /// The code's expiry, in microseconds since the Unix epoch (clock seam).
     pub expires_at_micros: i64,
     /// The code's creation time, in microseconds since the Unix epoch.
@@ -856,6 +899,10 @@ pub struct CodeBindings {
     /// asked for `max_age`, or the client registered `require_auth_time`). A
     /// [`None`] means the `auth_time` claim is omitted (issue #14).
     pub auth_time_unix_micros: Option<i64>,
+    /// The canonical JSON form of the `claims` request parameter frozen onto the
+    /// code (OIDC Core 5.5), or [`None`] when the request carried none. The token
+    /// endpoint applies its `id_token` member to the ID token at mint (issue #15).
+    pub claims_request: Option<String>,
 }
 
 impl fmt::Debug for CodeBindings {
@@ -938,7 +985,7 @@ impl AuthorizationRepo<'_> {
         let mut tx = begin_scoped(self.store, self.scope).await?;
         let row = sqlx::query(
             "SELECT grant_id, client_id, redirect_uri, nonce, code_challenge, \
-             code_challenge_method, subject, oauth_scope, auth_methods, \
+             code_challenge_method, subject, oauth_scope, auth_methods, claims_request, \
              (EXTRACT(EPOCH FROM auth_time) * 1000000)::bigint AS auth_time_us \
              FROM authorization_codes \
              WHERE id = $1 AND tenant_id = $2 AND environment_id = $3",
@@ -986,6 +1033,56 @@ impl AuthorizationRepo<'_> {
             Some(row) if row.get::<bool, _>("active") => TokenStatus::Active,
             Some(_) => TokenStatus::Revoked,
         })
+    }
+
+    /// Resolve an ACCESS token's `jti` back to the grant it was issued from
+    /// (issue #15), within scope. Returns the local subject, the client, and the
+    /// grant's live state, or [`None`] when no access token with this identifier
+    /// is recorded in scope (absent, out of scope, or an ID-token `jti`).
+    ///
+    /// The `UserInfo` endpoint uses this to build its response from authoritative
+    /// grant state and to honor grant-chain revocation: a revoked grant comes back
+    /// with `active = false`, and the caller rejects the token. The match is
+    /// filtered to `token_kind = 'access'`, so presenting an ID token's `jti` here
+    /// is a uniform [`None`] (an ID token is not a `UserInfo` credential).
+    ///
+    /// Scope isolation is the same three-layer guarantee as [`token_status`](Self::token_status):
+    /// the `jti` embeds its own scope (checked here), the query filters on the
+    /// caller's `(tenant, environment)`, and forced row-level security sits beneath.
+    /// So an access token minted in one environment never resolves under another.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn resolve_access_token(
+        &self,
+        jti: &IssuedTokenId,
+    ) -> Result<Option<AccessTokenResolution>, StoreError> {
+        if jti.scope() != self.scope {
+            return Ok(None);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT g.subject AS subject, g.client_id AS client_id, \
+             g.claims_request AS claims_request, (g.revoked_at IS NULL) AS active \
+             FROM issued_tokens t \
+             JOIN grants g ON g.id = t.grant_id \
+             AND g.tenant_id = t.tenant_id AND g.environment_id = t.environment_id \
+             WHERE t.id = $1 AND t.token_kind = 'access' \
+             AND t.tenant_id = $2 AND t.environment_id = $3",
+        )
+        .bind(jti.to_string())
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(row.map(|row| AccessTokenResolution {
+            subject: row.get("subject"),
+            client_id: row.get("client_id"),
+            claims_request: row.get("claims_request"),
+            active: row.get("active"),
+        }))
     }
 }
 
@@ -1035,9 +1132,9 @@ impl ActingAuthorizationRepo<'_> {
                 sqlx::query(
                     "INSERT INTO grants \
                      (id, tenant_id, environment_id, client_id, subject, session_ref, \
-                      consent_ref, created_at) \
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, \
-                             TIMESTAMPTZ 'epoch' + ($8::text || ' microseconds')::interval)",
+                      consent_ref, claims_request, created_at) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, \
+                             TIMESTAMPTZ 'epoch' + ($9::text || ' microseconds')::interval)",
                 )
                 .bind(code.grant_id.to_string())
                 .bind(scope.tenant().to_string())
@@ -1046,6 +1143,7 @@ impl ActingAuthorizationRepo<'_> {
                 .bind(code.subject)
                 .bind(code.session_ref)
                 .bind(code.consent_ref)
+                .bind(code.claims_request)
                 .bind(code.created_at_micros)
                 .execute(&mut **tx)
                 .await?;
@@ -1053,13 +1151,13 @@ impl ActingAuthorizationRepo<'_> {
                     "INSERT INTO authorization_codes \
                      (id, tenant_id, environment_id, grant_id, client_id, redirect_uri, nonce, \
                       code_challenge, code_challenge_method, subject, oauth_scope, auth_methods, \
-                      auth_time, expires_at, created_at) \
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, \
-                             CASE WHEN $13::bigint IS NULL THEN NULL \
+                      claims_request, auth_time, expires_at, created_at) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, \
+                             CASE WHEN $14::bigint IS NULL THEN NULL \
                                   ELSE TIMESTAMPTZ 'epoch' \
-                                       + ($13::text || ' microseconds')::interval END, \
-                             TIMESTAMPTZ 'epoch' + ($14::text || ' microseconds')::interval, \
-                             TIMESTAMPTZ 'epoch' + ($15::text || ' microseconds')::interval)",
+                                       + ($14::text || ' microseconds')::interval END, \
+                             TIMESTAMPTZ 'epoch' + ($15::text || ' microseconds')::interval, \
+                             TIMESTAMPTZ 'epoch' + ($16::text || ' microseconds')::interval)",
                 )
                 .bind(code.code_id.to_string())
                 .bind(scope.tenant().to_string())
@@ -1073,6 +1171,7 @@ impl ActingAuthorizationRepo<'_> {
                 .bind(code.subject)
                 .bind(code.oauth_scope)
                 .bind(code.auth_methods)
+                .bind(code.claims_request)
                 .bind(code.auth_time_micros)
                 .bind(code.expires_at_micros)
                 .bind(code.created_at_micros)
@@ -1662,6 +1761,7 @@ fn bindings_from_row(row: &PgRow, scope: &Scope) -> Result<CodeBindings, StoreEr
         oauth_scope: row.get("oauth_scope"),
         auth_methods: row.get("auth_methods"),
         auth_time_unix_micros: row.get("auth_time_us"),
+        claims_request: row.get("claims_request"),
     })
 }
 
@@ -1743,6 +1843,36 @@ impl UserRepo<'_> {
             }
         }
     }
+
+    /// Read a user's stored standard-claim document (issue #15) by their subject
+    /// (the `usr_` id string), within scope. Returns the raw JSON text of the
+    /// user's `claims` object (an empty object `{}` for a user with no releasable
+    /// claims), or [`None`] when no such user is visible in this scope.
+    ///
+    /// The `UserInfo` endpoint resolves an access token to its local subject and
+    /// then reads this document, releasing only the members a granted scope or an
+    /// explicit claims request selects. The value is opaque JSON text here; the
+    /// OIDC layer parses it (the store adds no JSON dependency). `sub` is never
+    /// stored or read from here: it is always derived through the shared subject
+    /// function.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn claims_for_subject(&self, subject: &str) -> Result<Option<String>, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT claims FROM users \
+             WHERE id = $1 AND tenant_id = $2 AND environment_id = $3",
+        )
+        .bind(subject)
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(row.map(|row| row.get::<String, _>("claims")))
+    }
 }
 
 /// The mutating bootstrap user repository (issue #20).
@@ -1768,6 +1898,48 @@ impl ActingUserRepo<'_> {
         identifier: &str,
         password_hash: &str,
     ) -> Result<UserId, StoreError> {
+        // The registration surface (issue #20) records no standard claims; the
+        // column defaults to the empty object, released as no claims by UserInfo.
+        self.register_inner(env, identifier, password_hash, "{}")
+            .await
+    }
+
+    /// Register a bootstrap user with a precomputed Argon2id `password_hash` and a
+    /// standard-claim document (issue #15), returning the fresh identifier. The
+    /// `claims_json` is the user's OIDC standard claim object as JSON text (for
+    /// example `{"email":"a@b.test","email_verified":true}`), stored verbatim and
+    /// released selectively by `UserInfo` per the granted scope and any claims
+    /// request. Writes a `user.register` audit row in the same transaction.
+    ///
+    /// There is no separate update path (the bootstrap `users` table grants only
+    /// SELECT and INSERT), so a user's claims are set here at registration and are
+    /// otherwise fixed until the full identity model lands.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Conflict`] if the login handle is already registered in this
+    /// scope; [`StoreError::Database`] on a persistence failure.
+    pub async fn register_with_claims(
+        &self,
+        env: &Env,
+        identifier: &str,
+        password_hash: &str,
+        claims_json: &str,
+    ) -> Result<UserId, StoreError> {
+        self.register_inner(env, identifier, password_hash, claims_json)
+            .await
+    }
+
+    /// Shared body of the registration path: insert the user (with its claim
+    /// document) and its audit row in one transaction, mapping a duplicate login
+    /// handle to the caller-facing [`StoreError::Conflict`].
+    async fn register_inner(
+        &self,
+        env: &Env,
+        identifier: &str,
+        password_hash: &str,
+        claims_json: &str,
+    ) -> Result<UserId, StoreError> {
         let id = UserId::generate(env, &self.scope);
         let scope = self.scope;
         write_audited(
@@ -1782,14 +1954,15 @@ impl ActingUserRepo<'_> {
             async move |tx| {
                 let result = sqlx::query(
                     "INSERT INTO users \
-                     (id, tenant_id, environment_id, identifier, password_hash) \
-                     VALUES ($1, $2, $3, $4, $5)",
+                     (id, tenant_id, environment_id, identifier, password_hash, claims) \
+                     VALUES ($1, $2, $3, $4, $5, $6)",
                 )
                 .bind(id.to_string())
                 .bind(scope.tenant().to_string())
                 .bind(scope.environment().to_string())
                 .bind(identifier)
                 .bind(password_hash)
+                .bind(claims_json)
                 .execute(&mut **tx)
                 .await;
                 match result {

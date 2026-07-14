@@ -138,14 +138,17 @@ impl IdorHarness {
         self
     }
 
-    /// Register the OIDC data-plane probes (issue #12): the scoped-resource
+    /// Register the OIDC data-plane probes (issue #12, #15): the scoped-resource
     /// resolve-by-id operations of the authorization-code grant. Today that is
-    /// `authorization_codes.redeem` (a cross-scope code must never be consumable)
-    /// and `issued_tokens.token_status` (a cross-scope token's active state must
-    /// never be observable). Run these with the data-plane store (`ironauth_app`).
+    /// `authorization_codes.redeem` (a cross-scope code must never be consumable),
+    /// `issued_tokens.token_status` (a cross-scope token's active state must never
+    /// be observable), and `issued_tokens.resolve_access_token` (a cross-scope
+    /// access token must never resolve to a subject/client for `UserInfo`). Run these
+    /// with the data-plane store (`ironauth_app`).
     pub fn register_oidc_probes(&mut self) -> &mut Self {
         self.register(Box::new(AuthorizationCodeRedeemProbe));
         self.register(Box::new(IssuedTokenStatusProbe));
+        self.register(Box::new(AccessTokenResolveProbe));
         self
     }
 
@@ -402,6 +405,43 @@ impl IsolationProbe for IssuedTokenStatusProbe {
                 // Observing a foreign token's active state would be a leak.
                 Ok(TokenStatus::Active | TokenStatus::Revoked) => ProbeOutcome::Leaked,
                 Ok(TokenStatus::Unknown) | Err(_) => ProbeOutcome::Denied,
+            }
+        })
+    }
+}
+
+/// Built-in probe for `AuthorizationRepo::resolve_access_token` (issue #15). An
+/// access token issued in another scope must never resolve to a subject and
+/// client under the caller's scope: that is what keeps a `UserInfo` request bearing
+/// an environment-A token from resolving in environment B.
+struct AccessTokenResolveProbe;
+
+impl IsolationProbe for AccessTokenResolveProbe {
+    fn name(&self) -> &'static str {
+        "issued_tokens.resolve_access_token"
+    }
+
+    fn probe<'a>(
+        &'a self,
+        store: &'a Store,
+        caller: Scope,
+        foreign_id: &'a str,
+    ) -> BoxProbeFuture<'a> {
+        Box::pin(async move {
+            // Parse the untrusted token id under the caller's OWN scope; a token
+            // minted in another scope fails here as a uniform not-found.
+            let Ok(jti) = IssuedTokenId::parse_in_scope(foreign_id, &caller) else {
+                return ProbeOutcome::Denied;
+            };
+            match store
+                .scoped(caller)
+                .authorization()
+                .resolve_access_token(&jti)
+                .await
+            {
+                // Resolving a foreign token to its subject/client would be a leak.
+                Ok(Some(_)) => ProbeOutcome::Leaked,
+                Ok(None) | Err(_) => ProbeOutcome::Denied,
             }
         })
     }

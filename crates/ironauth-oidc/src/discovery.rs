@@ -72,10 +72,11 @@ use crate::wellknown::{cacheable_response, not_found, parse_scope};
 const DISCOVERY_MEDIA_TYPE: &str = "application/json";
 
 /// The scopes IronAuth advertises. `openid` is the OIDC-mandated scope the
-/// authorization-code flow is defined against; richer scopes (`profile`, `email`)
-/// arrive with the claims that back them. This is the authoritative source until a
-/// scope subsystem exposes its own registry.
-pub const SCOPES_SUPPORTED: &[&str] = &["openid"];
+/// authorization-code flow is defined against; `profile`, `email`, `address`, and
+/// `phone` are the OIDC Core 5.4 claim-bearing scopes `UserInfo` backs (issue #15).
+/// This is the authoritative source until a scope subsystem exposes its own
+/// registry.
+pub const SCOPES_SUPPORTED: &[&str] = &["openid", "profile", "email", "address", "phone"];
 
 /// The claim names IronAuth may supply in an ID token today. `iss`/`aud`/`exp`/
 /// `iat` are protocol claims and `sub` is the user identifier; `nonce` is echoed
@@ -96,6 +97,23 @@ pub const ID_TOKEN_CLAIMS_SUPPORTED: &[&str] = &[
     "acr",
     "amr",
 ];
+
+/// The `claims_supported` array the discovery document advertises: every claim
+/// this OP may put in an ID token OR return from `UserInfo`, de-duplicated. It is the
+/// union of [`ID_TOKEN_CLAIMS_SUPPORTED`] and the `UserInfo`-returnable standard
+/// claims (issue #15's scope claim sets plus `sub`), so every `UserInfo`-returnable
+/// claim is advertised and the two surfaces never drift from what discovery
+/// announces.
+#[must_use]
+pub fn claims_supported() -> Vec<&'static str> {
+    let mut out: Vec<&'static str> = ID_TOKEN_CLAIMS_SUPPORTED.to_vec();
+    for name in crate::scope_claims::userinfo_standard_claims() {
+        if !out.contains(&name) {
+            out.push(name);
+        }
+    }
+    out
+}
 
 /// One endpoint advertised in the discovery document.
 ///
@@ -118,9 +136,9 @@ pub struct DiscoveryEndpoint {
 /// required top-level field handled directly by the generator, and its serving
 /// (the JWKS surface) is mounted by issue #194 once keys load.
 ///
-/// The M3/M4 endpoints (`end_session_endpoint`, `revocation_endpoint`,
-/// `introspection_endpoint`, `registration_endpoint`, `userinfo_endpoint`) join
-/// this list when their issues land.
+/// The remaining M3/M4 endpoints (`end_session_endpoint`, `revocation_endpoint`,
+/// `introspection_endpoint`, `registration_endpoint`) join this list when their
+/// issues land; `userinfo_endpoint` landed with issue #15.
 pub const ADVERTISED_ENDPOINTS: &[DiscoveryEndpoint] = &[
     DiscoveryEndpoint {
         metadata_key: "authorization_endpoint",
@@ -129,6 +147,10 @@ pub const ADVERTISED_ENDPOINTS: &[DiscoveryEndpoint] = &[
     DiscoveryEndpoint {
         metadata_key: "token_endpoint",
         path: "/token",
+    },
+    DiscoveryEndpoint {
+        metadata_key: "userinfo_endpoint",
+        path: "/userinfo",
     },
 ];
 
@@ -155,21 +177,34 @@ pub struct DiscoveryCapabilities {
     /// (issue #13). `false` until #13 lands and the authorization endpoint echoes
     /// `iss`, so discovery never claims a behavior the server does not yet have.
     authorization_response_iss_parameter_supported: bool,
+    /// Whether the `claims` request parameter is supported (OIDC Core 5.5, issue
+    /// #15). `true` once the authorization endpoint parses `claims` and both
+    /// placements honor it; [`DiscoveryCapabilities::from_config`] sets it, so
+    /// discovery advertises exactly what the server does.
+    claims_parameter_supported: bool,
 }
 
 impl DiscoveryCapabilities {
     /// The capabilities implied by live configuration.
     ///
-    /// The authorization endpoint now emits the RFC 9207 `iss` on every
-    /// authorization response, success and error, on every response mode (issue
-    /// #13), so discovery advertises
-    /// `authorization_response_iss_parameter_supported = true`. The remaining
-    /// per-environment features (legacy response types, `form_post`) stay off until
-    /// their owning issue (#17) wires their flags in here; discovery reflects each
-    /// with no change to the generator.
+    /// The `claims` request parameter is supported (issue #15) and the
+    /// authorization endpoint emits the RFC 9207 `iss` on every authorization
+    /// response, success and error, on every response mode (issue #13); discovery
+    /// advertises both. The remaining per-environment features (legacy response
+    /// types, `form_post`) stay off until their owning issue (#17) wires their flags
+    /// in here; discovery reflects each with no change to the generator.
     #[must_use]
     pub fn from_config(_config: &OidcConfig) -> Self {
-        Self::default().with_authorization_response_iss(true)
+        Self::default()
+            .with_claims_parameter(true)
+            .with_authorization_response_iss(true)
+    }
+
+    /// Declare whether the `claims` request parameter is supported (issue #15).
+    #[must_use]
+    pub fn with_claims_parameter(mut self, supported: bool) -> Self {
+        self.claims_parameter_supported = supported;
+        self
     }
 
     /// Enable a legacy response type for this environment (issue #17).
@@ -292,10 +327,7 @@ pub fn discovery_document(
             PromptValue::ALL.iter().map(|value| value.as_str())
         )),
     );
-    document.insert(
-        "claims_supported".to_owned(),
-        json!(ID_TOKEN_CLAIMS_SUPPORTED),
-    );
+    document.insert("claims_supported".to_owned(), json!(claims_supported()));
     // The ACR values this OP can actually achieve, sourced from the authentication
     // registry (issue #14) so discovery never advertises a level we cannot reach.
     document.insert(
@@ -310,7 +342,10 @@ pub fn discovery_document(
     // issue #13).
     document.insert("request_parameter_supported".to_owned(), json!(false));
     document.insert("request_uri_parameter_supported".to_owned(), json!(false));
-    document.insert("claims_parameter_supported".to_owned(), json!(false));
+    document.insert(
+        "claims_parameter_supported".to_owned(),
+        json!(capabilities.claims_parameter_supported),
+    );
     document.insert(
         "authorization_response_iss_parameter_supported".to_owned(),
         json!(capabilities.authorization_response_iss_parameter_supported),

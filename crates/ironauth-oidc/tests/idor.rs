@@ -61,6 +61,7 @@ async fn oidc_probes_deny_cross_scope_redeem_and_token_status() {
                 auth_time_micros: None,
                 session_ref: None,
                 consent_ref: None,
+                claims_request: None,
                 expires_at_micros: FAR_FUTURE_MICROS,
                 created_at_micros: 0,
             },
@@ -91,7 +92,11 @@ async fn oidc_probes_deny_cross_scope_redeem_and_token_status() {
     idor.register_oidc_probes();
     assert_eq!(
         idor.probe_names(),
-        vec!["authorization_codes.redeem", "issued_tokens.token_status"],
+        vec![
+            "authorization_codes.redeem",
+            "issued_tokens.token_status",
+            "issued_tokens.resolve_access_token",
+        ],
         "every OIDC resolve-by-id operation is registered",
     );
 
