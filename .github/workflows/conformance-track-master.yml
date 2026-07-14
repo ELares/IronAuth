@@ -43,6 +43,11 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Provision the OIDF runner dependencies (hash pinned)
+        run: python3 -m pip install --require-hashes -r deploy/conformance/requirements.txt
       - name: Drive the matrix against suite master (untrusted; report only)
         # SUITE_SERVER_IMAGE / SUITE_HTTPD_IMAGE are overridden to the master tag
         # for this run only. A failure here is an early warning, not a block.

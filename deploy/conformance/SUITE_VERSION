@@ -12,6 +12,15 @@
 # are informational (which upstream release the digest was taken from); the
 # *_IMAGE values in digest form are what compose actually resolves.
 #
+# That rule is ENFORCED, and enforced over the whole harness, not just this file:
+# scripts/conformance-check.sh scans EVERY file under deploy/conformance (shell
+# scripts included) and fails on any `image:` key or `docker run` that is not
+# pinned by @sha256:. It previously scanned only docker-compose.yml, which is how
+# seed.sh came to run a mutable `alpine:3.20` inside the gate lane, with a package
+# installed from the network at run time, while this file claimed otherwise. The
+# seed now installs a COMMITTED Argon2id hash (cert-user-password.phc) and pulls
+# no image at all.
+#
 # HOW TO RESOLVE OR BUMP A DIGEST (owner/infra step; needs registry network):
 #     docker pull <image>:<tag>
 #     docker image inspect <image>:<tag> --format '{{index .RepoDigests 0}}'

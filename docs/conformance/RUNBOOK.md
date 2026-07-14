@@ -7,9 +7,14 @@ one-command local reproduction in
 
 ## Owner/infra actions still outstanding
 
-The harness is complete and its runner-independent half is verified on every PR.
-The following require registry network access and repo settings, so they are
-owner actions and are NOT done in the repo:
+This list is the honest, COMPLETE account of what is not done. Until every item
+below is finished, the live conformance lane drives zero plans and enforces
+nothing; it is advisory, it is named so, and it prints a `NOT ENFORCING` banner.
+The runner-independent half (`scripts/conformance-check.sh` plus the Rust
+confinement and seed tests) is verified on every PR and is what enforces today.
+
+The items below need registry network access, a real suite runner, or repo
+settings, so they are owner actions and are NOT done in the repo:
 
 1. Resolve the real image digests. The digests in
    [`deploy/conformance/SUITE_VERSION`](../../deploy/conformance/SUITE_VERSION)
@@ -35,18 +40,52 @@ owner actions and are NOT done in the repo:
    likely to need a per-release tweak; validate it first.
 
 3. Provide the OIDF Python runner. Vendor or install `run-test-plan.py` from the
-   pinned suite release so `run-conformance.sh` can drive plans. Pin the runner's
-   Python deps from `deploy/conformance/requirements.txt`.
+   pinned suite release and put it on PATH, so `run-conformance.sh` can drive
+   plans. Its Python dependencies are already exact- and hash-pinned in
+   `deploy/conformance/requirements.txt`, and every workflow that drives the
+   suite installs them with `pip install --require-hashes`, so there is nothing
+   to pin by hand; only the runner script itself is missing.
 
-4. Set the repository variable `CONFORMANCE_ENABLED=true`. Until then both the
-   merge-gate `conformance` job and the nightly workflows are skipped (never a
-   false red).
+   Until it is on PATH, `run-conformance.sh` exits 1 with a diagnostic. That is
+   deliberate: it used to `continue` past a missing runner and exit 0, so a CI
+   run that drove ZERO plans reported the conformance gate as GREEN. A harness
+   that cannot run the suite must never report the suite as passing.
 
-5. Promote the merge-gate check to required. Add the `OIDF conformance
-   (merge-gate subset)` check to the default branch's protection rules. This is a
-   repo-settings decision and is intentionally not automatable from the repo.
+4. Validate the generated plan config against the real runner. `run-conformance.sh`
+   generates each plan's config from `profile-matrix.yaml` via
+   `gen-plan-config.py` (issuer, discovery URL, and browser-automation login all
+   come from the matrix, so the exact-string issuer has one definition). The
+   shape is asserted on every PR, but it has never been fed to the actual OIDF
+   runner. On the first live run, confirm against the pinned release:
+   - the config schema (`server.discoveryUrl`, the `browser` automation block,
+     and the form field ids the login and consent pages actually render);
+   - the plan-spec variant syntax `plan-id[k=v,...]` that the runner is invoked
+     with, which is the other thing only a live runner can confirm.
+   Expect this and the CA truststore (step 2) to be the two steps that need a
+   per-release tweak.
 
-6. Confirm the DCR posture end to end. The cert config uses
+5. Set the repository variable `CONFORMANCE_ENABLED=true`. Until then the
+   `conformance-live` job still RUNS (it is never skipped, because a skipped job
+   reports to branch protection as SUCCESS) but it drives nothing and prints a
+   `NOT ENFORCING` banner. The nightly workflows are inert until it is set; they
+   are scheduled-only and never required checks, so nothing there can be turned
+   green by a skip.
+
+6. Promote the live check to required, and rename it. Only after steps 1 to 5 are
+   done and a live run is genuinely green: rename the `conformance-live` job (its
+   name currently says `advisory until provisioned; NOT a gate`, which must stop
+   being true before it becomes a gate) and add it to the default branch's
+   protection rules. Adding it while it is advisory would make a required check
+   out of a job that verifies nothing. This is a repo-settings decision and is
+   intentionally not automatable from the repo.
+
+7. Demonstrate the seeded regression. Run one of the three seeded regressions in
+   [MATRIX.md](MATRIX.md) against the live suite, confirm the gate goes RED, and
+   revert to green. The mechanism is documented and each seed is a single reviewed
+   line, but the demonstration itself needs the runner, so the acceptance
+   criterion is NOT yet satisfied.
+
+8. Confirm the DCR posture end to end. The cert config uses
    `registration_mode = "open"` (the only anonymous mode) so the suite registers
    its own clients. A DCR-created client starts quarantined (consent shown,
    redirect set restricted to what it registered), which is compatible with the

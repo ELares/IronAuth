@@ -1,12 +1,50 @@
 # SPDX-License-Identifier: MIT OR Apache-2.0
 #
-# Python dependencies for the conformance runner wrapper (run-conformance.sh).
-# The results gate (parse_results.py) and its unit tests are standard-library
-# only and need NONE of these, so the always-on static check lane runs without
-# installing anything. These are only for driving the LIVE suite from the
-# provisioned runner.
+# Python dependencies for the conformance harness, EXACTLY pinned and HASH pinned.
 #
-# Pin exact versions when the runner is provisioned (an owner action) so a run is
-# reproducible; the ranges below are the known-good floors.
-requests>=2.31
-PyYAML>=6.0
+# A harness whose stated property is determinism cannot install floating version
+# ranges: a range means a rerun months later resolves different code, which is
+# the same rot that pinning every image by digest exists to prevent. So every
+# package here, including the full transitive closure, is pinned to ONE version
+# and ONE artifact hash. Install with --require-hashes so pip REFUSES anything
+# whose bits do not match:
+#
+#     pip install --require-hashes -r requirements.txt
+#
+# The hashes are for CPython 3.12 on linux x86_64, which is what CI pins with
+# actions/setup-python (see .github/workflows/ci.yml). That is deliberate: a hash
+# pin is only meaningful against a fixed interpreter and platform. On another
+# platform (a developer's macOS box) the wheel legitimately differs, so the
+# hashes cannot match there; install the same exact versions without the flag:
+#
+#     pip install -r requirements.txt
+#
+# WHO NEEDS WHAT
+#   PyYAML    the profile-matrix parser. Needed by the ALWAYS-ON static check
+#             lane (scripts/conformance-check.sh) and by run-conformance.sh.
+#   requests  the OIDF runner's HTTP client. Needed only to drive the LIVE suite.
+# The results gate (parse_results.py) and its unit tests are standard-library
+# only and need nothing from this file.
+#
+# TO BUMP: change the version, then re-resolve the hash with
+#     pip download --no-deps --only-binary=:all: \
+#         --platform manylinux2014_x86_64 --python-version 3.12 \
+#         --implementation cp --abi cp312 <pkg>==<version>
+#     pip hash <the downloaded artifact>
+
+PyYAML==6.0.2 \
+    --hash=sha256:80bab7bfc629882493af4aa31a4cfa43a4c57c83813253626916b8c7ada83476
+
+requests==2.32.3 \
+    --hash=sha256:70761cfe03c773ceb22aa2f671b4757976145175cdfca038c02654d061d6dcc6
+
+# requests' transitive closure. --require-hashes demands that every dependency be
+# pinned as well, which is exactly the point: nothing enters the harness unpinned.
+certifi==2024.8.30 \
+    --hash=sha256:922820b53db7a7257ffbda3f597266d435245903d80737e34f8a45ff3e3230d8
+charset-normalizer==3.4.0 \
+    --hash=sha256:8cda06946eac330cbe6598f77bb54e690b4ca93f593dee1568ad22b04f347c15
+idna==3.10 \
+    --hash=sha256:946d195a0d259cbba61165e88e65941f16e9b36ea6ddb97f00452bae8b1287d3
+urllib3==2.2.3 \
+    --hash=sha256:ca899ca043dcb1bafa3e262d73aa25c465bfb49e0bd9dd5d59f1d0acba2f8fac

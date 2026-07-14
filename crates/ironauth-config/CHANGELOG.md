@@ -13,6 +13,11 @@ range per docs/RELEASING.md.
   default keeps every one off. This proves the cert config parses under the
   strict schema and that the security downgrades cannot leak into the default
   posture. No library change; a test only.
+  - `oidc.registration_mode = "open"` (anonymous, unauthenticated DCR) is now in
+    the CONFINEMENT set, not only asserted on the cert side. It is one of the
+    downgrades the cert config turns on, so nothing previously checked that it
+    stayed OUT of the shipped default: open DCR could have leaked into the
+    default posture with no test going red.
 - Add the device-authorization knobs (issue #24, RFC 8628):
   - `oidc.device_code_ttl_secs` (default 600, validated to `1..=OIDC_MAX_DEVICE_CODE_TTL_SECS`
     = 1800): the short lifetime a device code and its user code are valid for.

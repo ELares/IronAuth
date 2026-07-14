@@ -33,8 +33,18 @@ fn repo_path(relative: &str) -> PathBuf {
 
 /// The full set of cert-only downgrade toggles this harness turns on. Reading a
 /// bool off the parsed config keeps the two assertions below in lockstep.
-fn downgrades(config: &Config) -> [(&'static str, bool); 6] {
+fn downgrades(config: &Config) -> [(&'static str, bool); 7] {
     [
+        // ANONYMOUS (unauthenticated) dynamic client registration. This is one of
+        // the downgrades the cert config turns on, so it belongs in the
+        // CONFINEMENT set, not only in the cert-side assertion below: without it
+        // here, open DCR could leak into the shipped default and no test would
+        // notice. It is an enum rather than a bool, so it is compared here and
+        // surfaced as a bool like the rest.
+        (
+            "oidc.registration_mode_open",
+            config.oidc.registration_mode == ironauth_config::RegistrationMode::Open,
+        ),
         (
             "oidc.enable_response_type_id_token",
             config.oidc.enable_response_type_id_token,

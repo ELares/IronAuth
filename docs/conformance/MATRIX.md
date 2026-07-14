@@ -35,7 +35,38 @@ profile and prints `not-yet-enabled: <plan> (blocked by <issue>)`; it never
 feeds a fabricated result to the gate. The results gate itself
 (`parse_results.py`) only ever sees the enabled profiles' real results and fails
 on any non-PASS among them, and it treats a run with zero modules as a vacuous
-failure. So there is no path by which an unimplemented profile counts as green.
+failure. `gen-plan-config.py` refuses outright to render a runner config for a
+disabled profile, and `scripts/conformance-check.sh` asserts that refusal on
+every PR. So no unimplemented profile can count as green.
+
+The narrower claim above is about DEFERRED PROFILES, and it is the only thing
+this section claims. It is emphatically NOT a claim that the live conformance
+lane is currently enforcing anything, because it is not: the OIDF runner is not
+provisioned in this repo, so the live suite drives ZERO plans today (see
+[README.md](README.md) for exactly what enforces now versus what is owner-gated,
+and the RUNBOOK for the outstanding owner actions). An earlier version of this
+document said "there is no path by which an unimplemented profile counts as
+green" in a way that read as a guarantee about the gate as a whole. It was not
+one, and the harness had three fail-open paths at the time. What now backs the
+claim, mechanically:
+
+- `run-conformance.sh` FAILS CLOSED. It exits 0 only after actually driving at
+  least one plan through the live suite with every module passing. A missing
+  OIDF runner, an empty profile selection, a crashed selector, or a plan config
+  that cannot be rendered are each a non-zero exit, not a skip.
+- The live CI lane is **not a gate and is named so it cannot be mistaken for
+  one** (`OIDF conformance live suite (advisory until provisioned; NOT a gate)`).
+  It always runs, and when the suite is not provisioned it prints a `NOT
+  ENFORCING` banner instead of posing as a passing check. It has no job-level
+  `if:`, because GitHub reports a SKIPPED job to branch protection as SUCCESS: a
+  required check gated on a repository variable would turn silently green the
+  moment that variable was unset or mistyped.
+- The conformance checks that DO enforce today are the always-on static lane
+  (`scripts/conformance-check.sh`, in the `invariants` job), which no repository
+  variable gates. It runs the results-gate unit tests, validates the matrix,
+  renders every enabled profile's runner config, verifies every image reference
+  under `deploy/conformance` is digest-pinned, and re-checks downgrade
+  confinement, on every PR.
 
 When a logout dependency merges, flip that profile to `enabled: true` in the
 SAME PR, so the gate starts holding it exactly when the surface becomes real.
@@ -54,6 +85,15 @@ ONLY in `deploy/conformance/ironauth.toml`; the shipped default
   this test goes red.
 - `scripts/conformance-check.sh` re-asserts the same thing with a fast grep, so
   it is also caught in the always-on static lane without a compile.
+
+The confinement set is: `enable_response_type_id_token`,
+`enable_response_type_code_id_token`, `enable_response_type_none`,
+`enable_response_mode_form_post`, `registration_enabled`, a disabled DCR rate
+limit, and `registration_mode = "open"`. That last one is anonymous,
+unauthenticated client registration, and it was previously asserted only on the
+CERT side: nothing checked that it stayed OUT of the shipped default, so open DCR
+could have leaked into the default posture with no test going red. It is now in
+the confinement set on both sides, in the Rust test and in the shell complement.
 
 ## Coverage vs protocol surface
 
