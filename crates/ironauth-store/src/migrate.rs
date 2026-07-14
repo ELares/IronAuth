@@ -260,6 +260,9 @@ CREATE TABLE IF NOT EXISTS _schema_migrations ( \
 /// [`MigrationRunner::from_migrations`]
 /// against a throwaway test database, so all three phases are exercised in CI
 /// without ever touching the real schema.
+// A flat, linear list of the shipped migrations (one struct literal each); it grows
+// by one entry per issue and is clearer as a single list than split across helpers.
+#[allow(clippy::too_many_lines)]
 fn registry() -> Vec<Migration> {
     vec![
         Migration {
@@ -357,6 +360,12 @@ fn registry() -> Vec<Migration> {
             name: "refresh_tokens",
             phase: Phase::Expand,
             sql: include_str!("../migrations/0016_refresh_tokens.sql"),
+        },
+        Migration {
+            version: 17,
+            name: "client_credentials_service_accounts",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0017_client_credentials_service_accounts.sql"),
         },
     ]
 }

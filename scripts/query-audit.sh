@@ -63,7 +63,11 @@ cd "$(git rev-parse --show-toplevel)"
 # refresh_families and refresh_tokens (#21) are the refresh-token rotation tables:
 # the revocation spine and the digest-only generation store. Both are TENANT-SCOPED
 # with forced row-level security, so their SQL stays in the repository module too.
-SCOPED_TABLES='clients|organizations|audit_log|management_credentials|idempotency_keys|grants|authorization_codes|issued_tokens|signing_keys|users|sessions|consents|resource_servers|opaque_access_tokens|client_assertion_jtis|client_auth_diagnostics|pushed_authorization_requests|refresh_families|refresh_tokens'
+#
+# service_accounts (#23) is the client-credentials service-account principal table:
+# the (client -> stable machine-`sub`) mapping. TENANT-SCOPED with forced row-level
+# security, so its SQL stays in the repository module too.
+SCOPED_TABLES='clients|organizations|audit_log|management_credentials|idempotency_keys|grants|authorization_codes|issued_tokens|signing_keys|users|sessions|consents|resource_servers|opaque_access_tokens|client_assertion_jtis|client_auth_diagnostics|pushed_authorization_requests|refresh_families|refresh_tokens|service_accounts'
 
 # The one module allowed to name a scoped table in SQL.
 REPO_MODULE='crates/ironauth-store/src/repository.rs'

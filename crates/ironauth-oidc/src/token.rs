@@ -116,6 +116,10 @@ pub struct TokenParams {
     /// The refresh token to redeem for the `refresh_token` grant (issue #21). A
     /// single-use rotating bearer credential, so it is redacted from `Debug`.
     pub refresh_token: Option<String>,
+    /// The requested OAuth `scope` for the `client_credentials` grant (RFC 6749
+    /// 4.4.2, issue #23). Optional; when present it is validated against the M2M
+    /// scope policy and echoed into the issued token.
+    pub scope: Option<String>,
 }
 
 impl fmt::Debug for TokenParams {
@@ -164,6 +168,9 @@ async fn exchange(
             authorization_code_grant(state, headers, params).await
         }
         Some(GrantType::RefreshToken) => refresh_token_grant(state, headers, params).await,
+        Some(GrantType::ClientCredentials) => {
+            crate::client_credentials::client_credentials_grant(state, headers, params).await
+        }
         None => Err(TokenError::UnsupportedGrantType),
     }
 }
@@ -598,7 +605,7 @@ fn client_actor(state: &OidcState, scope: Scope, client_id: &str) -> ActorRef {
 }
 
 /// A `200 OK` JSON token response with the no-store cache headers.
-fn token_ok(body: &str) -> Response {
+pub(crate) fn token_ok(body: &str) -> Response {
     (
         StatusCode::OK,
         [
@@ -613,7 +620,7 @@ fn token_ok(body: &str) -> Response {
 
 /// Map a store error at redemption: a not-found (out-of-scope code) is a uniform
 /// `invalid_grant`; anything else is an opaque server error.
-fn map_store_error(error: StoreError) -> TokenError {
+pub(crate) fn map_store_error(error: StoreError) -> TokenError {
     match error {
         StoreError::NotFound => TokenError::InvalidGrant,
         other => {

@@ -29,6 +29,9 @@ scripts/query-audit.sh
 echo "==> http audit (ironauth-fetch is the only outbound HTTP path)"
 scripts/http-audit.sh
 
+echo "==> no M2M metering (no metering/billing/quota hook on the client-credentials path)"
+scripts/no-m2m-metering.sh
+
 echo "==> dash scan"
 scripts/dash-scan.sh
 
