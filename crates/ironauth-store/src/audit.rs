@@ -125,6 +125,15 @@ pub enum Action {
     ClientDelete,
     /// A client's registered redirect URIs were set (issue #13).
     ClientRedirectUrisRegister,
+    /// A client was registered through Dynamic Client Registration (issue #30,
+    /// RFC 7591). Distinct from [`Action::ClientCreate`] so a self-service DCR
+    /// registration is legible in the audit trail as such.
+    ClientRegistered,
+    /// A dynamically registered client's configuration was updated through the
+    /// RFC 7592 management endpoint (issue #30). Every successful update also
+    /// ROTATES the client's registration access token in the same transaction, so
+    /// this one action covers the metadata change and the token rotation together.
+    ClientUpdated,
     /// A tenant was created (management plane, issue #11).
     TenantCreate,
     /// A tenant was deactivated (management plane, issue #11).
@@ -169,6 +178,8 @@ impl Action {
             Action::ClientCreate => "client.create",
             Action::ClientDelete => "client.delete",
             Action::ClientRedirectUrisRegister => "client.redirect_uris.register",
+            Action::ClientRegistered => "client.registered",
+            Action::ClientUpdated => "client.updated",
             Action::TenantCreate => "tenant.create",
             Action::TenantDelete => "tenant.delete",
             Action::EnvironmentCreate => "environment.create",

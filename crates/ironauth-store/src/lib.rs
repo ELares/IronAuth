@@ -86,14 +86,15 @@ pub use repository::{
     ActingTenantRepo, ActingUserRepo, ActiveOpaqueToken, AuditRecord, AuditRepo, AuthorizationRepo,
     ClientAssertionJtiRepo, ClientAuthDiagnosticReason, ClientAuthDiagnosticRecord,
     ClientAuthDiagnosticsRepo, ClientAuthRecord, ClientRecord, ClientRepo, CodeBindings,
-    ConsentRepo, CursorPosition, EnvironmentRecord, EnvironmentRepo, GrantedConsent,
-    IdempotencyRepo, IdempotencyWrite, IssueCode, IssuedTokenRecord, JtiOutcome,
-    MANAGEMENT_LIST_HARD_CAP, ManagementCredentialRecord, ManagementCredentialRepo,
-    ManagementStore, NewClientAuthDiagnostic, NewJwtAuthClient, NewOpaqueAccessToken,
-    NewResourceServer, NewSigningKey, RedeemOutcome, ResourceServerRecord, ResourceServerRepo,
-    ScopedStore, SessionRecord, SessionRepo, SigningKeyMaterial, SigningKeyMaterialKind,
-    SigningKeyRecord, SigningKeyRepo, StoredIdempotentResponse, TenantRecord, TenantRepo,
-    TokenFormat, TokenKind, TokenStatus, UserRecord, UserRepo, opaque_access_token_digest,
+    ConsentRepo, CursorPosition, DynamicClientRecord, DynamicClientRegistration,
+    DynamicClientUpdate, EnvironmentRecord, EnvironmentRepo, GrantedConsent, IdempotencyRepo,
+    IdempotencyWrite, IssueCode, IssuedTokenRecord, JtiOutcome, MANAGEMENT_LIST_HARD_CAP,
+    ManagementCredentialRecord, ManagementCredentialRepo, ManagementStore, NewClientAuthDiagnostic,
+    NewDynamicClient, NewJwtAuthClient, NewOpaqueAccessToken, NewResourceServer, NewSigningKey,
+    RedeemOutcome, ResourceServerRecord, ResourceServerRepo, ScopedStore, SessionRecord,
+    SessionRepo, SigningKeyMaterial, SigningKeyMaterialKind, SigningKeyRecord, SigningKeyRepo,
+    StoredIdempotentResponse, TenantRecord, TenantRepo, TokenFormat, TokenKind, TokenStatus,
+    UserRecord, UserRepo, opaque_access_token_digest,
 };
 pub use scope::Scope;
 pub use store::Store;

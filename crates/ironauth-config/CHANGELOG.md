@@ -6,6 +6,11 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Add `oidc.registration_enabled` (issue #30), a plain default-off flag gating the
+  Dynamic Client Registration endpoint (`/connect/register`). Off keeps the
+  endpoint unmounted and undiscoverable, the safe posture; the real abuse gating
+  (quotas, quarantine, initial-access-token policy) is owned by issue #31.
+
 - Add the JWT client-assertion authentication knobs (issue #25), shared with the
   JWT bearer grant (#26):
   - `oidc.client_assertion_audience`, a `ClientAssertionAudience` enum selecting
