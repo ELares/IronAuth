@@ -31,7 +31,10 @@
 //! - `token_endpoint_auth_method` defaults to `client_secret_basic`;
 //! - `response_types` defaults to `["code"]`, `grant_types` to
 //!   `["authorization_code"]` (the only flow this provider serves);
-//! - `id_token_signed_response_alg` defaults to `RS256`.
+//! - `id_token_signed_response_alg`, when omitted, records the ENVIRONMENT's actual
+//!   default signing algorithm (the algorithm the mint will sign this client's ID
+//!   tokens with), not the abstract RS256 spec default the environment may be unable
+//!   to honor.
 //!
 //! `token_endpoint_auth_method` and every algorithm value are validated against
 //! the ACTUALLY IMPLEMENTED client-authentication suite (issue #25,
@@ -51,10 +54,17 @@
 //!
 //! `id_token_signed_response_alg` may be supplied as an ARRAY of acceptable values
 //! (RP Metadata Choices 1.0), either under that name or under the plural
-//! `id_token_signed_response_alg_values`. The OP selects the best mutual option:
-//! it PREFERS `EdDSA` when the RP offers it, falls back to `RS256`, and otherwise
-//! takes the first offered value it can represent. The negotiated value is recorded
-//! on the client and echoed in the registration response.
+//! `id_token_signed_response_alg_values`. The OP negotiates against the algorithms
+//! the ENVIRONMENT can ACTUALLY sign with (each permitted by the environment policy
+//! AND backed by a loaded, active signing key), NOT the advertised
+//! `id_token_signing_alg_values` (which carries the RS256 discovery floor even where
+//! no RS256 key exists). Of the offered algorithms the environment can sign with, it
+//! PREFERS `EdDSA`, falls back to `RS256`, and otherwise takes the first mutual
+//! value. An offered set with NOTHING the environment can sign is REJECTED with
+//! `invalid_client_metadata` (never silently downgraded). The negotiated value is
+//! recorded on the client and echoed in the registration response, and the token
+//! endpoint signs THAT client's ID token under exactly that algorithm, so the
+//! recorded value equals the algorithm the OP actually uses.
 //!
 //! # Credentials at rest (never plaintext)
 //!
@@ -64,6 +74,8 @@
 //! successful update) and never persisted. Every value the OP mints (the client
 //! id, the secret, the registration access token) is drawn from the environment
 //! entropy seam.
+
+use std::time::SystemTime;
 
 use axum::body::Bytes;
 use axum::extract::{Path, State};
@@ -80,6 +92,7 @@ use ironauth_store::{
 use serde_json::{Value, json};
 
 use crate::client_auth::{ClientAuthMethod, generate_secret, hash_secret};
+use crate::issuer::IssuerEntry;
 use crate::state::OidcState;
 use crate::util::{client_service_actor, epoch_micros};
 use crate::wellknown::{not_found, parse_scope};
@@ -88,10 +101,6 @@ use crate::wellknown::{not_found, parse_scope};
 /// from the entropy seam and base64url-encoded (URL-safe, no padding) so the token
 /// is safe in an `Authorization: Bearer` header and in the response body.
 const REGISTRATION_TOKEN_BYTES: usize = 32;
-
-/// The spec-default `id_token_signed_response_alg` when the client expresses no
-/// preference (OIDC Core section 2 / Dynamic Client Registration).
-const DEFAULT_ID_TOKEN_ALG: &str = "RS256";
 
 /// The spec-default `token_endpoint_auth_method` when omitted (RFC 7591 section 2).
 const DEFAULT_AUTH_METHOD: &str = "client_secret_basic";
@@ -114,7 +123,14 @@ pub async fn register(
         return metadata_error("the request body must be a JSON object");
     };
 
-    let validated = match validate_metadata(&state, metadata, None).await {
+    // The environment's real ID-token signing capability drives the algorithm
+    // negotiation, so a recorded `id_token_signed_response_alg` is always one the OP
+    // can and will sign this client's ID tokens with (issue #30).
+    let Some((signable, default_alg)) = env_signing_capability(&state, &scope).await else {
+        return server_error();
+    };
+
+    let validated = match validate_metadata(&state, metadata, None, &signable, default_alg).await {
         Ok(validated) => validated,
         Err(error) => return error.into_response(),
     };
@@ -228,10 +244,15 @@ pub async fn update(
         return metadata_error("the request body must be a JSON object");
     };
 
-    let validated = match validate_metadata(&state, metadata, Some(&record)).await {
-        Ok(validated) => validated,
-        Err(error) => return error.into_response(),
+    let Some((signable, default_alg)) = env_signing_capability(&state, &scope).await else {
+        return server_error();
     };
+
+    let validated =
+        match validate_metadata(&state, metadata, Some(&record), &signable, default_alg).await {
+            Ok(validated) => validated,
+            Err(error) => return error.into_response(),
+        };
 
     // Rotate the registration access token on every successful update: mint a fresh
     // one, store only its new hash, and hand back the plaintext. The superseded
@@ -374,11 +395,16 @@ struct ValidatedMetadata {
 /// unrecognized properties, negotiating the ID token algorithm, and (for a
 /// `jwks_uri`) fetching through the SSRF-hardened fetcher. `existing` is the record
 /// being updated (RFC 7592), so the auth-method transition rules apply; `None` for
-/// a fresh registration.
+/// a fresh registration. `signable` is the set of algorithms the environment can
+/// actually sign an ID token with (the negotiation constrains to it), and
+/// `default_alg` is the environment's default signing algorithm (recorded when the
+/// client expresses no `id_token_signed_response_alg` preference).
 async fn validate_metadata(
     state: &OidcState,
     metadata: &serde_json::Map<String, Value>,
     existing: Option<&DynamicClientRecord>,
+    signable: &[JwsAlgorithm],
+    default_alg: JwsAlgorithm,
 ) -> Result<ValidatedMetadata, RegistrationError> {
     let application_type = match metadata.get("application_type") {
         None => "web".to_owned(),
@@ -416,7 +442,7 @@ async fn validate_metadata(
         }
     }
 
-    let id_token_signed_response_alg = negotiate_id_token_alg(metadata)?;
+    let id_token_signed_response_alg = negotiate_id_token_alg(metadata, signable, default_alg)?;
     let token_endpoint_auth_signing_alg = validate_signing_alg(metadata)?;
     let (jwks, jwks_uri) = validate_client_keys(state, metadata, auth_method).await?;
 
@@ -524,35 +550,84 @@ fn redirect_allowed(uri: &str, application_type: &str) -> bool {
     true
 }
 
-/// Negotiate `id_token_signed_response_alg` (RP Metadata Choices 1.0). The RP may
-/// offer a single value or an array of acceptable values (under the singular name
-/// or the plural `id_token_signed_response_alg_values`). The OP prefers `EdDSA`,
-/// then `RS256`, then the first representable offered value; an offered set with no
-/// representable algorithm is rejected. Omission takes the `RS256` default.
+/// The environment's ID-token signing capability for `scope`: the algorithms it can
+/// ACTUALLY sign an ID token with (each permitted by the environment policy AND
+/// backed by an active loaded key), in preference order, plus its DEFAULT signing
+/// algorithm (what the mint uses when a client expresses no per-client preference).
+///
+/// `None` when the environment has no active signing key, which the caller maps to a
+/// `server_error`: a client whose ID tokens could never be signed is never stored,
+/// so registration cannot record an algorithm the OP would not honor.
+async fn env_signing_capability(
+    state: &OidcState,
+    scope: &Scope,
+) -> Option<(Vec<JwsAlgorithm>, JwsAlgorithm)> {
+    let entry = state.issuer_entry(scope).await?;
+    let now = state.now();
+    let default_alg = entry.signer(now)?.algorithm();
+    Some((signable_id_token_algs(&entry, now), default_alg))
+}
+
+/// The algorithms this environment can ACTUALLY sign an ID token with at `now`, in
+/// the policy's preference order: each is permitted by the environment policy AND
+/// has an active signing key in the key set.
+///
+/// This is deliberately NOT the discovery `id_token_signing_alg_values`, which
+/// carries the RS256 "floor" (Discovery section 3) even in an environment that has
+/// NO RS256 key loaded. Negotiating against the floor would record an algorithm the
+/// mint could never sign with (no key), so the negotiation constrains to exactly the
+/// algorithms a signing key exists for.
+fn signable_id_token_algs(entry: &IssuerEntry, now: SystemTime) -> Vec<JwsAlgorithm> {
+    entry
+        .policy()
+        .allowed()
+        .iter()
+        .copied()
+        .filter(|&alg| entry.keyset().active_signer_for(now, alg).is_some())
+        .collect()
+}
+
+/// Negotiate `id_token_signed_response_alg` (RP Metadata Choices 1.0) against the
+/// algorithms the environment can ACTUALLY sign with (`signable`). The RP may offer a
+/// single value or an array of acceptable values (under the singular name or the
+/// plural `id_token_signed_response_alg_values`).
+///
+/// Of the offered algorithms the environment can sign with, the OP prefers `EdDSA`,
+/// then `RS256`, then the first mutual value. An offered set with NOTHING the
+/// environment can sign is REJECTED with `invalid_client_metadata`, never silently
+/// downgraded to an algorithm the RP never offered or the OP cannot sign with.
+/// Omission records `default_alg` (the environment's actual default signing
+/// algorithm). Every outcome equals the algorithm the mint will sign this client's
+/// ID token with, so the recorded and echoed value can never diverge from the
+/// signed algorithm.
 fn negotiate_id_token_alg(
     metadata: &serde_json::Map<String, Value>,
+    signable: &[JwsAlgorithm],
+    default_alg: JwsAlgorithm,
 ) -> Result<String, RegistrationError> {
-    let candidates = id_token_alg_candidates(metadata)?;
-    let Some(candidates) = candidates else {
-        return Ok(DEFAULT_ID_TOKEN_ALG.to_owned());
+    let Some(candidates) = id_token_alg_candidates(metadata)? else {
+        // No preference: record the environment's actual default signing algorithm.
+        return Ok(default_alg.as_jose_name().to_owned());
     };
-    let supported: Vec<JwsAlgorithm> = candidates
+    // The offered, representable algorithms the environment can actually sign with,
+    // in the RP's offered order.
+    let mutual: Vec<JwsAlgorithm> = candidates
         .iter()
         .filter_map(|name| JwsAlgorithm::from_jose_name(name))
+        .filter(|alg| signable.contains(alg))
         .collect();
-    if supported.is_empty() {
+    let Some(&first) = mutual.first() else {
         return Err(RegistrationError::metadata(
-            "no supported id_token_signed_response_alg was offered",
+            "no offered id_token_signed_response_alg is one this issuer can sign with",
         ));
-    }
-    // Prefer EdDSA when the RP offers it, else RS256, else the first offered value
-    // this provider can represent.
-    let chosen = if supported.contains(&JwsAlgorithm::EdDsa) {
+    };
+    // Prefer EdDSA when signable and offered, else RS256, else the first mutual value.
+    let chosen = if mutual.contains(&JwsAlgorithm::EdDsa) {
         JwsAlgorithm::EdDsa
-    } else if supported.contains(&JwsAlgorithm::Rs256) {
+    } else if mutual.contains(&JwsAlgorithm::Rs256) {
         JwsAlgorithm::Rs256
     } else {
-        supported[0]
+        first
     };
     Ok(chosen.as_jose_name().to_owned())
 }
@@ -745,8 +820,8 @@ fn base_metadata(
         &validated.display_name,
         validated.auth_method.as_str(),
         &validated.redirect_uris,
-        &validated.application_type,
-        &validated.id_token_signed_response_alg,
+        Some(&validated.application_type),
+        Some(&validated.id_token_signed_response_alg),
         validated.jwks.as_deref(),
         validated.jwks_uri.as_deref(),
         validated.token_endpoint_auth_signing_alg.as_deref(),
@@ -756,6 +831,12 @@ fn base_metadata(
 
 /// Build the client-metadata portion of an RFC 7592 read response from the stored
 /// record.
+///
+/// The `application_type` and `id_token_signed_response_alg` are surfaced FAITHFULLY
+/// from the stored columns (never substituted with a default): a DCR client always
+/// has both persisted, so a persistence regression that dropped a column would show
+/// as an absent field rather than a masked default, and the round-trip test genuinely
+/// proves persistence.
 fn read_metadata(
     record: &DynamicClientRecord,
     issued_at: i64,
@@ -767,11 +848,8 @@ fn read_metadata(
         &record.display_name,
         &record.auth_method,
         &record.redirect_uris,
-        record.application_type.as_deref().unwrap_or("web"),
-        record
-            .id_token_signed_response_alg
-            .as_deref()
-            .unwrap_or(DEFAULT_ID_TOKEN_ALG),
+        record.application_type.as_deref(),
+        record.id_token_signed_response_alg.as_deref(),
         record.jwks.as_deref(),
         record.jwks_uri.as_deref(),
         record.token_endpoint_auth_signing_alg.as_deref(),
@@ -789,8 +867,8 @@ fn metadata_object(
     display_name: &str,
     auth_method: &str,
     redirect_uris: &[String],
-    application_type: &str,
-    id_token_signed_response_alg: &str,
+    application_type: Option<&str>,
+    id_token_signed_response_alg: Option<&str>,
     jwks: Option<&str>,
     jwks_uri: Option<&str>,
     token_endpoint_auth_signing_alg: Option<&str>,
@@ -804,11 +882,18 @@ fn metadata_object(
     object.insert("token_endpoint_auth_method".to_owned(), json!(auth_method));
     object.insert("grant_types".to_owned(), json!(["authorization_code"]));
     object.insert("response_types".to_owned(), json!(["code"]));
-    object.insert("application_type".to_owned(), json!(application_type));
-    object.insert(
-        "id_token_signed_response_alg".to_owned(),
-        json!(id_token_signed_response_alg),
-    );
+    // Surfaced faithfully: a DCR client always has both persisted, so these are
+    // present with the stored value; a dropped column shows as absent, never a
+    // masked default (issue #30).
+    if let Some(application_type) = application_type {
+        object.insert("application_type".to_owned(), json!(application_type));
+    }
+    if let Some(id_token_signed_response_alg) = id_token_signed_response_alg {
+        object.insert(
+            "id_token_signed_response_alg".to_owned(),
+            json!(id_token_signed_response_alg),
+        );
+    }
     if let Some(jwks_uri) = jwks_uri {
         object.insert("jwks_uri".to_owned(), json!(jwks_uri));
     }
@@ -962,7 +1047,15 @@ mod tests {
             validate_auth_method(&m).expect("method"),
             ClientAuthMethod::Basic
         );
-        assert_eq!(negotiate_id_token_alg(&m).expect("alg"), "RS256");
+        // An omitted id_token_signed_response_alg records the environment's ACTUAL
+        // default signing algorithm (what the mint will sign this client's ID token
+        // with), not the abstract RS256 spec default the environment might be unable
+        // to honor (FIX 1). In an EdDSA-only environment that is EdDSA.
+        let signable = [JwsAlgorithm::EdDsa];
+        assert_eq!(
+            negotiate_id_token_alg(&m, &signable, JwsAlgorithm::EdDsa).expect("alg"),
+            "EdDSA"
+        );
         // response_types / grant_types omitted is accepted (defaults apply).
         check_only(&m, "response_types", "code").expect("default response_types");
         check_only(&m, "grant_types", "authorization_code").expect("default grant_types");
@@ -990,26 +1083,54 @@ mod tests {
     }
 
     #[test]
-    fn metadata_choices_prefer_eddsa_then_rs256() {
-        // EdDSA offered alongside RS256: EdDSA wins.
+    fn metadata_choices_negotiate_against_the_environments_signable_set() {
+        // FIX 1: the negotiation is constrained to the algorithms the environment
+        // can ACTUALLY sign with, so a recorded id_token_signed_response_alg is never
+        // one the OP would refuse to sign this client's ID tokens with.
+
+        // An EdDSA-only environment: EdDSA is the only signable algorithm.
+        let eddsa_only = [JwsAlgorithm::EdDsa];
+        // EdDSA offered alongside RS256: EdDSA wins (offered and signable).
         let m = meta(r#"{"id_token_signed_response_alg":["RS256","EdDSA"]}"#);
-        assert_eq!(negotiate_id_token_alg(&m).expect("alg"), "EdDSA");
-        // The plural RP Metadata Choices name works too.
-        let m = meta(r#"{"id_token_signed_response_alg_values":["ES256","EdDSA"]}"#);
-        assert_eq!(negotiate_id_token_alg(&m).expect("alg"), "EdDSA");
-        // No EdDSA, RS256 present: RS256 wins over ES256.
-        let m = meta(r#"{"id_token_signed_response_alg":["ES256","RS256"]}"#);
-        assert_eq!(negotiate_id_token_alg(&m).expect("alg"), "RS256");
-        // Neither EdDSA nor RS256: the first representable offered value.
+        assert_eq!(
+            negotiate_id_token_alg(&m, &eddsa_only, JwsAlgorithm::EdDsa).expect("alg"),
+            "EdDSA"
+        );
+        // ES256/ES384 offered, but the environment has no ES key: REJECTED, never
+        // recorded (this is the defect the fix closes: it used to record ES256).
         let m = meta(r#"{"id_token_signed_response_alg":["ES256","ES384"]}"#);
-        assert_eq!(negotiate_id_token_alg(&m).expect("alg"), "ES256");
-        // A single string value.
-        let m = meta(r#"{"id_token_signed_response_alg":"RS512"}"#);
-        assert_eq!(negotiate_id_token_alg(&m).expect("alg"), "RS512");
-        // An offered set with nothing representable (ES512 is unrepresentable) is
-        // rejected.
+        assert!(negotiate_id_token_alg(&m, &eddsa_only, JwsAlgorithm::EdDsa).is_err());
+        // Only RS256 offered in an EdDSA-only env (the RS256 discovery FLOOR has no
+        // key here): REJECTED rather than recording an unsignable RS256.
+        let m = meta(r#"{"id_token_signed_response_alg":["RS256"]}"#);
+        assert!(negotiate_id_token_alg(&m, &eddsa_only, JwsAlgorithm::EdDsa).is_err());
+
+        // A dual EdDSA + RS256 environment: BOTH are signable.
+        let dual = [JwsAlgorithm::EdDsa, JwsAlgorithm::Rs256];
+        // EdDSA preferred when offered (plural RP Metadata Choices name too).
+        let m = meta(r#"{"id_token_signed_response_alg_values":["ES256","EdDSA"]}"#);
+        assert_eq!(
+            negotiate_id_token_alg(&m, &dual, JwsAlgorithm::EdDsa).expect("alg"),
+            "EdDSA"
+        );
+        // No EdDSA offered, RS256 offered AND signable: RS256 recorded, because the
+        // mint can and will honor it for this client.
+        let m = meta(r#"{"id_token_signed_response_alg":["RS256"]}"#);
+        assert_eq!(
+            negotiate_id_token_alg(&m, &dual, JwsAlgorithm::EdDsa).expect("alg"),
+            "RS256"
+        );
+        // ES256 (no key) alongside RS256 (a key exists): the ES256 is filtered out,
+        // RS256 chosen.
+        let m = meta(r#"{"id_token_signed_response_alg":["ES256","RS256"]}"#);
+        assert_eq!(
+            negotiate_id_token_alg(&m, &dual, JwsAlgorithm::EdDsa).expect("alg"),
+            "RS256"
+        );
+        // An offered set with nothing signable (ES512 is neither representable nor
+        // backed by a key) is rejected.
         let m = meta(r#"{"id_token_signed_response_alg":["ES512"]}"#);
-        assert!(negotiate_id_token_alg(&m).is_err());
+        assert!(negotiate_id_token_alg(&m, &dual, JwsAlgorithm::EdDsa).is_err());
     }
 
     #[test]

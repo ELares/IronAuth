@@ -20,7 +20,9 @@ use std::time::Duration;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
-use common::{Harness, ISSUER_BASE};
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use common::{Harness, ISSUER_BASE, REDIRECT_URI, form, json as json_body};
 use ironauth_config::OidcConfig;
 use ironauth_fetch::{FetchLimits, Fetcher, RecordingDialer, StaticResolver};
 use ironauth_jose::{JwkSet, SigningKey};
@@ -102,9 +104,27 @@ fn published_jwks(seed: u8) -> String {
         .expect("jwks json")
 }
 
+/// The `alg` from a compact JWS's protected header (the first segment), for
+/// asserting the algorithm a token was actually signed under.
+fn jws_header_alg(jws: &str) -> String {
+    let header_segment = jws.split('.').next().expect("jws has a header segment");
+    let bytes = URL_SAFE_NO_PAD
+        .decode(header_segment)
+        .expect("jws header is base64url");
+    let header: Value = serde_json::from_slice(&bytes).expect("jws header is json");
+    header["alg"]
+        .as_str()
+        .expect("jws header has an alg")
+        .to_owned()
+}
+
 #[tokio::test]
 async fn omitted_metadata_gets_the_per_spec_defaults() {
-    // AC2: RS256 id_token signing, client_secret_basic auth, response_types ["code"].
+    // AC2: client_secret_basic auth, response_types ["code"], application_type web.
+    // The omitted id_token_signed_response_alg records the ENVIRONMENT's actual
+    // default signing algorithm (EdDSA in this eddsa-only harness), the algorithm the
+    // mint will sign this client's ID tokens with, not the abstract RS256 spec
+    // default the environment could not honor (FIX 1).
     let h = Harness::start_with(dcr_config()).await;
     let (status, body) = post_json(
         &h,
@@ -116,7 +136,7 @@ async fn omitted_metadata_gets_the_per_spec_defaults() {
     assert_eq!(body["token_endpoint_auth_method"], "client_secret_basic");
     assert_eq!(body["response_types"], json!(["code"]));
     assert_eq!(body["grant_types"], json!(["authorization_code"]));
-    assert_eq!(body["id_token_signed_response_alg"], "RS256");
+    assert_eq!(body["id_token_signed_response_alg"], "EdDSA");
     assert_eq!(body["application_type"], "web");
     assert!(body["client_id"].is_string(), "a client id is returned");
     assert!(
@@ -180,6 +200,75 @@ async fn an_update_rotates_the_registration_access_token_and_rejects_the_old_one
     let (status, read) = send_json(&h, "GET", &uri, Some(&second_token), None).await;
     assert_eq!(status, StatusCode::OK, "{read}");
     assert_eq!(read["client_name"], "after");
+}
+
+#[tokio::test]
+async fn a_downgrade_to_a_secretless_method_clears_the_stored_secret_hash() {
+    // FIX 3: a PUT that transitions the client to a method needing no secret (`none`)
+    // NULLs any stored secret_hash, so no dead credential material lingers.
+    let h = Harness::start_with(dcr_config()).await;
+    // Register a confidential (client_secret_basic) client, which stores a secret hash.
+    let (status, reg) = post_json(
+        &h,
+        &register_path(&h),
+        json!({
+            "redirect_uris": [REDIRECT_URI],
+            "token_endpoint_auth_method": "client_secret_basic"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{reg}");
+    let client_id = reg["client_id"].as_str().expect("client_id").to_owned();
+    let uri = to_path(reg["registration_client_uri"].as_str().expect("uri"));
+    let token = reg["registration_access_token"]
+        .as_str()
+        .expect("token")
+        .to_owned();
+
+    let id = h
+        .store()
+        .scoped(h.scope())
+        .clients()
+        .parse_id(&client_id)
+        .expect("client id parses");
+    let before = h
+        .store()
+        .scoped(h.scope())
+        .clients()
+        .auth_record(&id)
+        .await
+        .expect("auth record");
+    assert!(
+        before.secret_hash.is_some(),
+        "a client_secret_basic client stores a secret hash"
+    );
+
+    // PUT downgrading to the public (none) method: no secret is needed anymore.
+    let (status, _updated) = send_json(
+        &h,
+        "PUT",
+        &uri,
+        Some(&token),
+        Some(json!({
+            "redirect_uris": [REDIRECT_URI],
+            "token_endpoint_auth_method": "none"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let after = h
+        .store()
+        .scoped(h.scope())
+        .clients()
+        .auth_record(&id)
+        .await
+        .expect("auth record");
+    assert_eq!(after.auth_method, "none");
+    assert!(
+        after.secret_hash.is_none(),
+        "the stale secret hash is cleared on downgrade to a secretless method"
+    );
 }
 
 #[tokio::test]
@@ -251,11 +340,16 @@ async fn native_client_registrations_enforce_rfc8252() {
 
 #[tokio::test]
 async fn metadata_choices_select_eddsa_when_offered_and_rs256_otherwise() {
-    // AC5: EdDSA when the RP lists it, RS256 otherwise, and the choice appears in
-    // the registration response.
-    let h = Harness::start_with(dcr_config()).await;
+    // AC5 (corrected, FIX 1): the negotiation is constrained to the algorithms the
+    // ENVIRONMENT can actually sign with, so a recorded id_token_signed_response_alg
+    // is always the algorithm the OP will sign this client's ID tokens with. A dual
+    // EdDSA + RS256 environment, so both are truthfully signable and the "RS256
+    // otherwise" path is exercised against a real RS256 key (never the RS256
+    // discovery floor with no key behind it).
+    let h = Harness::start_dual_signing(dcr_config()).await;
     let path = register_path(&h);
 
+    // EdDSA preferred when offered alongside RS256.
     let (status, body) = post_json(
         &h,
         &path,
@@ -271,20 +365,136 @@ async fn metadata_choices_select_eddsa_when_offered_and_rs256_otherwise() {
         "EdDSA is preferred when offered"
     );
 
-    // The plural RP Metadata Choices parameter name works too.
+    // Only RS256 offered, and the environment can sign it: RS256 recorded (the
+    // plural RP Metadata Choices name works too). This is truthful because a real
+    // RS256 key exists; the token endpoint will honor it at mint.
     let (status, body) = post_json(
         &h,
         &path,
         json!({
             "redirect_uris": ["https://rp.example/cb"],
-            "id_token_signed_response_alg_values": ["ES256", "RS256"]
+            "id_token_signed_response_alg_values": ["RS256"]
         }),
     )
     .await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
     assert_eq!(
         body["id_token_signed_response_alg"], "RS256",
-        "RS256 is the fallback when EdDSA is not offered"
+        "RS256 is recorded when it is the only offered algorithm the env can sign"
+    );
+
+    // Only ES256 offered: the environment has NO ES256 key, so the request is
+    // REJECTED rather than recording (and echoing) an algorithm the OP would never
+    // sign this client's ID tokens with.
+    let (status, body) = post_json(
+        &h,
+        &path,
+        json!({
+            "redirect_uris": ["https://rp.example/cb"],
+            "id_token_signed_response_alg": ["ES256"]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"], "invalid_client_metadata");
+}
+
+#[tokio::test]
+async fn a_negotiated_id_token_alg_is_the_alg_the_mint_actually_signs_with() {
+    // FIX 1 proof-of-invariant: register a DCR client that negotiates a NON-default
+    // algorithm (RS256 in a dual EdDSA + RS256 environment whose default is EdDSA),
+    // then mint an ID token for it through the REAL token endpoint, and assert the
+    // JWS header `alg` equals the value DCR recorded and echoed. The recorded
+    // algorithm can never diverge from the algorithm the mint actually signs with;
+    // this test fails if the recorded alg is ever a decorative, unhonored value.
+    let h = Harness::start_dual_signing(dcr_config()).await;
+
+    // Register a confidential (client_secret_post) DCR client with the harness
+    // redirect URI (so the authorize flow accepts it), offering only RS256.
+    let (status, reg) = post_json(
+        &h,
+        &register_path(&h),
+        json!({
+            "redirect_uris": [REDIRECT_URI],
+            "token_endpoint_auth_method": "client_secret_post",
+            "id_token_signed_response_alg": ["RS256"]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{reg}");
+    assert_eq!(
+        reg["id_token_signed_response_alg"], "RS256",
+        "the registration records and echoes RS256"
+    );
+    let client_id = reg["client_id"].as_str().expect("client_id").to_owned();
+    let secret = reg["client_secret"].as_str().expect("secret").to_owned();
+
+    // Drive a real code exchange for this DCR client (no PKCE: confidential PKCE is
+    // relaxed in the harness config), so the ID token is minted through the token
+    // endpoint's real mint path.
+    let code = h.issue_authenticated_code(&client_id).await;
+    let token_form = form(&[
+        ("grant_type", "authorization_code"),
+        ("code", &code),
+        ("redirect_uri", REDIRECT_URI),
+        ("client_id", &client_id),
+        ("client_secret", &secret),
+    ]);
+    let (status, _headers, body) = h.token(&token_form).await;
+    assert_eq!(status, StatusCode::OK, "token exchange: {body}");
+    let response = json_body(&body);
+    let id_token = response["id_token"].as_str().expect("id_token");
+
+    // The minted ID token's JWS header alg is the recorded RS256, NOT the
+    // environment default EdDSA: the mint honored the per-client algorithm.
+    assert_eq!(
+        jws_header_alg(id_token),
+        "RS256",
+        "the id_token is signed under the recorded/echoed algorithm, not the env default"
+    );
+}
+
+#[tokio::test]
+async fn non_default_metadata_persists_across_a_read() {
+    // FIX 2: a GET reads the client back from the DATABASE and every non-default
+    // metadata field round-trips faithfully (never a masked default): a native
+    // application_type, a non-default token_endpoint_auth_method, and a non-default
+    // id_token_signed_response_alg (EdDSA is non-default here only vs the abstract
+    // RS256 spec default the read no longer substitutes). The dual environment can
+    // sign RS256, so the recorded RS256 is genuine and must survive the round-trip.
+    let h = Harness::start_dual_signing(dcr_config()).await;
+    let (status, reg) = post_json(
+        &h,
+        &register_path(&h),
+        json!({
+            "application_type": "native",
+            "token_endpoint_auth_method": "none",
+            "redirect_uris": ["http://127.0.0.1:52000/cb"],
+            "id_token_signed_response_alg": ["RS256"]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{reg}");
+    assert_eq!(reg["id_token_signed_response_alg"], "RS256");
+    let uri = to_path(reg["registration_client_uri"].as_str().expect("uri"));
+    let token = reg["registration_access_token"]
+        .as_str()
+        .expect("token")
+        .to_owned();
+
+    let (status, read) = send_json(&h, "GET", &uri, Some(&token), None).await;
+    assert_eq!(status, StatusCode::OK, "{read}");
+    assert_eq!(
+        read["application_type"], "native",
+        "application_type round-trips from the database"
+    );
+    assert_eq!(
+        read["token_endpoint_auth_method"], "none",
+        "token_endpoint_auth_method round-trips from the database"
+    );
+    assert_eq!(
+        read["id_token_signed_response_alg"], "RS256",
+        "the non-default id_token_signed_response_alg round-trips, not a masked default"
     );
 }
 

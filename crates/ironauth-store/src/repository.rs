@@ -642,6 +642,38 @@ impl ClientRepo<'_> {
         })
     }
 
+    /// The client's stored `id_token_signed_response_alg` within scope (issue #30),
+    /// or `None` when the client expressed no per-client preference (a client that
+    /// predates DCR, whose column is NULL) or is absent in this scope.
+    ///
+    /// The token endpoint reads this to sign THAT client's ID token with the
+    /// algorithm the client negotiated at registration, so the algorithm DCR
+    /// recorded and echoed is the algorithm the ID token is actually signed under.
+    /// A `None` (absent or no preference) leaves the mint on the environment default
+    /// signer, exactly as before DCR.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the identifier is out of this scope;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn id_token_signing_alg(&self, id: &ClientId) -> Result<Option<String>, StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT id_token_signed_response_alg FROM clients \
+             WHERE id = $1 AND tenant_id = $2 AND environment_id = $3",
+        )
+        .bind(id.to_string())
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(row.and_then(|row| row.get::<Option<String>, _>("id_token_signed_response_alg")))
+    }
+
     /// Read a dynamically registered client's stored configuration within scope
     /// (issue #30), for the RFC 7592 read/update/delete surface and for
     /// authenticating a presented registration access token.
@@ -1155,6 +1187,16 @@ impl ActingClientRepo<'_> {
         }
         let scope = self.scope;
         let redirect_uris: Vec<String> = update.redirect_uris.to_vec();
+        // When the update transitions the client to a method that carries no
+        // secret (`none` / `private_key_jwt`), NULL out any stored `secret_hash`
+        // so no dead credential material lingers. Only the two secret-based methods
+        // keep the existing hash (an update never mints a new secret, and the
+        // validation layer already refuses a transition INTO a secret method for a
+        // client that has none).
+        let keep_secret = matches!(
+            update.auth_method,
+            "client_secret_basic" | "client_secret_post"
+        );
         write_audited(
             AuditedWrite {
                 store: self.store,
@@ -1169,7 +1211,8 @@ impl ActingClientRepo<'_> {
                     "UPDATE clients SET display_name = $1, token_endpoint_auth_method = $2, \
                      redirect_uris = $3, application_type = $4, \
                      id_token_signed_response_alg = $5, jwks = $6, jwks_uri = $7, \
-                     token_endpoint_auth_signing_alg = $8, registration_access_token_hash = $9 \
+                     token_endpoint_auth_signing_alg = $8, registration_access_token_hash = $9, \
+                     secret_hash = CASE WHEN $13 THEN secret_hash ELSE NULL END \
                      WHERE id = $10 AND tenant_id = $11 AND environment_id = $12 \
                      AND dcr_registered = true",
                 )
@@ -1185,6 +1228,7 @@ impl ActingClientRepo<'_> {
                 .bind(id.to_string())
                 .bind(scope.tenant().to_string())
                 .bind(scope.environment().to_string())
+                .bind(keep_secret)
                 .execute(&mut **tx)
                 .await;
                 match result {
