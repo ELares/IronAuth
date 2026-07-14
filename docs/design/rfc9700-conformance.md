@@ -110,6 +110,37 @@ so the header rides every code-carrying redirect from one place and cannot drift
 This is a one-seam change, consistent with the codebase's rule that a security
 header is attached in exactly one place.
 
+### A form-hosting PAGE is a different seam, and must not be `no-referrer`
+
+`no-referrer` is not free on a page that hosts a form posting back to us. The Fetch
+standard's "append a request `Origin` header" step sets the serialized origin to
+`null` for a request whose method is neither `GET` nor `HEAD` and whose mode is not
+`cors` (exactly a same-origin HTML form POST) when the document's referrer policy is
+`no-referrer`. The bootstrap pages were served with `no-referrer`, so in a real
+browser every login, registration, consent, and device-approval POST arrived with
+`Origin: null`, which the same-origin CSRF allowlist (issue #196) read as a mismatch
+and refused: a `403` on every form submission. No test caught it because the harness
+sends no `Origin` at all, and the absent-header path deliberately falls through to
+allow.
+
+The pages therefore carry `Referrer-Policy: same-origin` (`pages::PAGE_REFERRER_POLICY`,
+still one seam). That keeps the property `no-referrer` was chosen for (no `Referer` is
+sent to any cross-origin destination, so an authorization URL carrying `state`,
+`nonce`, and the `redirect_uri` never leaks to a third party) while leaving a real,
+checkable `Origin` on the same-origin POST. The code-carrying responses host no form
+that posts back to this origin, so they keep `no-referrer`.
+
+The second layer is in the check itself: `interaction::same_origin_ok` resolves an
+opaque `Origin: null` by fetch metadata rather than by the origin comparison. It
+accepts `null` only alongside a `Sec-Fetch-Site` of `same-origin` or `same-site`, and
+rejects it when the metadata is absent or says `cross-site`. This cannot become a
+false allow: `Sec-Fetch-*` are forbidden header names, so page script cannot set them,
+and a browser reports a cross-site form POST (and any request whose initiator has an
+opaque origin, such as a sandboxed frame or a `data:` document) as `cross-site`, which
+is rejected before the `Origin` is even read. A genuine foreign `Origin` is still
+rejected whatever the metadata claims: the opaque rule is scoped to the literal
+`null`.
+
 ## The freshness lint (`scripts/rfc9700-scan.sh`)
 
 The lint mirrors the existing freshness scripts (`compat-matrix.sh` generate-and-diff
@@ -118,9 +149,15 @@ BCP-relevant endpoint cannot ship uncovered:
 
 1. It asserts `tests/rfc9700.rs` is a registered `[[test]]`.
 2. It regenerates the endpoint inventory (`docs/conformance/rfc9700-endpoints.txt`)
-   from the live `oidc_router` and `git diff --exit-code`s it, so adding a `.route()`
-   makes the committed inventory stale and fails CI until it is regenerated and
-   committed.
+   from EVERY `.route()` mounted under `crates/ironauth-oidc/src` and
+   `git diff --exit-code`s it, so adding a `.route()` anywhere in the crate makes the
+   committed inventory stale and fails CI until it is regenerated and committed. The
+   inventory is deliberately taken from the whole directory rather than from one
+   router function: an earlier version sliced `lib.rs` at `pub fn oidc_router`, which
+   made every route mounted by `discovery_router` and the issuer/JWKS router invisible
+   to the lint, so a new BCP-relevant metadata endpoint could ship uncovered while the
+   checklist still read complete. That is exactly the coverage rot this lint exists to
+   prevent.
 3. It asserts every generated endpoint is named in the checklist doc, so a new
    endpoint must be mapped to a covering test (or an explicit not-applicable reason).
 4. It asserts the checklist doc and the suite reference the SAME set of `rfc9700_*`

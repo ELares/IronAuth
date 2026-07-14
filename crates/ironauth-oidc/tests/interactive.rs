@@ -815,3 +815,143 @@ async fn register_post_rejects_cross_site_submissions() {
         "the same-origin registration creates the account"
     );
 }
+
+// ===========================================================================
+// The BROWSER-SHAPED submission (issue #38 review). The tests above post the
+// header shape a test harness produces; a real user agent produces a different
+// one, and the difference was a shipped defect: a page served with
+// `Referrer-Policy: no-referrer` makes the browser serialize the origin of its
+// own same-origin form POST as the opaque `null` (Fetch: "append a request
+// Origin header"), which the CSRF allowlist read as a mismatch and 403-ed. Every
+// login, consent, and registration form POST failed in a real browser while every
+// harness test passed, because the harness sent no Origin at all and the
+// absent-header path falls through to allow.
+//
+// The fix is two-layered: the interaction pages now send `Referrer-Policy:
+// same-origin` (a real Origin survives, and the Referer is still stripped from
+// every cross-origin request), and the allowlist resolves an opaque `Origin:
+// null` by fetch metadata, which page script cannot forge. These tests pin the
+// browser-shaped matrix on all three endpoints so the defect cannot return.
+// ===========================================================================
+
+/// The three interaction endpoints and a valid body for each, so the opaque-origin
+/// matrix below runs identically against all of them.
+async fn interaction_posts(harness: &Harness) -> Vec<(&'static str, String)> {
+    let client_id = harness.client_id().to_string();
+    let return_to = format!(
+        "/authorize?response_type=code&client_id={client_id}&redirect_uri={}&scope=openid",
+        enc(REDIRECT_URI)
+    );
+    harness
+        .seed_user("opaque@example.test", "s3cr3t-passphrase")
+        .await;
+    vec![
+        (
+            "/login",
+            form(&[
+                ("identifier", "opaque@example.test"),
+                ("password", "s3cr3t-passphrase"),
+                ("return_to", &return_to),
+            ]),
+        ),
+        (
+            "/register",
+            form(&[
+                ("identifier", "opaque-new@example.test"),
+                ("password", "s3cr3t-passphrase"),
+                ("return_to", &return_to),
+            ]),
+        ),
+        (
+            "/consent",
+            form(&[("decision", "allow"), ("return_to", &return_to)]),
+        ),
+    ]
+}
+
+#[tokio::test]
+async fn an_opaque_origin_with_same_origin_fetch_metadata_is_accepted() {
+    // What a REAL browser sends on the same-origin form POST from an interaction
+    // page: `Origin: null` (whenever the page's referrer policy blanks it) together
+    // with the unforgeable `Sec-Fetch-Site: same-origin`. This MUST be accepted: the
+    // pre-fix code 403-ed it, so every bootstrap form POST failed in a browser.
+    let harness = Harness::start().await;
+    let subject = harness.seed_unique_user().await;
+    let cookie = harness.session_cookie(&subject).await;
+
+    for (path, body) in interaction_posts(&harness).await {
+        let (status, _headers, text) = post_form_with(
+            &harness,
+            path,
+            &body,
+            Some(&cookie),
+            &[("origin", "null"), ("sec-fetch-site", "same-origin")],
+        )
+        .await;
+        assert_ne!(
+            status,
+            StatusCode::FORBIDDEN,
+            "a browser-shaped same-origin POST to {path} must not be blocked: {text}"
+        );
+        assert_eq!(
+            status,
+            StatusCode::SEE_OTHER,
+            "a browser-shaped same-origin POST to {path} resumes the request: {text}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_opaque_origin_is_rejected_without_own_site_fetch_metadata() {
+    // The opaque origin is rescued ONLY by unforgeable own-site fetch metadata. A
+    // cross-site signal, and metadata that is absent altogether, both stay a hard
+    // 403: the relaxation never becomes a false allow.
+    let harness = Harness::start().await;
+    let subject = harness.seed_unique_user().await;
+    let cookie = harness.session_cookie(&subject).await;
+
+    for (path, body) in interaction_posts(&harness).await {
+        // (a) `Origin: null` with a cross-site signal (a hostile page's form, or a
+        // sandboxed / `data:` initiator, both of which a browser reports as cross-site).
+        let (status, _headers, _text) = post_form_with(
+            &harness,
+            path,
+            &body,
+            Some(&cookie),
+            &[("origin", "null"), ("sec-fetch-site", "cross-site")],
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "an opaque cross-site POST to {path} is blocked"
+        );
+
+        // (b) `Origin: null` with NO fetch metadata proves nothing and is blocked.
+        let (status, _headers, _text) =
+            post_form_with(&harness, path, &body, Some(&cookie), &[("origin", "null")]).await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "an opaque POST to {path} with no fetch metadata is blocked"
+        );
+
+        // (c) A GENUINE foreign origin is blocked whatever the fetch metadata says
+        // (the opaque rule is scoped to the literal `null` and never rescues it).
+        for site in ["same-origin", "same-site", "cross-site"] {
+            let (status, _headers, _text) = post_form_with(
+                &harness,
+                path,
+                &body,
+                Some(&cookie),
+                &[("origin", "https://evil.test"), ("sec-fetch-site", site)],
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::FORBIDDEN,
+                "a foreign-origin POST to {path} with sec-fetch-site {site} is blocked"
+            );
+        }
+    }
+}

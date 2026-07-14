@@ -47,7 +47,7 @@ use common::{
     Harness, PKCE_CHALLENGE, PKCE_VERIFIER, REDIRECT_URI, enc, form, form_field, json, location,
     location_param,
 };
-use ironauth_config::OidcConfig;
+use ironauth_config::{OidcConfig, RegistrationMode};
 use ironauth_oidc::ClientAuthMethod;
 use serde_json::Value;
 
@@ -164,16 +164,123 @@ mod checks {
         Ok(())
     }
 
-    /// R9: the token endpoint MUST deliver tokens in the response body, never in a
-    /// URL. A token response that carried a `Location` header would be placing a
-    /// token (or a redirect target) in a URL, which RFC 9700 forbids for tokens.
-    pub fn token_never_in_url(headers: &HeaderMap) -> Result<(), String> {
-        match location(headers) {
-            Some(value) => Err(format!(
-                "token response set a Location (token in a URL?): {value}"
-            )),
-            None => Ok(()),
+    /// R9: a token MUST be delivered in the response body and NEVER placed in a URL.
+    ///
+    /// The weak form of this check (no `Location` header) only proves the response is
+    /// not a redirect; it would still pass if a token were smuggled into some OTHER
+    /// URL-valued header. The property asserted here is the requirement itself: no
+    /// URL-valued header is set at all, AND no issued token value appears anywhere in
+    /// the response headers, so no header can carry a token into a URL. `tokens` is
+    /// every credential the response actually issued (access, refresh, id).
+    pub fn token_never_in_url(headers: &HeaderMap, tokens: &[&str]) -> Result<(), String> {
+        // Every response header that a user agent (or a proxy, or a log) turns into a
+        // URL. None of these belongs on a token response.
+        for name in ["location", "content-location", "refresh", "link"] {
+            if let Some(value) = header_value(headers, name) {
+                return Err(format!(
+                    "token response set a URL-valued header {name}: {value}"
+                ));
+            }
         }
+        // Belt and braces: no issued token value appears in ANY header, so a token
+        // cannot ride a URL out of this response under a header we did not think of.
+        for (name, value) in headers {
+            let Ok(value) = value.to_str() else { continue };
+            for token in tokens {
+                if !token.is_empty() && value.contains(token) {
+                    return Err(format!(
+                        "an issued token appears in the {name} response header (token in a URL)"
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// R9: a token MUST NOT be ACCEPTED in a URL either (RFC 6750 2.3 / RFC 9700 2.3:
+    /// a query-string token leaks through logs, proxies, and `Referer`). A protected
+    /// resource presented with a valid access token in the query string MUST refuse it
+    /// and return NO claims.
+    pub fn token_in_query_is_refused(status: StatusCode, body: &str) -> Result<(), String> {
+        if !status.is_client_error() {
+            return Err(format!(
+                "a query-string access token was not refused: got {status}: {body}"
+            ));
+        }
+        if body.contains("\"sub\"") {
+            return Err("a query-string access token returned claims".to_owned());
+        }
+        Ok(())
+    }
+
+    /// R11 (the other half): a form-hosting interaction PAGE must NOT send
+    /// `Referrer-Policy: no-referrer`.
+    ///
+    /// Per the Fetch standard ("append a request `Origin` header"), a non-`GET`/`HEAD`,
+    /// non-CORS request (exactly a same-origin HTML form POST) made from a document
+    /// whose referrer policy is `no-referrer` has its serialized origin set to `null`.
+    /// A `no-referrer` interaction page therefore destroys the `Origin` the CSRF
+    /// allowlist checks, and every real browser's login, consent, and registration POST
+    /// arrives opaque. The policy must be present (so the `Referer` is still stripped
+    /// cross-origin) and must be anything but `no-referrer`.
+    pub fn page_referrer_policy_keeps_origin(headers: &HeaderMap) -> Result<(), String> {
+        match header_value(headers, "referrer-policy") {
+            None => Err("an interaction page has no Referrer-Policy".to_owned()),
+            Some(ref value) if value.eq_ignore_ascii_case("no-referrer") => Err(
+                "an interaction page sends Referrer-Policy: no-referrer, which blanks the Origin \
+                 on its own form POST (every browser submission would be 403-ed)"
+                    .to_owned(),
+            ),
+            Some(_) => Ok(()),
+        }
+    }
+
+    /// R16: a conclusively cross-site POST to a credential-bearing interaction endpoint
+    /// MUST be refused BEFORE any state change (RFC 9700 4.7, CSRF). The refusal is a
+    /// `403`, never a success and never a redirect that would resume the flow.
+    pub fn cross_site_post_blocked(status: StatusCode) -> Result<(), String> {
+        if status == StatusCode::FORBIDDEN {
+            Ok(())
+        } else {
+            Err(format!(
+                "a cross-site interaction POST was not blocked: got {status}, must be 403"
+            ))
+        }
+    }
+
+    /// R17: every interaction page MUST refuse to be framed (RFC 9700 4.16,
+    /// clickjacking): `X-Frame-Options: DENY` alongside the CSP `frame-ancestors
+    /// 'none'`, so a legacy browser that ignores the CSP directive still refuses.
+    pub fn framing_denied(headers: &HeaderMap) -> Result<(), String> {
+        match header_value(headers, "x-frame-options") {
+            Some(ref value) if value.eq_ignore_ascii_case("DENY") => {}
+            other => return Err(format!("X-Frame-Options is {other:?}, must be DENY")),
+        }
+        match header_value(headers, "content-security-policy") {
+            Some(ref policy) if policy.contains("frame-ancestors 'none'") => Ok(()),
+            other => Err(format!(
+                "the CSP is {other:?}, must contain frame-ancestors 'none'"
+            )),
+        }
+    }
+
+    /// R18: a redirect URI that is not REGISTRABLE (a non-loopback `http` URL, a
+    /// `javascript:` or `data:` URL, a URI carrying a fragment) MUST be refused at
+    /// registration, so an insecure or code-stealing target can never become an
+    /// exactly-matched, and therefore trusted, redirect (RFC 9700 2.1 / RFC 8252).
+    pub fn registration_refused_invalid_redirect_uri(
+        status: StatusCode,
+        body: &serde_json::Value,
+    ) -> Result<(), String> {
+        if status != StatusCode::BAD_REQUEST {
+            return Err(format!(
+                "an insecure redirect_uri was not refused: got {status}: {body}"
+            ));
+        }
+        if body.get("error").and_then(serde_json::Value::as_str) != Some("invalid_redirect_uri") {
+            return Err(format!("expected error=invalid_redirect_uri, got {body}"));
+        }
+        Ok(())
     }
 
     /// R1/R3: an unvalidated or unregistered `redirect_uri` MUST be refused by an
@@ -687,9 +794,11 @@ async fn rfc9700_access_token_is_audience_restricted() {
 
 #[tokio::test]
 async fn rfc9700_token_endpoint_never_delivers_a_token_in_a_url() {
-    // The token endpoint returns tokens in a JSON body with Cache-Control: no-store
-    // and NO Location header, so a token never appears in a URL, a Location, or a
-    // query string.
+    // The token endpoint delivers tokens in a JSON body with Cache-Control: no-store
+    // and sets NO URL-valued header, and no issued token value appears in ANY response
+    // header, so no token is ever placed in a URL. The front-channel authorization
+    // response is checked for the same property from the other side (R6): no token in
+    // the redirect Location's query or fragment.
     let harness = Harness::start().await;
     let client_id = harness.client_id().to_string();
     let code = harness.issue_authenticated_code_pkce(&client_id).await;
@@ -699,11 +808,20 @@ async fn rfc9700_token_endpoint_never_delivers_a_token_in_a_url() {
         ("redirect_uri", REDIRECT_URI),
         ("client_id", &client_id),
         ("code_verifier", PKCE_VERIFIER),
+        ("scope", "openid offline_access"),
     ]);
     let (status, headers, body) = harness.token(&redeem).await;
     assert_eq!(status, StatusCode::OK, "token exchange: {body}");
-    assert!(json(&body)["access_token"].is_string(), "a token is issued");
-    checks::token_never_in_url(&headers).unwrap_or_else(|reason| panic!("{reason}"));
+    let issued = json(&body);
+    let tokens: Vec<&str> = ["access_token", "refresh_token", "id_token"]
+        .iter()
+        .filter_map(|name| issued[*name].as_str())
+        .collect();
+    assert!(
+        issued["access_token"].is_string() && tokens.len() >= 2,
+        "the response issues the credentials this check is about: {body}"
+    );
+    checks::token_never_in_url(&headers, &tokens).unwrap_or_else(|reason| panic!("{reason}"));
     checks::cache_control_no_store(&headers).unwrap_or_else(|reason| panic!("{reason}"));
     assert_eq!(
         headers
@@ -712,6 +830,70 @@ async fn rfc9700_token_endpoint_never_delivers_a_token_in_a_url() {
         Some("application/json"),
         "tokens are delivered as JSON"
     );
+
+    // The front channel carries no token either: the authorization redirect's Location
+    // has no access_token in its query or fragment (the implicit flow is excluded).
+    let cookie = harness.authenticated_cookie().await;
+    let query = authorize_code_query(&client_id, "&state=s");
+    let (_status, authz_headers, _body) = harness.authorize_with_cookie(&query, &cookie).await;
+    checks::no_front_channel_access_token(&authz_headers)
+        .unwrap_or_else(|reason| panic!("front channel: {reason}"));
+}
+
+#[tokio::test]
+async fn rfc9700_access_token_in_a_url_query_is_refused() {
+    // The other direction of "never in a URL" (RFC 6750 2.3 / RFC 9700 2.3): a VALID
+    // access token presented in the query string of a protected resource is refused,
+    // and no claims come back. A server that accepted it would be inviting the token
+    // into logs, proxy traces, and Referer headers.
+    let harness = Harness::start().await;
+    let client_id = harness.client_id().to_string();
+
+    // A code carrying the `openid` scope, so the access token it mints is a UserInfo
+    // credential and the ONLY thing under test below is where the token is presented.
+    let cookie = harness.authenticated_cookie().await;
+    let query = authorize_code_query(&client_id, "&scope=openid");
+    let (status, headers, body) = harness.authorize_with_cookie(&query, &cookie).await;
+    assert_eq!(status, StatusCode::SEE_OTHER, "authorize: {body}");
+    let code = location_param(&headers, "code").expect("a code is issued");
+    let redeem = form(&[
+        ("grant_type", "authorization_code"),
+        ("code", &code),
+        ("redirect_uri", REDIRECT_URI),
+        ("client_id", &client_id),
+        ("code_verifier", PKCE_VERIFIER),
+    ]);
+    let (status, _headers, body) = harness.token(&redeem).await;
+    assert_eq!(status, StatusCode::OK, "token exchange: {body}");
+    let access_token = json(&body)["access_token"]
+        .as_str()
+        .expect("an access token is issued")
+        .to_owned();
+
+    // The SAME token in the Authorization header is accepted, so the refusal below is
+    // about the URL and nothing else.
+    let authorized = Request::builder()
+        .method("GET")
+        .uri("/userinfo")
+        .header(header::AUTHORIZATION, format!("Bearer {access_token}"))
+        .body(Body::empty())
+        .expect("request builds");
+    let (status, _headers, body) = harness.send(authorized).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the header-borne token works: {body}"
+    );
+    assert!(json(&body)["sub"].is_string(), "claims come back");
+
+    // The same token in the query string is refused, with no claims.
+    let in_url = Request::builder()
+        .method("GET")
+        .uri(format!("/userinfo?access_token={}", enc(&access_token)))
+        .body(Body::empty())
+        .expect("request builds");
+    let (status, _headers, body) = harness.send(in_url).await;
+    checks::token_in_query_is_refused(status, &body).unwrap_or_else(|reason| panic!("{reason}"));
 }
 
 // ===========================================================================
@@ -791,6 +973,42 @@ async fn rfc9700_code_carrying_response_sets_referrer_policy() {
     );
     checks::referrer_policy_no_referrer(&headers)
         .unwrap_or_else(|reason| panic!("form_post mode: {reason}"));
+}
+
+#[tokio::test]
+async fn rfc9700_interaction_page_referrer_policy_preserves_the_origin_header() {
+    // The OTHER half of R11. A code-carrying response must be `no-referrer` (above),
+    // but a FORM-HOSTING interaction page must not be: under `no-referrer` a browser
+    // serializes the origin of that page's own same-origin form POST as the opaque
+    // `null` (Fetch), which the CSRF allowlist cannot distinguish from a hostile
+    // submission, so every real browser's login, consent, and registration POST is
+    // 403-ed. The pages carry `same-origin` instead: the `Referer` is still stripped
+    // from every cross-origin request (the property `no-referrer` was there for) while
+    // a real, checkable `Origin` survives on the same-origin POST.
+    let harness = Harness::start().await;
+    let client_id = harness.client_id().to_string();
+    // An authenticated session, so the consent page renders instead of redirecting to
+    // login. The consent page is the one whose POST records a decision, so it is the
+    // one this defect hurt most.
+    let subject = harness.seed_unique_user().await;
+    let cookie = harness.session_cookie(&subject).await;
+    let return_to = enc(&format!(
+        "/authorize?response_type=code&client_id={client_id}&redirect_uri={}&scope=openid",
+        enc(REDIRECT_URI)
+    ));
+
+    for path in ["/login", "/register", "/consent"] {
+        let (status, headers, body) = harness
+            .get_with_cookie(&format!("{path}?return_to={return_to}"), Some(&cookie))
+            .await;
+        assert_eq!(status, StatusCode::OK, "the {path} page renders: {body}");
+        assert!(
+            body.contains("<form"),
+            "the {path} page hosts the form whose POST needs an Origin"
+        );
+        checks::page_referrer_policy_keeps_origin(&headers)
+            .unwrap_or_else(|reason| panic!("{path}: {reason}"));
+    }
 }
 
 // ===========================================================================
@@ -888,6 +1106,85 @@ async fn rfc9700_authorization_code_is_bound_to_client_and_redirect_uri() {
         .unwrap_or_else(|reason| panic!("client binding: {reason}"));
 }
 
+#[tokio::test]
+async fn rfc9700_authorization_code_is_short_lived() {
+    // "Short-lived" is a named part of the requirement, not an implementation detail:
+    // a code that outlives its window is a stealable credential (the browser-history
+    // and log-leak classes). The shipped default lifetime is a minute, and a code
+    // presented after it has passed is invalid_grant.
+    let ttl = OidcConfig::default().authorization_code_ttl_secs;
+    assert!(
+        (1..=600).contains(&ttl),
+        "the default authorization code lifetime is {ttl}s, which is not short-lived \
+         (RFC 9700 2.1.1 / RFC 6749 4.1.2: a maximum of 10 minutes, one minute recommended)"
+    );
+
+    let harness = Harness::start().await;
+    let client_id = harness.client_id().to_string();
+    let code = harness.issue_authenticated_code_pkce(&client_id).await;
+    let redeem = form(&[
+        ("grant_type", "authorization_code"),
+        ("code", &code),
+        ("redirect_uri", REDIRECT_URI),
+        ("client_id", &client_id),
+        ("code_verifier", PKCE_VERIFIER),
+    ]);
+
+    // One second past the lifetime the code is dead, from the deterministic clock the
+    // server reads (no wall-clock sleep).
+    harness.clock().advance(Duration::from_secs(ttl + 1));
+    let (status, _headers, body) = harness.token(&redeem).await;
+    checks::is_invalid_grant(status, &body)
+        .unwrap_or_else(|reason| panic!("expired code: {reason}"));
+}
+
+#[tokio::test]
+async fn rfc9700_authorization_code_reuse_revokes_the_grant_chain() {
+    // Single use is only half of the requirement: a REUSED code means the code leaked
+    // (a browser-history, log, or Referer capture), so everything already minted from
+    // it must die too. Replaying a spent code beyond the grace window revokes the whole
+    // grant chain, and the refresh token issued from the first, legitimate redemption
+    // stops working.
+    let harness = Harness::start().await;
+    let client_id = harness.client_id().to_string();
+    let code = harness.issue_authenticated_code_pkce(&client_id).await;
+    let redeem = form(&[
+        ("grant_type", "authorization_code"),
+        ("code", &code),
+        ("redirect_uri", REDIRECT_URI),
+        ("client_id", &client_id),
+        ("code_verifier", PKCE_VERIFIER),
+        ("scope", "openid offline_access"),
+    ]);
+
+    // The legitimate redemption mints the grant chain (an access token and a refresh
+    // token descended from this code).
+    let (status, _headers, body) = harness.token(&redeem).await;
+    assert_eq!(status, StatusCode::OK, "first redemption: {body}");
+    let refresh = json(&body)["refresh_token"]
+        .as_str()
+        .expect("a refresh token is issued")
+        .to_owned();
+
+    // Past the grace window (so the replay is a genuine reuse, not a double-submit).
+    harness.clock().advance(Duration::from_secs(30));
+
+    // The replay fails ...
+    let (status, _headers, body) = harness.token(&redeem).await;
+    checks::is_invalid_grant(status, &body).unwrap_or_else(|reason| panic!("code reuse: {reason}"));
+
+    // ... and takes the chain with it: the refresh token from the FIRST redemption is
+    // now dead.
+    let refresh_form = form(&[
+        ("grant_type", "refresh_token"),
+        ("refresh_token", &refresh),
+        ("client_id", &client_id),
+    ]);
+    let (status, _headers, body) = harness.token(&refresh_form).await;
+    checks::is_invalid_grant(status, &body)
+        .unwrap_or_else(|reason| panic!("grant chain revocation: {reason}"));
+}
+
 // ===========================================================================
 // R14: sender-uniform token errors (no failure oracle).
 // ===========================================================================
@@ -967,6 +1264,221 @@ async fn rfc9700_ropc_password_grant_is_unsupported() {
         json(&response)["error"],
         "unsupported_grant_type",
         "ROPC has no handler: {response}"
+    );
+}
+
+// ===========================================================================
+// R16: CSRF on the credential-bearing interaction POSTs (RFC 9700 4.7).
+// ===========================================================================
+
+#[tokio::test]
+async fn rfc9700_interaction_post_rejects_cross_site_submissions() {
+    // The redirect-based flow's CSRF surface on the AUTHORIZATION SERVER is the
+    // interaction POST: a cross-site auto-submit of the login form is login-CSRF
+    // (signing the victim into an attacker-known account), and of the consent form is a
+    // silent grant. A conclusively cross-site submission is refused with a 403 BEFORE
+    // any state change, on every interaction endpoint.
+    //
+    // The allowlist also has to survive a REAL browser, which is the shape the harness
+    // hides: a page whose referrer policy is `no-referrer` makes the browser serialize
+    // its own same-origin form POST's origin as the opaque `null` (Fetch), so `null`
+    // plus the unforgeable `Sec-Fetch-Site: same-origin` MUST be accepted while `null`
+    // with no own-site evidence stays refused. (The full matrix, including that the
+    // blocked POSTs create no account, session, or consent, is in the `interactive`
+    // suite.)
+    let harness = Harness::start().await;
+    let client_id = harness.client_id().to_string();
+    let subject = harness.seed_unique_user().await;
+    let cookie = harness.session_cookie(&subject).await;
+    let return_to = format!(
+        "/authorize?response_type=code&client_id={client_id}&redirect_uri={}&scope=openid",
+        enc(REDIRECT_URI)
+    );
+    let consent = form(&[("decision", "allow"), ("return_to", &return_to)]);
+
+    let post = async |extra: &[(&str, &str)]| {
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri("/consent")
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .header(header::COOKIE, cookie.clone());
+        for (name, value) in extra {
+            builder = builder.header(*name, *value);
+        }
+        harness
+            .send(
+                builder
+                    .body(Body::from(consent.clone()))
+                    .expect("request builds"),
+            )
+            .await
+    };
+
+    // Conclusively cross-site: blocked.
+    let (status, _headers, _body) = post(&[("sec-fetch-site", "cross-site")]).await;
+    checks::cross_site_post_blocked(status)
+        .unwrap_or_else(|reason| panic!("fetch metadata: {reason}"));
+    let (status, _headers, _body) = post(&[("origin", "https://evil.test")]).await;
+    checks::cross_site_post_blocked(status)
+        .unwrap_or_else(|reason| panic!("foreign origin: {reason}"));
+    // A foreign origin is blocked even when the fetch metadata claims same-origin.
+    let (status, _headers, _body) = post(&[
+        ("origin", "https://evil.test"),
+        ("sec-fetch-site", "same-origin"),
+    ])
+    .await;
+    checks::cross_site_post_blocked(status)
+        .unwrap_or_else(|reason| panic!("foreign origin with own-site metadata: {reason}"));
+    // An OPAQUE origin with no own-site evidence is blocked.
+    let (status, _headers, _body) = post(&[("origin", "null")]).await;
+    checks::cross_site_post_blocked(status)
+        .unwrap_or_else(|reason| panic!("opaque origin, no metadata: {reason}"));
+    let (status, _headers, _body) =
+        post(&[("origin", "null"), ("sec-fetch-site", "cross-site")]).await;
+    checks::cross_site_post_blocked(status)
+        .unwrap_or_else(|reason| panic!("opaque cross-site origin: {reason}"));
+
+    // The BROWSER-SHAPED same-origin submission is accepted (this is not a CSRF; a
+    // provider that 403-ed it would simply be broken for every real user).
+    let (status, _headers, body) =
+        post(&[("origin", "null"), ("sec-fetch-site", "same-origin")]).await;
+    assert_eq!(
+        status,
+        StatusCode::SEE_OTHER,
+        "a browser-shaped same-origin consent POST resumes the flow: {body}"
+    );
+}
+
+// ===========================================================================
+// R17: clickjacking defense on the interaction pages (RFC 9700 4.16).
+// ===========================================================================
+
+#[tokio::test]
+async fn rfc9700_interaction_pages_deny_framing() {
+    // A framed consent page plus an invisible overlay is a silent grant (clickjacking).
+    // Every interaction page refuses framing twice over: the CSP `frame-ancestors
+    // 'none'` and, for a legacy browser that ignores that directive, `X-Frame-Options:
+    // DENY`. (The full page-hardening set, including the strict default-deny CSP and
+    // the escaping of every reflected value, is asserted by the `interactive` suite.)
+    let harness = Harness::start().await;
+    let client_id = harness.client_id().to_string();
+    let subject = harness.seed_unique_user().await;
+    let cookie = harness.session_cookie(&subject).await;
+    let return_to = enc(&format!(
+        "/authorize?response_type=code&client_id={client_id}&redirect_uri={}&scope=openid",
+        enc(REDIRECT_URI)
+    ));
+
+    for path in ["/login", "/register", "/consent"] {
+        let (status, headers, body) = harness
+            .get_with_cookie(&format!("{path}?return_to={return_to}"), Some(&cookie))
+            .await;
+        assert_eq!(status, StatusCode::OK, "the {path} page renders: {body}");
+        checks::framing_denied(&headers).unwrap_or_else(|reason| panic!("{path}: {reason}"));
+    }
+}
+
+// ===========================================================================
+// R18: an insecure or non-registrable redirect URI is refused at registration.
+// ===========================================================================
+
+#[tokio::test]
+async fn rfc9700_insecure_redirect_uri_is_not_registrable() {
+    // Exact matching (R1) is only as strong as what is allowed INTO the registry: a
+    // registered `http://` URL, a `javascript:` URL, or a fragment-carrying URI would
+    // each be exactly matched and therefore trusted with a code. The same registrable
+    // rule the authorization endpoint enforces on a presented value is enforced at
+    // registration, so these never enter the registry at all.
+    let harness = Harness::start_with(OidcConfig {
+        registration_enabled: true,
+        registration_mode: RegistrationMode::Open,
+        ..OidcConfig::default()
+    })
+    .await;
+    let path = format!(
+        "/t/{}/e/{}/connect/register",
+        harness.scope().tenant(),
+        harness.scope().environment()
+    );
+
+    for redirect_uri in [
+        // Cleartext, non-loopback: the code would cross the network in the clear.
+        "http://client.test/cb",
+        // A script URL: the "redirect" would execute in the page that holds the code.
+        "javascript:alert(1)",
+        // An inline document.
+        "data:text/html,<script>1</script>",
+        // A fragment: not exactly comparable, and the code lands client-side.
+        "https://client.test/cb#fragment",
+        // Not an absolute URI at all.
+        "/relative/cb",
+    ] {
+        let request = Request::builder()
+            .method("POST")
+            .uri(&path)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::json!({ "redirect_uris": [redirect_uri] }).to_string(),
+            ))
+            .expect("request builds");
+        let (status, _headers, body) = harness.send(request).await;
+        checks::registration_refused_invalid_redirect_uri(status, &json(&body))
+            .unwrap_or_else(|reason| panic!("{redirect_uri}: {reason}"));
+    }
+}
+
+// ===========================================================================
+// R19: a client cannot choose its own identifier (RFC 9700 4.15).
+// ===========================================================================
+
+#[tokio::test]
+async fn rfc9700_a_client_cannot_choose_its_own_client_id() {
+    // RFC 9700 4.15: an authorization server must not let a client influence its
+    // `client_id` (or any claim that could be confused with a genuine resource owner).
+    // A client that could name itself could collide with a subject identifier and
+    // impersonate a user to a resource server. The identifier is minted by the server
+    // from its own entropy seam, so a `client_id` in the submitted metadata is simply
+    // not read.
+    let harness = Harness::start_with(OidcConfig {
+        registration_enabled: true,
+        registration_mode: RegistrationMode::Open,
+        ..OidcConfig::default()
+    })
+    .await;
+    let path = format!(
+        "/t/{}/e/{}/connect/register",
+        harness.scope().tenant(),
+        harness.scope().environment()
+    );
+
+    let chosen = "user_00000000000000000000000000";
+    let request = Request::builder()
+        .method("POST")
+        .uri(&path)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            serde_json::json!({
+                "redirect_uris": [REDIRECT_URI],
+                "client_id": chosen,
+                "sub": chosen,
+            })
+            .to_string(),
+        ))
+        .expect("request builds");
+    let (status, _headers, body) = harness.send(request).await;
+    assert_eq!(status, StatusCode::CREATED, "registration: {body}");
+    let minted = json(&body)["client_id"]
+        .as_str()
+        .expect("a client_id is returned")
+        .to_owned();
+    assert_ne!(
+        minted, chosen,
+        "the server must not honor a client-chosen client_id"
+    );
+    assert!(
+        minted.starts_with("cli_"),
+        "the client_id is minted in the server's own client namespace, so it can never \
+         collide with a subject identifier, got {minted}"
     );
 }
 
@@ -1087,9 +1599,147 @@ mod mutation {
 
     #[test]
     fn rfc9700_mutant_token_in_url_detects_location() {
-        checks::token_never_in_url(&HeaderMap::new()).expect("no Location is conforming");
-        checks::token_never_in_url(&with_location("https://client.test/cb?access_token=leaked"))
-            .expect_err("a token response with a Location must be caught");
+        let tokens = ["ira_at_secret", "ira_rt_secret"];
+        // Conforming: a body-only token delivery sets no URL-valued header and echoes
+        // no token into any header.
+        let mut ok = HeaderMap::new();
+        ok.insert(header::CACHE_CONTROL, "no-store".parse().expect("valid"));
+        checks::token_never_in_url(&ok, &tokens).expect("a body-only token response is conforming");
+
+        // Seeded violation: the token response became a redirect.
+        checks::token_never_in_url(
+            &with_location("https://client.test/cb?access_token=leaked"),
+            &tokens,
+        )
+        .expect_err("a token response with a Location must be caught");
+
+        // Seeded violation: an issued token smuggled into a URL under a header that is
+        // NOT Location. The weak form of this check (Location only) would pass this.
+        for name in ["content-location", "refresh", "link"] {
+            let mut leak = HeaderMap::new();
+            leak.insert(
+                name,
+                format!("https://client.test/cb?t={}", tokens[0])
+                    .parse()
+                    .expect("valid"),
+            );
+            assert!(
+                checks::token_never_in_url(&leak, &tokens).is_err(),
+                "a token in the {name} header must be caught"
+            );
+        }
+
+        // Seeded violation: a token echoed into an arbitrary header we never enumerated.
+        let mut echoed = HeaderMap::new();
+        echoed.insert(
+            "x-debug-token",
+            tokens[1].parse().expect("valid header value"),
+        );
+        checks::token_never_in_url(&echoed, &tokens)
+            .expect_err("an issued token echoed into any header must be caught");
+    }
+
+    #[test]
+    fn rfc9700_mutant_token_in_query_detects_acceptance() {
+        checks::token_in_query_is_refused(
+            StatusCode::BAD_REQUEST,
+            r#"{"error":"invalid_request"}"#,
+        )
+        .expect("refusing a query-string token is conforming");
+        // Seeded violation: the resource ACCEPTED a token from the URL and returned
+        // claims.
+        checks::token_in_query_is_refused(StatusCode::OK, r#"{"sub":"user_1"}"#)
+            .expect_err("accepting a token from the query string must be caught");
+        // Seeded violation: a client error that still leaked claims.
+        checks::token_in_query_is_refused(StatusCode::BAD_REQUEST, r#"{"sub":"user_1"}"#)
+            .expect_err("returning claims for a query-string token must be caught");
+    }
+
+    #[test]
+    fn rfc9700_mutant_page_referrer_policy_detects_no_referrer() {
+        let mut ok = HeaderMap::new();
+        ok.insert(
+            header::REFERRER_POLICY,
+            "same-origin".parse().expect("valid"),
+        );
+        checks::page_referrer_policy_keeps_origin(&ok)
+            .expect("same-origin keeps the Origin and is conforming");
+        // Seeded violation: the SHIPPED defect. A `no-referrer` interaction page makes
+        // the browser send `Origin: null` on its own form POST, which the CSRF allowlist
+        // refuses, so every real login, consent, and registration submission 403s.
+        let mut blanked = HeaderMap::new();
+        blanked.insert(
+            header::REFERRER_POLICY,
+            "no-referrer".parse().expect("valid"),
+        );
+        checks::page_referrer_policy_keeps_origin(&blanked)
+            .expect_err("a no-referrer form-hosting page must be caught");
+        // Seeded violation: no policy at all (the Referer would leak cross-origin).
+        checks::page_referrer_policy_keeps_origin(&HeaderMap::new())
+            .expect_err("a missing Referrer-Policy must be caught");
+    }
+
+    #[test]
+    fn rfc9700_mutant_csrf_detects_an_allowed_cross_site_post() {
+        checks::cross_site_post_blocked(StatusCode::FORBIDDEN).expect("a 403 is conforming");
+        // Seeded violations: the guard let a cross-site POST through, either resuming
+        // the flow (303) or succeeding outright (200).
+        for allowed in [StatusCode::SEE_OTHER, StatusCode::OK] {
+            checks::cross_site_post_blocked(allowed)
+                .expect_err("an unblocked cross-site interaction POST must be caught");
+        }
+    }
+
+    #[test]
+    fn rfc9700_mutant_framing_detects_a_frameable_page() {
+        let conforming = |xfo: Option<&str>, csp: &str| {
+            let mut headers = HeaderMap::new();
+            if let Some(xfo) = xfo {
+                headers.insert(header::X_FRAME_OPTIONS, xfo.parse().expect("valid"));
+            }
+            headers.insert(header::CONTENT_SECURITY_POLICY, csp.parse().expect("valid"));
+            headers
+        };
+        checks::framing_denied(&conforming(
+            Some("DENY"),
+            "default-src 'none'; frame-ancestors 'none'",
+        ))
+        .expect("DENY plus frame-ancestors none is conforming");
+        // Seeded violation: framing re-permitted in the CSP.
+        checks::framing_denied(&conforming(
+            Some("DENY"),
+            "default-src 'none'; frame-ancestors *",
+        ))
+        .expect_err("a permissive frame-ancestors must be caught");
+        // Seeded violation: X-Frame-Options dropped or downgraded (a legacy browser
+        // that ignores frame-ancestors would then frame the consent page).
+        checks::framing_denied(&conforming(None, "frame-ancestors 'none'"))
+            .expect_err("a missing X-Frame-Options must be caught");
+        checks::framing_denied(&conforming(Some("SAMEORIGIN"), "frame-ancestors 'none'"))
+            .expect_err("a downgraded X-Frame-Options must be caught");
+    }
+
+    #[test]
+    fn rfc9700_mutant_registrable_detects_an_accepted_insecure_redirect() {
+        checks::registration_refused_invalid_redirect_uri(
+            StatusCode::BAD_REQUEST,
+            &serde_json::json!({ "error": "invalid_redirect_uri" }),
+        )
+        .expect("a 400 invalid_redirect_uri is conforming");
+        // Seeded violation: the registry ACCEPTED an insecure redirect URI, which exact
+        // matching would then treat as trusted.
+        checks::registration_refused_invalid_redirect_uri(
+            StatusCode::CREATED,
+            &serde_json::json!({ "client_id": "minted" }),
+        )
+        .expect_err("registering an insecure redirect_uri must be caught");
+        // Seeded violation: refused, but as a different (uninformative) error, so the
+        // predicate cannot be satisfied by any 400 at all.
+        checks::registration_refused_invalid_redirect_uri(
+            StatusCode::BAD_REQUEST,
+            &serde_json::json!({ "error": "invalid_client_metadata" }),
+        )
+        .expect_err("a non-specific refusal must be caught");
     }
 
     #[test]

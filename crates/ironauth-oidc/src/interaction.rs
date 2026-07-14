@@ -98,6 +98,14 @@ pub fn cookie_header(headers: &HeaderMap) -> Option<&str> {
 /// case-insensitive).
 const SEC_FETCH_SITE: &str = "sec-fetch-site";
 
+/// The serialization of an OPAQUE origin. A browser sends this exact value (not an
+/// absent header) whenever it has an origin to report but must not disclose it: a
+/// sandboxed frame, a `data:` or `file:` document, and (per the Fetch standard's
+/// "append a request `Origin` header") any non-`GET`/`HEAD`, non-CORS request made
+/// from a document whose referrer policy is `no-referrer`. It is NEVER evidence of
+/// same-origin.
+const OPAQUE_ORIGIN: &str = "null";
+
 /// A CSRF defense-in-depth allowlist for the state-changing interactive POSTs
 /// (login, consent, and registration), evaluated BEFORE any state change (issue
 /// #196).
@@ -126,31 +134,65 @@ const SEC_FETCH_SITE: &str = "sec-fetch-site";
 /// `expected_origin` is [`None`] only when the deployment's origin could not be
 /// derived; the `Origin` comparison is then skipped and the `Sec-Fetch-Site` rule
 /// alone applies.
+///
+/// # The opaque `Origin: null` case
+///
+/// A browser serializes the origin of a form POST as the literal `null` in several
+/// situations that are NOT cross-site (most importantly a page served with
+/// `Referrer-Policy: no-referrer`, per the Fetch standard). Treating `null` as a
+/// plain mismatch would reject a legitimate same-origin submission, so `null` is
+/// resolved by FETCH METADATA instead of by the origin comparison:
+///
+/// - `null` with `Sec-Fetch-Site: same-origin` or `same-site` is INCONCLUSIVE (the
+///   check defers to the cookie, exactly as an absent `Origin` does);
+/// - `null` with any other, or with NO, `Sec-Fetch-Site` is a HARD REJECT.
+///
+/// This cannot produce a false ALLOW for a genuine cross-origin submission.
+/// `Sec-Fetch-*` are FORBIDDEN header names: page script (`fetch`, `XMLHttpRequest`,
+/// a form) cannot set or forge them, so the value is authored solely by the user
+/// agent. A cross-site form POST carries `Sec-Fetch-Site: cross-site`, and a request
+/// whose initiator has an opaque origin (a sandboxed frame, a `data:` document) is
+/// likewise reported as `cross-site`, so both are rejected here before the `Origin`
+/// is ever read. A caller that strips or never sends fetch metadata gets the strict
+/// old behavior (`null` rejected).
 #[must_use]
 pub fn same_origin_ok(headers: &HeaderMap, expected_origin: Option<&str>) -> bool {
-    // Positive cross-site signal from fetch metadata: reject.
-    if let Some(site) = headers
+    let fetch_site = headers
         .get(SEC_FETCH_SITE)
-        .and_then(|value| value.to_str().ok())
-    {
+        .and_then(|value| value.to_str().ok());
+    // Positive cross-site signal from fetch metadata: reject.
+    if let Some(site) = fetch_site {
         if site.eq_ignore_ascii_case("cross-site") {
             return false;
         }
     }
+    // Positive OWN-SITE evidence from fetch metadata (unforgeable by page script).
+    // This is the only thing that can rescue an opaque `Origin`.
+    let own_site = fetch_site.is_some_and(|site| {
+        site.eq_ignore_ascii_case("same-origin") || site.eq_ignore_ascii_case("same-site")
+    });
     // A present Origin that does not match our own is a cross-origin submission.
     if let Some(origin) = headers
         .get(header::ORIGIN)
         .and_then(|value| value.to_str().ok())
     {
+        if origin.trim().eq_ignore_ascii_case(OPAQUE_ORIGIN) {
+            // The opaque origin carries no information of its own: allow ONLY when
+            // the user agent has positively said the request came from our own site,
+            // and reject otherwise (fail closed on an absent or non-own-site signal).
+            return own_site;
+        }
         if let Some(expected) = expected_origin {
             // Compare CANONICAL origins (issue #196): a browser lowercases the host
             // and drops the default port in the `Origin` it sends, so both sides are
             // normalized the same way (crate::state::origin_of) before the byte
             // comparison. Without this a `public_url` with an uppercase host or an
             // explicit `:443`/`:80` would falsely reject every legitimate same-origin
-            // POST. A value that does not parse falls back to its raw form, so an
-            // opaque `Origin` (for example `null`) still fails the match and is
-            // rejected. This never produces a false ALLOW.
+            // POST. A value that does not parse falls back to its raw form, so a
+            // malformed `Origin` still fails the match and is rejected. Fetch metadata
+            // never rescues a genuine FOREIGN origin: this comparison is reached with
+            // a real origin value and rejects on mismatch regardless of
+            // `Sec-Fetch-Site`. This never produces a false ALLOW.
             let origin_canon = crate::state::origin_of(origin);
             let expected_canon = crate::state::origin_of(expected);
             let origin_cmp = origin_canon.as_deref().unwrap_or(origin);
@@ -434,6 +476,81 @@ mod tests {
         // rejected.
         assert!(same_origin_ok(&cross_origin, None));
         assert!(!same_origin_ok(&cross_site, None));
+    }
+
+    /// A header map built from `(name, value)` pairs, for the CSRF matrix below.
+    fn headers_of(pairs: &[(&'static str, &'static str)]) -> HeaderMap {
+        use axum::http::HeaderValue;
+
+        let mut headers = HeaderMap::new();
+        for (name, value) in pairs {
+            headers.insert(*name, HeaderValue::from_static(value));
+        }
+        headers
+    }
+
+    #[test]
+    fn same_origin_ok_resolves_an_opaque_origin_by_fetch_metadata() {
+        // A REAL browser posting the login, consent, or registration form sends
+        // `Origin: null` whenever the page's referrer policy is `no-referrer` (Fetch:
+        // "append a request Origin header" serializes the origin as `null` for a
+        // non-GET/HEAD, non-CORS request under that policy). The opaque origin is
+        // therefore resolved by fetch metadata, which page script cannot forge.
+        let expected = Some("https://issuer.test");
+
+        // ACCEPTED: the user agent positively says the request came from our own site.
+        assert!(same_origin_ok(
+            &headers_of(&[("origin", "null"), ("sec-fetch-site", "same-origin")]),
+            expected
+        ));
+        assert!(same_origin_ok(
+            &headers_of(&[("origin", "null"), ("sec-fetch-site", "same-site")]),
+            expected
+        ));
+
+        // REJECTED: an opaque origin with a cross-site signal (a hostile page's form,
+        // or a sandboxed/`data:` initiator, both of which a browser reports as
+        // cross-site).
+        assert!(!same_origin_ok(
+            &headers_of(&[("origin", "null"), ("sec-fetch-site", "cross-site")]),
+            expected
+        ));
+
+        // REJECTED: an opaque origin with NO fetch metadata proves nothing, so it fails
+        // closed exactly as it did before.
+        assert!(!same_origin_ok(
+            &headers_of(&[("origin", "null")]),
+            expected
+        ));
+
+        // REJECTED: `Sec-Fetch-Site: none` (a user-initiated navigation) is not
+        // own-site evidence either.
+        assert!(!same_origin_ok(
+            &headers_of(&[("origin", "null"), ("sec-fetch-site", "none")]),
+            expected
+        ));
+
+        // REJECTED: the opaque rule is scoped to the literal `null` and never rescues a
+        // genuine FOREIGN origin, whatever the fetch metadata claims.
+        for site in ["same-origin", "same-site", "cross-site", "none"] {
+            let mut headers = headers_of(&[("origin", "https://evil.test")]);
+            headers.insert(
+                SEC_FETCH_SITE,
+                axum::http::HeaderValue::from_str(site).expect("valid"),
+            );
+            assert!(
+                !same_origin_ok(&headers, expected),
+                "a foreign Origin is rejected with Sec-Fetch-Site: {site}"
+            );
+        }
+
+        // REJECTED even with no derivable expected origin: an opaque origin without
+        // own-site metadata is refused on the fetch-metadata rule alone.
+        assert!(!same_origin_ok(&headers_of(&[("origin", "null")]), None));
+        assert!(same_origin_ok(
+            &headers_of(&[("origin", "null"), ("sec-fetch-site", "same-origin")]),
+            None
+        ));
     }
 
     #[test]
