@@ -6,6 +6,28 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Session and refresh-family FLEET OPERATIONS (issue #32). Sessions and refresh-token
+  families are now first-class, searchable, metadata-carrying management resources
+  rather than an opaque internal table.
+  - **New endpoints.** `GET /sessions` (searchable by `subject` and `client_id`, cursor
+    paginated), `GET /sessions/{session_id}` (inspect any lifecycle state: live, revoked,
+    or rotated away), `POST /sessions/{session_id}/revoke`, `POST /sessions/revoke` (bulk),
+    `POST /users/{user_id}/sessions/revoke` (revoke everything for a user, cascading to
+    the refresh-token families), `GET /refresh-families`, and
+    `GET /refresh-families/{family_id}`, all under the environment scope.
+  - **Offline-preserving by default.** A revoke cascades to the session-bound refresh
+    families but PRESERVES the `offline_access` families (issue #21's
+    offline-survives-logout semantic). The documented `hard_kill` flag also ends those,
+    and their grants with them.
+  - **Scope-fenced.** Every id is parsed under the caller's own scope, so a foreign
+    session or family is the uniform not-found, and a BULK revoke silently drops a
+    foreign id rather than reaching across the boundary. Each surface registers an
+    `IsolationProbe` with the #6 IDOR harness.
+  - **Deterministic revocation responses.** Each revoke reports the POST-CONDITION rather
+    than a row count, so the Idempotency-Key record (written in the SAME transaction as
+    the revocation) replays byte-identically and an absent, foreign, or already-revoked
+    session stays indistinguishable from a live one.
+
 - DCR abuse-control management surface (issue #31). Five operator-plane endpoints,
   all honoring the crate's contract (Idempotency-Key, same-transaction audit,
   RateLimit headers, cursor pagination, OpenAPI as source of truth):

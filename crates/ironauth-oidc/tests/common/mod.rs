@@ -1002,23 +1002,48 @@ impl Harness {
         auth_methods: &str,
         auth_time_micros: i64,
     ) -> String {
+        let (_id, cookie) = self
+            .session_with_id(subject, auth_methods, auth_time_micros)
+            .await;
+        cookie
+    }
+
+    /// Seed a session exactly as [`Harness::session_cookie_at`] does, and return its
+    /// identifier alongside the `Cookie` value (issue #32), so a test can revoke or
+    /// inspect the very session a request presents.
+    pub async fn session_with_id(
+        &self,
+        subject: &str,
+        auth_methods: &str,
+        auth_time_micros: i64,
+    ) -> (SessionId, String) {
         let session_id = SessionId::generate(&self.env, &self.scope);
         let (actor, corr) = self.seeding_actor();
         self.store()
             .scoped(self.scope)
             .acting(actor, corr)
             .sessions()
-            .create(
+            // The authoritative create path (issue #32) is a rotation with no prior
+            // session: a fresh id, both lifetimes, and no binding metadata (the two
+            // binding knobs are off by default).
+            .rotate(
                 &self.env,
                 &session_id,
-                subject,
-                auth_methods,
-                auth_time_micros,
-                FAR_FUTURE_MICROS,
+                None,
+                ironauth_store::NewSession {
+                    subject,
+                    auth_methods,
+                    auth_time_micros,
+                    idle_expires_micros: FAR_FUTURE_MICROS,
+                    absolute_expires_micros: FAR_FUTURE_MICROS,
+                    user_agent: None,
+                    peer_ip: None,
+                },
             )
             .await
             .expect("create session");
-        format!("{SESSION_COOKIE}={session_id}")
+        let cookie = format!("{SESSION_COOKIE}={session_id}");
+        (session_id, cookie)
     }
 
     /// A ready authenticated `Cookie` value for the harness client: seeds a fresh

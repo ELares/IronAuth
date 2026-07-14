@@ -6,6 +6,35 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- The session model on the OIDC surface (issue #32).
+  - **`sid` in every authorization-code ID token.** The token endpoint resolves the
+    per-(client, session) `sid` from the code's authenticating SSO session and emits it
+    as a legitimate issuer claim; `claims_supported` advertises it. Discovery now
+    advertises `backchannel_logout_session_supported = true`, which is TRUTHFUL because
+    the `sid` is stable per (client, session) and distinct across pairs.
+  - **Session-fixation defense.** `interaction::establish_session` now takes the request
+    headers and ROTATES the session id at every privilege transition (login,
+    registration, device-verification login): a fresh entropy-seam id, with the prior
+    one invalidated in the SAME transaction, so no call site can forget to rotate.
+  - **Immediate revocation on the read path.** `interaction::resolve_session` takes the
+    headers too and refuses a revoked or rotated session at once (the store's read guard
+    is authoritative), so a logout can never silently no-op.
+  - **Hardened cookies.** The session cookie keeps `__Host-` + `Secure` + `HttpOnly` +
+    `SameSite=Lax` and carries a SMALL OPAQUE id (a size-bounding test keeps the
+    multi-KB-cookie 431 class structurally impossible). New: an off-by-default CHIPS
+    `Partitioned` toggle that only ADDS the attribute (it never drops `SameSite` and
+    never breaks the `__Host-` prefix), and `clear_set_cookie`, the `Max-Age=0` clear a
+    logout sets.
+  - **Off-by-default binding knobs.** Peer-IP and device/user-agent session binding, each
+    inert unless an operator enables it (the tunability principle) and each failing
+    CLOSED when enabled. The peer IP is the POLICY-RESOLVED client IP the server stamps
+    on `PEER_IP_HEADER`, never a client-supplied header.
+  - **Session lifecycle signal.** `SessionLifecycleEvent` and `SessionSignalCause` on the
+    existing `RevocationEventSink` seam (a default no-op method, so existing sinks keep
+    compiling), for the #35 fan-out to consume. A ROTATION carries a successor and is
+    explicitly NON-terminal (`is_terminal()`), so a naive consumer cannot mistake it for
+    a logout.
+
 - RFC 8628 device authorization grant with cross-device BCP mitigations (issue #24).
   - **Device-authorization endpoint.** `POST /device_authorization` authenticates the
     client (self-scoped, exactly like the token endpoint), gates on the per-client

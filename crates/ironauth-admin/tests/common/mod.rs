@@ -15,11 +15,20 @@ use ironauth_admin::{AdminState, management_router};
 use ironauth_config::{AdminConfig, Secret, SecretString};
 use ironauth_env::Env;
 use ironauth_store::test_support::TestDatabase;
-use ironauth_store::{ClientId, CorrelationId, NewDynamicClient, Scope, Store};
+use ironauth_store::{
+    AuthorizationCodeId, ClientId, CorrelationId, GrantId, IssueCode, NewDynamicClient,
+    NewRefreshFamily, NewSession, RefreshFamilyId, RefreshTokenId, Scope, SessionId, Store, UserId,
+    refresh_token_digest,
+};
 use tower::ServiceExt;
 
 /// The bootstrap operator token the harness configures.
 pub const OPERATOR_TOKEN: &str = "test-bootstrap-operator-token";
+
+/// A far-future expiry (year 2100) in epoch microseconds: a seeded session or family
+/// whose lifetime can never elapse during a test, so a resource that stops resolving
+/// can only have been revoked.
+pub const FAR_FUTURE_MICROS: i64 = 4_102_444_800_000_000;
 
 /// A running management API over a fresh database.
 pub struct Harness {
@@ -94,6 +103,135 @@ impl Harness {
             .await
             .expect("seed dcr client")
             .id
+    }
+
+    /// Seed a LIVE session in `scope` for `subject` through the app-role store, exactly
+    /// as an interactive login would (issue #32), and return its id. The management
+    /// plane can read and revoke a session but never create one (the control role holds
+    /// no INSERT on `sessions`), so the fleet-ops tests seed through the data plane.
+    ///
+    /// The lifetime runs to the year 2100, so a session that stops resolving in a test
+    /// can only have been REVOKED, never merely expired.
+    pub async fn seed_session(&self, scope: Scope, subject: &str) -> SessionId {
+        let env = Env::system();
+        let id = SessionId::generate(&env, &scope);
+        self.db
+            .store()
+            .scoped(scope)
+            .acting(self.db.test_actor(&env), CorrelationId::generate(&env))
+            .sessions()
+            .rotate(
+                &env,
+                &id,
+                None,
+                NewSession {
+                    subject,
+                    auth_methods: "pwd",
+                    auth_time_micros: 0,
+                    idle_expires_micros: FAR_FUTURE_MICROS,
+                    absolute_expires_micros: FAR_FUTURE_MICROS,
+                    user_agent: None,
+                    peer_ip: None,
+                },
+            )
+            .await
+            .expect("seed session");
+        id
+    }
+
+    /// Whether `session` still RESOLVES on the authentication read path (issue #32).
+    /// This is the property a revoke must flip immediately.
+    pub async fn session_resolves(&self, scope: Scope, session: &SessionId) -> bool {
+        self.db
+            .store()
+            .scoped(scope)
+            .sessions()
+            .get(session, 0)
+            .await
+            .expect("read session")
+            .is_some()
+    }
+
+    /// Seed a refresh-token family bound to `session` (session bound or
+    /// `offline_access`), through the app-role store, and return its id.
+    pub async fn seed_refresh_family(
+        &self,
+        scope: Scope,
+        subject: &str,
+        client_id: &str,
+        session: &SessionId,
+        offline: bool,
+    ) -> RefreshFamilyId {
+        let env = Env::system();
+        let code_id = AuthorizationCodeId::generate(&env, &scope);
+        let grant_id = GrantId::generate(&env, &scope);
+        let session_text = session.to_string();
+        let client = ClientId::generate(&env, &scope);
+        self.db
+            .store()
+            .scoped(scope)
+            .acting(self.db.test_actor(&env), CorrelationId::generate(&env))
+            .authorization()
+            .issue(
+                &env,
+                IssueCode {
+                    code_id: &code_id,
+                    grant_id: &grant_id,
+                    client_id: &client,
+                    redirect_uri: "https://rp.example/cb",
+                    nonce: None,
+                    code_challenge: None,
+                    code_challenge_method: None,
+                    subject,
+                    oauth_scope: Some("openid"),
+                    auth_methods: "pwd",
+                    auth_time_micros: None,
+                    session_ref: Some(&session_text),
+                    consent_ref: None,
+                    claims_request: None,
+                    granted_resources: &[],
+                    expires_at_micros: FAR_FUTURE_MICROS,
+                    created_at_micros: 0,
+                },
+            )
+            .await
+            .expect("seed grant");
+
+        let family_id = RefreshFamilyId::generate(&env, &scope);
+        let jti = RefreshTokenId::generate(&env, &scope);
+        let digest = refresh_token_digest(&format!("ira_rt_{jti}~seed"));
+        self.db
+            .store()
+            .scoped(scope)
+            .acting(self.db.test_actor(&env), CorrelationId::generate(&env))
+            .refresh()
+            .issue(
+                &env,
+                NewRefreshFamily {
+                    family_id: &family_id,
+                    token_jti: &jti,
+                    token_digest: &digest,
+                    grant_id: &grant_id,
+                    subject,
+                    client_id,
+                    scope: Some("openid"),
+                    auth_methods: "pwd",
+                    offline,
+                    created_at_unix_micros: 0,
+                    idle_expires_at_unix_micros: FAR_FUTURE_MICROS,
+                    absolute_expires_at_unix_micros: FAR_FUTURE_MICROS,
+                },
+            )
+            .await
+            .expect("seed refresh family");
+        family_id
+    }
+
+    /// A freshly generated, in-scope user id (never inserted; `sessions.subject` is a
+    /// text column, so no user row is needed to model a session's subject).
+    #[must_use]
+    pub fn fresh_user_id(scope: Scope) -> UserId {
+        UserId::generate(&Env::system(), &scope)
     }
 
     /// A freshly generated, in-scope client id that is NOT inserted, for the

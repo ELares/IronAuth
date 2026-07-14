@@ -145,11 +145,14 @@ pub use password::{PasswordError, hash_password, verify_password};
 pub use registry::{
     GrantType, PkceMethod, PromptSet, PromptSetError, PromptValue, ResponseMode, ResponseType,
 };
-pub use revocation::{NoopRevocationSink, RevocationEvent, RevocationEventSink, RevokedTokenType};
+pub use revocation::{
+    NoopRevocationSink, RevocationEvent, RevocationEventSink, RevokedTokenType,
+    SessionLifecycleEvent, SessionSignalCause,
+};
 pub use sector::{
     SectorError, check_sector_document, sector_uri_required, validate_sector_identifier,
 };
-pub use session::SESSION_COOKIE;
+pub use session::{PEER_IP_HEADER, SESSION_COOKIE, clear_set_cookie};
 pub use state::{OidcState, ResourceTargetError};
 pub use subject::{
     MAX_SUBJECT_LEN, PairwiseSalt, SubjectCache, SubjectConfig, SubjectType, resolve_subject,

@@ -24,12 +24,13 @@ use axum::body::Body;
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use ironauth_store::{
-    ActorRef, ClientId, CorrelationId, HumanId, Scope, SessionId, StoreError, UserId,
+    ActorRef, ClientId, CorrelationId, HumanId, NewSession, Scope, SessionId, StoreError, UserId,
 };
 
 use crate::authn::AuthenticationEvent;
 use crate::hints::InteractionHints;
 use crate::pages;
+use crate::revocation::{SessionLifecycleEvent, SessionSignalCause};
 use crate::session;
 use crate::state::OidcState;
 use crate::util::{append_query, epoch_micros, query_get};
@@ -179,16 +180,25 @@ pub struct AuthenticatedSession {
     pub auth_methods: String,
 }
 
-/// Resolve the session cookie to an authenticated session within `scope`, or
-/// [`None`] when there is no cookie, the cookie names a session in another scope,
-/// or the session is absent or expired. A store failure is also [`None`] (fail
-/// closed to unauthenticated).
+/// Resolve the session cookie on `headers` to an authenticated session within
+/// `scope`, or [`None`] when there is no cookie, the cookie names a session in
+/// another scope, the session is absent, expired, REVOKED, or ROTATED away, or the
+/// session's OFF-BY-DEFAULT binding does not match the presenting request. A store
+/// failure is also [`None`] (fail closed to unauthenticated).
+///
+/// The revocation and rotation guard is enforced authoritatively in the store's read
+/// query (issue #32), so a revoked or rotated session stops resolving IMMEDIATELY
+/// rather than lingering until its lifetime elapses.
+///
+/// This takes the whole [`HeaderMap`] rather than just the cookie so the binding
+/// check can never be forgotten at a call site: every session resolution sees the
+/// presenting request.
 pub async fn resolve_session(
     state: &OidcState,
     scope: Scope,
-    cookie: Option<&str>,
+    headers: &HeaderMap,
 ) -> Option<AuthenticatedSession> {
-    let value = session::session_value_from_cookie_header(cookie)?;
+    let value = session::session_value_from_cookie_header(cookie_header(headers))?;
     let session_id = SessionId::parse_in_scope(value, &scope).ok()?;
     let now = epoch_micros(state.now());
     let record = state
@@ -199,6 +209,21 @@ pub async fn resolve_session(
         .await
         .ok()
         .flatten()?;
+    // The OFF-BY-DEFAULT binding knobs (issue #32). Each is inert unless an operator
+    // turned it on; when it IS on it fails CLOSED: the presenting request must carry
+    // the same value the session was established from, so a session replayed from a
+    // different peer IP (or a different device/user agent) does not resolve.
+    let presented = session_binding(state, headers);
+    if state.session_peer_ip_binding()
+        && !bound_value_matches(record.peer_ip.as_deref(), presented.peer_ip)
+    {
+        return None;
+    }
+    if state.session_device_binding()
+        && !bound_value_matches(record.user_agent.as_deref(), presented.user_agent)
+    {
+        return None;
+    }
     Some(AuthenticatedSession {
         session_id,
         subject: record.subject,
@@ -207,11 +232,66 @@ pub async fn resolve_session(
     })
 }
 
-/// Create a session for `subject` in `scope` recording the authentication `event`
-/// (its methods and time), and return the `Set-Cookie` value to establish it,
-/// attributed to `actor`. The session's `expires_at` comes from the clock seam
-/// and the configured session lifetime; the recorded `auth_time` and methods come
-/// from the `event`, so the ID token's claims trace back to the actual login.
+/// Whether a bound value on the session matches the presenting request. Fails CLOSED:
+/// an absent stored value or an absent presented value is a MISMATCH, so a binding
+/// that is enabled can never be bypassed by simply omitting the header.
+fn bound_value_matches(stored: Option<&str>, presented: Option<&str>) -> bool {
+    match (stored, presented) {
+        (Some(stored), Some(presented)) => stored == presented,
+        _ => false,
+    }
+}
+
+/// The OFF-BY-DEFAULT session binding inputs captured from the presenting request
+/// (issue #32). Each field is [`None`] unless its knob is enabled, so the safe
+/// default records nothing and binds nothing (the tunability principle: a NAT or a
+/// mobile IP change must never log a user out unless an operator opted in).
+#[derive(Debug, Clone, Copy, Default)]
+struct SessionBinding<'a> {
+    /// The device / user-agent binding input (the `User-Agent` header).
+    user_agent: Option<&'a str>,
+    /// The peer-IP binding input (the resolved client IP, see [`session::PEER_IP_HEADER`]).
+    peer_ip: Option<&'a str>,
+}
+
+/// The binding inputs to capture (at a privilege transition) or to compare against
+/// (at a session resolution), read from `headers` and gated on the two knobs.
+fn session_binding<'a>(state: &OidcState, headers: &'a HeaderMap) -> SessionBinding<'a> {
+    SessionBinding {
+        user_agent: if state.session_device_binding() {
+            header_str(headers, header::USER_AGENT.as_str())
+        } else {
+            None
+        },
+        peer_ip: if state.session_peer_ip_binding() {
+            header_str(headers, session::PEER_IP_HEADER)
+        } else {
+            None
+        },
+    }
+}
+
+/// A header's value as UTF-8, or [`None`] when absent or not valid UTF-8.
+fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    headers.get(name)?.to_str().ok()
+}
+
+/// Establish a session for `subject` in `scope` at a privilege transition (login,
+/// registration, and the future MFA / step-up seam), recording the authentication
+/// `event` (its methods and time), and return the `Set-Cookie` value that sets it,
+/// attributed to `actor`.
+///
+/// This ROTATES the session identifier (issue #32, session-fixation defense): it
+/// mints a fresh unpredictable id from the entropy seam and, when the request already
+/// presented a session cookie, INVALIDATES that prior id in the SAME transaction, so
+/// the prior id stops resolving from the next request on. The prior id is read from
+/// `headers`, so no call site can forget to rotate.
+///
+/// The session carries both lifetimes from the clock seam (the idle timeout and the
+/// absolute cap) and the OFF-BY-DEFAULT binding inputs (captured only when their knob
+/// is on). The cookie carries the configured CHIPS `Partitioned` toggle. The recorded
+/// `auth_time` and methods come from the `event`, so the ID token's claims trace back
+/// to the actual login.
 ///
 /// # Errors
 ///
@@ -222,28 +302,64 @@ pub async fn establish_session(
     subject: &str,
     event: &AuthenticationEvent,
     actor: ActorRef,
+    headers: &HeaderMap,
 ) -> Result<String, StoreError> {
     let now = state.now();
     let session_id = SessionId::generate(state.env(), &scope);
-    let expires_micros = epoch_micros(now.checked_add(state.session_ttl()).unwrap_or(now));
+    let idle_micros = epoch_micros(now.checked_add(state.session_idle_ttl()).unwrap_or(now));
+    let absolute_micros = epoch_micros(now.checked_add(state.session_ttl()).unwrap_or(now));
+    // The session the browser already holds, if any: the one this privilege
+    // transition rotates AWAY (session-fixation defense).
+    let prior = prior_session_id(headers, scope);
+    let binding = session_binding(state, headers);
     state
         .store()
         .scoped(scope)
         .acting(actor, CorrelationId::generate(state.env()))
         .sessions()
-        .create(
+        .rotate(
             state.env(),
             &session_id,
-            subject,
-            &event.methods_token(),
-            event.auth_time_unix_micros(),
-            expires_micros,
+            prior.as_ref(),
+            NewSession {
+                subject,
+                auth_methods: &event.methods_token(),
+                auth_time_micros: event.auth_time_unix_micros(),
+                idle_expires_micros: idle_micros,
+                absolute_expires_micros: absolute_micros,
+                user_agent: binding.user_agent,
+                peer_ip: binding.peer_ip,
+            },
         )
         .await?;
+    // Publish the ROTATION signal on the session-lifecycle seam (issue #32) when a
+    // prior session was actually rotated away, so the durable session-ended fan-out
+    // (#35) can build on this seam. A rotation carries a successor and is explicitly
+    // NON-terminal, so a naive consumer never mistakes it for a logout.
+    if let Some(prior) = prior.as_ref() {
+        state
+            .revocation_sink()
+            .publish_session(&SessionLifecycleEvent {
+                tenant: scope.tenant().to_string(),
+                environment: scope.environment().to_string(),
+                session_id: prior.to_string(),
+                cause: SessionSignalCause::Rotated,
+                successor_session_id: Some(session_id.to_string()),
+            });
+    }
     Ok(session::build_set_cookie(
         &session_id.to_string(),
         state.session_ttl(),
+        state.session_partitioned_cookie(),
     ))
+}
+
+/// The prior session id presented on the request, if any, parsed under `scope`
+/// (issue #32). A missing, malformed, or cross-scope cookie is [`None`] (there is
+/// simply no prior session of this scope to rotate away).
+fn prior_session_id(headers: &HeaderMap, scope: Scope) -> Option<SessionId> {
+    let value = session::session_value_from_cookie_header(cookie_header(headers))?;
+    SessionId::parse_in_scope(value, &scope).ok()
 }
 
 /// The stable human audit actor for a user (derived from the user id's PUBLIC

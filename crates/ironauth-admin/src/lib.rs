@@ -53,6 +53,7 @@ mod openapi;
 mod pagination;
 mod ratelimit;
 mod response;
+mod sessions;
 mod state;
 mod tenants;
 mod views;
@@ -124,6 +125,38 @@ pub fn management_router(state: AdminState) -> Router {
         .route(
             "/v1/tenants/{tenant_id}/environments/{environment_id}/clients/{client_id}/verify",
             post(dcr::verify_dcr_client),
+        )
+        // Session and refresh-family fleet operations (issue #32). The static
+        // `/sessions/revoke` (the bulk surface) and the parameterized
+        // `/sessions/{session_id}` are siblings; the router matches the static segment
+        // first, so a bulk revoke can never be read as a session id.
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/sessions",
+            get(sessions::list_sessions),
+        )
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/sessions/revoke",
+            post(sessions::bulk_revoke_sessions),
+        )
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/sessions/{session_id}",
+            get(sessions::get_session),
+        )
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/sessions/{session_id}/revoke",
+            post(sessions::revoke_session),
+        )
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}/sessions/revoke",
+            post(sessions::revoke_user_sessions),
+        )
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/refresh-families",
+            get(sessions::list_refresh_families),
+        )
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/refresh-families/{family_id}",
+            get(sessions::get_refresh_family),
         )
         .route("/openapi.json", get(serve_openapi))
         .layer(from_fn(ratelimit::rate_limit_headers))

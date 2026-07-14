@@ -345,12 +345,29 @@ impl Default for AdminConfig {
 /// long-lived code). The safe defaults are far below this ceiling.
 pub const OIDC_MAX_LIFETIME_SECS: u64 = 86_400;
 
-/// The largest a bootstrap session lifetime may be configured to, in seconds.
-/// A session is longer lived than a code or an access token (a user stays logged
-/// in across requests), but a bootstrap session beyond thirty days is almost
-/// always a misconfiguration, so config load rejects it. The real two-tier
-/// session model (M4) replaces this bootstrap session entirely.
+/// The largest a session lifetime may be configured to, in seconds. A session is
+/// longer lived than a code or an access token (a user stays logged in across
+/// requests), but a session beyond thirty days is almost always a misconfiguration,
+/// so config load rejects it. Bounds both the absolute cap (`oidc.session_ttl_secs`)
+/// and the idle timeout (`oidc.session_idle_ttl_secs`).
 pub const OIDC_MAX_SESSION_TTL_SECS: u64 = 2_592_000;
+
+/// The internal request header carrying the POLICY-RESOLVED client IP: the input of
+/// the OFF-BY-DEFAULT peer-IP session binding (issue #32).
+///
+/// It lives here, in the crate both the server and the OIDC provider already depend
+/// on, so the two agree on the name WITHOUT the server crate taking a dependency on
+/// the OIDC crate (the server stays decoupled from the routers it mounts).
+///
+/// It is a trusted INTERNAL seam, never client input. The server's observability
+/// middleware resolves the effective client IP under the trusted-proxy policy (which
+/// ignores every forwarding header unless an operator declared a proxy topology) and
+/// `insert`s it here on every request, REPLACING any value a client tried to supply,
+/// so a spoofed header cannot survive. A request that never passed that middleware
+/// carries no value at all, and the peer-IP binding then fails CLOSED (a request with
+/// no resolvable peer IP does not resolve a bound session), so the binding cannot be
+/// bypassed by omitting the header either.
+pub const PEER_IP_HEADER: &str = "x-ironauth-peer-ip";
 
 /// The minimum permitted JWKS `Cache-Control: max-age` (issue #19), in seconds.
 /// A shorter window would make relying parties refetch the key set too often and
@@ -465,13 +482,42 @@ pub struct OidcConfig {
     /// it to 0 to treat every reuse as genuine. At most `OIDC_MAX_LIFETIME_SECS`.
     pub reuse_grace_secs: u64,
 
-    /// Bootstrap session lifetime in seconds (issue #20). The opaque `__Host-`
-    /// session cookie established at login or registration is valid for this long;
-    /// a request presenting an expired session re-authenticates. The default
-    /// (3600) is a conservative one hour. Must be at least 1 and at most
-    /// `OIDC_MAX_SESSION_TTL_SECS`. The real two-tier session model (M4) replaces
-    /// this bootstrap session.
+    /// Session ABSOLUTE hard-cap lifetime in seconds (issue #20, extended by issue
+    /// #32). The opaque `__Host-` session cookie established at login is valid for at
+    /// most this long however active; a request presenting an expired session
+    /// re-authenticates. The default (3600) is a conservative one hour. Must be at
+    /// least 1 and at most `OIDC_MAX_SESSION_TTL_SECS`. Pairs with
+    /// `session_idle_ttl_secs` (the idle timeout).
     pub session_ttl_secs: u64,
+
+    /// Session IDLE timeout in seconds (issue #32): a session unused for longer than
+    /// this stops resolving, independently of the absolute cap `session_ttl_secs`.
+    /// The default (3600) equals the absolute cap, so the default behavior matches
+    /// the single-lifetime bootstrap; lower it to expire idle sessions sooner. Must
+    /// be at least 1, at most `OIDC_MAX_SESSION_TTL_SECS`, and at most
+    /// `session_ttl_secs` (an idle timeout beyond the absolute cap is meaningless).
+    pub session_idle_ttl_secs: u64,
+
+    /// Add the CHIPS `Partitioned` attribute to session cookies (issue #32). The safe
+    /// default (`false`) leaves it OFF: the cookie is the standard
+    /// `__Host-`/`Secure`/`HttpOnly`/`SameSite=Lax` cookie. Set it to `true` for
+    /// embedded-widget (cross-site) scenarios so the browser gives each top-level
+    /// site its own partitioned session cookie; enabling it NEVER drops `SameSite`
+    /// and NEVER breaks the `__Host-` prefix, it only ADDS `Partitioned`.
+    pub session_partitioned_cookie: bool,
+
+    /// Bind the session to the peer IP it was established from (issue #32). The safe
+    /// default (`false`) leaves it OFF (the tunability principle: env-dependent
+    /// behavior is config, never a baked-in one-way choice), so a NAT or a mobile IP
+    /// change never logs a user out. Enable it only where clients have stable IPs; it
+    /// then fails closed (a session presented from a different peer IP does not
+    /// resolve).
+    pub session_peer_ip_binding: bool,
+
+    /// Bind the session to the device / user agent it was established from (issue
+    /// #32). The safe default (`false`) leaves it OFF (the tunability principle).
+    /// Enable it to fail closed when the device/user-agent fingerprint changes.
+    pub session_device_binding: bool,
 
     /// The `Cache-Control: max-age` (in seconds) advertised on every JWKS
     /// response (issue #19). A relying party may cache the published keys for this
@@ -791,6 +837,10 @@ impl Default for OidcConfig {
             default_access_token_format: TokenFormat::AtJwt,
             reuse_grace_secs: 10,
             session_ttl_secs: 3600,
+            session_idle_ttl_secs: 3600,
+            session_partitioned_cookie: false,
+            session_peer_ip_binding: false,
+            session_device_binding: false,
             jwks_cache_max_age_secs: 600,
             require_pkce_for_confidential_clients: true,
             conform_id_token_claims: false,
@@ -992,22 +1042,7 @@ impl Config {
                 ),
             });
         }
-        // The session lifetime has its own, larger ceiling (a session is longer
-        // lived than a code or access token). A zero-second session is born
-        // expired, so the lower bound is one second like the token lifetimes.
-        if self.oidc.session_ttl_secs < 1 {
-            return Err(ConfigError::Invalid {
-                message: "oidc.session_ttl_secs must be at least 1 second".to_owned(),
-            });
-        }
-        if self.oidc.session_ttl_secs > OIDC_MAX_SESSION_TTL_SECS {
-            return Err(ConfigError::Invalid {
-                message: format!(
-                    "oidc.session_ttl_secs ({}) must not exceed {OIDC_MAX_SESSION_TTL_SECS} seconds",
-                    self.oidc.session_ttl_secs
-                ),
-            });
-        }
+        validate_session_lifetimes(&self.oidc)?;
         // The JWKS cache window must stay in the operational-discipline range.
         let cache = self.oidc.jwks_cache_max_age_secs;
         if !(OIDC_JWKS_CACHE_MIN_SECS..=OIDC_JWKS_CACHE_MAX_SECS).contains(&cache) {
@@ -1137,6 +1172,55 @@ fn validate_device_authorization(oidc: &OidcConfig) -> Result<(), ConfigError> {
                 "oidc.device_verification_rate_window_secs ({}) must not exceed \
                  {OIDC_MAX_LIFETIME_SECS} seconds",
                 oidc.device_verification_rate_window_secs
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// Validate the session lifetimes (issue #20, extended by issue #32), kept out of
+/// [`Config::validate`] so each stays within the readable-length lint.
+///
+/// A session has its own, larger ceiling than a code or an access token (a session
+/// is longer lived). Both lifetimes have a one-second lower bound: a zero-second
+/// session is born expired. The IDLE timeout must not exceed the ABSOLUTE hard cap,
+/// because an idle timeout beyond the cap can never fire (the session is already
+/// dead), so accepting it would silently mislead an operator into believing idle
+/// expiry is configured when it is inert.
+fn validate_session_lifetimes(oidc: &OidcConfig) -> Result<(), ConfigError> {
+    if oidc.session_ttl_secs < 1 {
+        return Err(ConfigError::Invalid {
+            message: "oidc.session_ttl_secs must be at least 1 second".to_owned(),
+        });
+    }
+    if oidc.session_ttl_secs > OIDC_MAX_SESSION_TTL_SECS {
+        return Err(ConfigError::Invalid {
+            message: format!(
+                "oidc.session_ttl_secs ({}) must not exceed {OIDC_MAX_SESSION_TTL_SECS} seconds",
+                oidc.session_ttl_secs
+            ),
+        });
+    }
+    if oidc.session_idle_ttl_secs < 1 {
+        return Err(ConfigError::Invalid {
+            message: "oidc.session_idle_ttl_secs must be at least 1 second".to_owned(),
+        });
+    }
+    if oidc.session_idle_ttl_secs > OIDC_MAX_SESSION_TTL_SECS {
+        return Err(ConfigError::Invalid {
+            message: format!(
+                "oidc.session_idle_ttl_secs ({}) must not exceed \
+                 {OIDC_MAX_SESSION_TTL_SECS} seconds",
+                oidc.session_idle_ttl_secs
+            ),
+        });
+    }
+    if oidc.session_idle_ttl_secs > oidc.session_ttl_secs {
+        return Err(ConfigError::Invalid {
+            message: format!(
+                "oidc.session_idle_ttl_secs ({}) must not exceed oidc.session_ttl_secs ({}): an \
+                 idle timeout beyond the absolute cap can never fire",
+                oidc.session_idle_ttl_secs, oidc.session_ttl_secs
             ),
         });
     }

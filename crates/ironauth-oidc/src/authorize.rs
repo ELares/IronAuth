@@ -754,6 +754,11 @@ async fn mint_front_channel_id_token(
         oauth_scope: resolved.oauth_scope,
         auth_methods: resolved.auth_methods,
         auth_time_unix_micros: resolved.auth_time_micros,
+        // The legacy front-channel (implicit/hybrid) ID token does not yet carry the
+        // per-client `sid` (issue #32): that claim is emitted on the always-on
+        // authorization-code path at the token endpoint. This certification-only flow
+        // adopts it in a follow-up; None omits it here.
+        sid: None,
         at_hash: None,
         c_hash: c_hash.as_deref(),
         extra_claims: &extra_claims,
@@ -1282,7 +1287,6 @@ async fn resolve_gate(
 ) -> Result<Gate, AuthorizeError> {
     // The scope is the one the client_id declares (fixed at validation).
     let scope = client_id.scope();
-    let cookie = interaction::cookie_header(headers);
     let prompt_none = prompt.contains(PromptValue::None);
     // A negotiated-mode redirect error (redirect_uri is already validated), used for
     // the prompt=none surfaces so an interaction need becomes an error, never a page.
@@ -1295,7 +1299,7 @@ async fn resolve_gate(
         mode,
     };
 
-    let Some(session) = interaction::resolve_session(state, scope, cookie).await else {
+    let Some(session) = interaction::resolve_session(state, scope, headers).await else {
         // No usable session (absent, expired, or cross-scope).
         if prompt_none {
             return Err(gate_error(

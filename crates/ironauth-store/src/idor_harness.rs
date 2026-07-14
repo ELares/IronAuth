@@ -44,8 +44,10 @@ use std::time::Duration;
 use ironauth_env::Env;
 
 use crate::audit::ActorRef;
-use crate::id::{CorrelationId, GrantId, IssuedTokenId, ServiceId, SigningKeyId};
-use crate::repository::{RedeemOutcome, TokenStatus};
+use crate::id::{
+    CorrelationId, GrantId, IssuedTokenId, ServiceId, SessionId, SigningKeyId, UserId,
+};
+use crate::repository::{RedeemOutcome, SessionEndCause, TokenStatus};
 use crate::scope::Scope;
 use crate::store::Store;
 
@@ -159,6 +161,30 @@ impl IdorHarness {
     /// with the data-plane store (`ironauth_app`).
     pub fn register_signing_key_probes(&mut self) -> &mut Self {
         self.register(Box::new(SigningKeyGetProbe));
+        self
+    }
+
+    /// Register the session fleet-operations probes (issue #32): every surface the
+    /// management API exposes over the two-tier session model resolves a scoped
+    /// resource by identifier, so every one of them is registered here and runs under
+    /// forced row-level security.
+    ///
+    /// The set is the authentication read path (`sessions.get`), the per-client `sid`
+    /// store (`client_sessions.ensure_sid`, which must never attach a per-client
+    /// session to a foreign SSO session), the fleet read surfaces
+    /// (`session_fleet.get`, `refresh_family_fleet.get`), and the three mutating fleet
+    /// surfaces (`sessions.revoke`, `sessions.bulk_revoke`, `sessions.revoke_all`).
+    /// The bulk probe is the important one: a batch is scope-FENCED, so a foreign id
+    /// smuggled into an otherwise valid batch must be a uniform no-op rather than a
+    /// cross-tenant revocation.
+    pub fn register_session_fleet_probes(&mut self) -> &mut Self {
+        self.register(Box::new(SessionGetProbe));
+        self.register(Box::new(ClientSessionEnsureSidProbe));
+        self.register(Box::new(SessionFleetGetProbe));
+        self.register(Box::new(RefreshFamilyFleetGetProbe));
+        self.register(Box::new(SessionRevokeProbe));
+        self.register(Box::new(SessionBulkRevokeProbe));
+        self.register(Box::new(UserSessionsRevokeAllProbe));
         self
     }
 
@@ -473,6 +499,253 @@ impl IsolationProbe for SigningKeyGetProbe {
                 // Reading a foreign key's material or metadata would be a leak.
                 Ok(_) => ProbeOutcome::Leaked,
                 Err(_) => ProbeOutcome::Denied,
+            }
+        })
+    }
+}
+
+/// Built-in probe for `SessionRepo::get` (issue #32): the authentication read path.
+/// A session established in another tenant or environment must never resolve under
+/// the caller's scope, or a stolen cookie would authenticate across a tenant
+/// boundary.
+struct SessionGetProbe;
+
+impl IsolationProbe for SessionGetProbe {
+    fn name(&self) -> &'static str {
+        "sessions.get"
+    }
+
+    fn probe<'a>(
+        &'a self,
+        store: &'a Store,
+        caller: Scope,
+        foreign_id: &'a str,
+    ) -> BoxProbeFuture<'a> {
+        Box::pin(async move {
+            // Parse the untrusted cookie value under the caller's OWN scope; a
+            // session minted in another scope fails here as a uniform not-found.
+            let Ok(id) = SessionId::parse_in_scope(foreign_id, &caller) else {
+                return ProbeOutcome::Denied;
+            };
+            match store.scoped(caller).sessions().get(&id, 0).await {
+                Ok(Some(_)) => ProbeOutcome::Leaked,
+                Ok(None) | Err(_) => ProbeOutcome::Denied,
+            }
+        })
+    }
+}
+
+/// Built-in probe for `ClientSessionRepo::ensure_sid` (issue #32). The per-client
+/// `sid` tier must never be attached to a foreign SSO session: that would mint a
+/// `sid` for another tenant's session and hand the caller a back-channel-logout
+/// join key into a scope it does not own.
+struct ClientSessionEnsureSidProbe;
+
+impl IsolationProbe for ClientSessionEnsureSidProbe {
+    fn name(&self) -> &'static str {
+        "client_sessions.ensure_sid"
+    }
+
+    fn probe<'a>(
+        &'a self,
+        store: &'a Store,
+        caller: Scope,
+        foreign_id: &'a str,
+    ) -> BoxProbeFuture<'a> {
+        Box::pin(async move {
+            let env = Env::system();
+            // A foreign session id must not even parse under the caller's scope.
+            let Ok(id) = SessionId::parse_in_scope(foreign_id, &caller) else {
+                return ProbeOutcome::Denied;
+            };
+            match store
+                .scoped(caller)
+                .client_sessions()
+                .ensure_sid(&env, &id, "cli_probe", 0)
+                .await
+            {
+                // Minting a sid against a foreign SSO session would be a leak.
+                Ok(_) => ProbeOutcome::Leaked,
+                Err(_) => ProbeOutcome::Denied,
+            }
+        })
+    }
+}
+
+/// Built-in probe for `SessionFleetRepo::get` (issue #32): the management inspect
+/// surface. A foreign session's metadata (its subject, its user agent, its lifecycle)
+/// must never be readable under the caller's scope.
+struct SessionFleetGetProbe;
+
+impl IsolationProbe for SessionFleetGetProbe {
+    fn name(&self) -> &'static str {
+        "session_fleet.get"
+    }
+
+    fn probe<'a>(
+        &'a self,
+        store: &'a Store,
+        caller: Scope,
+        foreign_id: &'a str,
+    ) -> BoxProbeFuture<'a> {
+        Box::pin(async move {
+            let fleet = store.scoped(caller).session_fleet();
+            let Ok(id) = fleet.parse_id(foreign_id) else {
+                return ProbeOutcome::Denied;
+            };
+            match fleet.get(&id).await {
+                Ok(Some(_)) => ProbeOutcome::Leaked,
+                Ok(None) | Err(_) => ProbeOutcome::Denied,
+            }
+        })
+    }
+}
+
+/// Built-in probe for `RefreshFamilyFleetRepo::get` (issue #32): refresh-token
+/// families are a searchable fleet resource, so a foreign family must be a uniform
+/// not-found like every other cross-scope resource.
+struct RefreshFamilyFleetGetProbe;
+
+impl IsolationProbe for RefreshFamilyFleetGetProbe {
+    fn name(&self) -> &'static str {
+        "refresh_family_fleet.get"
+    }
+
+    fn probe<'a>(
+        &'a self,
+        store: &'a Store,
+        caller: Scope,
+        foreign_id: &'a str,
+    ) -> BoxProbeFuture<'a> {
+        Box::pin(async move {
+            let fleet = store.scoped(caller).refresh_family_fleet();
+            let Ok(id) = fleet.parse_id(foreign_id) else {
+                return ProbeOutcome::Denied;
+            };
+            match fleet.get(&id).await {
+                Ok(Some(_)) => ProbeOutcome::Leaked,
+                Ok(None) | Err(_) => ProbeOutcome::Denied,
+            }
+        })
+    }
+}
+
+/// Built-in probe for `ActingSessionRepo::revoke` (issue #32): the single-session
+/// fleet revoke. Revoking another tenant's session would be a cross-tenant denial of
+/// service, so it must be the uniform not-found.
+struct SessionRevokeProbe;
+
+impl IsolationProbe for SessionRevokeProbe {
+    fn name(&self) -> &'static str {
+        "sessions.revoke"
+    }
+
+    fn probe<'a>(
+        &'a self,
+        store: &'a Store,
+        caller: Scope,
+        foreign_id: &'a str,
+    ) -> BoxProbeFuture<'a> {
+        Box::pin(async move {
+            let env = Env::system();
+            let Ok(id) = store.scoped(caller).session_fleet().parse_id(foreign_id) else {
+                return ProbeOutcome::Denied;
+            };
+            let actor = ActorRef::service(ServiceId::generate(&env));
+            let correlation = CorrelationId::generate(&env);
+            match store
+                .scoped(caller)
+                .acting(actor, correlation)
+                .sessions()
+                .revoke(&env, &id, SessionEndCause::Revoked, false, None)
+                .await
+            {
+                // Flipping a foreign session would be a leak (a cross-tenant logout).
+                Ok(outcome) if outcome.session_flipped => ProbeOutcome::Leaked,
+                Ok(_) | Err(_) => ProbeOutcome::Denied,
+            }
+        })
+    }
+}
+
+/// Built-in probe for `ActingSessionRepo::bulk_revoke` (issue #32). A bulk revoke is
+/// the surface where a scope fence is easiest to forget: this hands it a session id
+/// carrying its OWN (foreign) declared scope, exactly as an attacker would smuggle
+/// one into an otherwise valid batch, and requires it to be a uniform no-op.
+struct SessionBulkRevokeProbe;
+
+impl IsolationProbe for SessionBulkRevokeProbe {
+    fn name(&self) -> &'static str {
+        "sessions.bulk_revoke"
+    }
+
+    fn probe<'a>(
+        &'a self,
+        store: &'a Store,
+        caller: Scope,
+        foreign_id: &'a str,
+    ) -> BoxProbeFuture<'a> {
+        Box::pin(async move {
+            let env = Env::system();
+            // Deliberately DO NOT parse under the caller's scope: parse the id under
+            // its OWN declared scope, so the typed value reaching the batch really is
+            // a foreign session. The repository's scope fence is what must reject it.
+            let Ok(id) = SessionId::parse_declared_scope(foreign_id) else {
+                return ProbeOutcome::Denied;
+            };
+            let actor = ActorRef::service(ServiceId::generate(&env));
+            let correlation = CorrelationId::generate(&env);
+            match store
+                .scoped(caller)
+                .acting(actor, correlation)
+                .sessions()
+                .bulk_revoke(&env, &[id], false, None)
+                .await
+            {
+                // Any flip means the batch reached a session outside the caller's
+                // scope.
+                Ok(0) | Err(_) => ProbeOutcome::Denied,
+                Ok(_) => ProbeOutcome::Leaked,
+            }
+        })
+    }
+}
+
+/// Built-in probe for `ActingSessionRepo::revoke_all_for_user` (issue #32): the
+/// revoke-everything-for-a-user cascade. Aimed at a foreign user it must be the
+/// uniform not-found, never a cross-tenant mass logout.
+struct UserSessionsRevokeAllProbe;
+
+impl IsolationProbe for UserSessionsRevokeAllProbe {
+    fn name(&self) -> &'static str {
+        "sessions.revoke_all"
+    }
+
+    fn probe<'a>(
+        &'a self,
+        store: &'a Store,
+        caller: Scope,
+        foreign_id: &'a str,
+    ) -> BoxProbeFuture<'a> {
+        Box::pin(async move {
+            let env = Env::system();
+            // The subject is a user id; parse it under the caller's OWN scope.
+            let Ok(subject) = UserId::parse_in_scope(foreign_id, &caller) else {
+                return ProbeOutcome::Denied;
+            };
+            let actor = ActorRef::service(ServiceId::generate(&env));
+            let correlation = CorrelationId::generate(&env);
+            match store
+                .scoped(caller)
+                .acting(actor, correlation)
+                .sessions()
+                .revoke_all_for_user(&env, &subject, false, None)
+                .await
+            {
+                Ok(outcome) if outcome.sessions_revoked > 0 || outcome.families_revoked > 0 => {
+                    ProbeOutcome::Leaked
+                }
+                Ok(_) | Err(_) => ProbeOutcome::Denied,
             }
         })
     }

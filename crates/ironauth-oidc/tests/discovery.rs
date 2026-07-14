@@ -678,3 +678,21 @@ fn string_array(doc: &Value, key: &str) -> Vec<String> {
 fn as_strs<T: Copy>(all: &[T], as_str: impl Fn(T) -> &'static str) -> Vec<String> {
     all.iter().map(|value| as_str(*value).to_owned()).collect()
 }
+
+#[tokio::test]
+async fn backchannel_logout_session_support_is_advertised_truthfully() {
+    // OIDC Back-Channel Logout 1.0 (issue #32): EVERY authorization-code ID token
+    // carries a `sid` that is stable per (client, session) and distinct across pairs
+    // (proven end to end in tests/sessions.rs), so advertising this is honest rather
+    // than aspirational. Advertising it WITHOUT the sid would make back-channel logout
+    // unimplementable for a relying party that trusted the metadata.
+    let issuer = "https://issuer.test/t/tnt/e/env";
+    let doc = discovery_document(
+        issuer,
+        ISSUER_BASE,
+        &format!("{issuer}/jwks.json"),
+        &SigningPolicy::eddsa_default(),
+        &DiscoveryCapabilities::default(),
+    );
+    assert_eq!(doc["backchannel_logout_session_supported"], json!(true));
+}

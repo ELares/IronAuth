@@ -125,12 +125,15 @@ pub async fn register_post(
             // Registration authenticates the new user with the password they just
             // set: a `pwd` authentication event at the current clock instant.
             let event = AuthenticationEvent::password(epoch_micros(state.now()));
+            // Session-fixation defense (issue #32): establish_session rotates away
+            // any prior session the request presented, in the same transaction.
             match interaction::establish_session(
                 &state,
                 resume.scope,
                 &subject,
                 &event,
                 session_actor,
+                &headers,
             )
             .await
             {

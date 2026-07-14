@@ -1554,10 +1554,798 @@
           }
         ]
       }
+    },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/refresh-families": {
+      "get": {
+        "tags": [
+          "sessions"
+        ],
+        "summary": "List the refresh-token families in an environment (cursor paginated), searchable by\nuser and by client.",
+        "operationId": "listRefreshFamilies",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "subject",
+            "in": "query",
+            "description": "Only sessions or families of this subject (a `usr_...` id).",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "client_id",
+            "in": "query",
+            "description": "Only sessions or families of this client (a `cli_...` id).",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "The desired page size, a positive integer. Clamped to\n`[1, max_page_size]`; defaults to the configured default when absent.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "The opaque cursor from a previous page's `next_cursor`. Absent for the\nfirst page (keyset pagination; there is no offset).",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "A page of refresh-token families",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RefreshFamilyList"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed cursor",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/refresh-families/{family_id}": {
+      "get": {
+        "tags": [
+          "sessions"
+        ],
+        "summary": "Inspect one refresh-token family.",
+        "operationId": "getRefreshFamily",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "family_id",
+            "in": "path",
+            "description": "The family identifier (rff_...)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The refresh-token family",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RefreshFamilyView"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found (absent or in another scope)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/sessions": {
+      "get": {
+        "tags": [
+          "sessions"
+        ],
+        "summary": "List the sessions in an environment (cursor paginated), searchable by user and by\nclient.",
+        "operationId": "listSessions",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "subject",
+            "in": "query",
+            "description": "Only sessions or families of this subject (a `usr_...` id).",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "client_id",
+            "in": "query",
+            "description": "Only sessions or families of this client (a `cli_...` id).",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "The desired page size, a positive integer. Clamped to\n`[1, max_page_size]`; defaults to the configured default when absent.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "The opaque cursor from a previous page's `next_cursor`. Absent for the\nfirst page (keyset pagination; there is no offset).",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "A page of sessions",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionList"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed cursor",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/sessions/revoke": {
+      "post": {
+        "tags": [
+          "sessions"
+        ],
+        "summary": "Revoke a BATCH of sessions in one audited transaction. A foreign-scope id in the\nbatch is a uniform no-op (never a cross-tenant revocation).",
+        "operationId": "bulkRevokeSessions",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Required. Replaying a POST with the same key returns the original response without re-executing.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BulkRevokeSessionsRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The batch was revoked",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BulkRevocationView"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed request or too many sessions",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency-Key reused with a different request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/sessions/{session_id}": {
+      "get": {
+        "tags": [
+          "sessions"
+        ],
+        "summary": "Inspect one session, whatever its lifecycle state (live, revoked, or rotated away).",
+        "operationId": "getSession",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "session_id",
+            "in": "path",
+            "description": "The session identifier (ses_...)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The session",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionView"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found (absent or in another scope)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/sessions/{session_id}/revoke": {
+      "post": {
+        "tags": [
+          "sessions"
+        ],
+        "summary": "Revoke ONE session. It stops resolving immediately and its session-bound refresh\nfamilies are revoked with it; the `offline_access` families survive unless\n`hard_kill` is set.",
+        "operationId": "revokeSession",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "session_id",
+            "in": "path",
+            "description": "The session identifier (ses_...)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Required. Replaying a POST with the same key returns the original response without re-executing.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RevokeSessionsRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Revoked",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionRevocationView"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found (absent or in another scope)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency-Key reused with a different request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}/sessions/revoke": {
+      "post": {
+        "tags": [
+          "sessions"
+        ],
+        "summary": "Revoke EVERYTHING for one user: every session, cascading to the user's\nrefresh-token families in the SAME transaction. The `offline_access` families\nSURVIVE (issue #21's offline-survives-logout semantic) unless the explicit\n`hard_kill` flag is passed, which also revokes their grants so every already-issued\naccess token dies immediately.",
+        "operationId": "revokeUserSessions",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "user_id",
+            "in": "path",
+            "description": "The user identifier (usr_...)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Required. Replaying a POST with the same key returns the original response without re-executing.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RevokeSessionsRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Every session of the user was revoked",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UserRevocationView"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found (absent or in another scope)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency-Key reused with a different request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
     }
   },
   "components": {
     "schemas": {
+      "BulkRevocationView": {
+        "type": "object",
+        "description": "The result of a BULK session revocation (issue #32). States the post-condition; see\n[`SessionRevocationView`] for why.",
+        "required": [
+          "sessions_targeted",
+          "hard_kill"
+        ],
+        "properties": {
+          "hard_kill": {
+            "type": "boolean",
+            "description": "Whether the `offline_access` refresh families were killed too."
+          },
+          "sessions_targeted": {
+            "type": "integer",
+            "format": "int64",
+            "description": "How many of the named sessions were IN SCOPE and therefore targeted. Ids that\nwere malformed or belonged to another tenant or environment are silently\ndropped (scope fence), so this can be lower than the number of ids sent.",
+            "minimum": 0
+          }
+        }
+      },
+      "BulkRevokeSessionsRequest": {
+        "type": "object",
+        "description": "The body of a BULK session revocation (issue #32).",
+        "properties": {
+          "hard_kill": {
+            "type": "boolean",
+            "description": "Also revoke the `offline_access` families and their grants (a HARD KILL). The\ndefault preserves them; see [`RevokeSessionsRequest::hard_kill`]."
+          },
+          "session_ids": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The sessions to revoke. Every id is scope-FENCED: one belonging to another\ntenant or environment is a uniform no-op (never an error that would confirm\nits existence), so a batch can never reach across a scope boundary."
+          }
+        }
+      },
       "ClientVerificationView": {
         "type": "object",
         "description": "A dynamically registered client's verification state (issue #31), as returned by\nthe management API. `quarantined` is the live gate the authorization/consent path\nhonors; `verified_at_unix_ms` records when an admin lifted the quarantine.",
@@ -1958,6 +2746,244 @@
           }
         }
       },
+      "RefreshFamilyList": {
+        "type": "object",
+        "description": "A page of refresh-token families.",
+        "required": [
+          "items"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RefreshFamilyView"
+            },
+            "description": "The families in this page."
+          },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The cursor for the next page, or null when this is the last page."
+          }
+        }
+      },
+      "RefreshFamilyView": {
+        "type": "object",
+        "description": "A refresh-token family, as the fleet-operations surface reports it (issue #32).\nFamilies are searchable fleet resources alongside sessions, so an operator can see\nexactly which long-lived credential chains a user or a client holds.",
+        "required": [
+          "id",
+          "subject",
+          "client_id",
+          "offline",
+          "created_at_unix_ms",
+          "absolute_expires_at_unix_ms"
+        ],
+        "properties": {
+          "absolute_expires_at_unix_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The absolute hard cap on the family's rotated lifetime."
+          },
+          "client_id": {
+            "type": "string",
+            "description": "The OAuth client the family belongs to."
+          },
+          "created_at_unix_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Creation time, milliseconds since the Unix epoch."
+          },
+          "id": {
+            "type": "string",
+            "description": "The family identifier (`rff_...`)."
+          },
+          "offline": {
+            "type": "boolean",
+            "description": "Whether this is an `offline_access` family. An offline family SURVIVES a\nlogout and a session revocation (issue #21); only an explicit hard kill ends\nit."
+          },
+          "revoked_at_unix_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "When the family was revoked, milliseconds since the Unix epoch, or null."
+          },
+          "scope": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The granted OAuth scope the family was issued against."
+          },
+          "session_ref": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The authenticating SSO session (`ses_...`), when a session backed the grant."
+          },
+          "subject": {
+            "type": "string",
+            "description": "The authenticated end-user subject the family's tokens are minted for."
+          }
+        }
+      },
+      "RevokeSessionsRequest": {
+        "type": "object",
+        "description": "The body of a single-session or revoke-everything-for-a-user revocation (issue\n#32). Both fields are optional, so an empty body is a plain, offline-preserving\nrevoke.",
+        "properties": {
+          "hard_kill": {
+            "type": "boolean",
+            "description": "Also revoke the user's `offline_access` refresh families AND their grants, so\nevery already-issued access token dies immediately (a HARD KILL).\n\nThe default (`false`) PRESERVES the `offline_access` families, which is the\ndocumented offline-survives-logout semantic (issue #21): a background job\nholding an offline token keeps working when the user's browser session is\nrevoked. Set this only when the intent is to cut a compromised principal off\nfrom everything."
+          }
+        }
+      },
+      "SessionList": {
+        "type": "object",
+        "description": "A page of sessions.",
+        "required": [
+          "items"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SessionView"
+            },
+            "description": "The sessions in this page."
+          },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The cursor for the next page, or null when this is the last page."
+          }
+        }
+      },
+      "SessionRevocationView": {
+        "type": "object",
+        "description": "The result of revoking one session (issue #32).\n\nEvery revocation view states the POST-CONDITION (what is true now), never a delta\n(how many rows this particular call happened to flip). That is deliberate, and it\nis what makes the two cross-cutting contracts hold at once:\n\n- **Idempotency-Key replay.** The stored response is written in the SAME\n  transaction as the revocation, so its body must be known before the write. A\n  post-condition is; a row count is not.\n- **The anti-oracle.** An absent session, a session in ANOTHER tenant, and an\n  already-revoked session all produce the identical response, so the surface never\n  confirms which sessions exist.\n\nThe actual cascade is observable where it belongs: the refresh-family fleet list,\nwhich shows exactly which families were revoked and which `offline_access`\nfamilies survived.",
+        "required": [
+          "id",
+          "revoked",
+          "hard_kill"
+        ],
+        "properties": {
+          "hard_kill": {
+            "type": "boolean",
+            "description": "Whether the `offline_access` refresh families were killed too. When false (the\ndefault) they SURVIVE, which is issue #21's offline-survives-logout semantic."
+          },
+          "id": {
+            "type": "string",
+            "description": "The session that was targeted."
+          },
+          "revoked": {
+            "type": "boolean",
+            "description": "Always true: after this call the session does not resolve, whether it was live,\nalready revoked, or absent (the anti-oracle)."
+          }
+        }
+      },
+      "SessionView": {
+        "type": "object",
+        "description": "A session, as the fleet-operations surface reports it (issue #32).\n\nSessions are first-class, searchable, metadata-carrying fleet resources rather\nthan an opaque internal table. The view deliberately reports REVOKED, ROTATED, and\nENDED sessions too (not just live ones), so an operator can inspect the whole\nlifecycle: `ended_at` plus `end_cause` say when and why, and `superseded_by` names\nthe successor when the session was rotated away at a privilege transition.\n\n`user_agent` and `peer_ip` are present only when the operator enabled the\ncorresponding OFF-BY-DEFAULT binding knob, so the safe default records neither.",
+        "required": [
+          "id",
+          "subject",
+          "auth_methods",
+          "created_at_unix_ms"
+        ],
+        "properties": {
+          "absolute_expires_at_unix_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "The absolute hard-cap expiry, milliseconds since the Unix epoch."
+          },
+          "auth_methods": {
+            "type": "string",
+            "description": "The recorded authentication methods (space-separated RFC 8176 values)."
+          },
+          "created_at_unix_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Creation time, milliseconds since the Unix epoch."
+          },
+          "end_cause": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Why the session ended (`revoked`, `bulk_revoked`, `user_revoked_all`,\n`logged_out`, or `rotated`), or null if it is live."
+          },
+          "ended_at_unix_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "When the session ended (revoked or rotated away), or null if it is live."
+          },
+          "id": {
+            "type": "string",
+            "description": "The session identifier (`ses_...`)."
+          },
+          "idle_expires_at_unix_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "The idle timeout, milliseconds since the Unix epoch."
+          },
+          "last_seen_at_unix_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "When the session was last seen, milliseconds since the Unix epoch."
+          },
+          "peer_ip": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The recorded peer IP (only when the peer-IP binding knob is on)."
+          },
+          "revoked_at_unix_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "When the session was revoked, milliseconds since the Unix epoch, or null."
+          },
+          "subject": {
+            "type": "string",
+            "description": "The authenticated end-user subject (`usr_...`)."
+          },
+          "superseded_by": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The successor session id when this one was ROTATED away, or null. Its presence\nis what distinguishes a rotation from a terminal end."
+          },
+          "user_agent": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The recorded user agent (only when the device binding knob is on)."
+          }
+        }
+      },
       "TenantCreated": {
         "type": "object",
         "description": "The result of creating a tenant: the tenant and its first environment.",
@@ -2022,6 +3048,29 @@
             "description": "The tenant identifier (`ten_...`)."
           }
         }
+      },
+      "UserRevocationView": {
+        "type": "object",
+        "description": "The result of revoking every session of one user (issue #32). States the\npost-condition; see [`SessionRevocationView`] for why.",
+        "required": [
+          "subject",
+          "revoked",
+          "hard_kill"
+        ],
+        "properties": {
+          "hard_kill": {
+            "type": "boolean",
+            "description": "Whether the user's `offline_access` refresh families were killed too. When\nfalse (the default) they SURVIVE the mass logout."
+          },
+          "revoked": {
+            "type": "boolean",
+            "description": "Always true: after this call none of the user's sessions resolve."
+          },
+          "subject": {
+            "type": "string",
+            "description": "The user that was targeted."
+          }
+        }
       }
     },
     "securitySchemes": {
@@ -2048,6 +3097,10 @@
     {
       "name": "dcr",
       "description": "Dynamic Client Registration abuse controls: policies, initial access tokens, client verification"
+    },
+    {
+      "name": "sessions",
+      "description": "Session and refresh-family fleet operations: search, inspect, revoke (single, bulk, and everything-for-a-user with a token-family cascade)"
     }
   ]
 }

@@ -164,6 +164,26 @@ pub enum Action {
     UserRegister,
     /// A bootstrap session was established at login or registration (issue #20).
     SessionCreate,
+    /// An SSO session identifier was ROTATED at a privilege transition (issue #32):
+    /// login (and the future MFA / step-up seam) mints a fresh unpredictable session
+    /// id and INVALIDATES the prior one in the SAME transaction (session-fixation
+    /// defense). Distinct from [`Action::SessionRevoke`] so a rotation is never
+    /// mistaken for a terminal revoke in the audit trail.
+    SessionRotate,
+    /// A single SSO session was REVOKED by the management API (issue #32), stopping it
+    /// from resolving immediately and cascading to its session-bound refresh-token
+    /// families (the `offline_access` families survive unless a hard kill was asked
+    /// for). Written in the same transaction as the revocation.
+    SessionRevoke,
+    /// One session of a BULK session revocation was revoked by the management API
+    /// (issue #32). Each session in the batch is its own audited transaction, so the
+    /// audit trail names every revoked session individually.
+    SessionsBulkRevoke,
+    /// EVERY session of one user was revoked by the management API (issue #32),
+    /// cascading to the user's refresh-token families in the SAME transaction (the
+    /// `offline_access` families survive unless a hard kill was asked for). One audit
+    /// row targets the user.
+    UserSessionsRevokeAll,
     /// A subject granted consent to a client (issue #20).
     ConsentGrant,
     /// A per-environment signing key was provisioned (issue #19). Covers both a
@@ -300,6 +320,10 @@ impl Action {
             Action::TokenIssue => "token.issue",
             Action::UserRegister => "user.register",
             Action::SessionCreate => "session.create",
+            Action::SessionRotate => "session.rotate",
+            Action::SessionRevoke => "session.revoke",
+            Action::SessionsBulkRevoke => "sessions.bulk_revoke",
+            Action::UserSessionsRevokeAll => "user.sessions.revoke_all",
             Action::ConsentGrant => "consent.grant",
             Action::SigningKeyProvision => "signing_key.provision",
             Action::ResourceServerRegister => "resource_server.register",

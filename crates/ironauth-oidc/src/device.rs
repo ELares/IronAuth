@@ -485,6 +485,9 @@ async fn mint_device_tokens(
             oauth_scope: grant.requested_scope.as_deref(),
             auth_methods: &grant.auth_methods,
             auth_time_unix_micros: grant.auth_time_unix_micros,
+            // The device grant's ID token does not yet carry the per-client `sid`
+            // (issue #32): the always-on authorization-code path emits it. None here.
+            sid: None,
             at_hash: None,
             c_hash: None,
             extra_claims: &extra_claims,

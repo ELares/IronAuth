@@ -6,6 +6,12 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- The observability middleware now stamps the POLICY-RESOLVED client IP on
+  `PEER_IP_HEADER` for the off-by-default peer-IP session binding (issue #32). It
+  `insert`s (never appends), REPLACING any value a client supplied, so the downstream
+  binding reads what the trusted-proxy policy resolved and a spoofed header cannot
+  survive.
+
 - Add `Server::mount_public` (issue #12): mount a self-contained router on the
   PUBLIC data plane, mirroring `mount_management`. The OIDC provider mounts here.
 - Initial HTTP server skeleton on tokio + axum (see docs/adr/0001-http-runtime.md):

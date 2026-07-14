@@ -58,7 +58,7 @@ use ironauth_store::{
     ActorRef, AuthorizationCodeId, ClientAuthRecord, ClientId, CodeBindings, CorrelationId,
     IssuedTokenRecord, NewOpaqueAccessToken, NewRefreshFamily, RedeemOutcome, RefreshFamilyId,
     RefreshRedeem, RefreshRedeemOutcome, RefreshTokenId, RefreshTokenResolution,
-    RotatedRefreshToken, Scope, ServiceId, StoreError, TokenKind,
+    RotatedRefreshToken, Scope, ServiceId, SessionId, StoreError, TokenKind,
 };
 use serde::Deserialize;
 
@@ -462,6 +462,30 @@ async fn authenticate_client(
 /// or a signing failure is an opaque `server_error`; because this runs before the
 /// consume, that failure leaves the code live for a retry.
 ///
+/// Resolve the per-client `sid` (issue #32) for a code exchange from the code's
+/// authenticating SSO session. Parses `bindings.session_ref` under the exchange
+/// scope, then gets-or-creates the per-(client, session) row and returns its STORED
+/// `sid` (stable across refreshes, distinct across clients). Returns [`None`] when no
+/// session backed the grant, when the session id does not parse in scope, or when the
+/// store hiccups: the exchange still succeeds, the ID token merely omits `sid` rather
+/// than failing (defense in depth; the interactive code flow always has a session).
+async fn resolve_client_session_sid(
+    state: &OidcState,
+    scope: Scope,
+    bindings: &CodeBindings,
+) -> Option<String> {
+    let session_ref = bindings.session_ref.as_deref()?;
+    let session_id = SessionId::parse_in_scope(session_ref, &scope).ok()?;
+    let now_micros = epoch_micros(state.now());
+    state
+        .store()
+        .scoped(scope)
+        .client_sessions()
+        .ensure_sid(state.env(), &session_id, &bindings.client_id, now_micros)
+        .await
+        .ok()
+}
+
 /// Resolves the environment's issuer entry (its signer and algorithm policy)
 /// through the shared registry, then hands the borrowed signer and policy into the
 /// pure, synchronous [`tokens::mint`]: the async key resolution is confined here,
@@ -473,6 +497,12 @@ async fn mint_tokens(
     extra_claims: &serde_json::Map<String, serde_json::Value>,
     target: &AccessTokenTarget,
 ) -> Result<IssuedTokens, TokenError> {
+    // Resolve the per-client `sid` (issue #32) from the code's authenticating SSO
+    // session BEFORE signing, so the ID token carries a `sid` that is stable per
+    // (client, session) and distinct across clients. A code with no session behind it,
+    // or a store hiccup, omits the claim rather than failing the exchange.
+    let sid = resolve_client_session_sid(state, scope, bindings).await;
+    let sid = sid.as_deref();
     let entry = state
         .issuer_entry(&scope)
         .await
@@ -516,6 +546,10 @@ async fn mint_tokens(
             // the code at issuance, never from the token request.
             auth_methods: &bindings.auth_methods,
             auth_time_unix_micros: bindings.auth_time_unix_micros,
+            // The per-client `sid` (issue #32), resolved from the authenticating SSO
+            // session through the per-client session store: stable per (client,
+            // session), distinct across clients.
+            sid,
             // A token-endpoint ID token never carries at_hash, and the code flow
             // never carries c_hash; the front-channel/hybrid path (#17) supplies
             // them. Both are absent here by construction.
@@ -1069,6 +1103,9 @@ async fn mint_refresh_access(
             oauth_scope: resolution.scope.as_deref(),
             auth_methods: &resolution.auth_methods,
             auth_time_unix_micros: None,
+            // The refresh path mints only an access token (no ID token), so `sid`
+            // (issue #32, an ID-token claim) is inert here.
+            sid: None,
             at_hash: None,
             c_hash: None,
             extra_claims: &extra_claims,

@@ -248,7 +248,7 @@ async fn expand_contract_example_chain_runs_all_three_phases_and_contract_remove
 // per real table); splitting it would not make it clearer.
 #[allow(clippy::too_many_lines)]
 #[tokio::test]
-async fn production_chain_is_only_the_twenty_one_real_migrations_and_ships_no_demo_object() {
+async fn production_chain_is_only_the_twenty_two_real_migrations_and_ships_no_demo_object() {
     // TestDatabase::start runs Store::migrate() (the production chain) on a
     // fresh, empty database.
     let db = TestDatabase::start().await;
@@ -265,20 +265,20 @@ async fn production_chain_is_only_the_twenty_one_real_migrations_and_ships_no_de
     );
     assert_eq!(
         report.already_applied(),
-        21,
-        "the production chain is exactly twenty-one migrations (isolation, audit log, management \
+        22,
+        "the production chain is exactly twenty-two migrations (isolation, audit log, management \
          API, OIDC authorization, signing keys, login/consent, authentication context, redirect \
          registration, UserInfo claims, consent scope upsert, resource servers, opaque access \
          tokens, client auth suite, dynamic client registration, pushed authorization requests, \
          refresh tokens, client-credentials service accounts, DCR abuse controls, resource \
-         indicators, JWT bearer assertion grant, device authorization)"
+         indicators, JWT bearer assertion grant, device authorization, session model)"
     );
 
-    // The ledger holds exactly versions 1 through 21.
+    // The ledger holds exactly versions 1 through 22.
     assert_eq!(
         applied_versions(pool).await,
         vec![
-            1_i64, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21
+            1_i64, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22
         ]
     );
     let phase_of = |version: i64| async move {
@@ -323,6 +323,9 @@ async fn production_chain_is_only_the_twenty_one_real_migrations_and_ships_no_de
     assert_eq!(phase_of(20).await, "expand");
     // A CREATE TABLE plus two additive clients ALTERs are all expands (issue #24).
     assert_eq!(phase_of(21).await, "expand");
+    // The session-model expand (issue #32): an additive sessions ALTER, a new
+    // client_sessions table, and additive refresh_families indexes are all expands.
+    assert_eq!(phase_of(22).await, "expand");
 
     // The demo object never reaches a production database.
     assert!(
@@ -681,6 +684,42 @@ async fn production_chain_is_only_the_twenty_one_real_migrations_and_ships_no_de
         column_exists(pool, "external_assertion_subject_mappings", "enabled").await,
         "external_assertion_subject_mappings.enabled exists"
     );
+    // The authoritative two-tier session model (issue #32). Tier two is the new
+    // per-client session table: it carries the per-(client, session) `sid` claim,
+    // which is STORED (never `sid = session_id`), so it is stable per pair and
+    // distinct across pairs.
+    assert!(
+        table_exists(pool, "client_sessions").await,
+        "client_sessions exists"
+    );
+    for column in ["session_id", "client_id", "sid", "revoked_at"] {
+        assert!(
+            column_exists(pool, "client_sessions", column).await,
+            "client_sessions.{column} exists"
+        );
+    }
+    // Tier one is the EXPANDED sessions table. It gains the immediate-revocation and
+    // rotation-lineage guard columns (a revoked or rotated session must stop
+    // resolving at once, never merely on expiry) and the session-expiry columns THIS
+    // issue owns (idle_expires_at, absolute_expires_at, ended_at, end_cause), so a
+    // later issue must not re-add them.
+    for column in [
+        "revoked_at",
+        "revoke_reason",
+        "superseded_by",
+        "idle_expires_at",
+        "absolute_expires_at",
+        "ended_at",
+        "end_cause",
+        "last_seen_at",
+        "user_agent",
+        "peer_ip",
+    ] {
+        assert!(
+            column_exists(pool, "sessions", column).await,
+            "sessions.{column} exists"
+        );
+    }
 }
 
 #[tokio::test]

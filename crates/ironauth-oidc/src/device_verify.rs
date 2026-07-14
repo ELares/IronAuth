@@ -143,7 +143,7 @@ pub async fn device_post(
     if form.decision.is_some() {
         device_decision(&state, scope, &action, &headers, &form).await
     } else if form.identifier.is_some() || form.password.is_some() {
-        device_login(&state, scope, &action, &form).await
+        device_login(&state, scope, &action, &headers, &form).await
     } else {
         device_enter(&state, scope, &action, peer, &headers, &form).await
     }
@@ -205,9 +205,7 @@ async fn device_enter(
             // Require an authenticated session; escalate into the M2 login otherwise.
             // The GET is prefill-only, so this handler (not a bounced GET) renders the
             // next step directly.
-            match interaction::resolve_session(state, scope, interaction::cookie_header(headers))
-                .await
-            {
+            match interaction::resolve_session(state, scope, headers).await {
                 Some(_) => render_confirm(state, scope, action, raw_code, &flow).await,
                 None => pages::secure_html(
                     StatusCode::OK,
@@ -226,6 +224,7 @@ async fn device_login(
     state: &OidcState,
     scope: Scope,
     action: &str,
+    headers: &HeaderMap,
     form: &DeviceForm,
 ) -> Response {
     let raw_code = form
@@ -252,7 +251,11 @@ async fn device_login(
             let actor = interaction::user_actor(&user.id);
             let subject = user.id.to_string();
             let event = AuthenticationEvent::password(epoch_micros(state.now()));
-            match interaction::establish_session(state, scope, &subject, &event, actor).await {
+            // A privilege transition (issue #32): establish_session mints a fresh
+            // session id and rotates away any prior one the request presented.
+            match interaction::establish_session(state, scope, &subject, &event, actor, headers)
+                .await
+            {
                 // The GET is prefill-only, so we cannot bounce through it to render the
                 // next step; render the confirmation directly and set the freshly
                 // established session cookie on that same response.
@@ -284,9 +287,7 @@ async fn device_decision(
     headers: &HeaderMap,
     form: &DeviceForm,
 ) -> Response {
-    let Some(session) =
-        interaction::resolve_session(state, scope, interaction::cookie_header(headers)).await
-    else {
+    let Some(session) = interaction::resolve_session(state, scope, headers).await else {
         // No session: fall back to the sign-in step for this code.
         let raw_code = form.user_code.as_deref().unwrap_or_default();
         return pages::secure_html(

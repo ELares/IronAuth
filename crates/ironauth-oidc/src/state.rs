@@ -87,7 +87,20 @@ struct Inner {
     // The spec-conform default is `at_jwt`, which keeps UserInfo working.
     default_access_token_format: TokenFormat,
     reuse_grace: Duration,
+    // The session ABSOLUTE hard-cap lifetime (issue #20 `session_ttl`, extended by
+    // issue #32): the session cannot outlive this however active. `session_idle_ttl`
+    // is the separate idle timeout (a session unused this long stops resolving); both
+    // are enforced by the SessionRepo read guard against the application clock.
     session_ttl: Duration,
+    session_idle_ttl: Duration,
+    // The session-model policy knobs (issue #32). The CHIPS `Partitioned` cookie
+    // attribute is OFF by default (only for embedded-widget scenarios); the peer-IP
+    // and device/user-agent session binding are BOTH OFF by default (the tunability
+    // principle: env-dependent behavior is config, never a baked-in one-way choice),
+    // so a NAT or mobile IP change never logs a user out unless an operator opts in.
+    session_partitioned_cookie: bool,
+    session_peer_ip_binding: bool,
+    session_device_binding: bool,
     // The pushed-authorization-request `request_uri` lifetime (RFC 9126, issue #27).
     // A pushed request is short-lived and single-use; validated non-zero and bounded
     // by config (oidc.par_ttl_secs).
@@ -242,6 +255,10 @@ impl OidcState {
                 default_access_token_format: map_token_format(config.default_access_token_format),
                 reuse_grace: Duration::from_secs(config.reuse_grace_secs),
                 session_ttl: Duration::from_secs(config.session_ttl_secs),
+                session_idle_ttl: Duration::from_secs(config.session_idle_ttl_secs),
+                session_partitioned_cookie: config.session_partitioned_cookie,
+                session_peer_ip_binding: config.session_peer_ip_binding,
+                session_device_binding: config.session_device_binding,
                 par_ttl: Duration::from_secs(config.par_ttl_secs),
                 require_pushed_authorization_requests: config.require_pushed_authorization_requests,
                 require_pkce_for_confidential: config.require_pkce_for_confidential_clients,
@@ -605,10 +622,40 @@ impl OidcState {
         self.inner.remembered_consent_ttl
     }
 
-    /// The configured bootstrap session lifetime (issue #20).
+    /// The configured session ABSOLUTE hard-cap lifetime (issue #20, extended by
+    /// issue #32). A session cannot outlive this however active.
     #[must_use]
     pub fn session_ttl(&self) -> Duration {
         self.inner.session_ttl
+    }
+
+    /// The configured session IDLE timeout (issue #32): a session unused for longer
+    /// than this stops resolving, independently of the absolute cap.
+    #[must_use]
+    pub fn session_idle_ttl(&self) -> Duration {
+        self.inner.session_idle_ttl
+    }
+
+    /// Whether session cookies carry the CHIPS `Partitioned` attribute (issue #32).
+    /// OFF by default; enabled for embedded-widget (cross-site) scenarios.
+    #[must_use]
+    pub fn session_partitioned_cookie(&self) -> bool {
+        self.inner.session_partitioned_cookie
+    }
+
+    /// Whether the session is bound to the peer IP it was established from (issue
+    /// #32). OFF by default (the tunability principle), so a NAT or mobile IP change
+    /// never logs a user out unless an operator opts in.
+    #[must_use]
+    pub fn session_peer_ip_binding(&self) -> bool {
+        self.inner.session_peer_ip_binding
+    }
+
+    /// Whether the session is bound to the device / user agent it was established
+    /// from (issue #32). OFF by default (the tunability principle).
+    #[must_use]
+    pub fn session_device_binding(&self) -> bool {
+        self.inner.session_device_binding
     }
 
     /// The configured pushed-authorization-request `request_uri` lifetime (RFC 9126,

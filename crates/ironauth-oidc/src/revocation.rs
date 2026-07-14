@@ -104,6 +104,63 @@ pub struct RevocationEvent {
     pub family_id: Option<String>,
 }
 
+/// Why a session lifecycle signal fired (issue #32), so a consumer can tell a
+/// session ENDING apart from a session-fixation ROTATION.
+///
+/// This is the crux of the "a rotation must not look like a terminal revoke to a
+/// naive consumer" requirement: a [`SessionSignalCause::Rotated`] event is NOT a
+/// terminal end (a successor session succeeds it, carried in
+/// [`SessionLifecycleEvent::successor_session_id`]), while every other cause IS a
+/// terminal end. [`SessionSignalCause::is_terminal`] answers that in one call, so a
+/// naive consumer never mistakes a rotation for a logout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionSignalCause {
+    /// The session identifier was ROTATED at a privilege transition (login, and the
+    /// future MFA / step-up seam). NOT a terminal end: a successor session exists.
+    Rotated,
+    /// The session was ended by the end user's RP logout.
+    LoggedOut,
+    /// The session was revoked by an operator (a single-session revoke).
+    Revoked,
+    /// The session was revoked as one item of a bulk revocation.
+    BulkRevoked,
+    /// The session was revoked by a revoke-everything-for-a-user.
+    UserRevokedAll,
+}
+
+impl SessionSignalCause {
+    /// Whether this cause is a TERMINAL end of the session. A rotation is NOT
+    /// terminal (a fresh session succeeds it); every revoke/logout cause is.
+    #[must_use]
+    pub fn is_terminal(&self) -> bool {
+        !matches!(self, SessionSignalCause::Rotated)
+    }
+}
+
+/// A typed session lifecycle signal (issue #32), published whenever a session is
+/// rotated or ended, so the durable session-ended fan-out (#35) can later be built on
+/// this seam without touching the emit sites. Its schema is shape-locked by a
+/// snapshot test (the reuse-event pattern from #21), so a rename or reorder is a
+/// deliberate, reviewed change. It names WHAT happened to WHICH session (never any
+/// bearer secret): the scope, the session id, the cause, and (for a rotation only)
+/// the successor session id.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SessionLifecycleEvent {
+    /// The tenant the session belongs to.
+    pub tenant: String,
+    /// The environment the session belongs to.
+    pub environment: String,
+    /// The session that was rotated or ended (a `ses_` id).
+    pub session_id: String,
+    /// Why the signal fired: a rotation (non-terminal) or an end (terminal).
+    pub cause: SessionSignalCause,
+    /// The successor session id, present ONLY for a rotation (so a consumer knows a
+    /// fresh session succeeded this one and this is NOT a terminal end).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub successor_session_id: Option<String>,
+}
+
 /// The internal seam a successful revocation is published on (issue #22).
 ///
 /// The endpoint publishes a [`RevocationEvent`] here for every revocation that
@@ -116,6 +173,15 @@ pub struct RevocationEvent {
 pub trait RevocationEventSink: Send + Sync {
     /// React to a successful token revocation.
     fn publish(&self, event: &RevocationEvent);
+
+    /// React to a session lifecycle signal (issue #32): a rotation or an end. The
+    /// DEFAULT is a no-op, so an existing token-revocation sink keeps compiling and
+    /// simply ignores session signals; the durable session-ended fan-out (#35)
+    /// overrides it. A rotation is distinguishable from a terminal end by the event's
+    /// [`SessionSignalCause`], so a naive consumer never mistakes the two.
+    fn publish_session(&self, event: &SessionLifecycleEvent) {
+        let _ = event;
+    }
 }
 
 /// The default revocation-event sink: it logs at debug and does NOT fan out
@@ -498,6 +564,48 @@ mod tests {
             serde_json::to_string(&access).expect("serialize"),
             r#"{"tenant":"ten_abc","environment":"env_def","client_id":"cli_xyz","token_type":"access_token","grant_id":"grt_123"}"#
         );
+    }
+
+    #[test]
+    fn session_signal_distinguishes_rotation_from_a_terminal_end() {
+        // The crux of issue #32's signal requirement: a rotation must NOT look like a
+        // terminal revoke. The shape is pinned (the reuse-event snapshot pattern): a
+        // rotation carries cause `rotated` AND a successor_session_id and is NON
+        // terminal; every end cause omits the successor and IS terminal.
+        let rotated = SessionLifecycleEvent {
+            tenant: "ten_abc".to_owned(),
+            environment: "env_def".to_owned(),
+            session_id: "ses_old".to_owned(),
+            cause: SessionSignalCause::Rotated,
+            successor_session_id: Some("ses_new".to_owned()),
+        };
+        assert!(!rotated.cause.is_terminal(), "a rotation is not terminal");
+        assert_eq!(
+            serde_json::to_string(&rotated).expect("serialize"),
+            r#"{"tenant":"ten_abc","environment":"env_def","session_id":"ses_old","cause":"rotated","successor_session_id":"ses_new"}"#
+        );
+
+        let ended = SessionLifecycleEvent {
+            tenant: "ten_abc".to_owned(),
+            environment: "env_def".to_owned(),
+            session_id: "ses_gone".to_owned(),
+            cause: SessionSignalCause::Revoked,
+            successor_session_id: None,
+        };
+        assert!(ended.cause.is_terminal(), "a revoke is terminal");
+        assert_eq!(
+            serde_json::to_string(&ended).expect("serialize"),
+            r#"{"tenant":"ten_abc","environment":"env_def","session_id":"ses_gone","cause":"revoked"}"#
+        );
+        // Every end cause is terminal; only a rotation is not.
+        for cause in [
+            SessionSignalCause::LoggedOut,
+            SessionSignalCause::Revoked,
+            SessionSignalCause::BulkRevoked,
+            SessionSignalCause::UserRevokedAll,
+        ] {
+            assert!(cause.is_terminal(), "{cause:?} must be terminal");
+        }
     }
 
     #[test]
