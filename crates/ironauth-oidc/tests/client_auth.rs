@@ -131,11 +131,22 @@ async fn a_wrong_basic_secret_is_invalid_client_with_www_authenticate() {
             Some(&basic_header(&client_id, "the-wrong-secret")),
         )
         .await;
+    // All four AC5 facets pinned together on a failed Basic attempt: the 401 status,
+    // the EXACT WWW-Authenticate challenge (a fixed server constant, no reflected
+    // input), and the opaque invalid_client body (no oracle for which check failed).
     assert_eq!(status, StatusCode::UNAUTHORIZED, "wrong secret: {response}");
     assert_eq!(json(&response)["error"], "invalid_client");
-    assert!(
-        headers.get(header::WWW_AUTHENTICATE).is_some(),
-        "a failed Basic attempt must carry WWW-Authenticate (RFC 6749 5.2)"
+    assert_eq!(
+        json(&response)["error_description"],
+        "client authentication failed",
+        "the description is a fixed generic string, never an oracle for which check failed"
+    );
+    assert_eq!(
+        headers
+            .get(header::WWW_AUTHENTICATE)
+            .and_then(|value| value.to_str().ok()),
+        Some("Basic realm=\"ironauth\", charset=\"UTF-8\""),
+        "a failed Basic attempt carries the exact WWW-Authenticate challenge (RFC 6749 5.2)"
     );
 }
 

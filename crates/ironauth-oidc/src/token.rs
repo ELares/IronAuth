@@ -174,6 +174,13 @@ async fn exchange(
     //    secret under its registered method; a failure is the spec-exact
     //    invalid_client. This runs BEFORE the code is burned, so a client-auth
     //    failure never consumes the one-time code.
+    //
+    //    Note (issue #25): for a private_key_jwt client this spends the assertion's
+    //    single-use jti HERE, before the code-binding re-check (step 5) and the redeem
+    //    (step 7). So a subsequent binding/redeem failure does NOT free the jti to be
+    //    retried; an assertion is single-use even across a failed exchange. This is
+    //    spec-acceptable (RFC 7523 jti is single-use) and is intentional: it favors
+    //    replay resistance over a grace-retry of the same assertion.
     let authenticated_client = authenticate_client(state, scope, headers, &params).await?;
 
     // 5. The authenticated client MUST be the one the code was issued to (the

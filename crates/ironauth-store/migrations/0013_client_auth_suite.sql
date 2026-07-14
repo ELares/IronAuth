@@ -45,6 +45,19 @@ ALTER TABLE clients ADD COLUMN token_endpoint_auth_signing_alg text;
 ALTER TABLE clients ADD CONSTRAINT clients_client_keys_exclusive
     CHECK (NOT (jwks IS NOT NULL AND jwks_uri IS NOT NULL));
 
+-- A private_key_jwt client MUST register EXACTLY ONE key source (jwks XOR
+-- jwks_uri): a keyless private_key_jwt client would register but fail EVERY request
+-- silently (no key to verify its assertion against), which is a misconfiguration
+-- that must fail LOUD at registration, not per request. The XOR here also subsumes
+-- the exclusivity CHECK above for a private_key_jwt row. The constraint is scoped to
+-- private_key_jwt, so a secret-based or public client (both key columns NULL) and a
+-- client_secret_jwt client (which keys no assertion) are unaffected.
+ALTER TABLE clients ADD CONSTRAINT clients_private_key_jwt_has_one_key
+    CHECK (
+        token_endpoint_auth_method <> 'private_key_jwt'
+        OR (jwks IS NOT NULL) <> (jwks_uri IS NOT NULL)
+    );
+
 -- ---------------------------------------------------------------------------
 -- 2. The cross-node single-use jti replay cache (issue #25).
 --
@@ -54,10 +67,16 @@ ALTER TABLE clients ADD CONSTRAINT clients_client_keys_exclusive
 -- this ONE shared table, the database's uniqueness enforces single use ACROSS
 -- nodes: two nodes racing the same jti cannot both insert it.
 --
--- `expires_at` is the last instant the assertion could still be replayed, namely
--- the assertion's `exp` PLUS the configured clock skew (never the bare `exp`), so
--- pruning a row whose `expires_at` has passed can never remove a jti whose
--- assertion is still acceptable and thus can never open a replay window.
+-- `expires_at` is the last instant the assertion could still be replayed. Acceptance
+-- (enforce_exp) floors `now` to WHOLE seconds and rejects only once
+-- `now_secs > exp + skew`, so an assertion stays acceptable for the ENTIRE wall-clock
+-- second [exp+skew, exp+skew+1). The recorder therefore stores `exp + skew + 1s` (one
+-- second BEYOND the last acceptable second), NOT the bare `exp + skew`: pruning runs
+-- at MICROSECOND precision, so a bare `exp + skew` row would be deleted partway through
+-- that final acceptable second, re-inserted as fresh, and let the single-use assertion
+-- replay. With the +1s margin the retained row strictly OUTLASTS acceptance, so pruning
+-- can never remove a jti whose assertion is still acceptable and thus can never open a
+-- replay window.
 CREATE TABLE client_assertion_jtis (
     tenant_id      text        NOT NULL,
     environment_id text        NOT NULL,
@@ -67,8 +86,9 @@ CREATE TABLE client_assertion_jtis (
     client_id      text        NOT NULL,
     -- The assertion's jti (a client-chosen token identifier).
     jti            text        NOT NULL,
-    -- The last replayable instant (assertion exp + skew), from the application
-    -- clock seam, so pruning is deterministic under a manual clock in tests.
+    -- The last replayable instant (assertion exp + skew + 1s; see the note above on
+    -- the +1s margin), from the application clock seam, so pruning is deterministic
+    -- under a manual clock in tests.
     expires_at     timestamptz NOT NULL,
     created_at     timestamptz NOT NULL DEFAULT now(),
     CONSTRAINT client_assertion_jtis_scope_nonempty
@@ -98,7 +118,7 @@ CREATE POLICY client_assertion_jtis_tenant_isolation ON client_assertion_jtis
 
 -- SELECT to check membership, INSERT to record a new jti, and DELETE for the
 -- on-insert prune of already-expired rows. The ONLY DELETE the repository issues
--- removes rows whose expires_at (assertion exp + skew) has passed, so the grant
+-- removes rows whose expires_at (assertion exp + skew + 1s) has passed, so the grant
 -- cannot be used to reopen a replay window for a still-valid assertion. There is
 -- deliberately no UPDATE grant: a jti row is never mutated in place.
 GRANT SELECT, INSERT, DELETE ON client_assertion_jtis TO ironauth_app;
@@ -112,11 +132,22 @@ GRANT SELECT, INSERT, DELETE ON client_assertion_jtis TO ironauth_app;
 -- key id and algorithm) is recorded HERE instead, for the future M9 admin view.
 -- Only the RECORDING lands in this issue; the admin rendering is out of scope.
 --
--- Append-only, exactly like audit_log: SELECT and INSERT, never UPDATE or DELETE
--- from the data plane. A diagnostic is a log entry, not a business mutation, so
+-- Insert-and-prune, like the jti cache: SELECT, INSERT, and a bounded on-insert
+-- DELETE, never UPDATE. A diagnostic is a log entry, not a business mutation, so
 -- like idempotency_keys it is deliberately OFF the audited-write path (auditing a
 -- diagnostic would be circular); it stays confined to the repository module and
 -- RLS-scoped so it is written only within its own (tenant, environment).
+--
+-- Retention (bounded growth). Every FAILED authentication writes one row with some
+-- attacker-influenced text (a best-effort client_id, and the assertion header alg /
+-- kid). At the token endpoint this is bounded (a diagnostic is written only after a
+-- valid, loaded authorization code gates the request), but issue #22
+-- introspection/revocation reuses the SAME authenticate_client seam PRE-grant, where
+-- an UNAUTHENTICATED caller reaches it. Without retention that would be one
+-- unbounded, persistent row per request. `expires_at` (occurred_at + a fixed
+-- retention window; see DIAGNOSTIC_RETENTION_MICROS in repository.rs) bounds the
+-- table: the recorder prunes expired rows before each insert, exactly like the jti
+-- cache. This is a growth bound only, NOT rate limiting.
 CREATE TABLE client_auth_diagnostics (
     -- A random per-row identifier (drawn from the application entropy seam), so a
     -- row is addressable without leaking an ordering or a count.
@@ -138,6 +169,11 @@ CREATE TABLE client_auth_diagnostics (
     -- When the attempt happened, from the application clock seam (never the
     -- database clock), so it is deterministic under a manual clock in tests.
     occurred_at    timestamptz NOT NULL,
+    -- When this row may be pruned (occurred_at + the fixed retention window), from
+    -- the application clock seam, so the on-insert prune is deterministic under a
+    -- manual clock. Bounds the table so #22's pre-grant reuse of the seam cannot grow
+    -- it without limit.
+    expires_at     timestamptz NOT NULL,
     -- When the row was persisted, from the database clock. Operational metadata
     -- only; occurred_at is the authoritative event time.
     recorded_at    timestamptz NOT NULL DEFAULT now(),
@@ -149,6 +185,10 @@ CREATE TABLE client_auth_diagnostics (
 
 CREATE INDEX client_auth_diagnostics_scope_idx
     ON client_auth_diagnostics (tenant_id, environment_id, occurred_at);
+
+-- The on-insert prune scans expired rows within scope by expiry.
+CREATE INDEX client_auth_diagnostics_expiry_idx
+    ON client_auth_diagnostics (tenant_id, environment_id, expires_at);
 
 ALTER TABLE client_auth_diagnostics ENABLE ROW LEVEL SECURITY;
 ALTER TABLE client_auth_diagnostics FORCE ROW LEVEL SECURITY;
@@ -162,4 +202,8 @@ CREATE POLICY client_auth_diagnostics_tenant_isolation ON client_auth_diagnostic
         AND environment_id = current_setting('ironauth.environment_id', true)
     );
 
-GRANT SELECT, INSERT ON client_auth_diagnostics TO ironauth_app;
+-- SELECT to read for the M9 view, INSERT to record, and DELETE for the on-insert
+-- retention prune of already-expired rows (the ONLY DELETE the repository issues,
+-- exactly like the jti cache). There is deliberately no UPDATE grant: a diagnostic is
+-- never mutated in place.
+GRANT SELECT, INSERT, DELETE ON client_auth_diagnostics TO ironauth_app;

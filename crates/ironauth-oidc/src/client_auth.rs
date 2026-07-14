@@ -97,6 +97,22 @@ const ASYMMETRIC_ALGS: &[JwsAlgorithm] = &[
     JwsAlgorithm::Ps512,
 ];
 
+/// The asymmetric JWS algorithms the token endpoint accepts for a `private_key_jwt`
+/// client assertion, as their JOSE names, for discovery's
+/// `token_endpoint_auth_signing_alg_values_supported` (OIDC Discovery 1.0 section 3,
+/// which REQUIRES this field whenever `private_key_jwt`/`client_secret_jwt` is
+/// advertised). This is exactly [`ASYMMETRIC_ALGS`] (the JOSE verify matrix used to
+/// validate assertions), so discovery advertises precisely what the token endpoint
+/// will verify. `none` is excluded (it is not asymmetric) and ES512 is excluded by
+/// construction (unrepresentable in [`JwsAlgorithm`]).
+#[must_use]
+pub fn assertion_signing_alg_values() -> Vec<String> {
+    ASYMMETRIC_ALGS
+        .iter()
+        .map(|alg| alg.as_jose_name().to_owned())
+        .collect()
+}
+
 /// A client's token-endpoint authentication method.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClientAuthMethod {
@@ -644,10 +660,15 @@ async fn verify_private_key_assertion(
     // A jti is REQUIRED for single use (OIDC Core 9): without it the assertion
     // could be replayed, so an assertion that omits it is rejected.
     let jti = verified.jti.ok_or(AssertionAuthError::Invalid)?;
-    // Retain the jti until its assertion can no longer be replayed: its `exp` PLUS
-    // the tolerated skew, so pruning never opens a replay window.
+    // Retain the jti until its assertion can no longer be accepted, PLUS one whole
+    // second. Acceptance (enforce_exp) floors `now` to whole seconds and rejects only
+    // once `now_secs > exp + skew`, so the assertion stays acceptable for the ENTIRE
+    // wall-clock second [exp+skew, exp+skew+1). The store prunes at MICROSECOND
+    // precision, so retaining only to `exp + skew` would drop the row partway through
+    // that final acceptable second and re-admit the single-use assertion as fresh.
+    // The extra `+ 1s` makes retention strictly OUTLAST acceptance, closing the window.
     let skew_secs = i64::try_from(skew.as_secs()).unwrap_or(i64::MAX);
-    let expires_secs = verified.exp.saturating_add(skew_secs);
+    let expires_secs = verified.exp.saturating_add(skew_secs).saturating_add(1);
     let expires_micros = expires_secs.saturating_mul(1_000_000);
 
     match state
@@ -712,10 +733,15 @@ fn verify_assertion_claims(
                     return None;
                 }
                 let exp = verified.claims().expiration()?;
+                // An empty or whitespace-only jti is no jti (RFC 7523 intends a real
+                // token identifier): treat it as absent so the single-use rule below
+                // rejects it, rather than recording a blank single-use key.
                 let jti = verified
                     .claims()
                     .get("jti")
                     .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|jti| !jti.is_empty())
                     .map(str::to_owned);
                 return Some(VerifiedAssertion { jti, exp });
             }
@@ -890,10 +916,17 @@ fn parse_basic(value: &str) -> Option<(String, String)> {
 }
 
 /// Decode an `application/x-www-form-urlencoded` component: `+` becomes a space
-/// and `%XX` becomes the byte. A malformed trailing escape is passed through
-/// verbatim. IronAuth's own URL-safe credentials contain neither `+` nor `%`, so
-/// this is a no-op for them; it exists so a client that DID form-encode still
-/// authenticates (RFC 6749 2.3.1).
+/// and `%XX` becomes the byte. A malformed escape (`%` not followed by two ASCII hex
+/// digits, or truncated at the end) is passed through verbatim. IronAuth's own
+/// URL-safe credentials contain neither `+` nor `%`, so this is a no-op for them; it
+/// exists so a client that DID form-encode still authenticates (RFC 6749 2.3.1).
+///
+/// Decoding operates on the BYTES: a `%` followed by a multi-byte UTF-8 character
+/// (for example the euro sign in `%<char>`) must never be string-sliced at
+/// `value[i+1..i+3]`, which would land inside a char boundary and PANIC on an
+/// unauthenticated request. The two escape digits are hex-decoded directly from the
+/// bytes and a non-hex pair is rejected (passed through), so no slice ever straddles
+/// a char boundary.
 fn form_urldecode(value: &str) -> String {
     let bytes = value.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
@@ -905,11 +938,12 @@ fn form_urldecode(value: &str) -> String {
                 i += 1;
             }
             b'%' if i + 3 <= bytes.len() => {
-                if let Ok(byte) = u8::from_str_radix(&value[i + 1..i + 3], 16) {
-                    out.push(byte);
+                if let (Some(hi), Some(lo)) = (hex_digit(bytes[i + 1]), hex_digit(bytes[i + 2])) {
+                    out.push((hi << 4) | lo);
                     i += 3;
                 } else {
-                    out.push(bytes[i]);
+                    // Not a valid `%XX`: pass the `%` through and continue past it.
+                    out.push(b'%');
                     i += 1;
                 }
             }
@@ -920,6 +954,18 @@ fn form_urldecode(value: &str) -> String {
         }
     }
     String::from_utf8_lossy(&out).into_owned()
+}
+
+/// The value of a single ASCII hex digit (`0-9`, `a-f`, `A-F`), or `None` for any
+/// other byte. Operates on a byte so a `%XX` escape is decoded without slicing the
+/// input string at a non-char-boundary.
+fn hex_digit(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 /// Compare two byte strings in time independent of where they first differ. A
@@ -1186,5 +1232,51 @@ mod tests {
 
         record.token_endpoint_auth_signing_alg = Some("EdDSA".to_owned());
         assert_eq!(allowed_assertion_algs(&record), vec![JwsAlgorithm::EdDsa]);
+    }
+
+    #[test]
+    fn form_urldecode_does_not_panic_on_a_multibyte_char_after_percent() {
+        // A `%` followed by a multi-byte UTF-8 character (the euro sign, 3 bytes) must
+        // NOT be string-sliced at value[i+1..i+3]: that lands inside a char boundary
+        // and panics on an unauthenticated request. The escape is not two ASCII hex
+        // digits, so it is passed through verbatim and the rest decodes cleanly.
+        let decoded = form_urldecode("a%\u{20ac}b");
+        assert!(
+            decoded.starts_with('a') && decoded.ends_with('b'),
+            "the surrounding text survives without a panic: {decoded:?}"
+        );
+        // A genuine escape still decodes; a valid `%2B` becomes '+'.
+        assert_eq!(form_urldecode("%2Bx"), "+x");
+        // A non-hex escape passes the `%` through.
+        assert_eq!(form_urldecode("%zz"), "%zz");
+    }
+
+    #[test]
+    fn a_basic_credential_with_a_multibyte_char_after_percent_parses_without_panic() {
+        // The reachable-unauthenticated path: an Authorization: Basic value whose
+        // decoded secret is `%<euro>` must parse (form-urldecoding each half) without
+        // panicking on the char boundary. Before the fix this reached a 500 via the
+        // catch-panic layer.
+        let header = format!("Basic {}", STANDARD.encode("a:%\u{20ac}"));
+        let parsed = parse_basic(&header).expect("credential parses without a panic");
+        assert_eq!(parsed.0, "a", "the client id half decodes");
+    }
+
+    #[test]
+    fn verify_with_no_keys_fails_closed() {
+        // A keyless private_key_jwt client is rejected at registration now, but if one
+        // somehow existed, verification fails CLOSED: no key means no acceptance, so
+        // the assertion can never authenticate.
+        let clock = ironauth_env::ManualClock::new(SystemTime::UNIX_EPOCH);
+        let result = verify_assertion_claims(
+            "aGVhZGVy.cGF5.c2ln",
+            &[],
+            ASYMMETRIC_ALGS,
+            "cli_x",
+            &["https://issuer.test".to_owned()],
+            Duration::from_secs(60),
+            &clock,
+        );
+        assert!(result.is_none(), "empty key set fails closed");
     }
 }

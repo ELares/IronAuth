@@ -600,17 +600,33 @@ impl ActingClientRepo<'_> {
     /// assertions must be signed with. Writes a `client.create` audit row in the
     /// same transaction, returning the fresh identifier.
     ///
-    /// At most one of `jwks`/`jwks_uri` may be set (a database CHECK enforces it).
+    /// A `private_key_jwt` client MUST register EXACTLY ONE key source (`jwks` XOR
+    /// `jwks_uri`): a keyless one would register but fail EVERY request silently (no
+    /// key to verify its assertion against), and two sources are ambiguous. The
+    /// database CHECK `clients_private_key_jwt_has_one_key` (with the older
+    /// `clients_client_keys_exclusive`) enforces this, so a misconfiguration fails
+    /// LOUD as a [`StoreError::Conflict`] at registration rather than per request. A
+    /// `client_secret_jwt` registration is refused outright here, because the method
+    /// is inert (see `client_auth.rs`) and no key CHECK expresses it.
     ///
     /// # Errors
     ///
-    /// [`StoreError::Conflict`] if both `jwks` and `jwks_uri` are set (the CHECK
+    /// [`StoreError::Conflict`] if the method is the inert `client_secret_jwt`, or if
+    /// a `private_key_jwt` client sets neither or both key sources (the key CHECK
     /// fails); [`StoreError::Database`] on a persistence failure.
     pub async fn create_jwt_auth(
         &self,
         env: &Env,
         client: NewJwtAuthClient<'_>,
     ) -> Result<ClientId, StoreError> {
+        // client_secret_jwt is inert (IronAuth stores no retrievable secret to key
+        // the HMAC; see client_auth.rs). Registering a client for it would silently
+        // fail every request, and no DB CHECK expresses "reject this method", so
+        // refuse the misconfiguration here at registration. The private_key_jwt
+        // exactly-one-key rule is enforced by the DB CHECK below (mapped to Conflict).
+        if client.auth_method == "client_secret_jwt" {
+            return Err(StoreError::Conflict);
+        }
         let id = ClientId::generate(env, &self.scope);
         let scope = self.scope;
         write_audited(
@@ -642,8 +658,9 @@ impl ActingClientRepo<'_> {
                 .await;
                 match result {
                     Ok(_) => Ok(()),
-                    // Both jwks and jwks_uri set trips the exclusivity CHECK: a
-                    // caller-facing conflict, not a persistence fault.
+                    // A key-source CHECK violation (both jwks and jwks_uri set, or a
+                    // keyless private_key_jwt) is a caller-facing conflict, not a
+                    // persistence fault.
                     Err(error) if is_check_violation(&error) => Err(StoreError::Conflict),
                     Err(error) => Err(error.into()),
                 }
@@ -2337,6 +2354,14 @@ impl ClientAuthDiagnosticReason {
     }
 }
 
+/// How long a client-authentication diagnostic is retained before the on-insert
+/// prune reclaims it (issue #25), in epoch microseconds (the unit the clock seam and
+/// the prune bind). Seven days is enough for the M9 admin view to surface a recent
+/// burst of failures, while bounding the table so the pre-grant reuse of the
+/// `authenticate_client` seam by #22 introspection/revocation cannot grow it without
+/// limit from unauthenticated requests. 7 days in microseconds is well within `i64`.
+const DIAGNOSTIC_RETENTION_MICROS: i64 = 7 * 24 * 60 * 60 * 1_000_000;
+
 /// A client-authentication failure diagnostic to record (issue #25). Carries the
 /// rich, structured detail kept OFF the wire.
 #[derive(Debug, Clone, Copy)]
@@ -2383,9 +2408,16 @@ pub struct ClientAuthDiagnosticsRepo<'a> {
 }
 
 impl ClientAuthDiagnosticsRepo<'_> {
-    /// Record a client-authentication failure diagnostic in this scope. The event
-    /// time comes from the application clock seam (`env`), so it is deterministic
-    /// under a manual clock in tests.
+    /// Record a client-authentication failure diagnostic in this scope, first
+    /// pruning any rows past their retention window. The event time comes from the
+    /// application clock seam (`env`), so both the recorded time and the prune are
+    /// deterministic under a manual clock in tests.
+    ///
+    /// The prune bounds the table: issue #22 introspection/revocation reuses the
+    /// `authenticate_client` seam PRE-grant, where an unauthenticated caller reaches
+    /// this sink, so without retention it would grow one row per request. The window
+    /// is [`DIAGNOSTIC_RETENTION_MICROS`], long enough for the M9 admin view. This is
+    /// a growth bound, NOT rate limiting.
     ///
     /// # Errors
     ///
@@ -2397,13 +2429,28 @@ impl ClientAuthDiagnosticsRepo<'_> {
     ) -> Result<(), StoreError> {
         let id = random_diagnostic_id(env);
         let occurred_micros = epoch_micros(env.clock().now_utc());
+        let expires_micros = occurred_micros.saturating_add(DIAGNOSTIC_RETENTION_MICROS);
         let mut tx = begin_scoped(self.store, self.scope).await?;
+        // Prune rows past their retention window before inserting (prune-then-insert,
+        // exactly like the jti cache). Bounds the table under the pre-grant reuse by
+        // #22; only already-expired rows are removed.
+        sqlx::query(
+            "DELETE FROM client_auth_diagnostics \
+             WHERE tenant_id = $1 AND environment_id = $2 \
+             AND expires_at <= TIMESTAMPTZ 'epoch' + ($3::text || ' microseconds')::interval",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(occurred_micros)
+        .execute(&mut *tx)
+        .await?;
         sqlx::query(
             "INSERT INTO client_auth_diagnostics \
              (id, tenant_id, environment_id, client_id, auth_method, failure_reason, \
-              key_id, signing_alg, occurred_at) \
+              key_id, signing_alg, occurred_at, expires_at) \
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, \
-                     TIMESTAMPTZ 'epoch' + ($9::text || ' microseconds')::interval)",
+                     TIMESTAMPTZ 'epoch' + ($9::text || ' microseconds')::interval, \
+                     TIMESTAMPTZ 'epoch' + ($10::text || ' microseconds')::interval)",
         )
         .bind(id)
         .bind(self.scope.tenant().to_string())
@@ -2414,6 +2461,7 @@ impl ClientAuthDiagnosticsRepo<'_> {
         .bind(diagnostic.key_id)
         .bind(diagnostic.signing_alg)
         .bind(occurred_micros)
+        .bind(expires_micros)
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;

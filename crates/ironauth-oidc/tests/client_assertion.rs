@@ -514,29 +514,151 @@ async fn the_audience_policy_accepts_issuer_or_token_endpoint_and_strict_rejects
 }
 
 #[tokio::test]
-async fn client_secret_jwt_is_a_documented_correctly_erroring_path() {
-    // The tradeoff: IronAuth stores no retrievable secret to key an HMAC, so a
-    // client registered for client_secret_jwt fails closed with the opaque
-    // invalid_client and a recorded diagnostic (never advertised in discovery).
+async fn client_secret_jwt_registration_is_refused_loud() {
+    // The tradeoff: IronAuth stores no retrievable secret to key an HMAC, so
+    // client_secret_jwt is inert. Rather than register a client that would silently
+    // fail every request, the registration itself is refused LOUD (a Conflict), so no
+    // client_secret_jwt client can ever reach the token endpoint. The method also
+    // stays unadvertised in discovery (asserted in discovery.rs) and the runtime
+    // fail-closed arm remains as defense in depth.
     let h = Harness::start().await;
+    let rejected = h
+        .try_create_jwt_auth_client(ClientAuthMethod::ClientSecretJwt, None, None, None)
+        .await;
+    assert!(
+        matches!(rejected, Err(ironauth_store::StoreError::Conflict)),
+        "client_secret_jwt registration is refused: {rejected:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_jti_cannot_replay_anywhere_in_the_final_acceptance_second() {
+    // FIX (issue #25 review): acceptance (enforce_exp) floors `now` to WHOLE seconds
+    // and rejects only once now_secs > exp+skew, so an assertion is acceptable for the
+    // ENTIRE wall-clock second [exp+skew, exp+skew+1). The recorder retains the jti to
+    // exp+skew+1s, so a replay is caught across that whole second; it stops being
+    // replay-relevant only once the assertion itself is no longer acceptable.
+    let h = Harness::start().await;
+    let key = signing_key_for(JwsAlgorithm::EdDsa);
+    let jwks = jwks_json(&key);
     let client = h
-        .create_jwt_auth_client(ClientAuthMethod::ClientSecretJwt, None, None, None)
+        .create_jwt_auth_client(ClientAuthMethod::PrivateKeyJwt, Some(&jwks), None, None)
         .await;
     let cid = client.to_string();
-    // Any assertion for it is refused (the key we sign with is irrelevant).
-    let key = signing_key_for(JwsAlgorithm::EdDsa);
-    let assertion = build_assertion(&key, &cid, &cid, h.issuer(), 3600, "jti-cs-jwt");
-    assert!(matches!(
-        present(&h, &assertion).await,
-        Err(ClientAuthError::InvalidClient { .. })
-    ));
+
+    let skew_secs = h.state().client_assertion_skew().as_secs();
+    let exp_secs: u64 = 100;
+    let assertion = build_assertion(
+        &key,
+        &cid,
+        &cid,
+        h.issuer(),
+        i64::try_from(exp_secs).expect("small exp"),
+        "jti-boundary",
+    );
+
+    // First use at the epoch (now = 0): recorded.
+    assert!(present(&h, &assertion).await.is_ok(), "first use");
+
+    // Advance to EXACTLY exp+skew (the last acceptable whole second). The assertion is
+    // still acceptable, so the replay is caught by the single-use cache (not slipped
+    // through by a prune): opaque invalid_client with a replayed_jti diagnostic.
+    h.clock().advance(Duration::from_secs(exp_secs + skew_secs));
+    assert!(
+        matches!(
+            present(&h, &assertion).await,
+            Err(ClientAuthError::InvalidClient { .. })
+        ),
+        "replay at exp+skew is rejected"
+    );
+
+    // Half a second later (still the same acceptance second): still a replay.
+    h.clock().advance(Duration::from_millis(500));
+    assert!(
+        matches!(
+            present(&h, &assertion).await,
+            Err(ClientAuthError::InvalidClient { .. })
+        ),
+        "replay at exp+skew+0.5s is rejected"
+    );
+    let diags = h.client_auth_diagnostics(&cid).await;
+    assert!(
+        diags.iter().any(|d| d.failure_reason == "replayed_jti"),
+        "the replay is diagnosed within the window: {diags:?}"
+    );
+
+    // Advance to exp+skew+1s: now_secs > exp+skew, so the assertion is no longer
+    // acceptable. It is still rejected (fail closed), now because verification refuses
+    // the expired assertion rather than because the jti is spent.
+    h.clock().advance(Duration::from_millis(500));
+    assert!(
+        matches!(
+            present(&h, &assertion).await,
+            Err(ClientAuthError::InvalidClient { .. })
+        ),
+        "the assertion is refused once it is no longer acceptable"
+    );
+}
+
+#[tokio::test]
+async fn a_client_pinned_to_eddsa_rejects_an_rs256_assertion() {
+    // FIX (issue #25 review): the per-client token_endpoint_auth_signing_alg is a
+    // strict allowlist. A client pinned to EdDSA must REJECT an otherwise-valid RS256
+    // assertion end to end (the per-client pin was only unit-tested on the returned
+    // Vec before). The key is RSA (so the RS256 signature itself is genuine), but the
+    // pin bans RS256, so verification refuses it before ever recording the jti.
+    let h = Harness::start().await;
+    let key = signing_key_for(JwsAlgorithm::Rs256);
+    let jwks = jwks_json(&key);
+    let client = h
+        .create_jwt_auth_client(
+            ClientAuthMethod::PrivateKeyJwt,
+            Some(&jwks),
+            None,
+            Some("EdDSA"),
+        )
+        .await;
+    let cid = client.to_string();
+    let assertion = build_assertion(&key, &cid, &cid, h.issuer(), 3600, "jti-pinned-rs256");
+    assert!(
+        matches!(
+            present(&h, &assertion).await,
+            Err(ClientAuthError::InvalidClient { .. })
+        ),
+        "an EdDSA-pinned client rejects an RS256 assertion"
+    );
     let diags = h.client_auth_diagnostics(&cid).await;
     assert!(
         diags
             .iter()
-            .any(|d| d.failure_reason == "client_secret_jwt_unsupported"),
-        "the unsupported reason is recorded: {diags:?}"
+            .any(|d| d.failure_reason == "assertion_invalid"),
+        "the disallowed algorithm is diagnosed: {diags:?}"
     );
+}
+
+#[tokio::test]
+async fn an_empty_or_whitespace_jti_is_treated_as_missing_and_rejected() {
+    // FIX (issue #25 review): jti = "" parsed to Some("") and was accepted. RFC 7523
+    // intends a real token identifier, so an empty or whitespace-only jti is no jti:
+    // single use is unprovable and the assertion is refused (never recorded as a blank
+    // single-use key).
+    let h = Harness::start().await;
+    let key = signing_key_for(JwsAlgorithm::EdDsa);
+    let jwks = jwks_json(&key);
+    let client = h
+        .create_jwt_auth_client(ClientAuthMethod::PrivateKeyJwt, Some(&jwks), None, None)
+        .await;
+    let cid = client.to_string();
+    for blank in ["", "   "] {
+        let assertion = build_assertion(&key, &cid, &cid, h.issuer(), 3600, blank);
+        assert!(
+            matches!(
+                present(&h, &assertion).await,
+                Err(ClientAuthError::InvalidClient { .. })
+            ),
+            "an empty/whitespace jti ({blank:?}) is rejected"
+        );
+    }
 }
 
 #[tokio::test]

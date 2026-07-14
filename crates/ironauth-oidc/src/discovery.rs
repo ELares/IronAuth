@@ -30,6 +30,9 @@
 //! - `grant_types_supported`      <- [`GrantType::ALL`]
 //! - `code_challenge_methods_supported` <- [`PkceMethod::ALL`]
 //! - `token_endpoint_auth_methods_supported` <- [`ClientAuthMethod::ALL`]
+//! - `token_endpoint_auth_signing_alg_values_supported` <- the asymmetric assertion
+//!   matrix ([`crate::client_auth::assertion_signing_alg_values`]), REQUIRED by
+//!   Discovery section 3 because `private_key_jwt` is advertised
 //! - `subject_types_supported`    <- [`SubjectType::ALL`]
 //! - `response_modes_supported`   <- [`ResponseMode::DEFAULT`] (+ per-env `fragment`/`form_post`, #17)
 //! - `prompt_values_supported`    <- [`PromptValue::ALL`] (`none login consent select_account create`, #16)
@@ -359,6 +362,15 @@ pub fn discovery_document(
         json!(to_strings(
             ClientAuthMethod::ALL.iter().map(|value| value.as_str())
         )),
+    );
+    // OIDC Discovery 1.0 section 3 REQUIRES this field whenever `private_key_jwt`
+    // (or `client_secret_jwt`) is advertised above. It is the asymmetric matrix the
+    // token endpoint verifies a `private_key_jwt` assertion against (EdDSA + the
+    // RS/ES/PS family), sourced from the client-auth module so it can never drift
+    // from what verification accepts; `none` and ES512 are excluded by construction.
+    document.insert(
+        "token_endpoint_auth_signing_alg_values_supported".to_owned(),
+        json!(crate::client_auth::assertion_signing_alg_values()),
     );
     document.insert(
         "code_challenge_methods_supported".to_owned(),

@@ -15,7 +15,8 @@ use std::time::Duration;
 use ironauth_env::Env;
 use ironauth_store::test_support::TestDatabase;
 use ironauth_store::{
-    ClientAuthDiagnosticReason, JtiOutcome, NewClientAuthDiagnostic, Scope, Store,
+    ClientAuthDiagnosticReason, CorrelationId, JtiOutcome, NewClientAuthDiagnostic,
+    NewJwtAuthClient, Scope, Store, StoreError,
 };
 
 /// A far-future expiry (year 2100) in epoch microseconds, so a recorded jti is
@@ -189,6 +190,204 @@ async fn a_client_auth_diagnostic_is_recorded_and_read_back_within_scope() {
             .expect("read diagnostics in other scope")
             .is_empty(),
         "a diagnostic is isolated to its own scope"
+    );
+}
+
+#[tokio::test]
+async fn the_retention_margin_keeps_a_jti_single_use_across_the_whole_acceptance_second() {
+    // FIX (issue #25 review): acceptance (enforce_exp) floors `now` to WHOLE seconds
+    // and rejects only once now_secs > exp+skew, so an assertion stays acceptable for
+    // the ENTIRE wall-clock second [exp+skew, exp+skew+1). The recorder stores
+    // expires_at = (exp+skew+1)*1e6, so the single-use row survives that whole second
+    // even though pruning runs at MICROSECOND precision. A bare (exp+skew)*1e6 row
+    // would be pruned partway through the second and re-admit the single-use assertion.
+    let db = TestDatabase::start().await;
+    let (env, clock) = Env::deterministic(std::time::SystemTime::UNIX_EPOCH, 0x29);
+    let scope = db.seed_scope(&env).await;
+
+    // exp+skew lands on a whole second; the recorder's +1s margin makes expires 101s.
+    let exp_plus_skew_secs: i64 = 100;
+    let retained_micros = (exp_plus_skew_secs + 1) * 1_000_000;
+
+    // First use at the epoch (now = 0): recorded.
+    assert_eq!(
+        record_expiring(
+            db.store(),
+            &env,
+            scope,
+            "cli_x",
+            "jti-window",
+            retained_micros
+        )
+        .await,
+        JtiOutcome::Recorded
+    );
+
+    // At EXACTLY exp+skew (the last acceptable whole second) the assertion is still
+    // acceptable, so a replay must still be caught: the row is NOT pruned yet.
+    clock.advance(Duration::from_secs(
+        u64::try_from(exp_plus_skew_secs).expect("non-negative"),
+    ));
+    assert_eq!(
+        record_expiring(
+            db.store(),
+            &env,
+            scope,
+            "cli_x",
+            "jti-window",
+            retained_micros
+        )
+        .await,
+        JtiOutcome::Replayed,
+        "still replayable at exp+skew"
+    );
+
+    // Half a second into that same acceptance second: still replayable.
+    clock.advance(Duration::from_millis(500));
+    assert_eq!(
+        record_expiring(
+            db.store(),
+            &env,
+            scope,
+            "cli_x",
+            "jti-window",
+            retained_micros
+        )
+        .await,
+        JtiOutcome::Replayed,
+        "still replayable at exp+skew+0.5s"
+    );
+
+    // At exp+skew+1s (now_secs > exp+skew: the assertion is no longer acceptable) the
+    // row is finally pruned, so the jti becomes re-insertable. This is the ONLY point
+    // it stops being replay-relevant, and by now verification itself would reject the
+    // (expired) assertion anyway.
+    clock.advance(Duration::from_millis(500));
+    assert_eq!(
+        record_expiring(
+            db.store(),
+            &env,
+            scope,
+            "cli_x",
+            "jti-window",
+            retained_micros
+        )
+        .await,
+        JtiOutcome::Recorded,
+        "reclaimed exactly at exp+skew+1s"
+    );
+}
+
+#[tokio::test]
+async fn registering_with_both_jwks_and_jwks_uri_is_a_conflict() {
+    // The key sources are mutually exclusive (a private_key_jwt client registers keys
+    // inline OR by reference, never both): setting both is a caller-facing Conflict,
+    // enforced by the database CHECK and mapped from SQLSTATE 23514.
+    let db = TestDatabase::start().await;
+    let (env, _clock) = Env::deterministic(std::time::SystemTime::UNIX_EPOCH, 0x2A);
+    let scope = db.seed_scope(&env).await;
+
+    let result = db
+        .store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .clients()
+        .create_jwt_auth(
+            &env,
+            NewJwtAuthClient {
+                display_name: "dual-source client",
+                auth_method: "private_key_jwt",
+                jwks: Some(r#"{"keys":[]}"#),
+                jwks_uri: Some("https://client.test/jwks.json"),
+                signing_alg: None,
+            },
+        )
+        .await;
+    assert!(
+        matches!(result, Err(StoreError::Conflict)),
+        "both jwks and jwks_uri is a Conflict: {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_keyless_private_key_jwt_registration_is_rejected() {
+    // A private_key_jwt client MUST register exactly one key source. A KEYLESS one
+    // would register but fail every request silently (no key to verify against), so
+    // it is rejected LOUD at registration (the DB CHECK maps to Conflict). The
+    // exactly-one-source control still registers cleanly.
+    let db = TestDatabase::start().await;
+    let (env, _clock) = Env::deterministic(std::time::SystemTime::UNIX_EPOCH, 0x2B);
+    let scope = db.seed_scope(&env).await;
+
+    let keyless = db
+        .store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .clients()
+        .create_jwt_auth(
+            &env,
+            NewJwtAuthClient {
+                display_name: "keyless client",
+                auth_method: "private_key_jwt",
+                jwks: None,
+                jwks_uri: None,
+                signing_alg: None,
+            },
+        )
+        .await;
+    assert!(
+        matches!(keyless, Err(StoreError::Conflict)),
+        "a keyless private_key_jwt registration is rejected: {keyless:?}"
+    );
+
+    // Exactly one source (inline jwks) is a valid registration.
+    let ok = db
+        .store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .clients()
+        .create_jwt_auth(
+            &env,
+            NewJwtAuthClient {
+                display_name: "one-key client",
+                auth_method: "private_key_jwt",
+                jwks: Some(r#"{"keys":[]}"#),
+                jwks_uri: None,
+                signing_alg: None,
+            },
+        )
+        .await;
+    assert!(ok.is_ok(), "a single-key private_key_jwt registers: {ok:?}");
+}
+
+#[tokio::test]
+async fn registering_client_secret_jwt_is_rejected_loud() {
+    // client_secret_jwt is inert (IronAuth stores no retrievable secret to key the
+    // HMAC), so registering a client for it would silently fail every request. The
+    // misconfiguration is refused LOUD at registration instead.
+    let db = TestDatabase::start().await;
+    let (env, _clock) = Env::deterministic(std::time::SystemTime::UNIX_EPOCH, 0x2C);
+    let scope = db.seed_scope(&env).await;
+
+    let result = db
+        .store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .clients()
+        .create_jwt_auth(
+            &env,
+            NewJwtAuthClient {
+                display_name: "client_secret_jwt client",
+                auth_method: "client_secret_jwt",
+                jwks: None,
+                jwks_uri: None,
+                signing_alg: None,
+            },
+        )
+        .await;
+    assert!(
+        matches!(result, Err(StoreError::Conflict)),
+        "client_secret_jwt registration is rejected: {result:?}"
     );
 }
 

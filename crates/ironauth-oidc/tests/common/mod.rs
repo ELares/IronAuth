@@ -814,7 +814,8 @@ impl Harness {
     /// Create a client that authenticates with a JWT assertion (issue #25):
     /// `private_key_jwt` (inline `jwks` or a `jwks_uri`) or `client_secret_jwt`,
     /// with an optional pinned `token_endpoint_auth_signing_alg`. Registers the
-    /// harness redirect URI and returns the id.
+    /// harness redirect URI and returns the id. Panics on a registration error; use
+    /// [`Harness::try_create_jwt_auth_client`] to assert a rejection.
     pub async fn create_jwt_auth_client(
         &self,
         auth_method: ClientAuthMethod,
@@ -822,6 +823,22 @@ impl Harness {
         jwks_uri: Option<&str>,
         signing_alg: Option<&str>,
     ) -> ClientId {
+        self.try_create_jwt_auth_client(auth_method, jwks, jwks_uri, signing_alg)
+            .await
+            .expect("create jwt-auth client")
+    }
+
+    /// Like [`Harness::create_jwt_auth_client`] but RETURNS the store result, so a
+    /// test can assert a registration is rejected (a keyless or dual-source
+    /// `private_key_jwt`, or the inert `client_secret_jwt`). The redirect URI is
+    /// registered only on success.
+    pub async fn try_create_jwt_auth_client(
+        &self,
+        auth_method: ClientAuthMethod,
+        jwks: Option<&str>,
+        jwks_uri: Option<&str>,
+        signing_alg: Option<&str>,
+    ) -> Result<ClientId, ironauth_store::StoreError> {
         let (actor, corr) = self.seeding_actor();
         let id = self
             .store()
@@ -838,10 +855,9 @@ impl Harness {
                     signing_alg,
                 },
             )
-            .await
-            .expect("create jwt-auth client");
+            .await?;
         self.register_default_redirect(&id).await;
-        id
+        Ok(id)
     }
 
     /// Read the recorded out-of-band client-authentication diagnostics for
