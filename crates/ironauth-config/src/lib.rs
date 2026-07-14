@@ -522,6 +522,20 @@ pub struct OidcConfig {
     /// spirit, like the token lifetimes; the process value is the deployment default
     /// until per-environment overrides ride the M5 promotion pipeline.
     pub par_ttl_secs: u64,
+
+    /// Whether to mount the Dynamic Client Registration endpoint
+    /// (`/connect/register`, RFC 7591 + OIDC DCR 1.0, issue #30). The SAFE default
+    /// (`false`) leaves it UNMOUNTED, because open self-service client registration
+    /// is an abuse surface whose real gating (initial access token policy chains,
+    /// per-tenant quotas, and quarantine) is owned by the abuse-controls work
+    /// (issue #31). This flag ships ONLY the endpoint and this plain on/off switch;
+    /// #31 layers its policy chains on top. When `true`, the RFC 7591 registration
+    /// endpoint and the RFC 7592 configuration-management endpoint are served under
+    /// each environment's issuer path, and discovery advertises
+    /// `registration_endpoint`. This is a promotable per-environment setting in
+    /// spirit; the process value is the deployment default until per-environment
+    /// overrides ride the M5 promotion pipeline.
+    pub registration_enabled: bool,
 }
 
 impl Default for OidcConfig {
@@ -545,6 +559,7 @@ impl Default for OidcConfig {
             enable_response_mode_form_post: false,
             require_pushed_authorization_requests: false,
             par_ttl_secs: 60,
+            registration_enabled: false,
         }
     }
 }

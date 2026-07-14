@@ -239,12 +239,16 @@ CREATE TABLE IF NOT EXISTS _schema_migrations ( \
 /// is version 12; the JWT-assertion client-authentication suite (issue #25: the
 /// additive `clients` key/alg registration columns, the cross-node single-use
 /// `client_assertion_jtis` replay cache, and the out-of-band
-/// `client_auth_diagnostics` sink) is version 13; the pushed-authorization-request
-/// store (issue #27: the single-use `pushed_authorization_requests` table RFC 9126
-/// stores a validated request behind a one-time `request_uri`, plus the additive
-/// per-client `clients.require_pushed_authorization_requests` flag) is version 14.
-/// That is
-/// the whole production chain: it deliberately
+/// `client_auth_diagnostics` sink) is version 13; the Dynamic Client Registration
+/// and configuration-management columns (issue #30: the additive `clients`
+/// expand for the RFC 7592 registration access token hash, the registration
+/// client URI, the negotiated `id_token_signed_response_alg`, the RFC 8252
+/// `application_type`, and the `dcr_registered` origin flag) are version 14; the
+/// pushed-authorization-request store (issue #27: the single-use
+/// `pushed_authorization_requests` table RFC 9126 stores a validated request behind
+/// a one-time `request_uri`, plus the additive per-client
+/// `clients.require_pushed_authorization_requests` flag) is version 15. That is the
+/// whole production chain: it deliberately
 /// carries no throwaway objects, so a real database never gains a demo table or
 /// ledger rows beyond what the product needs. The worked expand-contract example
 /// (add a nullable column, backfill, drop the old column) lives entirely in the
@@ -334,9 +338,15 @@ fn registry() -> Vec<Migration> {
         },
         Migration {
             version: 14,
+            name: "dynamic_client_registration",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0014_dynamic_client_registration.sql"),
+        },
+        Migration {
+            version: 15,
             name: "pushed_authorization_requests",
             phase: Phase::Expand,
-            sql: include_str!("../migrations/0014_pushed_authorization_requests.sql"),
+            sql: include_str!("../migrations/0015_pushed_authorization_requests.sql"),
         },
     ]
 }

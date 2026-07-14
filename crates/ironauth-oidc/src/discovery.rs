@@ -160,8 +160,11 @@ pub struct DiscoveryEndpoint {
 /// (the JWKS surface) is mounted by issue #194 once keys load.
 ///
 /// The remaining M3/M4 endpoints (`end_session_endpoint`, `revocation_endpoint`,
-/// `introspection_endpoint`, `registration_endpoint`) join this list when their
-/// issues land; `userinfo_endpoint` landed with issue #15.
+/// `introspection_endpoint`) join this list when their issues land;
+/// `userinfo_endpoint` landed with issue #15. `registration_endpoint` (issue #30)
+/// is NOT here: it is PER ENVIRONMENT (served under the issuer path, like
+/// `jwks_uri`), so the generator emits it directly as `{issuer}/connect/register`
+/// and only when [`DiscoveryCapabilities::registration_endpoint_enabled`] is set.
 pub const ADVERTISED_ENDPOINTS: &[DiscoveryEndpoint] = &[
     DiscoveryEndpoint {
         metadata_key: "authorization_endpoint",
@@ -191,6 +194,13 @@ pub const ADVERTISED_ENDPOINTS: &[DiscoveryEndpoint] = &[
 /// `query` response mode, the `prompt` values, the `display` values, and the
 /// supported locales) are read straight from the registries and consts and are
 /// never represented here.
+//
+// This is a bag of INDEPENDENT per-environment capability toggles, each a distinct
+// discovery field sourced from its own config flag; they do not form a state machine
+// and collapsing them into two-variant enums would only obscure that. The bool count
+// crossed clippy's `struct_excessive_bools` threshold when the #27 PAR and #30 DCR
+// toggles landed together, so the lint is allowed here with intent.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DiscoveryCapabilities {
     /// Legacy response types enabled for this environment (issue #17). Empty by
@@ -215,6 +225,12 @@ pub struct DiscoveryCapabilities {
     /// so discovery's `require_pushed_authorization_requests` reflects exactly what
     /// the authorization endpoint enforces. `false` by default (PAR is optional).
     require_pushed_authorization_requests: bool,
+    /// Whether the Dynamic Client Registration endpoint is enabled (issue #30). When
+    /// `true`, the document advertises the per-environment `registration_endpoint`
+    /// (`{issuer}/connect/register`); when `false` the field is absent, so discovery
+    /// never advertises an endpoint the server does not serve. Default-off, gated by
+    /// `oidc.registration_enabled`.
+    registration_endpoint_enabled: bool,
 }
 
 impl DiscoveryCapabilities {
@@ -253,7 +269,7 @@ impl DiscoveryCapabilities {
         if config.enable_response_mode_form_post {
             caps = caps.with_additional_response_mode(ResponseMode::FormPost.as_str());
         }
-        caps
+        caps.with_registration_endpoint(config.registration_enabled)
     }
 
     /// Declare whether the `claims` request parameter is supported (issue #15).
@@ -291,6 +307,15 @@ impl DiscoveryCapabilities {
     #[must_use]
     pub fn with_authorization_response_iss(mut self, supported: bool) -> Self {
         self.authorization_response_iss_parameter_supported = supported;
+        self
+    }
+
+    /// Declare whether the Dynamic Client Registration endpoint is served (issue
+    /// #30), so discovery advertises `registration_endpoint` only when the endpoint
+    /// is actually mounted.
+    #[must_use]
+    pub fn with_registration_endpoint(mut self, enabled: bool) -> Self {
+        self.registration_endpoint_enabled = enabled;
         self
     }
 }
@@ -355,6 +380,19 @@ pub fn discovery_document(
         document.insert(
             endpoint.metadata_key.to_owned(),
             json!(format!("{base}{}", endpoint.path)),
+        );
+    }
+
+    // The Dynamic Client Registration endpoint (issue #30) is PER ENVIRONMENT, like
+    // `jwks_uri`: it is served under the issuer path (`{issuer}/connect/register`),
+    // so a registration lands in the same (tenant, environment) the client will
+    // operate in. It is advertised ONLY when enabled, so discovery never announces
+    // an endpoint the server does not mount (the abuse-controls split of issue #31
+    // owns the real gating; here it is a plain on/off).
+    if capabilities.registration_endpoint_enabled {
+        document.insert(
+            "registration_endpoint".to_owned(),
+            json!(format!("{issuer}/connect/register")),
         );
     }
 
@@ -780,6 +818,45 @@ mod tests {
         assert_eq!(
             doc(&fp)["response_modes_supported"],
             json!(["query", "form_post"])
+        );
+    }
+
+    #[test]
+    fn registration_endpoint_is_advertised_per_environment_only_when_enabled() {
+        // Issue #30: the DCR registration_endpoint is per-environment
+        // ({issuer}/connect/register) and advertised ONLY when enabled, so
+        // discovery never announces an endpoint the server does not mount.
+        let policy = SigningPolicy::eddsa_default();
+        let doc = |caps: &DiscoveryCapabilities| {
+            discovery_document(
+                "https://i.test/t/a/e/b",
+                "https://i.test",
+                "https://i.test/t/a/e/b/jwks.json",
+                &policy,
+                caps,
+            )
+        };
+        // Default off: absent.
+        assert!(
+            doc(&DiscoveryCapabilities::default())
+                .get("registration_endpoint")
+                .is_none(),
+            "registration_endpoint is absent when the endpoint is disabled"
+        );
+        // Enabled: the per-environment issuer path, not the deployment root.
+        let on = DiscoveryCapabilities::default().with_registration_endpoint(true);
+        assert_eq!(
+            doc(&on)["registration_endpoint"],
+            json!("https://i.test/t/a/e/b/connect/register")
+        );
+        // from_config wires it from oidc.registration_enabled.
+        let caps = DiscoveryCapabilities::from_config(&OidcConfig {
+            registration_enabled: true,
+            ..OidcConfig::default()
+        });
+        assert_eq!(
+            doc(&caps)["registration_endpoint"],
+            json!("https://i.test/t/a/e/b/connect/register")
         );
     }
 

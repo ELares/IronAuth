@@ -417,6 +417,151 @@ pub struct NewJwtAuthClient<'a> {
     pub signing_alg: Option<&'a str>,
 }
 
+/// A dynamically registered client's stored configuration (issue #30), read
+/// within scope for the RFC 7592 read/update/delete surface and for
+/// authenticating a presented registration access token.
+///
+/// [`fmt::Debug`] is hand written: `registration_access_token_hash` is a stored
+/// credential hash, so a struct dump or a `tracing` field never spills it (its
+/// presence is reported as a bool instead), exactly like [`ClientAuthRecord`].
+#[derive(Clone, PartialEq, Eq)]
+pub struct DynamicClientRecord {
+    /// The client identifier (embeds its tenant and environment).
+    pub id: ClientId,
+    /// The human-facing display name (`client_name`).
+    pub display_name: String,
+    /// The registered `token_endpoint_auth_method` wire string.
+    pub auth_method: String,
+    /// The registered redirect URI set.
+    pub redirect_uris: Vec<String>,
+    /// The RFC 8252 `application_type` (`web` or `native`), or `None` for a client
+    /// that predates DCR.
+    pub application_type: Option<String>,
+    /// The negotiated `id_token_signed_response_alg`, or `None` for a pre-DCR
+    /// client.
+    pub id_token_signed_response_alg: Option<String>,
+    /// The client's inline `jwks` (a JWK Set JSON document), or `None`.
+    pub jwks: Option<String>,
+    /// The client's `jwks_uri`, or `None`.
+    pub jwks_uri: Option<String>,
+    /// The pinned `token_endpoint_auth_signing_alg` for `private_key_jwt`, or
+    /// `None`.
+    pub token_endpoint_auth_signing_alg: Option<String>,
+    /// The RFC 7592 client configuration endpoint URL, or `None` for a pre-DCR
+    /// client.
+    pub registration_client_uri: Option<String>,
+    /// The SHA-256 (hex) hash of the RFC 7592 registration access token. The
+    /// management surface compares a presented token's hash against this in
+    /// constant time; `None` means the client is not a DCR registration.
+    pub registration_access_token_hash: Option<String>,
+    /// Creation time in microseconds since the Unix epoch (the DCR response's
+    /// `client_id_issued_at`).
+    pub created_at_unix_micros: i64,
+}
+
+impl fmt::Debug for DynamicClientRecord {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DynamicClientRecord")
+            .field("id", &self.id)
+            .field("display_name", &self.display_name)
+            .field("auth_method", &self.auth_method)
+            .field("redirect_uris", &self.redirect_uris)
+            .field("application_type", &self.application_type)
+            .field(
+                "id_token_signed_response_alg",
+                &self.id_token_signed_response_alg,
+            )
+            .field("has_jwks", &self.jwks.is_some())
+            .field("jwks_uri", &self.jwks_uri)
+            .field(
+                "token_endpoint_auth_signing_alg",
+                &self.token_endpoint_auth_signing_alg,
+            )
+            .field("registration_client_uri", &self.registration_client_uri)
+            .field(
+                "has_registration_access_token",
+                &self.registration_access_token_hash.is_some(),
+            )
+            .field("created_at_unix_micros", &self.created_at_unix_micros)
+            .finish()
+    }
+}
+
+/// The parameters for a Dynamic Client Registration (issue #30, RFC 7591),
+/// created through [`ActingClientRepo::register_dynamic`]. The OIDC layer has
+/// already validated the metadata, negotiated the algorithm, and hashed the
+/// secret and the registration access token; the repository stores them and mints
+/// the identifier.
+#[derive(Debug, Clone, Copy)]
+pub struct NewDynamicClient<'a> {
+    /// The `client_name` / display name (non-empty).
+    pub display_name: &'a str,
+    /// The validated `token_endpoint_auth_method` wire string
+    /// (`client_secret_basic`, `client_secret_post`, `private_key_jwt`, or `none`).
+    pub auth_method: &'a str,
+    /// The SHA-256 (hex) of the generated client secret, for a confidential
+    /// (`basic`/`post`) client; `None` for a public or `private_key_jwt` client.
+    pub secret_hash: Option<&'a str>,
+    /// The validated redirect URI set (already RFC 8252 / application-type
+    /// checked by the OIDC layer; the repository re-checks registrability).
+    pub redirect_uris: &'a [String],
+    /// The RFC 8252 `application_type` (`web` or `native`).
+    pub application_type: &'a str,
+    /// The negotiated `id_token_signed_response_alg`.
+    pub id_token_signed_response_alg: &'a str,
+    /// The inline `jwks`, or `None` (mutually exclusive with `jwks_uri`).
+    pub jwks: Option<&'a str>,
+    /// The `jwks_uri`, or `None`.
+    pub jwks_uri: Option<&'a str>,
+    /// The pinned `token_endpoint_auth_signing_alg`, or `None`.
+    pub token_endpoint_auth_signing_alg: Option<&'a str>,
+    /// The SHA-256 (hex) of the freshly minted registration access token.
+    pub registration_access_token_hash: &'a str,
+    /// The base of the RFC 7592 client configuration endpoint
+    /// (`{issuer}/connect/register`); the repository appends `/{client_id}` once
+    /// the identifier is minted.
+    pub registration_uri_base: &'a str,
+}
+
+/// The result of a Dynamic Client Registration: the minted identifier and the RFC
+/// 7592 client configuration endpoint URL built from it.
+#[derive(Debug, Clone)]
+pub struct DynamicClientRegistration {
+    /// The freshly minted client identifier.
+    pub id: ClientId,
+    /// The RFC 7592 client configuration endpoint URL
+    /// (`{issuer}/connect/register/{client_id}`).
+    pub registration_client_uri: String,
+}
+
+/// The full-replacement parameters for an RFC 7592 update (issue #30), applied
+/// through [`ActingClientRepo::update_dynamic`]. Every update ROTATES the
+/// registration access token: the new hash is stored and the old hash no longer
+/// matches. The client secret is deliberately NOT rotated by an update (it is kept
+/// as registered), so this struct carries no secret.
+#[derive(Debug, Clone, Copy)]
+pub struct DynamicClientUpdate<'a> {
+    /// The replacement `client_name` / display name (non-empty).
+    pub display_name: &'a str,
+    /// The replacement `token_endpoint_auth_method` wire string.
+    pub auth_method: &'a str,
+    /// The replacement redirect URI set (already validated by the OIDC layer; the
+    /// repository re-checks registrability).
+    pub redirect_uris: &'a [String],
+    /// The replacement `application_type`.
+    pub application_type: &'a str,
+    /// The re-negotiated `id_token_signed_response_alg`.
+    pub id_token_signed_response_alg: &'a str,
+    /// The replacement inline `jwks`, or `None`.
+    pub jwks: Option<&'a str>,
+    /// The replacement `jwks_uri`, or `None`.
+    pub jwks_uri: Option<&'a str>,
+    /// The replacement pinned `token_endpoint_auth_signing_alg`, or `None`.
+    pub token_endpoint_auth_signing_alg: Option<&'a str>,
+    /// The SHA-256 (hex) of the NEWLY ROTATED registration access token.
+    pub registration_access_token_hash: &'a str,
+}
+
 /// The read-only repository for tenant-scoped OAuth clients.
 ///
 /// The scope is fixed at construction and applied to every statement; there is
@@ -526,6 +671,98 @@ impl ClientRepo<'_> {
             jwks: row.get("jwks"),
             jwks_uri: row.get("jwks_uri"),
             token_endpoint_auth_signing_alg: row.get("token_endpoint_auth_signing_alg"),
+        })
+    }
+
+    /// The client's stored `id_token_signed_response_alg` within scope (issue #30),
+    /// or `None` when the client expressed no per-client preference (a client that
+    /// predates DCR, whose column is NULL) or is absent in this scope.
+    ///
+    /// The token endpoint reads this to sign THAT client's ID token with the
+    /// algorithm the client negotiated at registration, so the algorithm DCR
+    /// recorded and echoed is the algorithm the ID token is actually signed under.
+    /// A `None` (absent or no preference) leaves the mint on the environment default
+    /// signer, exactly as before DCR.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the identifier is out of this scope;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn id_token_signing_alg(&self, id: &ClientId) -> Result<Option<String>, StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT id_token_signed_response_alg FROM clients \
+             WHERE id = $1 AND tenant_id = $2 AND environment_id = $3",
+        )
+        .bind(id.to_string())
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(row.and_then(|row| row.get::<Option<String>, _>("id_token_signed_response_alg")))
+    }
+
+    /// Read a dynamically registered client's stored configuration within scope
+    /// (issue #30), for the RFC 7592 read/update/delete surface and for
+    /// authenticating a presented registration access token.
+    ///
+    /// ONLY a DCR-origin client (`dcr_registered`) is a dynamic registration: a
+    /// client created by any other path is the uniform [`StoreError::NotFound`]
+    /// here, so the RFC 7592 endpoint cannot be turned into an oracle for the
+    /// existence of a non-DCR client. A client absent in this scope (or minted in
+    /// another) is likewise the uniform not-found.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if no DCR client with this identifier is visible in
+    /// this scope; [`StoreError::Database`] on a persistence failure.
+    pub async fn dynamic_registration(
+        &self,
+        id: &ClientId,
+    ) -> Result<DynamicClientRecord, StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT id, display_name, token_endpoint_auth_method, redirect_uris, \
+             application_type, id_token_signed_response_alg, jwks, jwks_uri, \
+             token_endpoint_auth_signing_alg, registration_client_uri, \
+             registration_access_token_hash, dcr_registered, \
+             (EXTRACT(EPOCH FROM created_at) * 1000000)::bigint AS created_us \
+             FROM clients \
+             WHERE id = $1 AND tenant_id = $2 AND environment_id = $3",
+        )
+        .bind(id.to_string())
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        let row = row.ok_or(StoreError::NotFound)?;
+        // A client not created through dynamic registration is not manageable
+        // through the RFC 7592 surface: report it as not found, uniformly.
+        let dcr_registered: bool = row.get("dcr_registered");
+        if !dcr_registered {
+            return Err(StoreError::NotFound);
+        }
+        Ok(DynamicClientRecord {
+            id: ClientId::parse_in_scope(&row.get::<String, _>("id"), &self.scope)?,
+            display_name: row.get("display_name"),
+            auth_method: row.get("token_endpoint_auth_method"),
+            redirect_uris: row.get("redirect_uris"),
+            application_type: row.get("application_type"),
+            id_token_signed_response_alg: row.get("id_token_signed_response_alg"),
+            jwks: row.get("jwks"),
+            jwks_uri: row.get("jwks_uri"),
+            token_endpoint_auth_signing_alg: row.get("token_endpoint_auth_signing_alg"),
+            registration_client_uri: row.get("registration_client_uri"),
+            registration_access_token_hash: row.get("registration_access_token_hash"),
+            created_at_unix_micros: row.get("created_us"),
         })
     }
 
@@ -904,6 +1141,186 @@ impl ActingClientRepo<'_> {
                     return Err(StoreError::NotFound);
                 }
                 Ok(())
+            },
+            false,
+        )
+        .await
+    }
+
+    /// Register a client through Dynamic Client Registration (issue #30, RFC
+    /// 7591), returning the minted identifier and the RFC 7592 client
+    /// configuration endpoint URL. Writes a `client.registered` audit row in the
+    /// same transaction.
+    ///
+    /// The OIDC layer has already validated the metadata, negotiated the
+    /// `id_token_signed_response_alg`, generated and hashed the client secret and
+    /// the registration access token, and fetched any `jwks_uri` through the
+    /// SSRF-hardened fetcher. The repository re-validates every redirect URI as an
+    /// RFC 8252 registrable target (defense in depth) BEFORE any write, stores the
+    /// hashes (never a plaintext credential), marks the row `dcr_registered`, and
+    /// builds `registration_client_uri` from the freshly minted identifier.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::InvalidRedirectUri`] if any redirect URI is not registrable
+    /// (nothing is written); [`StoreError::Conflict`] if a `private_key_jwt`
+    /// registration violates the key-source CHECK (both or neither of
+    /// `jwks`/`jwks_uri`); [`StoreError::Database`] on a persistence failure.
+    pub async fn register_dynamic(
+        &self,
+        env: &Env,
+        params: NewDynamicClient<'_>,
+    ) -> Result<DynamicClientRegistration, StoreError> {
+        for uri in params.redirect_uris {
+            if !crate::redirect::redirect_uri_is_registrable(uri) {
+                return Err(StoreError::InvalidRedirectUri);
+            }
+        }
+        let id = ClientId::generate(env, &self.scope);
+        let registration_client_uri = format!(
+            "{}/{}",
+            params.registration_uri_base.trim_end_matches('/'),
+            id
+        );
+        let scope = self.scope;
+        let redirect_uris: Vec<String> = params.redirect_uris.to_vec();
+        let client_uri = registration_client_uri.clone();
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::ClientRegistered,
+                target: &id,
+            },
+            async move |tx| {
+                let result = sqlx::query(
+                    "INSERT INTO clients \
+                     (id, tenant_id, environment_id, display_name, \
+                      token_endpoint_auth_method, secret_hash, redirect_uris, \
+                      application_type, id_token_signed_response_alg, jwks, jwks_uri, \
+                      token_endpoint_auth_signing_alg, registration_client_uri, \
+                      registration_access_token_hash, dcr_registered) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, true)",
+                )
+                .bind(id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(params.display_name)
+                .bind(params.auth_method)
+                .bind(params.secret_hash)
+                .bind(&redirect_uris)
+                .bind(params.application_type)
+                .bind(params.id_token_signed_response_alg)
+                .bind(params.jwks)
+                .bind(params.jwks_uri)
+                .bind(params.token_endpoint_auth_signing_alg)
+                .bind(&client_uri)
+                .bind(params.registration_access_token_hash)
+                .execute(&mut **tx)
+                .await;
+                match result {
+                    Ok(_) => Ok(()),
+                    // A key-source CHECK violation (both jwks and jwks_uri, or a
+                    // keyless private_key_jwt) is a caller-facing conflict.
+                    Err(error) if is_check_violation(&error) => Err(StoreError::Conflict),
+                    Err(error) => Err(error.into()),
+                }
+            },
+            false,
+        )
+        .await?;
+        Ok(DynamicClientRegistration {
+            id,
+            registration_client_uri,
+        })
+    }
+
+    /// Apply an RFC 7592 update to a dynamically registered client (issue #30),
+    /// ROTATING its registration access token in the same transaction. Writes a
+    /// `client.updated` audit row.
+    ///
+    /// This is a full replacement of the DCR-managed metadata (display name, auth
+    /// method, redirect URIs, application type, negotiated algorithm, and the
+    /// `jwks`/`jwks_uri` pair) PLUS a mandatory registration-access-token rotation:
+    /// `registration_access_token_hash` becomes the new hash, so the superseded
+    /// token stops matching immediately. The client SECRET is deliberately left
+    /// unchanged. The `WHERE` clause filters on `dcr_registered`, so only a
+    /// DCR-origin client is updatable through this path.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::InvalidRedirectUri`] if any redirect URI is not registrable
+    /// (nothing is written); [`StoreError::NotFound`] if no DCR client with this
+    /// identifier is visible in this scope; [`StoreError::Conflict`] on a key-source
+    /// CHECK violation; [`StoreError::Database`] on a persistence failure.
+    pub async fn update_dynamic(
+        &self,
+        env: &Env,
+        id: &ClientId,
+        update: DynamicClientUpdate<'_>,
+    ) -> Result<(), StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        for uri in update.redirect_uris {
+            if !crate::redirect::redirect_uri_is_registrable(uri) {
+                return Err(StoreError::InvalidRedirectUri);
+            }
+        }
+        let scope = self.scope;
+        let redirect_uris: Vec<String> = update.redirect_uris.to_vec();
+        // When the update transitions the client to a method that carries no
+        // secret (`none` / `private_key_jwt`), NULL out any stored `secret_hash`
+        // so no dead credential material lingers. Only the two secret-based methods
+        // keep the existing hash (an update never mints a new secret, and the
+        // validation layer already refuses a transition INTO a secret method for a
+        // client that has none).
+        let keep_secret = matches!(
+            update.auth_method,
+            "client_secret_basic" | "client_secret_post"
+        );
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::ClientUpdated,
+                target: id,
+            },
+            async move |tx| {
+                let result = sqlx::query(
+                    "UPDATE clients SET display_name = $1, token_endpoint_auth_method = $2, \
+                     redirect_uris = $3, application_type = $4, \
+                     id_token_signed_response_alg = $5, jwks = $6, jwks_uri = $7, \
+                     token_endpoint_auth_signing_alg = $8, registration_access_token_hash = $9, \
+                     secret_hash = CASE WHEN $13 THEN secret_hash ELSE NULL END \
+                     WHERE id = $10 AND tenant_id = $11 AND environment_id = $12 \
+                     AND dcr_registered = true",
+                )
+                .bind(update.display_name)
+                .bind(update.auth_method)
+                .bind(&redirect_uris)
+                .bind(update.application_type)
+                .bind(update.id_token_signed_response_alg)
+                .bind(update.jwks)
+                .bind(update.jwks_uri)
+                .bind(update.token_endpoint_auth_signing_alg)
+                .bind(update.registration_access_token_hash)
+                .bind(id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(keep_secret)
+                .execute(&mut **tx)
+                .await;
+                match result {
+                    Ok(outcome) if outcome.rows_affected() == 0 => Err(StoreError::NotFound),
+                    Ok(_) => Ok(()),
+                    Err(error) if is_check_violation(&error) => Err(StoreError::Conflict),
+                    Err(error) => Err(error.into()),
+                }
             },
             false,
         )

@@ -590,6 +590,12 @@ async fn require_par_still_rejects_a_plain_and_a_forged_request() {
     // The fix must NOT weaken the gate: with require-PAR set, a PLAIN request (no
     // request_uri) is still rejected, and a FORGED/unknown request_uri is rejected too
     // (it resolves to nothing, so it is never a bypass and issues no code).
+    //
+    // Both cases ALSO carry the exact bypass vector the re-review probed by hand:
+    // `&par_resume=1&prompt=login`, the internal PAR-resume marker plus a forcing
+    // prompt. The marker is only honored on a resume WE emitted over a VALID pushed
+    // request_uri; it must never satisfy the require-PAR gate for a plain request nor
+    // let a forged request_uri skip the forced interaction. Both must still 400.
     let harness = Harness::start().await;
     let client_id = harness.client_id().to_string();
     harness.require_par_for_client(harness.client_id()).await;
@@ -597,14 +603,15 @@ async fn require_par_still_rejects_a_plain_and_a_forged_request() {
 
     let plain = format!(
         "response_type=code&client_id={client_id}&redirect_uri={}&scope=openid&\
-         code_challenge={PKCE_CHALLENGE}&code_challenge_method=S256",
+         code_challenge={PKCE_CHALLENGE}&code_challenge_method=S256&par_resume=1&prompt=login",
         enc(REDIRECT_URI)
     );
     let (status, headers, body) = harness.authorize_with_cookie(&plain, &cookie).await;
     assert_eq!(
         status,
         StatusCode::BAD_REQUEST,
-        "a plain request from a require-PAR client is still rejected: {body}"
+        "a plain request from a require-PAR client is still rejected even with the \
+         par_resume/prompt marker: {body}"
     );
     assert!(
         location_param(&headers, "code").is_none(),
@@ -613,13 +620,16 @@ async fn require_par_still_rejects_a_plain_and_a_forged_request() {
 
     // A well-formed PAR urn with no backing storage row is a forged reference.
     let forged = format!("{PAR_PREFIX}par_forgedforgedforgedforgedforged");
-    let (status, headers, body) = harness
-        .authorize_with_cookie(&authorize_via_par(&client_id, &forged), &cookie)
-        .await;
+    let forged_query = format!(
+        "{}&par_resume=1&prompt=login",
+        authorize_via_par(&client_id, &forged)
+    );
+    let (status, headers, body) = harness.authorize_with_cookie(&forged_query, &cookie).await;
     assert_eq!(
         status,
         StatusCode::BAD_REQUEST,
-        "a forged request_uri is rejected (no bypass): {body}"
+        "a forged request_uri is rejected even with the par_resume/prompt marker (no \
+         bypass): {body}"
     );
     assert!(
         location_param(&headers, "code").is_none(),

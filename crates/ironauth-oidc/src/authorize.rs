@@ -700,6 +700,11 @@ async fn mint_front_channel_id_token(
         at_hash: None,
         c_hash: c_hash.as_deref(),
         extra_claims: &extra_claims,
+        // The front channel signs with the environment default (a DCR client, which
+        // is the only client carrying a per-client id_token algorithm, registers
+        // `response_types = ["code"]` only and so never reaches this path); the
+        // `c_hash` above is derived from the same `signer`.
+        id_token_signer: None,
     };
     tokens::mint_id_token(state, signer, entry.policy(), &request).map(|(id_token, _jti)| id_token)
 }

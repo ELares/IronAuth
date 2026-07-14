@@ -6,6 +6,10 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Add `oidc.registration_enabled` (issue #30), a plain default-off flag gating the
+  Dynamic Client Registration endpoint (`/connect/register`). Off keeps the
+  endpoint unmounted and undiscoverable, the safe posture; the real abuse gating
+  (quotas, quarantine, initial-access-token policy) is owned by issue #31.
 - Add the pushed-authorization-request settings (PAR, RFC 9126, issue #27):
   - `oidc.require_pushed_authorization_requests` (default `false`), the
     environment-wide switch that requires every client to use PAR; when `true` the
