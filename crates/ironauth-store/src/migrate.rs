@@ -251,7 +251,11 @@ CREATE TABLE IF NOT EXISTS _schema_migrations ( \
 /// refresh-token rotation suite (issue #21: the `refresh_families` revocation spine
 /// and the digest-only `refresh_tokens` generation store, plus the additive
 /// `clients` consent-mode and rotation-override columns and the additive
-/// `consents.expires_at` for remembered consent) is version 16. That is
+/// `consents.expires_at` for remembered consent) is version 16; the Dynamic
+/// Client Registration abuse controls (issue #31: the `dcr_policies` reusable
+/// named policy objects, the `dcr_initial_access_tokens` store, the
+/// `dcr_rate_counters` endpoint-local counters, and the additive `clients`
+/// quarantine and policy-chain columns) are version 17. That is
 /// the whole production chain: it deliberately
 /// carries no throwaway objects, so a real database never gains a demo table or
 /// ledger rows beyond what the product needs. The worked expand-contract example
@@ -260,6 +264,9 @@ CREATE TABLE IF NOT EXISTS _schema_migrations ( \
 /// [`MigrationRunner::from_migrations`]
 /// against a throwaway test database, so all three phases are exercised in CI
 /// without ever touching the real schema.
+// One uniform six-line entry per migration; the list crossed the line lint at the
+// seventeenth. Splitting the registry would not make it clearer.
+#[allow(clippy::too_many_lines)]
 fn registry() -> Vec<Migration> {
     vec![
         Migration {
@@ -357,6 +364,12 @@ fn registry() -> Vec<Migration> {
             name: "refresh_tokens",
             phase: Phase::Expand,
             sql: include_str!("../migrations/0016_refresh_tokens.sql"),
+        },
+        Migration {
+            version: 17,
+            name: "dcr_abuse_controls",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0017_dcr_abuse_controls.sql"),
         },
     ]
 }

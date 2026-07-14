@@ -21,7 +21,7 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use ironauth_config::{ClientAssertionAudience, OidcConfig};
+use ironauth_config::{ClientAssertionAudience, OidcConfig, RegistrationMode};
 use ironauth_env::Env;
 use ironauth_jose::{JwsAlgorithm, TrustedKey, VerificationPolicy, VerifiedToken, verify};
 use ironauth_store::{Scope, Store, TokenFormat};
@@ -99,6 +99,14 @@ struct Inner {
     // whose real gating (quotas, quarantine, initial-access-token policy) is owned
     // by issue #31; this flag is the plain on/off switch #31 layers policy onto.
     registration_enabled: bool,
+    // The DCR abuse controls (issue #31): the exposure switch (closed / token_gated
+    // / open), the per-environment registered-client quota, and the endpoint-local
+    // rate limit (max registrations per source or IAT per window). Safe defaults:
+    // token_gated, a bounded quota, and a conservative rate limit.
+    registration_mode: RegistrationMode,
+    registration_max_clients: u32,
+    registration_rate_limit: u32,
+    registration_rate_window: Duration,
     // The audience policy an inbound JWT client assertion must satisfy (issue #25),
     // shared with the JWT bearer grant (#26). Default: accept the token-endpoint
     // URL OR the issuer; strict: the issuer only.
@@ -204,6 +212,10 @@ impl OidcState {
                 enable_response_type_none: config.enable_response_type_none,
                 enable_response_mode_form_post: config.enable_response_mode_form_post,
                 registration_enabled: config.registration_enabled,
+                registration_mode: config.registration_mode,
+                registration_max_clients: config.registration_max_clients,
+                registration_rate_limit: config.registration_rate_limit,
+                registration_rate_window: Duration::from_secs(config.registration_rate_window_secs),
                 subjects: SubjectCache::new(),
                 issue_refresh_tokens: config.issue_refresh_tokens,
                 refresh_idle_ttl: Duration::from_secs(config.refresh_idle_ttl_secs),
@@ -480,6 +492,38 @@ impl OidcState {
     #[must_use]
     pub fn registration_enabled(&self) -> bool {
         self.inner.registration_enabled
+    }
+
+    /// The Dynamic Client Registration exposure switch for this environment (issue
+    /// #31): `closed` (management API only), `token_gated` (an initial access token
+    /// is required), or `open` (anonymous, resulting client quarantined). Takes
+    /// effect only when the endpoint is mounted ([`OidcState::registration_enabled`]).
+    #[must_use]
+    pub fn registration_mode(&self) -> RegistrationMode {
+        self.inner.registration_mode
+    }
+
+    /// The per-environment cap on the number of dynamically registered clients
+    /// (issue #31). A registration that would exceed it is refused with a typed
+    /// error and a `dcr.quota_hit` audit event.
+    #[must_use]
+    pub fn registration_max_clients(&self) -> u32 {
+        self.inner.registration_max_clients
+    }
+
+    /// The endpoint-local registration rate limit (issue #31): the maximum number
+    /// of registration requests one source (or one initial access token) may make
+    /// within [`OidcState::registration_rate_window`]. 0 disables rate limiting.
+    #[must_use]
+    pub fn registration_rate_limit(&self) -> u32 {
+        self.inner.registration_rate_limit
+    }
+
+    /// The fixed rate-limit window for [`OidcState::registration_rate_limit`] (issue
+    /// #31).
+    #[must_use]
+    pub fn registration_rate_window(&self) -> Duration {
+        self.inner.registration_rate_window
     }
 
     /// Whether a CONFIDENTIAL client must use PKCE under this environment's policy

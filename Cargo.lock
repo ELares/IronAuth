@@ -876,6 +876,7 @@ dependencies = [
  "http-body-util",
  "ironauth-config",
  "ironauth-env",
+ "ironauth-oidc",
  "ironauth-store",
  "serde",
  "serde_json",

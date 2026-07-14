@@ -197,6 +197,27 @@ pub enum Action {
     /// A client's `require_pushed_authorization_requests` flag was set (RFC 9126
     /// section 5, issue #27).
     ClientRequirePushedAuthorizationSet,
+    /// A DCR initial access token was minted through the management API (issue
+    /// #31, RFC 7591 section 1.2). The token authorizes future self-service client
+    /// registrations, optionally under an attached policy chain.
+    DcrInitialAccessTokenMint,
+    /// A DCR policy object was created through the management API (issue #31): a
+    /// named, reusable set of registration-metadata primitives.
+    DcrPolicyCreate,
+    /// A DCR registration was refused because its submitted metadata violated the
+    /// initial access token's policy chain (issue #31). The actionable diagnostic
+    /// is recorded out of band; the wire response stays an opaque
+    /// `invalid_client_metadata`.
+    DcrPolicyRejected,
+    /// A DCR registration was refused because the environment's registered-client
+    /// quota was already reached (issue #31).
+    DcrQuotaHit,
+    /// A DCR registration was refused because the endpoint's per-source or per-token
+    /// rate limit was exceeded (issue #31).
+    DcrRateLimited,
+    /// An admin verified a dynamically registered client through the management API
+    /// (issue #31), lifting its unverified-client quarantine.
+    DcrClientVerified,
 }
 
 impl Action {
@@ -234,6 +255,12 @@ impl Action {
             Action::ClientRequirePushedAuthorizationSet => {
                 "client.require_pushed_authorization_requests.set"
             }
+            Action::DcrInitialAccessTokenMint => "dcr.iat_minted",
+            Action::DcrPolicyCreate => "dcr.policy_created",
+            Action::DcrPolicyRejected => "dcr.policy_rejected",
+            Action::DcrQuotaHit => "dcr.quota_hit",
+            Action::DcrRateLimited => "dcr.rate_limited",
+            Action::DcrClientVerified => "dcr.client_verified",
         }
     }
 }

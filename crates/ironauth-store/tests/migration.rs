@@ -242,13 +242,13 @@ async fn expand_contract_example_chain_runs_all_three_phases_and_contract_remove
     );
 }
 
-/// The PRODUCTION chain (`MigrationRunner::new`) contains exactly the sixteen
+/// The PRODUCTION chain (`MigrationRunner::new`) contains exactly the seventeen
 /// real migrations and leaves no throwaway demo object in a real database.
 // A long but linear ledger-and-table assertion sweep (one line per migration and
 // per real table); splitting it would not make it clearer.
 #[allow(clippy::too_many_lines)]
 #[tokio::test]
-async fn production_chain_is_only_the_sixteen_real_migrations_and_ships_no_demo_object() {
+async fn production_chain_is_only_the_seventeen_real_migrations_and_ships_no_demo_object() {
     // TestDatabase::start runs Store::migrate() (the production chain) on a
     // fresh, empty database.
     let db = TestDatabase::start().await;
@@ -265,18 +265,20 @@ async fn production_chain_is_only_the_sixteen_real_migrations_and_ships_no_demo_
     );
     assert_eq!(
         report.already_applied(),
-        16,
-        "the production chain is exactly sixteen migrations (isolation, audit log, management \
+        17,
+        "the production chain is exactly seventeen migrations (isolation, audit log, management \
          API, OIDC authorization, signing keys, login/consent, authentication context, redirect \
          registration, UserInfo claims, consent scope upsert, resource servers, opaque access \
          tokens, client auth suite, dynamic client registration, pushed authorization requests, \
-         refresh tokens)"
+         refresh tokens, DCR abuse controls)"
     );
 
-    // The ledger holds exactly versions 1 through 16.
+    // The ledger holds exactly versions 1 through 17.
     assert_eq!(
         applied_versions(pool).await,
-        vec![1_i64, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+        vec![
+            1_i64, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17
+        ]
     );
     let phase_of = |version: i64| async move {
         sqlx::query("SELECT phase FROM _schema_migrations WHERE version = $1")
@@ -307,6 +309,8 @@ async fn production_chain_is_only_the_sixteen_real_migrations_and_ships_no_demo_
     assert_eq!(phase_of(15).await, "expand");
     // Two CREATE TABLEs and two additive ALTERs are all expands (issue #21).
     assert_eq!(phase_of(16).await, "expand");
+    // Three CREATE TABLEs and an additive ALTER are all expands (issue #31).
+    assert_eq!(phase_of(17).await, "expand");
 
     // The demo object never reaches a production database.
     assert!(
@@ -495,6 +499,48 @@ async fn production_chain_is_only_the_sixteen_real_migrations_and_ships_no_demo_
             "refresh_tokens must have no plaintext-token column ({forbidden})"
         );
     }
+    // The Dynamic Client Registration abuse-control tables (issue #31): the
+    // reusable named policy objects, the SHA-256-hashed initial-access-token store,
+    // and the endpoint-local rate counters.
+    assert!(
+        table_exists(pool, "dcr_policies").await,
+        "dcr_policies exists"
+    );
+    assert!(
+        table_exists(pool, "dcr_initial_access_tokens").await,
+        "dcr_initial_access_tokens exists"
+    );
+    assert!(
+        table_exists(pool, "dcr_rate_counters").await,
+        "dcr_rate_counters exists"
+    );
+    // The initial-access-token store keeps only the token's HASH, never the
+    // plaintext (the credential-at-rest invariant, issue #31).
+    assert!(
+        column_exists(pool, "dcr_initial_access_tokens", "token_hash").await,
+        "dcr_initial_access_tokens stores a hash"
+    );
+    for forbidden in ["token", "secret", "plaintext"] {
+        assert!(
+            !column_exists(pool, "dcr_initial_access_tokens", forbidden).await,
+            "dcr_initial_access_tokens must have no plaintext-token column ({forbidden})"
+        );
+    }
+    // The unverified-client quarantine columns (issue #31): the quarantine flag,
+    // the admin verification timestamp, and the policy-chain snapshot that binds
+    // RFC 7592 updates for the client's lifetime.
+    assert!(
+        column_exists(pool, "clients", "quarantined").await,
+        "clients.quarantined exists"
+    );
+    assert!(
+        column_exists(pool, "clients", "verified_at").await,
+        "clients.verified_at exists"
+    );
+    assert!(
+        column_exists(pool, "clients", "dcr_policy_chain").await,
+        "clients.dcr_policy_chain exists"
+    );
 }
 
 #[tokio::test]

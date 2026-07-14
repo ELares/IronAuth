@@ -632,6 +632,549 @@
         ]
       }
     },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/clients/{client_id}": {
+      "get": {
+        "tags": [
+          "dcr"
+        ],
+        "summary": "Get a dynamically registered client's verification state.",
+        "operationId": "getDcrClient",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "client_id",
+            "in": "path",
+            "description": "The client identifier (cli_...)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The client verification state",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClientVerificationView"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found (absent, not a DCR client, or in another scope)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/clients/{client_id}/verify": {
+      "post": {
+        "tags": [
+          "dcr"
+        ],
+        "summary": "Verify a dynamically registered client, lifting its unverified-client quarantine.",
+        "operationId": "verifyDcrClient",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "client_id",
+            "in": "path",
+            "description": "The client identifier (cli_...)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Required. Replaying a POST with the same key returns the original response without re-executing.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Verified (quarantine lifted)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClientVerificationView"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found (absent, not a DCR client, or in another scope)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency-Key reused with a different request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/dcr/initial-access-tokens": {
+      "post": {
+        "tags": [
+          "dcr"
+        ],
+        "summary": "Mint a DCR initial access token. Returns the plaintext token ONCE.",
+        "operationId": "createDcrInitialAccessToken",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Required. Replaying a POST with the same key returns the original response without re-executing.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateInitialAccessTokenRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Idempotent replay; the token is omitted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InitialAccessTokenCreated"
+                }
+              }
+            }
+          },
+          "201": {
+            "description": "Created; the token is present on this response ONCE",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InitialAccessTokenCreated"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed request or unknown policy name",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Environment not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency-Key reused with a different request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/dcr/policies": {
+      "get": {
+        "tags": [
+          "dcr"
+        ],
+        "summary": "List DCR policies in an environment (cursor paginated).",
+        "operationId": "listDcrPolicies",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "The desired page size, a positive integer. Clamped to\n`[1, max_page_size]`; defaults to the configured default when absent.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "The opaque cursor from a previous page's `next_cursor`. Absent for the\nfirst page (keyset pagination; there is no offset).",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "A page of policies",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DcrPolicyList"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed cursor",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      },
+      "post": {
+        "tags": [
+          "dcr"
+        ],
+        "summary": "Create a named, reusable DCR policy.",
+        "operationId": "createDcrPolicy",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Required. Replaying a POST with the same key returns the original response without re-executing.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateDcrPolicyRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Created",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DcrPolicyView"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed request or invalid primitives",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Environment not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "A policy with this name already exists",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency-Key reused with a different request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/v1/tenants/{tenant_id}/environments/{environment_id}/keys": {
       "get": {
         "tags": [
@@ -1015,6 +1558,57 @@
   },
   "components": {
     "schemas": {
+      "ClientVerificationView": {
+        "type": "object",
+        "description": "A dynamically registered client's verification state (issue #31), as returned by\nthe management API. `quarantined` is the live gate the authorization/consent path\nhonors; `verified_at_unix_ms` records when an admin lifted the quarantine.",
+        "required": [
+          "id",
+          "quarantined",
+          "verified"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "The client identifier (`cli_...`)."
+          },
+          "quarantined": {
+            "type": "boolean",
+            "description": "Whether the client is under the unverified-client quarantine."
+          },
+          "verified": {
+            "type": "boolean",
+            "description": "Whether an admin has verified the client (the quarantine is lifted)."
+          },
+          "verified_at_unix_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "When the client was verified, milliseconds since the Unix epoch, or null if\nnever verified."
+          }
+        }
+      },
+      "CreateDcrPolicyRequest": {
+        "type": "object",
+        "description": "The body to create a named, reusable DCR policy (issue #31).\n\n`primitives` is the ordered list of policy primitives, each a JSON object with a\n`kind` of `force`, `restrict`, `reject`, or `default` plus its fields (a `force`\nor `default` carries `property` and `value`; a `restrict` carries `property` and\n`allowed`; a `reject` carries `property`). The management API validates the shape\nat create time against the OIDC policy engine.",
+        "required": [
+          "name",
+          "primitives"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "The policy name, unique per environment (referenced by name at token mint).",
+            "example": "force-private-key-jwt"
+          },
+          "primitives": {
+            "type": "array",
+            "items": {},
+            "description": "The ordered primitive list (force / restrict / reject / default objects)."
+          }
+        }
+      },
       "CreateEnvironmentRequest": {
         "type": "object",
         "description": "The body to create an environment under a tenant.",
@@ -1026,6 +1620,38 @@
             "type": "string",
             "description": "The environment's display name.",
             "example": "staging"
+          }
+        }
+      },
+      "CreateInitialAccessTokenRequest": {
+        "type": "object",
+        "description": "The body to mint a DCR initial access token (RFC 7591, issue #31).",
+        "required": [
+          "expires_in_secs"
+        ],
+        "properties": {
+          "expires_in_secs": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The token lifetime in seconds from now (from the server clock).",
+            "example": 86400,
+            "minimum": 0
+          },
+          "max_uses": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "The maximum number of registrations this token may authorize, or null for\nunlimited (within its lifetime).",
+            "minimum": 0
+          },
+          "policy_names": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The ordered names of the policies to attach as this token's chain. Each must\nname a policy that exists in this environment; the chain is resolved to its\nprimitives and snapshotted onto the token, so a later edit of a named policy\nnever changes an already-minted token. Empty means an unconstrained token."
           }
         }
       },
@@ -1061,6 +1687,59 @@
               "null"
             ],
             "description": "The first environment's display name. Defaults to `production`."
+          }
+        }
+      },
+      "DcrPolicyList": {
+        "type": "object",
+        "description": "A page of DCR policies.",
+        "required": [
+          "items"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DcrPolicyView"
+            },
+            "description": "The policies on this page, oldest first."
+          },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The opaque cursor for the next page, or null if this is the last page."
+          }
+        }
+      },
+      "DcrPolicyView": {
+        "type": "object",
+        "description": "A DCR policy, as returned by the management API.",
+        "required": [
+          "id",
+          "name",
+          "primitives",
+          "created_at_unix_ms"
+        ],
+        "properties": {
+          "created_at_unix_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Creation time, milliseconds since the Unix epoch."
+          },
+          "id": {
+            "type": "string",
+            "description": "The policy identifier (`pol_...`)."
+          },
+          "name": {
+            "type": "string",
+            "description": "The policy name."
+          },
+          "primitives": {
+            "type": "array",
+            "items": {},
+            "description": "The ordered primitive list (as stored)."
           }
         }
       },
@@ -1147,6 +1826,52 @@
             "type": "string",
             "description": "A human-readable message. Never carries a secret; for a wrong-scope error\nit names only the scope identifiers the caller already presented.",
             "example": "resource not found"
+          }
+        }
+      },
+      "InitialAccessTokenCreated": {
+        "type": "object",
+        "description": "The result of minting a DCR initial access token.\n\nOn the genuine first creation (HTTP 201) `token` carries the plaintext bearer\ntoken, shown exactly ONCE and never stored. An idempotent replay (HTTP 200) omits\nit and sets `token_already_issued`.\n\n`Debug` is hand-written to redact the token so a live credential never reaches a\nlog line through `{value:?}`.",
+        "required": [
+          "id",
+          "token_already_issued",
+          "expires_at_unix_ms",
+          "created_at_unix_ms"
+        ],
+        "properties": {
+          "created_at_unix_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Creation time, milliseconds since the Unix epoch."
+          },
+          "expires_at_unix_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Expiry time, milliseconds since the Unix epoch."
+          },
+          "id": {
+            "type": "string",
+            "description": "The token identifier (`iat_...`; embeds its scope; safe to display)."
+          },
+          "max_uses": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "The usage limit, or null for unlimited.",
+            "minimum": 0
+          },
+          "token": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The plaintext bearer token, present ONLY on the first creation (HTTP 201) and\nnever stored. Present it as `Authorization: Bearer <token>` at registration."
+          },
+          "token_already_issued": {
+            "type": "boolean",
+            "description": "True on an idempotent replay, when the token has already been issued and is\nnot repeated."
           }
         }
       },
@@ -1319,6 +2044,10 @@
     {
       "name": "keys",
       "description": "Environment-scoped management API keys"
+    },
+    {
+      "name": "dcr",
+      "description": "Dynamic Client Registration abuse controls: policies, initial access tokens, client verification"
     }
   ]
 }

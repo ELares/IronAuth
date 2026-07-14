@@ -23,7 +23,7 @@ use axum::http::{Request, StatusCode, header};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use common::{Harness, ISSUER_BASE, REDIRECT_URI, form, json as json_body};
-use ironauth_config::OidcConfig;
+use ironauth_config::{OidcConfig, RegistrationMode};
 use ironauth_fetch::{FetchLimits, Fetcher, RecordingDialer, StaticResolver};
 use ironauth_jose::{JwkSet, SigningKey};
 use ironauth_oidc::ClientKeyResolver;
@@ -33,9 +33,18 @@ use tokio::net::TcpListener;
 
 /// A config with the DCR endpoint enabled and confidential PKCE relaxed (the
 /// harness default), so the tests drive registration directly.
+///
+/// The exposure switch is set to `open` because these tests exercise the #30
+/// registration MECHANICS (metadata defaults, RFC 7592 update/read/delete, redirect
+/// validation, algorithm negotiation, jwks fetching), which predate the #31 gating
+/// and register anonymously. The #31 abuse controls (the `closed`/`token_gated`
+/// exposure switch, initial access tokens, policies, quotas, quarantine) are covered
+/// by the dedicated `dcr_abuse` test. An anonymous open registration still starts the
+/// client quarantined, which is invisible to these mechanics assertions.
 fn dcr_config() -> OidcConfig {
     OidcConfig {
         registration_enabled: true,
+        registration_mode: RegistrationMode::Open,
         require_pkce_for_confidential_clients: false,
         ..OidcConfig::default()
     }

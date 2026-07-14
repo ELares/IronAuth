@@ -6,6 +6,36 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Dynamic Client Registration abuse controls (issue #31, migration 0017, expand).
+  - **New scoped tables.** `dcr_policies` (named, reusable policy-primitive chains),
+    `dcr_initial_access_tokens` (SHA-256-hashed initial access tokens carrying a
+    resolved policy-chain snapshot, an expiry, and a usage limit; the plaintext is
+    never stored), and `dcr_rate_counters` (the endpoint's fixed-window rate counter).
+    All three ENABLE + FORCE row-level security with the `(tenant, environment)`
+    isolation policy (USING + WITH CHECK) and are registered in
+    `scripts/query-audit.sh`; the schema-level migration test asserts the token table
+    holds no plaintext/secret column.
+  - **Two-role separation across the DCR lifecycle.** A token is MINTED by the control
+    plane and CONSUMED by the data plane, so the grants are deliberately narrow:
+    `ironauth_control` gets INSERT/SELECT on policies and tokens (mint) plus
+    SELECT + `UPDATE(quarantined, verified_at)` on `clients` (verify), while
+    `ironauth_app` gets SELECT/UPDATE on tokens (atomic consume) and SELECT/INSERT/
+    UPDATE on the rate counters. Neither role is a superset of the other.
+  - **Unverified-client quarantine columns.** `clients` gains `quarantined`,
+    `verified_at`, and `dcr_policy_chain` (the policy snapshot that bound the
+    registration, persisted so RFC 7592 updates re-apply the SAME chain for the
+    client's lifetime).
+  - **Repositories.** `DcrPolicyRepo`/`ActingDcrPolicyRepo` (by-name resolve, create),
+    `InitialAccessTokenRepo::consume` (one atomic UPDATE that increments the use count
+    only when unexpired and under its limit, so a usage limit cannot be raced past),
+    `ActingInitialAccessTokenRepo::mint`, `DcrRateLimiterRepo::check_and_increment`
+    (an atomic window-rollover upsert), `ActingClientRepo::verify_dynamic_client`, and
+    `record_dcr_event` (the one audited no-op-mutation event for a policy rejection,
+    quota hit, or rate-limit hit). `register_dynamic` now enforces the per-environment
+    client quota ATOMICALLY inside its transaction under a per-scope advisory lock, so
+    two concurrent registrations cannot both slip past the cap. New typed
+    `StoreError::QuotaExceeded`.
+
 - Refresh-token rotation, families, `offline_access`, and consent-mode persistence
   (issue #21, migration 0016, expand).
   - **Token families and digest-only tokens.** New `refresh_families` (the

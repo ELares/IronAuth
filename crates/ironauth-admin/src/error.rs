@@ -62,6 +62,11 @@ pub enum ApiError {
     /// malformed identifier, or belonging to another scope, all identical. The
     /// uniform anti-oracle half. Renders 404.
     NotFound,
+    /// A named resource already exists (for example a DCR policy name reused within
+    /// an environment, issue #31). Distinct from the anti-oracle not-found because a
+    /// name collision is a legitimate signal the operator asked to create by name.
+    /// Renders 409.
+    Conflict(String),
     /// An Idempotency-Key was replayed with a DIFFERENT request. Renders 422.
     IdempotencyKeyConflict,
     /// An unexpected internal failure. Renders 500; never leaks detail.
@@ -76,6 +81,7 @@ impl ApiError {
             ApiError::Unauthorized(_) => StatusCode::UNAUTHORIZED,
             ApiError::WrongScope { .. } => StatusCode::FORBIDDEN,
             ApiError::NotFound => StatusCode::NOT_FOUND,
+            ApiError::Conflict(_) => StatusCode::CONFLICT,
             ApiError::IdempotencyKeyConflict => StatusCode::UNPROCESSABLE_ENTITY,
             ApiError::Internal => StatusCode::INTERNAL_SERVER_ERROR,
         }
@@ -109,6 +115,12 @@ impl ApiError {
             ApiError::NotFound => ErrorBody {
                 error: "not_found".to_owned(),
                 message: "resource not found".to_owned(),
+                expected_scope: None,
+                actual_scope: None,
+            },
+            ApiError::Conflict(message) => ErrorBody {
+                error: "conflict".to_owned(),
+                message: message.clone(),
                 expected_scope: None,
                 actual_scope: None,
             },

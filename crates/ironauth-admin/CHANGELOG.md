@@ -6,6 +6,25 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- DCR abuse-control management surface (issue #31). Five operator-plane endpoints,
+  all honoring the crate's contract (Idempotency-Key, same-transaction audit,
+  RateLimit headers, cursor pagination, OpenAPI as source of truth):
+  - `POST` / `GET` `.../dcr/policies`: author a named, reusable policy (its primitives
+    validated at create time against the OIDC policy engine, one source of truth for
+    the shape; a duplicate name is a 409) and list policies (cursor paginated).
+  - `POST .../dcr/initial-access-tokens`: mint an initial access token attaching a
+    policy chain by name (resolved to a primitive snapshot so a later policy edit
+    never changes an already-minted token). The plaintext token is returned exactly
+    ONCE (HTTP 201); an idempotent replay omits it (HTTP 200). Only its SHA-256 is
+    stored.
+  - `GET` / `POST .../clients/{client_id}` (+`/verify`): read a dynamically registered
+    client's quarantine state, and verify it (lifting the quarantine) idempotently. A
+    not-found is a uniform anti-oracle 404.
+  - The DCR resources are DATA-plane scoped, so these control-plane endpoints route
+    through the control role's narrow grants (mint/verify), never a second data-plane
+    store. New `ApiError::Conflict` (409). Now depends on `ironauth-oidc` for the
+    shared policy-primitive type.
+
 - Initial OpenAPI-first management API skeleton (issue #11). Establishes the
   management API contract and discipline once, so the later admin SPA, CLI,
   Terraform, and MCP surfaces inherit it as thin clients.

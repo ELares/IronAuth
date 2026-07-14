@@ -21,9 +21,11 @@ use utoipa::{Modify, OpenApi};
 
 use crate::error::ErrorBody;
 use crate::views::{
-    CreateEnvironmentRequest, CreateManagementKeyRequest, CreateTenantRequest, EnvironmentList,
-    EnvironmentView, ManagementKeyCreated, ManagementKeyList, ManagementKeyView, TenantCreated,
-    TenantList, TenantView,
+    ClientVerificationView, CreateDcrPolicyRequest, CreateEnvironmentRequest,
+    CreateInitialAccessTokenRequest, CreateManagementKeyRequest, CreateTenantRequest,
+    DcrPolicyList, DcrPolicyView, EnvironmentList, EnvironmentView, InitialAccessTokenCreated,
+    ManagementKeyCreated, ManagementKeyList, ManagementKeyView, TenantCreated, TenantList,
+    TenantView,
 };
 
 /// The management API's OpenAPI document. The handlers listed in `paths(...)`
@@ -45,7 +47,9 @@ use crate::views::{
     tags(
         (name = "tenants", description = "Tenant CRUD (operator plane)"),
         (name = "environments", description = "Environment CRUD under a tenant"),
-        (name = "keys", description = "Environment-scoped management API keys")
+        (name = "keys", description = "Environment-scoped management API keys"),
+        (name = "dcr", description = "Dynamic Client Registration abuse controls: \
+                                     policies, initial access tokens, client verification")
     ),
     paths(
         crate::tenants::list_tenants,
@@ -60,6 +64,11 @@ use crate::views::{
         crate::keys::create_key,
         crate::keys::get_key,
         crate::keys::delete_key,
+        crate::dcr::create_dcr_policy,
+        crate::dcr::list_dcr_policies,
+        crate::dcr::create_initial_access_token,
+        crate::dcr::get_dcr_client,
+        crate::dcr::verify_dcr_client,
     ),
     components(schemas(
         ErrorBody,
@@ -74,6 +83,12 @@ use crate::views::{
         ManagementKeyCreated,
         ManagementKeyList,
         CreateManagementKeyRequest,
+        CreateDcrPolicyRequest,
+        DcrPolicyView,
+        DcrPolicyList,
+        CreateInitialAccessTokenRequest,
+        InitialAccessTokenCreated,
+        ClientVerificationView,
     ))
 )]
 struct ApiDoc;

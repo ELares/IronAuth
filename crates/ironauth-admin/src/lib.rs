@@ -42,6 +42,7 @@
 //! `ironauth_store::Store::management` and `docs/adr/0005-management-api.md`.
 
 mod auth;
+mod dcr;
 mod environments;
 mod error;
 mod hash;
@@ -106,6 +107,23 @@ pub fn management_router(state: AdminState) -> Router {
         .route(
             "/v1/tenants/{tenant_id}/environments/{environment_id}/keys/{key_id}",
             get(keys::get_key).delete(keys::delete_key),
+        )
+        // Dynamic Client Registration abuse controls (issue #31).
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/dcr/policies",
+            post(dcr::create_dcr_policy).get(dcr::list_dcr_policies),
+        )
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/dcr/initial-access-tokens",
+            post(dcr::create_initial_access_token),
+        )
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/clients/{client_id}",
+            get(dcr::get_dcr_client),
+        )
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/clients/{client_id}/verify",
+            post(dcr::verify_dcr_client),
         )
         .route("/openapi.json", get(serve_openapi))
         .layer(from_fn(ratelimit::rate_limit_headers))

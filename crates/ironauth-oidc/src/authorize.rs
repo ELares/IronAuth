@@ -1059,7 +1059,23 @@ fn validate_registered_redirect<'a>(
     {
         return Err("the redirect_uri is not registered for this client");
     }
+    // Unverified-client quarantine (issue #31): a quarantined client's EFFECTIVE
+    // redirect set is RESTRICTED to its https targets, so a native/loopback or
+    // custom-scheme redirect (the higher-interception-risk shapes for an unverified
+    // app) is refused at authorize time until an admin verifies the client. This is
+    // a PAGE error (it runs before the redirect target is trusted), never a redirect,
+    // so it can never be turned into an open redirector. Verification lifts it.
+    if client.quarantined && !is_https_redirect(redirect_uri) {
+        return Err("the redirect_uri is not permitted for an unverified client");
+    }
     Ok(redirect_uri)
+}
+
+/// Whether `uri` uses the https scheme (case-insensitive), the only redirect shape
+/// a quarantined client may use until it is verified (issue #31).
+fn is_https_redirect(uri: &str) -> bool {
+    uri.split_once(':')
+        .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case("https"))
 }
 
 /// Validate and enforce the PKCE parameters (issue #13, RFC 7636 / RFC 9700),
@@ -1337,7 +1353,13 @@ async fn resolve_consent_gate(
     // The trusted first-party carve-out: an `implicit`-mode client, or one whose
     // `skip_consent` flag is set, never sees the consent screen and is auto-granted.
     // `prompt=consent` still forces a fresh screen, so it wins over the carve-out.
-    let first_party = matches!(consent_mode, ConsentMode::Implicit) || client.skip_consent;
+    //
+    // Unverified-client quarantine (issue #31): a quarantined client NEVER gets the
+    // first-party carve-out. Its `implicit`/`skip_consent`/first-party trust is
+    // IGNORED and consent is ALWAYS shown, until an admin verifies it (which flips
+    // `quarantined` off and restores the carve-out).
+    let first_party = !client.quarantined
+        && (matches!(consent_mode, ConsentMode::Implicit) || client.skip_consent);
     if first_party && !force_consent {
         // Record the skipped consent so an offline grant stays enumerable and
         // revocable per app, UNLESS the no-store performance knob is off.

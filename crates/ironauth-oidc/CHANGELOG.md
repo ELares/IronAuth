@@ -6,6 +6,37 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Dynamic Client Registration abuse controls (issue #31), wrapping the #30 create.
+  - **Exposure switch.** A per-environment `closed` / `token_gated` / `open` mode
+    (default `token_gated`) governs who may register: `closed` refuses every public
+    registration, `token_gated` requires a valid initial access token, and `open`
+    allows anonymous registration but starts the client quarantined. An unauthorized
+    request is a uniform 403 `access_denied` (no oracle for an unknown vs expired vs
+    exhausted token).
+  - **Initial access tokens with reusable policy chains.** A presented token is
+    consumed atomically (its usage limit cannot be raced past), and the policy chain
+    it carries (force / restrict / reject / default primitives, a pure engine in
+    `dcr_policy`) is applied to the submitted metadata BEFORE validation. The chain
+    snapshot is persisted on the client, so an RFC 7592 update re-applies the SAME
+    chain for the client's lifetime, even if the source policy is later edited or
+    deleted.
+  - **Opaque-but-diagnosable rejections.** A policy rejection is the generic
+    `invalid_client_metadata` on the wire (it never names the property or the
+    operator's policy), while the actionable diagnostic is recorded out of band as a
+    `dcr.policy_rejected` audit event plus a structured log line.
+  - **Quota and rate limit.** The per-environment registered-client quota is enforced
+    atomically inside the create transaction; over it, the request is a typed 403 plus
+    a `dcr.quota_hit` audit event. The endpoint's fixed-window rate limit (keyed by
+    source and by presented token) yields a 429 `temporarily_unavailable` plus a
+    `dcr.rate_limited` audit event.
+  - **Unverified-client quarantine.** A quarantined client NEVER gets the first-party
+    consent carve-out (consent is always shown, ignoring `skip_consent` / implicit
+    mode) and its effective redirect set is restricted to its https targets (a
+    native/loopback redirect is refused with a page error, never an open redirect),
+    until an admin verifies it (which lifts both). Exports the `dcr_policy` engine
+    (`PolicyPrimitive`, `apply_chain`, `parse_chain`, `serialize_chain`) for reuse by
+    the management API.
+
 - Refresh-token rotation, families, `offline_access`, and consent modes (issue #21).
   - **The `refresh_token` grant.** The token endpoint exchanges a rotating refresh
     token for a fresh access token. The refresh token is an opaque reference mirroring

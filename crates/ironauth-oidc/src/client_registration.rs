@@ -83,15 +83,18 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use ironauth_config::RegistrationMode;
 use ironauth_env::Env;
 use ironauth_jose::JwsAlgorithm;
 use ironauth_store::{
-    ActorRef, CorrelationId, DynamicClientRecord, DynamicClientUpdate, NewDynamicClient, Scope,
-    ServiceId, StoreError, redirect_uri_is_registrable,
+    Action, ActorRef, CorrelationId, DynamicClientRecord, DynamicClientUpdate,
+    InitialAccessTokenId, NewDynamicClient, Scope, ServiceId, StoreError,
+    redirect_uri_is_registrable,
 };
 use serde_json::{Value, json};
 
 use crate::client_auth::{ClientAuthMethod, generate_secret, hash_secret};
+use crate::dcr_policy::{PolicyPrimitive, PolicyRejection, apply_chain, parse_chain};
 use crate::issuer::IssuerEntry;
 use crate::state::OidcState;
 use crate::util::{client_service_actor, epoch_micros};
@@ -107,14 +110,50 @@ const DEFAULT_AUTH_METHOD: &str = "client_secret_basic";
 
 /// `POST {issuer}/connect/register`: register a client from an RFC 7591 metadata
 /// document, returning the created client and its credentials (201 Created).
+///
+/// The issue #31 abuse controls WRAP the issue #30 create: the exposure switch
+/// decides whether an anonymous / initial-access-token / closed request is allowed;
+/// a `token_gated` environment requires a valid initial access token (checked and
+/// consumed first); that token's policy chain is applied to the submitted metadata
+/// (force / restrict / reject / default) BEFORE the client is created; the created
+/// client starts QUARANTINED unless a token vouched for it; and the endpoint's rate
+/// limit and per-environment quota are enforced.
+// The abuse-control orchestration (rate limit, exposure resolve, policy apply,
+// signing negotiation, validate, mint, create) is a linear pipeline; splitting it
+// would only scatter the request's single control flow across helpers.
+#[allow(clippy::too_many_lines)]
 pub async fn register(
     State(state): State<OidcState>,
     Path((tenant_id, environment_id)): Path<(String, String)>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Response {
     let Some(scope) = enabled_scope(&state, &tenant_id, &environment_id).await else {
         return not_found();
     };
+
+    // One acting identity for the whole request, so the registration audit and every
+    // abuse event (rate limit, quota, policy rejection) attribute to the same
+    // service actor and correlation id.
+    let actor = ActorRef::service(ServiceId::generate(state.env()));
+    let correlation = CorrelationId::generate(state.env());
+    let presented = bearer_token(&headers);
+
+    // Endpoint-local rate limiting (issue #31), keyed by source and by presented
+    // token, using the clock seam for the window. Checked before any store write, so
+    // a flood never reaches the create path.
+    if let Some(refusal) = enforce_rate_limits(
+        &state,
+        scope,
+        actor,
+        correlation,
+        &headers,
+        presented.as_deref(),
+    )
+    .await
+    {
+        return refusal;
+    }
 
     let Ok(metadata) = serde_json::from_slice::<Value>(&body) else {
         return metadata_error("the request body must be a JSON object");
@@ -122,6 +161,35 @@ pub async fn register(
     let Some(metadata) = metadata.as_object() else {
         return metadata_error("the request body must be a JSON object");
     };
+    let mut metadata = metadata.clone();
+
+    // The exposure switch + initial access token (issue #31): decide whether this
+    // request is authorized, resolve the policy chain it must satisfy, and whether
+    // the resulting client starts quarantined. A `token_gated` environment CONSUMES
+    // the presented token here (atomically), so an exhausted or expired token is
+    // refused before the client is created.
+    let authz = match resolve_registration(&state, scope, presented.as_deref()).await {
+        Ok(authz) => authz,
+        Err(refusal) => return refusal,
+    };
+
+    // Apply the policy chain to the submitted metadata BEFORE validation (force /
+    // default / restrict / reject). A rejection stays a GENERIC
+    // `invalid_client_metadata` on the wire, but the actionable diagnostic is
+    // recorded OUT OF BAND (a `dcr.policy_rejected` audit event plus a structured
+    // log line), so the endpoint is never an oracle for the operator's policy (AC5).
+    if let Err(rejection) = apply_chain(&authz.chain, &mut metadata) {
+        record_policy_rejection(
+            &state,
+            scope,
+            actor,
+            correlation,
+            authz.iat_id.as_ref(),
+            &rejection,
+        )
+        .await;
+        return metadata_error("the request metadata is not acceptable");
+    }
 
     // The environment's real ID-token signing capability drives the algorithm
     // negotiation, so a recorded `id_token_signed_response_alg` is always one the OP
@@ -130,7 +198,7 @@ pub async fn register(
         return server_error();
     };
 
-    let validated = match validate_metadata(&state, metadata, None, &signable, default_alg).await {
+    let validated = match validate_metadata(&state, &metadata, None, &signable, default_alg).await {
         Ok(validated) => validated,
         Err(error) => return error.into_response(),
     };
@@ -148,7 +216,6 @@ pub async fn register(
 
     let issuer = state.issuer_for(&scope);
     let registration_uri_base = format!("{issuer}/connect/register");
-    let actor = ActorRef::service(ServiceId::generate(state.env()));
 
     let params = NewDynamicClient {
         display_name: &validated.display_name,
@@ -162,17 +229,27 @@ pub async fn register(
         token_endpoint_auth_signing_alg: validated.token_endpoint_auth_signing_alg.as_deref(),
         registration_access_token_hash: &registration_token_hash,
         registration_uri_base: &registration_uri_base,
+        quarantined: authz.quarantined,
+        dcr_policy_chain: authz.chain_text.as_deref(),
     };
 
+    // The per-environment quota is enforced ATOMICALLY inside register_dynamic (under
+    // a per-scope advisory lock), so two concurrent registrations cannot both slip
+    // past the cap.
+    let max_clients = i64::from(state.registration_max_clients());
     let registration = match state
         .store()
         .scoped(scope)
-        .acting(actor, CorrelationId::generate(state.env()))
+        .acting(actor, correlation)
         .clients()
-        .register_dynamic(state.env(), params)
+        .register_dynamic(state.env(), params, Some(max_clients))
         .await
     {
         Ok(registration) => registration,
+        Err(StoreError::QuotaExceeded) => {
+            record_quota_hit(&state, scope, actor, correlation).await;
+            return quota_refused();
+        }
         Err(StoreError::InvalidRedirectUri) => {
             return redirect_error("a redirect_uri is not a registrable target");
         }
@@ -243,13 +320,28 @@ pub async fn update(
     let Some(metadata) = metadata.as_object() else {
         return metadata_error("the request body must be a JSON object");
     };
+    let mut metadata = metadata.clone();
+
+    // AC1: the SAME policy chain that bound the original registration binds this RFC
+    // 7592 update. The chain snapshot rides on the client (and thus on the
+    // registration access token that authenticated this call) for the client's
+    // lifetime, so a later edit or deletion of the source policy object never
+    // loosens the constraint. A rejection is opaque on the wire but recorded out of
+    // band, exactly as at registration (AC5).
+    if let Some(chain_text) = &record.dcr_policy_chain {
+        let chain = parse_chain(chain_text).unwrap_or_default();
+        if let Err(rejection) = apply_chain(&chain, &mut metadata) {
+            record_policy_rejection_for_client(&state, scope, &record.id, &rejection).await;
+            return metadata_error("the request metadata is not acceptable");
+        }
+    }
 
     let Some((signable, default_alg)) = env_signing_capability(&state, &scope).await else {
         return server_error();
     };
 
     let validated =
-        match validate_metadata(&state, metadata, Some(&record), &signable, default_alg).await {
+        match validate_metadata(&state, &metadata, Some(&record), &signable, default_alg).await {
             Ok(validated) => validated,
             Err(error) => return error.into_response(),
         };
@@ -342,6 +434,297 @@ async fn enabled_scope(state: &OidcState, tenant_id: &str, environment_id: &str)
     // no entry, so registration cannot be aimed at another tenant's environment.
     state.issuer_entry(&scope).await?;
     Some(scope)
+}
+
+/// The resolved authorization for a registration request (issue #31): the policy
+/// chain the submitted metadata must satisfy, the snapshot text to persist on the
+/// client (so RFC 7592 updates re-apply the SAME chain), whether the resulting
+/// client starts quarantined, and the initial access token that authorized it (if
+/// any, for the audit target).
+struct RegistrationAuthz {
+    chain: Vec<PolicyPrimitive>,
+    chain_text: Option<String>,
+    quarantined: bool,
+    iat_id: Option<InitialAccessTokenId>,
+}
+
+/// Resolve the exposure switch and initial access token for a registration request
+/// (issue #31), returning the authorization on success or a typed refusal
+/// [`Response`] otherwise.
+///
+/// - `closed`: every public registration is refused (clients are created only
+///   through the management API).
+/// - `token_gated`: a valid initial access token is REQUIRED; it is consumed here,
+///   its policy chain applies, and the resulting client is trusted (not quarantined).
+/// - `open`: a request WITHOUT a token registers anonymously and the client starts
+///   quarantined; a request WITH a token must present a valid one (a bad token is a
+///   refusal, never a silent fallback to anonymous), which vouches for the client.
+async fn resolve_registration(
+    state: &OidcState,
+    scope: Scope,
+    presented: Option<&str>,
+) -> Result<RegistrationAuthz, Response> {
+    match state.registration_mode() {
+        RegistrationMode::Closed => Err(exposure_refused(
+            "dynamic client registration is closed for this environment",
+        )),
+        RegistrationMode::TokenGated => match presented {
+            Some(token) => consume_iat_authz(state, scope, token).await,
+            None => Err(exposure_refused(
+                "an initial access token is required to register a client here",
+            )),
+        },
+        RegistrationMode::Open => match presented {
+            Some(token) => consume_iat_authz(state, scope, token).await,
+            // Anonymous open registration: no policy chain, and the client starts
+            // quarantined until an admin verifies it.
+            None => Ok(RegistrationAuthz {
+                chain: Vec::new(),
+                chain_text: None,
+                quarantined: true,
+                iat_id: None,
+            }),
+        },
+    }
+}
+
+/// Consume a presented initial access token (issue #31), returning the
+/// authorization it grants, or a typed refusal when it is invalid, expired, or
+/// exhausted (all indistinguishable, so the endpoint is never an oracle). Consuming
+/// increments the token's use count ATOMICALLY, so a usage limit cannot be raced
+/// past.
+async fn consume_iat_authz(
+    state: &OidcState,
+    scope: Scope,
+    token: &str,
+) -> Result<RegistrationAuthz, Response> {
+    let hash = hash_secret(token);
+    let now = epoch_micros(state.now());
+    match state
+        .store()
+        .scoped(scope)
+        .initial_access_tokens()
+        .consume(&hash, now)
+        .await
+    {
+        Ok(consumed) => {
+            let chain = parse_chain(&consumed.policy_chain).unwrap_or_default();
+            // Persist the token's snapshot verbatim (so a 7592 update re-applies the
+            // exact chain); a token that carried no constraints leaves the column NULL.
+            let chain_text = (!chain.is_empty()).then(|| consumed.policy_chain.clone());
+            Ok(RegistrationAuthz {
+                chain,
+                chain_text,
+                quarantined: false,
+                iat_id: Some(consumed.id),
+            })
+        }
+        Err(StoreError::NotFound) => Err(exposure_refused(
+            "the initial access token is invalid, expired, or exhausted",
+        )),
+        Err(_) => Err(server_error()),
+    }
+}
+
+/// Enforce the endpoint-local registration rate limit (issue #31), keyed by source
+/// AND by presented token, using the clock seam for the fixed window. Returns a
+/// typed refusal [`Response`] when either key is over its limit (and records a
+/// `dcr.rate_limited` audit event), or `None` to proceed. A configured limit of 0
+/// disables it.
+async fn enforce_rate_limits(
+    state: &OidcState,
+    scope: Scope,
+    actor: ActorRef,
+    correlation: CorrelationId,
+    headers: &HeaderMap,
+    presented: Option<&str>,
+) -> Option<Response> {
+    let limit = i64::from(state.registration_rate_limit());
+    if limit <= 0 {
+        return None;
+    }
+    let window = i64::try_from(state.registration_rate_window().as_secs()).unwrap_or(i64::MAX);
+    let now = epoch_micros(state.now());
+    let limiter = state.store().scoped(scope).dcr_rate_limiter();
+
+    // The source key is best-effort (a forwarded-for hop) and the token key is the
+    // robust one; a request is refused if EITHER is over its limit.
+    let source_key = format!("src:{}", request_source(headers));
+    match limiter
+        .check_and_increment(&source_key, limit, window, now)
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => {
+            record_rate_limited(state, scope, actor, correlation).await;
+            return Some(rate_limited_refused());
+        }
+        Err(_) => return Some(server_error()),
+    }
+    if let Some(token) = presented {
+        let iat_key = format!("iat:{}", hash_secret(token));
+        match limiter
+            .check_and_increment(&iat_key, limit, window, now)
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                record_rate_limited(state, scope, actor, correlation).await;
+                return Some(rate_limited_refused());
+            }
+            Err(_) => return Some(server_error()),
+        }
+    }
+    None
+}
+
+/// A best-effort source identifier for rate limiting (issue #31): the first
+/// `X-Forwarded-For` hop when present, else a fixed `unknown` bucket. Endpoint-local
+/// and best-effort; the robust keying is by initial access token. A later issue
+/// delegates this to the M15 layered rate limiter.
+fn request_source(headers: &HeaderMap) -> String {
+    headers
+        .get("x-forwarded-for")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(',').next())
+        .map(str::trim)
+        .filter(|hop| !hop.is_empty())
+        .unwrap_or("unknown")
+        .to_owned()
+}
+
+/// Record a `dcr.policy_rejected` event out of band (issue #31, AC5): a structured
+/// diagnostic log line plus the typed audit event, targeting the initial access
+/// token that carried the offending policy.
+async fn record_policy_rejection(
+    state: &OidcState,
+    scope: Scope,
+    actor: ActorRef,
+    correlation: CorrelationId,
+    iat_id: Option<&InitialAccessTokenId>,
+    rejection: &PolicyRejection,
+) {
+    tracing::warn!(diagnostic = %rejection.diagnostic(), "dcr registration policy rejection");
+    let acting = state.store().scoped(scope).acting(actor, correlation);
+    let result = match iat_id {
+        Some(iat) => {
+            acting
+                .clients()
+                .record_dcr_event(state.env(), Action::DcrPolicyRejected, iat)
+                .await
+        }
+        // A policy chain only exists when a token was consumed, so this branch is
+        // defensive; target the environment when no token id is available.
+        None => {
+            acting
+                .clients()
+                .record_dcr_event(state.env(), Action::DcrPolicyRejected, &scope.environment())
+                .await
+        }
+    };
+    if let Err(error) = result {
+        tracing::error!(%error, "failed to record dcr.policy_rejected");
+    }
+}
+
+/// Record a `dcr.policy_rejected` event for an RFC 7592 update rejection (issue #31,
+/// AC5): the target is the client whose stored chain refused the update.
+async fn record_policy_rejection_for_client(
+    state: &OidcState,
+    scope: Scope,
+    client_id: &ironauth_store::ClientId,
+    rejection: &PolicyRejection,
+) {
+    tracing::warn!(diagnostic = %rejection.diagnostic(), "dcr update policy rejection");
+    let actor = client_service_actor(client_id);
+    let correlation = CorrelationId::generate(state.env());
+    if let Err(error) = state
+        .store()
+        .scoped(scope)
+        .acting(actor, correlation)
+        .clients()
+        .record_dcr_event(state.env(), Action::DcrPolicyRejected, client_id)
+        .await
+    {
+        tracing::error!(%error, "failed to record dcr.policy_rejected (update)");
+    }
+}
+
+/// Record a `dcr.quota_hit` event (issue #31), targeting the environment.
+async fn record_quota_hit(
+    state: &OidcState,
+    scope: Scope,
+    actor: ActorRef,
+    correlation: CorrelationId,
+) {
+    if let Err(error) = state
+        .store()
+        .scoped(scope)
+        .acting(actor, correlation)
+        .clients()
+        .record_dcr_event(state.env(), Action::DcrQuotaHit, &scope.environment())
+        .await
+    {
+        tracing::error!(%error, "failed to record dcr.quota_hit");
+    }
+}
+
+/// Record a `dcr.rate_limited` event (issue #31), targeting the environment.
+async fn record_rate_limited(
+    state: &OidcState,
+    scope: Scope,
+    actor: ActorRef,
+    correlation: CorrelationId,
+) {
+    if let Err(error) = state
+        .store()
+        .scoped(scope)
+        .acting(actor, correlation)
+        .clients()
+        .record_dcr_event(state.env(), Action::DcrRateLimited, &scope.environment())
+        .await
+    {
+        tracing::error!(%error, "failed to record dcr.rate_limited");
+    }
+}
+
+/// A 403 `access_denied` refusal for an exposure-switch or quota block (issue #31).
+/// The description is safe (it names the policy posture, never a secret).
+fn exposure_refused(description: &str) -> Response {
+    refused(StatusCode::FORBIDDEN, "access_denied", description)
+}
+
+/// The 403 `access_denied` refusal when the environment is at its registered-client
+/// quota (issue #31). The count itself is not disclosed.
+fn quota_refused() -> Response {
+    refused(
+        StatusCode::FORBIDDEN,
+        "access_denied",
+        "the registered-client quota for this environment has been reached",
+    )
+}
+
+/// The 429 refusal when the endpoint's rate limit is exceeded (issue #31).
+fn rate_limited_refused() -> Response {
+    refused(
+        StatusCode::TOO_MANY_REQUESTS,
+        "temporarily_unavailable",
+        "the registration endpoint is rate limited; retry later",
+    )
+}
+
+/// Build a typed refusal response with a `no-store` cache directive.
+fn refused(status: StatusCode, code: &str, description: &str) -> Response {
+    let body = json!({ "error": code, "error_description": description }).to_string();
+    (
+        status,
+        [
+            (header::CONTENT_TYPE, "application/json".to_owned()),
+            (header::CACHE_CONTROL, "no-store".to_owned()),
+        ],
+        body,
+    )
+        .into_response()
 }
 
 /// Authenticate an RFC 7592 request: resolve the scope and DCR client, then compare

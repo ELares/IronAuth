@@ -196,3 +196,125 @@ pub struct ManagementKeyList {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<String>,
 }
+
+// ---------------------------------------------------------------------------
+// Dynamic Client Registration abuse controls (issue #31).
+// ---------------------------------------------------------------------------
+
+/// The body to create a named, reusable DCR policy (issue #31).
+///
+/// `primitives` is the ordered list of policy primitives, each a JSON object with a
+/// `kind` of `force`, `restrict`, `reject`, or `default` plus its fields (a `force`
+/// or `default` carries `property` and `value`; a `restrict` carries `property` and
+/// `allowed`; a `reject` carries `property`). The management API validates the shape
+/// at create time against the OIDC policy engine.
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct CreateDcrPolicyRequest {
+    /// The policy name, unique per environment (referenced by name at token mint).
+    #[schema(example = "force-private-key-jwt")]
+    pub name: String,
+    /// The ordered primitive list (force / restrict / reject / default objects).
+    pub primitives: Vec<serde_json::Value>,
+}
+
+/// A DCR policy, as returned by the management API.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct DcrPolicyView {
+    /// The policy identifier (`pol_...`).
+    pub id: String,
+    /// The policy name.
+    pub name: String,
+    /// The ordered primitive list (as stored).
+    pub primitives: Vec<serde_json::Value>,
+    /// Creation time, milliseconds since the Unix epoch.
+    pub created_at_unix_ms: i64,
+}
+
+/// A page of DCR policies.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct DcrPolicyList {
+    /// The policies on this page, oldest first.
+    pub items: Vec<DcrPolicyView>,
+    /// The opaque cursor for the next page, or null if this is the last page.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+/// The body to mint a DCR initial access token (RFC 7591, issue #31).
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct CreateInitialAccessTokenRequest {
+    /// The ordered names of the policies to attach as this token's chain. Each must
+    /// name a policy that exists in this environment; the chain is resolved to its
+    /// primitives and snapshotted onto the token, so a later edit of a named policy
+    /// never changes an already-minted token. Empty means an unconstrained token.
+    #[serde(default)]
+    pub policy_names: Vec<String>,
+    /// The token lifetime in seconds from now (from the server clock).
+    #[schema(example = 86_400)]
+    pub expires_in_secs: u64,
+    /// The maximum number of registrations this token may authorize, or null for
+    /// unlimited (within its lifetime).
+    #[serde(default)]
+    pub max_uses: Option<u32>,
+}
+
+/// The result of minting a DCR initial access token.
+///
+/// On the genuine first creation (HTTP 201) `token` carries the plaintext bearer
+/// token, shown exactly ONCE and never stored. An idempotent replay (HTTP 200) omits
+/// it and sets `token_already_issued`.
+///
+/// `Debug` is hand-written to redact the token so a live credential never reaches a
+/// log line through `{value:?}`.
+#[derive(Clone, Serialize, ToSchema)]
+pub struct InitialAccessTokenCreated {
+    /// The token identifier (`iat_...`; embeds its scope; safe to display).
+    pub id: String,
+    /// The plaintext bearer token, present ONLY on the first creation (HTTP 201) and
+    /// never stored. Present it as `Authorization: Bearer <token>` at registration.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
+    /// True on an idempotent replay, when the token has already been issued and is
+    /// not repeated.
+    pub token_already_issued: bool,
+    /// Expiry time, milliseconds since the Unix epoch.
+    pub expires_at_unix_ms: i64,
+    /// The usage limit, or null for unlimited.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_uses: Option<u32>,
+    /// Creation time, milliseconds since the Unix epoch.
+    pub created_at_unix_ms: i64,
+}
+
+impl fmt::Debug for InitialAccessTokenCreated {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("InitialAccessTokenCreated")
+            .field("id", &self.id)
+            .field(
+                "token",
+                &self.token.as_ref().map(|_| ironauth_config::REDACTED),
+            )
+            .field("token_already_issued", &self.token_already_issued)
+            .field("expires_at_unix_ms", &self.expires_at_unix_ms)
+            .field("max_uses", &self.max_uses)
+            .field("created_at_unix_ms", &self.created_at_unix_ms)
+            .finish()
+    }
+}
+
+/// A dynamically registered client's verification state (issue #31), as returned by
+/// the management API. `quarantined` is the live gate the authorization/consent path
+/// honors; `verified_at_unix_ms` records when an admin lifted the quarantine.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct ClientVerificationView {
+    /// The client identifier (`cli_...`).
+    pub id: String,
+    /// Whether the client is under the unverified-client quarantine.
+    pub quarantined: bool,
+    /// Whether an admin has verified the client (the quarantine is lifted).
+    pub verified: bool,
+    /// When the client was verified, milliseconds since the Unix epoch, or null if
+    /// never verified.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verified_at_unix_ms: Option<i64>,
+}

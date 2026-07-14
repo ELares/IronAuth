@@ -264,6 +264,32 @@
           "description": "Whether to mount the Dynamic Client Registration endpoint\n(`/connect/register`, RFC 7591 + OIDC DCR 1.0, issue #30). The SAFE default\n(`false`) leaves it UNMOUNTED, because open self-service client registration\nis an abuse surface whose real gating (initial access token policy chains,\nper-tenant quotas, and quarantine) is owned by the abuse-controls work\n(issue #31). This flag ships ONLY the endpoint and this plain on/off switch;\n#31 layers its policy chains on top. When `true`, the RFC 7591 registration\nendpoint and the RFC 7592 configuration-management endpoint are served under\neach environment's issuer path, and discovery advertises\n`registration_endpoint`. This is a promotable per-environment setting in\nspirit; the process value is the deployment default until per-environment\noverrides ride the M5 promotion pipeline.",
           "type": "boolean"
         },
+        "registration_max_clients": {
+          "default": 100,
+          "description": "The maximum number of dynamically registered clients allowed per environment\n(issue #31). A registration that would exceed this cap is refused with a\ntyped error and a `dcr.quota_hit` audit event. The default (100) bounds the\nself-service abuse surface; only DCR-origin clients count toward it (clients\ncreated through the management API do not). Raise it for an environment that\nlegitimately hosts many self-service clients.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "registration_mode": {
+          "$ref": "#/$defs/RegistrationMode",
+          "default": "token_gated",
+          "description": "The Dynamic Client Registration exposure switch (issue #31): `closed`\n(management API only), `token_gated` (a valid initial access token is\nrequired), or `open` (anonymous registration allowed, but the resulting\nclient starts quarantined). The SAFE default (`token_gated`) makes open\nself-service registration opt-in. This only takes effect when\n`registration_enabled` mounts the endpoint. This is a promotable\nper-environment setting in spirit; the process value is the deployment\ndefault until per-environment overrides ride the M5 promotion pipeline."
+        },
+        "registration_rate_limit": {
+          "default": 20,
+          "description": "The maximum number of registration requests one source (or one initial\naccess token) may make within `registration_rate_window_secs` (issue #31). A\nrequest beyond the limit is refused with a typed error and a\n`dcr.rate_limited` audit event. The default (20) is a conservative\nendpoint-local guard; set it to 0 to disable rate limiting (relying on the\nquota alone). This ships endpoint-local controls that later delegate to the\nM15 layered rate limiter.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "registration_rate_window_secs": {
+          "default": 60,
+          "description": "The fixed rate-limit window in seconds for `registration_rate_limit` (issue\n#31). The default (60) is one minute. Must be at least 1 and at most\n`OIDC_MAX_LIFETIME_SECS`.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
         "remembered_consent_ttl_secs": {
           "default": 2592000,
           "description": "The lifetime in seconds of a REMEMBERED consent (issue #21): the TTL applied\nto a recorded consent for a client whose consent mode is `remembered`. After\nthis long the recorded consent expires and the next authorization re-prompts.\nThe default (2592000) is thirty days. Must be at least 1 and at most\n`OIDC_MAX_REMEMBERED_CONSENT_TTL_SECS`. It has no effect on `explicit` mode\n(whose consent never expires) or `implicit` mode (which never prompts).",
@@ -324,6 +350,26 @@
         }
       },
       "type": "object"
+    },
+    "RegistrationMode": {
+      "description": "The Dynamic Client Registration exposure switch (issue #31): who may register\na client through the public `/connect/register` endpoint. Layered under\n`oidc.registration_enabled` (which mounts the endpoint at all): when the\nendpoint is mounted, this decides whether a request is allowed and how.\n\nThe SAFE default is `token_gated`: a valid initial access token is required,\nso open self-service registration is opt-in, never on by accident. `closed`\nrefuses every public registration (clients are then created only through the\nmanagement API). `open` allows anonymous registration but the resulting client\nstarts QUARANTINED (consent always shown, redirect set restricted) until an\nadmin verifies it.",
+      "oneOf": [
+        {
+          "const": "closed",
+          "description": "The public endpoint refuses every registration; clients are created only\nthrough the management API. The most restrictive posture.",
+          "type": "string"
+        },
+        {
+          "const": "token_gated",
+          "description": "A valid initial access token (RFC 7591 section 1.2) is required; a request\nwithout one is refused. The safe default.",
+          "type": "string"
+        },
+        {
+          "const": "open",
+          "description": "Anonymous registration is allowed, but the resulting client starts\nquarantined until an admin verifies it. Requires explicit opt-in.",
+          "type": "string"
+        }
+      ]
     },
     "Secret": {
       "description": "A secret value by indirection: the contents of a file ({ file = \"/path\" }), an environment variable ({ env = \"VAR_NAME\" }), or a literal string (discouraged; flagged outside dev mode).",
@@ -488,6 +534,10 @@
         "refresh_rotation_grace_secs": 10,
         "refresh_rotation_threshold_percent": 70,
         "registration_enabled": false,
+        "registration_max_clients": 100,
+        "registration_mode": "token_gated",
+        "registration_rate_limit": 20,
+        "registration_rate_window_secs": 60,
         "remembered_consent_ttl_secs": 2592000,
         "require_pkce_for_confidential_clients": true,
         "require_pushed_authorization_requests": false,
