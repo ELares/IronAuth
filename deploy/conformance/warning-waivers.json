@@ -1,0 +1,12 @@
+{
+  "$comment": [
+    "Reviewed WARNING waivers for the OIDF conformance gate (parse_results.py).",
+    "A WARNING for a test listed here, WITH a written reason, is downgraded to a",
+    "pass-with-note; every other WARNING blocks the merge gate as 'unreviewed'.",
+    "Only WARNING is waivable: REVIEW, FAILED, and SKIPPED can never be waived.",
+    "Adding an entry is a reviewed change (it goes through the same PR review as",
+    "code). Keep this list empty unless a warning is a known, tracked suite quirk.",
+    "Each entry: {\"test\": \"<exact test name>\", \"reason\": \"<why, with an issue link>\", \"reviewer\": \"<who>\"}."
+  ],
+  "waived_warnings": []
+}

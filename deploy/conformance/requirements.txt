@@ -1,0 +1,12 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+#
+# Python dependencies for the conformance runner wrapper (run-conformance.sh).
+# The results gate (parse_results.py) and its unit tests are standard-library
+# only and need NONE of these, so the always-on static check lane runs without
+# installing anything. These are only for driving the LIVE suite from the
+# provisioned runner.
+#
+# Pin exact versions when the runner is provisioned (an owner action) so a run is
+# reproducible; the ranges below are the known-good floors.
+requests>=2.31
+PyYAML>=6.0

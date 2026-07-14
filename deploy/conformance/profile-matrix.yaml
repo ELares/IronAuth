@@ -1,0 +1,111 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+#
+# The OIDF conformance profile matrix (issue #37). Version-controlled and
+# reviewed like code: which test plans run on which trigger. run-conformance.sh
+# consumes it; scripts/conformance-check.sh validates its shape on every PR.
+#
+# TRIGGERS
+#   merge-gate  the fast, deterministic OP-profile subset that gates merges to
+#               the default branch once the runner is provisioned and the check
+#               is promoted to required (an owner action).
+#   nightly     the full matrix, run on a schedule; publishes the status badge.
+#
+# ENABLEMENT
+#   A profile with `enabled: false` is EXPLICITLY not-yet-wired. The runner skips
+#   it and reports it as "not-yet-enabled (blocked by <issue>)". It is NEVER
+#   reported as passed: an unimplemented profile can never be vacuously green.
+#   The results gate (parse_results.py) only ever sees results for enabled
+#   profiles, and it fails on any non-PASS among those.
+#
+# ISSUER
+#   The issuer below MUST exact-string-match, byte for byte, the value the suite
+#   fetches from discovery on BOTH well-known forms (no trailing slash). It is
+#   derived from ironauth.toml's public_url (https://op) plus the cert scope
+#   (tenant "cert", environment "cert"). This is the #194 discovery-divergence
+#   surface; a mismatch here is the single most common conformance-bootstrap
+#   failure.
+
+op:
+  issuer: "https://op/t/cert/e/cert"
+  # The two well-known forms the suite may probe; both must return the identical
+  # document with the issuer above (see scripts/discovery-scan.sh and #194).
+  well_known:
+    - "https://op/t/cert/e/cert/.well-known/openid-configuration"
+    - "https://op/.well-known/openid-configuration/t/cert/e/cert"
+  login:
+    username: "alice@conformance.test"
+    # The password is the throwaway cert credential seed.sh installs.
+    password_env: "CERT_USER_PASSWORD"
+
+profiles:
+  # --- OP profiles: wireable NOW (M2 shipped these response types/modes) -------
+  - id: oidcc-basic-certification-test-plan
+    name: "Basic OP"
+    triggers: [merge-gate, nightly]
+    enabled: true
+    variant: { server_metadata: discovery, client_registration: dynamic_client }
+
+  - id: oidcc-config-certification-test-plan
+    name: "Config OP"
+    triggers: [merge-gate, nightly]
+    enabled: true
+    variant: { server_metadata: discovery, client_registration: dynamic_client }
+
+  - id: oidcc-dynamic-certification-test-plan
+    name: "Dynamic OP"
+    triggers: [merge-gate, nightly]
+    enabled: true
+    variant: { server_metadata: discovery, client_registration: dynamic_client }
+
+  - id: oidcc-formpost-basic-certification-test-plan
+    name: "Form Post OP (Basic)"
+    triggers: [merge-gate, nightly]
+    enabled: true
+    variant: { server_metadata: discovery, client_registration: dynamic_client, response_mode: form_post }
+
+  # --- Front-channel OP profiles: implemented, run nightly (not merge-gate) ----
+  # These exercise the legacy front-channel response types the cert config turns
+  # on (enable_response_type_id_token / _code_id_token). They are slower and less
+  # central than the code flow, so they run in the full nightly matrix, not the
+  # fast merge gate.
+  - id: oidcc-implicit-certification-test-plan
+    name: "Implicit OP"
+    triggers: [nightly]
+    enabled: true
+    variant: { server_metadata: discovery, client_registration: dynamic_client, response_type: "id_token" }
+
+  - id: oidcc-hybrid-certification-test-plan
+    name: "Hybrid OP"
+    triggers: [nightly]
+    enabled: true
+    variant: { server_metadata: discovery, client_registration: dynamic_client, response_type: "code id_token" }
+
+  # --- Logout profiles: DEFERRED, add incrementally as the deps land -----------
+  # Not yet enabled: the sessions/logout surfaces they certify are not merged.
+  # They are listed so the matrix is complete and the wiring is reviewed now, but
+  # `enabled: false` guarantees the runner reports them as not-yet-enabled, never
+  # as passed. Flip a profile to `enabled: true` in the SAME PR that merges its
+  # dependency, so the gate starts holding it exactly when it becomes real.
+  - id: oidcc-rp-initiated-logout-certification-test-plan
+    name: "RP-Initiated Logout"
+    triggers: [nightly]
+    enabled: false
+    blocked_by: "#39"
+
+  - id: oidcc-session-management-certification-test-plan
+    name: "Session Management"
+    triggers: [nightly]
+    enabled: false
+    blocked_by: "#33, #34"
+
+  - id: oidcc-frontchannel-logout-certification-test-plan
+    name: "Front-Channel Logout"
+    triggers: [nightly]
+    enabled: false
+    blocked_by: "#33, #34"
+
+  - id: oidcc-backchannel-logout-certification-test-plan
+    name: "Back-Channel Logout"
+    triggers: [nightly]
+    enabled: false
+    blocked_by: "#33, #34"

@@ -3,7 +3,11 @@
 # The merge gate. Every lane here is required before merge once branch
 # protection lists them; scripts/gate.sh runs the locally runnable subset in
 # the same order. Lanes: fmt, clippy (pedantic, -D warnings), test, msrv,
-# musl static build, cargo-deny, invariant lints, dash scan, compat matrix.
+# musl static build, cargo-deny, invariant lints (including the conformance
+# harness static checks), dash scan, compat matrix. The OIDF conformance lane
+# (issue #37) that drives the LIVE suite is owner-gated: it runs only when the
+# repository variable CONFORMANCE_ENABLED is set and the runner is provisioned,
+# and it is promoted to a required check by an owner (see docs/conformance).
 name: ci
 
 on:
@@ -146,6 +150,13 @@ jobs:
         run: scripts/dash-scan.sh
       - name: discovery scan (no static discovery JSON; generated at serve time)
         run: scripts/discovery-scan.sh
+      - name: conformance harness static checks (results gate, matrix, digest pins, downgrade confinement)
+        # Always-on, runner-independent checks over deploy/conformance: the
+        # results-gate unit tests, the profile matrix and compose shape, that
+        # every suite image is pinned by digest, and that the cert-only
+        # downgrades stay out of the shipped default. The LIVE suite run is the
+        # separate, owner-gated `conformance` job below.
+        run: scripts/conformance-check.sh
       - name: compatibility matrix freshness
         run: |
           scripts/compat-matrix.sh
@@ -186,3 +197,35 @@ jobs:
               sys.exit(f'security.txt Expires more than ~13 months out: {expires}')
           print('security.txt: valid, expires', expires)
           EOF
+
+  conformance:
+    name: OIDF conformance (merge-gate subset)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    # OWNER-GATED. This lane drives the LIVE OIDF suite against an ephemeral
+    # certification-representative deployment and fails on any non-PASS. It needs
+    # the provisioned runner: the real suite image digests pinned in
+    # deploy/conformance/SUITE_VERSION and the suite's trust of the OP CA. Until
+    # an owner provisions those and sets the repository variable
+    # CONFORMANCE_ENABLED=true, this job is SKIPPED (never a false red), and it
+    # is not a required check until an owner adds it to branch protection. It
+    # keeps the default least-privilege permissions (contents: read); nothing
+    # here writes. The static, runner-independent half runs unconditionally in
+    # the `invariants` job above.
+    if: ${{ vars.CONFORMANCE_ENABLED == 'true' }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run the merge-gate profile subset
+        # Brings up the pinned stack, seeds the deterministic user, drives the
+        # Basic / Config / Dynamic / Form Post plans, and fails on any non-PASS
+        # (parse_results.py treats WARNING/REVIEW/FAILED/SKIPPED and unfinished
+        # as blocking). See docs/conformance/RUNBOOK.md.
+        working-directory: deploy/conformance
+        run: ./run-conformance.sh --trigger merge-gate --up
+      - name: Archive suite logs for certification submission
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: conformance-logs-merge-gate
+          path: deploy/conformance/results/
+          if-no-files-found: ignore

@@ -1,0 +1,46 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+#
+# Pinned image versions for the OIDF conformance harness (issue #37).
+#
+# This file is BOTH the human-readable pin record AND a docker compose env-file.
+# The compose stack and the helper scripts load it explicitly:
+#
+#     docker compose --env-file SUITE_VERSION -f docker-compose.yml <cmd>
+#
+# Determinism rule: every image is pinned BY DIGEST (sha256), never by a mutable
+# tag, so a rerun months later resolves the identical bits. The *_VERSION values
+# are informational (which upstream release the digest was taken from); the
+# *_IMAGE values in digest form are what compose actually resolves.
+#
+# HOW TO RESOLVE OR BUMP A DIGEST (owner/infra step; needs registry network):
+#     docker pull <image>:<tag>
+#     docker image inspect <image>:<tag> --format '{{index .RepoDigests 0}}'
+# Paste the returned <image>@sha256:... into the matching *_IMAGE line below and
+# record the tag in the matching *_VERSION line. The full bump runbook (including
+# the scheduled "track suite master" early-warning job) is in
+# docs/conformance/RUNBOOK.md.
+#
+# PLACEHOLDER DIGESTS: the sha256 values below are all-zero PLACEHOLDERS. They
+# are intentionally un-pullable, so the live stack FAILS CLOSED until an owner
+# resolves and pins the real digests against a certification-representative
+# release. Resolving them is an owner/infra action (the runner is not provisioned
+# in this repo). The rest of the harness (config confinement test, results
+# parser and its unit tests, matrix validation, compose syntax) is verifiable
+# without these digests and runs in the always-on static check lane.
+
+# --- OIDF conformance suite (gitlab.com/openid/conformance-suite) -------------
+SUITE_VERSION=release-v5.1.30
+SUITE_SERVER_IMAGE=registry.gitlab.com/openid/conformance-suite/server@sha256:0000000000000000000000000000000000000000000000000000000000000000
+SUITE_HTTPD_IMAGE=registry.gitlab.com/openid/conformance-suite/httpd@sha256:0000000000000000000000000000000000000000000000000000000000000000
+
+# --- The suite's MongoDB backing store ----------------------------------------
+MONGO_VERSION=8.0
+MONGO_IMAGE=mongo@sha256:0000000000000000000000000000000000000000000000000000000000000000
+
+# --- IronAuth's PostgreSQL backing store --------------------------------------
+POSTGRES_VERSION=17-alpine
+POSTGRES_IMAGE=postgres@sha256:0000000000000000000000000000000000000000000000000000000000000000
+
+# --- TLS terminator in front of the IronAuth data plane (the "op" issuer) -----
+NGINX_VERSION=1.27-alpine
+NGINX_IMAGE=nginx@sha256:0000000000000000000000000000000000000000000000000000000000000000

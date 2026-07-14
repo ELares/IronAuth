@@ -6,6 +6,13 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Add a conformance cert-config confinement test (issue #37):
+  `tests/conformance_cert_config.rs` loads both `deploy/ironauth.toml` and
+  `deploy/conformance/ironauth.toml` through the strict loader and asserts the
+  cert config turns the legacy/downgrade OP-profile toggles on while the shipped
+  default keeps every one off. This proves the cert config parses under the
+  strict schema and that the security downgrades cannot leak into the default
+  posture. No library change; a test only.
 - Add the device-authorization knobs (issue #24, RFC 8628):
   - `oidc.device_code_ttl_secs` (default 600, validated to `1..=OIDC_MAX_DEVICE_CODE_TTL_SECS`
     = 1800): the short lifetime a device code and its user code are valid for.

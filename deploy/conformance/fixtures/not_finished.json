@@ -1,0 +1,8 @@
+{
+  "plan_name": "oidcc-dynamic-certification-test-plan",
+  "plan_id": "example-not-finished",
+  "modules": [
+    {"name": "oidcc-server", "id": "m1", "status": "FINISHED", "result": "PASSED"},
+    {"name": "oidcc-registration", "id": "m2", "status": "RUNNING", "result": null}
+  ]
+}

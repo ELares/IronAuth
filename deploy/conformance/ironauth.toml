@@ -1,0 +1,92 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+#
+# CERTIFICATION-REPRESENTATIVE IronAuth configuration for the OIDF conformance
+# harness. Derived from deploy/ironauth.toml. Validated against the strict schema
+# (docs/config-schema.json) exactly like every other config; see docs/CONFIG.md.
+#
+# This file exists ONLY to drive the OIDF conformance suite (deploy/conformance).
+# It flips ON, for THIS cert deployment only, the legacy/downgrade OP-profile
+# toggles the certified profiles exercise. Every one of those toggles is a
+# SECURITY DOWNGRADE. They are confined here: the shipped default config
+# (deploy/ironauth.toml) keeps all of them OFF, and that confinement is proven by
+# crates/ironauth-config/tests/conformance_cert_config.rs, which loads BOTH files
+# and asserts the cert file turns them on while the default keeps the hardened
+# posture. The downgrades therefore can never become the default posture by
+# editing one file: the test fails if the default drifts.
+
+[server]
+# Public data plane. The TLS-terminating proxy (see docker-compose.yml) forwards
+# to this over the internal compose network; the suite reaches the OP only through
+# the proxy on HTTPS.
+bind = "0.0.0.0:8443"
+# Management plane (health, readiness, metrics) on loopback only, never published.
+management_bind = "127.0.0.1:9443"
+# The issuer origin. Scheme, host, and every per-environment issuer derive from
+# THIS value, never from request headers, so the issuer the suite fetches is
+# byte-stable. With tenant "cert" and environment "cert" the per-environment
+# issuer is EXACTLY:
+#
+#     https://op/t/cert/e/cert
+#
+# and discovery advertises that exact string on BOTH well-known forms with no
+# trailing-slash drift (the #194 discovery-divergence surface). NOTE: no trailing
+# slash on public_url; a trailing slash would push the issuer to
+# https://op//t/... and the suite's exact-string issuer match would fail.
+public_url = "https://op"
+shutdown_grace_secs = 25
+
+# The cert stack has exactly one proxy hop (the TLS terminator), but the issuer
+# and all endpoint URLs derive from public_url, not headers, so trusting the
+# forwarding chain is not required for issuer correctness. Keep the hardened
+# default (trust nothing); the only cost is that request logs see the proxy's
+# address rather than the suite's, which is immaterial for a cert run.
+[proxy]
+trusted_hops = 0
+trust_forwarded = false
+
+[telemetry]
+log_format = "json"
+
+[database]
+url = "postgres://ironauth@postgres:5432/ironauth"
+# Supplied out of band via the container environment; never in the file.
+password = { env = "IRONAUTH_DB_PASSWORD" }
+
+# ---------------------------------------------------------------------------
+# OIDC provider, in a certification-representative posture.
+[oidc]
+enabled = true
+
+# --- CERT-ONLY SECURITY DOWNGRADES (legacy/downgrade OP-profile toggles) -----
+# Each defaults to false in the shipped config and stays false there. They are ON
+# here only so the Implicit, Hybrid, response_type=none, and Form Post profiles
+# have a surface to certify. See the per-key docs in docs/CONFIG.md.
+#
+# enable_response_type_id_token        -> the Implicit (id_token) OP profile.
+# enable_response_type_code_id_token   -> the Hybrid (code id_token) OP profile.
+# enable_response_type_none            -> response_type=none coverage.
+# enable_response_mode_form_post       -> the Form Post OP profile.
+enable_response_type_id_token = true
+enable_response_type_code_id_token = true
+enable_response_type_none = true
+enable_response_mode_form_post = true
+
+# --- Dynamic Client Registration for the Dynamic profile ---------------------
+# registration_enabled mounts the RFC 7591 / 7592 endpoint (default off). The
+# Dynamic profile and the suite's automated client setup register clients here.
+registration_enabled = true
+# "open" is the only anonymous registration mode; the suite registers without an
+# initial access token. A DCR-created client starts quarantined (consent always
+# shown, redirect set restricted to what it registered), which is compatible with
+# the suite (it registers its own callback and uses that same callback). See the
+# runbook for the alternative token_gated + seeded-IAT posture.
+registration_mode = "open"
+
+# --- Relax the DCR abuse throttle for the cert environment only --------------
+# migration 0018 (DCR abuse controls) rate-limits and quota-caps registrations.
+# The suite registers many clients in quick succession, so throttle it OFF here:
+# 0 disables the endpoint-local rate limit, and the client cap is raised well
+# above any single run. These relaxations live ONLY in this cert file; the
+# shipped default keeps the conservative limits (20 per window, 100 clients).
+registration_rate_limit = 0
+registration_max_clients = 100000

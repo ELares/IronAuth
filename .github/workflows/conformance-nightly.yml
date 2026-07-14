@@ -1,0 +1,104 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+#
+# Nightly OIDF conformance full matrix (issue #37). Runs the complete profile
+# matrix (not just the merge-gate subset) on a schedule and on demand, archives
+# the suite logs for certification submission, and publishes a status badge.
+#
+# This is NEVER a merge gate: it runs only on schedule / manual dispatch, never
+# on pull_request. It is owner-gated on the CONFORMANCE_ENABLED repository
+# variable exactly like the merge-gate lane, so it is inert until the runner is
+# provisioned.
+#
+# Least privilege: the default token is contents:read. The ONLY job that writes
+# is `badge`, which elevates to contents:write and touches only the narrow status
+# file. The heavy suite drive (full-matrix) never holds a write token.
+name: conformance-nightly
+
+on:
+  schedule:
+    # Nightly, off-peak, arbitrary minute to dodge the top-of-hour herd.
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: conformance-nightly
+  cancel-in-progress: false
+
+jobs:
+  full-matrix:
+    name: full matrix
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    if: ${{ vars.CONFORMANCE_ENABLED == 'true' }}
+    permissions:
+      contents: read
+    outputs:
+      result: ${{ steps.run.outputs.result }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Drive the full profile matrix
+        id: run
+        working-directory: deploy/conformance
+        run: |
+          if ./run-conformance.sh --trigger nightly --up; then
+            echo "result=passing" >> "$GITHUB_OUTPUT"
+          else
+            echo "result=failing" >> "$GITHUB_OUTPUT"
+            # Do not fail the step here: the badge job must still publish the
+            # (failing) result. The workflow's overall status reflects failure
+            # via the badge job's own exit below if desired.
+          fi
+      - name: Archive suite logs (certification submission format)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: conformance-logs-nightly
+          path: deploy/conformance/results/
+          if-no-files-found: ignore
+          retention-days: 90
+
+  badge:
+    name: publish status badge
+    needs: full-matrix
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # Runs whether the matrix passed or failed so the badge always reflects the
+    # latest result. Still owner-gated and never on a PR trigger.
+    if: ${{ always() && vars.CONFORMANCE_ENABLED == 'true' }}
+    # The ONLY elevation in this harness. Scoped to this job; the suite never
+    # runs while this token is live (this job checks out clean and writes one
+    # file). Never grant a write token to the PR pipeline.
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Write the narrow status file
+        env:
+          RESULT: ${{ needs.full-matrix.result == 'success' && needs.full-matrix.outputs.result || 'failing' }}
+        run: |
+          set -euo pipefail
+          stamp="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          case "$RESULT" in
+            passing) color=brightgreen ;;
+            *)       color=red ; RESULT=failing ;;
+          esac
+          mkdir -p docs/conformance/status
+          # shields.io endpoint format; the README badge reads this file.
+          cat > docs/conformance/status/badge.json <<JSON
+          {"schemaVersion":1,"label":"OIDF conformance","message":"$RESULT ($stamp)","color":"$color"}
+          JSON
+      - name: Commit only the status file if it changed
+        run: |
+          set -euo pipefail
+          if git diff --quiet -- docs/conformance/status/badge.json; then
+            echo "badge unchanged; nothing to publish"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add docs/conformance/status/badge.json
+          git commit -m "conformance: update nightly status badge"
+          git push

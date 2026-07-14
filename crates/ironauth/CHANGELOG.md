@@ -6,6 +6,24 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Wire the OIDF conformance suite into CI as a merge gate (issue #37). New
+  `deploy/conformance/` harness: a docker-compose stack pinned BY DIGEST via a
+  committed `SUITE_VERSION` (the OIDF suite, MongoDB, an nginx TLS terminator
+  fronting the OP as the `op` issuer host, and IronAuth), a
+  certification-representative `ironauth.toml` that turns on the legacy/downgrade
+  OP-profile toggles FOR THE CERT ENVIRONMENT ONLY (the shipped default stays
+  hardened, proven by a config test), a reviewed `profile-matrix.yaml` (the four
+  OP profiles on the merge gate, Implicit/Hybrid nightly, the four logout
+  profiles deferred to #33/#34/#39 as explicitly not-yet-enabled), a strict
+  results gate (`parse_results.py`) that fails on ANY non-PASS (finished-but-
+  failed, unreviewed WARNING, REVIEW, SKIPPED, unfinished, or a vacuously empty
+  run) with 17 standard-library unit tests, and a one-command runner. CI gains
+  an always-on static lane (`scripts/conformance-check.sh`, in the invariants
+  job) plus an owner-gated live merge-gate job, a nightly full-matrix workflow
+  with a least-privilege badge-publish job, and a secret-isolated track-suite-
+  master workflow. Provisioning the runner and secrets, promoting the merge-gate
+  check to required, and resolving the real image digests are owner actions;
+  see docs/conformance.
 - Compose per-environment issuers, JWKS serving, and signing into the live data
   plane (issue #194). `build_oidc_router` now builds ONE store-backed
   `IssuerRegistry` (keys load lazily and RLS-scoped from the data-plane store on

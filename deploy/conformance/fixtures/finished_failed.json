@@ -1,0 +1,9 @@
+{
+  "plan_name": "oidcc-basic-certification-test-plan",
+  "plan_id": "example-finished-failed",
+  "modules": [
+    {"name": "oidcc-server", "id": "m1", "status": "FINISHED", "result": "PASSED"},
+    {"name": "oidcc-scope-profile", "id": "m2", "status": "FINISHED", "result": "FAILED"},
+    {"name": "oidcc-userinfo-get", "id": "m3", "status": "FINISHED", "result": "PASSED"}
+  ]
+}
