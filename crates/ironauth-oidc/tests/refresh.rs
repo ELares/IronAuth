@@ -10,11 +10,16 @@ mod common;
 
 use std::time::Duration;
 
-use axum::http::StatusCode;
+use axum::body::Body;
+use axum::http::{Request, StatusCode, header};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
-use common::{Harness, PKCE_VERIFIER, REDIRECT_URI, enc, form, json, location, location_param};
+use common::{
+    Harness, PKCE_VERIFIER, REDIRECT_URI, enc, form, json, location, location_param, send_through,
+};
+use ironauth_config::OidcConfig;
 use ironauth_oidc::ClientAuthMethod;
+use ironauth_store::{ActorRef, ServiceId};
 
 /// A standard-padded Basic credential of `client_id:client_secret`.
 fn basic_header(client_id: &str, secret: &str) -> String {
@@ -166,28 +171,304 @@ async fn a_reused_refresh_token_outside_grace_is_invalid_grant_and_revokes_the_f
 }
 
 #[tokio::test]
-async fn concurrent_refreshes_within_grace_both_succeed() {
-    // Acceptance criterion 2 (end to end): two presentations of the same token within
-    // the grace window both succeed (multi-tab / retry), without locking the user out.
+async fn concurrent_refreshes_within_grace_both_succeed_and_converge() {
+    // Acceptance criterion 2 (end to end), hardened (issue #21 adversarial FIX 1): two
+    // presentations of the same token within the grace window both succeed (multi-tab
+    // / retry), without locking the user out, AND the family converges on exactly one
+    // live leaf. The within-grace loser gets a fresh ACCESS token but NO new refresh
+    // token (RFC 6749 5.1 makes it optional): minting a second leaf would fork the
+    // family, so the field is omitted instead.
     let harness = Harness::start().await;
     let (client_id, r0) = public_refresh_token(&harness).await;
+    let family = harness
+        .resolve_refresh(&r0)
+        .await
+        .expect("r0 recorded")
+        .family_id;
+    assert_eq!(
+        harness.count_live_refresh_leaves(&family).await,
+        1,
+        "one live leaf at issuance"
+    );
 
-    // First refresh rotates R0.
+    // First refresh rotates R0 -> R1 (the winner). R1 is the family's live leaf.
     let (status, _, body) = harness.token(&refresh_form(&r0, &client_id)).await;
     assert_eq!(status, StatusCode::OK, "first: {body}");
+    let r1 = json(&body)["refresh_token"]
+        .as_str()
+        .expect("winner rotates")
+        .to_owned();
+    assert_eq!(
+        harness.count_live_refresh_leaves(&family).await,
+        1,
+        "after the rotate the successor is the one live leaf"
+    );
+
     // A second presentation of the SAME R0 within the (frozen-clock) grace window is a
-    // benign concurrent refresh: it succeeds and hands out a fresh token.
+    // benign concurrent refresh: it succeeds with a fresh access token but hands out NO
+    // new refresh token, so the family does NOT fork.
     let (status, _, body) = harness.token(&refresh_form(&r0, &client_id)).await;
     assert_eq!(
         status,
         StatusCode::OK,
         "within-grace concurrent refresh: {body}"
     );
-    assert!(json(&body)["refresh_token"].is_string());
+    let value = json(&body);
+    assert!(
+        value["access_token"].is_string(),
+        "the loser still gets a fresh access token (no lockout)"
+    );
+    assert!(
+        value.get("refresh_token").is_none(),
+        "the within-grace loser mints no new refresh leaf, so refresh_token is omitted"
+    );
+    assert_eq!(
+        harness.count_live_refresh_leaves(&family).await,
+        1,
+        "the family CONVERGES on exactly one live leaf, never forks"
+    );
+
+    // The one live leaf is the winner's successor R1: it still refreshes.
+    let (status, _, body) = harness.token(&refresh_form(&r1, &client_id)).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the one live leaf still works: {body}"
+    );
     assert_eq!(
         harness.count_audit_action("refresh_token.reuse").await,
         0,
         "a within-grace concurrent refresh never trips reuse detection"
+    );
+}
+
+#[tokio::test]
+async fn a_confidential_client_rotates_once_past_the_ttl_threshold() {
+    // Issue #21 adversarial FIX 2: the confidential rotate-PAST-70%-TTL branch of
+    // decide_rotate, exercised end to end (the store test drives `rotate` as an
+    // explicit bool; the other HTTP test only covers 0% elapsed = no rotation). A
+    // short 1000-second idle TTL puts the default 70% threshold at a clean t=700s: a
+    // refresh just below it does NOT rotate (pinning the boundary from below), and one
+    // past it DOES.
+    let harness = Harness::start_with(OidcConfig {
+        require_pkce_for_confidential_clients: false,
+        refresh_idle_ttl_secs: 1000,
+        ..OidcConfig::default()
+    })
+    .await;
+    let (client, secret) = harness
+        .create_confidential_client(ClientAuthMethod::Basic)
+        .await;
+    let client_id = client.to_string();
+    let auth = basic_header(&client_id, &secret);
+
+    // Exchange a code -> r0 (issued at t=0, idle 1000s, so the rotation threshold is
+    // t=700s).
+    let code = harness.issue_authenticated_code(&client_id).await;
+    let exchange = form(&[
+        ("grant_type", "authorization_code"),
+        ("code", &code),
+        ("redirect_uri", REDIRECT_URI),
+    ]);
+    let (status, _, body) = harness.token_with_auth(&exchange, Some(&auth)).await;
+    assert_eq!(status, StatusCode::OK, "code exchange: {body}");
+    let r0 = json(&body)["refresh_token"]
+        .as_str()
+        .expect("refresh token")
+        .to_owned();
+
+    // Just BELOW the threshold (t=600 < 700): a refresh does NOT rotate; the SAME
+    // refresh token comes back and r0 stays live (unrotated).
+    harness.clock().advance(Duration::from_secs(600));
+    let refresh = form(&[("grant_type", "refresh_token"), ("refresh_token", &r0)]);
+    let (status, _, body) = harness.token_with_auth(&refresh, Some(&auth)).await;
+    assert_eq!(status, StatusCode::OK, "below-threshold refresh: {body}");
+    assert_eq!(
+        json(&body)["refresh_token"].as_str(),
+        Some(r0.as_str()),
+        "below the 70% threshold a confidential client does NOT rotate"
+    );
+    assert!(
+        !harness
+            .resolve_refresh(&r0)
+            .await
+            .expect("r0 recorded")
+            .rotated,
+        "r0 is still live below the threshold"
+    );
+
+    // Cross the threshold (advance to t=800 > 700): the next refresh DOES rotate; a
+    // NEW refresh token is returned and r0 becomes superseded.
+    harness.clock().advance(Duration::from_secs(200));
+    let (status, _, body) = harness.token_with_auth(&refresh, Some(&auth)).await;
+    assert_eq!(status, StatusCode::OK, "past-threshold refresh: {body}");
+    let r1 = json(&body)["refresh_token"]
+        .as_str()
+        .expect("rotated token")
+        .to_owned();
+    assert_ne!(
+        r1, r0,
+        "past the 70% threshold a confidential client rotates"
+    );
+    assert!(
+        harness
+            .resolve_refresh(&r0)
+            .await
+            .expect("r0 recorded")
+            .rotated,
+        "the past-threshold rotation supersedes r0"
+    );
+}
+
+#[tokio::test]
+async fn the_reuse_event_has_a_locked_siem_facing_shape() {
+    // Issue #21 adversarial FIX 3: a shape-lock snapshot of the SIEM-facing
+    // refresh_token.reuse audit row, so its shape cannot drift silently (an explicit
+    // sub-AC of the issue). Drives a genuine reuse (rotate, then replay the superseded
+    // token beyond grace) and locks the whole envelope: the action verb, the client
+    // service-actor, the target (the family id), the correlation, and the reuse
+    // instant from the clock seam.
+    let harness = Harness::start().await;
+    let (client_id, r0) = public_refresh_token(&harness).await;
+    let family = harness
+        .resolve_refresh(&r0)
+        .await
+        .expect("r0 recorded")
+        .family_id;
+
+    // Rotate R0, then advance past the grace window and replay the superseded R0.
+    let (status, _, _) = harness.token(&refresh_form(&r0, &client_id)).await;
+    assert_eq!(status, StatusCode::OK);
+    harness.clock().advance(Duration::from_secs(30));
+    let (status, _, body) = harness.token(&refresh_form(&r0, &client_id)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "reuse: {body}");
+
+    // Exactly one reuse row; lock its full shape.
+    let reuse_rows: Vec<_> = harness
+        .store()
+        .scoped(harness.scope())
+        .audit()
+        .list()
+        .await
+        .expect("audit list")
+        .into_iter()
+        .filter(|row| row.action == "refresh_token.reuse")
+        .collect();
+    assert_eq!(reuse_rows.len(), 1, "exactly one reuse event");
+    let row = &reuse_rows[0];
+
+    // action: the stable dotted verb the OCSF/SIEM mapping keys on.
+    assert_eq!(row.action, "refresh_token.reuse");
+    // actor: the client's stable service-actor (svc_), derived from the client id
+    // exactly as the token endpoint attributes it.
+    let expected_actor = ActorRef::service(ServiceId::from_seed_bytes(
+        harness.client_id().unique_bytes(),
+    ));
+    assert_eq!(
+        row.actor, expected_actor,
+        "attributed to the client service-actor"
+    );
+    assert_eq!(row.actor.kind_str(), "service");
+    assert!(row.actor.id_string().starts_with("svc_"));
+    // target: the family id (the revocation spine), a rff_ scoped id.
+    assert_eq!(row.target_kind, "rff", "target kind is the refresh family");
+    assert_eq!(
+        row.target_id,
+        family.to_string(),
+        "target is the reused family"
+    );
+    // correlation: a req_ id links the row to the causing request.
+    assert!(
+        row.correlation_id.to_string().starts_with("req_"),
+        "correlated to the causing request"
+    );
+    // the reuse was recorded at the (advanced) clock instant, from the seam.
+    assert_eq!(
+        row.occurred_at_unix_micros, 30_000_000,
+        "reuse instant from the clock seam"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn parallel_refreshes_within_grace_converge_on_one_live_leaf() {
+    // Issue #21 adversarial FIX 4 (the HTTP-layer regression guard for FIX 1): fire N
+    // TRUE-parallel refreshes of the SAME token within the grace window through routers
+    // sharing one store pool. All succeed (no lockout); exactly ONE is the atomic-
+    // rotate winner and returns a new refresh token; the rest return only a fresh
+    // access token; the family ends with EXACTLY ONE live leaf and NO reuse event. This
+    // is a faithful stand-in for N stateless nodes racing on the same database.
+    const RACERS: usize = 8;
+
+    let harness = Harness::start().await;
+    let (client_id, r0) = public_refresh_token(&harness).await;
+    let family = harness
+        .resolve_refresh(&r0)
+        .await
+        .expect("r0 recorded")
+        .family_id;
+
+    // Fire RACERS concurrent refreshes at once, each through a cloned router.
+    let mut tasks = Vec::with_capacity(RACERS);
+    for _ in 0..RACERS {
+        let router = harness.router();
+        let body = refresh_form(&r0, &client_id);
+        tasks.push(tokio::spawn(async move {
+            let request = Request::builder()
+                .method("POST")
+                .uri("/token")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from(body))
+                .expect("request builds");
+            send_through(router, request).await
+        }));
+    }
+
+    let mut ok = 0_usize;
+    let mut with_refresh = 0_usize;
+    let mut winner = None;
+    for task in tasks {
+        let (status, _headers, body) = task.await.expect("task joins");
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "every within-grace parallel refresh succeeds: {body}"
+        );
+        let value = json(&body);
+        assert!(
+            value["access_token"].is_string(),
+            "each racer gets a fresh access token"
+        );
+        ok += 1;
+        if let Some(rt) = value.get("refresh_token").and_then(|v| v.as_str()) {
+            with_refresh += 1;
+            winner = Some(rt.to_owned());
+        }
+    }
+    assert_eq!(ok, RACERS, "all parallel refreshes succeed (no lockout)");
+    assert_eq!(
+        with_refresh, 1,
+        "exactly one winner mints a new refresh token; every loser omits it"
+    );
+
+    // The family CONVERGES on exactly one live leaf, the winner's successor.
+    assert_eq!(
+        harness.count_live_refresh_leaves(&family).await,
+        1,
+        "N parallel within-grace refreshes converge on one live leaf, never fork"
+    );
+    let winner = winner.expect("one winner produced a refresh token");
+    assert!(
+        harness
+            .resolve_refresh(&winner)
+            .await
+            .expect("winner recorded")
+            .active,
+        "the one live leaf is the winner's successor"
+    );
+    assert_eq!(
+        harness.count_audit_action("refresh_token.reuse").await,
+        0,
+        "a within-grace parallel refresh never trips reuse detection"
     );
 }
 

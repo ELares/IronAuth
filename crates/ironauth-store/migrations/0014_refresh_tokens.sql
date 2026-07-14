@@ -142,7 +142,9 @@ CREATE TABLE refresh_tokens (
     rotated_at     timestamptz,
     -- The jti of the successor minted when this token rotated (NULL until rotated).
     successor_jti  text,
-    created_at     timestamptz NOT NULL DEFAULT now(),
+    -- No separate created_at: issued_at already records the generation's creation
+    -- instant from the application clock seam (issue #21), so a DB-clock DEFAULT now()
+    -- would only diverge from that seam and be invisible to a deterministic-clock test.
     CONSTRAINT refresh_tokens_scope_nonempty
         CHECK (tenant_id <> '' AND environment_id <> ''),
     UNIQUE (tenant_id, environment_id, jti),

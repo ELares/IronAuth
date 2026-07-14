@@ -176,6 +176,19 @@ async fn count_action(db: &TestDatabase, scope: Scope, action: &str) -> usize {
         .count()
 }
 
+/// Count the LIVE leaves of `family`: refresh-token rows that are neither rotated
+/// (superseded) nor in a revoked family, through the scoped repository read. The
+/// rotation invariant (issue #21) is that this is ALWAYS at most one: a family never
+/// forks into two sibling live leaves.
+async fn count_live_leaves(db: &TestDatabase, scope: Scope, family: &RefreshFamilyId) -> i64 {
+    db.store()
+        .scoped(scope)
+        .refresh()
+        .live_leaf_count(family)
+        .await
+        .expect("count live leaves")
+}
+
 #[tokio::test]
 async fn reuse_outside_grace_revokes_the_whole_family_and_emits_one_reuse_event() {
     // Acceptance criterion 1: a superseded token presented OUTSIDE the grace window
@@ -258,14 +271,19 @@ async fn reuse_outside_grace_revokes_the_whole_family_and_emits_one_reuse_event(
 }
 
 #[tokio::test]
-async fn concurrent_refreshes_within_grace_all_succeed_without_revoking_the_family() {
-    // Acceptance criterion 2: N benign concurrent refreshes of the same token WITHIN
-    // the grace window all succeed and none revokes the family.
+async fn concurrent_refreshes_within_grace_converge_on_one_live_leaf() {
+    // Acceptance criterion 2, hardened (issue #21 adversarial FIX 1): N benign
+    // concurrent refreshes of the same token WITHIN the grace window all succeed
+    // (no lockout) and none revokes the family, AND the family CONVERGES on EXACTLY
+    // ONE live leaf. A within-grace loser mints only a fresh access token, never a
+    // second successor leaf, so the family can never fork into two independent,
+    // never-reconciled live chains (which would each rotate forever with no reuse
+    // signal). This is the store-level proof of the one-live-leaf invariant.
     let db = TestDatabase::start().await;
     let (env, _clock) = Env::deterministic(std::time::SystemTime::UNIX_EPOCH, 0x21_00_02);
     let scope = db.seed_scope(&env).await;
     let grant = seed_grant(&db, &env, scope, "usr_grace", None).await;
-    let (_family, t0, _jti0, _d0) = open_family(
+    let (family, t0, _jti0, _d0) = open_family(
         &db,
         &env,
         scope,
@@ -277,21 +295,35 @@ async fn concurrent_refreshes_within_grace_all_succeed_without_revoking_the_fami
     )
     .await;
 
-    let grace = Duration::from_secs(10);
-    // First refresh rotates T0.
-    let (first, _t1) = redeem(&db, &env, scope, &t0, true, grace).await;
-    assert_eq!(first, RefreshRedeemOutcome::Rotated);
+    // Exactly one live leaf at issuance (generation 0).
+    assert_eq!(
+        count_live_leaves(&db, scope, &family).await,
+        1,
+        "one leaf at issuance"
+    );
 
-    // Three more presentations of the SAME T0, all within the (frozen-clock) grace
-    // window: each is a benign concurrent refresh that mints a fresh successor
-    // without revoking.
+    let grace = Duration::from_secs(10);
+    // First refresh rotates T0 -> T1: T1 is now the family's single live leaf.
+    let (first, t1) = redeem(&db, &env, scope, &t0, true, grace).await;
+    assert_eq!(first, RefreshRedeemOutcome::Rotated);
+    assert_eq!(
+        count_live_leaves(&db, scope, &family).await,
+        1,
+        "after the rotate the successor is the one live leaf"
+    );
+
+    // Three more presentations of the SAME (now superseded) T0, all within the
+    // (frozen-clock) grace window: each is a benign concurrent refresh that succeeds
+    // with a fresh access token but mints NO new refresh leaf, so the live-leaf count
+    // stays exactly one every time (convergence, never a fork).
     for _ in 0..3 {
         let (outcome, succ) = redeem(&db, &env, scope, &t0, true, grace).await;
         assert_eq!(
             outcome,
-            RefreshRedeemOutcome::RotatedWithinGrace,
-            "a within-grace duplicate is a benign concurrent refresh"
+            RefreshRedeemOutcome::RefreshedWithinGrace,
+            "a within-grace duplicate is a benign access-only concurrent refresh"
         );
+        // The loser's pre-generated successor was NOT recorded: it does not resolve.
         assert!(
             db.store()
                 .scoped(scope)
@@ -299,11 +331,28 @@ async fn concurrent_refreshes_within_grace_all_succeed_without_revoking_the_fami
                 .load(&succ)
                 .await
                 .expect("load")
-                .expect("successor recorded")
-                .active,
-            "each within-grace refresh yields a live successor"
+                .is_none(),
+            "a within-grace loser mints no new leaf, so its successor is never recorded"
+        );
+        assert_eq!(
+            count_live_leaves(&db, scope, &family).await,
+            1,
+            "the family has EXACTLY ONE live leaf after every within-grace refresh"
         );
     }
+
+    // The single live leaf is the winner's successor T1, still active.
+    assert!(
+        db.store()
+            .scoped(scope)
+            .refresh()
+            .load(&t1)
+            .await
+            .expect("load")
+            .expect("t1 recorded")
+            .active,
+        "the one live leaf is the winner's successor"
+    );
     assert_eq!(
         count_action(&db, scope, "refresh_token.reuse").await,
         0,

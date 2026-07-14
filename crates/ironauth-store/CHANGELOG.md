@@ -26,6 +26,25 @@ range per docs/RELEASING.md.
     family/grant. `ActingRefreshRepo::revoke_session_bound` revokes a session's
     session-bound families at RP logout while leaving `offline_access` families
     intact.
+  - **Within-grace refreshes CONVERGE, they do not fork.** A within-grace
+    duplicate presentation (the loser of the atomic rotate, a multi-tab retry, or a
+    lost rotation response) now records ONLY a fresh access token against the
+    family's grant (audited as `token.issue`) and mints NO second successor leaf, so
+    a family always holds EXACTLY ONE live (unrotated, unrevoked) leaf: the winner's
+    successor. Previously each within-grace duplicate minted its own successor,
+    forking the family into independent chains that never presented each other's
+    tokens, so reuse detection could never fire (a stolen token replayed within the
+    grace window yielded a persistent undetected parallel chain). The new outcome is
+    `RefreshRedeemOutcome::RefreshedWithinGrace` (was `RotatedWithinGrace`). The
+    strict benign window is `[0, grace)`. `RefreshRepo::live_leaf_count` reads a
+    family's live-leaf count, the ground truth a concurrency test asserts is always
+    at most one. Accepted, documented limitation: a client that ENTIRELY loses the
+    winner's rotation response never receives the new refresh token and must
+    re-authenticate; no plaintext token is cached for replay (that would violate the
+    no-replayable-material-at-rest guarantee).
+  - **`refresh_tokens.created_at` dropped.** The generation's creation instant is
+    already recorded by the clock-seam `issued_at`; a `DEFAULT now()` DB-clock column
+    would only diverge from the seam and be invisible to a deterministic-clock test.
   - **Consent modes and offline expiry.** `clients` gains `consent_mode`,
     `skip_consent`, `store_skipped_consent`, and an optional `refresh_rotation`
     override (all defaulted to today's behavior), surfaced on `ClientRecord` /

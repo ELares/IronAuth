@@ -729,6 +729,19 @@ impl Harness {
             .expect("load refresh token")
     }
 
+    /// Count `family`'s LIVE leaves: unrotated refresh-token rows in an unrevoked
+    /// family (issue #21). The rotation invariant is that this is ALWAYS at most one,
+    /// even under concurrent within-grace refreshes: a family must never fork into two
+    /// sibling live leaves.
+    pub async fn count_live_refresh_leaves(&self, family: &ironauth_store::RefreshFamilyId) -> i64 {
+        self.store()
+            .scoped(self.scope)
+            .refresh()
+            .live_leaf_count(family)
+            .await
+            .expect("count live leaves")
+    }
+
     /// Create a session for `subject` (a bootstrap `pwd` authentication event at
     /// the epoch) and return the `Cookie` header value. The session is far-future
     /// so it survives the clock advances in the expiry and reuse tests.

@@ -21,7 +21,23 @@ range per docs/RELEASING.md.
   - **Reuse detection.** A superseded token presented outside the grace window is
     `invalid_grant`, revokes the entire family, and emits the typed reuse event
     exactly once per incident; benign concurrent refreshes within the grace window all
-    succeed without revoking. A revoked-family refresh is `invalid_grant`.
+    succeed without revoking. A revoked-family refresh is `invalid_grant`. An event
+    shape-lock test pins the SIEM-facing `refresh_token.reuse` audit row so it cannot
+    drift silently.
+  - **Concurrent within-grace refreshes converge on one live leaf.** A within-grace
+    refresh that is NOT the atomic-rotate winner (a concurrent loser, a multi-tab
+    retry, or a lost rotation response) now returns ONLY a fresh access token and
+    OMITS the `refresh_token` (optional per RFC 6749 5.1): it mints no new refresh
+    leaf, so N concurrent refreshes CONVERGE on the winner's single live leaf instead
+    of forking the family into independent, never-detected chains. Accepted,
+    documented limitation: a client that ENTIRELY loses the winner's rotation response
+    never receives the new refresh token and must re-authenticate; no plaintext token
+    is cached and replayed (that would forfeit the no-replayable-material-at-rest
+    guarantee). Regression is guarded by an HTTP-layer test that fires 8 true-parallel
+    refreshes and asserts exactly one live leaf and zero reuse events.
+  - **`offline_access` advertised in discovery.** `scopes_supported` now lists
+    `offline_access` (OIDC Core 11), so an RP can learn the provider issues refresh
+    tokens.
   - **`offline_access` (OIDC Core 11).** Ignored on a flow that returns no
     authorization code; a web client must consent to it, with a trusted first-party
     carve-out (`implicit` mode or `skip_consent`). An `offline_access` family survives

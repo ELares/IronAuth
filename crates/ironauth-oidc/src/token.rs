@@ -760,23 +760,36 @@ async fn refresh_token_grant(
         .await;
 
     match outcome {
-        // Rotated (policy), or a within-grace concurrent refresh: return the fresh
-        // access token AND the new refresh token.
-        Ok(RefreshRedeemOutcome::Rotated | RefreshRedeemOutcome::RotatedWithinGrace) => {
-            Ok(refresh_response(
-                &minted,
-                expires_in,
-                resolution.scope.as_deref(),
-                &successor.token,
-            ))
-        }
+        // Rotated (policy): the atomic-rotate winner. Return the fresh access token
+        // AND the newly minted successor refresh token.
+        Ok(RefreshRedeemOutcome::Rotated) => Ok(refresh_response(
+            &minted,
+            expires_in,
+            resolution.scope.as_deref(),
+            Some(&successor.token),
+        )),
+        // A within-grace benign concurrent refresh (a loser of the atomic rotate, a
+        // multi-tab retry, or a lost rotation response): return ONLY a fresh access
+        // token. No new refresh leaf was minted (the family's single live leaf is the
+        // winner's successor A, which the well-behaved client already holds or reads
+        // from shared storage), so per RFC 6749 5.1 the OPTIONAL refresh_token field
+        // is OMITTED rather than forking the family. A client that ENTIRELY lost the
+        // winner's response never receives A and must re-authenticate: an accepted,
+        // documented limitation of an AC7-respecting design (no replayable material at
+        // rest, so no cache-and-replay).
+        Ok(RefreshRedeemOutcome::RefreshedWithinGrace) => Ok(refresh_response(
+            &minted,
+            expires_in,
+            resolution.scope.as_deref(),
+            None,
+        )),
         // Not rotated (a confidential/bound client under the threshold): a fresh
         // access token and the SAME refresh token.
         Ok(RefreshRedeemOutcome::NotRotated) => Ok(refresh_response(
             &minted,
             expires_in,
             resolution.scope.as_deref(),
-            presented,
+            Some(presented),
         )),
         // A genuine reuse revoked the whole family (audited once in the redeem
         // transaction). Meter it and return the uniform invalid_grant.
@@ -930,20 +943,25 @@ fn refresh_access_records<'a>(
 }
 
 /// Build the `200 OK` refresh-response (RFC 6749 5.1) for the refresh grant (issue
-/// #21): the fresh access token, its lifetime, the (rotated or unchanged) refresh
-/// token, and the granted scope.
+/// #21): the fresh access token, its lifetime, an OPTIONAL refresh token, and the
+/// granted scope. `refresh_token` is [`Some`] for a policy rotation (the new
+/// successor) or an unchanged confidential-under-threshold token, and [`None`] for a
+/// within-grace benign concurrent refresh, which mints no new leaf and so omits the
+/// optional field rather than forking the family.
 fn refresh_response(
     minted: &MintedAccessToken,
     expires_in: i64,
     scope: Option<&str>,
-    refresh_token: &str,
+    refresh_token: Option<&str>,
 ) -> Response {
     let mut body = serde_json::json!({
         "access_token": minted.token(),
         "token_type": "Bearer",
         "expires_in": expires_in,
-        "refresh_token": refresh_token,
     });
+    if let Some(refresh_token) = refresh_token {
+        body["refresh_token"] = serde_json::json!(refresh_token);
+    }
     if let Some(scope) = scope {
         body["scope"] = serde_json::json!(scope);
     }

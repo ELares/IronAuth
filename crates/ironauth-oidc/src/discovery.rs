@@ -96,10 +96,19 @@ pub const CLAIMS_LOCALES_SUPPORTED: &[&str] = &["en"];
 
 /// The scopes IronAuth advertises. `openid` is the OIDC-mandated scope the
 /// authorization-code flow is defined against; `profile`, `email`, `address`, and
-/// `phone` are the OIDC Core 5.4 claim-bearing scopes `UserInfo` backs (issue #15).
+/// `phone` are the OIDC Core 5.4 claim-bearing scopes `UserInfo` backs (issue #15);
+/// `offline_access` (OIDC Core 11) requests a refresh token, which the provider now
+/// issues and rotates (issue #21), so an RP can learn the capability from discovery.
 /// This is the authoritative source until a scope subsystem exposes its own
 /// registry.
-pub const SCOPES_SUPPORTED: &[&str] = &["openid", "profile", "email", "address", "phone"];
+pub const SCOPES_SUPPORTED: &[&str] = &[
+    "openid",
+    "profile",
+    "email",
+    "address",
+    "phone",
+    "offline_access",
+];
 
 /// The claim names IronAuth may supply in an ID token today. `iss`/`aud`/`exp`/
 /// `iat` are protocol claims and `sub` is the user identifier; `nonce` is echoed

@@ -2899,9 +2899,10 @@ pub struct RotatedRefreshToken<'a> {
 /// The caller has already resolved the token's state ([`RefreshRepo::load`]),
 /// decided the rotation policy (`rotate`), pre-signed the access token, and
 /// pre-generated the successor refresh token; this is the authoritative single-use
-/// gate that decides whether those are handed out. A `successor` is ALWAYS supplied
-/// (even when `rotate` is false) because a superseded-token presentation within the
-/// grace window mints a fresh successor regardless of the policy.
+/// gate that decides whether those are handed out. A `successor` is supplied even
+/// when `rotate` is false so that whichever concurrent caller WINS the atomic rotate
+/// has its successor ready; a within-grace loser leaves its own pre-generated
+/// successor unused (it mints no new leaf, so the family cannot fork).
 #[derive(Clone, Copy)]
 pub struct RefreshRedeem<'a> {
     /// The presented refresh token, hashed to its digest for the lookup.
@@ -2911,8 +2912,8 @@ pub struct RefreshRedeem<'a> {
     /// client only past the TTL threshold. When `false`, a live token is left in
     /// place and only a fresh access token is recorded.
     pub rotate: bool,
-    /// The pre-generated successor refresh token, recorded when the token rotates
-    /// (a policy rotation, or a within-grace concurrent refresh).
+    /// The pre-generated successor refresh token, recorded ONLY by the winner of the
+    /// atomic rotate (a policy rotation). A within-grace loser leaves it unused.
     pub successor: RotatedRefreshToken<'a>,
     /// The refreshed access (and optional ID) token records to write against the
     /// grant, so grant-chain revocation reaches them.
@@ -2931,10 +2932,13 @@ pub enum RefreshRedeemOutcome {
     /// token recorded. The token endpoint returns the new refresh and access tokens.
     Rotated,
     /// The presented token was already superseded but within the grace window: a
-    /// benign concurrent refresh (multi-tab, retry). A fresh successor and access
-    /// token were recorded WITHOUT revoking the family; the token endpoint returns
-    /// them, so the user is not locked out.
-    RotatedWithinGrace,
+    /// benign concurrent refresh (multi-tab, retry, or a lost rotation response). A
+    /// fresh access token was recorded WITHOUT revoking the family and WITHOUT
+    /// minting a second successor leaf, so N concurrent within-grace refreshes
+    /// CONVERGE on the winner's single live leaf (no family fork). The token endpoint
+    /// returns the access token and OMITS the refresh token (RFC 6749 5.1 makes it
+    /// optional): the well-behaved client keeps the winner's rotated token.
+    RefreshedWithinGrace,
     /// The presented (live) token was NOT rotated (a confidential/bound client
     /// under the TTL threshold): a fresh access token was recorded and the SAME
     /// refresh token is returned.
@@ -2998,6 +3002,38 @@ impl RefreshRepo<'_> {
             None => Ok(None),
             Some(row) => Ok(Some(refresh_resolution_from_row(&row, &self.scope)?)),
         }
+    }
+
+    /// Count `family`'s LIVE leaves in scope: refresh-token rows that are neither
+    /// rotated (superseded) nor in a revoked family (issue #21). The rotation
+    /// invariant is that this is ALWAYS at most one, even under concurrent
+    /// within-grace refreshes: a family never forks into two sibling live leaves, so
+    /// this is the ground-truth check a concurrency test asserts.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the family is out of scope; [`StoreError::Database`]
+    /// on a persistence failure.
+    pub async fn live_leaf_count(&self, family: &RefreshFamilyId) -> Result<i64, StoreError> {
+        if family.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let count: i64 = sqlx::query(
+            "SELECT COUNT(*) AS n FROM refresh_tokens rt \
+             JOIN refresh_families f ON f.id = rt.family_id \
+             AND f.tenant_id = rt.tenant_id AND f.environment_id = rt.environment_id \
+             WHERE rt.family_id = $1 AND rt.tenant_id = $2 AND rt.environment_id = $3 \
+             AND rt.rotated_at IS NULL AND f.revoked_at IS NULL",
+        )
+        .bind(family.to_string())
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .fetch_one(&mut *tx)
+        .await?
+        .get("n");
+        tx.commit().await?;
+        Ok(count)
     }
 }
 
@@ -3110,15 +3146,18 @@ impl ActingRefreshRepo<'_> {
     /// - a token whose family or grant is already revoked, or whose idle timeout or
     ///   family hard cap has passed, is [`RefreshRedeemOutcome::Invalid`];
     /// - a token that is ALREADY superseded is classified against the grace window:
-    ///   within it, a fresh successor is minted without revoking
-    ///   ([`RefreshRedeemOutcome::RotatedWithinGrace`]); beyond it, the whole family
+    ///   within it, only a fresh access token is recorded without revoking and
+    ///   without minting a second successor leaf
+    ///   ([`RefreshRedeemOutcome::RefreshedWithinGrace`]); beyond it, the whole family
     ///   is revoked and the reuse event emitted EXACTLY once
     ///   ([`RefreshRedeemOutcome::Reused`]);
     /// - a LIVE token with `rotate` set is atomically consumed (superseded) and a
     ///   successor plus access token recorded ([`RefreshRedeemOutcome::Rotated`]); a
     ///   concurrent loser that misses the single-row consume re-reads and classifies
     ///   against the grace window exactly as an already-superseded token does, so N
-    ///   parallel refreshes all succeed within the window;
+    ///   parallel refreshes all succeed within the window and CONVERGE on the one live
+    ///   leaf (the winner's successor): a within-grace loser mints NO new leaf, so a
+    ///   family never forks into two sibling live leaves;
     /// - a LIVE token with `rotate` unset records only a fresh access token and
     ///   leaves the token in place ([`RefreshRedeemOutcome::NotRotated`]).
     ///
@@ -3203,7 +3242,6 @@ impl ActingRefreshRepo<'_> {
                     env,
                     tx,
                     &family_text,
-                    &jti_text,
                     &grant_text,
                     rotated_us,
                     now_micros,
@@ -3329,7 +3367,6 @@ impl ActingRefreshRepo<'_> {
             env,
             tx,
             family_text,
-            jti_text,
             grant_text,
             rotated_us,
             now_micros,
@@ -3341,17 +3378,21 @@ impl ActingRefreshRepo<'_> {
 
     /// Classify a presentation of an ALREADY-superseded refresh token (issue #21),
     /// and commit its transaction. Within the grace window of `rotated_us` it is a
-    /// benign concurrent refresh: a fresh successor and access token are recorded
-    /// without revoking, so the user is not locked out. Beyond the window it is a
-    /// genuine reuse: the whole family is revoked and the reuse audit written in this
-    /// transaction, EXACTLY once (only the revoke that flips `revoked_at` emits it).
+    /// benign concurrent refresh: ONLY a fresh access token is recorded (bound to the
+    /// family's grant) without revoking, so the user is not locked out. A second
+    /// successor leaf is deliberately NOT minted: the winner of the atomic rotate
+    /// already minted the family's one live successor, so a within-grace loser (or any
+    /// within-grace repeat presentation) converges on that single live leaf instead of
+    /// forking the family into two independent, never-reconciled chains. Beyond the
+    /// window it is a genuine reuse: the whole family is revoked and the reuse audit
+    /// written in this transaction, EXACTLY once (only the revoke that flips
+    /// `revoked_at` emits it).
     #[allow(clippy::too_many_arguments)]
     async fn classify_superseded(
         &self,
         env: &Env,
         mut tx: Transaction<'_, Postgres>,
         family_text: &str,
-        predecessor_jti: &str,
         grant_text: &str,
         rotated_us: i64,
         now_micros: i64,
@@ -3359,31 +3400,33 @@ impl ActingRefreshRepo<'_> {
         redeem: &RefreshRedeem<'_>,
     ) -> Result<RefreshRedeemOutcome, StoreError> {
         let scope = self.scope;
-        if now_micros.saturating_sub(rotated_us) <= grace_micros {
-            // Within the grace window: a benign concurrent refresh. Mint a fresh
-            // successor (a second live leaf) and a fresh access token WITHOUT
-            // revoking, so multi-tab / retry all succeed.
-            insert_refresh_generation(
-                &mut tx,
-                scope,
-                family_text,
-                &redeem.successor,
-                Some(predecessor_jti),
-                now_micros,
-            )
-            .await?;
+        // The benign window is strictly [0, grace): a token whose OWN rotation was
+        // strictly within grace is a concurrent refresh; at or beyond it, reuse.
+        if now_micros.saturating_sub(rotated_us) < grace_micros {
+            // Within the grace window: a benign concurrent refresh (multi-tab, retry,
+            // or a lost rotation response). Record ONLY a fresh access token bound to
+            // the family's grant, without revoking. Deliberately mint NO new successor
+            // leaf: the winner of the atomic rotate already minted the family's single
+            // live successor, and creating a second leaf here would FORK the family
+            // into two independent live chains that never present each other's tokens,
+            // so reuse detection would never fire. Not minting keeps EXACTLY ONE live
+            // leaf, so N concurrent within-grace refreshes converge (no fork). The
+            // predecessor's successor is unchanged; `redeem.successor` is intentionally
+            // left unused here (it is only consumed by the atomic-rotate winner).
             record_refresh_access(&mut tx, scope, grant_text, redeem).await?;
             let spec = AuditedWrite {
                 store: self.store,
                 scope,
                 acting: &self.acting,
                 env,
-                action: Action::RefreshTokenRotate,
-                target: &RefreshFamilyId::parse_in_scope(family_text, &scope)?,
+                // No rotation happened: this is a plain access-token issue against the
+                // grant, mirroring the confidential under-threshold NotRotated path.
+                action: Action::TokenIssue,
+                target: &GrantId::parse_in_scope(grant_text, &scope)?,
             };
             insert_audit_row(&mut tx, &spec).await?;
             tx.commit().await?;
-            return Ok(RefreshRedeemOutcome::RotatedWithinGrace);
+            return Ok(RefreshRedeemOutcome::RefreshedWithinGrace);
         }
 
         // Beyond the grace window: a genuine reuse. Revoke the whole family (and
