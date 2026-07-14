@@ -198,19 +198,24 @@ async fn build_management_router(config: &Config, env: &Env) -> Option<Router> {
 /// Per-environment signing keys load LAZILY from the store (issue #194): the ONE
 /// shared [`IssuerRegistry`] reads a scope's keys through the RLS-forced
 /// [`Store::scoped`] on the first request for that issuer, and caches the result.
-/// Both the token mint (through [`OidcState`]) and the JWKS/discovery serving
-/// (through [`IssuerState`]) read that SAME registry, so a signed `kid` is in the
-/// published JWKS by construction. An environment with no provisioned key resolves
-/// to an empty key set: its token endpoint fails closed with `server_error` and
-/// its JWKS/discovery return 404, which is the correct behavior for a provider with
-/// no signing key. The authorization endpoint and every binding, single-use, and
-/// revocation guarantee work regardless.
+/// The token mint (through [`OidcState`]), the JWKS serving (through
+/// [`IssuerState`]), AND discovery (through [`DiscoveryState`]) all read that SAME
+/// registry, so a signed `kid` is in the published JWKS and the discovery document
+/// advertises the environment's real signing algorithms by construction. An
+/// environment with no provisioned key resolves to an empty key set: its token
+/// endpoint fails closed with `server_error` and its JWKS AND discovery return 404,
+/// which is the correct behavior for a provider with no signing key. The
+/// authorization endpoint and every binding, single-use, and revocation guarantee
+/// work regardless.
 ///
 /// All three surfaces mount on the public plane: the protocol router
-/// (`/authorize`, `/token`, `/userinfo`), discovery (both well-known forms,
-/// config-only per issue #18), and the per-environment JWKS. The JWKS cache window
-/// is derived from `oidc.jwks_cache_max_age_secs` and carried by the registry, so
-/// the served `Cache-Control: max-age` reflects the configured value (AC #4).
+/// (`/authorize`, `/token`, `/userinfo`), discovery (both well-known forms), and
+/// the per-environment JWKS, all over that one store-backed registry. Discovery
+/// resolves the per-environment algorithm policy from the loaded keys and returns
+/// 404 for an unprovisioned OR cross-tenant scope, exactly like the JWKS surface.
+/// The JWKS/discovery cache window is derived from `oidc.jwks_cache_max_age_secs`
+/// and carried by the registry, so the served `Cache-Control: max-age` reflects the
+/// configured value (AC #4).
 async fn build_oidc_router(
     oidc_config: &OidcConfig,
     data_plane_dsn: &str,
@@ -241,14 +246,17 @@ async fn build_oidc_router(
         store.clone(),
     ));
 
-    // The discovery surface (both well-known forms) is config-only: it needs the
-    // issuer string and the per-environment algorithm policy, never the loaded
-    // keys.
+    // The discovery surface (both well-known forms) resolves the per-environment
+    // signing policy from the SAME store-backed registry the mint and the JWKS read
+    // (issue #194), so discovery, JWKS, and minted tokens can never advertise
+    // divergent algorithms; an unprovisioned or cross-tenant scope resolves to no
+    // entry and returns 404, exactly like the JWKS surface.
     let capabilities = DiscoveryCapabilities::from_config(oidc_config);
     let discovery = discovery_router(DiscoveryState::new(
         issuer_base.clone(),
         cache,
         capabilities,
+        Arc::clone(&registry),
     ));
 
     // The per-environment JWKS surface, over the SAME registry the mint reads.

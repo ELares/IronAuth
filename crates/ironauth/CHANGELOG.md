@@ -11,10 +11,14 @@ range per docs/RELEASING.md.
   `IssuerRegistry` (keys load lazily and RLS-scoped from the data-plane store on
   first use) and mounts all three surfaces on the public plane: the protocol
   router, discovery (both well-known forms), and the per-environment JWKS, all over
-  that one registry. The JWKS/discovery `Cache-Control` max-age comes from
-  `oidc.jwks_cache_max_age_secs`. The stale "mounted with NO signing keys" warning
-  is gone; an environment without a provisioned key still fails closed (token
-  endpoint `server_error`, JWKS/discovery 404). Default boot is unchanged.
+  that one registry. Discovery resolves each environment's signing policy from its
+  loaded keys, so the advertised `id_token_signing_alg_values_supported`, the served
+  JWKS, and the minted tokens cannot diverge, and an unprovisioned or cross-tenant
+  scope returns 404 exactly like the JWKS surface. The JWKS/discovery
+  `Cache-Control` max-age comes from `oidc.jwks_cache_max_age_secs`. The stale
+  "mounted with NO signing keys" warning is gone; an environment without a
+  provisioned key still fails closed (token endpoint `server_error`, JWKS/discovery
+  404). Default boot is unchanged.
 - Mount the OIDC provider (issue #12) on the PUBLIC plane when `oidc.enabled` is
   set, connecting the data-plane store with `database.url`. Per-environment
   signing-key provisioning is a later milestone: until an environment has a key,

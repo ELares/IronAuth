@@ -22,6 +22,12 @@
 //!   registry, asserted here by the token `kid` being present in the served JWKS.
 //! - AC #5: a request that names this environment under a DIFFERENT tenant is a
 //!   uniform `404`, never a self-consistent bogus 200.
+//! - Discovery reconciliation: the LIVE discovery document, served over the SAME
+//!   store-backed registry the mint and the JWKS read, advertises each
+//!   environment's REAL signing algorithm (an ES256-only environment advertises
+//!   `ES256`, never the `EdDSA` default), so discovery, JWKS, and the minted tokens
+//!   cannot diverge; and a cross-tenant scope 404s on every well-known form exactly
+//!   like the JWKS surface, never a self-consistent bogus 200.
 
 mod common;
 
@@ -335,4 +341,136 @@ async fn an_es256_only_environment_never_emits_a_non_es256_token() {
     let verified = verify(&access_token, &policy, &common::verify_clock())
         .expect("ES256 token verifies against the published EC key");
     assert_eq!(verified.algorithm(), JwsAlgorithm::Es256);
+}
+
+/// Fetch a discovery document from a mounted well-known route, returning the status
+/// and the body.
+async fn get_discovery(harness: &Harness, uri: &str) -> (StatusCode, String) {
+    let (status, _headers, body) = harness
+        .send(
+            Request::builder()
+                .method("GET")
+                .uri(uri)
+                .body(Body::empty())
+                .expect("request builds"),
+        )
+        .await;
+    (status, body)
+}
+
+/// The `id_token_signing_alg_values_supported` array from a discovery document.
+fn advertised_algs(doc: &serde_json::Value) -> Vec<String> {
+    doc["id_token_signing_alg_values_supported"]
+        .as_array()
+        .expect("alg array")
+        .iter()
+        .map(|v| v.as_str().expect("alg string").to_owned())
+        .collect()
+}
+
+#[tokio::test]
+async fn live_discovery_advertises_the_environments_real_signing_alg() {
+    // Discovery used to advertise the EdDSA default for EVERY environment, even one
+    // provisioned with ES256 keys, so a conforming RP that honors
+    // id_token_signing_alg_values_supported would reject the environment's ES256
+    // id_token. Now discovery resolves the per-environment policy from the SAME
+    // store-backed registry the mint and the JWKS read, so an ES256-only environment
+    // advertises ES256 (its real, minted, published algorithm), never the EdDSA
+    // default.
+    let harness = Harness::start_store_backed_es256().await;
+    let scope = harness.scope();
+
+    // Every well-known form the router serves reflects the loaded ES256 key (MCP
+    // clients probe the host-inserted forms, so assert all three).
+    for uri in [
+        format!(
+            "/t/{}/e/{}/.well-known/openid-configuration",
+            scope.tenant(),
+            scope.environment()
+        ),
+        format!(
+            "/.well-known/oauth-authorization-server/t/{}/e/{}",
+            scope.tenant(),
+            scope.environment()
+        ),
+        format!(
+            "/.well-known/openid-configuration/t/{}/e/{}",
+            scope.tenant(),
+            scope.environment()
+        ),
+    ] {
+        let (status, body) = get_discovery(&harness, &uri).await;
+        assert_eq!(status, StatusCode::OK, "discovery form {uri}: {body}");
+        let doc = json(&body);
+        let algs = advertised_algs(&doc);
+        assert!(
+            algs.contains(&"ES256".to_owned()),
+            "discovery advertises the loaded ES256 key on {uri}: {algs:?}"
+        );
+        assert_ne!(
+            algs,
+            vec!["EdDSA".to_owned(), "RS256".to_owned()],
+            "discovery does not fall back to the EdDSA default on {uri}: {algs:?}"
+        );
+        assert!(
+            !algs.contains(&"EdDSA".to_owned()),
+            "an ES256-only environment never advertises EdDSA on {uri}: {algs:?}"
+        );
+        // The advertised issuer still exact-matches the tokens' issuer.
+        assert_eq!(doc["issuer"].as_str(), Some(harness.issuer()), "{uri}");
+    }
+}
+
+#[tokio::test]
+async fn cross_tenant_discovery_is_a_uniform_not_found() {
+    // Because discovery never consulted the store, a cross-tenant scope rendered a
+    // self-consistent 200 while the JWKS path for the SAME scope correctly 404'd.
+    // Now discovery resolves through the SAME RLS-scoped registry, so a foreign
+    // environment named under the harness's tenant loads zero rows and 404s on every
+    // well-known form, exactly like the JWKS surface.
+    let harness = Harness::start_store_backed().await;
+    let foreign = harness.provision_foreign_scope().await;
+
+    // Under its OWN tenant the foreign environment's discovery resolves (200),
+    // proving the 404s below are the cross-tenant binding, not a missing document.
+    let own = format!(
+        "/t/{}/e/{}/.well-known/openid-configuration",
+        foreign.tenant(),
+        foreign.environment()
+    );
+    let (status, body) = get_discovery(&harness, &own).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "foreign env discovery resolves under its tenant: {body}"
+    );
+
+    // The foreign environment id named under the HARNESS's (different) tenant: RLS
+    // finds no rows, so every discovery form is a uniform 404, never a
+    // self-consistent bogus 200 serving the foreign scope's metadata.
+    let bogus_tenant = harness.scope().tenant();
+    for uri in [
+        format!(
+            "/t/{}/e/{}/.well-known/openid-configuration",
+            bogus_tenant,
+            foreign.environment()
+        ),
+        format!(
+            "/.well-known/oauth-authorization-server/t/{}/e/{}",
+            bogus_tenant,
+            foreign.environment()
+        ),
+        format!(
+            "/.well-known/openid-configuration/t/{}/e/{}",
+            bogus_tenant,
+            foreign.environment()
+        ),
+    ] {
+        let (status, _) = get_discovery(&harness, &uri).await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "cross-tenant discovery fails closed on {uri}"
+        );
+    }
 }

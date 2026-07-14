@@ -22,8 +22,9 @@ use ironauth_jose::{
     JwsAlgorithm, KeySet, SigningKey, SigningPolicy, TrustedKey, VerificationPolicy,
 };
 use ironauth_oidc::{
-    ClientAuthMethod, IssuerEntry, IssuerRegistry, IssuerState, JwksCacheWindow, OidcState,
-    PairwiseSalt, SESSION_COOKIE, issuer_router, oidc_router,
+    ClientAuthMethod, DiscoveryCapabilities, DiscoveryState, IssuerEntry, IssuerRegistry,
+    IssuerState, JwksCacheWindow, OidcState, PairwiseSalt, SESSION_COOKIE, discovery_router,
+    issuer_router, oidc_router,
 };
 use ironauth_store::test_support::TestDatabase;
 use ironauth_store::{
@@ -228,8 +229,10 @@ impl Harness {
     }
 
     /// Build a store-backed harness whose environment is provisioned with `key`,
-    /// mounting the protocol, discovery-less JWKS, and issuer routers over the one
-    /// lazy registry.
+    /// mounting the protocol, per-environment JWKS, and discovery routers over the
+    /// one lazy registry (exactly as `main.rs` mounts all three), so a test can
+    /// fetch the LIVE discovery document whose per-environment policy is derived from
+    /// the loaded key set.
     async fn build_store_backed(config: OidcConfig, key: HarnessKey) -> Self {
         let (db, env, clock, scope, client_id) = Self::seed_common().await;
 
@@ -266,6 +269,14 @@ impl Harness {
             db.store().clone(),
         ));
         let issuer_state = IssuerState::new(Arc::clone(&registry), env.clone());
+        // Discovery over the SAME store-backed registry (issue #194), so the served
+        // discovery document derives its per-environment policy from the loaded keys.
+        let discovery_state = DiscoveryState::new(
+            ISSUER_BASE,
+            JwksCacheWindow::clamped(config.jwks_cache_max_age_secs),
+            DiscoveryCapabilities::from_config(&config),
+            Arc::clone(&registry),
+        );
         let state = OidcState::new(
             db.store().clone(),
             env.clone(),
@@ -274,7 +285,9 @@ impl Harness {
             ISSUER_BASE,
         );
         let issuer = state.issuer_for(&scope);
-        let router = oidc_router(state).merge(issuer_router(issuer_state));
+        let router = oidc_router(state)
+            .merge(issuer_router(issuer_state))
+            .merge(discovery_router(discovery_state));
 
         Self {
             db,
