@@ -1215,9 +1215,10 @@ impl Harness {
     }
 
     /// Register an external assertion issuer as a trust anchor for the JWT bearer
-    /// assertion grant (issue #26), returning the `issuer` string. Exactly one of
-    /// `jwks`/`jwks_uri` must be set. `enabled` registers the enable switch, so a
-    /// test can register a disabled issuer to prove disabled issuers are rejected.
+    /// assertion grant (issue #26), returning its `xai_` identifier so a test can later
+    /// toggle its enable switch. Exactly one of `jwks`/`jwks_uri` must be set.
+    /// `enabled` registers the enable switch, so a test can register a disabled issuer
+    /// to prove disabled issuers are rejected.
     pub async fn register_external_issuer(
         &self,
         issuer: &str,
@@ -1225,7 +1226,7 @@ impl Harness {
         jwks_uri: Option<&str>,
         signing_alg_allow: Option<&str>,
         enabled: bool,
-    ) {
+    ) -> ExternalIssuerId {
         let id = ExternalIssuerId::generate(&self.env, &self.scope);
         let (actor, corr) = self.seeding_actor();
         self.store()
@@ -1245,6 +1246,22 @@ impl Harness {
             )
             .await
             .expect("register external assertion issuer");
+        id
+    }
+
+    /// Toggle a registered external issuer's enable switch (issue #26) through the
+    /// column-scoped data-plane grant, exactly as the (M13) management surface will.
+    /// Proves the revocability capability end to end: disabling a live issuer makes
+    /// the grant reject its assertions.
+    pub async fn set_external_issuer_enabled(&self, id: &ExternalIssuerId, enabled: bool) {
+        let (actor, corr) = self.seeding_actor();
+        self.store()
+            .scoped(self.scope)
+            .acting(actor, corr)
+            .external_assertion_issuers()
+            .set_enabled(&self.env, id, enabled)
+            .await
+            .expect("set external issuer enabled");
     }
 
     /// Like [`Harness::register_external_issuer`] but RETURNS the store result, so a
@@ -1278,6 +1295,8 @@ impl Harness {
     /// Author a subject-mapping rule for the JWT bearer assertion grant (issue #26):
     /// map an external (`issuer` + `external_subject`), optionally gated on a claim,
     /// to `principal` (the issued token's `sub`). Unmapped subjects are rejected.
+    /// Returns the rule's `asm_` identifier so a test can later toggle its enable
+    /// switch.
     pub async fn create_subject_mapping(
         &self,
         issuer: &str,
@@ -1285,7 +1304,7 @@ impl Harness {
         match_claim: Option<&str>,
         match_value: Option<&str>,
         principal: &str,
-    ) {
+    ) -> AssertionMappingId {
         let id = AssertionMappingId::generate(&self.env, &self.scope);
         let (actor, corr) = self.seeding_actor();
         self.store()
@@ -1305,6 +1324,21 @@ impl Harness {
             )
             .await
             .expect("create subject mapping");
+        id
+    }
+
+    /// Toggle a subject-mapping rule's enable switch (issue #26) through the
+    /// column-scoped data-plane grant. Proves the revocability capability end to end:
+    /// disabling a live mapping makes the grant reject the subject as unmapped.
+    pub async fn set_subject_mapping_enabled(&self, id: &AssertionMappingId, enabled: bool) {
+        let (actor, corr) = self.seeding_actor();
+        self.store()
+            .scoped(self.scope)
+            .acting(actor, corr)
+            .external_assertion_subject_mappings()
+            .set_enabled(&self.env, id, enabled)
+            .await
+            .expect("set subject mapping enabled");
     }
 
     /// Issue an `authorization_code` bound to `client_id` WITH PKCE (the RFC 7636

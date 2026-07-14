@@ -704,6 +704,310 @@ async fn a_dual_source_or_keyless_issuer_registration_is_refused() {
     );
 }
 
+#[tokio::test]
+async fn disabling_a_live_issuer_revokes_the_grant() {
+    // The revocability capability (issue #26 fix): a live, working issuer can be
+    // DISABLED through the column-scoped data-plane grant, after which its assertions
+    // reject exactly as an unregistered issuer's do. This is why `GRANT UPDATE
+    // (enabled)` and the store toggle must ship now (the HTTP management surface is
+    // M13): without them a compromised or decommissioned issuer could not be turned
+    // off.
+    let h = Harness::start().await;
+    let jwks = jwks_json(&issuer_key());
+    let issuer_id = h
+        .register_external_issuer(EXTERNAL_ISSUER, Some(&jwks), None, None, true)
+        .await;
+    h.create_subject_mapping(
+        EXTERNAL_ISSUER,
+        EXTERNAL_SUBJECT,
+        None,
+        None,
+        MAPPED_PRINCIPAL,
+    )
+    .await;
+    let client_id = h.client_id().to_string();
+    let key = issuer_key();
+
+    // While enabled, the grant succeeds.
+    let ok = assertion(
+        &key,
+        EXTERNAL_ISSUER,
+        EXTERNAL_SUBJECT,
+        h.issuer(),
+        3600,
+        "jti-live-ok",
+    );
+    let (status, _h, body) = present(&h, &client_id, &ok).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the enabled issuer exchanges: {body}"
+    );
+
+    // Disable the issuer through the data-plane toggle (the revocation path).
+    h.set_external_issuer_enabled(&issuer_id, false).await;
+
+    // A FRESH assertion (distinct jti) now rejects as an untrusted issuer.
+    let after = assertion(
+        &key,
+        EXTERNAL_ISSUER,
+        EXTERNAL_SUBJECT,
+        h.issuer(),
+        3600,
+        "jti-live-revoked",
+    );
+    let (status, _h, body) = present(&h, &client_id, &after).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "the disabled issuer rejects: {body}"
+    );
+    assert_eq!(json(&body)["error"], "invalid_grant");
+    assert!(
+        h.client_auth_diagnostics(&client_id)
+            .await
+            .iter()
+            .any(|d| d.failure_reason == "assertion_issuer_untrusted"),
+        "a revoked issuer is diagnosed as untrusted"
+    );
+}
+
+#[tokio::test]
+async fn disabling_a_live_mapping_revokes_the_grant() {
+    // The revocability capability for a mis-authored mapping (issue #26 fix): a live
+    // mapping can be DISABLED through the column-scoped data-plane grant, after which
+    // the subject resolves to no rule and the grant rejects it as unmapped
+    // (reject-by-default), never auto-provisioned.
+    let h = Harness::start().await;
+    let jwks = jwks_json(&issuer_key());
+    h.register_external_issuer(EXTERNAL_ISSUER, Some(&jwks), None, None, true)
+        .await;
+    let mapping_id = h
+        .create_subject_mapping(
+            EXTERNAL_ISSUER,
+            EXTERNAL_SUBJECT,
+            None,
+            None,
+            MAPPED_PRINCIPAL,
+        )
+        .await;
+    let client_id = h.client_id().to_string();
+    let key = issuer_key();
+
+    // While enabled, the grant succeeds.
+    let ok = assertion(
+        &key,
+        EXTERNAL_ISSUER,
+        EXTERNAL_SUBJECT,
+        h.issuer(),
+        3600,
+        "jti-map-ok",
+    );
+    let (status, _h, body) = present(&h, &client_id, &ok).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the enabled mapping exchanges: {body}"
+    );
+
+    // Disable the mapping through the data-plane toggle (the revocation path).
+    h.set_subject_mapping_enabled(&mapping_id, false).await;
+
+    // A FRESH assertion now rejects as unmapped.
+    let after = assertion(
+        &key,
+        EXTERNAL_ISSUER,
+        EXTERNAL_SUBJECT,
+        h.issuer(),
+        3600,
+        "jti-map-revoked",
+    );
+    let (status, _h, body) = present(&h, &client_id, &after).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "the disabled mapping rejects: {body}"
+    );
+    assert_eq!(json(&body)["error"], "invalid_grant");
+    assert!(
+        h.client_auth_diagnostics(&client_id)
+            .await
+            .iter()
+            .any(|d| d.failure_reason == "assertion_subject_unmapped"),
+        "a revoked mapping is diagnosed as unmapped"
+    );
+}
+
+#[tokio::test]
+async fn a_user_or_oidc_scope_is_rejected_as_invalid_scope() {
+    // FIX 2 (spec): the assertion grant applies the SAME machine-grant scope policy as
+    // the client-credentials grant, so a mapped-identity token can never carry
+    // `openid` (an OIDC/user concept requiring an authenticated end user) or
+    // `offline_access` (a refresh token, which this grant never issues). Either is
+    // invalid_scope, rejected BEFORE the assertion's single-use jti is spent.
+    let h = Harness::start().await;
+    let client_id = seed_trust(&h).await;
+    let key = issuer_key();
+
+    for scope in ["openid", "offline_access"] {
+        let asrt = assertion(
+            &key,
+            EXTERNAL_ISSUER,
+            EXTERNAL_SUBJECT,
+            h.issuer(),
+            3600,
+            "jti-scope-rejected",
+        );
+        let body = form(&[
+            ("grant_type", JWT_BEARER_GRANT),
+            ("assertion", &asrt),
+            ("client_id", &client_id),
+            ("scope", scope),
+        ]);
+        let (status, _h, resp) = h.token(&body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "scope `{scope}`: {resp}");
+        assert_eq!(
+            json(&resp)["error"],
+            "invalid_scope",
+            "an out-of-policy scope `{scope}` is invalid_scope"
+        );
+    }
+
+    // Positive control: an in-policy scope is accepted and echoed (whitespace
+    // collapsed), so the policy is not over-blocking.
+    let asrt = assertion(
+        &key,
+        EXTERNAL_ISSUER,
+        EXTERNAL_SUBJECT,
+        h.issuer(),
+        3600,
+        "jti-scope-ok",
+    );
+    let body = form(&[
+        ("grant_type", JWT_BEARER_GRANT),
+        ("assertion", &asrt),
+        ("client_id", &client_id),
+        ("scope", "  read   write "),
+    ]);
+    let (status, _h, resp) = h.token(&body).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "an in-policy scope is accepted: {resp}"
+    );
+    assert_eq!(
+        json(&resp)["scope"],
+        "read write",
+        "the granted scope is normalized and echoed"
+    );
+}
+
+#[tokio::test]
+async fn the_exp_skew_boundary_is_accepted_and_one_second_past_is_rejected() {
+    // FIX 3 (test rigor): under an ADVANCING clock (not the frozen-epoch default), an
+    // assertion whose `exp` sits EXACTLY at the acceptance boundary (now == exp + skew)
+    // is accepted, and a fresh one just past it (now == exp + skew + 1) is rejected
+    // invalid_grant. Verification rejects only once now_secs > exp + skew.
+    let h = Harness::start().await;
+    let client_id = seed_trust(&h).await;
+    let key = issuer_key();
+    let skew = i64::try_from(h.state().client_assertion_skew().as_secs()).expect("skew fits i64");
+    let exp = 3600_i64;
+
+    // Advance to EXACTLY exp + skew: the last instant the assertion is still valid.
+    let boundary = u64::try_from(exp + skew).expect("boundary fits u64");
+    h.clock().advance(Duration::from_secs(boundary));
+    let at_boundary = assertion(
+        &key,
+        EXTERNAL_ISSUER,
+        EXTERNAL_SUBJECT,
+        h.issuer(),
+        exp,
+        "jti-boundary-ok",
+    );
+    let (status, _h, body) = present(&h, &client_id, &at_boundary).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "exp exactly at exp+skew is accepted: {body}"
+    );
+
+    // Advance one more second: now exceeds exp + skew, so a fresh assertion (distinct
+    // jti, so this is an EXPIRY rejection, not a replay) is expired.
+    h.clock().advance(Duration::from_secs(1));
+    let past_boundary = assertion(
+        &key,
+        EXTERNAL_ISSUER,
+        EXTERNAL_SUBJECT,
+        h.issuer(),
+        exp,
+        "jti-boundary-past",
+    );
+    let (status, _h, body) = present(&h, &client_id, &past_boundary).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "one second past exp+skew is rejected: {body}"
+    );
+    assert_eq!(json(&body)["error"], "invalid_grant");
+    assert!(
+        h.client_auth_diagnostics(&client_id)
+            .await
+            .iter()
+            .any(|d| d.failure_reason == "assertion_invalid"),
+        "the past-boundary expiry is diagnosed as an invalid assertion"
+    );
+}
+
+#[tokio::test]
+async fn an_assertion_missing_sub_is_rejected_with_invalid_grant() {
+    // FIX 3: RFC 7523 3 REQUIRES `sub`. An assertion that VERIFIES (good signature,
+    // iss/aud/exp present) but carries NO `sub`, or an empty `sub`, is rejected
+    // invalid_grant at the grant level: the JOSE layer treats `sub` as optional, and
+    // the grant is what enforces its presence (never issuing a token with no subject).
+    let h = Harness::start().await;
+    let client_id = seed_trust(&h).await;
+    let key = issuer_key();
+
+    // Every REQUIRED claim EXCEPT sub.
+    let no_sub = sign_assertion(
+        &key,
+        &serde_json::json!({
+            "iss": EXTERNAL_ISSUER, "aud": h.issuer(), "exp": 3600, "iat": 0, "jti": "jti-no-sub",
+        }),
+    );
+    let (status, _h, body) = present(&h, &client_id, &no_sub).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a missing sub rejects: {body}"
+    );
+    assert_eq!(json(&body)["error"], "invalid_grant");
+    assert!(
+        h.client_auth_diagnostics(&client_id)
+            .await
+            .iter()
+            .any(|d| d.failure_reason == "assertion_invalid"),
+        "a missing sub is diagnosed as an invalid assertion"
+    );
+
+    // An empty/whitespace sub is rejected the same way.
+    let empty_sub = sign_assertion(
+        &key,
+        &serde_json::json!({
+            "iss": EXTERNAL_ISSUER, "sub": "   ", "aud": h.issuer(),
+            "exp": 3600, "iat": 0, "jti": "jti-empty-sub",
+        }),
+    );
+    let (status, _h, body) = present(&h, &client_id, &empty_sub).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "an empty sub rejects: {body}"
+    );
+    assert_eq!(json(&body)["error"], "invalid_grant");
+}
+
 /// Start an in-process loopback HTTP server that serves `body` as a JSON JWKS to
 /// every request, returning its address (mirrors the #25 client-assertion test).
 async fn start_jwks_server(body: String) -> SocketAddr {

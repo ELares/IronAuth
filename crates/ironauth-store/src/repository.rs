@@ -5000,6 +5000,60 @@ impl ActingExternalAssertionIssuerRepo<'_> {
         )
         .await
     }
+
+    /// Toggle a registered external assertion issuer's enable switch (issue #26),
+    /// auditing `external_assertion_issuer.set_enabled` in the same transaction.
+    ///
+    /// This is the data-plane REVOCATION capability: DISABLING a compromised or
+    /// decommissioned issuer makes the grant reject its assertions exactly as an
+    /// unregistered issuer's are (the grant filters on `enabled`). The COLUMN-SCOPED
+    /// `GRANT UPDATE (enabled)` is the enforcement: this path can flip only `enabled`,
+    /// never the issuer's identity, key source, or signing-alg allowlist. Idempotent:
+    /// re-setting the same value still updates the one row.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the identifier is out of this scope or names no
+    /// issuer visible here; [`StoreError::Database`] on a persistence failure.
+    pub async fn set_enabled(
+        &self,
+        env: &Env,
+        id: &ExternalIssuerId,
+        enabled: bool,
+    ) -> Result<(), StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::ExternalAssertionIssuerSetEnabled,
+                target: id,
+            },
+            async move |tx| {
+                let result = sqlx::query(
+                    "UPDATE external_assertion_issuers SET enabled = $1 \
+                     WHERE id = $2 AND tenant_id = $3 AND environment_id = $4",
+                )
+                .bind(enabled)
+                .bind(id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .execute(&mut **tx)
+                .await?;
+                if result.rows_affected() == 0 {
+                    return Err(StoreError::NotFound);
+                }
+                Ok(())
+            },
+            false,
+        )
+        .await
+    }
 }
 
 /// A registered subject-mapping rule read back within scope (issue #26): the
@@ -5052,11 +5106,14 @@ pub struct AssertionSubjectMappingRepo<'a> {
 }
 
 impl AssertionSubjectMappingRepo<'_> {
-    /// Resolve the mapping rule for a verified external (`issuer`, `external_subject`)
-    /// within scope, or [`None`] when no rule is registered. The grant applies the
-    /// rule's OPTIONAL claim gate itself against the verified claims, then issues the
-    /// token under `principal`. A [`None`] here is the reject-by-default posture: an
-    /// unmapped subject is rejected, never auto-provisioned.
+    /// Resolve the ENABLED mapping rule for a verified external (`issuer`,
+    /// `external_subject`) within scope, or [`None`] when no enabled rule is
+    /// registered. The lookup FILTERS on `enabled = true`, so a DISABLED (revoked)
+    /// mapping resolves to [`None`] and the grant rejects the subject exactly as an
+    /// absent one. The grant applies the rule's OPTIONAL claim gate itself against the
+    /// verified claims, then issues the token under `principal`. A [`None`] here is the
+    /// reject-by-default posture: an unmapped subject is rejected, never
+    /// auto-provisioned.
     ///
     /// # Errors
     ///
@@ -5072,7 +5129,7 @@ impl AssertionSubjectMappingRepo<'_> {
             "SELECT id, issuer, external_subject, match_claim, match_value, principal \
              FROM external_assertion_subject_mappings \
              WHERE issuer = $1 AND external_subject = $2 \
-             AND tenant_id = $3 AND environment_id = $4",
+             AND tenant_id = $3 AND environment_id = $4 AND enabled = true",
         )
         .bind(issuer)
         .bind(external_subject)
@@ -5160,6 +5217,60 @@ impl ActingAssertionSubjectMappingRepo<'_> {
                     }
                     Err(error) => Err(error.into()),
                 }
+            },
+            false,
+        )
+        .await
+    }
+
+    /// Toggle a subject-mapping rule's enable switch (issue #26), auditing
+    /// `external_assertion_subject_mapping.set_enabled` in the same transaction.
+    ///
+    /// This is the data-plane REVOCATION capability: DISABLING a mis-authored or
+    /// decommissioned mapping makes the resolve return no rule, so the grant rejects
+    /// the subject exactly as an unmapped one (never auto-provisions). The
+    /// COLUMN-SCOPED `GRANT UPDATE (enabled)` is the enforcement: this path can flip
+    /// only `enabled`, never the rule's issuer, subject, claim gate, or principal.
+    /// Idempotent: re-setting the same value still updates the one row.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the identifier is out of this scope or names no
+    /// mapping visible here; [`StoreError::Database`] on a persistence failure.
+    pub async fn set_enabled(
+        &self,
+        env: &Env,
+        id: &AssertionMappingId,
+        enabled: bool,
+    ) -> Result<(), StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::ExternalAssertionSubjectMappingSetEnabled,
+                target: id,
+            },
+            async move |tx| {
+                let result = sqlx::query(
+                    "UPDATE external_assertion_subject_mappings SET enabled = $1 \
+                     WHERE id = $2 AND tenant_id = $3 AND environment_id = $4",
+                )
+                .bind(enabled)
+                .bind(id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .execute(&mut **tx)
+                .await?;
+                if result.rows_affected() == 0 {
+                    return Err(StoreError::NotFound);
+                }
+                Ok(())
             },
             false,
         )

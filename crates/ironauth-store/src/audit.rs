@@ -242,6 +242,17 @@ pub enum Action {
     /// #26): the explicit rule mapping an external (issuer + `sub`) to an IronAuth
     /// principal. Unmapped subjects are rejected, never auto-provisioned.
     ExternalAssertionSubjectMappingCreate,
+    /// An external assertion issuer's enable switch was toggled (issue #26): a
+    /// compromised or decommissioned trust anchor was DISABLED (or re-enabled)
+    /// through the column-scoped data-plane grant, so its assertions are rejected
+    /// exactly as an unregistered issuer's are. The data-plane revocation capability
+    /// (the HTTP management surface for it is M13).
+    ExternalAssertionIssuerSetEnabled,
+    /// A subject-mapping rule's enable switch was toggled (issue #26): a mis-authored
+    /// or decommissioned mapping was DISABLED (or re-enabled) through the
+    /// column-scoped data-plane grant, so it resolves to no rule and the grant
+    /// rejects the subject exactly as an unmapped one.
+    ExternalAssertionSubjectMappingSetEnabled,
     /// A short-lived access token was issued under the JWT bearer assertion grant
     /// (issue #26): a validated external assertion was exchanged for a token under
     /// the mapped identity. No refresh token accompanies it (RFC 7521 4.1).
@@ -295,6 +306,10 @@ impl Action {
             Action::ExternalAssertionIssuerRegister => "external_assertion_issuer.register",
             Action::ExternalAssertionSubjectMappingCreate => {
                 "external_assertion_subject_mapping.create"
+            }
+            Action::ExternalAssertionIssuerSetEnabled => "external_assertion_issuer.set_enabled",
+            Action::ExternalAssertionSubjectMappingSetEnabled => {
+                "external_assertion_subject_mapping.set_enabled"
             }
             Action::JwtBearerAssertionIssue => "jwt_bearer_assertion.issue",
         }

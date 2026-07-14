@@ -27,7 +27,11 @@
 -- ENABLEs and FORCEs row-level security, adds the (tenant, environment) isolation
 -- policy (USING + WITH CHECK), adds the nonempty-scope CHECK, takes LEAST-PRIVILEGE
 -- grants, and is registered in scripts/query-audit.sh. All three tables do all of
--- this. Following the issue #31 lesson, NO table gets a table-wide UPDATE grant.
+-- this. Following the issue #31 lesson, grants stay COLUMN-SCOPED: the data plane
+-- gets UPDATE on exactly the column it legitimately mutates (here only `enabled`, so
+-- a compromised or decommissioned issuer can be disabled and a mis-authored mapping
+-- revoked), and NEVER a table-wide UPDATE (which auto-extends to every later column,
+-- including the app-immutable issuer id, keys, principal, and match rules).
 
 -- ---------------------------------------------------------------------------
 -- 1. Registered external assertion issuers (issue #26).
@@ -90,11 +94,16 @@ CREATE POLICY external_assertion_issuers_tenant_isolation ON external_assertion_
         AND environment_id = current_setting('ironauth.environment_id', true)
     );
 
--- SELECT to resolve a trust anchor at grant time, INSERT to register one. There is
--- deliberately NO UPDATE grant (the issue #31 lesson: a table-wide UPDATE
--- auto-extends to later columns) and NO DELETE grant: a registration is authored
--- once and never mutated in place by the data plane.
+-- SELECT to resolve a trust anchor at grant time, INSERT to register one, plus a
+-- COLUMN-SCOPED UPDATE of exactly `enabled` so a compromised or decommissioned
+-- issuer can be DISABLED through the data plane (revocation must be possible now;
+-- the HTTP management surface for it is M13). This is the issue #31 lesson applied
+-- correctly: grant UPDATE only on the column the data plane legitimately mutates,
+-- NEVER a table-wide UPDATE (which auto-extends to later columns) and never UPDATE on
+-- the app-immutable id / issuer / jwks / jwks_uri / signing_alg_allow. No DELETE
+-- grant: a registration is disabled, not deleted, by the data plane.
 GRANT SELECT, INSERT ON external_assertion_issuers TO ironauth_app;
+GRANT UPDATE (enabled) ON external_assertion_issuers TO ironauth_app;
 
 -- ---------------------------------------------------------------------------
 -- 2. Registered subject-mapping rules (issue #26).
@@ -125,6 +134,10 @@ CREATE TABLE external_assertion_subject_mappings (
     match_value       text,
     -- The IronAuth principal the mapped token is issued under (the token's `sub`).
     principal         text        NOT NULL,
+    -- The enable switch. A disabled mapping is rejected exactly as an absent one
+    -- (reject-by-default): the resolve filters on `enabled = true`, so a mis-authored
+    -- or decommissioned mapping can be revoked through the data plane.
+    enabled           boolean     NOT NULL DEFAULT true,
     created_at        timestamptz NOT NULL DEFAULT now(),
     CONSTRAINT external_assertion_subject_mappings_scope_nonempty
         CHECK (tenant_id <> '' AND environment_id <> ''),
@@ -152,10 +165,15 @@ CREATE POLICY external_assertion_subject_mappings_tenant_isolation
         AND environment_id = current_setting('ironauth.environment_id', true)
     );
 
--- SELECT to resolve a mapping at grant time, INSERT to author one. No UPDATE grant
--- (the #31 lesson) and no DELETE grant: a mapping is authored once, never mutated in
--- place by the data plane.
+-- SELECT to resolve a mapping at grant time, INSERT to author one, plus a
+-- COLUMN-SCOPED UPDATE of exactly `enabled` so a mis-authored or decommissioned
+-- mapping can be DISABLED (revoked) through the data plane. The issue #31 lesson
+-- applied correctly: UPDATE only the column the data plane legitimately mutates,
+-- NEVER a table-wide UPDATE and never UPDATE on the app-immutable
+-- id / issuer / external_subject / match_claim / match_value / principal. No DELETE
+-- grant: a mapping is disabled, not deleted, by the data plane.
 GRANT SELECT, INSERT ON external_assertion_subject_mappings TO ironauth_app;
+GRANT UPDATE (enabled) ON external_assertion_subject_mappings TO ironauth_app;
 
 -- ---------------------------------------------------------------------------
 -- 3. The external-issuer single-use jti replay cache (issue #26).

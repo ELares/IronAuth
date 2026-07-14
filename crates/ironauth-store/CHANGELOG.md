@@ -40,6 +40,21 @@ range per docs/RELEASING.md.
   - **New identifier kinds.** `xai_` (a registered external assertion issuer) and
     `asm_` (a subject-mapping rule), both tenant-scoped and used as the row primary
     key and the audit target.
+  - **Revocable trust config (column-scoped, the #31 lesson applied correctly).** The
+    trust anchor and mapping must be DISABLE-able so a compromised or decommissioned
+    issuer, or a mis-authored mapping, can be turned off through the data plane (the
+    HTTP management surface for it is M13). Migration 0019 now adds an `enabled` column
+    to `external_assertion_subject_mappings` (the issuers table already had one) and a
+    COLUMN-SCOPED `GRANT UPDATE (enabled)` on BOTH trust tables to `ironauth_app` -
+    only `enabled`, never a table-wide UPDATE and never the app-immutable
+    id/issuer/keys/principal/match columns. New audited acting methods
+    `ActingExternalAssertionIssuerRepo::set_enabled` and
+    `ActingAssertionSubjectMappingRepo::set_enabled` toggle the switch (audited
+    `external_assertion_issuer.set_enabled` / `external_assertion_subject_mapping.set_enabled`,
+    two new `Action` variants), and `AssertionSubjectMappingRepo::resolve` now FILTERS
+    on `enabled = true` so a disabled mapping resolves to no rule. New `tests/rls.rs`
+    coverage proves the app role can flip `enabled` on both tables but is refused
+    (42501) on every other column.
 - Dynamic Client Registration abuse controls (issue #31, migration 0018, expand).
   - **New scoped tables.** `dcr_policies` (named, reusable policy-primitive chains),
     `dcr_initial_access_tokens` (SHA-256-hashed initial access tokens carrying a

@@ -83,6 +83,7 @@ use crate::client_auth::{
     self, ASYMMETRIC_ALGS, ClientAuthError, ClientAuthInputs, parse_presented,
     peek_assertion_header,
 };
+use crate::client_credentials::validate_m2m_scope;
 use crate::error::TokenError;
 use crate::state::OidcState;
 use crate::token::{TokenParams, map_store_error, token_ok};
@@ -155,7 +156,16 @@ pub async fn jwt_bearer_grant(
         })?;
     let client_id_str = authenticated.client_id;
 
-    // 3-4. Validate the assertion against a registered external issuer and map its
+    // 3. Validate the requested `scope` against the SHARED machine-grant policy
+    //    (issue #23's `validate_m2m_scope`, reused here): a mapped-identity
+    //    assertion-grant token is a machine token with no interactive user, so
+    //    `openid`/`offline_access` are out of policy (invalid_scope). Do this BEFORE
+    //    touching the assertion so an out-of-policy scope never spends the assertion's
+    //    single-use jti. The returned value is the normalized (whitespace-collapsed)
+    //    granted scope, echoed into the issued token.
+    let requested_scope = validate_m2m_scope(params.scope.as_deref())?;
+
+    // 4-5. Validate the assertion against a registered external issuer and map its
     //       subject to an IronAuth principal. A validation/mapping failure is the
     //       uniform invalid_grant with the specific reason recorded out of band; a
     //       store/persistence fault fails closed as a server_error (no diagnostic).
@@ -168,9 +178,8 @@ pub async fn jwt_bearer_grant(
         Err(JwtBearerError::Server) => return Err(TokenError::ServerError),
     };
 
-    // 5. Mint the short-lived access token under the mapped principal and persist
+    // 6. Mint the short-lived access token under the mapped principal and persist
     //    the grant. No ID token, no refresh token (RFC 7521 4.1).
-    let requested_scope = normalize_scope(params.scope.as_deref());
     mint_and_persist(
         state,
         scope,
@@ -294,6 +303,12 @@ async fn spend_optional_jti(
         .map(str::trim)
         .filter(|value| !value.is_empty())
     else {
+        // BY DESIGN (accepted residual): a jti-less assertion has NO replay
+        // protection within its `exp` + skew window. RFC 7523 makes `jti` OPTIONAL on
+        // the authorization grant (unlike client authentication), so we accept the
+        // assertion; replay is bounded by the short `aud` + `exp` window, matching the
+        // #25 client-assertion posture. An issuer that wants strict single-use mints a
+        // `jti` (which is then spent below).
         return Ok(());
     };
     // Retain the jti until its assertion can no longer be accepted, PLUS one whole
@@ -357,6 +372,12 @@ async fn resolve_mapped_principal(
             ));
         }
     }
+    // BY DESIGN (accepted residual): the mapped `principal` is OPERATOR-AUTHORED (a
+    // registered mapping rule) and is NOT liveness-checked at mint. Cross-tenant
+    // misuse is contained by RLS plus the assertion's own verified `iss`/signature;
+    // intra-tenant correctness relies on the privileged authorship of the mapping
+    // rule. A mint-time in-scope principal-liveness check (rejecting a mapping to a
+    // deactivated principal) is deferred defense-in-depth, not a correctness gap here.
     Ok(mapping.principal)
 }
 
@@ -586,13 +607,6 @@ fn jwt_bearer_response(
     token_ok(&body.to_string())
 }
 
-/// Normalize an optional requested `scope`: trim, collapse internal whitespace, and
-/// drop an empty value. Echoed into the issued token when present.
-fn normalize_scope(raw: Option<&str>) -> Option<String> {
-    let raw = raw.map(str::trim).filter(|value| !value.is_empty())?;
-    Some(raw.split_whitespace().collect::<Vec<_>>().join(" "))
-}
-
 /// Read a top-level string claim from a compact JWS's (UNVERIFIED) payload, for
 /// deriving WHICH registered issuer to verify against. The verification then binds
 /// `iss` cryptographically, so reading it before verification introduces no trust.
@@ -664,16 +678,6 @@ mod tests {
         assert!(peek_unverified_claim(&assertion, "aud").is_none());
         // A non-JWS or a garbage payload reads nothing rather than panicking.
         assert!(peek_unverified_claim("not-a-jws", "iss").is_none());
-    }
-
-    #[test]
-    fn normalize_scope_collapses_whitespace_and_drops_empty() {
-        assert_eq!(normalize_scope(None), None);
-        assert_eq!(normalize_scope(Some("   ")), None);
-        assert_eq!(
-            normalize_scope(Some("  read   write ")).as_deref(),
-            Some("read write")
-        );
     }
 
     #[test]

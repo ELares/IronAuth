@@ -42,6 +42,18 @@ range per docs/RELEASING.md.
     uses; the presenting client's authentication fails INDEPENDENTLY as
     `invalid_client`. `urn:ietf:params:oauth:grant-type:jwt-bearer` joins
     `grant_types_supported` in generated discovery (from live config).
+  - **Machine-grant scope policy (shared with client-credentials).** The requested
+    `scope` is validated through the SAME `validate_m2m_scope` helper the #23
+    client-credentials grant uses, so a mapped-identity assertion-grant token can
+    never carry `openid` (an OIDC/user concept) or `offline_access` (a refresh token,
+    which this grant never issues): either is `invalid_scope`, rejected BEFORE the
+    assertion's single-use jti is spent.
+  - **Revocable trust config.** A registered issuer OR mapping can be DISABLED through
+    the data plane, after which the grant rejects its assertions exactly as an
+    unregistered/unmapped one (uniform `invalid_grant`, existing diagnostic reason).
+    The issuer resolve already required `enabled`; the mapping resolve now filters on
+    `enabled = true` too, so a mis-authored mapping is revocable now (the HTTP
+    management surface is M13).
 - Dynamic Client Registration abuse controls (issue #31), wrapping the #30 create.
   - **Exposure switch.** A per-environment `closed` / `token_gated` / `open` mode
     (default `token_gated`) governs who may register: `closed` refuses every public

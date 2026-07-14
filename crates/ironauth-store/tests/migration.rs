@@ -597,6 +597,14 @@ async fn production_chain_is_only_the_nineteen_real_migrations_and_ships_no_demo
         column_exists(pool, "external_assertion_subject_mappings", "principal").await,
         "external_assertion_subject_mappings.principal exists"
     );
+    // Both trust-config tables carry an `enabled` switch, so a compromised issuer or
+    // a mis-authored mapping can be REVOKED through the column-scoped data-plane
+    // grant (issue #26 revocability fix). The issuer switch shipped with the table;
+    // the mapping switch is the additive column this fix added within migration 19.
+    assert!(
+        column_exists(pool, "external_assertion_subject_mappings", "enabled").await,
+        "external_assertion_subject_mappings.enabled exists"
+    );
 }
 
 #[tokio::test]
