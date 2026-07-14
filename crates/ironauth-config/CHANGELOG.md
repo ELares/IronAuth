@@ -6,6 +6,10 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Add `oidc.require_pkce_for_confidential_clients` (issue #13, default `true`):
+  the per-environment PKCE policy for confidential clients. Public clients always
+  require PKCE regardless. Regenerates `docs/config-schema.json` and
+  `docs/CONFIG.md`.
 - Add the `[oidc]` section (issue #12): `enabled` (opt-in mount, default off),
   `authorization_code_ttl_secs` (default 60), and `access_token_ttl_secs`
   (default 300). Lifetimes are validated non-zero and bounded by

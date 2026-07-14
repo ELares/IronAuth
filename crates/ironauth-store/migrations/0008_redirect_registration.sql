@@ -1,0 +1,24 @@
+-- SPDX-License-Identifier: MIT OR Apache-2.0
+--
+-- Registered redirect URIs for OAuth clients (issue #13).
+--
+-- The authorization endpoint returns a code (or an error) to the redirect_uri
+-- the client presents. RFC 6749 4.1.2.1 and RFC 9700 2.1 require that value to be
+-- matched by EXACT STRING against a set the client registered ahead of time: an
+-- unregistered target is an open redirector that would leak the code or the
+-- error to an attacker-chosen URI. Before this migration a client carried no
+-- registered set, so the endpoint could only validate a redirect_uri
+-- syntactically; this column is the registered set the exact-string comparator
+-- checks against (issue #13, crates/ironauth-store/src/redirect.rs).
+--
+-- Additive and safe for the old binary: the set defaults to the empty array, so
+-- every client created before this migration keeps an empty registered set and
+-- the existing create path (which names no redirect_uris column) is unchanged.
+-- The redirect URIs a client registers are validated as RFC 8252 redirect
+-- targets (a claimed https URL, an http loopback IP-literal, or a reverse-domain
+-- private-use scheme) by the register path before they are stored, so a malformed
+-- scheme is rejected at registration time. This is a column on the already
+-- tenant-isolated clients table (its forced row-level security and nonempty-scope
+-- CHECK from 0001 apply unchanged), so it adds no new isolation obligation.
+ALTER TABLE clients
+    ADD COLUMN redirect_uris text[] NOT NULL DEFAULT '{}';

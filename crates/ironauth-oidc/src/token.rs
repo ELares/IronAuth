@@ -241,16 +241,30 @@ async fn exchange(
 /// (see the exchange). This runs BEFORE the code is consumed, so a mismatch does
 /// not burn the one-time code.
 fn bindings_match(bindings: &CodeBindings, params: &TokenParams) -> bool {
+    // The redirect_uri re-check is EXACT string against the value bound at
+    // authorization (RFC 6749 4.1.3): the code was bound to the specific URI the
+    // client used, so no loopback-port latitude applies here (that latitude was
+    // already spent when the code was issued against the presented port).
     let redirect_ok = params
         .redirect_uri
         .as_deref()
         .is_some_and(|presented| presented == bindings.redirect_uri);
+    // PKCE downgrade prevention in BOTH directions (RFC 7636, RFC 9700):
+    // - a code issued WITH a challenge is redeemable ONLY with a verifier that
+    //   hashes (S256) to that challenge;
+    // - a code issued WITHOUT a challenge is NOT redeemable WITH a verifier (a
+    //   presented verifier for a no-challenge code is a downgrade attempt), so the
+    //   token request must present none.
+    let presented_verifier = params
+        .code_verifier
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
     let pkce_ok = match &bindings.code_challenge {
-        Some(challenge) => params
-            .code_verifier
-            .as_deref()
-            .is_some_and(|verifier| verify_s256(verifier, challenge)),
-        None => true,
+        Some(challenge) => {
+            presented_verifier.is_some_and(|verifier| verify_s256(verifier, challenge))
+        }
+        None => presented_verifier.is_none(),
     };
     redirect_ok && pkce_ok
 }

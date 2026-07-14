@@ -24,10 +24,13 @@ async fn one_code_redeemed_concurrently_succeeds_exactly_once() {
     let harness = Harness::start().await;
     let client_id = harness.client_id().to_string();
 
-    // Issue one code (as an authenticated, consenting subject).
+    // Issue one code (as an authenticated, consenting subject). The public client
+    // requires PKCE (issue #13), so bind the S256 challenge the exchange verifies.
     let query = format!(
-        "response_type=code&client_id={client_id}&redirect_uri={}",
-        common::enc(REDIRECT_URI)
+        "response_type=code&client_id={client_id}&redirect_uri={}&\
+         code_challenge={}&code_challenge_method=S256",
+        common::enc(REDIRECT_URI),
+        common::PKCE_CHALLENGE,
     );
     let cookie = harness.authenticated_cookie().await;
     let (status, headers, body) = harness.authorize_with_cookie(&query, &cookie).await;

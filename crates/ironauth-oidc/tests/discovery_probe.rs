@@ -30,7 +30,7 @@ use ironauth_oidc::{
 use serde_json::Value;
 use tower::ServiceExt;
 
-use crate::common::{Harness, ISSUER_BASE, REDIRECT_URI, form, json};
+use crate::common::{Harness, ISSUER_BASE, PKCE_VERIFIER, REDIRECT_URI, form, json};
 
 /// The merged live router (protocol + discovery) and the appended-form discovery
 /// URL for the harness scope.
@@ -195,12 +195,14 @@ async fn advertised_claims_cover_every_claim_a_minted_id_token_carries() {
     let harness = Harness::start().await;
     let client_id = harness.client_id().to_string();
 
-    let code = harness.issue_authenticated_code(&client_id).await;
+    // The harness client is public, so PKCE is mandatory (issue #13).
+    let code = harness.issue_authenticated_code_pkce(&client_id).await;
     let exchange = form(&[
         ("grant_type", "authorization_code"),
         ("code", &code),
         ("redirect_uri", REDIRECT_URI),
         ("client_id", &client_id),
+        ("code_verifier", PKCE_VERIFIER),
     ]);
     let (status, _, body) = harness.token(&exchange).await;
     assert_eq!(status, StatusCode::OK, "token exchange: {body}");

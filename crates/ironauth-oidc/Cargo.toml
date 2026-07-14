@@ -179,5 +179,13 @@ name = "interop"
 path = "tests/interop.rs"
 required-features = ["testing"]
 
+# PKCE enforcement (S256-only, mandatory, downgrade prevention both ways), exact
+# redirect matching with the loopback exception and native-app schemes, and the
+# RFC 9207 iss on success and error responses (issue #13). Over a real database.
+[[test]]
+name = "pkce_redirect"
+path = "tests/pkce_redirect.rs"
+required-features = ["testing"]
+
 [lints]
 workspace = true

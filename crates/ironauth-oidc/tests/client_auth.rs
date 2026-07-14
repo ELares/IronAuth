@@ -168,7 +168,10 @@ async fn a_public_client_presenting_a_secret_is_invalid_client() {
     // mismatch, so it fails invalid_client rather than being silently ignored.
     let harness = Harness::start().await;
     let public = harness.client_id().to_string();
-    let code = issue_code_for(&harness, &public).await;
+    // The public client requires PKCE, so its code is issued with a challenge; this
+    // request trips on client authentication (a public client presenting a secret)
+    // before the PKCE check, so no verifier is needed.
+    let code = harness.issue_authenticated_code_pkce(&public).await;
 
     let body = form(&[
         ("grant_type", "authorization_code"),
@@ -190,7 +193,9 @@ async fn a_public_client_presenting_a_secret_is_invalid_client() {
 async fn an_unknown_client_is_invalid_client() {
     let harness = Harness::start().await;
     let public = harness.client_id().to_string();
-    let code = issue_code_for(&harness, &public).await;
+    // The public client requires PKCE; this request fails on an unknown client id
+    // during client authentication, before the PKCE check.
+    let code = harness.issue_authenticated_code_pkce(&public).await;
 
     // A well-formed but never-created client id: unknown, so invalid_client.
     let unknown = ClientId::generate(harness.env(), &harness.scope()).to_string();

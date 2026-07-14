@@ -16,7 +16,8 @@ mod common;
 
 use axum::http::{StatusCode, header};
 use common::{
-    Harness, REDIRECT_URI, enc, form, form_field, json, location, location_param, set_cookie_pair,
+    Harness, PKCE_CHALLENGE, PKCE_VERIFIER, REDIRECT_URI, enc, form, form_field, json, location,
+    location_param, set_cookie_pair,
 };
 use ironauth_jose::verify;
 use ironauth_oidc::ClientAuthMethod;
@@ -54,8 +55,12 @@ fn assert_hardened(headers: &axum::http::HeaderMap) {
 /// The authorization query for the harness public client, with the given prompt.
 fn authorize_query(client_id: &str, prompt: Option<&str>) -> String {
     use std::fmt::Write as _;
+    // The harness client is public, so PKCE is mandatory (issue #13): the challenge
+    // rides through the login/consent resume, and the exchange presents its
+    // verifier.
     let mut query = format!(
-        "response_type=code&client_id={client_id}&redirect_uri={}&scope={}&state=xyz&nonce=n-1",
+        "response_type=code&client_id={client_id}&redirect_uri={}&scope={}&state=xyz&nonce=n-1&\
+         code_challenge={PKCE_CHALLENGE}&code_challenge_method=S256",
         enc(REDIRECT_URI),
         enc("openid profile"),
     );
@@ -145,12 +150,13 @@ async fn a_user_can_register_consent_and_receive_tokens_end_to_end() {
     assert_eq!(location_param(&headers, "state").as_deref(), Some("xyz"));
     let code = location_param(&headers, "code").expect("authorization code");
 
-    // 8. Exchange the code for tokens (public client, no PKCE was requested).
+    // 8. Exchange the code for tokens (public client: PKCE verifier presented).
     let token_body = form(&[
         ("grant_type", "authorization_code"),
         ("code", &code),
         ("redirect_uri", REDIRECT_URI),
         ("client_id", &client_id),
+        ("code_verifier", PKCE_VERIFIER),
     ]);
     let (status, _headers, body) = harness.token(&token_body).await;
     assert_eq!(status, StatusCode::OK, "token exchange: {body}");
@@ -231,6 +237,7 @@ async fn an_existing_user_can_log_in_and_receive_tokens() {
         ("code", &code),
         ("redirect_uri", REDIRECT_URI),
         ("client_id", &client_id),
+        ("code_verifier", PKCE_VERIFIER),
     ]);
     let (status, _h, body) = harness.token(&token_body).await;
     assert_eq!(status, StatusCode::OK, "token exchange: {body}");

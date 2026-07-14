@@ -323,6 +323,20 @@ pub struct OidcConfig {
     /// in spirit; the process value is the deployment default until per-environment
     /// overrides ride the M5 promotion pipeline.
     pub jwks_cache_max_age_secs: u64,
+
+    /// Whether a CONFIDENTIAL client (one that authenticates at the token endpoint
+    /// with a secret) must use PKCE (issue #13, RFC 9700 2.1). Default `true`: PKCE
+    /// is required for every client. A PUBLIC client (`token_endpoint_auth_method`
+    /// = `none`) ALWAYS requires PKCE regardless of this setting, because RFC 9700
+    /// 2.1.1 makes it structural for public clients; this knob only governs the
+    /// per-environment policy for confidential clients, whose default is `required`.
+    /// Set it to `false` only for an environment whose confidential clients cannot
+    /// yet send a `code_challenge` (a migration aid); a code issued without a
+    /// challenge is still never redeemable with a verifier (downgrade prevention
+    /// holds in both directions). This is a promotable per-environment setting in
+    /// spirit, like `jwks_cache_max_age_secs`; the process value is the deployment
+    /// default until per-environment overrides ride the M5 promotion pipeline.
+    pub require_pkce_for_confidential_clients: bool,
 }
 
 impl Default for OidcConfig {
@@ -334,6 +348,7 @@ impl Default for OidcConfig {
             reuse_grace_secs: 10,
             session_ttl_secs: 3600,
             jwks_cache_max_age_secs: 600,
+            require_pkce_for_confidential_clients: true,
         }
     }
 }
@@ -732,6 +747,9 @@ mod tests {
         assert_eq!(config.oidc.reuse_grace_secs, 10);
         assert_eq!(config.oidc.session_ttl_secs, 3600);
         assert_eq!(config.oidc.jwks_cache_max_age_secs, 600);
+        // PKCE is required for confidential clients by default (issue #13); public
+        // clients always require it regardless.
+        assert!(config.oidc.require_pkce_for_confidential_clients);
 
         // A zero session lifetime (born expired) is rejected; a lifetime above the
         // session ceiling is rejected too.

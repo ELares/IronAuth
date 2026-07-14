@@ -225,7 +225,9 @@ CREATE TABLE IF NOT EXISTS _schema_migrations ( \
 /// tables (issue #20: `users`, `sessions`, `consents`, plus the additive `clients`
 /// expand) are version 6; the recorded authentication context for honest ID token
 /// claims (issue #14: the additive `sessions`, `authorization_codes`, and `clients`
-/// column expands carrying the login method and `auth_time`) is version 7. That is
+/// column expands carrying the login method and `auth_time`) is version 7; the
+/// registered redirect URIs for the exact-string redirect match (issue #13: the
+/// additive `clients.redirect_uris` array column) are version 8. That is
 /// the whole production chain: it deliberately
 /// carries no throwaway objects, so a real database never gains a demo table or
 /// ledger rows beyond what the product needs. The worked expand-contract example
@@ -277,6 +279,12 @@ fn registry() -> Vec<Migration> {
             name: "authentication_context",
             phase: Phase::Expand,
             sql: include_str!("../migrations/0007_authentication_context.sql"),
+        },
+        Migration {
+            version: 8,
+            name: "redirect_registration",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0008_redirect_registration.sql"),
         },
     ]
 }
