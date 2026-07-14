@@ -229,7 +229,10 @@ CREATE TABLE IF NOT EXISTS _schema_migrations ( \
 /// registered redirect URIs for the exact-string redirect match (issue #13: the
 /// additive `clients.redirect_uris` array column) are version 8; the `UserInfo`
 /// standard-claim store (issue #15: the additive `users.claims` column backing the
-/// scope-derived and claims-parameter-selected claim sets) is version 9. That is
+/// scope-derived and claims-parameter-selected claim sets) is version 9; the
+/// scope-aware-consent grant (issue #196: `GRANT UPDATE ON consents` so a
+/// broadened consent is `UPSERTed` rather than dropped, a privilege grant with NO
+/// schema change) is version 10. That is
 /// the whole production chain: it deliberately
 /// carries no throwaway objects, so a real database never gains a demo table or
 /// ledger rows beyond what the product needs. The worked expand-contract example
@@ -293,6 +296,12 @@ fn registry() -> Vec<Migration> {
             name: "userinfo_claims",
             phase: Phase::Expand,
             sql: include_str!("../migrations/0009_userinfo_claims.sql"),
+        },
+        Migration {
+            version: 10,
+            name: "consent_scope_upsert",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0010_consent_scope_upsert.sql"),
         },
     ]
 }

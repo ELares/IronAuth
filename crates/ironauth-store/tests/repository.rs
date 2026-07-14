@@ -136,3 +136,75 @@ async fn management_list_at_the_hard_cap_keeps_the_has_next_sentinel() {
         "the has-next sentinel survives at a page size equal to the hard cap"
     );
 }
+
+/// Scope-aware consent (issue #196): `granted_ref` returns the granted scope, and a
+/// re-consent to a BROADER scope UPSERTs the scope in place, keeping the row's
+/// ORIGINAL id rather than inserting a second row or dropping the broadened scope.
+#[tokio::test]
+async fn consent_grant_upserts_the_scope_and_keeps_the_original_id() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+
+    // The consents table keys on (subject, client_id) text with no FK to users or
+    // clients, so literal ids exercise the grant/read contract directly.
+    let subject = "usr_example-subject";
+    let client_id = "cli_example-client";
+
+    // A first consent for a NARROW scope records the granted scope and returns its id.
+    let first = db
+        .store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .consents()
+        .grant(&env, subject, client_id, Some("openid"))
+        .await
+        .expect("first grant");
+    let recorded = db
+        .store()
+        .scoped(scope)
+        .consents()
+        .granted_ref(subject, client_id)
+        .await
+        .expect("granted_ref read")
+        .expect("a consent is recorded");
+    assert_eq!(recorded.id, first.to_string(), "granted_ref returns the id");
+    assert_eq!(
+        recorded.granted_scope.as_deref(),
+        Some("openid"),
+        "granted_ref returns the granted scope"
+    );
+
+    // Re-consent to a BROADER scope UPDATEs granted_scope in place and returns the
+    // ORIGINAL row id (the upsert keeps it), not a fresh id or a second row.
+    let second = db
+        .store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .consents()
+        .grant(&env, subject, client_id, Some("openid profile email"))
+        .await
+        .expect("re-grant");
+    assert_eq!(
+        second, first,
+        "the upsert returns the original consent id on re-consent"
+    );
+    let updated = db
+        .store()
+        .scoped(scope)
+        .consents()
+        .granted_ref(subject, client_id)
+        .await
+        .expect("granted_ref read")
+        .expect("a consent is recorded");
+    assert_eq!(
+        updated.id,
+        first.to_string(),
+        "the row keeps its original id"
+    );
+    assert_eq!(
+        updated.granted_scope.as_deref(),
+        Some("openid profile email"),
+        "the broadened scope is persisted rather than dropped"
+    );
+}

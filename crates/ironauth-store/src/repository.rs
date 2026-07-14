@@ -2110,6 +2110,22 @@ impl ActingSessionRepo<'_> {
     }
 }
 
+/// A recorded consent decision (issue #196): the `con_` id the grant references
+/// AND the `scope` value the decision was made against.
+///
+/// The authorization endpoint checks a later request's scope against
+/// `granted_scope`, so a consent recorded for a narrow scope never silently
+/// auto-grants a broader one. `granted_scope` is [`None`] when the consented
+/// request carried no `scope` (an empty granted set).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrantedConsent {
+    /// The `con_` consent identifier the grant references through its consent seam.
+    pub id: String,
+    /// The space-separated `scope` value the decision was recorded against, or
+    /// [`None`] when the consented request carried no scope.
+    pub granted_scope: Option<String>,
+}
+
 /// The read-only consent repository (issue #20).
 pub struct ConsentRepo<'a> {
     store: &'a Store,
@@ -2117,11 +2133,15 @@ pub struct ConsentRepo<'a> {
 }
 
 impl ConsentRepo<'_> {
-    /// The recorded consent id for `subject` and `client_id` in this scope, or
+    /// The recorded consent for `subject` and `client_id` in this scope, or
     /// [`None`] when the subject has not consented to the client. The bootstrap
     /// records consent per (subject, client), so a granted decision skips the
-    /// consent prompt on a later authorization for the same client, and the
-    /// returned `con_` id is what the grant references through its consent seam.
+    /// consent prompt on a later authorization for the same client.
+    ///
+    /// Returns BOTH the `con_` id the grant references AND the `granted_scope` the
+    /// decision was made against (issue #196), so the authorization endpoint can
+    /// re-prompt when a later request's scope is not a subset of the granted scope
+    /// rather than auto-granting the broader scope off the narrower recorded one.
     ///
     /// # Errors
     ///
@@ -2130,10 +2150,10 @@ impl ConsentRepo<'_> {
         &self,
         subject: &str,
         client_id: &str,
-    ) -> Result<Option<String>, StoreError> {
+    ) -> Result<Option<GrantedConsent>, StoreError> {
         let mut tx = begin_scoped(self.store, self.scope).await?;
         let row = sqlx::query(
-            "SELECT id FROM consents \
+            "SELECT id, granted_scope FROM consents \
              WHERE subject = $1 AND client_id = $2 \
              AND tenant_id = $3 AND environment_id = $4",
         )
@@ -2144,7 +2164,10 @@ impl ConsentRepo<'_> {
         .fetch_optional(&mut *tx)
         .await?;
         tx.commit().await?;
-        Ok(row.map(|row| row.get::<String, _>("id")))
+        Ok(row.map(|row| GrantedConsent {
+            id: row.get::<String, _>("id"),
+            granted_scope: row.get::<Option<String>, _>("granted_scope"),
+        }))
     }
 }
 
@@ -2156,11 +2179,19 @@ pub struct ActingConsentRepo<'a> {
 }
 
 impl ActingConsentRepo<'_> {
-    /// Record `subject`'s consent to `client_id` (idempotent per (subject,
-    /// client)), and return the fresh consent id so the grant can reference it.
-    /// Writes a `consent.grant` audit row in the same transaction. A repeat grant
-    /// for an already-consented (subject, client) inserts no second row (ON
-    /// CONFLICT DO NOTHING) but still returns a fresh id and audits the decision.
+    /// Record `subject`'s consent to `client_id` against `granted_scope`, and
+    /// return the ACTUAL consent id the grant references. Writes a `consent.grant`
+    /// audit row in the same transaction.
+    ///
+    /// The write is an UPSERT keyed on (subject, client): a first consent INSERTs a
+    /// row with the freshly generated id; a RE-consent for an already-consented
+    /// (subject, client) UPDATEs the stored `granted_scope` in place (issue #196),
+    /// so broadening a previously narrow consent is PERSISTED rather than dropped
+    /// (the old `ON CONFLICT DO NOTHING` silently kept the narrow scope, which then
+    /// re-prompted forever). Because a re-consent keeps the row's ORIGINAL id, the
+    /// freshly generated id is only the INSERT candidate (and the audit target);
+    /// `RETURNING id` yields the real stored id, which is what is returned to the
+    /// caller. The audit is attributed to the ATTEMPTED id.
     ///
     /// # Errors
     ///
@@ -2174,6 +2205,10 @@ impl ActingConsentRepo<'_> {
     ) -> Result<ConsentId, StoreError> {
         let id = ConsentId::generate(env, &self.scope);
         let scope = self.scope;
+        // The upsert's RETURNING id is read out through this slot: the closure runs
+        // inside the audited transaction, so it cannot return a value directly.
+        let mut stored_id: Option<String> = None;
+        let stored_id_out = &mut stored_id;
         write_audited(
             AuditedWrite {
                 store: self.store,
@@ -2184,11 +2219,13 @@ impl ActingConsentRepo<'_> {
                 target: &id,
             },
             async move |tx| {
-                sqlx::query(
+                let row = sqlx::query(
                     "INSERT INTO consents \
                      (id, tenant_id, environment_id, subject, client_id, granted_scope) \
                      VALUES ($1, $2, $3, $4, $5, $6) \
-                     ON CONFLICT (tenant_id, environment_id, subject, client_id) DO NOTHING",
+                     ON CONFLICT (tenant_id, environment_id, subject, client_id) \
+                     DO UPDATE SET granted_scope = EXCLUDED.granted_scope \
+                     RETURNING id",
                 )
                 .bind(id.to_string())
                 .bind(scope.tenant().to_string())
@@ -2196,14 +2233,23 @@ impl ActingConsentRepo<'_> {
                 .bind(subject)
                 .bind(client_id)
                 .bind(granted_scope)
-                .execute(&mut **tx)
+                .fetch_one(&mut **tx)
                 .await?;
+                *stored_id_out = Some(row.get::<String, _>("id"));
                 Ok(())
             },
             false,
         )
         .await?;
-        Ok(id)
+        // The actual stored id: the freshly generated id on a first consent, or the
+        // row's ORIGINAL id on a re-consent (the upsert keeps it). `fetch_one`
+        // guarantees exactly one RETURNING row, so `stored_id` is always set here;
+        // the fallback to the generated id is unreachable and only keeps this
+        // panic-free. Parsing it back in scope cannot fail for a row this scope just
+        // wrote; it is checked anyway for defense in depth (the anti-oracle boundary).
+        let stored_id = stored_id.unwrap_or_else(|| id.to_string());
+        let consent_id = ConsentId::parse_in_scope(&stored_id, &self.scope)?;
+        Ok(consent_id)
     }
 }
 

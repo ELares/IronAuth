@@ -87,11 +87,15 @@ pub async fn consent_post(
         return interaction::login_redirect(&resume.return_to);
     };
 
-    // CSRF: this state-changing POST currently relies on the SameSite=Lax session
-    // cookie alone, which blocks the standard cross-site auto-submit but leaves a
-    // narrow residual (Chromium Lax+POST window, non-enforcing legacy clients).
-    // Defense-in-depth (a session-bound CSRF token or an Origin check) is a hard
-    // prerequisite for enabling OIDC (#13), tracked in #196.
+    // CSRF defense-in-depth (issue #196), BEFORE recording consent: the SameSite=Lax
+    // session cookie blocks the standard cross-site auto-submit, and this Origin +
+    // Sec-Fetch-Site allowlist closes the two residuals it leaves (the Chromium
+    // Lax+POST window and non-enforcing legacy clients). A conclusively cross-site
+    // POST is refused with a generic 403 and records nothing.
+    if !interaction::same_origin_ok(&headers, state.self_origin().as_deref()) {
+        return interaction::forbidden_page();
+    }
+
     if form.decision.as_deref() == Some("allow") {
         let actor = interaction::subject_actor(&state, resume.scope, &auth.subject);
         let client_id = resume.client_id.to_string();

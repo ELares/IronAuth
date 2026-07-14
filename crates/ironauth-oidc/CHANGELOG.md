@@ -6,6 +6,31 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Consent-hardening prerequisites for enabling OIDC (issue #196, blocking
+  issue #13). Two hard security gaps in the issue #20 bootstrap are closed; the
+  provider stays gated off by default (`oidc.enabled` unchanged).
+  - **Scope-aware consent.** `resolve_gate` (the authorize login/consent gate) now
+    treats a recorded consent as covering a request only when the request's scope is
+    a SUBSET of the scope the consent was granted against (new
+    `consent_covers_scope`, splitting on ASCII whitespace like the mint's own
+    `parse_scope_set`). A consent for a narrow scope (for example `openid`) no longer
+    silently auto-grants a later broader request (`openid profile email`): the
+    broader request re-prompts through the consent screen, and under `prompt=none`
+    returns `consent_required`, exactly as an absent consent does. A same-or-narrower
+    request still issues directly. Re-consent persists the broadened scope (the store
+    `grant` upsert), so it does not loop. Reads the granted scope through the store's
+    new `GrantedConsent`.
+  - **CSRF defense-in-depth on the login and consent POSTs.** Both `login_post` and
+    `consent_post` now evaluate an Origin + `Sec-Fetch-Site` allowlist
+    (`interaction::same_origin_ok`) BEFORE any state change (before verifying the
+    password / recording consent). A conclusively cross-site POST (`Sec-Fetch-Site:
+    cross-site`, or an `Origin` that does not match the deployment's own origin,
+    derived from `issuer_base` via `OidcState::self_origin`) is refused with a
+    generic `403` that creates no session and records no consent. When neither header
+    is conclusive the existing `SameSite=Lax` cookie remains the backstop, so
+    header-stripped and non-browser clients are unaffected. This closes the Chromium
+    "Lax+POST" transitional window and the non-enforcing-legacy-client residual with
+    no schema, cookie, or token plumbing. `login_post` now takes `HeaderMap`.
 - Compose per-environment issuers, JWKS serving, and signing into the LIVE data
   plane (issue #194). The #19 primitives (per-environment `IssuerRegistry`, JWKS
   serving, algorithm policy, rotation `KeySet`) were inert; they now back the live

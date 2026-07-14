@@ -14,10 +14,10 @@
 
 mod common;
 
-use axum::http::{StatusCode, header};
+use axum::http::{HeaderMap, StatusCode, header};
 use common::{
-    Harness, PKCE_CHALLENGE, PKCE_VERIFIER, REDIRECT_URI, enc, form, form_field, json, location,
-    location_param, set_cookie_pair,
+    Harness, ISSUER_BASE, PKCE_CHALLENGE, PKCE_VERIFIER, REDIRECT_URI, enc, form, form_field, json,
+    location, location_param, set_cookie_pair,
 };
 use ironauth_jose::verify;
 use ironauth_oidc::ClientAuthMethod;
@@ -350,5 +350,356 @@ async fn the_consent_screen_escapes_a_hostile_client_name() {
     assert!(
         body.contains("&lt;script&gt;"),
         "the client name is HTML-escaped"
+    );
+}
+
+// ===========================================================================
+// Scope-aware consent (issue #196, item 1): a consent recorded for a narrow scope
+// must never silently auto-grant a broader later request.
+// ===========================================================================
+
+/// A `code`-flow authorize query for the harness public client with an explicit
+/// `scope` (PKCE is mandatory for the public client, so the S256 challenge rides
+/// every request).
+fn scoped_authorize_query(client_id: &str, scope: &str) -> String {
+    format!(
+        "response_type=code&client_id={client_id}&redirect_uri={}&scope={}&\
+         code_challenge={PKCE_CHALLENGE}&code_challenge_method=S256",
+        enc(REDIRECT_URI),
+        enc(scope),
+    )
+}
+
+#[tokio::test]
+async fn a_narrower_consent_reprompts_on_a_broader_scope_and_issues_on_a_subset() {
+    let harness = Harness::start().await;
+    let client_id = harness.client_id().to_string();
+
+    // A prior consent for a NARROW scope (openid) plus an authenticated session.
+    let subject = harness.seed_unique_user().await;
+    harness
+        .grant_consent_scoped(&subject, &client_id, Some("openid"))
+        .await;
+    let cookie = harness.session_cookie(&subject).await;
+
+    // A BROADER request (openid profile email) must NOT auto-issue a code off the
+    // narrow consent: it re-prompts through the consent screen (issue #196).
+    let (status, headers, body) = harness
+        .authorize_with_cookie(
+            &scoped_authorize_query(&client_id, "openid profile email"),
+            &cookie,
+        )
+        .await;
+    assert_eq!(status, StatusCode::FOUND, "authorize redirects: {body}");
+    let broader_location = location(&headers).expect("a redirect location");
+    assert!(
+        broader_location.starts_with("/consent?return_to="),
+        "a broader request re-prompts consent instead of issuing: {broader_location}"
+    );
+    assert!(
+        location_param(&headers, "code").is_none(),
+        "no code is issued to the client for the un-consented broader scope"
+    );
+
+    // A same-or-narrower request (a subset of the granted openid) issues directly,
+    // with no re-prompt.
+    let (status, headers, body) = harness
+        .authorize_with_cookie(&scoped_authorize_query(&client_id, "openid"), &cookie)
+        .await;
+    assert_eq!(status, StatusCode::FOUND, "authorize redirects: {body}");
+    let subset_location = location(&headers).expect("a redirect location");
+    assert!(
+        subset_location.starts_with(REDIRECT_URI),
+        "a subset request issues the code to the redirect_uri: {subset_location}"
+    );
+    assert!(
+        location_param(&headers, "code").is_some(),
+        "a code is issued for the covered scope"
+    );
+}
+
+#[tokio::test]
+async fn re_consenting_broadens_the_grant_and_stops_reprompting() {
+    let harness = Harness::start().await;
+    let client_id = harness.client_id().to_string();
+    let scope = harness.scope();
+
+    // A prior NARROW consent (openid) plus an authenticated session.
+    let subject = harness.seed_unique_user().await;
+    harness
+        .grant_consent_scoped(&subject, &client_id, Some("openid"))
+        .await;
+    let cookie = harness.session_cookie(&subject).await;
+
+    let original = harness
+        .store()
+        .scoped(scope)
+        .consents()
+        .granted_ref(&subject, &client_id)
+        .await
+        .expect("granted_ref read")
+        .expect("a consent is recorded");
+    assert_eq!(
+        original.granted_scope.as_deref(),
+        Some("openid"),
+        "the prior consent is the narrow scope"
+    );
+
+    // A broader request re-prompts; walk the consent redirect and ALLOW it (the
+    // resume return_to carries the broader scope).
+    let (_s, headers, _b) = harness
+        .authorize_with_cookie(
+            &scoped_authorize_query(&client_id, "openid profile email"),
+            &cookie,
+        )
+        .await;
+    let consent_location = location(&headers).expect("consent redirect");
+    assert!(consent_location.starts_with("/consent?return_to="));
+    let (_s, _h, consent_html) = harness
+        .get_with_cookie(&consent_location, Some(&cookie))
+        .await;
+    let consent_return_to = form_field(&consent_html, "return_to").expect("consent return_to");
+    let allow_body = form(&[("decision", "allow"), ("return_to", &consent_return_to)]);
+    let (status, headers, body) = harness
+        .post_form("/consent", &allow_body, Some(&cookie))
+        .await;
+    assert_eq!(status, StatusCode::FOUND, "consent allow: {body}");
+    let resume = location(&headers).expect("resume after consent");
+
+    // The grant now records the BROADER scope, keeping its ORIGINAL id (the upsert
+    // updates in place rather than inserting a second row).
+    let updated = harness
+        .store()
+        .scoped(scope)
+        .consents()
+        .granted_ref(&subject, &client_id)
+        .await
+        .expect("granted_ref read")
+        .expect("a consent is recorded");
+    assert_eq!(
+        updated.granted_scope.as_deref(),
+        Some("openid profile email"),
+        "re-consent persisted the broadened scope"
+    );
+    assert_eq!(
+        updated.id, original.id,
+        "the upsert kept the original consent id"
+    );
+
+    // Resuming now issues the code directly: the broadened consent covers the
+    // request, so there is no re-prompt loop.
+    let (status, headers, body) = harness.get_with_cookie(&resume, Some(&cookie)).await;
+    assert_eq!(status, StatusCode::FOUND, "resume issues: {body}");
+    let final_location = location(&headers).expect("code redirect");
+    assert!(
+        final_location.starts_with(REDIRECT_URI),
+        "the broadened consent issues the code: {final_location}"
+    );
+    assert!(
+        location_param(&headers, "code").is_some(),
+        "a code is issued after the broadened consent"
+    );
+}
+
+// ===========================================================================
+// CSRF defense-in-depth on the login and consent POSTs (issue #196, item 2).
+// ===========================================================================
+
+/// POST a form body to `path` with an optional session cookie AND explicit extra
+/// request headers (name, value), driven through the harness router. Used to attach
+/// the `Origin` / `Sec-Fetch-Site` headers the generic `post_form` does not set.
+async fn post_form_with(
+    harness: &Harness,
+    path: &str,
+    body: &str,
+    cookie: Option<&str>,
+    extra_headers: &[(&str, &str)],
+) -> (StatusCode, HeaderMap, String) {
+    use axum::body::Body;
+    use axum::http::Request;
+
+    let mut builder = Request::builder()
+        .method("POST")
+        .uri(path)
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded");
+    if let Some(cookie) = cookie {
+        builder = builder.header(header::COOKIE, cookie);
+    }
+    for (name, value) in extra_headers {
+        builder = builder.header(*name, *value);
+    }
+    harness
+        .send(
+            builder
+                .body(Body::from(body.to_owned()))
+                .expect("request builds"),
+        )
+        .await
+}
+
+#[tokio::test]
+async fn consent_post_rejects_cross_site_submissions() {
+    let harness = Harness::start().await;
+    let client_id = harness.client_id().to_string();
+    let scope = harness.scope();
+
+    // An authenticated session WITHOUT consent, and a valid consent resume target.
+    let subject = harness.seed_unique_user().await;
+    let cookie = harness.session_cookie(&subject).await;
+    let return_to = format!(
+        "/authorize?response_type=code&client_id={client_id}&redirect_uri={}&scope=openid",
+        enc(REDIRECT_URI)
+    );
+    let allow_body = form(&[("decision", "allow"), ("return_to", &return_to)]);
+
+    // (a) Sec-Fetch-Site: cross-site is refused with a 403 and records NO consent.
+    let (status, _h, _b) = post_form_with(
+        &harness,
+        "/consent",
+        &allow_body,
+        Some(&cookie),
+        &[("sec-fetch-site", "cross-site")],
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "cross-site consent is blocked"
+    );
+    assert!(
+        !consent_is_recorded(&harness, scope, &subject, &client_id).await,
+        "a blocked consent records nothing"
+    );
+
+    // (b) A cross-origin Origin is refused too.
+    let (status, _h, _b) = post_form_with(
+        &harness,
+        "/consent",
+        &allow_body,
+        Some(&cookie),
+        &[("origin", "https://evil.test")],
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "cross-origin consent is blocked"
+    );
+    assert!(
+        !consent_is_recorded(&harness, scope, &subject, &client_id).await,
+        "a blocked consent still records nothing"
+    );
+
+    // (c) A same-origin POST (matching Origin + same-origin fetch metadata) SUCCEEDS:
+    // consent is recorded and the request resumes.
+    let (status, headers, body) = post_form_with(
+        &harness,
+        "/consent",
+        &allow_body,
+        Some(&cookie),
+        &[("origin", ISSUER_BASE), ("sec-fetch-site", "same-origin")],
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FOUND,
+        "same-origin consent succeeds: {body}"
+    );
+    assert!(
+        location(&headers).is_some(),
+        "the same-origin consent resumes the authorization request"
+    );
+    assert!(
+        consent_is_recorded(&harness, scope, &subject, &client_id).await,
+        "the same-origin consent is recorded"
+    );
+}
+
+/// Whether a consent row exists for `subject`/`client_id` in `scope`.
+async fn consent_is_recorded(
+    harness: &Harness,
+    scope: ironauth_store::Scope,
+    subject: &str,
+    client_id: &str,
+) -> bool {
+    harness
+        .store()
+        .scoped(scope)
+        .consents()
+        .granted_ref(subject, client_id)
+        .await
+        .expect("granted_ref read")
+        .is_some()
+}
+
+#[tokio::test]
+async fn login_post_rejects_cross_site_submissions() {
+    let harness = Harness::start().await;
+    let client_id = harness.client_id().to_string();
+    harness
+        .seed_user("csrf@example.test", "s3cr3t-passphrase")
+        .await;
+
+    // A valid login resume target (from the authorize -> login redirect).
+    let (_s, headers, _b) = harness.authorize(&authorize_query(&client_id, None)).await;
+    let return_to = location_param(&headers, "return_to").expect("return_to");
+    let login_body = form(&[
+        ("identifier", "csrf@example.test"),
+        ("password", "s3cr3t-passphrase"),
+        ("return_to", &return_to),
+    ]);
+
+    // (a) Sec-Fetch-Site: cross-site is refused with a 403 and creates NO session.
+    let (status, headers, _b) = post_form_with(
+        &harness,
+        "/login",
+        &login_body,
+        None,
+        &[("sec-fetch-site", "cross-site")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "cross-site login is blocked");
+    assert!(
+        headers.get(header::SET_COOKIE).is_none(),
+        "no session on a blocked login"
+    );
+
+    // (b) A cross-origin Origin is refused too.
+    let (status, headers, _b) = post_form_with(
+        &harness,
+        "/login",
+        &login_body,
+        None,
+        &[("origin", "https://evil.test")],
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "cross-origin login is blocked"
+    );
+    assert!(
+        headers.get(header::SET_COOKIE).is_none(),
+        "still no session on a blocked login"
+    );
+
+    // (c) A same-origin POST with the correct credentials SUCCEEDS and establishes a
+    // session (the redirect carries the Set-Cookie).
+    let (status, headers, body) = post_form_with(
+        &harness,
+        "/login",
+        &login_body,
+        None,
+        &[("origin", ISSUER_BASE)],
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FOUND,
+        "same-origin login succeeds: {body}"
+    );
+    assert!(
+        set_cookie_pair(&headers).is_some(),
+        "the same-origin login establishes a session"
     );
 }

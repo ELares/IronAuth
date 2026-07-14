@@ -242,16 +242,19 @@ async fn expand_contract_example_chain_runs_all_three_phases_and_contract_remove
     );
 }
 
-/// The PRODUCTION chain (`MigrationRunner::new`) contains exactly the eight real
+/// The PRODUCTION chain (`MigrationRunner::new`) contains exactly the ten real
 /// migrations and leaves no throwaway demo object in a real database.
+// A long but linear ledger-and-table assertion sweep (one line per migration and
+// per real table); splitting it would not make it clearer.
+#[allow(clippy::too_many_lines)]
 #[tokio::test]
-async fn production_chain_is_only_the_eight_real_migrations_and_ships_no_demo_object() {
+async fn production_chain_is_only_the_ten_real_migrations_and_ships_no_demo_object() {
     // TestDatabase::start runs Store::migrate() (the production chain) on a
     // fresh, empty database.
     let db = TestDatabase::start().await;
     let pool = db.owner_pool();
 
-    // Re-running is idempotent and reports exactly eight tracked migrations.
+    // Re-running is idempotent and reports exactly ten tracked migrations.
     let report = MigrationRunner::new(pool)
         .run()
         .await
@@ -262,16 +265,16 @@ async fn production_chain_is_only_the_eight_real_migrations_and_ships_no_demo_ob
     );
     assert_eq!(
         report.already_applied(),
-        9,
-        "the production chain is exactly nine migrations (isolation, audit log, management API, \
+        10,
+        "the production chain is exactly ten migrations (isolation, audit log, management API, \
          OIDC authorization, signing keys, login/consent, authentication context, redirect \
-         registration, UserInfo claims)"
+         registration, UserInfo claims, consent scope upsert)"
     );
 
-    // The ledger holds exactly versions 1 through 9.
+    // The ledger holds exactly versions 1 through 10.
     assert_eq!(
         applied_versions(pool).await,
-        vec![1_i64, 2, 3, 4, 5, 6, 7, 8, 9]
+        vec![1_i64, 2, 3, 4, 5, 6, 7, 8, 9, 10]
     );
     let phase_of = |version: i64| async move {
         sqlx::query("SELECT phase FROM _schema_migrations WHERE version = $1")
@@ -290,6 +293,7 @@ async fn production_chain_is_only_the_eight_real_migrations_and_ships_no_demo_ob
     assert_eq!(phase_of(7).await, "expand");
     assert_eq!(phase_of(8).await, "expand");
     assert_eq!(phase_of(9).await, "expand");
+    assert_eq!(phase_of(10).await, "expand");
 
     // The demo object never reaches a production database.
     assert!(

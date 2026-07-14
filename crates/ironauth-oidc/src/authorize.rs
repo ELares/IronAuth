@@ -29,8 +29,8 @@ use axum::extract::{Form, Query, State};
 use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
 use ironauth_store::{
-    AuthorizationCodeId, ClientId, ClientRecord, CorrelationId, GrantId, IssueCode, Scope,
-    StoreError, redirect_uri_is_registrable, redirect_uri_matches,
+    AuthorizationCodeId, ClientId, ClientRecord, CorrelationId, GrantId, GrantedConsent, IssueCode,
+    Scope, StoreError, redirect_uri_is_registrable, redirect_uri_matches,
 };
 use serde::Deserialize;
 
@@ -765,9 +765,11 @@ enum Gate {
 /// With no usable session it redirects to login (or registration for
 /// `prompt=create`); with a session that `prompt=login`/`select_account`/`max_age`
 /// mark stale it forces a fresh login; with a usable session it re-prompts consent
-/// for `prompt=consent` or when none is recorded, and otherwise reports the request
-/// ready. Under `prompt=none` NO UI is ever rendered: the matching `login_required`
-/// / `consent_required` error is returned through the negotiated `mode` instead. A
+/// for `prompt=consent`, when none is recorded, or when the recorded consent does
+/// NOT cover the requested scope (issue #196: a narrow prior consent never
+/// auto-grants a broader request), and otherwise reports the request ready. Under
+/// `prompt=none` NO UI is ever rendered: the matching `login_required` /
+/// `consent_required` error is returned through the negotiated `mode` instead. A
 /// consent-store failure is a `server_error` redirect (the `redirect_uri` is
 /// already validated).
 #[allow(clippy::too_many_arguments)]
@@ -843,48 +845,69 @@ async fn resolve_gate(
 
     let client_id_str = client_id.to_string();
     let force_consent = prompt.contains(PromptValue::Consent);
-    // Bootstrap limitation tracked in #196 (a hard prerequisite for enabling OIDC,
-    // #13): consent is looked up per (subject, client_id) only, so a prior consent
-    // for a narrow scope auto-grants any later broader scope. Before enablement this
-    // must re-prompt when the requested scope is not a subset of the granted scope.
-    match state
+    // Consent is recorded per (subject, client) TOGETHER with the scope it was
+    // granted against (issue #196). A recorded consent authorizes a later request
+    // only when that request's scope is a SUBSET of the granted scope (see
+    // [`consent_covers_scope`]), so a consent for a narrow scope never silently
+    // auto-grants a broader (or disjoint) one: an uncovered request is treated as
+    // un-consented and re-prompts, exactly as a missing consent does.
+    // prompt=consent forces a fresh screen regardless.
+    let Ok(recorded) = state
         .store()
         .scoped(scope)
         .consents()
         .granted_ref(&session.subject, &client_id_str)
         .await
-    {
-        // Consent recorded. prompt=consent forces a fresh consent screen even so
-        // (never reached under prompt=none, which cannot combine with consent).
-        Ok(Some(consent_ref)) => {
-            if force_consent {
-                Ok(Gate::Interaction(interaction::consent_redirect(
-                    &consent_resume_url(params, hints, prompt),
-                )))
-            } else {
-                Ok(Gate::Ready {
-                    session,
-                    consent_ref,
-                })
-            }
-        }
-        // No consent recorded: consent is required.
-        Ok(None) => {
-            if prompt_none {
-                return Err(gate_error(
-                    AuthzErrorCode::ConsentRequired,
-                    "consent is required but prompt=none forbids interaction",
-                ));
-            }
-            Ok(Gate::Interaction(interaction::consent_redirect(
-                &consent_resume_url(params, hints, prompt),
-            )))
-        }
-        Err(_) => Err(gate_error(
+    else {
+        // A consent-store failure fails closed to a server_error redirect (the
+        // redirect_uri is already validated).
+        return Err(gate_error(
             AuthzErrorCode::ServerError,
             "the authorization request could not be processed",
-        )),
+        ));
+    };
+
+    if consent_covers_scope(recorded.as_ref(), params.scope.as_deref()) && !force_consent {
+        // A recorded consent covers the requested scope and none is forced: ready.
+        let consent_ref = recorded.expect("a covering consent is recorded").id;
+        return Ok(Gate::Ready {
+            session,
+            consent_ref,
+        });
     }
+
+    // Consent is required: none recorded, the recorded one does not cover the
+    // requested scope, or prompt=consent forced a fresh screen. Under prompt=none no
+    // UI is rendered: the consent_required error goes back through the negotiated
+    // mode instead (prompt=none cannot combine with prompt=consent, so a forced
+    // screen never reaches here under it).
+    if prompt_none {
+        return Err(gate_error(
+            AuthzErrorCode::ConsentRequired,
+            "consent is required but prompt=none forbids interaction",
+        ));
+    }
+    Ok(Gate::Interaction(interaction::consent_redirect(
+        &consent_resume_url(params, hints, prompt),
+    )))
+}
+
+/// Whether a recorded consent covers a request's `scope` (issue #196).
+///
+/// A consent covers the request only when the request's scope token set is a
+/// SUBSET of the consent's granted scope set, both split on ASCII whitespace (the
+/// OAuth scope grammar, matching the mint's own [`parse_scope_set`]) with an absent
+/// value being the empty set. So a consent recorded for a narrow scope (for example
+/// `openid`) does NOT cover a later broader request (`openid profile email`), which
+/// must re-prompt; a same-or-narrower request stays covered. A missing consent
+/// ([`None`]) covers nothing.
+fn consent_covers_scope(recorded: Option<&GrantedConsent>, requested_scope: Option<&str>) -> bool {
+    let Some(consent) = recorded else {
+        return false;
+    };
+    let requested = parse_scope_set(requested_scope);
+    let granted = parse_scope_set(consent.granted_scope.as_deref());
+    requested.is_subset(&granted)
 }
 
 /// Parse the `prompt` request parameter into a [`PromptSet`] (issue #16). An absent
@@ -1222,5 +1245,41 @@ mod tests {
         )
         .expect("parse");
         assert!(acr_requirement_error(&met, "pwd").is_none());
+    }
+
+    #[test]
+    fn consent_covers_scope_enforces_the_subset_rule() {
+        // A consent recorded for a NARROW scope does not cover a BROADER request:
+        // that is the #196 fix (a narrow prior consent must not auto-grant more).
+        let narrow = GrantedConsent {
+            id: "con_x".to_owned(),
+            granted_scope: Some("openid".to_owned()),
+        };
+        assert!(!consent_covers_scope(
+            Some(&narrow),
+            Some("openid profile email")
+        ));
+        // The same or a narrower (subset) request stays covered.
+        assert!(consent_covers_scope(Some(&narrow), Some("openid")));
+        assert!(consent_covers_scope(Some(&narrow), None));
+
+        // Set semantics: token ORDER and repeated whitespace do not matter, but a
+        // token outside the granted set (address) is never covered.
+        let broad = GrantedConsent {
+            id: "con_y".to_owned(),
+            granted_scope: Some("openid  profile   email".to_owned()),
+        };
+        assert!(consent_covers_scope(Some(&broad), Some("email openid")));
+        assert!(!consent_covers_scope(Some(&broad), Some("openid address")));
+
+        // A missing consent covers nothing; an absent granted_scope is the empty set
+        // (covers only an empty request).
+        assert!(!consent_covers_scope(None, Some("openid")));
+        let unscoped = GrantedConsent {
+            id: "con_z".to_owned(),
+            granted_scope: None,
+        };
+        assert!(!consent_covers_scope(Some(&unscoped), Some("openid")));
+        assert!(consent_covers_scope(Some(&unscoped), None));
     }
 }

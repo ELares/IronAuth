@@ -1,0 +1,25 @@
+-- SPDX-License-Identifier: MIT OR Apache-2.0
+--
+-- Scope-aware consent: let the data-plane role UPDATE a recorded consent's
+-- granted_scope (issue #196).
+--
+-- Issue #20 recorded consent per (subject, client) and granted the data-plane
+-- role only SELECT and INSERT on `consents` (see 0006), because a re-grant was an
+-- idempotent no-op (ON CONFLICT DO NOTHING). The scope-aware consent fix
+-- (issue #196) makes the authorization endpoint re-prompt when a request's scope
+-- is not a subset of the recorded granted_scope, and records the broadened scope
+-- on re-consent via an UPSERT (ON CONFLICT DO UPDATE SET granted_scope). Without
+-- this, a broadened consent would never be persisted and the subject would
+-- re-prompt forever.
+--
+-- PostgreSQL requires the UPDATE privilege on the target table for any
+-- INSERT ... ON CONFLICT DO UPDATE (checked whether or not a conflict fires), so
+-- the data-plane role needs UPDATE on `consents`. This is the ONLY change: the
+-- column (`granted_scope`) and the row-level-security policy (whose USING and
+-- WITH CHECK clauses already cover UPDATE) both already exist from 0006, so no
+-- table, column, index, constraint, or policy is added or altered.
+--
+-- Additive and safe for the old binary: the old code path only ever runs
+-- INSERT ... ON CONFLICT DO NOTHING, which an extra privilege never affects.
+
+GRANT UPDATE ON consents TO ironauth_app;
