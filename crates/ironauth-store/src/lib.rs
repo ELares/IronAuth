@@ -107,14 +107,14 @@ pub use repository::{
     NewDynamicClient, NewExternalAssertionIssuer, NewInitialAccessToken, NewJwtAuthClient,
     NewOpaqueAccessToken, NewRefreshFamily, NewResourceServer, NewSession, NewSigningKey,
     PriorSessionOutcome, PushRequest, PushedRequestRepo, RedeemOutcome, RefreshFamilyFleetFilter,
-    RefreshFamilyFleetRepo, RefreshFamilySummary, RefreshRedeem, RefreshRedeemOutcome, RefreshRepo,
-    RefreshTokenResolution, ResourceServerRecord, ResourceServerRepo, RotatedRefreshToken,
-    ScopedStore, ServiceAccountRepo, SessionEndCause, SessionFleetFilter, SessionFleetRepo,
-    SessionRecord, SessionRepo, SessionRevocation, SessionSummary, SigningKeyMaterial,
-    SigningKeyMaterialKind, SigningKeyRecord, SigningKeyRepo, StoredIdempotentResponse,
-    TenantRecord, TenantRepo, TokenFormat, TokenKind, TokenStatus, UserRecord, UserRepo,
-    UserRevocation, device_code_digest, opaque_access_token_digest, refresh_token_digest,
-    user_code_hash,
+    RefreshFamilyFleetRepo, RefreshFamilyOpenOutcome, RefreshFamilySummary, RefreshRedeem,
+    RefreshRedeemOutcome, RefreshRepo, RefreshTokenResolution, ResourceServerRecord,
+    ResourceServerRepo, RotatedRefreshToken, ScopedStore, ServiceAccountRepo, SessionEndCause,
+    SessionFleetFilter, SessionFleetRepo, SessionRecord, SessionRepo, SessionRevocation,
+    SessionSummary, SigningKeyMaterial, SigningKeyMaterialKind, SigningKeyRecord, SigningKeyRepo,
+    StoredIdempotentResponse, TenantRecord, TenantRepo, TokenFormat, TokenKind, TokenStatus,
+    UserRecord, UserRepo, UserRevocation, device_code_digest, opaque_access_token_digest,
+    refresh_token_digest, user_code_hash,
 };
 pub use scope::Scope;
 pub use store::Store;

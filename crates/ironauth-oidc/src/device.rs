@@ -37,7 +37,7 @@ use ironauth_env::Env;
 use ironauth_store::{
     ApprovedDeviceGrant, ClientId, CorrelationId, DeviceCodeId, DevicePollOutcome,
     DeviceRedeemOutcome, IssuedTokenRecord, NewDeviceCode, NewOpaqueAccessToken, NewRefreshFamily,
-    RefreshFamilyId, Scope, SessionId, StoreError, TokenKind,
+    RefreshFamilyId, RefreshFamilyOpenOutcome, Scope, SessionId, StoreError, TokenKind,
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -438,7 +438,7 @@ async fn issue_device_tokens(
 
     match outcome {
         DeviceRedeemOutcome::Redeemed => {
-            let refresh = issue_device_refresh(state, scope, &grant).await;
+            let refresh = issue_device_refresh(state, scope, &grant).await?;
             Ok(device_token_response(
                 &minted,
                 grant.requested_scope.as_deref(),
@@ -547,8 +547,12 @@ async fn mint_device_tokens(
 }
 
 /// Open a refresh-token family for an approved device flow, if the environment issues
-/// refresh tokens (issue #24, #21). A failure only costs this exchange its refresh
-/// token (logged), never the whole exchange, exactly like the code grant.
+/// refresh tokens (issue #24, #21). A store fault only costs this exchange its refresh
+/// token (logged), never the whole exchange, exactly like the code grant. But a
+/// session-bound (non-offline) open REFUSED because the approving human's SSO session
+/// was revoked in the open window (issue #32) is a hard `invalid_grant`: no family is
+/// created, so a logout that already cascaded cannot be outlived by a family opened
+/// just after it (the same rule the code grant enforces).
 ///
 /// DELIBERATE decision (issue #24): the device grant issues a refresh token whenever
 /// the environment issues them AT ALL, regardless of whether `offline_access` was
@@ -563,9 +567,9 @@ async fn issue_device_refresh(
     state: &OidcState,
     scope: Scope,
     grant: &ApprovedDeviceGrant,
-) -> Option<String> {
+) -> Result<Option<String>, TokenError> {
     if !state.issue_refresh_tokens() {
-        return None;
+        return Ok(None);
     }
     let offline = grant.requested_scope.as_deref().is_some_and(|value| {
         value
@@ -585,7 +589,7 @@ async fn issue_device_refresh(
             .unwrap_or(now),
     );
     let Ok(client_id) = ClientId::parse_in_scope(&grant.client_id, &scope) else {
-        return None;
+        return Ok(None);
     };
     let actor = client_service_actor(&client_id);
     let correlation = CorrelationId::generate(state.env());
@@ -613,10 +617,13 @@ async fn issue_device_refresh(
         )
         .await;
     match result {
-        Ok(()) => Some(minted.token),
+        Ok(RefreshFamilyOpenOutcome::Opened) => Ok(Some(minted.token)),
+        // The approving human's SSO session was revoked in the open window, so no
+        // session-bound family was created: fail the exchange closed.
+        Ok(RefreshFamilyOpenOutcome::SessionNotLive) => Err(TokenError::InvalidGrant),
         Err(error) => {
             tracing::warn!(%error, "could not open a refresh-token family for a device flow");
-            None
+            Ok(None)
         }
     }
 }

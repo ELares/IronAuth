@@ -18,9 +18,9 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use ironauth_env::Env;
 use ironauth_store::test_support::TestDatabase;
 use ironauth_store::{
-    AuthorizationCodeId, ClientId, CorrelationId, GrantId, IssueCode, RefreshFamilyId,
-    RefreshRedeem, RefreshRedeemOutcome, RefreshTokenId, RotatedRefreshToken, Scope, SessionId,
-    refresh_token_digest,
+    AuthorizationCodeId, ClientId, CorrelationId, GrantId, IssueCode, NewRefreshFamily, NewSession,
+    RefreshFamilyId, RefreshFamilyOpenOutcome, RefreshRedeem, RefreshRedeemOutcome, RefreshTokenId,
+    RotatedRefreshToken, Scope, SessionEndCause, SessionId, refresh_token_digest,
 };
 use sqlx::Row;
 
@@ -86,6 +86,34 @@ async fn seed_grant(
     grant_id
 }
 
+/// Create a LIVE session in `scope` for `subject`, so a session-bound family opened
+/// against it passes the live-session guard (issue #32). Far-future expiries keep it
+/// live until a test explicitly revokes it.
+async fn create_session(db: &TestDatabase, env: &Env, scope: Scope, subject: &str) -> SessionId {
+    let id = SessionId::generate(env, &scope);
+    db.store()
+        .scoped(scope)
+        .acting(db.test_actor(env), CorrelationId::generate(env))
+        .sessions()
+        .rotate(
+            env,
+            &id,
+            None,
+            NewSession {
+                subject,
+                auth_methods: "pwd",
+                auth_time_micros: 0,
+                idle_expires_micros: FAR_FUTURE_MICROS,
+                absolute_expires_micros: FAR_FUTURE_MICROS,
+                user_agent: None,
+                peer_ip: None,
+            },
+        )
+        .await
+        .expect("create session");
+    id
+}
+
 /// Open a refresh-token family (generation 0) rooted at `grant_id`, returning the
 /// family id, the generation-0 token, its jti, and its digest.
 #[allow(clippy::too_many_arguments)]
@@ -107,7 +135,7 @@ async fn open_family(
         .refresh()
         .issue(
             env,
-            ironauth_store::NewRefreshFamily {
+            NewRefreshFamily {
                 family_id: &family_id,
                 token_jti: &jti,
                 token_digest: &digest,
@@ -479,7 +507,7 @@ async fn rp_logout_revokes_session_bound_families_but_offline_access_survives() 
     let db = TestDatabase::start().await;
     let (env, _clock) = Env::deterministic(std::time::SystemTime::UNIX_EPOCH, 0x21_00_06);
     let scope = db.seed_scope(&env).await;
-    let session = SessionId::generate(&env, &scope);
+    let session = create_session(&db, &env, scope, "usr_logout").await;
 
     // Two families under the SAME session: one session-bound, one offline_access.
     let bound_grant = seed_grant(&db, &env, scope, "usr_logout", Some(&session)).await;
@@ -551,6 +579,210 @@ async fn rp_logout_revokes_session_bound_families_but_offline_access_survives() 
         count_action(&db, scope, "refresh_token.reuse").await,
         0,
         "an RP logout is not a reuse"
+    );
+}
+
+/// Count the refresh families in scope bound to `session`, through the OWNER pool
+/// (bypassing RLS), so a test can prove a refused open created NONE.
+async fn families_bound_to(db: &TestDatabase, session: &SessionId) -> i64 {
+    sqlx::query("SELECT count(*) AS c FROM refresh_families WHERE session_ref = $1")
+        .bind(session.to_string())
+        .fetch_one(db.owner_pool())
+        .await
+        .expect("count families")
+        .get("c")
+}
+
+/// Open a family rooted at `grant` for `session_subject` with the given `offline`
+/// flag, returning the open OUTCOME and the plaintext generation-0 token, WITHOUT
+/// asserting success (the point of these tests is the outcome itself).
+async fn issue_family(
+    db: &TestDatabase,
+    env: &Env,
+    scope: Scope,
+    grant: &GrantId,
+    subject: &str,
+    offline: bool,
+) -> (RefreshFamilyOpenOutcome, String, RefreshFamilyId) {
+    let family_id = RefreshFamilyId::generate(env, &scope);
+    let (token, jti, digest) = make_refresh_token(env, scope);
+    let outcome = db
+        .store()
+        .scoped(scope)
+        .acting(db.test_actor(env), CorrelationId::generate(env))
+        .refresh()
+        .issue(
+            env,
+            NewRefreshFamily {
+                family_id: &family_id,
+                token_jti: &jti,
+                token_digest: &digest,
+                grant_id: grant,
+                subject,
+                client_id: "cli_family",
+                scope: Some("openid"),
+                auth_methods: "pwd",
+                offline,
+                created_at_unix_micros: 0,
+                idle_expires_at_unix_micros: FAR_FUTURE_MICROS,
+                absolute_expires_at_unix_micros: FAR_FUTURE_MICROS,
+            },
+        )
+        .await
+        .expect("the issue call itself succeeds");
+    (outcome, token, family_id)
+}
+
+#[tokio::test]
+async fn a_session_bound_family_is_refused_when_its_session_died_in_the_open_window() {
+    // Issue #32, the same class as the rotation-orphaning fix: the token endpoint's
+    // liveness read and this family open run in SEPARATE transactions. A session revoke
+    // that commits in the window between them (its cascade already run) must NOT leave a
+    // fresh session-bound family bound to the now-dead session, outliving the logout
+    // that should have killed it. The guarded open fails CLOSED with SessionNotLive and
+    // writes nothing. Modeled by revoking the session directly between seeding the grant
+    // and opening the family.
+    let db = TestDatabase::start().await;
+    let (env, _clock) = Env::deterministic(std::time::SystemTime::UNIX_EPOCH, 0x32_00_01);
+    let scope = db.seed_scope(&env).await;
+    let session = create_session(&db, &env, scope, "usr_window").await;
+    let grant = seed_grant(&db, &env, scope, "usr_window", Some(&session)).await;
+
+    // The window revoke: the SSO session is logged out after the liveness read but
+    // before the open.
+    db.store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .sessions()
+        .revoke(&env, &session, SessionEndCause::LoggedOut, false, None)
+        .await
+        .expect("revoke session in the window");
+
+    let (outcome, token, _family) =
+        issue_family(&db, &env, scope, &grant, "usr_window", false).await;
+    assert_eq!(
+        outcome,
+        RefreshFamilyOpenOutcome::SessionNotLive,
+        "a session-bound family whose session died in the window must be refused"
+    );
+    assert_eq!(
+        families_bound_to(&db, &session).await,
+        0,
+        "NO session-bound refresh family exists after the refusal"
+    );
+    assert!(
+        db.store()
+            .scoped(scope)
+            .refresh()
+            .load(&token)
+            .await
+            .expect("load")
+            .is_none(),
+        "and no generation-0 refresh token was recorded"
+    );
+    assert_eq!(
+        count_action(&db, scope, "refresh_token.issue").await,
+        0,
+        "a refused open writes no refresh_token.issue audit row"
+    );
+}
+
+#[tokio::test]
+async fn a_live_session_still_opens_its_session_bound_family() {
+    // The other side of the guard: a genuinely LIVE session opens its family normally.
+    let db = TestDatabase::start().await;
+    let (env, _clock) = Env::deterministic(std::time::SystemTime::UNIX_EPOCH, 0x32_00_02);
+    let scope = db.seed_scope(&env).await;
+    let session = create_session(&db, &env, scope, "usr_live").await;
+    let grant = seed_grant(&db, &env, scope, "usr_live", Some(&session)).await;
+
+    let (outcome, token, _family) = issue_family(&db, &env, scope, &grant, "usr_live", false).await;
+    assert_eq!(
+        outcome,
+        RefreshFamilyOpenOutcome::Opened,
+        "a live session opens its session-bound family"
+    );
+    assert_eq!(
+        families_bound_to(&db, &session).await,
+        1,
+        "exactly one session-bound family exists"
+    );
+    assert!(
+        db.store()
+            .scoped(scope)
+            .refresh()
+            .load(&token)
+            .await
+            .expect("load")
+            .expect("recorded")
+            .active,
+        "and its generation-0 token is live"
+    );
+}
+
+#[tokio::test]
+async fn an_offline_family_opens_even_when_its_session_is_already_dead() {
+    // offline_access deliberately survives RP logout (issue #21), so the liveness guard
+    // must NOT apply to it: the family opens even though the bound session is revoked.
+    let db = TestDatabase::start().await;
+    let (env, _clock) = Env::deterministic(std::time::SystemTime::UNIX_EPOCH, 0x32_00_03);
+    let scope = db.seed_scope(&env).await;
+    let session = create_session(&db, &env, scope, "usr_offline").await;
+    let grant = seed_grant(&db, &env, scope, "usr_offline", Some(&session)).await;
+    db.store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .sessions()
+        .revoke(&env, &session, SessionEndCause::LoggedOut, false, None)
+        .await
+        .expect("revoke session");
+
+    let (outcome, token, _family) =
+        issue_family(&db, &env, scope, &grant, "usr_offline", true).await;
+    assert_eq!(
+        outcome,
+        RefreshFamilyOpenOutcome::Opened,
+        "an offline_access family opens regardless of session liveness"
+    );
+    assert!(
+        db.store()
+            .scoped(scope)
+            .refresh()
+            .load(&token)
+            .await
+            .expect("load")
+            .expect("recorded")
+            .active,
+        "and it is live: offline_access survives logout"
+    );
+}
+
+#[tokio::test]
+async fn a_grant_with_no_session_opens_its_family_unconditionally() {
+    // A grant that never carried a session (session_ref NULL) is not session-bound, so
+    // the guard does not apply and a non-offline family opens unconditionally.
+    let db = TestDatabase::start().await;
+    let (env, _clock) = Env::deterministic(std::time::SystemTime::UNIX_EPOCH, 0x32_00_04);
+    let scope = db.seed_scope(&env).await;
+    let grant = seed_grant(&db, &env, scope, "usr_nosession", None).await;
+
+    let (outcome, token, _family) =
+        issue_family(&db, &env, scope, &grant, "usr_nosession", false).await;
+    assert_eq!(
+        outcome,
+        RefreshFamilyOpenOutcome::Opened,
+        "a grant with no session opens its family unconditionally"
+    );
+    assert!(
+        db.store()
+            .scoped(scope)
+            .refresh()
+            .load(&token)
+            .await
+            .expect("load")
+            .expect("recorded")
+            .active,
+        "and its token is live"
     );
 }
 

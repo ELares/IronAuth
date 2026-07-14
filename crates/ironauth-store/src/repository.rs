@@ -5999,6 +5999,22 @@ impl fmt::Debug for NewRefreshFamily<'_> {
     }
 }
 
+/// The outcome of opening a refresh-token family ([`ActingRefreshRepo::issue`], issue
+/// #21 / #32).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefreshFamilyOpenOutcome {
+    /// The family and its generation-0 token were recorded.
+    Opened,
+    /// A SESSION-BOUND (non-offline) family was refused because the SSO session it
+    /// would hang off is no longer live: it was revoked (an RP logout, an operator
+    /// revoke) in the window between the token endpoint's liveness read and this
+    /// open, and that revoke's cascade already ran, so opening the family would leave
+    /// it outliving the logout that should have killed it. NOTHING was written. The
+    /// token grant maps this to `invalid_grant`. An offline family (survives logout
+    /// per issue #21) and a grant with no session are never refused this way.
+    SessionNotLive,
+}
+
 /// A rotated successor refresh token to record when a presented token rotates
 /// (issue #21). Only the digest is carried, never the plaintext.
 #[derive(Clone, Copy)]
@@ -6205,14 +6221,30 @@ impl ActingRefreshRepo<'_> {
     /// Open a refresh-token family at first issuance: record the family and its
     /// generation-0 token, plus a `refresh_token.issue` audit row, in one
     /// transaction. Reads the grant's `session_ref` (so an RP logout can later
-    /// revoke a session-bound family) inside the same transaction. Called after a
-    /// successful code exchange.
+    /// revoke a session-bound family) inside the SAME statement that opens the
+    /// family. Called after a successful code exchange (or an approved device flow).
+    ///
+    /// # A dead session gets no session-bound family
+    ///
+    /// For a SESSION-BOUND (non-offline) family the open is guarded, in that same
+    /// statement, by the live-session predicate the auth read path uses, so a session
+    /// that was revoked in the window after the token endpoint's liveness read but
+    /// before this open yields no row: nothing is inserted and this returns
+    /// [`RefreshFamilyOpenOutcome::SessionNotLive`] (the grant path maps it to
+    /// `invalid_grant`). That closes the check-then-act window in which a logout's
+    /// cascade, already run, would otherwise miss a freshly opened family and let it
+    /// outlive the logout. An offline family (survives logout per issue #21) and a
+    /// grant with no session both open unconditionally.
     ///
     /// # Errors
     ///
     /// [`StoreError::NotFound`] if any supplied identifier is out of scope;
     /// [`StoreError::Database`] on a persistence failure.
-    pub async fn issue(&self, env: &Env, family: NewRefreshFamily<'_>) -> Result<(), StoreError> {
+    pub async fn issue(
+        &self,
+        env: &Env,
+        family: NewRefreshFamily<'_>,
+    ) -> Result<RefreshFamilyOpenOutcome, StoreError> {
         if family.family_id.scope() != self.scope
             || family.token_jti.scope() != self.scope
             || family.grant_id.scope() != self.scope
@@ -6220,72 +6252,94 @@ impl ActingRefreshRepo<'_> {
             return Err(StoreError::NotFound);
         }
         let scope = self.scope;
-        write_audited(
-            AuditedWrite {
-                store: self.store,
-                scope,
-                acting: &self.acting,
-                env,
-                action: Action::RefreshTokenIssue,
-                target: family.family_id,
-            },
-            async move |tx| {
-                // Read the grant's session_ref so a session-bound family can be
-                // revoked at RP logout. NULL when no session backed the grant.
-                let session_ref: Option<String> = sqlx::query(
-                    "SELECT session_ref FROM grants \
-                     WHERE id = $1 AND tenant_id = $2 AND environment_id = $3",
-                )
-                .bind(family.grant_id.to_string())
-                .bind(scope.tenant().to_string())
-                .bind(scope.environment().to_string())
-                .fetch_optional(&mut **tx)
-                .await?
-                .and_then(|row| row.get::<Option<String>, _>("session_ref"));
-                sqlx::query(
-                    "INSERT INTO refresh_families \
-                     (id, tenant_id, environment_id, grant_id, subject, client_id, scope, \
-                      auth_methods, session_ref, offline, created_at, absolute_expires_at) \
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, \
-                             TIMESTAMPTZ 'epoch' + ($11::text || ' microseconds')::interval, \
-                             TIMESTAMPTZ 'epoch' + ($12::text || ' microseconds')::interval)",
-                )
-                .bind(family.family_id.to_string())
-                .bind(scope.tenant().to_string())
-                .bind(scope.environment().to_string())
-                .bind(family.grant_id.to_string())
-                .bind(family.subject)
-                .bind(family.client_id)
-                .bind(family.scope)
-                .bind(family.auth_methods)
-                .bind(session_ref)
-                .bind(family.offline)
-                .bind(family.created_at_unix_micros)
-                .bind(family.absolute_expires_at_unix_micros)
-                .execute(&mut **tx)
-                .await?;
-                sqlx::query(
-                    "INSERT INTO refresh_tokens \
-                     (token_digest, tenant_id, environment_id, family_id, jti, generation, \
-                      predecessor_jti, issued_at, idle_expires_at) \
-                     VALUES ($1, $2, $3, $4, $5, 0, NULL, \
-                             TIMESTAMPTZ 'epoch' + ($6::text || ' microseconds')::interval, \
-                             TIMESTAMPTZ 'epoch' + ($7::text || ' microseconds')::interval)",
-                )
-                .bind(family.token_digest)
-                .bind(scope.tenant().to_string())
-                .bind(scope.environment().to_string())
-                .bind(family.family_id.to_string())
-                .bind(family.token_jti.to_string())
-                .bind(family.created_at_unix_micros)
-                .bind(family.idle_expires_at_unix_micros)
-                .execute(&mut **tx)
-                .await?;
-                Ok(())
-            },
-            false,
+        let tenant = scope.tenant().to_string();
+        let environment = scope.environment().to_string();
+        // Liveness comparison time from the application clock seam, never the DB
+        // clock, so it stays deterministic under a manual test clock.
+        let now_micros = epoch_micros(env.clock().now_utc());
+        // Bespoke committing path (like the redeem): the family open, its
+        // generation-0 token, and the issue audit share ONE transaction, and a
+        // refused open writes NONE of them.
+        let mut tx = begin_scoped(self.store, scope).await?;
+        // Open the family reading the grant's session_ref in the SAME statement, and
+        // for a SESSION-BOUND (non-offline) family ONLY when that session is still
+        // live. This closes the check-then-act window between the token endpoint's
+        // liveness read and this open: an RP logout that commits in between (its
+        // cascade already run over the families that existed then) would otherwise
+        // leave a fresh session-bound family bound to a now-dead session, outliving
+        // the logout that should have killed it. An offline family (offline = true)
+        // deliberately survives logout (issue #21), and a grant with no session
+        // (session_ref NULL) is not session-bound; both open unconditionally. When
+        // the session is dead the SELECT yields no row, nothing is inserted, and this
+        // reports SessionNotLive (the token grant maps it to invalid_grant). The
+        // liveness predicate is the SAME one the session read path applies.
+        let inserted = sqlx::query(
+            "INSERT INTO refresh_families \
+             (id, tenant_id, environment_id, grant_id, subject, client_id, scope, \
+              auth_methods, session_ref, offline, created_at, absolute_expires_at) \
+             SELECT $1, $2, $3, $4, $5, $6, $7, $8, g.session_ref, $9, \
+                    TIMESTAMPTZ 'epoch' + ($10::text || ' microseconds')::interval, \
+                    TIMESTAMPTZ 'epoch' + ($11::text || ' microseconds')::interval \
+             FROM grants g \
+             WHERE g.id = $4 AND g.tenant_id = $2 AND g.environment_id = $3 \
+             AND ($9 OR g.session_ref IS NULL OR EXISTS ( \
+                 SELECT 1 FROM sessions s \
+                 WHERE s.id = g.session_ref AND s.tenant_id = $2 AND s.environment_id = $3 \
+                 AND s.revoked_at IS NULL AND s.ended_at IS NULL AND s.superseded_by IS NULL \
+                 AND COALESCE(s.absolute_expires_at, s.expires_at) > \
+                     TIMESTAMPTZ 'epoch' + ($12::text || ' microseconds')::interval \
+                 AND (s.idle_expires_at IS NULL OR s.idle_expires_at > \
+                      TIMESTAMPTZ 'epoch' + ($12::text || ' microseconds')::interval)))",
         )
-        .await
+        .bind(family.family_id.to_string())
+        .bind(&tenant)
+        .bind(&environment)
+        .bind(family.grant_id.to_string())
+        .bind(family.subject)
+        .bind(family.client_id)
+        .bind(family.scope)
+        .bind(family.auth_methods)
+        .bind(family.offline)
+        .bind(family.created_at_unix_micros)
+        .bind(family.absolute_expires_at_unix_micros)
+        .bind(now_micros)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if inserted == 0 {
+            // No live session backed a session-bound family (or the grant vanished):
+            // open nothing, write no token and no issue audit, and report the refusal.
+            tx.commit().await?;
+            return Ok(RefreshFamilyOpenOutcome::SessionNotLive);
+        }
+        sqlx::query(
+            "INSERT INTO refresh_tokens \
+             (token_digest, tenant_id, environment_id, family_id, jti, generation, \
+              predecessor_jti, issued_at, idle_expires_at) \
+             VALUES ($1, $2, $3, $4, $5, 0, NULL, \
+                     TIMESTAMPTZ 'epoch' + ($6::text || ' microseconds')::interval, \
+                     TIMESTAMPTZ 'epoch' + ($7::text || ' microseconds')::interval)",
+        )
+        .bind(family.token_digest)
+        .bind(&tenant)
+        .bind(&environment)
+        .bind(family.family_id.to_string())
+        .bind(family.token_jti.to_string())
+        .bind(family.created_at_unix_micros)
+        .bind(family.idle_expires_at_unix_micros)
+        .execute(&mut *tx)
+        .await?;
+        let spec = AuditedWrite {
+            store: self.store,
+            scope,
+            acting: &self.acting,
+            env,
+            action: Action::RefreshTokenIssue,
+            target: family.family_id,
+        };
+        insert_audit_row(&mut tx, &spec, None).await?;
+        tx.commit().await?;
+        Ok(RefreshFamilyOpenOutcome::Opened)
     }
 
     /// Atomically redeem (refresh) a presented refresh token, with reuse detection.

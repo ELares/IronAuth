@@ -57,8 +57,9 @@ use ironauth_jose::JwsAlgorithm;
 use ironauth_store::{
     ActorRef, AuthorizationCodeId, ClientAuthRecord, ClientId, CodeBindings, CorrelationId,
     IssuedTokenRecord, NewOpaqueAccessToken, NewRefreshFamily, RedeemOutcome, RefreshFamilyId,
-    RefreshRedeem, RefreshRedeemOutcome, RefreshTokenId, RefreshTokenResolution,
-    RotatedRefreshToken, Scope, ServiceId, SessionId, StoreError, TokenKind,
+    RefreshFamilyOpenOutcome, RefreshRedeem, RefreshRedeemOutcome, RefreshTokenId,
+    RefreshTokenResolution, RotatedRefreshToken, Scope, ServiceId, SessionId, StoreError,
+    TokenKind,
 };
 use serde::Deserialize;
 
@@ -359,7 +360,7 @@ async fn authorization_code_grant(
         // the family degrades to an access+ID response without a refresh token
         // (logged), rather than failing an otherwise-successful exchange.
         Ok(RedeemOutcome::Consumed) => {
-            let refresh = issue_refresh_for_code(state, scope, &bindings).await;
+            let refresh = issue_refresh_for_code(state, scope, &bindings).await?;
             Ok(token_response(&minted, &bindings, refresh.as_deref()))
         }
         // A benign within-grace retry or an expired/absent code: plain
@@ -830,9 +831,9 @@ pub(crate) fn map_store_error(error: StoreError) -> TokenError {
 // ===========================================================================
 
 /// Open a refresh-token family for a just-consumed code (issue #21), returning the
-/// plaintext refresh token to hand to the client. Returns [`None`] when the
+/// plaintext refresh token to hand to the client. Returns `Ok(None)` when the
 /// environment does not issue refresh tokens, or (fail-soft) when opening the
-/// family failed: a failure only costs the client a refresh token on this
+/// family faulted: such a fault only costs the client a refresh token on this
 /// exchange, never the whole exchange, so it is logged and swallowed.
 ///
 /// The family is OFFLINE when the granted scope carried `offline_access` (so it
@@ -840,13 +841,20 @@ pub(crate) fn map_store_error(error: StoreError) -> TokenError {
 /// session-bound (revoked when the RP session is logged out). `offline_access` is
 /// honored here because the code grant IS the flow that returns an authorization
 /// code; the consent for it was enforced at the authorization endpoint.
+///
+/// A session-bound open is REFUSED (issue #32) when the SSO session it would hang
+/// off was revoked in the window between the redeem's liveness read and this open:
+/// no family is created and this returns `Err(TokenError::InvalidGrant)`, so a
+/// logout that already cascaded cannot be outlived by a family opened just after
+/// it. That is a hard failure, not a fail-soft, because a session-bound token that
+/// escaped its logout is the exact invariant this milestone protects.
 async fn issue_refresh_for_code(
     state: &OidcState,
     scope: Scope,
     bindings: &CodeBindings,
-) -> Option<String> {
+) -> Result<Option<String>, TokenError> {
     if !state.issue_refresh_tokens() {
-        return None;
+        return Ok(None);
     }
     let offline = scope_contains(bindings.oauth_scope.as_deref(), OFFLINE_ACCESS_SCOPE);
     let minted = tokens::mint_refresh_token(state, &scope);
@@ -887,10 +895,14 @@ async fn issue_refresh_for_code(
         )
         .await;
     match result {
-        Ok(()) => Some(minted.token),
+        Ok(RefreshFamilyOpenOutcome::Opened) => Ok(Some(minted.token)),
+        // The bound SSO session was revoked in the open window, so no session-bound
+        // family was created: fail the exchange closed rather than hand back a token
+        // no logout could ever reach.
+        Ok(RefreshFamilyOpenOutcome::SessionNotLive) => Err(TokenError::InvalidGrant),
         Err(error) => {
             tracing::warn!(%error, "could not open a refresh-token family; issuing without a refresh token");
-            None
+            Ok(None)
         }
     }
 }
