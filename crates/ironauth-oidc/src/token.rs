@@ -188,7 +188,7 @@ async fn exchange(
     //    `claims`-parameter id_token member and, only under the non-conform
     //    conformIdTokenClaims override, the scope-derived claims (issue #15).
     let extra_claims = id_token_extra_claims(state, scope, &bindings).await;
-    let minted = mint_tokens(state, scope, &bindings, &extra_claims)?;
+    let minted = mint_tokens(state, scope, &bindings, &extra_claims).await?;
     let records: Vec<IssuedTokenRecord> = minted
         .records()
         .into_iter()
@@ -350,15 +350,22 @@ fn map_parse_error(error: ClientAuthParseError) -> TokenError {
 /// Mint the ID and access tokens through the signing core. A missing signing key
 /// or a signing failure is an opaque `server_error`; because this runs before the
 /// consume, that failure leaves the code live for a retry.
-fn mint_tokens(
+///
+/// Resolves the environment's issuer entry (its signer and algorithm policy)
+/// through the shared registry, then hands the borrowed signer and policy into the
+/// pure, synchronous [`tokens::mint`]: the async key resolution is confined here,
+/// the crypto stays pure.
+async fn mint_tokens(
     state: &OidcState,
     scope: Scope,
     bindings: &CodeBindings,
     extra_claims: &serde_json::Map<String, serde_json::Value>,
 ) -> Result<IssuedTokens, TokenError> {
-    let signer = state
-        .signer_for(&scope.environment())
+    let entry = state
+        .issuer_entry(&scope)
+        .await
         .ok_or(TokenError::ServerError)?;
+    let signer = entry.signer(state.now()).ok_or(TokenError::ServerError)?;
     let issuer = state.issuer_for(&scope);
     // Resolve the `sub` through the ONE shared subject-derivation function, so the
     // ID token's subject can never diverge from what `UserInfo`/introspection would
@@ -369,6 +376,7 @@ fn mint_tokens(
     tokens::mint(
         state,
         signer,
+        entry.policy(),
         &MintRequest {
             scope,
             issuer: &issuer,

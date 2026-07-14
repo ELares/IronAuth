@@ -217,5 +217,16 @@ name = "userinfo"
 path = "tests/userinfo.rs"
 required-features = ["testing"]
 
+# Live wiring of per-environment issuers, JWKS serving, and signing into the data
+# plane over a STORE-BACKED registry (issue #194): the signing key is provisioned
+# into the database, the mint and the mounted JWKS read the one lazy registry, a
+# minted token's kid is present in the served JWKS and verifies against the
+# published keys, the Cache-Control max-age reflects the configured window, and an
+# environment named under the wrong tenant fails closed (RLS). Over a real database.
+[[test]]
+name = "live_wiring"
+path = "tests/live_wiring.rs"
+required-features = ["testing"]
+
 [lints]
 workspace = true

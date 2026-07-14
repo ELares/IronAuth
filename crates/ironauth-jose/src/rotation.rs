@@ -311,6 +311,23 @@ impl KeySet {
             .collect()
     }
 
+    /// The signing keys published at `now`, before policy filtering: every key
+    /// whose publish window has opened and that has not yet expired.
+    ///
+    /// These are exactly the keys any currently-valid token could have been
+    /// signed by (the retention rule keeps a retired key published for one
+    /// max-token-lifetime), so they are the trusted verifying set an issuer's own
+    /// token-verification path checks a presented token against. Unlike
+    /// [`KeySet::published_jwks`] this hands back the private [`SigningKey`]s (from
+    /// which the caller takes each public verifying projection), not the serialized
+    /// public JWK Set.
+    #[must_use]
+    pub fn published_signing_keys(&self, now: SystemTime) -> Vec<&SigningKey> {
+        self.published_keys(now)
+            .map(|managed| &managed.key)
+            .collect()
+    }
+
     /// The algorithms of every key ever provisioned in this set (full history),
     /// in insertion order. Used to assert `kid` uniqueness across history.
     #[must_use]

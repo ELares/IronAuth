@@ -8,18 +8,18 @@
 //! `--help` stay dependency-light and never touch the async runtime.
 
 use std::process::ExitCode;
+use std::sync::Arc;
 
 use axum::Router;
 use ironauth_admin::AdminState;
 use ironauth_config::{Config, Loaded, OidcConfig};
 use ironauth_env::Env;
-use ironauth_jose::EnvironmentKeyStore;
 use ironauth_oidc::{
-    DiscoveryCapabilities, DiscoveryState, JwksCacheWindow, OidcState, discovery_router,
-    oidc_router,
+    DiscoveryCapabilities, DiscoveryState, IssuerRegistry, IssuerState, JwksCacheWindow, OidcState,
+    discovery_router, issuer_router, oidc_router,
 };
 use ironauth_server::Server;
-use ironauth_store::{EnvironmentId, Store};
+use ironauth_store::Store;
 
 /// Semantic version of this build, injected by Cargo.
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -195,19 +195,22 @@ async fn build_management_router(config: &Config, env: &Env) -> Option<Router> {
 /// production). A failure to connect is logged and the server keeps serving the
 /// rest of the public plane rather than refusing to boot.
 ///
-/// The per-environment signing keys start EMPTY here: key provisioning and
-/// rotation are a later milestone (there is no key-management dependency for this
-/// issue). Until keys are provisioned for an environment, that environment's token
-/// endpoint fails closed with a `server_error`, which is the correct behavior for
-/// a provider with no signing key. The authorization endpoint and every binding,
-/// single-use, and revocation guarantee work regardless.
+/// Per-environment signing keys load LAZILY from the store (issue #194): the ONE
+/// shared [`IssuerRegistry`] reads a scope's keys through the RLS-forced
+/// [`Store::scoped`] on the first request for that issuer, and caches the result.
+/// Both the token mint (through [`OidcState`]) and the JWKS/discovery serving
+/// (through [`IssuerState`]) read that SAME registry, so a signed `kid` is in the
+/// published JWKS by construction. An environment with no provisioned key resolves
+/// to an empty key set: its token endpoint fails closed with `server_error` and
+/// its JWKS/discovery return 404, which is the correct behavior for a provider with
+/// no signing key. The authorization endpoint and every binding, single-use, and
+/// revocation guarantee work regardless.
 ///
-/// Discovery (issue #18) is mounted alongside the protocol router. It is generated
-/// entirely from live config, the per-environment issuer string, and the algorithm
-/// policy, so it needs NONE of the loaded signing keys and serves live now. The
-/// JWKS surface DOES need the loaded keys and stays unmounted until issue #194
-/// loads them (which is the only remaining discovery-adjacent work: `jwks_uri` is
-/// advertised, pointing at where #194 will serve the key set).
+/// All three surfaces mount on the public plane: the protocol router
+/// (`/authorize`, `/token`, `/userinfo`), discovery (both well-known forms,
+/// config-only per issue #18), and the per-environment JWKS. The JWKS cache window
+/// is derived from `oidc.jwks_cache_max_age_secs` and carried by the registry, so
+/// the served `Cache-Control: max-age` reflects the configured value (AC #4).
 async fn build_oidc_router(
     oidc_config: &OidcConfig,
     data_plane_dsn: &str,
@@ -224,19 +227,23 @@ async fn build_oidc_router(
             return None;
         }
     };
-    let keys: EnvironmentKeyStore<EnvironmentId> = EnvironmentKeyStore::new();
-    tracing::warn!(
-        "OIDC provider mounted with NO signing keys provisioned. Per-environment key \
-         provisioning is a later milestone; until an environment has a signing key, its token \
-         endpoint fails closed. The authorization endpoint, discovery, and the single-use, \
-         binding, and revocation guarantees are unaffected."
-    );
+
+    // The JWKS cache window from config (validated into the 300..=900s range, so
+    // `clamped` is a no-op here); it governs the JWKS AND discovery Cache-Control.
+    let cache = JwksCacheWindow::clamped(oidc_config.jwks_cache_max_age_secs);
+
+    // The ONE shared registry: store-backed and lazy. The Store is cheap to clone
+    // (it wraps a reference-counted pool), so the mint (via OidcState) and the
+    // JWKS/discovery serving (via IssuerState) share one registry Arc.
+    let registry = Arc::new(IssuerRegistry::store_backed(
+        issuer_base.clone(),
+        cache,
+        store.clone(),
+    ));
 
     // The discovery surface (both well-known forms) is config-only: it needs the
     // issuer string and the per-environment algorithm policy, never the loaded
-    // keys. Its cache discipline mirrors the JWKS window (the config value is
-    // validated into the 300..=900s range, so `clamped` is a no-op here).
-    let cache = JwksCacheWindow::clamped(oidc_config.jwks_cache_max_age_secs);
+    // keys.
     let capabilities = DiscoveryCapabilities::from_config(oidc_config);
     let discovery = discovery_router(DiscoveryState::new(
         issuer_base.clone(),
@@ -244,9 +251,16 @@ async fn build_oidc_router(
         capabilities,
     ));
 
-    let state = OidcState::new(store, env, keys, oidc_config, issuer_base);
-    tracing::info!("OIDC provider and discovery surface mounted on the public plane");
-    Some(oidc_router(state).merge(discovery))
+    // The per-environment JWKS surface, over the SAME registry the mint reads.
+    let issuer_state = IssuerState::new(Arc::clone(&registry), env.clone());
+    let jwks = issuer_router(issuer_state);
+
+    let state = OidcState::new(store, env, registry, oidc_config, issuer_base);
+    tracing::info!(
+        "OIDC provider, discovery, and per-environment JWKS mounted on the public plane; \
+         per-environment signing keys load lazily from the store on first use"
+    );
+    Some(oidc_router(state).merge(discovery).merge(jwks))
 }
 
 /// Choose the control-plane database DSN for the management store (D2).

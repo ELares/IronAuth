@@ -6,6 +6,39 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Compose per-environment issuers, JWKS serving, and signing into the LIVE data
+  plane (issue #194). The #19 primitives (per-environment `IssuerRegistry`, JWKS
+  serving, algorithm policy, rotation `KeySet`) were inert; they now back the live
+  mint and the mounted JWKS surface. The provider stays gated off by default
+  (`oidc.enabled` unchanged).
+  - **One lazy, store-backed, RLS-scoped registry is the single source of truth.**
+    The `IssuerRegistry` is now interior-mutable and keyed by the FULL
+    `(tenant, environment)` scope. On the first request for an issuer it loads that
+    scope's keys through `Store::scoped` (row-level-security FORCED), builds the
+    `KeySet` and the algorithm policy from exactly those keys, and caches the entry.
+    `OidcState` no longer holds a separate `EnvironmentKeyStore`: BOTH the mint (via
+    `OidcState`) and the JWKS/discovery serving (via `IssuerState`) read the SAME
+    `Arc<IssuerRegistry>` and the SAME cached entry, so a signed `kid` is in the
+    published JWKS by construction (they cannot drift).
+  - **Env-to-tenant binding falls out of the RLS-scoped load.** A request to
+    `/t/{tenantA}/e/{envOfTenantB}/...` loads under scope `(tenantA, envOfTenantB)`;
+    RLS finds no rows, so the key set is empty and JWKS/discovery return 404 and the
+    mint fails closed. Keying the cache by the full scope (not the environment id
+    alone) means a cross-tenant probe gets its own empty slot and can never collide
+    with a legitimately cached entry: a self-consistent bogus issuer cannot resolve.
+  - **The mint enforces the environment's algorithm policy.** Both tokens are now
+    signed through `sign_jws_with_policy`, so an ES256-only environment (its loaded
+    keys are all ES256, hence policy `{ES256}`) can emit nothing but ES256: a
+    non-ES256 key is neither present nor policy-permitted. `verify_access_token`
+    likewise builds its trusted keys and allowlist from the SAME loaded key set.
+  - **The mounted surface** now serves the protocol router, discovery (both
+    well-known forms, config-only), AND the per-environment JWKS, all over the one
+    registry. The JWKS/discovery `Cache-Control` max-age is derived from
+    `oidc.jwks_cache_max_age_secs`. An environment with no provisioned key resolves
+    to an empty key set: its token endpoint fails closed and its JWKS/discovery
+    return 404, exactly as before. Pairwise salt persistence, per-environment policy
+    persistence, and rotation timers remain later milestones (a documented
+    placeholder salt is used; nothing live reads it).
 - `prompt`, `max_age`, interaction-hint plumbing, `prompt=create`, and the
   `unmet_authentication_requirements` error (issue #16). Extends the #12/#13/#17
   authorization endpoint and the #20 interaction surfaces; the provider stays gated

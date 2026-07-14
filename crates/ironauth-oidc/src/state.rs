@@ -4,15 +4,18 @@
 //!
 //! [`OidcState`] carries the data-plane [`Store`] (which in production
 //! authenticates as the least-privilege `ironauth_app` role), the environment
-//! seam, the per-environment signing keys, the issuer base, and the configured
+//! seam, the per-environment issuer registry, the issuer base, and the configured
 //! code and access-token lifetimes. It is the axum router state, so every handler
 //! reaches it, and it is cheap to clone (everything lives behind one `Arc`).
 //!
 //! Issuers are PER ENVIRONMENT: [`OidcState::issuer_for`] derives a distinct
 //! issuer string from the `(tenant, environment)` scope, so a token minted in one
 //! environment carries an issuer no other environment shares. The signing key is
-//! likewise selected per environment from the [`EnvironmentKeyStore`], so moving a
-//! client between environments is a configuration flip, not a key regeneration.
+//! likewise selected per environment through the shared [`IssuerRegistry`], the ONE
+//! holder of every environment's keys, algorithm policy, and salt, so moving a
+//! client between environments is a configuration flip, not a key regeneration, and
+//! the key the mint signs with is by construction the key the published JWKS
+//! serves (they read the same registry entry).
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -20,12 +23,10 @@ use std::time::{Duration, SystemTime};
 
 use ironauth_config::OidcConfig;
 use ironauth_env::Env;
-use ironauth_jose::{
-    EnvironmentKeyStore, JwsAlgorithm, SigningKey, TrustedKey, VerificationPolicy, VerifiedToken,
-    verify,
-};
-use ironauth_store::{EnvironmentId, Scope, Store};
+use ironauth_jose::{JwsAlgorithm, TrustedKey, VerificationPolicy, VerifiedToken, verify};
+use ironauth_store::{Scope, Store};
 
+use crate::issuer::{IssuerEntry, IssuerRegistry};
 use crate::registry::{ResponseMode, ResponseType};
 use crate::subject::{PairwiseSalt, SubjectCache, SubjectConfig};
 
@@ -43,7 +44,11 @@ pub struct OidcState {
 struct Inner {
     store: Store,
     env: Env,
-    keys: EnvironmentKeyStore<EnvironmentId>,
+    // The ONE holder of every environment's signing keys, algorithm policy, and
+    // salt (issue #194). The mint resolves its signer through this SAME registry
+    // the JWKS/discovery serving reads, so a signed `kid` is always in the
+    // published JWKS. Store-backed and lazy in production; pre-populated in tests.
+    issuers: Arc<IssuerRegistry>,
     issuer_base: String,
     code_ttl: Duration,
     access_token_ttl: Duration,
@@ -88,15 +93,17 @@ impl OidcState {
     ///
     /// In production `store` MUST authenticate as `ironauth_app` (the data-plane
     /// role), so the forced row-level-security backstop applies beneath the
-    /// repository layer. `keys` holds one or more signing keys per environment;
-    /// `issuer_base` is the deployment's externally visible base URL (from
-    /// `server.public_url`), which the per-environment issuer is derived from. The
-    /// lifetimes come from [`OidcConfig`] (already validated non-zero and bounded).
+    /// repository layer. `issuers` is the shared registry that holds (and, when
+    /// store-backed, lazily loads) each environment's keys, algorithm policy, and
+    /// salt; the JWKS/discovery serving reads the SAME `Arc`. `issuer_base` is the
+    /// deployment's externally visible base URL (from `server.public_url`), which
+    /// the per-environment issuer is derived from. The lifetimes come from
+    /// [`OidcConfig`] (already validated non-zero and bounded).
     #[must_use]
     pub fn new(
         store: Store,
         env: Env,
-        keys: EnvironmentKeyStore<EnvironmentId>,
+        issuers: Arc<IssuerRegistry>,
         config: &OidcConfig,
         issuer_base: impl Into<String>,
     ) -> Self {
@@ -104,7 +111,7 @@ impl OidcState {
             inner: Arc::new(Inner {
                 store,
                 env,
-                keys,
+                issuers,
                 issuer_base: issuer_base.into(),
                 code_ttl: Duration::from_secs(config.authorization_code_ttl_secs),
                 access_token_ttl: Duration::from_secs(config.access_token_ttl_secs),
@@ -228,12 +235,25 @@ impl OidcState {
         )
     }
 
-    /// The default signing key for `environment`, or `None` if the environment
-    /// has no provisioned key. The first key inserted for the environment is the
-    /// default (stable across a same-algorithm rotation).
+    /// The shared per-environment issuer registry: the ONE holder of every
+    /// environment's signing keys, algorithm policy, and salt. The JWKS/discovery
+    /// serving reads the SAME `Arc`, so a signed `kid` cannot diverge from the
+    /// published key set.
     #[must_use]
-    pub fn signer_for(&self, environment: &EnvironmentId) -> Option<&SigningKey> {
-        self.inner.keys.keys_for(environment).first()
+    pub fn issuers(&self) -> &Arc<IssuerRegistry> {
+        &self.inner.issuers
+    }
+
+    /// Resolve the live issuer entry for `scope` (its key set, algorithm policy,
+    /// and salt), loading and caching it from the store on the first access when
+    /// the registry is store-backed.
+    ///
+    /// `None` when the environment has no provisioned signing key (fail closed) or
+    /// names a cross-tenant environment (the RLS-scoped load yields no rows). The
+    /// caller resolves this ONCE at the handler top, then hands the borrowed signer
+    /// and policy into the pure, synchronous mint functions.
+    pub(crate) async fn issuer_entry(&self, scope: &Scope) -> Option<Arc<IssuerEntry>> {
+        self.inner.issuers.entry_for(scope).await
     }
 
     /// Whether this environment copies the scope-derived claims into the ID token
@@ -311,19 +331,22 @@ impl OidcState {
     ///
     /// `Err(())` if no signing key is provisioned for the scope's environment, or
     /// the token does not verify under the built policy.
-    pub(crate) fn verify_access_token(
+    pub(crate) async fn verify_access_token(
         &self,
         scope: &Scope,
         audience: &str,
         token: &str,
     ) -> Result<VerifiedToken, ()> {
-        let environment = scope.environment();
-        let keys = self.inner.keys.keys_for(&environment);
+        // Resolve the ONE registry entry (the same keys the JWKS serves); an
+        // unprovisioned or cross-tenant environment has none, and fails closed.
+        let entry = self.issuer_entry(scope).await.ok_or(())?;
+        // The keys published at `now` are exactly those a currently-valid token
+        // could have been signed by (the rotation retention rule); a token's `kid`
+        // only selects among these, never introduces one (issue #9's verify path).
+        let keys = entry.keyset().published_signing_keys(self.now());
         if keys.is_empty() {
             return Err(());
         }
-        // Every current signing key is a trusted verifying key; a token's `kid`
-        // only selects among these, never introduces one (issue #9's verify path).
         let trusted: Vec<TrustedKey> = keys
             .iter()
             .filter_map(|key| key.verifying_key().ok())
@@ -331,9 +354,9 @@ impl OidcState {
         if trusted.is_empty() {
             return Err(());
         }
-        // The allowlist is exactly the algorithms the environment's keys sign with.
+        // The allowlist is exactly the algorithms those published keys sign with.
         let mut algorithms: Vec<JwsAlgorithm> = Vec::new();
-        for key in keys {
+        for key in &keys {
             if !algorithms.contains(&key.algorithm()) {
                 algorithms.push(key.algorithm());
             }

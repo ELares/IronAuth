@@ -2,9 +2,11 @@
 
 //! Minting the ID token and the access token through the one signing core.
 //!
-//! Both tokens are compact JWSs signed by [`ironauth_jose::sign_jws`] with the
-//! target environment's signing key, so every token IronAuth issues round-trips
-//! through the same hardened verify path.
+//! Both tokens are compact JWSs signed by [`ironauth_jose::sign_jws_with_policy`]
+//! with the target environment's signing key UNDER its algorithm policy, so every
+//! token IronAuth issues round-trips through the same hardened verify path and an
+//! environment can never emit a token in an algorithm its policy forbids (issue
+//! #194): the policy refuses a wrong-algorithm key BEFORE any signing happens.
 //!
 //! # The ID token's conditional claims (issue #14)
 //!
@@ -31,7 +33,7 @@
 
 use std::time::SystemTime;
 
-use ironauth_jose::{EmissionOptions, SigningKey, sign_jws};
+use ironauth_jose::{EmissionOptions, SigningKey, SigningPolicy, sign_jws_with_policy};
 use ironauth_store::{IssuedTokenId, Scope, TokenKind};
 use serde_json::json;
 
@@ -189,12 +191,14 @@ pub(crate) fn build_id_token_claims(
 ///
 /// # Errors
 ///
-/// Returns `Err(())` if the environment has no signing key, the signing backend
-/// fails, or the ID token claims are refused (an out-of-bounds `sub`); the caller
-/// maps that to a token-endpoint `server_error`, so issuance fails closed.
+/// Returns `Err(())` if the environment has no signing key, `signer`'s algorithm
+/// is not permitted by `policy`, the signing backend fails, or the ID token claims
+/// are refused (an out-of-bounds `sub`); the caller maps that to a token-endpoint
+/// `server_error`, so issuance fails closed.
 pub fn mint(
     state: &OidcState,
     signer: &SigningKey,
+    policy: &SigningPolicy,
     request: &MintRequest<'_>,
 ) -> Result<IssuedTokens, ()> {
     let now = state.now();
@@ -213,7 +217,8 @@ pub fn mint(
                 "refusing to issue an ID token with an invalid subject"
             );
         })?;
-    let id_token = sign_jws(
+    let id_token = sign_jws_with_policy(
+        policy,
         signer,
         &serde_json::to_vec(&id_claims).map_err(|_| ())?,
         &EmissionOptions::new().with_typ("JWT"),
@@ -234,7 +239,8 @@ pub fn mint(
     if let Some(scope) = request.oauth_scope {
         access_claims["scope"] = json!(scope);
     }
-    let access_token = sign_jws(
+    let access_token = sign_jws_with_policy(
+        policy,
         signer,
         &serde_json::to_vec(&access_claims).map_err(|_| ())?,
         &EmissionOptions::new().with_typ("at+jwt"),
@@ -265,12 +271,14 @@ pub fn mint(
 ///
 /// # Errors
 ///
-/// `Err(())` if the ID token claims are refused (an out-of-bounds `sub`) or the
-/// signing backend fails; the caller maps that to a `server_error` returned via
-/// the negotiated response mode, so the front channel fails closed.
+/// `Err(())` if the ID token claims are refused (an out-of-bounds `sub`),
+/// `signer`'s algorithm is not permitted by `policy`, or the signing backend
+/// fails; the caller maps that to a `server_error` returned via the negotiated
+/// response mode, so the front channel fails closed.
 pub fn mint_id_token(
     state: &OidcState,
     signer: &SigningKey,
+    policy: &SigningPolicy,
     request: &MintRequest<'_>,
 ) -> Result<(String, IssuedTokenId), ()> {
     let now = state.now();
@@ -284,7 +292,8 @@ pub fn mint_id_token(
                 "refusing to issue a front-channel ID token with an invalid subject"
             );
         })?;
-    let id_token = sign_jws(
+    let id_token = sign_jws_with_policy(
+        policy,
         signer,
         &serde_json::to_vec(&id_claims).map_err(|_| ())?,
         &EmissionOptions::new().with_typ("JWT"),
