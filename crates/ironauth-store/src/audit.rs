@@ -168,6 +168,17 @@ pub enum Action {
     /// A resource server was registered (issue #29). Records the audience and the
     /// access-token format a registered protected API receives.
     ResourceServerRegister,
+    /// A pushed authorization request was stored behind a one-time `request_uri`
+    /// (RFC 9126, issue #27). The back-channel push the authorization endpoint later
+    /// consumes exactly once.
+    PushedAuthorizationRequestPush,
+    /// A pushed authorization request's `request_uri` was consumed at the
+    /// authorization endpoint (RFC 9126, issue #27). Written only on the winning
+    /// single-use consume; a reuse, expiry, or client-mismatch miss writes nothing.
+    PushedAuthorizationRequestConsume,
+    /// A client's `require_pushed_authorization_requests` flag was set (RFC 9126
+    /// section 5, issue #27).
+    ClientRequirePushedAuthorizationSet,
 }
 
 impl Action {
@@ -195,6 +206,11 @@ impl Action {
             Action::ConsentGrant => "consent.grant",
             Action::SigningKeyProvision => "signing_key.provision",
             Action::ResourceServerRegister => "resource_server.register",
+            Action::PushedAuthorizationRequestPush => "pushed_authorization_request.push",
+            Action::PushedAuthorizationRequestConsume => "pushed_authorization_request.consume",
+            Action::ClientRequirePushedAuthorizationSet => {
+                "client.require_pushed_authorization_requests.set"
+            }
         }
     }
 }

@@ -178,6 +178,10 @@ pub const ADVERTISED_ENDPOINTS: &[DiscoveryEndpoint] = &[
         metadata_key: "userinfo_endpoint",
         path: "/userinfo",
     },
+    DiscoveryEndpoint {
+        metadata_key: "pushed_authorization_request_endpoint",
+        path: "/par",
+    },
 ];
 
 /// The per-environment, config-driven capability toggles the generator layers on
@@ -190,6 +194,13 @@ pub const ADVERTISED_ENDPOINTS: &[DiscoveryEndpoint] = &[
 /// `query` response mode, the `prompt` values, the `display` values, and the
 /// supported locales) are read straight from the registries and consts and are
 /// never represented here.
+//
+// This is a bag of INDEPENDENT per-environment capability toggles, each a distinct
+// discovery field sourced from its own config flag; they do not form a state machine
+// and collapsing them into two-variant enums would only obscure that. The bool count
+// crossed clippy's `struct_excessive_bools` threshold when the #27 PAR and #30 DCR
+// toggles landed together, so the lint is allowed here with intent.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DiscoveryCapabilities {
     /// Legacy response types enabled for this environment (issue #17). Empty by
@@ -209,6 +220,11 @@ pub struct DiscoveryCapabilities {
     /// placements honor it; [`DiscoveryCapabilities::from_config`] sets it, so
     /// discovery advertises exactly what the server does.
     claims_parameter_supported: bool,
+    /// Whether EVERY authorization request in this environment must be pushed (RFC
+    /// 9126 section 5, issue #27). Sourced from `oidc.require_pushed_authorization_requests`
+    /// so discovery's `require_pushed_authorization_requests` reflects exactly what
+    /// the authorization endpoint enforces. `false` by default (PAR is optional).
+    require_pushed_authorization_requests: bool,
     /// Whether the Dynamic Client Registration endpoint is enabled (issue #30). When
     /// `true`, the document advertises the per-environment `registration_endpoint`
     /// (`{issuer}/connect/register`); when `false` the field is absent, so discovery
@@ -233,7 +249,10 @@ impl DiscoveryCapabilities {
     pub fn from_config(config: &OidcConfig) -> Self {
         let mut caps = Self::default()
             .with_claims_parameter(true)
-            .with_authorization_response_iss(true);
+            .with_authorization_response_iss(true)
+            .with_require_pushed_authorization_requests(
+                config.require_pushed_authorization_requests,
+            );
         if config.enable_response_type_id_token {
             caps = caps.with_additional_response_type(ResponseType::IdToken.as_str());
         }
@@ -257,6 +276,14 @@ impl DiscoveryCapabilities {
     #[must_use]
     pub fn with_claims_parameter(mut self, supported: bool) -> Self {
         self.claims_parameter_supported = supported;
+        self
+    }
+
+    /// Declare whether EVERY authorization request must be pushed (RFC 9126, issue
+    /// #27).
+    #[must_use]
+    pub fn with_require_pushed_authorization_requests(mut self, required: bool) -> Self {
+        self.require_pushed_authorization_requests = required;
         self
     }
 
@@ -455,6 +482,14 @@ pub fn discovery_document(
     document.insert(
         "authorization_response_iss_parameter_supported".to_owned(),
         json!(capabilities.authorization_response_iss_parameter_supported),
+    );
+    // RFC 9126 section 5 (issue #27): the PAR endpoint is advertised through
+    // ADVERTISED_ENDPOINTS above, and this flag says whether pushing is MANDATORY
+    // for every client in this environment (sourced from live config, so it reflects
+    // exactly what the authorization endpoint enforces).
+    document.insert(
+        "require_pushed_authorization_requests".to_owned(),
+        json!(capabilities.require_pushed_authorization_requests),
     );
 
     Value::Object(document)

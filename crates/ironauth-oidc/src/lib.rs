@@ -82,6 +82,7 @@ mod issuer;
 mod jwks;
 mod login;
 mod pages;
+mod par;
 mod password;
 mod pkce;
 mod register;
@@ -153,6 +154,11 @@ pub fn oidc_router(state: OidcState) -> Router {
             get(authorize::authorize_get).post(authorize::authorize_post),
         )
         .route("/token", post(token::token))
+        // Pushed authorization requests (PAR, RFC 9126, issue #27): an authenticated
+        // back-channel POST that validates a complete authorization request and
+        // returns a one-time request_uri. Advertised in discovery as
+        // pushed_authorization_request_endpoint at this exact path.
+        .route("/par", post(par::par))
         // UserInfo (OIDC Core 5.3): GET and POST with header Bearer auth, plus the
         // OPTIONS preflight for the CORS SPA origins (issue #15). CORS is applied on
         // this endpoint ONLY; the authorization endpoint above never gets it.

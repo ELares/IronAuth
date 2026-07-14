@@ -262,5 +262,18 @@ name = "client_registration"
 path = "tests/client_registration.rs"
 required-features = ["testing"]
 
+# Pushed authorization requests (issue #27, RFC 9126) end to end through the live
+# router: a pushed request_uri works exactly once, an expired one is rejected and the
+# TTL is configurable, a request_uri from client A presented by client B is rejected
+# and not burned, invalid parameters (redirect_uri, PKCE) are caught AT the PAR
+# endpoint, the per-client and global require-PAR switches reject a plain request, the
+# endpoint enforces client authentication, an external request_uri is refused with no
+# outbound fetch, and discovery advertises the endpoint and flag on both well-known
+# forms. Over a real database with a provisioned signing key.
+[[test]]
+name = "par"
+path = "tests/par.rs"
+required-features = ["testing"]
+
 [lints]
 workspace = true

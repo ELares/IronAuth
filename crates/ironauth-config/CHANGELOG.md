@@ -10,6 +10,14 @@ range per docs/RELEASING.md.
   Dynamic Client Registration endpoint (`/connect/register`). Off keeps the
   endpoint unmounted and undiscoverable, the safe posture; the real abuse gating
   (quotas, quarantine, initial-access-token policy) is owned by issue #31.
+- Add the pushed-authorization-request settings (PAR, RFC 9126, issue #27):
+  - `oidc.require_pushed_authorization_requests` (default `false`), the
+    environment-wide switch that requires every client to use PAR; when `true` the
+    authorization endpoint rejects a plain request with `invalid_request` and
+    discovery advertises the requirement.
+  - `oidc.par_ttl_secs` (default 60), the pushed `request_uri` lifetime in
+    seconds, validated to stay between 1 and `OIDC_MAX_PAR_TTL_SECS` (600) so a
+    misconfiguration cannot mint a long-lived reference.
 
 - Add the JWT client-assertion authentication knobs (issue #25), shared with the
   JWT bearer grant (#26):

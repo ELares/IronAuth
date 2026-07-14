@@ -6,6 +6,42 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Pushed authorization requests (PAR, RFC 9126, issue #27).
+  - **`POST /par`.** A new back-channel endpoint that authenticates the client
+    with the SAME suite as the token endpoint (the shared `authenticate_client`
+    seam: public `none`, secret, or `private_key_jwt`) and validates the COMPLETE
+    authorization request at push time, then returns a single-use
+    `urn:ietf:params:oauth:request_uri:<par_id>` reference and its `expires_in`. A
+    bad `redirect_uri`, missing PKCE, a disabled response type, or a malformed
+    `claims`/`prompt`/`max_age` is rejected HERE on the back channel, not later at
+    `/authorize`. A `request_uri` in the pushed request is refused (RFC 9126
+    section 2.1).
+  - **One shared request validator.** The authorization-request validation is
+    factored into a single `validate_request` function that BOTH `/authorize` and
+    `/par` run, so the two paths cannot diverge; `/authorize` renders a page or a
+    redirect and `/par` renders JSON from the same neutral error.
+  - **`request_uri` at `/authorize`.** A `request_uri` is accepted ONLY as a PAR
+    reference. It is PEEKED (read, not consumed) at every authorization hop, so it
+    survives the login and consent interaction round-trip, and the single-use
+    consume happens ATOMICALLY at the moment of code issuance: exactly one code per
+    `request_uri`, and a concurrent or prior issuance, a reuse, or an expiry is
+    rejected (single use holds end to end across stateless nodes). The reference is
+    bound to the pushing client (a reference presented by a different `client_id`
+    resolves to nothing, and is never revealed or burned), the pushed values are
+    authoritative and any conflicting inline query parameters are ignored (RFC 9126
+    section 4), and no code path ever dereferences an external `request_uri` over
+    the network (there is no outbound fetch on this path, test-enforced).
+  - **Require-PAR enforcement.** When the environment switch
+    (`oidc.require_pushed_authorization_requests`) OR the per-client registration
+    flag is set, a plain (non-PAR) authorization request is rejected with
+    `invalid_request`. A request that arrived through PAR satisfies the requirement
+    at the first hop AND at every login/consent resume hop: the gate keys off the
+    unforgeable `request_uri`, which is re-presented on the minimal resume link (not
+    the expanded parameters), so a fresh-login user of a require-PAR client resumes
+    through the interaction to a real code rather than a 400.
+  - **Discovery.** `pushed_authorization_request_endpoint` and
+    `require_pushed_authorization_requests` are advertised from live config on both
+    well-known forms.
 - Dynamic Client Registration and configuration management (issue #30).
   - **RFC 7591 registration.** New `client_registration` module serving
     `POST {issuer}/connect/register` (a distinct concept and path from the human
