@@ -197,6 +197,13 @@ pub enum Action {
     /// A client's `require_pushed_authorization_requests` flag was set (RFC 9126
     /// section 5, issue #27).
     ClientRequirePushedAuthorizationSet,
+    /// A service-account principal was minted for a client (issue #23), lazily on
+    /// its first client-credentials issuance. The stable machine `sub` the client's
+    /// M2M tokens carry.
+    ServiceAccountCreate,
+    /// A client's static custom-claims configuration was set (issue #23): the
+    /// declarative claims embedded in its client-credentials access tokens.
+    ClientCustomClaimsSet,
 }
 
 impl Action {
@@ -234,6 +241,8 @@ impl Action {
             Action::ClientRequirePushedAuthorizationSet => {
                 "client.require_pushed_authorization_requests.set"
             }
+            Action::ServiceAccountCreate => "service_account.create",
+            Action::ClientCustomClaimsSet => "client.custom_claims.set",
         }
     }
 }

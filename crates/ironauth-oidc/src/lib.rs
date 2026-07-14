@@ -71,6 +71,7 @@ mod authn;
 mod authorize;
 mod claims_request;
 mod client_auth;
+mod client_credentials;
 mod client_keys;
 mod client_registration;
 mod consent;
@@ -139,7 +140,8 @@ pub use subject::{
 };
 pub use token_hash::{HashKind, at_hash, c_hash, left_half_hash};
 pub use tokens::{
-    AccessTokenTarget, MintedAccessToken, OPAQUE_ACCESS_TOKEN_PREFIX, OPAQUE_REFRESH_TOKEN_PREFIX,
+    AccessTokenTarget, ClientCredentialsMintRequest, MintedAccessToken, OPAQUE_ACCESS_TOKEN_PREFIX,
+    OPAQUE_REFRESH_TOKEN_PREFIX,
 };
 
 /// Build the OIDC provider router.

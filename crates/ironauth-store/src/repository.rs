@@ -57,7 +57,7 @@ use crate::error::StoreError;
 use crate::id::{
     AuditId, AuditTarget, AuthorizationCodeId, ClientId, ConsentId, CorrelationId, EnvironmentId,
     GrantId, IssuedTokenId, ManagementKeyId, OperatorId, PushedRequestId, RefreshFamilyId,
-    RefreshTokenId, ResourceServerId, SessionId, SigningKeyId, TenantId, UserId,
+    RefreshTokenId, ResourceServerId, ServiceAccountId, SessionId, SigningKeyId, TenantId, UserId,
 };
 use crate::scope::Scope;
 use crate::store::Store;
@@ -171,6 +171,17 @@ impl<'a> ScopedStore<'a> {
     #[must_use]
     pub fn refresh(&self) -> RefreshRepo<'a> {
         RefreshRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
+    /// The read-only service-account repository for this scope (issue #23).
+    /// Resolves a client's STABLE service-account principal id (the client-
+    /// credentials `sub`); the lazy mint lives on [`ActingStore::service_accounts`].
+    #[must_use]
+    pub fn service_accounts(&self) -> ServiceAccountRepo<'a> {
+        ServiceAccountRepo {
             store: self.store,
             scope: self.scope,
         }
@@ -327,6 +338,18 @@ impl<'a> ActingStore<'a> {
     #[must_use]
     pub fn refresh(&self) -> ActingRefreshRepo<'a> {
         ActingRefreshRepo {
+            store: self.store,
+            scope: self.scope,
+            acting: self.acting,
+        }
+    }
+
+    /// The mutating service-account repository for this scope and actor (issue
+    /// #23): lazily mint a client's stable service-account principal at its first
+    /// client-credentials issuance, audited (idempotent per client).
+    #[must_use]
+    pub fn service_accounts(&self) -> ActingServiceAccountRepo<'a> {
+        ActingServiceAccountRepo {
             store: self.store,
             scope: self.scope,
             acting: self.acting,
@@ -756,6 +779,41 @@ impl ClientRepo<'_> {
         .await?;
         tx.commit().await?;
         Ok(row.and_then(|row| row.get::<Option<String>, _>("id_token_signed_response_alg")))
+    }
+
+    /// The client's stored STATIC custom-claims configuration within scope (issue
+    /// #23), as the raw JSON text of the stored `custom_token_claims` JSONB, or
+    /// `None` when the client configured none (the column is NULL) or is absent in
+    /// this scope.
+    ///
+    /// The client-credentials mint reads this and embeds the object's members into
+    /// the issued access token, with the protected-registered-claim guard applied
+    /// in the mint (a custom claim can never override `iss`/`sub`/`aud`/`exp`/`iat`/
+    /// `jti`/`client_id`/`scope`). The value is opaque JSON to the store; the OIDC
+    /// layer parses and validates it.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the identifier is out of this scope;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn custom_token_claims(&self, id: &ClientId) -> Result<Option<String>, StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        // Read the JSONB back as text (::text) so the store stays agnostic to the
+        // claim shape; the OIDC layer parses it.
+        let row = sqlx::query(
+            "SELECT custom_token_claims::text AS custom_token_claims FROM clients \
+             WHERE id = $1 AND tenant_id = $2 AND environment_id = $3",
+        )
+        .bind(id.to_string())
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(row.and_then(|row| row.get::<Option<String>, _>("custom_token_claims")))
     }
 
     /// Read a dynamically registered client's stored configuration within scope
@@ -1254,6 +1312,67 @@ impl ActingClientRepo<'_> {
                      WHERE id = $2 AND tenant_id = $3 AND environment_id = $4",
                 )
                 .bind(required)
+                .bind(id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .execute(&mut **tx)
+                .await?;
+                if result.rows_affected() == 0 {
+                    return Err(StoreError::NotFound);
+                }
+                Ok(())
+            },
+            false,
+        )
+        .await
+    }
+
+    /// Set (or clear) a client's STATIC custom-claims configuration within scope
+    /// (issue #23), writing a `client.custom_claims.set` audit row in the same
+    /// transaction.
+    ///
+    /// `claims_json` is the JSON text of a claims OBJECT to embed into the client's
+    /// client-credentials access tokens, or `None` to clear the configuration. The
+    /// caller (the OIDC layer) has already validated that it is a JSON object and
+    /// that it names no protected registered claim; the store persists it verbatim
+    /// as JSONB (an invalid document is rejected by the JSONB cast as
+    /// [`StoreError::Database`], defense in depth). A client absent in this scope is
+    /// the uniform [`StoreError::NotFound`].
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if no such client is visible in this scope;
+    /// [`StoreError::Database`] on a persistence failure (including a malformed JSON
+    /// document).
+    pub async fn set_custom_token_claims(
+        &self,
+        env: &Env,
+        id: &ClientId,
+        claims_json: Option<&str>,
+    ) -> Result<(), StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let claims_json = claims_json.map(str::to_owned);
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::ClientCustomClaimsSet,
+                target: id,
+            },
+            async move |tx| {
+                // The bind is text; the ::jsonb cast validates it is a JSON document
+                // (a malformed value fails here rather than at read time). NULL
+                // clears the configuration.
+                let result = sqlx::query(
+                    "UPDATE clients SET custom_token_claims = $1::jsonb \
+                     WHERE id = $2 AND tenant_id = $3 AND environment_id = $4",
+                )
+                .bind(claims_json)
                 .bind(id.to_string())
                 .bind(scope.tenant().to_string())
                 .bind(scope.environment().to_string())
@@ -2326,6 +2445,322 @@ impl ActingAuthorizationRepo<'_> {
             false,
         )
         .await
+    }
+
+    /// Issue a client-credentials access token and its grant in one audited
+    /// transaction (issue #23).
+    ///
+    /// The client-credentials grant (RFC 6749 4.4) has NO authorization code and no
+    /// user: the tokens are minted directly for a machine principal. To make the
+    /// issued token revocable and introspectable by the SAME mechanism the #22
+    /// revoke/introspect endpoints consume (the grant chain), this mints a fresh
+    /// grant rooted at the service-account principal and records the access token
+    /// against it, exactly as a code exchange records its tokens against the code's
+    /// grant. The grant row is inserted first (the token references it), then the
+    /// access-token row (an `issued_tokens` row for an at+jwt, or an
+    /// `opaque_access_tokens` row for an opaque token), then exactly one
+    /// `token.issue` audit row, all in the same transaction: a token cannot exist
+    /// without its grant or its audit row, and revoking the grant flips the token's
+    /// observable active state (the revocation reach #22 will use).
+    ///
+    /// There is deliberately NO refresh-token family opened here (RFC 6749 4.4.3): a
+    /// client-credentials issuance never returns a refresh token.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if any supplied identifier is out of this scope;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn issue_client_credentials(
+        &self,
+        env: &Env,
+        request: IssueClientCredentials<'_>,
+    ) -> Result<(), StoreError> {
+        let in_scope = request.grant_id.scope() == self.scope
+            && request.client_id.scope() == self.scope
+            && match &request.access {
+                ClientCredentialsAccess::Jwt { jti } => jti.scope() == self.scope,
+                ClientCredentialsAccess::Opaque(opaque) => opaque.jti.scope() == self.scope,
+            };
+        if !in_scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::TokenIssue,
+                target: request.grant_id,
+            },
+            async move |tx| {
+                // The grant is the machine principal's grant: no session, no consent,
+                // no claims_request (this is not a user flow). subject is the stable
+                // `sva_` service-account principal id, so grant-chain revocation and
+                // the #22 introspection resolve read it exactly as they read a user
+                // grant's subject.
+                sqlx::query(
+                    "INSERT INTO grants \
+                     (id, tenant_id, environment_id, client_id, subject, session_ref, \
+                      consent_ref, claims_request, created_at) \
+                     VALUES ($1, $2, $3, $4, $5, NULL, NULL, NULL, \
+                             TIMESTAMPTZ 'epoch' + ($6::text || ' microseconds')::interval)",
+                )
+                .bind(request.grant_id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(request.client_id.to_string())
+                .bind(request.subject)
+                .bind(request.created_at_unix_micros)
+                .execute(&mut **tx)
+                .await?;
+                match &request.access {
+                    ClientCredentialsAccess::Jwt { jti } => {
+                        sqlx::query(
+                            "INSERT INTO issued_tokens \
+                             (id, tenant_id, environment_id, grant_id, token_kind) \
+                             VALUES ($1, $2, $3, $4, 'access')",
+                        )
+                        .bind(jti.to_string())
+                        .bind(scope.tenant().to_string())
+                        .bind(scope.environment().to_string())
+                        .bind(request.grant_id.to_string())
+                        .execute(&mut **tx)
+                        .await?;
+                    }
+                    ClientCredentialsAccess::Opaque(opaque) => {
+                        // The opaque row carries THIS grant, so grant-chain revocation
+                        // reaches the opaque token exactly as it reaches an at+jwt.
+                        sqlx::query(
+                            "INSERT INTO opaque_access_tokens \
+                             (token_digest, tenant_id, environment_id, grant_id, subject, \
+                              client_id, audience, scope, jti, expires_at) \
+                             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, \
+                                     TIMESTAMPTZ 'epoch' + ($10::text || ' microseconds')::interval)",
+                        )
+                        .bind(opaque.token_digest)
+                        .bind(scope.tenant().to_string())
+                        .bind(scope.environment().to_string())
+                        .bind(request.grant_id.to_string())
+                        .bind(opaque.subject)
+                        .bind(opaque.client_id)
+                        .bind(opaque.audience)
+                        .bind(opaque.scope)
+                        .bind(opaque.jti.to_string())
+                        .bind(opaque.expires_at_unix_micros)
+                        .execute(&mut **tx)
+                        .await?;
+                    }
+                }
+                Ok(())
+            },
+            false,
+        )
+        .await
+    }
+}
+
+/// The persistence for one client-credentials issuance (issue #23): the machine
+/// grant to open and the access token to record against it. Passed to
+/// [`ActingAuthorizationRepo::issue_client_credentials`].
+#[derive(Debug)]
+pub struct IssueClientCredentials<'a> {
+    /// The fresh grant this issuance is rooted at (the revocation spine the #22
+    /// revoke/introspect endpoints consume).
+    pub grant_id: &'a GrantId,
+    /// The authenticated OAuth client the token is for.
+    pub client_id: &'a ClientId,
+    /// The stable service-account principal id (a `sva_` id): the token's `sub` and
+    /// the grant's subject. DISTINCT from `client_id`.
+    pub subject: &'a str,
+    /// The issuance instant in epoch microseconds, from the application clock seam.
+    pub created_at_unix_micros: i64,
+    /// The minted access token to record against the grant.
+    pub access: ClientCredentialsAccess<'a>,
+}
+
+/// The access token a client-credentials issuance records against its grant (issue
+/// #23): an at+jwt records only its `jti` in `issued_tokens`; an opaque token
+/// records its digest and metadata in `opaque_access_tokens`.
+#[derive(Debug)]
+pub enum ClientCredentialsAccess<'a> {
+    /// An RFC 9068 at+jwt: its `jti` recorded in `issued_tokens`.
+    Jwt {
+        /// The access token's `jti`.
+        jti: &'a IssuedTokenId,
+    },
+    /// An opaque reference token: its digest and metadata for `opaque_access_tokens`
+    /// (the embedded `grant_id` is bound by the issuing method, so any `grant_id`
+    /// set here is ignored).
+    Opaque(NewOpaqueAccessToken<'a>),
+}
+
+/// The read-only service-account repository (issue #23): resolve a client's STABLE
+/// service-account principal id (the client-credentials `sub`).
+///
+/// The scope is fixed at construction and applied to every statement. Minting the
+/// principal lazily lives on [`ActingServiceAccountRepo`], reachable only with an
+/// acting context.
+pub struct ServiceAccountRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl ServiceAccountRepo<'_> {
+    /// The stable service-account principal for `client_id` within scope (issue
+    /// #23), or [`None`] if the client has not yet had one minted (it is minted
+    /// lazily at the first client-credentials issuance) or is out of this scope.
+    ///
+    /// The returned id is the client-credentials access token's `sub`: STABLE
+    /// (stored once and read back every time) and DISTINCT from the client id.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure; a stored value that does
+    /// not parse in this scope (which the isolation FK and INSERT make unreachable)
+    /// is [`StoreError::NotFound`].
+    pub async fn principal_for(
+        &self,
+        client_id: &ClientId,
+    ) -> Result<Option<ServiceAccountId>, StoreError> {
+        if client_id.scope() != self.scope {
+            return Ok(None);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT id FROM service_accounts \
+             WHERE client_id = $1 AND tenant_id = $2 AND environment_id = $3",
+        )
+        .bind(client_id.to_string())
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        match row {
+            None => Ok(None),
+            Some(row) => {
+                let raw: String = row.get("id");
+                Ok(Some(ServiceAccountId::parse_in_scope(&raw, &self.scope)?))
+            }
+        }
+    }
+}
+
+/// The mutating service-account repository (issue #23): lazily mint a client's
+/// stable service-account principal. Reachable only through
+/// [`ScopedStore::acting`], so the mint carries an actor and correlation id.
+pub struct ActingServiceAccountRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+    acting: ActingContext,
+}
+
+impl ActingServiceAccountRepo<'_> {
+    /// Resolve `client_id`'s service-account principal, minting it (audited) if this
+    /// is the client's FIRST client-credentials issuance (issue #23).
+    ///
+    /// The principal id is STABLE: minted once and read back on every subsequent
+    /// issuance, so a client's `sub` is consistent across issuances. The mint is
+    /// idempotent under a race: a concurrent first-issuance that lost the
+    /// `UNIQUE (tenant, environment, client_id)` insert is caught (the
+    /// unique-violation maps to a re-read of the winner's principal), so two
+    /// simultaneous first calls still agree on one principal and neither fails.
+    ///
+    /// A first mint writes exactly one `service_account.create` audit row in the
+    /// same transaction as the INSERT; resolving an existing principal writes
+    /// nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if `client_id` is out of this scope;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn ensure(
+        &self,
+        env: &Env,
+        client_id: &ClientId,
+    ) -> Result<ServiceAccountId, StoreError> {
+        if client_id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        // Read first: an already-minted principal is returned without a write (so no
+        // audit row for a resolve), and its id is the stable `sub`.
+        if let Some(existing) = self.read(client_id).await? {
+            return Ok(existing);
+        }
+        let id = ServiceAccountId::generate(env, &self.scope);
+        let scope = self.scope;
+        let now_micros = epoch_micros(env.clock().now_utc());
+        let result = write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::ServiceAccountCreate,
+                target: &id,
+            },
+            async move |tx| {
+                let insert = sqlx::query(
+                    "INSERT INTO service_accounts \
+                     (id, tenant_id, environment_id, client_id, created_at) \
+                     VALUES ($1, $2, $3, $4, \
+                             TIMESTAMPTZ 'epoch' + ($5::text || ' microseconds')::interval)",
+                )
+                .bind(id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(client_id.to_string())
+                .bind(now_micros)
+                .execute(&mut **tx)
+                .await;
+                match insert {
+                    Ok(_) => Ok(()),
+                    // A concurrent first-issuance already minted the principal (the
+                    // UNIQUE(tenant, environment, client_id) fired): a benign race, not
+                    // a fault. Surface it as a Conflict so the caller re-reads the
+                    // winner rather than writing a duplicate.
+                    Err(error) if is_unique_violation(&error) => Err(StoreError::Conflict),
+                    Err(error) => Err(error.into()),
+                }
+            },
+            false,
+        )
+        .await;
+        match result {
+            Ok(()) => Ok(id),
+            // The race loser reads back the winner's principal, so both callers agree
+            // on the one stable principal. The unique violation means the winner has
+            // committed (Postgres holds the conflicting insert until the other
+            // transaction commits or rolls back), so this re-read always finds it; a
+            // None here is unreachable and surfaces as the uniform not-found.
+            Err(StoreError::Conflict) => self.read(client_id).await?.ok_or(StoreError::NotFound),
+            Err(other) => Err(other),
+        }
+    }
+
+    /// Read the existing principal for `client_id` within scope (the pre-mint check
+    /// and the race-loser re-read), or [`None`] if none is minted yet.
+    async fn read(&self, client_id: &ClientId) -> Result<Option<ServiceAccountId>, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT id FROM service_accounts \
+             WHERE client_id = $1 AND tenant_id = $2 AND environment_id = $3",
+        )
+        .bind(client_id.to_string())
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        match row {
+            None => Ok(None),
+            Some(row) => {
+                let raw: String = row.get("id");
+                Ok(Some(ServiceAccountId::parse_in_scope(&raw, &self.scope)?))
+            }
+        }
     }
 }
 

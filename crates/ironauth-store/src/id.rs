@@ -251,6 +251,23 @@ impl ScopedKind for ResourceServerKind {
     const PREFIX: &'static str = "rsv";
 }
 
+/// Marker for a service-account principal (`sva_`), the first-class machine
+/// identity every M2M-capable client maps to (issue #23). A tenant-scoped
+/// resource: the identifier embeds its `(tenant, environment)`, so a service
+/// account minted in one scope parses as a uniform not-found under another, and
+/// two tenants can never share a principal. This is the STABLE `sub` a
+/// client-credentials access token carries, distinct from the `cli_` client id and
+/// consistent across every issuance. The prefix is `sva` (not the `svc` of the
+/// audit-actor [`ServiceKind`], which is a single-level actor id, not a scoped
+/// principal). Roles and permissions (RBAC, M10) will attach to this principal;
+/// this issue only mints and reads it. Not a bearer secret, so its debug form stays
+/// legible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ServiceAccountKind;
+impl ScopedKind for ServiceAccountKind {
+    const PREFIX: &'static str = "sva";
+}
+
 /// Marker for a pushed authorization request (`par_`), a request the PAR endpoint
 /// (RFC 9126, issue #27) stored for later single-use reference from `/authorize`. A
 /// tenant-scoped resource: the identifier embeds its `(tenant, environment)`, so the
@@ -463,6 +480,10 @@ pub type ResourceServerId = ScopedId<ResourceServerKind>;
 /// the PAR endpoint returns and `/authorize` consumes (RFC 9126, issue #27). It is
 /// the reference portion of the `urn:ietf:params:oauth:request_uri:<id>` value.
 pub type PushedRequestId = ScopedId<PushedRequestKind>;
+/// A service-account principal identifier (`sva_...`), the stable machine `sub` a
+/// client-credentials access token carries (issue #23). Distinct from the client's
+/// `cli_` id and consistent across issuances.
+pub type ServiceAccountId = ScopedId<ServiceAccountKind>;
 
 impl<K: ScopedKind> ScopedId<K> {
     /// Mint a fresh scoped identifier under `scope`, drawing the unique
