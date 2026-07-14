@@ -146,6 +146,8 @@ jobs:
         run: scripts/dash-scan.sh
       - name: discovery scan (no static discovery JSON; generated at serve time)
         run: scripts/discovery-scan.sh
+      - name: rfc9700 scan (every OAuth endpoint bound to a conformance test)
+        run: scripts/rfc9700-scan.sh
       - name: compatibility matrix freshness
         run: |
           scripts/compat-matrix.sh

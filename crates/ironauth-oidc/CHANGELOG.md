@@ -6,6 +6,37 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- RFC 9700 (OAuth 2.0 Security BCP) checklist encoded as CI conformance invariants
+  (issue #38).
+  - **Conformance suite.** A new registered test target `tests/rfc9700.rs` drives the
+    live authorization, token, discovery, and interaction endpoints and asserts each
+    applicable RFC 9700 item: exact `redirect_uri` matching with the scoped RFC 8252
+    loopback exception, no open redirector, S256-only PKCE with downgrade prevention in
+    both directions, no front-channel access token, RFC 9207 `iss` on every
+    authorization response, refresh rotation with reuse family revocation,
+    audience-restricted tokens never delivered in a URL, single-use client- and
+    `redirect_uri`-bound codes, sender-uniform token errors, and no ROPC. Each
+    header/shape item reduces to a shared predicate scored against the live response;
+    an in-binary mutation harness feeds each predicate the regression shape a flipped
+    guard would produce and asserts it is rejected, so no test can pass vacuously. The
+    harness lives only in the test binary and is absent from the release and musl
+    builds. Traceability: `docs/conformance/rfc9700-checklist.md`; rationale:
+    `docs/design/rfc9700-conformance.md`.
+  - **303 for credential-bearing redirects (behavior change).** The authorization and
+    interaction redirects now emit `303 See Other` instead of `302 Found`, so the user
+    agent re-issues the follow-up as a body-less `GET` (a submitted login/consent POST
+    body is never replayed to the redirect target) and a code-carrying redirect is
+    never method-ambiguous; `307`/`308` are forbidden. Emitted from the three existing
+    redirect builders (`error.rs::redirect_response`, `interaction.rs::redirect` and
+    `redirect_setting_cookie`).
+  - **Referrer-Policy on code-carrying redirects.** `Referrer-Policy: no-referrer` now
+    rides the `query`-mode authorization redirect (which carries the code in the
+    `Location` query) from the same single seam, closing the gap where it previously
+    set only `Cache-Control: no-store`; HTML and `form_post` responses already had it.
+  - **Freshness lint.** `scripts/rfc9700-scan.sh` (wired into `scripts/gate.sh` and the
+    `invariants` CI job) generates the OAuth endpoint inventory from the live router,
+    diffs it, and binds every mounted endpoint to a covering test, so a future
+    BCP-relevant endpoint cannot ship uncovered while the checklist reads complete.
 - RFC 8628 device authorization grant with cross-device BCP mitigations (issue #24).
   - **Device-authorization endpoint.** `POST /device_authorization` authenticates the
     client (self-scoped, exactly like the token endpoint), gates on the per-client

@@ -41,7 +41,7 @@ async fn get_code(harness: &Harness) -> String {
         .await;
     assert_eq!(
         status,
-        StatusCode::FOUND,
+        StatusCode::SEE_OTHER,
         "authorize should redirect: {body}"
     );
     assert_eq!(
@@ -478,7 +478,7 @@ async fn implicit_flow_response_types_are_refused_by_redirect_without_a_token() 
     let (status, headers, _) = harness.authorize(&query).await;
     assert_eq!(
         status,
-        StatusCode::FOUND,
+        StatusCode::SEE_OTHER,
         "a valid client redirects the error"
     );
     assert_eq!(

@@ -59,7 +59,7 @@ async fn issue_tokens(harness: &Harness, nonce: &str) -> (String, String) {
     let (status, headers, body) = harness.authorize_with_cookie(&query, &cookie).await;
     assert_eq!(
         status,
-        StatusCode::FOUND,
+        StatusCode::SEE_OTHER,
         "authorize should redirect: {body}"
     );
     let code = location_param(&headers, "code").expect("code in redirect");

@@ -264,19 +264,19 @@ pub fn subject_actor(state: &OidcState, scope: Scope, subject: &str) -> ActorRef
     }
 }
 
-/// A `302` redirect to the login page carrying `return_to`.
+/// A `303` redirect to the login page carrying `return_to`.
 #[must_use]
 pub fn login_redirect(return_to: &str) -> Response {
     redirect(&interaction_url(LOGIN_PATH, return_to))
 }
 
-/// A `302` redirect to the registration page carrying `return_to`.
+/// A `303` redirect to the registration page carrying `return_to`.
 #[must_use]
 pub fn register_redirect(return_to: &str) -> Response {
     redirect(&interaction_url(REGISTER_PATH, return_to))
 }
 
-/// A `302` redirect to the consent page carrying `return_to`.
+/// A `303` redirect to the consent page carrying `return_to`.
 #[must_use]
 pub fn consent_redirect(return_to: &str) -> Response {
     redirect(&interaction_url(CONSENT_PATH, return_to))
@@ -287,25 +287,40 @@ fn interaction_url(path: &str, return_to: &str) -> String {
     append_query(path, &[("return_to", Some(return_to))])
 }
 
-/// A `302 Found` to `location` with `Cache-Control: no-store`.
+/// A `303 See Other` to `location` with `Cache-Control: no-store` and
+/// `Referrer-Policy: no-referrer`.
+///
+/// `303` (never `302`, never `307`/`308`) is the RFC 9700 status for these
+/// interaction redirects: several are the result of a credential-bearing POST
+/// (the login, registration, and consent form submits), and `303` forces the user
+/// agent to follow up with a `GET` carrying NO request body, so a password in the
+/// request body is never replayed to the `return_to` target. A body-preserving
+/// `307`/`308`
+/// would replay it; `302` leaves the conversion browser-dependent. `no-referrer`
+/// keeps the `return_to` authorization URL (which carries request parameters) out
+/// of the `Referer` header.
 #[must_use]
 pub fn redirect(location: &str) -> Response {
     Response::builder()
-        .status(StatusCode::FOUND)
+        .status(StatusCode::SEE_OTHER)
         .header(header::LOCATION, location)
         .header(header::CACHE_CONTROL, "no-store")
+        .header(header::REFERRER_POLICY, "no-referrer")
         .body(Body::empty())
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
-/// A `302 Found` to `location` that also sets a session cookie.
+/// A `303 See Other` to `location` that also sets a session cookie. `303` (never
+/// `307`/`308`) so the post-login POST is not replayed to `return_to`; see
+/// [`redirect`] for the full rationale.
 #[must_use]
 pub fn redirect_setting_cookie(location: &str, set_cookie: &str) -> Response {
     Response::builder()
-        .status(StatusCode::FOUND)
+        .status(StatusCode::SEE_OTHER)
         .header(header::LOCATION, location)
         .header(header::SET_COOKIE, set_cookie)
         .header(header::CACHE_CONTROL, "no-store")
+        .header(header::REFERRER_POLICY, "no-referrer")
         .body(Body::empty())
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }

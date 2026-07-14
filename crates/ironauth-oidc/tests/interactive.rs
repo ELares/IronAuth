@@ -79,7 +79,7 @@ async fn a_user_can_register_consent_and_receive_tokens_end_to_end() {
     let (status, headers, _) = harness
         .authorize(&authorize_query(&client_id, Some("create")))
         .await;
-    assert_eq!(status, StatusCode::FOUND);
+    assert_eq!(status, StatusCode::SEE_OTHER);
     let register_location = location(&headers).expect("register redirect");
     assert!(
         register_location.starts_with("/register?return_to="),
@@ -104,7 +104,7 @@ async fn a_user_can_register_consent_and_receive_tokens_end_to_end() {
         ("return_to", &form_return_to),
     ]);
     let (status, headers, body) = harness.post_form("/register", &register_body, None).await;
-    assert_eq!(status, StatusCode::FOUND, "register post: {body}");
+    assert_eq!(status, StatusCode::SEE_OTHER, "register post: {body}");
     let cookie = set_cookie_pair(&headers).expect("session cookie set on registration");
     assert!(cookie.starts_with("__Host-ironauth_session="), "{cookie}");
     let resume = location(&headers).expect("resume location");
@@ -115,7 +115,7 @@ async fn a_user_can_register_consent_and_receive_tokens_end_to_end() {
 
     // 4. Resume authorize (now authenticated) -> consent is required.
     let (status, headers, _) = harness.get_with_cookie(&resume, Some(&cookie)).await;
-    assert_eq!(status, StatusCode::FOUND);
+    assert_eq!(status, StatusCode::SEE_OTHER);
     let consent_location = location(&headers).expect("consent redirect");
     assert!(
         consent_location.starts_with("/consent?return_to="),
@@ -136,12 +136,12 @@ async fn a_user_can_register_consent_and_receive_tokens_end_to_end() {
     let (status, headers, body) = harness
         .post_form("/consent", &consent_body, Some(&cookie))
         .await;
-    assert_eq!(status, StatusCode::FOUND, "consent post: {body}");
+    assert_eq!(status, StatusCode::SEE_OTHER, "consent post: {body}");
     let resume = location(&headers).expect("resume after consent");
 
     // 7. Resume authorize once more -> the code is issued to the redirect_uri.
     let (status, headers, _) = harness.get_with_cookie(&resume, Some(&cookie)).await;
-    assert_eq!(status, StatusCode::FOUND);
+    assert_eq!(status, StatusCode::SEE_OTHER);
     let final_location = location(&headers).expect("code redirect");
     assert!(
         final_location.starts_with(REDIRECT_URI),
@@ -193,7 +193,7 @@ async fn an_existing_user_can_log_in_and_receive_tokens() {
 
     // 1. Unauthenticated authorize redirects to login.
     let (status, headers, _) = harness.authorize(&authorize_query(&client_id, None)).await;
-    assert_eq!(status, StatusCode::FOUND);
+    assert_eq!(status, StatusCode::SEE_OTHER);
     let login_location = location(&headers).expect("login redirect");
     assert!(
         login_location.starts_with("/login?return_to="),
@@ -213,7 +213,7 @@ async fn an_existing_user_can_log_in_and_receive_tokens() {
         ("return_to", &return_to),
     ]);
     let (status, headers, body) = harness.post_form("/login", &login_body, None).await;
-    assert_eq!(status, StatusCode::FOUND, "login post: {body}");
+    assert_eq!(status, StatusCode::SEE_OTHER, "login post: {body}");
     let cookie = set_cookie_pair(&headers).expect("session cookie set on login");
     let resume = location(&headers).expect("resume after login");
 
@@ -390,7 +390,7 @@ async fn a_narrower_consent_reprompts_on_a_broader_scope_and_issues_on_a_subset(
             &cookie,
         )
         .await;
-    assert_eq!(status, StatusCode::FOUND, "authorize redirects: {body}");
+    assert_eq!(status, StatusCode::SEE_OTHER, "authorize redirects: {body}");
     let broader_location = location(&headers).expect("a redirect location");
     assert!(
         broader_location.starts_with("/consent?return_to="),
@@ -406,7 +406,7 @@ async fn a_narrower_consent_reprompts_on_a_broader_scope_and_issues_on_a_subset(
     let (status, headers, body) = harness
         .authorize_with_cookie(&scoped_authorize_query(&client_id, "openid"), &cookie)
         .await;
-    assert_eq!(status, StatusCode::FOUND, "authorize redirects: {body}");
+    assert_eq!(status, StatusCode::SEE_OTHER, "authorize redirects: {body}");
     let subset_location = location(&headers).expect("a redirect location");
     assert!(
         subset_location.starts_with(REDIRECT_URI),
@@ -463,7 +463,7 @@ async fn re_consenting_broadens_the_grant_and_stops_reprompting() {
     let (status, headers, body) = harness
         .post_form("/consent", &allow_body, Some(&cookie))
         .await;
-    assert_eq!(status, StatusCode::FOUND, "consent allow: {body}");
+    assert_eq!(status, StatusCode::SEE_OTHER, "consent allow: {body}");
     let resume = location(&headers).expect("resume after consent");
 
     // The grant now records the BROADER scope, keeping its ORIGINAL id (the upsert
@@ -489,7 +489,7 @@ async fn re_consenting_broadens_the_grant_and_stops_reprompting() {
     // Resuming now issues the code directly: the broadened consent covers the
     // request, so there is no re-prompt loop.
     let (status, headers, body) = harness.get_with_cookie(&resume, Some(&cookie)).await;
-    assert_eq!(status, StatusCode::FOUND, "resume issues: {body}");
+    assert_eq!(status, StatusCode::SEE_OTHER, "resume issues: {body}");
     let final_location = location(&headers).expect("code redirect");
     assert!(
         final_location.starts_with(REDIRECT_URI),
@@ -602,7 +602,7 @@ async fn consent_post_rejects_cross_site_submissions() {
     .await;
     assert_eq!(
         status,
-        StatusCode::FOUND,
+        StatusCode::SEE_OTHER,
         "same-origin consent succeeds: {body}"
     );
     assert!(
@@ -695,7 +695,7 @@ async fn login_post_rejects_cross_site_submissions() {
     .await;
     assert_eq!(
         status,
-        StatusCode::FOUND,
+        StatusCode::SEE_OTHER,
         "same-origin login succeeds: {body}"
     );
     assert!(
@@ -803,7 +803,7 @@ async fn register_post_rejects_cross_site_submissions() {
     .await;
     assert_eq!(
         status,
-        StatusCode::FOUND,
+        StatusCode::SEE_OTHER,
         "same-origin registration succeeds: {body}"
     );
     assert!(
