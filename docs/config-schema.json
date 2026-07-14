@@ -46,6 +46,21 @@
       },
       "type": "object"
     },
+    "ClientAssertionAudience": {
+      "description": "The audience an inbound JWT client assertion (`private_key_jwt` /\n`client_secret_jwt`, issue #25) must be addressed to (RFC 7523 section 3, OIDC\nCore section 9). This is the SHARED audience knob the JWT bearer grant (#26)\nreuses: both surfaces validate an assertion's `aud` through it.\n\nThe default accepts the token-endpoint URL OR the per-environment issuer, which\nis the interoperable choice: real client libraries disagree on which they place\nin `aud`. The strict mode accepts ONLY the issuer, per rfc7523bis and FAPI 2.0,\nwhich reject a token-endpoint-audienced assertion.",
+      "oneOf": [
+        {
+          "const": "token_endpoint_or_issuer",
+          "description": "Accept an assertion whose `aud` is the token-endpoint URL OR the\nper-environment issuer. The interoperable default.",
+          "type": "string"
+        },
+        {
+          "const": "issuer_only",
+          "description": "Accept ONLY an assertion whose `aud` is the per-environment issuer (a\ntoken-endpoint-audienced assertion is rejected), per rfc7523bis / FAPI 2.0.",
+          "type": "string"
+        }
+      ]
+    },
     "DatabaseConfig": {
       "additionalProperties": false,
       "description": "Primary database settings.",
@@ -127,6 +142,18 @@
         "authorization_code_ttl_secs": {
           "default": 60,
           "description": "Authorization-code lifetime in seconds. A code is single-use and\nshort-lived; the default (60) follows the OAuth 2.1 guidance that codes\nlive about a minute. Must be at least 1 and at most\n`OIDC_MAX_LIFETIME_SECS`.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "client_assertion_audience": {
+          "$ref": "#/$defs/ClientAssertionAudience",
+          "default": "token_endpoint_or_issuer",
+          "description": "The audience an inbound JWT client assertion (`private_key_jwt`, issue #25)\nmust be addressed to (RFC 7523, OIDC Core section 9). The interoperable\ndefault (`token_endpoint_or_issuer`) accepts an assertion whose `aud` is the\ntoken-endpoint URL OR the per-environment issuer; `issuer_only` accepts ONLY\nthe issuer (rejecting a token-endpoint-audienced assertion) per rfc7523bis\nand FAPI 2.0. This is the SHARED knob the JWT bearer grant (#26) reuses. A\npromotable per-environment setting in spirit; the process value is the\ndeployment default until per-environment overrides ride the M5 pipeline."
+        },
+        "client_assertion_max_skew_secs": {
+          "default": 60,
+          "description": "The clock-skew tolerance (in seconds) applied to a JWT client assertion's\n`exp`/`nbf`/`iat` (issue #25). A small window absorbs realistic client/server\nclock drift; the default (60) is one minute and config load rejects a value\nabove `OIDC_MAX_CLIENT_ASSERTION_SKEW_SECS` (300), because a wide skew keeps\nan expired assertion replayable for too long. The replay cache retains a\njti until its assertion's `exp` PLUS this skew, so pruning never opens a\nreplay window.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
@@ -365,6 +392,8 @@
       "default": {
         "access_token_ttl_secs": 300,
         "authorization_code_ttl_secs": 60,
+        "client_assertion_audience": "token_endpoint_or_issuer",
+        "client_assertion_max_skew_secs": 60,
         "conform_id_token_claims": false,
         "default_access_token_format": "at_jwt",
         "enable_response_mode_form_post": false,

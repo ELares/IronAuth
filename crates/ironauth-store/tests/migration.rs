@@ -242,19 +242,19 @@ async fn expand_contract_example_chain_runs_all_three_phases_and_contract_remove
     );
 }
 
-/// The PRODUCTION chain (`MigrationRunner::new`) contains exactly the twelve real
-/// migrations and leaves no throwaway demo object in a real database.
+/// The PRODUCTION chain (`MigrationRunner::new`) contains exactly the thirteen
+/// real migrations and leaves no throwaway demo object in a real database.
 // A long but linear ledger-and-table assertion sweep (one line per migration and
 // per real table); splitting it would not make it clearer.
 #[allow(clippy::too_many_lines)]
 #[tokio::test]
-async fn production_chain_is_only_the_twelve_real_migrations_and_ships_no_demo_object() {
+async fn production_chain_is_only_the_thirteen_real_migrations_and_ships_no_demo_object() {
     // TestDatabase::start runs Store::migrate() (the production chain) on a
     // fresh, empty database.
     let db = TestDatabase::start().await;
     let pool = db.owner_pool();
 
-    // Re-running is idempotent and reports exactly twelve tracked migrations.
+    // Re-running is idempotent and reports exactly thirteen tracked migrations.
     let report = MigrationRunner::new(pool)
         .run()
         .await
@@ -265,17 +265,17 @@ async fn production_chain_is_only_the_twelve_real_migrations_and_ships_no_demo_o
     );
     assert_eq!(
         report.already_applied(),
-        12,
-        "the production chain is exactly twelve migrations (isolation, audit log, management API, \
-         OIDC authorization, signing keys, login/consent, authentication context, redirect \
+        13,
+        "the production chain is exactly thirteen migrations (isolation, audit log, management \
+         API, OIDC authorization, signing keys, login/consent, authentication context, redirect \
          registration, UserInfo claims, consent scope upsert, resource servers, opaque access \
-         tokens)"
+         tokens, client auth suite)"
     );
 
-    // The ledger holds exactly versions 1 through 12.
+    // The ledger holds exactly versions 1 through 13.
     assert_eq!(
         applied_versions(pool).await,
-        vec![1_i64, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+        vec![1_i64, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
     );
     let phase_of = |version: i64| async move {
         sqlx::query("SELECT phase FROM _schema_migrations WHERE version = $1")
@@ -298,6 +298,8 @@ async fn production_chain_is_only_the_twelve_real_migrations_and_ships_no_demo_o
     // A CREATE TABLE is an additive expand (issue #29).
     assert_eq!(phase_of(11).await, "expand");
     assert_eq!(phase_of(12).await, "expand");
+    // An ALTER TABLE ADD COLUMN and a CREATE TABLE are both additive expands (#25).
+    assert_eq!(phase_of(13).await, "expand");
 
     // The demo object never reaches a production database.
     assert!(
@@ -385,6 +387,29 @@ async fn production_chain_is_only_the_twelve_real_migrations_and_ships_no_demo_o
     assert!(
         table_exists(pool, "opaque_access_tokens").await,
         "opaque_access_tokens exists"
+    );
+    // The JWT-assertion client-authentication suite (issue #25): the additive
+    // clients key/alg registration columns, the cross-node single-use jti replay
+    // cache, and the out-of-band diagnostics sink.
+    assert!(
+        column_exists(pool, "clients", "jwks").await,
+        "clients.jwks exists"
+    );
+    assert!(
+        column_exists(pool, "clients", "jwks_uri").await,
+        "clients.jwks_uri exists"
+    );
+    assert!(
+        column_exists(pool, "clients", "token_endpoint_auth_signing_alg").await,
+        "clients.token_endpoint_auth_signing_alg exists"
+    );
+    assert!(
+        table_exists(pool, "client_assertion_jtis").await,
+        "client_assertion_jtis exists"
+    );
+    assert!(
+        table_exists(pool, "client_auth_diagnostics").await,
+        "client_auth_diagnostics exists"
     );
 }
 

@@ -21,11 +21,12 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use ironauth_config::OidcConfig;
+use ironauth_config::{ClientAssertionAudience, OidcConfig};
 use ironauth_env::Env;
 use ironauth_jose::{JwsAlgorithm, TrustedKey, VerificationPolicy, VerifiedToken, verify};
 use ironauth_store::{Scope, Store, TokenFormat};
 
+use crate::client_keys::ClientKeyResolver;
 use crate::issuer::{IssuerEntry, IssuerRegistry};
 use crate::registry::{ResponseMode, ResponseType};
 use crate::subject::{PairwiseSalt, SubjectCache, SubjectConfig};
@@ -84,6 +85,18 @@ struct Inner {
     enable_response_type_code_id_token: bool,
     enable_response_type_none: bool,
     enable_response_mode_form_post: bool,
+    // The audience policy an inbound JWT client assertion must satisfy (issue #25),
+    // shared with the JWT bearer grant (#26). Default: accept the token-endpoint
+    // URL OR the issuer; strict: the issuer only.
+    client_assertion_audience: ClientAssertionAudience,
+    // The clock-skew tolerance for a JWT client assertion's exp/nbf/iat (issue #25).
+    client_assertion_skew: Duration,
+    // The resolver for a private_key_jwt client's `jwks_uri` keys, fetched through
+    // the SSRF-hardened fetcher and cached (issue #25). `None` when no fetcher is
+    // wired: a `jwks_uri` client then fails closed (an inline-`jwks` client still
+    // works). It is optional so the many database-only OIDC tests need not stand up
+    // a fetcher, and the existing `OidcState::new` signature is unchanged.
+    client_key_resolver: Option<Arc<ClientKeyResolver>>,
     // The one shared subject-derivation cache. The surface that emits a `sub` (the
     // ID token today, and `UserInfo`/introspection once they land) resolves it
     // through this cache; because it is a single shared derivation, any two
@@ -112,6 +125,34 @@ impl OidcState {
         config: &OidcConfig,
         issuer_base: impl Into<String>,
     ) -> Self {
+        Self::build(store, env, issuers, config, issuer_base, None)
+    }
+
+    /// Like [`OidcState::new`] but wiring the `private_key_jwt` client-key resolver
+    /// (issue #25), so a `jwks_uri` client's keys are fetched (through the
+    /// SSRF-hardened fetcher) and cached. Use this where clients authenticate with
+    /// `private_key_jwt` via a `jwks_uri`; an inline-`jwks` client needs no
+    /// resolver and works through [`OidcState::new`] too.
+    #[must_use]
+    pub fn with_client_key_resolver(
+        store: Store,
+        env: Env,
+        issuers: Arc<IssuerRegistry>,
+        config: &OidcConfig,
+        issuer_base: impl Into<String>,
+        resolver: Arc<ClientKeyResolver>,
+    ) -> Self {
+        Self::build(store, env, issuers, config, issuer_base, Some(resolver))
+    }
+
+    fn build(
+        store: Store,
+        env: Env,
+        issuers: Arc<IssuerRegistry>,
+        config: &OidcConfig,
+        issuer_base: impl Into<String>,
+        client_key_resolver: Option<Arc<ClientKeyResolver>>,
+    ) -> Self {
         Self {
             inner: Arc::new(Inner {
                 store,
@@ -125,6 +166,9 @@ impl OidcState {
                 session_ttl: Duration::from_secs(config.session_ttl_secs),
                 require_pkce_for_confidential: config.require_pkce_for_confidential_clients,
                 conform_id_token_claims: config.conform_id_token_claims,
+                client_assertion_audience: config.client_assertion_audience,
+                client_assertion_skew: Duration::from_secs(config.client_assertion_max_skew_secs),
+                client_key_resolver,
                 userinfo_cors_origins: config.userinfo_cors_origins.iter().cloned().collect(),
                 enable_response_type_id_token: config.enable_response_type_id_token,
                 enable_response_type_code_id_token: config.enable_response_type_code_id_token,
@@ -271,6 +315,44 @@ impl OidcState {
     #[must_use]
     pub fn session_ttl(&self) -> Duration {
         self.inner.session_ttl
+    }
+
+    /// The token endpoint's absolute URL (`{issuer_base}/token`). The token
+    /// endpoint is mounted at the deployment root (shared across environments), so
+    /// it is derived from `issuer_base`, not the per-environment issuer. One of the
+    /// audiences a JWT client assertion may be addressed to (issue #25).
+    #[must_use]
+    pub fn token_endpoint_url(&self) -> String {
+        format!("{}/token", self.inner.issuer_base.trim_end_matches('/'))
+    }
+
+    /// The set of audiences a JWT client assertion may be addressed to in `scope`
+    /// under the configured audience policy (issue #25): the per-environment issuer
+    /// (always), plus the token-endpoint URL unless the policy is issuer-only. The
+    /// SHARED knob the JWT bearer grant (#26) reuses.
+    #[must_use]
+    pub fn client_assertion_audiences(&self, scope: &Scope) -> Vec<String> {
+        let issuer = self.issuer_for(scope);
+        match self.inner.client_assertion_audience {
+            ClientAssertionAudience::IssuerOnly => vec![issuer],
+            ClientAssertionAudience::TokenEndpointOrIssuer => {
+                vec![issuer, self.token_endpoint_url()]
+            }
+        }
+    }
+
+    /// The clock-skew tolerance for a JWT client assertion's `exp`/`nbf`/`iat`
+    /// (issue #25).
+    #[must_use]
+    pub fn client_assertion_skew(&self) -> Duration {
+        self.inner.client_assertion_skew
+    }
+
+    /// The `private_key_jwt` client-key resolver, if one is wired (issue #25). A
+    /// `jwks_uri` client fails closed when it is absent.
+    #[must_use]
+    pub fn client_key_resolver(&self) -> Option<&Arc<ClientKeyResolver>> {
+        self.inner.client_key_resolver.as_ref()
     }
 
     /// Whether a CONFIDENTIAL client must use PKCE under this environment's policy

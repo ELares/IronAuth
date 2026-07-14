@@ -53,7 +53,9 @@ default = []
 testing = ["ironauth-store/testing"]
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+# net + io-util let the #25 client-assertion test stand up an in-process loopback
+# HTTP server that serves a client JWK Set through the fetcher's injected dialer.
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-util"] }
 tower = { workspace = true, features = ["util"] }
 http-body-util.workspace = true
 # Verify tokens end to end through the one hardened verify path.
@@ -236,6 +238,17 @@ required-features = ["testing"]
 [[test]]
 name = "token_formats"
 path = "tests/token_formats.rs"
+required-features = ["testing"]
+
+# The JWT-assertion client-authentication suite (issue #25): the private_key_jwt
+# per-algorithm matrix (RS/ES/PS/EdDSA) with an ES512-rejected negative, the
+# iss/sub/aud/exp/jti and audience-policy rules, cross-node jti replay through the
+# reusable authenticate_client seam, jwks_uri resolution and caching through the
+# SSRF-hardened fetcher, the opaque wire error plus the recorded diagnostic, and a
+# full token-endpoint exchange. Over a real database with a provisioned signing key.
+[[test]]
+name = "client_assertion"
+path = "tests/client_assertion.rs"
 required-features = ["testing"]
 
 [lints]

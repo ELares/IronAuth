@@ -50,7 +50,12 @@ cd "$(git rev-parse --show-toplevel)"
 # tables: the audience-to-format registry and the digest-only opaque-token store.
 # Both are TENANT-SCOPED with forced row-level security, so their SQL stays in the
 # repository module too.
-SCOPED_TABLES='clients|organizations|audit_log|management_credentials|idempotency_keys|grants|authorization_codes|issued_tokens|signing_keys|users|sessions|consents|resource_servers|opaque_access_tokens'
+#
+# client_assertion_jtis and client_auth_diagnostics (#25) are the JWT-assertion
+# client-authentication tables: the cross-node single-use jti replay cache and the
+# out-of-band client-authentication diagnostics sink. Both are TENANT-SCOPED with
+# forced row-level security, so their SQL stays in the repository module too.
+SCOPED_TABLES='clients|organizations|audit_log|management_credentials|idempotency_keys|grants|authorization_codes|issued_tokens|signing_keys|users|sessions|consents|resource_servers|opaque_access_tokens|client_assertion_jtis|client_auth_diagnostics'
 
 # The one module allowed to name a scoped table in SQL.
 REPO_MODULE='crates/ironauth-store/src/repository.rs'

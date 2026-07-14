@@ -164,6 +164,33 @@ impl<'a> ScopedStore<'a> {
         }
     }
 
+    /// The single-use JWT-assertion `jti` replay cache for this scope (issue #25).
+    /// Records an accepted assertion's `jti`; a second use of the same `jti` is a
+    /// REPLAY, which the shared database enforces ACROSS nodes. It is a
+    /// replay-prevention cache, not a business mutation, so (like
+    /// `idempotency_keys`) it is deliberately off the audited-write path and needs
+    /// no acting context.
+    #[must_use]
+    pub fn client_assertion_jtis(&self) -> ClientAssertionJtiRepo<'a> {
+        ClientAssertionJtiRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
+    /// The out-of-band client-authentication diagnostics sink for this scope (issue
+    /// #25). Records the rich, structured detail of a failed client authentication
+    /// for the future M9 admin view; it is a diagnostic log, not a business
+    /// mutation, so (like `idempotency_keys`) it is deliberately off the
+    /// audited-write path and needs no acting context.
+    #[must_use]
+    pub fn client_auth_diagnostics(&self) -> ClientAuthDiagnosticsRepo<'a> {
+        ClientAuthDiagnosticsRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
     /// Enter an acting context (who is acting, and under which correlation id).
     /// The returned store hands out the *mutating* repositories, so every write
     /// carries an actor and a correlation id into its audit row.
@@ -302,11 +329,25 @@ pub struct ClientAuthRecord {
     /// The client's display name (shown on the consent screen).
     pub display_name: String,
     /// The registered `token_endpoint_auth_method` wire string
-    /// (`client_secret_basic`, `client_secret_post`, or `none`).
+    /// (`client_secret_basic`, `client_secret_post`, `private_key_jwt`,
+    /// `client_secret_jwt`, or `none`).
     pub auth_method: String,
     /// The SHA-256 hex hash of the client's secret, or `None` for a public
-    /// (method `none`) client that has no secret.
+    /// (method `none`) or JWT-assertion client that has no stored secret.
     pub secret_hash: Option<String>,
+    /// The client's inline `jwks` (a JWK Set JSON document), for a
+    /// `private_key_jwt` client that registered its verification keys inline;
+    /// `None` if unset. At most one of `jwks`/`jwks_uri` is set (a database CHECK
+    /// enforces this). Public key material, not a secret.
+    pub jwks: Option<String>,
+    /// The client's `jwks_uri`, for a `private_key_jwt` client whose verification
+    /// keys are fetched (through the SSRF-hardened fetcher) rather than inline;
+    /// `None` if unset.
+    pub jwks_uri: Option<String>,
+    /// The client's registered `token_endpoint_auth_signing_alg`: the single JWS
+    /// algorithm its assertions must be signed with (a per-client allowlist), or
+    /// `None` to allow the supported asymmetric set.
+    pub token_endpoint_auth_signing_alg: Option<String>,
 }
 
 impl fmt::Debug for ClientAuthRecord {
@@ -315,8 +356,33 @@ impl fmt::Debug for ClientAuthRecord {
             .field("display_name", &self.display_name)
             .field("auth_method", &self.auth_method)
             .field("has_secret", &self.secret_hash.is_some())
+            .field("has_jwks", &self.jwks.is_some())
+            .field("jwks_uri", &self.jwks_uri)
+            .field(
+                "token_endpoint_auth_signing_alg",
+                &self.token_endpoint_auth_signing_alg,
+            )
             .finish()
     }
+}
+
+/// The registration parameters for a JWT-assertion client (issue #25), created
+/// through [`ActingClientRepo::create_jwt_auth`].
+#[derive(Debug, Clone, Copy)]
+pub struct NewJwtAuthClient<'a> {
+    /// The client's display name.
+    pub display_name: &'a str,
+    /// The `token_endpoint_auth_method` wire string (`private_key_jwt` or
+    /// `client_secret_jwt`).
+    pub auth_method: &'a str,
+    /// The inline `jwks` (a JWK Set JSON document), or `None`. At most one of
+    /// `jwks`/`jwks_uri` may be set.
+    pub jwks: Option<&'a str>,
+    /// The `jwks_uri`, or `None`.
+    pub jwks_uri: Option<&'a str>,
+    /// The pinned `token_endpoint_auth_signing_alg`, or `None` to allow the
+    /// supported asymmetric set.
+    pub signing_alg: Option<&'a str>,
 }
 
 /// The read-only repository for tenant-scoped OAuth clients.
@@ -410,7 +476,8 @@ impl ClientRepo<'_> {
         }
         let mut tx = begin_scoped(self.store, self.scope).await?;
         let row = sqlx::query(
-            "SELECT display_name, token_endpoint_auth_method, secret_hash FROM clients \
+            "SELECT display_name, token_endpoint_auth_method, secret_hash, \
+             jwks, jwks_uri, token_endpoint_auth_signing_alg FROM clients \
              WHERE id = $1 AND tenant_id = $2 AND environment_id = $3",
         )
         .bind(id.to_string())
@@ -424,6 +491,9 @@ impl ClientRepo<'_> {
             display_name: row.get("display_name"),
             auth_method: row.get("token_endpoint_auth_method"),
             secret_hash: row.get("secret_hash"),
+            jwks: row.get("jwks"),
+            jwks_uri: row.get("jwks_uri"),
+            token_endpoint_auth_signing_alg: row.get("token_endpoint_auth_signing_alg"),
         })
     }
 
@@ -514,6 +584,86 @@ impl ActingClientRepo<'_> {
                 .execute(&mut **tx)
                 .await?;
                 Ok(())
+            },
+            false,
+        )
+        .await?;
+        Ok(id)
+    }
+
+    /// Create a client that authenticates at the token endpoint with a JWT
+    /// assertion (issue #25): `private_key_jwt` (verification keys from `jwks`
+    /// inline or `jwks_uri` by reference) or `client_secret_jwt`. No secret hash is
+    /// stored (the asymmetric case keeps only public keys; the symmetric case is a
+    /// documented, correctly-erroring path that stores no retrievable secret).
+    /// `signing_alg` optionally pins the single JWS algorithm the client's
+    /// assertions must be signed with. Writes a `client.create` audit row in the
+    /// same transaction, returning the fresh identifier.
+    ///
+    /// A `private_key_jwt` client MUST register EXACTLY ONE key source (`jwks` XOR
+    /// `jwks_uri`): a keyless one would register but fail EVERY request silently (no
+    /// key to verify its assertion against), and two sources are ambiguous. The
+    /// database CHECK `clients_private_key_jwt_has_one_key` (with the older
+    /// `clients_client_keys_exclusive`) enforces this, so a misconfiguration fails
+    /// LOUD as a [`StoreError::Conflict`] at registration rather than per request. A
+    /// `client_secret_jwt` registration is refused outright here, because the method
+    /// is inert (see `client_auth.rs`) and no key CHECK expresses it.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Conflict`] if the method is the inert `client_secret_jwt`, or if
+    /// a `private_key_jwt` client sets neither or both key sources (the key CHECK
+    /// fails); [`StoreError::Database`] on a persistence failure.
+    pub async fn create_jwt_auth(
+        &self,
+        env: &Env,
+        client: NewJwtAuthClient<'_>,
+    ) -> Result<ClientId, StoreError> {
+        // client_secret_jwt is inert (IronAuth stores no retrievable secret to key
+        // the HMAC; see client_auth.rs). Registering a client for it would silently
+        // fail every request, and no DB CHECK expresses "reject this method", so
+        // refuse the misconfiguration here at registration. The private_key_jwt
+        // exactly-one-key rule is enforced by the DB CHECK below (mapped to Conflict).
+        if client.auth_method == "client_secret_jwt" {
+            return Err(StoreError::Conflict);
+        }
+        let id = ClientId::generate(env, &self.scope);
+        let scope = self.scope;
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::ClientCreate,
+                target: &id,
+            },
+            async move |tx| {
+                let result = sqlx::query(
+                    "INSERT INTO clients \
+                     (id, tenant_id, environment_id, display_name, \
+                      token_endpoint_auth_method, jwks, jwks_uri, \
+                      token_endpoint_auth_signing_alg) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+                )
+                .bind(id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(client.display_name)
+                .bind(client.auth_method)
+                .bind(client.jwks)
+                .bind(client.jwks_uri)
+                .bind(client.signing_alg)
+                .execute(&mut **tx)
+                .await;
+                match result {
+                    Ok(_) => Ok(()),
+                    // A key-source CHECK violation (both jwks and jwks_uri set, or a
+                    // keyless private_key_jwt) is a caller-facing conflict, not a
+                    // persistence fault.
+                    Err(error) if is_check_violation(&error) => Err(StoreError::Conflict),
+                    Err(error) => Err(error.into()),
+                }
             },
             false,
         )
@@ -2069,6 +2219,306 @@ fn resource_server_from_row(
     })
 }
 
+/// The outcome of recording a JWT-assertion `jti` (issue #25).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JtiOutcome {
+    /// The `jti` was recorded: this is its first (and single) use.
+    Recorded,
+    /// The `jti` was already present: a REPLAY, so the assertion is rejected.
+    Replayed,
+}
+
+/// The single-use JWT-assertion `jti` replay cache (issue #25).
+///
+/// This is the cross-node replay-prevention store. Recording an accepted
+/// assertion's `jti` is an INSERT into one shared table; a primary-key conflict is
+/// a REPLAY. Because every server node inserts into the SAME row space, the
+/// database enforces single use across nodes: two nodes that race the same `jti`
+/// cannot both insert it, so exactly one sees [`JtiOutcome::Recorded`] and the
+/// other [`JtiOutcome::Replayed`].
+///
+/// The recording is deliberately OFF the audited-write path (it is a security
+/// cache, not a business mutation, exactly like `idempotency_keys`); it is still
+/// confined to this repository module and RLS-scoped.
+pub struct ClientAssertionJtiRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl ClientAssertionJtiRepo<'_> {
+    /// Record `jti` for `client_id` as single-use in this scope, first pruning any
+    /// already-expired rows.
+    ///
+    /// `expires_at_micros` is the last instant the assertion could still be
+    /// replayed (its `exp` PLUS the configured skew), so a pruned row can never
+    /// remove a `jti` whose assertion is still acceptable. The prune uses the
+    /// application clock seam (`env`), never the database clock, so it is
+    /// deterministic under a manual clock in tests.
+    ///
+    /// Returns [`JtiOutcome::Recorded`] on the first use and [`JtiOutcome::Replayed`]
+    /// when the `jti` was already present (a second use, from this or any other
+    /// node).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn record(
+        &self,
+        env: &Env,
+        client_id: &str,
+        jti: &str,
+        expires_at_micros: i64,
+    ) -> Result<JtiOutcome, StoreError> {
+        let now_micros = epoch_micros(env.clock().now_utc());
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        // Prune rows whose last-replayable instant has passed. Only these are
+        // removed, so a still-valid assertion's jti is never dropped.
+        sqlx::query(
+            "DELETE FROM client_assertion_jtis \
+             WHERE tenant_id = $1 AND environment_id = $2 \
+             AND expires_at <= TIMESTAMPTZ 'epoch' + ($3::text || ' microseconds')::interval",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(now_micros)
+        .execute(&mut *tx)
+        .await?;
+        let result = sqlx::query(
+            "INSERT INTO client_assertion_jtis \
+             (tenant_id, environment_id, client_id, jti, expires_at) \
+             VALUES ($1, $2, $3, $4, \
+                     TIMESTAMPTZ 'epoch' + ($5::text || ' microseconds')::interval)",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(client_id)
+        .bind(jti)
+        .bind(expires_at_micros)
+        .execute(&mut *tx)
+        .await;
+        match result {
+            Ok(_) => {
+                tx.commit().await?;
+                Ok(JtiOutcome::Recorded)
+            }
+            // A primary-key conflict is a replay: the jti was already used. Roll
+            // back (the prune, if any, need not persist) and report the replay.
+            Err(error) if is_unique_violation(&error) => {
+                tx.rollback().await?;
+                Ok(JtiOutcome::Replayed)
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+}
+
+/// A bounded-cardinality reason a client authentication failed (issue #25),
+/// recorded in the diagnostics sink. No attacker-controlled free text, so it is
+/// safe as a metric-like dimension and never an oracle on the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClientAuthDiagnosticReason {
+    /// The presented credentials could not be parsed into one coherent attempt
+    /// (more than one method, a malformed header, a missing or conflicting id).
+    Unparsable,
+    /// The client is unknown in this scope, or its identifier was malformed.
+    UnknownClient,
+    /// The presented method did not match the client's single registered method.
+    MethodMismatch,
+    /// A presented secret did not match the client's stored hash.
+    BadSecret,
+    /// A JWT assertion did not verify (bad signature, wrong iss/sub/aud, expired,
+    /// unsupported or disallowed algorithm, or unresolvable keys).
+    AssertionInvalid,
+    /// A JWT assertion's `jti` was replayed (already used).
+    ReplayedJti,
+    /// The `client_secret_jwt` method is registered but unsupported: IronAuth
+    /// stores no retrievable secret to key its HMAC, so it fails closed.
+    ClientSecretJwtUnsupported,
+}
+
+impl ClientAuthDiagnosticReason {
+    /// The stable wire string recorded in the diagnostics row.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ClientAuthDiagnosticReason::Unparsable => "unparsable",
+            ClientAuthDiagnosticReason::UnknownClient => "unknown_client",
+            ClientAuthDiagnosticReason::MethodMismatch => "method_mismatch",
+            ClientAuthDiagnosticReason::BadSecret => "bad_secret",
+            ClientAuthDiagnosticReason::AssertionInvalid => "assertion_invalid",
+            ClientAuthDiagnosticReason::ReplayedJti => "replayed_jti",
+            ClientAuthDiagnosticReason::ClientSecretJwtUnsupported => {
+                "client_secret_jwt_unsupported"
+            }
+        }
+    }
+}
+
+/// How long a client-authentication diagnostic is retained before the on-insert
+/// prune reclaims it (issue #25), in epoch microseconds (the unit the clock seam and
+/// the prune bind). Seven days is enough for the M9 admin view to surface a recent
+/// burst of failures, while bounding the table so the pre-grant reuse of the
+/// `authenticate_client` seam by #22 introspection/revocation cannot grow it without
+/// limit from unauthenticated requests. 7 days in microseconds is well within `i64`.
+const DIAGNOSTIC_RETENTION_MICROS: i64 = 7 * 24 * 60 * 60 * 1_000_000;
+
+/// A client-authentication failure diagnostic to record (issue #25). Carries the
+/// rich, structured detail kept OFF the wire.
+#[derive(Debug, Clone, Copy)]
+pub struct NewClientAuthDiagnostic<'a> {
+    /// The client identifier the attempt claimed (best effort on a failure).
+    pub client_id: &'a str,
+    /// The token-endpoint authentication method the attempt used.
+    pub auth_method: &'a str,
+    /// The bounded-cardinality failure reason.
+    pub reason: ClientAuthDiagnosticReason,
+    /// The assertion header's `kid`, if the attempt presented a JWT assertion.
+    pub key_id: Option<&'a str>,
+    /// The assertion header's `alg`, if the attempt presented a JWT assertion.
+    pub signing_alg: Option<&'a str>,
+}
+
+/// A read-back client-authentication diagnostic row (issue #25), for the future
+/// M9 admin view and for tests asserting a failure was recorded out of band.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientAuthDiagnosticRecord {
+    /// The client identifier the attempt claimed.
+    pub client_id: String,
+    /// The authentication method the attempt used.
+    pub auth_method: String,
+    /// The bounded-cardinality failure reason (see [`ClientAuthDiagnosticReason`]).
+    pub failure_reason: String,
+    /// The assertion header `kid`, if any.
+    pub key_id: Option<String>,
+    /// The assertion header `alg`, if any.
+    pub signing_alg: Option<String>,
+}
+
+/// The out-of-band client-authentication diagnostics sink (issue #25).
+///
+/// Records a failed client authentication's rich, structured detail (the method
+/// attempted, the bounded-cardinality reason, and the assertion header's key id
+/// and algorithm) for the future M9 admin view, so the wire can stay a uniform,
+/// opaque `invalid_client` with no oracle. Append-only and deliberately off the
+/// audited-write path (a diagnostic is a log entry, not a business mutation),
+/// mirroring `idempotency_keys`.
+pub struct ClientAuthDiagnosticsRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl ClientAuthDiagnosticsRepo<'_> {
+    /// Record a client-authentication failure diagnostic in this scope, first
+    /// pruning any rows past their retention window. The event time comes from the
+    /// application clock seam (`env`), so both the recorded time and the prune are
+    /// deterministic under a manual clock in tests.
+    ///
+    /// The prune bounds the table: issue #22 introspection/revocation reuses the
+    /// `authenticate_client` seam PRE-grant, where an unauthenticated caller reaches
+    /// this sink, so without retention it would grow one row per request. The window
+    /// is [`DIAGNOSTIC_RETENTION_MICROS`], long enough for the M9 admin view. This is
+    /// a growth bound, NOT rate limiting.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn record(
+        &self,
+        env: &Env,
+        diagnostic: NewClientAuthDiagnostic<'_>,
+    ) -> Result<(), StoreError> {
+        let id = random_diagnostic_id(env);
+        let occurred_micros = epoch_micros(env.clock().now_utc());
+        let expires_micros = occurred_micros.saturating_add(DIAGNOSTIC_RETENTION_MICROS);
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        // Prune rows past their retention window before inserting (prune-then-insert,
+        // exactly like the jti cache). Bounds the table under the pre-grant reuse by
+        // #22; only already-expired rows are removed.
+        sqlx::query(
+            "DELETE FROM client_auth_diagnostics \
+             WHERE tenant_id = $1 AND environment_id = $2 \
+             AND expires_at <= TIMESTAMPTZ 'epoch' + ($3::text || ' microseconds')::interval",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(occurred_micros)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO client_auth_diagnostics \
+             (id, tenant_id, environment_id, client_id, auth_method, failure_reason, \
+              key_id, signing_alg, occurred_at, expires_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, \
+                     TIMESTAMPTZ 'epoch' + ($9::text || ' microseconds')::interval, \
+                     TIMESTAMPTZ 'epoch' + ($10::text || ' microseconds')::interval)",
+        )
+        .bind(id)
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(diagnostic.client_id)
+        .bind(diagnostic.auth_method)
+        .bind(diagnostic.reason.as_str())
+        .bind(diagnostic.key_id)
+        .bind(diagnostic.signing_alg)
+        .bind(occurred_micros)
+        .bind(expires_micros)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Read every recorded diagnostic for `client_id` in this scope, oldest first.
+    /// For the future M9 admin view and for tests asserting a failure was recorded.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn for_client(
+        &self,
+        client_id: &str,
+    ) -> Result<Vec<ClientAuthDiagnosticRecord>, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let rows = sqlx::query(
+            "SELECT client_id, auth_method, failure_reason, key_id, signing_alg \
+             FROM client_auth_diagnostics \
+             WHERE client_id = $1 AND tenant_id = $2 AND environment_id = $3 \
+             ORDER BY occurred_at, id",
+        )
+        .bind(client_id)
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(rows
+            .iter()
+            .map(|row| ClientAuthDiagnosticRecord {
+                client_id: row.get("client_id"),
+                auth_method: row.get("auth_method"),
+                failure_reason: row.get("failure_reason"),
+                key_id: row.get("key_id"),
+                signing_alg: row.get("signing_alg"),
+            })
+            .collect())
+    }
+}
+
+/// A random 128-bit hex identifier for a diagnostics row, drawn from the
+/// application entropy seam (never the crate's own RNG), so it is deterministic
+/// under a seeded stream in tests and leaks no ordering or count.
+fn random_diagnostic_id(env: &Env) -> String {
+    use std::fmt::Write as _;
+    let mut bytes = [0_u8; 16];
+    env.entropy().fill_bytes(&mut bytes);
+    bytes
+        .iter()
+        .fold(String::with_capacity(32), |mut acc, byte| {
+            let _ = write!(acc, "{byte:02x}");
+            acc
+        })
+}
+
 /// An opaque access token to record, digest-only (issue #29). The plaintext token
 /// is NEVER carried here: only its SHA-256 hex `token_digest` (compute it with
 /// [`opaque_access_token_digest`]) plus the token's metadata. `Debug` redacts the
@@ -2716,6 +3166,17 @@ fn is_unique_violation(error: &sqlx::Error) -> bool {
         .and_then(sqlx::error::DatabaseError::code)
         .as_deref()
         == Some("23505")
+}
+
+/// Whether a database error is a Postgres check-constraint violation (SQLSTATE
+/// 23514). Used to turn a rejected registration (for example a client that set
+/// both `jwks` and `jwks_uri`) into the caller-facing [`StoreError::Conflict`].
+fn is_check_violation(error: &sqlx::Error) -> bool {
+    error
+        .as_database_error()
+        .and_then(sqlx::error::DatabaseError::code)
+        .as_deref()
+        == Some("23514")
 }
 
 /// A record read back from the `audit_log` table, always within scope. The full

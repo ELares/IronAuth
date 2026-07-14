@@ -6,6 +6,60 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Complete the client authentication suite with JWT assertions and uniform
+  failure hygiene (issue #25).
+  - **`private_key_jwt` (RFC 7523).** A client authenticates the token endpoint
+    with a JWS assertion signed by a key it registered (`jwks` inline or a
+    `jwks_uri` fetched through the SSRF-hardened `ironauth-fetch`, cached with a
+    TTL). Every asymmetric algorithm the verify core represents is accepted
+    (`EdDSA`, `RS256/384/512`, `ES256/384`, `PS256/384/512`); an `ES512`
+    assertion is rejected, matching the M1 exclusion. The assertion is validated
+    through the one hardened `verify` path: `iss` and `sub` must equal the client
+    id, `exp` is enforced with the configured skew through the `Clock` seam, and
+    `aud` must be an accepted audience per the `oidc.client_assertion_audience`
+    policy (the token-endpoint URL or the issuer by default, issuer-only in the
+    strict mode). A non-empty `jti` is required (an empty or whitespace-only `jti`
+    is treated as absent and rejected) and spent through the cross-node single-use
+    store, so a replayed assertion is refused on every node. The single-use row is
+    retained until `exp + skew + 1s`: acceptance floors `now` to whole seconds and
+    accepts while `now_secs <= exp+skew`, so the assertion stays acceptable for the
+    whole wall-clock second `[exp+skew, exp+skew+1)`; the +1s margin makes retention
+    strictly outlast acceptance so a replay is caught across that entire second (a
+    bare `exp+skew` retention pruned at microsecond precision would re-admit it).
+  - **`private_key_jwt` key-source and algorithm pin.** A `private_key_jwt` client
+    must register EXACTLY ONE key source; a per-client `token_endpoint_auth_signing_alg`
+    is a strict allowlist (a client pinned to `EdDSA` rejects an otherwise-valid
+    `RS256` assertion). Discovery advertises the asymmetric assertion matrix in
+    `token_endpoint_auth_signing_alg_values_supported` (REQUIRED by OIDC Discovery 1.0
+    section 3 whenever `private_key_jwt` is advertised; `none` and `ES512` excluded).
+  - **`client_secret_jwt` fails closed, by decision.** The method is inert: HMAC
+    verification would require the raw client secret at verify time, and IronAuth
+    stores only a one-way hash of client secrets; implementing it would have weakened
+    the `basic`/`post` hashed-secret posture or pulled in retrievable-secret key
+    management, both out of scope for #25. It is therefore NOT advertised in
+    discovery's `token_endpoint_auth_methods_supported`, and registering a client for
+    it is refused LOUD at registration (a `Conflict`), so no such client can reach the
+    token endpoint; the runtime fail-closed arm (an opaque `invalid_client` with a
+    recorded diagnostic) remains as defense in depth. The tradeoff is documented at
+    the top of `client_auth.rs`.
+  - **Uniform failure hygiene.** Presenting more than one authentication method
+    is an `invalid_request`; every other authentication failure is an opaque
+    `invalid_client` (HTTP 401 with the correct `WWW-Authenticate` challenge only
+    when the client used HTTP Basic, per RFC 6749 5.2), with no oracle
+    distinguishing an unknown client from a bad signature from a replayed `jti`.
+    The rich reason is written out of band to `client_auth_diagnostics`, never to
+    the wire. Exactly one registered method is honored per client.
+  - **Reusable `authenticate_client` seam.** The token endpoint's client
+    authentication is now the crate-public `client_auth::authenticate_client`
+    (over `ClientAuthInputs`), so #22 introspection/revocation and #26's JWT
+    bearer grant inherit the same parsing, routing, verification, single-use, and
+    diagnostics without reimplementing them. `ClientKeyResolver` centralizes
+    `jwks`/`jwks_uri` key resolution and caching.
+  - **`client_secret_basic` decode hardening.** `form_urldecode` now decodes `%XX`
+    escapes from the raw BYTES (rejecting a non-hex pair), so a `%` followed by a
+    multi-byte UTF-8 character in an `Authorization: Basic` credential can no longer
+    string-slice at a non-char-boundary and panic (previously a 500 via the
+    catch-panic layer, reachable unauthenticated).
 - JWT (RFC 9068) and opaque access tokens with per-resource-server format
   selection (issue #29).
   - **RFC 9068 `at+jwt` conformance.** The access token now carries the RFC 9068

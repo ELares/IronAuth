@@ -172,6 +172,27 @@ pub enum TokenFormat {
     Opaque,
 }
 
+/// The audience an inbound JWT client assertion (`private_key_jwt` /
+/// `client_secret_jwt`, issue #25) must be addressed to (RFC 7523 section 3, OIDC
+/// Core section 9). This is the SHARED audience knob the JWT bearer grant (#26)
+/// reuses: both surfaces validate an assertion's `aud` through it.
+///
+/// The default accepts the token-endpoint URL OR the per-environment issuer, which
+/// is the interoperable choice: real client libraries disagree on which they place
+/// in `aud`. The strict mode accepts ONLY the issuer, per rfc7523bis and FAPI 2.0,
+/// which reject a token-endpoint-audienced assertion.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ClientAssertionAudience {
+    /// Accept an assertion whose `aud` is the token-endpoint URL OR the
+    /// per-environment issuer. The interoperable default.
+    #[default]
+    TokenEndpointOrIssuer,
+    /// Accept ONLY an assertion whose `aud` is the per-environment issuer (a
+    /// token-endpoint-audienced assertion is rejected), per rfc7523bis / FAPI 2.0.
+    IssuerOnly,
+}
+
 /// Structured-log output format.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -291,6 +312,13 @@ pub const OIDC_JWKS_CACHE_MIN_SECS: u64 = 300;
 /// longer window would keep a rotated-out key trusted in caches for too long.
 pub const OIDC_JWKS_CACHE_MAX_SECS: u64 = 900;
 
+/// The largest clock skew a JWT client assertion's `exp`/`nbf`/`iat` may be
+/// tolerated by, in seconds (issue #25). A small skew absorbs realistic clock
+/// drift between a client and the provider; a large one would keep an expired
+/// assertion replayable for too long, so config load rejects a value above this
+/// ceiling. The default is one minute.
+pub const OIDC_MAX_CLIENT_ASSERTION_SKEW_SECS: u64 = 300;
+
 /// OIDC provider settings (issue #12).
 ///
 /// The public authorization and token endpoints. Lifetimes are configurable (the
@@ -390,6 +418,25 @@ pub struct OidcConfig {
     /// deployment default until per-environment overrides land.
     pub conform_id_token_claims: bool,
 
+    /// The audience an inbound JWT client assertion (`private_key_jwt`, issue #25)
+    /// must be addressed to (RFC 7523, OIDC Core section 9). The interoperable
+    /// default (`token_endpoint_or_issuer`) accepts an assertion whose `aud` is the
+    /// token-endpoint URL OR the per-environment issuer; `issuer_only` accepts ONLY
+    /// the issuer (rejecting a token-endpoint-audienced assertion) per rfc7523bis
+    /// and FAPI 2.0. This is the SHARED knob the JWT bearer grant (#26) reuses. A
+    /// promotable per-environment setting in spirit; the process value is the
+    /// deployment default until per-environment overrides ride the M5 pipeline.
+    pub client_assertion_audience: ClientAssertionAudience,
+
+    /// The clock-skew tolerance (in seconds) applied to a JWT client assertion's
+    /// `exp`/`nbf`/`iat` (issue #25). A small window absorbs realistic client/server
+    /// clock drift; the default (60) is one minute and config load rejects a value
+    /// above `OIDC_MAX_CLIENT_ASSERTION_SKEW_SECS` (300), because a wide skew keeps
+    /// an expired assertion replayable for too long. The replay cache retains a
+    /// jti until its assertion's `exp` PLUS this skew, so pruning never opens a
+    /// replay window.
+    pub client_assertion_max_skew_secs: u64,
+
     /// The web origins (scheme + host + optional port, no path) of registered
     /// single-page-app clients allowed to call the `UserInfo` endpoint cross-origin
     /// (issue #15). Empty by default, so no CORS is offered. Each entry is matched
@@ -460,6 +507,8 @@ impl Default for OidcConfig {
             jwks_cache_max_age_secs: 600,
             require_pkce_for_confidential_clients: true,
             conform_id_token_claims: false,
+            client_assertion_audience: ClientAssertionAudience::TokenEndpointOrIssuer,
+            client_assertion_max_skew_secs: 60,
             userinfo_cors_origins: Vec::new(),
             enable_response_type_id_token: false,
             enable_response_type_code_id_token: false,
@@ -656,6 +705,17 @@ impl Config {
                 message: format!(
                     "oidc.jwks_cache_max_age_secs ({cache}) must be between \
                      {OIDC_JWKS_CACHE_MIN_SECS} and {OIDC_JWKS_CACHE_MAX_SECS} seconds"
+                ),
+            });
+        }
+        // The client-assertion skew has only an upper bound: 0 is valid (no
+        // tolerance), but a wide skew keeps an expired assertion replayable.
+        if self.oidc.client_assertion_max_skew_secs > OIDC_MAX_CLIENT_ASSERTION_SKEW_SECS {
+            return Err(ConfigError::Invalid {
+                message: format!(
+                    "oidc.client_assertion_max_skew_secs ({}) must not exceed \
+                     {OIDC_MAX_CLIENT_ASSERTION_SKEW_SECS} seconds",
+                    self.oidc.client_assertion_max_skew_secs
                 ),
             });
         }
@@ -1032,6 +1092,57 @@ mod tests {
                 "https://spa.example".to_owned(),
                 "https://app.test:8443".to_owned()
             ]
+        );
+    }
+
+    #[test]
+    fn oidc_client_assertion_audience_and_skew_parse_and_validate() {
+        // Issue #25: the shared audience knob is a snake_case enum with two members;
+        // the skew is bounded above (0 is valid, over the ceiling aborts).
+        let default = OidcConfig::default();
+        assert_eq!(
+            default.client_assertion_audience,
+            ClientAssertionAudience::TokenEndpointOrIssuer,
+            "the interoperable audience is the default"
+        );
+        assert_eq!(default.client_assertion_max_skew_secs, 60);
+
+        let strict = Config::from_toml_str(
+            "[oidc]\nclient_assertion_audience = \"issuer_only\"\n\
+             client_assertion_max_skew_secs = 0\n",
+            "<inline>",
+        )
+        .expect("valid")
+        .config;
+        assert_eq!(
+            strict.oidc.client_assertion_audience,
+            ClientAssertionAudience::IssuerOnly
+        );
+        assert_eq!(strict.oidc.client_assertion_max_skew_secs, 0);
+
+        // An unknown audience aborts with the accepted alternatives.
+        let err = Config::from_toml_str(
+            "[oidc]\nclient_assertion_audience = \"whatever\"\n",
+            "ironauth.toml",
+        )
+        .expect_err("unknown audience");
+        assert!(
+            err.to_string().contains("token_endpoint_or_issuer"),
+            "{err}"
+        );
+
+        // A skew above the ceiling aborts.
+        let err = Config::from_toml_str(
+            &format!(
+                "[oidc]\nclient_assertion_max_skew_secs = {}\n",
+                OIDC_MAX_CLIENT_ASSERTION_SKEW_SECS + 1
+            ),
+            "ironauth.toml",
+        )
+        .expect_err("skew over ceiling");
+        assert!(
+            err.to_string().contains("client_assertion_max_skew_secs"),
+            "{err}"
         );
     }
 

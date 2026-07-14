@@ -239,9 +239,16 @@ fn es256_only_policy_bans_eddsa_everywhere_but_keeps_the_rs256_floor() {
     let algs = string_array(&doc, "id_token_signing_alg_values_supported");
     assert_eq!(algs, vec!["ES256".to_owned(), "RS256".to_owned()]);
 
-    // No *_supported array anywhere mentions EdDSA under an ES256-only policy.
+    // No *_supported array anywhere mentions EdDSA under an ES256-only policy,
+    // EXCEPT token_endpoint_auth_signing_alg_values_supported: that is the token
+    // endpoint's fixed `private_key_jwt` assertion-VERIFY matrix (issue #25), which
+    // is independent of the environment's id-token signing policy, so it advertises
+    // the whole asymmetric family (EdDSA included) even here.
     let object = doc.as_object().expect("object");
     for (key, value) in object {
+        if key == "token_endpoint_auth_signing_alg_values_supported" {
+            continue;
+        }
         if key.ends_with("_supported") {
             if let Some(items) = value.as_array() {
                 for item in items {
@@ -253,6 +260,53 @@ fn es256_only_policy_bans_eddsa_everywhere_but_keeps_the_rs256_floor() {
                 }
             }
         }
+    }
+}
+
+#[test]
+fn token_endpoint_auth_signing_alg_values_are_advertised_for_private_key_jwt() {
+    // OIDC Discovery 1.0 section 3 REQUIRES
+    // token_endpoint_auth_signing_alg_values_supported whenever private_key_jwt (or
+    // client_secret_jwt) is advertised (issue #25). It is the asymmetric assertion
+    // matrix the token endpoint verifies against: non-empty, contains EdDSA, and
+    // excludes both ES512 (the M1 exclusion) and `none`.
+    let doc = discovery_document(
+        "https://issuer.test/t/tnt/e/env",
+        ISSUER_BASE,
+        "https://issuer.test/t/tnt/e/env/jwks.json",
+        &SigningPolicy::eddsa_default(),
+        &DiscoveryCapabilities::default(),
+    );
+
+    // private_key_jwt is advertised, so the signing-alg-values field MUST be present.
+    let methods = string_array(&doc, "token_endpoint_auth_methods_supported");
+    assert!(
+        methods.contains(&"private_key_jwt".to_owned()),
+        "private_key_jwt is advertised: {methods:?}"
+    );
+    let algs = string_array(&doc, "token_endpoint_auth_signing_alg_values_supported");
+    assert!(
+        !algs.is_empty(),
+        "the signing-alg-values field is non-empty"
+    );
+    assert!(
+        algs.contains(&"EdDSA".to_owned()),
+        "the asymmetric matrix advertises EdDSA: {algs:?}"
+    );
+    assert!(
+        !algs.contains(&"ES512".to_owned()),
+        "ES512 is excluded (M1): {algs:?}"
+    );
+    assert!(
+        !algs.contains(&"none".to_owned()),
+        "`none` is not a signing alg: {algs:?}"
+    );
+    // Every advertised value is a real asymmetric JWS algorithm the verify core knows.
+    for alg in &algs {
+        assert!(
+            JwsAlgorithm::from_jose_name(alg).is_some(),
+            "{alg} is a representable algorithm"
+        );
     }
 }
 

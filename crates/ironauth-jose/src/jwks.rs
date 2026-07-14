@@ -18,6 +18,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::Serialize;
 use serde_json::{Map, Value};
 
+use crate::policy::TrustedKey;
 use crate::signing_key::{PublicComponents, SigningKey, SigningKeyError};
 
 /// A single public JSON Web Key.
@@ -150,4 +151,123 @@ impl JwkSet {
 /// base64url-encode without padding, as JOSE requires for JWK members.
 fn b64(bytes: &[u8]) -> Value {
     Value::String(URL_SAFE_NO_PAD.encode(bytes))
+}
+
+/// Parse an inbound JWK Set document into the trusted keys it names.
+///
+/// This is the INBOUND counterpart of the outbound [`JwkSet`] builder: it turns a
+/// relying party's or client's published `{"keys":[...]}` document (fetched from a
+/// `jwks_uri` through the SSRF-hardened fetcher, or supplied inline) into
+/// [`TrustedKey`]s a [`VerificationPolicy`](crate::VerificationPolicy) can trust to
+/// verify a client assertion (RFC 7523, OIDC Core `private_key_jwt`).
+///
+/// It is deliberately CONSERVATIVE, so an inbound document can never smuggle in a
+/// trust it should not have:
+///
+/// - a JWK whose `kty`/`crv` this core cannot represent (an `OKP` that is not
+///   `Ed25519`, an `EC` `P-521` key, which is the excluded ES512 family, or any
+///   other type) is SKIPPED, never trusted;
+/// - a JWK whose material is malformed (a bad base64url member, a wrong-length
+///   coordinate, an RSA modulus below the 2048-bit floor) is SKIPPED, since the
+///   [`TrustedKey`] constructor refuses it;
+/// - a malformed document (not JSON, or with no `keys` array) yields an EMPTY set.
+///
+/// An empty result is a fail-closed outcome for the caller: a policy cannot be
+/// built without at least one trusted key, so a document that names no usable key
+/// verifies nothing. Only the PUBLIC members (`kty`, `crv`, `x`, `y`, `n`, `e`,
+/// `kid`) are read; nothing in the document selects an algorithm or reaches trust
+/// beyond producing a candidate public key.
+#[must_use]
+pub fn trusted_keys_from_jwks(json: &[u8]) -> Vec<TrustedKey> {
+    let Ok(value) = serde_json::from_slice::<Value>(json) else {
+        return Vec::new();
+    };
+    let Some(keys) = value.get("keys").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    keys.iter().filter_map(trusted_key_from_jwk).collect()
+}
+
+/// Turn one JWK object into a [`TrustedKey`], or [`None`] for a type, curve, or
+/// material this core cannot represent (so it is never trusted).
+fn trusted_key_from_jwk(jwk: &Value) -> Option<TrustedKey> {
+    let kid = jwk.get("kid").and_then(Value::as_str).map(str::to_owned);
+    match jwk.get("kty").and_then(Value::as_str)? {
+        "OKP" => {
+            // Only Ed25519 among OKP curves; Ed448/X25519/X448 are not represented.
+            if jwk.get("crv").and_then(Value::as_str)? != "Ed25519" {
+                return None;
+            }
+            let x = jwk_b64(jwk, "x")?;
+            TrustedKey::ed25519(kid, &x).ok()
+        }
+        "EC" => {
+            let x = jwk_b64(jwk, "x")?;
+            let y = jwk_b64(jwk, "y")?;
+            match jwk.get("crv").and_then(Value::as_str)? {
+                "P-256" => TrustedKey::ecdsa_p256(kid, &x, &y).ok(),
+                "P-384" => TrustedKey::ecdsa_p384(kid, &x, &y).ok(),
+                // P-521 is the ES512 family, excluded in M1; any other curve is
+                // likewise unrepresented. Never trusted.
+                _ => None,
+            }
+        }
+        "RSA" => {
+            let n = jwk_b64(jwk, "n")?;
+            let e = jwk_b64(jwk, "e")?;
+            TrustedKey::rsa(kid, &n, &e).ok()
+        }
+        // oct (symmetric) and every unknown type are never a verify key here.
+        _ => None,
+    }
+}
+
+/// Read and base64url-decode a JWK member, or [`None`] if absent or malformed.
+fn jwk_b64(jwk: &Value, member: &str) -> Option<Vec<u8>> {
+    let encoded = jwk.get(member)?.as_str()?;
+    URL_SAFE_NO_PAD.decode(encoded.as_bytes()).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_published_jwk_set_round_trips_back_into_trusted_keys() {
+        // Build the public JWK for an Ed25519 signing key from a fixed seed,
+        // serialize the set, and prove the inbound parser recovers a usable trusted
+        // key with the same kid (the material verification will trust).
+        use crate::signing_key::SigningKey;
+
+        let seed = [7_u8; 32];
+        let ed = SigningKey::ed25519_from_seed(Some("ed".to_owned()), &seed).expect("ed25519");
+        let set = JwkSet::from_signing_keys([&ed]).expect("jwk set");
+        let json = set.to_json().expect("json");
+
+        let keys = trusted_keys_from_jwks(json.as_bytes());
+        assert_eq!(keys.len(), 1, "the one published key parses back");
+        assert_eq!(keys[0].kid(), Some("ed"));
+    }
+
+    #[test]
+    fn unsupported_types_and_curves_and_malformed_entries_are_skipped() {
+        // A P-521 EC key (the excluded ES512 family), an oct (symmetric) key, and a
+        // structurally broken EC key are all skipped; a good Ed25519 remains.
+        let json = br#"{"keys":[
+            {"kty":"EC","crv":"P-521","x":"AA","y":"AA","kid":"es512"},
+            {"kty":"oct","k":"AAAA","kid":"sym"},
+            {"kty":"EC","crv":"P-256","x":"!!bad!!","y":"AA","kid":"broken"},
+            {"kty":"OKP","crv":"Ed25519","x":"11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo","kid":"ok"}
+        ]}"#;
+        let keys = trusted_keys_from_jwks(json);
+        assert_eq!(keys.len(), 1, "only the Ed25519 key is usable");
+        assert_eq!(keys[0].kid(), Some("ok"));
+    }
+
+    #[test]
+    fn a_malformed_document_yields_no_keys_fail_closed() {
+        assert!(trusted_keys_from_jwks(b"not json").is_empty());
+        assert!(trusted_keys_from_jwks(b"{}").is_empty());
+        assert!(trusted_keys_from_jwks(br#"{"keys":"nope"}"#).is_empty());
+    }
 }
