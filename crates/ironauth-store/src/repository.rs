@@ -1333,11 +1333,13 @@ impl ActingClientRepo<'_> {
     ///
     /// `claims_json` is the JSON text of a claims OBJECT to embed into the client's
     /// client-credentials access tokens, or `None` to clear the configuration. The
-    /// caller (the OIDC layer) has already validated that it is a JSON object and
-    /// that it names no protected registered claim; the store persists it verbatim
-    /// as JSONB (an invalid document is rejected by the JSONB cast as
-    /// [`StoreError::Database`], defense in depth). A client absent in this scope is
-    /// the uniform [`StoreError::NotFound`].
+    /// store persists it verbatim as JSONB (an invalid document is rejected by the
+    /// JSONB cast as [`StoreError::Database`], defense in depth). The store does NOT
+    /// filter protected registered claim names: the MINT is the SINGLE enforcement
+    /// point for the protected-claim guard (a custom claim can never set a reserved
+    /// name, per `PROTECTED_ACCESS_TOKEN_CLAIMS` in the OIDC layer), so the guard
+    /// holds even for a value written straight into this column. A client absent in
+    /// this scope is the uniform [`StoreError::NotFound`].
     ///
     /// # Errors
     ///
@@ -4250,6 +4252,35 @@ impl RefreshRepo<'_> {
         .get("n");
         tx.commit().await?;
         Ok(count)
+    }
+
+    /// Count the refresh-token rows recorded in this scope: the `(refresh_families,
+    /// refresh_tokens)` row counts visible under the scope's forced row-level
+    /// security. Used by the client-credentials test (issue #23) to prove at the
+    /// DATABASE that a machine-token issuance opened NO refresh family and minted NO
+    /// refresh token (RFC 6749 4.4.3 forbids a refresh token on that grant), so the
+    /// no-refresh guarantee holds beyond the token-response body.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn count_in_scope(&self) -> Result<(i64, i64), StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT \
+             (SELECT COUNT(*) FROM refresh_families \
+              WHERE tenant_id = $1 AND environment_id = $2) AS families, \
+             (SELECT COUNT(*) FROM refresh_tokens \
+              WHERE tenant_id = $1 AND environment_id = $2) AS tokens",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .fetch_one(&mut *tx)
+        .await?;
+        let families: i64 = row.get("families");
+        let tokens: i64 = row.get("tokens");
+        tx.commit().await?;
+        Ok((families, tokens))
     }
 }
 

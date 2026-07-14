@@ -101,21 +101,59 @@ pub const OPAQUE_ACCESS_TOKEN_DELIMITER: char = '~';
 /// opaque token cannot be guessed or enumerated.
 const OPAQUE_ACCESS_TOKEN_BYTES: usize = 32;
 
-/// The registered access-token claims a per-client STATIC custom claim may NEVER
-/// override (issue #23): the RFC 9068 protocol claims. The client-credentials mint
-/// drops any custom claim whose name collides with one of these, so a client can
-/// never forge its own `iss`/`sub`/`aud`/`exp`/`iat`/`jti`/`client_id`/`scope`
-/// through its custom-claims configuration. This is the single enforcement point
-/// (the mint), so it holds even for a claim written straight into the store.
+/// The reserved access-token claim names a per-client STATIC custom claim may NEVER
+/// set (issue #23). The client-credentials mint DROPS any custom claim whose name is
+/// in this set, so a per-client `custom_token_claims` config can never forge or
+/// inject a claim that carries protocol, authentication-context, binding, or session
+/// meaning. This is the single enforcement point (the mint), so the guard holds even
+/// for a value written straight into the store's `custom_token_claims` column.
+///
+/// It is a comprehensive DENYLIST of reserved names (NOT an allowlist): a custom
+/// claim exists precisely to carry ARBITRARY business data, so anything not reserved
+/// here is admitted. Each class below is reserved for a distinct reason:
+///
+/// - **Protocol claims** (RFC 9068 section 2.2 + the JWT registered claims of RFC
+///   7519): the token's own identity, audience, lifetime, and validity window. A
+///   business claim has no business restating `iss`/`sub`/`aud`/`exp`/... or moving
+///   `nbf`. `typ`/`token_type` are reserved for defense in depth: the `at+jwt` header
+///   `typ` is set separately via [`EmissionOptions`] (so a PAYLOAD `typ` is harmless),
+///   but reserving both avoids ever confusing a lax verifier that reads the payload.
+/// - **Authentication-context claims** (OIDC): `acr`/`amr`/`auth_time`/`nonce`/`azp`.
+///   A machine token must NEVER assert a human authentication context; the M2M claim
+///   builder ([`build_client_credentials_access_token_claims`]) DELIBERATELY omits
+///   `acr`/`amr`/`auth_time`, so allowing a custom claim to re-inject one would defeat
+///   the exact invariant that builder exists to guarantee.
+/// - **Binding / security claims**: `cnf` (RFC 7800). A self-asserted confirmation key
+///   would undermine sender-constrained (`DPoP` / mTLS proof-of-possession) token
+///   binding once it lands; only the issuer may state `cnf`.
+/// - **Hash / session claims** (OIDC): `at_hash`/`c_hash`/`sid`. IronAuth computes and
+///   emits these itself where they belong; a self-asserted value carries security
+///   meaning it must never be allowed to forge.
 pub(crate) const PROTECTED_ACCESS_TOKEN_CLAIMS: &[&str] = &[
+    // Protocol claims (RFC 9068 section 2.2 + RFC 7519 registered).
     "iss",
     "sub",
     "aud",
     "exp",
     "iat",
+    "nbf",
     "jti",
     "client_id",
     "scope",
+    "typ",
+    "token_type",
+    // Authentication-context claims (OIDC): a machine token asserts no human auth.
+    "acr",
+    "amr",
+    "auth_time",
+    "nonce",
+    "azp",
+    // Binding / security claims: only the issuer may state a confirmation key.
+    "cnf",
+    // Hash / session claims (OIDC): IronAuth emits these itself where they belong.
+    "at_hash",
+    "c_hash",
+    "sid",
 ];
 
 /// The resolved target for an access token: the audience it is minted for, the
@@ -389,9 +427,11 @@ pub struct ClientCredentialsMintRequest<'a> {
     pub client_id: &'a str,
     /// The granted OAuth `scope` value, echoed into the token when present.
     pub oauth_scope: Option<&'a str>,
-    /// The per-client STATIC custom claims to embed. A custom claim can never
-    /// override a protected registered claim (see
-    /// [`PROTECTED_ACCESS_TOKEN_CLAIMS`]).
+    /// The per-client STATIC custom claims to embed. A custom claim can never set a
+    /// reserved claim name (see [`PROTECTED_ACCESS_TOKEN_CLAIMS`]). Custom claims are
+    /// an at+jwt feature ONLY: an opaque access token carries no embedded claims by
+    /// design, so when the resolved format is opaque these claims are dropped (and the
+    /// mint warns), their metadata surfacing instead through #22 introspection.
     pub custom_claims: &'a serde_json::Map<String, serde_json::Value>,
 }
 
@@ -488,7 +528,25 @@ pub fn mint_client_credentials_access_token(
         }
         // Opaque tokens carry no claims, so this is the exact same reference token as
         // every other grant mints (shared helper), only its stored metadata differs.
-        TokenFormat::Opaque => mint_opaque_access(state, &request.scope, target, now),
+        // Consequently a client's configured custom claims CANNOT ride on an opaque
+        // token: an opaque token is a reference credential with no embedded payload by
+        // design, and its metadata surfaces only through the #22 introspection resolve;
+        // custom claims are an at+jwt feature. This is NOT silent: when custom claims
+        // are configured but the resolved resource-server/environment format is opaque,
+        // warn (without the claim VALUES, honoring the log-scrubbing rule) so the drop
+        // is observable rather than a silent gap. Storing the claims in the opaque row
+        // is deliberately out of scope here (cross-cutting with introspection, #22).
+        TokenFormat::Opaque => {
+            if !request.custom_claims.is_empty() {
+                tracing::warn!(
+                    "client custom claims are configured but the resolved access-token \
+                     format is opaque; custom claims are an at+jwt feature and are not \
+                     embedded in an opaque reference token (they surface via #22 \
+                     introspection instead)"
+                );
+            }
+            mint_opaque_access(state, &request.scope, target, now)
+        }
     };
     Ok((minted, secs(target.ttl)))
 }
@@ -1058,18 +1116,37 @@ mod tests {
     }
 
     #[test]
-    fn a_custom_claim_never_overrides_a_protected_claim() {
-        // A hostile custom-claims config naming every protected claim plus a benign
-        // one: the protected claims keep their real values, only the benign lands.
+    fn a_custom_claim_never_sets_a_reserved_claim() {
+        // A hostile custom-claims config naming EVERY reserved claim (protocol,
+        // authentication-context, binding, and hash/session) plus a benign one. The
+        // protocol claims the machine token emits keep their real values; the
+        // reserved-but-not-emitted claims are dropped entirely (a machine token
+        // carries no auth context and no self-asserted cnf); only the benign lands.
         let custom = json!({
+            // Protocol claims (must keep their real minted values).
             "sub": "attacker",
             "iss": "https://evil.test",
             "aud": "https://evil.test/api",
             "client_id": "cli_attacker",
             "exp": 9_999_999_999_i64,
             "iat": 0,
+            "nbf": 0,
             "jti": "forged",
             "scope": "admin",
+            "typ": "forged+jwt",
+            "token_type": "mac",
+            // Authentication-context claims (a machine token must assert none).
+            "acr": "urn:evil:acr:high",
+            "amr": ["mfa", "hwk"],
+            "auth_time": 123,
+            "nonce": "evil-nonce",
+            "azp": "cli_attacker",
+            // Binding / session / hash claims (only the issuer may state these).
+            "cnf": { "jkt": "evil-thumbprint" },
+            "at_hash": "evil-at-hash",
+            "c_hash": "evil-c-hash",
+            "sid": "evil-session",
+            // A benign business claim, which is admitted.
             "department": "payments"
         })
         .as_object()
@@ -1084,6 +1161,7 @@ mod tests {
             "tok_real",
             "cli_example",
         );
+        // The emitted protocol claims keep their real minted values.
         assert_eq!(claims["sub"], "sva_real", "protected sub is never shadowed");
         assert_eq!(claims["iss"], "https://issuer.test/t/x/e/y");
         assert_eq!(claims["aud"], "cli_example");
@@ -1095,15 +1173,40 @@ mod tests {
             claims["scope"], "read",
             "the granted scope wins over a custom scope"
         );
+        // The reserved names the machine token does NOT emit must stay absent: a
+        // custom claim can never inject an authentication context, a binding key, a
+        // hash/session claim, or an out-of-band nbf/typ/token_type.
+        for reserved_absent in [
+            "nbf",
+            "typ",
+            "token_type",
+            "acr",
+            "amr",
+            "auth_time",
+            "nonce",
+            "azp",
+            "cnf",
+            "at_hash",
+            "c_hash",
+            "sid",
+        ] {
+            assert!(
+                claims.get(reserved_absent).is_none(),
+                "{reserved_absent} must never be injected by a custom claim"
+            );
+        }
+        // The benign, non-reserved business claim is admitted.
         assert_eq!(
             claims["department"], "payments",
             "a benign custom claim lands"
         );
-        // Every protected name is one this guard covers.
-        for protected in PROTECTED_ACCESS_TOKEN_CLAIMS {
-            assert!(
-                claims.get(*protected).is_some(),
-                "{protected} present and unshadowed"
+        // Sanity: every name the guard reserves is one it recognises, so none of the
+        // hostile values above could have slipped through under a different spelling.
+        for reserved in PROTECTED_ACCESS_TOKEN_CLAIMS {
+            assert_ne!(
+                claims.get(*reserved),
+                custom.get(*reserved),
+                "{reserved} must never carry the hostile custom value"
             );
         }
     }

@@ -24,10 +24,14 @@ range per docs/RELEASING.md.
     unique-violation re-read).
   - **Per-client custom claims.** Additive nullable `clients.custom_token_claims`
     JSONB column: the declarative static claims embedded in a client's
-    client-credentials tokens (opaque JSON to the store; the protected-claim guard
-    lives in the mint). `ClientRepo::custom_token_claims` reads it;
-    `ActingClientRepo::set_custom_token_claims` sets it (audited
-    `client.custom_claims.set`, validated as JSON by the `::jsonb` cast).
+    client-credentials tokens (opaque JSON to the store; the MINT is the single
+    enforcement point for the reserved-claim guard, so the store persists the
+    configuration verbatim and does not itself filter claim names).
+    `ClientRepo::custom_token_claims` reads it; `ActingClientRepo::set_custom_token_claims`
+    sets it (audited `client.custom_claims.set`, validated as JSON by the `::jsonb`
+    cast). `RefreshRepo::count_in_scope` returns the scope's
+    `(refresh_families, refresh_tokens)` row counts for the client-credentials
+    no-refresh database negative (RFC 6749 4.4.3).
   - **Client-credentials issuance persistence.**
     `ActingAuthorizationRepo::issue_client_credentials` opens a fresh machine GRANT
     (subject = the `sva_` principal, no session/consent/claims) and records the

@@ -21,14 +21,26 @@ range per docs/RELEASING.md.
     DISTINCT from `client_id`, consistent across issuances); `client_id` is the OAuth
     client. RBAC (M10) will attach to the principal.
   - **Custom claims.** Per-client STATIC claims (the `clients.custom_token_claims`
-    JSON object) are embedded in the token. A custom claim can NEVER override a
-    protected registered claim (`iss`/`sub`/`aud`/`exp`/`iat`/`jti`/`client_id`/
-    `scope`): the guard is enforced in the mint, so it holds even for a value written
-    straight into the store.
+    JSON object) are embedded in the token. A custom claim can NEVER set a RESERVED
+    claim name: the guard is a comprehensive denylist enforced in the mint, so it
+    holds even for a value written straight into the store. The reserved set covers
+    the protocol claims (`iss`/`sub`/`aud`/`exp`/`iat`/`nbf`/`jti`/`client_id`/`scope`
+    plus `typ`/`token_type`), the authentication-context claims
+    (`acr`/`amr`/`auth_time`/`nonce`/`azp`), the binding claim `cnf`, and the
+    hash/session claims (`at_hash`/`c_hash`/`sid`): a static business claim can never
+    forge an authentication context a machine token must not carry, nor a
+    self-asserted confirmation key that would undermine sender-constrained (DPoP /
+    mTLS) token binding. Custom claims are an at+jwt feature ONLY: an opaque access
+    token carries no embedded claims by design, so when the resolved format is opaque
+    the configured custom claims are dropped and the mint WARNS (without the claim
+    values), their metadata surfacing instead through #22 introspection.
   - **No auth context, no refresh token.** A machine token carries NO `acr` and NO
     `auth_time` (there is no user authentication event), via a dedicated M2M claim
     builder that reuses the same signing core and opaque mint as every other access
-    token. NO refresh token is returned (RFC 6749 4.4.3) and no ID token (no user).
+    token. NO refresh token is returned (RFC 6749 4.4.3) and no ID token (no user);
+    this is asserted at the DATABASE too (a client-credentials issuance opens no
+    `refresh_families` row and mints no `refresh_tokens` row), not only in the
+    response body.
   - **Revocable/introspectable by construction.** The token is minted in the same #29
     formats (at+jwt with `jti`, opaque `ira_at_`) and recorded against a fresh grant
     in one transaction, so the #22 revoke/introspect endpoints consume it through the
@@ -43,7 +55,11 @@ range per docs/RELEASING.md.
     request (`openid`/`offline_access` are not valid for a machine principal; the full
     per-client scope allowlist is M10 RBAC).
   - **Covenant.** NO metering, counting-for-billing, or quota hook exists on the M2M
-    issuance path; `scripts/no-m2m-metering.sh` asserts it in CI, and SDK-facing
+    issuance path; `scripts/no-m2m-metering.sh` asserts it in CI over the WHOLE
+    issuance path (the request handler in full, plus the CC-specific mint helpers
+    `mint_client_credentials_access_token` /
+    `build_client_credentials_access_token_claims` and the persistence helper
+    `issue_client_credentials`, scoped to those function regions), and SDK-facing
     token-caching guidance is published at `docs/design/M2M-TOKEN-CACHING.md`.
 - Refresh-token rotation, families, `offline_access`, and consent modes (issue #21).
   - **The `refresh_token` grant.** The token endpoint exchanges a rotating refresh

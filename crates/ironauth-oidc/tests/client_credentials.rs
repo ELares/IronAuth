@@ -215,10 +215,28 @@ async fn no_refresh_token_or_id_token_is_returned() {
     assert!(value.get("id_token").is_none(), "no id_token (no user)");
     // The granted scope is echoed.
     assert_eq!(value["scope"], "read write");
+
+    // DB-negative (RFC 6749 4.4.3): the guarantee holds at the DATABASE, not only in
+    // the response body. A client-credentials issuance opens NO refresh family and
+    // mints NO refresh token, so both rotation tables are empty for this scope.
+    let (families, tokens) = harness.count_refresh_rows().await;
+    assert_eq!(
+        families, 0,
+        "no refresh_families row for a client_credentials grant"
+    );
+    assert_eq!(
+        tokens, 0,
+        "no refresh_tokens row for a client_credentials grant"
+    );
 }
 
-/// Adversarial: a custom claim can NEVER override a protected registered claim, even
-/// when the stored config hostilely names `sub`, `iss`, `aud`, and `client_id`.
+/// Adversarial: a custom claim can NEVER set a reserved claim name, proven against the
+/// REAL mint (a signed, verified token). The hostile stored config names the protocol
+/// claims (`sub`/`iss`/`aud`/`client_id`/`scope`/`exp`) AND the authentication-context
+/// and binding claims (`acr`/`amr`/`auth_time`/`nonce`/`cnf`) a machine token must
+/// never carry: the protocol claims keep their real values and the auth-context/binding
+/// claims never appear, so a per-client config cannot forge an authentication context
+/// or a self-asserted confirmation key.
 #[tokio::test]
 async fn a_custom_claim_cannot_override_a_protected_claim() {
     let harness = Harness::start().await;
@@ -226,12 +244,13 @@ async fn a_custom_claim_cannot_override_a_protected_claim() {
         .create_confidential_client(ClientAuthMethod::Basic)
         .await;
     let client_id = client.to_string();
-    // A hostile custom-claims config written straight into the store, naming every
-    // protected claim plus a benign one.
+    // A hostile custom-claims config written straight into the store, naming the
+    // protocol claims plus the authentication-context and binding claims a machine
+    // token must never assert, plus a benign one.
     set_custom_claims(
         &harness,
         &client,
-        r#"{"sub":"attacker","iss":"https://evil.test","aud":"https://evil.test/api","client_id":"cli_attacker","scope":"admin","exp":9999999999,"role":"reader"}"#,
+        r#"{"sub":"attacker","iss":"https://evil.test","aud":"https://evil.test/api","client_id":"cli_attacker","scope":"admin","exp":9999999999,"acr":"urn:evil:acr:high","amr":["mfa"],"auth_time":123,"nonce":"evil-nonce","cnf":{"jkt":"evil-thumbprint"},"role":"reader"}"#,
     )
     .await;
 
@@ -264,6 +283,15 @@ async fn a_custom_claim_cannot_override_a_protected_claim() {
         9_999_999_999,
         "the real exp is not overridden"
     );
+    // The authentication-context and binding claims a machine token never carries stay
+    // absent: a custom claim cannot inject a human auth context (acr/amr/auth_time/
+    // nonce) or a self-asserted confirmation key (cnf) into the minted token.
+    for forbidden in ["acr", "amr", "auth_time", "nonce", "cnf"] {
+        assert!(
+            claims.get(forbidden).is_none(),
+            "{forbidden} must never be injected by a custom claim on a machine token"
+        );
+    }
     assert_eq!(
         claims["role"], "reader",
         "the benign non-protected claim lands"

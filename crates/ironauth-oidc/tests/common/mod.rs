@@ -916,6 +916,19 @@ impl Harness {
             .expect("count live leaves")
     }
 
+    /// The `(refresh_families, refresh_tokens)` row counts in the harness scope (issue
+    /// #23), for the client-credentials DB-negative: a machine-token issuance must open
+    /// NO refresh family and mint NO refresh token (RFC 6749 4.4.3), proven at the
+    /// database rather than only in the token-response body.
+    pub async fn count_refresh_rows(&self) -> (i64, i64) {
+        self.store()
+            .scoped(self.scope)
+            .refresh()
+            .count_in_scope()
+            .await
+            .expect("count refresh rows")
+    }
+
     /// Create a session for `subject` (a bootstrap `pwd` authentication event at
     /// the epoch) and return the `Cookie` header value. The session is far-future
     /// so it survives the clock advances in the expiry and reuse tests.
