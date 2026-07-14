@@ -502,7 +502,15 @@ async fn ropc_and_unknown_grant_types_are_unsupported() {
     let code = get_code(&harness).await;
     let client_id = harness.client_id().to_string();
 
-    for grant in ["password", "client_credentials"] {
+    // ROPC (`password`) has no variant and no handler, and a genuinely unknown grant
+    // never resolves. (The client-credentials grant IS serviced, issue #23; it is
+    // exercised in tests/client_credentials.rs, so it is deliberately not in this
+    // unsupported set.)
+    for grant in [
+        "password",
+        "urn:ietf:params:oauth:grant-type:device_code",
+        "made_up",
+    ] {
         let body = form(&[
             ("grant_type", grant),
             ("username", "alice"),

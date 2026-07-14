@@ -168,12 +168,13 @@ pub struct DiscoveryEndpoint {
 /// required top-level field handled directly by the generator, and its serving
 /// (the JWKS surface) is mounted by issue #194 once keys load.
 ///
-/// The remaining M3/M4 endpoints (`end_session_endpoint`, `revocation_endpoint`,
-/// `introspection_endpoint`) join this list when their issues land;
-/// `userinfo_endpoint` landed with issue #15. `registration_endpoint` (issue #30)
-/// is NOT here: it is PER ENVIRONMENT (served under the issuer path, like
-/// `jwks_uri`), so the generator emits it directly as `{issuer}/connect/register`
-/// and only when [`DiscoveryCapabilities::registration_endpoint_enabled`] is set.
+/// The remaining M3/M4 endpoint (`end_session_endpoint`) joins this list when its
+/// issue lands; `userinfo_endpoint` landed with issue #15, and the RFC 7009
+/// `revocation_endpoint` and RFC 7662 `introspection_endpoint` with issue #22.
+/// `registration_endpoint` (issue #30) is NOT here: it is PER ENVIRONMENT (served
+/// under the issuer path, like `jwks_uri`), so the generator emits it directly as
+/// `{issuer}/connect/register` and only when
+/// [`DiscoveryCapabilities::registration_endpoint_enabled`] is set.
 pub const ADVERTISED_ENDPOINTS: &[DiscoveryEndpoint] = &[
     DiscoveryEndpoint {
         metadata_key: "authorization_endpoint",
@@ -190,6 +191,14 @@ pub const ADVERTISED_ENDPOINTS: &[DiscoveryEndpoint] = &[
     DiscoveryEndpoint {
         metadata_key: "pushed_authorization_request_endpoint",
         path: "/par",
+    },
+    DiscoveryEndpoint {
+        metadata_key: "revocation_endpoint",
+        path: "/revoke",
+    },
+    DiscoveryEndpoint {
+        metadata_key: "introspection_endpoint",
+        path: "/introspect",
     },
 ];
 
@@ -360,7 +369,13 @@ pub fn id_token_signing_alg_values(policy: &SigningPolicy) -> Vec<String> {
 /// `policy`, and the per-environment `capabilities`. The `issuer` value in the
 /// returned document is `issuer` verbatim, so it exact-string-matches whatever URL
 /// it was derived from.
+//
+// The generator is one long, flat sequence of `document.insert(...)` statements, one
+// per advertised metadata field; it grew past the line threshold as endpoints and
+// their auth-method arrays landed (issue #22). Splitting it would only scatter the
+// single source of truth across helpers for no clarity gain, so the lint is allowed.
 #[must_use]
+#[allow(clippy::too_many_lines)]
 pub fn discovery_document(
     issuer: &str,
     base: &str,
@@ -437,6 +452,39 @@ pub fn discovery_document(
     // from what verification accepts; `none` and ES512 are excluded by construction.
     document.insert(
         "token_endpoint_auth_signing_alg_values_supported".to_owned(),
+        json!(crate::client_auth::assertion_signing_alg_values()),
+    );
+    // The RFC 7009 revocation and RFC 7662 introspection endpoints authenticate the
+    // client through the SAME token-endpoint client-auth suite (issue #22), sourced
+    // from the one client-auth module so the advertised set can never drift from what
+    // the endpoints accept. They differ in ONE method: `/revoke` accepts a public
+    // `none` client (RFC 7009 allows public clients), so it advertises the full
+    // `ClientAuthMethod::ALL`; `/introspect` REQUIRES a confidential client (RFC 7662
+    // section 2.1, and a `client_id` is not secret), so it advertises exactly
+    // `ClientAuthMethod::CONFIDENTIAL` (ALL minus `none`). RFC 8414 section 2 then
+    // REQUIRES the matching `*_endpoint_auth_signing_alg_values_supported` whenever
+    // `private_key_jwt` is advertised, which it is on both; the values are the same
+    // asymmetric assertion matrix the token endpoint verifies against.
+    document.insert(
+        "revocation_endpoint_auth_methods_supported".to_owned(),
+        json!(to_strings(
+            ClientAuthMethod::ALL.iter().map(|value| value.as_str())
+        )),
+    );
+    document.insert(
+        "revocation_endpoint_auth_signing_alg_values_supported".to_owned(),
+        json!(crate::client_auth::assertion_signing_alg_values()),
+    );
+    document.insert(
+        "introspection_endpoint_auth_methods_supported".to_owned(),
+        json!(to_strings(
+            ClientAuthMethod::CONFIDENTIAL
+                .iter()
+                .map(|value| value.as_str())
+        )),
+    );
+    document.insert(
+        "introspection_endpoint_auth_signing_alg_values_supported".to_owned(),
         json!(crate::client_auth::assertion_signing_alg_values()),
     );
     document.insert(
@@ -733,6 +781,44 @@ mod tests {
             json!("https://issuer.test/authorize")
         );
         assert_eq!(doc["token_endpoint"], json!("https://issuer.test/token"));
+        // The issue #22 revocation and introspection endpoints (and #27's PAR
+        // endpoint) this test is named for: each is advertised at its path.
+        assert_eq!(
+            doc["pushed_authorization_request_endpoint"],
+            json!("https://issuer.test/par")
+        );
+        assert_eq!(
+            doc["revocation_endpoint"],
+            json!("https://issuer.test/revoke")
+        );
+        assert_eq!(
+            doc["introspection_endpoint"],
+            json!("https://issuer.test/introspect")
+        );
+        // Their auth-method arrays DIFFER by exactly `none`: `/revoke` accepts a public
+        // client (RFC 7009), `/introspect` requires a confidential one (RFC 7662).
+        assert_eq!(
+            doc["revocation_endpoint_auth_methods_supported"],
+            json!([
+                "client_secret_basic",
+                "client_secret_post",
+                "private_key_jwt",
+                "none"
+            ]),
+            "revocation advertises the full method set including none"
+        );
+        assert_eq!(
+            doc["introspection_endpoint_auth_methods_supported"],
+            json!([
+                "client_secret_basic",
+                "client_secret_post",
+                "private_key_jwt"
+            ]),
+            "introspection advertises the confidential methods, excluding none"
+        );
+        // RFC 8414 section 2: the signing-alg arrays accompany private_key_jwt on both.
+        assert!(doc["revocation_endpoint_auth_signing_alg_values_supported"].is_array());
+        assert!(doc["introspection_endpoint_auth_signing_alg_values_supported"].is_array());
         // The explicit defaults-if-omitted traps.
         assert_eq!(doc["request_uri_parameter_supported"], json!(false));
         assert_eq!(doc["request_parameter_supported"], json!(false));

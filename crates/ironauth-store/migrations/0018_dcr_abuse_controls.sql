@@ -249,7 +249,7 @@ GRANT UPDATE (quarantined, verified_at) ON clients TO ironauth_control;
 -- lifted by the control plane's verify grant above.
 --
 -- The column list is the full clients schema (0001 create plus every additive ALTER
--- through 0017) minus the two quarantine columns. Missing a column here would break a
+-- through 0018) minus the two quarantine columns. Missing a column here would break a
 -- real data-plane UPDATE (the store DB suite exercises them), so it is enumerated in
 -- full; a FUTURE clients column stays app-unwritable until deliberately granted,
 -- which is the whole point (a new control-plane column is never silently data-plane
@@ -278,6 +278,7 @@ GRANT UPDATE (
     skip_consent,
     store_skipped_consent,
     refresh_rotation,
+    custom_token_claims,
     dcr_policy_chain
 ) ON clients TO ironauth_app;
 

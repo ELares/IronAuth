@@ -140,6 +140,8 @@ jobs:
         run: scripts/query-audit.sh
       - name: http audit (no outbound HTTP client outside the fetch dispatcher)
         run: scripts/http-audit.sh
+      - name: no M2M metering (no metering/billing/quota hook on the client-credentials path)
+        run: scripts/no-m2m-metering.sh
       - name: dash scan
         run: scripts/dash-scan.sh
       - name: discovery scan (no static discovery JSON; generated at serve time)

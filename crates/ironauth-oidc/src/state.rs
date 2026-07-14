@@ -21,14 +21,18 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use ironauth_config::{ClientAssertionAudience, OidcConfig, RegistrationMode};
+use ironauth_config::{
+    ClientAssertionAudience, ClientCredentialsAudience, OidcConfig, RegistrationMode,
+};
 use ironauth_env::Env;
 use ironauth_jose::{JwsAlgorithm, TrustedKey, VerificationPolicy, VerifiedToken, verify};
 use ironauth_store::{Scope, Store, TokenFormat};
 
 use crate::client_keys::ClientKeyResolver;
+use crate::introspection::{IntrospectionSerializer, default_serializer};
 use crate::issuer::{IssuerEntry, IssuerRegistry};
 use crate::registry::{ResponseMode, ResponseType};
+use crate::revocation::{RevocationEventSink, default_sink};
 use crate::subject::{PairwiseSalt, SubjectCache, SubjectConfig};
 use crate::tokens::AccessTokenTarget;
 
@@ -36,6 +40,16 @@ use crate::tokens::AccessTokenTarget;
 #[derive(Clone)]
 pub struct OidcState {
     inner: Arc<Inner>,
+    // The internal revocation-event sink (issue #22): every successful revocation is
+    // published here. Kept OUTSIDE `Inner` so it is swappable with a cheap builder
+    // (the M4 external fan-out installs its own sink) while the rest of the state
+    // stays a shared, immutable `Arc<Inner>`. Default: the no-op sink.
+    revocation_sink: Arc<dyn RevocationEventSink>,
+    // The pluggable introspection-response serializer (issue #22): the endpoint hands
+    // it the typed claims and it renders the wire body, so the RFC 9701 signed-JWT
+    // response (M16) slots in as a new serializer without touching the endpoint.
+    // Default: the RFC 7662 plain-JSON serializer.
+    introspection_serializer: Arc<dyn IntrospectionSerializer>,
 }
 
 // The per-environment policy flags each mirror an independent, individually
@@ -139,6 +153,11 @@ struct Inner {
     refresh_rotation_threshold_percent: u64,
     offline_access_requires_consent: bool,
     remembered_consent_ttl: Duration,
+    // The default audience a client-credentials access token carries when no
+    // resource server is targeted (issue #23): the client id or the per-environment
+    // issuer. A registered resource server (the RFC 8707 `resource` parameter, #28)
+    // overrides it. A promotable per-environment setting sourced from OidcConfig.
+    client_credentials_default_audience: ClientCredentialsAudience,
 }
 
 impl OidcState {
@@ -226,8 +245,44 @@ impl OidcState {
                 refresh_rotation_threshold_percent: config.refresh_rotation_threshold_percent,
                 offline_access_requires_consent: config.offline_access_requires_consent,
                 remembered_consent_ttl: Duration::from_secs(config.remembered_consent_ttl_secs),
+                client_credentials_default_audience: config.client_credentials_default_audience,
             }),
+            revocation_sink: default_sink(),
+            introspection_serializer: default_serializer(),
         }
+    }
+
+    /// Install a custom internal revocation-event sink (issue #22), replacing the
+    /// default no-op sink. The M4 external fan-out wires its sink here; a test can
+    /// wire a recording sink to assert an event is published on every revocation.
+    #[must_use]
+    pub fn with_revocation_sink(mut self, sink: Arc<dyn RevocationEventSink>) -> Self {
+        self.revocation_sink = sink;
+        self
+    }
+
+    /// Install a custom introspection-response serializer (issue #22), replacing the
+    /// default RFC 7662 plain-JSON serializer. The M16 RFC 9701 signed-JWT response
+    /// wires its serializer here without touching the introspection endpoint.
+    #[must_use]
+    pub fn with_introspection_serializer(
+        mut self,
+        serializer: Arc<dyn IntrospectionSerializer>,
+    ) -> Self {
+        self.introspection_serializer = serializer;
+        self
+    }
+
+    /// The internal revocation-event sink every successful revocation is published on.
+    #[must_use]
+    pub(crate) fn revocation_sink(&self) -> &Arc<dyn RevocationEventSink> {
+        &self.revocation_sink
+    }
+
+    /// The pluggable introspection-response serializer.
+    #[must_use]
+    pub(crate) fn introspection_serializer(&self) -> &Arc<dyn IntrospectionSerializer> {
+        &self.introspection_serializer
     }
 
     /// The shared subject-derivation cache.
@@ -351,6 +406,23 @@ impl OidcState {
             audience: client_id.to_owned(),
             format: self.inner.default_access_token_format,
             ttl: self.inner.access_token_ttl,
+        }
+    }
+
+    /// The default audience a client-credentials access token (issue #23) carries
+    /// when NO resource server is targeted, resolved for `client_id` in `scope`.
+    ///
+    /// Per the environment's `client_credentials_default_audience` policy: the OAuth
+    /// client id (the default), or the per-environment issuer. This is the fallback
+    /// audience the M2M mint passes into [`Self::resolve_access_token_target`]; when
+    /// a request targets a registered resource server (the RFC 8707 `resource`
+    /// parameter, issue #28), that resource server's audience wins instead and this
+    /// default does not apply.
+    #[must_use]
+    pub fn client_credentials_default_audience(&self, scope: &Scope, client_id: &str) -> String {
+        match self.inner.client_credentials_default_audience {
+            ClientCredentialsAudience::ClientId => client_id.to_owned(),
+            ClientCredentialsAudience::Issuer => self.issuer_for(scope),
         }
     }
 

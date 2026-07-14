@@ -61,6 +61,21 @@
         }
       ]
     },
+    "ClientCredentialsAudience": {
+      "description": "The default audience a client-credentials access token carries when the request\ntargets NO resource server (issue #23).\n\nThe client-credentials grant (RFC 6749 4.4) mints machine-to-machine tokens. RFC\n8707 lets a request target a specific resource server via the `resource`\nparameter (issue #28), whose registered audience then wins; when none is\ntargeted, this configurable default applies. The default (`client_id`) preserves\nthe environment's existing no-resource behavior (the token's `aud` is the OAuth\nclient id). `issuer` sets the per-environment issuer as the audience instead, for\ndeployments that treat the provider itself as the default M2M audience. This is a\npromotable per-environment setting in spirit; the process value is the deployment\ndefault until per-environment overrides ride the M5 promotion pipeline.",
+      "oneOf": [
+        {
+          "const": "client_id",
+          "description": "The token's `aud` is the OAuth client id (the default; preserves the existing\nno-resource behavior).",
+          "type": "string"
+        },
+        {
+          "const": "issuer",
+          "description": "The token's `aud` is the per-environment issuer.",
+          "type": "string"
+        }
+      ]
+    },
     "DatabaseConfig": {
       "additionalProperties": false,
       "description": "Primary database settings.",
@@ -157,6 +172,11 @@
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
+        },
+        "client_credentials_default_audience": {
+          "$ref": "#/$defs/ClientCredentialsAudience",
+          "default": "client_id",
+          "description": "The default audience a client-credentials access token (RFC 6749 4.4, issue\n#23) carries when the request targets NO resource server. The default\n(`client_id`) makes the token's `aud` the OAuth client id, preserving the\nenvironment's existing no-resource behavior; `issuer` makes it the\nper-environment issuer. When a request DOES target a registered resource\nserver (the RFC 8707 `resource` parameter, issue #28), that resource server's\naudience wins and this default does not apply. This is a promotable\nper-environment setting in spirit; the process value is the deployment default\nuntil per-environment overrides ride the M5 promotion pipeline."
         },
         "conform_id_token_claims": {
           "default": false,
@@ -516,6 +536,7 @@
         "authorization_code_ttl_secs": 60,
         "client_assertion_audience": "token_endpoint_or_issuer",
         "client_assertion_max_skew_secs": 60,
+        "client_credentials_default_audience": "client_id",
         "conform_id_token_claims": false,
         "default_access_token_format": "at_jwt",
         "enable_response_mode_form_post": false,

@@ -71,6 +71,7 @@ mod authn;
 mod authorize;
 mod claims_request;
 mod client_auth;
+mod client_credentials;
 mod client_keys;
 mod client_registration;
 mod consent;
@@ -79,6 +80,7 @@ mod discovery;
 mod error;
 mod hints;
 mod interaction;
+mod introspection;
 mod issuer;
 mod jwks;
 mod login;
@@ -89,12 +91,14 @@ mod pkce;
 mod register;
 mod registry;
 mod response;
+mod revocation;
 mod scope_claims;
 mod sector;
 mod session;
 mod state;
 mod subject;
 mod token;
+mod token_credential;
 mod token_hash;
 mod tokens;
 mod userinfo;
@@ -110,8 +114,8 @@ pub use authn::{
 };
 pub use client_auth::{
     AuthenticatedClient, ClientAuthError, ClientAuthInputs, ClientAuthMethod, ClientAuthParseError,
-    JWT_BEARER_ASSERTION_TYPE, PresentedClientAuth, authenticate_client, generate_secret,
-    hash_secret, parse_presented,
+    JWT_BEARER_ASSERTION_TYPE, PresentedClientAuth, authenticate_client,
+    authenticate_client_self_scoped, generate_secret, hash_secret, parse_presented,
 };
 pub use client_keys::ClientKeyResolver;
 pub use dcr_policy::{
@@ -124,6 +128,10 @@ pub use discovery::{
 };
 pub use error::{AuthorizeError, AuthzErrorCode, TokenError};
 pub use hints::{Display, InteractionHints};
+pub use introspection::{
+    IntrospectionClaims, IntrospectionSerializer, JsonIntrospectionSerializer,
+    SerializedIntrospection,
+};
 pub use issuer::{
     IssuerEntry, IssuerError, IssuerRegistry, JwksCacheError, JwksCacheWindow, load_signing_key,
 };
@@ -132,6 +140,7 @@ pub use password::{PasswordError, hash_password, verify_password};
 pub use registry::{
     GrantType, PkceMethod, PromptSet, PromptSetError, PromptValue, ResponseMode, ResponseType,
 };
+pub use revocation::{NoopRevocationSink, RevocationEvent, RevocationEventSink, RevokedTokenType};
 pub use sector::{
     SectorError, check_sector_document, sector_uri_required, validate_sector_identifier,
 };
@@ -143,7 +152,8 @@ pub use subject::{
 };
 pub use token_hash::{HashKind, at_hash, c_hash, left_half_hash};
 pub use tokens::{
-    AccessTokenTarget, MintedAccessToken, OPAQUE_ACCESS_TOKEN_PREFIX, OPAQUE_REFRESH_TOKEN_PREFIX,
+    AccessTokenTarget, ClientCredentialsMintRequest, MintedAccessToken, OPAQUE_ACCESS_TOKEN_PREFIX,
+    OPAQUE_REFRESH_TOKEN_PREFIX,
 };
 
 /// Build the OIDC provider router.
@@ -165,6 +175,14 @@ pub fn oidc_router(state: OidcState) -> Router {
         // returns a one-time request_uri. Advertised in discovery as
         // pushed_authorization_request_endpoint at this exact path.
         .route("/par", post(par::par))
+        // Token revocation (RFC 7009, issue #22): an authenticated client revokes one
+        // of its own tokens (refresh, opaque access, or at+jwt). Advertised in
+        // discovery as revocation_endpoint at this exact path.
+        .route("/revoke", post(revocation::revoke))
+        // Token introspection (RFC 7662, issue #22): an authenticated caller reads a
+        // token's active state and metadata. Advertised in discovery as
+        // introspection_endpoint at this exact path.
+        .route("/introspect", post(introspection::introspect))
         // UserInfo (OIDC Core 5.3): GET and POST with header Bearer auth, plus the
         // OPTIONS preflight for the CORS SPA origins (issue #15). CORS is applied on
         // this endpoint ONLY; the authorization endpoint above never gets it.

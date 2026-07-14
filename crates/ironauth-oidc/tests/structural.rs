@@ -5,7 +5,8 @@
 //! The grant-type, response-type, and PKCE-method registries CANNOT express:
 //!
 //! - ROPC (the `password` grant): there is no `GrantType` variant for it, so it
-//!   has no value and no handler.
+//!   has no value and no handler. (The client-credentials grant IS offered, issue
+//!   #23, but ROPC and every non-serviced grant stay unrepresentable.)
 //! - an ACCESS TOKEN from the authorization endpoint (the implicit/hybrid
 //!   token-bearing flows): there is no access-token component anywhere in
 //!   `ResponseType`, so `token`, `code token`, `id_token token`, and
@@ -21,16 +22,21 @@
 use ironauth_oidc::{GrantType, PkceMethod, ResponseMode, ResponseType};
 
 #[test]
-fn grant_type_registry_expresses_authorization_code_and_refresh_token() {
-    // The whole registry is exactly two variants: the authorization-code grant and
-    // the refresh-token grant (issue #21). No other grant type is representable.
+fn grant_type_registry_expresses_authorization_code_refresh_token_and_client_credentials() {
+    // The whole registry is exactly three variants: the authorization-code grant,
+    // the refresh-token grant (issue #21), and the client-credentials grant (issue
+    // #23). No other grant type is representable (ROPC has no variant at all).
     assert_eq!(
         GrantType::ALL,
-        &[GrantType::AuthorizationCode, GrantType::RefreshToken]
+        &[
+            GrantType::AuthorizationCode,
+            GrantType::RefreshToken,
+            GrantType::ClientCredentials,
+        ]
     );
-    assert_eq!(GrantType::ALL.len(), 2);
+    assert_eq!(GrantType::ALL.len(), 3);
 
-    // Both offered grants round-trip.
+    // Every offered grant round-trips through its exact wire spelling.
     assert_eq!(
         GrantType::parse("authorization_code"),
         Some(GrantType::AuthorizationCode)
@@ -39,17 +45,23 @@ fn grant_type_registry_expresses_authorization_code_and_refresh_token() {
         GrantType::parse("refresh_token"),
         Some(GrantType::RefreshToken)
     );
+    assert_eq!(
+        GrantType::parse("client_credentials"),
+        Some(GrantType::ClientCredentials)
+    );
 
     // Every forbidden or unknown grant type is unrepresentable: it parses to
     // None, so it can never resolve to a handler. ROPC is the headline case.
     for forbidden in [
-        "password",           // ROPC: structurally excluded.
-        "client_credentials", // not offered here.
+        "password", // ROPC: structurally excluded.
         "implicit",
         "urn:ietf:params:oauth:grant-type:device_code",
+        "urn:ietf:params:oauth:grant-type:jwt-bearer",
         "",
         "Authorization_Code", // casing is exact.
         "Refresh_Token",      // casing is exact.
+        "Client_Credentials", // casing is exact.
+        "clientcredentials",
     ] {
         assert!(
             GrantType::parse(forbidden).is_none(),

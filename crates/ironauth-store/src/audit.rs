@@ -185,7 +185,16 @@ pub enum Action {
     RefreshTokenReuse,
     /// A session's session-bound refresh-token families were revoked at RP logout
     /// (issue #21). The `offline_access` families are left intact by construction.
+    /// Also emitted when a client REVOKES a refresh token at the RFC 7009 revocation
+    /// endpoint (issue #22): the whole family and its grant are revoked together, so
+    /// the reuse of this action covers both the logout and the explicit-revoke paths.
     RefreshFamilyRevoke,
+    /// A token was revoked at the RFC 7009 revocation endpoint (issue #22). Written
+    /// against the token's GRANT (the append-only issued/opaque token rows derive
+    /// their active state from `grants.revoked_at`), so revoking an access token
+    /// revokes its grant chain. The refresh-token revoke path audits through
+    /// [`Action::RefreshFamilyRevoke`] instead (it also revokes the family spine).
+    TokenRevoke,
     /// A pushed authorization request was stored behind a one-time `request_uri`
     /// (RFC 9126, issue #27). The back-channel push the authorization endpoint later
     /// consumes exactly once.
@@ -218,6 +227,13 @@ pub enum Action {
     /// An admin verified a dynamically registered client through the management API
     /// (issue #31), lifting its unverified-client quarantine.
     DcrClientVerified,
+    /// A service-account principal was minted for a client (issue #23), lazily on
+    /// its first client-credentials issuance. The stable machine `sub` the client's
+    /// M2M tokens carry.
+    ServiceAccountCreate,
+    /// A client's static custom-claims configuration was set (issue #23): the
+    /// declarative claims embedded in its client-credentials access tokens.
+    ClientCustomClaimsSet,
 }
 
 impl Action {
@@ -250,6 +266,7 @@ impl Action {
             Action::RefreshTokenRotate => "refresh_token.rotate",
             Action::RefreshTokenReuse => "refresh_token.reuse",
             Action::RefreshFamilyRevoke => "refresh_family.revoke",
+            Action::TokenRevoke => "token.revoke",
             Action::PushedAuthorizationRequestPush => "pushed_authorization_request.push",
             Action::PushedAuthorizationRequestConsume => "pushed_authorization_request.consume",
             Action::ClientRequirePushedAuthorizationSet => {
@@ -261,6 +278,8 @@ impl Action {
             Action::DcrQuotaHit => "dcr.quota_hit",
             Action::DcrRateLimited => "dcr.rate_limited",
             Action::DcrClientVerified => "dcr.client_verified",
+            Action::ServiceAccountCreate => "service_account.create",
+            Action::ClientCustomClaimsSet => "client.custom_claims.set",
         }
     }
 }
