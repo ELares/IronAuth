@@ -941,12 +941,14 @@ async fn a_multi_audience_at_jwt_introspects_active() {
         Value::Bool(true),
         "a multi-aud at+jwt with a live store row introspects active: {doc}"
     );
-    // The reported `aud` is the token's FIRST audience (its client_id), per the
-    // serializer's single-string aud mapping.
+    // The reported `aud` is the token's FULL signed audience set (RFC 7662 section
+    // 2.2), an ARRAY for a multi-audience token, in the order the token carries them:
+    // its client_id followed by the resource. Under-reporting only the first would be
+    // fail-closed but inconsistent (an RS could wrongly reject a valid token).
     assert_eq!(
         doc["aud"],
-        client_id.to_string(),
-        "first aud reported: {doc}"
+        serde_json::json!([client_id.to_string(), "https://api.example/resource"]),
+        "the full aud array is reported: {doc}"
     );
 }
 

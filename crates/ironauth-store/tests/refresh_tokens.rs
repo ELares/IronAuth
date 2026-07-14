@@ -76,6 +76,7 @@ async fn seed_grant(
                 session_ref: session.as_deref(),
                 consent_ref: None,
                 claims_request: None,
+                granted_resources: &[],
                 expires_at_micros: FAR_FUTURE_MICROS,
                 created_at_micros: 0,
             },

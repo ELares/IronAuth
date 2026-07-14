@@ -234,6 +234,10 @@ pub enum Action {
     /// A client's static custom-claims configuration was set (issue #23): the
     /// declarative claims embedded in its client-credentials access tokens.
     ClientCustomClaimsSet,
+    /// A client's RFC 8707 resource-indicator policy was set (issue #28): the
+    /// per-client allowed-resource allowlist and the no-resource behavior
+    /// (default audience or refusal).
+    ClientResourceIndicatorPolicySet,
 }
 
 impl Action {
@@ -280,6 +284,7 @@ impl Action {
             Action::DcrClientVerified => "dcr.client_verified",
             Action::ServiceAccountCreate => "service_account.create",
             Action::ClientCustomClaimsSet => "client.custom_claims.set",
+            Action::ClientResourceIndicatorPolicySet => "client.resource_indicator_policy.set",
         }
     }
 }

@@ -6,6 +6,24 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- RFC 8707 Resource Indicators storage (issue #28, migration 0019, expand).
+  - **New columns.** `clients` gains `allowed_resources` (a JSON array; NULL means no
+    per-client allowlist, `[]` means allow nothing) and `resource_indicator_policy`
+    (a CHECK-constrained `default_audience` / `refuse` string for the no-resource
+    case). `grants` and `authorization_codes` gain `granted_resources` (the JSON array
+    of resources approved at authorization, frozen for the downscope-not-expand check).
+    `opaque_access_tokens` gains `audiences` (the JSON array of recorded audiences so
+    introspection can report them).
+  - **Column-scoped grant.** `ironauth_app` receives `UPDATE (allowed_resources,
+    resource_indicator_policy)` on `clients` only (never a table-wide UPDATE), so the
+    policy write cannot touch any other client column.
+  - **New store surface.** `ClientRepo::resource_policy` reads a client's
+    `ClientResourcePolicy`; `ActingClientRepo::set_resource_indicator_policy` is an
+    audited write (new `client.resource_indicator_policy.set` action). `IssueCode` and
+    `NewOpaqueAccessToken` carry the resources/audiences; the code, grant, refresh, and
+    opaque-token resolutions surface them. Encoding empty to NULL keeps the pre-#28
+    single-audience behavior byte-identical.
+
 - Dynamic Client Registration abuse controls (issue #31, migration 0018, expand).
   - **New scoped tables.** `dcr_policies` (named, reusable policy-primitive chains),
     `dcr_initial_access_tokens` (SHA-256-hashed initial access tokens carrying a
