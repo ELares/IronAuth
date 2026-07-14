@@ -234,6 +234,20 @@ pub enum Action {
     /// A client's static custom-claims configuration was set (issue #23): the
     /// declarative claims embedded in its client-credentials access tokens.
     ClientCustomClaimsSet,
+    /// A device-authorization device code and user code were issued (issue #24, RFC
+    /// 8628 section 3.2). The back-channel row a constrained device polls against and
+    /// a human approves through the verification page.
+    DeviceCodeIssue,
+    /// A device-authorization request was APPROVED by an authenticated human at the
+    /// verification page (issue #24, RFC 8628 section 3.3): the explicit
+    /// confirmation that binds the flow to a subject and opens its grant, so the
+    /// next poll at the token endpoint issues tokens.
+    DeviceCodeApprove,
+    /// A device-authorization request was DENIED (issue #24, RFC 8628 section 3.5):
+    /// the human explicitly rejected it at the verification page, or the user code
+    /// was invalidated after exhausting its bounded failed-match budget (RFC 8628
+    /// section 5.1). A subsequent poll at the token endpoint yields `access_denied`.
+    DeviceCodeDeny,
 }
 
 impl Action {
@@ -280,6 +294,9 @@ impl Action {
             Action::DcrClientVerified => "dcr.client_verified",
             Action::ServiceAccountCreate => "service_account.create",
             Action::ClientCustomClaimsSet => "client.custom_claims.set",
+            Action::DeviceCodeIssue => "device_code.issue",
+            Action::DeviceCodeApprove => "device_code.approve",
+            Action::DeviceCodeDeny => "device_code.deny",
         }
     }
 }

@@ -76,6 +76,8 @@ mod client_keys;
 mod client_registration;
 mod consent;
 mod dcr_policy;
+mod device;
+mod device_verify;
 mod discovery;
 mod error;
 mod hints;
@@ -121,6 +123,7 @@ pub use client_keys::ClientKeyResolver;
 pub use dcr_policy::{
     PolicyPrimitive, PolicyRejectReason, PolicyRejection, apply_chain, parse_chain, serialize_chain,
 };
+pub use device::normalize_user_code;
 pub use discovery::{
     ADVERTISED_ENDPOINTS, CLAIMS_LOCALES_SUPPORTED, DiscoveryCapabilities, DiscoveryEndpoint,
     DiscoveryState, ID_TOKEN_CLAIMS_SUPPORTED, SCOPES_SUPPORTED, UI_LOCALES_SUPPORTED,
@@ -205,6 +208,17 @@ pub fn oidc_router(state: OidcState) -> Router {
         .route(
             "/consent",
             get(consent::consent_get).post(consent::consent_post),
+        )
+        // The RFC 8628 device authorization grant (issue #24). The back-channel
+        // device-authorization endpoint (advertised in the discovery document, whose
+        // metadata key is defined only in discovery.rs) at this deployment-root path
+        // mints a device_code and user_code; the scope-routed verification page under
+        // the per-environment issuer path is where a human enters the user code, signs
+        // in, and EXPLICITLY approves before the device is issued any token.
+        .route("/device_authorization", post(device::device_authorization))
+        .route(
+            "/t/{tenant_id}/e/{environment_id}/device",
+            get(device_verify::device_get).post(device_verify::device_post),
         );
 
     // Dynamic Client Registration (issue #30, RFC 7591 + RFC 7592), mounted ONLY

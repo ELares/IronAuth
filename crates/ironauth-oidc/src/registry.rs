@@ -62,14 +62,25 @@ pub enum GrantType {
     /// service-account principal. No user, no ID token, and no refresh token (RFC
     /// 6749 4.4.3).
     ClientCredentials,
+    /// The `urn:ietf:params:oauth:grant-type:device_code` grant (RFC 8628, issue
+    /// #24): a constrained device polls the token endpoint with a device code it was
+    /// issued at the device-authorization endpoint, and receives tokens once a human
+    /// approved the paired user code at the verification page. Enabled per client via
+    /// a grant allowlist.
+    DeviceCode,
 }
 
 impl GrantType {
+    /// The wire `grant_type` value of the RFC 8628 device grant (issue #24). Named
+    /// once so the parser, the serializer, and discovery cannot drift.
+    pub const DEVICE_CODE_URN: &'static str = "urn:ietf:params:oauth:grant-type:device_code";
+
     /// Every grant type this build can express.
     pub const ALL: &'static [GrantType] = &[
         GrantType::AuthorizationCode,
         GrantType::RefreshToken,
         GrantType::ClientCredentials,
+        GrantType::DeviceCode,
     ];
 
     /// The wire `grant_type` value.
@@ -79,6 +90,7 @@ impl GrantType {
             GrantType::AuthorizationCode => "authorization_code",
             GrantType::RefreshToken => "refresh_token",
             GrantType::ClientCredentials => "client_credentials",
+            GrantType::DeviceCode => Self::DEVICE_CODE_URN,
         }
     }
 
@@ -91,6 +103,7 @@ impl GrantType {
             "authorization_code" => Some(GrantType::AuthorizationCode),
             "refresh_token" => Some(GrantType::RefreshToken),
             "client_credentials" => Some(GrantType::ClientCredentials),
+            other if other == Self::DEVICE_CODE_URN => Some(GrantType::DeviceCode),
             _ => None,
         }
     }

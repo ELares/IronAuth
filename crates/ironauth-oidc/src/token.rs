@@ -120,6 +120,10 @@ pub struct TokenParams {
     /// 4.4.2, issue #23). Optional; when present it is validated against the M2M
     /// scope policy and echoed into the issued token.
     pub scope: Option<String>,
+    /// The device code to poll for the RFC 8628 device grant (issue #24). A bearer
+    /// credential the constrained device presents on every poll, so it is redacted
+    /// from `Debug` and never logged in plaintext.
+    pub device_code: Option<String>,
 }
 
 impl fmt::Debug for TokenParams {
@@ -133,6 +137,7 @@ impl fmt::Debug for TokenParams {
             .field("client_assertion_type", &self.client_assertion_type)
             .field("has_code", &self.code.is_some())
             .field("has_refresh_token", &self.refresh_token.is_some())
+            .field("has_device_code", &self.device_code.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -170,6 +175,9 @@ async fn exchange(
         Some(GrantType::RefreshToken) => refresh_token_grant(state, headers, params).await,
         Some(GrantType::ClientCredentials) => {
             crate::client_credentials::client_credentials_grant(state, headers, params).await
+        }
+        Some(GrantType::DeviceCode) => {
+            crate::device::device_code_grant(state, headers, params).await
         }
         None => Err(TokenError::UnsupportedGrantType),
     }

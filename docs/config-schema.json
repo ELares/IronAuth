@@ -188,6 +188,48 @@
           "default": "at_jwt",
           "description": "The access-token format this environment mints when no resource server is\ntargeted (issue #29). The spec-conform default (`at_jwt`) mints a\nself-contained RFC 9068 signed JWT whose audience is the client id, so\n`UserInfo` and offline verification keep working. Setting it to `opaque`\nmints a random, digest-only reference token instead, validated by a scoped\nstore lookup (`UserInfo` resolves it directly; the RFC 7662 introspection\nendpoint, #22, exposes the same lookup). A registered resource server overrides this per\naudience. This is a promotable per-environment setting: it appears in config\nsnapshots and rides the M5 promotion pipeline; the process value is the\ndeployment default until per-environment overrides land."
         },
+        "device_code_ttl_secs": {
+          "default": 600,
+          "description": "The device-authorization flow lifetime in seconds (RFC 8628 section 3.2, issue\n#24). Both the device code and the user code expire after this; a poll after it\nyields `expired_token` and the verification page shows a safe error. A short TTL\nis a core user-code brute-force mitigation (RFC 8628 section 5.1), so the\ndefault (600) is a conservative ten minutes. Must be at least 1 and at most\n`OIDC_MAX_DEVICE_CODE_TTL_SECS` (1800).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "device_poll_interval_secs": {
+          "default": 5,
+          "description": "The base minimum polling interval a device-authorization response advertises,\nin seconds (RFC 8628 section 3.2 `interval`, issue #24). A constrained device\nwaits this long between polls; a poll sooner than the current interval is\nanswered with `slow_down` and the interval is increased server-side. The default\n(5) follows RFC 8628's recommended default. Must be at least 1 and at most\n`OIDC_MAX_DEVICE_POLL_INTERVAL_SECS`.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "device_slow_down_increment_secs": {
+          "default": 5,
+          "description": "The number of seconds the enforced polling interval grows by each time a device\npolls too fast (RFC 8628 section 3.5 `slow_down`, issue #24). Tracked per device\ncode, so a device that keeps polling early is throttled progressively. The\ndefault (5) matches RFC 8628's guidance; 0 answers `slow_down` without growing\nthe interval. At most `OIDC_MAX_DEVICE_POLL_INTERVAL_SECS`.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "device_user_code_max_attempts": {
+          "default": 5,
+          "description": "The number of failed user-code match attempts a single device-authorization\nflow tolerates before it is invalidated (RFC 8628 section 5.1, issue #24). Once\na flow reaches this bound it is denied, so a user code cannot be brute forced by\nrepeated guessing against a known flow. The default (5) is conservative. Must be\nat least 1.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "device_verification_rate_limit": {
+          "default": 10,
+          "description": "The maximum number of user-code submissions one source may make against the\nverification page within `device_verification_rate_window_secs` (RFC 8628\nsection 5.1, issue #24). A submission beyond the limit is refused with a safe\nrate-limited page, the primary defense against brute forcing the user-code space\nacross many flows. The default (10) is a conservative endpoint-local guard; 0\ndisables per-source rate limiting (relying on entropy, the short TTL, and the\nper-flow attempt bound alone).",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "device_verification_rate_window_secs": {
+          "default": 60,
+          "description": "The fixed rate-limit window in seconds for `device_verification_rate_limit`\n(issue #24). The default (60) is one minute. Must be at least 1 and at most\n`OIDC_MAX_LIFETIME_SECS`.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
         "enable_response_mode_form_post": {
           "default": false,
           "description": "Enable the `response_mode=form_post` encoding for this environment (issue\n#17, OAuth 2.0 Form Post Response Mode 1.0). The safe default (`false`)\nleaves it DISABLED: the authorization endpoint returns results only by\n`query` (and, when a front-channel response type is enabled, `fragment`).\nWhen `true`, a client may request `response_mode=form_post` and the endpoint\nreturns an auto-submitting HTML form that POSTs the authorization-response\nparameters to the `redirect_uri`, and discovery advertises `form_post`.\nIntended for certification runs. This is a promotable per-environment\nsetting: it appears in config snapshots and rides the M5 promotion pipeline;\nthe process value is the deployment default until per-environment overrides\nland.",
@@ -539,6 +581,12 @@
         "client_credentials_default_audience": "client_id",
         "conform_id_token_claims": false,
         "default_access_token_format": "at_jwt",
+        "device_code_ttl_secs": 600,
+        "device_poll_interval_secs": 5,
+        "device_slow_down_increment_secs": 5,
+        "device_user_code_max_attempts": 5,
+        "device_verification_rate_limit": 10,
+        "device_verification_rate_window_secs": 60,
         "enable_response_mode_form_post": false,
         "enable_response_type_code_id_token": false,
         "enable_response_type_id_token": false,

@@ -158,6 +158,16 @@ struct Inner {
     // issuer. A registered resource server (the RFC 8707 `resource` parameter, #28)
     // overrides it. A promotable per-environment setting sourced from OidcConfig.
     client_credentials_default_audience: ClientCredentialsAudience,
+    // Device-authorization grant policy (issue #24, RFC 8628). All sourced from
+    // OidcConfig at this single boundary: the flow TTL, the base and slow_down poll
+    // intervals, the per-flow failed-user-code bound, and the per-source verification
+    // rate limit and its window.
+    device_code_ttl: Duration,
+    device_poll_interval_secs: u64,
+    device_slow_down_increment_secs: u64,
+    device_user_code_max_attempts: u32,
+    device_verification_rate_limit: u32,
+    device_verification_rate_window: Duration,
 }
 
 impl OidcState {
@@ -246,6 +256,14 @@ impl OidcState {
                 offline_access_requires_consent: config.offline_access_requires_consent,
                 remembered_consent_ttl: Duration::from_secs(config.remembered_consent_ttl_secs),
                 client_credentials_default_audience: config.client_credentials_default_audience,
+                device_code_ttl: Duration::from_secs(config.device_code_ttl_secs),
+                device_poll_interval_secs: config.device_poll_interval_secs,
+                device_slow_down_increment_secs: config.device_slow_down_increment_secs,
+                device_user_code_max_attempts: config.device_user_code_max_attempts,
+                device_verification_rate_limit: config.device_verification_rate_limit,
+                device_verification_rate_window: Duration::from_secs(
+                    config.device_verification_rate_window_secs,
+                ),
             }),
             revocation_sink: default_sink(),
             introspection_serializer: default_serializer(),
@@ -506,6 +524,57 @@ impl OidcState {
     #[must_use]
     pub fn par_ttl(&self) -> Duration {
         self.inner.par_ttl
+    }
+
+    /// The configured device-authorization flow lifetime (issue #24, RFC 8628). Both
+    /// the device code and the user code expire this long after issuance.
+    #[must_use]
+    pub fn device_code_ttl(&self) -> Duration {
+        self.inner.device_code_ttl
+    }
+
+    /// The base minimum polling interval a device-authorization response advertises,
+    /// in seconds (issue #24, RFC 8628 3.2 `interval`).
+    #[must_use]
+    pub fn device_poll_interval_secs(&self) -> u64 {
+        self.inner.device_poll_interval_secs
+    }
+
+    /// The seconds the enforced polling interval grows by on each too-fast poll (issue
+    /// #24, RFC 8628 3.5 `slow_down`).
+    #[must_use]
+    pub fn device_slow_down_increment_secs(&self) -> u64 {
+        self.inner.device_slow_down_increment_secs
+    }
+
+    /// The number of failed user-code match attempts a single flow tolerates before it
+    /// is invalidated (issue #24, RFC 8628 5.1).
+    #[must_use]
+    pub fn device_user_code_max_attempts(&self) -> u32 {
+        self.inner.device_user_code_max_attempts
+    }
+
+    /// The per-source user-code submission limit for the verification page, and its
+    /// window (issue #24, RFC 8628 5.1). A limit of 0 disables per-source rate
+    /// limiting.
+    #[must_use]
+    pub fn device_verification_rate_limit(&self) -> u32 {
+        self.inner.device_verification_rate_limit
+    }
+
+    /// The window for [`OidcState::device_verification_rate_limit`] (issue #24).
+    #[must_use]
+    pub fn device_verification_rate_window(&self) -> Duration {
+        self.inner.device_verification_rate_window
+    }
+
+    /// The device-verification page URL for `scope` (issue #24, RFC 8628 3.2
+    /// `verification_uri`): the per-environment issuer path plus `/device`, so the
+    /// page is scope-routed by its own URL. The QR-friendly `verification_uri_complete`
+    /// appends the user code as a query parameter.
+    #[must_use]
+    pub fn verification_uri_for(&self, scope: &Scope) -> String {
+        format!("{}/device", self.issuer_for(scope))
     }
 
     /// Whether EVERY client in this environment must use a pushed authorization

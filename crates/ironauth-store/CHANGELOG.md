@@ -6,6 +6,34 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Device authorization grant persistence (issue #24, migration 0019, expand).
+  - **New scoped table.** `device_codes` holds a device-authorization flow keyed by the
+    SHA-256 digest of the WHOLE device code (never the code itself): the non-secret
+    `dc_` handle, the SHA-256 `user_code_hash` (unique per environment), the client,
+    requested scope, `status` (pending / approved / denied / expired / redeemed), the
+    enforced `interval_secs` and `last_poll_at` for slow_down bookkeeping, the
+    `failed_attempts` counter, a coarse `initiation_hint`, and the approval linkage
+    (subject, `grant_id`, consent, auth methods, auth time). It ENABLE + FORCEs
+    row-level security with the `(tenant, environment)` isolation policy and is
+    registered in `scripts/query-audit.sh`; the schema-level migration test asserts it
+    holds a digest and a user-code hash but no plaintext device_code / user_code /
+    secret column.
+  - **Column-scoped grants (no table-wide UPDATE).** `ironauth_app` gets SELECT + INSERT
+    on `device_codes` plus a COLUMN-SCOPED `UPDATE` over only the poll/approval columns
+    (`status`, `interval_secs`, `last_poll_at`, `failed_attempts`, `subject`,
+    `grant_id`, `consent_ref`, `auth_methods`, `auth_time`), so a data-plane path can
+    never rewrite the digest, the user-code hash, the client, or the expiry. The migration
+    also adds `clients.grant_types` (default `authorization_code`, the per-client device
+    opt-in) and `clients.logo_uri`, re-granting `ironauth_app` a column-scoped
+    `UPDATE(grant_types, logo_uri)` rather than widening its `clients` grant.
+  - **Repository API.** A read-and-bookkeeping `DeviceCodeRepo` (user-code lookup that is
+    non-oracular Active/Dead/NotFound, the client display profile, `record_failed_user_code`
+    that atomically invalidates a flow at its bound, and a `FOR UPDATE` `poll` state
+    machine enforcing expiry and an in-place slow_down interval increase) and an audited
+    `ActingDeviceCodeRepo` (issue / approve / deny / atomic `redeem_approved`). New
+    `DeviceCodeId` (`ira_dc_` opaque-credential id kind, redacted from `Debug`),
+    `device_code_digest` / `user_code_hash`, and the `device_code.issue` /
+    `device_code.approve` / `device_code.deny` audit actions.
 - Dynamic Client Registration abuse controls (issue #31, migration 0018, expand).
   - **New scoped tables.** `dcr_policies` (named, reusable policy-primitive chains),
     `dcr_initial_access_tokens` (SHA-256-hashed initial access tokens carrying a

@@ -6,6 +6,19 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Add the device-authorization knobs (issue #24, RFC 8628):
+  - `oidc.device_code_ttl_secs` (default 600, validated to `1..=OIDC_MAX_DEVICE_CODE_TTL_SECS`
+    = 1800): the short lifetime a device code and its user code are valid for.
+  - `oidc.device_poll_interval_secs` (default 5, validated to
+    `1..=OIDC_MAX_DEVICE_POLL_INTERVAL_SECS` = 300): the advertised minimum poll interval.
+  - `oidc.device_slow_down_increment_secs` (default 5, may be 0, bounded by the same
+    ceiling): how much a `slow_down` grows the enforced interval per too-fast poll.
+  - `oidc.device_user_code_max_attempts` (default 5, at least 1): the number of failed
+    user-code matches after which a flow is invalidated.
+  - `oidc.device_verification_rate_limit` (default 10; 0 disables) and
+    `oidc.device_verification_rate_window_secs` (default 60, validated to
+    `1..=OIDC_MAX_LIFETIME_SECS`): the per-source fixed-window rate limit on user-code
+    entry. The regenerated `docs/config-schema.json` and `docs/CONFIG.md` document them.
 - Add the DCR abuse-control knobs (issue #31):
   - `oidc.registration_mode` (`closed` / `token_gated` / `open`, default
     `token_gated`): the per-environment exposure switch for Dynamic Client

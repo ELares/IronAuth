@@ -380,6 +380,12 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0018_dcr_abuse_controls.sql"),
         },
+        Migration {
+            version: 19,
+            name: "device_authorization",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0019_device_authorization.sql"),
+        },
     ]
 }
 

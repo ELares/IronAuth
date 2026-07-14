@@ -238,6 +238,157 @@ pub fn notice_page(title: &str, message: &str) -> String {
     notice_document(&escape_html(title), &body)
 }
 
+/// The Content-Security-Policy for the RFC 8628 device verification page (issue #24).
+/// It keeps the same strict discipline as [`CONTENT_SECURITY_POLICY`] and opens
+/// exactly ONE extra source: `img-src https:` so a client's REGISTERED `logo_uri`
+/// renders as an `<img>` the BROWSER fetches (the server never fetches it, closing the
+/// SSRF surface), restricted to `https` so an `http` or `javascript:` logo cannot
+/// load. No script, style, or font is ever permitted.
+const DEVICE_VERIFY_CSP: &str = "default-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; \
+     img-src https:";
+
+/// Build a device-verification HTML response at `status` with the hardening header
+/// set, using the device CSP that permits a browser-fetched `https` logo image (issue
+/// #24). Every other header matches [`secure_html`].
+#[must_use]
+pub fn device_verify_html(status: StatusCode, body: String) -> Response {
+    (
+        status,
+        [
+            (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+            (header::CONTENT_SECURITY_POLICY, DEVICE_VERIFY_CSP),
+            (header::X_FRAME_OPTIONS, "DENY"),
+            (header::REFERRER_POLICY, "no-referrer"),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
+        body,
+    )
+        .into_response()
+}
+
+/// A hidden form field carrying the (escaped) value, so the device verification POST
+/// threads the flow handle and the entered code across its steps (issue #24).
+fn hidden_field(name: &str, value: &str) -> String {
+    format!(
+        "<input type=\"hidden\" name=\"{}\" value=\"{}\">",
+        escape_html(name),
+        escape_html(value)
+    )
+}
+
+/// The RFC 8628 verification page's code-entry step (issue #24): a single field for
+/// the user code shown on the device, posting back to the same scope-routed page.
+/// `action` is the page's own path, `user_code` prefills the field (from
+/// `verification_uri_complete`), and `error` shows a generic, non-oracular message.
+#[must_use]
+pub fn device_enter_page(action: &str, user_code: &str, error: Option<&str>) -> String {
+    let body = format!(
+        "<h1>Connect a device</h1>\
+         <p>Enter the code shown on your device.</p>{error}\
+         <form method=\"post\" action=\"{action}\">\
+         <p><label>Code <input type=\"text\" name=\"user_code\" value=\"{user_code}\" \
+         autocomplete=\"one-time-code\" required></label></p>\
+         <p><button type=\"submit\">Continue</button></p></form>",
+        error = error_banner(error),
+        action = escape_html(action),
+        user_code = escape_html(user_code),
+    );
+    notice_document("Connect a device", &body)
+}
+
+/// The RFC 8628 verification page's sign-in step (issue #24): the M2 identifier and
+/// password form, carrying the entered user code so the flow resumes at confirmation
+/// after authentication. Reuses the same credential mechanism as `/login`.
+#[must_use]
+pub fn device_login_page(action: &str, user_code: &str, error: Option<&str>) -> String {
+    let body = format!(
+        "<h1>Sign in</h1>\
+         <p>Sign in to review the request for code <strong>{code}</strong>.</p>{error}\
+         <form method=\"post\" action=\"{action}\">{user_code_field}\
+         <p><label>Identifier <input type=\"text\" name=\"identifier\" \
+         autocomplete=\"username\" required></label></p>\
+         <p><label>Password <input type=\"password\" name=\"password\" \
+         autocomplete=\"current-password\" required></label></p>\
+         <p><button type=\"submit\">Sign in</button></p></form>",
+        error = error_banner(error),
+        action = escape_html(action),
+        code = escape_html(user_code),
+        user_code_field = hidden_field("user_code", user_code),
+    );
+    notice_document("Sign in", &body)
+}
+
+/// The RFC 8628 verification page's confirmation step (issue #24, cross-device BCP):
+/// shows the client name, its registered logo, the initiation-location hint, the
+/// requested scopes, and the user code, and requires an EXPLICIT Approve (or Deny)
+/// before any consent is recorded. The flow handle and the code ride hidden fields so
+/// the decision POST is bound to this exact flow. Every reflected value is escaped;
+/// only an `https` logo URI is rendered (the browser fetches it, never the server).
+#[must_use]
+pub fn device_confirm_page(page: &DeviceConfirmPage<'_>) -> String {
+    let scope_items: String = if page.scopes.is_empty() {
+        "<li>(no scopes requested)</li>".to_owned()
+    } else {
+        page.scopes.iter().fold(String::new(), |mut acc, scope| {
+            let _ = write!(acc, "<li>{}</li>", escape_html(scope));
+            acc
+        })
+    };
+    let logo = match page.logo_uri {
+        Some(uri) if uri.starts_with("https://") => format!(
+            "<p><img src=\"{}\" alt=\"\" width=\"64\" height=\"64\"></p>",
+            escape_html(uri)
+        ),
+        _ => String::new(),
+    };
+    let location = match page.initiation_hint {
+        Some(hint) => format!(
+            "<p>This request was initiated from: <strong>{}</strong>. \
+             Approve it only if you started it.</p>",
+            escape_html(hint)
+        ),
+        None => String::new(),
+    };
+    let body = format!(
+        "<h1>Authorize device</h1>{logo}\
+         <p>The application <strong>{client}</strong> is requesting access from a device.</p>\
+         {location}\
+         <p>Confirm the code shown on your device is <strong>{code}</strong>.</p>\
+         <p>Requested scopes:</p><ul>{scopes}</ul>\
+         <form method=\"post\" action=\"{action}\">{handle}{code_field}\
+         <p><button type=\"submit\" name=\"decision\" value=\"allow\">Approve</button> \
+         <button type=\"submit\" name=\"decision\" value=\"deny\">Deny</button></p></form>",
+        client = escape_html(page.client_name),
+        code = escape_html(page.user_code),
+        scopes = scope_items,
+        action = escape_html(page.action),
+        handle = hidden_field("device_code_id", page.device_code_id),
+        code_field = hidden_field("user_code", page.user_code),
+    );
+    notice_document("Authorize device", &body)
+}
+
+/// The fields the RFC 8628 confirmation page renders (issue #24). Grouped into one
+/// borrow so the builder stays within the argument-count lint and the call site is
+/// legible.
+pub struct DeviceConfirmPage<'a> {
+    /// The page's own scope-routed path (the decision form's action).
+    pub action: &'a str,
+    /// The requesting client's display name.
+    pub client_name: &'a str,
+    /// The client's registered logo URI (rendered only when `https`), if any.
+    pub logo_uri: Option<&'a str>,
+    /// The coarse initiation-location hint, if the source was observed.
+    pub initiation_hint: Option<&'a str>,
+    /// The OAuth scopes the device requested.
+    pub scopes: &'a [&'a str],
+    /// The user code, shown for the human to confirm and carried as a hidden field.
+    pub user_code: &'a str,
+    /// The flow's non-secret handle, carried as a hidden field to bind the decision.
+    pub device_code_id: &'a str,
+}
+
 /// The exact inline script the `form_post` interstitial runs: submit the single
 /// form as soon as the document parses, so the response posts to the client's
 /// `redirect_uri` with no user interaction (OAuth 2.0 Form Post Response Mode

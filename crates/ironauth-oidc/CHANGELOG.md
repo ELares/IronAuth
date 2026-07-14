@@ -6,6 +6,33 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- RFC 8628 device authorization grant with cross-device BCP mitigations (issue #24).
+  - **Device-authorization endpoint.** `POST /device_authorization` authenticates the
+    client (self-scoped, exactly like the token endpoint), gates on the per-client
+    grant allowlist (the device grant is opt-in), and returns `device_code`,
+    `user_code`, `verification_uri`, `verification_uri_complete`, `expires_in`, and
+    `interval`. The device code is the scope-declaring opaque credential
+    `ira_dc_<scoped-handle>~<256-bit-secret>` (only its whole-token digest is stored),
+    so the GLOBAL token endpoint recovers its `(tenant, environment)` scope. The
+    `user_code` is drawn by unbiased rejection sampling from the RFC 8628 restricted,
+    transcription-friendly alphabet (`BCDFGHJKLMNPQRSTVWXZ`) and stored only as a hash.
+  - **Token-endpoint poll.** A new `grant_type=urn:ietf:params:oauth:grant-type:device_code`
+    arm returns the RFC 8628 section 3.5 set: `authorization_pending`, an ENFORCED
+    `slow_down` (a poll faster than the per-device_code interval increases that interval
+    in place), `access_denied`, and `expired_token`. Tokens are pre-signed then the flow
+    is atomically redeemed, so a signing failure never burns it and the device code is
+    single use.
+  - **Verification page** at `/t/{tenant}/e/{environment}/device`, built on the M2
+    login/consent bootstrap: it shows the client name, its registered logo (rendered as
+    a browser-fetched `<img>` under a narrowed CSP, never fetched server-side), and a
+    coarse initiation-location hint, and requires an EXPLICIT approval before any consent
+    is recorded or any token is issued. `verification_uri_complete` prefills the code for
+    a QR scan. An unknown, expired, or exhausted code shows one NON-oracular error;
+    user-code entry is rate limited per source and a flow dies after a bounded number of
+    failed matches. The device code and user code are never logged in plaintext
+    (redacted from every `Debug`; a test captures a full flow's trace output and asserts
+    their absence). Discovery advertises the endpoint and the grant on both well-known
+    forms.
 - Dynamic Client Registration abuse controls (issue #31), wrapping the #30 create.
   - **Exposure switch.** A per-environment `closed` / `token_gated` / `open` mode
     (default `token_gated`) governs who may register: `closed` refuses every public

@@ -191,6 +191,22 @@ impl ScopedKind for RefreshTokenKind {
     const REDACT_DEBUG: bool = true;
 }
 
+/// Marker for a device-authorization grant's device code (`dc_`), the routing
+/// handle embedded in the `ira_dc_<jti>~<secret>` wire device code (issue #24, RFC
+/// 8628), exactly as an opaque access token embeds its `tok_` id. It declares the
+/// device code's `(tenant, environment)` in the clear so the GLOBAL `/token`
+/// endpoint recovers the scope from a presented device code and runs the RLS-scoped
+/// digest resolve; the 256-bit secret suffix and the whole-token digest are what
+/// bind it. Because it is one segment of a live bearer credential, its debug form
+/// REDACTS the payload (like an issued token's `jti` and a refresh token's handle).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct DeviceCodeKind;
+impl ScopedKind for DeviceCodeKind {
+    const PREFIX: &'static str = "dc";
+    // The `dc_` id is embedded in the presented device code; keep it out of logs.
+    const REDACT_DEBUG: bool = true;
+}
+
 /// Marker for a bootstrap end user (`usr_`), the account the login and
 /// registration surfaces authenticate (issue #20). A tenant-scoped resource: the
 /// user id embeds its `(tenant, environment)`, and its string is the stable
@@ -484,6 +500,11 @@ pub type RefreshFamilyId = ScopedId<RefreshFamilyKind>;
 /// A refresh token's logical identifier (`rft_...`), the scope-declaring routing
 /// handle embedded in the `ira_rt_<jti>~<secret>` wire token (issue #21).
 pub type RefreshTokenId = ScopedId<RefreshTokenKind>;
+/// A device-authorization device-code identifier (`dc_...`), the scope-declaring
+/// routing handle embedded in the `ira_dc_<jti>~<secret>` wire device code (issue
+/// #24, RFC 8628). It declares the code's `(tenant, environment)` so the GLOBAL
+/// `/token` endpoint recovers the scope and runs the RLS-scoped digest resolve.
+pub type DeviceCodeId = ScopedId<DeviceCodeKind>;
 /// A bootstrap end-user identifier (`usr_...`), the account the login and
 /// registration surfaces authenticate (issue #20).
 pub type UserId = ScopedId<UserKind>;
