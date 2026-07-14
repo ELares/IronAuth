@@ -226,9 +226,10 @@ CREATE TABLE IF NOT EXISTS _schema_migrations ( \
 /// expand) are version 6; the recorded authentication context for honest ID token
 /// claims (issue #14: the additive `sessions`, `authorization_codes`, and `clients`
 /// column expands carrying the login method and `auth_time`) is version 7; the
-/// `UserInfo` standard-claim store (issue #15: the additive `users.claims` column
-/// backing the scope-derived and claims-parameter-selected claim sets) is version
-/// 8. That is
+/// registered redirect URIs for the exact-string redirect match (issue #13: the
+/// additive `clients.redirect_uris` array column) are version 8; the `UserInfo`
+/// standard-claim store (issue #15: the additive `users.claims` column backing the
+/// scope-derived and claims-parameter-selected claim sets) is version 9. That is
 /// the whole production chain: it deliberately
 /// carries no throwaway objects, so a real database never gains a demo table or
 /// ledger rows beyond what the product needs. The worked expand-contract example
@@ -283,9 +284,15 @@ fn registry() -> Vec<Migration> {
         },
         Migration {
             version: 8,
+            name: "redirect_registration",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0008_redirect_registration.sql"),
+        },
+        Migration {
+            version: 9,
             name: "userinfo_claims",
             phase: Phase::Expand,
-            sql: include_str!("../migrations/0008_userinfo_claims.sql"),
+            sql: include_str!("../migrations/0009_userinfo_claims.sql"),
         },
     ]
 }

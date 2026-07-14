@@ -187,17 +187,17 @@ pub struct DiscoveryCapabilities {
 impl DiscoveryCapabilities {
     /// The capabilities implied by live configuration.
     ///
-    /// The `claims` request parameter is always supported now (issue #15), so this
-    /// is the default set with `claims_parameter_supported` on. The legacy response
-    /// types, `form_post`, and RFC 9207 `iss` stay off until their issues (#13,
-    /// #17) wire their flags in here, and discovery reflects each with no change to
-    /// the generator.
+    /// The `claims` request parameter is supported (issue #15) and the
+    /// authorization endpoint emits the RFC 9207 `iss` on every authorization
+    /// response, success and error, on every response mode (issue #13); discovery
+    /// advertises both. The remaining per-environment features (legacy response
+    /// types, `form_post`) stay off until their owning issue (#17) wires their flags
+    /// in here; discovery reflects each with no change to the generator.
     #[must_use]
     pub fn from_config(_config: &OidcConfig) -> Self {
-        Self {
-            claims_parameter_supported: true,
-            ..Self::default()
-        }
+        Self::default()
+            .with_claims_parameter(true)
+            .with_authorization_response_iss(true)
     }
 
     /// Declare whether the `claims` request parameter is supported (issue #15).
@@ -588,6 +588,28 @@ mod tests {
             doc["authorization_response_iss_parameter_supported"],
             json!(false)
         );
+    }
+
+    #[test]
+    fn from_config_advertises_iss_and_only_s256_pkce() {
+        // Issue #13 flips the RFC 9207 capability on: the authorization endpoint
+        // now emits iss on every response, so discovery advertises it.
+        let caps = DiscoveryCapabilities::from_config(&OidcConfig::default());
+        let policy = SigningPolicy::eddsa_default();
+        let doc = discovery_document(
+            "https://i.test/t/a/e/b",
+            "https://i.test",
+            "https://i.test/t/a/e/b/jwks.json",
+            &policy,
+            &caps,
+        );
+        assert_eq!(
+            doc["authorization_response_iss_parameter_supported"],
+            json!(true)
+        );
+        // PKCE is S256-only: plain is structurally absent from the registry, so it
+        // can never be advertised.
+        assert_eq!(doc["code_challenge_methods_supported"], json!(["S256"]));
     }
 
     #[test]

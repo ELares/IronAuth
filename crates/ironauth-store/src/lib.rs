@@ -51,6 +51,7 @@ pub mod audit;
 mod error;
 mod id;
 mod migrate;
+mod redirect;
 mod repository;
 mod scope;
 mod store;
@@ -77,6 +78,7 @@ pub use id::{
     SigningKeyKind, TenantId, TenantKind, UserId, UserKind,
 };
 pub use migrate::{Migration, MigrationError, MigrationReport, MigrationRunner, Phase};
+pub use redirect::{redirect_uri_is_registrable, redirect_uri_matches};
 pub use repository::{
     AccessTokenResolution, ActingAuthorizationRepo, ActingClientRepo, ActingConsentRepo,
     ActingEnvironmentRepo, ActingManagementCredentialRepo, ActingManagementStore,

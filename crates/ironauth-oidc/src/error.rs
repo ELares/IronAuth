@@ -24,6 +24,7 @@ use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 
 use crate::pages;
+use crate::response;
 use crate::util::append_query;
 
 /// The authorization-endpoint OAuth error codes this issue emits (RFC 6749
@@ -78,6 +79,13 @@ pub enum AuthorizeError {
         description: String,
         /// The `state` value to echo back, if the request carried one.
         state: Option<String>,
+        /// The RFC 9207 issuer identifier, emitted on EVERY authorization
+        /// response, success and error (issue #13). Set from
+        /// [`OidcState::issuer_for`](crate::OidcState::issuer_for) once the request
+        /// scope is known (which is always the case by the time an error can
+        /// redirect, since the `client_id` that fixes the scope is validated
+        /// first).
+        iss: String,
     },
 }
 
@@ -110,14 +118,20 @@ impl IntoResponse for AuthorizeError {
                 error,
                 description,
                 state,
+                iss,
             } => {
+                // The error-response parameter set ALWAYS carries the RFC 9207
+                // `iss` (issue #13); the same assembler feeds the fragment and
+                // form_post encoders #17 adds, so iss is emitted uniformly on every
+                // mode.
                 let location = append_query(
                     &redirect_uri,
-                    &[
-                        ("error", Some(error.as_str())),
-                        ("error_description", Some(description.as_str())),
-                        ("state", state.as_deref()),
-                    ],
+                    &response::error_params(
+                        error.as_str(),
+                        description.as_str(),
+                        state.as_deref(),
+                        &iss,
+                    ),
                 );
                 redirect_response(&location)
             }

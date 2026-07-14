@@ -57,8 +57,21 @@ impl Harness {
     /// Start a fresh database, seed a scope and a client, provision a signing
     /// key, and build the OIDC router. Uses a deterministic clock frozen at the
     /// Unix epoch so token lifetimes and code expiry are driven explicitly.
+    ///
+    /// The default harness relaxes the confidential-client PKCE policy
+    /// (`require_pkce_for_confidential_clients = false`, issue #13) so the
+    /// client-authentication and interop tests can drive a confidential client
+    /// through the token exchange WITHOUT PKCE (they exercise client auth, not
+    /// PKCE). A PUBLIC client still always requires PKCE, so the public-client
+    /// flows include a `code_challenge`. Tests that want the production default
+    /// (PKCE required for confidential clients too) build the config explicitly and
+    /// call [`Harness::start_with`].
     pub async fn start() -> Self {
-        Self::start_with(OidcConfig::default()).await
+        Self::start_with(OidcConfig {
+            require_pkce_for_confidential_clients: false,
+            ..OidcConfig::default()
+        })
+        .await
     }
 
     /// Like [`Harness::start`] but with explicit OIDC settings (for the expiry
@@ -68,7 +81,9 @@ impl Harness {
         let (env, clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0x0D1C_5EED);
         let scope = db.seed_scope(&env).await;
 
-        // One OAuth client in scope (the authorization endpoint validates it).
+        // One OAuth client in scope (the authorization endpoint validates it),
+        // with the harness redirect URI registered so the exact-string redirect
+        // match (issue #13) accepts it.
         let client_id = db
             .store()
             .scoped(scope)
@@ -77,6 +92,13 @@ impl Harness {
             .create(&env, "oidc test client")
             .await
             .expect("create client");
+        db.store()
+            .scoped(scope)
+            .acting(db.test_actor(&env), CorrelationId::generate(&env))
+            .clients()
+            .register_redirect_uris(&env, &client_id, &[REDIRECT_URI])
+            .await
+            .expect("register redirect uri");
 
         // One Ed25519 signing key for the environment.
         let signing_key =
@@ -390,13 +412,57 @@ impl Harness {
     /// its id.
     pub async fn create_client_requiring_auth_time(&self) -> ClientId {
         let (actor, corr) = self.seeding_actor();
-        self.store()
+        let id = self
+            .store()
             .scoped(self.scope)
             .acting(actor, corr)
             .clients()
             .create_requiring_auth_time(&self.env, "require-auth-time client")
             .await
-            .expect("create require_auth_time client")
+            .expect("create require_auth_time client");
+        self.register_default_redirect(&id).await;
+        id
+    }
+
+    /// Create a PUBLIC client (`token_endpoint_auth_method` = none) and register
+    /// `redirect_uris` for it, returning its id. Used by the redirect-matching and
+    /// native-app tests to register loopback and private-use-scheme redirects.
+    pub async fn create_public_client_with_redirects(
+        &self,
+        display_name: &str,
+        redirect_uris: &[&str],
+    ) -> ClientId {
+        let (actor, corr) = self.seeding_actor();
+        let id = self
+            .store()
+            .scoped(self.scope)
+            .acting(actor, corr)
+            .clients()
+            .create(&self.env, display_name)
+            .await
+            .expect("create public client");
+        let (actor, corr) = self.seeding_actor();
+        self.store()
+            .scoped(self.scope)
+            .acting(actor, corr)
+            .clients()
+            .register_redirect_uris(&self.env, &id, redirect_uris)
+            .await
+            .expect("register redirect uris");
+        id
+    }
+
+    /// Register the harness redirect URI for `client_id`, so the authorization
+    /// endpoint's exact-string redirect match (issue #13) accepts it.
+    pub async fn register_default_redirect(&self, client_id: &ClientId) {
+        let (actor, corr) = self.seeding_actor();
+        self.store()
+            .scoped(self.scope)
+            .acting(actor, corr)
+            .clients()
+            .register_redirect_uris(&self.env, client_id, &[REDIRECT_URI])
+            .await
+            .expect("register redirect uri");
     }
 
     /// Issue an `authorization_code` bound to `client_id` for a fresh consenting
@@ -442,7 +508,27 @@ impl Harness {
             .create_confidential(&self.env, display_name, method.as_str(), &secret_hash)
             .await
             .expect("create confidential client");
+        self.register_default_redirect(&id).await;
         (id, secret)
+    }
+
+    /// Issue an `authorization_code` bound to `client_id` WITH PKCE (the RFC 7636
+    /// Appendix B S256 challenge), for a fresh consenting subject, returning the
+    /// raw code. Used where the target client requires PKCE (a public client always
+    /// does): the caller redeems it with [`PKCE_VERIFIER`], or exercises a failure
+    /// that trips before the PKCE check.
+    pub async fn issue_authenticated_code_pkce(&self, client_id: &str) -> String {
+        let subject = self.seed_unique_user().await;
+        self.grant_consent(&subject, client_id).await;
+        let cookie = self.session_cookie(&subject).await;
+        let query = format!(
+            "response_type=code&client_id={client_id}&redirect_uri={}&\
+             code_challenge={PKCE_CHALLENGE}&code_challenge_method=S256",
+            enc(REDIRECT_URI)
+        );
+        let (status, headers, body) = self.authorize_with_cookie(&query, &cookie).await;
+        assert_eq!(status, StatusCode::FOUND, "authorize: {body}");
+        location_param(&headers, "code").expect("code in redirect")
     }
 }
 

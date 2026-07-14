@@ -6,6 +6,70 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- UserInfo endpoint, scope-to-claims mapping, and the `claims` request parameter
+  (issue #15). Builds on the #12/#13 authorization and token endpoints; the
+  provider stays gated off (`oidc.enabled` unchanged).
+  - **UserInfo endpoint** (`GET`/`POST`/`OPTIONS /userinfo`) that authenticates a
+    Bearer access token from the `Authorization` header ONLY (a query-string token
+    is `invalid_request`; a POST body token is unsupported by design). The token is
+    resolved by an UNTRUSTED `jti` peek, then a scope-bound store lookup (the
+    IDOR/revocation gate), then the one hardened JWS verify (signature BEFORE
+    claims, `aud` bound to the resolved grant's client, `exp`/`iss`/revocation
+    enforced): no claim is released before a valid signature. A missing token or an
+    unsupported/empty `Authorization` scheme gets the bare `401 Bearer` challenge
+    with no error code (RFC 6750 3); invalid/expired/revoked collapse to a uniform
+    `401 invalid_token`; a token lacking `openid` is `403 insufficient_scope`.
+  - **Scope-to-claims** (OIDC Core 5.4): the `profile`, `email`, `address`, and
+    `phone` scopes map to their standard claim sets, served from UserInfo. `sub` is
+    always derived through the ONE shared subject function (so the ID token and
+    UserInfo agree) and can never be shadowed by stored claim data.
+  - **The `claims` request parameter** (OIDC Core 5.5): voluntary and essential
+    members, `value`/`values`, and both the `userinfo` and `id_token` targets. It
+    is parsed and canonicalized at `/authorize` and FROZEN onto the grant and the
+    code, so a client cannot widen its release at call time. Unsatisfiable
+    voluntary/essential claims are omitted rather than erroring; an essential `acr`
+    fails CLOSED at `/authorize`. Discovery advertises
+    `claims_parameter_supported = true` via `DiscoveryCapabilities::from_config`.
+  - **`oidc.conform_id_token_claims`** (default `false`, spec-conform) keeps the ID
+    token lean with scope claims at UserInfo; `true` additionally copies them into
+    the ID token for legacy relying parties (the node-oidc-provider
+    `conformIdTokenClaims = false` behavior), documented as NON-conform.
+    **`oidc.userinfo_cors_origins`** lists SPA web origins allowed to call UserInfo
+    cross-origin: each is matched EXACTLY and echoed back (never a wildcard, no
+    credentials), and CORS is offered on UserInfo ONLY. Both are promotable
+    per-environment settings.
+- PKCE enforcement, exact redirect matching, native-app redirect rules, and the
+  RFC 9207 `iss` (issue #13). Hardens the #12 authorization and token endpoints;
+  the provider stays gated off (`oidc.enabled` unchanged).
+  - **PKCE is S256-only and mandatory.** `plain` is structurally absent (no
+    registry variant, no config), so any method but `S256` (and a challenge with a
+    defaulted method) is `invalid_request`. A PUBLIC client
+    (`token_endpoint_auth_method` = none) MUST use PKCE (RFC 9700 2.1.1); a
+    CONFIDENTIAL client follows the per-environment policy
+    `oidc.require_pkce_for_confidential_clients` (default required). Downgrade
+    prevention holds BOTH ways: a challenge-bound code needs the matching verifier,
+    and a no-challenge code is never redeemable WITH one.
+  - **redirect_uri is matched by EXACT string** against the client's registered set
+    (via `ironauth_store`), with only the RFC 8252 loopback port exception; native
+    private-use-scheme and claimed-`https` redirects are accepted, and a malformed
+    scheme is rejected at authorization time as it is at registration. An
+    unregistered or malformed redirect NEVER receives a redirect (an error page),
+    so it cannot become an open redirector, and this holds on error paths too.
+  - **RFC 9207 `iss`** is emitted on EVERY authorization response, success and
+    error, assembled mode-independently (`src/response.rs`) so it covers the
+    fragment and `form_post` modes issue #17 enables; discovery now advertises
+    `authorization_response_iss_parameter_supported = true` via
+    `DiscoveryCapabilities::from_config`.
+  - **PKCE format is validated, not just the transform** (RFC 7636 4.1/4.2). The
+    `code_challenge` must be a 43-character unpadded base64url SHA-256 digest at
+    `/authorize` (a truncated or low-entropy binding is rejected up front as
+    `invalid_request`, not deferred to a guaranteed token failure), and the
+    `code_verifier` must be 43 to 128 unreserved characters at redemption, so a
+    client cannot slip below the RFC's entropy floor even with a self-consistent
+    challenge. The exact-string redirect comparator's loopback port exception now
+    range-checks the port (`1..=65535`), and a registered `https` redirect carrying
+    userinfo (`https://good@evil/cb`, a host-confusion vector) is refused at
+    registration.
 - Initial OIDC core provider: the authorization endpoint and the
   `authorization_code` grant (issue #12), mounted on the PUBLIC listener.
   - **Authorization endpoint** (`GET`/`POST /authorize`) and the token endpoint's

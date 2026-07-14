@@ -12,7 +12,9 @@
 mod common;
 
 use axum::http::StatusCode;
-use common::{Harness, REDIRECT_URI, enc, form, json, location_param};
+use common::{
+    Harness, PKCE_CHALLENGE, PKCE_VERIFIER, REDIRECT_URI, enc, form, json, location_param,
+};
 use ironauth_jose::verify;
 use serde_json::Value;
 
@@ -26,8 +28,11 @@ const RECORDED_AUTH_SECS: i64 = 1_700_000_123;
 /// Build the authorization query for `client_id`, appending any extra pre-encoded
 /// `key=value` fragments (`nonce`, `max_age`, `acr_values`).
 fn authorize_query(client_id: &str, extra: &[&str]) -> String {
+    // The harness client is public, so PKCE is mandatory (issue #13): bind the RFC
+    // 7636 Appendix B S256 challenge and redeem with its verifier.
     let mut query = format!(
-        "response_type=code&client_id={client_id}&redirect_uri={}",
+        "response_type=code&client_id={client_id}&redirect_uri={}&\
+         code_challenge={PKCE_CHALLENGE}&code_challenge_method=S256",
         enc(REDIRECT_URI),
     );
     for fragment in extra {
@@ -37,13 +42,15 @@ fn authorize_query(client_id: &str, extra: &[&str]) -> String {
     query
 }
 
-/// The standard token-exchange form for a public client's code (no PKCE bound).
+/// The standard token-exchange form for a public client's code (with the PKCE
+/// verifier the authorize request bound a challenge for).
 fn token_form(code: &str, client_id: &str) -> String {
     form(&[
         ("grant_type", "authorization_code"),
         ("code", code),
         ("redirect_uri", REDIRECT_URI),
         ("client_id", client_id),
+        ("code_verifier", PKCE_VERIFIER),
     ])
 }
 

@@ -262,15 +262,16 @@ async fn production_chain_is_only_the_eight_real_migrations_and_ships_no_demo_ob
     );
     assert_eq!(
         report.already_applied(),
-        8,
-        "the production chain is exactly eight migrations (isolation, audit log, management API, \
-         OIDC authorization, signing keys, login/consent, authentication context, UserInfo claims)"
+        9,
+        "the production chain is exactly nine migrations (isolation, audit log, management API, \
+         OIDC authorization, signing keys, login/consent, authentication context, redirect \
+         registration, UserInfo claims)"
     );
 
-    // The ledger holds exactly versions 1 through 8.
+    // The ledger holds exactly versions 1 through 9.
     assert_eq!(
         applied_versions(pool).await,
-        vec![1_i64, 2, 3, 4, 5, 6, 7, 8]
+        vec![1_i64, 2, 3, 4, 5, 6, 7, 8, 9]
     );
     let phase_of = |version: i64| async move {
         sqlx::query("SELECT phase FROM _schema_migrations WHERE version = $1")
@@ -288,6 +289,7 @@ async fn production_chain_is_only_the_eight_real_migrations_and_ships_no_demo_ob
     assert_eq!(phase_of(6).await, "expand");
     assert_eq!(phase_of(7).await, "expand");
     assert_eq!(phase_of(8).await, "expand");
+    assert_eq!(phase_of(9).await, "expand");
 
     // The demo object never reaches a production database.
     assert!(
@@ -343,6 +345,11 @@ async fn production_chain_is_only_the_eight_real_migrations_and_ships_no_demo_ob
     assert!(
         column_exists(pool, "clients", "require_auth_time").await,
         "clients.require_auth_time exists"
+    );
+    // The registered redirect URIs for the exact-string redirect match (issue #13).
+    assert!(
+        column_exists(pool, "clients", "redirect_uris").await,
+        "clients.redirect_uris exists"
     );
     // The UserInfo standard-claim store (issue #15): the additive users.claims
     // column backing the scope-derived and claims-parameter-selected claim sets,

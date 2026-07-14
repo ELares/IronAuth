@@ -83,6 +83,7 @@ mod password;
 mod pkce;
 mod register;
 mod registry;
+mod response;
 mod scope_claims;
 mod sector;
 mod session;

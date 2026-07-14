@@ -177,11 +177,13 @@ async fn default_policy_environment_publishes_the_explicit_traps_and_rs256_floor
 
     assert_eq!(doc["request_uri_parameter_supported"], json!(false));
     assert_eq!(doc["request_parameter_supported"], json!(false));
-    // The claims request parameter IS supported now (issue #15).
+    // The claims request parameter IS supported now (issue #15), and the RFC 9207
+    // `iss` is advertised now that the authorization endpoint always emits it
+    // (issue #13); the live capabilities come from config, so both are true.
     assert_eq!(doc["claims_parameter_supported"], json!(true));
     assert_eq!(
         doc["authorization_response_iss_parameter_supported"],
-        json!(false)
+        json!(true)
     );
 
     let algs = string_array(&doc, "id_token_signing_alg_values_supported");

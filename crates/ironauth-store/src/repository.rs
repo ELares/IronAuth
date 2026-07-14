@@ -255,6 +255,15 @@ pub struct ClientRecord {
     /// token issued to it carries `auth_time` even without a `max_age` request
     /// (issue #14).
     pub require_auth_time: bool,
+    /// The registered `token_endpoint_auth_method` wire string
+    /// (`client_secret_basic`, `client_secret_post`, or `none`). A `none` client
+    /// is PUBLIC and, per RFC 9700 2.1.1, must use PKCE (issue #13).
+    pub auth_method: String,
+    /// The client's registered redirect URIs, the set the authorization endpoint
+    /// matches a presented `redirect_uri` against by exact string (issue #13).
+    /// Empty for a client that registered none (which therefore cannot complete an
+    /// authorization request until it registers one).
+    pub redirect_uris: Vec<String>,
 }
 
 /// The client-authentication metadata for a client, read within scope (issue
@@ -326,7 +335,8 @@ impl ClientRepo<'_> {
         }
         let mut tx = begin_scoped(self.store, self.scope).await?;
         let row = sqlx::query(
-            "SELECT id, display_name, require_auth_time FROM clients \
+            "SELECT id, display_name, require_auth_time, token_endpoint_auth_method, \
+             redirect_uris FROM clients \
              WHERE id = $1 AND tenant_id = $2 AND environment_id = $3",
         )
         .bind(id.to_string())
@@ -347,7 +357,8 @@ impl ClientRepo<'_> {
     pub async fn list(&self) -> Result<Vec<ClientRecord>, StoreError> {
         let mut tx = begin_scoped(self.store, self.scope).await?;
         let rows = sqlx::query(
-            "SELECT id, display_name, require_auth_time FROM clients \
+            "SELECT id, display_name, require_auth_time, token_endpoint_auth_method, \
+             redirect_uris FROM clients \
              WHERE tenant_id = $1 AND environment_id = $2 ORDER BY created_at, id",
         )
         .bind(self.scope.tenant().to_string())
@@ -402,6 +413,8 @@ impl ClientRepo<'_> {
             id,
             display_name: row.get("display_name"),
             require_auth_time: row.get("require_auth_time"),
+            auth_method: row.get("token_endpoint_auth_method"),
+            redirect_uris: row.get("redirect_uris"),
         })
     }
 }
@@ -570,6 +583,73 @@ impl ActingClientRepo<'_> {
         )
         .await?;
         Ok(id)
+    }
+
+    /// Register (replace) the set of redirect URIs a client is allowed to use, in
+    /// scope (issue #13). Every URI is validated as an RFC 8252 redirect target
+    /// ([`redirect_uri_is_registrable`](crate::redirect_uri_is_registrable)) BEFORE
+    /// anything is written, so a malformed scheme is rejected at registration time
+    /// (as it is at authorization time) and never enters the registered set. On
+    /// success the client's `redirect_uris` become exactly `uris`, and a
+    /// `client.redirect_uris.register` audit row is written in the same
+    /// transaction.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::InvalidRedirectUri`] if any entry is not a registrable
+    /// redirect target (nothing is written); [`StoreError::NotFound`] if no such
+    /// client is visible in this scope; [`StoreError::Database`] on a persistence
+    /// failure.
+    pub async fn register_redirect_uris(
+        &self,
+        env: &Env,
+        id: &ClientId,
+        uris: &[&str],
+    ) -> Result<(), StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        // Validate the whole set before touching the database, so a malformed
+        // entry rejects the registration wholesale rather than storing a partial
+        // set.
+        for uri in uris {
+            if !crate::redirect::redirect_uri_is_registrable(uri) {
+                return Err(StoreError::InvalidRedirectUri);
+            }
+        }
+        let owned: Vec<String> = uris.iter().map(|uri| (*uri).to_owned()).collect();
+        let scope = self.scope;
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::ClientRedirectUrisRegister,
+                target: id,
+            },
+            async move |tx| {
+                let result = sqlx::query(
+                    "UPDATE clients SET redirect_uris = $1 \
+                     WHERE id = $2 AND tenant_id = $3 AND environment_id = $4",
+                )
+                .bind(&owned)
+                .bind(id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .execute(&mut **tx)
+                .await?;
+                // A no-op update (nothing in scope matched) is a uniform not-found;
+                // erroring here short-circuits before the audit insert, so it
+                // leaves no audit row (we audit real mutations only).
+                if result.rows_affected() == 0 {
+                    return Err(StoreError::NotFound);
+                }
+                Ok(())
+            },
+            false,
+        )
+        .await
     }
 
     /// Shared body of the client-create path. `poison_after_audit` is always

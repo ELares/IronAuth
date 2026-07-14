@@ -241,10 +241,13 @@ fn query_carries_access_token(query: Option<&str>) -> bool {
 
 /// Extract the Bearer access token from the `Authorization` header, ONLY.
 ///
-/// Returns [`UserInfoError::MissingToken`] when no `Authorization` header is
-/// present (a bare `401` with no error code), and [`UserInfoError::InvalidRequest`]
-/// when more than one `Authorization` header is sent or the header is not a
-/// non-empty `Bearer` credential.
+/// Returns [`UserInfoError::MissingToken`] (a bare `401` with no error code) when
+/// there is no usable Bearer credential: no `Authorization` header at all, an
+/// unsupported scheme (e.g. `Basic`), or an empty `Bearer` value. RFC 6750 3 says a
+/// request that "attempted using an unsupported authentication method" gets the
+/// bare challenge, not an error code, so the client is told to retry with a Bearer
+/// token rather than handed a `400`. A genuinely malformed header (non-visible
+/// bytes) or more than one `Authorization` header is [`UserInfoError::InvalidRequest`].
 fn bearer_token(headers: &HeaderMap) -> Result<String, UserInfoError> {
     let mut values = headers.get_all(header::AUTHORIZATION).iter();
     let Some(first) = values.next() else {
@@ -258,15 +261,15 @@ fn bearer_token(headers: &HeaderMap) -> Result<String, UserInfoError> {
     let value = first
         .to_str()
         .map_err(|_| UserInfoError::InvalidRequest("malformed Authorization header"))?;
-    // The scheme is case-insensitive (RFC 7235); the token itself is not decoded.
+    // The scheme is case-insensitive (RFC 7235); the token itself is not decoded. A
+    // non-Bearer scheme or an empty Bearer value is "no usable authentication
+    // information", so it maps to the bare challenge (MissingToken), not an error.
     let token = value
         .strip_prefix("Bearer ")
         .or_else(|| value.strip_prefix("bearer "))
         .map(str::trim)
         .filter(|token| !token.is_empty())
-        .ok_or(UserInfoError::InvalidRequest(
-            "the Authorization header must be a Bearer credential",
-        ))?;
+        .ok_or(UserInfoError::MissingToken)?;
     Ok(token.to_owned())
 }
 
@@ -416,21 +419,17 @@ mod tests {
         );
         assert_eq!(bearer_token(&headers).as_deref(), Ok("tok-123"));
 
-        // A non-Bearer scheme is an invalid_request, not a valid credential.
+        // A non-Bearer scheme is an unsupported authentication method, so it gets
+        // the bare challenge (MissingToken), not an error code (RFC 6750 3).
         headers.insert(header::AUTHORIZATION, HeaderValue::from_static("Basic abc"));
-        assert!(matches!(
-            bearer_token(&headers),
-            Err(UserInfoError::InvalidRequest(_))
-        ));
+        assert_eq!(bearer_token(&headers), Err(UserInfoError::MissingToken));
 
-        // An empty Bearer credential is refused.
+        // An empty Bearer value carries no usable credential, so likewise the bare
+        // challenge rather than a 400.
         headers.insert(header::AUTHORIZATION, HeaderValue::from_static("Bearer "));
-        assert!(matches!(
-            bearer_token(&headers),
-            Err(UserInfoError::InvalidRequest(_))
-        ));
+        assert_eq!(bearer_token(&headers), Err(UserInfoError::MissingToken));
 
-        // Two Authorization headers are ambiguous.
+        // Two Authorization headers are ambiguous: a genuinely malformed request.
         headers.append(
             header::AUTHORIZATION,
             HeaderValue::from_static("Bearer other"),

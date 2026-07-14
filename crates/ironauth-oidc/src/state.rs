@@ -43,6 +43,11 @@ struct Inner {
     access_token_ttl: Duration,
     reuse_grace: Duration,
     session_ttl: Duration,
+    // The per-environment PKCE policy for CONFIDENTIAL clients (issue #13). A
+    // public client always requires PKCE (RFC 9700 2.1.1, enforced structurally in
+    // the authorize path); this only governs confidential clients, and defaults to
+    // required.
+    require_pkce_for_confidential: bool,
     // Whether to copy the scope-derived claims into the ID token (the non-conform
     // node-oidc-provider `conformIdTokenClaims = false` behavior, issue #15). The
     // spec-conform default is false: scope claims live at UserInfo and the ID token
@@ -89,6 +94,7 @@ impl OidcState {
                 access_token_ttl: Duration::from_secs(config.access_token_ttl_secs),
                 reuse_grace: Duration::from_secs(config.reuse_grace_secs),
                 session_ttl: Duration::from_secs(config.session_ttl_secs),
+                require_pkce_for_confidential: config.require_pkce_for_confidential_clients,
                 conform_id_token_claims: config.conform_id_token_claims,
                 userinfo_cors_origins: config.userinfo_cors_origins.iter().cloned().collect(),
                 subjects: SubjectCache::new(),
@@ -172,6 +178,15 @@ impl OidcState {
     #[must_use]
     pub fn session_ttl(&self) -> Duration {
         self.inner.session_ttl
+    }
+
+    /// Whether a CONFIDENTIAL client must use PKCE under this environment's policy
+    /// (issue #13). Defaults to required. A public client always requires PKCE
+    /// regardless of this value (RFC 9700 2.1.1), so the authorize path checks that
+    /// separately; this governs only confidential clients.
+    #[must_use]
+    pub fn require_pkce_for_confidential(&self) -> bool {
+        self.inner.require_pkce_for_confidential
     }
 
     /// The current wall-clock time from the environment clock seam.

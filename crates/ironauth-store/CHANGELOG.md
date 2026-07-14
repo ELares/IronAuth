@@ -6,6 +6,40 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- UserInfo standard-claim persistence and the frozen `claims` request parameter
+  (issue #15).
+  - **The ninth production migration** (`0009_userinfo_claims`, Expand) adds the
+    additive `users.claims` (`text NOT NULL DEFAULT '{}'`) column backing the
+    scope-derived and claims-parameter-selected claim sets, plus the nullable
+    `grants.claims_request` and `authorization_codes.claims_request` columns holding
+    the canonicalized `claims` parameter frozen at authorization (read by UserInfo
+    and at the token endpoint). All are additive columns on already-RLS-forced
+    tables, so they inherit the existing tenant/environment isolation.
+  - **Access-token resolution** (`resolve_access_token`) is scope-bound and
+    registered in the cross-scope IDOR harness, so a token minted in one
+    environment yields a uniform not-found in another; the repository reads and
+    writes the claim columns through the runtime query API only.
+- Registered redirect URIs and the exact-string redirect comparator (issue #13).
+  - **The redirect-matching policy** lives here as two pure functions,
+    `redirect_uri_matches` and `redirect_uri_is_registrable` (`src/redirect.rs`),
+    since the store owns the client registry and thus the registered set matched
+    against. Matching is EXACT byte string, with the single RFC 8252 section 7.3
+    loopback deviation (a variable port on an `http` loopback IP literal:
+    `127.0.0.1` or `[::1]`, never `localhost`). Registrability accepts exactly the
+    three RFC 8252 redirect shapes (claimed `https`, `http` loopback IP literal, a
+    reverse-domain private-use scheme) and rejects everything else. A permanent CVE
+    regression corpus (wildcard, substring, case-fold, normalization, encoding, and
+    homograph classes) and a cargo-fuzz target (`fuzz/`, `redirect_match`) guard
+    against any accepted bypass. The loopback port exception range-checks the port
+    (`1..=65535`, so `:0`/`:99999` are not port variants), and a registrable `https`
+    redirect carrying userinfo (`https://good@evil/cb`, a host-confusion vector) is
+    refused rather than stored and later matched byte-for-byte.
+  - **The eighth production migration** adds the additive `clients.redirect_uris`
+    (`text[]`) column, the registered set; `ClientRecord` now carries
+    `redirect_uris` and `auth_method`, and `ActingClientRepo::register_redirect_uris`
+    validates each URI as a registrable redirect target BEFORE storing it (a
+    malformed scheme is `StoreError::InvalidRedirectUri`, rejected at registration).
+    New audit action `client.redirect_uris.register`.
 - OIDC authorization-code grant persistence (issue #12). Adds the fourth
   production migration and the scoped `authorization` repository, all under the
   existing tenant-isolation model (RLS enabled and forced, nonempty-scope CHECK).
