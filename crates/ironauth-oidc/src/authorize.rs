@@ -38,8 +38,9 @@ use crate::authn;
 use crate::claims_request::{ClaimsRequest, ClaimsRequestError};
 use crate::client_auth::ClientAuthMethod;
 use crate::error::{AuthorizeError, AuthzErrorCode};
+use crate::hints::InteractionHints;
 use crate::interaction;
-use crate::registry::{PkceMethod, ResponseMode, ResponseType};
+use crate::registry::{PkceMethod, PromptSet, PromptValue, ResponseMode, ResponseType};
 use crate::response;
 use crate::scope_claims::{assemble_claims, parse_scope_set};
 use crate::state::OidcState;
@@ -76,22 +77,27 @@ pub struct AuthorizeParams {
     pub code_challenge: Option<String>,
     /// The PKCE `code_challenge_method` (must be `S256` when a challenge is set).
     pub code_challenge_method: Option<String>,
-    /// The OIDC `prompt`. Only `create` (route to registration) is acted on in the
-    /// bootstrap; the rest of the `prompt`/`max_age` semantics build on the session
-    /// the bootstrap establishes and are a later milestone.
+    /// The OIDC `prompt`: a space-separated SET of `none`, `login`, `consent`,
+    /// `select_account`, `create` (issue #16). `none` renders no UI and returns the
+    /// matching `*_required` error through the negotiated mode; `login` (and
+    /// `max_age`) force fresh authentication; `consent` forces the consent screen;
+    /// `select_account` degrades to re-login under the single-session bootstrap;
+    /// `create` deep-links to registration. `none` combined with any other value is
+    /// `invalid_request`.
     pub prompt: Option<String>,
-    /// The OIDC `max_age`. Its PRESENCE (including `max_age=0`) requires the ID
-    /// token to carry `auth_time` (issue #14). The re-authentication ENFORCEMENT
-    /// that `max_age` also implies (a stale session must re-authenticate) is
-    /// step-up policy, owned by #16 and M7; only the `auth_time` emission lands
-    /// here.
+    /// The OIDC `max_age`: seconds since authentication. Its PRESENCE (including
+    /// `max_age=0`, distinguished from absent by an explicit presence check, not a
+    /// truthiness test) requires the ID token to carry `auth_time` (issue #14) AND
+    /// drives re-authentication (issue #16): a session older than `max_age` must
+    /// re-authenticate, and `max_age=0` is treated exactly as `prompt=login`. A
+    /// non-integer value is `invalid_request`.
     pub max_age: Option<String>,
     /// The OIDC `acr_values`: the ACR values the client would prefer, most
-    /// preferred first. IronAuth attempts to satisfy them but the ID token's `acr`
-    /// always reflects the ACHIEVED level (derived from the authentication event),
-    /// never a copied-through requested value (issue #14). The
-    /// `unmet_authentication_requirements` error when a requested level cannot be
-    /// met is owned by #16.
+    /// preferred first. This is a VOLUNTARY preference: IronAuth attempts to satisfy
+    /// it but the ID token's `acr` always reflects the ACHIEVED level (issue #14),
+    /// and an unsatisfiable `acr_values` is never an error. A BINDING requirement is
+    /// expressed only through an essential `acr` in the `claims` parameter, whose
+    /// unmet surface is `unmet_authentication_requirements` (issue #16).
     pub acr_values: Option<String>,
     /// The OIDC `claims` request parameter (issue #15): a JSON object requesting
     /// individual claims for the `id_token` and/or `userinfo` (OIDC Core 5.5). It
@@ -99,6 +105,22 @@ pub struct AuthorizeParams {
     /// later at the token endpoint (`id_token` member) and `UserInfo` (`userinfo`
     /// member). A malformed value is a redirect `invalid_request`.
     pub claims: Option<String>,
+    /// The OIDC `login_hint`: an identifier to prefill on the hosted login page
+    /// (issue #16). Reflected into the login form (escaped); carried across the
+    /// interaction round-trip so the login page recovers it.
+    pub login_hint: Option<String>,
+    /// The OIDC `logout_hint`: accepted and carried for a later logout surface
+    /// (issue #16). Never acted on here (no logout endpoint exists yet).
+    pub logout_hint: Option<String>,
+    /// The OIDC `ui_locales`: the space-separated end-user UI language preference
+    /// (issue #16), threaded into the interaction page-rendering context.
+    pub ui_locales: Option<String>,
+    /// The OIDC `claims_locales`: the space-separated claim-value language
+    /// preference (issue #16), threaded into the page-rendering context.
+    pub claims_locales: Option<String>,
+    /// The OIDC `display` (`page`/`popup`/`touch`/`wap`): the UI presentation hint
+    /// (issue #16), threaded into the page-rendering context.
+    pub display: Option<String>,
 }
 
 /// `GET /authorize`.
@@ -295,10 +317,36 @@ async fn issue_code(
     let (claims_request, claims_canonical) = parse_claims_request(params.claims.as_deref())
         .map_err(|description| redirect_error(AuthzErrorCode::InvalidRequest, description))?;
 
-    // 6. Establish the authenticated subject and their consent. A missing session
-    //    or missing consent short-circuits to a LOCAL interaction redirect (never
-    //    the client's redirect_uri), carrying a return_to that resumes this exact
-    //    request.
+    // 5c. prompt and max_age (OIDC Core 3.1.2.1, issue #16). prompt is a
+    //     space-separated SET; `none` combined with any other value, or an
+    //     unrecognized value, is invalid_request. max_age is a non-negative integer
+    //     (a non-integer is invalid_request); its PRESENCE (including max_age=0)
+    //     drives both the auth_time emission and the stale-session re-authentication.
+    //     Both errors are delivered by the negotiated mode (redirect_uri is valid).
+    let prompt = parse_prompt(params.prompt.as_deref())
+        .map_err(|description| redirect_error(AuthzErrorCode::InvalidRequest, description))?;
+    let max_age_secs = parse_max_age(params.max_age.as_deref())
+        .map_err(|description| redirect_error(AuthzErrorCode::InvalidRequest, description))?;
+
+    // 5d. The typed interaction-hint seam (issue #16), produced once here and passed
+    //     into the interaction layer. It carries the login/logout hints, the locales,
+    //     and the display, so the interaction pages render with the requested prefill,
+    //     language, and layout, and upstream IdP forwarding (M8) has one place to
+    //     read them. It is NOT forwarded upstream here.
+    let hints = InteractionHints::from_request(
+        params.login_hint.as_deref(),
+        params.logout_hint.as_deref(),
+        params.ui_locales.as_deref(),
+        params.claims_locales.as_deref(),
+        params.display.as_deref(),
+    );
+
+    // 6. Establish the authenticated subject and their consent, applying prompt and
+    //    max_age. A missing session, missing consent, or a forced (re-)authentication
+    //    short-circuits to a LOCAL interaction redirect (never the client's
+    //    redirect_uri), carrying a return_to that resumes this exact request. Under
+    //    prompt=none no UI is ever rendered: the matching login_required /
+    //    consent_required error is returned through the negotiated mode instead.
     let (session, consent_ref) = match resolve_gate(
         state,
         headers,
@@ -307,6 +355,9 @@ async fn issue_code(
         redirect_uri,
         &iss,
         mode,
+        &prompt,
+        max_age_secs,
+        &hints,
     )
     .await?
     {
@@ -317,20 +368,20 @@ async fn issue_code(
         } => (session, consent_ref),
     };
 
-    // 6b. Essential acr binding (OIDC Core 5.5.1.1): if the `claims` parameter pins
-    //     an essential acr to specific values, the request MUST NOT be silently
-    //     downgraded to a lower level. The achieved acr is DERIVED from the recorded
-    //     authentication event (issue #14), never from the request; if it is not
-    //     among the requested values, the authentication requirement is unmet and
-    //     the request fails closed. The full `unmet_authentication_requirements`
-    //     surface (and any step-up re-authentication) is issue #16; this fails
-    //     closed through today's redirect error path rather than silently
-    //     succeeding, leaving a clean seam for #16 to refine the error.
-    if !essential_acr_met(&claims_request, &session) {
-        return Err(redirect_error(
-            AuthzErrorCode::AccessDenied,
-            "the requested authentication context (essential acr) cannot be satisfied",
-        ));
+    // 6b. Essential acr binding and the unmet-authentication surface (OIDC Core
+    //     5.5.1.1, issue #16). A voluntary `acr_values` preference is best-effort:
+    //     the achieved acr always reflects the real authentication event (issue #14),
+    //     never a copied-through request, and an unsatisfiable `acr_values` is not an
+    //     error. An ESSENTIAL acr in the `claims` parameter is binding: if NONE of
+    //     its pinned values is achievable by any method the server offers, no
+    //     authentication can ever satisfy it, so it is
+    //     `unmet_authentication_requirements`; if it is achievable in principle but
+    //     not by THIS session (a step-up, unreachable under the single-method
+    //     bootstrap, owned by M7), it fails closed via `access_denied` as issue #15
+    //     established. Either is delivered by the negotiated mode.
+    if let Some((code, description)) = acr_requirement_error(&claims_request, &session.auth_methods)
+    {
+        return Err(redirect_error(code, description));
     }
 
     // 7. Freeze the authentication context. auth_time is emitted in the ID token
@@ -340,11 +391,7 @@ async fn issue_code(
     //    methods are always frozen so amr/acr can be derived. acr_values is honored
     //    as a preference only: the achieved acr comes from the event, never the
     //    request.
-    let max_age_requested = params
-        .max_age
-        .as_deref()
-        .map(str::trim)
-        .is_some_and(|value| !value.is_empty());
+    let max_age_requested = max_age_secs.is_some();
     let auth_time_micros =
         (max_age_requested || client.require_auth_time).then_some(session.auth_time_unix_micros);
 
@@ -645,16 +692,46 @@ fn parse_claims_request(
     Ok((request, canonical))
 }
 
-/// Whether the request's essential-`acr` binding (Core 5.5.1.1) is met by the
-/// session's ACHIEVED authentication context. The achieved `acr` is derived from
-/// the recorded authentication event (issue #14), never the request; a voluntary
-/// or absent `acr` request is always met (issue #15).
-fn essential_acr_met(
+/// The authorization error for an unmet essential-`acr` binding (OIDC Core 5.5.1.1,
+/// issue #16), or [`None`] when the request's acr requirement is satisfied (or is
+/// only a voluntary preference).
+///
+/// An ESSENTIAL acr with pinned values is binding. If NONE of the pinned values is
+/// in the achievable set ([`authn::acr_values_supported`]), no method the server
+/// offers can ever satisfy it, so it is `unmet_authentication_requirements`. If a
+/// pinned value IS achievable in principle but not by THIS session's achieved acr (a
+/// step-up, unreachable under the single-method bootstrap and owned by M7), it fails
+/// closed via `access_denied`, preserving issue #15's fail-closed posture. A
+/// voluntary or absent acr request is always satisfied (the achieved acr is reported
+/// honestly, issue #14), so a preference-only `acr_values` never errors here.
+fn acr_requirement_error(
     claims_request: &ClaimsRequest,
-    session: &interaction::AuthenticatedSession,
-) -> bool {
-    let achieved = authn::achieved_acr(&authn::parse_methods(&session.auth_methods));
-    claims_request.acr_satisfied(achieved)
+    auth_methods: &str,
+) -> Option<(AuthzErrorCode, &'static str)> {
+    let required = claims_request.essential_acr_values();
+    if required.is_empty() {
+        // No binding acr requirement: a voluntary/absent acr is best-effort.
+        return None;
+    }
+    let supported = authn::acr_values_supported();
+    let achievable = required
+        .iter()
+        .any(|value| supported.contains(&value.as_str()));
+    if !achievable {
+        return Some((
+            AuthzErrorCode::UnmetAuthenticationRequirements,
+            "no available authentication method can satisfy the requested acr",
+        ));
+    }
+    let achieved = authn::achieved_acr(&authn::parse_methods(auth_methods));
+    if required.iter().any(|value| value.as_str() == achieved) {
+        None
+    } else {
+        Some((
+            AuthzErrorCode::AccessDenied,
+            "the requested authentication context (essential acr) cannot be satisfied",
+        ))
+    }
 }
 
 /// The outcome of resolving the login/consent gate: either an interaction is
@@ -672,11 +749,18 @@ enum Gate {
     },
 }
 
-/// Resolve the login/consent gate for a validated request. Redirects an
-/// unauthenticated user to login (or registration for `prompt=create`), and an
-/// authenticated user without consent to the consent screen; otherwise reports the
-/// request ready. A consent-store failure is a `server_error` redirect (the
-/// `redirect_uri` is already validated).
+/// Resolve the login/consent gate for a validated request, applying `prompt` and
+/// `max_age` (issue #16).
+///
+/// With no usable session it redirects to login (or registration for
+/// `prompt=create`); with a session that `prompt=login`/`select_account`/`max_age`
+/// mark stale it forces a fresh login; with a usable session it re-prompts consent
+/// for `prompt=consent` or when none is recorded, and otherwise reports the request
+/// ready. Under `prompt=none` NO UI is ever rendered: the matching `login_required`
+/// / `consent_required` error is returned through the negotiated `mode` instead. A
+/// consent-store failure is a `server_error` redirect (the `redirect_uri` is
+/// already validated).
+#[allow(clippy::too_many_arguments)]
 async fn resolve_gate(
     state: &OidcState,
     headers: &HeaderMap,
@@ -685,15 +769,37 @@ async fn resolve_gate(
     redirect_uri: &str,
     iss: &str,
     mode: ResponseMode,
+    prompt: &PromptSet,
+    max_age_secs: Option<u64>,
+    hints: &InteractionHints,
 ) -> Result<Gate, AuthorizeError> {
     // The scope is the one the client_id declares (fixed at validation).
     let scope = client_id.scope();
     let cookie = interaction::cookie_header(headers);
+    let prompt_none = prompt.contains(PromptValue::None);
+    // A negotiated-mode redirect error (redirect_uri is already validated), used for
+    // the prompt=none surfaces so an interaction need becomes an error, never a page.
+    let gate_error = |code: AuthzErrorCode, description: &str| AuthorizeError::Redirect {
+        redirect_uri: redirect_uri.to_owned(),
+        error: code,
+        description: description.to_owned(),
+        state: params.state.as_deref().map(str::to_owned),
+        iss: iss.to_owned(),
+        mode,
+    };
+
     let Some(session) = interaction::resolve_session(state, scope, cookie).await else {
-        let return_to = build_authorize_url(params);
+        // No usable session (absent, expired, or cross-scope).
+        if prompt_none {
+            return Err(gate_error(
+                AuthzErrorCode::LoginRequired,
+                "authentication is required but prompt=none forbids interaction",
+            ));
+        }
+        let return_to = build_authorize_url(params, hints);
         // prompt=create routes an UNAUTHENTICATED user to registration; once a
         // session exists it is ignored, so registration never loops.
-        let redirect = if params.prompt.as_deref().map(str::trim) == Some("create") {
+        let redirect = if prompt.contains(PromptValue::Create) {
             interaction::register_redirect(&return_to)
         } else {
             interaction::login_redirect(&return_to)
@@ -701,7 +807,30 @@ async fn resolve_gate(
         return Ok(Gate::Interaction(redirect));
     };
 
+    // A session exists. Does prompt or max_age force fresh authentication?
+    // select_account has no multi-session chooser in the bootstrap, so it degrades
+    // to a forced re-login (the semantics and error codes stay correct).
+    let now_micros = epoch_micros(state.now());
+    let force_reauth = prompt.contains(PromptValue::Login)
+        || prompt.contains(PromptValue::SelectAccount)
+        || max_age_forces_reauth(max_age_secs, session.auth_time_unix_micros, now_micros);
+    if force_reauth {
+        if prompt_none {
+            // prompt=none cannot combine with login/select_account (rejected at
+            // parse), so a forced re-auth here is a max_age-stale session: the user
+            // must re-authenticate, which prompt=none forbids.
+            return Err(gate_error(
+                AuthzErrorCode::LoginRequired,
+                "re-authentication is required but prompt=none forbids interaction",
+            ));
+        }
+        return Ok(Gate::Interaction(interaction::login_redirect(
+            &build_authorize_url(params, hints),
+        )));
+    }
+
     let client_id_str = client_id.to_string();
+    let force_consent = prompt.contains(PromptValue::Consent);
     // Bootstrap limitation tracked in #196 (a hard prerequisite for enabling OIDC,
     // #13): consent is looked up per (subject, client_id) only, so a prior consent
     // for a narrow scope auto-grants any later broader scope. Before enablement this
@@ -713,29 +842,101 @@ async fn resolve_gate(
         .granted_ref(&session.subject, &client_id_str)
         .await
     {
-        Ok(Some(consent_ref)) => Ok(Gate::Ready {
-            session,
-            consent_ref,
-        }),
-        Ok(None) => Ok(Gate::Interaction(interaction::consent_redirect(
-            &build_authorize_url(params),
-        ))),
-        Err(_) => Err(AuthorizeError::Redirect {
-            redirect_uri: redirect_uri.to_owned(),
-            error: AuthzErrorCode::ServerError,
-            description: "the authorization request could not be processed".to_owned(),
-            state: params.state.as_deref().map(str::to_owned),
-            iss: iss.to_owned(),
-            mode,
-        }),
+        // Consent recorded. prompt=consent forces a fresh consent screen even so
+        // (never reached under prompt=none, which cannot combine with consent).
+        Ok(Some(consent_ref)) => {
+            if force_consent {
+                Ok(Gate::Interaction(interaction::consent_redirect(
+                    &build_authorize_url(params, hints),
+                )))
+            } else {
+                Ok(Gate::Ready {
+                    session,
+                    consent_ref,
+                })
+            }
+        }
+        // No consent recorded: consent is required.
+        Ok(None) => {
+            if prompt_none {
+                return Err(gate_error(
+                    AuthzErrorCode::ConsentRequired,
+                    "consent is required but prompt=none forbids interaction",
+                ));
+            }
+            Ok(Gate::Interaction(interaction::consent_redirect(
+                &build_authorize_url(params, hints),
+            )))
+        }
+        Err(_) => Err(gate_error(
+            AuthzErrorCode::ServerError,
+            "the authorization request could not be processed",
+        )),
     }
+}
+
+/// Parse the `prompt` request parameter into a [`PromptSet`] (issue #16). An absent
+/// or blank value is the empty set (no prompt requested); otherwise the value is a
+/// space-separated set whose one illegal combination (`none` with any other value)
+/// or unrecognized token is a short `invalid_request` description.
+fn parse_prompt(raw: Option<&str>) -> Result<PromptSet, &'static str> {
+    match raw.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(value) => {
+            PromptSet::parse(value).map_err(crate::registry::PromptSetError::as_description)
+        }
+        None => Ok(PromptSet::default()),
+    }
+}
+
+/// Parse the `max_age` request parameter (issue #16). Returns [`None`] for an
+/// absent or blank value, `Some(secs)` for a non-negative integer (including the
+/// load-bearing `Some(0)`, which is distinguished from absent by this explicit
+/// presence check rather than a truthiness test), and a short `invalid_request`
+/// description for a non-integer value.
+fn parse_max_age(raw: Option<&str>) -> Result<Option<u64>, &'static str> {
+    match raw.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(value) => value
+            .parse::<u64>()
+            .map(Some)
+            .map_err(|_| "max_age must be a non-negative integer number of seconds"),
+        None => Ok(None),
+    }
+}
+
+/// Whether `max_age` forces re-authentication of a session recorded at
+/// `auth_time_micros`, evaluated at `now_micros` (both epoch microseconds, from the
+/// clock seam). Absent `max_age` never forces re-auth. A present `max_age` (INCLUDING
+/// `max_age=0`) forces re-auth when the session's authentication is strictly older
+/// than the allowed window, so `max_age=0` behaves as `prompt=login` for any session
+/// that was not authenticated at this very instant. A future-dated `auth_time` (an
+/// artifact of a frozen test clock) yields a negative elapsed time and is never
+/// stale.
+fn max_age_forces_reauth(
+    max_age_secs: Option<u64>,
+    auth_time_micros: i64,
+    now_micros: i64,
+) -> bool {
+    let Some(secs) = max_age_secs else {
+        return false;
+    };
+    let elapsed_micros = now_micros.saturating_sub(auth_time_micros);
+    let max_micros = i64::try_from(secs)
+        .unwrap_or(i64::MAX)
+        .saturating_mul(1_000_000);
+    elapsed_micros > max_micros
 }
 
 /// Reconstruct the canonical `/authorize?...` URL from the request parameters, so
 /// an interaction redirect can resume this exact request after login or consent.
-/// Built from the raw parameters (percent-encoding each) so the resumed request is
-/// byte-for-byte equivalent whether the original arrived as a GET or a POST.
-fn build_authorize_url(params: &AuthorizeParams) -> String {
+///
+/// The protocol parameters are carried from the RAW request (percent-encoding each)
+/// so the resumed request is byte-for-byte equivalent whether the original arrived
+/// as a GET or a POST. The NON-security interaction hints (`login_hint`,
+/// `logout_hint`, `ui_locales`, `claims_locales`, `display`) are carried from the
+/// typed [`InteractionHints`] seam (issue #16), which is their single source of
+/// truth across the round-trip, so the interaction pages reconstruct them and a
+/// malformed one (an unknown `display`) is simply not carried.
+fn build_authorize_url(params: &AuthorizeParams, hints: &InteractionHints) -> String {
     append_query(
         "/authorize",
         &[
@@ -755,6 +956,11 @@ fn build_authorize_url(params: &AuthorizeParams) -> String {
             ("max_age", params.max_age.as_deref()),
             ("acr_values", params.acr_values.as_deref()),
             ("claims", params.claims.as_deref()),
+            ("login_hint", hints.login_hint()),
+            ("logout_hint", hints.logout_hint()),
+            ("ui_locales", hints.ui_locales()),
+            ("claims_locales", hints.claims_locales()),
+            ("display", hints.display_param()),
         ],
     )
 }
@@ -845,4 +1051,99 @@ async fn persist_code(
     }
 
     Ok(code_id.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The recorded session's `auth_time` (epoch micros) used by the `max_age`
+    /// tests, chosen so a session is clearly in the past relative to a `now` after it.
+    const AUTH_MICROS: i64 = 1_000_000_000_000_000;
+
+    #[test]
+    fn parse_prompt_accepts_the_set_and_rejects_none_combinations() {
+        assert!(parse_prompt(None).expect("absent").is_empty());
+        assert!(parse_prompt(Some("  ")).expect("blank").is_empty());
+        let set = parse_prompt(Some("login consent")).expect("valid");
+        assert!(set.contains(PromptValue::Login) && set.contains(PromptValue::Consent));
+        assert!(
+            parse_prompt(Some("create"))
+                .expect("valid")
+                .contains(PromptValue::Create)
+        );
+        assert!(
+            parse_prompt(Some("none login")).is_err(),
+            "none + other is invalid"
+        );
+        assert!(
+            parse_prompt(Some("bogus")).is_err(),
+            "unknown token is invalid"
+        );
+    }
+
+    #[test]
+    fn parse_max_age_distinguishes_zero_from_absent_and_rejects_non_integers() {
+        // The integer-falsy trap: max_age=0 is PRESENT (Some(0)); absent is None.
+        assert_eq!(parse_max_age(None), Ok(None), "absent max_age");
+        assert_eq!(parse_max_age(Some("   ")), Ok(None), "blank is absent");
+        assert_eq!(
+            parse_max_age(Some("0")),
+            Ok(Some(0)),
+            "max_age=0 is present"
+        );
+        assert_eq!(parse_max_age(Some(" 3600 ")), Ok(Some(3600)));
+        assert!(parse_max_age(Some("-1")).is_err(), "negative is invalid");
+        assert!(
+            parse_max_age(Some("soon")).is_err(),
+            "non-integer is invalid"
+        );
+    }
+
+    #[test]
+    fn max_age_forces_reauth_guards_the_integer_falsy_trap() {
+        let now = AUTH_MICROS + 100 * 1_000_000; // 100 seconds after authentication.
+        // Absent max_age never forces re-auth, even for an old session.
+        assert!(!max_age_forces_reauth(None, AUTH_MICROS, now));
+        // max_age=0 (present) forces re-auth for any session not authenticated at
+        // this very instant: it behaves as prompt=login.
+        assert!(max_age_forces_reauth(Some(0), AUTH_MICROS, now));
+        // A session younger than max_age is fresh; older is stale.
+        assert!(!max_age_forces_reauth(Some(3600), AUTH_MICROS, now));
+        assert!(max_age_forces_reauth(Some(60), AUTH_MICROS, now));
+        // A session authenticated exactly now (or in the frozen-clock future) is
+        // never stale, so a re-authenticated max_age=0 request does not loop.
+        assert!(!max_age_forces_reauth(Some(0), now, now));
+        assert!(!max_age_forces_reauth(Some(0), now + 1, now));
+    }
+
+    #[test]
+    fn acr_requirement_error_is_unmet_only_when_no_method_can_satisfy() {
+        use crate::claims_request::ClaimsRequest;
+
+        // A voluntary acr_values-style request has no essential binding, so it never
+        // errors (the achieved acr is reported honestly instead).
+        let voluntary =
+            ClaimsRequest::parse(r#"{"id_token":{"acr":{"values":["urn:example:high"]}}}"#)
+                .expect("parse");
+        assert!(acr_requirement_error(&voluntary, "pwd").is_none());
+
+        // An essential acr pinned to a level NO method can achieve is
+        // unmet_authentication_requirements.
+        let unmet = ClaimsRequest::parse(
+            r#"{"id_token":{"acr":{"essential":true,"values":["urn:example:high"]}}}"#,
+        )
+        .expect("parse");
+        assert_eq!(
+            acr_requirement_error(&unmet, "pwd").map(|(code, _)| code),
+            Some(AuthzErrorCode::UnmetAuthenticationRequirements),
+        );
+
+        // An essential acr pinned to the achievable-and-achieved level is satisfied.
+        let met = ClaimsRequest::parse(
+            r#"{"id_token":{"acr":{"essential":true,"values":["urn:ironauth:acr:pwd"]}}}"#,
+        )
+        .expect("parse");
+        assert!(acr_requirement_error(&met, "pwd").is_none());
+    }
 }

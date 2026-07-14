@@ -29,7 +29,10 @@
 //! - `token_endpoint_auth_methods_supported` <- [`ClientAuthMethod::ALL`]
 //! - `subject_types_supported`    <- [`SubjectType::ALL`]
 //! - `response_modes_supported`   <- [`ResponseMode::DEFAULT`] (+ per-env `fragment`/`form_post`, #17)
-//! - `prompt_values_supported`    <- [`PromptValue::ALL`]
+//! - `prompt_values_supported`    <- [`PromptValue::ALL`] (`none login consent select_account create`, #16)
+//! - `display_values_supported`   <- [`Display::SUPPORTED`] (the page layouts honored, #16)
+//! - `ui_locales_supported` / `claims_locales_supported` <- the bootstrap page
+//!   locales ([`UI_LOCALES_SUPPORTED`] / [`CLAIMS_LOCALES_SUPPORTED`], #16)
 //! - `id_token_signing_alg_values_supported` <- the environment policy, with the
 //!   Discovery section 3 RS256 FLOOR (see [`id_token_signing_alg_values`]).
 //!
@@ -63,6 +66,7 @@ use ironauth_store::Scope;
 use serde_json::{Value, json};
 
 use crate::client_auth::ClientAuthMethod;
+use crate::hints::Display;
 use crate::issuer::JwksCacheWindow;
 use crate::registry::{GrantType, PkceMethod, PromptValue, ResponseMode, ResponseType};
 use crate::subject::SubjectType;
@@ -70,6 +74,17 @@ use crate::wellknown::{cacheable_response, not_found, parse_scope};
 
 /// The media type for the discovery document (OIDC Discovery 1.0).
 const DISCOVERY_MEDIA_TYPE: &str = "application/json";
+
+/// The `ui_locales_supported` the discovery document advertises (issue #16): the
+/// end-user UI languages the bootstrap interaction pages are written in. The pages
+/// are English, so this is the honest minimal set; it grows when real translations
+/// land, so discovery never advertises a language the pages do not render.
+pub const UI_LOCALES_SUPPORTED: &[&str] = &["en"];
+
+/// The `claims_locales_supported` the discovery document advertises (issue #16):
+/// the languages this OP can return claim values in. Only English today (the
+/// bootstrap stores claim values verbatim), so the honest minimal set.
+pub const CLAIMS_LOCALES_SUPPORTED: &[&str] = &["en"];
 
 /// The scopes IronAuth advertises. `openid` is the OIDC-mandated scope the
 /// authorization-code flow is defined against; `profile`, `email`, `address`, and
@@ -161,8 +176,9 @@ pub const ADVERTISED_ENDPOINTS: &[DiscoveryEndpoint] = &[
 /// (whose flag flows in through [`DiscoveryCapabilities::from_config`] once that
 /// issue lands) or a deployment default. The FIXED capabilities (`code`,
 /// `authorization_code`, `S256`, the client-auth methods, the subject types, the
-/// `query` response mode, the `create` prompt) are read straight from the
-/// registries and are never represented here.
+/// `query` response mode, the `prompt` values, the `display` values, and the
+/// supported locales) are read straight from the registries and consts and are
+/// never represented here.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DiscoveryCapabilities {
     /// Legacy response types enabled for this environment (issue #17). Empty by
@@ -350,6 +366,24 @@ pub fn discovery_document(
         json!(to_strings(
             PromptValue::ALL.iter().map(|value| value.as_str())
         )),
+    );
+    // The interaction hints the authorization endpoint acts on (issue #16). Only
+    // the `display` values and locales the bootstrap actually honors are advertised
+    // (no advertise/refuse mismatch): `page` (the layout rendered) and English (the
+    // language the pages are written in).
+    document.insert(
+        "display_values_supported".to_owned(),
+        json!(to_strings(
+            Display::SUPPORTED.iter().map(|value| value.as_str())
+        )),
+    );
+    document.insert(
+        "ui_locales_supported".to_owned(),
+        json!(UI_LOCALES_SUPPORTED),
+    );
+    document.insert(
+        "claims_locales_supported".to_owned(),
+        json!(CLAIMS_LOCALES_SUPPORTED),
     );
     document.insert("claims_supported".to_owned(), json!(claims_supported()));
     // The ACR values this OP can actually achieve, sourced from the authentication

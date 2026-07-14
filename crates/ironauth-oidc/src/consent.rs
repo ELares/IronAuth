@@ -68,7 +68,7 @@ pub async fn consent_get(
         .collect();
     pages::secure_html(
         StatusCode::OK,
-        pages::consent_page(&client_name, &scopes, &resume.return_to),
+        pages::consent_page(&client_name, &scopes, &resume.return_to, &resume.hints),
     )
 }
 

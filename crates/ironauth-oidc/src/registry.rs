@@ -32,10 +32,11 @@
 //!   (OAuth 2.0 Form Post Response Mode 1.0). `fragment` and `form_post` are
 //!   enabled per environment alongside the legacy response types they serve
 //!   (issue #17), so discovery advertises them only where enabled.
-//! - [`PromptValue`] has exactly one variant, [`PromptValue::Create`]: the only
-//!   `prompt` value the bootstrap acts on (route an unauthenticated user to
-//!   registration). The rest of the `prompt` semantics build on the session model
-//!   in later issues.
+//! - [`PromptValue`] names every `prompt` value the authorization endpoint acts on
+//!   (`none`, `login`, `consent`, `select_account`, `create`), and [`PromptSet`]
+//!   models a parsed `prompt` request as an ORDER-INSENSITIVE SET of them (a
+//!   `prompt` value is space-delimited, OIDC Core 3.1.2.1), rejecting the one
+//!   illegal combination: `none` with any other value.
 //!
 //! A structural test (`tests/structural.rs`) enumerates each registry's full
 //! variant set and asserts every forbidden spelling parses to `None`, so a future
@@ -289,38 +290,155 @@ impl ResponseMode {
     }
 }
 
-/// The OIDC `prompt` values the authorization endpoint acts on.
+/// The OIDC `prompt` values the authorization endpoint acts on (OIDC Core
+/// 3.1.2.1, plus `create` from Initiating User Registration via OpenID Connect).
 ///
-/// Closed on purpose: the only member the bootstrap acts on is `create` (route an
-/// unauthenticated user to registration, per the Initiating User Registration
-/// spec). The remaining `prompt` values (`none`, `login`, `consent`,
-/// `select_account`) build on the session model in later issues and are advertised
-/// only once they are acted on.
+/// `none` renders no UI and returns the corresponding `*_required` error through
+/// the negotiated response mode; `login` forces fresh authentication;
+/// `select_account` forces account selection (which, under the single-session
+/// bootstrap, degrades to a forced re-login); `consent` forces the consent screen;
+/// `create` routes an unauthenticated user to the registration surface. A `prompt`
+/// value is a SET of these (see [`PromptSet`]); the whole set drives the gate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PromptValue {
+    /// `none`: render no authentication or consent UI. If interaction would be
+    /// required, return the matching `*_required` error instead of a page.
+    None,
+    /// `login`: force fresh authentication even with a valid session.
+    Login,
+    /// `consent`: force the consent screen even when consent already exists.
+    Consent,
+    /// `select_account`: force account selection (single-session: re-login).
+    SelectAccount,
     /// `create`: route an unauthenticated user to the registration surface.
     Create,
 }
 
 impl PromptValue {
-    /// Every prompt value this build acts on. Exactly one today, by design.
-    pub const ALL: &'static [PromptValue] = &[PromptValue::Create];
+    /// Every prompt value the authorization endpoint acts on, in the order
+    /// discovery advertises them (`none login consent select_account create`).
+    pub const ALL: &'static [PromptValue] = &[
+        PromptValue::None,
+        PromptValue::Login,
+        PromptValue::Consent,
+        PromptValue::SelectAccount,
+        PromptValue::Create,
+    ];
 
     /// The wire / metadata `prompt` value.
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
+            PromptValue::None => "none",
+            PromptValue::Login => "login",
+            PromptValue::Consent => "consent",
+            PromptValue::SelectAccount => "select_account",
             PromptValue::Create => "create",
         }
     }
 
-    /// Parse a wire `prompt` value. Returns `None` for every value the bootstrap
-    /// does not act on, so only `create` resolves.
+    /// Parse a single wire `prompt` token. Returns `None` for every value the
+    /// endpoint does not act on, so an unrecognized token makes the whole set
+    /// unrepresentable (see [`PromptSet::parse`]).
     #[must_use]
     pub fn parse(raw: &str) -> Option<Self> {
         match raw {
+            "none" => Some(PromptValue::None),
+            "login" => Some(PromptValue::Login),
+            "consent" => Some(PromptValue::Consent),
+            "select_account" => Some(PromptValue::SelectAccount),
             "create" => Some(PromptValue::Create),
             _ => None,
+        }
+    }
+}
+
+/// A parsed `prompt` request: an ORDER-INSENSITIVE SET of [`PromptValue`]s (OIDC
+/// Core 3.1.2.1). `prompt` is space-delimited, so `login consent` and
+/// `consent login` name the same set and duplicates collapse.
+///
+/// The one illegal combination the parser rejects is `none` with ANY other value:
+/// `none` means "render no UI", which cannot coexist with a value that demands UI,
+/// so the whole request is `invalid_request` (per spec). An unrecognized token also
+/// makes the set unrepresentable, mirroring [`ResponseType::parse`].
+// A set membership flag per `prompt` value: one field per registry member, which is
+// exactly what a SET is. Folding them into a state machine or two-variant enums (the
+// excessive-bools remedy) would obscure the one-to-one mapping to the wire values
+// for no gain, so the lint is allowed here.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PromptSet {
+    none: bool,
+    login: bool,
+    consent: bool,
+    select_account: bool,
+    create: bool,
+}
+
+impl PromptSet {
+    /// Parse a wire `prompt` value as an order-insensitive set of tokens.
+    ///
+    /// # Errors
+    ///
+    /// [`PromptSetError::Unknown`] if any token is not a recognized `prompt` value;
+    /// [`PromptSetError::NoneWithOther`] if `none` is combined with any other value.
+    pub fn parse(raw: &str) -> Result<Self, PromptSetError> {
+        let mut set = PromptSet::default();
+        for token in raw.split_ascii_whitespace() {
+            match PromptValue::parse(token) {
+                Some(PromptValue::None) => set.none = true,
+                Some(PromptValue::Login) => set.login = true,
+                Some(PromptValue::Consent) => set.consent = true,
+                Some(PromptValue::SelectAccount) => set.select_account = true,
+                Some(PromptValue::Create) => set.create = true,
+                None => return Err(PromptSetError::Unknown),
+            }
+        }
+        // `none` renders no UI, so it cannot be combined with a UI-demanding value.
+        if set.none && (set.login || set.consent || set.select_account || set.create) {
+            return Err(PromptSetError::NoneWithOther);
+        }
+        Ok(set)
+    }
+
+    /// Whether the set contains `value`.
+    #[must_use]
+    pub fn contains(self, value: PromptValue) -> bool {
+        match value {
+            PromptValue::None => self.none,
+            PromptValue::Login => self.login,
+            PromptValue::Consent => self.consent,
+            PromptValue::SelectAccount => self.select_account,
+            PromptValue::Create => self.create,
+        }
+    }
+
+    /// Whether the request carried no prompt value at all.
+    #[must_use]
+    pub fn is_empty(self) -> bool {
+        !(self.none || self.login || self.consent || self.select_account || self.create)
+    }
+}
+
+/// Why a `prompt` request was rejected. Both map to `invalid_request`; neither
+/// carries a secret.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptSetError {
+    /// `none` was combined with another prompt value (OIDC Core 3.1.2.1).
+    NoneWithOther,
+    /// The value contained a token that is not a recognized `prompt` value.
+    Unknown,
+}
+
+impl PromptSetError {
+    /// A short, non-secret description for the `error_description`.
+    #[must_use]
+    pub fn as_description(self) -> &'static str {
+        match self {
+            PromptSetError::NoneWithOther => {
+                "prompt=none must not be combined with any other prompt value"
+            }
+            PromptSetError::Unknown => "the prompt parameter contains an unsupported value",
         }
     }
 }
@@ -454,6 +572,72 @@ mod tests {
             ResponseType::CodeIdToken.default_response_mode(),
             ResponseMode::Fragment
         );
+    }
+
+    #[test]
+    fn prompt_value_registry_is_exactly_the_five_acted_on_values() {
+        // The structural lock (issue #16): every value the endpoint acts on, in the
+        // order discovery advertises them. `create` is included so the registration
+        // deep-link stays advertised.
+        assert_eq!(
+            PromptValue::ALL,
+            &[
+                PromptValue::None,
+                PromptValue::Login,
+                PromptValue::Consent,
+                PromptValue::SelectAccount,
+                PromptValue::Create,
+            ]
+        );
+        assert!(PromptValue::ALL.contains(&PromptValue::Create));
+        for value in PromptValue::ALL {
+            assert_eq!(PromptValue::parse(value.as_str()), Some(*value));
+        }
+    }
+
+    #[test]
+    fn prompt_set_parses_as_an_order_insensitive_set() {
+        let single = PromptSet::parse("login").expect("valid");
+        assert!(single.contains(PromptValue::Login));
+        assert!(!single.contains(PromptValue::Consent));
+        assert!(!single.is_empty());
+
+        // Order does not matter and duplicates collapse.
+        let a = PromptSet::parse("login consent").expect("valid");
+        let b = PromptSet::parse("consent   login").expect("valid");
+        let c = PromptSet::parse("login login consent").expect("valid");
+        assert_eq!(a, b, "prompt is an order-insensitive set");
+        assert_eq!(a, c, "a duplicated value collapses");
+        assert!(a.contains(PromptValue::Login) && a.contains(PromptValue::Consent));
+
+        // An empty/whitespace value is the empty set (no prompt requested).
+        assert!(PromptSet::parse("   ").expect("valid").is_empty());
+    }
+
+    #[test]
+    fn prompt_none_is_rejected_when_combined_and_unknown_tokens_are_rejected() {
+        // `none` alone is fine.
+        assert!(
+            PromptSet::parse("none")
+                .expect("valid")
+                .contains(PromptValue::None)
+        );
+        // `none` with ANY other value is invalid_request (OIDC Core 3.1.2.1).
+        for combined in ["none login", "login none", "none consent", "none create"] {
+            assert_eq!(
+                PromptSet::parse(combined),
+                Err(PromptSetError::NoneWithOther),
+                "{combined:?} must be rejected"
+            );
+        }
+        // An unrecognized token makes the whole set unrepresentable.
+        for unknown in ["nope", "login foobar", "select-account"] {
+            assert_eq!(
+                PromptSet::parse(unknown),
+                Err(PromptSetError::Unknown),
+                "{unknown:?} must be rejected"
+            );
+        }
     }
 
     #[test]

@@ -39,12 +39,19 @@ pub struct RegisterForm {
     pub return_to: Option<String>,
 }
 
-/// `GET /register`: render the registration form for a valid resume target.
+/// `GET /register`: render the registration form for a valid resume target. The
+/// `display` / `ui_locales` hints carried on the resuming request shape the page
+/// shell, and the `login_hint` prefills the identifier (issue #16).
 pub async fn register_get(Query(query): Query<ResumeQuery>) -> Response {
     match parse_resume(query.return_to.as_deref()) {
         Some(resume) => pages::secure_html(
             StatusCode::OK,
-            pages::register_page("", &resume.return_to, None),
+            pages::register_page(
+                resume.hints.login_hint().unwrap_or_default(),
+                &resume.return_to,
+                None,
+                &resume.hints,
+            ),
         ),
         None => interaction::invalid_link_page(),
     }
@@ -66,13 +73,19 @@ pub async fn register_post(
     let password = form.password.as_deref().unwrap_or_default();
 
     if identifier.is_empty() {
-        return register_error(identifier, &resume.return_to, "An identifier is required.");
+        return register_error(
+            identifier,
+            &resume.return_to,
+            "An identifier is required.",
+            &resume.hints,
+        );
     }
     if password.len() < MIN_PASSWORD_LEN {
         return register_error(
             identifier,
             &resume.return_to,
             "The password must be at least 8 characters.",
+            &resume.hints,
         );
     }
 
@@ -115,15 +128,21 @@ pub async fn register_post(
             identifier,
             &resume.return_to,
             "That identifier is already registered.",
+            &resume.hints,
         ),
         Err(_) => interaction::server_error_page(),
     }
 }
 
 /// Re-render the registration form with an error, prefilling the identifier.
-fn register_error(identifier: &str, return_to: &str, message: &str) -> Response {
+fn register_error(
+    identifier: &str,
+    return_to: &str,
+    message: &str,
+    hints: &crate::hints::InteractionHints,
+) -> Response {
     pages::secure_html(
         StatusCode::OK,
-        pages::register_page(identifier, return_to, Some(message)),
+        pages::register_page(identifier, return_to, Some(message), hints),
     )
 }

@@ -40,12 +40,20 @@ pub struct LoginForm {
     pub return_to: Option<String>,
 }
 
-/// `GET /login`: render the sign-in form for a valid resume target.
+/// `GET /login`: render the sign-in form for a valid resume target. The
+/// `login_hint` carried on the resuming authorization request prefills the
+/// identifier field (escaped into the attribute by the page), and the `display` /
+/// `ui_locales` hints shape the page shell (issue #16).
 pub async fn login_get(Query(query): Query<ResumeQuery>) -> Response {
     match parse_resume(query.return_to.as_deref()) {
         Some(resume) => pages::secure_html(
             StatusCode::OK,
-            pages::login_page("", &resume.return_to, None),
+            pages::login_page(
+                resume.hints.login_hint().unwrap_or_default(),
+                &resume.return_to,
+                None,
+                &resume.hints,
+            ),
         ),
         None => interaction::invalid_link_page(),
     }
@@ -87,27 +95,32 @@ pub async fn login_post(State(state): State<OidcState>, Form(form): Form<LoginFo
             }
         }
         // Present but wrong password: generic failure (no wrong-password oracle).
-        Ok(Some(_)) => failed_login_page(identifier, &resume.return_to),
+        Ok(Some(_)) => failed_login_page(identifier, &resume.return_to, &resume.hints),
         // Absent account: spend comparable Argon2id time, then the SAME generic
         // failure (no user-enumeration oracle).
         Ok(None) => {
             let _ = password::verify_absent(password);
-            failed_login_page(identifier, &resume.return_to)
+            failed_login_page(identifier, &resume.return_to, &resume.hints)
         }
         Err(_) => interaction::server_error_page(),
     }
 }
 
 /// Re-render the login form with a generic failure message, prefilling the
-/// identifier. The message never distinguishes a wrong password from an unknown
-/// account.
-fn failed_login_page(identifier: &str, return_to: &str) -> Response {
+/// SUBMITTED identifier. The message never distinguishes a wrong password from an
+/// unknown account.
+fn failed_login_page(
+    identifier: &str,
+    return_to: &str,
+    hints: &crate::hints::InteractionHints,
+) -> Response {
     pages::secure_html(
         StatusCode::OK,
         pages::login_page(
             identifier,
             return_to,
             Some("Incorrect identifier or password."),
+            hints,
         ),
     )
 }

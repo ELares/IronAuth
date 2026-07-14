@@ -198,5 +198,24 @@ name = "response_types"
 path = "tests/response_types.rs"
 required-features = ["testing"]
 
+# prompt (the SET model, prompt=none through the response mode, login/consent/
+# select_account/create), max_age re-authentication (including the max_age=0
+# integer-falsy trap), and the login_hint / locale / display interaction-hint
+# plumbing (issue #16). Over a real database with a provisioned signing key.
+[[test]]
+name = "prompt_hints"
+path = "tests/prompt_hints.rs"
+required-features = ["testing"]
+
+# UserInfo endpoint, scope-to-claims, and the claims request parameter (issue #15),
+# including the essential-acr binding whose unmet surface issue #16 refines to
+# unmet_authentication_requirements. This target was missing from the manifest, so
+# the #15 tests never ran (and never bound the #13 PKCE the public harness client
+# requires); registered and PKCE-corrected here. Over a real database.
+[[test]]
+name = "userinfo"
+path = "tests/userinfo.rs"
+required-features = ["testing"]
+
 [lints]
 workspace = true

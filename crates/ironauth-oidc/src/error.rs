@@ -38,24 +38,49 @@ pub enum AuthzErrorCode {
     /// (structurally unrepresentable), otherwise unknown, or a legacy type not
     /// enabled in this environment (issue #17).
     UnsupportedResponseType,
-    /// The authorization server denied the request. Used for the fail-closed
-    /// essential-`acr` binding (issue #15): a requested authentication context the
-    /// server cannot achieve is refused rather than silently downgraded. The full
-    /// `unmet_authentication_requirements` surface (OIDC Core) is issue #16; this
-    /// standard RFC 6749 code is the clean seam it refines.
+    /// The authorization server denied the request. Used for the residual
+    /// essential-`acr` fail-closed (issue #15): an authentication context that some
+    /// method COULD achieve but this session did not, and that the single-method
+    /// bootstrap cannot step up to. When NO available method can EVER achieve the
+    /// requested context, [`AuthzErrorCode::UnmetAuthenticationRequirements`] is
+    /// returned instead (issue #16).
     AccessDenied,
+    /// The end user is not authenticated and `prompt=none` forbids showing a login
+    /// UI (OIDC Core 3.1.2.6). Returned through the negotiated response mode.
+    LoginRequired,
+    /// Consent is required but `prompt=none` forbids showing the consent UI (OIDC
+    /// Core 3.1.2.6). Returned through the negotiated response mode.
+    ConsentRequired,
+    /// An interaction is required that is neither a plain login nor consent, and
+    /// `prompt=none` forbids it (OIDC Core 3.1.2.6). Returned through the negotiated
+    /// response mode.
+    InteractionRequired,
+    /// Account selection is required but `prompt=none` forbids showing the chooser
+    /// (OIDC Core 3.1.2.6). Registered for completeness; the single-session
+    /// bootstrap resolves `prompt=none` to login/consent instead.
+    AccountSelectionRequired,
+    /// The requested authentication context (an essential `acr`) cannot be
+    /// satisfied by ANY authentication method this server offers (OIDC Core, the
+    /// registered `unmet_authentication_requirements`). Returned through the
+    /// negotiated response mode.
+    UnmetAuthenticationRequirements,
     /// The server encountered an unexpected condition.
     ServerError,
 }
 
 impl AuthzErrorCode {
-    /// The wire `error` value.
+    /// The wire `error` value (the registered OIDC / RFC 6749 error-code strings).
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
             AuthzErrorCode::InvalidRequest => "invalid_request",
             AuthzErrorCode::UnsupportedResponseType => "unsupported_response_type",
             AuthzErrorCode::AccessDenied => "access_denied",
+            AuthzErrorCode::LoginRequired => "login_required",
+            AuthzErrorCode::ConsentRequired => "consent_required",
+            AuthzErrorCode::InteractionRequired => "interaction_required",
+            AuthzErrorCode::AccountSelectionRequired => "account_selection_required",
+            AuthzErrorCode::UnmetAuthenticationRequirements => "unmet_authentication_requirements",
             AuthzErrorCode::ServerError => "server_error",
         }
     }
@@ -249,5 +274,37 @@ impl IntoResponse for TokenError {
             );
         }
         response
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn authz_error_codes_render_the_registered_wire_strings() {
+        // The registered OIDC / RFC 6749 error-code strings, locked so a rename
+        // cannot silently change what a relying party sees (issue #16).
+        assert_eq!(AuthzErrorCode::InvalidRequest.as_str(), "invalid_request");
+        assert_eq!(
+            AuthzErrorCode::UnsupportedResponseType.as_str(),
+            "unsupported_response_type"
+        );
+        assert_eq!(AuthzErrorCode::AccessDenied.as_str(), "access_denied");
+        assert_eq!(AuthzErrorCode::LoginRequired.as_str(), "login_required");
+        assert_eq!(AuthzErrorCode::ConsentRequired.as_str(), "consent_required");
+        assert_eq!(
+            AuthzErrorCode::InteractionRequired.as_str(),
+            "interaction_required"
+        );
+        assert_eq!(
+            AuthzErrorCode::AccountSelectionRequired.as_str(),
+            "account_selection_required"
+        );
+        assert_eq!(
+            AuthzErrorCode::UnmetAuthenticationRequirements.as_str(),
+            "unmet_authentication_requirements"
+        );
+        assert_eq!(AuthzErrorCode::ServerError.as_str(), "server_error");
     }
 }
