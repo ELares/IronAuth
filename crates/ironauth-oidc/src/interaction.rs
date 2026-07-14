@@ -143,9 +143,11 @@ const OPAQUE_ORIGIN: &str = "null";
 /// plain mismatch would reject a legitimate same-origin submission, so `null` is
 /// resolved by FETCH METADATA instead of by the origin comparison:
 ///
-/// - `null` with `Sec-Fetch-Site: same-origin` or `same-site` is INCONCLUSIVE (the
-///   check defers to the cookie, exactly as an absent `Origin` does);
-/// - `null` with any other, or with NO, `Sec-Fetch-Site` is a HARD REJECT.
+/// - `null` with `Sec-Fetch-Site: same-origin` is INCONCLUSIVE (the check defers to
+///   the cookie, exactly as an absent `Origin` does);
+/// - `null` with any other value (including `same-site`, which is a sibling subdomain
+///   on the same registrable domain, a DIFFERENT origin), or with NO,
+///   `Sec-Fetch-Site` is a HARD REJECT.
 ///
 /// This cannot produce a false ALLOW for a genuine cross-origin submission.
 /// `Sec-Fetch-*` are FORBIDDEN header names: page script (`fetch`, `XMLHttpRequest`,
@@ -166,11 +168,16 @@ pub fn same_origin_ok(headers: &HeaderMap, expected_origin: Option<&str>) -> boo
             return false;
         }
     }
-    // Positive OWN-SITE evidence from fetch metadata (unforgeable by page script).
-    // This is the only thing that can rescue an opaque `Origin`.
-    let own_site = fetch_site.is_some_and(|site| {
-        site.eq_ignore_ascii_case("same-origin") || site.eq_ignore_ascii_case("same-site")
-    });
+    // Positive SAME-ORIGIN evidence from fetch metadata (unforgeable by page script).
+    // This is the only thing that can rescue an opaque `Origin`, and it must be
+    // exactly `same-origin`: `same-site` covers a sibling subdomain sharing the
+    // registrable domain, which is a DIFFERENT origin, so accepting it would be a
+    // cross-origin CSRF false-allow (a no-referrer sibling page nulls the Origin yet
+    // reports `same-site`). A genuine same-origin no-referrer POST always carries a
+    // REAL matching Origin, never null, so requiring `same-origin` rescues zero
+    // legitimate traffic.
+    let same_origin_signal =
+        fetch_site.is_some_and(|site| site.eq_ignore_ascii_case("same-origin"));
     // A present Origin that does not match our own is a cross-origin submission.
     if let Some(origin) = headers
         .get(header::ORIGIN)
@@ -178,9 +185,10 @@ pub fn same_origin_ok(headers: &HeaderMap, expected_origin: Option<&str>) -> boo
     {
         if origin.trim().eq_ignore_ascii_case(OPAQUE_ORIGIN) {
             // The opaque origin carries no information of its own: allow ONLY when
-            // the user agent has positively said the request came from our own site,
-            // and reject otherwise (fail closed on an absent or non-own-site signal).
-            return own_site;
+            // the user agent has positively said the request came from our own
+            // origin, and reject otherwise (fail closed on an absent, `same-site`,
+            // `cross-site`, or `none` signal).
+            return same_origin_signal;
         }
         if let Some(expected) = expected_origin {
             // Compare CANONICAL origins (issue #196): a browser lowercases the host
@@ -498,12 +506,20 @@ mod tests {
         // therefore resolved by fetch metadata, which page script cannot forge.
         let expected = Some("https://issuer.test");
 
-        // ACCEPTED: the user agent positively says the request came from our own site.
+        // ACCEPTED: the user agent positively says the request came from our own
+        // origin. This is the ONLY signal that rescues an opaque `Origin: null`.
         assert!(same_origin_ok(
             &headers_of(&[("origin", "null"), ("sec-fetch-site", "same-origin")]),
             expected
         ));
-        assert!(same_origin_ok(
+
+        // REJECTED: `same-site` is NOT `same-origin`. A sibling subdomain sharing the
+        // registrable domain, serving a page with `Referrer-Policy: no-referrer`, makes
+        // the browser send `Origin: null` alongside a UA-authored
+        // `Sec-Fetch-Site: same-site`; accepting it would be a cross-origin CSRF
+        // false-allow. A genuine same-origin no-referrer POST always carries a REAL
+        // matching Origin, never null, so this rescues zero legitimate traffic.
+        assert!(!same_origin_ok(
             &headers_of(&[("origin", "null"), ("sec-fetch-site", "same-site")]),
             expected
         ));
