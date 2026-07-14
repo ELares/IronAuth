@@ -37,7 +37,7 @@ use ironauth_env::Env;
 use ironauth_store::{
     ApprovedDeviceGrant, ClientId, CorrelationId, DeviceCodeId, DevicePollOutcome,
     DeviceRedeemOutcome, IssuedTokenRecord, NewDeviceCode, NewOpaqueAccessToken, NewRefreshFamily,
-    RefreshFamilyId, Scope, StoreError, TokenKind,
+    RefreshFamilyId, Scope, SessionId, StoreError, TokenKind,
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -368,7 +368,7 @@ pub async fn device_code_grant(
             if grant.client_id != authenticated.client_id {
                 return Err(TokenError::InvalidGrant);
             }
-            issue_device_tokens(state, scope, grant).await
+            issue_device_tokens(state, scope, *grant).await
         }
     }
 }
@@ -451,10 +451,51 @@ async fn issue_device_tokens(
     }
 }
 
+/// Resolve the per-(client, session) `sid` for an approved device flow (issue #32),
+/// from the SSO session of the human who approved it at the verification page.
+///
+/// Returns [`None`] only for a grant approved BEFORE the approving session was recorded
+/// (there is genuinely no session to resolve), so an in-flight upgrade keeps working:
+/// such a flow simply mints without a `sid`, exactly as it did before.
+///
+/// If the approving human's session is no longer LIVE (they logged out, or an operator
+/// revoked it, between approving the device and the device polling for its tokens), the
+/// store refuses to hang a per-client session off a dead SSO session and this is a
+/// uniform `invalid_grant`: the same rule the code exchange enforces, so a revoked
+/// session cannot be laundered into fresh live tokens through the slower flow.
+///
+/// A genuine store fault fails CLOSED as a `server_error`, never a silently
+/// session-less ID token.
+async fn resolve_device_sid(
+    state: &OidcState,
+    scope: Scope,
+    grant: &ApprovedDeviceGrant,
+) -> Result<Option<String>, TokenError> {
+    let Some(session_ref) = grant.session_ref.as_deref() else {
+        return Ok(None);
+    };
+    let session_id =
+        SessionId::parse_in_scope(session_ref, &scope).map_err(|_| TokenError::InvalidGrant)?;
+    let now_micros = epoch_micros(state.now());
+    match state
+        .store()
+        .scoped(scope)
+        .client_sessions()
+        .ensure_sid(state.env(), &session_id, &grant.client_id, now_micros)
+        .await
+    {
+        Ok(sid) => Ok(Some(sid)),
+        // The store's live-session guard found no live SSO session to bind to.
+        Err(StoreError::NotFound) => Err(TokenError::InvalidGrant),
+        Err(_) => Err(TokenError::ServerError),
+    }
+}
+
 /// Mint the ID and access tokens for an approved device flow (issue #24). Reuses the
 /// SAME pure minting core as the code grant; the auth-context claims derive from the
 /// approving human's session, frozen onto the flow at approval. A device flow has no
-/// `nonce` (RFC 8628 carries none), so the ID token omits it.
+/// `nonce` (RFC 8628 carries none), so the ID token omits it. The ID token carries the
+/// per-(client, session) `sid` (issue #32) of the approving human's SSO session.
 async fn mint_device_tokens(
     state: &OidcState,
     scope: Scope,
@@ -472,6 +513,15 @@ async fn mint_device_tokens(
         .await
         .map_err(|_| TokenError::ServerError)?;
     let extra_claims = serde_json::Map::new();
+    // The per-client `sid` (issue #32), resolved from the SSO session of the human who
+    // APPROVED this flow at the verification page, through the same (client, session)
+    // row the code flow uses. So a device-flow ID token carries the SAME sid the code
+    // flow would issue for that pair, and discovery's
+    // backchannel_logout_session_supported is true for the device flow too.
+    //
+    // Fails CLOSED: a store error is a server_error, never a silently session-less ID
+    // token that no back-channel logout could target.
+    let sid = resolve_device_sid(state, scope, grant).await?;
     tokens::mint(
         state,
         signer,
@@ -485,9 +535,7 @@ async fn mint_device_tokens(
             oauth_scope: grant.requested_scope.as_deref(),
             auth_methods: &grant.auth_methods,
             auth_time_unix_micros: grant.auth_time_unix_micros,
-            // The device grant's ID token does not yet carry the per-client `sid`
-            // (issue #32): the always-on authorization-code path emits it. None here.
-            sid: None,
+            sid: sid.as_deref(),
             at_hash: None,
             c_hash: None,
             extra_claims: &extra_claims,

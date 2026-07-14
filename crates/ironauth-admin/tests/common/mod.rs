@@ -146,7 +146,7 @@ impl Harness {
             .store()
             .scoped(scope)
             .sessions()
-            .get(session, 0)
+            .get(session, 0, 0)
             .await
             .expect("read session")
             .is_some()

@@ -47,6 +47,30 @@ range per docs/RELEASING.md.
     `sessions`, `client_sessions`, `refresh_families`, and `grants`.
   - **New audit actions.** `session.rotate`, `session.revoke`, `sessions.bulk_revoke`,
     and `user.sessions.revoke_all`.
+  - **Rotation carries or terminates the prior lineage (never orphans it).** A rotation
+    now reconciles the prior session INSIDE its existing transaction and returns a
+    `PriorSessionOutcome`. When the prior session is the SAME subject (a re-authentication
+    in the same browser) its per-client sessions and refresh families are RE-POINTED onto
+    the successor, so the `sid` stays stable and a later revoke/logout still cascades to
+    everything the earlier lineage segment opened. When it is a DIFFERENT subject (a login
+    while presenting somebody else's cookie) the prior session is TERMINALLY revoked with
+    the full cascade and the incoming user inherits nothing, with a distinct
+    `replaced_by_other_subject` end cause. Previously the supersede moved only the
+    `sessions` row, orphaning the prior lineage's families and per-client sessions so a
+    logout of the successor never revoked them.
+  - **Idle timeout actually slides.** `SessionRepo::get` now takes the configured idle
+    window and, on a successful resolve past roughly half of it, rewrites
+    `idle_expires_at`/`last_seen_at` (re-asserting the full liveness guard, so a revoked
+    session is never resurrected). Previously nothing slid the window after insert, so a
+    continuously active session was killed at the idle TTL as if it were a second
+    absolute cap.
+  - **`ensure_sid` refuses a dead session.** The per-client session is inserted only if
+    the SSO session still resolves live (same guard as the read path), so a code minted
+    before a revoke and redeemed after it can never mint a fresh live `sid` bound to a
+    dead session. Returns `NotFound` for a dead session.
+  - **Fleet LIST isolation probes.** `session_fleet.list` and `refresh_family_fleet.list`
+    now register `IsolationProbe`s too (the list surfaces, where a broken policy would
+    leak a whole tenant at once rather than one row).
   - **Removed.** `ActingSessionRepo::create` (the bootstrap create path): `rotate` with
     no prior session is now the single create path, so no session can be created that
     skips the rotation seam.

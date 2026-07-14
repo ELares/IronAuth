@@ -180,7 +180,7 @@ async fn a_revoked_session_stops_resolving_immediately_not_on_expiry() {
     // Baseline: the session resolves NOW (its lifetime runs to the year 2100).
     let sessions = db.store().scoped(scope).sessions();
     assert!(
-        sessions.get(&session, 0).await.expect("read").is_some(),
+        sessions.get(&session, 0, 0).await.expect("read").is_some(),
         "a live session resolves"
     );
 
@@ -196,7 +196,7 @@ async fn a_revoked_session_stops_resolving_immediately_not_on_expiry() {
     // expiry still 75 years away. An expiry-only guard would have returned it here
     // and the logout would have silently no-opped.
     assert!(
-        sessions.get(&session, 0).await.expect("read").is_none(),
+        sessions.get(&session, 0, 0).await.expect("read").is_none(),
         "a revoked session must stop resolving IMMEDIATELY, not at expiry"
     );
 
@@ -213,7 +213,7 @@ async fn a_revoked_session_stops_resolving_immediately_not_on_expiry() {
         !again.session_flipped,
         "an already-revoked session does not flip twice"
     );
-    assert!(sessions.get(&session, 0).await.expect("read").is_none());
+    assert!(sessions.get(&session, 0, 0).await.expect("read").is_none());
 }
 
 #[tokio::test]
@@ -226,7 +226,7 @@ async fn login_rotation_invalidates_the_prior_session_id_in_the_same_transaction
     // The session the browser holds before the privilege transition.
     let prior = create_session(&db, &env, scope, &subject, None).await;
     let sessions = db.store().scoped(scope).sessions();
-    assert!(sessions.get(&prior, 0).await.expect("read").is_some());
+    assert!(sessions.get(&prior, 0, 0).await.expect("read").is_some());
 
     // The login: a fresh id, and the prior one invalidated in the SAME transaction.
     let fresh = create_session(&db, &env, scope, &subject, Some(&prior)).await;
@@ -234,11 +234,11 @@ async fn login_rotation_invalidates_the_prior_session_id_in_the_same_transaction
 
     // Session-fixation defense: the id an attacker may have fixated stops resolving.
     assert!(
-        sessions.get(&prior, 0).await.expect("read").is_none(),
+        sessions.get(&prior, 0, 0).await.expect("read").is_none(),
         "the prior session id must stop resolving after a rotation"
     );
     assert!(
-        sessions.get(&fresh, 0).await.expect("read").is_some(),
+        sessions.get(&fresh, 0, 0).await.expect("read").is_some(),
         "the successor resolves"
     );
 
@@ -411,10 +411,10 @@ async fn revoke_all_for_a_user_ends_every_session_and_cascades_offline_preservin
     assert_eq!(outcome.families_revoked, 1, "only the session-bound family");
 
     let sessions = db.store().scoped(scope).sessions();
-    assert!(sessions.get(&s1, 0).await.expect("read").is_none());
-    assert!(sessions.get(&s2, 0).await.expect("read").is_none());
+    assert!(sessions.get(&s1, 0, 0).await.expect("read").is_none());
+    assert!(sessions.get(&s2, 0, 0).await.expect("read").is_none());
     assert!(
-        sessions.get(&other, 0).await.expect("read").is_some(),
+        sessions.get(&other, 0, 0).await.expect("read").is_some(),
         "another user's session is untouched"
     );
     assert!(family_revoked(&db, scope, &bound).await);
@@ -454,7 +454,7 @@ async fn a_bulk_revoke_is_scope_fenced_and_audits_every_session() {
         db.store()
             .scoped(scope_b)
             .sessions()
-            .get(&foreign, 0)
+            .get(&foreign, 0, 0)
             .await
             .expect("read")
             .is_some(),
@@ -551,7 +551,7 @@ async fn a_revocation_and_its_audit_row_commit_together_or_not_at_all() {
         db.store()
             .scoped(scope)
             .sessions()
-            .get(&session, 0)
+            .get(&session, 0, 0)
             .await
             .expect("read")
             .is_some(),
@@ -601,11 +601,11 @@ async fn a_rotation_and_its_audit_row_commit_together_or_not_at_all() {
 
     let sessions = db.store().scoped(scope).sessions();
     assert!(
-        sessions.get(&prior, 0).await.expect("read").is_some(),
+        sessions.get(&prior, 0, 0).await.expect("read").is_some(),
         "a rolled-back rotation leaves the PRIOR session live (it was not invalidated)"
     );
     assert!(
-        sessions.get(&fresh, 0).await.expect("read").is_none(),
+        sessions.get(&fresh, 0, 0).await.expect("read").is_none(),
         "a rolled-back rotation creates no successor"
     );
     assert_eq!(
@@ -658,7 +658,7 @@ async fn every_fleet_surface_returns_the_uniform_not_found_for_a_foreign_id() {
         db.store()
             .scoped(scope_b)
             .sessions()
-            .get(&victim, 0)
+            .get(&victim, 0, 0)
             .await
             .expect("read")
             .is_some(),
@@ -684,4 +684,426 @@ async fn every_fleet_surface_returns_the_uniform_not_found_for_a_foreign_id() {
         .ensure_sid(&env, &victim, "cli_a", 0)
         .await;
     assert!(matches!(sid, Err(StoreError::NotFound)));
+}
+
+/// The `sid` of a (session, client) pair as the store holds it, or [`None`].
+async fn stored_sid(
+    db: &TestDatabase,
+    scope: Scope,
+    session: &SessionId,
+    client_id: &str,
+) -> Option<String> {
+    sqlx::query_scalar::<_, String>(
+        "SELECT sid FROM client_sessions \
+         WHERE session_id = $1 AND client_id = $2 AND tenant_id = $3 AND environment_id = $4",
+    )
+    .bind(session.to_string())
+    .bind(client_id)
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .fetch_optional(db.owner_pool())
+    .await
+    .expect("read sid")
+}
+
+/// How many refresh families point at `session`, whatever their revocation state.
+async fn families_pointing_at(db: &TestDatabase, scope: Scope, session: &SessionId) -> i64 {
+    sqlx::query_scalar::<_, i64>(
+        "SELECT count(*) FROM refresh_families \
+         WHERE session_ref = $1 AND tenant_id = $2 AND environment_id = $3",
+    )
+    .bind(session.to_string())
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .fetch_one(db.owner_pool())
+    .await
+    .expect("count families")
+}
+
+/// How many per-client sessions hang off `session`, whatever their revocation state.
+async fn client_sessions_on(db: &TestDatabase, scope: Scope, session: &SessionId) -> i64 {
+    sqlx::query_scalar::<_, i64>(
+        "SELECT count(*) FROM client_sessions \
+         WHERE session_id = $1 AND tenant_id = $2 AND environment_id = $3",
+    )
+    .bind(session.to_string())
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .fetch_one(db.owner_pool())
+    .await
+    .expect("count client sessions")
+}
+
+/// The session's `end_cause`, if it has ended.
+async fn end_cause(db: &TestDatabase, scope: Scope, session: &SessionId) -> Option<String> {
+    sqlx::query_scalar::<_, Option<String>>(
+        "SELECT end_cause FROM sessions \
+         WHERE id = $1 AND tenant_id = $2 AND environment_id = $3",
+    )
+    .bind(session.to_string())
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .fetch_one(db.owner_pool())
+    .await
+    .expect("read end_cause")
+}
+
+#[tokio::test]
+async fn a_same_subject_reauth_carries_the_lineage_so_a_later_revoke_still_reaches_it() {
+    // The milestone-defining hazard. A login ROTATES the session id. If the rotation
+    // moved only the `sessions` row, everything the PRE-rotation lineage segment opened
+    // (its refresh families, its per-client sessions) would be ORPHANED: they would keep
+    // session_ref = <prior>, and every later cascade runs on session_ref = <successor>,
+    // so nothing would ever reach them. The user's refresh tokens from before the
+    // re-authentication would stay valid FOREVER and logout would not actually revoke.
+    //
+    // So a same-subject rotation must CARRY the lineage forward. This test proves both
+    // halves of that: the sid stays stable, and the pre-rotation family is still KILLED
+    // when the successor is revoked.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let subject = UserId::generate(&env, &scope).to_string();
+    let client = "cli_carry";
+
+    // A session, a per-client sid on it, and a session-bound refresh family.
+    let prior = create_session(&db, &env, scope, &subject, None).await;
+    let sid_before = db
+        .store()
+        .scoped(scope)
+        .client_sessions()
+        .ensure_sid(&env, &prior, client, 0)
+        .await
+        .expect("ensure sid");
+    let grant = seed_grant(&db, &env, scope, &subject, &prior).await;
+    let family = open_family(&db, &env, scope, &grant, &subject, false).await;
+
+    // The SAME human re-authenticates in the SAME browser: a rotation.
+    let successor = create_session(&db, &env, scope, &subject, Some(&prior)).await;
+
+    // The lineage moved: nothing is left hanging off the prior id.
+    assert_eq!(
+        families_pointing_at(&db, scope, &prior).await,
+        0,
+        "the pre-rotation family must NOT be left orphaned on the prior session"
+    );
+    assert_eq!(
+        families_pointing_at(&db, scope, &successor).await,
+        1,
+        "the pre-rotation family must be carried onto the successor"
+    );
+    assert_eq!(client_sessions_on(&db, scope, &prior).await, 0);
+    assert_eq!(client_sessions_on(&db, scope, &successor).await, 1);
+
+    // The sid is STABLE across the re-authentication: same browser SSO session, same
+    // sid, which is exactly what the OIDC sid contract wants.
+    let sid_after = db
+        .store()
+        .scoped(scope)
+        .client_sessions()
+        .ensure_sid(&env, &successor, client, 0)
+        .await
+        .expect("ensure sid after rotation");
+    assert_eq!(
+        sid_after, sid_before,
+        "the sid must be STABLE across a re-authentication of the same user"
+    );
+    assert_eq!(
+        stored_sid(&db, scope, &successor, client).await.as_deref(),
+        Some(sid_before.as_str()),
+    );
+
+    // THE assertion: revoking the successor still reaches the family the PRE-rotation
+    // lineage segment opened. With the carry reverted this fails: the family would keep
+    // session_ref = <prior> and the cascade on <successor> would miss it entirely.
+    let outcome = db
+        .store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .sessions()
+        .revoke(&env, &successor, SessionEndCause::LoggedOut, false, None)
+        .await
+        .expect("revoke successor");
+    assert_eq!(
+        outcome.families_revoked, 1,
+        "logout MUST cascade to the family opened before the rotation"
+    );
+    assert!(
+        family_revoked(&db, scope, &family).await,
+        "the pre-rotation refresh family must die with the session it belongs to"
+    );
+}
+
+#[tokio::test]
+async fn a_different_subject_login_terminally_revokes_the_prior_session_and_inherits_nothing() {
+    // The cross-user privilege escalation the obvious fix would introduce. A rotation
+    // happens at a privilege TRANSITION, and the prior session is not necessarily the
+    // rotating user's: a login performed while presenting SOMEBODY ELSE's session cookie
+    // lands on the same path. Carrying the lineage there would hand the incoming user
+    // the OUTGOING user's refresh families and sids.
+    //
+    // So a different-subject rotation must CARRY NOTHING and terminally revoke the prior
+    // session with its full cascade.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let victim = UserId::generate(&env, &scope).to_string();
+    let attacker = UserId::generate(&env, &scope).to_string();
+    let client = "cli_takeover";
+
+    // The victim's session, with a sid and a session-bound refresh family on it.
+    let victim_session = create_session(&db, &env, scope, &victim, None).await;
+    let victim_sid = db
+        .store()
+        .scoped(scope)
+        .client_sessions()
+        .ensure_sid(&env, &victim_session, client, 0)
+        .await
+        .expect("victim sid");
+    let victim_grant = seed_grant(&db, &env, scope, &victim, &victim_session).await;
+    let victim_family = open_family(&db, &env, scope, &victim_grant, &victim, false).await;
+
+    // A DIFFERENT human logs in while the victim's cookie is still being presented.
+    let attacker_session = create_session(&db, &env, scope, &attacker, Some(&victim_session)).await;
+
+    // Nothing was inherited. The attacker's session owns NONE of the victim's
+    // dependents: no carried family, no carried per-client session (hence no carried
+    // sid). Read straight from the database, not through a repository that could be
+    // lying by the same bug.
+    assert_eq!(
+        families_pointing_at(&db, scope, &attacker_session).await,
+        0,
+        "the incoming user must NOT inherit the outgoing user's refresh families"
+    );
+    assert_eq!(
+        client_sessions_on(&db, scope, &attacker_session).await,
+        0,
+        "the incoming user must NOT inherit the outgoing user's per-client sessions"
+    );
+
+    // The victim's dependents stayed the victim's, and were REVOKED at the transition.
+    assert_eq!(families_pointing_at(&db, scope, &victim_session).await, 1);
+    assert!(
+        family_revoked(&db, scope, &victim_family).await,
+        "the outgoing user's session-bound family must die at the transition"
+    );
+    assert_eq!(
+        end_cause(&db, scope, &victim_session).await.as_deref(),
+        Some("replaced_by_other_subject"),
+        "the prior session ended TERMINALLY, not as a rotation"
+    );
+
+    // The victim's session no longer resolves, and the attacker cannot obtain the
+    // victim's sid: a fresh (attacker session, client) pair mints a NEW one.
+    let sessions = db.store().scoped(scope).sessions();
+    assert!(
+        sessions
+            .get(&victim_session, 0, 0)
+            .await
+            .expect("read")
+            .is_none(),
+        "the terminally revoked session must stop resolving at once"
+    );
+    let attacker_sid = db
+        .store()
+        .scoped(scope)
+        .client_sessions()
+        .ensure_sid(&env, &attacker_session, client, 0)
+        .await
+        .expect("attacker sid");
+    assert_ne!(
+        attacker_sid, victim_sid,
+        "the incoming user must never be handed the outgoing user's sid"
+    );
+}
+
+#[tokio::test]
+async fn ensure_sid_refuses_a_dead_session_so_no_sid_is_ever_minted_for_one() {
+    // Defense in depth for the token endpoint (a code minted before a revoke and
+    // redeemed after it): the store must never hang a LIVE per-client session, with a
+    // fresh sid, off a session that is already dead. No cascade would ever reach it.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let subject = UserId::generate(&env, &scope).to_string();
+    let session = create_session(&db, &env, scope, &subject, None).await;
+
+    db.store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .sessions()
+        .revoke(&env, &session, SessionEndCause::LoggedOut, false, None)
+        .await
+        .expect("revoke");
+
+    let result = db
+        .store()
+        .scoped(scope)
+        .client_sessions()
+        .ensure_sid(&env, &session, "cli_dead", 0)
+        .await;
+    assert!(
+        matches!(result, Err(StoreError::NotFound)),
+        "a revoked session must never mint a sid, got {result:?}"
+    );
+    assert_eq!(
+        client_sessions_on(&db, scope, &session).await,
+        0,
+        "no per-client session row may be created for a dead SSO session"
+    );
+}
+
+#[tokio::test]
+async fn an_active_session_slides_its_idle_window_while_an_idle_one_dies_at_the_idle_ttl() {
+    // session_idle_ttl_secs is documented as an IDLE timeout. Nothing slid it, so it was
+    // a second ABSOLUTE cap: a CONTINUOUSLY ACTIVE session was killed at idle_ttl. A
+    // successful resolve is exactly the evidence the session is not idle, so it must
+    // slide the window.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let subject = UserId::generate(&env, &scope).to_string();
+
+    // A ten-second idle window inside a far-future absolute cap, so anything that dies
+    // here died of IDLENESS, never of the absolute cap.
+    //
+    // Three sessions, because a successful resolve IS activity and therefore slides:
+    // the two idle probes must each be read EXACTLY ONCE, or the first read would touch
+    // them and the second would be measuring the slide rather than the timeout.
+    let idle_ttl: i64 = 10_000_000;
+    let touched = SessionId::generate(&env, &scope);
+    let idle_just_alive = SessionId::generate(&env, &scope);
+    let idle_just_dead = SessionId::generate(&env, &scope);
+    for id in [&touched, &idle_just_alive, &idle_just_dead] {
+        db.store()
+            .scoped(scope)
+            .acting(db.test_actor(&env), CorrelationId::generate(&env))
+            .sessions()
+            .rotate(
+                &env,
+                id,
+                None,
+                NewSession {
+                    subject: &subject,
+                    auth_methods: "pwd",
+                    auth_time_micros: 0,
+                    idle_expires_micros: idle_ttl,
+                    absolute_expires_micros: FAR_FUTURE_MICROS,
+                    user_agent: None,
+                    peer_ip: None,
+                },
+            )
+            .await
+            .expect("create session");
+    }
+
+    let sessions = db.store().scoped(scope).sessions();
+
+    // Touch the active session every 0.6 idle windows, well past the point where an
+    // unslid window would have lapsed. It must survive indefinitely.
+    let step = idle_ttl * 6 / 10;
+    let mut now = 0_i64;
+    for _ in 0..10 {
+        now += step;
+        assert!(
+            sessions
+                .get(&touched, now, idle_ttl)
+                .await
+                .expect("read")
+                .is_some(),
+            "a CONTINUOUSLY ACTIVE session must never hit the idle timeout (t={now})"
+        );
+    }
+    // Six idle windows have now elapsed since it was created.
+    assert!(now > idle_ttl * 5);
+
+    // The UNTOUCHED sessions die exactly at their idle TTL: the timeout still bites, so
+    // the slide made the window slide without disabling it. Each probe is resolved
+    // exactly once (a resolve is a touch, and a touched session is by definition not
+    // idle).
+    assert!(
+        sessions
+            .get(&idle_just_alive, idle_ttl - 1, idle_ttl)
+            .await
+            .expect("read")
+            .is_some(),
+        "an idle session is alive right up to its idle expiry"
+    );
+    assert!(
+        sessions
+            .get(&idle_just_dead, idle_ttl, idle_ttl)
+            .await
+            .expect("read")
+            .is_none(),
+        "an idle session dies AT its idle expiry: the slide must not disable the timeout"
+    );
+}
+
+#[tokio::test]
+async fn a_slide_never_resurrects_a_revoked_session() {
+    // The slide writes idle_expires_at. It must re-assert the FULL liveness guard, or a
+    // resolve racing a revoke could push a dead session's window forward and hand it
+    // back to life.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let subject = UserId::generate(&env, &scope).to_string();
+    let idle_ttl: i64 = 10_000_000;
+
+    let session = SessionId::generate(&env, &scope);
+    db.store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .sessions()
+        .rotate(
+            &env,
+            &session,
+            None,
+            NewSession {
+                subject: &subject,
+                auth_methods: "pwd",
+                auth_time_micros: 0,
+                idle_expires_micros: idle_ttl,
+                absolute_expires_micros: FAR_FUTURE_MICROS,
+                user_agent: None,
+                peer_ip: None,
+            },
+        )
+        .await
+        .expect("create session");
+
+    db.store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .sessions()
+        .revoke(&env, &session, SessionEndCause::LoggedOut, false, None)
+        .await
+        .expect("revoke");
+
+    // Resolve well inside the idle window: the revoked session must stay dead, and the
+    // read must not have slid its window.
+    let sessions = db.store().scoped(scope).sessions();
+    assert!(
+        sessions
+            .get(&session, idle_ttl / 2, idle_ttl)
+            .await
+            .expect("read")
+            .is_none(),
+        "a revoked session must never resolve, slide or no slide"
+    );
+    let idle_after = sqlx::query_scalar::<_, Option<i64>>(
+        "SELECT (EXTRACT(EPOCH FROM idle_expires_at) * 1000000)::bigint FROM sessions \
+         WHERE id = $1 AND tenant_id = $2 AND environment_id = $3",
+    )
+    .bind(session.to_string())
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .fetch_one(db.owner_pool())
+    .await
+    .expect("read idle window");
+    assert_eq!(
+        idle_after,
+        Some(idle_ttl),
+        "a revoked session's idle window must never be pushed forward by a resolve"
+    );
 }

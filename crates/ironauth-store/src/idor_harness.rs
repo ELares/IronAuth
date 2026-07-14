@@ -47,9 +47,16 @@ use crate::audit::ActorRef;
 use crate::id::{
     CorrelationId, GrantId, IssuedTokenId, ServiceId, SessionId, SigningKeyId, UserId,
 };
-use crate::repository::{RedeemOutcome, SessionEndCause, TokenStatus};
+use crate::repository::{
+    RedeemOutcome, RefreshFamilyFleetFilter, SessionEndCause, SessionFleetFilter, TokenStatus,
+};
 use crate::scope::Scope;
 use crate::store::Store;
+
+/// The page size the fleet LIST probes read. Comfortably larger than the handful of
+/// rows any probe fixture plants, so a leaked foreign row can never hide behind
+/// pagination.
+const PROBE_PAGE_LIMIT: i64 = 100;
 
 /// The outcome of a single cross-scope probe.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -172,16 +179,24 @@ impl IdorHarness {
     /// The set is the authentication read path (`sessions.get`), the per-client `sid`
     /// store (`client_sessions.ensure_sid`, which must never attach a per-client
     /// session to a foreign SSO session), the fleet read surfaces
-    /// (`session_fleet.get`, `refresh_family_fleet.get`), and the three mutating fleet
-    /// surfaces (`sessions.revoke`, `sessions.bulk_revoke`, `sessions.revoke_all`).
-    /// The bulk probe is the important one: a batch is scope-FENCED, so a foreign id
-    /// smuggled into an otherwise valid batch must be a uniform no-op rather than a
-    /// cross-tenant revocation.
+    /// (`session_fleet.get`, `refresh_family_fleet.get`) AND the fleet LIST surfaces
+    /// (`session_fleet.list`, `refresh_family_fleet.list`), and the three mutating
+    /// fleet surfaces (`sessions.revoke`, `sessions.bulk_revoke`,
+    /// `sessions.revoke_all`).
+    ///
+    /// The bulk probe is the important MUTATING one: a batch is scope-FENCED, so a
+    /// foreign id smuggled into an otherwise valid batch must be a uniform no-op rather
+    /// than a cross-tenant revocation. The two LIST probes are the important READING
+    /// ones: unlike every by-id surface, a list has no identifier to fence on, so it is
+    /// where a broken isolation policy would leak an entire foreign tenant at once
+    /// instead of a single row.
     pub fn register_session_fleet_probes(&mut self) -> &mut Self {
         self.register(Box::new(SessionGetProbe));
         self.register(Box::new(ClientSessionEnsureSidProbe));
         self.register(Box::new(SessionFleetGetProbe));
+        self.register(Box::new(SessionFleetListProbe));
         self.register(Box::new(RefreshFamilyFleetGetProbe));
+        self.register(Box::new(RefreshFamilyFleetListProbe));
         self.register(Box::new(SessionRevokeProbe));
         self.register(Box::new(SessionBulkRevokeProbe));
         self.register(Box::new(UserSessionsRevokeAllProbe));
@@ -527,7 +542,7 @@ impl IsolationProbe for SessionGetProbe {
             let Ok(id) = SessionId::parse_in_scope(foreign_id, &caller) else {
                 return ProbeOutcome::Denied;
             };
-            match store.scoped(caller).sessions().get(&id, 0).await {
+            match store.scoped(caller).sessions().get(&id, 0, 0).await {
                 Ok(Some(_)) => ProbeOutcome::Leaked,
                 Ok(None) | Err(_) => ProbeOutcome::Denied,
             }
@@ -626,6 +641,76 @@ impl IsolationProbe for RefreshFamilyFleetGetProbe {
                 Ok(Some(_)) => ProbeOutcome::Leaked,
                 Ok(None) | Err(_) => ProbeOutcome::Denied,
             }
+        })
+    }
+}
+
+/// Built-in probe for `SessionFleetRepo::list` (issue #32): the management LIST
+/// surface.
+///
+/// A list has no identifier to fence on (it returns whatever row-level security lets
+/// through), so it is the surface where a broken RLS policy leaks a whole tenant at
+/// once rather than one row. The probe lists under the CALLER's scope and fails if a
+/// foreign session appears anywhere in the page.
+struct SessionFleetListProbe;
+
+impl IsolationProbe for SessionFleetListProbe {
+    fn name(&self) -> &'static str {
+        "session_fleet.list"
+    }
+
+    fn probe<'a>(
+        &'a self,
+        store: &'a Store,
+        caller: Scope,
+        foreign_id: &'a str,
+    ) -> BoxProbeFuture<'a> {
+        Box::pin(async move {
+            // An unfiltered list: the widest read this surface offers.
+            let Ok(page) = store
+                .scoped(caller)
+                .session_fleet()
+                .list(SessionFleetFilter::default(), PROBE_PAGE_LIMIT, None)
+                .await
+            else {
+                return ProbeOutcome::Denied;
+            };
+            if page.iter().any(|session| session.id == foreign_id) {
+                return ProbeOutcome::Leaked;
+            }
+            ProbeOutcome::Denied
+        })
+    }
+}
+
+/// Built-in probe for `RefreshFamilyFleetRepo::list` (issue #32): the refresh-family
+/// LIST surface, fenced the same way as the session list above.
+struct RefreshFamilyFleetListProbe;
+
+impl IsolationProbe for RefreshFamilyFleetListProbe {
+    fn name(&self) -> &'static str {
+        "refresh_family_fleet.list"
+    }
+
+    fn probe<'a>(
+        &'a self,
+        store: &'a Store,
+        caller: Scope,
+        foreign_id: &'a str,
+    ) -> BoxProbeFuture<'a> {
+        Box::pin(async move {
+            let Ok(page) = store
+                .scoped(caller)
+                .refresh_family_fleet()
+                .list(RefreshFamilyFleetFilter::default(), PROBE_PAGE_LIMIT, None)
+                .await
+            else {
+                return ProbeOutcome::Denied;
+            };
+            if page.iter().any(|family| family.id == foreign_id) {
+                return ProbeOutcome::Leaked;
+            }
+            ProbeOutcome::Denied
         })
     }
 }

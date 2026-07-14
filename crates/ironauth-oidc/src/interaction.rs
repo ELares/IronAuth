@@ -24,7 +24,8 @@ use axum::body::Body;
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use ironauth_store::{
-    ActorRef, ClientId, CorrelationId, HumanId, NewSession, Scope, SessionId, StoreError, UserId,
+    ActorRef, ClientId, CorrelationId, HumanId, NewSession, PriorSessionOutcome, Scope, SessionId,
+    StoreError, UserId,
 };
 
 use crate::authn::AuthenticationEvent;
@@ -201,11 +202,17 @@ pub async fn resolve_session(
     let value = session::session_value_from_cookie_header(cookie_header(headers))?;
     let session_id = SessionId::parse_in_scope(value, &scope).ok()?;
     let now = epoch_micros(state.now());
+    // A successful resolve SLIDES the idle window (issue #32), so the idle timeout is a
+    // real idle timeout rather than a second absolute cap that would kill a
+    // continuously active session at idle_ttl. The store does the slide in the same
+    // transaction as the read, and only past roughly half the window (no hot-path write
+    // amplification).
+    let idle_ttl = idle_ttl_micros(state);
     let record = state
         .store()
         .scoped(scope)
         .sessions()
-        .get(&session_id, now)
+        .get(&session_id, now, idle_ttl)
         .await
         .ok()
         .flatten()?;
@@ -230,6 +237,12 @@ pub async fn resolve_session(
         auth_time_unix_micros: record.auth_time_unix_micros,
         auth_methods: record.auth_methods,
     })
+}
+
+/// The configured idle window in microseconds, saturating (never negative), for the
+/// idle slide on the session read path (issue #32).
+fn idle_ttl_micros(state: &OidcState) -> i64 {
+    i64::try_from(state.session_idle_ttl().as_micros()).unwrap_or(i64::MAX)
 }
 
 /// Whether a bound value on the session matches the presenting request. Fails CLOSED:
@@ -312,7 +325,7 @@ pub async fn establish_session(
     // transition rotates AWAY (session-fixation defense).
     let prior = prior_session_id(headers, scope);
     let binding = session_binding(state, headers);
-    state
+    let outcome = state
         .store()
         .scoped(scope)
         .acting(actor, CorrelationId::generate(state.env()))
@@ -332,20 +345,41 @@ pub async fn establish_session(
             },
         )
         .await?;
-    // Publish the ROTATION signal on the session-lifecycle seam (issue #32) when a
-    // prior session was actually rotated away, so the durable session-ended fan-out
-    // (#35) can build on this seam. A rotation carries a successor and is explicitly
-    // NON-terminal, so a naive consumer never mistakes it for a logout.
+    // Publish the session-lifecycle signal (issue #32) that TRUTHFULLY describes what
+    // the store did with the prior session, so the durable fan-out (#35) can build on
+    // this seam. The store's two branches are semantically opposite and the signal must
+    // not blur them:
+    //
+    //   - Carried: the SAME subject re-authenticated, so this is a genuine ROTATION.
+    //     It carries a successor and is explicitly NON-terminal (the session lives on
+    //     under a new id, with its sids and refresh families), so a naive consumer must
+    //     never mistake it for a logout.
+    //   - RevokedForeignSubject: a DIFFERENT subject's session was terminally revoked
+    //     with its full cascade. There is NO successor for it (the new session belongs
+    //     to somebody else), so the signal is TERMINAL and carries no successor. Calling
+    //     this a rotation would tell a consumer the outgoing user's session lived on as
+    //     the incoming user's, which is exactly backwards.
     if let Some(prior) = prior.as_ref() {
-        state
-            .revocation_sink()
-            .publish_session(&SessionLifecycleEvent {
+        let signal = match outcome {
+            PriorSessionOutcome::None => None,
+            PriorSessionOutcome::Carried => Some(SessionLifecycleEvent {
                 tenant: scope.tenant().to_string(),
                 environment: scope.environment().to_string(),
                 session_id: prior.to_string(),
                 cause: SessionSignalCause::Rotated,
                 successor_session_id: Some(session_id.to_string()),
-            });
+            }),
+            PriorSessionOutcome::RevokedForeignSubject => Some(SessionLifecycleEvent {
+                tenant: scope.tenant().to_string(),
+                environment: scope.environment().to_string(),
+                session_id: prior.to_string(),
+                cause: SessionSignalCause::ReplacedByOtherSubject,
+                successor_session_id: None,
+            }),
+        };
+        if let Some(signal) = signal {
+            state.revocation_sink().publish_session(&signal);
+        }
     }
     Ok(session::build_set_cookie(
         &session_id.to_string(),

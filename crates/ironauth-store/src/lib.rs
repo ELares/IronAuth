@@ -106,7 +106,7 @@ pub use repository::{
     NewAssertionSubjectMapping, NewClientAuthDiagnostic, NewDcrPolicy, NewDeviceCode,
     NewDynamicClient, NewExternalAssertionIssuer, NewInitialAccessToken, NewJwtAuthClient,
     NewOpaqueAccessToken, NewRefreshFamily, NewResourceServer, NewSession, NewSigningKey,
-    PushRequest, PushedRequestRepo, RedeemOutcome, RefreshFamilyFleetFilter,
+    PriorSessionOutcome, PushRequest, PushedRequestRepo, RedeemOutcome, RefreshFamilyFleetFilter,
     RefreshFamilyFleetRepo, RefreshFamilySummary, RefreshRedeem, RefreshRedeemOutcome, RefreshRepo,
     RefreshTokenResolution, ResourceServerRecord, ResourceServerRepo, RotatedRefreshToken,
     ScopedStore, ServiceAccountRepo, SessionEndCause, SessionFleetFilter, SessionFleetRepo,

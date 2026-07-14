@@ -383,6 +383,13 @@ async fn approve_flow(
 
     let grant_id = GrantId::generate(state.env(), &scope);
     let now = epoch_micros(state.now());
+    // Record the APPROVING human's SSO session on the grant (issue #32). The device
+    // flow does authenticate a human (right here, at the verification page), so its
+    // grant has a real authenticating session exactly like the code flow's, and its ID
+    // token can therefore carry the per-(client, session) `sid` that back-channel
+    // logout targets. Without this the sid would be unresolvable at redeem and the
+    // device flow would be the hole in the sid advertisement.
+    let session_ref = session.session_id.to_string();
     let result = state
         .store()
         .scoped(scope)
@@ -395,6 +402,7 @@ async fn approve_flow(
                 grant_id: &grant_id,
                 subject: &session.subject,
                 consent_ref: Some(&consent_id),
+                session_ref: Some(&session_ref),
                 auth_methods: &session.auth_methods,
                 auth_time_unix_micros: Some(session.auth_time_unix_micros),
                 created_at_unix_micros: now,

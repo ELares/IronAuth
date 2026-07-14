@@ -463,27 +463,63 @@ async fn authenticate_client(
 /// consume, that failure leaves the code live for a retry.
 ///
 /// Resolve the per-client `sid` (issue #32) for a code exchange from the code's
-/// authenticating SSO session. Parses `bindings.session_ref` under the exchange
-/// scope, then gets-or-creates the per-(client, session) row and returns its STORED
-/// `sid` (stable across refreshes, distinct across clients). Returns [`None`] when no
-/// session backed the grant, when the session id does not parse in scope, or when the
-/// store hiccups: the exchange still succeeds, the ID token merely omits `sid` rather
-/// than failing (defense in depth; the interactive code flow always has a session).
-async fn resolve_client_session_sid(
+/// authenticating SSO session, and, in doing so, ENFORCE that the SSO session is still
+/// LIVE at redemption.
+///
+/// # Why the liveness check lives here
+///
+/// An authorization code is minted at the authorize endpoint and redeemed later at the
+/// token endpoint. A session revoke (a logout, an operator revoke) can land IN BETWEEN.
+/// Without this check the exchange would mint a brand-new LIVE refresh family, and a
+/// fresh `sid`, bound to a session that is already DEAD: no cascade would ever reach
+/// them (they hang off a session nothing revokes twice), so a logout would silently
+/// fail to revoke the tokens minted right after it. So the code's `session_ref` is
+/// resolved through the SAME authoritative read guard the authentication path uses
+/// (revoked / ended / superseded / expired all refuse), BEFORE anything is minted, and
+/// a session that no longer resolves is a uniform `invalid_grant`.
+///
+/// # Fail CLOSED
+///
+/// A store error is a `server_error`, never a silently session-less ID token. Dropping
+/// the `sid` on a store hiccup would emit an ID token that a relying party cannot
+/// correlate to any OP session, which quietly breaks back-channel logout for that
+/// token while looking like a success.
+///
+/// A grant with NO `session_ref` at all (not an interactive code flow) legitimately has
+/// no SSO session and resolves to [`None`]: no session to check, no `sid` to emit.
+async fn resolve_code_exchange_sid(
     state: &OidcState,
     scope: Scope,
     bindings: &CodeBindings,
-) -> Option<String> {
-    let session_ref = bindings.session_ref.as_deref()?;
-    let session_id = SessionId::parse_in_scope(session_ref, &scope).ok()?;
+) -> Result<Option<String>, TokenError> {
+    let Some(session_ref) = bindings.session_ref.as_deref() else {
+        return Ok(None);
+    };
+    // A session_ref that does not parse in the exchange scope names no session we could
+    // ever resolve: the grant is not redeemable.
+    let session_id =
+        SessionId::parse_in_scope(session_ref, &scope).map_err(|_| TokenError::InvalidGrant)?;
     let now_micros = epoch_micros(state.now());
-    state
+    let idle_ttl = i64::try_from(state.session_idle_ttl().as_micros()).unwrap_or(i64::MAX);
+    let session = state
+        .store()
+        .scoped(scope)
+        .sessions()
+        .get(&session_id, now_micros, idle_ttl)
+        .await
+        .map_err(|_| TokenError::ServerError)?;
+    if session.is_none() {
+        // Revoked, logged out, rotated away, or expired since the code was issued.
+        return Err(TokenError::InvalidGrant);
+    }
+    let sid = state
         .store()
         .scoped(scope)
         .client_sessions()
         .ensure_sid(state.env(), &session_id, &bindings.client_id, now_micros)
         .await
-        .ok()
+        .map_err(|_| TokenError::ServerError)?;
+    Ok(Some(sid))
 }
 
 /// Resolves the environment's issuer entry (its signer and algorithm policy)
@@ -499,9 +535,10 @@ async fn mint_tokens(
 ) -> Result<IssuedTokens, TokenError> {
     // Resolve the per-client `sid` (issue #32) from the code's authenticating SSO
     // session BEFORE signing, so the ID token carries a `sid` that is stable per
-    // (client, session) and distinct across clients. A code with no session behind it,
-    // or a store hiccup, omits the claim rather than failing the exchange.
-    let sid = resolve_client_session_sid(state, scope, bindings).await;
+    // (client, session) and distinct across clients. This ALSO enforces that the SSO
+    // session is still live: a code minted before a revoke and redeemed after it is an
+    // invalid_grant, never a live token bound to a dead session.
+    let sid = resolve_code_exchange_sid(state, scope, bindings).await?;
     let sid = sid.as_deref();
     let entry = state
         .issuer_entry(&scope)

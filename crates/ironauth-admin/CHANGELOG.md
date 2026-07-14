@@ -27,6 +27,9 @@ range per docs/RELEASING.md.
     than a row count, so the Idempotency-Key record (written in the SAME transaction as
     the revocation) replays byte-identically and an absent, foreign, or already-revoked
     session stays indistinguishable from a live one.
+  - **Test-helper adaptation.** The shared admin test harness follows the new
+    `SessionRepo::get` signature (which now takes the idle-window for the idle slide);
+    no admin behavior changed.
 
 - DCR abuse-control management surface (issue #31). Five operator-plane endpoints,
   all honoring the crate's contract (Idempotency-Key, same-transaction audit,

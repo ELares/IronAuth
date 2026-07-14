@@ -11,7 +11,10 @@
 //!   the cookie to exactly this host over HTTPS);
 //! - `Secure` (never sent over plaintext) and `HttpOnly` (unreadable from
 //!   script, so an XSS cannot exfiltrate the session);
-//! - `SameSite=Lax`, so the cookie is withheld from cross-site subrequests.
+//! - `SameSite=Lax` by default, so the cookie is withheld from cross-site
+//!   subrequests. The OFF-BY-DEFAULT CHIPS toggle swaps this for the real CHIPS
+//!   shape (`SameSite=None; Partitioned`), which is double-keyed to the top-level
+//!   site; see [`build_set_cookie`].
 //!
 //! The value is the `ses_` session identifier, which is URL-safe base64 and
 //! embeds its `(tenant, environment)` scope, so the authorization endpoint
@@ -46,35 +49,57 @@ pub use ironauth_config::PEER_IP_HEADER;
 /// have expired anyway; the server still enforces expiry authoritatively at read
 /// time.
 ///
-/// `partitioned` adds the CHIPS `Partitioned` attribute (issue #32) for embedded
-/// widget scenarios, so a cross-site embed gets a per-top-level-site partitioned
-/// cookie. It is OFF by default: it NEVER drops `SameSite` and NEVER breaks the
-/// `__Host-` prefix (both remain present), it only ADDS `Partitioned`.
+/// `partitioned` switches the cookie to the real CHIPS shape (issue #32) for the
+/// embedded-widget (cross-site iframe) scenario. It is OFF by default.
+///
+/// CHIPS is `Secure; SameSite=None; Partitioned`. `SameSite=None` is the load-bearing
+/// half: `Partitioned` alone, bolted onto a `SameSite=Lax` cookie, is INERT, because a
+/// conformant browser withholds a `Lax` cookie from exactly the cross-site
+/// subrequests CHIPS exists to serve. So the toggle moves `SameSite` to `None` and adds
+/// `Partitioned` together, or it does neither.
+///
+/// This is not a weakening. `Partitioned` is what makes `SameSite=None` safe here: the
+/// cookie is double-keyed to the top-level site, so an embed on `evil.example` gets a
+/// DIFFERENT jar than the same embed on the legitimate site and cannot read this
+/// session. The `__Host-` prefix (and `Secure`, `HttpOnly`, `Path=/`, no `Domain`)
+/// survive in BOTH shapes: `__Host-` remains valid with `SameSite=None`, and CSRF
+/// defense on the interactive endpoints does not rest on `SameSite` alone (the
+/// same-origin check does).
 #[must_use]
 pub fn build_set_cookie(session_id: &str, ttl: Duration, partitioned: bool) -> String {
     let max_age = i64::try_from(ttl.as_secs()).unwrap_or(i64::MAX);
-    let mut cookie = format!(
-        "{SESSION_COOKIE}={session_id}; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age={max_age}"
-    );
-    if partitioned {
-        cookie.push_str("; Partitioned");
-    }
-    cookie
+    format!(
+        "{SESSION_COOKIE}={session_id}; Path=/; Secure; HttpOnly; SameSite={}; \
+         Max-Age={max_age}{}",
+        same_site(partitioned),
+        partitioned_suffix(partitioned),
+    )
+}
+
+/// The `SameSite` value for the cookie: `None` under the CHIPS toggle (so the cookie
+/// actually rides the cross-site subrequests it is partitioned for), `Lax` otherwise.
+fn same_site(partitioned: bool) -> &'static str {
+    if partitioned { "None" } else { "Lax" }
+}
+
+/// The trailing `; Partitioned` attribute under the CHIPS toggle, empty otherwise.
+fn partitioned_suffix(partitioned: bool) -> &'static str {
+    if partitioned { "; Partitioned" } else { "" }
 }
 
 /// Build the `Set-Cookie` header value that CLEARS the session cookie at logout
 /// (issue #32): the same `__Host-`/`Secure`/`HttpOnly`/`SameSite` hardened cookie
 /// with an empty value and `Max-Age=0`, so a conformant browser drops it
-/// immediately. `partitioned` keeps the CHIPS attribute consistent with how the
-/// cookie was set, so the clear targets the same partitioned jar.
+/// immediately. `partitioned` MUST match how the cookie was set: a clear has to name
+/// the same `SameSite` and `Partitioned` attributes to target the same jar, or the
+/// partitioned cookie would survive the logout.
 #[must_use]
 pub fn clear_set_cookie(partitioned: bool) -> String {
-    let mut cookie =
-        format!("{SESSION_COOKIE}=; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=0");
-    if partitioned {
-        cookie.push_str("; Partitioned");
-    }
-    cookie
+    format!(
+        "{SESSION_COOKIE}=; Path=/; Secure; HttpOnly; SameSite={}; Max-Age=0{}",
+        same_site(partitioned),
+        partitioned_suffix(partitioned),
+    )
 }
 
 /// Extract the session-cookie value from a `Cookie` header value, if present. The
@@ -114,15 +139,31 @@ mod tests {
     }
 
     #[test]
-    fn partitioned_toggle_adds_chips_without_dropping_any_hardening() {
-        // The CHIPS toggle (issue #32) ADDS Partitioned; it must not drop SameSite
-        // and must not break the __Host- prefix (both stay present).
+    fn partitioned_toggle_emits_the_real_chips_shape_and_keeps_every_hardening_attribute() {
+        // The CHIPS toggle (issue #32) must emit the shape a conformant browser
+        // actually honors on a cross-site embedded subrequest: Secure + SameSite=None
+        // + Partitioned. Appending Partitioned to a SameSite=Lax cookie (what this
+        // used to do) is INERT: the browser withholds a Lax cookie from exactly the
+        // subrequests CHIPS exists to serve, so the toggle bought nothing.
         let cookie = build_set_cookie("ses_abc", Duration::from_secs(3600), true);
         assert!(cookie.starts_with("__Host-ironauth_session=ses_abc; "));
-        assert!(cookie.contains("Partitioned"), "{cookie}");
-        for attr in ["Path=/", "Secure", "HttpOnly", "SameSite=Lax"] {
+        for attr in [
+            "Path=/",
+            "Secure",
+            "HttpOnly",
+            "SameSite=None",
+            "Partitioned",
+            "Max-Age=3600",
+        ] {
             assert!(cookie.contains(attr), "missing {attr}: {cookie}");
         }
+        // SameSite=None is the whole point of the toggle: Lax must be GONE, or the
+        // cookie is still withheld cross-site and Partitioned stays decorative.
+        assert!(
+            !cookie.contains("SameSite=Lax"),
+            "the CHIPS toggle must move SameSite off Lax: {cookie}"
+        );
+        // The __Host- prefix (valid with SameSite=None) survives: still no Domain.
         assert!(!cookie.contains("Domain"), "{cookie}");
     }
 
@@ -137,8 +178,24 @@ mod tests {
             assert!(cookie.contains(attr), "missing {attr}: {cookie}");
         }
         assert!(!cookie.contains("Domain"), "{cookie}");
-        // Partitioned mirrors how the cookie was set.
-        assert!(clear_set_cookie(true).contains("Partitioned"));
+        assert!(!cookie.contains("Partitioned"), "{cookie}");
+
+        // The clear MUST mirror the shape the cookie was SET with, attribute for
+        // attribute, or it names a different jar and the partitioned cookie survives
+        // the logout.
+        let partitioned = clear_set_cookie(true);
+        assert!(partitioned.starts_with("__Host-ironauth_session=; "));
+        for attr in [
+            "Path=/",
+            "Secure",
+            "HttpOnly",
+            "SameSite=None",
+            "Partitioned",
+            "Max-Age=0",
+        ] {
+            assert!(partitioned.contains(attr), "missing {attr}: {partitioned}");
+        }
+        assert!(!partitioned.contains("Domain"), "{partitioned}");
     }
 
     #[test]

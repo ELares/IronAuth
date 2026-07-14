@@ -127,6 +127,12 @@ pub enum SessionSignalCause {
     BulkRevoked,
     /// The session was revoked by a revoke-everything-for-a-user.
     UserRevokedAll,
+    /// A DIFFERENT subject authenticated on the same browser session, so this session
+    /// was terminally revoked with its full cascade (issue #32). TERMINAL, and it
+    /// carries NO successor: the session that replaced it belongs to somebody else and
+    /// inherited nothing of this one. Reporting this as a `Rotated` would tell a
+    /// consumer the outgoing user's session lived on as the incoming user's.
+    ReplacedByOtherSubject,
 }
 
 impl SessionSignalCause {

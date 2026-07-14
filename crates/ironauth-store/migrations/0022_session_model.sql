@@ -92,9 +92,12 @@ ALTER TABLE sessions
 CREATE INDEX sessions_subject_idx ON sessions (tenant_id, environment_id, subject);
 
 -- The data-plane role rotates (superseded_by, ended_at, end_cause) and revokes
--- (revoked_at, revoke_reason, ended_at, end_cause), and stamps last_seen_at. Least
--- privilege: COLUMN-scoped UPDATE only, never table-wide (the #31 lesson).
-GRANT UPDATE (revoked_at, revoke_reason, superseded_by, ended_at, end_cause, last_seen_at)
+-- (revoked_at, revoke_reason, ended_at, end_cause), and SLIDES the idle window on an
+-- active session (idle_expires_at, last_seen_at), which is what makes the idle timeout
+-- an IDLE timeout rather than a second absolute cap. Least privilege: COLUMN-scoped
+-- UPDATE only, never table-wide (the #31 lesson).
+GRANT UPDATE (revoked_at, revoke_reason, superseded_by, ended_at, end_cause,
+              idle_expires_at, last_seen_at)
     ON sessions TO ironauth_app;
 
 -- The control-plane role (the fleet-ops management surfaces) reads sessions and
@@ -165,9 +168,14 @@ CREATE POLICY client_sessions_tenant_isolation ON client_sessions
     );
 
 -- The data-plane role creates a per-client session (the sid ensure), reads it, stamps
--- last_seen_at, and revokes it. COLUMN-scoped UPDATE only (the #31 lesson).
+-- last_seen_at, and revokes it. It also CARRIES a per-client session forward onto the
+-- successor session when the SAME subject re-authenticates (session_id), which is what
+-- keeps the `sid` stable across a re-authentication and keeps the pre-rotation lineage
+-- reachable by a later revoke instead of orphaning it. COLUMN-scoped UPDATE only (the
+-- #31 lesson).
 GRANT SELECT, INSERT ON client_sessions TO ironauth_app;
-GRANT UPDATE (last_seen_at, revoked_at, revoke_reason) ON client_sessions TO ironauth_app;
+GRANT UPDATE (session_id, last_seen_at, revoked_at, revoke_reason)
+    ON client_sessions TO ironauth_app;
 
 -- The control-plane role (fleet ops) reads per-client sessions and revokes them.
 GRANT SELECT ON client_sessions TO ironauth_control;

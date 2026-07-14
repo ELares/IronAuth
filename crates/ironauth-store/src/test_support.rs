@@ -44,12 +44,22 @@ const APP_ROLE: &str = "ironauth_app";
 const CONTROL_ROLE: &str = "ironauth_control";
 
 /// A fresh, isolated database plus the handles the isolation tests need.
+///
+/// Cloning shares the same throwaway database and the same pools (every pool handle is
+/// `Arc`-backed), which is what lets a test hold the database across a simulated
+/// process restart. The database itself is torn down by the harness script, not by a
+/// `Drop`, so a clone can never pull it out from under a live handle.
+#[derive(Clone)]
 pub struct TestDatabase {
     owner_pool: PgPool,
     app_pool: PgPool,
     control_pool: PgPool,
     store: Store,
     control_store: Store,
+    /// The data-plane connection URL, kept so a test can open a BRAND-NEW pool against
+    /// the SAME database and rebuild its process-level state from nothing: the
+    /// rolling-restart simulation (issue #32 AC 1).
+    app_url: String,
 }
 
 impl TestDatabase {
@@ -117,7 +127,26 @@ impl TestDatabase {
             control_pool,
             store,
             control_store,
+            app_url,
         }
+    }
+
+    /// Open a BRAND-NEW data-plane pool against the SAME database and wrap it in a NEW
+    /// [`Store`]: a node restart, simulated.
+    ///
+    /// Nothing in-process survives this (new pool, new connections, new `Store`), while
+    /// Postgres keeps every row. It is what lets a test prove the milestone's first
+    /// acceptance criterion: sessions are AUTHORITATIVE in Postgres, with no
+    /// in-memory-only authoritative state, so a rolling restart loses no sessions.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the new connection cannot be established.
+    pub async fn restart_app_store(&self) -> Store {
+        let pool = PgPool::connect(&self.app_url)
+            .await
+            .expect("reconnect as low-privilege app role after a simulated restart");
+        Store::from_pool(pool)
     }
 
     /// The store bound to the low-privilege application role. Repository

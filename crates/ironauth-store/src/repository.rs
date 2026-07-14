@@ -7119,6 +7119,26 @@ impl SessionRepo<'_> {
     /// in tests. `COALESCE(absolute_expires_at, expires_at)` keeps a pre-#32 row
     /// (which set only `expires_at`) resolving correctly across the expand.
     ///
+    /// # The idle window SLIDES on a successful resolve
+    ///
+    /// `idle_ttl_micros` is the configured idle window, and a successful resolve is
+    /// exactly the evidence that the session is NOT idle, so this SLIDES it: it
+    /// rewrites `idle_expires_at = now + idle_ttl` and stamps `last_seen_at`. Without
+    /// the slide the "idle" timeout would be a second ABSOLUTE cap, killing a
+    /// CONTINUOUSLY ACTIVE session at `idle_ttl`, which is neither what an idle timeout
+    /// means nor what the setting documents.
+    ///
+    /// The write does NOT happen on every request (that would be pure hot-path write
+    /// amplification: a busy session would write a row on every single resolve). It
+    /// fires only once the session is past roughly HALF its idle window, so an active
+    /// session writes at most about twice per window while still never expiring out
+    /// from under an active user.
+    ///
+    /// The slide runs in the SAME transaction as the read and re-asserts the FULL
+    /// liveness guard (`revoked_at` / `superseded_by` / `ended_at` all still NULL), so
+    /// a session revoked concurrently can never be RESURRECTED by a slide. Time is the
+    /// application clock seam throughout, never the database clock.
+    ///
     /// # Errors
     ///
     /// [`StoreError::Database`] on a persistence failure.
@@ -7126,14 +7146,19 @@ impl SessionRepo<'_> {
         &self,
         id: &SessionId,
         now_micros: i64,
+        idle_ttl_micros: i64,
     ) -> Result<Option<SessionRecord>, StoreError> {
         if id.scope() != self.scope {
             return Ok(None);
         }
+        let id_text = id.to_string();
+        let tenant = self.scope.tenant().to_string();
+        let environment = self.scope.environment().to_string();
         let mut tx = begin_scoped(self.store, self.scope).await?;
         let row = sqlx::query(
             "SELECT subject, auth_methods, user_agent, peer_ip, \
-             (EXTRACT(EPOCH FROM auth_time) * 1000000)::bigint AS auth_us \
+             (EXTRACT(EPOCH FROM auth_time) * 1000000)::bigint AS auth_us, \
+             (EXTRACT(EPOCH FROM idle_expires_at) * 1000000)::bigint AS idle_us \
              FROM sessions \
              WHERE id = $1 AND tenant_id = $2 AND environment_id = $3 \
              AND revoked_at IS NULL AND ended_at IS NULL AND superseded_by IS NULL \
@@ -7142,14 +7167,43 @@ impl SessionRepo<'_> {
              AND (idle_expires_at IS NULL OR idle_expires_at > \
                   TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval)",
         )
-        .bind(id.to_string())
-        .bind(self.scope.tenant().to_string())
-        .bind(self.scope.environment().to_string())
+        .bind(&id_text)
+        .bind(&tenant)
+        .bind(&environment)
         .bind(now_micros)
         .fetch_optional(&mut *tx)
         .await?;
+        let Some(row) = row else {
+            tx.commit().await?;
+            return Ok(None);
+        };
+        // Slide the idle window, but only once the session is past roughly half of it.
+        // A pre-#32 row (no idle window) and a non-positive configured window never
+        // slide.
+        let idle_us: Option<i64> = row.get("idle_us");
+        if let Some(idle_us) = idle_us
+            && idle_ttl_micros > 0
+            && idle_us.saturating_sub(now_micros) < idle_ttl_micros / 2
+        {
+            sqlx::query(
+                "UPDATE sessions \
+                 SET idle_expires_at = TIMESTAMPTZ 'epoch' \
+                         + (($1 + $2)::text || ' microseconds')::interval, \
+                     last_seen_at = TIMESTAMPTZ 'epoch' \
+                         + ($1::text || ' microseconds')::interval \
+                 WHERE id = $3 AND tenant_id = $4 AND environment_id = $5 \
+                 AND revoked_at IS NULL AND superseded_by IS NULL AND ended_at IS NULL",
+            )
+            .bind(now_micros)
+            .bind(idle_ttl_micros)
+            .bind(&id_text)
+            .bind(&tenant)
+            .bind(&environment)
+            .execute(&mut *tx)
+            .await?;
+        }
         tx.commit().await?;
-        Ok(row.map(|row| SessionRecord {
+        Ok(Some(SessionRecord {
             subject: row.get("subject"),
             auth_time_unix_micros: row.get("auth_us"),
             auth_methods: row.get("auth_methods"),
@@ -7181,6 +7235,30 @@ impl ActingSessionRepo<'_> {
     /// (`session.create` vs `session.rotate`), so a rotation is never mistaken for a
     /// creation in the audit trail.
     ///
+    /// # What happens to the prior session's DEPENDENTS
+    ///
+    /// The prior session is not necessarily the rotating user's: a rotation happens at
+    /// a privilege transition, so a login performed while presenting SOMEBODY ELSE's
+    /// session cookie reaches this same path. The two cases MUST diverge, and the
+    /// returned [`PriorSessionOutcome`] reports which one was taken:
+    ///
+    /// - **Same subject** (a re-authentication of the same human in the same browser):
+    ///   the prior session's per-client sessions and refresh families are CARRIED
+    ///   FORWARD onto the successor. Re-pointing them is what keeps the `sid` STABLE
+    ///   across the re-authentication and, critically, keeps them REACHABLE: a
+    ///   supersede that moved only the `sessions` row would ORPHAN them (they would
+    ///   keep `session_ref = <prior>`, and no cascade on `session_ref = <successor>`
+    ///   would ever reach them, so a later logout would not actually revoke the user's
+    ///   refresh tokens from the earlier lineage segment).
+    /// - **Different subject**: the prior session is TERMINALLY revoked with the full
+    ///   cascade and NOTHING is carried, so the incoming user can never inherit the
+    ///   outgoing user's refresh families or `sid`s. Re-pointing them unconditionally
+    ///   would be a cross-user privilege escalation.
+    ///
+    /// A prior session that is already revoked, ended, or superseded is left alone
+    /// ([`PriorSessionOutcome::None`]): whatever killed it already dealt with its
+    /// dependents.
+    ///
     /// # Errors
     ///
     /// [`StoreError::NotFound`] if `id` is out of this scope;
@@ -7191,7 +7269,7 @@ impl ActingSessionRepo<'_> {
         id: &SessionId,
         prior: Option<&SessionId>,
         params: NewSession<'_>,
-    ) -> Result<(), StoreError> {
+    ) -> Result<PriorSessionOutcome, StoreError> {
         self.rotate_inner(env, id, prior, params, false).await
     }
 
@@ -7211,7 +7289,7 @@ impl ActingSessionRepo<'_> {
         id: &SessionId,
         prior: Option<&SessionId>,
         params: NewSession<'_>,
-    ) -> Result<(), StoreError> {
+    ) -> Result<PriorSessionOutcome, StoreError> {
         self.rotate_inner(env, id, prior, params, true).await
     }
 
@@ -7224,16 +7302,15 @@ impl ActingSessionRepo<'_> {
         prior: Option<&SessionId>,
         params: NewSession<'_>,
         poison_after_audit: bool,
-    ) -> Result<(), StoreError> {
+    ) -> Result<PriorSessionOutcome, StoreError> {
         if id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
         let scope = self.scope;
         // A prior id in ANOTHER scope is treated as absent (no cross-scope
         // supersede): only a same-scope prior session is rotated away.
-        let prior_text = prior
-            .filter(|prior| prior.scope() == scope)
-            .map(ToString::to_string);
+        let prior = prior.filter(|prior| prior.scope() == scope);
+        let prior_text = prior.map(ToString::to_string);
         // A rotation past a real prior session audits as session.rotate; a first
         // login (no prior) audits as session.create.
         let action = if prior_text.is_some() {
@@ -7242,6 +7319,8 @@ impl ActingSessionRepo<'_> {
             Action::SessionCreate
         };
         let now_micros = epoch_micros(env.clock().now_utc());
+        let mut outcome = PriorSessionOutcome::None;
+        let out = &mut outcome;
         write_audited(
             AuditedWrite {
                 store: self.store,
@@ -7278,32 +7357,29 @@ impl ActingSessionRepo<'_> {
                 .bind(params.peer_ip)
                 .execute(&mut **tx)
                 .await?;
-                if let Some(prior_text) = &prior_text {
-                    // Invalidate the prior id in the SAME transaction: it stops
-                    // resolving from the next request on. The guards keep this
-                    // idempotent and never clobber an already-revoked/rotated row.
-                    sqlx::query(
-                        "UPDATE sessions \
-                         SET superseded_by = $1, \
-                             ended_at = \
-                                 TIMESTAMPTZ 'epoch' + ($2::text || ' microseconds')::interval, \
-                             end_cause = 'rotated' \
-                         WHERE id = $3 AND tenant_id = $4 AND environment_id = $5 \
-                         AND revoked_at IS NULL AND superseded_by IS NULL AND ended_at IS NULL",
+                if let (Some(prior_id), Some(prior_text)) = (prior, &prior_text) {
+                    *out = reconcile_prior_session_at_rotation(
+                        PriorReconcile {
+                            store: self.store,
+                            acting: &self.acting,
+                            env,
+                            scope,
+                            successor: id,
+                            prior_id,
+                            prior_text,
+                            subject: params.subject,
+                            now_micros,
+                        },
+                        tx,
                     )
-                    .bind(id.to_string())
-                    .bind(now_micros)
-                    .bind(prior_text)
-                    .bind(scope.tenant().to_string())
-                    .bind(scope.environment().to_string())
-                    .execute(&mut **tx)
                     .await?;
                 }
                 Ok(())
             },
             poison_after_audit,
         )
-        .await
+        .await?;
+        Ok(outcome)
     }
 
     /// Revoke ONE SSO session by id (issue #32), stopping it from resolving
@@ -7566,6 +7642,163 @@ impl ActingSessionRepo<'_> {
     }
 }
 
+/// The inputs the rotation's prior-session reconciliation needs (issue #32), bundled so
+/// the helper stays inside the readable-argument-count lint.
+struct PriorReconcile<'a> {
+    /// The store, for the terminal-branch audit row.
+    store: &'a Store,
+    /// The acting context, for the terminal-branch audit row.
+    acting: &'a ActingContext,
+    /// The environment (clock/entropy seam), for the terminal-branch audit row.
+    env: &'a Env,
+    /// The rotation scope.
+    scope: Scope,
+    /// The successor session the rotation is creating (the carry target).
+    successor: &'a SessionId,
+    /// The prior session presented at the rotation.
+    prior_id: &'a SessionId,
+    /// The prior session id as text (already stringified once).
+    prior_text: &'a str,
+    /// The subject the successor authenticates (the carry-vs-terminate discriminator).
+    subject: &'a str,
+    /// The rotation instant, in epoch microseconds.
+    now_micros: i64,
+}
+
+/// Reconcile the PRIOR session at a rotation, inside the open rotation transaction
+/// (issue #32), and report what happened to it.
+///
+/// A rotation happens at a privilege transition, and the prior session is not
+/// necessarily the rotating user's. This decides between the two mandatory, opposite
+/// behaviors and NEVER conflates them:
+///
+/// - the prior session is not live any more -> [`PriorSessionOutcome::None`] (whatever
+///   killed it already dealt with its dependents);
+/// - it belongs to the SAME subject -> supersede it and CARRY its per-client sessions
+///   and refresh families onto the successor, so the `sid` stays stable and nothing is
+///   orphaned ([`PriorSessionOutcome::Carried`]);
+/// - it belongs to a DIFFERENT subject -> TERMINALLY revoke it with the full cascade and
+///   carry NOTHING, so the incoming user inherits none of the outgoing user's tokens or
+///   sids ([`PriorSessionOutcome::RevokedForeignSubject`]). Carrying here would be a
+///   cross-user privilege escalation.
+async fn reconcile_prior_session_at_rotation(
+    args: PriorReconcile<'_>,
+    tx: &mut Transaction<'_, Postgres>,
+) -> Result<PriorSessionOutcome, StoreError> {
+    let PriorReconcile {
+        store,
+        acting,
+        env,
+        scope,
+        successor,
+        prior_id,
+        prior_text,
+        subject,
+        now_micros,
+    } = args;
+    let tenant = scope.tenant().to_string();
+    let environment = scope.environment().to_string();
+    // Classify the prior session under a row lock, and only if it is still LIVE.
+    let prior_row = sqlx::query(
+        "SELECT subject FROM sessions \
+         WHERE id = $1 AND tenant_id = $2 AND environment_id = $3 \
+         AND revoked_at IS NULL AND superseded_by IS NULL AND ended_at IS NULL \
+         FOR UPDATE",
+    )
+    .bind(prior_text)
+    .bind(&tenant)
+    .bind(&environment)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some(prior_row) = prior_row else {
+        return Ok(PriorSessionOutcome::None);
+    };
+    let prior_subject: String = prior_row.get("subject");
+    let successor_text = successor.to_string();
+
+    if prior_subject != subject {
+        // DIFFERENT subject: a login while presenting somebody else's cookie. Terminally
+        // revoke the prior session with the full cascade and carry NOTHING (offline
+        // families survive, the #21 semantic: another human logging in must not kill the
+        // first user's background access). Carrying would be a cross-user escalation.
+        revoke_session_in_tx(
+            tx,
+            scope,
+            prior_id,
+            SessionEndCause::ReplacedByOtherSubject,
+            now_micros,
+            false,
+        )
+        .await?;
+        // NAME the terminally revoked session in the trail: the rotation's own audit row
+        // targets the successor, so without this the revocation would be invisible.
+        insert_audit_row(
+            tx,
+            &AuditedWrite {
+                store,
+                scope,
+                acting,
+                env,
+                action: Action::SessionRevoke,
+                target: prior_id,
+            },
+            None,
+        )
+        .await?;
+        return Ok(PriorSessionOutcome::RevokedForeignSubject);
+    }
+
+    // SAME subject: a re-authentication of the same human in the same browser. Supersede
+    // the prior id (it stops resolving at once, the session-fixation defense) and CARRY
+    // its lineage onto the successor.
+    sqlx::query(
+        "UPDATE sessions \
+         SET superseded_by = $1, \
+             ended_at = TIMESTAMPTZ 'epoch' + ($2::text || ' microseconds')::interval, \
+             end_cause = 'rotated' \
+         WHERE id = $3 AND tenant_id = $4 AND environment_id = $5 \
+         AND revoked_at IS NULL AND superseded_by IS NULL AND ended_at IS NULL",
+    )
+    .bind(&successor_text)
+    .bind(now_micros)
+    .bind(prior_text)
+    .bind(&tenant)
+    .bind(&environment)
+    .execute(&mut **tx)
+    .await?;
+    // The per-client sessions move to the successor, so the `sid` is STABLE across the
+    // re-authentication (the OIDC sid contract) and a later revoke still ends them.
+    sqlx::query(
+        "UPDATE client_sessions \
+         SET session_id = $1 \
+         WHERE session_id = $2 AND tenant_id = $3 AND environment_id = $4 \
+         AND revoked_at IS NULL",
+    )
+    .bind(&successor_text)
+    .bind(prior_text)
+    .bind(&tenant)
+    .bind(&environment)
+    .execute(&mut **tx)
+    .await?;
+    // The refresh families move with them, so a later revoke or logout of the successor
+    // CASCADES to the families the pre-rotation lineage opened. Without this the rotation
+    // ORPHANS them (they keep session_ref = <prior>, no cascade on <successor> reaches
+    // them, and the user's earlier-segment refresh tokens stay valid forever).
+    sqlx::query(
+        "UPDATE refresh_families \
+         SET session_ref = $1 \
+         WHERE session_ref = $2 AND tenant_id = $3 AND environment_id = $4 \
+         AND revoked_at IS NULL",
+    )
+    .bind(&successor_text)
+    .bind(prior_text)
+    .bind(&tenant)
+    .bind(&environment)
+    .execute(&mut **tx)
+    .await?;
+    Ok(PriorSessionOutcome::Carried)
+}
+
 /// What one single-session revoke does, bundled so the shared body stays inside the
 /// readable-argument-count lint (issue #32).
 struct RevokeSpec<'a> {
@@ -7712,6 +7945,13 @@ pub enum SessionEndCause {
     UserRevokedAll,
     /// Ended by the end user's RP logout.
     LoggedOut,
+    /// Ended because a DIFFERENT subject authenticated on the same browser session
+    /// (issue #32). This is a TERMINAL end of the outgoing user's session, never a
+    /// rotation: the incoming user inherits NOTHING of it (not its per-client
+    /// sessions, not its refresh families), and the outgoing user's session-bound
+    /// tokens die at the transition. Carrying the lineage forward here instead would
+    /// be a cross-user privilege escalation.
+    ReplacedByOtherSubject,
 }
 
 impl SessionEndCause {
@@ -7723,8 +7963,35 @@ impl SessionEndCause {
             SessionEndCause::BulkRevoked => "bulk_revoked",
             SessionEndCause::UserRevokedAll => "user_revoked_all",
             SessionEndCause::LoggedOut => "logged_out",
+            SessionEndCause::ReplacedByOtherSubject => "replaced_by_other_subject",
         }
     }
+}
+
+/// What a rotation did with the session the browser previously presented (issue #32).
+///
+/// A rotation happens at a privilege transition (a login), and the prior session is
+/// NOT necessarily the rotating user's: a login performed while presenting somebody
+/// else's session cookie reaches the same path. The two cases MUST diverge, and this
+/// reports which one the store took, so the caller publishes the truthful lifecycle
+/// signal (a rotation is non-terminal; a replacement is terminal).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PriorSessionOutcome {
+    /// No live prior session of this scope was presented (no cookie, a cross-scope
+    /// cookie, or a session that was already revoked, ended, or rotated away): nothing
+    /// was carried and nothing was ended.
+    None,
+    /// The prior session belonged to the SAME subject, so this is a re-authentication
+    /// of the same human in the same browser: its lineage (its per-client sessions,
+    /// hence its `sid`s, and its refresh families) was CARRIED FORWARD onto the
+    /// successor. The `sid` is therefore STABLE across the re-authentication (the OIDC
+    /// contract), and a later revoke of the successor still reaches every dependent
+    /// the earlier lineage segment opened, instead of orphaning them.
+    Carried,
+    /// The prior session belonged to a DIFFERENT subject, so it was terminally REVOKED
+    /// with the FULL cascade (its per-client sessions, its refresh families, and, on a
+    /// hard kill, its grants). The incoming user inherits nothing.
+    RevokedForeignSubject,
 }
 
 /// The outcome of revoking one session (issue #32): whether the session itself
@@ -7828,9 +8095,21 @@ impl ClientSessionRepo<'_> {
     ///
     /// `now_micros` (the application clock seam) stamps `last_seen_at`.
     ///
+    /// # A DEAD session gets no sid
+    ///
+    /// The INSERT selects its row FROM `sessions` under the SAME liveness guard the
+    /// authentication read path uses (not revoked, not ended, not superseded, and
+    /// within both the idle and the absolute expiry), so a session that is no longer
+    /// live yields no row and this returns [`StoreError::NotFound`]. That is defense in
+    /// depth for the token endpoint: an authorization code minted BEFORE a session
+    /// revoke and redeemed AFTER it must not be able to mint a brand-new LIVE per-client
+    /// session (and a fresh `sid`) bound to a DEAD SSO session, which no cascade would
+    /// ever reach.
+    ///
     /// # Errors
     ///
-    /// [`StoreError::NotFound`] if `session_id` is out of this scope;
+    /// [`StoreError::NotFound`] if `session_id` is out of this scope, or if the SSO
+    /// session is no longer live;
     /// [`StoreError::Database`] on a persistence failure.
     pub async fn ensure_sid(
         &self,
@@ -7849,9 +8128,16 @@ impl ClientSessionRepo<'_> {
         let row = sqlx::query(
             "INSERT INTO client_sessions \
              (id, tenant_id, environment_id, session_id, client_id, sid, created_at, last_seen_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, \
-                     TIMESTAMPTZ 'epoch' + ($7::text || ' microseconds')::interval, \
-                     TIMESTAMPTZ 'epoch' + ($7::text || ' microseconds')::interval) \
+             SELECT $1, $2, $3, $4, $5, $6, \
+                    TIMESTAMPTZ 'epoch' + ($7::text || ' microseconds')::interval, \
+                    TIMESTAMPTZ 'epoch' + ($7::text || ' microseconds')::interval \
+             FROM sessions s \
+             WHERE s.id = $4 AND s.tenant_id = $2 AND s.environment_id = $3 \
+             AND s.revoked_at IS NULL AND s.ended_at IS NULL AND s.superseded_by IS NULL \
+             AND COALESCE(s.absolute_expires_at, s.expires_at) > \
+                 TIMESTAMPTZ 'epoch' + ($7::text || ' microseconds')::interval \
+             AND (s.idle_expires_at IS NULL OR s.idle_expires_at > \
+                  TIMESTAMPTZ 'epoch' + ($7::text || ' microseconds')::interval) \
              ON CONFLICT (tenant_id, environment_id, session_id, client_id) \
              DO UPDATE SET last_seen_at = \
                  TIMESTAMPTZ 'epoch' + ($7::text || ' microseconds')::interval \
@@ -7864,10 +8150,33 @@ impl ClientSessionRepo<'_> {
         .bind(client_id)
         .bind(&sid)
         .bind(now_micros)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        // No row means the SELECT found no LIVE session to hang the per-client session
+        // off, so nothing was inserted and no conflict fired: the session is dead.
+        row.map(|row| row.get::<String, _>("sid"))
+            .ok_or(StoreError::NotFound)
+    }
+
+    /// Count the per-client session rows in scope (issue #32). A test uses it to prove a
+    /// refused code exchange minted NO new per-client session (hence no fresh `sid`).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn count_in_scope(&self) -> Result<i64, StoreError> {
+        let scope = self.scope;
+        let mut tx = begin_scoped(self.store, scope).await?;
+        let count = sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM client_sessions WHERE tenant_id = $1 AND environment_id = $2",
+        )
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
         .fetch_one(&mut *tx)
         .await?;
         tx.commit().await?;
-        Ok(row.get::<String, _>("sid"))
+        Ok(count)
     }
 }
 
@@ -8639,8 +8948,10 @@ pub enum DevicePollOutcome {
         interval_secs: i64,
     },
     /// The flow was approved: the pre-signing caller now mints tokens and calls
-    /// [`ActingDeviceCodeRepo::redeem_approved`] to atomically consume it.
-    Approved(ApprovedDeviceGrant),
+    /// [`ActingDeviceCodeRepo::redeem_approved`] to atomically consume it. Boxed so the
+    /// grant linkage (much larger than the other variants) does not bloat every
+    /// `DevicePollOutcome` value.
+    Approved(Box<ApprovedDeviceGrant>),
     /// The flow was denied by the human or invalidated (`access_denied`).
     Denied,
     /// The flow's TTL has passed (`expired_token`).
@@ -8667,6 +8978,12 @@ pub struct ApprovedDeviceGrant {
     pub auth_methods: String,
     /// The approving human's authentication instant, in epoch microseconds, if present.
     pub auth_time_unix_micros: Option<i64>,
+    /// The approving human's SSO session (a `ses_` id string), recorded on the grant at
+    /// approval (issue #32). The device flow DOES authenticate a human (at the
+    /// verification page), so its ID token carries the per-(client, session) `sid` like
+    /// every other flow's; this is what that `sid` resolves from. [`None`] only for a
+    /// grant approved before this was recorded.
+    pub session_ref: Option<String>,
 }
 
 impl fmt::Debug for ApprovedDeviceGrant {
@@ -8690,6 +9007,10 @@ pub struct DeviceApproval<'a> {
     pub subject: &'a str,
     /// The recorded consent decision (a `con_` id string), if any.
     pub consent_ref: Option<&'a str>,
+    /// The approving human's SSO session (a `ses_` id string), recorded on the opened
+    /// grant (issue #32) so the device flow's ID token can carry the per-(client,
+    /// session) `sid` exactly like the code flow's does.
+    pub session_ref: Option<&'a str>,
     /// The authentication methods (space-separated RFC 8176 values) from the session.
     pub auth_methods: &'a str,
     /// The approving human's authentication instant, in epoch microseconds, if any.
@@ -8899,15 +9220,25 @@ impl DeviceCodeRepo<'_> {
         let tenant = self.scope.tenant().to_string();
         let environment = self.scope.environment().to_string();
         let mut tx = begin_scoped(self.store, self.scope).await?;
+        // The approving human's SSO session rides on the grant this flow opened at
+        // approval (grants.session_ref, the SAME column the code flow records it in),
+        // so the device grant's ID token can carry the per-(client, session) `sid`
+        // (issue #32). LEFT JOIN: a pending flow has no grant yet. `FOR UPDATE OF dc`
+        // keeps the row lock on device_codes only (the joined grant is read-only here,
+        // and an outer-joined row cannot be locked).
         let Some(row) = sqlx::query(
-            "SELECT id, client_id, subject, grant_id, requested_scope, auth_methods, status, \
-             interval_secs, \
-             (EXTRACT(EPOCH FROM auth_time) * 1000000)::bigint AS auth_time_us, \
-             (EXTRACT(EPOCH FROM expires_at) * 1000000)::bigint AS expires_us, \
-             (EXTRACT(EPOCH FROM last_poll_at) * 1000000)::bigint AS last_poll_us \
-             FROM device_codes \
-             WHERE device_code_digest = $1 AND tenant_id = $2 AND environment_id = $3 \
-             FOR UPDATE",
+            "SELECT dc.id, dc.client_id, dc.subject, dc.grant_id, dc.requested_scope, \
+             dc.auth_methods, dc.status, dc.interval_secs, g.session_ref, \
+             (EXTRACT(EPOCH FROM dc.auth_time) * 1000000)::bigint AS auth_time_us, \
+             (EXTRACT(EPOCH FROM dc.expires_at) * 1000000)::bigint AS expires_us, \
+             (EXTRACT(EPOCH FROM dc.last_poll_at) * 1000000)::bigint AS last_poll_us \
+             FROM device_codes dc \
+             LEFT JOIN grants g \
+             ON g.id = dc.grant_id AND g.tenant_id = dc.tenant_id \
+             AND g.environment_id = dc.environment_id \
+             WHERE dc.device_code_digest = $1 AND dc.tenant_id = $2 \
+             AND dc.environment_id = $3 \
+             FOR UPDATE OF dc",
         )
         .bind(&digest)
         .bind(&tenant)
@@ -9006,7 +9337,7 @@ fn approved_device_outcome(row: &PgRow, scope: &Scope) -> Result<DevicePollOutco
         return Ok(DevicePollOutcome::Unknown);
     };
     let id_text: String = row.get("id");
-    Ok(DevicePollOutcome::Approved(ApprovedDeviceGrant {
+    Ok(DevicePollOutcome::Approved(Box::new(ApprovedDeviceGrant {
         device_code_id: DeviceCodeId::parse_in_scope(&id_text, scope)?,
         grant_id: GrantId::parse_in_scope(&grant_text, scope)?,
         subject: row.get::<Option<String>, _>("subject").unwrap_or_default(),
@@ -9016,7 +9347,8 @@ fn approved_device_outcome(row: &PgRow, scope: &Scope) -> Result<DevicePollOutco
             .get::<Option<String>, _>("auth_methods")
             .unwrap_or_default(),
         auth_time_unix_micros: row.get("auth_time_us"),
-    }))
+        session_ref: row.get::<Option<String>, _>("session_ref"),
+    })))
 }
 
 /// The mutating device-authorization repository (issue #24). Reachable only through
@@ -9136,14 +9468,15 @@ impl ActingDeviceCodeRepo<'_> {
             "INSERT INTO grants \
              (id, tenant_id, environment_id, client_id, subject, session_ref, consent_ref, \
               claims_request, created_at) \
-             VALUES ($1, $2, $3, $4, $5, NULL, $6, NULL, \
-                     TIMESTAMPTZ 'epoch' + ($7::text || ' microseconds')::interval)",
+             VALUES ($1, $2, $3, $4, $5, $6, $7, NULL, \
+                     TIMESTAMPTZ 'epoch' + ($8::text || ' microseconds')::interval)",
         )
         .bind(approval.grant_id.to_string())
         .bind(&tenant)
         .bind(&environment)
         .bind(&client_id)
         .bind(approval.subject)
+        .bind(approval.session_ref)
         .bind(approval.consent_ref)
         .bind(approval.created_at_unix_micros)
         .execute(&mut *tx)

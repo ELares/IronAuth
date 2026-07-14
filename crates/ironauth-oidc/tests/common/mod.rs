@@ -486,6 +486,56 @@ impl Harness {
         }
     }
 
+    /// Simulate a NODE RESTART: rebuild every scrap of process-level state from
+    /// scratch against the SAME Postgres (issue #32, acceptance criterion 1).
+    ///
+    /// A brand-new connection pool, a brand-new `Store`, a brand-new (cold, empty)
+    /// `IssuerRegistry`, a brand-new `OidcState`, and a brand-new router. Nothing
+    /// in-process is carried over, so anything the restarted node can still do it does
+    /// PURELY from what Postgres holds. If any authoritative session state lived only
+    /// in memory, it is gone now and the caller's next request fails.
+    ///
+    /// The clock and the `(tenant, environment)` scope are kept: this is a restart of
+    /// the same node against the same database, not a new deployment.
+    #[must_use]
+    pub async fn restart(&self, config: &OidcConfig) -> Self {
+        let store = self.db.restart_app_store().await;
+        let registry = Arc::new(IssuerRegistry::store_backed(
+            ISSUER_BASE,
+            JwksCacheWindow::clamped(config.jwks_cache_max_age_secs),
+            store.clone(),
+        ));
+        let issuer_state = IssuerState::new(Arc::clone(&registry), self.env.clone());
+        let discovery_state = DiscoveryState::new(
+            ISSUER_BASE,
+            JwksCacheWindow::clamped(config.jwks_cache_max_age_secs),
+            DiscoveryCapabilities::from_config(config),
+            Arc::clone(&registry),
+        );
+        let state = OidcState::new(
+            store,
+            self.env.clone(),
+            Arc::clone(&registry),
+            config,
+            ISSUER_BASE,
+        );
+        let router = oidc_router(state.clone())
+            .merge(issuer_router(issuer_state))
+            .merge(discovery_router(discovery_state));
+        Self {
+            db: self.db.clone(),
+            env: self.env.clone(),
+            clock: Arc::clone(&self.clock),
+            scope: self.scope,
+            client_id: self.client_id,
+            verifying_key: self.verifying_key.clone(),
+            issuer: self.issuer.clone(),
+            registry,
+            state,
+            router,
+        }
+    }
+
     /// Seed the shared fixtures both constructors build on: a fresh database, a
     /// deterministic clock frozen at the Unix epoch, a `(tenant, environment)`
     /// scope, and one OAuth client with the harness redirect URI registered (so the
@@ -983,6 +1033,18 @@ impl Harness {
             .count_in_scope()
             .await
             .expect("count refresh rows")
+    }
+
+    /// Count the `client_sessions` rows in the harness scope (issue #32), so a test can
+    /// prove the code-exchange path minted NO new per-client session (hence no fresh
+    /// `sid`) when it refused a dead session.
+    pub async fn count_client_sessions(&self) -> i64 {
+        self.store()
+            .scoped(self.scope)
+            .client_sessions()
+            .count_in_scope()
+            .await
+            .expect("count client sessions")
     }
 
     /// Create a session for `subject` (a bootstrap `pwd` authentication event at
