@@ -55,10 +55,10 @@ use sqlx::{Postgres, Row, Transaction};
 use crate::audit::{ActingContext, Action, ActorRef};
 use crate::error::StoreError;
 use crate::id::{
-    AuditId, AuditTarget, AuthorizationCodeId, ClientId, ConsentId, CorrelationId, DcrPolicyId,
-    EnvironmentId, GrantId, InitialAccessTokenId, IssuedTokenId, ManagementKeyId, OperatorId,
-    PushedRequestId, RefreshFamilyId, RefreshTokenId, ResourceServerId, ServiceAccountId,
-    SessionId, SigningKeyId, TenantId, UserId,
+    AssertionMappingId, AuditId, AuditTarget, AuthorizationCodeId, ClientId, ConsentId,
+    CorrelationId, DcrPolicyId, EnvironmentId, ExternalIssuerId, GrantId, InitialAccessTokenId,
+    IssuedTokenId, ManagementKeyId, OperatorId, PushedRequestId, RefreshFamilyId, RefreshTokenId,
+    ResourceServerId, ServiceAccountId, SessionId, SigningKeyId, TenantId, UserId,
 };
 use crate::scope::Scope;
 use crate::store::Store;
@@ -210,6 +210,45 @@ impl<'a> ScopedStore<'a> {
     #[must_use]
     pub fn client_auth_diagnostics(&self) -> ClientAuthDiagnosticsRepo<'a> {
         ClientAuthDiagnosticsRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
+    /// The read-only registered external assertion issuer repository for this scope
+    /// (issue #26). Resolves the trust anchor an inbound JWT bearer assertion's `iss`
+    /// names, so the grant can verify the assertion against the issuer's keys;
+    /// registration lives on [`ActingStore::external_assertion_issuers`].
+    #[must_use]
+    pub fn external_assertion_issuers(&self) -> ExternalAssertionIssuerRepo<'a> {
+        ExternalAssertionIssuerRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
+    /// The read-only subject-mapping repository for the JWT bearer assertion grant in
+    /// this scope (issue #26). Resolves the explicit rule that maps a verified
+    /// external (issuer + `sub`) to an IronAuth principal; authoring lives on
+    /// [`ActingStore::external_assertion_subject_mappings`]. An unmapped subject
+    /// resolves to `None`, and the grant rejects it (never auto-provisions).
+    #[must_use]
+    pub fn external_assertion_subject_mappings(&self) -> AssertionSubjectMappingRepo<'a> {
+        AssertionSubjectMappingRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
+    /// The single-use external-issuer JWT-assertion `jti` replay cache for this scope
+    /// (issue #26). Records an accepted assertion's `jti` keyed by the EXTERNAL
+    /// issuer, so an external issuer's `jti` can never collide with a client
+    /// assertion's `jti` (they live in distinct tables). Like the #25 client cache it
+    /// is a replay-prevention cache, not a business mutation, so it is deliberately
+    /// off the audited-write path and needs no acting context.
+    #[must_use]
+    pub fn external_assertion_jtis(&self) -> ExternalAssertionJtiRepo<'a> {
+        ExternalAssertionJtiRepo {
             store: self.store,
             scope: self.scope,
         }
@@ -429,6 +468,32 @@ impl<'a> ActingStore<'a> {
     #[must_use]
     pub fn initial_access_tokens(&self) -> ActingInitialAccessTokenRepo<'a> {
         ActingInitialAccessTokenRepo {
+            store: self.store,
+            scope: self.scope,
+            acting: self.acting,
+        }
+    }
+
+    /// The mutating external assertion issuer repository for this scope and actor
+    /// (issue #26): register a trust anchor (its key source, signing-alg allowlist,
+    /// and enable switch) for the JWT bearer assertion grant, audited
+    /// (`external_assertion_issuer.register`) in the same transaction.
+    #[must_use]
+    pub fn external_assertion_issuers(&self) -> ActingExternalAssertionIssuerRepo<'a> {
+        ActingExternalAssertionIssuerRepo {
+            store: self.store,
+            scope: self.scope,
+            acting: self.acting,
+        }
+    }
+
+    /// The mutating subject-mapping repository for the JWT bearer assertion grant in
+    /// this scope and actor (issue #26): author an explicit rule mapping an external
+    /// (issuer + `sub`) to an IronAuth principal, audited
+    /// (`external_assertion_subject_mapping.create`) in the same transaction.
+    #[must_use]
+    pub fn external_assertion_subject_mappings(&self) -> ActingAssertionSubjectMappingRepo<'a> {
+        ActingAssertionSubjectMappingRepo {
             store: self.store,
             scope: self.scope,
             acting: self.acting,
@@ -3304,6 +3369,44 @@ impl ActingAuthorizationRepo<'_> {
         env: &Env,
         request: IssueClientCredentials<'_>,
     ) -> Result<(), StoreError> {
+        self.issue_machine_grant(env, request, Action::TokenIssue)
+            .await
+    }
+
+    /// Persist a JWT bearer assertion grant's short-lived access token against a
+    /// fresh grant (issue #26), audited as [`Action::JwtBearerAssertionIssue`] in the
+    /// same transaction, so the mapped-identity token is revocable and
+    /// introspectable by the #22 endpoints by construction (the SAME grant chain the
+    /// code/refresh/client-credentials tokens use). It REUSES the machine-grant
+    /// persistence shape ([`IssueClientCredentials`]): `subject` is the MAPPED
+    /// principal (the token's `sub`), `client_id` is the presenting OAuth client, and
+    /// there is NO refresh token (RFC 7521 4.1). The audit action is distinct so a
+    /// federation issuance is legible in the trail as such, not as an M2M issuance.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if any identifier is out of this scope;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn issue_jwt_bearer_assertion(
+        &self,
+        env: &Env,
+        request: IssueClientCredentials<'_>,
+    ) -> Result<(), StoreError> {
+        self.issue_machine_grant(env, request, Action::JwtBearerAssertionIssue)
+            .await
+    }
+
+    /// The shared body behind [`Self::issue_client_credentials`] and
+    /// [`Self::issue_jwt_bearer_assertion`]: open a subject-bearing grant (no
+    /// session, no consent, no user flow) and record the minted access token against
+    /// it, auditing `action` in the same transaction. Both callers persist an
+    /// identical grant + access-token shape; only the audit verb differs.
+    async fn issue_machine_grant(
+        &self,
+        env: &Env,
+        request: IssueClientCredentials<'_>,
+        action: Action,
+    ) -> Result<(), StoreError> {
         let in_scope = request.grant_id.scope() == self.scope
             && request.client_id.scope() == self.scope
             && match &request.access {
@@ -3320,7 +3423,7 @@ impl ActingAuthorizationRepo<'_> {
                 scope,
                 acting: &self.acting,
                 env,
-                action: Action::TokenIssue,
+                action,
                 target: request.grant_id,
             },
             async move |tx| {
@@ -4530,9 +4633,10 @@ impl ClientAssertionJtiRepo<'_> {
     }
 }
 
-/// A bounded-cardinality reason a client authentication failed (issue #25),
-/// recorded in the diagnostics sink. No attacker-controlled free text, so it is
-/// safe as a metric-like dimension and never an oracle on the wire.
+/// A bounded-cardinality reason a client authentication OR a JWT bearer assertion
+/// grant validation failed (issues #25 and #26), recorded in the diagnostics sink.
+/// No attacker-controlled free text, so it is safe as a metric-like dimension and
+/// never an oracle on the wire.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClientAuthDiagnosticReason {
     /// The presented credentials could not be parsed into one coherent attempt
@@ -4552,6 +4656,13 @@ pub enum ClientAuthDiagnosticReason {
     /// The `client_secret_jwt` method is registered but unsupported: IronAuth
     /// stores no retrievable secret to key its HMAC, so it fails closed.
     ClientSecretJwtUnsupported,
+    /// A JWT bearer assertion grant assertion named an `iss` that is not a
+    /// registered, ENABLED external issuer in this scope (issue #26).
+    AssertionIssuerUntrusted,
+    /// A JWT bearer assertion grant assertion verified, but its (issuer, `sub`)
+    /// names no registered subject-mapping rule (or the rule's optional claim gate
+    /// did not match): the subject is rejected, never auto-provisioned (issue #26).
+    AssertionSubjectUnmapped,
 }
 
 impl ClientAuthDiagnosticReason {
@@ -4568,6 +4679,8 @@ impl ClientAuthDiagnosticReason {
             ClientAuthDiagnosticReason::ClientSecretJwtUnsupported => {
                 "client_secret_jwt_unsupported"
             }
+            ClientAuthDiagnosticReason::AssertionIssuerUntrusted => "assertion_issuer_untrusted",
+            ClientAuthDiagnosticReason::AssertionSubjectUnmapped => "assertion_subject_unmapped",
         }
     }
 }
@@ -4719,6 +4832,416 @@ impl ClientAuthDiagnosticsRepo<'_> {
                 signing_alg: row.get("signing_alg"),
             })
             .collect())
+    }
+}
+
+// ===========================================================================
+// The JWT bearer assertion grant trust and mapping stores (issue #26).
+// ===========================================================================
+
+/// A registered external assertion issuer read back within scope (issue #26): the
+/// trust anchor an inbound JWT bearer assertion's `iss` names, plus its key source,
+/// signing-alg allowlist, and enable switch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalAssertionIssuerRecord {
+    /// The `xai_` identifier (embeds its tenant and environment).
+    pub id: ExternalIssuerId,
+    /// The external issuer's `iss` claim value.
+    pub issuer: String,
+    /// The inline pinned JWK Set JSON, or [`None`] when keys are at `jwks_uri`.
+    pub jwks: Option<String>,
+    /// The issuer's JWKS URL (fetched through the SSRF-hardened fetcher), or [`None`]
+    /// when keys are pinned inline. At most one of `jwks`/`jwks_uri` is set.
+    pub jwks_uri: Option<String>,
+    /// An OPTIONAL space-separated JOSE algorithm allowlist for this issuer's
+    /// assertions; [`None`] means the supported asymmetric set applies.
+    pub signing_alg_allow: Option<String>,
+    /// The enable switch. A disabled issuer's assertions are rejected exactly as an
+    /// unregistered issuer's are.
+    pub enabled: bool,
+}
+
+/// An external assertion issuer to register (issue #26). The `id` is minted under
+/// the caller's scope; the `issuer` is unique per environment. Exactly one of
+/// `jwks`/`jwks_uri` must be set (a database CHECK enforces it).
+#[derive(Debug, Clone, Copy)]
+pub struct NewExternalAssertionIssuer<'a> {
+    /// The `xai_` identifier, minted under this scope.
+    pub id: &'a ExternalIssuerId,
+    /// The external issuer's `iss` claim value.
+    pub issuer: &'a str,
+    /// The inline pinned JWK Set JSON, or [`None`] to register a `jwks_uri` instead.
+    pub jwks: Option<&'a str>,
+    /// The issuer's JWKS URL, or [`None`] to register inline `jwks` instead.
+    pub jwks_uri: Option<&'a str>,
+    /// The OPTIONAL space-separated JOSE algorithm allowlist, or [`None`].
+    pub signing_alg_allow: Option<&'a str>,
+    /// The enable switch to register the issuer with.
+    pub enabled: bool,
+}
+
+/// The read-only registered external assertion issuer repository (issue #26).
+pub struct ExternalAssertionIssuerRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl ExternalAssertionIssuerRepo<'_> {
+    /// Fetch a registered external assertion issuer by its `issuer` string within
+    /// scope, or [`None`] when none is registered (absent, or belonging to another
+    /// tenant or environment: indistinguishable). The JWT bearer grant calls this to
+    /// resolve the trust anchor an assertion's `iss` names before verifying it.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure, or if a stored row fails to
+    /// decode (an out-of-scope identifier).
+    pub async fn by_issuer(
+        &self,
+        issuer: &str,
+    ) -> Result<Option<ExternalAssertionIssuerRecord>, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT id, issuer, jwks, jwks_uri, signing_alg_allow, enabled \
+             FROM external_assertion_issuers \
+             WHERE issuer = $1 AND tenant_id = $2 AND environment_id = $3",
+        )
+        .bind(issuer)
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        match row {
+            None => Ok(None),
+            Some(row) => {
+                let id_text: String = row.get("id");
+                let id = ExternalIssuerId::parse_in_scope(&id_text, &self.scope)?;
+                Ok(Some(ExternalAssertionIssuerRecord {
+                    id,
+                    issuer: row.get("issuer"),
+                    jwks: row.get("jwks"),
+                    jwks_uri: row.get("jwks_uri"),
+                    signing_alg_allow: row.get("signing_alg_allow"),
+                    enabled: row.get("enabled"),
+                }))
+            }
+        }
+    }
+}
+
+/// The mutating external assertion issuer repository (issue #26). Reachable only
+/// through [`ScopedStore::acting`], so every registration carries an actor and
+/// correlation id and routes through the audited-write primitive.
+pub struct ActingExternalAssertionIssuerRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+    acting: ActingContext,
+}
+
+impl ActingExternalAssertionIssuerRepo<'_> {
+    /// Register an external assertion issuer and audit
+    /// `external_assertion_issuer.register` in the same transaction.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the identifier is out of this scope;
+    /// [`StoreError::Conflict`] if the issuer is already registered in this
+    /// environment, or the key source is not exactly one of `jwks`/`jwks_uri` (the
+    /// database CHECK); [`StoreError::Database`] on a persistence failure.
+    pub async fn register(
+        &self,
+        env: &Env,
+        issuer: NewExternalAssertionIssuer<'_>,
+    ) -> Result<(), StoreError> {
+        if issuer.id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::ExternalAssertionIssuerRegister,
+                target: issuer.id,
+            },
+            async move |tx| {
+                let result = sqlx::query(
+                    "INSERT INTO external_assertion_issuers \
+                     (id, tenant_id, environment_id, issuer, jwks, jwks_uri, \
+                      signing_alg_allow, enabled) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+                )
+                .bind(issuer.id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(issuer.issuer)
+                .bind(issuer.jwks)
+                .bind(issuer.jwks_uri)
+                .bind(issuer.signing_alg_allow)
+                .bind(issuer.enabled)
+                .execute(&mut **tx)
+                .await;
+                match result {
+                    Ok(_) => Ok(()),
+                    // A duplicate issuer OR a CHECK violation (not exactly one key
+                    // source) is a caller-facing conflict, not a persistence fault:
+                    // erroring here rolls the audited write back, so a rejected
+                    // registration leaves neither an issuer row nor an audit row.
+                    Err(error) if is_unique_violation(&error) || is_check_violation(&error) => {
+                        Err(StoreError::Conflict)
+                    }
+                    Err(error) => Err(error.into()),
+                }
+            },
+            false,
+        )
+        .await
+    }
+}
+
+/// A registered subject-mapping rule read back within scope (issue #26): the
+/// explicit rule that maps an external (issuer + `sub`), optionally gated on an
+/// additional claim, to an IronAuth principal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AssertionSubjectMappingRecord {
+    /// The `asm_` identifier (embeds its tenant and environment).
+    pub id: AssertionMappingId,
+    /// The external issuer this rule maps from.
+    pub issuer: String,
+    /// The external `sub` this rule maps from.
+    pub external_subject: String,
+    /// An OPTIONAL additional claim NAME the assertion must carry with
+    /// `match_value` for the rule to fire; [`None`] when the (issuer, sub) match
+    /// alone suffices.
+    pub match_claim: Option<String>,
+    /// The value the OPTIONAL `match_claim` must equal; [`None`] when `match_claim`
+    /// is [`None`].
+    pub match_value: Option<String>,
+    /// The IronAuth principal the mapped token is issued under (the token's `sub`).
+    pub principal: String,
+}
+
+/// A subject-mapping rule to author (issue #26). The `id` is minted under the
+/// caller's scope; one rule per (issuer, `external_subject`) per environment. The
+/// optional claim gate is all-or-nothing (both `match_claim`/`match_value` set, or
+/// both [`None`]); a database CHECK enforces it.
+#[derive(Debug, Clone, Copy)]
+pub struct NewAssertionSubjectMapping<'a> {
+    /// The `asm_` identifier, minted under this scope.
+    pub id: &'a AssertionMappingId,
+    /// The external issuer this rule maps from.
+    pub issuer: &'a str,
+    /// The external `sub` this rule maps from.
+    pub external_subject: &'a str,
+    /// The OPTIONAL additional claim NAME, or [`None`].
+    pub match_claim: Option<&'a str>,
+    /// The OPTIONAL additional claim VALUE, or [`None`] (paired with `match_claim`).
+    pub match_value: Option<&'a str>,
+    /// The IronAuth principal the mapped token is issued under.
+    pub principal: &'a str,
+}
+
+/// The read-only subject-mapping repository for the JWT bearer assertion grant
+/// (issue #26).
+pub struct AssertionSubjectMappingRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl AssertionSubjectMappingRepo<'_> {
+    /// Resolve the mapping rule for a verified external (`issuer`, `external_subject`)
+    /// within scope, or [`None`] when no rule is registered. The grant applies the
+    /// rule's OPTIONAL claim gate itself against the verified claims, then issues the
+    /// token under `principal`. A [`None`] here is the reject-by-default posture: an
+    /// unmapped subject is rejected, never auto-provisioned.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure, or if a stored row fails to
+    /// decode (an out-of-scope identifier).
+    pub async fn resolve(
+        &self,
+        issuer: &str,
+        external_subject: &str,
+    ) -> Result<Option<AssertionSubjectMappingRecord>, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT id, issuer, external_subject, match_claim, match_value, principal \
+             FROM external_assertion_subject_mappings \
+             WHERE issuer = $1 AND external_subject = $2 \
+             AND tenant_id = $3 AND environment_id = $4",
+        )
+        .bind(issuer)
+        .bind(external_subject)
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        match row {
+            None => Ok(None),
+            Some(row) => {
+                let id_text: String = row.get("id");
+                let id = AssertionMappingId::parse_in_scope(&id_text, &self.scope)?;
+                Ok(Some(AssertionSubjectMappingRecord {
+                    id,
+                    issuer: row.get("issuer"),
+                    external_subject: row.get("external_subject"),
+                    match_claim: row.get("match_claim"),
+                    match_value: row.get("match_value"),
+                    principal: row.get("principal"),
+                }))
+            }
+        }
+    }
+}
+
+/// The mutating subject-mapping repository for the JWT bearer assertion grant (issue
+/// #26). Reachable only through [`ScopedStore::acting`], so every mapping carries an
+/// actor and correlation id and routes through the audited-write primitive.
+pub struct ActingAssertionSubjectMappingRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+    acting: ActingContext,
+}
+
+impl ActingAssertionSubjectMappingRepo<'_> {
+    /// Author a subject-mapping rule and audit
+    /// `external_assertion_subject_mapping.create` in the same transaction.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the identifier is out of this scope;
+    /// [`StoreError::Conflict`] if a rule for the same (issuer, `external_subject`) is
+    /// already registered, or the claim gate is half-configured (the database CHECK);
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn create(
+        &self,
+        env: &Env,
+        mapping: NewAssertionSubjectMapping<'_>,
+    ) -> Result<(), StoreError> {
+        if mapping.id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::ExternalAssertionSubjectMappingCreate,
+                target: mapping.id,
+            },
+            async move |tx| {
+                let result = sqlx::query(
+                    "INSERT INTO external_assertion_subject_mappings \
+                     (id, tenant_id, environment_id, issuer, external_subject, \
+                      match_claim, match_value, principal) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+                )
+                .bind(mapping.id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(mapping.issuer)
+                .bind(mapping.external_subject)
+                .bind(mapping.match_claim)
+                .bind(mapping.match_value)
+                .bind(mapping.principal)
+                .execute(&mut **tx)
+                .await;
+                match result {
+                    Ok(_) => Ok(()),
+                    Err(error) if is_unique_violation(&error) || is_check_violation(&error) => {
+                        Err(StoreError::Conflict)
+                    }
+                    Err(error) => Err(error.into()),
+                }
+            },
+            false,
+        )
+        .await
+    }
+}
+
+/// The single-use external-issuer JWT-assertion `jti` replay cache (issue #26).
+///
+/// REUSES the #25 client-assertion prune-then-insert single-use mechanism (a
+/// primary-key conflict on insert is a REPLAY, enforced across nodes because every
+/// node inserts into one shared table), but keyed by the EXTERNAL ISSUER rather than
+/// the OAuth client id, in a DISTINCT table, so an external issuer's `jti` can never
+/// collide with a client-assertion `jti`. Deliberately off the audited-write path (a
+/// security cache, not a business mutation), like the #25 cache and
+/// `idempotency_keys`, but still RLS-scoped.
+pub struct ExternalAssertionJtiRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl ExternalAssertionJtiRepo<'_> {
+    /// Record `jti` for external `issuer` as single-use in this scope, first pruning
+    /// any already-expired rows.
+    ///
+    /// `expires_at_micros` is the last instant the assertion could still be replayed
+    /// (its `exp` plus the configured skew plus one second; see the migration note),
+    /// so a pruned row can never remove a `jti` whose assertion is still acceptable.
+    /// The prune uses the application clock seam (`env`), never the database clock, so
+    /// it is deterministic under a manual clock in tests. Returns
+    /// [`JtiOutcome::Recorded`] on the first use and [`JtiOutcome::Replayed`] when the
+    /// `jti` was already present (a second use, from this or any other node).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn record(
+        &self,
+        env: &Env,
+        issuer: &str,
+        jti: &str,
+        expires_at_micros: i64,
+    ) -> Result<JtiOutcome, StoreError> {
+        let now_micros = epoch_micros(env.clock().now_utc());
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        // Prune rows whose last-replayable instant has passed. Only these are removed,
+        // so a still-valid assertion's jti is never dropped.
+        sqlx::query(
+            "DELETE FROM external_assertion_jtis \
+             WHERE tenant_id = $1 AND environment_id = $2 \
+             AND expires_at <= TIMESTAMPTZ 'epoch' + ($3::text || ' microseconds')::interval",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(now_micros)
+        .execute(&mut *tx)
+        .await?;
+        let result = sqlx::query(
+            "INSERT INTO external_assertion_jtis \
+             (tenant_id, environment_id, issuer, jti, expires_at) \
+             VALUES ($1, $2, $3, $4, \
+                     TIMESTAMPTZ 'epoch' + ($5::text || ' microseconds')::interval)",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(issuer)
+        .bind(jti)
+        .bind(expires_at_micros)
+        .execute(&mut *tx)
+        .await;
+        match result {
+            Ok(_) => {
+                tx.commit().await?;
+                Ok(JtiOutcome::Recorded)
+            }
+            // A primary-key conflict is a replay: the (issuer, jti) was already used.
+            Err(error) if is_unique_violation(&error) => {
+                tx.rollback().await?;
+                Ok(JtiOutcome::Replayed)
+            }
+            Err(error) => Err(error.into()),
+        }
     }
 }
 

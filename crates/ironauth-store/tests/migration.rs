@@ -242,13 +242,13 @@ async fn expand_contract_example_chain_runs_all_three_phases_and_contract_remove
     );
 }
 
-/// The PRODUCTION chain (`MigrationRunner::new`) contains exactly the eighteen
+/// The PRODUCTION chain (`MigrationRunner::new`) contains exactly the nineteen
 /// real migrations and leaves no throwaway demo object in a real database.
 // A long but linear ledger-and-table assertion sweep (one line per migration and
 // per real table); splitting it would not make it clearer.
 #[allow(clippy::too_many_lines)]
 #[tokio::test]
-async fn production_chain_is_only_the_eighteen_real_migrations_and_ships_no_demo_object() {
+async fn production_chain_is_only_the_nineteen_real_migrations_and_ships_no_demo_object() {
     // TestDatabase::start runs Store::migrate() (the production chain) on a
     // fresh, empty database.
     let db = TestDatabase::start().await;
@@ -265,19 +265,20 @@ async fn production_chain_is_only_the_eighteen_real_migrations_and_ships_no_demo
     );
     assert_eq!(
         report.already_applied(),
-        18,
-        "the production chain is exactly eighteen migrations (isolation, audit log, management \
+        19,
+        "the production chain is exactly nineteen migrations (isolation, audit log, management \
          API, OIDC authorization, signing keys, login/consent, authentication context, redirect \
          registration, UserInfo claims, consent scope upsert, resource servers, opaque access \
          tokens, client auth suite, dynamic client registration, pushed authorization requests, \
-         refresh tokens, client-credentials service accounts, DCR abuse controls)"
+         refresh tokens, client-credentials service accounts, DCR abuse controls, JWT bearer \
+         assertion grant)"
     );
 
-    // The ledger holds exactly versions 1 through 18.
+    // The ledger holds exactly versions 1 through 19.
     assert_eq!(
         applied_versions(pool).await,
         vec![
-            1_i64, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18
+            1_i64, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19
         ]
     );
     let phase_of = |version: i64| async move {
@@ -314,6 +315,9 @@ async fn production_chain_is_only_the_eighteen_real_migrations_and_ships_no_demo
     // expands (issue #31).
     assert_eq!(phase_of(17).await, "expand");
     assert_eq!(phase_of(18).await, "expand");
+    // Three CREATE TABLEs (the trust anchors, the subject-mapping rules, and the
+    // external-issuer jti replay cache) are all additive expands (issue #26).
+    assert_eq!(phase_of(19).await, "expand");
 
     // The demo object never reaches a production database.
     assert!(
@@ -559,6 +563,39 @@ async fn production_chain_is_only_the_eighteen_real_migrations_and_ships_no_demo
     assert!(
         column_exists(pool, "audit_log", "detail").await,
         "audit_log.detail exists"
+    );
+    // The JWT bearer assertion grant trust and mapping stores (issue #26): the
+    // registered external assertion issuers, the explicit subject-mapping rules, and
+    // the external-issuer single-use jti replay cache (distinct from the #25 client
+    // cache so an external jti cannot collide with a client-assertion jti).
+    assert!(
+        table_exists(pool, "external_assertion_issuers").await,
+        "external_assertion_issuers exists"
+    );
+    assert!(
+        table_exists(pool, "external_assertion_subject_mappings").await,
+        "external_assertion_subject_mappings exists"
+    );
+    assert!(
+        table_exists(pool, "external_assertion_jtis").await,
+        "external_assertion_jtis exists"
+    );
+    // The external-issuer jti cache is keyed by the ISSUER (not a client id), the
+    // distinct-table choice that keeps an external jti from colliding with a
+    // client-assertion jti.
+    assert!(
+        column_exists(pool, "external_assertion_jtis", "issuer").await,
+        "external_assertion_jtis is keyed by issuer"
+    );
+    // A registered issuer carries an enable switch and a key source.
+    assert!(
+        column_exists(pool, "external_assertion_issuers", "enabled").await,
+        "external_assertion_issuers.enabled exists"
+    );
+    // A subject-mapping rule maps to an explicit principal (never auto-provisioned).
+    assert!(
+        column_exists(pool, "external_assertion_subject_mappings", "principal").await,
+        "external_assertion_subject_mappings.principal exists"
     );
 }
 

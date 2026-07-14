@@ -263,6 +263,20 @@ name = "client_assertion"
 path = "tests/client_assertion.rs"
 required-features = ["testing"]
 
+# The JWT bearer assertion grant (issue #26, RFC 7521 4.1 / RFC 7523): a simulated
+# external issuer (inline jwks and jwks_uri key sources) exchanges an assertion for a
+# mapped-identity access token; the full negative matrix (unregistered/disabled
+# issuer, bad signature, expired, replayed jti, unmapped subject) is a uniform
+# invalid_grant with a recorded diagnostic; strict issuer-only aud rejects a
+# token-endpoint-audienced assertion; no refresh token; client auth fails
+# independently as invalid_client; and a SHARED aud-policy test proves the one knob
+# governs this grant and #25 client assertions identically. Over a real database with
+# a provisioned signing key.
+[[test]]
+name = "jwt_bearer"
+path = "tests/jwt_bearer.rs"
+required-features = ["testing"]
+
 # Dynamic Client Registration and configuration management (issue #30): omitted
 # metadata takes the per-spec defaults, an RFC 7592 update rotates and invalidates
 # the registration access token, native-client redirects follow RFC 8252, the RP

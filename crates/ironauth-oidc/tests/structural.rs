@@ -22,19 +22,21 @@
 use ironauth_oidc::{GrantType, PkceMethod, ResponseMode, ResponseType};
 
 #[test]
-fn grant_type_registry_expresses_authorization_code_refresh_token_and_client_credentials() {
-    // The whole registry is exactly three variants: the authorization-code grant,
-    // the refresh-token grant (issue #21), and the client-credentials grant (issue
-    // #23). No other grant type is representable (ROPC has no variant at all).
+fn grant_type_registry_expresses_the_four_serviced_grants_and_no_ropc() {
+    // The whole registry is exactly four variants: the authorization-code grant,
+    // the refresh-token grant (issue #21), the client-credentials grant (issue #23),
+    // and the JWT bearer assertion grant (issue #26). No other grant type is
+    // representable (ROPC has no variant at all).
     assert_eq!(
         GrantType::ALL,
         &[
             GrantType::AuthorizationCode,
             GrantType::RefreshToken,
             GrantType::ClientCredentials,
+            GrantType::JwtBearer,
         ]
     );
-    assert_eq!(GrantType::ALL.len(), 3);
+    assert_eq!(GrantType::ALL.len(), 4);
 
     // Every offered grant round-trips through its exact wire spelling.
     assert_eq!(
@@ -49,6 +51,10 @@ fn grant_type_registry_expresses_authorization_code_refresh_token_and_client_cre
         GrantType::parse("client_credentials"),
         Some(GrantType::ClientCredentials)
     );
+    assert_eq!(
+        GrantType::parse("urn:ietf:params:oauth:grant-type:jwt-bearer"),
+        Some(GrantType::JwtBearer)
+    );
 
     // Every forbidden or unknown grant type is unrepresentable: it parses to
     // None, so it can never resolve to a handler. ROPC is the headline case.
@@ -56,12 +62,14 @@ fn grant_type_registry_expresses_authorization_code_refresh_token_and_client_cre
         "password", // ROPC: structurally excluded.
         "implicit",
         "urn:ietf:params:oauth:grant-type:device_code",
-        "urn:ietf:params:oauth:grant-type:jwt-bearer",
+        // RFC 8693 token exchange is a separate M13 grant, not serviced here.
+        "urn:ietf:params:oauth:grant-type:token-exchange",
         "",
         "Authorization_Code", // casing is exact.
         "Refresh_Token",      // casing is exact.
         "Client_Credentials", // casing is exact.
         "clientcredentials",
+        "jwt-bearer", // the bare token is not the URN.
     ] {
         assert!(
             GrantType::parse(forbidden).is_none(),

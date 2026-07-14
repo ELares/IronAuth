@@ -83,6 +83,7 @@ mod interaction;
 mod introspection;
 mod issuer;
 mod jwks;
+mod jwt_bearer;
 mod login;
 mod pages;
 mod par;

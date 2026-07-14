@@ -6,6 +6,40 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- JWT bearer assertion grant trust and mapping stores (issue #26, migration 0019, expand).
+  - **New scoped tables.** `external_assertion_issuers` (the registered external
+    trust anchors the RFC 7521 / RFC 7523 jwt-bearer grant accepts assertions from,
+    each with an inline `jwks` XOR a `jwks_uri`, an optional signing-alg allowlist,
+    and an enable switch), `external_assertion_subject_mappings` (the explicit rules
+    mapping an external (issuer + `sub`), optionally gated on a claim, to an IronAuth
+    principal; reject-by-default, never auto-provisioned), and
+    `external_assertion_jtis` (the external-issuer single-use jti replay cache). All
+    three ENABLE + FORCE row-level security with the `(tenant, environment)`
+    isolation policy (USING + WITH CHECK) and are registered in
+    `scripts/query-audit.sh`.
+  - **Distinct external jti cache.** `external_assertion_jtis` REUSES the #25
+    client-assertion prune-then-insert single-use mechanism but is a DISTINCT table
+    keyed by the external ISSUER (not the OAuth client id), so an external issuer's
+    `jti` can never collide with a client-assertion `jti` (they live in separate
+    tables). It retains a jti to `exp + skew + 1s`, the same +1s margin the #25 cache
+    documents, so a prune never reopens a replay window.
+  - **Least-privilege grants (the #31 lesson).** The two configuration tables take
+    `GRANT SELECT, INSERT` (no table-wide UPDATE, which auto-extends to later
+    columns; no DELETE), and the jti cache takes `GRANT SELECT, INSERT, DELETE` (the
+    DELETE is the on-insert prune only), all to `ironauth_app`.
+  - **Repositories and audited writes.** `ExternalAssertionIssuerRepo` /
+    `AssertionSubjectMappingRepo` read the trust anchor and mapping at grant time;
+    the mutating `ActingExternalAssertionIssuerRepo::register` and
+    `ActingAssertionSubjectMappingRepo::create` route through the one audited-write
+    primitive (`external_assertion_issuer.register` /
+    `external_assertion_subject_mapping.create`). `ActingAuthorizationRepo` gains
+    `issue_jwt_bearer_assertion`, which shares the machine-grant + access-token
+    persistence with the client-credentials path but audits the distinct
+    `jwt_bearer_assertion.issue` verb, so a federated issuance is legible in the
+    trail as such. New `Action` variants back all three verbs.
+  - **New identifier kinds.** `xai_` (a registered external assertion issuer) and
+    `asm_` (a subject-mapping rule), both tenant-scoped and used as the row primary
+    key and the audit target.
 - Dynamic Client Registration abuse controls (issue #31, migration 0018, expand).
   - **New scoped tables.** `dcr_policies` (named, reusable policy-primitive chains),
     `dcr_initial_access_tokens` (SHA-256-hashed initial access tokens carrying a
