@@ -228,5 +228,15 @@ name = "live_wiring"
 path = "tests/live_wiring.rs"
 required-features = ["testing"]
 
+# JWT (RFC 9068) and opaque access tokens with per-resource-server format selection
+# (issue #29): the per-RS format choice from one environment, RFC 9068 typ/claims,
+# acr/auth_time from an authenticated flow, opaque tokens that resolve only via the
+# internal store function with no replayable stored material, the documented
+# prefix/regex, and EdDSA/ES256 verification. Over a real database.
+[[test]]
+name = "token_formats"
+path = "tests/token_formats.rs"
+required-features = ["testing"]
+
 [lints]
 workspace = true

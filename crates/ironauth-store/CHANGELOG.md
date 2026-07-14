@@ -6,6 +6,49 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Access-token formats: resource-server registry and opaque, digest-only access
+  tokens (issue #29).
+  - **New `resource_servers` table (migration 0011, expand).** A tenant-scoped
+    audience-to-format registry: `audience` (unique per environment), `token_format`
+    (`at_jwt` or `opaque`, CHECK-constrained), and an optional per-resource-server
+    `access_token_ttl_secs`. Isolated exactly like every other scoped table (ENABLE
+    + FORCE row-level security, the `(tenant, environment)` isolation policy with
+    USING + WITH CHECK, the nonempty-scope CHECK, isolation-preserving foreign keys),
+    with least-privilege `SELECT, INSERT` to `ironauth_app`. New `ResourceServerRepo`
+    (read `by_audience`) and audited-mutating `ActingResourceServerRepo` (`register`,
+    a `resource_server.register` audit row in the same transaction). A new `rsv_`
+    scoped identifier kind (`ResourceServerId`), a `TokenFormat` enum, and the
+    `resource_server.register` audit action.
+  - **New `opaque_access_tokens` table (migration 0012, expand).** The digest-only
+    store for opaque reference tokens: `token_digest` (SHA-256 hex, PRIMARY KEY, the
+    lookup key), plus `subject`, `client_id`, `audience`, `scope`, `jti`, an optional
+    `grant_id` (the revocation spine, where applicable), and `expires_at`. The token
+    PLAINTEXT is never stored, only its digest, so a database dump contains nothing
+    replayable as a valid token. Same forced-RLS + isolation-policy + least-privilege
+    (`SELECT, INSERT`) discipline. New `NewOpaqueAccessToken` write input,
+    `ActiveOpaqueToken` result, and the exported `opaque_access_token_digest` helper
+    (the ONE canonical digest so the mint and the resolve can never disagree).
+    `ActiveOpaqueToken` now also returns `expires_at_unix_micros` (the token's `exp`)
+    and `issued_at_unix_micros` (its `iat`, from the row's `created_at`), read back as
+    exact epoch microseconds, so the RFC 7662 introspection response (issue #22) the
+    resolve seam feeds is complete; the resolve semantics are unchanged (an expired
+    token still resolves to `None`).
+  - **`AuthorizationRepo::resolve_opaque_access_token`.** The INTERNAL resolve the
+    RFC 7662 introspection endpoint (issue #22) will expose: it hashes the presented
+    token and matches it against `token_digest` within scope, returning the live
+    claims only when the row exists, its grant (when present) is not revoked, and it
+    has not expired at the supplied clock-seam instant. There is no offline
+    validation path for opaque tokens.
+  - **`ActingAuthorizationRepo::redeem` records an opaque access token.** It now
+    takes an `opaque: Option<NewOpaqueAccessToken>` and, on the winning consume,
+    inserts the digest-only row in the SAME transaction as the code consume and the
+    redeem audit (binding it to the consumed code's grant, so grant-chain revocation
+    reaches it exactly as it reaches an at+jwt jti). The existing at+jwt path is
+    unchanged (`opaque = None`).
+  - **`scripts/query-audit.sh`** now lists `resource_servers` and
+    `opaque_access_tokens` among the scoped tables, and the production-chain guard
+    test expects twelve migrations (versions 1..=12, both new ones `expand`).
+
 - Scope-aware consent (issue #196), a hard prerequisite for enabling OIDC
   (issue #13).
   - **`ConsentRepo::granted_ref` now returns the granted scope.** Its return type

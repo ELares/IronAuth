@@ -24,11 +24,12 @@ use std::time::{Duration, SystemTime};
 use ironauth_config::OidcConfig;
 use ironauth_env::Env;
 use ironauth_jose::{JwsAlgorithm, TrustedKey, VerificationPolicy, VerifiedToken, verify};
-use ironauth_store::{Scope, Store};
+use ironauth_store::{Scope, Store, TokenFormat};
 
 use crate::issuer::{IssuerEntry, IssuerRegistry};
 use crate::registry::{ResponseMode, ResponseType};
 use crate::subject::{PairwiseSalt, SubjectCache, SubjectConfig};
+use crate::tokens::AccessTokenTarget;
 
 /// Cheaply cloneable state shared by every OIDC handler.
 #[derive(Clone)]
@@ -52,6 +53,10 @@ struct Inner {
     issuer_base: String,
     code_ttl: Duration,
     access_token_ttl: Duration,
+    // The access-token format this environment mints when no resource server is
+    // targeted (issue #29). A registered resource server overrides it per audience.
+    // The spec-conform default is `at_jwt`, which keeps UserInfo working.
+    default_access_token_format: TokenFormat,
     reuse_grace: Duration,
     session_ttl: Duration,
     // The per-environment PKCE policy for CONFIDENTIAL clients (issue #13). A
@@ -115,6 +120,7 @@ impl OidcState {
                 issuer_base: issuer_base.into(),
                 code_ttl: Duration::from_secs(config.authorization_code_ttl_secs),
                 access_token_ttl: Duration::from_secs(config.access_token_ttl_secs),
+                default_access_token_format: map_token_format(config.default_access_token_format),
                 reuse_grace: Duration::from_secs(config.reuse_grace_secs),
                 session_ttl: Duration::from_secs(config.session_ttl_secs),
                 require_pkce_for_confidential: config.require_pkce_for_confidential_clients,
@@ -191,6 +197,66 @@ impl OidcState {
     #[must_use]
     pub fn access_token_ttl(&self) -> Duration {
         self.inner.access_token_ttl
+    }
+
+    /// The environment's default access-token format (issue #29): the format used
+    /// when no resource server is targeted. `at_jwt` by default.
+    #[must_use]
+    pub fn default_access_token_format(&self) -> TokenFormat {
+        self.inner.default_access_token_format
+    }
+
+    /// Resolve the access-token target (audience, format, lifetime) for an exchange
+    /// (issue #29): the SELECTION seam issue #28 feeds.
+    ///
+    /// When `resource` names a registered resource server's `audience` in this
+    /// scope, its `token_format` and `access_token_ttl_secs` (falling back to the
+    /// environment default lifetime when the resource server left it unset) apply,
+    /// and the token's `aud` becomes that resource server's audience. Otherwise the
+    /// environment default applies: the token's `aud` is the `client_id` (so
+    /// `UserInfo`'s `aud == client` check keeps working), the format is the
+    /// environment default, and the lifetime is the environment access-token
+    /// lifetime.
+    ///
+    /// The full RFC 8707 `resource` REQUEST-parameter wiring is issue #28; today
+    /// the token endpoint passes `resource = None`, so this resolves to the
+    /// environment default. Taking the resolved audience here (rather than the
+    /// request) is what lets #28 feed the `resource` parameter without reshaping
+    /// the pure mint. A store read failure while looking up a resource server is
+    /// treated as "no matching resource server" (the environment default applies),
+    /// so a transient database blip never fails an otherwise-valid exchange or
+    /// silently changes the audience.
+    pub async fn resolve_access_token_target(
+        &self,
+        scope: &Scope,
+        resource: Option<&str>,
+        client_id: &str,
+    ) -> AccessTokenTarget {
+        if let Some(audience) = resource {
+            if let Ok(Some(server)) = self
+                .inner
+                .store
+                .scoped(*scope)
+                .resource_servers()
+                .by_audience(audience)
+                .await
+            {
+                let ttl = server
+                    .access_token_ttl_secs
+                    .and_then(|secs| u64::try_from(secs).ok())
+                    .map_or(self.inner.access_token_ttl, Duration::from_secs);
+                return AccessTokenTarget {
+                    audience: server.audience,
+                    format: server.token_format,
+                    ttl,
+                };
+            }
+        }
+        AccessTokenTarget {
+            audience: client_id.to_owned(),
+            format: self.inner.default_access_token_format,
+            ttl: self.inner.access_token_ttl,
+        }
     }
 
     /// The configured reuse grace window for an already-consumed code. A second
@@ -437,6 +503,16 @@ pub(crate) fn origin_of(url: &str) -> Option<String> {
 /// may be dropped from a canonical origin.
 fn is_default_port(scheme: &str, port: &str) -> bool {
     matches!((scheme, port), ("https", "443") | ("http", "80"))
+}
+
+/// Map the config-layer access-token format onto the store-layer one (issue #29).
+/// Two enums (one per crate boundary) keep the config contract and the store type
+/// independent; this is the single crossing point.
+fn map_token_format(format: ironauth_config::TokenFormat) -> TokenFormat {
+    match format {
+        ironauth_config::TokenFormat::AtJwt => TokenFormat::AtJwt,
+        ironauth_config::TokenFormat::Opaque => TokenFormat::Opaque,
+    }
 }
 
 #[cfg(test)]

@@ -156,6 +156,9 @@ pub enum Action {
     /// A per-environment signing key was provisioned (issue #19). Covers both a
     /// day-one key and a manually rotated-in successor.
     SigningKeyProvision,
+    /// A resource server was registered (issue #29). Records the audience and the
+    /// access-token format a registered protected API receives.
+    ResourceServerRegister,
 }
 
 impl Action {
@@ -180,6 +183,7 @@ impl Action {
             Action::SessionCreate => "session.create",
             Action::ConsentGrant => "consent.grant",
             Action::SigningKeyProvision => "signing_key.provision",
+            Action::ResourceServerRegister => "resource_server.register",
         }
     }
 }

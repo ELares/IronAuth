@@ -56,7 +56,8 @@ use crate::audit::{ActingContext, Action, ActorRef};
 use crate::error::StoreError;
 use crate::id::{
     AuditId, AuditTarget, AuthorizationCodeId, ClientId, ConsentId, CorrelationId, EnvironmentId,
-    GrantId, IssuedTokenId, ManagementKeyId, OperatorId, SessionId, SigningKeyId, TenantId, UserId,
+    GrantId, IssuedTokenId, ManagementKeyId, OperatorId, ResourceServerId, SessionId, SigningKeyId,
+    TenantId, UserId,
 };
 use crate::scope::Scope;
 use crate::store::Store;
@@ -152,6 +153,17 @@ impl<'a> ScopedStore<'a> {
         }
     }
 
+    /// The read-only resource-server repository for this scope (issue #29). Reads
+    /// a registered resource server by audience so the mint can select its
+    /// access-token format; registration lives on [`ActingStore::resource_servers`].
+    #[must_use]
+    pub fn resource_servers(&self) -> ResourceServerRepo<'a> {
+        ResourceServerRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
     /// Enter an acting context (who is acting, and under which correlation id).
     /// The returned store hands out the *mutating* repositories, so every write
     /// carries an actor and a correlation id into its audit row.
@@ -237,6 +249,18 @@ impl<'a> ActingStore<'a> {
     #[must_use]
     pub fn signing_keys(&self) -> ActingSigningKeyRepo<'a> {
         ActingSigningKeyRepo {
+            store: self.store,
+            scope: self.scope,
+            acting: self.acting,
+        }
+    }
+
+    /// The mutating resource-server repository for this scope and actor (issue
+    /// #29): register a resource server (its audience, token format, and optional
+    /// lifetime), audited in the same transaction.
+    #[must_use]
+    pub fn resource_servers(&self) -> ActingResourceServerRepo<'a> {
+        ActingResourceServerRepo {
             store: self.store,
             scope: self.scope,
             acting: self.acting,
@@ -1084,6 +1108,67 @@ impl AuthorizationRepo<'_> {
             active: row.get("active"),
         }))
     }
+
+    /// Resolve a presented OPAQUE access token back to its live claims (issue
+    /// #29), within scope. This is the INTERNAL resolve the RFC 7662 introspection
+    /// endpoint (issue #22) will expose over HTTP: there is NO offline validation
+    /// path for an opaque token, so verification is exclusively this store lookup.
+    ///
+    /// The presented token is hashed with [`opaque_access_token_digest`] and
+    /// matched against the stored `token_digest` within the caller's scope, so a
+    /// token minted in one environment never resolves under another (the query
+    /// filters on the caller's `(tenant, environment)` and forced row-level
+    /// security sits beneath). Returns the claims ONLY when the row exists, its
+    /// grant (when present) is not revoked, and it has not expired at `now_micros`
+    /// (compared against the application clock seam, never the database clock);
+    /// otherwise [`None`]. The digest, not the token, is stored, so a leaked
+    /// database row cannot be replayed as a valid token.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn resolve_opaque_access_token(
+        &self,
+        presented_token: &str,
+        now_micros: i64,
+    ) -> Result<Option<ActiveOpaqueToken>, StoreError> {
+        let digest = opaque_access_token_digest(presented_token);
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        // LEFT JOIN grants so a token with no grant (grant_id NULL) still resolves,
+        // while a token whose grant chain was revoked comes back inactive. Expiry is
+        // compared against the application clock (bound as epoch microseconds).
+        // expires_at/created_at are read back as epoch microseconds (an exact bigint
+        // on PostgreSQL 14+, where EXTRACT(EPOCH ...) is numeric), so the seam issue
+        // #22's introspection response consumes carries the token's `exp` and `iat`.
+        let row = sqlx::query(
+            "SELECT t.subject AS subject, t.client_id AS client_id, t.audience AS audience, \
+             t.scope AS scope, t.jti AS jti, \
+             (EXTRACT(EPOCH FROM t.expires_at) * 1000000)::bigint AS expires_us, \
+             (EXTRACT(EPOCH FROM t.created_at) * 1000000)::bigint AS issued_us \
+             FROM opaque_access_tokens t \
+             LEFT JOIN grants g ON g.id = t.grant_id \
+             AND g.tenant_id = t.tenant_id AND g.environment_id = t.environment_id \
+             WHERE t.token_digest = $1 AND t.tenant_id = $2 AND t.environment_id = $3 \
+             AND t.expires_at > TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval \
+             AND (t.grant_id IS NULL OR g.revoked_at IS NULL)",
+        )
+        .bind(&digest)
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(now_micros)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(row.map(|row| ActiveOpaqueToken {
+            subject: row.get("subject"),
+            client_id: row.get("client_id"),
+            audience: row.get("audience"),
+            scope: row.get("scope"),
+            jti: row.get("jti"),
+            expires_at_unix_micros: row.get("expires_us"),
+            issued_at_unix_micros: row.get("issued_us"),
+        }))
+    }
 }
 
 /// The mutating OIDC authorization repository (issue #12). Reachable only through
@@ -1244,11 +1329,18 @@ impl ActingAuthorizationRepo<'_> {
         code_id: &AuthorizationCodeId,
         grant_id: &GrantId,
         tokens: &[IssuedTokenRecord],
+        opaque: Option<NewOpaqueAccessToken<'_>>,
         reuse_grace: Duration,
     ) -> Result<RedeemOutcome, StoreError> {
         if code_id.scope() != self.scope
             || grant_id.scope() != self.scope
             || tokens.iter().any(|t| t.id.scope() != self.scope)
+            || opaque.as_ref().is_some_and(|opaque| {
+                opaque.jti.scope() != self.scope
+                    || opaque
+                        .grant_id
+                        .is_some_and(|grant| grant.scope() != self.scope)
+            })
         {
             return Err(StoreError::NotFound);
         }
@@ -1287,6 +1379,32 @@ impl ActingAuthorizationRepo<'_> {
                 .bind(scope.environment().to_string())
                 .bind(&grant_text)
                 .bind(token.kind.as_str())
+                .execute(&mut *tx)
+                .await?;
+            }
+            // An opaque access token (issue #29) records ONLY its digest and
+            // metadata here, in the SAME transaction as the consume, so it can no
+            // more be handed out without its stored row than an at+jwt jti can. The
+            // grant is the consumed code's grant (grant_text), so grant-chain
+            // revocation reaches the opaque token exactly as it reaches an at+jwt.
+            if let Some(opaque) = &opaque {
+                sqlx::query(
+                    "INSERT INTO opaque_access_tokens \
+                     (token_digest, tenant_id, environment_id, grant_id, subject, \
+                      client_id, audience, scope, jti, expires_at) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, \
+                             TIMESTAMPTZ 'epoch' + ($10::text || ' microseconds')::interval)",
+                )
+                .bind(opaque.token_digest)
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(&grant_text)
+                .bind(opaque.subject)
+                .bind(opaque.client_id)
+                .bind(opaque.audience)
+                .bind(opaque.scope)
+                .bind(opaque.jti.to_string())
+                .bind(opaque.expires_at_unix_micros)
                 .execute(&mut *tx)
                 .await?;
             }
@@ -1744,6 +1862,306 @@ fn signing_key_from_row(row: &PgRow, scope: &Scope) -> Result<SigningKeyRecord, 
         retire_at_unix_micros: row.get("retire_us"),
         expire_at_unix_micros: row.get("expire_us"),
     })
+}
+
+// ===========================================================================
+// Resource servers and opaque access tokens (issue #29).
+//
+// The persistence half of per-resource-server access-token formats: a registry
+// mapping an audience to the token format that resource server receives, and the
+// digest-only store for opaque reference tokens. Both are tenant-scoped rows
+// isolated exactly like every other data-plane table, reached only through the
+// scoped repository (ironauth_app), so the format selection and the opaque-token
+// resolve are structurally scope-bound like every other read.
+// ===========================================================================
+
+/// The access-token format a resource server receives (issue #29).
+///
+/// An `at+jwt` is a self-contained RFC 9068 signed JWT; an opaque token is a
+/// random reference token whose state lives only in the store (digest-only). The
+/// mint selects the format from the targeted resource server, defaulting to the
+/// environment default when no resource server is targeted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TokenFormat {
+    /// An RFC 9068 `at+jwt` signed access token.
+    AtJwt,
+    /// An opaque, digest-only reference access token.
+    Opaque,
+}
+
+impl TokenFormat {
+    /// The stable wire string recorded in `resource_servers.token_format`.
+    #[must_use]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            TokenFormat::AtJwt => "at_jwt",
+            TokenFormat::Opaque => "opaque",
+        }
+    }
+
+    /// Parse a stored `token_format` value. Returns [`None`] for an unknown value
+    /// (a row a newer build wrote), so the caller fails closed rather than
+    /// guessing a format.
+    #[must_use]
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "at_jwt" => Some(TokenFormat::AtJwt),
+            "opaque" => Some(TokenFormat::Opaque),
+            _ => None,
+        }
+    }
+}
+
+/// A resource server read back from the `resource_servers` table, always within
+/// scope (issue #29). The mint reads it by audience to select the access-token
+/// format and lifetime a registered protected API receives.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResourceServerRecord {
+    /// The `rsv_` identifier (embeds its tenant and environment).
+    pub id: ResourceServerId,
+    /// The resource-server identifier / resource URI a token targets.
+    pub audience: String,
+    /// The access-token format this resource server receives.
+    pub token_format: TokenFormat,
+    /// The per-resource-server access-token lifetime in seconds, or [`None`] to
+    /// fall back to the environment default lifetime.
+    pub access_token_ttl_secs: Option<i64>,
+}
+
+/// A resource server to register (issue #29). The `id` is minted under the
+/// caller's scope; the `audience` is unique per environment.
+#[derive(Debug, Clone, Copy)]
+pub struct NewResourceServer<'a> {
+    /// The `rsv_` identifier, minted under this scope.
+    pub id: &'a ResourceServerId,
+    /// The resource-server identifier / resource URI a token targets.
+    pub audience: &'a str,
+    /// The access-token format this resource server receives.
+    pub token_format: TokenFormat,
+    /// The per-resource-server access-token lifetime in seconds, or [`None`] for
+    /// the environment default.
+    pub access_token_ttl_secs: Option<i64>,
+}
+
+/// The read-only resource-server repository (issue #29).
+pub struct ResourceServerRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl ResourceServerRepo<'_> {
+    /// Fetch a resource server by its `audience` within scope, or [`None`] when no
+    /// resource server with that audience is registered in this scope (absent, or
+    /// belonging to another tenant or environment: the outcomes are
+    /// indistinguishable). The mint calls this to select the access-token format
+    /// for a targeted resource/audience.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure, or if a stored row fails
+    /// to decode (an unknown token format).
+    pub async fn by_audience(
+        &self,
+        audience: &str,
+    ) -> Result<Option<ResourceServerRecord>, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT id, audience, token_format, access_token_ttl_secs FROM resource_servers \
+             WHERE audience = $1 AND tenant_id = $2 AND environment_id = $3",
+        )
+        .bind(audience)
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        match row {
+            None => Ok(None),
+            Some(row) => Ok(Some(resource_server_from_row(&row, &self.scope)?)),
+        }
+    }
+}
+
+/// The mutating resource-server repository (issue #29). Reachable only through
+/// [`ScopedStore::acting`], so every registration carries an actor and
+/// correlation id and routes through the audited-write primitive.
+pub struct ActingResourceServerRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+    acting: ActingContext,
+}
+
+impl ActingResourceServerRepo<'_> {
+    /// Register a resource server and audit `resource_server.register` in the same
+    /// transaction, returning nothing (the caller minted the id).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the identifier is out of this scope;
+    /// [`StoreError::Conflict`] if the audience is already registered in this
+    /// environment; [`StoreError::Database`] on a persistence failure.
+    pub async fn register(
+        &self,
+        env: &Env,
+        server: NewResourceServer<'_>,
+    ) -> Result<(), StoreError> {
+        if server.id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::ResourceServerRegister,
+                target: server.id,
+            },
+            async move |tx| {
+                let result = sqlx::query(
+                    "INSERT INTO resource_servers \
+                     (id, tenant_id, environment_id, audience, token_format, access_token_ttl_secs) \
+                     VALUES ($1, $2, $3, $4, $5, $6)",
+                )
+                .bind(server.id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(server.audience)
+                .bind(server.token_format.as_str())
+                .bind(server.access_token_ttl_secs)
+                .execute(&mut **tx)
+                .await;
+                match result {
+                    Ok(_) => Ok(()),
+                    // A duplicate audience is a caller-facing conflict (the audience
+                    // is taken), not a persistence fault. Erroring here rolls the
+                    // audited write back, so a rejected registration leaves neither a
+                    // resource-server row nor an audit row.
+                    Err(error) if is_unique_violation(&error) => Err(StoreError::Conflict),
+                    Err(error) => Err(error.into()),
+                }
+            },
+            false,
+        )
+        .await
+    }
+}
+
+/// Reconstruct a [`ResourceServerRecord`] from a row read within scope.
+fn resource_server_from_row(
+    row: &PgRow,
+    scope: &Scope,
+) -> Result<ResourceServerRecord, StoreError> {
+    let id_text: String = row.get("id");
+    let id = ResourceServerId::parse_in_scope(&id_text, scope)?;
+    let format_text: String = row.get("token_format");
+    let token_format = TokenFormat::parse(&format_text).ok_or_else(|| {
+        StoreError::Database(sqlx::Error::Decode(
+            format!("unknown resource-server token format: {format_text}").into(),
+        ))
+    })?;
+    Ok(ResourceServerRecord {
+        id,
+        audience: row.get("audience"),
+        token_format,
+        access_token_ttl_secs: row.get("access_token_ttl_secs"),
+    })
+}
+
+/// An opaque access token to record, digest-only (issue #29). The plaintext token
+/// is NEVER carried here: only its SHA-256 hex `token_digest` (compute it with
+/// [`opaque_access_token_digest`]) plus the token's metadata. `Debug` redacts the
+/// end-user subject.
+#[derive(Clone, Copy)]
+pub struct NewOpaqueAccessToken<'a> {
+    /// The SHA-256 hex digest of the token (the lookup key). NEVER the plaintext.
+    pub token_digest: &'a str,
+    /// The grant this token was issued from (the revocation spine), where
+    /// applicable.
+    pub grant_id: Option<&'a GrantId>,
+    /// The authenticated end-user subject.
+    pub subject: &'a str,
+    /// The OAuth client the token belongs to.
+    pub client_id: &'a str,
+    /// The audience the token targets (a resource server's audience or the client
+    /// id).
+    pub audience: &'a str,
+    /// The granted OAuth scope value, if any.
+    pub scope: Option<&'a str>,
+    /// The token's logical identifier (a `tok_` scoped id).
+    pub jti: &'a IssuedTokenId,
+    /// The token's expiry, in microseconds since the Unix epoch (clock seam).
+    pub expires_at_unix_micros: i64,
+}
+
+impl fmt::Debug for NewOpaqueAccessToken<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("NewOpaqueAccessToken")
+            .field("jti", &self.jti)
+            .field("client_id", &self.client_id)
+            .field("audience", &self.audience)
+            .field("expires_at_unix_micros", &self.expires_at_unix_micros)
+            .finish_non_exhaustive()
+    }
+}
+
+/// An opaque access token resolved from a presented token back to its live claims
+/// (issue #29). Returned by [`AuthorizationRepo::resolve_opaque_access_token`],
+/// the INTERNAL resolve the RFC 7662 introspection endpoint (issue #22) will
+/// expose. `Debug` redacts the end-user subject.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ActiveOpaqueToken {
+    /// The authenticated end-user subject.
+    pub subject: String,
+    /// The OAuth client the token belongs to.
+    pub client_id: String,
+    /// The audience the token targets.
+    pub audience: String,
+    /// The granted OAuth scope value, if any.
+    pub scope: Option<String>,
+    /// The token's logical identifier (a `tok_` id string).
+    pub jti: String,
+    /// The token's expiry, in microseconds since the Unix epoch (the clock seam
+    /// value the row was written with). The RFC 7662 introspection response (issue
+    /// #22) reports this as `exp`. Reading it does NOT change the resolve semantics:
+    /// an expired token still resolves to [`None`] (the query filters on `expires_at`
+    /// against the caller's `now_micros`), so this field is always in the future of
+    /// the `now_micros` that resolved the token.
+    pub expires_at_unix_micros: i64,
+    /// The token's issuance time, in microseconds since the Unix epoch, read from the
+    /// row's `created_at`. The introspection response (issue #22) reports this as
+    /// `iat`.
+    pub issued_at_unix_micros: i64,
+}
+
+impl fmt::Debug for ActiveOpaqueToken {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ActiveOpaqueToken")
+            .field("client_id", &self.client_id)
+            .field("audience", &self.audience)
+            .field("jti", &self.jti)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The SHA-256 hex digest of an opaque token, the lookup key stored in
+/// `opaque_access_tokens.token_digest` (issue #29).
+///
+/// The one canonical digest for the format: the mint hashes the token with this
+/// to store it, and [`AuthorizationRepo::resolve_opaque_access_token`] hashes the
+/// presented token with this to look it up, so the two can never disagree. The
+/// plaintext token never reaches the database; only this one-way digest does.
+#[must_use]
+pub fn opaque_access_token_digest(token: &str) -> String {
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write as _;
+    let digest = Sha256::digest(token.as_bytes());
+    let mut out = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
 }
 
 /// Reconstruct [`CodeBindings`] from a consumed-code row.

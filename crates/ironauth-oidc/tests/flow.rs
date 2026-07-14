@@ -384,7 +384,7 @@ async fn a_code_from_another_scope_cannot_be_redeemed() {
             CorrelationId::generate(harness.env()),
         )
         .authorization()
-        .redeem(harness.env(), &code_id, &grant_b, &[], Duration::ZERO)
+        .redeem(harness.env(), &code_id, &grant_b, &[], None, Duration::ZERO)
         .await;
     assert!(
         matches!(outcome, Err(StoreError::NotFound)),
@@ -410,7 +410,7 @@ async fn a_code_from_another_scope_cannot_be_redeemed() {
             CorrelationId::generate(harness.env()),
         )
         .authorization()
-        .redeem(harness.env(), &code_id, &grant_a, &[], Duration::ZERO)
+        .redeem(harness.env(), &code_id, &grant_a, &[], None, Duration::ZERO)
         .await
         .expect("redeem in own scope");
     assert!(matches!(good, RedeemOutcome::Consumed));

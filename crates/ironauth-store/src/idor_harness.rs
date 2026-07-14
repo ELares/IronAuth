@@ -358,7 +358,7 @@ impl IsolationProbe for AuthorizationCodeRedeemProbe {
             // foreign code never gets this far (parse_code_id above denies it).
             let grant_id = GrantId::generate(&env, &caller);
             match authorization
-                .redeem(&env, &code_id, &grant_id, &[], Duration::ZERO)
+                .redeem(&env, &code_id, &grant_id, &[], None, Duration::ZERO)
                 .await
             {
                 // Any outcome that shows the code existed (consumed now, a benign

@@ -106,6 +106,24 @@ name = "signing_keys"
 path = "tests/signing_keys.rs"
 required-features = ["testing"]
 
+# Resource-server registry persistence and isolation (issue #29): the
+# audience-to-format registry round-trips both formats, is scope-isolated, rejects
+# a duplicate audience per environment, and audits registration. Needs a real
+# database (DATABASE_URL).
+[[test]]
+name = "resource_servers"
+path = "tests/resource_servers.rs"
+required-features = ["testing"]
+
+# Opaque access-token storage, resolution, and dump safety (issue #29): digest-only
+# recording in the redeem transaction, resolve to live claims, revocation and
+# expiry flipping it inactive, cross-scope denial, and a simulated database-dump
+# proof that no stored material is replayable. Needs a real database (DATABASE_URL).
+[[test]]
+name = "opaque_access_tokens"
+path = "tests/opaque_access_tokens.rs"
+required-features = ["testing"]
+
 # Compile-fail proofs. Database-free, so it runs on every lane (including MSRV).
 [[test]]
 name = "compile_fail"

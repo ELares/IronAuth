@@ -6,6 +6,15 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Add `oidc.default_access_token_format` (issue #29), a `TokenFormat` enum
+  (`at_jwt` or `opaque`) selecting the access-token format an environment mints
+  when no resource server is targeted. The spec-conform default (`at_jwt`) mints a
+  self-contained RFC 9068 signed JWT whose audience is the client id, so `UserInfo`
+  and offline verification keep working; `opaque` mints a random, digest-only
+  reference token. A promotable per-environment setting; a registered resource
+  server overrides it per audience. The generated `docs/config-schema.json` and
+  `docs/CONFIG.md` are regenerated.
+
 - Add the legacy response-type toggles (issue #17, all default `false`):
   `oidc.enable_response_type_id_token`, `oidc.enable_response_type_code_id_token`,
   `oidc.enable_response_type_none`, and `oidc.enable_response_mode_form_post`. Each

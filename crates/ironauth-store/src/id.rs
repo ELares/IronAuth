@@ -212,6 +212,18 @@ impl ScopedKind for SigningKeyKind {
     const PREFIX: &'static str = "sik";
 }
 
+/// Marker for a resource server (`rsv_`), a registered protected API that OAuth
+/// access tokens are minted FOR (issue #29). A tenant-scoped resource: the
+/// identifier embeds its `(tenant, environment)`, so a resource-server row can
+/// never be read across a tenant or environment boundary. The resource server's
+/// `audience` (its resource identifier) is what selects the access-token format
+/// the mint emits for it. Not a bearer secret, so its debug form stays legible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ResourceServerKind;
+impl ScopedKind for ResourceServerKind {
+    const PREFIX: &'static str = "rsv";
+}
+
 /// Marker for a human actor (an interactive user). One of the three actor kinds
 /// an audit envelope can name (see [`crate::audit::ActorRef`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -394,6 +406,10 @@ pub type ConsentId = ScopedId<ConsentKind>;
 /// A signing-key identifier (`sik_...`), which doubles as the JOSE `kid` of a
 /// per-environment signing key (issue #19).
 pub type SigningKeyId = ScopedId<SigningKeyKind>;
+/// A resource-server identifier (`rsv_...`), a registered protected API that
+/// access tokens are minted for (issue #29). Its `audience` selects the token
+/// format the mint emits.
+pub type ResourceServerId = ScopedId<ResourceServerKind>;
 
 impl<K: ScopedKind> ScopedId<K> {
     /// Mint a fresh scoped identifier under `scope`, drawing the unique

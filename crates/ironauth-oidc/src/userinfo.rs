@@ -25,6 +25,30 @@
 //!
 //! # How a token is resolved
 //!
+//! The access token comes in two formats (issue #29), and `UserInfo` consumes
+//! both. The format is told apart by the presented token's prefix: an opaque
+//! reference token carries the `ira_at_` prefix; anything else is a compact
+//! `at+jwt` JWS. Both formats fail the SAME uniform `invalid_token` `401`, so
+//! nothing distinguishes an opaque-but-unknown token from a malformed JWS.
+//!
+//! ## The opaque token
+//!
+//! An opaque `ira_at_` token (an environment or resource server may select it)
+//! carries no self-contained claims: its ONLY authority is the store. It
+//! SELF-DECLARES its `(tenant, environment)` scope through an embedded routing
+//! handle (its own `jti`, a scoped id), exactly as an at+jwt's `jti` does, so this
+//! GLOBAL endpoint can recover the scope and run the SCOPE-BOUND resolve
+//! ([`ironauth_store::AuthorizationRepo::resolve_opaque_access_token`], forced
+//! row-level security beneath). The resolve honors expiry and grant-chain
+//! revocation and matches the digest of the WHOLE token, so a forged handle, an
+//! expired token, a revoked grant, or a cross-scope presentation all resolve to
+//! nothing. On success `UserInfo` enforces the SAME checks it enforces for an
+//! at+jwt: `aud == client` (the confused-deputy check, so a resource-server token
+//! is refused) and the `openid` scope, and derives `sub` through the ONE shared
+//! subject function from the resolved LOCAL subject.
+//!
+//! ## The `at+jwt`
+//!
 //! The access token is a signed `at+jwt` JWS whose authoritative state lives in
 //! the store (grant-chain revocation cannot be expressed in the JWT itself). So
 //! resolution uses BOTH halves:
@@ -49,12 +73,13 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use ironauth_store::{AccessTokenResolution, IssuedTokenId};
+use ironauth_store::{AccessTokenResolution, IssuedTokenId, Scope};
 use serde_json::{Map, Value};
 
 use crate::claims_request::ClaimsRequest;
 use crate::scope_claims::{assemble_claims, parse_scope_set};
 use crate::state::OidcState;
+use crate::tokens::{OPAQUE_ACCESS_TOKEN_DELIMITER, OPAQUE_ACCESS_TOKEN_PREFIX};
 
 /// The realm named in every `WWW-Authenticate` challenge.
 const REALM: &str = "ironauth";
@@ -144,6 +169,15 @@ async fn resolve(
     // The access token, taken ONLY from the Authorization header.
     let token = bearer_token(headers)?;
 
+    // Branch on the token FORMAT (issue #29). An opaque reference token is told
+    // apart by its `ira_at_` prefix and validated ONLY by the internal store
+    // resolve; anything else is an at+jwt validated by JWS verification plus the
+    // store. Both fail the SAME uniform invalid_token, so the branch reveals
+    // nothing about which format a rejected token was.
+    if token.starts_with(OPAQUE_ACCESS_TOKEN_PREFIX) {
+        return resolve_opaque(state, &token).await;
+    }
+
     // 1. Read the jti (an opaque handle) and recover its embedded scope. A token
     //    whose payload is unreadable, or whose jti is not a scoped token id, is a
     //    uniform invalid_token.
@@ -204,6 +238,88 @@ async fn resolve(
     released.insert("sub".to_owned(), Value::String(sub));
 
     Ok(released)
+}
+
+/// Resolve a presented OPAQUE access token (issue #29) and build the released claim
+/// set, or the precise challenge. The opaque token's ONLY authority is the store,
+/// so this is a single scope-bound resolve, with the SAME checks and the SAME
+/// uniform failures as the at+jwt path.
+async fn resolve_opaque(
+    state: &OidcState,
+    token: &str,
+) -> Result<Map<String, Value>, UserInfoError> {
+    // Recover the scope the token declares in its routing handle. An unreadable
+    // handle is a uniform invalid_token; the scope is only a lookup key and is
+    // CONFIRMED by the scope-bound resolve (forced row-level security beneath), so
+    // a forged handle resolves to nothing.
+    let scope = opaque_token_scope(token).ok_or(UserInfoError::InvalidToken)?;
+
+    // The single authority: the digest-only store resolve, SCOPE-BOUND. None covers
+    // absent / expired / revoked-grant / cross-scope, all the SAME invalid_token the
+    // at+jwt path returns, with no distinguishing oracle.
+    let active = state
+        .store()
+        .scoped(scope)
+        .authorization()
+        .resolve_opaque_access_token(token, epoch_micros(state))
+        .await
+        .map_err(|_| UserInfoError::ServerError)?
+        .ok_or(UserInfoError::InvalidToken)?;
+
+    // Confused-deputy: the token must have been minted for the CLIENT itself
+    // (aud == client), not for a resource server. A resource-server opaque token is
+    // not a UserInfo credential, exactly as the at+jwt verify enforces aud == client
+    // through the resolved client as the expected audience.
+    if active.audience != active.client_id {
+        return Err(UserInfoError::InvalidToken);
+    }
+
+    // UserInfo requires the openid scope (OIDC Core 5.3.1); its absence is the SAME
+    // insufficient_scope the at+jwt path returns.
+    let granted = parse_scope_set(active.scope.as_deref());
+    if !granted.contains(REQUIRED_SCOPE) {
+        return Err(UserInfoError::InsufficientScope);
+    }
+
+    // The opaque row freezes no `claims` request parameter (issue #15's claims-member
+    // selection stays with the at+jwt/grant path), so only the scope-selected claims
+    // are released here.
+    let claims_request = ClaimsRequest::default();
+    let bag = user_claim_bag(state, &scope, &active.subject).await?;
+    let mut released = assemble_claims(&bag, &granted, claims_request.userinfo());
+
+    // sub is derived through the ONE shared subject function from the resolved LOCAL
+    // subject, byte-identical to the ID token's (the opaque row stores the usr_
+    // subject, never the public sub), and can never be shadowed by stored claim data.
+    let sub = state.resolve_public_subject(&active.subject);
+    released.insert("sub".to_owned(), Value::String(sub));
+
+    Ok(released)
+}
+
+/// Recover the `(tenant, environment)` scope an opaque access token declares in its
+/// routing handle (issue #29). The token is `ira_at_<jti><delimiter><secret>`, where
+/// `<jti>` is a scoped id embedding its scope. Total and non-trusting: a token
+/// without the prefix, or whose handle is not a valid scoped `jti`, yields [`None`]
+/// (a uniform `invalid_token`). The scope is only a lookup key; the scope-bound
+/// resolve (forced row-level security) is what actually authenticates the token.
+fn opaque_token_scope(token: &str) -> Option<Scope> {
+    let rest = token.strip_prefix(OPAQUE_ACCESS_TOKEN_PREFIX)?;
+    let handle = rest.split(OPAQUE_ACCESS_TOKEN_DELIMITER).next()?;
+    IssuedTokenId::parse_declared_scope(handle)
+        .ok()
+        .map(|jti| jti.scope())
+}
+
+/// Now, in microseconds since the Unix epoch, from the environment clock seam (never
+/// the raw system clock), for the opaque resolve's expiry comparison.
+fn epoch_micros(state: &OidcState) -> i64 {
+    state
+        .now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|delta| i64::try_from(delta.as_micros()).ok())
+        .unwrap_or(i64::MAX)
 }
 
 /// Read the user's stored standard-claim document as a JSON object. An absent user,
