@@ -60,6 +60,15 @@ struct Inner {
     default_access_token_format: TokenFormat,
     reuse_grace: Duration,
     session_ttl: Duration,
+    // The pushed-authorization-request `request_uri` lifetime (RFC 9126, issue #27).
+    // A pushed request is short-lived and single-use; validated non-zero and bounded
+    // by config (oidc.par_ttl_secs).
+    par_ttl: Duration,
+    // Whether EVERY client in this environment must use a pushed authorization
+    // request (RFC 9126 section 5, issue #27). Layered with the per-client flag: a
+    // request must be pushed when either this OR the client's own flag is set. A
+    // promotable per-environment setting sourced from OidcConfig; default false.
+    require_pushed_authorization_requests: bool,
     // The per-environment PKCE policy for CONFIDENTIAL clients (issue #13). A
     // public client always requires PKCE (RFC 9700 2.1.1, enforced structurally in
     // the authorize path); this only governs confidential clients, and defaults to
@@ -164,6 +173,8 @@ impl OidcState {
                 default_access_token_format: map_token_format(config.default_access_token_format),
                 reuse_grace: Duration::from_secs(config.reuse_grace_secs),
                 session_ttl: Duration::from_secs(config.session_ttl_secs),
+                par_ttl: Duration::from_secs(config.par_ttl_secs),
+                require_pushed_authorization_requests: config.require_pushed_authorization_requests,
                 require_pkce_for_confidential: config.require_pkce_for_confidential_clients,
                 conform_id_token_claims: config.conform_id_token_claims,
                 client_assertion_audience: config.client_assertion_audience,
@@ -315,6 +326,24 @@ impl OidcState {
     #[must_use]
     pub fn session_ttl(&self) -> Duration {
         self.inner.session_ttl
+    }
+
+    /// The configured pushed-authorization-request `request_uri` lifetime (RFC 9126,
+    /// issue #27). A pushed request expires this long after it is pushed; validated
+    /// non-zero and bounded by config.
+    #[must_use]
+    pub fn par_ttl(&self) -> Duration {
+        self.inner.par_ttl
+    }
+
+    /// Whether EVERY client in this environment must use a pushed authorization
+    /// request (RFC 9126 section 5, issue #27). When true, the authorization endpoint
+    /// rejects a plain (non-PAR) request. The per-client
+    /// `require_pushed_authorization_requests` registration flag applies ON TOP of
+    /// this: PAR is required when either is set.
+    #[must_use]
+    pub fn require_pushed_authorization_requests(&self) -> bool {
+        self.inner.require_pushed_authorization_requests
     }
 
     /// The token endpoint's absolute URL (`{issuer_base}/token`). The token

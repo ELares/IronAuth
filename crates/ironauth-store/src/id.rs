@@ -224,6 +224,22 @@ impl ScopedKind for ResourceServerKind {
     const PREFIX: &'static str = "rsv";
 }
 
+/// Marker for a pushed authorization request (`par_`), a request the PAR endpoint
+/// (RFC 9126, issue #27) stored for later single-use reference from `/authorize`. A
+/// tenant-scoped resource: the identifier embeds its `(tenant, environment)`, so the
+/// authorization endpoint recovers the scope from a presented `request_uri`
+/// reference exactly as it recovers a code's scope, and a reference minted in one
+/// scope parses as a uniform not-found under another. The identifier is the
+/// reference portion of the `urn:ietf:params:oauth:request_uri:<id>` value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PushedRequestKind;
+impl ScopedKind for PushedRequestKind {
+    const PREFIX: &'static str = "par";
+    // The reference is a single-use handle to a stored request; keep it out of logs
+    // exactly as the authorization code and session id are.
+    const REDACT_DEBUG: bool = true;
+}
+
 /// Marker for a human actor (an interactive user). One of the three actor kinds
 /// an audit envelope can name (see [`crate::audit::ActorRef`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -410,6 +426,10 @@ pub type SigningKeyId = ScopedId<SigningKeyKind>;
 /// access tokens are minted for (issue #29). Its `audience` selects the token
 /// format the mint emits.
 pub type ResourceServerId = ScopedId<ResourceServerKind>;
+/// A pushed-authorization-request identifier (`par_...`), the single-use reference
+/// the PAR endpoint returns and `/authorize` consumes (RFC 9126, issue #27). It is
+/// the reference portion of the `urn:ietf:params:oauth:request_uri:<id>` value.
+pub type PushedRequestId = ScopedId<PushedRequestKind>;
 
 impl<K: ScopedKind> ScopedId<K> {
     /// Mint a fresh scoped identifier under `scope`, drawing the unique

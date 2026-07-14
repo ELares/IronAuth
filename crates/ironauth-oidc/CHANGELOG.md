@@ -6,6 +6,33 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Pushed authorization requests (PAR, RFC 9126, issue #27).
+  - **`POST /par`.** A new back-channel endpoint that authenticates the client
+    with the SAME suite as the token endpoint (the shared `authenticate_client`
+    seam: public `none`, secret, or `private_key_jwt`) and validates the COMPLETE
+    authorization request at push time, then returns a single-use
+    `urn:ietf:params:oauth:request_uri:<par_id>` reference and its `expires_in`. A
+    bad `redirect_uri`, missing PKCE, a disabled response type, or a malformed
+    `claims`/`prompt`/`max_age` is rejected HERE on the back channel, not later at
+    `/authorize`. A `request_uri` in the pushed request is refused (RFC 9126
+    section 2.1).
+  - **One shared request validator.** The authorization-request validation is
+    factored into a single `validate_request` function that BOTH `/authorize` and
+    `/par` run, so the two paths cannot diverge; `/authorize` renders a page or a
+    redirect and `/par` renders JSON from the same neutral error.
+  - **`request_uri` at `/authorize`.** A `request_uri` is accepted ONLY as a PAR
+    reference, consumed atomically on first use (reuse or expiry is rejected), and
+    bound to the pushing client (a reference presented by a different `client_id`
+    is rejected). No code path ever dereferences an external `request_uri` over the
+    network: there is no outbound fetch on this path (test-enforced).
+  - **Require-PAR enforcement.** When the environment switch
+    (`oidc.require_pushed_authorization_requests`) OR the per-client registration
+    flag is set, a plain (non-PAR) authorization request is rejected with
+    `invalid_request`.
+  - **Discovery.** `pushed_authorization_request_endpoint` and
+    `require_pushed_authorization_requests` are advertised from live config on both
+    well-known forms.
+
 - Complete the client authentication suite with JWT assertions and uniform
   failure hygiene (issue #25).
   - **`private_key_jwt` (RFC 7523).** A client authenticates the token endpoint

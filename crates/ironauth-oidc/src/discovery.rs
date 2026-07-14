@@ -175,6 +175,10 @@ pub const ADVERTISED_ENDPOINTS: &[DiscoveryEndpoint] = &[
         metadata_key: "userinfo_endpoint",
         path: "/userinfo",
     },
+    DiscoveryEndpoint {
+        metadata_key: "pushed_authorization_request_endpoint",
+        path: "/par",
+    },
 ];
 
 /// The per-environment, config-driven capability toggles the generator layers on
@@ -206,6 +210,11 @@ pub struct DiscoveryCapabilities {
     /// placements honor it; [`DiscoveryCapabilities::from_config`] sets it, so
     /// discovery advertises exactly what the server does.
     claims_parameter_supported: bool,
+    /// Whether EVERY authorization request in this environment must be pushed (RFC
+    /// 9126 section 5, issue #27). Sourced from `oidc.require_pushed_authorization_requests`
+    /// so discovery's `require_pushed_authorization_requests` reflects exactly what
+    /// the authorization endpoint enforces. `false` by default (PAR is optional).
+    require_pushed_authorization_requests: bool,
 }
 
 impl DiscoveryCapabilities {
@@ -224,7 +233,10 @@ impl DiscoveryCapabilities {
     pub fn from_config(config: &OidcConfig) -> Self {
         let mut caps = Self::default()
             .with_claims_parameter(true)
-            .with_authorization_response_iss(true);
+            .with_authorization_response_iss(true)
+            .with_require_pushed_authorization_requests(
+                config.require_pushed_authorization_requests,
+            );
         if config.enable_response_type_id_token {
             caps = caps.with_additional_response_type(ResponseType::IdToken.as_str());
         }
@@ -248,6 +260,14 @@ impl DiscoveryCapabilities {
     #[must_use]
     pub fn with_claims_parameter(mut self, supported: bool) -> Self {
         self.claims_parameter_supported = supported;
+        self
+    }
+
+    /// Declare whether EVERY authorization request must be pushed (RFC 9126, issue
+    /// #27).
+    #[must_use]
+    pub fn with_require_pushed_authorization_requests(mut self, required: bool) -> Self {
+        self.require_pushed_authorization_requests = required;
         self
     }
 
@@ -424,6 +444,14 @@ pub fn discovery_document(
     document.insert(
         "authorization_response_iss_parameter_supported".to_owned(),
         json!(capabilities.authorization_response_iss_parameter_supported),
+    );
+    // RFC 9126 section 5 (issue #27): the PAR endpoint is advertised through
+    // ADVERTISED_ENDPOINTS above, and this flag says whether pushing is MANDATORY
+    // for every client in this environment (sourced from live config, so it reflects
+    // exactly what the authorization endpoint enforces).
+    document.insert(
+        "require_pushed_authorization_requests".to_owned(),
+        json!(capabilities.require_pushed_authorization_requests),
     );
 
     Value::Object(document)

@@ -517,6 +517,39 @@ impl Harness {
         self.send(request).await
     }
 
+    /// `POST /par` (RFC 9126, issue #27) with a pre-built form body (already encoded)
+    /// and an optional `Authorization` header (for a `client_secret_basic` client).
+    pub async fn par(
+        &self,
+        form: &str,
+        authorization: Option<&str>,
+    ) -> (StatusCode, HeaderMap, String) {
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri("/par")
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded");
+        if let Some(value) = authorization {
+            builder = builder.header(header::AUTHORIZATION, value);
+        }
+        let request = builder
+            .body(Body::from(form.to_owned()))
+            .expect("request builds");
+        self.send(request).await
+    }
+
+    /// Set the per-client `require_pushed_authorization_requests` flag (issue #27) for
+    /// `client_id`, so a plain (non-PAR) authorization request from it is rejected.
+    pub async fn require_par_for_client(&self, client_id: &ClientId) {
+        let (actor, corr) = self.seeding_actor();
+        self.store()
+            .scoped(self.scope)
+            .acting(actor, corr)
+            .clients()
+            .set_require_pushed_authorization_requests(&self.env, client_id, true)
+            .await
+            .expect("set require PAR");
+    }
+
     /// `GET /authorize` with a session cookie, so a request from an authenticated,
     /// consenting subject proceeds straight to issuing the code.
     pub async fn authorize_with_cookie(

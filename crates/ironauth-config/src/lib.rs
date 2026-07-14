@@ -319,6 +319,13 @@ pub const OIDC_JWKS_CACHE_MAX_SECS: u64 = 900;
 /// ceiling. The default is one minute.
 pub const OIDC_MAX_CLIENT_ASSERTION_SKEW_SECS: u64 = 300;
 
+/// The largest a pushed-authorization-request `request_uri` lifetime may be
+/// configured to, in seconds (RFC 9126, issue #27). A pushed request is a
+/// short-lived, single-use reference the client redeems immediately at the
+/// authorization endpoint; RFC 9126 section 2.2 recommends a short expiry, so config
+/// load rejects a value above this ceiling (ten minutes). The default is one minute.
+pub const OIDC_MAX_PAR_TTL_SECS: u64 = 600;
+
 /// OIDC provider settings (issue #12).
 ///
 /// The public authorization and token endpoints. Lifetimes are configurable (the
@@ -493,6 +500,28 @@ pub struct OidcConfig {
     /// the process value is the deployment default until per-environment overrides
     /// land.
     pub enable_response_mode_form_post: bool,
+
+    /// Require a pushed authorization request (PAR, RFC 9126 section 5) for EVERY
+    /// client in this environment. The safe default (`false`) leaves PAR optional:
+    /// a client may still push a request, but a plain authorization request is also
+    /// accepted. When `true`, the authorization endpoint rejects any plain (non-PAR)
+    /// request with `invalid_request`, and discovery advertises
+    /// `require_pushed_authorization_requests = true`. A per-client
+    /// `require_pushed_authorization_requests` registration flag layers ON TOP of
+    /// this: either the environment switch OR the client flag being set requires PAR
+    /// for that client. This is a promotable per-environment setting: it appears in
+    /// config snapshots and rides the M5 promotion pipeline; the process value is the
+    /// deployment default until per-environment overrides land.
+    pub require_pushed_authorization_requests: bool,
+
+    /// The pushed-authorization-request `request_uri` lifetime in seconds (RFC 9126
+    /// section 2.2, issue #27). A pushed request is short-lived and single-use; the
+    /// default (60) is one minute, following the RFC's guidance that a `request_uri`
+    /// expires soon after it is pushed. Must be at least 1 and at most
+    /// `OIDC_MAX_PAR_TTL_SECS` (600). This is a promotable per-environment setting in
+    /// spirit, like the token lifetimes; the process value is the deployment default
+    /// until per-environment overrides ride the M5 promotion pipeline.
+    pub par_ttl_secs: u64,
 }
 
 impl Default for OidcConfig {
@@ -514,6 +543,8 @@ impl Default for OidcConfig {
             enable_response_type_code_id_token: false,
             enable_response_type_none: false,
             enable_response_mode_form_post: false,
+            require_pushed_authorization_requests: false,
+            par_ttl_secs: 60,
         }
     }
 }
@@ -716,6 +747,23 @@ impl Config {
                     "oidc.client_assertion_max_skew_secs ({}) must not exceed \
                      {OIDC_MAX_CLIENT_ASSERTION_SKEW_SECS} seconds",
                     self.oidc.client_assertion_max_skew_secs
+                ),
+            });
+        }
+        // The PAR request_uri lifetime is bounded like the other credential
+        // lifetimes: a zero-second request_uri is born expired, and a lifetime beyond
+        // the ceiling would keep a pushed request usable for too long (RFC 9126
+        // recommends a short expiry).
+        if self.oidc.par_ttl_secs < 1 {
+            return Err(ConfigError::Invalid {
+                message: "oidc.par_ttl_secs must be at least 1 second".to_owned(),
+            });
+        }
+        if self.oidc.par_ttl_secs > OIDC_MAX_PAR_TTL_SECS {
+            return Err(ConfigError::Invalid {
+                message: format!(
+                    "oidc.par_ttl_secs ({}) must not exceed {OIDC_MAX_PAR_TTL_SECS} seconds",
+                    self.oidc.par_ttl_secs
                 ),
             });
         }
@@ -1093,6 +1141,52 @@ mod tests {
                 "https://app.test:8443".to_owned()
             ]
         );
+    }
+
+    #[test]
+    fn oidc_par_settings_default_parse_and_validate() {
+        // Issue #27 (RFC 9126): PAR is optional by default, with a short default
+        // request_uri lifetime.
+        let default = OidcConfig::default();
+        assert!(
+            !default.require_pushed_authorization_requests,
+            "PAR is optional by default"
+        );
+        assert_eq!(
+            default.par_ttl_secs, 60,
+            "the default request_uri TTL is 60s"
+        );
+
+        // The environment-wide require switch and a bounded, in-range TTL parse.
+        let config = Config::from_toml_str(
+            "[oidc]\nrequire_pushed_authorization_requests = true\npar_ttl_secs = 120\n",
+            "<inline>",
+        )
+        .expect("valid")
+        .config;
+        assert!(config.oidc.require_pushed_authorization_requests);
+        assert_eq!(config.oidc.par_ttl_secs, 120);
+
+        // A zero TTL (born expired) is rejected; a TTL above the ceiling is rejected.
+        let err = Config::from_toml_str("[oidc]\npar_ttl_secs = 0\n", "ironauth.toml")
+            .expect_err("zero par ttl");
+        assert!(err.to_string().contains("par_ttl_secs"), "{err}");
+        let over = format!("[oidc]\npar_ttl_secs = {}\n", OIDC_MAX_PAR_TTL_SECS + 1);
+        let err = Config::from_toml_str(&over, "ironauth.toml").expect_err("par ttl over cap");
+        assert!(err.to_string().contains("par_ttl_secs"), "{err}");
+
+        // The boundary values are accepted.
+        for ok in [1, OIDC_MAX_PAR_TTL_SECS] {
+            let input = format!("[oidc]\npar_ttl_secs = {ok}\n");
+            assert_eq!(
+                Config::from_toml_str(&input, "<inline>")
+                    .expect("boundary valid")
+                    .config
+                    .oidc
+                    .par_ttl_secs,
+                ok
+            );
+        }
     }
 
     #[test]

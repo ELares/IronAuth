@@ -239,7 +239,11 @@ CREATE TABLE IF NOT EXISTS _schema_migrations ( \
 /// is version 12; the JWT-assertion client-authentication suite (issue #25: the
 /// additive `clients` key/alg registration columns, the cross-node single-use
 /// `client_assertion_jtis` replay cache, and the out-of-band
-/// `client_auth_diagnostics` sink) is version 13. That is
+/// `client_auth_diagnostics` sink) is version 13; the pushed-authorization-request
+/// store (issue #27: the single-use `pushed_authorization_requests` table RFC 9126
+/// stores a validated request behind a one-time `request_uri`, plus the additive
+/// per-client `clients.require_pushed_authorization_requests` flag) is version 14.
+/// That is
 /// the whole production chain: it deliberately
 /// carries no throwaway objects, so a real database never gains a demo table or
 /// ledger rows beyond what the product needs. The worked expand-contract example
@@ -327,6 +331,12 @@ fn registry() -> Vec<Migration> {
             name: "client_auth_suite",
             phase: Phase::Expand,
             sql: include_str!("../migrations/0013_client_auth_suite.sql"),
+        },
+        Migration {
+            version: 14,
+            name: "pushed_authorization_requests",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0014_pushed_authorization_requests.sql"),
         },
     ]
 }

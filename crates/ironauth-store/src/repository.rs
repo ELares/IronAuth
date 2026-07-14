@@ -56,8 +56,8 @@ use crate::audit::{ActingContext, Action, ActorRef};
 use crate::error::StoreError;
 use crate::id::{
     AuditId, AuditTarget, AuthorizationCodeId, ClientId, ConsentId, CorrelationId, EnvironmentId,
-    GrantId, IssuedTokenId, ManagementKeyId, OperatorId, ResourceServerId, SessionId, SigningKeyId,
-    TenantId, UserId,
+    GrantId, IssuedTokenId, ManagementKeyId, OperatorId, PushedRequestId, ResourceServerId,
+    SessionId, SigningKeyId, TenantId, UserId,
 };
 use crate::scope::Scope;
 use crate::store::Store;
@@ -293,6 +293,20 @@ impl<'a> ActingStore<'a> {
             acting: self.acting,
         }
     }
+
+    /// The mutating pushed-authorization-request repository for this scope and actor
+    /// (RFC 9126, issue #27): push a validated authorization request behind a
+    /// one-time `request_uri`, and atomically consume it exactly once at the
+    /// authorization endpoint. Both the push and the consume audit in the same
+    /// transaction as the state change.
+    #[must_use]
+    pub fn pushed_authorization_requests(&self) -> ActingPushedRequestRepo<'a> {
+        ActingPushedRequestRepo {
+            store: self.store,
+            scope: self.scope,
+            acting: self.acting,
+        }
+    }
 }
 
 /// A record read back from the `clients` table, always within scope.
@@ -315,6 +329,11 @@ pub struct ClientRecord {
     /// Empty for a client that registered none (which therefore cannot complete an
     /// authorization request until it registers one).
     pub redirect_uris: Vec<String>,
+    /// Whether this client requires a pushed authorization request (RFC 9126
+    /// section 5, issue #27): when true, a plain (non-PAR) authorization request
+    /// from this client is rejected with `invalid_request`. The environment-wide
+    /// switch (config) applies on top of this per-client flag.
+    pub require_pushed_authorization_requests: bool,
 }
 
 /// The client-authentication metadata for a client, read within scope (issue
@@ -426,7 +445,7 @@ impl ClientRepo<'_> {
         let mut tx = begin_scoped(self.store, self.scope).await?;
         let row = sqlx::query(
             "SELECT id, display_name, require_auth_time, token_endpoint_auth_method, \
-             redirect_uris FROM clients \
+             redirect_uris, require_pushed_authorization_requests FROM clients \
              WHERE id = $1 AND tenant_id = $2 AND environment_id = $3",
         )
         .bind(id.to_string())
@@ -448,7 +467,7 @@ impl ClientRepo<'_> {
         let mut tx = begin_scoped(self.store, self.scope).await?;
         let rows = sqlx::query(
             "SELECT id, display_name, require_auth_time, token_endpoint_auth_method, \
-             redirect_uris FROM clients \
+             redirect_uris, require_pushed_authorization_requests FROM clients \
              WHERE tenant_id = $1 AND environment_id = $2 ORDER BY created_at, id",
         )
         .bind(self.scope.tenant().to_string())
@@ -509,6 +528,7 @@ impl ClientRepo<'_> {
             require_auth_time: row.get("require_auth_time"),
             auth_method: row.get("token_endpoint_auth_method"),
             redirect_uris: row.get("redirect_uris"),
+            require_pushed_authorization_requests: row.get("require_pushed_authorization_requests"),
         })
     }
 }
@@ -816,6 +836,57 @@ impl ActingClientRepo<'_> {
                 // A no-op update (nothing in scope matched) is a uniform not-found;
                 // erroring here short-circuits before the audit insert, so it
                 // leaves no audit row (we audit real mutations only).
+                if result.rows_affected() == 0 {
+                    return Err(StoreError::NotFound);
+                }
+                Ok(())
+            },
+            false,
+        )
+        .await
+    }
+
+    /// Set (or clear) a client's `require_pushed_authorization_requests` flag (RFC
+    /// 9126 section 5, issue #27), auditing
+    /// `client.require_pushed_authorization_requests.set` in the same transaction.
+    /// When set, the authorization endpoint rejects a plain (non-PAR) request from
+    /// this client. Dynamic Client Registration (#30) and the management surface
+    /// reuse this; today it is the one path that toggles the per-client requirement.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if no such client is visible in this scope;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn set_require_pushed_authorization_requests(
+        &self,
+        env: &Env,
+        id: &ClientId,
+        required: bool,
+    ) -> Result<(), StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::ClientRequirePushedAuthorizationSet,
+                target: id,
+            },
+            async move |tx| {
+                let result = sqlx::query(
+                    "UPDATE clients SET require_pushed_authorization_requests = $1 \
+                     WHERE id = $2 AND tenant_id = $3 AND environment_id = $4",
+                )
+                .bind(required)
+                .bind(id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .execute(&mut **tx)
+                .await?;
                 if result.rows_affected() == 0 {
                     return Err(StoreError::NotFound);
                 }
@@ -1703,6 +1774,215 @@ impl ActingAuthorizationRepo<'_> {
             false,
         )
         .await
+    }
+}
+
+/// A pushed authorization request to store behind a one-time `request_uri` (RFC
+/// 9126, issue #27). The `id` is the `par_` reference minted under the caller's
+/// scope; the `request_params` is the serialized authorization request the PAR
+/// endpoint validated (opaque to the store), and `client_id` is the AUTHENTICATED
+/// pushing client the request is bound to.
+///
+/// [`fmt::Debug`] is hand written and redacting: `request_params` may carry
+/// end-user request detail and must not reach a log line.
+#[derive(Clone, Copy)]
+pub struct PushRequest<'a> {
+    /// The `par_` reference identifier, minted under this scope.
+    pub id: &'a PushedRequestId,
+    /// The AUTHENTICATED pushing client the request is bound to. A `request_uri`
+    /// presented under a different `client_id` at `/authorize` is rejected.
+    pub client_id: &'a str,
+    /// The serialized authorization-request parameters (an application-owned JSON
+    /// document), replayed verbatim when the `request_uri` is consumed.
+    pub request_params: &'a str,
+    /// The `request_uri` expiry in epoch microseconds, from the application clock
+    /// seam (never the database clock).
+    pub expires_at_micros: i64,
+    /// The push instant in epoch microseconds, from the application clock seam.
+    pub created_at_micros: i64,
+}
+
+impl fmt::Debug for PushRequest<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PushRequest")
+            .field("id", &self.id)
+            .field("client_id", &self.client_id)
+            .field("expires_at_micros", &self.expires_at_micros)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The outcome of consuming a pushed-authorization-request `request_uri` (RFC 9126,
+/// issue #27).
+///
+/// The store owns the whole single-use decision (the atomic UPDATE under the clock
+/// seam), so the authorization endpoint only maps an outcome to behavior. A
+/// mismatched presenting client, an expired request, and an already-consumed request
+/// all collapse to [`Invalid`](ConsumePushedRequest::Invalid): the caller returns a
+/// uniform `invalid_request`, and none of those misses burns the pending request.
+///
+/// [`fmt::Debug`] is hand written and redacting: the replayed `request_params` may
+/// carry end-user request detail.
+#[derive(Clone, PartialEq, Eq)]
+pub enum ConsumePushedRequest {
+    /// This call won the single-use race: the request is now consumed and its
+    /// serialized parameters are returned for replay. The consume audit row was
+    /// written in the SAME transaction as the consume.
+    Consumed {
+        /// The serialized authorization-request parameters to replay verbatim.
+        request_params: String,
+    },
+    /// The `request_uri` was absent, expired, already consumed, or presented under a
+    /// different `client_id` than it was bound to. A uniform miss with no state
+    /// change; the caller returns `invalid_request`.
+    Invalid,
+}
+
+impl fmt::Debug for ConsumePushedRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ConsumePushedRequest::Consumed { .. } => {
+                f.debug_struct("Consumed").finish_non_exhaustive()
+            }
+            ConsumePushedRequest::Invalid => f.write_str("Invalid"),
+        }
+    }
+}
+
+/// The mutating pushed-authorization-request repository (RFC 9126, issue #27).
+/// Reachable only through [`ScopedStore::acting`], so every push and consume carries
+/// an actor and correlation id. The push routes through the module's single audited
+/// write primitive; the consume is a bespoke committing path (it folds the atomic
+/// single-use consume and its audit row into one transaction, exactly as the
+/// authorization-code redeem does), documented at its call site.
+pub struct ActingPushedRequestRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+    acting: ActingContext,
+}
+
+impl ActingPushedRequestRepo<'_> {
+    /// Store a validated authorization request behind a one-time `request_uri`,
+    /// auditing `pushed_authorization_request.push` in the same transaction.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the reference identifier is out of this scope;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn push(&self, env: &Env, request: PushRequest<'_>) -> Result<(), StoreError> {
+        if request.id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::PushedAuthorizationRequestPush,
+                target: request.id,
+            },
+            async move |tx| {
+                sqlx::query(
+                    "INSERT INTO pushed_authorization_requests \
+                     (id, tenant_id, environment_id, client_id, request_params, expires_at, \
+                      created_at) \
+                     VALUES ($1, $2, $3, $4, $5, \
+                             TIMESTAMPTZ 'epoch' + ($6::text || ' microseconds')::interval, \
+                             TIMESTAMPTZ 'epoch' + ($7::text || ' microseconds')::interval)",
+                )
+                .bind(request.id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(request.client_id)
+                .bind(request.request_params)
+                .bind(request.expires_at_micros)
+                .bind(request.created_at_micros)
+                .execute(&mut **tx)
+                .await?;
+                Ok(())
+            },
+            false,
+        )
+        .await
+    }
+
+    /// Atomically consume a `request_uri` exactly once, enforcing single use, expiry,
+    /// AND the client binding in ONE statement, returning the stored parameters on
+    /// the winning call.
+    ///
+    /// The consume is a single `UPDATE ... SET consumed_at = <now> WHERE id = $1 AND
+    /// consumed_at IS NULL AND expires_at > <now> AND client_id = <presenter>
+    /// RETURNING request_params`. Postgres serializes concurrent updates of the one
+    /// row (READ COMMITTED, pinned in [`begin_scoped`]), so exactly one caller sees
+    /// `consumed_at` NULL and gets [`ConsumePushedRequest::Consumed`]; every other
+    /// concurrent presentation affects zero rows. Because the `client_id` filter is
+    /// IN the statement, a request presented under a DIFFERENT `client_id` matches
+    /// zero rows: it is a uniform miss AND it never burns the pending request, so the
+    /// legitimate client's `request_uri` stays live (RFC 9126 client binding). Reuse
+    /// and expiry likewise miss.
+    ///
+    /// On the winning branch exactly one `pushed_authorization_request.consume` audit
+    /// row is written in this same transaction. A zero-row miss (reuse, expiry,
+    /// absent, or client mismatch) writes no audit row and returns
+    /// [`ConsumePushedRequest::Invalid`].
+    ///
+    /// `now` flows from the application clock seam (bound as epoch microseconds),
+    /// never the database clock, so expiry is deterministic under a manual clock.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the reference identifier is out of this scope;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn consume(
+        &self,
+        env: &Env,
+        id: &PushedRequestId,
+        presenting_client_id: &str,
+    ) -> Result<ConsumePushedRequest, StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let now_micros = epoch_micros(env.clock().now_utc());
+
+        let mut tx = begin_scoped(self.store, scope).await?;
+        let won = sqlx::query(
+            "UPDATE pushed_authorization_requests \
+             SET consumed_at = TIMESTAMPTZ 'epoch' + ($1::text || ' microseconds')::interval \
+             WHERE id = $2 AND tenant_id = $3 AND environment_id = $4 \
+             AND client_id = $5 \
+             AND consumed_at IS NULL \
+             AND expires_at > TIMESTAMPTZ 'epoch' + ($1::text || ' microseconds')::interval \
+             RETURNING request_params",
+        )
+        .bind(now_micros)
+        .bind(id.to_string())
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(presenting_client_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        let Some(row) = won else {
+            // Zero rows: absent, expired, already consumed, or presented under a
+            // different client_id. A uniform miss with no state change and no audit.
+            tx.commit().await?;
+            return Ok(ConsumePushedRequest::Invalid);
+        };
+        let request_params: String = row.get("request_params");
+        let spec = AuditedWrite {
+            store: self.store,
+            scope,
+            acting: &self.acting,
+            env,
+            action: Action::PushedAuthorizationRequestConsume,
+            target: id,
+        };
+        insert_audit_row(&mut tx, &spec).await?;
+        tx.commit().await?;
+        Ok(ConsumePushedRequest::Consumed { request_params })
     }
 }
 

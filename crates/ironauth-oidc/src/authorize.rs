@@ -29,10 +29,11 @@ use axum::extract::{Form, Query, State};
 use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
 use ironauth_store::{
-    AuthorizationCodeId, ClientId, ClientRecord, CorrelationId, GrantId, GrantedConsent, IssueCode,
-    Scope, StoreError, redirect_uri_is_registrable, redirect_uri_matches,
+    ActorRef, AuthorizationCodeId, ClientId, ClientRecord, ConsumePushedRequest, CorrelationId,
+    GrantId, GrantedConsent, IssueCode, PushedRequestId, Scope, ServiceId, StoreError,
+    redirect_uri_is_registrable, redirect_uri_matches,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::authn;
 use crate::claims_request::{ClaimsRequest, ClaimsRequestError};
@@ -40,6 +41,7 @@ use crate::client_auth::ClientAuthMethod;
 use crate::error::{AuthorizeError, AuthzErrorCode};
 use crate::hints::InteractionHints;
 use crate::interaction;
+use crate::par::PAR_REQUEST_URI_PREFIX;
 use crate::registry::{PkceMethod, PromptSet, PromptValue, ResponseMode, ResponseType};
 use crate::response;
 use crate::scope_claims::{assemble_claims, parse_scope_set};
@@ -51,8 +53,22 @@ use crate::util::{append_query, client_service_actor, epoch_micros};
 /// The authorization-request parameters. Every field is optional at
 /// deserialization so a missing parameter is a validated error (with the correct
 /// error behavior) rather than a deserialization failure.
-#[derive(Debug, Deserialize)]
+///
+/// It also derives [`Serialize`] so a pushed authorization request (RFC 9126, issue
+/// #27) can be stored verbatim by the PAR endpoint and replayed here when its
+/// `request_uri` is consumed: the pushed request is EXACTLY an `AuthorizeParams`, so
+/// the two paths validate one identical shape.
+#[derive(Debug, Deserialize, Serialize)]
 pub struct AuthorizeParams {
+    /// The PAR (RFC 9126, issue #27) `request_uri`: a reference to a request the
+    /// client already pushed to the PAR endpoint. When present, the authorization
+    /// endpoint consumes the referenced request from PAR storage (single use, bound
+    /// to the pushing client) and IGNORES the rest of the query. It is accepted ONLY
+    /// in the `urn:ietf:params:oauth:request_uri:<id>` form backed by PAR storage:
+    /// an external `request_uri` is NEVER dereferenced (a documented non-goal). It is
+    /// never itself part of a pushed request (the PAR endpoint rejects it), so it is
+    /// [`None`] on every replayed request.
+    pub request_uri: Option<String>,
     /// The OAuth `response_type`: `code` always, plus the per-environment legacy
     /// types (`id_token`, `code id_token`, `none`) when enabled (issue #17). It is
     /// an ORDER-INSENSITIVE space-separated set; token-bearing values are
@@ -151,22 +167,133 @@ pub async fn authorize_post(
 /// Run the authorization request, returning the success redirect, an interaction
 /// redirect (login/registration/consent), or an [`AuthorizeError`] (an error page
 /// or an error redirect).
+///
+/// A PAR (RFC 9126, issue #27) `request_uri` is resolved FIRST: if the request
+/// carries one, the referenced pushed request is consumed from PAR storage (single
+/// use, bound to the pushing client) and its parameters REPLACE the presented ones,
+/// so the rest of the pipeline runs on the pushed request. A `via_par` flag records
+/// that the request arrived through PAR, so the require-PAR gate does not reject it.
 async fn handle(state: &OidcState, headers: &HeaderMap, params: AuthorizeParams) -> Response {
-    match issue_code(state, headers, params).await {
+    let (params, via_par) = match resolve_pushed_request(state, params).await {
+        Ok(resolved) => resolved,
+        Err(error) => return error.into_response(),
+    };
+    match issue_code(state, headers, params, via_par).await {
         Ok(response) => response,
         Err(error) => error.into_response(),
     }
 }
 
-// A linear, numbered validation pipeline (client, redirect, response_type, PKCE,
-// claims, gate, acr, issue): each step is short but heavily commented for the
-// security rationale, so the whole reads over the line budget. Kept as one
+/// Resolve a PAR (RFC 9126, issue #27) `request_uri` to the pushed request it
+/// references, or pass a plain request through unchanged.
+///
+/// When the request carries no `request_uri`, this returns `(params, false)`: a
+/// plain authorization request. When it carries one, the reference is accepted ONLY
+/// in the `urn:ietf:params:oauth:request_uri:<id>` form backed by PAR storage; an
+/// external URI is a uniform `invalid_request` PAGE and is NEVER dereferenced over
+/// the network (a documented, test-enforced non-goal). The referenced request is
+/// consumed ATOMICALLY exactly once, filtered on the PRESENTED `client_id`, so a
+/// reuse, an expiry, or a presentation under a different client all fail closed and
+/// none of them burns another client's pending request (RFC 9126 client binding). On
+/// success the pushed parameters (an `AuthorizeParams` the PAR endpoint validated and
+/// stored) REPLACE the presented ones, and the pipeline runs on them with
+/// `via_par = true`.
+///
+/// Every error here is a PAGE (not a redirect): the pushed request's own
+/// `redirect_uri` is gone (consumed or never resolved) and the presented one is not
+/// yet validated, so there is no trusted URI to send an error to.
+async fn resolve_pushed_request(
+    state: &OidcState,
+    params: AuthorizeParams,
+) -> Result<(AuthorizeParams, bool), AuthorizeError> {
+    let Some(request_uri) = params
+        .request_uri
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok((params, false));
+    };
+
+    // Accept ONLY our PAR urn form. Anything else (an https/http URL, an unknown
+    // urn) is a request to dereference an EXTERNAL request_uri, which IronAuth never
+    // does: it is a uniform invalid_request, and no fetch is performed.
+    let Some(reference) = request_uri.strip_prefix(PAR_REQUEST_URI_PREFIX) else {
+        return Err(AuthorizeError::page(
+            "the request_uri is invalid, expired, or already used",
+        ));
+    };
+
+    // The client_id is required alongside a request_uri (RFC 9126 section 4): it is
+    // what binds the consume to the pushing client, so a different client cannot use
+    // (or burn) the pending request.
+    let presented_client = params
+        .client_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| AuthorizeError::page("the client_id parameter is required"))?;
+
+    // The reference declares its own scope (a par_ scoped id), exactly as an
+    // authorization code does, so the consume runs under that scope with row-level
+    // security. A malformed reference is a uniform miss (never an oracle).
+    let Ok(par_id) = PushedRequestId::parse_declared_scope(reference) else {
+        return Err(AuthorizeError::page(
+            "the request_uri is invalid, expired, or already used",
+        ));
+    };
+    let scope = par_id.scope();
+
+    // Attribute the consume audit to the presenting client where it parses in scope,
+    // exactly as the code issue/redeem audits are; otherwise a generated service
+    // actor (defense in depth against a malformed stored/presented value).
+    let actor = match ClientId::parse_in_scope(presented_client, &scope) {
+        Ok(id) => client_service_actor(&id),
+        Err(_) => ActorRef::service(ServiceId::generate(state.env())),
+    };
+    let correlation = CorrelationId::generate(state.env());
+    let outcome = state
+        .store()
+        .scoped(scope)
+        .acting(actor, correlation)
+        .pushed_authorization_requests()
+        .consume(state.env(), &par_id, presented_client)
+        .await;
+
+    match outcome {
+        Ok(ConsumePushedRequest::Consumed { request_params }) => {
+            // The stored parameters ARE an AuthorizeParams (validated at push time);
+            // deserialize and run the pipeline on them, marked as arriving via PAR.
+            let stored: AuthorizeParams = serde_json::from_str(&request_params).map_err(|_| {
+                AuthorizeError::page("the authorization request could not be processed")
+            })?;
+            Ok((stored, true))
+        }
+        // A miss: absent, expired, already consumed, or presented under a different
+        // client_id. Uniform invalid_request; the pending request (if any) is not
+        // burned by a mismatched presenter.
+        Ok(ConsumePushedRequest::Invalid) => Err(AuthorizeError::page(
+            "the request_uri is invalid, expired, or already used",
+        )),
+        Err(error) => {
+            tracing::error!(error = %error, "failed to consume a pushed authorization request");
+            Err(AuthorizeError::page(
+                "the authorization request could not be processed",
+            ))
+        }
+    }
+}
+
+// A linear, numbered validation pipeline (client, require-PAR gate, shared
+// request validation, gate, acr, issue): each step is short but heavily commented
+// for the security rationale, so the whole reads over the line budget. Kept as one
 // sequence deliberately, since the ORDER is the security property.
 #[allow(clippy::too_many_lines)]
 async fn issue_code(
     state: &OidcState,
     headers: &HeaderMap,
     params: AuthorizeParams,
+    via_par: bool,
 ) -> Result<Response, AuthorizeError> {
     // 1. client_id: present and well formed. A cli_ id declares its own scope, so
     //    it is the routing key to the (tenant, environment) this request lives in.
@@ -185,7 +312,8 @@ async fn issue_code(
     //    store failure here also fails closed to a page (we cannot safely redirect
     //    without a validated client). The record carries the client's
     //    `require_auth_time` registration, which (with `max_age`) decides whether
-    //    the ID token must carry `auth_time` (issue #14).
+    //    the ID token must carry `auth_time` (issue #14), and its
+    //    `require_pushed_authorization_requests` flag (issue #27).
     let client = match state.store().scoped(scope).clients().get(&client_id).await {
         Ok(record) => record,
         Err(StoreError::NotFound) => {
@@ -200,153 +328,56 @@ async fn issue_code(
         }
     };
 
-    // 3. redirect_uri: present, a registrable RFC 8252 target, and an EXACT match
-    //    against the client's registered set. Still BEFORE any redirect (see
-    //    validate_registered_redirect): an unregistered or malformed redirect target
-    //    renders an error PAGE and never receives a redirect, so it can never be
-    //    turned into an open redirector (RFC 6749 4.1.2.1, RFC 9700 2.1).
-    let redirect_uri = validate_registered_redirect(&client, &params)?;
+    // 2b. require-PAR gate (RFC 9126 sections 5 and 6, issue #27). When the
+    //     environment-wide switch OR this client's registration flag requires a
+    //     pushed authorization request, a plain (non-PAR) request is rejected with
+    //     invalid_request. A request that arrived THROUGH PAR (via_par) satisfies the
+    //     requirement and is exempt. This runs BEFORE the redirect_uri is validated,
+    //     so it is a PAGE error, never an open-redirector-able redirect.
+    if !via_par
+        && (state.require_pushed_authorization_requests()
+            || client.require_pushed_authorization_requests)
+    {
+        return Err(AuthorizeError::page(
+            "this client requires a pushed authorization request (RFC 9126)",
+        ));
+    }
+
+    // 3. Validate the authorization request through the ONE shared validator
+    //    (redirect_uri exact match, response_type, response-mode negotiation, PKCE,
+    //    the `claims` parameter, prompt/max_age). The PAR endpoint (issue #27) runs
+    //    the SAME validator at push time, so a pushed request and a plain request are
+    //    checked by EXACTLY the same rules and cannot diverge. An error before a
+    //    redirect target is validated is a page; after, it rides the negotiated mode.
+    let validated = validate_request(state, &client, &params)
+        .map_err(|error| error.into_authorize(state.issuer_for(&scope), params.state.as_deref()))?;
+    let ValidatedRequest {
+        redirect_uri,
+        response_type,
+        mode,
+        nonce,
+        code_challenge,
+        code_challenge_method,
+        claims_request,
+        claims_canonical,
+        prompt,
+        max_age_secs,
+        hints,
+    } = validated;
 
     // From here on, client_id and redirect_uri are validated, so every error is
-    // returned to the client by redirecting to redirect_uri. RFC 9207 requires the
-    // issuer identifier `iss` on every such response, success and error (issue
-    // #13); the scope (and thus the issuer) was fixed by the validated client_id.
+    // returned to the client by redirecting to redirect_uri with the RFC 9207 `iss`
+    // (issue #13) through the negotiated mode.
     let iss = state.issuer_for(&scope);
     let state_echo = params.state.as_deref();
-    // Build a mode-parameterized redirect error. Errors raised BEFORE a response
-    // mode can be negotiated (an unknown response_type, an illegal response_mode)
-    // pass a safe explicit mode; once the mode is negotiated, the rest of the
-    // pipeline reuses it so an error travels back the way a result would have.
-    let redirect_error_mode =
-        |mode: ResponseMode, code: AuthzErrorCode, description: &str| AuthorizeError::Redirect {
-            redirect_uri: redirect_uri.to_owned(),
-            error: code,
-            description: description.to_owned(),
-            state: state_echo.map(str::to_owned),
-            iss: iss.clone(),
-            mode,
-        };
-
-    // 4. response_type: present, representable, and enabled. A token-bearing value
-    //    is structurally unrepresentable (parse returns None), so the implicit
-    //    access-token flow is refused here; the legacy id_token/code id_token/none
-    //    types are representable but DISABLED per environment by default.
-    let response_type_raw = params
-        .response_type
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| {
-            // No type at all: we cannot know a front-channel default, so the error
-            // goes back by the safe query mode.
-            redirect_error_mode(
-                ResponseMode::Query,
-                AuthzErrorCode::InvalidRequest,
-                "response_type is required",
-            )
-        })?;
-    let Some(response_type) = ResponseType::parse(response_type_raw) else {
-        // Unknown or token-bearing: unsupported, delivered by the safe query mode
-        // (no front-channel default is known for an unrepresentable type).
-        return Err(redirect_error_mode(
-            ResponseMode::Query,
-            AuthzErrorCode::UnsupportedResponseType,
-            "the response_type is not supported",
-        ));
+    let redirect_error = |code: AuthzErrorCode, description: &str| AuthorizeError::Redirect {
+        redirect_uri: redirect_uri.to_owned(),
+        error: code,
+        description: description.to_owned(),
+        state: state_echo.map(str::to_owned),
+        iss: iss.clone(),
+        mode,
     };
-
-    // 4b. Negotiate the response mode (issue #17). The default is the type's
-    //     (query for code/none, fragment for the front-channel types); an explicit
-    //     response_mode is honored only where spec-legal AND enabled. An illegal or
-    //     disabled mode is invalid_request, delivered by the type's DEFAULT mode
-    //     (never form_post, so there is no circular dependency on an enabled mode).
-    let default_mode = response_type.default_response_mode();
-    let mode = match resolve_mode(state, response_type, params.response_mode.as_deref()) {
-        Ok(mode) => mode,
-        Err(description) => {
-            return Err(redirect_error_mode(
-                default_mode,
-                AuthzErrorCode::InvalidRequest,
-                description,
-            ));
-        }
-    };
-
-    // 4c. Enablement: `code` is always enabled; a legacy type not enabled in this
-    //     environment is unsupported_response_type, delivered by the negotiated
-    //     mode.
-    if !state.response_type_enabled(response_type) {
-        return Err(redirect_error_mode(
-            mode,
-            AuthzErrorCode::UnsupportedResponseType,
-            "the response_type is not enabled in this environment",
-        ));
-    }
-
-    // 4d. nonce is REQUIRED for a front-channel ID token (OIDC Core 3.2.2.1 /
-    //     3.3.2.1): it binds the ID token to this request and defends replay.
-    let nonce = params
-        .nonce
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
-    if response_type.is_front_channel() && nonce.is_none() {
-        return Err(redirect_error_mode(
-            mode,
-            AuthzErrorCode::InvalidRequest,
-            "nonce is required for this response_type",
-        ));
-    }
-
-    // The negotiated-mode error helper the rest of the pipeline uses.
-    let redirect_error =
-        |code: AuthzErrorCode, description: &str| redirect_error_mode(mode, code, description);
-
-    // 5. PKCE (S256-only, mandatory; see resolve_pkce). A PUBLIC client
-    //    (token_endpoint_auth_method = none) always requires PKCE (RFC 9700 2.1.1);
-    //    a CONFIDENTIAL client follows the per-environment policy, required by
-    //    default. `plain` and a defaulted method are invalid_request. PKCE binds a
-    //    code, so it is enforced for the flows that issue one (`code`,
-    //    `code id_token`); a pure `id_token` or `none` request issues no code, so a
-    //    code_challenge is simply unused there.
-    let is_public = client.auth_method == ClientAuthMethod::None.as_str();
-    let pkce_required =
-        response_type.issues_code() && (is_public || state.require_pkce_for_confidential());
-    let code_challenge = resolve_pkce(&params, pkce_required)
-        .map_err(|description| redirect_error(AuthzErrorCode::InvalidRequest, description))?;
-    let code_challenge_method = code_challenge.map(|_| PkceMethod::S256.as_str());
-
-    // 5b. The OIDC `claims` request parameter (Core 5.5): parse and validate. A
-    //     malformed value is a redirect invalid_request. It is frozen onto the code
-    //     and grant (canonical form) below, so the token endpoint can honor its
-    //     `id_token` member at mint and UserInfo its `userinfo` member later
-    //     (issue #15).
-    let (claims_request, claims_canonical) = parse_claims_request(params.claims.as_deref())
-        .map_err(|description| redirect_error(AuthzErrorCode::InvalidRequest, description))?;
-
-    // 5c. prompt and max_age (OIDC Core 3.1.2.1, issue #16). prompt is a
-    //     space-separated SET; `none` combined with any other value, or an
-    //     unrecognized value, is invalid_request. max_age is a non-negative integer
-    //     (a non-integer is invalid_request); its PRESENCE (including max_age=0)
-    //     drives both the auth_time emission and the stale-session re-authentication.
-    //     Both errors are delivered by the negotiated mode (redirect_uri is valid).
-    let prompt = parse_prompt(params.prompt.as_deref())
-        .map_err(|description| redirect_error(AuthzErrorCode::InvalidRequest, description))?;
-    let max_age_secs = parse_max_age(params.max_age.as_deref())
-        .map_err(|description| redirect_error(AuthzErrorCode::InvalidRequest, description))?;
-
-    // 5d. The typed interaction-hint seam (issue #16), produced once here and passed
-    //     into the interaction layer. It carries the login/logout hints, the locales,
-    //     and the display, so the interaction pages render with the requested prefill,
-    //     language, and layout, and upstream IdP forwarding (M8) has one place to
-    //     read them. It is NOT forwarded upstream here.
-    let hints = InteractionHints::from_request(
-        params.login_hint.as_deref(),
-        params.logout_hint.as_deref(),
-        params.ui_locales.as_deref(),
-        params.claims_locales.as_deref(),
-        params.display.as_deref(),
-    );
 
     // 6. Establish the authenticated subject and their consent, applying prompt and
     //    max_age. A missing session, missing consent, or a forced (re-)authentication
@@ -601,34 +632,304 @@ async fn front_channel_id_token_claims(
     assemble_claims(&bag, &granted, claims_request.id_token())
 }
 
+/// A validated authorization request: the fields that survive the shared
+/// [`validate_request`] pipeline, ready for the login/consent gate and issuance.
+///
+/// The borrows are tied to the [`AuthorizeParams`] the validator was run over.
+pub(crate) struct ValidatedRequest<'a> {
+    /// The validated, registered `redirect_uri` (borrowed from the request).
+    pub(crate) redirect_uri: &'a str,
+    /// The parsed, enabled response type.
+    pub(crate) response_type: ResponseType,
+    /// The negotiated response mode.
+    pub(crate) mode: ResponseMode,
+    /// The OIDC `nonce`, trimmed to a non-empty value or [`None`].
+    pub(crate) nonce: Option<&'a str>,
+    /// The validated PKCE `code_challenge` (S256) or [`None`].
+    pub(crate) code_challenge: Option<&'a str>,
+    /// The PKCE `code_challenge_method` string (`S256`) when a challenge is bound.
+    pub(crate) code_challenge_method: Option<&'static str>,
+    /// The parsed `claims` request parameter (OIDC Core 5.5).
+    pub(crate) claims_request: ClaimsRequest,
+    /// The canonical JSON form of the `claims` request parameter, or [`None`].
+    pub(crate) claims_canonical: Option<String>,
+    /// The parsed `prompt` set.
+    pub(crate) prompt: PromptSet,
+    /// The parsed `max_age` seconds (present including `max_age=0`), or [`None`].
+    pub(crate) max_age_secs: Option<u64>,
+    /// The typed interaction-hint seam (login/logout hints, locales, display).
+    pub(crate) hints: InteractionHints,
+}
+
+/// An error from the shared authorization-request validation, in a NEUTRAL form
+/// both the authorization endpoint and the PAR endpoint (issue #27) can render.
+///
+/// The `/authorize` endpoint renders it through [`AuthRequestError::into_authorize`]
+/// (a page before a redirect target is validated, a redirect after); the PAR
+/// endpoint renders the SAME `code` and `description` as a back-channel JSON error
+/// (RFC 9126 section 2.3), so an error surfaces identically wherever the one
+/// validator runs.
+pub(crate) struct AuthRequestError {
+    /// The OAuth error code.
+    pub(crate) code: AuthzErrorCode,
+    /// A short, non-secret `error_description`.
+    pub(crate) description: String,
+    /// When `Some`, the error is redirectable to this validated `redirect_uri`
+    /// through this mode (so `/authorize` sends a redirect); when `None`, no redirect
+    /// target is validated yet (so `/authorize` renders a page). The PAR endpoint
+    /// ignores this classification and always returns JSON.
+    pub(crate) redirect: Option<(String, ResponseMode)>,
+}
+
+impl AuthRequestError {
+    /// A pre-redirect error (no validated redirect target): an `invalid_request`
+    /// page at `/authorize`, a JSON `invalid_request` at PAR.
+    fn page(description: impl Into<String>) -> Self {
+        Self {
+            code: AuthzErrorCode::InvalidRequest,
+            description: description.into(),
+            redirect: None,
+        }
+    }
+
+    /// A redirectable error: the `redirect_uri` is validated, so `/authorize` sends
+    /// the error back through `mode`; PAR still returns JSON.
+    fn redirect(
+        redirect_uri: &str,
+        mode: ResponseMode,
+        code: AuthzErrorCode,
+        description: impl Into<String>,
+    ) -> Self {
+        Self {
+            code,
+            description: description.into(),
+            redirect: Some((redirect_uri.to_owned(), mode)),
+        }
+    }
+
+    /// Render this validation error as an authorization-endpoint [`AuthorizeError`],
+    /// given the request's issuer and echoed `state`. A redirectable error becomes a
+    /// redirect (carrying the RFC 9207 `iss`, issue #13); a page error becomes an
+    /// error page.
+    fn into_authorize(self, iss: String, state_echo: Option<&str>) -> AuthorizeError {
+        match self.redirect {
+            Some((redirect_uri, mode)) => AuthorizeError::Redirect {
+                redirect_uri,
+                error: self.code,
+                description: self.description,
+                state: state_echo.map(str::to_owned),
+                iss,
+                mode,
+            },
+            None => AuthorizeError::Page {
+                message: self.description,
+            },
+        }
+    }
+}
+
+/// Validate an authorization request's parameters, the ONE shared validator both
+/// `/authorize` and the PAR endpoint (RFC 9126, issue #27) run.
+///
+/// The steps and their ORDER are the security property, identical to what the
+/// authorization endpoint has always enforced (RFC 6749 4.1.2.1, RFC 9700): the
+/// `redirect_uri` is validated FIRST (a bad one is a page error, never a redirect),
+/// then the response type, response-mode negotiation, the front-channel nonce
+/// requirement, PKCE (S256-only, mandatory per the public/confidential policy), the
+/// `claims` request parameter, and the `prompt` and `max_age` parameters. Every error is returned as a
+/// neutral [`AuthRequestError`] so the two callers render it in their own way (a
+/// page/redirect at `/authorize`, a JSON error at PAR) with no divergence.
+///
+/// This performs NO login/consent gate and issues nothing: it validates only the
+/// re-checkable request parameters. The caller supplies the already-resolved
+/// [`ClientRecord`] (its `redirect_uris` and `auth_method` drive the redirect match
+/// and the PKCE requirement).
+pub(crate) fn validate_request<'a>(
+    state: &OidcState,
+    client: &ClientRecord,
+    params: &'a AuthorizeParams,
+) -> Result<ValidatedRequest<'a>, AuthRequestError> {
+    // 3. redirect_uri: present, a registrable RFC 8252 target, and an EXACT match
+    //    against the client's registered set. A failure is a PAGE error (no redirect
+    //    target is trusted yet), so it can never be turned into an open redirector.
+    let redirect_uri =
+        validate_registered_redirect(client, params).map_err(AuthRequestError::page)?;
+
+    // 4. response_type: present, representable, and enabled. A token-bearing value is
+    //    structurally unrepresentable (parse returns None), so the implicit
+    //    access-token flow is refused; the legacy types are DISABLED by default.
+    let response_type_raw = params
+        .response_type
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            // No type at all: no front-channel default is known, so the safe query
+            // mode carries the error.
+            AuthRequestError::redirect(
+                redirect_uri,
+                ResponseMode::Query,
+                AuthzErrorCode::InvalidRequest,
+                "response_type is required",
+            )
+        })?;
+    let Some(response_type) = ResponseType::parse(response_type_raw) else {
+        return Err(AuthRequestError::redirect(
+            redirect_uri,
+            ResponseMode::Query,
+            AuthzErrorCode::UnsupportedResponseType,
+            "the response_type is not supported",
+        ));
+    };
+
+    // 4b. Negotiate the response mode (issue #17), delivering any error by the type's
+    //     DEFAULT mode (never form_post, so there is no circular dependency).
+    let default_mode = response_type.default_response_mode();
+    let mode = resolve_mode(state, response_type, params.response_mode.as_deref()).map_err(
+        |description| {
+            AuthRequestError::redirect(
+                redirect_uri,
+                default_mode,
+                AuthzErrorCode::InvalidRequest,
+                description,
+            )
+        },
+    )?;
+
+    // 4c. Enablement: `code` is always enabled; a legacy type not enabled in this
+    //     environment is unsupported_response_type, by the negotiated mode.
+    if !state.response_type_enabled(response_type) {
+        return Err(AuthRequestError::redirect(
+            redirect_uri,
+            mode,
+            AuthzErrorCode::UnsupportedResponseType,
+            "the response_type is not enabled in this environment",
+        ));
+    }
+
+    // 4d. nonce is REQUIRED for a front-channel ID token (OIDC Core 3.2.2.1 /
+    //     3.3.2.1): it binds the ID token to this request and defends replay.
+    let nonce = params
+        .nonce
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if response_type.is_front_channel() && nonce.is_none() {
+        return Err(AuthRequestError::redirect(
+            redirect_uri,
+            mode,
+            AuthzErrorCode::InvalidRequest,
+            "nonce is required for this response_type",
+        ));
+    }
+
+    // Steps 5-5d (PKCE, claims, prompt/max_age, hints) run in the tail helper, which
+    // assembles the ValidatedRequest. It is split out only to keep this validator
+    // within the per-function length budget; the order and semantics are unchanged.
+    validate_request_tail(
+        state,
+        client,
+        params,
+        redirect_uri,
+        response_type,
+        mode,
+        nonce,
+    )
+}
+
+/// The tail of the shared validator (steps 5-5d): PKCE, the `claims` request
+/// parameter, `prompt`/`max_age`, and the interaction-hint seam. Any error redirects
+/// by the already-negotiated `mode`. Split from [`validate_request`] only to satisfy
+/// the per-function length budget; it is never called except from there.
+fn validate_request_tail<'a>(
+    state: &OidcState,
+    client: &ClientRecord,
+    params: &'a AuthorizeParams,
+    redirect_uri: &'a str,
+    response_type: ResponseType,
+    mode: ResponseMode,
+    nonce: Option<&'a str>,
+) -> Result<ValidatedRequest<'a>, AuthRequestError> {
+    // Every step below delivers its error as an invalid_request redirect by the
+    // already-negotiated mode; this closure captures that one shape (both captures are
+    // Copy, so it is reusable across the steps).
+    let invalid = |description: &'static str| {
+        AuthRequestError::redirect(
+            redirect_uri,
+            mode,
+            AuthzErrorCode::InvalidRequest,
+            description,
+        )
+    };
+
+    // 5. PKCE (S256-only, mandatory; see resolve_pkce). A PUBLIC client always
+    //    requires PKCE (RFC 9700 2.1.1); a CONFIDENTIAL client follows the
+    //    per-environment policy, required by default.
+    let is_public = client.auth_method == ClientAuthMethod::None.as_str();
+    let pkce_required =
+        response_type.issues_code() && (is_public || state.require_pkce_for_confidential());
+    let code_challenge = resolve_pkce(params, pkce_required).map_err(invalid)?;
+    let code_challenge_method = code_challenge.map(|_| PkceMethod::S256.as_str());
+
+    // 5b. The OIDC `claims` request parameter (Core 5.5): parse and validate.
+    let (claims_request, claims_canonical) =
+        parse_claims_request(params.claims.as_deref()).map_err(invalid)?;
+
+    // 5c. prompt and max_age (OIDC Core 3.1.2.1, issue #16).
+    let prompt = parse_prompt(params.prompt.as_deref()).map_err(invalid)?;
+    let max_age_secs = parse_max_age(params.max_age.as_deref()).map_err(invalid)?;
+
+    // 5d. The typed interaction-hint seam (issue #16).
+    let hints = InteractionHints::from_request(
+        params.login_hint.as_deref(),
+        params.logout_hint.as_deref(),
+        params.ui_locales.as_deref(),
+        params.claims_locales.as_deref(),
+        params.display.as_deref(),
+    );
+
+    Ok(ValidatedRequest {
+        redirect_uri,
+        response_type,
+        mode,
+        nonce,
+        code_challenge,
+        code_challenge_method,
+        claims_request,
+        claims_canonical,
+        prompt,
+        max_age_secs,
+        hints,
+    })
+}
+
 /// Validate the request's `redirect_uri` against the client's registered set
 /// (issue #13), BEFORE any redirect. It must be present, a registrable RFC 8252
 /// target (a claimed https URL, an http loopback IP literal, or a reverse-domain
 /// private-use scheme), and an EXACT-string match of a registered value (the only
 /// deviation being the RFC 8252 loopback port exception, inside
-/// [`redirect_uri_matches`]). Every failure is an error PAGE, never a redirect, so
-/// an unvalidated or unregistered URI can never be turned into an open redirector.
+/// [`redirect_uri_matches`]). Every failure returns a short, non-secret description
+/// the caller renders as an error PAGE, never a redirect, so an unvalidated or
+/// unregistered URI can never be turned into an open redirector.
 fn validate_registered_redirect<'a>(
     client: &ClientRecord,
     params: &'a AuthorizeParams,
-) -> Result<&'a str, AuthorizeError> {
+) -> Result<&'a str, &'static str> {
     let redirect_uri = params
         .redirect_uri
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .ok_or_else(|| AuthorizeError::page("the redirect_uri parameter is required"))?;
+        .ok_or("the redirect_uri parameter is required")?;
     if !redirect_uri_is_registrable(redirect_uri) {
-        return Err(AuthorizeError::page("the redirect_uri is invalid"));
+        return Err("the redirect_uri is invalid");
     }
     if !client
         .redirect_uris
         .iter()
         .any(|registered| redirect_uri_matches(registered, redirect_uri))
     {
-        return Err(AuthorizeError::page(
-            "the redirect_uri is not registered for this client",
-        ));
+        return Err("the redirect_uri is not registered for this client");
     }
     Ok(redirect_uri)
 }

@@ -200,9 +200,21 @@
           "minimum": 0,
           "type": "integer"
         },
+        "par_ttl_secs": {
+          "default": 60,
+          "description": "The pushed-authorization-request `request_uri` lifetime in seconds (RFC 9126\nsection 2.2, issue #27). A pushed request is short-lived and single-use; the\ndefault (60) is one minute, following the RFC's guidance that a `request_uri`\nexpires soon after it is pushed. Must be at least 1 and at most\n`OIDC_MAX_PAR_TTL_SECS` (600). This is a promotable per-environment setting in\nspirit, like the token lifetimes; the process value is the deployment default\nuntil per-environment overrides ride the M5 promotion pipeline.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
         "require_pkce_for_confidential_clients": {
           "default": true,
           "description": "Whether a CONFIDENTIAL client (one that authenticates at the token endpoint\nwith a secret) must use PKCE (issue #13, RFC 9700 2.1). Default `true`: PKCE\nis required for every client. A PUBLIC client (`token_endpoint_auth_method`\n= `none`) ALWAYS requires PKCE regardless of this setting, because RFC 9700\n2.1.1 makes it structural for public clients; this knob only governs the\nper-environment policy for confidential clients, whose default is `required`.\nSet it to `false` only for an environment whose confidential clients cannot\nyet send a `code_challenge` (a migration aid); a code issued without a\nchallenge is still never redeemable with a verifier (downgrade prevention\nholds in both directions). This is a promotable per-environment setting in\nspirit, like `jwks_cache_max_age_secs`; the process value is the deployment\ndefault until per-environment overrides ride the M5 promotion pipeline.",
+          "type": "boolean"
+        },
+        "require_pushed_authorization_requests": {
+          "default": false,
+          "description": "Require a pushed authorization request (PAR, RFC 9126 section 5) for EVERY\nclient in this environment. The safe default (`false`) leaves PAR optional:\na client may still push a request, but a plain authorization request is also\naccepted. When `true`, the authorization endpoint rejects any plain (non-PAR)\nrequest with `invalid_request`, and discovery advertises\n`require_pushed_authorization_requests = true`. A per-client\n`require_pushed_authorization_requests` registration flag layers ON TOP of\nthis: either the environment switch OR the client flag being set requires PAR\nfor that client. This is a promotable per-environment setting: it appears in\nconfig snapshots and rides the M5 promotion pipeline; the process value is the\ndeployment default until per-environment overrides land.",
           "type": "boolean"
         },
         "reuse_grace_secs": {
@@ -402,7 +414,9 @@
         "enable_response_type_none": false,
         "enabled": false,
         "jwks_cache_max_age_secs": 600,
+        "par_ttl_secs": 60,
         "require_pkce_for_confidential_clients": true,
+        "require_pushed_authorization_requests": false,
         "reuse_grace_secs": 10,
         "session_ttl_secs": 3600,
         "userinfo_cors_origins": []
