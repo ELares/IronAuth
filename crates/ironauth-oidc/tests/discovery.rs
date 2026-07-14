@@ -520,6 +520,50 @@ fn every_supported_array_equals_the_registry_its_subsystem_exposes() {
     }
 }
 
+#[tokio::test]
+async fn prompt_display_and_locale_capabilities_are_advertised() {
+    // Issue #16: prompt_values_supported advertises the full acted-on set including
+    // create; the display and locale capabilities advertise exactly what the
+    // interaction pages honor (page, English), never a capability the server refuses.
+    let (router, scope) =
+        router_and_scope(DiscoveryCapabilities::from_config(&OidcConfig::default()));
+    let uri = format!(
+        "/t/{}/e/{}/.well-known/openid-configuration",
+        scope.tenant(),
+        scope.environment()
+    );
+    let (status, _, body) = get(&router, &uri).await;
+    assert_eq!(status, StatusCode::OK);
+    let doc: Value = serde_json::from_str(&body).expect("json");
+
+    let prompts = string_array(&doc, "prompt_values_supported");
+    assert_eq!(
+        prompts,
+        vec!["none", "login", "consent", "select_account", "create"]
+    );
+    assert!(
+        prompts.contains(&"create".to_owned()),
+        "prompt=create stays advertised"
+    );
+    // display: only page (the layout the bootstrap renders).
+    assert_eq!(string_array(&doc, "display_values_supported"), vec!["page"]);
+    // ui/claims locales: the honest bootstrap set, sourced from the module consts.
+    assert_eq!(
+        string_array(&doc, "ui_locales_supported"),
+        ironauth_oidc::UI_LOCALES_SUPPORTED
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        string_array(&doc, "claims_locales_supported"),
+        ironauth_oidc::CLAIMS_LOCALES_SUPPORTED
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+    );
+}
+
 #[test]
 fn rs256_floor_is_the_only_advertised_alg_that_need_not_be_policy_permitted() {
     // The documented single carve-out: every advertised id-token signing alg is

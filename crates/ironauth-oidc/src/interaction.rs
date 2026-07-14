@@ -28,6 +28,7 @@ use ironauth_store::{
 };
 
 use crate::authn::AuthenticationEvent;
+use crate::hints::InteractionHints;
 use crate::pages;
 use crate::session;
 use crate::state::OidcState;
@@ -44,7 +45,7 @@ const REGISTER_PATH: &str = "/register";
 const CONSENT_PATH: &str = "/consent";
 
 /// A validated resume target: the local authorization URL to send the user back
-/// to, and the client and scope recovered from it.
+/// to, and the client, scope, and interaction hints recovered from it.
 pub struct ResumeTarget {
     /// The validated `/authorize?...` path to resume at.
     pub return_to: String,
@@ -54,6 +55,11 @@ pub struct ResumeTarget {
     pub scope: Scope,
     /// The requested OAuth `scope` value, if the request carried one.
     pub oauth_scope: Option<String>,
+    /// The typed interaction hints (`login_hint`, `ui_locales`, `display`, and the
+    /// rest) reconstructed from the resuming query (issue #16), so the interaction
+    /// page renders with the identifier prefill, language, and layout the
+    /// authorization request asked for.
+    pub hints: InteractionHints,
 }
 
 /// Validate and parse a `return_to`. Returns [`None`] for any value that is not a
@@ -71,11 +77,13 @@ pub fn parse_resume(raw: Option<&str>) -> Option<ResumeTarget> {
     let client_id = ClientId::parse_declared_scope(&client_id_raw).ok()?;
     let scope = client_id.scope();
     let oauth_scope = query_get(query, "scope").filter(|value| !value.is_empty());
+    let hints = InteractionHints::from_query(query);
     Some(ResumeTarget {
         return_to: return_to.to_owned(),
         client_id,
         scope,
         oauth_scope,
+        hints,
     })
 }
 
@@ -270,12 +278,18 @@ mod tests {
         let (env, _) = ironauth_env::Env::deterministic(std::time::SystemTime::UNIX_EPOCH, 1);
         let scope = Scope::new(TenantId::generate(&env), EnvironmentId::generate(&env));
         let client = ClientId::generate(&env, &scope);
-        let return_to =
-            format!("/authorize?response_type=code&client_id={client}&scope=openid%20profile");
+        let return_to = format!(
+            "/authorize?response_type=code&client_id={client}&scope=openid%20profile&\
+             login_hint=ada%40example.test&ui_locales=fr&display=popup"
+        );
         let resume = parse_resume(Some(&return_to)).expect("valid resume");
         assert_eq!(resume.scope, scope);
         assert_eq!(resume.client_id, client);
         assert_eq!(resume.oauth_scope.as_deref(), Some("openid profile"));
+        // The interaction hints ride the resuming query (issue #16).
+        assert_eq!(resume.hints.login_hint(), Some("ada@example.test"));
+        assert_eq!(resume.hints.ui_locales(), Some("fr"));
+        assert_eq!(resume.hints.display(), crate::hints::Display::Popup);
     }
 
     #[test]

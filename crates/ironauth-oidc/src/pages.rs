@@ -37,6 +37,8 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use sha2::{Digest as _, Sha256};
 
+use crate::hints::InteractionHints;
+
 /// The strict Content-Security-Policy every bootstrap page carries. `default-src
 /// 'none'` denies everything not explicitly re-permitted; the pages load no
 /// script, style, image, or font, so only `form-action 'self'` (a form may post
@@ -88,12 +90,27 @@ pub fn secure_html(status: StatusCode, body: String) -> Response {
 /// Wrap page `body_html` in the minimal, unbranded document shell. `title` and
 /// `body_html` must already be escaped by the caller where they carry reflected
 /// input; the fixed chrome here is server-authored.
-fn document(title: &str, body_html: &str) -> String {
+///
+/// `lang` sets the `<html lang>` (an English page shell by default; the interaction
+/// pages pass the request's `ui_locales` primary tag), and `display` sets a
+/// `<body data-display>` layout hint (the request's OIDC `display`, `page` by
+/// default). Both are UNTRUSTED-derived, so both are escaped here regardless: the
+/// `lang` value is charset-guarded by [`InteractionHints::lang`] and escaped, and
+/// `display` comes from the closed [`crate::hints::Display`] registry.
+fn document(title: &str, body_html: &str, lang: &str, display: &str) -> String {
+    let lang = escape_html(lang);
+    let display = escape_html(display);
     format!(
-        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
+        "<!doctype html><html lang=\"{lang}\"><head><meta charset=\"utf-8\">\
          <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
-         <title>{title}</title></head><body>{body_html}</body></html>"
+         <title>{title}</title></head><body data-display=\"{display}\">{body_html}</body></html>"
     )
+}
+
+/// The document shell for a server-authored notice page (English, the default
+/// `page` layout): the interaction-hint context does not apply to a fixed notice.
+fn notice_document(title: &str, body_html: &str) -> String {
+    document(title, body_html, "en", "page")
 }
 
 /// A hidden `return_to` form field carrying the (escaped) resume target, so the
@@ -115,10 +132,17 @@ fn error_banner(error: Option<&str>) -> String {
 }
 
 /// The minimal login page: an identifier and password form posting to `/login`.
-/// `identifier` prefills the field after a failed attempt; `error` shows a
-/// generic failure message. Both are escaped.
+/// `identifier` prefills the field (from the `login_hint` on the first render, or
+/// the submitted value after a failed attempt); `error` shows a generic failure
+/// message; `hints` is the typed rendering context (issue #16) whose `display` and
+/// `ui_locales` shape the document shell. Every reflected value is escaped.
 #[must_use]
-pub fn login_page(identifier: &str, return_to: &str, error: Option<&str>) -> String {
+pub fn login_page(
+    identifier: &str,
+    return_to: &str,
+    error: Option<&str>,
+    hints: &InteractionHints,
+) -> String {
     let body = format!(
         "<h1>Sign in</h1>{error}\
          <form method=\"post\" action=\"/login\">{return_to}\
@@ -131,13 +155,19 @@ pub fn login_page(identifier: &str, return_to: &str, error: Option<&str>) -> Str
         return_to = return_to_field(return_to),
         identifier = escape_html(identifier),
     );
-    document("Sign in", &body)
+    document("Sign in", &body, hints.lang(), hints.display().as_str())
 }
 
 /// The minimal registration page: an identifier and password form posting to
-/// `/register`. Reached directly and as the target of `prompt=create`.
+/// `/register`. Reached directly and as the target of `prompt=create`. `hints` is
+/// the typed rendering context (issue #16).
 #[must_use]
-pub fn register_page(identifier: &str, return_to: &str, error: Option<&str>) -> String {
+pub fn register_page(
+    identifier: &str,
+    return_to: &str,
+    error: Option<&str>,
+    hints: &InteractionHints,
+) -> String {
     let body = format!(
         "<h1>Create account</h1>{error}\
          <form method=\"post\" action=\"/register\">{return_to}\
@@ -150,14 +180,25 @@ pub fn register_page(identifier: &str, return_to: &str, error: Option<&str>) -> 
         return_to = return_to_field(return_to),
         identifier = escape_html(identifier),
     );
-    document("Create account", &body)
+    document(
+        "Create account",
+        &body,
+        hints.lang(),
+        hints.display().as_str(),
+    )
 }
 
 /// The minimal consent page: shows the client's display name and the requested
 /// scopes, with Allow and Deny buttons posting to `/consent`. Every reflected
-/// value (client name, each scope, `return_to`) is escaped.
+/// value (client name, each scope, `return_to`) is escaped. `hints` is the typed
+/// rendering context (issue #16).
 #[must_use]
-pub fn consent_page(client_name: &str, scopes: &[&str], return_to: &str) -> String {
+pub fn consent_page(
+    client_name: &str,
+    scopes: &[&str],
+    return_to: &str,
+    hints: &InteractionHints,
+) -> String {
     let scope_items: String = if scopes.is_empty() {
         "<li>(no scopes requested)</li>".to_owned()
     } else {
@@ -177,7 +218,12 @@ pub fn consent_page(client_name: &str, scopes: &[&str], return_to: &str) -> Stri
         scopes = scope_items,
         return_to = return_to_field(return_to),
     );
-    document("Authorize access", &body)
+    document(
+        "Authorize access",
+        &body,
+        hints.lang(),
+        hints.display().as_str(),
+    )
 }
 
 /// A minimal server-authored notice page (for example after a denied consent).
@@ -189,7 +235,7 @@ pub fn notice_page(title: &str, message: &str) -> String {
         title = escape_html(title),
         message = escape_html(message),
     );
-    document(&escape_html(title), &body)
+    notice_document(&escape_html(title), &body)
 }
 
 /// The exact inline script the `form_post` interstitial runs: submit the single
@@ -264,7 +310,7 @@ pub fn form_post_page(action: &str, params: &[(&str, Option<&str>)]) -> String {
         action = escape_html(action),
         script = FORM_POST_AUTO_SUBMIT,
     );
-    document("Submit this form", &body)
+    notice_document("Submit this form", &body)
 }
 
 /// Build the `200 OK` `form_post` interstitial response for `action` (the
@@ -331,11 +377,12 @@ mod tests {
     fn reflected_return_to_is_escaped_in_every_form_page() {
         // A crafted return_to must never break out of the hidden input's quoted
         // attribute on any page that reflects it.
+        let hints = InteractionHints::default();
         let hostile = "\"><script>alert(1)</script>";
         for page in [
-            login_page("", hostile, None),
-            register_page("", hostile, None),
-            consent_page("Acme", &["openid"], hostile),
+            login_page("", hostile, None, &hints),
+            register_page("", hostile, None, &hints),
+            consent_page("Acme", &["openid"], hostile, &hints),
         ] {
             assert!(
                 !page.contains("<script>alert(1)"),
@@ -350,10 +397,66 @@ mod tests {
 
     #[test]
     fn consent_page_escapes_client_name_and_scopes() {
-        let page = consent_page("<b>Evil</b>", &["openid", "<img src=x>"], "/authorize?x=1");
+        let page = consent_page(
+            "<b>Evil</b>",
+            &["openid", "<img src=x>"],
+            "/authorize?x=1",
+            &InteractionHints::default(),
+        );
         assert!(!page.contains("<b>Evil</b>"), "client name escaped");
         assert!(!page.contains("<img src=x>"), "scope escaped");
         assert!(page.contains("&lt;b&gt;Evil&lt;/b&gt;"));
+    }
+
+    #[test]
+    fn interaction_hints_reach_the_page_shell() {
+        // The display and ui_locales from the typed context reach the rendered page
+        // (issue #16 acceptance 5): the lang attribute is the ui_locales primary tag
+        // and the body carries the display layout hint.
+        let hints = InteractionHints::from_request(
+            Some("ada@example.test"),
+            None,
+            Some("fr-CA en"),
+            None,
+            Some("touch"),
+        );
+        let page = login_page("ada@example.test", "/authorize?x=1", None, &hints);
+        assert!(
+            page.contains("<html lang=\"fr-CA\">"),
+            "ui_locales lang: {page}"
+        );
+        assert!(
+            page.contains("data-display=\"touch\""),
+            "display layout hint: {page}"
+        );
+        // The login_hint prefills the identifier field, escaped.
+        assert!(
+            page.contains("value=\"ada@example.test\""),
+            "login_hint prefilled: {page}"
+        );
+        // The default context renders the English page layout.
+        let plain = register_page("", "/authorize?x=1", None, &InteractionHints::default());
+        assert!(plain.contains("<html lang=\"en\">"));
+        assert!(plain.contains("data-display=\"page\""));
+    }
+
+    #[test]
+    fn a_hostile_ui_locale_cannot_break_out_of_the_lang_attribute() {
+        // ui_locales is untrusted; a hostile primary tag is charset-guarded to the
+        // default and, even so, escaped, so it can never break the lang attribute.
+        let hints = InteractionHints::from_request(
+            None,
+            None,
+            Some("\"><script>alert(1)</script>"),
+            None,
+            None,
+        );
+        let page = login_page("", "/authorize?x=1", None, &hints);
+        assert!(!page.contains("<script>alert(1)"), "no breakout: {page}");
+        assert!(
+            page.contains("<html lang=\"en\">"),
+            "guarded to default: {page}"
+        );
     }
 
     #[test]

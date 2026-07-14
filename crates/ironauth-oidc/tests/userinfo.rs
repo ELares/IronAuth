@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! The UserInfo endpoint end to end, against a real Postgres (issue #15).
+//! The `UserInfo` endpoint end to end, against a real Postgres (issue #15).
 //!
 //! Covers the acceptance criteria: GET and POST with header Bearer auth (and a
 //! query-string token refused), the spec-exact RFC 6750 challenges for missing,
@@ -15,12 +15,15 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use common::{Harness, REDIRECT_URI, SEED_PASSWORD, enc, form, json, location_param};
+use common::{
+    Harness, PKCE_CHALLENGE, PKCE_VERIFIER, REDIRECT_URI, SEED_PASSWORD, enc, form, json,
+    location_param,
+};
 use ironauth_config::OidcConfig;
 use serde_json::Value;
 use std::time::Duration;
 
-/// The standard-claim document the seeded UserInfo user carries.
+/// The standard-claim document the seeded `UserInfo` user carries.
 const CLAIMS_JSON: &str = r#"{
     "name": "Ada Lovelace",
     "given_name": "Ada",
@@ -46,8 +49,11 @@ async fn issue_tokens(
     harness.grant_consent(&subject, &client_id).await;
     let cookie = harness.session_cookie(&subject).await;
 
+    // The harness client is public, so PKCE is mandatory (issue #13): bind the RFC
+    // 7636 Appendix B S256 challenge and redeem with its verifier.
     let mut query = format!(
-        "response_type=code&client_id={client_id}&redirect_uri={}&scope={}",
+        "response_type=code&client_id={client_id}&redirect_uri={}&scope={}&\
+         code_challenge={PKCE_CHALLENGE}&code_challenge_method=S256",
         enc(REDIRECT_URI),
         enc(scope),
     );
@@ -56,7 +62,11 @@ async fn issue_tokens(
         query.push_str(&enc(claims));
     }
     let (status, headers, body) = harness.authorize_with_cookie(&query, &cookie).await;
-    assert_eq!(status, StatusCode::FOUND, "authorize should redirect: {body}");
+    assert_eq!(
+        status,
+        StatusCode::FOUND,
+        "authorize should redirect: {body}"
+    );
     let code = location_param(&headers, "code").expect("code in redirect");
 
     let exchange = form(&[
@@ -64,11 +74,15 @@ async fn issue_tokens(
         ("code", &code),
         ("redirect_uri", REDIRECT_URI),
         ("client_id", &client_id),
+        ("code_verifier", PKCE_VERIFIER),
     ]);
     let (status, _, body) = harness.token(&exchange).await;
     assert_eq!(status, StatusCode::OK, "token exchange: {body}");
     let value = json(&body);
-    let access = value["access_token"].as_str().expect("access_token").to_owned();
+    let access = value["access_token"]
+        .as_str()
+        .expect("access_token")
+        .to_owned();
     let id = value["id_token"].as_str().expect("id_token").to_owned();
     (subject, access, id)
 }
@@ -85,7 +99,7 @@ fn unique_identifier(harness: &Harness) -> String {
     format!("userinfo-{id}@example.test")
 }
 
-/// A UserInfo request with an optional Bearer token, Origin, and raw query.
+/// A `UserInfo` request with an optional Bearer token, Origin, and raw query.
 async fn userinfo(
     harness: &Harness,
     method: &str,
@@ -126,7 +140,10 @@ fn challenge(headers: &axum::http::HeaderMap) -> Option<String> {
 async fn get_and_post_return_claims_and_sub_matches_the_id_token() {
     let harness = Harness::start().await;
     let (_subject, access, id_token) = issue_tokens(&harness, "openid profile email", None).await;
-    let id_sub = payload_claims(&id_token)["sub"].as_str().expect("id sub").to_owned();
+    let id_sub = payload_claims(&id_token)["sub"]
+        .as_str()
+        .expect("id sub")
+        .to_owned();
 
     for method in ["GET", "POST"] {
         let (status, headers, body) = userinfo(&harness, method, Some(&access), None, None).await;
@@ -145,8 +162,14 @@ async fn get_and_post_return_claims_and_sub_matches_the_id_token() {
         assert_eq!(claims["given_name"], "Ada", "{method}");
         assert_eq!(claims["email"], "ada@example.test", "{method}");
         assert_eq!(claims["email_verified"], true, "{method}");
-        assert!(claims.get("address").is_none(), "address not granted: {method}");
-        assert!(claims.get("phone_number").is_none(), "phone not granted: {method}");
+        assert!(
+            claims.get("address").is_none(),
+            "address not granted: {method}"
+        );
+        assert!(
+            claims.get("phone_number").is_none(),
+            "phone not granted: {method}"
+        );
     }
 }
 
@@ -175,9 +198,16 @@ async fn conform_override_copies_scope_claims_into_the_id_token() {
     let harness = Harness::start_with(config).await;
     let (_subject, access, id_token) = issue_tokens(&harness, "openid email", None).await;
     let id_claims = payload_claims(&id_token);
-    assert_eq!(id_claims["email"], "ada@example.test", "override copies email into the ID token");
+    assert_eq!(
+        id_claims["email"], "ada@example.test",
+        "override copies email into the ID token"
+    );
     // sub is still the required protocol claim, never shadowed.
-    assert!(id_claims["sub"].as_str().is_some_and(|s| s.starts_with("usr_")));
+    assert!(
+        id_claims["sub"]
+            .as_str()
+            .is_some_and(|s| s.starts_with("usr_"))
+    );
 
     let (status, _, body) = userinfo(&harness, "GET", Some(&access), None, None).await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -191,7 +221,10 @@ async fn a_missing_token_is_401_with_a_bare_bearer_challenge() {
     assert_eq!(status, StatusCode::UNAUTHORIZED);
     let www = challenge(&headers).expect("challenge");
     assert_eq!(www, "Bearer realm=\"ironauth\"");
-    assert!(!www.contains("error="), "a missing token names no error code");
+    assert!(
+        !www.contains("error="),
+        "a missing token names no error code"
+    );
 }
 
 #[tokio::test]
@@ -199,7 +232,11 @@ async fn a_malformed_token_is_401_invalid_token() {
     let harness = Harness::start().await;
     let (status, headers, _) = userinfo(&harness, "GET", Some("not-a-jwt"), None, None).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
-    assert!(challenge(&headers).unwrap().contains("error=\"invalid_token\""));
+    assert!(
+        challenge(&headers)
+            .unwrap()
+            .contains("error=\"invalid_token\"")
+    );
 }
 
 #[tokio::test]
@@ -210,7 +247,11 @@ async fn a_query_string_token_is_refused_invalid_request() {
     let query = format!("access_token={}", enc(&access));
     let (status, headers, _) = userinfo(&harness, "GET", None, None, Some(&query)).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert!(challenge(&headers).unwrap().contains("error=\"invalid_request\""));
+    assert!(
+        challenge(&headers)
+            .unwrap()
+            .contains("error=\"invalid_request\"")
+    );
 }
 
 #[tokio::test]
@@ -221,7 +262,11 @@ async fn an_expired_token_is_401_invalid_token() {
     harness.clock().advance(Duration::from_secs(600));
     let (status, headers, _) = userinfo(&harness, "GET", Some(&access), None, None).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
-    assert!(challenge(&headers).unwrap().contains("error=\"invalid_token\""));
+    assert!(
+        challenge(&headers)
+            .unwrap()
+            .contains("error=\"invalid_token\"")
+    );
 }
 
 #[tokio::test]
@@ -236,7 +281,8 @@ async fn a_token_whose_grant_was_revoked_is_401_invalid_token() {
     harness.grant_consent(&subject, &client_id).await;
     let cookie = harness.session_cookie(&subject).await;
     let query = format!(
-        "response_type=code&client_id={client_id}&redirect_uri={}&scope=openid",
+        "response_type=code&client_id={client_id}&redirect_uri={}&scope=openid&\
+         code_challenge={PKCE_CHALLENGE}&code_challenge_method=S256",
         enc(REDIRECT_URI),
     );
     let (_, headers, _) = harness.authorize_with_cookie(&query, &cookie).await;
@@ -246,10 +292,14 @@ async fn a_token_whose_grant_was_revoked_is_401_invalid_token() {
         ("code", &code),
         ("redirect_uri", REDIRECT_URI),
         ("client_id", &client_id),
+        ("code_verifier", PKCE_VERIFIER),
     ]);
     let (status, _, body) = harness.token(&exchange).await;
     assert_eq!(status, StatusCode::OK, "first exchange: {body}");
-    let access = json(&body)["access_token"].as_str().expect("access").to_owned();
+    let access = json(&body)["access_token"]
+        .as_str()
+        .expect("access")
+        .to_owned();
 
     // The token works before revocation.
     let (status, _, _) = userinfo(&harness, "GET", Some(&access), None, None).await;
@@ -263,7 +313,11 @@ async fn a_token_whose_grant_was_revoked_is_401_invalid_token() {
     // The access token is now inactive at UserInfo.
     let (status, headers, _) = userinfo(&harness, "GET", Some(&access), None, None).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
-    assert!(challenge(&headers).unwrap().contains("error=\"invalid_token\""));
+    assert!(
+        challenge(&headers)
+            .unwrap()
+            .contains("error=\"invalid_token\"")
+    );
 }
 
 #[tokio::test]
@@ -275,7 +329,10 @@ async fn a_token_without_the_openid_scope_is_403_insufficient_scope() {
     assert_eq!(status, StatusCode::FORBIDDEN);
     let www = challenge(&headers).expect("challenge");
     assert!(www.contains("error=\"insufficient_scope\""));
-    assert!(www.contains("scope=\"openid\""), "carries the scope attribute");
+    assert!(
+        www.contains("scope=\"openid\""),
+        "carries the scope attribute"
+    );
 }
 
 #[tokio::test]
@@ -299,17 +356,21 @@ async fn the_claims_parameter_is_honored_end_to_end() {
     assert_eq!(claims["name"], "Ada Lovelace");
     assert_eq!(claims["email"], "ada@example.test");
     // The unsatisfiable voluntary claim (website, absent from the user) is omitted.
-    assert!(claims.get("website").is_none(), "unsatisfiable voluntary claim omitted");
+    assert!(
+        claims.get("website").is_none(),
+        "unsatisfiable voluntary claim omitted"
+    );
     // A claim neither scope nor request selected is absent.
     assert!(claims.get("phone_number").is_none());
 }
 
 #[tokio::test]
 async fn an_essential_acr_that_cannot_be_met_fails_closed_at_authorize() {
-    // The bootstrap can only achieve the password ACR. An essential acr pinned to
-    // a level it cannot reach must NOT silently downgrade: the request fails closed
-    // (issue #15), surfaced through the authorize redirect error path (issue #16
-    // refines the exact code).
+    // The bootstrap can only achieve the password ACR. An essential acr pinned to a
+    // level NO method can reach must NOT silently downgrade: the request fails closed
+    // with the registered `unmet_authentication_requirements` code (issue #16
+    // refines the issue #15 fail-closed to this exact code), delivered through the
+    // negotiated response mode.
     let harness = Harness::start().await;
     let client_id = harness.client_id().to_string();
     let subject = harness.seed_unique_user().await;
@@ -318,20 +379,31 @@ async fn an_essential_acr_that_cannot_be_met_fails_closed_at_authorize() {
 
     let claims = r#"{"id_token":{"acr":{"essential":true,"values":["urn:example:high"]}}}"#;
     let query = format!(
-        "response_type=code&client_id={client_id}&redirect_uri={}&scope=openid&state=xyz&claims={}",
+        "response_type=code&client_id={client_id}&redirect_uri={}&scope=openid&state=xyz&\
+         code_challenge={PKCE_CHALLENGE}&code_challenge_method=S256&claims={}",
         enc(REDIRECT_URI),
         enc(claims),
     );
     let (status, headers, body) = harness.authorize_with_cookie(&query, &cookie).await;
-    assert_eq!(status, StatusCode::FOUND, "fails closed by redirect: {body}");
+    assert_eq!(
+        status,
+        StatusCode::FOUND,
+        "fails closed by redirect: {body}"
+    );
     let location = headers
         .get(header::LOCATION)
         .and_then(|v| v.to_str().ok())
         .expect("location");
-    assert!(location.contains("error=access_denied"), "fail-closed error: {location}");
+    assert!(
+        location.contains("error=unmet_authentication_requirements"),
+        "unmet_authentication_requirements when no method can satisfy the acr: {location}"
+    );
     assert!(location.contains("state=xyz"), "echoes state");
     // No code was issued.
-    assert!(location_param(&headers, "code").is_none(), "no code on a failed auth");
+    assert!(
+        location_param(&headers, "code").is_none(),
+        "no code on a failed auth"
+    );
 }
 
 #[tokio::test]
@@ -356,8 +428,7 @@ async fn cors_is_present_for_a_registered_origin_and_absent_otherwise() {
     let (_subject, access, _) = issue_tokens(&harness, "openid email", None).await;
 
     // Preflight for the registered origin: 204 with the CORS headers.
-    let (status, headers, _) =
-        userinfo(&harness, "OPTIONS", None, Some(REGISTERED), None).await;
+    let (status, headers, _) = userinfo(&harness, "OPTIONS", None, Some(REGISTERED), None).await;
     assert_eq!(status, StatusCode::NO_CONTENT);
     assert_eq!(
         headers
@@ -369,8 +440,7 @@ async fn cors_is_present_for_a_registered_origin_and_absent_otherwise() {
     assert!(headers.get(header::ACCESS_CONTROL_ALLOW_HEADERS).is_some());
 
     // Preflight for an unregistered origin: 204 with NO CORS headers.
-    let (status, headers, _) =
-        userinfo(&harness, "OPTIONS", None, Some(UNREGISTERED), None).await;
+    let (status, headers, _) = userinfo(&harness, "OPTIONS", None, Some(UNREGISTERED), None).await;
     assert_eq!(status, StatusCode::NO_CONTENT);
     assert!(headers.get(header::ACCESS_CONTROL_ALLOW_ORIGIN).is_none());
 

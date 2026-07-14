@@ -28,9 +28,10 @@
 //! `acr`. An essential `acr` with `value`/`values` is a binding authentication
 //! requirement: if the achieved authentication context is not among the requested
 //! values, the request MUST NOT be silently downgraded to a lower level. This
-//! module reports whether the achieved `acr` satisfies such a request; the
-//! fail-closed handling lives at the authorization endpoint (the full
-//! `unmet_authentication_requirements` surface is issue #16).
+//! module exposes the pinned values of such a binding ([`ClaimsRequest::essential_acr_values`]);
+//! the authorization endpoint owns the decision (issue #16), returning
+//! `unmet_authentication_requirements` when no method can satisfy the binding and
+//! failing closed via `access_denied` for the residual step-up case.
 
 use std::collections::BTreeMap;
 
@@ -251,27 +252,23 @@ impl ClaimsRequest {
         Value::Object(top).to_string()
     }
 
-    /// Whether the achieved `acr` satisfies an essential `acr` request in the ID
-    /// token member (OIDC Core 5.5.1.1). Returns `true` when there is no essential
-    /// `acr` request, or when it pins no string values, or when `achieved_acr` is
-    /// among the pinned values. Returns `false` ONLY when an essential `acr` pins
-    /// values and the achieved level is not one of them: a binding requirement the
-    /// server cannot meet, which must fail closed rather than silently downgrade.
+    /// The acceptable `acr` values an ESSENTIAL `acr` request in the ID token member
+    /// pins (OIDC Core 5.5.1.1), used by the authorization endpoint to decide the
+    /// `unmet_authentication_requirements` surface (issue #16). Empty when there is
+    /// no essential `acr` request, or the essential `acr` pins no string values (a
+    /// level-report request, not a specific-level binding). A non-empty result is a
+    /// binding requirement: the request must be met by one of these values.
+    ///
+    /// The binding decision (whether the achieved level satisfies these values, and
+    /// whether ANY method can, which distinguishes `access_denied` from
+    /// `unmet_authentication_requirements`) lives at the authorization endpoint,
+    /// which knows the achievable set (issue #16).
     #[must_use]
-    pub fn acr_satisfied(&self, achieved_acr: &str) -> bool {
-        let Some(spec) = self.id_token.get("acr") else {
-            return true;
-        };
-        if !spec.is_essential() {
-            return true;
+    pub fn essential_acr_values(&self) -> Vec<String> {
+        match self.id_token.get("acr") {
+            Some(spec) if spec.is_essential() => spec.accepted_string_values(),
+            _ => Vec::new(),
         }
-        let accepted = spec.accepted_string_values();
-        // Essential acr without any pinned value is a request for auth_time/level
-        // reporting, not a specific-level binding; it cannot fail closed here.
-        if accepted.is_empty() {
-            return true;
-        }
-        accepted.iter().any(|value| value == achieved_acr)
     }
 }
 
@@ -403,27 +400,30 @@ mod tests {
     }
 
     #[test]
-    fn essential_acr_binding_fails_closed_only_on_an_unachievable_level() {
-        // Essential acr pinning l2/l3: achieving pwd (a different level) fails.
-        let req =
+    fn essential_acr_values_exposes_only_a_binding_requirement() {
+        // An essential acr with pinned values is a binding requirement.
+        let binding =
             ClaimsRequest::parse(r#"{"id_token":{"acr":{"essential":true,"values":["l2","l3"]}}}"#)
                 .expect("parse");
-        assert!(!req.acr_satisfied("urn:ironauth:acr:pwd"));
-        assert!(req.acr_satisfied("l2"));
+        assert_eq!(
+            binding.essential_acr_values(),
+            vec!["l2".to_owned(), "l3".to_owned()]
+        );
 
-        // A VOLUNTARY acr never fails closed (best effort).
-        let voluntary =
-            ClaimsRequest::parse(r#"{"id_token":{"acr":{"values":["l2"]}}}"#).expect("parse");
-        assert!(voluntary.acr_satisfied("urn:ironauth:acr:pwd"));
-
-        // No acr request at all is trivially satisfied.
-        let none = ClaimsRequest::parse(r#"{"userinfo":{"email":null}}"#).expect("parse");
-        assert!(none.acr_satisfied("urn:ironauth:acr:pwd"));
-
-        // Essential acr with no pinned value is a level-report request, not a
-        // binding, so it is satisfied by any achieved level.
-        let report =
-            ClaimsRequest::parse(r#"{"id_token":{"acr":{"essential":true}}}"#).expect("parse");
-        assert!(report.acr_satisfied("urn:ironauth:acr:pwd"));
+        // A voluntary acr, an essential acr with no pinned value, and an absent acr
+        // are all NOT binding, so they expose no values.
+        for not_binding in [
+            r#"{"id_token":{"acr":{"values":["l2"]}}}"#,
+            r#"{"id_token":{"acr":{"essential":true}}}"#,
+            r#"{"userinfo":{"email":null}}"#,
+        ] {
+            assert!(
+                ClaimsRequest::parse(not_binding)
+                    .expect("parse")
+                    .essential_acr_values()
+                    .is_empty(),
+                "{not_binding} is not a binding acr requirement"
+            );
+        }
     }
 }

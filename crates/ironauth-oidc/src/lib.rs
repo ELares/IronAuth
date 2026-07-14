@@ -74,6 +74,7 @@ mod client_auth;
 mod consent;
 mod discovery;
 mod error;
+mod hints;
 mod interaction;
 mod issuer;
 mod jwks;
@@ -105,17 +106,20 @@ pub use authn::{
 };
 pub use client_auth::{ClientAuthMethod, generate_secret, hash_secret};
 pub use discovery::{
-    ADVERTISED_ENDPOINTS, DiscoveryCapabilities, DiscoveryEndpoint, DiscoveryState,
-    ID_TOKEN_CLAIMS_SUPPORTED, SCOPES_SUPPORTED, claims_supported, discovery_document,
-    discovery_router, id_token_signing_alg_values,
+    ADVERTISED_ENDPOINTS, CLAIMS_LOCALES_SUPPORTED, DiscoveryCapabilities, DiscoveryEndpoint,
+    DiscoveryState, ID_TOKEN_CLAIMS_SUPPORTED, SCOPES_SUPPORTED, UI_LOCALES_SUPPORTED,
+    claims_supported, discovery_document, discovery_router, id_token_signing_alg_values,
 };
 pub use error::{AuthorizeError, AuthzErrorCode, TokenError};
+pub use hints::{Display, InteractionHints};
 pub use issuer::{
     IssuerEntry, IssuerError, IssuerRegistry, JwksCacheError, JwksCacheWindow, load_signing_key,
 };
 pub use jwks::{IssuerState, issuer_router};
 pub use password::{PasswordError, hash_password, verify_password};
-pub use registry::{GrantType, PkceMethod, PromptValue, ResponseMode, ResponseType};
+pub use registry::{
+    GrantType, PkceMethod, PromptSet, PromptSetError, PromptValue, ResponseMode, ResponseType,
+};
 pub use sector::{
     SectorError, check_sector_document, sector_uri_required, validate_sector_identifier,
 };

@@ -6,6 +6,55 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- `prompt`, `max_age`, interaction-hint plumbing, `prompt=create`, and the
+  `unmet_authentication_requirements` error (issue #16). Extends the #12/#13/#17
+  authorization endpoint and the #20 interaction surfaces; the provider stays gated
+  off (`oidc.enabled` unchanged).
+  - **`prompt` is a space-separated SET** (`PromptSet`, parsed order-insensitively
+    like `ResponseType`). `none` renders NO UI: a missing session, missing consent,
+    or a `max_age`-stale session returns `login_required` / `consent_required`
+    through the NEGOTIATED response mode (never a page), exactly as other authorize
+    errors to a validated `redirect_uri`. `login` forces fresh authentication despite
+    a valid session; `consent` re-prompts consent even when recorded;
+    `select_account` degrades to a forced re-login under the single-session
+    bootstrap; `create` still deep-links to registration. `none` combined with any
+    other value, or an unrecognized value, is `invalid_request`.
+  - **`max_age`** forces re-authentication when the session's `auth_time` is older
+    than the requested window, and `max_age=0` behaves exactly as `prompt=login`
+    (and forces `auth_time` in the ID token). The PRESENCE of `max_age` (including
+    `max_age=0`) is checked EXPLICITLY, never by truthiness, so `max_age=0` is
+    distinguished from an absent `max_age` (the classic integer-falsy conformance
+    trap); a non-integer value is `invalid_request`.
+  - **A forced interaction is CONSUMED on the resume**, so the flow completes after
+    one round-trip instead of looping forever. The `/authorize` URL an interaction
+    redirects back to drops the `prompt` token it just satisfied (`login` and
+    `select_account` for a login, `consent` for a consent) and removes a consumed
+    `max_age` (the fresh authentication satisfies any `max_age`, including
+    `max_age=0`), while a marker preserves the `auth_time` emission that `max_age`
+    required. Because a resume can only ever DROP a trigger, never inject a bypass,
+    this cannot be used to skip a demanded re-authentication or consent.
+  - **Interaction-hint seam** (`InteractionHints`): `login_hint` prefills the login
+    form (reflected through the HTML escaper); `ui_locales`, `claims_locales`, and
+    `display` (`page`/`popup`/`touch`/`wap`) reach a typed page-rendering context
+    (the page `lang` attribute and a `data-display` layout hint); `logout_hint` is
+    accepted and carried for a later logout surface (no logout endpoint is added).
+    The typed struct is produced once at `/authorize` and carried across the
+    interaction round-trip, the seam upstream-IdP forwarding (M8) plugs into (no
+    upstream forwarding is done here).
+  - **`unmet_authentication_requirements`** (and the new registered
+    `login_required` / `consent_required` / `interaction_required` /
+    `account_selection_required` error codes) refines the issue #15 essential-`acr`
+    fail-closed: an essential `acr` whose pinned values NO available method can
+    achieve (checked against `acr_values_supported`) is
+    `unmet_authentication_requirements`; a value achievable in principle but not by
+    this session stays `access_denied` (the residual step-up, M7). A VOLUNTARY
+    `acr_values` preference remains best-effort and never errors (the achieved `acr`
+    is reported honestly).
+  - **Discovery** advertises `prompt_values_supported`
+    (`none login consent select_account create`), `display_values_supported`
+    (`page`), and `ui_locales_supported` / `claims_locales_supported` (English, the
+    languages the bootstrap pages render), each sourced from the owning registry or
+    const so discovery never advertises a capability the server does not honor.
 - Legacy response types (`id_token`, `code id_token`, `none`), `form_post`, and
   per-mode response negotiation, DISABLED by default (issue #17). Extends the
   #12/#13 authorization endpoint; the provider stays gated off.
