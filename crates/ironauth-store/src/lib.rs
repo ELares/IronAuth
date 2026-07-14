@@ -78,16 +78,16 @@ pub use id::{
 };
 pub use migrate::{Migration, MigrationError, MigrationReport, MigrationRunner, Phase};
 pub use repository::{
-    ActingAuthorizationRepo, ActingClientRepo, ActingConsentRepo, ActingEnvironmentRepo,
-    ActingManagementCredentialRepo, ActingManagementStore, ActingSessionRepo, ActingSigningKeyRepo,
-    ActingStore, ActingTenantRepo, ActingUserRepo, AuditRecord, AuditRepo, AuthorizationRepo,
-    ClientAuthRecord, ClientRecord, ClientRepo, CodeBindings, ConsentRepo, CursorPosition,
-    EnvironmentRecord, EnvironmentRepo, IdempotencyRepo, IdempotencyWrite, IssueCode,
-    IssuedTokenRecord, MANAGEMENT_LIST_HARD_CAP, ManagementCredentialRecord,
-    ManagementCredentialRepo, ManagementStore, NewSigningKey, RedeemOutcome, ScopedStore,
-    SessionRecord, SessionRepo, SigningKeyMaterial, SigningKeyMaterialKind, SigningKeyRecord,
-    SigningKeyRepo, StoredIdempotentResponse, TenantRecord, TenantRepo, TokenKind, TokenStatus,
-    UserRecord, UserRepo,
+    AccessTokenResolution, ActingAuthorizationRepo, ActingClientRepo, ActingConsentRepo,
+    ActingEnvironmentRepo, ActingManagementCredentialRepo, ActingManagementStore,
+    ActingSessionRepo, ActingSigningKeyRepo, ActingStore, ActingTenantRepo, ActingUserRepo,
+    AuditRecord, AuditRepo, AuthorizationRepo, ClientAuthRecord, ClientRecord, ClientRepo,
+    CodeBindings, ConsentRepo, CursorPosition, EnvironmentRecord, EnvironmentRepo, IdempotencyRepo,
+    IdempotencyWrite, IssueCode, IssuedTokenRecord, MANAGEMENT_LIST_HARD_CAP,
+    ManagementCredentialRecord, ManagementCredentialRepo, ManagementStore, NewSigningKey,
+    RedeemOutcome, ScopedStore, SessionRecord, SessionRepo, SigningKeyMaterial,
+    SigningKeyMaterialKind, SigningKeyRecord, SigningKeyRepo, StoredIdempotentResponse,
+    TenantRecord, TenantRepo, TokenKind, TokenStatus, UserRecord, UserRepo,
 };
 pub use scope::Scope;
 pub use store::Store;

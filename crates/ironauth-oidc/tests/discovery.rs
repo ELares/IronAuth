@@ -18,6 +18,7 @@ use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
 use http_body_util::BodyExt;
+use ironauth_config::OidcConfig;
 use ironauth_env::Env;
 use ironauth_jose::{JwsAlgorithm, SigningPolicy};
 use ironauth_oidc::{
@@ -160,8 +161,11 @@ async fn mcp_style_rfc8414_host_inserted_probe_succeeds() {
 #[tokio::test]
 async fn default_policy_environment_publishes_the_explicit_traps_and_rs256_floor() {
     // Acceptance criterion 3: request_uri_parameter_supported is false EXPLICITLY,
-    // and RS256 appears alongside EdDSA in a default-policy environment.
-    let (router, scope) = router_and_scope(DiscoveryCapabilities::default());
+    // and RS256 appears alongside EdDSA in a default-policy environment. The live
+    // capabilities come from config (as the server mounts them), so the `claims`
+    // request parameter is advertised true (issue #15).
+    let (router, scope) =
+        router_and_scope(DiscoveryCapabilities::from_config(&OidcConfig::default()));
     let uri = format!(
         "/t/{}/e/{}/.well-known/openid-configuration",
         scope.tenant(),
@@ -173,7 +177,8 @@ async fn default_policy_environment_publishes_the_explicit_traps_and_rs256_floor
 
     assert_eq!(doc["request_uri_parameter_supported"], json!(false));
     assert_eq!(doc["request_parameter_supported"], json!(false));
-    assert_eq!(doc["claims_parameter_supported"], json!(false));
+    // The claims request parameter IS supported now (issue #15).
+    assert_eq!(doc["claims_parameter_supported"], json!(true));
     assert_eq!(
         doc["authorization_response_iss_parameter_supported"],
         json!(false)
@@ -409,13 +414,26 @@ fn every_supported_array_equals_the_registry_its_subsystem_exposes() {
             .map(ToString::to_string)
             .collect::<Vec<_>>()
     );
+    // claims_supported is the union of the ID-token claims and the
+    // UserInfo-returnable standard claims (issue #15), so every claim either
+    // surface can emit is advertised.
+    let claims = string_array(&doc, "claims_supported");
     assert_eq!(
-        string_array(&doc, "claims_supported"),
-        ID_TOKEN_CLAIMS_SUPPORTED
+        claims,
+        ironauth_oidc::claims_supported()
             .iter()
             .map(ToString::to_string)
             .collect::<Vec<_>>()
     );
+    for name in ID_TOKEN_CLAIMS_SUPPORTED {
+        assert!(claims.contains(&(*name).to_owned()), "{name} advertised");
+    }
+    for name in ["email", "name", "address", "phone_number"] {
+        assert!(
+            claims.contains(&name.to_owned()),
+            "UserInfo claim {name} advertised"
+        );
+    }
 
     // Endpoints: exactly the registry entries, no phantom endpoint advertised.
     let object = doc.as_object().expect("object");

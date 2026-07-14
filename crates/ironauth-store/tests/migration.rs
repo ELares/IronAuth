@@ -242,16 +242,16 @@ async fn expand_contract_example_chain_runs_all_three_phases_and_contract_remove
     );
 }
 
-/// The PRODUCTION chain (`MigrationRunner::new`) contains exactly the seven real
+/// The PRODUCTION chain (`MigrationRunner::new`) contains exactly the eight real
 /// migrations and leaves no throwaway demo object in a real database.
 #[tokio::test]
-async fn production_chain_is_only_the_seven_real_migrations_and_ships_no_demo_object() {
+async fn production_chain_is_only_the_eight_real_migrations_and_ships_no_demo_object() {
     // TestDatabase::start runs Store::migrate() (the production chain) on a
     // fresh, empty database.
     let db = TestDatabase::start().await;
     let pool = db.owner_pool();
 
-    // Re-running is idempotent and reports exactly seven tracked migrations.
+    // Re-running is idempotent and reports exactly eight tracked migrations.
     let report = MigrationRunner::new(pool)
         .run()
         .await
@@ -262,13 +262,16 @@ async fn production_chain_is_only_the_seven_real_migrations_and_ships_no_demo_ob
     );
     assert_eq!(
         report.already_applied(),
-        7,
-        "the production chain is exactly seven migrations (isolation, audit log, management API, \
-         OIDC authorization, signing keys, login/consent, authentication context)"
+        8,
+        "the production chain is exactly eight migrations (isolation, audit log, management API, \
+         OIDC authorization, signing keys, login/consent, authentication context, UserInfo claims)"
     );
 
-    // The ledger holds exactly versions 1 through 7.
-    assert_eq!(applied_versions(pool).await, vec![1_i64, 2, 3, 4, 5, 6, 7]);
+    // The ledger holds exactly versions 1 through 8.
+    assert_eq!(
+        applied_versions(pool).await,
+        vec![1_i64, 2, 3, 4, 5, 6, 7, 8]
+    );
     let phase_of = |version: i64| async move {
         sqlx::query("SELECT phase FROM _schema_migrations WHERE version = $1")
             .bind(version)
@@ -284,6 +287,7 @@ async fn production_chain_is_only_the_seven_real_migrations_and_ships_no_demo_ob
     assert_eq!(phase_of(5).await, "expand");
     assert_eq!(phase_of(6).await, "expand");
     assert_eq!(phase_of(7).await, "expand");
+    assert_eq!(phase_of(8).await, "expand");
 
     // The demo object never reaches a production database.
     assert!(
@@ -339,6 +343,22 @@ async fn production_chain_is_only_the_seven_real_migrations_and_ships_no_demo_ob
     assert!(
         column_exists(pool, "clients", "require_auth_time").await,
         "clients.require_auth_time exists"
+    );
+    // The UserInfo standard-claim store (issue #15): the additive users.claims
+    // column backing the scope-derived and claims-parameter-selected claim sets,
+    // plus the persisted `claims` request parameter frozen onto the grant (read by
+    // UserInfo) and the code (read at the token endpoint).
+    assert!(
+        column_exists(pool, "users", "claims").await,
+        "users.claims exists"
+    );
+    assert!(
+        column_exists(pool, "grants", "claims_request").await,
+        "grants.claims_request exists"
+    );
+    assert!(
+        column_exists(pool, "authorization_codes", "claims_request").await,
+        "authorization_codes.claims_request exists"
     );
 }
 

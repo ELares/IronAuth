@@ -14,12 +14,16 @@
 //! likewise selected per environment from the [`EnvironmentKeyStore`], so moving a
 //! client between environments is a configuration flip, not a key regeneration.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use ironauth_config::OidcConfig;
 use ironauth_env::Env;
-use ironauth_jose::{EnvironmentKeyStore, SigningKey};
+use ironauth_jose::{
+    EnvironmentKeyStore, JwsAlgorithm, SigningKey, TrustedKey, VerificationPolicy, VerifiedToken,
+    verify,
+};
 use ironauth_store::{EnvironmentId, Scope, Store};
 
 use crate::subject::{PairwiseSalt, SubjectCache, SubjectConfig};
@@ -39,6 +43,16 @@ struct Inner {
     access_token_ttl: Duration,
     reuse_grace: Duration,
     session_ttl: Duration,
+    // Whether to copy the scope-derived claims into the ID token (the non-conform
+    // node-oidc-provider `conformIdTokenClaims = false` behavior, issue #15). The
+    // spec-conform default is false: scope claims live at UserInfo and the ID token
+    // stays lean. A promotable per-environment setting sourced from OidcConfig.
+    conform_id_token_claims: bool,
+    // The registered SPA web origins allowed to call UserInfo cross-origin (issue
+    // #15), matched exactly against a request's `Origin`. Empty means no CORS. CORS
+    // is offered on UserInfo ONLY, never on the authorization endpoint. A promotable
+    // per-environment setting sourced from OidcConfig.
+    userinfo_cors_origins: BTreeSet<String>,
     // The one shared subject-derivation cache. The surface that emits a `sub` (the
     // ID token today, and `UserInfo`/introspection once they land) resolves it
     // through this cache; because it is a single shared derivation, any two
@@ -75,6 +89,8 @@ impl OidcState {
                 access_token_ttl: Duration::from_secs(config.access_token_ttl_secs),
                 reuse_grace: Duration::from_secs(config.reuse_grace_secs),
                 session_ttl: Duration::from_secs(config.session_ttl_secs),
+                conform_id_token_claims: config.conform_id_token_claims,
+                userinfo_cors_origins: config.userinfo_cors_origins.iter().cloned().collect(),
                 subjects: SubjectCache::new(),
             }),
         }
@@ -183,6 +199,72 @@ impl OidcState {
     #[must_use]
     pub fn signer_for(&self, environment: &EnvironmentId) -> Option<&SigningKey> {
         self.inner.keys.keys_for(environment).first()
+    }
+
+    /// Whether this environment copies the scope-derived claims into the ID token
+    /// (issue #15). The spec-conform default is `false`: scope claims live at
+    /// `UserInfo` and the ID token stays lean. When `true`, the token endpoint also
+    /// places those claims in the ID token (a documented non-conform legacy mode).
+    #[must_use]
+    pub fn conform_id_token_claims(&self) -> bool {
+        self.inner.conform_id_token_claims
+    }
+
+    /// Whether `origin` is a registered SPA origin allowed to call `UserInfo`
+    /// cross-origin (issue #15). Matched EXACTLY; an unregistered origin is denied
+    /// (no CORS headers). Used ONLY by the `UserInfo` endpoint.
+    #[must_use]
+    pub fn is_registered_spa_origin(&self, origin: &str) -> bool {
+        self.inner.userinfo_cors_origins.contains(origin)
+    }
+
+    /// Verify a presented access token (a compact `at+jwt` JWS) against the
+    /// environment's signing keys, the per-environment issuer, and `audience` (the
+    /// client the grant was resolved to), using the environment clock seam.
+    ///
+    /// This is the cryptographic half of `UserInfo`'s token check: it authenticates
+    /// the token and enforces `exp`/`iss`/`aud` through the ONE hardened verify
+    /// path ([`ironauth_jose::verify`]). The revocation and IDOR half is the
+    /// scope-bound store resolution the caller performs alongside it. Returns
+    /// `Err(())` when the environment has no keys, or the token fails to verify
+    /// (bad signature, expired, wrong issuer or audience, malformed); the caller
+    /// maps that to the RFC 6750 `invalid_token` challenge.
+    ///
+    /// # Errors
+    ///
+    /// `Err(())` if no signing key is provisioned for the scope's environment, or
+    /// the token does not verify under the built policy.
+    pub(crate) fn verify_access_token(
+        &self,
+        scope: &Scope,
+        audience: &str,
+        token: &str,
+    ) -> Result<VerifiedToken, ()> {
+        let environment = scope.environment();
+        let keys = self.inner.keys.keys_for(&environment);
+        if keys.is_empty() {
+            return Err(());
+        }
+        // Every current signing key is a trusted verifying key; a token's `kid`
+        // only selects among these, never introduces one (issue #9's verify path).
+        let trusted: Vec<TrustedKey> = keys
+            .iter()
+            .filter_map(|key| key.verifying_key().ok())
+            .collect();
+        if trusted.is_empty() {
+            return Err(());
+        }
+        // The allowlist is exactly the algorithms the environment's keys sign with.
+        let mut algorithms: Vec<JwsAlgorithm> = Vec::new();
+        for key in keys {
+            if !algorithms.contains(&key.algorithm()) {
+                algorithms.push(key.algorithm());
+            }
+        }
+        let issuer = self.issuer_for(scope);
+        let policy = VerificationPolicy::new(algorithms, trusted, issuer, audience.to_owned())
+            .map_err(|_| ())?;
+        verify(token, &policy, self.inner.env.clock()).map_err(|_| ())
     }
 }
 

@@ -131,6 +131,11 @@
           "minimum": 0,
           "type": "integer"
         },
+        "conform_id_token_claims": {
+          "default": false,
+          "description": "Copy the scope-derived standard claims into the ID token (issue #15). The\nspec-conform default (`false`) places scope-derived claims (`profile`,\n`email`, `address`, `phone`) at the `UserInfo` endpoint and keeps the ID\ntoken lean, per OIDC Core 5.4. Setting this `true` additionally copies those\nclaims into the ID token for legacy relying parties that never call\n`UserInfo`; that placement is explicitly NON-conform (it is the\nnode-oidc-provider `conformIdTokenClaims = false` behavior) and is documented\nas such. This is a promotable per-environment setting: it appears in config\nsnapshots and rides the M5 promotion pipeline; the process value is the\ndeployment default until per-environment overrides land.",
+          "type": "boolean"
+        },
         "enabled": {
           "default": false,
           "description": "Whether to mount the public OIDC endpoints (`/authorize`, `/token`). Off\nby default so the default boot serves only the skeleton and needs no\ndatabase. When on, the provider connects the data-plane store using\n`database.url`.",
@@ -156,6 +161,14 @@
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
+        },
+        "userinfo_cors_origins": {
+          "default": [],
+          "description": "The web origins (scheme + host + optional port, no path) of registered\nsingle-page-app clients allowed to call the `UserInfo` endpoint cross-origin\n(issue #15). Empty by default, so no CORS is offered. Each entry is matched\nEXACTLY against a request's `Origin`; a match echoes that origin back in the\n`UserInfo` CORS headers (never a wildcard), and an unmatched origin gets no\nCORS headers at all. CORS is offered on `UserInfo` ONLY and never on the\nauthorization endpoint. This is a promotable per-environment setting: it\nappears in config snapshots and rides the M5 promotion pipeline; the process\nvalue is the deployment default until per-environment overrides land.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
         }
       },
       "type": "object"
@@ -307,10 +320,12 @@
       "default": {
         "access_token_ttl_secs": 300,
         "authorization_code_ttl_secs": 60,
+        "conform_id_token_claims": false,
         "enabled": false,
         "jwks_cache_max_age_secs": 600,
         "reuse_grace_secs": 10,
-        "session_ttl_secs": 3600
+        "session_ttl_secs": 3600,
+        "userinfo_cors_origins": []
       },
       "description": "OIDC provider settings (issue #12)."
     },

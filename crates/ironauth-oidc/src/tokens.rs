@@ -82,6 +82,14 @@ pub struct MintRequest<'a> {
     /// The authorization-code hash for a hybrid ID token (issue #17). The code
     /// flow always passes [`None`]: it never carries `c_hash`.
     pub c_hash: Option<&'a str>,
+    /// Extra standard claims to place in the ID token (issue #15): the claims the
+    /// `claims` request parameter's `id_token` member selected, and (only when the
+    /// environment sets the non-conform `conformIdTokenClaims`) the scope-derived
+    /// claims. Empty by default, so the spec-conform ID token stays lean and these
+    /// claims are served from `UserInfo` instead. Protocol/REQUIRED claims always
+    /// win: an entry whose name is already set (for example `sub`) is never
+    /// overwritten.
+    pub extra_claims: &'a serde_json::Map<String, serde_json::Value>,
 }
 
 /// Why building the ID token claims failed. Every variant is fail-closed at
@@ -156,6 +164,19 @@ pub(crate) fn build_id_token_claims(
     // azp is deliberately omitted: aud is the single client, which IS the
     // authorized party, and the code flow uses no extension beyond Core, so
     // errata set 2 §2 leaves azp out.
+
+    // Extra standard claims (issue #15): the claims-parameter `id_token` member,
+    // and (only under the non-conform conformIdTokenClaims override) the
+    // scope-derived claims. Protocol/REQUIRED claims always win, so an extra claim
+    // whose name is already set is never overwritten (it cannot shadow sub, iss,
+    // aud, exp, iat, nonce, acr, amr, or auth_time).
+    if let serde_json::Value::Object(claims_object) = &mut claims {
+        for (name, value) in request.extra_claims {
+            claims_object
+                .entry(name.clone())
+                .or_insert_with(|| value.clone());
+        }
+    }
 
     Ok(claims)
 }
@@ -259,6 +280,14 @@ mod tests {
     use ironauth_env::Env;
     use ironauth_store::{EnvironmentId, TenantId};
 
+    /// An empty extra-claims map for the pure claim-builder tests (the spec-conform
+    /// default, so the ID token stays lean).
+    fn empty_extra() -> &'static serde_json::Map<String, serde_json::Value> {
+        use std::sync::OnceLock;
+        static EMPTY: OnceLock<serde_json::Map<String, serde_json::Value>> = OnceLock::new();
+        EMPTY.get_or_init(serde_json::Map::new)
+    }
+
     /// A minimal request over a throwaway scope, for the pure claim builder.
     fn request<'a>(subject: &'a str, auth_methods: &'a str) -> MintRequest<'a> {
         let (env, _) = Env::deterministic(SystemTime::UNIX_EPOCH, 1);
@@ -274,6 +303,7 @@ mod tests {
             auth_time_unix_micros: None,
             at_hash: None,
             c_hash: None,
+            extra_claims: empty_extra(),
         }
     }
 
@@ -340,6 +370,32 @@ mod tests {
         req.auth_time_unix_micros = None;
         let claims = build_id_token_claims(&req, 1, 2, "tok").expect("claims");
         assert!(claims.get("auth_time").is_none());
+    }
+
+    #[test]
+    fn extra_claims_land_in_the_id_token_but_never_shadow_protocol_claims() {
+        // Issue #15: the conformIdTokenClaims override / id_token claims-member
+        // places extra standard claims in the ID token, but a protocol claim
+        // (here a hostile `sub`) is never overwritten.
+        let extra = json!({ "email": "ada@example.test", "sub": "attacker" })
+            .as_object()
+            .cloned()
+            .expect("object");
+        let mut req = request("usr_abc", "pwd");
+        req.extra_claims = &extra;
+        let claims = build_id_token_claims(&req, 1, 2, "tok").expect("claims");
+        assert_eq!(claims["email"], "ada@example.test", "extra claim lands");
+        assert_eq!(claims["sub"], "usr_abc", "protocol sub is never shadowed");
+    }
+
+    #[test]
+    fn the_default_id_token_carries_no_extra_claims() {
+        // The spec-conform default (empty extra_claims) keeps the ID token lean.
+        let claims =
+            build_id_token_claims(&request("usr_abc", "pwd"), 1, 2, "tok").expect("claims");
+        for absent in ["email", "name", "phone_number", "address"] {
+            assert!(claims.get(absent).is_none(), "{absent} stays at UserInfo");
+        }
     }
 
     #[test]

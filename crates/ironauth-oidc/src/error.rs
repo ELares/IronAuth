@@ -35,6 +35,12 @@ pub enum AuthzErrorCode {
     InvalidRequest,
     /// The `response_type` is not one this server supports (only `code`).
     UnsupportedResponseType,
+    /// The authorization server denied the request. Used for the fail-closed
+    /// essential-`acr` binding (issue #15): a requested authentication context the
+    /// server cannot achieve is refused rather than silently downgraded. The full
+    /// `unmet_authentication_requirements` surface (OIDC Core) is issue #16; this
+    /// standard RFC 6749 code is the clean seam it refines.
+    AccessDenied,
     /// The server encountered an unexpected condition.
     ServerError,
 }
@@ -46,6 +52,7 @@ impl AuthzErrorCode {
         match self {
             AuthzErrorCode::InvalidRequest => "invalid_request",
             AuthzErrorCode::UnsupportedResponseType => "unsupported_response_type",
+            AuthzErrorCode::AccessDenied => "access_denied",
             AuthzErrorCode::ServerError => "server_error",
         }
     }

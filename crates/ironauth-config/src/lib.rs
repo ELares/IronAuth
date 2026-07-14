@@ -323,6 +323,29 @@ pub struct OidcConfig {
     /// in spirit; the process value is the deployment default until per-environment
     /// overrides ride the M5 promotion pipeline.
     pub jwks_cache_max_age_secs: u64,
+
+    /// Copy the scope-derived standard claims into the ID token (issue #15). The
+    /// spec-conform default (`false`) places scope-derived claims (`profile`,
+    /// `email`, `address`, `phone`) at the `UserInfo` endpoint and keeps the ID
+    /// token lean, per OIDC Core 5.4. Setting this `true` additionally copies those
+    /// claims into the ID token for legacy relying parties that never call
+    /// `UserInfo`; that placement is explicitly NON-conform (it is the
+    /// node-oidc-provider `conformIdTokenClaims = false` behavior) and is documented
+    /// as such. This is a promotable per-environment setting: it appears in config
+    /// snapshots and rides the M5 promotion pipeline; the process value is the
+    /// deployment default until per-environment overrides land.
+    pub conform_id_token_claims: bool,
+
+    /// The web origins (scheme + host + optional port, no path) of registered
+    /// single-page-app clients allowed to call the `UserInfo` endpoint cross-origin
+    /// (issue #15). Empty by default, so no CORS is offered. Each entry is matched
+    /// EXACTLY against a request's `Origin`; a match echoes that origin back in the
+    /// `UserInfo` CORS headers (never a wildcard), and an unmatched origin gets no
+    /// CORS headers at all. CORS is offered on `UserInfo` ONLY and never on the
+    /// authorization endpoint. This is a promotable per-environment setting: it
+    /// appears in config snapshots and rides the M5 promotion pipeline; the process
+    /// value is the deployment default until per-environment overrides land.
+    pub userinfo_cors_origins: Vec<String>,
 }
 
 impl Default for OidcConfig {
@@ -334,6 +357,8 @@ impl Default for OidcConfig {
             reuse_grace_secs: 10,
             session_ttl_secs: 3600,
             jwks_cache_max_age_secs: 600,
+            conform_id_token_claims: false,
+            userinfo_cors_origins: Vec::new(),
         }
     }
 }
@@ -732,6 +757,10 @@ mod tests {
         assert_eq!(config.oidc.reuse_grace_secs, 10);
         assert_eq!(config.oidc.session_ttl_secs, 3600);
         assert_eq!(config.oidc.jwks_cache_max_age_secs, 600);
+        // The UserInfo placement default is spec-conform (claims at UserInfo, lean
+        // ID token) and no SPA origins are registered for CORS by default.
+        assert!(!config.oidc.conform_id_token_claims);
+        assert!(config.oidc.userinfo_cors_origins.is_empty());
 
         // A zero session lifetime (born expired) is rejected; a lifetime above the
         // session ceiling is rejected too.
@@ -810,6 +839,24 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("ttl"), "{msg}");
         assert!(msg.contains("authorization_code_ttl_secs"), "{msg}");
+    }
+
+    #[test]
+    fn oidc_userinfo_placement_and_cors_origins_parse() {
+        // The conform override and the registered SPA origins parse from TOML.
+        let input = "[oidc]\nconform_id_token_claims = true\n\
+                     userinfo_cors_origins = [\"https://spa.example\", \"https://app.test:8443\"]\n";
+        let config = Config::from_toml_str(input, "<inline>")
+            .expect("valid")
+            .config;
+        assert!(config.oidc.conform_id_token_claims);
+        assert_eq!(
+            config.oidc.userinfo_cors_origins,
+            vec![
+                "https://spa.example".to_owned(),
+                "https://app.test:8443".to_owned()
+            ]
+        );
     }
 
     #[test]

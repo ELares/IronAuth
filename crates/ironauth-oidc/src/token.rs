@@ -59,10 +59,12 @@ use ironauth_store::{
 };
 use serde::Deserialize;
 
+use crate::claims_request::ClaimsRequest;
 use crate::client_auth::{self, ClientAuthParseError, PresentedClientAuth};
 use crate::error::TokenError;
 use crate::pkce::verify_s256;
 use crate::registry::GrantType;
+use crate::scope_claims::{assemble_claims, parse_scope_set};
 use crate::state::OidcState;
 use crate::tokens::{self, IssuedTokens, MintRequest};
 use crate::util::client_service_actor;
@@ -181,8 +183,12 @@ async fn exchange(
     }
 
     // 6. Mint (sign) the tokens BEFORE the consume, so a missing key or a signing
-    //    failure fails closed without burning the code.
-    let minted = mint_tokens(state, scope, &bindings)?;
+    //    failure fails closed without burning the code. The ID token stays lean by
+    //    default (scope claims are served from UserInfo); the extra claims are the
+    //    `claims`-parameter id_token member and, only under the non-conform
+    //    conformIdTokenClaims override, the scope-derived claims (issue #15).
+    let extra_claims = id_token_extra_claims(state, scope, &bindings).await;
+    let minted = mint_tokens(state, scope, &bindings, &extra_claims)?;
     let records: Vec<IssuedTokenRecord> = minted
         .records()
         .into_iter()
@@ -334,6 +340,7 @@ fn mint_tokens(
     state: &OidcState,
     scope: Scope,
     bindings: &CodeBindings,
+    extra_claims: &serde_json::Map<String, serde_json::Value>,
 ) -> Result<IssuedTokens, TokenError> {
     let signer = state
         .signer_for(&scope.environment())
@@ -364,9 +371,72 @@ fn mint_tokens(
             // them. Both are absent here by construction.
             at_hash: None,
             c_hash: None,
+            extra_claims,
         },
     )
     .map_err(|()| TokenError::ServerError)
+}
+
+/// Build the extra standard claims to place in the ID token (issue #15).
+///
+/// The spec-conform default keeps the ID token lean: scope-derived claims are
+/// served from `UserInfo`, so nothing is added unless the request explicitly asked
+/// for ID-token claims through the `claims` parameter's `id_token` member, or the
+/// environment sets the non-conform `conformIdTokenClaims`. When neither applies,
+/// this returns an empty map WITHOUT reading the store.
+///
+/// When something is due, it reads the user's stored claim document once and
+/// releases claims through the ONE shared [`assemble_claims`] function, exactly as
+/// `UserInfo` does, so the two placements can never derive a different set:
+///
+/// - the `id_token` claims-member is always honored (its explicitly requested
+///   claims), and
+/// - under `conformIdTokenClaims`, the granted scope's claim set is additionally
+///   copied in (the documented non-conform legacy placement).
+///
+/// A store read failure is fail-open (an empty extra set, logged): the ID token
+/// simply omits the scope/requested claims rather than failing issuance, which
+/// only ever under-claims (the authoritative copy is still at `UserInfo`).
+async fn id_token_extra_claims(
+    state: &OidcState,
+    scope: Scope,
+    bindings: &CodeBindings,
+) -> serde_json::Map<String, serde_json::Value> {
+    let claims_request = bindings
+        .claims_request
+        .as_deref()
+        .and_then(|raw| ClaimsRequest::parse(raw).ok())
+        .unwrap_or_default();
+    let conform = state.conform_id_token_claims();
+    // Nothing to add: no id_token claims-member and not in the copy-in mode.
+    if !conform && claims_request.id_token().is_empty() {
+        return serde_json::Map::new();
+    }
+    let bag = match state
+        .store()
+        .scoped(scope)
+        .users()
+        .claims_for_subject(&bindings.subject)
+        .await
+    {
+        Ok(Some(raw)) => serde_json::from_str(&raw).unwrap_or_default(),
+        // No user record, or an unreadable/malformed claim document: under-claim
+        // rather than fail issuance. The authoritative claims are at UserInfo.
+        Ok(None) => serde_json::Map::new(),
+        Err(error) => {
+            tracing::warn!(%error, "could not read user claims for the ID token; omitting them");
+            serde_json::Map::new()
+        }
+    };
+    // Scope-derived claims are copied in ONLY under the non-conform override; the
+    // id_token claims-member is always honored. Passing an empty scope set when the
+    // override is off keeps the spec-conform ID token free of scope-derived claims.
+    let granted = if conform {
+        parse_scope_set(bindings.oauth_scope.as_deref())
+    } else {
+        std::collections::BTreeSet::new()
+    };
+    assemble_claims(&bag, &granted, claims_request.id_token())
 }
 
 /// Build the `200 OK` token response (RFC 6749 5.1) from the pre-signed tokens.

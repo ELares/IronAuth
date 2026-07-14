@@ -283,6 +283,28 @@ impl Harness {
             .to_string()
     }
 
+    /// Register a bootstrap user with a standard-claim document (issue #15) and
+    /// return its subject. `claims_json` is the OIDC standard-claim object as JSON
+    /// text (for example `{"email":"a@b.test","email_verified":true}`), which
+    /// `UserInfo` releases selectively per the granted scope and claims request.
+    pub async fn seed_user_with_claims(
+        &self,
+        identifier: &str,
+        password: &str,
+        claims_json: &str,
+    ) -> String {
+        let hash = ironauth_oidc::hash_password(&self.env, password).expect("hash password");
+        let (actor, corr) = self.seeding_actor();
+        self.store()
+            .scoped(self.scope)
+            .acting(actor, corr)
+            .users()
+            .register_with_claims(&self.env, identifier, &hash, claims_json)
+            .await
+            .expect("register user with claims")
+            .to_string()
+    }
+
     /// Seed a fresh user with a unique identifier (drawn from the deterministic
     /// entropy stream, which advances per call) and return its subject.
     pub async fn seed_unique_user(&self) -> String {
