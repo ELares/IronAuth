@@ -20,6 +20,14 @@ range per docs/RELEASING.md.
     presenting `client_id` is a filter INSIDE that UPDATE, so a request pushed by
     client A and presented by client B matches zero rows: it is rejected AND not
     burned. Only the winning consume writes an audit row.
+  - **Non-consuming peek.** A read-only `PushedRequestRepo::read`
+    (`ScopedStore::pushed_authorization_requests`) returns a live (unconsumed,
+    unexpired, client-bound) request's stored parameters WITHOUT consuming it, using
+    the same `client_id` filter and clock-seam expiry as the consume. It lets the
+    authorization endpoint resolve a `request_uri` at every login/consent
+    interaction hop while deferring the single-use consume to the moment of code
+    issuance, so a fresh-login user's request survives the round-trip; it changes no
+    state and writes no audit row.
   - **Per-client require-PAR flag.** `clients` gains
     `require_pushed_authorization_requests`; `ClientRecord` carries it and
     `ActingClientRepo::set_require_pushed_authorization_requests` sets it (audited),

@@ -191,6 +191,19 @@ impl<'a> ScopedStore<'a> {
         }
     }
 
+    /// The read-only pushed-authorization-request repository for this scope (RFC
+    /// 9126, issue #27). PEEKS a `request_uri`'s stored parameters WITHOUT consuming
+    /// them, so the authorization endpoint can resolve a PAR reference across the
+    /// login/consent interaction round-trip; the single-use consume lives on
+    /// [`ActingStore::pushed_authorization_requests`].
+    #[must_use]
+    pub fn pushed_authorization_requests(&self) -> PushedRequestRepo<'a> {
+        PushedRequestRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
     /// Enter an acting context (who is acting, and under which correlation id).
     /// The returned store hands out the *mutating* repositories, so every write
     /// carries an actor and a correlation id into its audit row.
@@ -1846,6 +1859,71 @@ impl fmt::Debug for ConsumePushedRequest {
             }
             ConsumePushedRequest::Invalid => f.write_str("Invalid"),
         }
+    }
+}
+
+/// The read-only pushed-authorization-request repository (RFC 9126, issue #27).
+///
+/// It PEEKS a `request_uri`'s stored parameters WITHOUT consuming them, so the
+/// authorization endpoint can resolve a PAR reference at EVERY interaction hop (the
+/// login and consent resume round-trips) while deferring the single-use consume to
+/// the moment of code issuance ([`ActingPushedRequestRepo::consume`]). A peek proves
+/// only that the reference resolves; it changes no state and writes no audit row.
+pub struct PushedRequestRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl PushedRequestRepo<'_> {
+    /// Read the stored authorization-request parameters for a LIVE (unconsumed,
+    /// unexpired) `request_uri` bound to `presenting_client_id`, or [`None`] on any
+    /// miss (absent, expired, already consumed, or presented under a different
+    /// client). This does NOT consume the reference: single use is enforced only by
+    /// [`ActingPushedRequestRepo::consume`] at issuance, so a login or consent
+    /// interaction can re-present the same `request_uri` across the round-trip
+    /// without burning it before an authenticated, consenting subject receives a code.
+    ///
+    /// The `client_id` filter is IN the query, so a reference presented under a
+    /// different client resolves to [`None`] (RFC 9126 client binding), exactly like
+    /// the consume, and a peek never reveals or burns another client's request. A
+    /// forged or expired reference is likewise a uniform [`None`].
+    ///
+    /// `now` flows from the application clock seam (bound as epoch microseconds),
+    /// never the database clock, so expiry is deterministic under a manual clock,
+    /// consistent with the consume.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the reference identifier is out of this scope;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn read(
+        &self,
+        env: &Env,
+        id: &PushedRequestId,
+        presenting_client_id: &str,
+    ) -> Result<Option<String>, StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let now_micros = epoch_micros(env.clock().now_utc());
+        let mut tx = begin_scoped(self.store, scope).await?;
+        let row = sqlx::query(
+            "SELECT request_params FROM pushed_authorization_requests \
+             WHERE id = $1 AND tenant_id = $2 AND environment_id = $3 \
+             AND client_id = $4 \
+             AND consumed_at IS NULL \
+             AND expires_at > TIMESTAMPTZ 'epoch' + ($5::text || ' microseconds')::interval",
+        )
+        .bind(id.to_string())
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(presenting_client_id)
+        .bind(now_micros)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(row.map(|row| row.get::<String, _>("request_params")))
     }
 }
 

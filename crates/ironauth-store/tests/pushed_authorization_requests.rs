@@ -76,6 +76,92 @@ async fn consume(
         .await
 }
 
+async fn read(
+    db: &TestDatabase,
+    env: &Env,
+    scope: Scope,
+    id: &PushedRequestId,
+    presenting_client_id: &str,
+) -> Result<Option<String>, StoreError> {
+    db.store()
+        .scoped(scope)
+        .pushed_authorization_requests()
+        .read(env, id, presenting_client_id)
+        .await
+}
+
+#[tokio::test]
+async fn a_peek_reads_the_request_without_consuming_it() {
+    // The peek (read) backs the authorization endpoint resolving a request_uri at
+    // EVERY interaction hop while deferring the single-use consume to issuance (RFC
+    // 9126, issue #27): a read never consumes, is bound to the presenting client, and
+    // reflects the eventual consume once it lands.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let client_a = create_client(&db, &env, scope).await.to_string();
+    let client_b = create_client(&db, &env, scope).await.to_string();
+
+    let id = push(&db, &env, scope, &client_a, r#"{"a":1}"#, FAR_FUTURE_MICROS).await;
+
+    // Repeated reads all return the stored params and NEVER consume the request.
+    for _ in 0..3 {
+        assert_eq!(
+            read(&db, &env, scope, &id, &client_a).await.expect("read"),
+            Some(r#"{"a":1}"#.to_owned()),
+            "a peek returns the stored params without consuming"
+        );
+    }
+
+    // A read under a DIFFERENT client is a uniform miss (client binding), and does not
+    // burn the request.
+    assert_eq!(
+        read(&db, &env, scope, &id, &client_b).await.expect("read"),
+        None,
+        "a peek by a different client resolves to nothing"
+    );
+
+    // The request is still live: a peek by the bound client still resolves, and the
+    // eventual consume wins exactly once.
+    assert!(
+        read(&db, &env, scope, &id, &client_a)
+            .await
+            .expect("read")
+            .is_some(),
+        "the request stays live after a mismatched peek"
+    );
+    assert!(matches!(
+        consume(&db, &env, scope, &id, &client_a)
+            .await
+            .expect("consume"),
+        ConsumePushedRequest::Consumed { .. }
+    ));
+
+    // After the consume, a peek reflects the single-use state: the request is gone.
+    assert_eq!(
+        read(&db, &env, scope, &id, &client_a).await.expect("read"),
+        None,
+        "a peek after the consume resolves to nothing (single use)"
+    );
+}
+
+#[tokio::test]
+async fn a_peek_of_an_expired_request_is_a_miss() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let client = create_client(&db, &env, scope).await.to_string();
+
+    // An expiry in the distant past (relative to the real system clock) is never
+    // peekable, exactly as it is never consumable.
+    let id = push(&db, &env, scope, &client, r#"{"x":1}"#, 1_000).await;
+    assert_eq!(
+        read(&db, &env, scope, &id, &client).await.expect("read"),
+        None,
+        "an expired request_uri does not peek"
+    );
+}
+
 #[tokio::test]
 async fn a_pushed_request_is_consumable_exactly_once() {
     let db = TestDatabase::start().await;
@@ -268,6 +354,85 @@ async fn a_reused_request_writes_no_second_consume_audit() {
         .filter(|row| row.action == "pushed_authorization_request.consume")
         .count();
     assert_eq!(consume_rows, 1, "only the winning consume audits");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn one_request_uri_consumed_concurrently_succeeds_exactly_once() {
+    // The consume moved to the moment of code issuance (RFC 9126, issue #27), so two
+    // concurrent issuances driven by the SAME request_uri race on this atomic consume.
+    // The `UPDATE ... WHERE consumed_at IS NULL AND client_id = ... RETURNING ...` is
+    // the only serialization: exactly one caller sees the row unconsumed and gets
+    // Consumed, and the other N-1 see zero rows and get a uniform Invalid. No in-memory
+    // marker is involved, so this is a faithful stand-in for N stateless nodes racing
+    // on one database, proving a request_uri yields AT MOST ONE code.
+    const RACERS: usize = 8;
+
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let client = create_client(&db, &env, scope).await.to_string();
+    let id = push(
+        &db,
+        &env,
+        scope,
+        &client,
+        r#"{"response_type":"code"}"#,
+        FAR_FUTURE_MICROS,
+    )
+    .await;
+    let actor = db.test_actor(&env);
+
+    // Fire RACERS concurrent consumes at once, each on its own cloned store handle
+    // (sharing the one pool) and its own transaction.
+    let mut tasks = Vec::with_capacity(RACERS);
+    for _ in 0..RACERS {
+        let store = db.store().clone();
+        let env = env.clone();
+        let client = client.clone();
+        tasks.push(tokio::spawn(async move {
+            store
+                .scoped(scope)
+                .acting(actor, CorrelationId::generate(&env))
+                .pushed_authorization_requests()
+                .consume(&env, &id, &client)
+                .await
+        }));
+    }
+
+    let mut consumed = 0_usize;
+    let mut invalid = 0_usize;
+    for task in tasks {
+        match task.await.expect("task joins").expect("consume") {
+            ConsumePushedRequest::Consumed { .. } => consumed += 1,
+            ConsumePushedRequest::Invalid => invalid += 1,
+        }
+    }
+    assert_eq!(
+        consumed, 1,
+        "exactly one concurrent consume wins the single-use race"
+    );
+    assert_eq!(
+        invalid,
+        RACERS - 1,
+        "every other concurrent consume is a uniform miss"
+    );
+
+    // Only the winning consume audits, across the whole race.
+    let audit = db
+        .store()
+        .scoped(scope)
+        .audit()
+        .list()
+        .await
+        .expect("list audit");
+    assert_eq!(
+        audit
+            .iter()
+            .filter(|row| row.action == "pushed_authorization_request.consume")
+            .count(),
+        1,
+        "only the winning consume is audited across the concurrent race",
+    );
 }
 
 #[tokio::test]

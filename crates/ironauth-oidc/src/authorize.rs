@@ -29,9 +29,9 @@ use axum::extract::{Form, Query, State};
 use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
 use ironauth_store::{
-    ActorRef, AuthorizationCodeId, ClientId, ClientRecord, ConsumePushedRequest, CorrelationId,
-    GrantId, GrantedConsent, IssueCode, PushedRequestId, Scope, ServiceId, StoreError,
-    redirect_uri_is_registrable, redirect_uri_matches,
+    AuthorizationCodeId, ClientId, ClientRecord, ConsumePushedRequest, CorrelationId, GrantId,
+    GrantedConsent, IssueCode, PushedRequestId, Scope, StoreError, redirect_uri_is_registrable,
+    redirect_uri_matches,
 };
 use serde::{Deserialize, Serialize};
 
@@ -144,6 +144,20 @@ pub struct AuthorizeParams {
     /// that `max_age` implied. It only ever ADDS the honest `auth_time` claim, so a
     /// forged value is harmless (it can never suppress an interaction or a claim).
     pub emit_auth_time: Option<String>,
+    /// An INTERNAL PAR-resume marker (RFC 9126, issue #27), NOT a client-facing
+    /// parameter. A `request_uri` is PEEKED (read, not consumed) at every
+    /// authorization hop, so its stored parameters are re-read verbatim after each
+    /// login/consent interaction. When such an interaction CONSUMES a re-auth/consent
+    /// forcing token (issue #16) whose stored value would otherwise re-force forever,
+    /// the PAR resume URL sets this marker and carries the reduced `prompt`/`max_age`
+    /// (and `emit_auth_time`); on the resumed hop those three fields, and ONLY those,
+    /// are taken from the query rather than storage, so the interaction loop is
+    /// broken. It can only ever RELAX a forcing token (or ADD the honest
+    /// `emit_auth_time`), never widen the request, and it does NOT satisfy the
+    /// require-PAR gate (that keys off the unforgeable `request_uri`), so a forged
+    /// value is harmless. It is cleared before storage (a pushed request never
+    /// carries it), so it is always [`None`] on a replayed request.
+    pub par_resume: Option<String>,
 }
 
 /// `GET /authorize`.
@@ -169,50 +183,76 @@ pub async fn authorize_post(
 /// or an error redirect).
 ///
 /// A PAR (RFC 9126, issue #27) `request_uri` is resolved FIRST: if the request
-/// carries one, the referenced pushed request is consumed from PAR storage (single
-/// use, bound to the pushing client) and its parameters REPLACE the presented ones,
-/// so the rest of the pipeline runs on the pushed request. A `via_par` flag records
-/// that the request arrived through PAR, so the require-PAR gate does not reject it.
+/// carries one, the referenced pushed request is READ (peeked, NOT consumed) from PAR
+/// storage and its parameters REPLACE the presented ones, so the rest of the pipeline
+/// runs on the pushed request. A [`PushedContext`] records that the request arrived
+/// through PAR (so the require-PAR gate does not reject it) and carries the reference
+/// forward so the single-use consume happens ATOMICALLY at code issuance.
 async fn handle(state: &OidcState, headers: &HeaderMap, params: AuthorizeParams) -> Response {
-    let (params, via_par) = match resolve_pushed_request(state, params).await {
+    let (params, pushed) = match resolve_pushed_request(state, params).await {
         Ok(resolved) => resolved,
         Err(error) => return error.into_response(),
     };
-    match issue_code(state, headers, params, via_par).await {
+    match issue_code(state, headers, params, pushed.as_ref()).await {
         Ok(response) => response,
         Err(error) => error.into_response(),
     }
 }
 
+/// The context of an authorization request that arrived through a PAR `request_uri`
+/// (RFC 9126, issue #27): the reference was PEEKED (validated live and bound to the
+/// presenting client) but NOT yet consumed, so a login/consent interaction can
+/// re-present it and the single-use consume is deferred to code issuance.
+struct PushedContext {
+    /// The `par_` reference, for the atomic single-use consume at issuance.
+    par_id: PushedRequestId,
+    /// The full `request_uri` urn, re-presented verbatim on the interaction resume
+    /// URL so the resumed hop resolves to the SAME pushed request.
+    request_uri: String,
+    /// The client the reference is bound to (the presenting `client_id`): the filter
+    /// for BOTH the peek and the issuance-time consume, and the resume URL's
+    /// `client_id`.
+    presenting_client: String,
+}
+
 /// Resolve a PAR (RFC 9126, issue #27) `request_uri` to the pushed request it
 /// references, or pass a plain request through unchanged.
 ///
-/// When the request carries no `request_uri`, this returns `(params, false)`: a
-/// plain authorization request. When it carries one, the reference is accepted ONLY
-/// in the `urn:ietf:params:oauth:request_uri:<id>` form backed by PAR storage; an
-/// external URI is a uniform `invalid_request` PAGE and is NEVER dereferenced over
-/// the network (a documented, test-enforced non-goal). The referenced request is
-/// consumed ATOMICALLY exactly once, filtered on the PRESENTED `client_id`, so a
-/// reuse, an expiry, or a presentation under a different client all fail closed and
-/// none of them burns another client's pending request (RFC 9126 client binding). On
-/// success the pushed parameters (an `AuthorizeParams` the PAR endpoint validated and
-/// stored) REPLACE the presented ones, and the pipeline runs on them with
-/// `via_par = true`.
+/// When the request carries no `request_uri`, this returns `(params, None)`: a plain
+/// authorization request. When it carries one, the reference is accepted ONLY in the
+/// `urn:ietf:params:oauth:request_uri:<id>` form backed by PAR storage; an external
+/// URI is a uniform `invalid_request` PAGE and is NEVER dereferenced over the network
+/// (a documented, test-enforced non-goal). The referenced request is PEEKED (read,
+/// NOT consumed), filtered on the PRESENTED `client_id`, so a forged reference, an
+/// expiry, or a presentation under a different client all fail closed and none of
+/// them burns another client's pending request (RFC 9126 client binding). Because the
+/// peek does not consume, the SAME `request_uri` resolves again on every login/consent
+/// resume hop; the single-use consume is deferred to code issuance ([`issue_code`]),
+/// so a fresh-login user of a require-PAR client is not rejected mid-interaction.
+///
+/// On success the pushed parameters (an `AuthorizeParams` the PAR endpoint validated
+/// and stored) REPLACE the presented ones (RFC 9126 section 4: the pushed values are
+/// authoritative and the inline query is ignored), and a [`PushedContext`] is
+/// returned. The ONE documented exception to that precedence is the internal
+/// `par_resume` marker (see [`AuthorizeParams::par_resume`]): on a resume WE emitted,
+/// the reduced `prompt`/`max_age`/`emit_auth_time` are taken from the query so the
+/// issue #16 interaction loop is broken.
 ///
 /// Every error here is a PAGE (not a redirect): the pushed request's own
-/// `redirect_uri` is gone (consumed or never resolved) and the presented one is not
-/// yet validated, so there is no trusted URI to send an error to.
+/// `redirect_uri` is not trusted and the presented one is not yet validated, so there
+/// is no trusted URI to send an error to.
 async fn resolve_pushed_request(
     state: &OidcState,
     params: AuthorizeParams,
-) -> Result<(AuthorizeParams, bool), AuthorizeError> {
+) -> Result<(AuthorizeParams, Option<PushedContext>), AuthorizeError> {
     let Some(request_uri) = params
         .request_uri
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
+        .map(str::to_owned)
     else {
-        return Ok((params, false));
+        return Ok((params, None));
     };
 
     // Accept ONLY our PAR urn form. Anything else (an https/http URL, an unknown
@@ -225,17 +265,20 @@ async fn resolve_pushed_request(
     };
 
     // The client_id is required alongside a request_uri (RFC 9126 section 4): it is
-    // what binds the consume to the pushing client, so a different client cannot use
-    // (or burn) the pending request.
-    let presented_client = params
+    // what binds the reference to the pushing client, so a different client cannot use
+    // (or even reveal) the pending request.
+    let Some(presented_client) = params
         .client_id
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .ok_or_else(|| AuthorizeError::page("the client_id parameter is required"))?;
+        .map(str::to_owned)
+    else {
+        return Err(AuthorizeError::page("the client_id parameter is required"));
+    };
 
     // The reference declares its own scope (a par_ scoped id), exactly as an
-    // authorization code does, so the consume runs under that scope with row-level
+    // authorization code does, so the read runs under that scope with row-level
     // security. A malformed reference is a uniform miss (never an oracle).
     let Ok(par_id) = PushedRequestId::parse_declared_scope(reference) else {
         return Err(AuthorizeError::page(
@@ -244,39 +287,84 @@ async fn resolve_pushed_request(
     };
     let scope = par_id.scope();
 
-    // Attribute the consume audit to the presenting client where it parses in scope,
-    // exactly as the code issue/redeem audits are; otherwise a generated service
-    // actor (defense in depth against a malformed stored/presented value).
-    let actor = match ClientId::parse_in_scope(presented_client, &scope) {
-        Ok(id) => client_service_actor(&id),
-        Err(_) => ActorRef::service(ServiceId::generate(state.env())),
+    // PEEK, do not consume: read the stored parameters if the reference is LIVE
+    // (unconsumed, unexpired) and bound to the presenting client. A miss (absent,
+    // expired, already consumed, forged, or a different client) is the uniform
+    // invalid_request page, and NO outbound fetch is ever performed. Single use is
+    // enforced later, atomically, at code issuance.
+    let request_params = match state
+        .store()
+        .scoped(scope)
+        .pushed_authorization_requests()
+        .read(state.env(), &par_id, &presented_client)
+        .await
+    {
+        Ok(Some(request_params)) => request_params,
+        Ok(None) => {
+            return Err(AuthorizeError::page(
+                "the request_uri is invalid, expired, or already used",
+            ));
+        }
+        Err(error) => {
+            tracing::error!(error = %error, "failed to read a pushed authorization request");
+            return Err(AuthorizeError::page(
+                "the authorization request could not be processed",
+            ));
+        }
     };
+
+    // The stored parameters ARE an AuthorizeParams (validated at push time).
+    let mut stored: AuthorizeParams = serde_json::from_str(&request_params)
+        .map_err(|_| AuthorizeError::page("the authorization request could not be processed"))?;
+
+    // RFC 9126 section 4: the pushed values win; the inline query is ignored. The ONE
+    // exception is the internal PAR-resume marker: on a login/consent resume WE
+    // emitted (par_resume=1), the reduced prompt/max_age and the emit_auth_time marker
+    // are authoritative from the query so the issue #16 interaction loop is broken.
+    // These only relax a forcing token or add an honest claim; every
+    // security-relevant parameter still comes from storage.
+    if params.par_resume.as_deref() == Some("1") {
+        stored.prompt = params.prompt;
+        stored.max_age = params.max_age;
+        stored.emit_auth_time = params.emit_auth_time;
+    }
+
+    let context = PushedContext {
+        par_id,
+        request_uri,
+        presenting_client: presented_client,
+    };
+    Ok((stored, Some(context)))
+}
+
+/// Atomically consume the pushed request behind `context` at the moment of code
+/// issuance (RFC 9126, issue #27), returning whether this call WON the single-use
+/// race. The `client_id` filter is inside the atomic consume, so the binding holds and
+/// a reference presented under a different client (or already consumed, or expired)
+/// wins zero rows and returns `false`. The consume writes its audit row (target =
+/// the real `par_id`) in the same transaction, on the winning branch only.
+async fn consume_pushed_request(
+    state: &OidcState,
+    scope: Scope,
+    client_id: &ClientId,
+    context: &PushedContext,
+) -> Result<bool, AuthorizeError> {
+    // Attribute the consume audit to the client the code is for, exactly as the code
+    // issue audit is (the client_id is validated in scope by this point).
+    let actor = client_service_actor(client_id);
     let correlation = CorrelationId::generate(state.env());
-    let outcome = state
+    match state
         .store()
         .scoped(scope)
         .acting(actor, correlation)
         .pushed_authorization_requests()
-        .consume(state.env(), &par_id, presented_client)
-        .await;
-
-    match outcome {
-        Ok(ConsumePushedRequest::Consumed { request_params }) => {
-            // The stored parameters ARE an AuthorizeParams (validated at push time);
-            // deserialize and run the pipeline on them, marked as arriving via PAR.
-            let stored: AuthorizeParams = serde_json::from_str(&request_params).map_err(|_| {
-                AuthorizeError::page("the authorization request could not be processed")
-            })?;
-            Ok((stored, true))
-        }
-        // A miss: absent, expired, already consumed, or presented under a different
-        // client_id. Uniform invalid_request; the pending request (if any) is not
-        // burned by a mismatched presenter.
-        Ok(ConsumePushedRequest::Invalid) => Err(AuthorizeError::page(
-            "the request_uri is invalid, expired, or already used",
-        )),
+        .consume(state.env(), &context.par_id, &context.presenting_client)
+        .await
+    {
+        Ok(ConsumePushedRequest::Consumed { .. }) => Ok(true),
+        Ok(ConsumePushedRequest::Invalid) => Ok(false),
         Err(error) => {
-            tracing::error!(error = %error, "failed to consume a pushed authorization request");
+            tracing::error!(error = %error, "failed to consume a pushed authorization request at issuance");
             Err(AuthorizeError::page(
                 "the authorization request could not be processed",
             ))
@@ -293,7 +381,7 @@ async fn issue_code(
     state: &OidcState,
     headers: &HeaderMap,
     params: AuthorizeParams,
-    via_par: bool,
+    pushed: Option<&PushedContext>,
 ) -> Result<Response, AuthorizeError> {
     // 1. client_id: present and well formed. A cli_ id declares its own scope, so
     //    it is the routing key to the (tenant, environment) this request lives in.
@@ -331,10 +419,13 @@ async fn issue_code(
     // 2b. require-PAR gate (RFC 9126 sections 5 and 6, issue #27). When the
     //     environment-wide switch OR this client's registration flag requires a
     //     pushed authorization request, a plain (non-PAR) request is rejected with
-    //     invalid_request. A request that arrived THROUGH PAR (via_par) satisfies the
-    //     requirement and is exempt. This runs BEFORE the redirect_uri is validated,
-    //     so it is a PAGE error, never an open-redirector-able redirect.
-    if !via_par
+    //     invalid_request. A request that arrived THROUGH PAR (a resolved
+    //     [`PushedContext`], keyed off the unforgeable `request_uri`) satisfies the
+    //     requirement and is exempt, at the FIRST hop and at every login/consent
+    //     resume hop alike (the reference is peeked, not consumed, so it resolves
+    //     again each time). This runs BEFORE the redirect_uri is validated, so it is a
+    //     PAGE error, never an open-redirector-able redirect.
+    if pushed.is_none()
         && (state.require_pushed_authorization_requests()
             || client.require_pushed_authorization_requests)
     {
@@ -396,6 +487,7 @@ async fn issue_code(
         prompt,
         max_age_secs,
         &hints,
+        pushed,
     )
     .await?
     {
@@ -453,6 +545,25 @@ async fn issue_code(
         consent_ref: &consent_ref,
         claims_request: claims_canonical.as_deref(),
     };
+
+    // 7b. Single-use PAR consume at the moment of issuance (RFC 9126, issue #27).
+    //     The `request_uri` was PEEKED (read, not consumed) at every hop so the
+    //     login/consent interaction could re-present it. Now that an authenticated,
+    //     consenting subject is about to receive a code, consume it ATOMICALLY,
+    //     exactly once, with the client_id filter INSIDE the consume (the binding
+    //     holds here too). A concurrent or prior issuance (or an expiry) that already
+    //     consumed it wins the race and this one fails closed, so a `request_uri`
+    //     yields AT MOST ONE code. This runs AFTER the interactive gate (the
+    //     sign-before-consume discipline the code redeem uses), so a login or consent
+    //     round-trip never burns the pending request; the consume's audit row is
+    //     written on the winning branch only.
+    if let Some(context) = pushed {
+        if !consume_pushed_request(state, scope, &client_id, context).await? {
+            return Err(AuthorizeError::page(
+                "the request_uri is invalid, expired, or already used",
+            ));
+        }
+    }
 
     // 8. Dispatch by response type, consuming the SAME success parameter list
     //    through the negotiated mode encoder (issue #17):
@@ -1085,6 +1196,7 @@ async fn resolve_gate(
     prompt: PromptSet,
     max_age_secs: Option<u64>,
     hints: &InteractionHints,
+    pushed: Option<&PushedContext>,
 ) -> Result<Gate, AuthorizeError> {
     // The scope is the one the client_id declares (fixed at validation).
     let scope = client_id.scope();
@@ -1115,9 +1227,9 @@ async fn resolve_gate(
         // (login/select_account/max_age) so the fresh login does not re-force and
         // loop.
         let redirect = if prompt.contains(PromptValue::Create) {
-            interaction::register_redirect(&preserve_resume_url(params, hints))
+            interaction::register_redirect(&preserve_resume_url(params, hints, pushed))
         } else {
-            interaction::login_redirect(&login_resume_url(params, hints, prompt))
+            interaction::login_redirect(&login_resume_url(params, hints, prompt, pushed))
         };
         return Ok(Gate::Interaction(redirect));
     };
@@ -1140,7 +1252,7 @@ async fn resolve_gate(
             ));
         }
         return Ok(Gate::Interaction(interaction::login_redirect(
-            &login_resume_url(params, hints, prompt),
+            &login_resume_url(params, hints, prompt, pushed),
         )));
     }
 
@@ -1189,7 +1301,7 @@ async fn resolve_gate(
         ));
     }
     Ok(Gate::Interaction(interaction::consent_redirect(
-        &consent_resume_url(params, hints, prompt),
+        &consent_resume_url(params, hints, prompt, pushed),
     )))
 }
 
@@ -1312,14 +1424,25 @@ fn build_authorize_url(
 /// preserving the whole request verbatim (`prompt` and `max_age` unchanged). Used
 /// where nothing is consumed (the registration deep-link, whose `prompt=create` is
 /// already ignored once a session exists).
-fn preserve_resume_url(params: &AuthorizeParams, hints: &InteractionHints) -> String {
-    build_authorize_url(
-        params,
-        hints,
-        params.prompt.as_deref(),
-        params.max_age.as_deref(),
-        false,
-    )
+///
+/// On the PAR path (RFC 9126, issue #27) the resume re-presents the `request_uri` (no
+/// overlay): `prompt=create` is stored and re-read verbatim, and it is already ignored
+/// once a session exists, so nothing needs relaxing.
+fn preserve_resume_url(
+    params: &AuthorizeParams,
+    hints: &InteractionHints,
+    pushed: Option<&PushedContext>,
+) -> String {
+    match pushed {
+        Some(context) => build_par_resume_url(context, params.scope.as_deref(), hints, None),
+        None => build_authorize_url(
+            params,
+            hints,
+            params.prompt.as_deref(),
+            params.max_age.as_deref(),
+            false,
+        ),
+    }
 }
 
 /// The `/authorize` resume URL for a LOGIN interaction, with the re-auth forcing
@@ -1329,40 +1452,141 @@ fn preserve_resume_url(params: &AuthorizeParams, hints: &InteractionHints) -> St
 /// in an infinite redirect loop. When a `max_age` is consumed the `emit_auth_time`
 /// marker is set so the resumed request still carries the ID token's `auth_time`
 /// that `max_age` required.
+///
+/// On the PAR path (RFC 9126, issue #27) the resume re-presents the unforgeable
+/// `request_uri` rather than the expanded parameters. When the login consumed a
+/// forcing token (a `login`/`select_account` prompt or a `max_age`) it additionally
+/// carries the reduced controls over the `request_uri` (the `par_resume` overlay) so
+/// the loop is broken; when there was nothing to consume it stays MINIMAL.
 fn login_resume_url(
     params: &AuthorizeParams,
     hints: &InteractionHints,
     prompt: PromptSet,
+    pushed: Option<&PushedContext>,
 ) -> String {
     let residual = prompt
         .without(PromptValue::Login)
         .without(PromptValue::SelectAccount)
         .to_param();
-    build_authorize_url(
-        params,
-        hints,
-        residual.as_deref(),
-        None,
-        params.max_age.is_some(),
-    )
+    match pushed {
+        Some(context) => {
+            // A login relaxes login/select_account and any max_age. Carry the reduced
+            // controls ONLY when there is something to relax; otherwise no overlay.
+            let controls = (prompt.contains(PromptValue::Login)
+                || prompt.contains(PromptValue::SelectAccount)
+                || params.max_age.is_some())
+            .then_some(ResumeControls {
+                prompt: residual.as_deref(),
+                max_age: None,
+                emit_auth_time: params.max_age.is_some(),
+            });
+            build_par_resume_url(context, params.scope.as_deref(), hints, controls)
+        }
+        None => build_authorize_url(
+            params,
+            hints,
+            residual.as_deref(),
+            None,
+            params.max_age.is_some(),
+        ),
+    }
 }
 
 /// The `/authorize` resume URL for a CONSENT interaction, with the `consent` prompt
 /// token CONSUMED (issue #16) so the consent just recorded does not re-trigger a
 /// consent loop. `max_age` is preserved (a consent step performs no
 /// authentication, and a stale `max_age` would already have forced login first).
+///
+/// On the PAR path (RFC 9126, issue #27) the resume re-presents the unforgeable
+/// `request_uri`. When the request carried `prompt=consent` (which would re-force the
+/// screen forever) it carries the reduced controls over the `request_uri` (the
+/// `par_resume` overlay, `max_age` preserved); otherwise the recorded consent already
+/// breaks the loop, so no overlay is carried.
 fn consent_resume_url(
     params: &AuthorizeParams,
     hints: &InteractionHints,
     prompt: PromptSet,
+    pushed: Option<&PushedContext>,
 ) -> String {
     let residual = prompt.without(PromptValue::Consent).to_param();
-    build_authorize_url(
-        params,
-        hints,
-        residual.as_deref(),
-        params.max_age.as_deref(),
-        false,
+    match pushed {
+        Some(context) => {
+            let controls = prompt
+                .contains(PromptValue::Consent)
+                .then_some(ResumeControls {
+                    prompt: residual.as_deref(),
+                    max_age: params.max_age.as_deref(),
+                    emit_auth_time: false,
+                });
+            build_par_resume_url(context, params.scope.as_deref(), hints, controls)
+        }
+        None => build_authorize_url(
+            params,
+            hints,
+            residual.as_deref(),
+            params.max_age.as_deref(),
+            false,
+        ),
+    }
+}
+
+/// The reduced interaction controls (issue #16) carried on a PAR resume URL behind the
+/// `par_resume` marker, present ONLY when an interaction consumed a forcing token that
+/// the stored request would otherwise re-force forever.
+struct ResumeControls<'a> {
+    /// The residual `prompt` after the consumed forcing tokens were dropped.
+    prompt: Option<&'a str>,
+    /// The `max_age` to carry (a login drops it; a consent preserves it).
+    max_age: Option<&'a str>,
+    /// Whether to set `emit_auth_time` (a login that dropped a `max_age`).
+    emit_auth_time: bool,
+}
+
+/// Build the `/authorize` resume URL for a request that arrived via PAR (RFC 9126,
+/// issue #27).
+///
+/// It re-presents the unforgeable `request_uri` and its `client_id`: those are the
+/// source of truth for the require-PAR gate and for every security parameter
+/// (`redirect_uri`, PKCE, `nonce`, `claims`, the client binding), all re-read from
+/// storage on the resumed hop and NEVER trusted from this URL. It additionally carries
+/// the `scope` and the interaction hints the login/consent PAGES render and record
+/// from (the interaction layer is URL-driven): those are INERT at `/authorize`, where
+/// the stored values win (RFC 9126 section 4), but the consent screen must display and
+/// record the requested scope, so it rides the resume link. When an interaction
+/// consumed a forcing token, `controls` carries the reduced `prompt`/`max_age` (and
+/// `emit_auth_time`) behind the `par_resume` marker so the issue #16 loop is broken;
+/// otherwise no marker is emitted and the stored `prompt`/`max_age` stand.
+fn build_par_resume_url(
+    context: &PushedContext,
+    scope: Option<&str>,
+    hints: &InteractionHints,
+    controls: Option<ResumeControls<'_>>,
+) -> String {
+    let (marker, prompt, max_age, emit_auth_time) = match controls {
+        Some(controls) => (
+            Some("1"),
+            controls.prompt,
+            controls.max_age,
+            controls.emit_auth_time.then_some("1"),
+        ),
+        None => (None, None, None, None),
+    };
+    append_query(
+        "/authorize",
+        &[
+            ("client_id", Some(context.presenting_client.as_str())),
+            ("request_uri", Some(context.request_uri.as_str())),
+            ("scope", scope),
+            ("login_hint", hints.login_hint()),
+            ("logout_hint", hints.logout_hint()),
+            ("ui_locales", hints.ui_locales()),
+            ("claims_locales", hints.claims_locales()),
+            ("display", hints.display_param()),
+            ("par_resume", marker),
+            ("prompt", prompt),
+            ("max_age", max_age),
+            ("emit_auth_time", emit_auth_time),
+        ],
     )
 }
 

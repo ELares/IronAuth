@@ -91,9 +91,9 @@ pub use repository::{
     EnvironmentRepo, GrantedConsent, IdempotencyRepo, IdempotencyWrite, IssueCode,
     IssuedTokenRecord, JtiOutcome, MANAGEMENT_LIST_HARD_CAP, ManagementCredentialRecord,
     ManagementCredentialRepo, ManagementStore, NewClientAuthDiagnostic, NewJwtAuthClient,
-    NewOpaqueAccessToken, NewResourceServer, NewSigningKey, PushRequest, RedeemOutcome,
-    ResourceServerRecord, ResourceServerRepo, ScopedStore, SessionRecord, SessionRepo,
-    SigningKeyMaterial, SigningKeyMaterialKind, SigningKeyRecord, SigningKeyRepo,
+    NewOpaqueAccessToken, NewResourceServer, NewSigningKey, PushRequest, PushedRequestRepo,
+    RedeemOutcome, ResourceServerRecord, ResourceServerRepo, ScopedStore, SessionRecord,
+    SessionRepo, SigningKeyMaterial, SigningKeyMaterialKind, SigningKeyRecord, SigningKeyRepo,
     StoredIdempotentResponse, TenantRecord, TenantRepo, TokenFormat, TokenKind, TokenStatus,
     UserRecord, UserRepo, opaque_access_token_digest,
 };

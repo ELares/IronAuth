@@ -14,10 +14,14 @@ mod common;
 
 use std::time::Duration;
 
-use axum::http::StatusCode;
+use axum::body::Body;
+use axum::http::{Request, StatusCode, header};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
-use common::{Harness, ISSUER_BASE, PKCE_CHALLENGE, REDIRECT_URI, enc, form, json, location_param};
+use common::{
+    Harness, ISSUER_BASE, PKCE_CHALLENGE, REDIRECT_URI, SEED_PASSWORD, enc, form, form_field, json,
+    location, location_param, send_through, set_cookie_pair,
+};
 use ironauth_config::OidcConfig;
 use ironauth_oidc::ClientAuthMethod;
 
@@ -430,4 +434,318 @@ async fn discovery_advertises_the_par_endpoint_and_the_require_flag_on_both_well
             "the JAR request_uri parameter stays unsupported at {path}"
         );
     }
+}
+
+// ===========================================================================
+// Require-PAR through the full login/consent interaction (RFC 9126, issue #27).
+//
+// The regression these lock: a require-PAR client's request_uri is PEEKED (not
+// consumed) at every authorization hop, so a fresh-login user resumes through login
+// AND consent to a REAL code instead of a 400. The pre-existing require-PAR tests use
+// an already-authenticated, already-consenting cookie and jump straight to issuance,
+// so they never exercise this interaction->resume path (the broken path).
+// ===========================================================================
+
+/// Drive a PAR authorization request that requires interaction all the way through
+/// login AND consent, returning the FINAL authorize response (the code redirect).
+///
+/// It mirrors the interactive-flow tests: walk each redirect and round-trip the hidden
+/// `return_to` field through the login and consent forms. Along the way it asserts the
+/// two properties the fix rests on: the resume target re-presents the `request_uri`
+/// (the minimal PAR presentation, NOT the expanded params), and the RESUMED request is
+/// not rejected by the require-PAR gate (it routes to consent, not a 400).
+async fn drive_par_login_consent(
+    harness: &Harness,
+    client_id: &str,
+    request_uri: &str,
+    identifier: &str,
+    password: &str,
+) -> (StatusCode, axum::http::HeaderMap, String) {
+    // 1. Present client_id + request_uri with NO session -> login redirect.
+    let (status, headers, body) = harness
+        .authorize(&authorize_via_par(client_id, request_uri))
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::FOUND,
+        "PAR authorize redirects to login: {body}"
+    );
+    let login_location = location(&headers).expect("login redirect");
+    assert!(
+        login_location.starts_with("/login?return_to="),
+        "an unauthenticated PAR request routes to login: {login_location}"
+    );
+    let return_to = location_param(&headers, "return_to").expect("login return_to");
+    assert!(
+        return_to.contains("request_uri="),
+        "the resume re-presents the request_uri (not the expanded params): {return_to}"
+    );
+
+    // 2. GET the login page, round-trip its return_to, POST the credentials.
+    let (_s, _h, login_html) = harness.get_with_cookie(&login_location, None).await;
+    let form_return_to = form_field(&login_html, "return_to").expect("login return_to field");
+    let login_body = form(&[
+        ("identifier", identifier),
+        ("password", password),
+        ("return_to", &form_return_to),
+    ]);
+    let (status, headers, body) = harness.post_form("/login", &login_body, None).await;
+    assert_eq!(status, StatusCode::FOUND, "login post: {body}");
+    let cookie = set_cookie_pair(&headers).expect("session cookie set on login");
+    let resume = location(&headers).expect("resume after login");
+
+    // 3. Resume (authenticated) -> consent required, NOT a 400. This is the exact hop
+    //    that regressed: the require-PAR gate must accept the resumed PAR request.
+    let (status, headers, body) = harness.get_with_cookie(&resume, Some(&cookie)).await;
+    assert_eq!(
+        status,
+        StatusCode::FOUND,
+        "the resumed PAR request must not be rejected by the require-PAR gate: {body}"
+    );
+    let consent_location = location(&headers).expect("consent redirect");
+    assert!(
+        consent_location.starts_with("/consent?return_to="),
+        "the resumed request routes to consent: {consent_location}"
+    );
+
+    // 4. Consent allow, then the final resume issues the code.
+    let (_s, _h, consent_html) = harness
+        .get_with_cookie(&consent_location, Some(&cookie))
+        .await;
+    let consent_return_to = form_field(&consent_html, "return_to").expect("consent return_to");
+    let consent_body = form(&[("decision", "allow"), ("return_to", &consent_return_to)]);
+    let (status, headers, body) = harness
+        .post_form("/consent", &consent_body, Some(&cookie))
+        .await;
+    assert_eq!(status, StatusCode::FOUND, "consent post: {body}");
+    let resume = location(&headers).expect("resume after consent");
+    harness.get_with_cookie(&resume, Some(&cookie)).await
+}
+
+#[tokio::test]
+async fn require_par_per_client_resumes_through_login_and_consent_to_a_code() {
+    let harness = Harness::start().await;
+    let client_id = harness.client_id().to_string();
+    harness.require_par_for_client(harness.client_id()).await;
+    harness
+        .seed_user("par-e2e@example.test", SEED_PASSWORD)
+        .await;
+
+    let request_uri = push_request_uri(&harness, &valid_public_par_form(&client_id), None).await;
+    let (status, headers, body) = drive_par_login_consent(
+        &harness,
+        &client_id,
+        &request_uri,
+        "par-e2e@example.test",
+        SEED_PASSWORD,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FOUND, "the final resume issues: {body}");
+    assert!(
+        location(&headers).is_some_and(|l| l.starts_with(REDIRECT_URI)),
+        "the code is delivered to the redirect_uri"
+    );
+    assert!(
+        location_param(&headers, "code").is_some(),
+        "a real authorization code is issued through the interaction, not a 400"
+    );
+    assert_eq!(
+        location_param(&headers, "state").as_deref(),
+        Some("xyz"),
+        "the pushed state is echoed"
+    );
+}
+
+#[tokio::test]
+async fn the_global_require_par_switch_resumes_through_login_and_consent_to_a_code() {
+    let harness = Harness::start_with(OidcConfig {
+        require_pushed_authorization_requests: true,
+        require_pkce_for_confidential_clients: false,
+        ..OidcConfig::default()
+    })
+    .await;
+    let client_id = harness.client_id().to_string();
+    harness
+        .seed_user("par-e2e-global@example.test", SEED_PASSWORD)
+        .await;
+
+    let request_uri = push_request_uri(&harness, &valid_public_par_form(&client_id), None).await;
+    let (status, headers, body) = drive_par_login_consent(
+        &harness,
+        &client_id,
+        &request_uri,
+        "par-e2e-global@example.test",
+        SEED_PASSWORD,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FOUND, "the final resume issues: {body}");
+    assert!(
+        location_param(&headers, "code").is_some(),
+        "a real authorization code is issued through the interaction under the global switch, not a 400"
+    );
+}
+
+#[tokio::test]
+async fn require_par_still_rejects_a_plain_and_a_forged_request() {
+    // The fix must NOT weaken the gate: with require-PAR set, a PLAIN request (no
+    // request_uri) is still rejected, and a FORGED/unknown request_uri is rejected too
+    // (it resolves to nothing, so it is never a bypass and issues no code).
+    let harness = Harness::start().await;
+    let client_id = harness.client_id().to_string();
+    harness.require_par_for_client(harness.client_id()).await;
+    let cookie = harness.authenticated_cookie().await;
+
+    let plain = format!(
+        "response_type=code&client_id={client_id}&redirect_uri={}&scope=openid&\
+         code_challenge={PKCE_CHALLENGE}&code_challenge_method=S256",
+        enc(REDIRECT_URI)
+    );
+    let (status, headers, body) = harness.authorize_with_cookie(&plain, &cookie).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a plain request from a require-PAR client is still rejected: {body}"
+    );
+    assert!(
+        location_param(&headers, "code").is_none(),
+        "no code for a plain request"
+    );
+
+    // A well-formed PAR urn with no backing storage row is a forged reference.
+    let forged = format!("{PAR_PREFIX}par_forgedforgedforgedforgedforged");
+    let (status, headers, body) = harness
+        .authorize_with_cookie(&authorize_via_par(&client_id, &forged), &cookie)
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a forged request_uri is rejected (no bypass): {body}"
+    );
+    assert!(
+        location_param(&headers, "code").is_none(),
+        "no code is issued for a forged request_uri"
+    );
+}
+
+#[tokio::test]
+async fn an_invalid_response_mode_is_rejected_at_the_par_endpoint() {
+    // Acceptance criterion 4 (push-time parity beyond redirect_uri/PKCE): an
+    // unsupported response_mode is caught at PUSH time on the back channel as a JSON
+    // invalid_request, not later at /authorize.
+    let harness = Harness::start().await;
+    let client_id = harness.client_id().to_string();
+    let bad = form(&[
+        ("client_id", &client_id),
+        ("response_type", "code"),
+        ("response_mode", "bogus"),
+        ("redirect_uri", REDIRECT_URI),
+        ("scope", "openid"),
+        ("code_challenge", PKCE_CHALLENGE),
+        ("code_challenge_method", "S256"),
+    ]);
+    let (status, _, body) = harness.par(&bad, None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "par rejects: {body}");
+    assert_eq!(
+        json(&body)["error"].as_str(),
+        Some("invalid_request"),
+        "an unsupported response_mode is invalid_request at PAR: {body}"
+    );
+}
+
+#[tokio::test]
+async fn pushed_values_win_over_conflicting_inline_params_at_authorize() {
+    // RFC 9126 section 4: when a request_uri is presented, the STORED pushed values are
+    // authoritative and any conflicting inline query parameters are IGNORED.
+    let harness = Harness::start().await;
+    let client_id = harness.client_id().to_string();
+    // The pushed request binds redirect_uri=REDIRECT_URI, scope=openid, state=xyz.
+    let request_uri = push_request_uri(&harness, &valid_public_par_form(&client_id), None).await;
+
+    // Present the request_uri alongside CONFLICTING inline redirect_uri/scope/state.
+    let cookie = harness.authenticated_cookie().await;
+    let conflicting = format!(
+        "client_id={client_id}&request_uri={}&redirect_uri={}&scope={}&state=forged",
+        enc(&request_uri),
+        enc("https://evil.test/cb"),
+        enc("openid profile email address"),
+    );
+    let (status, headers, body) = harness.authorize_with_cookie(&conflicting, &cookie).await;
+    assert_eq!(
+        status,
+        StatusCode::FOUND,
+        "authorize via PAR issues: {body}"
+    );
+    let loc = location(&headers).expect("code redirect");
+    assert!(
+        loc.starts_with(REDIRECT_URI),
+        "the code is delivered to the STORED redirect_uri, not the inline one: {loc}"
+    );
+    assert!(
+        !loc.contains("evil.test"),
+        "the inline redirect_uri is ignored: {loc}"
+    );
+    assert!(
+        location_param(&headers, "code").is_some(),
+        "a code is issued for the pushed request"
+    );
+    assert_eq!(
+        location_param(&headers, "state").as_deref(),
+        Some("xyz"),
+        "the STORED state wins over the conflicting inline state"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_issuances_of_one_request_uri_yield_at_most_one_code() {
+    // The consume moved to issuance (RFC 9126, issue #27), so N concurrent issuances
+    // driven by the SAME request_uri race on the atomic consume-at-issuance: exactly
+    // one produces a code and the rest are rejected (single use holds end to end).
+    const RACERS: usize = 6;
+
+    let harness = Harness::start().await;
+    let client_id = harness.client_id().to_string();
+    let request_uri = push_request_uri(&harness, &valid_public_par_form(&client_id), None).await;
+
+    // Pre-seed an authenticated, consenting session per racer (distinct users), so the
+    // race is purely on the issuance-time consume, not on login/consent.
+    let mut cookies = Vec::with_capacity(RACERS);
+    for _ in 0..RACERS {
+        cookies.push(harness.authenticated_cookie().await);
+    }
+
+    let query = authorize_via_par(&client_id, &request_uri);
+    let mut tasks = Vec::with_capacity(RACERS);
+    for cookie in cookies {
+        let router = harness.router();
+        let query = query.clone();
+        tasks.push(tokio::spawn(async move {
+            let request = Request::builder()
+                .method("GET")
+                .uri(format!("/authorize?{query}"))
+                .header(header::COOKIE, cookie)
+                .body(Body::empty())
+                .expect("request builds");
+            send_through(router, request).await
+        }));
+    }
+
+    let mut codes = 0_usize;
+    let mut rejected = 0_usize;
+    for task in tasks {
+        let (status, headers, _body) = task.await.expect("task joins");
+        if status == StatusCode::FOUND && location_param(&headers, "code").is_some() {
+            codes += 1;
+        } else {
+            rejected += 1;
+        }
+    }
+    assert_eq!(
+        codes, 1,
+        "exactly one concurrent issuance of a request_uri produces a code"
+    );
+    assert_eq!(
+        rejected,
+        RACERS - 1,
+        "every other concurrent issuance is rejected (single use)"
+    );
 }

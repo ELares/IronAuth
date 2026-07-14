@@ -21,14 +21,24 @@ range per docs/RELEASING.md.
     `/par` run, so the two paths cannot diverge; `/authorize` renders a page or a
     redirect and `/par` renders JSON from the same neutral error.
   - **`request_uri` at `/authorize`.** A `request_uri` is accepted ONLY as a PAR
-    reference, consumed atomically on first use (reuse or expiry is rejected), and
+    reference. It is PEEKED (read, not consumed) at every authorization hop, so it
+    survives the login and consent interaction round-trip, and the single-use
+    consume happens ATOMICALLY at the moment of code issuance: exactly one code per
+    `request_uri`, and a concurrent or prior issuance, a reuse, or an expiry is
+    rejected (single use holds end to end across stateless nodes). The reference is
     bound to the pushing client (a reference presented by a different `client_id`
-    is rejected). No code path ever dereferences an external `request_uri` over the
-    network: there is no outbound fetch on this path (test-enforced).
+    resolves to nothing, and is never revealed or burned), the pushed values are
+    authoritative and any conflicting inline query parameters are ignored (RFC 9126
+    section 4), and no code path ever dereferences an external `request_uri` over
+    the network (there is no outbound fetch on this path, test-enforced).
   - **Require-PAR enforcement.** When the environment switch
     (`oidc.require_pushed_authorization_requests`) OR the per-client registration
     flag is set, a plain (non-PAR) authorization request is rejected with
-    `invalid_request`.
+    `invalid_request`. A request that arrived through PAR satisfies the requirement
+    at the first hop AND at every login/consent resume hop: the gate keys off the
+    unforgeable `request_uri`, which is re-presented on the minimal resume link (not
+    the expanded parameters), so a fresh-login user of a require-PAR client resumes
+    through the interaction to a real code rather than a 400.
   - **Discovery.** `pushed_authorization_request_endpoint` and
     `require_pushed_authorization_requests` are advertised from live config on both
     well-known forms.

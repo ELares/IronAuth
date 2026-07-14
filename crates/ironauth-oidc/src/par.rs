@@ -117,8 +117,9 @@ impl ParParams {
     /// Build the [`AuthorizeParams`] to validate and store from this pushed form,
     /// binding the request to the AUTHENTICATED `client_id` (so a Basic-authenticated
     /// push, whose form carried no `client_id`, still replays with the right client).
-    /// `request_uri` and the internal `emit_auth_time` marker are always cleared: a
-    /// pushed request never references another, and the resume marker is internal.
+    /// `request_uri` and the internal `emit_auth_time`/`par_resume` markers are always
+    /// cleared: a pushed request never references another, and the resume markers are
+    /// internal to the interaction round-trip.
     fn into_authorize_params(self, authenticated_client_id: String) -> AuthorizeParams {
         AuthorizeParams {
             request_uri: None,
@@ -141,6 +142,7 @@ impl ParParams {
             claims_locales: self.claims_locales,
             display: self.display,
             emit_auth_time: None,
+            par_resume: None,
         }
     }
 }
