@@ -23,6 +23,7 @@ members = [
     "crates/ironauth-admin",
     "crates/ironauth-oidc",
     "crates/ironauth-quota",
+    "crates/ironauth-apply",
     "crates/ironauth",
 ]
 
@@ -43,6 +44,7 @@ ironauth-kms = { path = "crates/ironauth-kms", version = "0.1.0" }
 ironauth-admin = { path = "crates/ironauth-admin", version = "0.1.0" }
 ironauth-oidc = { path = "crates/ironauth-oidc", version = "0.1.0" }
 ironauth-quota = { path = "crates/ironauth-quota", version = "0.1.0" }
+ironauth-apply = { path = "crates/ironauth-apply", version = "0.1.0" }
 getrandom = "0.3"
 
 # OpenAPI 3.1 source of truth for the management API (crates/ironauth-admin,

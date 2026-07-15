@@ -1,0 +1,84 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+[package]
+name = "ironauth-apply"
+version = "0.1.0"
+description = "IronAuth config-as-code CLI: a thin client over the server-side snapshot validate and promotion plan/apply primitives (validate, plan, dry-run, apply, drift)"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# Explicit target list: the integration tests need a real database and an
+# in-process management server, gated behind `required-features = ["testing"]`
+# so the DB-free lanes (clippy, msrv, musl, cargo check) never try to run them.
+# Auto-discovery is off so a new test file cannot silently run without its gate.
+autotests = false
+
+[dependencies]
+# The snapshot format and its validator (issue #43): the CLI's `validate`
+# subcommand REUSES `validate_document` rather than reimplementing validation,
+# so the client can never drift from the server's notion of a valid document.
+# Pure (operates on bytes, touches no database), so linking it costs the CLI no
+# runtime dependency.
+ironauth-store.workspace = true
+serde_json.workspace = true
+
+# The CLI is a CLIENT of the operator's OWN management/control plane, which by
+# design runs on a loopback or private address (a control plane is not exposed to
+# the internet). ironauth-fetch is the server's SSRF-hardened OUTBOUND path: it
+# refuses loopback and private destinations by policy (deliberately not
+# configurable), so it structurally cannot reach the very endpoints this CLI must
+# talk to. The two have opposite threat models -- the fetcher stops the SERVER
+# from being tricked into dialing internal addresses from an attacker-controlled
+# URL; this CLI is an operator deliberately dialing their own control plane. So
+# the CLI carries its own minimal HTTP/1.1 client over the same vetted hyper +
+# tokio-rustls stack the fetcher uses (no new crate enters the lock, cargo-deny is
+# unchanged), and each banned-by-http-audit dependency carries the marker below.
+hyper = { workspace = true, features = [ # http-audit-allow: control-plane client, see note above
+    "client",
+    "http1",
+] }
+hyper-util = { workspace = true, features = ["tokio"] } # http-audit-allow: control-plane client, see note above
+http.workspace = true
+http-body-util.workspace = true
+bytes.workspace = true
+# Client TLS for an https control plane, native OS trust roots, ring provider:
+# the exact stack ironauth-fetch and ironauth-store use, so no new crate and no
+# openssl/native-tls/webpki-roots enters the graph and the musl static lane holds.
+tokio-rustls.workspace = true # http-audit-allow: control-plane client TLS, see note above
+rustls-native-certs.workspace = true
+tokio = { workspace = true, features = ["net", "io-util", "time", "rt"] }
+
+[features]
+# Default build is lean: the production CLI. `testing` gates the integration
+# tests' required-features so the DB-free lanes skip them; it turns on no extra
+# production code.
+default = []
+testing = []
+
+[dev-dependencies]
+# The integration tests stand up an in-process management API over a real
+# database and drive the CLI's real HTTP client against it over loopback.
+ironauth-store = { workspace = true, features = ["testing"] }
+ironauth-admin.workspace = true
+ironauth-config.workspace = true
+ironauth-env.workspace = true
+tokio = { workspace = true, features = [
+    "rt-multi-thread",
+    "macros",
+    "net",
+    "io-util",
+    "time",
+] }
+axum = { workspace = true, features = ["tokio", "http1"] }
+
+# CLI integration tests: validate, plan, dry-run parity, apply idempotency, drift
+# exit codes, unresolved references, and the write-only-secret output scan. All
+# need the in-process server + database.
+[[test]]
+name = "cli"
+path = "tests/cli.rs"
+required-features = ["testing"]
+
+[lints]
+workspace = true

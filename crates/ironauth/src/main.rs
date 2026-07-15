@@ -33,6 +33,13 @@ fn main() -> ExitCode {
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
         Some("serve") => serve(&mut args),
+        // The config-as-code subcommands (issue #51) dispatch into ironauth-apply.
+        // The verb is re-prepended so that crate parses its own argument vector.
+        Some(verb @ ("validate" | "plan" | "apply" | "drift")) => {
+            let mut subcommand_args = vec![verb.to_owned()];
+            subcommand_args.extend(args);
+            ironauth_apply::run(&subcommand_args)
+        }
         Some("--version" | "-V" | "version") => {
             println!("ironauth {VERSION}");
             ExitCode::SUCCESS
@@ -557,11 +564,17 @@ fn print_help() {
     println!();
     println!("USAGE:");
     println!("  ironauth serve [--config PATH]   Run the server until SIGTERM/SIGINT");
+    println!("  ironauth validate <document>     Validate a config document (local)");
+    println!("  ironauth plan <document> ...      Render the server-computed promotion plan");
+    println!("  ironauth apply <document> ...     Apply a config document to a target");
+    println!("  ironauth drift <document> ...     Report whether a target has drifted");
     println!("  ironauth --version               Print the version");
     println!("  ironauth --help                  Print this help");
     println!();
     println!("The server serves a public data plane and a private management plane");
     println!("(health, readiness, metrics) on separate ports; see docs/CONFIG.md.");
+    println!("The config-as-code subcommands are a thin client of the management API;");
+    println!("run 'ironauth <subcommand> --help' for their usage.");
 }
 
 #[cfg(test)]
