@@ -131,6 +131,11 @@ pub enum Action {
     /// [`Action::ClientRedirectUrisRegister`] so the two registered sets are legible
     /// apart in the audit trail.
     ClientPostLogoutRedirectUrisRegister,
+    /// A client's Back-Channel Logout registration was set (issue #34): the
+    /// `backchannel_logout_uri` the OP POSTs a signed Logout Token to, and the
+    /// `backchannel_logout_session_required` flag. Distinct from the redirect-URI
+    /// registrations so the back-channel target is legible on its own in the audit trail.
+    ClientBackchannelLogoutRegister,
     /// A client's consent mode and refresh-rotation policy were configured (issue
     /// #21): the consent mode, the skip and no-store consent knobs, and the optional
     /// per-client rotation override.
@@ -311,6 +316,7 @@ impl Action {
             Action::ClientCreate => "client.create",
             Action::ClientDelete => "client.delete",
             Action::ClientRedirectUrisRegister => "client.redirect_uris.register",
+            Action::ClientBackchannelLogoutRegister => "client.backchannel_logout.register",
             Action::ClientPostLogoutRedirectUrisRegister => {
                 "client.post_logout_redirect_uris.register"
             }

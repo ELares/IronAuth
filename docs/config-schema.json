@@ -161,6 +161,39 @@
           "minimum": 0,
           "type": "integer"
         },
+        "backchannel_logout_enabled": {
+          "default": false,
+          "description": "Whether the OIDC Back-Channel Logout delivery worker runs (issue #34). OFF by\ndefault (the covenant posture: no mandatory background infrastructure), so the\ndefault build enqueues nothing and sends nothing. When enabled, the worker drains\nthe durable session-ended outbox, builds one signed Logout Token per participating\nrelying party (each carrying that RP's own `sid`), and POSTs it to the RP's\nregistered `backchannel_logout_uri` through the SSRF-hardened outbound fetcher,\nwith bounded-backoff retries and a dead-letter state. Discovery advertises\n`backchannel_logout_supported` regardless (the OP supports the mechanism); this\nswitch governs only whether the delivery worker is scheduled.",
+          "type": "boolean"
+        },
+        "backchannel_logout_max_attempts": {
+          "default": 5,
+          "description": "The maximum number of delivery attempts the back-channel logout worker makes for\none relying party before it DEAD-LETTERS the delivery (issue #34). A slow or down\nRP is retried with exponential backoff up to this cap, then given up on (recorded\nwith its last error) so it never retries unboundedly. The default (5) is\nconservative. Must be at least 1.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "backchannel_logout_poll_interval_secs": {
+          "default": 5,
+          "description": "How often, in seconds, the back-channel logout worker polls the queue for due work\n(issue #34). The default (5) is a responsive-yet-cheap cadence. Must be at least 1\nand at most `OIDC_MAX_LIFETIME_SECS`.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "backchannel_logout_request_timeout_secs": {
+          "default": 10,
+          "description": "The per-delivery total time budget in seconds for one back-channel logout POST\n(issue #34): the SSRF-hardened fetcher aborts a delivery that exceeds it, so a slow\nRP cannot wedge the worker or block other RPs. The default (10) is conservative.\nMust be at least 1 and at most `OIDC_MAX_LIFETIME_SECS`.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "backchannel_logout_retry_base_secs": {
+          "default": 10,
+          "description": "The base delay in seconds for the back-channel logout worker's exponential backoff\nbetween delivery retries (issue #34). The nth retry waits about\n`base * 2^(n-1)` seconds plus jitter (both drawn from the deterministic clock and\nentropy seams). The default (10) is conservative. Must be at least 1 and at most\n`OIDC_MAX_LIFETIME_SECS`.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
         "client_assertion_audience": {
           "$ref": "#/$defs/ClientAssertionAudience",
           "default": "token_endpoint_or_issuer",
@@ -603,6 +636,11 @@
       "default": {
         "access_token_ttl_secs": 300,
         "authorization_code_ttl_secs": 60,
+        "backchannel_logout_enabled": false,
+        "backchannel_logout_max_attempts": 5,
+        "backchannel_logout_poll_interval_secs": 5,
+        "backchannel_logout_request_timeout_secs": 10,
+        "backchannel_logout_retry_base_secs": 10,
         "client_assertion_audience": "token_endpoint_or_issuer",
         "client_assertion_max_skew_secs": 60,
         "client_credentials_default_audience": "client_id",

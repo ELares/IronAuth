@@ -258,6 +258,18 @@ impl ScopedKind for SessionEventKind {
     const PREFIX: &'static str = "sev";
 }
 
+/// Marker for a per-RP back-channel-logout delivery (`bld_`), one row per participating
+/// relying party a drained session-ended event is exploded into (issue #34). It is the
+/// at-least-once, per-recipient delivery queue with its own attempts / backoff /
+/// dead-letter state, distinct from the shared session-ended outbox (`sev_`). Tenant
+/// scoped like every other resource, so a scope can never drain another tenant's
+/// back-channel deliveries. An INTERNAL tracking row, never a bearer credential.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct BackChannelDeliveryKind;
+impl ScopedKind for BackChannelDeliveryKind {
+    const PREFIX: &'static str = "bld";
+}
+
 /// Marker for a recorded consent decision (`con_`), the row that means a subject
 /// authorized a client (issue #20). Tenant scoped like every other resource; the
 /// grant's `consent_ref` seam references it.
@@ -565,6 +577,9 @@ pub type ClientSessionId = ScopedId<ClientSessionKind>;
 /// A session-ended outbox event identifier (`sev_...`), the durable row enqueued on
 /// every terminal session end and the idempotency key a consumer dedups on (issue #35).
 pub type SessionEventId = ScopedId<SessionEventKind>;
+/// A per-RP back-channel-logout delivery identifier (`bld_...`), one row in the
+/// at-least-once delivery queue per participating relying party (issue #34).
+pub type BackChannelDeliveryId = ScopedId<BackChannelDeliveryKind>;
 /// A recorded-consent identifier (`con_...`), the decision row a grant references
 /// (issue #20).
 pub type ConsentId = ScopedId<ConsentKind>;

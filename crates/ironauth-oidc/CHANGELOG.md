@@ -6,6 +6,30 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Back-Channel Logout: the Logout Token and the delivery worker (OIDC Back-Channel Logout
+  1.0, issue #34). `backchannel.rs`.
+  - **The Logout Token (`build_logout_token_claims`).** A signed JWT per section 2.4:
+    `iss`, `aud` (the RP client id), `iat`, `exp`, `jti`, the `events` member naming the
+    back-channel-logout event, and `sid` (this session-based OP always sends the
+    per-(client, session) value from #32, never the raw session id). It carries NO `nonce`
+    and no `sub` (sid alone identifies the session, avoiding the ambiguous sub-only token),
+    and is minted through the SAME ironauth-jose signing core and per-environment key as an
+    ID token, with the header `typ = logout+jwt`.
+  - **The delivery worker (`BackChannelLogoutWorker`).** Generic over a `LogoutSender`
+    seam so the network is injectable. `run_once(scope)` drains the durable session-ended
+    outbox (#35), EXPLODES each ended session into one per-RP delivery (resolving the
+    participating clients and each one's own `sid`), then attempts every due delivery:
+    marking delivered on a 2xx, or scheduling a bounded exponential-backoff retry (its
+    schedule and jitter drawn from the `ironauth-env` clock and entropy seams, so it is
+    deterministic under a manual clock) and dead-lettering the delivery once the attempts
+    cap is reached. A slow or failing RP never blocks the others or wedges the worker.
+  - **The SSRF-hardened sender (`FetchLogoutSender`).** The production `LogoutSender` POSTs
+    the form-encoded `logout_token` through `ironauth-fetch` (the only sanctioned outbound
+    path), so an RP-controlled `backchannel_logout_uri` that resolves to a loopback,
+    private, or metadata address is refused, no redirect is followed, and a per-delivery
+    timeout caps a slow RP. `SendFailure` gives bounded, non-secret failure labels.
+  - **Discovery** now advertises `backchannel_logout_supported = true` (alongside the
+    `backchannel_logout_session_supported` already advertised since #32).
 - RP-Initiated Logout: the `end_session` endpoint (OIDC RP-Initiated Logout 1.0, issue
   #33). A top-level browser navigation that ends the OP session and, only when it is
   cryptographically attributable, redirects back to the relying party.

@@ -186,5 +186,17 @@ name = "session_ended_fanout"
 path = "tests/session_ended_fanout.rs"
 required-features = ["testing"]
 
+# The per-RP back-channel-logout delivery queue (issue #34): a drained session-ended
+# event explodes into one delivery row per participating RP (only clients that registered
+# a backchannel_logout_uri, each carrying its OWN sid, never another client's); claim_due
+# leases due rows and a lapsed lease reappears them; mark_delivered and record_failure
+# drive the delivered / retry / dead-letter transitions; two concurrent claimers lease
+# disjoint sets via FOR UPDATE SKIP LOCKED; and the queue is cross-tenant isolated. Needs
+# a real database (DATABASE_URL).
+[[test]]
+name = "backchannel_delivery"
+path = "tests/backchannel_delivery.rs"
+required-features = ["testing"]
+
 [lints]
 workspace = true
