@@ -53,10 +53,12 @@ fn operation_ids_are_the_stable_set() {
             "createManagementKey",
             "createOrganization",
             "createTenant",
+            "createUser",
             "deleteEnvironment",
             "deleteManagementKey",
             "deleteOrganization",
             "deleteTenant",
+            "deleteUser",
             "exportConfigSnapshot",
             "getDcrClient",
             "getEnvironment",
@@ -66,6 +68,8 @@ fn operation_ids_are_the_stable_set() {
             "getRefreshFamily",
             "getSession",
             "getTenant",
+            "getUser",
+            "linkUserExternalId",
             "listDcrPolicies",
             "listEnvironments",
             "listManagementKeys",
@@ -75,12 +79,16 @@ fn operation_ids_are_the_stable_set() {
             "listResourceTypes",
             "listSessions",
             "listTenants",
+            "listUsers",
             "planConfigPromotion",
             "restoreTenant",
             "resumeTenant",
             "revokeSession",
             "revokeUserSessions",
+            "setUserState",
             "suspendTenant",
+            "unlinkUserExternalId",
+            "updateUser",
             "verifyDcrClient",
         ]
     );
@@ -111,6 +119,7 @@ fn every_list_endpoint_documents_cursor_pagination() {
         "listDcrPolicies",
         "listSessions",
         "listRefreshFamilies",
+        "listUsers",
     ] {
         let params = find_operation(&doc, op)["parameters"]
             .as_array()
@@ -144,6 +153,8 @@ fn every_post_documents_the_idempotency_key_header() {
         "suspendTenant",
         "resumeTenant",
         "restoreTenant",
+        "createUser",
+        "setUserState",
     ] {
         let params = find_operation(&doc, op)["parameters"]
             .as_array()
@@ -186,6 +197,8 @@ fn documented_paths_are_the_expected_set() {
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}",
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/keys/{key_id}",
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}",
+            "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}",
+            "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}/external-id",
             "GET /v1/operators",
             "GET /v1/operators/{operator_id}",
             "GET /v1/resource-types",
@@ -204,6 +217,9 @@ fn documented_paths_are_the_expected_set() {
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/refresh-families/{family_id}",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/sessions",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/sessions/{session_id}",
+            "GET /v1/tenants/{tenant_id}/environments/{environment_id}/users",
+            "GET /v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}",
+            "PATCH /v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}",
             "POST /v1/tenants",
             "POST /v1/tenants/{tenant_id}/environments",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/clients/{client_id}/verify",
@@ -215,10 +231,13 @@ fn documented_paths_are_the_expected_set() {
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/sessions/revoke",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/sessions/{session_id}/revoke",
+            "POST /v1/tenants/{tenant_id}/environments/{environment_id}/users",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}/sessions/revoke",
+            "POST /v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}/state",
             "POST /v1/tenants/{tenant_id}/restore",
             "POST /v1/tenants/{tenant_id}/resume",
             "POST /v1/tenants/{tenant_id}/suspend",
+            "PUT /v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}/external-id",
         ]
     );
 }
@@ -257,7 +276,7 @@ fn committed_artifact_matches_generated_spec() {
 async fn served_routes_match_documented_routes() {
     let router = db_free_router();
     let documented = documented_method_paths();
-    assert_eq!(documented.len(), 37, "the documented route count is pinned");
+    assert_eq!(documented.len(), 45, "the documented route count is pinned");
 
     // 1. Every documented (method, path) is wired and auth-gated (401, not
     //    404/405). The unauthenticated probe rejects before any DB access.

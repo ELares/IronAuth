@@ -108,6 +108,14 @@ pub async fn login_post(
         .await;
 
     match lookup {
+        // A user whose lifecycle state cannot authenticate (blocked, disabled, or
+        // pending verification) is FENCED (issue #52): the password is still spent
+        // (so a fenced account is timing-indistinguishable from a wrong password),
+        // then the SAME generic failure is returned, never a distinct signal.
+        Ok(Some(user)) if !user.state.can_authenticate() => {
+            let _ = password::verify_password(password, &user.password_hash);
+            failed_login_page(identifier, &resume.return_to, &resume.hints, banner)
+        }
         Ok(Some(user)) if password::verify_password(password, &user.password_hash) => {
             let actor = interaction::user_actor(&user.id);
             let subject = user.id.to_string();

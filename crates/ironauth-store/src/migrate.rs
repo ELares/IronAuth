@@ -482,6 +482,12 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0035_config_promotion.sql"),
         },
+        Migration {
+            version: 36,
+            name: "admin_user_lifecycle",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0036_admin_user_lifecycle.sql"),
+        },
     ]
 }
 

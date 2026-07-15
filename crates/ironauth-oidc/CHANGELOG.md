@@ -6,6 +6,13 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- User lifecycle authentication fence (issue #52): the interactive login and the
+  device-verification login paths now consult the resolved user's lifecycle `state`
+  and REFUSE a user that cannot authenticate (blocked, disabled, or
+  pending-verification). The password is still verified (so a fenced account is
+  timing-indistinguishable from a wrong password) and the SAME generic failure is
+  returned, so there is no blocked-vs-wrong-password oracle. A soft-deleted user
+  resolves as absent.
 - ACME certificate-authority DIRECTORY client for custom domains (issue #47,
   EXPLORATORY): `AcmeDirectoryClient` fetches and parses a CA's directory (RFC 8555
   7.1.1) ONLY through the SSRF-hardened `ironauth_fetch::Fetcher`, so a directory or

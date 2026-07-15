@@ -225,6 +225,15 @@ async fn build_management_router(config: &Config, env: &Env) -> Option<Router> {
             return None;
         }
     };
+    // The management plane manages users end to end (issue #52), which is a PII
+    // surface: it seals, blind-indexes, and opens user PII through the envelope
+    // substrate (issue #48) exactly as the data plane does, so attach the platform
+    // master key. Without it the admin user create/read paths fail closed (never
+    // plaintext); resolve_master_key logs when it is unset.
+    let store = match resolve_master_key(config) {
+        Some(master) => store.with_master_key(master),
+        None => store,
+    };
     match AdminState::new(store, env.clone(), &config.admin) {
         Ok(state) => {
             tracing::info!("management API mounted on the management plane");

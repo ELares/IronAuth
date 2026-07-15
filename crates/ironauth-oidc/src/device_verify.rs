@@ -247,6 +247,13 @@ async fn device_login(
         .by_identifier(identifier)
         .await;
     match lookup {
+        // A user whose lifecycle state cannot authenticate (blocked, disabled, or
+        // pending verification) is FENCED (issue #52): spend comparable password time,
+        // then return the SAME generic failure as a wrong password (no oracle).
+        Ok(Some(user)) if !user.state.can_authenticate() => {
+            let _ = password::verify_password(password, &user.password_hash);
+            failed_login(action, raw_code)
+        }
         Ok(Some(user)) if password::verify_password(password, &user.password_hash) => {
             let actor = interaction::user_actor(&user.id);
             let subject = user.id.to_string();

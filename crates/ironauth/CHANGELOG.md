@@ -6,6 +6,11 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- The management-plane control store is now built with the platform envelope master
+  key attached (issue #52), so the admin user-management API can seal, blind-index,
+  and open user PII (issue #48) exactly as the data plane does. Without the key those
+  admin user paths fail closed (never plaintext); `resolve_master_key` logs when it
+  is unset.
 - The binary now dispatches the config-as-code subcommands `validate`, `plan`,
   `apply`, and `drift` (issue #51, CLI half) into the new `ironauth-apply` crate.
   They are a THIN client of the management API: `validate` checks a document

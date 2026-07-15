@@ -202,6 +202,40 @@ pub enum Action {
     TokenIssue,
     /// A bootstrap end user was registered (issue #20).
     UserRegister,
+    /// A user was created through the management API (issue #52): the admin
+    /// create, optionally with a caller-supplied id. Distinct from
+    /// [`Action::UserRegister`] (the data-plane self-registration) so an
+    /// operator-created account is legible as such in the audit trail.
+    UserCreate,
+    /// A user's mutable profile was updated through the management API (issue #52):
+    /// a PATCH of the standard-claim document. The claim values are never recorded
+    /// on the audit row; only that the user was updated, by whom, and when.
+    UserUpdate,
+    /// A user was DELETED through the management API (issue #52): a soft-delete
+    /// tombstone that cascades the user's sessions and non-offline refresh families
+    /// and publishes to the session-ended fan-out (issue #35), then reads as a
+    /// uniform not-found. Offboarding, not erasure (crypto-shredding is #48/#49).
+    UserDelete,
+    /// A user's lifecycle STATE was changed through the management API (issue #52):
+    /// a validated transition of the user state machine (active, blocked, disabled,
+    /// `pending_verification`, `scheduled_offboarding`). The audit row's operator-safe
+    /// `detail` records the target state; a session-ending transition (block,
+    /// disable) cascades in the same transaction and fans out to relying parties.
+    UserStateChange,
+    /// A user's EXTERNAL ID was linked through the management API (issue #52): a
+    /// correlation id from the tenant's own systems was claimed for the user
+    /// (unique per scope, so a second claim of the same external id is refused).
+    /// The external-id value is never recorded on the audit row.
+    UserExternalIdLink,
+    /// A user's EXTERNAL ID was unlinked through the management API (issue #52): the
+    /// user's correlation id was cleared, freeing it for another user in the scope.
+    UserExternalIdUnlink,
+    /// A scheduled-offboarding user was EXECUTED by the worker (issue #52): at or
+    /// past its scheduled instant the user was disabled and its sessions and
+    /// non-offline refresh families cascaded, fanning out identically to a manual
+    /// disable. Idempotent: once executed the user is no longer scheduled, so a
+    /// re-run of the worker re-processes nothing.
+    UserOffboardingExecute,
     /// A bootstrap session was established at login or registration (issue #20).
     SessionCreate,
     /// An SSO session identifier was ROTATED at a privilege transition (issue #32):
@@ -444,6 +478,13 @@ impl Action {
             Action::AuthorizationCodeReuse => "authorization_code.reuse",
             Action::TokenIssue => "token.issue",
             Action::UserRegister => "user.register",
+            Action::UserCreate => "user.create",
+            Action::UserUpdate => "user.update",
+            Action::UserDelete => "user.delete",
+            Action::UserStateChange => "user.state_change",
+            Action::UserExternalIdLink => "user.external_id.link",
+            Action::UserExternalIdUnlink => "user.external_id.unlink",
+            Action::UserOffboardingExecute => "user.offboarding.execute",
             Action::SessionCreate => "session.create",
             Action::SessionRotate => "session.rotate",
             Action::SessionRevoke => "session.revoke",

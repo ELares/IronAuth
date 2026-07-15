@@ -6,6 +6,24 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Admin user management API (issue #52): complete control-plane user CRUD,
+  lifecycle transitions, and external-id correlation under an environment, on the M1
+  API discipline (OpenAPI source of truth, cursor pagination, `Idempotency-Key` on
+  POST, audit-on-mutation, uniform cross-tenant not-found). Endpoints:
+  `POST /users` (create, with an optional caller-supplied id honored and a 409 on
+  collision, an external id, and a chosen initial state), `GET /users` (cursor
+  paginated, filterable by `state` / `external_id` / `identifier`),
+  `GET/PATCH/DELETE /users/{user_id}` (read; RFC 7396 profile patch; a soft-delete
+  offboarding that cascades sessions and reads as not-found after),
+  `POST /users/{user_id}/state` (a validated lifecycle transition, 409 on an invalid
+  one, with a session cascade + back-channel logout fan-out on block/disable), and
+  `PUT`/`DELETE /users/{user_id}/external-id` (link/unlink, 409 when the external id
+  is already claimed in the scope). A management response never returns the password
+  hash. New `users` tag, eight new operations, and the wire types (`UserView`,
+  `UserList`, `UserStateView`, `CreateUserRequest`, `UpdateUserRequest`,
+  `SetUserStateRequest`, `UserStateChangeView`, `LinkExternalIdRequest`,
+  `UserExternalIdView`) in the committed OpenAPI document. The control-plane store
+  now carries the platform master key so it seals/opens user PII (issue #48).
 - Server-side config promotion (issue #44): the write half of the flagship. Two
   operator-plane POSTs on the target environment scope:
   `POST .../config/promotion/plan` dry-runs a promotion of a submitted source

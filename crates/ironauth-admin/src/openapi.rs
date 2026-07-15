@@ -23,12 +23,14 @@ use crate::error::ErrorBody;
 use crate::views::{
     BulkRevocationView, BulkRevokeSessionsRequest, ClientVerificationView, CreateDcrPolicyRequest,
     CreateEnvironmentRequest, CreateInitialAccessTokenRequest, CreateManagementKeyRequest,
-    CreateOrganizationRequest, CreateTenantRequest, DcrPolicyList, DcrPolicyView, EnvironmentList,
-    EnvironmentView, GuardrailView, InitialAccessTokenCreated, ManagementKeyCreated,
-    ManagementKeyList, ManagementKeyView, OperatorList, OperatorView, OrganizationList,
-    OrganizationView, RefreshFamilyList, RefreshFamilyView, ResourceTypeView, ResourceTypesList,
-    RevokeSessionsRequest, SessionList, SessionRevocationView, SessionView, TenantCreated,
-    TenantList, TenantStatusView, TenantView, UserRevocationView,
+    CreateOrganizationRequest, CreateTenantRequest, CreateUserRequest, DcrPolicyList,
+    DcrPolicyView, EnvironmentList, EnvironmentView, GuardrailView, InitialAccessTokenCreated,
+    LinkExternalIdRequest, ManagementKeyCreated, ManagementKeyList, ManagementKeyView,
+    OperatorList, OperatorView, OrganizationList, OrganizationView, RefreshFamilyList,
+    RefreshFamilyView, ResourceTypeView, ResourceTypesList, RevokeSessionsRequest, SessionList,
+    SessionRevocationView, SessionView, SetUserStateRequest, TenantCreated, TenantList,
+    TenantStatusView, TenantView, UpdateUserRequest, UserExternalIdView, UserList,
+    UserRevocationView, UserStateChangeView, UserStateView, UserView,
 };
 
 /// The management API's OpenAPI document. The handlers listed in `paths(...)`
@@ -64,7 +66,10 @@ use crate::views::{
                                      policies, initial access tokens, client verification"),
         (name = "sessions", description = "Session and refresh-family fleet operations: \
                                           search, inspect, revoke (single, bulk, and \
-                                          everything-for-a-user with a token-family cascade)")
+                                          everything-for-a-user with a token-family cascade)"),
+        (name = "users", description = "Admin user CRUD, lifecycle state transitions, and \
+                                       external-id correlation, with a session cascade on the \
+                                       session-ending transitions")
     ),
     paths(
         crate::operators::list_operators,
@@ -104,6 +109,14 @@ use crate::views::{
         crate::sessions::revoke_user_sessions,
         crate::sessions::list_refresh_families,
         crate::sessions::get_refresh_family,
+        crate::users::create_user,
+        crate::users::list_users,
+        crate::users::get_user,
+        crate::users::update_user,
+        crate::users::delete_user,
+        crate::users::set_user_state,
+        crate::users::link_user_external_id,
+        crate::users::unlink_user_external_id,
     ),
     components(schemas(
         ErrorBody,
@@ -143,6 +156,15 @@ use crate::views::{
         SessionRevocationView,
         BulkRevocationView,
         UserRevocationView,
+        UserView,
+        UserList,
+        UserStateView,
+        CreateUserRequest,
+        UpdateUserRequest,
+        SetUserStateRequest,
+        UserStateChangeView,
+        LinkExternalIdRequest,
+        UserExternalIdView,
     ))
 )]
 struct ApiDoc;

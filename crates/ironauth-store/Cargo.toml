@@ -230,6 +230,17 @@ name = "user_pii"
 path = "tests/user_pii.rs"
 required-features = ["testing"]
 
+# Admin user CRUD, lifecycle state machine, and external ids (issue #52): create
+# with a caller-supplied id, list pagination and filters, every valid and invalid
+# lifecycle transition, the suspended-user fence, the delete/disable session
+# cascade, external-id uniqueness and cross-tenant isolation and lookup, and that
+# the PII (login handle, external id) never lands in plaintext. Needs a real
+# database.
+[[test]]
+name = "user_admin"
+path = "tests/user_admin.rs"
+required-features = ["testing"]
+
 # Compile-fail proofs. Database-free, so it runs on every lane (including MSRV).
 [[test]]
 name = "compile_fail"

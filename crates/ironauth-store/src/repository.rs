@@ -7556,6 +7556,10 @@ pub struct UserRecord {
     pub identifier: String,
     /// The Argon2id PHC verifier string. One-way; never the plaintext password.
     pub password_hash: String,
+    /// The user's lifecycle state (issue #52). The login read path FENCES a user
+    /// whose state cannot authenticate (blocked, disabled, `pending_verification`):
+    /// the credential is correct but the account is not permitted to sign in.
+    pub state: UserState,
 }
 
 impl fmt::Debug for UserRecord {
@@ -7563,8 +7567,159 @@ impl fmt::Debug for UserRecord {
         f.debug_struct("UserRecord")
             .field("id", &self.id)
             .field("identifier", &self.identifier)
+            .field("state", &self.state)
             .finish_non_exhaustive()
     }
+}
+
+/// A user's lifecycle state (issue #52): a first-class enum with an explicit state
+/// machine, distinct from the soft-delete tombstone. Every management-plane
+/// transition is validated ([`UserState::can_transition_to`]), audited, and (for a
+/// session-ending target) cascades to the user's sessions and refresh families.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UserState {
+    /// A live account that can authenticate.
+    Active,
+    /// Administratively BLOCKED: cannot authenticate; its live sessions were ended
+    /// on the transition. A reversible fence (an operator can move it back).
+    Blocked,
+    /// DISABLED: cannot authenticate; its live sessions were ended on the
+    /// transition. Distinct from blocked so the operator's intent is legible.
+    Disabled,
+    /// PENDING VERIFICATION: created but not yet verified, so it cannot authenticate
+    /// until it is moved to active. A creation-time state, never a transition target.
+    PendingVerification,
+    /// SCHEDULED for offboarding at a recorded instant. Still able to authenticate
+    /// until the worker executes the offboarding (which disables it and cascades).
+    ScheduledOffboarding,
+}
+
+impl UserState {
+    /// The stable wire string stored in `users.state`.
+    #[must_use]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            UserState::Active => "active",
+            UserState::Blocked => "blocked",
+            UserState::Disabled => "disabled",
+            UserState::PendingVerification => "pending_verification",
+            UserState::ScheduledOffboarding => "scheduled_offboarding",
+        }
+    }
+
+    /// Reconstruct a state from its wire string. The soft-delete tombstone
+    /// (`deleted`) and any unknown tag both return [`None`], so a deleted user
+    /// (which the reads already filter out) never surfaces as a live state and a
+    /// corrupt row surfaces as an error rather than a panic.
+    #[must_use]
+    pub fn from_wire(state: &str) -> Option<Self> {
+        match state {
+            "active" => Some(UserState::Active),
+            "blocked" => Some(UserState::Blocked),
+            "disabled" => Some(UserState::Disabled),
+            "pending_verification" => Some(UserState::PendingVerification),
+            "scheduled_offboarding" => Some(UserState::ScheduledOffboarding),
+            _ => None,
+        }
+    }
+
+    /// Whether a user in this state may complete an interactive or OIDC login. The
+    /// data-plane read path fences every other state (the credential is correct but
+    /// the account is not permitted to sign in), with no wrong-password oracle.
+    #[must_use]
+    pub fn can_authenticate(&self) -> bool {
+        matches!(self, UserState::Active | UserState::ScheduledOffboarding)
+    }
+
+    /// Whether entering this state ENDS the user's live sessions: blocking or
+    /// disabling a user cascades to its sessions and non-offline refresh families
+    /// and publishes to the session-ended fan-out (issue #35).
+    #[must_use]
+    pub fn ends_sessions(&self) -> bool {
+        matches!(self, UserState::Blocked | UserState::Disabled)
+    }
+
+    /// Whether this state is a valid INITIAL state for an admin-created user. A
+    /// scheduled offboarding needs a timestamp and is only ever reached by a
+    /// transition, so it is never a creation-time state.
+    #[must_use]
+    pub fn is_creatable(&self) -> bool {
+        !matches!(self, UserState::ScheduledOffboarding)
+    }
+
+    /// The state machine: whether a live user may move from `self` to `to`. A no-op
+    /// (same state) is refused, and pending-verification is a creation-time state
+    /// only (never a transition target). Every other move between live states is
+    /// permitted; the store additionally requires a timestamp for a move to
+    /// scheduled-offboarding. An invalid transition is refused fail closed.
+    #[must_use]
+    pub fn can_transition_to(self, to: UserState) -> bool {
+        if self == to {
+            return false;
+        }
+        !matches!(to, UserState::PendingVerification)
+    }
+}
+
+/// A user as the management-plane surface reports it (issue #52): the searchable
+/// metadata and lifecycle state, with the login handle and external id decrypted
+/// for display. It NEVER carries the password hash (the #11 secret lesson: a
+/// management response must not return a stored credential). Every timestamp is
+/// microseconds since the Unix epoch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserAdminRecord {
+    /// The user identifier (a `usr_` id embedding its scope).
+    pub id: UserId,
+    /// The login handle, decrypted from its sealed column for display.
+    pub identifier: String,
+    /// The lifecycle state.
+    pub state: UserState,
+    /// The external correlation id, decrypted for display, or [`None`] when the
+    /// user has no external id linked.
+    pub external_id: Option<String>,
+    /// The scheduled-offboarding instant, present only in the scheduled-offboarding
+    /// state.
+    pub scheduled_offboarding_at_unix_micros: Option<i64>,
+    /// Creation time (the pagination key).
+    pub created_at_unix_micros: i64,
+    /// The last-mutation instant.
+    pub updated_at_unix_micros: i64,
+}
+
+/// The management-plane user list filters (issue #52): by lifecycle state, by
+/// external id, and by login handle. The external-id and identifier filters are
+/// resolved through their per-tenant blind indexes (the plaintext is never stored),
+/// so an equality search matches without a plaintext column. The environment
+/// dimension is the scope itself.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct UserListFilter<'a> {
+    /// Only users in this lifecycle state, or [`None`] for all live users.
+    pub state: Option<UserState>,
+    /// Only the user whose external id equals this value, or [`None`] for all.
+    pub external_id: Option<&'a str>,
+    /// Only the user whose login handle equals this value, or [`None`] for all.
+    pub identifier: Option<&'a str>,
+}
+
+/// Everything the admin user create needs, bundled so the repository method stays
+/// within the readable-argument-count lint (issue #52).
+#[derive(Debug, Clone, Copy)]
+pub struct NewAdminUser<'a> {
+    /// The caller-supplied user id, or [`None`] to mint a fresh one. A supplied id
+    /// already taken in the scope is a [`StoreError::Conflict`] (a 409).
+    pub id: Option<&'a UserId>,
+    /// The login handle (unique per scope through its blind index).
+    pub identifier: &'a str,
+    /// The precomputed Argon2id hash, or [`None`] for a credential-less account
+    /// (created pending verification / awaiting a credential; it cannot log in
+    /// until one is set, which the login fence enforces).
+    pub password_hash: Option<&'a str>,
+    /// The standard-claim JSON document (issue #15), or [`None`] for `{}`.
+    pub claims_json: Option<&'a str>,
+    /// The external correlation id to link at creation, or [`None`].
+    pub external_id: Option<&'a str>,
+    /// The initial lifecycle state (must be a creatable state).
+    pub state: UserState,
 }
 
 /// The read-only bootstrap user repository (issue #20).
@@ -7595,9 +7750,13 @@ impl UserRepo<'_> {
         let master = self.store.master().ok_or(StoreError::Encryption)?;
         let bidx = user_identifier_blind_index(master, self.scope, identifier);
         let mut tx = begin_scoped(self.store, self.scope).await?;
+        // A soft-deleted user (a tombstone) never resolves as a login account: the
+        // `deleted_at IS NULL` filter reads it as absent, so a deleted user cannot
+        // authenticate exactly as an unknown one cannot.
         let row = sqlx::query(
-            "SELECT id, identifier_sealed, password_hash, pii_dek_version FROM users \
-             WHERE identifier_bidx = $1 AND tenant_id = $2 AND environment_id = $3",
+            "SELECT id, identifier_sealed, password_hash, pii_dek_version, state FROM users \
+             WHERE identifier_bidx = $1 AND tenant_id = $2 AND environment_id = $3 \
+             AND deleted_at IS NULL",
         )
         .bind(bidx.into_bytes())
         .bind(self.scope.tenant().to_string())
@@ -7612,6 +7771,8 @@ impl UserRepo<'_> {
         let id = UserId::parse_in_scope(&id_text, &self.scope)?;
         let dek_version: i32 = row.get("pii_dek_version");
         let sealed: Vec<u8> = row.get("identifier_sealed");
+        let state =
+            UserState::from_wire(&row.get::<String, _>("state")).ok_or(StoreError::Encryption)?;
         let dek = fetch_dek_by_version(&mut tx, self.scope, master, dek_version).await?;
         let plaintext = dek.open(
             &user_pii_seal_aad(self.scope, USER_IDENTIFIER_PURPOSE, dek_version),
@@ -7623,7 +7784,153 @@ impl UserRepo<'_> {
             id,
             identifier,
             password_hash: row.get("password_hash"),
+            state,
         }))
+    }
+
+    /// Parse an untrusted user identifier under this scope (issue #52). A malformed
+    /// identifier and one minted in another scope both return the uniform not-found.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if malformed or out of scope.
+    pub fn parse_id(&self, raw: &str) -> Result<UserId, StoreError> {
+        Ok(UserId::parse_in_scope(raw, &self.scope)?)
+    }
+
+    /// Fetch one live (non-deleted) user by id, within scope, for the management
+    /// surface (issue #52). A user absent in this scope (including a cross-scope id
+    /// or a soft-deleted one) is the uniform [`StoreError::NotFound`].
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if no such live user is visible in this scope;
+    /// [`StoreError::Encryption`] if no master key is configured or a sealed value
+    /// cannot be opened; [`StoreError::Database`] on a persistence failure.
+    pub async fn get(&self, id: &UserId) -> Result<UserAdminRecord, StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let master = self.store.master().ok_or(StoreError::Encryption)?;
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT id, identifier_sealed, pii_dek_version, state, \
+             external_id_sealed, external_id_dek_version, \
+             (EXTRACT(EPOCH FROM scheduled_offboarding_at) * 1000000)::bigint AS scheduled_us, \
+             (EXTRACT(EPOCH FROM created_at) * 1000000)::bigint AS created_us, \
+             (EXTRACT(EPOCH FROM updated_at) * 1000000)::bigint AS updated_us \
+             FROM users \
+             WHERE id = $1 AND tenant_id = $2 AND environment_id = $3 AND deleted_at IS NULL",
+        )
+        .bind(id.to_string())
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(row) = row else {
+            tx.commit().await?;
+            return Err(StoreError::NotFound);
+        };
+        let record = user_admin_record_from_row(&mut tx, self.scope, master, &row).await?;
+        tx.commit().await?;
+        Ok(record)
+    }
+
+    /// Look up a live user by EXTERNAL ID within scope (issue #52). The external id
+    /// is a lookup key stored as a per-tenant blind index, so this resolves the
+    /// deterministic index rather than a plaintext column. Returns [`None`] when no
+    /// user in this scope has claimed that external id.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Encryption`] if no master key is configured or a sealed value
+    /// cannot be opened; [`StoreError::Database`] on a persistence failure.
+    pub async fn by_external_id(
+        &self,
+        external_id: &str,
+    ) -> Result<Option<UserAdminRecord>, StoreError> {
+        let master = self.store.master().ok_or(StoreError::Encryption)?;
+        let bidx = user_external_id_blind_index(master, self.scope, external_id);
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT id, identifier_sealed, pii_dek_version, state, \
+             external_id_sealed, external_id_dek_version, \
+             (EXTRACT(EPOCH FROM scheduled_offboarding_at) * 1000000)::bigint AS scheduled_us, \
+             (EXTRACT(EPOCH FROM created_at) * 1000000)::bigint AS created_us, \
+             (EXTRACT(EPOCH FROM updated_at) * 1000000)::bigint AS updated_us \
+             FROM users \
+             WHERE external_id_bidx = $1 AND tenant_id = $2 AND environment_id = $3 \
+             AND deleted_at IS NULL",
+        )
+        .bind(bidx.into_bytes())
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(row) = row else {
+            tx.commit().await?;
+            return Ok(None);
+        };
+        let record = user_admin_record_from_row(&mut tx, self.scope, master, &row).await?;
+        tx.commit().await?;
+        Ok(Some(record))
+    }
+
+    /// One page of live users matching `filter`, ordered by `(created_at, id)`,
+    /// starting strictly after `after` (issue #52). The filter searches by
+    /// lifecycle state, by external id, and by login handle within this scope; the
+    /// external-id and identifier searches resolve their per-tenant blind indexes.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Encryption`] if no master key is configured or a sealed value
+    /// cannot be opened; [`StoreError::Database`] on a persistence failure.
+    pub async fn list(
+        &self,
+        filter: UserListFilter<'_>,
+        limit: i64,
+        after: Option<&CursorPosition>,
+    ) -> Result<Vec<UserAdminRecord>, StoreError> {
+        let master = self.store.master().ok_or(StoreError::Encryption)?;
+        let (after_micros, after_id) = split_cursor(after);
+        let external_bidx = filter
+            .external_id
+            .map(|value| user_external_id_blind_index(master, self.scope, value).into_bytes());
+        let identifier_bidx = filter
+            .identifier
+            .map(|value| user_identifier_blind_index(master, self.scope, value).into_bytes());
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let rows = sqlx::query(
+            "SELECT id, identifier_sealed, pii_dek_version, state, \
+             external_id_sealed, external_id_dek_version, \
+             (EXTRACT(EPOCH FROM scheduled_offboarding_at) * 1000000)::bigint AS scheduled_us, \
+             (EXTRACT(EPOCH FROM created_at) * 1000000)::bigint AS created_us, \
+             (EXTRACT(EPOCH FROM updated_at) * 1000000)::bigint AS updated_us \
+             FROM users \
+             WHERE tenant_id = $1 AND environment_id = $2 AND deleted_at IS NULL \
+             AND ($5::text IS NULL OR state = $5) \
+             AND ($6::bytea IS NULL OR external_id_bidx = $6) \
+             AND ($7::bytea IS NULL OR identifier_bidx = $7) \
+             AND ($3::bigint IS NULL OR (created_at, id) > \
+                  (TIMESTAMPTZ 'epoch' + ($3::text || ' microseconds')::interval, $4::text)) \
+             ORDER BY created_at, id LIMIT $8",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(after_micros)
+        .bind(after_id)
+        .bind(filter.state.map(|s| s.as_str()))
+        .bind(external_bidx)
+        .bind(identifier_bidx)
+        .bind(limit.clamp(0, MANAGEMENT_LIST_HARD_CAP + 1))
+        .fetch_all(&mut *tx)
+        .await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in &rows {
+            out.push(user_admin_record_from_row(&mut tx, self.scope, master, row).await?);
+        }
+        tx.commit().await?;
+        Ok(out)
     }
 
     /// Read a user's stored standard-claim document (issue #15) by their subject
@@ -7825,7 +8132,616 @@ impl ActingUserRepo<'_> {
         .await?;
         Ok(id)
     }
+
+    /// Create a user through the management API (issue #52): the admin create, with
+    /// an optional caller-supplied id and an optional external id, in a chosen
+    /// initial lifecycle state. Seals the login handle, the claim document, and (when
+    /// present) the external id under the scope's active DEK, and writes a
+    /// `user.create` audit row in the same transaction. Returns the id (the supplied
+    /// one, or a freshly minted one).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Conflict`] if the supplied id, the login handle, or the external
+    /// id is already taken in the scope (a 409); [`StoreError::IdempotencyConflict`]
+    /// if the idempotency key is already stored; [`StoreError::Encryption`] if no
+    /// master key is configured; [`StoreError::Database`] on a persistence failure.
+    pub async fn admin_create(
+        &self,
+        env: &Env,
+        spec: NewAdminUser<'_>,
+        created_at_micros: i64,
+        idempotency: Option<IdempotencyWrite<'_>>,
+    ) -> Result<UserId, StoreError> {
+        let master = self.store.master().ok_or(StoreError::Encryption)?;
+        self.ensure_scope_keys(env, master).await?;
+        let scope = self.scope;
+        // A supplied id must be in THIS scope (a foreign id is the uniform not-found,
+        // never a cross-scope create). An absent id mints a fresh one.
+        let id = match spec.id {
+            Some(supplied) => {
+                if supplied.scope() != scope {
+                    return Err(StoreError::NotFound);
+                }
+                *supplied
+            }
+            None => UserId::generate(env, &scope),
+        };
+        let identifier_bidx = user_identifier_blind_index(master, scope, spec.identifier);
+        let external_id_bidx = spec
+            .external_id
+            .map(|value| user_external_id_blind_index(master, scope, value).into_bytes());
+        let password_hash = spec.password_hash.unwrap_or(USER_UNUSABLE_PASSWORD_HASH);
+        let claims_json = spec.claims_json.unwrap_or("{}");
+        let external_id = spec.external_id;
+        let state = spec.state;
+        // created_at and updated_at are bound from the caller's clock read (not the
+        // database clock), so the response body built before the write matches the
+        // stored row exactly and paging stays deterministic under a manual clock.
+        let now_micros = created_at_micros;
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::UserCreate,
+                target: &id,
+            },
+            async move |tx| {
+                let (dek_version, dek) = fetch_active_dek(tx, scope, master).await?;
+                let identifier_sealed = dek.seal(
+                    env.entropy(),
+                    &user_pii_seal_aad(scope, USER_IDENTIFIER_PURPOSE, dek_version),
+                    spec.identifier.as_bytes(),
+                );
+                let claims_sealed = dek.seal(
+                    env.entropy(),
+                    &user_pii_seal_aad(scope, USER_CLAIMS_PURPOSE, dek_version),
+                    claims_json.as_bytes(),
+                );
+                let external_id_sealed = external_id.map(|value| {
+                    dek.seal(
+                        env.entropy(),
+                        &user_pii_seal_aad(scope, USER_EXTERNAL_ID_PURPOSE, dek_version),
+                        value.as_bytes(),
+                    )
+                    .into_bytes()
+                });
+                let external_id_dek_version = external_id.map(|_| dek_version);
+                let result = sqlx::query(
+                    "INSERT INTO users \
+                     (id, tenant_id, environment_id, identifier_bidx, identifier_sealed, \
+                      password_hash, claims_sealed, pii_dek_version, state, \
+                      external_id_bidx, external_id_sealed, external_id_dek_version, \
+                      created_at, updated_at) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, \
+                             TIMESTAMPTZ 'epoch' + ($13::text || ' microseconds')::interval, \
+                             TIMESTAMPTZ 'epoch' + ($13::text || ' microseconds')::interval)",
+                )
+                .bind(id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(identifier_bidx.into_bytes())
+                .bind(identifier_sealed.into_bytes())
+                .bind(password_hash)
+                .bind(claims_sealed.into_bytes())
+                .bind(dek_version)
+                .bind(state.as_str())
+                .bind(external_id_bidx)
+                .bind(external_id_sealed)
+                .bind(external_id_dek_version)
+                .bind(now_micros)
+                .execute(&mut **tx)
+                .await;
+                match result {
+                    Ok(_) => {}
+                    // A collision on the id primary key, the login-handle blind index,
+                    // or the external-id blind index is a caller-facing conflict (a
+                    // 409), never a persistence fault. The audited write rolls back, so
+                    // a rejected create leaves neither a user row nor an audit row.
+                    Err(error) if is_unique_violation(&error) => return Err(StoreError::Conflict),
+                    Err(error) => return Err(error.into()),
+                }
+                insert_idempotency(tx, idempotency).await?;
+                Ok(())
+            },
+            false,
+        )
+        .await?;
+        Ok(id)
+    }
+
+    /// Update a live user's standard-claim profile through the management API (RFC
+    /// 7396 semantics are applied by the caller; the store persists the resolved
+    /// document). Re-seals the claim JSON under the row's EXISTING DEK version (so the
+    /// login handle and claims stay sealed under one version) and writes a
+    /// `user.update` audit row in the same transaction.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if no live user matched in this scope;
+    /// [`StoreError::Encryption`] if no master key is configured;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn update_claims(
+        &self,
+        env: &Env,
+        id: &UserId,
+        claims_json: &str,
+    ) -> Result<(), StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let master = self.store.master().ok_or(StoreError::Encryption)?;
+        let scope = self.scope;
+        // Pre-read the row's DEK version (and confirm it is live) under this scope's
+        // row-level-security variables (the `users` table forces RLS): claims re-seal
+        // under the SAME version the identifier is sealed under, so a single
+        // pii_dek_version keeps describing both.
+        let mut pre = begin_scoped(self.store, scope).await?;
+        let row = sqlx::query(
+            "SELECT pii_dek_version FROM users \
+             WHERE id = $1 AND tenant_id = $2 AND environment_id = $3 AND deleted_at IS NULL",
+        )
+        .bind(id.to_string())
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .fetch_optional(&mut *pre)
+        .await?;
+        pre.commit().await?;
+        let dek_version: i32 = row.ok_or(StoreError::NotFound)?.get("pii_dek_version");
+        let now_micros = epoch_micros(env.clock().now_utc());
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::UserUpdate,
+                target: id,
+            },
+            async move |tx| {
+                let dek = fetch_dek_by_version(tx, scope, master, dek_version).await?;
+                let claims_sealed = dek.seal(
+                    env.entropy(),
+                    &user_pii_seal_aad(scope, USER_CLAIMS_PURPOSE, dek_version),
+                    claims_json.as_bytes(),
+                );
+                let result = sqlx::query(
+                    "UPDATE users SET claims_sealed = $1, \
+                         updated_at = TIMESTAMPTZ 'epoch' + ($2::text || ' microseconds')::interval \
+                     WHERE id = $3 AND tenant_id = $4 AND environment_id = $5 \
+                     AND deleted_at IS NULL",
+                )
+                .bind(claims_sealed.into_bytes())
+                .bind(now_micros)
+                .bind(id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .execute(&mut **tx)
+                .await?;
+                if result.rows_affected() == 0 {
+                    return Err(StoreError::NotFound);
+                }
+                Ok(())
+            },
+            false,
+        )
+        .await
+    }
+
+    /// Transition a live user's lifecycle state through the management API (issue
+    /// #52). Validates the transition against the user state machine (an invalid
+    /// transition is refused fail closed), flips the state guarded on the source
+    /// state, and, for a session-ending target (block, disable), cascades the user's
+    /// sessions and non-offline refresh families and publishes to the session-ended
+    /// fan-out, all in ONE audited transaction (`user.state_change`, with the target
+    /// state on the audit row's operator-safe detail).
+    ///
+    /// A move to scheduled-offboarding requires `scheduled_at`; every other target
+    /// must pass [`None`]. `hard_kill` (only meaningful for a session-ending target)
+    /// also revokes the offline families and their grants.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if no live user matched in this scope;
+    /// [`StoreError::Conflict`] if the transition is invalid or lost a concurrent
+    /// race; [`StoreError::IdempotencyConflict`] if the idempotency key is already
+    /// stored; [`StoreError::Database`] on a persistence failure.
+    pub async fn set_state(
+        &self,
+        env: &Env,
+        id: &UserId,
+        to: UserState,
+        scheduled_at: Option<i64>,
+        hard_kill: bool,
+        idempotency: Option<IdempotencyWrite<'_>>,
+    ) -> Result<(), StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        // A scheduled-offboarding target needs an instant; every other target must
+        // not carry one. A mismatch is an invalid request, refused fail closed.
+        if (to == UserState::ScheduledOffboarding) != scheduled_at.is_some() {
+            return Err(StoreError::Conflict);
+        }
+        let scope = self.scope;
+        // The pre-read must run under this scope's row-level-security variables (the
+        // `users` table forces RLS), so read it inside a scoped transaction rather
+        // than against the bare pool. The in-transaction UPDATE below re-checks
+        // `state = from` so a concurrent change cannot slip an invalid transition in.
+        let mut pre = begin_scoped(self.store, scope).await?;
+        let row = sqlx::query(
+            "SELECT state FROM users \
+             WHERE id = $1 AND tenant_id = $2 AND environment_id = $3 AND deleted_at IS NULL",
+        )
+        .bind(id.to_string())
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .fetch_optional(&mut *pre)
+        .await?;
+        pre.commit().await?;
+        let from =
+            UserState::from_wire(&row.ok_or(StoreError::NotFound)?.get::<String, _>("state"))
+                .ok_or(StoreError::NotFound)?;
+        if !from.can_transition_to(to) {
+            return Err(StoreError::Conflict);
+        }
+        let now_micros = epoch_micros(env.clock().now_utc());
+        let emit = SessionEndedEmit::from_acting(env, &self.acting);
+        let subject_text = id.to_string();
+        write_audited_detailed(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::UserStateChange,
+                target: id,
+            },
+            async move |tx| {
+                insert_idempotency(tx, idempotency).await?;
+                let result = sqlx::query(
+                    "UPDATE users SET state = $1, \
+                         scheduled_offboarding_at = CASE WHEN $2::bigint IS NULL THEN NULL ELSE \
+                             TIMESTAMPTZ 'epoch' + ($2::text || ' microseconds')::interval END, \
+                         updated_at = TIMESTAMPTZ 'epoch' + ($3::text || ' microseconds')::interval \
+                     WHERE id = $4 AND tenant_id = $5 AND environment_id = $6 \
+                     AND deleted_at IS NULL AND state = $7",
+                )
+                .bind(to.as_str())
+                .bind(scheduled_at)
+                .bind(now_micros)
+                .bind(&subject_text)
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(from.as_str())
+                .execute(&mut **tx)
+                .await?;
+                if result.rows_affected() == 0 {
+                    // Lost the race: the user changed state or was deleted between the
+                    // pre-read and here. Refuse fail closed.
+                    return Err(StoreError::Conflict);
+                }
+                if to.ends_sessions() {
+                    cascade_user_sessions_ended(
+                        tx,
+                        scope,
+                        &subject_text,
+                        SessionEndCause::UserRevokedAll,
+                        now_micros,
+                        hard_kill,
+                        &emit,
+                    )
+                    .await?;
+                }
+                Ok(())
+            },
+            false,
+            Some(to.as_str()),
+        )
+        .await
+    }
+
+    /// Delete a live user through the management API (issue #52): a soft-delete
+    /// tombstone that cascades the user's sessions and non-offline refresh families
+    /// and publishes to the session-ended fan-out, in ONE audited transaction
+    /// (`user.delete`), then reads as a uniform not-found. Retaining the tombstone
+    /// keeps the append-only audit log's references to the user legible and keeps the
+    /// login lookup resolving it as absent. `hard_kill` also revokes the offline
+    /// families and their grants.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if no live user matched in this scope (absent, or
+    /// already deleted: a repeat delete is the uniform not-found);
+    /// [`StoreError::IdempotencyConflict`] if the idempotency key is already stored;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn delete(
+        &self,
+        env: &Env,
+        id: &UserId,
+        hard_kill: bool,
+        idempotency: Option<IdempotencyWrite<'_>>,
+    ) -> Result<(), StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let now_micros = epoch_micros(env.clock().now_utc());
+        let emit = SessionEndedEmit::from_acting(env, &self.acting);
+        let subject_text = id.to_string();
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::UserDelete,
+                target: id,
+            },
+            async move |tx| {
+                insert_idempotency(tx, idempotency).await?;
+                let result = sqlx::query(
+                    "UPDATE users SET state = 'deleted', \
+                         deleted_at = TIMESTAMPTZ 'epoch' + ($1::text || ' microseconds')::interval, \
+                         updated_at = TIMESTAMPTZ 'epoch' + ($1::text || ' microseconds')::interval \
+                     WHERE id = $2 AND tenant_id = $3 AND environment_id = $4 \
+                     AND deleted_at IS NULL",
+                )
+                .bind(now_micros)
+                .bind(&subject_text)
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .execute(&mut **tx)
+                .await?;
+                if result.rows_affected() == 0 {
+                    return Err(StoreError::NotFound);
+                }
+                cascade_user_sessions_ended(
+                    tx,
+                    scope,
+                    &subject_text,
+                    SessionEndCause::UserRevokedAll,
+                    now_micros,
+                    hard_kill,
+                    &emit,
+                )
+                .await?;
+                Ok(())
+            },
+            false,
+        )
+        .await
+    }
+
+    /// Link an EXTERNAL ID to a live user through the management API (issue #52): a
+    /// correlation id from the tenant's own systems, sealed and blind-indexed under
+    /// the scope's active DEK, written with a `user.external_id.link` audit row. The
+    /// external id is unique per scope, so a value already claimed by another user in
+    /// the scope is a conflict.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if no live user matched in this scope;
+    /// [`StoreError::Conflict`] if the external id is already claimed by another user
+    /// in the scope; [`StoreError::Encryption`] if no master key is configured;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn link_external_id(
+        &self,
+        env: &Env,
+        id: &UserId,
+        external_id: &str,
+    ) -> Result<(), StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let master = self.store.master().ok_or(StoreError::Encryption)?;
+        let scope = self.scope;
+        let bidx = user_external_id_blind_index(master, scope, external_id).into_bytes();
+        let now_micros = epoch_micros(env.clock().now_utc());
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::UserExternalIdLink,
+                target: id,
+            },
+            async move |tx| {
+                let (dek_version, dek) = fetch_active_dek(tx, scope, master).await?;
+                let sealed = dek.seal(
+                    env.entropy(),
+                    &user_pii_seal_aad(scope, USER_EXTERNAL_ID_PURPOSE, dek_version),
+                    external_id.as_bytes(),
+                );
+                let result = sqlx::query(
+                    "UPDATE users SET external_id_bidx = $1, external_id_sealed = $2, \
+                         external_id_dek_version = $3, \
+                         updated_at = TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval \
+                     WHERE id = $5 AND tenant_id = $6 AND environment_id = $7 \
+                     AND deleted_at IS NULL",
+                )
+                .bind(bidx)
+                .bind(sealed.into_bytes())
+                .bind(dek_version)
+                .bind(now_micros)
+                .bind(id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .execute(&mut **tx)
+                .await;
+                match result {
+                    Ok(done) if done.rows_affected() == 0 => Err(StoreError::NotFound),
+                    Ok(_) => Ok(()),
+                    // The external id is already claimed by another user in the scope
+                    // (the per-scope partial unique index): a conflict, not a fault.
+                    Err(error) if is_unique_violation(&error) => Err(StoreError::Conflict),
+                    Err(error) => Err(error.into()),
+                }
+            },
+            false,
+        )
+        .await
+    }
+
+    /// Unlink a live user's EXTERNAL ID through the management API (issue #52),
+    /// freeing it for another user in the scope, with a `user.external_id.unlink`
+    /// audit row. Idempotent in effect: unlinking a user that has no external id
+    /// clears nothing and still succeeds.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if no live user matched in this scope;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn unlink_external_id(&self, env: &Env, id: &UserId) -> Result<(), StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let now_micros = epoch_micros(env.clock().now_utc());
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::UserExternalIdUnlink,
+                target: id,
+            },
+            async move |tx| {
+                let result = sqlx::query(
+                    "UPDATE users SET external_id_bidx = NULL, external_id_sealed = NULL, \
+                         external_id_dek_version = NULL, \
+                         updated_at = TIMESTAMPTZ 'epoch' + ($1::text || ' microseconds')::interval \
+                     WHERE id = $2 AND tenant_id = $3 AND environment_id = $4 \
+                     AND deleted_at IS NULL",
+                )
+                .bind(now_micros)
+                .bind(id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .execute(&mut **tx)
+                .await?;
+                if result.rows_affected() == 0 {
+                    return Err(StoreError::NotFound);
+                }
+                Ok(())
+            },
+            false,
+        )
+        .await
+    }
+
+    /// Execute every DUE scheduled-offboarding in this scope (issue #52): a user in
+    /// the scheduled-offboarding state whose instant is at or before `now_micros` is
+    /// disabled and its sessions cascaded, fanning out identically to a manual
+    /// disable, each in its own audited transaction (`user.offboarding.execute`).
+    /// Idempotent: an executed user is no longer scheduled, so a re-run reprocesses
+    /// nothing, and a user a concurrent run already flipped is skipped. Returns how
+    /// many users were offboarded.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn execute_scheduled_offboardings(
+        &self,
+        env: &Env,
+        now_micros: i64,
+    ) -> Result<u64, StoreError> {
+        let scope = self.scope;
+        // Read the due ids up front; each is then executed in its own audited
+        // transaction, guarded on the scheduled state so a concurrent run cannot
+        // double-execute one.
+        let mut tx = begin_scoped(self.store, scope).await?;
+        let due = sqlx::query(
+            "SELECT id FROM users \
+             WHERE tenant_id = $1 AND environment_id = $2 AND deleted_at IS NULL \
+             AND state = 'scheduled_offboarding' \
+             AND scheduled_offboarding_at IS NOT NULL \
+             AND scheduled_offboarding_at <= \
+                 TIMESTAMPTZ 'epoch' + ($3::text || ' microseconds')::interval \
+             ORDER BY scheduled_offboarding_at, id",
+        )
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(now_micros)
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        let mut executed = 0_u64;
+        for row in &due {
+            let Ok(id) = UserId::parse_in_scope(&row.get::<String, _>("id"), &scope) else {
+                continue;
+            };
+            let subject_text = id.to_string();
+            let emit = SessionEndedEmit::from_acting(env, &self.acting);
+            let mut flipped = false;
+            let flipped_ref = &mut flipped;
+            write_audited(
+                AuditedWrite {
+                    store: self.store,
+                    scope,
+                    acting: &self.acting,
+                    env,
+                    action: Action::UserOffboardingExecute,
+                    target: &id,
+                },
+                async move |tx| {
+                    let result = sqlx::query(
+                        "UPDATE users SET state = 'disabled', \
+                             updated_at = \
+                                 TIMESTAMPTZ 'epoch' + ($1::text || ' microseconds')::interval \
+                         WHERE id = $2 AND tenant_id = $3 AND environment_id = $4 \
+                         AND deleted_at IS NULL AND state = 'scheduled_offboarding'",
+                    )
+                    .bind(now_micros)
+                    .bind(&subject_text)
+                    .bind(scope.tenant().to_string())
+                    .bind(scope.environment().to_string())
+                    .execute(&mut **tx)
+                    .await?;
+                    if result.rows_affected() == 0 {
+                        // A concurrent run already executed this one: skip it (its own
+                        // audited transaction wrote the row). Rolling back here leaves
+                        // no duplicate audit row.
+                        return Err(StoreError::NotFound);
+                    }
+                    cascade_user_sessions_ended(
+                        tx,
+                        scope,
+                        &subject_text,
+                        SessionEndCause::UserRevokedAll,
+                        now_micros,
+                        false,
+                        &emit,
+                    )
+                    .await?;
+                    *flipped_ref = true;
+                    Ok(())
+                },
+                false,
+            )
+            .await
+            .or_else(|error| match error {
+                // A concurrently-executed user is a benign skip, not a failure.
+                StoreError::NotFound => Ok(()),
+                other => Err(other),
+            })?;
+            if flipped {
+                executed += 1;
+            }
+        }
+        Ok(executed)
+    }
 }
+
+/// The sentinel `password_hash` stored for an admin-created user with no credential
+/// (issue #52): not a valid Argon2id PHC string, so it never verifies against any
+/// password. Such a user cannot log in until a real credential is set (and the login
+/// fence rejects it anyway while it is pending verification).
+const USER_UNUSABLE_PASSWORD_HASH: &str = "!";
 
 /// An SSO session read back within scope (issue #20, extended by issue #32).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -13621,6 +14537,14 @@ const USER_IDENTIFIER_BIDX_LABEL: &str = "ironauth.envelope.user-identifier-bidx
 const USER_IDENTIFIER_PURPOSE: &str = "identifier";
 /// The purpose label bound into a sealed `users.claims` (the standard-claim JSON).
 const USER_CLAIMS_PURPOSE: &str = "claims";
+/// The purpose label bound into a sealed `users.external_id` (issue #52): the
+/// external correlation id from the tenant's own systems.
+const USER_EXTERNAL_ID_PURPOSE: &str = "external_id";
+/// The AAD label domain-separating the `users.external_id` blind index (issue #52)
+/// from every other keyed derivation, including the login-handle blind index, so a
+/// value that is BOTH someone's login handle and another user's external id never
+/// produces a colliding index tag.
+const USER_EXTERNAL_ID_BIDX_LABEL: &str = "ironauth.envelope.user-external-id-bidx.v1";
 
 /// The associated data binding a wrapped KEK to its scope, version, and master
 /// key. A KEK wrapped under one context fails to unwrap under any other, so it
@@ -13695,6 +14619,145 @@ fn user_identifier_bidx_aad(scope: Scope, identifier: &str) -> Aad {
 /// value an equality lookup queries against `users.identifier_bidx`.
 fn user_identifier_blind_index(master: &MasterKey, scope: Scope, identifier: &str) -> BlindIndex {
     master.blind_index(&user_identifier_bidx_aad(scope, identifier))
+}
+
+/// The blind-index context for a `users.external_id` (issue #52): the label, the
+/// scope, and the external-id value, length-prefixed. As with the login handle, the
+/// per-tenant HMAC key means the SAME external-id string in two tenants maps to two
+/// different tags, so an index collision can never leak or link across tenants.
+fn user_external_id_bidx_aad(scope: Scope, external_id: &str) -> Aad {
+    Aad::builder()
+        .text(USER_EXTERNAL_ID_BIDX_LABEL)
+        .text(&scope.tenant().to_string())
+        .text(&scope.environment().to_string())
+        .field(external_id.as_bytes())
+        .build()
+}
+
+/// The deterministic blind index for `external_id` in `scope` under `master`, the
+/// value an equality lookup and the per-scope unique constraint query against
+/// `users.external_id_bidx`.
+fn user_external_id_blind_index(master: &MasterKey, scope: Scope, external_id: &str) -> BlindIndex {
+    master.blind_index(&user_external_id_bidx_aad(scope, external_id))
+}
+
+/// Reconstruct a [`UserAdminRecord`] from a management-plane `users` row, opening
+/// the sealed login handle (always) and the sealed external id (when present)
+/// through the row's DEK versions. Runs inside the caller's open transaction.
+async fn user_admin_record_from_row(
+    tx: &mut Transaction<'_, Postgres>,
+    scope: Scope,
+    master: &MasterKey,
+    row: &PgRow,
+) -> Result<UserAdminRecord, StoreError> {
+    let id = UserId::parse_in_scope(&row.get::<String, _>("id"), &scope)?;
+    let state =
+        UserState::from_wire(&row.get::<String, _>("state")).ok_or(StoreError::Encryption)?;
+    let pii_dek_version: i32 = row.get("pii_dek_version");
+    let identifier_sealed: Vec<u8> = row.get("identifier_sealed");
+    let dek = fetch_dek_by_version(tx, scope, master, pii_dek_version).await?;
+    let identifier_bytes = dek.open(
+        &user_pii_seal_aad(scope, USER_IDENTIFIER_PURPOSE, pii_dek_version),
+        &Sealed::from_bytes(identifier_sealed)?,
+    )?;
+    let identifier = String::from_utf8(identifier_bytes).map_err(|_| StoreError::Encryption)?;
+    let external_id = match (
+        row.get::<Option<Vec<u8>>, _>("external_id_sealed"),
+        row.get::<Option<i32>, _>("external_id_dek_version"),
+    ) {
+        (Some(sealed), Some(version)) => {
+            let ext_dek = fetch_dek_by_version(tx, scope, master, version).await?;
+            let bytes = ext_dek.open(
+                &user_pii_seal_aad(scope, USER_EXTERNAL_ID_PURPOSE, version),
+                &Sealed::from_bytes(sealed)?,
+            )?;
+            Some(String::from_utf8(bytes).map_err(|_| StoreError::Encryption)?)
+        }
+        _ => None,
+    };
+    Ok(UserAdminRecord {
+        id,
+        identifier,
+        state,
+        external_id,
+        scheduled_offboarding_at_unix_micros: row.get("scheduled_us"),
+        created_at_unix_micros: row.get("created_us"),
+        updated_at_unix_micros: row.get("updated_us"),
+    })
+}
+
+/// Cascade a user's live sessions to ENDED inside an open transaction (issue #52),
+/// exactly as the revoke-everything-for-a-user path does (issue #32/#35): flip every
+/// live session, enqueue one durable session-ended event per genuine flip (so the
+/// unified fan-out delivers back-channel logout to affected relying parties), end the
+/// per-client sessions, and cascade the non-offline refresh families (and, on a hard
+/// kill, the offline families and their grants). Shared by the block/disable state
+/// transition, the delete, and the scheduled-offboarding execution, so each ends
+/// sessions identically. The `cause` is the terminal end cause recorded on the
+/// session and the event.
+async fn cascade_user_sessions_ended(
+    tx: &mut Transaction<'_, Postgres>,
+    scope: Scope,
+    subject_text: &str,
+    cause: SessionEndCause,
+    now_micros: i64,
+    hard_kill: bool,
+    emit: &SessionEndedEmit<'_>,
+) -> Result<UserRevocation, StoreError> {
+    let mut out = UserRevocation::default();
+    let revoked = sqlx::query(
+        "UPDATE sessions \
+         SET revoked_at = TIMESTAMPTZ 'epoch' + ($1::text || ' microseconds')::interval, \
+             revoke_reason = $5, \
+             ended_at = TIMESTAMPTZ 'epoch' + ($1::text || ' microseconds')::interval, \
+             end_cause = $5 \
+         WHERE subject = $2 AND tenant_id = $3 AND environment_id = $4 \
+         AND revoked_at IS NULL AND ended_at IS NULL \
+         RETURNING id",
+    )
+    .bind(now_micros)
+    .bind(subject_text)
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .bind(cause.as_str())
+    .fetch_all(&mut **tx)
+    .await?;
+    out.revoked_session_ids = revoked
+        .iter()
+        .map(|row| row.get::<String, _>("id"))
+        .collect();
+    out.sessions_revoked = out.revoked_session_ids.len() as u64;
+    for session_text in &out.revoked_session_ids {
+        enqueue_session_ended_event(
+            tx,
+            emit,
+            scope,
+            session_text,
+            subject_text,
+            cause,
+            now_micros,
+        )
+        .await?;
+    }
+    sqlx::query(
+        "UPDATE client_sessions cs \
+         SET revoked_at = TIMESTAMPTZ 'epoch' + ($1::text || ' microseconds')::interval, \
+             revoke_reason = $5 \
+         WHERE cs.tenant_id = $3 AND cs.environment_id = $4 \
+         AND cs.revoked_at IS NULL \
+         AND EXISTS (SELECT 1 FROM sessions s \
+                     WHERE s.id = cs.session_id AND s.tenant_id = cs.tenant_id \
+                     AND s.environment_id = cs.environment_id AND s.subject = $2)",
+    )
+    .bind(now_micros)
+    .bind(subject_text)
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .bind(cause.as_str())
+    .execute(&mut **tx)
+    .await?;
+    cascade_families_for_subject(tx, scope, subject_text, now_micros, hard_kill, &mut out).await?;
+    Ok(out)
 }
 
 /// Load and unwrap the scope's active KEK (the highest live version), under the
