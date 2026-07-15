@@ -40,6 +40,8 @@ scripts/discovery-scan.sh
 
 echo "==> rfc9700 scan (every OAuth endpoint bound to a conformance test)"
 scripts/rfc9700-scan.sh
+echo "==> conformance harness static checks (results gate, matrix, plan config, digest pins, fail-closed wiring, downgrade confinement)"
+scripts/conformance-check.sh
 
 echo "==> compatibility matrix freshness"
 scripts/compat-matrix.sh

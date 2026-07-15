@@ -1,0 +1,158 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+#
+# Nightly OIDF conformance full matrix (issue #37). Runs the complete profile
+# matrix (not just the merge-gate subset) on a schedule and on demand, archives
+# the suite logs for certification submission, and publishes a status badge.
+#
+# This is NEVER a merge gate: it runs only on schedule / manual dispatch, never
+# on pull_request, and it must never be added to branch protection. Because it is
+# not a required check, gating it on the CONFORMANCE_ENABLED repository variable
+# is safe here (a skipped scheduled run cannot masquerade as a passing gate), so
+# it is simply inert until an owner provisions the runner.
+#
+# A FAILING matrix FAILS THE RUN. The full-matrix job captures its own result so
+# the badge can still be published, and the final `gate` job then turns a
+# non-passing result into a red workflow run. Without that, a failing nightly was
+# a green run that only a JSON badge recorded, which notified nobody.
+#
+# Least privilege: the default token is contents:read. The ONLY job that writes
+# is `badge`, which elevates to contents:write and touches only the narrow status
+# file. The heavy suite drive (full-matrix) never holds a write token.
+name: conformance-nightly
+
+on:
+  schedule:
+    # Nightly, off-peak, arbitrary minute to dodge the top-of-hour herd.
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: conformance-nightly
+  cancel-in-progress: false
+
+jobs:
+  full-matrix:
+    name: full matrix
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    if: ${{ vars.CONFORMANCE_ENABLED == 'true' }}
+    permissions:
+      contents: read
+    outputs:
+      result: ${{ steps.run.outputs.result }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Provision the OIDF runner dependencies (hash pinned)
+        run: python3 -m pip install --require-hashes -r deploy/conformance/requirements.txt
+      - name: Drive the full profile matrix
+        id: run
+        working-directory: deploy/conformance
+        # The result is CAPTURED rather than allowed to abort the step, because
+        # the badge job below must still publish a `failing` badge. That capture
+        # is why this step exits 0 even on a failing matrix, and it is exactly how
+        # a failing nightly used to produce a GREEN workflow run and no
+        # notification. The `gate` job at the bottom closes that hole: it re-reads
+        # this output AFTER the badge is published and fails the run.
+        run: |
+          if ./run-conformance.sh --trigger nightly --up; then
+            echo "result=passing" >> "$GITHUB_OUTPUT"
+          else
+            echo "result=failing" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Archive suite logs (certification submission format)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: conformance-logs-nightly
+          path: deploy/conformance/results/
+          if-no-files-found: ignore
+          retention-days: 90
+
+  badge:
+    name: publish status badge
+    needs: full-matrix
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # Runs whether the matrix passed or failed so the badge always reflects the
+    # latest result. Still owner-gated and never on a PR trigger.
+    if: ${{ always() && vars.CONFORMANCE_ENABLED == 'true' }}
+    # The ONLY elevation in this harness. Scoped to this job; the suite never
+    # runs while this token is live (this job checks out clean and writes one
+    # file). Never grant a write token to the PR pipeline.
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Write the narrow status file
+        env:
+          RESULT: ${{ needs.full-matrix.result == 'success' && needs.full-matrix.outputs.result || 'failing' }}
+        run: |
+          set -euo pipefail
+          stamp="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          case "$RESULT" in
+            passing) color=brightgreen ;;
+            *)       color=red ; RESULT=failing ;;
+          esac
+          mkdir -p docs/conformance/status
+          # shields.io endpoint format; the README badge reads this file.
+          cat > docs/conformance/status/badge.json <<JSON
+          {"schemaVersion":1,"label":"OIDF conformance","message":"$RESULT ($stamp)","color":"$color"}
+          JSON
+      - name: Commit only the status file if it changed
+        run: |
+          set -euo pipefail
+          if git diff --quiet -- docs/conformance/status/badge.json; then
+            echo "badge unchanged; nothing to publish"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add docs/conformance/status/badge.json
+          git commit -m "conformance: update nightly status badge"
+          git push
+
+  # A FAILING nightly must FAIL THE WORKFLOW RUN.
+  #
+  # The full-matrix job deliberately swallows its own exit status so the badge job
+  # can still publish a `failing` badge. On its own that means a failing nightly
+  # conformance run produced a GREEN workflow run and no notification: only the
+  # badge JSON recorded the failure, and nobody is watching a JSON file. This job
+  # runs last, after the badge is published, and turns a non-passing matrix into a
+  # red run (which is what actually notifies).
+  #
+  # It runs whenever the suite is enabled, including when full-matrix errored out
+  # entirely (in which case `result` is empty, which is not 'passing', so it
+  # fails). When the suite is not enabled the whole workflow is inert by design:
+  # this is a scheduled early-warning lane, never a merge gate, so there is no
+  # required check here that a skip could turn green.
+  gate:
+    name: fail the run if the matrix did not pass
+    needs: [full-matrix, badge]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    if: ${{ always() && vars.CONFORMANCE_ENABLED == 'true' }}
+    permissions:
+      contents: read
+    steps:
+      - name: Assert the nightly matrix passed
+        env:
+          RESULT: ${{ needs.full-matrix.outputs.result }}
+          MATRIX_JOB: ${{ needs.full-matrix.result }}
+        run: |
+          set -euo pipefail
+          if [ "${RESULT:-}" = "passing" ] && [ "$MATRIX_JOB" = "success" ]; then
+            echo "nightly conformance matrix: passing"
+            exit 0
+          fi
+          echo "nightly conformance matrix did NOT pass" >&2
+          echo "  results gate: ${RESULT:-<the matrix job did not report one>}" >&2
+          echo "  matrix job:   $MATRIX_JOB" >&2
+          echo "The badge has been published; this run is failed so it NOTIFIES." >&2
+          echo "Triage: docs/conformance/RUNBOOK.md ('Triaging a suite failure')." >&2
+          exit 1

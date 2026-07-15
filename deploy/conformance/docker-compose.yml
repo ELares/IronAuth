@@ -1,0 +1,121 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+#
+# The OIDF conformance stack (issue #37). It stands up, on one internal network:
+#
+#   postgres        IronAuth's backing store.
+#   ironauth-cert   IronAuth in a certification-representative posture
+#                   (ironauth.toml in this directory), serving plain HTTP on the
+#                   internal network only.
+#   op              nginx, terminating TLS with the self-signed cert from
+#                   gen-certs.sh and forwarding to ironauth-cert. Its network
+#                   alias is "op", so the per-environment issuer is exactly
+#                   https://op/t/cert/e/cert (see ironauth.toml). This is the
+#                   only surface the suite reaches; it is the issuer host.
+#   mongodb         The conformance suite's backing store.
+#   conformance     The OIDF conformance suite (its Python runner drives plans
+#                   against https://op).
+#   conformance-httpd  The suite's own TLS front proxy, published to the host so
+#                   a developer can open the suite UI and one-command reproduce.
+#
+# Every pulled image is pinned BY DIGEST via the SUITE_VERSION env-file (never a
+# mutable tag). The ironauth-cert service is the exception: it BUILDS from
+# deploy/Dockerfile rather than pulling, and that file's base tags are an
+# owner/infra pin recorded in docs/conformance/RUNBOOK.md. Bring it up with the
+# helper, which loads the pins and seeds:
+#
+#     docker compose --env-file SUITE_VERSION -f docker-compose.yml up -d
+#
+# All credentials here are throwaway cert-only values and must never be reused.
+
+name: ironauth-conformance
+
+services:
+  postgres:
+    image: ${POSTGRES_IMAGE:?set POSTGRES_IMAGE (see SUITE_VERSION)}
+    environment:
+      POSTGRES_USER: ironauth
+      POSTGRES_PASSWORD: ironauth-cert-password
+      POSTGRES_DB: ironauth
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ironauth -d ironauth"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    networks:
+      - conformance
+
+  ironauth-cert:
+    build:
+      context: ../..
+      dockerfile: deploy/Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      IRONAUTH_DB_PASSWORD: ironauth-cert-password
+    volumes:
+      - ./ironauth.toml:/etc/ironauth/ironauth.toml:ro
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:9443/readyz"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+    networks:
+      - conformance
+
+  op:
+    image: ${NGINX_IMAGE:?set NGINX_IMAGE (see SUITE_VERSION)}
+    depends_on:
+      ironauth-cert:
+        condition: service_healthy
+    volumes:
+      - ./nginx-tls.conf:/etc/nginx/conf.d/default.conf:ro
+      # gen-certs.sh writes these; they are gitignored (never commit private keys).
+      - ./tls/op.crt:/etc/nginx/tls/op.crt:ro
+      - ./tls/op.key:/etc/nginx/tls/op.key:ro
+    networks:
+      conformance:
+        # The issuer host. ironauth.toml sets public_url = https://op, so this
+        # alias is what makes the advertised issuer resolvable in-network.
+        aliases:
+          - op
+
+  mongodb:
+    image: ${MONGO_IMAGE:?set MONGO_IMAGE (see SUITE_VERSION)}
+    networks:
+      - conformance
+
+  conformance:
+    image: ${SUITE_SERVER_IMAGE:?set SUITE_SERVER_IMAGE (see SUITE_VERSION)}
+    depends_on:
+      - mongodb
+      - op
+    # The suite reads its own base URL and Mongo connection from the environment
+    # the upstream distribution expects. The base_url is the SUITE's public URL
+    # (fronted by conformance-httpd), distinct from the OP issuer (https://op).
+    environment:
+      # The suite trusts the OP's self-signed CA via a mounted trust bundle; see
+      # docs/conformance/RUNBOOK.md for the exact truststore wiring (owner step).
+      CONFORMANCE_SERVER: >-
+        {"jwks":{},"mongodbHost":"mongodb","base_url":"https://localhost.emobix.co.uk:8443","base_mtls_url":"https://localhost.emobix.co.uk:8444"}
+    volumes:
+      - ./tls/ca.crt:/usr/local/share/ca-certificates/op-ca.crt:ro
+    networks:
+      - conformance
+
+  conformance-httpd:
+    image: ${SUITE_HTTPD_IMAGE:?set SUITE_HTTPD_IMAGE (see SUITE_VERSION)}
+    depends_on:
+      - conformance
+    ports:
+      # The suite UI and API, published to the host for local reproduction. The
+      # OP itself is not published; it is reached only in-network as https://op.
+      - "8443:8443"
+      - "8444:8444"
+    networks:
+      - conformance
+
+networks:
+  conformance:
+    driver: bridge

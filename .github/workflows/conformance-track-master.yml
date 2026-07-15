@@ -1,0 +1,67 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+#
+# Track the OIDF conformance suite's MASTER branch (issue #37, the OIDF nightly
+# pattern). It runs the profile matrix against the suite's bleeding-edge master
+# image to catch upstream test changes BEFORE a pinned bump adopts them, so a new
+# or tightened conformance condition is an early warning rather than a surprise
+# on bump day.
+#
+# SECURITY BOUNDARY (deliberate, do not relax):
+#   - This job runs UNTRUSTED upstream code (the suite's unreviewed master).
+#   - It is therefore SECRET-ISOLATED: the token is contents:read and NO secret
+#     is referenced, so a compromised upstream image has nothing to steal here.
+#     Never add a secret or a write permission to this workflow.
+#   - It is NEVER a merge gate: it runs only on schedule / manual dispatch (never
+#     on pull_request or push) and must never be added to branch protection. Its
+#     result is informational; `continue-on-error` keeps a master-side breakage
+#     from paging as a repo failure.
+#
+# It is a SEPARATE workflow from the pinned nightly matrix precisely to make this
+# isolation boundary unmistakable.
+name: conformance-track-master
+
+on:
+  schedule:
+    # A different off-peak minute from the pinned nightly matrix.
+    - cron: "43 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: conformance-track-master
+  cancel-in-progress: false
+
+jobs:
+  track-master:
+    name: track suite master (informational, never a gate)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    if: ${{ vars.CONFORMANCE_ENABLED == 'true' }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Provision the OIDF runner dependencies (hash pinned)
+        run: python3 -m pip install --require-hashes -r deploy/conformance/requirements.txt
+      - name: Drive the matrix against suite master (untrusted; report only)
+        # SUITE_SERVER_IMAGE / SUITE_HTTPD_IMAGE are overridden to the master tag
+        # for this run only. A failure here is an early warning, not a block.
+        continue-on-error: true
+        working-directory: deploy/conformance
+        env:
+          SUITE_SERVER_IMAGE: registry.gitlab.com/openid/conformance-suite/server:master
+          SUITE_HTTPD_IMAGE: registry.gitlab.com/openid/conformance-suite/httpd:master
+        run: ./run-conformance.sh --trigger nightly --up
+      - name: Archive master-run logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: conformance-logs-track-master
+          path: deploy/conformance/results/
+          if-no-files-found: ignore
+          retention-days: 14

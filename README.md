@@ -1,5 +1,7 @@
 # IronAuth
 
+[![OIDF conformance](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/ELares/IronAuth/main/docs/conformance/status/badge.json)](docs/conformance/README.md)
+
 A modern, standards-first OpenID Connect identity platform. Multi-tenant,
 multi-environment, EdDSA-first. One repository holds everything: the provider
 server (Rust), management APIs, SDKs, the admin SPA, hosted auth pages, and

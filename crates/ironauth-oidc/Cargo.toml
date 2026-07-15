@@ -383,6 +383,14 @@ required-features = ["testing"]
 name = "rfc9700"
 path = "tests/rfc9700.rs"
 required-features = ["testing"]
+# The OIDF conformance seed credential (issue #37). seed.sh installs a COMMITTED
+# Argon2id hash rather than computing one in a network container, so this proves
+# the committed hash actually verifies the committed cert password through the
+# product's own verifier, and that the harness scripts have not drifted from it.
+# Database-free, so it runs on every lane.
+[[test]]
+name = "conformance_seed"
+path = "tests/conformance_seed.rs"
 
 [lints]
 workspace = true
