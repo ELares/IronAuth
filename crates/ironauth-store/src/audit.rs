@@ -388,6 +388,19 @@ pub enum Action {
     /// and the domain row was pointed at the sealed bundle. The key never touches
     /// a plaintext column.
     CustomDomainCertificateStore,
+    /// An environment VARIABLE (a non-secret named config value) was set through
+    /// the management API (issue #45): a first write or an overwrite. The audit row
+    /// names the variable id and scope; the value itself is not recorded here.
+    EnvironmentVariableSet,
+    /// An environment VARIABLE was deleted through the management API (issue #45).
+    EnvironmentVariableDelete,
+    /// An environment SECRET was set through the management API (issue #45): a
+    /// plaintext value was sealed under the scope's envelope DEK (issue #48) and
+    /// stored as ciphertext. The audit row names the secret id and scope; the
+    /// value is NEVER recorded (the write-only discipline, the #11 secret lesson).
+    EnvironmentSecretPut,
+    /// An environment SECRET was deleted through the management API (issue #45).
+    EnvironmentSecretDelete,
 }
 
 impl Action {
@@ -474,6 +487,10 @@ impl Action {
             Action::CustomDomainChallengeSucceed => "custom_domain.challenge.succeed",
             Action::CustomDomainChallengeFail => "custom_domain.challenge.fail",
             Action::CustomDomainCertificateStore => "custom_domain.certificate.store",
+            Action::EnvironmentVariableSet => "environment_variable.set",
+            Action::EnvironmentVariableDelete => "environment_variable.delete",
+            Action::EnvironmentSecretPut => "environment_secret.put",
+            Action::EnvironmentSecretDelete => "environment_secret.delete",
         }
     }
 }

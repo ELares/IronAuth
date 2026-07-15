@@ -124,6 +124,12 @@ pub enum ResourceType {
     /// A per-environment custom domain the environment is served under, with a
     /// built-in-ACME certificate (issue #47).
     CustomDomain,
+    /// A per-environment non-secret configuration VARIABLE (name -> value), a
+    /// promotable value a config snapshot carries (issue #45).
+    Variable,
+    /// A per-environment SECRET (name -> sealed value), whose value never travels
+    /// between environments; only a named reference does (issue #45).
+    EnvironmentSecret,
     /// A bootstrap end user.
     User,
     /// An authenticated session.
@@ -134,7 +140,7 @@ impl ResourceType {
     /// Every resource type, in a stable order. The classification lint and the
     /// metadata endpoint both iterate this; a variant missing here is caught by
     /// the `all_lists_every_variant` test and by `scripts/classification-lint.sh`.
-    pub const ALL: [ResourceType; 12] = [
+    pub const ALL: [ResourceType; 14] = [
         ResourceType::Operator,
         ResourceType::Tenant,
         ResourceType::Environment,
@@ -145,6 +151,8 @@ impl ResourceType {
         ResourceType::DcrPolicy,
         ResourceType::SigningKey,
         ResourceType::CustomDomain,
+        ResourceType::Variable,
+        ResourceType::EnvironmentSecret,
         ResourceType::User,
         ResourceType::Session,
     ];
@@ -163,6 +171,8 @@ impl ResourceType {
             ResourceType::DcrPolicy => "dcr_policy",
             ResourceType::SigningKey => "signing_key",
             ResourceType::CustomDomain => "custom_domain",
+            ResourceType::Variable => "variable",
+            ResourceType::EnvironmentSecret => "environment_secret",
             ResourceType::User => "user",
             ResourceType::Session => "session",
         }
@@ -183,6 +193,8 @@ impl ResourceType {
             | ResourceType::DcrPolicy
             | ResourceType::SigningKey
             | ResourceType::CustomDomain
+            | ResourceType::Variable
+            | ResourceType::EnvironmentSecret
             | ResourceType::User
             | ResourceType::Session => ResourceLevel::Environment,
         }
@@ -207,18 +219,27 @@ pub fn classify(resource: ResourceType) -> ResourceClassification {
         // Static configuration that a snapshot captures and a promotion replays:
         // clients, resource servers, and registration policies are exactly the
         // "static configuration" the promotion story moves between environments.
-        ResourceType::Client | ResourceType::ResourceServer | ResourceType::DcrPolicy => Promotable,
+        // A non-secret environment VARIABLE (issue #45) joins them: its name and
+        // value are promotable config a snapshot carries and a target environment
+        // may override.
+        ResourceType::Client
+        | ResourceType::ResourceServer
+        | ResourceType::DcrPolicy
+        | ResourceType::Variable => Promotable,
 
         // Environment-intrinsic identity, excluded from every snapshot so a
         // promotion never copies one environment's identity onto another: the
         // environment itself, its signing keys (issuer key material), its
-        // per-environment management credentials, and its custom domains (a
-        // domain and its certificate are what a specific environment is served
-        // under, never something a dev->prod promotion should copy).
+        // per-environment management credentials, its custom domains (a domain and
+        // its certificate are what a specific environment is served under, never
+        // something a dev->prod promotion should copy), and its SECRETS (issue
+        // #45): a secret's VALUE is per environment and never travels, so only a
+        // named reference to it appears in a snapshot, resolved per target env.
         ResourceType::Environment
         | ResourceType::SigningKey
         | ResourceType::ManagementCredential
-        | ResourceType::CustomDomain => EnvironmentIdentity,
+        | ResourceType::CustomDomain
+        | ResourceType::EnvironmentSecret => EnvironmentIdentity,
 
         // Structural resources above the per-environment data plane (operators,
         // tenants) and dynamic per-environment data (organizations as customer

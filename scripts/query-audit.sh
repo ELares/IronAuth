@@ -130,7 +130,13 @@ cd "$(git rev-parse --show-toplevel)"
 # environments level table whose WHERE clause pins the bound scope), but its SQL is
 # kept in the repository module for the same reason: no other file may name it, so
 # the scoped read stays in one place.
-SCOPED_TABLES='clients|organizations|audit_log|management_credentials|idempotency_keys|grants|authorization_codes|issued_tokens|signing_keys|users|sessions|consents|resource_servers|opaque_access_tokens|client_assertion_jtis|client_auth_diagnostics|pushed_authorization_requests|refresh_families|refresh_tokens|service_accounts|dcr_policies|dcr_initial_access_tokens|dcr_rate_counters|external_assertion_issuers|external_assertion_subject_mappings|external_assertion_jtis|device_codes|client_sessions|session_ended_events|backchannel_logout_deliveries|tenant_keks|tenant_deks|encrypted_secrets|environment_states|tenant_byok_bindings|environment_guardrails|custom_domains|acme_challenges'
+#
+# environment_variables and environment_secrets (#45) are the per-environment
+# config store: non-secret promotable variables (name -> value) and write-only
+# secrets (name -> value sealed under the scope's envelope DEK, ciphertext only, no
+# plaintext column). Both are TENANT-SCOPED with forced row-level security, so their
+# SQL stays in the repository module too.
+SCOPED_TABLES='clients|organizations|audit_log|management_credentials|idempotency_keys|grants|authorization_codes|issued_tokens|signing_keys|users|sessions|consents|resource_servers|opaque_access_tokens|client_assertion_jtis|client_auth_diagnostics|pushed_authorization_requests|refresh_families|refresh_tokens|service_accounts|dcr_policies|dcr_initial_access_tokens|dcr_rate_counters|external_assertion_issuers|external_assertion_subject_mappings|external_assertion_jtis|device_codes|client_sessions|session_ended_events|backchannel_logout_deliveries|tenant_keks|tenant_deks|encrypted_secrets|environment_states|tenant_byok_bindings|environment_guardrails|custom_domains|acme_challenges|environment_variables|environment_secrets'
 
 # The one module allowed to name a scoped table in SQL.
 REPO_MODULE='crates/ironauth-store/src/repository.rs'

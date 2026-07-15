@@ -5,7 +5,10 @@
   "description": "A canonical, deterministic, secret-free export of one environment's promotable configuration (issue #43). Two exports of the same configuration are byte-identical; no secret or key material appears. This schema is the published contract the promotion engine (issue #44) and the Terraform provider / CLI consume. The Rust validator in ironauth-store::snapshot enforces the same constraints and additionally rejects raw secret-shaped material and private JWK parameters.",
   "type": "object",
   "additionalProperties": false,
-  "required": ["schema_version", "resources"],
+  "required": [
+    "schema_version",
+    "resources"
+  ],
   "properties": {
     "schema_version": {
       "type": "string",
@@ -19,15 +22,27 @@
       "properties": {
         "client": {
           "type": "array",
-          "items": { "$ref": "#/$defs/client" }
+          "items": {
+            "$ref": "#/$defs/client"
+          }
         },
         "resource_server": {
           "type": "array",
-          "items": { "$ref": "#/$defs/resource_server" }
+          "items": {
+            "$ref": "#/$defs/resource_server"
+          }
         },
         "dcr_policy": {
           "type": "array",
-          "items": { "$ref": "#/$defs/dcr_policy" }
+          "items": {
+            "$ref": "#/$defs/dcr_policy"
+          }
+        },
+        "variable": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/variable"
+          }
         }
       }
     }
@@ -37,9 +52,14 @@
       "type": "object",
       "additionalProperties": false,
       "description": "A NAMED reference to a secret in the environment-scoped secret store. Never a secret value; import resolves it against the target environment (issue #45).",
-      "required": ["reference"],
+      "required": [
+        "reference"
+      ],
       "properties": {
-        "reference": { "type": "string", "minLength": 1 }
+        "reference": {
+          "type": "string",
+          "minLength": 1
+        }
       }
     },
     "client": {
@@ -60,8 +80,14 @@
         "require_auth_time"
       ],
       "properties": {
-        "client_id": { "type": "string", "minLength": 1 },
-        "display_name": { "type": "string", "minLength": 1 },
+        "client_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "display_name": {
+          "type": "string",
+          "minLength": 1
+        },
         "token_endpoint_auth_method": {
           "type": "string",
           "enum": [
@@ -72,44 +98,117 @@
             "none"
           ]
         },
-        "redirect_uris": { "type": "array", "items": { "type": "string" } },
-        "post_logout_redirect_uris": { "type": "array", "items": { "type": "string" } },
-        "frontchannel_logout_uri": { "type": "string" },
-        "frontchannel_logout_session_required": { "type": "boolean" },
-        "consent_mode": { "type": "string" },
-        "skip_consent": { "type": "boolean" },
-        "store_skipped_consent": { "type": "boolean" },
-        "require_pushed_authorization_requests": { "type": "boolean" },
-        "require_auth_time": { "type": "boolean" },
+        "redirect_uris": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "post_logout_redirect_uris": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "frontchannel_logout_uri": {
+          "type": "string"
+        },
+        "frontchannel_logout_session_required": {
+          "type": "boolean"
+        },
+        "consent_mode": {
+          "type": "string"
+        },
+        "skip_consent": {
+          "type": "boolean"
+        },
+        "store_skipped_consent": {
+          "type": "boolean"
+        },
+        "require_pushed_authorization_requests": {
+          "type": "boolean"
+        },
+        "require_auth_time": {
+          "type": "boolean"
+        },
         "jwks": {
           "type": "string",
           "description": "A PUBLIC JWK Set as a JSON string. A private JWK parameter (d, p, q, dp, dq, qi, k) is rejected by the validator."
         },
-        "jwks_uri": { "type": "string" },
-        "token_endpoint_auth_signing_alg": { "type": "string" },
-        "refresh_rotation": { "type": "string" },
-        "secret": { "$ref": "#/$defs/secret_reference" }
+        "jwks_uri": {
+          "type": "string"
+        },
+        "token_endpoint_auth_signing_alg": {
+          "type": "string"
+        },
+        "refresh_rotation": {
+          "type": "string"
+        },
+        "secret": {
+          "$ref": "#/$defs/secret_reference"
+        }
       }
     },
     "resource_server": {
       "type": "object",
       "additionalProperties": false,
       "description": "The secret-free projection of one resource server (audience-to-format registry). No secret material.",
-      "required": ["audience", "token_format"],
+      "required": [
+        "audience",
+        "token_format"
+      ],
       "properties": {
-        "audience": { "type": "string", "minLength": 1 },
-        "token_format": { "type": "string", "enum": ["at_jwt", "opaque"] },
-        "access_token_ttl_secs": { "type": "integer", "minimum": 1 }
+        "audience": {
+          "type": "string",
+          "minLength": 1
+        },
+        "token_format": {
+          "type": "string",
+          "enum": [
+            "at_jwt",
+            "opaque"
+          ]
+        },
+        "access_token_ttl_secs": {
+          "type": "integer",
+          "minimum": 1
+        }
       }
     },
     "dcr_policy": {
       "type": "object",
       "additionalProperties": false,
       "description": "The secret-free projection of one Dynamic Client Registration policy. No secret material.",
-      "required": ["name", "primitives"],
+      "required": [
+        "name",
+        "primitives"
+      ],
       "properties": {
-        "name": { "type": "string", "minLength": 1 },
-        "primitives": { "type": "array" }
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "primitives": {
+          "type": "array"
+        }
+      }
+    },
+    "variable": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "The secret-free projection of one environment variable (issue #45): a non-secret name to value pair. A secret value never appears in a snapshot; only a variable's plain value does.",
+      "required": [
+        "name",
+        "value"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "value": {
+          "type": "string"
+        }
       }
     }
   }

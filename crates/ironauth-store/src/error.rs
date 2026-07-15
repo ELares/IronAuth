@@ -85,6 +85,11 @@ pub enum StoreError {
     /// to point serving or an ACME/CA request at internal infrastructure. Carries
     /// no tenant data.
     InvalidCustomDomain,
+    /// An environment secret or variable was submitted with a name that is not a
+    /// valid reference key (issue #45): empty, too long, or carrying a character
+    /// outside the reference-name alphabet, so a config field could never name it.
+    /// Rejected before it is written. Carries no tenant data.
+    InvalidName,
 }
 
 impl fmt::Display for StoreError {
@@ -102,6 +107,7 @@ impl fmt::Display for StoreError {
             StoreError::QuotaExceeded => f.write_str("registration quota exceeded"),
             StoreError::Encryption => f.write_str("envelope decryption failed"),
             StoreError::InvalidCustomDomain => f.write_str("invalid custom domain"),
+            StoreError::InvalidName => f.write_str("invalid secret or variable name"),
         }
     }
 }
@@ -116,7 +122,8 @@ impl std::error::Error for StoreError {
             | StoreError::GuardrailViolation(_)
             | StoreError::QuotaExceeded
             | StoreError::Encryption
-            | StoreError::InvalidCustomDomain => None,
+            | StoreError::InvalidCustomDomain
+            | StoreError::InvalidName => None,
             StoreError::Database(source) => Some(source),
             StoreError::Migration(source) => Some(source),
         }

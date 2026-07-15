@@ -6,6 +6,40 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Environment-scoped secrets and variables (issue #45, migration 0034, expand).
+  - **Persistence.** Two new tenant-scoped, RLS-forced tables. `environment_variables`
+    holds non-secret promotable config (name to plaintext value, readable);
+    `environment_secrets` holds write-only secrets whose value is sealed under the
+    scope's envelope DEK (issue #48, the same AEAD substrate the users PII columns
+    use) and stored as ciphertext, with the tenant, environment, secret name, and
+    DEK version bound as associated data. There is NO plaintext value column, so a
+    database dump of a secret yields only ciphertext. Column-scoped grants only (the
+    #31 lesson); the control role is granted SELECT on `environment_variables` (for
+    the snapshot export) and nothing on `environment_secrets`.
+  - **Repositories.** New `EnvironmentVariableRepo` / `ActingEnvironmentVariableRepo`
+    (get, exists, list, list_all, referents; set and delete, audited) and
+    `EnvironmentSecretRepo` / `ActingEnvironmentSecretRepo` (metadata, exists, list,
+    open_value; put and delete, audited). A secret is WRITE-ONLY: a read returns
+    metadata (name, version, updated-at) only, never the value; `open_value` (under
+    the master key) is the sole value-returning path and is used only by
+    apply-time resolution. A set/put reuses a stable row id across overwrites and
+    bumps a version; a name is validated against the reference-key alphabet first.
+  - **Reference syntax and resolution (`esv` module).** `Reference::parse` reads a
+    config field value as a whole `${var:NAME}` or `${secret:NAME}` token, failing
+    CLOSED on anything malformed. `reference_resolves` is the plan-time existence
+    check (no value read); `resolve_value` is the apply-time value injection (a
+    variable's string, or a secret's value opened from ciphertext), reading only the
+    bound scope so the SAME reference resolves to different values per environment.
+  - **Snapshot binding.** A `variable` is PROMOTABLE (issue #41): `VariableSnapshot`
+    joins the canonical export (issue #43), so a variable's name and value travel in
+    the snapshot (a field may carry a `${secret:NAME}` reference). An
+    `environment_secret` is ENVIRONMENT-IDENTITY: its VALUE never travels; only a
+    reference does. New `Action` variants `environment_variable.set`/`.delete` and
+    `environment_secret.put`/`.delete`, and a new `StoreError::InvalidName`.
+  - **Deletion protection.** Deleting a secret or variable still referenced by a
+    live variable value is rejected (`referents` names the referents); an
+    unreferenced one deletes.
+
 - Canonical secret-free config snapshot export (issue #43, migration 0031, expand).
   - **New `snapshot` module.** `Snapshot`/`SnapshotResources` plus the per-type
     secret-free projections (`ClientSnapshot`, `ResourceServerSnapshot`,

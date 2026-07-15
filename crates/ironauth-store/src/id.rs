@@ -365,6 +365,34 @@ impl ScopedKind for AcmeChallengeKind {
     const PREFIX: &'static str = "chal";
 }
 
+/// Marker for an environment-scoped VARIABLE (`var_`), a non-secret named
+/// configuration value (an endpoint, a feature toggle, a display string) an
+/// environment carries (issue #45). A tenant-scoped resource: the identifier
+/// embeds its `(tenant, environment)`, so a variable is never readable across a
+/// tenant or environment boundary. A variable is PROMOTABLE (issue #41): its name
+/// and value travel in a config snapshot. Its value is not sensitive, so the id
+/// and value stay legible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct VariableKind;
+impl ScopedKind for VariableKind {
+    const PREFIX: &'static str = "var";
+}
+
+/// Marker for an environment-scoped SECRET (`esec_`), a sensitive named value
+/// (a connector credential, a webhook signing key) an environment carries (issue
+/// #45). A tenant-scoped resource: the identifier embeds its
+/// `(tenant, environment)`. The secret is ENVIRONMENT-IDENTITY (issue #41): its
+/// VALUE never travels between environments (only a named reference does, resolved
+/// per target environment), and the value is sealed under the scope's envelope DEK
+/// (issue #48), never a plaintext column. The id is a public handle (it carries no
+/// key material), so its debug form stays legible; the sealed value is what is
+/// protected, not this reference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct EnvironmentSecretKind;
+impl ScopedKind for EnvironmentSecretKind {
+    const PREFIX: &'static str = "esec";
+}
+
 /// Marker for a service-account principal (`sva_`), the first-class machine
 /// identity every M2M-capable client maps to (issue #23). A tenant-scoped
 /// resource: the identifier embeds its `(tenant, environment)`, so a service
@@ -667,6 +695,12 @@ pub type CustomDomainId = ScopedId<CustomDomainKind>;
 /// An ACME challenge identifier (`chal_...`), one domain-control verification
 /// attempt in the ACME issuance lifecycle (issue #47, RFC 8555).
 pub type AcmeChallengeId = ScopedId<AcmeChallengeKind>;
+/// An environment-variable identifier (`var_...`), a non-secret named
+/// configuration value an environment carries (issue #45). Promotable.
+pub type VariableId = ScopedId<VariableKind>;
+/// An environment-secret identifier (`esec_...`), a sensitive named value sealed
+/// under the scope's envelope DEK (issue #45, #48). Environment-identity.
+pub type EnvironmentSecretId = ScopedId<EnvironmentSecretKind>;
 /// A pushed-authorization-request identifier (`par_...`), the single-use reference
 /// the PAR endpoint returns and `/authorize` consumes (RFC 9126, issue #27). It is
 /// the reference portion of the `urn:ietf:params:oauth:request_uri:<id>` value.

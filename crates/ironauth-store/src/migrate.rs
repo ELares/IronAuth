@@ -470,6 +470,12 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0033_custom_domains.sql"),
         },
+        Migration {
+            version: 34,
+            name: "environment_secrets_variables",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0034_environment_secrets_variables.sql"),
+        },
     ]
 }
 
