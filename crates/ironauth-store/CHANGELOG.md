@@ -6,6 +6,37 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- The four-level resource model as public APIs (issue #41, migration 0027, expand).
+  Completes the operator > tenant > environment > organization hierarchy at the store
+  layer so the management API can expose all four levels as first-class resources.
+  - **Organization lifecycle.** New `OrganizationRepo` (parse-in-scope, get, list) and
+    `ActingOrganizationRepo` (create, delete), reached through `ManagementStore` and its
+    acting door. Organizations are environment-scoped: each repository is constructible
+    only from a `(tenant, environment)` `Scope`, binds forced row-level security before
+    every statement, and rejects a cross-scope `OrganizationId` as the uniform
+    not-found. Create and delete route through the same `write_audited` primitive, so
+    every mutation writes its audit row in the same transaction (new `Action`s
+    `organization.create` and `organization.delete`).
+  - **Operator read repository.** New `OperatorRepo` (parse, get, list) over the
+    operator-plane level table (no row-level security; the operator embeds neither a
+    tenant nor an environment).
+  - **Soft-delete on organizations.** `migration 0027` adds a nullable
+    `organizations.deleted_at` so an organization deactivates without ever hard-deleting
+    a row the append-only audit log references, exactly as tenants and environments do.
+    The control role gains `SELECT, INSERT` and a COLUMN-SCOPED `UPDATE (deleted_at)`
+    (never a table-wide UPDATE: the #31 lesson). The existing `ENABLE`/`FORCE` row-level
+    security, the `(tenant, environment)` isolation policy, and the nonempty-scope CHECK
+    from migration 0001 are unchanged.
+  - **Machine-readable classification.** New `classification` module: a closed
+    `ResourceType` enum, an exhaustive `classify()` mapping every type to `Promotable`,
+    `Runtime`, or `EnvironmentIdentity`, and a `ResourceType::ALL` registry. The single
+    source of truth the config snapshot (5.3) and promotion (5.4) will consume, so the
+    "does this travel in a snapshot?" decision is declared in the schema, never
+    reverse-engineered. `scripts/classification-lint.sh` fails CI if a type lands
+    unclassified or unlisted, or if any of the three classes goes unused.
+  - **IDOR coverage.** `register_management_probes` now also registers `organizations.get`
+    and `organizations.delete`, so the #6 cross-tenant harness proves a foreign-scope
+    organization is a uniform not-found on every new resolve-by-id surface.
 - Per-tenant envelope encryption for PII and secrets (issue #48, migration 0027,
   expand). The DEK/KEK envelope substrate at the persistence layer: PII and secret
   values are encrypted at rest under a per-tenant key, and destroying a tenant's

@@ -242,19 +242,19 @@ async fn expand_contract_example_chain_runs_all_three_phases_and_contract_remove
     );
 }
 
-/// The PRODUCTION chain (`MigrationRunner::new`) contains exactly the twenty-seven
+/// The PRODUCTION chain (`MigrationRunner::new`) contains exactly the twenty-eight
 /// real migrations and leaves no throwaway demo object in a real database.
 // A long but linear ledger-and-table assertion sweep (one line per migration and
 // per real table); splitting it would not make it clearer.
 #[allow(clippy::too_many_lines)]
 #[tokio::test]
-async fn production_chain_is_only_the_twenty_seven_real_migrations_and_ships_no_demo_object() {
+async fn production_chain_is_only_the_twenty_eight_real_migrations_and_ships_no_demo_object() {
     // TestDatabase::start runs Store::migrate() (the production chain) on a
     // fresh, empty database.
     let db = TestDatabase::start().await;
     let pool = db.owner_pool();
 
-    // Re-running is idempotent and reports exactly twenty-seven tracked migrations.
+    // Re-running is idempotent and reports exactly twenty-eight tracked migrations.
     let report = MigrationRunner::new(pool)
         .run()
         .await
@@ -265,23 +265,23 @@ async fn production_chain_is_only_the_twenty_seven_real_migrations_and_ships_no_
     );
     assert_eq!(
         report.already_applied(),
-        27,
-        "the production chain is exactly twenty-seven migrations (isolation, audit log, management \
+        28,
+        "the production chain is exactly twenty-eight migrations (isolation, audit log, management \
          API, OIDC authorization, signing keys, login/consent, authentication context, redirect \
          registration, UserInfo claims, consent scope upsert, resource servers, opaque access \
          tokens, client auth suite, dynamic client registration, pushed authorization requests, \
          refresh tokens, client-credentials service accounts, DCR abuse controls, resource \
          indicators, JWT bearer assertion grant, device authorization, session model, RP-initiated \
-         logout, session-ended events, back-channel logout, front-channel logout, envelope \
-         encryption)"
+         logout, session-ended events, back-channel logout, front-channel logout, resource-model \
+         APIs, envelope encryption)"
     );
 
-    // The ledger holds exactly versions 1 through 27.
+    // The ledger holds exactly versions 1 through 28.
     assert_eq!(
         applied_versions(pool).await,
         vec![
             1_i64, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
-            24, 25, 26, 27
+            24, 25, 26, 27, 28
         ]
     );
     let phase_of = |version: i64| async move {
@@ -343,13 +343,19 @@ async fn production_chain_is_only_the_twenty_seven_real_migrations_and_ships_no_
     // COLUMNs (frontchannel_logout_uri, frontchannel_logout_session_required) plus a
     // column-scoped grant are all expands.
     assert_eq!(phase_of(26).await, "expand");
+    // The resource-model APIs expand (issue #41): one additive organizations ALTER
+    // ADD COLUMN (deleted_at) plus control-plane grants, and a REVOKE of the unused
+    // over-broad data-plane grant on organizations (the #31 least-privilege lesson).
+    // The revoke is expand-safe: no pre-#41 binary issued an organization statement
+    // as ironauth_app, so removing the grant depends on and breaks nothing.
+    assert_eq!(phase_of(27).await, "expand");
     // The envelope-encryption migration (issue #48): three new CREATE TABLEs
     // (tenant_keks, tenant_deks, encrypted_secrets) with their indexes, policies,
     // and column-scoped grants, PLUS the conversion of the two plaintext users PII
     // columns to sealed envelope columns (a full expand-contract folded in, since
     // the pre-1.0 bootstrap users table has no cross-release contract to protect).
     // The predominant shape is additive, so it is registered as an expand.
-    assert_eq!(phase_of(27).await, "expand");
+    assert_eq!(phase_of(28).await, "expand");
 
     // The demo object never reaches a production database.
     assert!(
@@ -816,6 +822,20 @@ async fn production_chain_is_only_the_twenty_seven_real_migrations_and_ships_no_
             "clients.{column} exists"
         );
     }
+    // The four-level resource model as public APIs (issue #41): the organizations
+    // level table (a schema slot since #6) gains a soft-delete column so it can be
+    // deactivated as a first-class management resource without ever hard-deleting a
+    // row the append-only audit log references. The operators, tenants, and
+    // environments level tables already exist from the isolation root.
+    assert!(
+        table_exists(pool, "organizations").await,
+        "organizations exists"
+    );
+    assert!(table_exists(pool, "operators").await, "operators exists");
+    assert!(
+        column_exists(pool, "organizations", "deleted_at").await,
+        "organizations.deleted_at exists"
+    );
     // The per-tenant envelope-encryption tables (issue #48): the wrapped
     // key-encryption keys, the wrapped data-encryption keys, and the transparent
     // encrypted-secret store.

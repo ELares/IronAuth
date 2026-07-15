@@ -50,8 +50,11 @@ mod idempotency;
 mod input;
 mod keys;
 mod openapi;
+mod operators;
+mod organizations;
 mod pagination;
 mod ratelimit;
+mod resource_types;
 mod response;
 mod sessions;
 mod state;
@@ -85,6 +88,17 @@ pub use state::{AdminState, StateError};
 /// pins that documented set, so the router and the spec cannot silently diverge.
 pub fn management_router(state: AdminState) -> Router {
     Router::new()
+        // The operator plane: the root of the four-level resource model (issue
+        // #41), a documented read surface above tenants.
+        .route("/v1/operators", get(operators::list_operators))
+        .route("/v1/operators/{operator_id}", get(operators::get_operator))
+        // The resource-type classification catalog (issue #41): machine-readable
+        // promotable/runtime/environment-identity metadata the snapshot and
+        // promotion engines consume.
+        .route(
+            "/v1/resource-types",
+            get(resource_types::list_resource_types),
+        )
         .route(
             "/v1/tenants",
             post(tenants::create_tenant).get(tenants::list_tenants),
@@ -108,6 +122,16 @@ pub fn management_router(state: AdminState) -> Router {
         .route(
             "/v1/tenants/{tenant_id}/environments/{environment_id}/keys/{key_id}",
             get(keys::get_key).delete(keys::delete_key),
+        )
+        // Organizations: the fourth level of the resource model (issue #41), a
+        // minimal per-environment shell M10 extends with membership.
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations",
+            post(organizations::create_organization).get(organizations::list_organizations),
+        )
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}",
+            get(organizations::get_organization).delete(organizations::delete_organization),
         )
         // Dynamic Client Registration abuse controls (issue #31).
         .route(
