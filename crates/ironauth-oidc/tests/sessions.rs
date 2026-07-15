@@ -62,7 +62,7 @@ async fn id_token_claims(harness: &Harness, client_id: &str, cookie: &str) -> Va
         .await;
     assert_eq!(
         status,
-        StatusCode::FOUND,
+        StatusCode::SEE_OTHER,
         "authorize should redirect: {body}"
     );
     let code = location_param(&headers, "code").expect("code in redirect");
@@ -147,7 +147,7 @@ async fn a_revoked_session_no_longer_authenticates_the_authorization_endpoint() 
         .await;
     assert_eq!(
         status,
-        StatusCode::FOUND,
+        StatusCode::SEE_OTHER,
         "a live session authorizes: {body}"
     );
 
@@ -178,7 +178,7 @@ async fn a_revoked_session_no_longer_authenticates_the_authorization_endpoint() 
         .unwrap_or_default()
         .to_owned();
     assert!(
-        status == StatusCode::FOUND && location.contains("/login"),
+        status == StatusCode::SEE_OTHER && location.contains("/login"),
         "a revoked session must stop authenticating IMMEDIATELY (got {status}, \
          location {location}): {body}"
     );
@@ -208,7 +208,11 @@ async fn a_code_redeemed_after_its_session_is_revoked_is_invalid_grant_and_mints
         enc(REDIRECT_URI),
     );
     let (status, headers, body) = harness.authorize_with_cookie(&query, &cookie).await;
-    assert_eq!(status, StatusCode::FOUND, "authorize issues a code: {body}");
+    assert_eq!(
+        status,
+        StatusCode::SEE_OTHER,
+        "authorize issues a code: {body}"
+    );
     let code = location_param(&headers, "code").expect("code in redirect");
 
     // The session is revoked AFTER the code was issued but BEFORE it is redeemed.

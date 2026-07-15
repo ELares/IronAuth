@@ -519,7 +519,7 @@ async fn the_implicit_and_hybrid_id_tokens_carry_the_same_sid_the_code_flow_issu
     let (status, headers, body) = harness
         .authorize_with_cookie(&implicit_query, &cookie)
         .await;
-    assert_eq!(status, StatusCode::FOUND, "implicit redirect: {body}");
+    assert_eq!(status, StatusCode::SEE_OTHER, "implicit redirect: {body}");
     let implicit_token =
         location_fragment_param(&headers, "id_token").expect("implicit id_token in fragment");
     let implicit_claims = verified_claims(&harness, &client_id, &implicit_token);
@@ -537,7 +537,7 @@ async fn the_implicit_and_hybrid_id_tokens_carry_the_same_sid_the_code_flow_issu
         enc(REDIRECT_URI),
     );
     let (status, headers, body) = harness.authorize_with_cookie(&hybrid_query, &cookie).await;
-    assert_eq!(status, StatusCode::FOUND, "hybrid redirect: {body}");
+    assert_eq!(status, StatusCode::SEE_OTHER, "hybrid redirect: {body}");
     let hybrid_token =
         location_fragment_param(&headers, "id_token").expect("hybrid id_token in fragment");
     let hybrid_claims = verified_claims(&harness, &client_id, &hybrid_token);
