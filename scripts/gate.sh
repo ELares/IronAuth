@@ -26,6 +26,9 @@ scripts/invariant-lints.sh
 echo "==> query audit (no scoped-table SQL outside the repository module)"
 scripts/query-audit.sh
 
+echo "==> classification lint (every resource type is classified; all three classes used)"
+scripts/classification-lint.sh
+
 echo "==> http audit (ironauth-fetch is the only outbound HTTP path)"
 scripts/http-audit.sh
 

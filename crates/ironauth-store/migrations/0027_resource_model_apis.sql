@@ -1,0 +1,74 @@
+-- SPDX-License-Identifier: MIT OR Apache-2.0
+--
+-- Complete the four-level resource model as public management APIs (issue #41).
+--
+-- The four levels (operator > tenant > environment > organization) and their
+-- tables already exist from the isolation root (0001) and the management-plane
+-- migration (0003). This migration completes the ORGANIZATION level so it can be
+-- managed as a first-class control-plane resource (create, list, get, and a soft
+-- deactivation), exactly as tenants and environments already are:
+--
+--   1. A soft-delete column on organizations. Deleting an organization is a
+--      deactivation that RETAINS the row (so the append-only audit_log foreign
+--      key to it stays satisfiable forever, the same reason tenants and
+--      environments soft-delete in 0003). A NULL deleted_at is live; a non-NULL
+--      value is the deactivation instant, sourced from the application clock seam.
+--   2. Control-plane grants on organizations. The organization lifecycle is a
+--      MANAGEMENT-plane operation (issue #11), so the control role gets exactly
+--      the rights it needs: SELECT, INSERT, and a COLUMN-SCOPED UPDATE on the one
+--      soft-delete column (never a table-wide GRANT UPDATE, which would silently
+--      cover every future column: the #31 lesson).
+--
+-- What this migration does NOT touch, because it already holds from 0001:
+--   - organizations is TENANT-and-ENVIRONMENT scoped (organizations live inside
+--     environments), with mandatory tenant_id and environment_id, a nonempty-scope
+--     CHECK, and ROW LEVEL SECURITY ENABLED and FORCED under the (tenant,
+--     environment) isolation policy. The control role is never a superuser and
+--     never the table owner, so FORCE row-level security applies to it too; the
+--     repository binds the scope session variables before every organization
+--     statement, exactly as it does for management_credentials.
+--   - organizations is already registered in scripts/query-audit.sh, so all of
+--     its SQL is confined to the repository module.
+--
+-- The data-plane grant on organizations is REVOKED here (the #31 least-privilege
+-- lesson this issue cites, applied to the other role). The isolation root (0001)
+-- gave ironauth_app a table-wide SELECT, INSERT, UPDATE, DELETE on organizations
+-- when the level was a schema slot only, but the organization lifecycle is entirely
+-- a MANAGEMENT-plane operation: no data-plane or OIDC path creates, mutates, OR
+-- reads organizations (every organization statement runs through the control-plane
+-- repository as ironauth_control). The broad data-plane grant is therefore a
+-- capability with no caller, and a hazard: it lets the low-privilege role HARD
+-- DELETE an organization row (breaking the soft-delete retention that keeps the
+-- append-only audit_log foreign key satisfiable) and UPDATE any column. Grant what
+-- a caller needs when it needs it: M10's B2B read path (issue #6) will re-grant
+-- exactly SELECT to ironauth_app in its own migration, once a data-plane reader
+-- actually exists.
+
+-- ---------------------------------------------------------------------------
+-- Soft deactivation for organizations, mirroring tenants and environments (0003).
+--
+-- A NULL deleted_at means live (the active state the API reports); a non-NULL
+-- value is the deactivation instant. Reads filter deleted_at IS NULL. The row is
+-- retained so the audit_log foreign key that references an organization stays
+-- satisfiable forever, which is what makes DELETE expressible at all against an
+-- append-only audit log.
+ALTER TABLE organizations ADD COLUMN deleted_at timestamptz;
+
+-- ---------------------------------------------------------------------------
+-- Control-plane rights on organizations.
+--
+-- The management plane creates, lists, and soft-deactivates organizations. It
+-- gets SELECT and INSERT, and UPDATE on ONLY the deleted_at column (the sole
+-- column a soft deactivation writes). A hard DELETE is never granted, so an
+-- organization row can never be removed and its audit history stays intact.
+GRANT SELECT, INSERT ON organizations TO ironauth_control;
+GRANT UPDATE (deleted_at) ON organizations TO ironauth_control;
+
+-- ---------------------------------------------------------------------------
+-- Revoke the unused, over-broad data-plane grant on organizations (see the note
+-- above). The data plane never touches organizations, so this removes a hazard
+-- (a low-privilege hard DELETE or a table-wide UPDATE) without affecting any
+-- running binary. It is expand-safe: the pre-#41 releases treated organizations
+-- as a schema slot only and issued no organization statement as ironauth_app, so
+-- no N-1 binary depends on the grant being present.
+REVOKE SELECT, INSERT, UPDATE, DELETE ON organizations FROM ironauth_app;

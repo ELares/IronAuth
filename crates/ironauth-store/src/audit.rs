@@ -166,6 +166,12 @@ pub enum Action {
     ManagementKeyCreate,
     /// A management API key was revoked (management plane, issue #11).
     ManagementKeyDelete,
+    /// An organization was created (management plane, issue #41). The minimal
+    /// per-environment organization shell M10 later extends with membership.
+    OrganizationCreate,
+    /// An organization was deactivated (management plane, issue #41): a soft
+    /// delete that retains the row so the audit foreign key to it stays intact.
+    OrganizationDelete,
     /// An authorization code and its grant were issued (issue #12).
     AuthorizationCodeIssue,
     /// An authorization code was redeemed at the token endpoint (issue #12).
@@ -335,6 +341,8 @@ impl Action {
             Action::EnvironmentDelete => "environment.delete",
             Action::ManagementKeyCreate => "management_key.create",
             Action::ManagementKeyDelete => "management_key.delete",
+            Action::OrganizationCreate => "organization.create",
+            Action::OrganizationDelete => "organization.delete",
             Action::AuthorizationCodeIssue => "authorization_code.issue",
             Action::AuthorizationCodeRedeem => "authorization_code.redeem",
             Action::AuthorizationCodeReuse => "authorization_code.reuse",

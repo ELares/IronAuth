@@ -198,5 +198,23 @@ name = "backchannel_delivery"
 path = "tests/backchannel_delivery.rs"
 required-features = ["testing"]
 
+# The organization resource (issue #41): create/get/list/delete, cursor pagination,
+# cross-tenant and cross-environment uniform not-found, containment (no child under a
+# foreign or nonexistent parent), idempotent creation, and the audited-mutation
+# invariant. Needs a real database (DATABASE_URL).
+[[test]]
+name = "organizations"
+path = "tests/organizations.rs"
+required-features = ["testing"]
+
+# Least-privilege enforcement of the data-plane role on organizations (issue #41):
+# as ironauth_app, every statement on organizations is refused as insufficient
+# privilege (the #31 lesson applied to the other role), while ironauth_control keeps
+# its column-scoped soft delete. Needs a real database (DATABASE_URL).
+[[test]]
+name = "organization_grants"
+path = "tests/organization_grants.rs"
+required-features = ["testing"]
+
 [lints]
 workspace = true

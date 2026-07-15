@@ -428,6 +428,12 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0026_frontchannel_logout.sql"),
         },
+        Migration {
+            version: 27,
+            name: "resource_model_apis",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0027_resource_model_apis.sql"),
+        },
     ]
 }
 

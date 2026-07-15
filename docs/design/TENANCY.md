@@ -156,6 +156,37 @@ scoped-repository operation that exists today. Every future surface registers
 its operations with it, so coverage grows with the system rather than lagging
 it. The registration recipe is documented on the module.
 
+## The four levels as public APIs (issue #41)
+
+Issue #6 lands the schema and the isolation mechanism; issue #41 completes the
+model as public, documented management-API resources on `ironauth-admin`:
+
+- **All four levels are manageable.** Operator (list, get), tenant (CRUD),
+  environment (CRUD), and organization (CRUD) each have documented endpoints,
+  served under the OpenAPI contract with cursor pagination, `Idempotency-Key` on
+  creates, rate-limit headers, and a same-transaction audit row on every
+  mutation. Organizations live inside environments, so they are addressed under
+  `/v1/tenants/{tenant}/environments/{environment}/organizations` and are the
+  minimal shell (typed scoped id, name, containment, active state) M10 later
+  extends with membership.
+- **Identifiers embed the scope their level defines.** An organization id embeds
+  its `(tenant, environment)` and collapses to the uniform not-found in any other
+  scope; a tenant or environment id is a level id; an operator id embeds neither.
+  Containment is structural: an organization cannot be created under a foreign or
+  nonexistent environment (the typed id, the `WITH CHECK` policy, and the
+  `(environment, tenant)` foreign key each reject it), and deleting a parent
+  cascades a soft deactivation to its children.
+- **Promotion classification is declared in the schema.** Every resource type
+  carries a machine-readable `promotable` / `runtime` / `environment-identity`
+  class (`ironauth_store::classification`), served at `GET /v1/resource-types`.
+  Promotion (M5.4) and snapshot export (M5.3) consume that one source of truth
+  instead of a parallel list, and `scripts/classification-lint.sh` fails CI if a
+  resource type ever lands unclassified. Environments and their intrinsic
+  material (signing keys, per-environment credentials) are `environment-identity`
+  and never travel in a snapshot; clients, resource servers, and policies are
+  `promotable`; operators, tenants, organizations, users, and sessions are
+  `runtime`.
+
 ## Scope of issue #6 (and what it defers)
 
 This issue ships the schema decision and the isolation mechanism. It
