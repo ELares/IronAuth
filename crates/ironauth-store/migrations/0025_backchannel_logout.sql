@@ -91,6 +91,12 @@ CREATE TABLE backchannel_logout_deliveries (
     sid            text        NOT NULL,
     -- The RP's registered backchannel_logout_uri, snapshotted at explode time.
     logout_uri     text        NOT NULL,
+    -- The Logout Token `jti`, assigned ONCE at explode time and reused across every
+    -- delivery ATTEMPT of this row. At-least-once delivery re-POSTs the SAME token, so the
+    -- jti is stable and the RP dedups a retry on it (a fresh jti per attempt would defeat
+    -- that dedup). Part of the immutable delivery body, so it lives under SELECT + INSERT,
+    -- never the column-scoped UPDATE grant.
+    jti            text        NOT NULL,
     -- The number of delivery attempts so far (the attempts cap dead-letters the row).
     attempts       integer     NOT NULL DEFAULT 0,
     -- The backoff gate: the row is eligible only once now >= next_attempt_at. Written
@@ -143,7 +149,7 @@ CREATE POLICY backchannel_logout_deliveries_tenant_isolation ON backchannel_logo
 -- queue to drain it, and mutates ONLY the delivery-lifecycle columns: the attempts
 -- counter, the backoff gate, the lease, the last-error label, and the two terminal
 -- markers. It is NEVER granted a table-wide UPDATE (the #31 lesson): the delivery body
--- (event_id, session_id, client_id, sid, logout_uri) is immutable once exploded.
+-- (event_id, session_id, client_id, sid, logout_uri, jti) is immutable once exploded.
 GRANT SELECT, INSERT ON backchannel_logout_deliveries TO ironauth_app;
 GRANT UPDATE (attempts, next_attempt_at, claimed_at, last_error, delivered_at,
               dead_lettered_at)

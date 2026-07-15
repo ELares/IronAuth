@@ -782,6 +782,7 @@ async fn production_chain_is_only_the_twenty_five_real_migrations_and_ships_no_d
         "client_id",
         "sid",
         "logout_uri",
+        "jti",
         "attempts",
         "next_attempt_at",
         "claimed_at",

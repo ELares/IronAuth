@@ -193,6 +193,18 @@ fn header_of(token: &str) -> Value {
     serde_json::from_slice(&bytes).expect("header json")
 }
 
+/// Decode a compact JWS payload and return its `jti` claim.
+fn jti_of(token: &str) -> String {
+    let segment = token.split('.').nth(1).expect("payload segment");
+    let bytes = URL_SAFE_NO_PAD.decode(segment).expect("base64 payload");
+    let claims: Value = serde_json::from_slice(&bytes).expect("payload json");
+    claims
+        .get("jti")
+        .and_then(Value::as_str)
+        .expect("jti claim")
+        .to_owned()
+}
+
 #[tokio::test]
 async fn a_logout_token_carries_the_rp_sid_the_events_claim_and_no_nonce() {
     let harness = Harness::start().await;
@@ -471,6 +483,68 @@ async fn a_failing_rp_is_retried_with_backoff_and_dead_letters_without_blocking_
     assert!(down.dead_lettered_at_unix_micros.is_some());
     assert!(down.delivered_at_unix_micros.is_none());
     assert_eq!(down.attempts, 3);
+}
+
+#[tokio::test]
+async fn a_delivery_keeps_one_stable_jti_across_retries_while_distinct_deliveries_differ() {
+    let harness = Harness::start().await;
+    let scope = harness.scope();
+    let store = harness.store().clone();
+    let env = harness.env().clone();
+    let clock = Arc::clone(harness.clock());
+    let subject = UserId::generate(&env, &scope).to_string();
+
+    // One ended session, two RPs: a down one (retried across attempts) and a healthy one.
+    let session = create_session(&store, &env, scope, &subject).await;
+    participant(&store, &env, scope, &session, "https://down.example/bc").await;
+    participant(&store, &env, scope, &session, "https://healthy.example/bc").await;
+    end_session(&store, &env, scope, &session).await;
+
+    let sender = MockSender::default();
+    sender.fail_uri("https://down.example/bc");
+    let settings = WorkerSettings {
+        max_attempts: 5,
+        retry_base: Duration::from_secs(10),
+        lease: Duration::from_secs(30),
+        batch: 64,
+    };
+    let worker = worker(&harness, sender.clone(), settings);
+
+    // Attempt 1: the down RP fails and is retried; the healthy RP is delivered.
+    worker.run_once(scope).await.expect("pass 1");
+    // Attempt 2: advance past the backoff so the down RP is due again; it fails again.
+    clock.advance(Duration::from_secs(120));
+    worker.run_once(scope).await.expect("pass 2");
+
+    let sent = sender.sent();
+    let down_jtis: Vec<String> = sent
+        .iter()
+        .filter(|(uri, _)| uri == "https://down.example/bc")
+        .map(|(_, token)| jti_of(token))
+        .collect();
+    assert_eq!(
+        down_jtis.len(),
+        2,
+        "the down RP was attempted twice: a first-attempt failure then a retry"
+    );
+    // The SAME delivery row keeps ONE jti across attempts, so at-least-once redelivery
+    // re-POSTs the SAME token and the RP dedups a retry on the jti. A fresh per-attempt
+    // jti (the pre-fix behaviour) would make these two differ and defeat that dedup.
+    assert_eq!(
+        down_jtis[0], down_jtis[1],
+        "two attempts of one delivery carry the identical jti"
+    );
+
+    // A DISTINCT delivery (a different RP) carries a DIFFERENT jti.
+    let healthy_jti = sent
+        .iter()
+        .find(|(uri, _)| uri == "https://healthy.example/bc")
+        .map(|(_, token)| jti_of(token))
+        .expect("the healthy RP was delivered");
+    assert_ne!(
+        down_jtis[0], healthy_jti,
+        "distinct deliveries carry distinct jtis"
+    );
 }
 
 #[tokio::test]

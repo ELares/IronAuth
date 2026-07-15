@@ -8578,6 +8578,10 @@ pub struct LogoutDelivery {
     pub sid: String,
     /// The RP's registered `backchannel_logout_uri`, snapshotted at explode time.
     pub logout_uri: String,
+    /// The Logout Token `jti`, assigned once at explode time and reused across every
+    /// delivery attempt of this row, so a retry re-POSTs the SAME token and the RP dedups
+    /// on it.
+    pub jti: String,
     /// The number of delivery attempts made so far.
     pub attempts: i32,
     /// The most recent failure reason, if any attempt has failed.
@@ -8592,7 +8596,7 @@ pub struct LogoutDelivery {
 /// The columns every delivery read selects, in one place so the claim, the pending peek,
 /// and the full listing return the identical shape.
 const LOGOUT_DELIVERY_COLUMNS: &str = "id, event_id, session_id, client_id, sid, \
-     logout_uri, attempts, last_error, \
+     logout_uri, jti, attempts, last_error, \
      (EXTRACT(EPOCH FROM delivered_at) * 1000000)::bigint AS delivered_us, \
      (EXTRACT(EPOCH FROM dead_lettered_at) * 1000000)::bigint AS dead_us";
 
@@ -8605,6 +8609,7 @@ fn logout_delivery_from_row(row: &PgRow) -> LogoutDelivery {
         client_id: row.get("client_id"),
         sid: row.get("sid"),
         logout_uri: row.get("logout_uri"),
+        jti: row.get("jti"),
         attempts: row.get("attempts"),
         last_error: row.get("last_error"),
         delivered_at_unix_micros: row.get("delivered_us"),
@@ -8680,12 +8685,17 @@ impl BackChannelDeliveryRepo<'_> {
             let sid: String = row.get("sid");
             let logout_uri: String = row.get("logout_uri");
             let delivery_id = BackChannelDeliveryId::generate(env, &scope);
+            // The Logout Token jti, minted ONCE here at explode time and carried on the
+            // row, so every delivery ATTEMPT of this delivery re-POSTs the SAME token and
+            // the RP can dedup a retry on the jti (a fresh jti per attempt would defeat
+            // that at-least-once dedup).
+            let jti = IssuedTokenId::generate(env, &scope);
             let inserted = sqlx::query(
                 "INSERT INTO backchannel_logout_deliveries \
                  (id, tenant_id, environment_id, event_id, session_id, client_id, sid, \
-                  logout_uri, next_attempt_at) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, \
-                         TIMESTAMPTZ 'epoch' + ($9::text || ' microseconds')::interval) \
+                  logout_uri, jti, next_attempt_at) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, \
+                         TIMESTAMPTZ 'epoch' + ($10::text || ' microseconds')::interval) \
                  ON CONFLICT (tenant_id, environment_id, event_id, client_id) DO NOTHING",
             )
             .bind(delivery_id.to_string())
@@ -8696,6 +8706,7 @@ impl BackChannelDeliveryRepo<'_> {
             .bind(&client_id)
             .bind(&sid)
             .bind(&logout_uri)
+            .bind(jti.to_string())
             .bind(now_micros)
             .execute(&mut *tx)
             .await?;

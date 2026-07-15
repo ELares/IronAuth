@@ -37,7 +37,7 @@ use std::time::{Duration, SystemTime};
 
 use ironauth_env::Env;
 use ironauth_jose::{EmissionOptions, sign_jws_with_policy};
-use ironauth_store::{IssuedTokenId, Scope, Store};
+use ironauth_store::{Scope, Store};
 use serde_json::json;
 
 use crate::issuer::IssuerRegistry;
@@ -396,18 +396,21 @@ impl<S: LogoutSender> BackChannelLogoutWorker<S> {
         delivery: &ironauth_store::LogoutDelivery,
     ) -> Result<(), SendFailure> {
         let token = self
-            .build_token(scope, &delivery.client_id, &delivery.sid)
+            .build_token(scope, &delivery.client_id, &delivery.sid, &delivery.jti)
             .await?;
         self.sender.deliver(&delivery.logout_uri, &token).await
     }
 
     /// Build and sign the Logout Token for one (client, session) pair, through the SAME
-    /// per-environment issuer/key and ironauth-jose core an ID token uses.
+    /// per-environment issuer/key and ironauth-jose core an ID token uses. The `jti` is
+    /// the delivery's OWN, minted once at explode time and reused across every attempt, so
+    /// a retry re-POSTs the SAME token and the RP dedups on it.
     async fn build_token(
         &self,
         scope: Scope,
         client_id: &str,
         sid: &str,
+        jti: &str,
     ) -> Result<String, SendFailure> {
         let entry = self
             .issuers
@@ -420,8 +423,7 @@ impl<S: LogoutSender> BackChannelLogoutWorker<S> {
         let issuer = self.issuers.issuer_for(&scope);
         let iat = unix_secs(now);
         let exp = iat.saturating_add(secs_i64(LOGOUT_TOKEN_TTL));
-        let jti = IssuedTokenId::generate(&self.env, &scope).to_string();
-        let claims = build_logout_token_claims(&issuer, client_id, sid, &jti, iat, exp);
+        let claims = build_logout_token_claims(&issuer, client_id, sid, jti, iat, exp);
         let payload = serde_json::to_vec(&claims).map_err(|_| SendFailure::Transport)?;
         sign_jws_with_policy(
             policy,
