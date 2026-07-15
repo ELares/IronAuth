@@ -18,6 +18,17 @@ range per docs/RELEASING.md.
   tokens all collapse to one uniform not-found, so the endpoint is never a
   token-guessing oracle. No CSRF gate: it carries no ambient authority, so there is
   no cookie for a cross-site submit to ride.
+- Foreign-hash login with verify-then-rehash (issue #55): the interactive login now
+  verifies an imported FOREIGN password hash (bcrypt, scrypt, PBKDF2, the Argon2
+  family, or Firebase modified scrypt) when the native Argon2id verifier is the
+  unusable import sentinel, dispatching through the `ironauth-import` scheme layer.
+  On the FIRST successful foreign login the password is transparently rehashed to
+  the native Argon2id verifier and the foreign hash is retired
+  (`ActingUserRepo::upgrade_foreign_password`), so the second login verifies
+  natively; the upgrade is best-effort, so a transient failure or a lost race leaves
+  the foreign hash for the next login rather than failing the sign-in. A present but
+  wrong password stays a generic failure whether the stored verifier is native or
+  foreign (no wrong-password oracle).
 
 - User lifecycle authentication fence (issue #52): the interactive login and the
   device-verification login paths now consult the resolved user's lifecycle `state`

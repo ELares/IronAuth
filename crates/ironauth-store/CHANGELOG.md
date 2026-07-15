@@ -6,7 +6,7 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
-- User invitation persistence (issue #60, migration 0038, expand): the one new
+- User invitation persistence (issue #60, migration 0040, expand): the one new
   piece of durable state the admin-initiated invitation flow needs, a tenant-scoped
   `user_invitations` table with RLS forced and the (tenant, environment) isolation
   policy. Everything else reuses existing state (the invited identity is a normal
@@ -28,6 +28,70 @@ range per docs/RELEASING.md.
     fresh digest and expiry on a still-pending invite) round it out; every mutation
     audits. Column-scoped grants only (the #31 lesson): control plane
     creates/lists/revokes/resends, the data plane accepts.
+- Foreign password-hash storage for bulk import (issue #55, migration 0039,
+  expand): the persistence half of the streaming import engine (the engine and the
+  algorithm-tagged verify/rehash scheme layer live in the new `ironauth-import`
+  crate).
+  - **Two additive `users` columns.** `foreign_password_hash` (the imported
+    verifier in its canonical algorithm-tagged string, stored AS-IS) and
+    `foreign_password_algo` (the non-secret algorithm tag). A password hash is a
+    one-way verifier, not PII, so both are stored as text exactly like the native
+    `password_hash`; neither is in the PII taxonomy. A user with no imported
+    credential stores NULL for both.
+  - **`NewAdminUser` foreign fields.** `admin_create` now accepts
+    `foreign_password_hash` / `foreign_password_algo`, so the import path creates
+    users through the same audited, isolation-scoped, PII-sealing write path as the
+    management create (issue #52). `UserRecord` (the login read) carries the two
+    columns.
+  - **Verify-then-rehash landing.** `ActingUserRepo::upgrade_foreign_password`
+    writes the fresh native Argon2id verifier onto the user and clears the foreign
+    hash and its tag atomically, guarded on the foreign hash still being present so
+    two concurrent logins race safely (the loser is a benign no-op, no audit row),
+    and audits `user.password.upgrade`. A column-scoped UPDATE grant on exactly the
+    two import columns to the data and control roles (never table-wide, the #31
+    lesson) backs it.
+- JSON Schema identity traits with versioning and migration jobs (issue #53,
+  migration 0038, expand): custom user profile fields (traits) beyond the standard
+  OIDC claims, validated against a per (tenant, environment) JSON Schema (draft
+  2020-12), with immutable schema versioning and a Postgres-backed migration/dry-run
+  job substrate.
+  - **Self-contained validator (`trait_schema`).** A purpose-built draft 2020-12
+    validator over `serde_json` (no new external dependency): `type`, `properties`,
+    `required`, `additionalProperties`, `items`/`prefixItems`, `enum`, and the
+    length/size/range assertions. Validation failures carry an RFC 6901 JSON Pointer
+    to the exact failing location; schema compilation and instance validation are
+    DEPTH BOUNDED (`MAX_DEPTH`) so a hostile deeply nested schema or payload cannot
+    exhaust the stack (the fuzz obligation). Arrays and nested objects are
+    first-class (the named Ory Kratos regression is a unit test). The IronAuth
+    behavior vocabulary (`x-ironauth`: login identifier, verification address,
+    recovery channel, admin-only visibility) parses off the schema, and the
+    admin-only visibility split is enforced by `TraitAnnotations::redact_for_user`.
+    A declarative transform (`rename`/`default`/`drop`) applies deterministically.
+  - **Versioned registry (`trait_schemas`).** `ActingTraitSchemaRepo::create_version`
+    (a malformed schema is refused before anything is written) mints an immutable
+    per-scope `candidate` version; `activate_version` is the cutover, REFUSED while
+    any identity's traits fail the target schema (`CutoverBlocked`), and at most one
+    `active` version per scope (a partial unique index). `TraitSchemaRepo` reads the
+    active version, a specific version, and the full list.
+  - **Sealed per-user traits.** `users` gains `traits_sealed` (the trait document
+    sealed under the scope's envelope DEK, issue #48: trait data is user profile PII
+    and never lands on a plaintext column), `traits_dek_version`, and
+    `traits_schema_version`. `ActingUserRepo::set_traits` validates against the active
+    schema at write (an invalid document is refused with per-field JSON Pointer
+    failures and nothing is persisted), seals, and records the version; `UserRepo::traits`
+    and `traits_user_visible` read it back (the latter with admin-only fields stripped).
+  - **Migration / dry-run jobs (`trait_migration_jobs`).** `ActingTraitMigrationJobRepo::create`
+    (dry-run or migrate) counts the candidate population and queues the job;
+    `advance` runs one bounded batch, deterministically (identities ascending by id),
+    idempotently (a terminal job is a no-op and a migrated identity is filtered out,
+    so re-running double-migrates nothing), resumably (the cursor commits per batch),
+    and per (tenant, environment) scoped. Per-record failures are reported by subject
+    and JSON Pointer reason (never a trait value, so a job carries no PII). Every
+    mutation audits (`trait_schema.create`/`activate`, `user.traits.update`,
+    `trait_migration_job.create`/`advance`).
+  - Deferred to a follow-up: the `ironauth-admin` HTTP control-plane surface over
+    these repositories (set/get schema, trigger/inspect a job) and its OpenAPI
+    contract; the store seam #54 (flexible identifiers) and #59 build on is complete.
 
 - Admin user CRUD, lifecycle states, and external IDs (issue #52, migration 0037,
   expand): the foundational M6 promotion of the bootstrap `users` directory into a

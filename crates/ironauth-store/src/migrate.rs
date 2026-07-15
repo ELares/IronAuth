@@ -495,6 +495,18 @@ fn registry() -> Vec<Migration> {
             sql: include_str!("../migrations/0037_admin_user_lifecycle.sql"),
         },
         Migration {
+            version: 38,
+            name: "identity_traits",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0038_identity_traits.sql"),
+        },
+        Migration {
+            version: 39,
+            name: "foreign_password_import",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0039_foreign_password_import.sql"),
+        },
+        Migration {
             version: 40,
             name: "user_invitations",
             phase: Phase::Expand,

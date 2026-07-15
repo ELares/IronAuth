@@ -218,6 +218,11 @@ pub async fn create_invitation(
                 claims_json: None,
                 external_id: None,
                 state: UserState::PendingVerification,
+                // The invitation create surface (issue #60) sets no foreign
+                // credential; the streaming bulk import path (issue #55) is where an
+                // imported foreign hash enters.
+                foreign_password_hash: None,
+                foreign_password_algo: None,
             },
             created_at_micros,
             None,

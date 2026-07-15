@@ -70,6 +70,8 @@ async fn create_invitation(
                 claims_json: None,
                 external_id: None,
                 state: UserState::PendingVerification,
+                foreign_password_hash: None,
+                foreign_password_algo: None,
             },
             created,
             None,

@@ -14,6 +14,10 @@ range per docs/RELEASING.md.
   invitations, revoke a pending one, and resend (rotate the token digest and
   expiry). The plaintext token is returned to the caller exactly once, at create and
   resend, and is never persisted or re-readable.
+- Foreign password import follow-through (issue #55): the admin user create path
+  passes the new `NewAdminUser` foreign-hash fields as `None` (the management create
+  surface sets no imported credential; the streaming bulk import path in
+  `ironauth-import` is where an imported foreign hash enters).
 
 - Admin user management API (issue #52): complete control-plane user CRUD,
   lifecycle transitions, and external-id correlation under an environment, on the M1

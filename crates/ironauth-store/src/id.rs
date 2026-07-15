@@ -502,6 +502,29 @@ impl ScopedKind for AssertionMappingKind {
     const PREFIX: &'static str = "asm";
 }
 
+/// Marker for a trait-schema version (`tsc_`), one immutable version in a
+/// (tenant, environment) identity-traits schema registry (issue #53). The
+/// identifier embeds its scope, so a schema version minted in one scope parses as
+/// a uniform not-found under another. This id is the registry row's primary key and
+/// the audit target of a schema-version create/activate. Not a secret.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TraitSchemaKind;
+impl ScopedKind for TraitSchemaKind {
+    const PREFIX: &'static str = "tsc";
+}
+
+/// Marker for a trait migration/dry-run job (`tmj_`), one queued job that
+/// validates or migrates a scope's existing identities against a candidate schema
+/// version (issue #53). Tenant scoped, so a job in one scope can never touch
+/// another tenant's identities; the id is the job row's primary key and the audit
+/// target of the job's create/run. An INTERNAL tracking row, never a bearer
+/// credential.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TraitMigrationJobKind;
+impl ScopedKind for TraitMigrationJobKind {
+    const PREFIX: &'static str = "tmj";
+}
+
 /// Marker for a human actor (an interactive user). One of the three actor kinds
 /// an audit envelope can name (see [`crate::audit::ActorRef`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -756,6 +779,12 @@ pub type ExternalIssuerId = ScopedId<ExternalIssuerKind>;
 /// A subject-mapping rule identifier (`asm_...`), the explicit rule mapping an
 /// external assertion's (issuer + `sub`) to an IronAuth principal (issue #26).
 pub type AssertionMappingId = ScopedId<AssertionMappingKind>;
+/// A trait-schema version identifier (`tsc_`), one immutable version in a
+/// (tenant, environment) identity-traits schema registry (issue #53).
+pub type TraitSchemaId = ScopedId<TraitSchemaKind>;
+/// A trait migration/dry-run job identifier (`tmj_`), one queued job over a scope's
+/// identities against a candidate schema version (issue #53).
+pub type TraitMigrationJobId = ScopedId<TraitMigrationJobKind>;
 
 impl<K: ScopedKind> ScopedId<K> {
     /// Mint a fresh scoped identifier under `scope`, drawing the unique

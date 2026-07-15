@@ -222,6 +222,12 @@ pub enum Action {
     /// `detail` records the target state; a session-ending transition (block,
     /// disable) cascades in the same transaction and fans out to relying parties.
     UserStateChange,
+    /// A user's imported FOREIGN password hash was verified on first login and
+    /// transparently rehashed to the native Argon2id verifier (issue #55): the
+    /// verify-then-rehash upgrade. The foreign hash and its algorithm tag are
+    /// cleared in the same transaction; no credential material is recorded on the
+    /// audit row, only that the user's credential was upgraded, and when.
+    UserPasswordUpgrade,
     /// A user's EXTERNAL ID was linked through the management API (issue #52): a
     /// correlation id from the tenant's own systems was claimed for the user
     /// (unique per scope, so a second claim of the same external id is refused).
@@ -254,6 +260,31 @@ pub enum Action {
     /// the prior token was invalidated (its digest overwritten) and a fresh
     /// single-use token with a reset expiry was issued for the same invitation.
     InvitationResend,
+    /// A user's identity TRAITS were set or updated through an audited write (issue
+    /// #53): the custom profile fields beyond the standard OIDC claims, validated
+    /// against the active trait-schema version and sealed at rest. The trait values
+    /// are never recorded on the audit row; only that the user's traits changed, by
+    /// whom, and when.
+    UserTraitsUpdate,
+    /// A new identity trait-schema VERSION was created in a (tenant, environment)
+    /// registry (issue #53): an immutable candidate JSON Schema (draft 2020-12) the
+    /// scope's future trait writes may validate against once it is activated.
+    TraitSchemaCreate,
+    /// A trait-schema version was ACTIVATED as the scope's served default (issue
+    /// #53): the cutover, refused while a dry-run or migration reports unresolved
+    /// invalid identities. The audit row's operator-safe `detail` records the
+    /// activated version.
+    TraitSchemaActivate,
+    /// A trait migration or dry-run JOB was created (issue #53): a queued job that
+    /// validates (dry-run) or transforms and re-validates (migrate) the scope's
+    /// existing identities against a candidate schema version.
+    TraitMigrationJobCreate,
+    /// A trait migration/dry-run job was ADVANCED by a worker step (issue #53): a
+    /// deterministic, idempotent, resumable batch that processed a bounded run of the
+    /// scope's identities and recorded per-record failures. Re-running a completed or
+    /// failed job is a no-op (idempotent), so a crash mid-migration resumes without
+    /// double-migrating.
+    TraitMigrationJobAdvance,
     /// A bootstrap session was established at login or registration (issue #20).
     SessionCreate,
     /// An SSO session identifier was ROTATED at a privilege transition (issue #32):
@@ -497,6 +528,8 @@ pub enum Action {
 
 impl Action {
     /// The stable wire string for this action.
+    // One flat arm per action verb; splitting the map would not make it clearer.
+    #[allow(clippy::too_many_lines)]
     #[must_use]
     #[allow(clippy::too_many_lines)]
     pub fn as_str(&self) -> &'static str {
@@ -533,6 +566,7 @@ impl Action {
             Action::UserUpdate => "user.update",
             Action::UserDelete => "user.delete",
             Action::UserStateChange => "user.state_change",
+            Action::UserPasswordUpgrade => "user.password.upgrade",
             Action::UserExternalIdLink => "user.external_id.link",
             Action::UserExternalIdUnlink => "user.external_id.unlink",
             Action::UserOffboardingExecute => "user.offboarding.execute",
@@ -540,6 +574,11 @@ impl Action {
             Action::InvitationRedeem => "invitation.redeem",
             Action::InvitationRevoke => "invitation.revoke",
             Action::InvitationResend => "invitation.resend",
+            Action::UserTraitsUpdate => "user.traits.update",
+            Action::TraitSchemaCreate => "trait_schema.create",
+            Action::TraitSchemaActivate => "trait_schema.activate",
+            Action::TraitMigrationJobCreate => "trait_migration_job.create",
+            Action::TraitMigrationJobAdvance => "trait_migration_job.advance",
             Action::SessionCreate => "session.create",
             Action::SessionRotate => "session.rotate",
             Action::SessionRevoke => "session.revoke",
