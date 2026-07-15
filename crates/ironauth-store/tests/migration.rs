@@ -248,7 +248,7 @@ async fn expand_contract_example_chain_runs_all_three_phases_and_contract_remove
 // per real table); splitting it would not make it clearer.
 #[allow(clippy::too_many_lines)]
 #[tokio::test]
-async fn production_chain_is_only_the_twenty_three_real_migrations_and_ships_no_demo_object() {
+async fn production_chain_is_only_the_twenty_four_real_migrations_and_ships_no_demo_object() {
     // TestDatabase::start runs Store::migrate() (the production chain) on a
     // fresh, empty database.
     let db = TestDatabase::start().await;
@@ -265,21 +265,22 @@ async fn production_chain_is_only_the_twenty_three_real_migrations_and_ships_no_
     );
     assert_eq!(
         report.already_applied(),
-        23,
-        "the production chain is exactly twenty-three migrations (isolation, audit log, management \
+        24,
+        "the production chain is exactly twenty-four migrations (isolation, audit log, management \
          API, OIDC authorization, signing keys, login/consent, authentication context, redirect \
          registration, UserInfo claims, consent scope upsert, resource servers, opaque access \
          tokens, client auth suite, dynamic client registration, pushed authorization requests, \
          refresh tokens, client-credentials service accounts, DCR abuse controls, resource \
          indicators, JWT bearer assertion grant, device authorization, session model, RP-initiated \
-         logout)"
+         logout, session-ended events)"
     );
 
-    // The ledger holds exactly versions 1 through 23.
+    // The ledger holds exactly versions 1 through 24.
     assert_eq!(
         applied_versions(pool).await,
         vec![
-            1_i64, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23
+            1_i64, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
+            24
         ]
     );
     let phase_of = |version: i64| async move {
@@ -330,6 +331,9 @@ async fn production_chain_is_only_the_twenty_three_real_migrations_and_ships_no_
     // The RP-initiated logout expand (issue #33): an additive clients ALTER ADD COLUMN
     // (post_logout_redirect_uris) plus its column-scoped grant is an expand.
     assert_eq!(phase_of(23).await, "expand");
+    // The session-ended outbox (issue #35): one new CREATE TABLE plus its indexes,
+    // policy, and column-scoped grants are all additive, so this is an expand too.
+    assert_eq!(phase_of(24).await, "expand");
 
     // The demo object never reaches a production database.
     assert!(
@@ -731,6 +735,28 @@ async fn production_chain_is_only_the_twenty_three_real_migrations_and_ships_no_
         column_exists(pool, "clients", "post_logout_redirect_uris").await,
         "clients.post_logout_redirect_uris exists"
     );
+    // The durable session-ended outbox (issue #35): the transactional-outbox table the
+    // session domain enqueues a row on for EVERY terminal end, drained by the
+    // back-channel logout worker. Its lifecycle columns (claimed_at, delivered_at) are
+    // the only ones a draining consumer is granted UPDATE on.
+    assert!(
+        table_exists(pool, "session_ended_events").await,
+        "session_ended_events exists"
+    );
+    for column in [
+        "session_id",
+        "subject",
+        "cause",
+        "actor_kind",
+        "occurred_at",
+        "claimed_at",
+        "delivered_at",
+    ] {
+        assert!(
+            column_exists(pool, "session_ended_events", column).await,
+            "session_ended_events.{column} exists"
+        );
+    }
 }
 
 #[tokio::test]

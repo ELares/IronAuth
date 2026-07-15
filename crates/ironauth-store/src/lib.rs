@@ -78,8 +78,9 @@ pub use id::{
     LevelKind, ManagementKeyId, ManagementKeyKind, NotInScope, OperatorId, OperatorKind,
     OrganizationId, OrganizationKind, PushedRequestId, PushedRequestKind, RefreshFamilyId,
     RefreshFamilyKind, RefreshTokenId, RefreshTokenKind, ResourceServerId, ResourceServerKind,
-    ScopedId, ScopedKind, ServiceAccountId, ServiceAccountKind, ServiceId, ServiceKind, SessionId,
-    SessionKind, SigningKeyId, SigningKeyKind, TenantId, TenantKind, UserId, UserKind,
+    ScopedId, ScopedKind, ServiceAccountId, ServiceAccountKind, ServiceId, ServiceKind,
+    SessionEventId, SessionEventKind, SessionId, SessionKind, SigningKeyId, SigningKeyKind,
+    TenantId, TenantKind, UserId, UserKind,
 };
 pub use migrate::{Migration, MigrationError, MigrationReport, MigrationRunner, Phase};
 pub use redirect::{redirect_uri_is_registrable, redirect_uri_matches};
@@ -110,11 +111,11 @@ pub use repository::{
     RefreshFamilyFleetRepo, RefreshFamilyOpenOutcome, RefreshFamilySummary, RefreshRedeem,
     RefreshRedeemOutcome, RefreshRepo, RefreshTokenResolution, ResourceServerRecord,
     ResourceServerRepo, RotatedRefreshToken, ScopedStore, ServiceAccountRepo, SessionEndCause,
-    SessionFleetFilter, SessionFleetRepo, SessionRecord, SessionRepo, SessionRevocation,
-    SessionSummary, SigningKeyMaterial, SigningKeyMaterialKind, SigningKeyRecord, SigningKeyRepo,
-    StoredIdempotentResponse, TenantRecord, TenantRepo, TokenFormat, TokenKind, TokenStatus,
-    UserRecord, UserRepo, UserRevocation, device_code_digest, opaque_access_token_digest,
-    refresh_token_digest, user_code_hash,
+    SessionEndedEvent, SessionEventOutboxRepo, SessionFleetFilter, SessionFleetRepo, SessionRecord,
+    SessionRepo, SessionRevocation, SessionSummary, SigningKeyMaterial, SigningKeyMaterialKind,
+    SigningKeyRecord, SigningKeyRepo, StoredIdempotentResponse, TenantRecord, TenantRepo,
+    TokenFormat, TokenKind, TokenStatus, UserRecord, UserRepo, UserRevocation, device_code_digest,
+    opaque_access_token_digest, refresh_token_digest, user_code_hash,
 };
 pub use scope::Scope;
 pub use store::Store;

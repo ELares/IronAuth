@@ -175,5 +175,16 @@ name = "sessions"
 path = "tests/sessions.rs"
 required-features = ["testing"]
 
+# The durable session-ended event fan-out (issue #35): a transactional outbox row is
+# enqueued on EVERY terminal end and NEVER on a rotation, the enqueue is transactional
+# with the revoke (a forced rollback emits nothing), the cause matrix carries each
+# terminal cause, the outbox is cross-tenant isolated, delivery is at-least-once with a
+# claim lease and idempotent mark-delivered, and the app role can drain but cannot
+# rewrite the immutable event body. Needs a real database (DATABASE_URL).
+[[test]]
+name = "session_ended_fanout"
+path = "tests/session_ended_fanout.rs"
+required-features = ["testing"]
+
 [lints]
 workspace = true
