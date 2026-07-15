@@ -6,6 +6,26 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- RP-Initiated Logout persistence (issue #33, migration 0023, expand). Lets the OIDC
+  `end_session` endpoint terminate an SSO session and, only on an exact match with a
+  verifiable `id_token_hint`, redirect back to a client.
+  - **Registered post-logout redirect set.** A new additive `clients` column
+    `post_logout_redirect_uris text[]` (default `{}`), the exact-string set the
+    `end_session` endpoint matches a presented `post_logout_redirect_uri` against
+    (RFC 9700 section 2.1, the same discipline `redirect_uris` uses). It is read into
+    `ClientRecord::post_logout_redirect_uris` and written by the new audited
+    `ActingClientRepo::register_post_logout_redirect_uris` (each entry validated as a
+    registrable RFC 8252 target before anything is stored; a
+    `client.post_logout_redirect_uris.register` audit row in the same transaction). The
+    data-plane write is a COLUMN-SCOPED `GRANT UPDATE (post_logout_redirect_uris)` (the
+    #31 lesson: never a table-wide UPDATE).
+  - **`sid` to session reverse lookup.** `ClientSessionRepo::session_for_sid(sid)` maps
+    the per-(client, session) `sid` an `id_token_hint` carries back to the tier-one SSO
+    `session_id` the logout ends, so the hint (not merely the browser cookie) identifies
+    the session to terminate. Scope-fenced: a `sid` from another tenant loads zero rows.
+  - The SSO session termination itself reuses `ActingSessionRepo::revoke` with
+    `SessionEndCause::LoggedOut` and `hard_kill = false`, which already preserves the
+    `offline_access` families (issue #21), so an offline token survives an RP logout.
 - The authoritative two-tier session model with fleet operations (issue #32, migration
   0022, expand). Closes the M4 slice of tracking issue #206: this model SUPERSEDES the
   #20 bootstrap session.

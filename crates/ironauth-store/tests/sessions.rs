@@ -313,6 +313,67 @@ async fn sid_is_stable_per_client_session_pair_and_distinct_across_clients() {
 }
 
 #[tokio::test]
+async fn session_for_sid_maps_a_client_sid_back_to_its_sso_session() {
+    // RP-Initiated Logout (issue #33) targets the SSO session by the per-client `sid`
+    // its id_token_hint carries. The reverse lookup maps that sid back to the tier-one
+    // session, is scope-fenced, and returns None for an unknown sid.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let subject = UserId::generate(&env, &scope).to_string();
+    let session = create_session(&db, &env, scope, &subject, None).await;
+    let client_sessions = db.store().scoped(scope).client_sessions();
+
+    let sid = client_sessions
+        .ensure_sid(&env, &session, "cli_a", 0)
+        .await
+        .expect("sid for A");
+
+    // The sid maps back to exactly the SSO session it was minted for.
+    let resolved = client_sessions
+        .session_for_sid(&sid)
+        .await
+        .expect("lookup ok");
+    assert_eq!(
+        resolved,
+        Some(session),
+        "the sid resolves to its SSO session"
+    );
+
+    // A distinct client's sid on the same session resolves to the same session.
+    let sid_b = client_sessions
+        .ensure_sid(&env, &session, "cli_b", 0)
+        .await
+        .expect("sid for B");
+    assert_ne!(sid, sid_b, "distinct clients get distinct sids");
+    assert_eq!(
+        client_sessions
+            .session_for_sid(&sid_b)
+            .await
+            .expect("lookup"),
+        Some(session)
+    );
+
+    // An unknown sid is a clean miss, never an error and never another tenant's session.
+    assert_eq!(
+        client_sessions
+            .session_for_sid("sid_deadbeef")
+            .await
+            .expect("lookup ok"),
+        None
+    );
+
+    // A second tenant's identical-shaped sid never resolves here: scope-fenced.
+    let other_scope = db.seed_scope(&env).await;
+    let other = db.store().scoped(other_scope).client_sessions();
+    assert_eq!(
+        other.session_for_sid(&sid).await.expect("lookup ok"),
+        None,
+        "a sid never resolves across a tenant boundary"
+    );
+}
+
+#[tokio::test]
 async fn revoking_a_session_cascades_to_families_but_preserves_offline_access() {
     let db = TestDatabase::start().await;
     let env = Env::system();

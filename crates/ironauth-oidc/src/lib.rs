@@ -87,6 +87,7 @@ mod issuer;
 mod jwks;
 mod jwt_bearer;
 mod login;
+mod logout;
 mod pages;
 mod par;
 mod password;
@@ -141,6 +142,7 @@ pub use issuer::{
     IssuerEntry, IssuerError, IssuerRegistry, JwksCacheError, JwksCacheWindow, load_signing_key,
 };
 pub use jwks::{IssuerState, issuer_router};
+pub use logout::LogoutParams;
 pub use password::{PasswordError, hash_password, verify_password};
 pub use registry::{
     GrantType, PkceMethod, PromptSet, PromptSetError, PromptValue, ResponseMode, ResponseType,
@@ -191,6 +193,16 @@ pub fn oidc_router(state: OidcState) -> Router {
         // token's active state and metadata. Advertised in discovery as
         // introspection_endpoint at this exact path.
         .route("/introspect", post(introspection::introspect))
+        // RP-Initiated Logout (OIDC RP-Initiated Logout 1.0, issue #33): a top-level
+        // browser navigation that ends the SSO session and, only on an exact registered
+        // post_logout_redirect_uri match with a verifiable id_token_hint, redirects back
+        // to the client. Advertised in discovery as end_session_endpoint at this exact
+        // path. GET is the RP-initiated navigation; POST is the confirmation submit for
+        // an unattributable request (behind the same-origin CSRF check).
+        .route(
+            "/end_session",
+            get(logout::end_session_get).post(logout::end_session_post),
+        )
         // UserInfo (OIDC Core 5.3): GET and POST with header Bearer auth, plus the
         // OPTIONS preflight for the CORS SPA origins (issue #15). CORS is applied on
         // this endpoint ONLY; the authorization endpoint above never gets it.

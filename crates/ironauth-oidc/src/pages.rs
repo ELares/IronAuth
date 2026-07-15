@@ -515,6 +515,42 @@ pub fn form_post_response(action: &str, params: &[(&str, Option<&str>)]) -> Resp
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
+/// The RP-Initiated Logout CONFIRMATION page (issue #33): shown when a logout request
+/// is NOT cryptographically attributable (no verifiable `id_token_hint`), so ending the
+/// session on the spot would be a logout-CSRF vector. It performs NO state change; it
+/// asks the user to confirm, and the confirm button posts back to `action`
+/// (`/end_session`) where the same-origin CSRF check gates the actual termination.
+///
+/// The original request parameters ride hidden fields (each escaped) so the confirming
+/// POST reconstructs the request; only spec parameters are carried. Every reflected
+/// value is escaped, and the page is served with the strict [`secure_html`] headers.
+#[must_use]
+pub fn logout_confirm_page(action: &str, carried: &[(&str, &str)]) -> String {
+    let hidden: String = carried
+        .iter()
+        .filter(|(_, value)| !value.is_empty())
+        .map(|(name, value)| hidden_field(name, value))
+        .collect();
+    let body = format!(
+        "<h1>Sign out?</h1>\
+         <p>Do you want to sign out?</p>\
+         <form method=\"post\" action=\"{action}\">{hidden}\
+         <p><button type=\"submit\">Sign out</button></p></form>",
+        action = escape_html(action),
+    );
+    notice_document("Sign out", &body)
+}
+
+/// The RP-Initiated Logout completed page (issue #33): the neutral, unbranded page
+/// shown once the session has been ended and no post-logout redirect applies (the
+/// client registered no matching `post_logout_redirect_uri`, or the request carried no
+/// verifiable hint to bind one). It is a plain notice, NEVER a redirect to an
+/// attacker-supplied URI.
+#[must_use]
+pub fn logged_out_page() -> String {
+    notice_page("Signed out", "You have been signed out.")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

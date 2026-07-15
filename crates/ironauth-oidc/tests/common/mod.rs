@@ -1171,6 +1171,19 @@ impl Harness {
         id
     }
 
+    /// Register the client's POST-LOGOUT redirect URIs (issue #33), so the
+    /// RP-Initiated Logout `end_session` endpoint's exact-string match honors one.
+    pub async fn register_post_logout_redirects(&self, client_id: &ClientId, uris: &[&str]) {
+        let (actor, corr) = self.seeding_actor();
+        self.store()
+            .scoped(self.scope)
+            .acting(actor, corr)
+            .clients()
+            .register_post_logout_redirect_uris(&self.env, client_id, uris)
+            .await
+            .expect("register post-logout redirect uris");
+    }
+
     /// Register the harness redirect URI for `client_id`, so the authorization
     /// endpoint's exact-string redirect match (issue #13) accepts it.
     pub async fn register_default_redirect(&self, client_id: &ClientId) {

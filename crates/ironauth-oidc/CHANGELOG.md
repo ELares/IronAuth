@@ -6,6 +6,35 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- RP-Initiated Logout: the `end_session` endpoint (OIDC RP-Initiated Logout 1.0, issue
+  #33). A top-level browser navigation that ends the OP session and, only when it is
+  cryptographically attributable, redirects back to the relying party.
+  - **The endpoint (`logout.rs`), GET and POST at `/end_session`.** Accepts ONLY the
+    spec parameters (`id_token_hint`, `client_id`, `logout_hint`, `state`, `ui_locales`,
+    `post_logout_redirect_uri`); nothing proprietary (no Cognito-style `logout_uri`).
+    Advertised in discovery as `end_session_endpoint`.
+  - **Hint verification through the JOSE core.** The `id_token_hint` is verified by the
+    new `OidcState::verify_logout_hint` against the environment's own published keys
+    (rotated-out verification keys retained), accepting a PAST `exp` (the new
+    `VerificationPolicy::allow_expired`, mandated by the spec for a stale hint) while
+    still enforcing the signature, algorithm allowlist, exact issuer, exact audience,
+    `nbf`, and `iat`. The scope is recovered from the client the `aud` names; a foreign
+    or unverifiable hint does NOT attribute the request.
+  - **Synchronous termination (the hydra#4070 race).** An attributed logout ends the SSO
+    session via `ActingSessionRepo::revoke` (cause `LoggedOut`, `hard_kill = false`)
+    BEFORE the response, so the immediate-revocation read guard refuses it on the very
+    next request; `offline_access` families survive. The terminal `SessionLifecycleEvent`
+    fires on the revocation sink for the #35/#34 fan-out. The session cookie is cleared
+    (`Max-Age=0`).
+  - **Exact-match redirect, or none.** `post_logout_redirect_uri` is honored only on an
+    EXACT string match against the client's registered set AND with a verifiable hint
+    (RFC 9700 section 2.1: no wildcards, normalization, or case folding); `state`
+    round-trips only then. A near miss, an unregistered value, or an unattributable
+    request renders a neutral logged-out page, never an open redirect.
+  - **CSRF: confirm an unattributable logout.** Without a verifiable hint a GET renders a
+    confirmation prompt and changes nothing; the confirm POST ends the session behind the
+    `same_origin_ok` check (issue #196). New `pages::logout_confirm_page` /
+    `pages::logged_out_page`; `LogoutParams` is exported.
 - The session model on the OIDC surface (issue #32).
   - **`sid` in EVERY flow's ID token (not just the code flow).** The token endpoint
     resolves the per-(client, session) `sid` from the code's authenticating SSO session

@@ -381,6 +381,17 @@ required-features = ["testing"]
 name = "sessions"
 path = "tests/sessions.rs"
 required-features = ["testing"]
+# RP-Initiated Logout (OIDC RP-Initiated Logout 1.0, issue #33): the LIVE end_session
+# endpoint over a real database. A verifiable id_token_hint ends the SSO session
+# synchronously (the hydra#4070 race), clears the cookie, and redirects ONLY on an exact
+# registered post_logout_redirect_uri match (echoing state); an expired hint still
+# targets; a near-miss or unregistered uri never redirects; an unverifiable or absent
+# hint confirms first (CSRF), with the confirm POST behind the same-origin check;
+# offline_access families survive; a foreign tenant's session is untouched.
+[[test]]
+name = "logout"
+path = "tests/logout.rs"
+required-features = ["testing"]
 # RFC 9700 (OAuth 2.0 Security BCP) as executable CI conformance invariants (issue
 # #38): one named test per applicable checklist item driving the LIVE endpoints, plus
 # an in-binary mutation harness proving every shared checker predicate rejects the

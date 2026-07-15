@@ -125,6 +125,12 @@ pub enum Action {
     ClientDelete,
     /// A client's registered redirect URIs were set (issue #13).
     ClientRedirectUrisRegister,
+    /// A client's registered POST-LOGOUT redirect URIs were set (issue #33): the
+    /// exact-match set the RP-Initiated Logout `end_session` endpoint honors a
+    /// `post_logout_redirect_uri` against. Distinct from
+    /// [`Action::ClientRedirectUrisRegister`] so the two registered sets are legible
+    /// apart in the audit trail.
+    ClientPostLogoutRedirectUrisRegister,
     /// A client's consent mode and refresh-rotation policy were configured (issue
     /// #21): the consent mode, the skip and no-store consent knobs, and the optional
     /// per-client rotation override.
@@ -305,6 +311,9 @@ impl Action {
             Action::ClientCreate => "client.create",
             Action::ClientDelete => "client.delete",
             Action::ClientRedirectUrisRegister => "client.redirect_uris.register",
+            Action::ClientPostLogoutRedirectUrisRegister => {
+                "client.post_logout_redirect_uris.register"
+            }
             Action::ClientConfigure => "client.configure",
             Action::ClientRegistered => "client.registered",
             Action::ClientUpdated => "client.updated",
