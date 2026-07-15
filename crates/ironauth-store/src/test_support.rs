@@ -29,6 +29,7 @@
 
 use ironauth_env::Env;
 use sqlx::PgPool;
+use sqlx::postgres::PgPoolOptions;
 
 use crate::audit::ActorRef;
 use crate::id::{EnvironmentId, HumanId, OperatorId, TenantId};
@@ -154,6 +155,28 @@ impl TestDatabase {
     #[must_use]
     pub fn store(&self) -> &Store {
         &self.store
+    }
+
+    /// A data-plane [`Store`] over a FRESH pool sized for a concurrency storm.
+    ///
+    /// The default per-run pool (10 connections) would serialize a many-way storm of
+    /// concurrent writers and blunt the very race the concurrency tests exist to catch,
+    /// so those tests build a WIDER pool (still well under the server's connection cap)
+    /// and share it: the pool is `Arc`-backed, so cloning the returned [`Store`] into
+    /// each spawned task hands out connections from the SAME bounded set rather than
+    /// opening a new pool per task. Authenticates as the same low-privilege app role as
+    /// [`TestDatabase::store`], so forced row-level security still applies.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the wider pool cannot be established.
+    pub async fn app_store_with_pool(&self, max_connections: u32) -> Store {
+        let pool = PgPoolOptions::new()
+            .max_connections(max_connections)
+            .connect(&self.app_url)
+            .await
+            .expect("build a wider data-plane pool for the concurrency storm");
+        Store::from_pool(pool)
     }
 
     /// The store bound to the low-privilege control-plane role (issue #11).

@@ -839,3 +839,117 @@ async fn only_the_digest_is_stored_never_the_plaintext_refresh_token() {
         assert_ne!(value.as_deref(), Some(token.as_str()));
     }
 }
+
+/// PART 2 of issue #32 (defence in depth): a SESSION-BOUND refresh token must NEVER
+/// mint after its bound session dies, even if a family were somehow left orphaned by a
+/// missed revoke cascade. PART 1 makes that orphan unreachable through the open path;
+/// this test manufactures it directly to prove redeem refuses it independently.
+///
+/// The manufactured state is exactly what a missed concurrent cascade leaves: the
+/// SESSION is killed (as `revoke_session_in_tx`'s `UPDATE sessions` does) WITHOUT
+/// touching the family, so the family stays live (`revoked_at IS NULL`) bound to a dead
+/// session. Redeeming its token must be `invalid_grant`, not a fresh rotation.
+#[tokio::test]
+async fn redeem_refuses_a_session_bound_token_once_its_session_dies_even_off_an_orphan() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let subject = "usr_orphan";
+    let session = create_session(&db, &env, scope, subject).await;
+    let grant = seed_grant(&db, &env, scope, subject, Some(&session)).await;
+    let (_family, t0, _jti, _digest) = open_family(
+        &db,
+        &env,
+        scope,
+        &grant,
+        subject,
+        false,
+        FAR_FUTURE_MICROS,
+        FAR_FUTURE_MICROS,
+    )
+    .await;
+
+    // Kill ONLY the session, deliberately skipping the family cascade, to forge the
+    // orphan a missed concurrent cascade would leave.
+    sqlx::query(
+        "UPDATE sessions SET revoked_at = now(), ended_at = now(), \
+         end_cause = 'revoked', revoke_reason = 'revoked' \
+         WHERE id = $1 AND tenant_id = $2 AND environment_id = $3",
+    )
+    .bind(session.to_string())
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .execute(db.owner_pool())
+    .await
+    .expect("kill only the session, not its family");
+
+    // The orphan really exists: the family is still live while its session is dead.
+    let family_live: bool = sqlx::query(
+        "SELECT revoked_at IS NULL AS c FROM refresh_families \
+         WHERE session_ref = $1 AND tenant_id = $2 AND environment_id = $3",
+    )
+    .bind(session.to_string())
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .fetch_one(db.owner_pool())
+    .await
+    .expect("read family state")
+    .get("c");
+    assert!(
+        family_live,
+        "the manufactured orphan family must be live (cascade deliberately skipped)"
+    );
+
+    let (outcome, _succ) = redeem(&db, &env, scope, &t0, true, Duration::from_secs(10)).await;
+    assert_eq!(
+        outcome,
+        RefreshRedeemOutcome::Invalid,
+        "PART 2: a session-bound token never mints after its session dies, \
+         even off a missed-cascade orphan"
+    );
+}
+
+/// PART 2 must NOT break `offline_access`: an offline family deliberately SURVIVES its
+/// session's logout (issue #21). The redeem-time session re-check is gated on
+/// `offline = false`, so an offline token still rotates after its session dies.
+#[tokio::test]
+async fn redeem_still_rotates_an_offline_family_after_its_session_dies() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let subject = "usr_offline";
+    let session = create_session(&db, &env, scope, subject).await;
+    let grant = seed_grant(&db, &env, scope, subject, Some(&session)).await;
+    let (_family, t0, _jti, _digest) = open_family(
+        &db,
+        &env,
+        scope,
+        &grant,
+        subject,
+        true,
+        FAR_FUTURE_MICROS,
+        FAR_FUTURE_MICROS,
+    )
+    .await;
+
+    // Kill the session (an ordinary logout). The offline family is intentionally left
+    // untouched, as the #21 cascade leaves it.
+    sqlx::query(
+        "UPDATE sessions SET revoked_at = now(), ended_at = now(), \
+         end_cause = 'revoked', revoke_reason = 'revoked' \
+         WHERE id = $1 AND tenant_id = $2 AND environment_id = $3",
+    )
+    .bind(session.to_string())
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .execute(db.owner_pool())
+    .await
+    .expect("log the session out");
+
+    let (outcome, _succ) = redeem(&db, &env, scope, &t0, true, Duration::from_secs(10)).await;
+    assert_eq!(
+        outcome,
+        RefreshRedeemOutcome::Rotated,
+        "an offline_access token survives its session's logout and still rotates (issue #21)"
+    );
+}

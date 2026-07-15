@@ -6261,6 +6261,21 @@ impl ActingRefreshRepo<'_> {
         // generation-0 token, and the issue audit share ONE transaction, and a
         // refused open writes NONE of them.
         let mut tx = begin_scoped(self.store, scope).await?;
+        // PART 1 (issue #32): serialize a SESSION-BOUND open against a CONCURRENT
+        // session revoke with an explicit row lock on the bound session, taken in THIS
+        // transaction BEFORE the family row is written (see lock_bound_session_live for
+        // the full ordering argument). The single-statement EXISTS guard below closes
+        // only the fully-SEQUENTIAL window; the FOR UPDATE lock is what closes the
+        // concurrent race. An offline family (survives logout per issue #21) and a grant
+        // with no session are NOT session-bound and are neither locked nor gated.
+        if !family.offline
+            && !lock_bound_session_live(&mut tx, scope, family.grant_id, now_micros).await?
+        {
+            // The bound session is not (or no longer) live: open nothing, write no
+            // token and no issue audit, and report the refusal.
+            tx.commit().await?;
+            return Ok(RefreshFamilyOpenOutcome::SessionNotLive);
+        }
         // Open the family reading the grant's session_ref in the SAME statement, and
         // for a SESSION-BOUND (non-offline) family ONLY when that session is still
         // live. This closes the check-then-act window between the token endpoint's
@@ -6402,7 +6417,16 @@ impl ActingRefreshRepo<'_> {
              (EXTRACT(EPOCH FROM rt.rotated_at) * 1000000)::bigint AS rotated_us, \
              (EXTRACT(EPOCH FROM rt.idle_expires_at) * 1000000)::bigint AS idle_us, \
              (EXTRACT(EPOCH FROM f.absolute_expires_at) * 1000000)::bigint AS abs_us, \
-             (f.revoked_at IS NULL) AS family_live, (g.revoked_at IS NULL) AS grant_live \
+             (f.revoked_at IS NULL) AS family_live, (g.revoked_at IS NULL) AS grant_live, \
+             (f.offline OR f.session_ref IS NULL OR EXISTS ( \
+                 SELECT 1 FROM sessions s \
+                 WHERE s.id = f.session_ref AND s.tenant_id = f.tenant_id \
+                 AND s.environment_id = f.environment_id \
+                 AND s.revoked_at IS NULL AND s.ended_at IS NULL AND s.superseded_by IS NULL \
+                 AND COALESCE(s.absolute_expires_at, s.expires_at) > \
+                     TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval \
+                 AND (s.idle_expires_at IS NULL OR s.idle_expires_at > \
+                      TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval))) AS session_live \
              FROM refresh_tokens rt \
              JOIN refresh_families f ON f.id = rt.family_id \
              AND f.tenant_id = rt.tenant_id AND f.environment_id = rt.environment_id \
@@ -6413,6 +6437,7 @@ impl ActingRefreshRepo<'_> {
         .bind(&digest)
         .bind(scope.tenant().to_string())
         .bind(scope.environment().to_string())
+        .bind(now_micros)
         .fetch_optional(&mut *tx)
         .await?
         else {
@@ -6428,6 +6453,19 @@ impl ActingRefreshRepo<'_> {
         // grant revoke) makes the token inactive: invalid_grant, and NO reuse event
         // (the event, if any, was already emitted when the family was revoked).
         if !row.get::<bool, _>("family_live") || !row.get::<bool, _>("grant_live") {
+            tx.commit().await?;
+            return Ok(RefreshRedeemOutcome::Invalid);
+        }
+        // PART 2 (issue #32, defence in depth): a SESSION-BOUND (non-offline) family
+        // re-validates its bound session is still live here, under the SAME predicate
+        // the open used. This guarantees the property we actually want -- a
+        // session-bound refresh token never mints after its session dies -- directly at
+        // the redeem, independent of whether any revoke cascade ever reached the family.
+        // Even if a family were somehow left orphaned (a missed cascade), a redeem
+        // against a dead session is invalid_grant, not a fresh mint. offline_access
+        // (survives logout, issue #21) and a grant with no session are session_live by
+        // construction, so RP-logout offline redemption is unaffected.
+        if !row.get::<bool, _>("session_live") {
             tx.commit().await?;
             return Ok(RefreshRedeemOutcome::Invalid);
         }
@@ -7717,6 +7755,75 @@ struct PriorReconcile<'a> {
     subject: &'a str,
     /// The rotation instant, in epoch microseconds.
     now_micros: i64,
+}
+
+/// Lock a SESSION-BOUND family's bound session LIVE inside `tx`, to serialize a
+/// concurrent refresh-family open against a session revoke (issue #32).
+///
+/// Reads the grant's `session_ref`; for a session-bound grant it takes SELECT ... FOR
+/// UPDATE on that session under the SAME live predicate the auth read path and the
+/// family-open INSERT guard apply, and reports whether the session is live under that
+/// lock. The caller opens the family only when this returns `true`; on `false` it must
+/// refuse with [`RefreshFamilyOpenOutcome::SessionNotLive`], writing nothing.
+///
+/// Why the lock, not just the INSERT's EXISTS guard: [`begin_scoped`] pins READ
+/// COMMITTED, and that EXISTS takes NO lock, so under true concurrency the open's
+/// snapshot can still see a session a concurrent revoke is mid-flight on and insert the
+/// family, while the revoke's cascade `UPDATE refresh_families` cannot see the open's
+/// still-uncommitted family row and misses it. Both commit and a family is left bound
+/// to a now-dead session with its own `revoked_at` NULL, which redeem would then mint
+/// fresh tokens off after logout. The FOR UPDATE (exactly as
+/// [`reconcile_prior_session_at_rotation`] does, and against the SAME
+/// `revoke_session_in_tx` `UPDATE sessions`, which locks the row) forces one of two
+/// safe orderings: (a) this open locks first, the revoke blocks until the open commits,
+/// and the cascade THEN sees and revokes the just-opened family; or (b) the revoke
+/// locks and commits first, this FOR UPDATE re-reads the latest row under READ
+/// COMMITTED (`EvalPlanQual`), the live predicate now fails, zero rows, and the open
+/// refuses. A grant with no session (`session_ref` NULL) is not session-bound and is
+/// not locked; the caller skips an offline family entirely (it survives logout, #21).
+async fn lock_bound_session_live(
+    tx: &mut Transaction<'_, Postgres>,
+    scope: Scope,
+    grant_id: &GrantId,
+    now_micros: i64,
+) -> Result<bool, StoreError> {
+    let tenant = scope.tenant().to_string();
+    let environment = scope.environment().to_string();
+    let Some(grant_row) = sqlx::query(
+        "SELECT session_ref FROM grants \
+         WHERE id = $1 AND tenant_id = $2 AND environment_id = $3",
+    )
+    .bind(grant_id.to_string())
+    .bind(&tenant)
+    .bind(&environment)
+    .fetch_optional(&mut **tx)
+    .await?
+    else {
+        // The grant vanished; the INSERT ... SELECT guard finds nothing and refuses.
+        return Ok(true);
+    };
+    let session_ref: Option<String> = grant_row.get("session_ref");
+    let Some(session_ref) = session_ref else {
+        // Not session-bound: open unconditionally.
+        return Ok(true);
+    };
+    let locked = sqlx::query(
+        "SELECT 1 FROM sessions \
+         WHERE id = $1 AND tenant_id = $2 AND environment_id = $3 \
+         AND revoked_at IS NULL AND ended_at IS NULL AND superseded_by IS NULL \
+         AND COALESCE(absolute_expires_at, expires_at) > \
+             TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval \
+         AND (idle_expires_at IS NULL OR idle_expires_at > \
+              TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval) \
+         FOR UPDATE",
+    )
+    .bind(&session_ref)
+    .bind(&tenant)
+    .bind(&environment)
+    .bind(now_micros)
+    .fetch_optional(&mut **tx)
+    .await?;
+    Ok(locked.is_some())
 }
 
 /// Reconcile the PRIOR session at a rotation, inside the open rotation transaction

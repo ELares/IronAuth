@@ -22,8 +22,8 @@ use ironauth_env::Env;
 use ironauth_store::test_support::TestDatabase;
 use ironauth_store::{
     AuthorizationCodeId, ClientId, CorrelationId, GrantId, IssueCode, NewRefreshFamily, NewSession,
-    RefreshFamilyId, RefreshTokenId, Scope, SessionEndCause, SessionFleetFilter, SessionId,
-    StoreError, UserId, refresh_token_digest,
+    RefreshFamilyId, RefreshFamilyOpenOutcome, RefreshTokenId, Scope, SessionEndCause,
+    SessionFleetFilter, SessionId, StoreError, UserId, refresh_token_digest,
 };
 use sqlx::Row;
 
@@ -1105,5 +1105,176 @@ async fn a_slide_never_resurrects_a_revoked_session() {
         idle_after,
         Some(idle_ttl),
         "a revoked session's idle window must never be pushed forward by a resolve"
+    );
+}
+
+/// Count families that are the exact orphan the fix forbids: a SESSION-BOUND
+/// (non-offline) family whose OWN `revoked_at` is still NULL while the session it is
+/// bound to is dead (revoked, ended, or superseded). After a session revoke has
+/// completed this MUST be zero: every session-bound family for that session is either
+/// revoked with it (the open won the race, the cascade then reached it) or was never
+/// opened at all (the open lost the race and refused with `SessionNotLive`). A non-zero
+/// count is a redeemable refresh family that outlived its logout.
+async fn orphaned_live_families(db: &TestDatabase, scope: Scope) -> i64 {
+    sqlx::query(
+        "SELECT count(*) AS c FROM refresh_families f \
+         JOIN sessions s ON s.id = f.session_ref \
+         AND s.tenant_id = f.tenant_id AND s.environment_id = f.environment_id \
+         WHERE f.tenant_id = $1 AND f.environment_id = $2 \
+         AND f.offline = false AND f.revoked_at IS NULL \
+         AND (s.revoked_at IS NOT NULL OR s.ended_at IS NOT NULL \
+              OR s.superseded_by IS NOT NULL)",
+    )
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .fetch_one(db.owner_pool())
+    .await
+    .expect("count orphaned live families")
+    .get("c")
+}
+
+/// The heart of issue #32: under TRUE concurrency, a storm of session-bound family
+/// opens racing one session revoke must never leave a live family bound to a dead
+/// session. This is the reviewer's storm distilled to an invariant, run against real
+/// Postgres over many rounds so a regression shows.
+///
+/// Each round seeds one live session and `OPENS` session-bound grants, then fires all
+/// `OPENS` family opens PLUS one revoke of that session concurrently, on a pool wide
+/// enough that they genuinely overlap (the default 10-connection pool would serialize
+/// them and hide the race). After the dust settles the invariant is asserted: ZERO
+/// orphaned live families for that revoked session. The FOR UPDATE row lock the open
+/// takes on the bound session (PART 1) is what forces every open to serialize against
+/// the revoke's `UPDATE sessions`, so an open either commits before the revoke (its
+/// family is then reached by the cascade) or re-reads the dead session and refuses.
+///
+/// The EXISTS-only guard the previous fix shipped passes the sequential tests but
+/// FAILS this one: removing/weakening the FOR UPDATE lets an open's snapshot see the
+/// session live and insert a family the concurrent revoke's cascade cannot yet see,
+/// leaving orphans (the reviewer measured 237 across 30 rounds that way).
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[allow(clippy::too_many_lines)]
+async fn a_storm_of_session_bound_opens_never_orphans_a_family_onto_a_revoked_session() {
+    // >= 24 concurrent opens vs 1 concurrent revoke (the reviewer's storm width), over
+    // >= 20 rounds (enough that a regression accumulates visible orphans).
+    const OPENS: usize = 24;
+    const ROUNDS: usize = 20;
+
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let subject = UserId::generate(&env, &scope).to_string();
+
+    // One shared, wide pool so the storm actually overlaps; comfortably under the
+    // server's default 100-connection cap even with the revoke contending.
+    let store = db.app_store_with_pool(40).await;
+
+    let mut total_opened: i64 = 0;
+    for round in 0..ROUNDS {
+        let session = create_session(&db, &env, scope, &subject, None).await;
+        // One session-bound grant per concurrent opener (a family roots at a grant).
+        let mut grants = Vec::with_capacity(OPENS);
+        for _ in 0..OPENS {
+            grants.push(seed_grant(&db, &env, scope, &subject, &session).await);
+        }
+
+        let mut tasks = tokio::task::JoinSet::new();
+        for grant in grants {
+            let store = store.clone();
+            let db = db.clone();
+            let subject = subject.clone();
+            tasks.spawn(async move {
+                let env = Env::system();
+                let family_id = RefreshFamilyId::generate(&env, &scope);
+                let jti = RefreshTokenId::generate(&env, &scope);
+                let digest = refresh_token_digest(&format!("ira_rt_{jti}~storm"));
+                store
+                    .scoped(scope)
+                    .acting(db.test_actor(&env), CorrelationId::generate(&env))
+                    .refresh()
+                    .issue(
+                        &env,
+                        NewRefreshFamily {
+                            family_id: &family_id,
+                            token_jti: &jti,
+                            token_digest: &digest,
+                            grant_id: &grant,
+                            subject: &subject,
+                            client_id: "cli_storm",
+                            scope: Some("openid"),
+                            auth_methods: "pwd",
+                            offline: false,
+                            created_at_unix_micros: 0,
+                            idle_expires_at_unix_micros: FAR_FUTURE_MICROS,
+                            absolute_expires_at_unix_micros: FAR_FUTURE_MICROS,
+                        },
+                    )
+                    .await
+                    .expect("open family in the storm")
+            });
+        }
+        // The lone revoke, fired into the same overlap window as the opens.
+        {
+            let store = store.clone();
+            let db = db.clone();
+            tasks.spawn(async move {
+                let env = Env::system();
+                store
+                    .scoped(scope)
+                    .acting(db.test_actor(&env), CorrelationId::generate(&env))
+                    .sessions()
+                    .revoke(&env, &session, SessionEndCause::Revoked, false, None)
+                    .await
+                    .expect("revoke the session mid-storm");
+                RefreshFamilyOpenOutcome::Opened
+            });
+        }
+        while let Some(joined) = tasks.join_next().await {
+            joined.expect("a storm task panicked");
+        }
+
+        // The session really is dead now, so the invariant is meaningful.
+        let revoked: bool = sqlx::query(
+            "SELECT revoked_at IS NOT NULL AS r FROM sessions \
+             WHERE id = $1 AND tenant_id = $2 AND environment_id = $3",
+        )
+        .bind(session.to_string())
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .fetch_one(db.owner_pool())
+        .await
+        .expect("read session state")
+        .get("r");
+        assert!(
+            revoked,
+            "round {round}: the storm's revoke must have landed"
+        );
+
+        // THE INVARIANT: no live session-bound family survives the revoked session.
+        assert_eq!(
+            orphaned_live_families(&db, scope).await,
+            0,
+            "round {round}: a session-bound family outlived its revoked session",
+        );
+
+        total_opened += sqlx::query(
+            "SELECT count(*) AS c FROM refresh_families \
+             WHERE session_ref = $1 AND tenant_id = $2 AND environment_id = $3",
+        )
+        .bind(session.to_string())
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .fetch_one(db.owner_pool())
+        .await
+        .expect("count families opened this round")
+        .get::<i64, _>("c");
+    }
+
+    // Guard against a silent no-op: across the whole run the storm must have actually
+    // WON some opens (families that raced ahead of the revoke and were then cascaded),
+    // otherwise every open merely lost and the invariant would hold vacuously.
+    assert!(
+        total_opened > 0,
+        "the storm never opened a single family across {ROUNDS} rounds -- \
+         the test is not exercising the race it claims to",
     );
 }
