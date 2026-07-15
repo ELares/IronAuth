@@ -7273,10 +7273,12 @@ impl SessionRepo<'_> {
         // A pre-#32 row (no idle window) and a non-positive configured window never
         // slide.
         let idle_us: Option<i64> = row.get("idle_us");
-        if let Some(idle_us) = idle_us
-            && idle_ttl_micros > 0
-            && idle_us.saturating_sub(now_micros) < idle_ttl_micros / 2
-        {
+        // A let chain (if let ... && cond) would raise the MSRV above 1.85 (let chains
+        // stabilized in 1.88), so the boolean guards stay nested inside the if let.
+        let should_slide = matches!(idle_us, Some(idle_us)
+            if idle_ttl_micros > 0
+                && idle_us.saturating_sub(now_micros) < idle_ttl_micros / 2);
+        if should_slide {
             sqlx::query(
                 "UPDATE sessions \
                  SET idle_expires_at = TIMESTAMPTZ 'epoch' \
