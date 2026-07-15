@@ -87,6 +87,7 @@ mod global_revocation;
 mod hints;
 mod interaction;
 mod introspection;
+mod invitations;
 mod issuer;
 mod jwks;
 mod jwt_bearer;
@@ -279,6 +280,17 @@ pub fn oidc_router(state: OidcState) -> Router {
         .route(
             "/t/{tenant_id}/e/{environment_id}/account/password",
             post(account::change_password),
+        )
+        // The public invitation-accept endpoint (issue #60): the invitee side of the
+        // admin-initiated invitation flow. Scope-routed under the per-environment path
+        // so the redeem runs under the right row-level-security scope, and
+        // authenticated by the single-use TOKEN in the body (never a session cookie,
+        // never an admin credential). Accepting atomically consumes the invitation and
+        // activates the pending_verification user (pending_verification -> active),
+        // enrolling the credential; every non-resolving token is the uniform not-found.
+        .route(
+            "/t/{tenant_id}/e/{environment_id}/invitations/accept",
+            post(invitations::accept_invitation),
         );
 
     // Dynamic Client Registration (issue #30, RFC 7591 + RFC 7592), mounted ONLY

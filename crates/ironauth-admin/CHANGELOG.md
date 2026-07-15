@@ -6,6 +6,14 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- User invitation management API (issue #60): the admin side of the invitation
+  flow, on the M1 API discipline (OpenAPI source of truth, cursor pagination,
+  `Idempotency-Key` on POST, audit-on-mutation, uniform cross-tenant not-found).
+  Create an invitation (provisions a `pending_verification` user through the #52
+  path, mints the single-use token, seals the invited identifier), list and inspect
+  invitations, revoke a pending one, and resend (rotate the token digest and
+  expiry). The plaintext token is returned to the caller exactly once, at create and
+  resend, and is never persisted or re-readable.
 - Foreign password import follow-through (issue #55): the admin user create path
   passes the new `NewAdminUser` foreign-hash fields as `None` (the management create
   surface sets no imported credential; the streaming bulk import path in

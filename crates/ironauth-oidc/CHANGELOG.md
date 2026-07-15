@@ -6,6 +6,18 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Public invitation-accept endpoint (issue #60):
+  `POST /t/{tenant}/e/{environment}/invitations/accept` on the public data plane
+  (never the management port), scope-routed so the redeem runs under the right RLS
+  scope. Authenticated by the single-use token alone (no session, no admin
+  credential): the token is hashed and resolved by digest, then consumed atomically
+  while the invited user is activated (`pending_verification -> active`) in the same
+  transaction, so a concurrent double-accept redeems at most once. A `password`
+  invitation enrolls an Argon2id verifier through the #20 path; a `passkey`
+  invitation provisions none. Forged, expired, redeemed, revoked, and cross-scope
+  tokens all collapse to one uniform not-found, so the endpoint is never a
+  token-guessing oracle. No CSRF gate: it carries no ambient authority, so there is
+  no cookie for a cross-site submit to ride.
 - Foreign-hash login with verify-then-rehash (issue #55): the interactive login now
   verifies an imported FOREIGN password hash (bcrypt, scrypt, PBKDF2, the Argon2
   family, or Firebase modified scrypt) when the native Argon2id verifier is the

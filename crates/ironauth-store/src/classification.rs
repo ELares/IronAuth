@@ -137,13 +137,16 @@ pub enum ResourceType {
     /// An enrolled self-service account credential (a passkey, TOTP authenticator,
     /// or recovery-code set; issue #61).
     AccountCredential,
+    /// A pending user invitation (issue #60): the single-use, expiring token that
+    /// provisions and activates an invited user.
+    Invitation,
 }
 
 impl ResourceType {
     /// Every resource type, in a stable order. The classification lint and the
     /// metadata endpoint both iterate this; a variant missing here is caught by
     /// the `all_lists_every_variant` test and by `scripts/classification-lint.sh`.
-    pub const ALL: [ResourceType; 15] = [
+    pub const ALL: [ResourceType; 16] = [
         ResourceType::Operator,
         ResourceType::Tenant,
         ResourceType::Environment,
@@ -159,6 +162,7 @@ impl ResourceType {
         ResourceType::User,
         ResourceType::Session,
         ResourceType::AccountCredential,
+        ResourceType::Invitation,
     ];
 
     /// The stable wire name of this resource type (for example `organization`).
@@ -180,6 +184,7 @@ impl ResourceType {
             ResourceType::User => "user",
             ResourceType::Session => "session",
             ResourceType::AccountCredential => "account_credential",
+            ResourceType::Invitation => "invitation",
         }
     }
 
@@ -202,7 +207,8 @@ impl ResourceType {
             | ResourceType::EnvironmentSecret
             | ResourceType::User
             | ResourceType::Session
-            | ResourceType::AccountCredential => ResourceLevel::Environment,
+            | ResourceType::AccountCredential
+            | ResourceType::Invitation => ResourceLevel::Environment,
         }
     }
 
@@ -255,7 +261,8 @@ pub fn classify(resource: ResourceType) -> ResourceClassification {
         | ResourceType::Organization
         | ResourceType::User
         | ResourceType::Session
-        | ResourceType::AccountCredential => Runtime,
+        | ResourceType::AccountCredential
+        | ResourceType::Invitation => Runtime,
     }
 }
 

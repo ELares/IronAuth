@@ -248,7 +248,7 @@ async fn expand_contract_example_chain_runs_all_three_phases_and_contract_remove
 // per real table); splitting it would not make it clearer.
 #[allow(clippy::too_many_lines)]
 #[tokio::test]
-async fn production_chain_is_only_the_thirty_nine_real_migrations_and_ships_no_demo_object() {
+async fn production_chain_is_only_the_forty_real_migrations_and_ships_no_demo_object() {
     // TestDatabase::start runs Store::migrate() (the production chain) on a
     // fresh, empty database.
     let db = TestDatabase::start().await;
@@ -265,8 +265,8 @@ async fn production_chain_is_only_the_thirty_nine_real_migrations_and_ships_no_d
     );
     assert_eq!(
         report.already_applied(),
-        39,
-        "the production chain is exactly thirty-nine migrations (isolation, audit log, management \
+        40,
+        "the production chain is exactly forty migrations (isolation, audit log, management \
          API, OIDC authorization, signing keys, login/consent, authentication context, redirect \
          registration, UserInfo claims, consent scope upsert, resource servers, opaque access \
          tokens, client auth suite, dynamic client registration, pushed authorization requests, \
@@ -276,7 +276,7 @@ async fn production_chain_is_only_the_thirty_nine_real_migrations_and_ships_no_d
          APIs, envelope encryption, environment guardrails, tenant lifecycle, BYOK bindings, \
          snapshot export, custom domains, environment secrets and variables, config promotion, \
          self-service account, admin user lifecycle, identity traits, foreign password \
-         import)"
+         import, user invitations)"
     );
 
     // The ledger holds exactly versions 1 through 38.
@@ -284,7 +284,7 @@ async fn production_chain_is_only_the_thirty_nine_real_migrations_and_ships_no_d
         applied_versions(pool).await,
         vec![
             1_i64, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
-            24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39
+            24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40
         ]
     );
     let phase_of = |version: i64| async move {
@@ -422,6 +422,12 @@ async fn production_chain_is_only_the_thirty_nine_real_migrations_and_ships_no_d
     // UPDATE grant to the data and control roles so the verify-then-rehash login
     // landing can retire the foreign hash. All additive, so it is an expand too.
     assert_eq!(phase_of(39).await, "expand");
+    // The user-invitations migration (issue #60): one new user_invitations scoped
+    // table with its unique digest index, scope and identifier indexes, isolation
+    // policy, nonempty-scope / closed-credential-type / closed-state CHECKs, and
+    // column-scoped grants (control-plane SELECT/INSERT plus a lifecycle UPDATE,
+    // data-plane SELECT plus an accept UPDATE). All additive, so it is an expand too.
+    assert_eq!(phase_of(40).await, "expand");
 
     // The demo object never reaches a production database.
     assert!(
@@ -1258,6 +1264,60 @@ async fn production_chain_is_only_the_thirty_nine_real_migrations_and_ships_no_d
         assert!(
             column_exists(pool, "users", column).await,
             "users.{column} exists after 0039"
+        );
+    }
+
+    // The user-invitations table (issue #60): the pending invitation row with the
+    // user it provisions, the token digest (never the token), the sealed and
+    // blind-indexed invited identifier (user PII never lands on a plaintext column),
+    // the closed credential type and lifecycle state, the expiry, and the terminal
+    // timestamps.
+    assert!(
+        table_exists(pool, "user_invitations").await,
+        "user_invitations exists after 0040"
+    );
+    for column in [
+        "id",
+        "tenant_id",
+        "environment_id",
+        "user_id",
+        "token_digest",
+        "target_identifier_sealed",
+        "target_identifier_bidx",
+        "pii_dek_version",
+        "credential_type",
+        "state",
+        "org_context",
+        "expires_at",
+        "created_at",
+        "updated_at",
+        "accepted_at",
+        "revoked_at",
+    ] {
+        assert!(
+            column_exists(pool, "user_invitations", column).await,
+            "user_invitations.{column} exists after 0040"
+        );
+    }
+    // The digest-only invariant (issue #60, acceptance criterion 6): the
+    // user_invitations table stores only a digest of the token, never a plaintext
+    // token, so a database read cannot yield a redeemable link.
+    assert!(
+        column_exists(pool, "user_invitations", "token_digest").await,
+        "user_invitations stores a token digest"
+    );
+    for forbidden in ["token", "secret", "plaintext", "invite_token", "raw_token"] {
+        assert!(
+            !column_exists(pool, "user_invitations", forbidden).await,
+            "user_invitations must have no plaintext-token column ({forbidden})"
+        );
+    }
+    // The invited identifier is user PII, sealed and blind-indexed (issue #48): the
+    // plaintext identifier / email never lands on a column.
+    for forbidden in ["target_identifier", "identifier", "email"] {
+        assert!(
+            !column_exists(pool, "user_invitations", forbidden).await,
+            "user_invitations must have no plaintext identifier column ({forbidden})"
         );
     }
 }

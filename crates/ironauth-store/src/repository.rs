@@ -48,6 +48,8 @@
 use std::fmt;
 use std::time::{Duration, SystemTime};
 
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use ironauth_env::Env;
 use ironauth_jose::{Aad, BlindIndex, Dek, Kek, MasterKey, Sealed};
 use sqlx::postgres::PgRow;
@@ -65,10 +67,10 @@ use crate::id::{
     AcmeChallengeId, AssertionMappingId, AuditId, AuditTarget, AuthorizationCodeId,
     BackChannelDeliveryId, ClientId, ClientSessionId, ConsentId, CorrelationId, CredentialId,
     CustomDomainId, DcrPolicyId, DekId, DeviceCodeId, EncryptedSecretId, EnvironmentId,
-    EnvironmentSecretId, ExternalIssuerId, GrantId, InitialAccessTokenId, IssuedTokenId, KekId,
-    ManagementKeyId, OperatorId, OrganizationId, PushedRequestId, RefreshFamilyId, RefreshTokenId,
-    ResourceServerId, ServiceAccountId, SessionEventId, SessionId, SigningKeyId, TenantId,
-    TraitMigrationJobId, TraitSchemaId, UserId, VariableId,
+    EnvironmentSecretId, ExternalIssuerId, GrantId, InitialAccessTokenId, InvitationId,
+    IssuedTokenId, KekId, ManagementKeyId, OperatorId, OrganizationId, PushedRequestId,
+    RefreshFamilyId, RefreshTokenId, ResourceServerId, ServiceAccountId, SessionEventId, SessionId,
+    SigningKeyId, TenantId, TraitMigrationJobId, TraitSchemaId, UserId, VariableId,
 };
 use crate::scope::Scope;
 use crate::store::Store;
@@ -158,6 +160,18 @@ impl<'a> ScopedStore<'a> {
     #[must_use]
     pub fn users(&self) -> UserRepo<'a> {
         UserRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
+    /// The read-only invitation repository for this scope (issue #60): resolve a
+    /// presented invite token to its pending invitation (the accept path), and list /
+    /// inspect invitations as management resources. The mutating create/revoke/resend/
+    /// accept live on [`ActingStore::invitations`].
+    #[must_use]
+    pub fn invitations(&self) -> InvitationRepo<'a> {
+        InvitationRepo {
             store: self.store,
             scope: self.scope,
         }
@@ -552,6 +566,18 @@ impl<'a> ActingStore<'a> {
     #[must_use]
     pub fn users(&self) -> ActingUserRepo<'a> {
         ActingUserRepo {
+            store: self.store,
+            scope: self.scope,
+            acting: self.acting,
+        }
+    }
+
+    /// The mutating invitation repository for this scope and actor (issue #60):
+    /// create, revoke, and resend an invitation (management plane), and accept one
+    /// (data plane, token-authenticated), each audited.
+    #[must_use]
+    pub fn invitations(&self) -> ActingInvitationRepo<'a> {
+        ActingInvitationRepo {
             store: self.store,
             scope: self.scope,
             acting: self.acting,
@@ -11950,6 +11976,805 @@ impl ConsentRepo<'_> {
     }
 }
 
+// ===========================================================================
+// User invitations (issue #60).
+//
+// An admin invites a new identity: a pending_verification user is created through
+// the #52 audited management repo, and one `user_invitations` row carries the
+// single-use, expiring token that provisions it. The token is a scope-declaring
+// reference credential (`ira_inv_<inv-id>~<256-bit-secret>`, mirroring the #21
+// refresh token): ONLY its SHA-256 digest is stored, so a database dump yields
+// nothing replayable. Accepting consumes the invitation atomically (a guarded
+// pending -> accepted flip) AND activates the user (pending_verification ->
+// active) with a credential set, all in one transaction, so a token cannot be
+// redeemed twice and a concurrent double-accept redeems at most once. The invited
+// identifier is user PII, sealed under the scope's envelope DEK (issue #48).
+// ===========================================================================
+
+/// The closed set of primary-login credentials an invitation enrolls on accept
+/// (issue #60): a password (the #20 Argon2id path) or a passkey deep link (the
+/// Zitadel enrollment pattern; the flow contract ships here and the concrete passkey
+/// ceremony wires in with the M7 factor issues).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InvitationCredentialType {
+    /// A password: the invitee sets an Argon2id verifier on accept.
+    Password,
+    /// A passkey: the invitee enrolls a passkey (no password is ever provisioned).
+    Passkey,
+}
+
+impl InvitationCredentialType {
+    /// The stable wire string, matching the migration's `credential_type` CHECK.
+    #[must_use]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            InvitationCredentialType::Password => "password",
+            InvitationCredentialType::Passkey => "passkey",
+        }
+    }
+
+    /// Parse a wire credential kind, or [`None`] for any value outside the closed set.
+    #[must_use]
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "password" => Some(InvitationCredentialType::Password),
+            "passkey" => Some(InvitationCredentialType::Passkey),
+            _ => None,
+        }
+    }
+
+    /// Whether accepting this invitation REQUIRES a password to be provisioned. A
+    /// passkey invitation provisions none (the passkey ceremony enrolls the factor),
+    /// so a password-first onboarding is never forced on a passkey-first tenant.
+    #[must_use]
+    pub fn requires_password(&self) -> bool {
+        matches!(self, InvitationCredentialType::Password)
+    }
+}
+
+/// The invitation lifecycle state (issue #60): pending until it is redeemed
+/// (accepted) or invalidated (revoked). Both terminal states make the token
+/// unredeemable, so a used or revoked token is refused with the uniform not-found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InvitationState {
+    /// Awaiting redemption: the token can still be accepted (until it expires).
+    Pending,
+    /// Redeemed: the invitee accepted it and the user was activated. Terminal.
+    Accepted,
+    /// Revoked by an admin before acceptance. Terminal.
+    Revoked,
+}
+
+impl InvitationState {
+    /// The stable wire string, matching the migration's `state` CHECK.
+    #[must_use]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            InvitationState::Pending => "pending",
+            InvitationState::Accepted => "accepted",
+            InvitationState::Revoked => "revoked",
+        }
+    }
+
+    /// Reconstruct a state from its wire string; [`None`] for an unknown tag.
+    #[must_use]
+    pub fn from_wire(raw: &str) -> Option<Self> {
+        match raw {
+            "pending" => Some(InvitationState::Pending),
+            "accepted" => Some(InvitationState::Accepted),
+            "revoked" => Some(InvitationState::Revoked),
+            _ => None,
+        }
+    }
+}
+
+/// The SHA-256 hex digest of an invitation token (issue #60), the single-use lookup
+/// key stored in `user_invitations.token_digest`.
+///
+/// The one canonical digest for the format: [`mint_invitation_token`] hashes the
+/// whole `ira_inv_<inv-id>~<secret>` token with this to store it, and
+/// [`ActingInvitationRepo::accept`] hashes the presented token with this to look it
+/// up, so the two can never disagree. The plaintext token never reaches the
+/// database; only this one-way digest does, so a database dump yields nothing
+/// replayable.
+#[must_use]
+pub fn invitation_token_digest(token: &str) -> String {
+    sha256_hex(token)
+}
+
+/// The prefix of an invitation token wire form (issue #60), mirroring the #21
+/// refresh token (`ira_rt_`) and the #29 opaque access token.
+pub const INVITATION_TOKEN_PREFIX: &str = "ira_inv_";
+/// The delimiter between the routing handle and the secret in an invitation token.
+const INVITATION_TOKEN_DELIMITER: char = '~';
+/// The entropy width of an invitation token secret: 256 bits, drawn from the seam.
+const INVITATION_TOKEN_SECRET_BYTES: usize = 32;
+
+/// A freshly minted invitation token (issue #60): the plaintext handed to the caller
+/// for delivery (NEVER stored), the digest-only material the store records, and the
+/// `inv_` routing handle it is keyed by (which is also the invitation row id).
+pub struct MintedInvitationToken {
+    /// The `ira_inv_...` plaintext token, delivered to the invitee and never persisted.
+    pub token: String,
+    /// The SHA-256 hex digest of `token`, the only token material stored.
+    pub digest: String,
+    /// The invitation's `inv_` identifier (embedded in `token`, and the row id).
+    pub id: InvitationId,
+}
+
+/// Mint an invitation token under `scope` (issue #60): a fresh `inv_` routing handle,
+/// the [`INVITATION_TOKEN_PREFIX`], the delimiter, and 256 bits of entropy from the
+/// ironauth-env seam, exactly mirroring the refresh token. The whole-token SHA-256
+/// digest is what the store persists; a forged handle resolves to nothing (the digest
+/// binds the handle to the secret), and a database dump yields nothing replayable.
+#[must_use]
+pub fn mint_invitation_token(env: &Env, scope: &Scope) -> MintedInvitationToken {
+    mint_invitation_token_for(env, InvitationId::generate(env, scope))
+}
+
+/// Mint a FRESH invitation token for an EXISTING invitation `id` (issue #60): the
+/// resend path rotates a pending invitation's token without minting a new row, so
+/// the fresh token embeds the same `inv_` handle but carries 256 bits of new
+/// entropy (invalidating the prior token, whose digest the resend overwrites). The
+/// accept path resolves purely by the whole-token digest, so the embedded handle is
+/// a routing convenience, never the authenticator.
+#[must_use]
+pub fn mint_invitation_token_for(env: &Env, id: InvitationId) -> MintedInvitationToken {
+    let mut bytes = [0_u8; INVITATION_TOKEN_SECRET_BYTES];
+    env.entropy().fill_bytes(&mut bytes);
+    let token = format!(
+        "{INVITATION_TOKEN_PREFIX}{id}{INVITATION_TOKEN_DELIMITER}{}",
+        URL_SAFE_NO_PAD.encode(bytes)
+    );
+    let digest = invitation_token_digest(&token);
+    MintedInvitationToken { token, digest, id }
+}
+
+/// A user invitation as the management surface reports it (issue #60). It NEVER
+/// carries the token or its digest (the token is delivered once at create/resend and
+/// only its digest is ever stored). The invited identifier is decrypted from its
+/// sealed column for display. Every timestamp is microseconds since the Unix epoch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InvitationAdminRecord {
+    /// The invitation identifier (an `inv_` id embedding its scope).
+    pub id: InvitationId,
+    /// The `pending_verification` user (a `usr_` id) this invitation provisions.
+    pub user_id: UserId,
+    /// The invited identifier, decrypted from its sealed column for display.
+    pub target_identifier: String,
+    /// The primary-login credential the invitee enrolls on accept.
+    pub credential_type: InvitationCredentialType,
+    /// The lifecycle state.
+    pub state: InvitationState,
+    /// The opaque org handle M10 layers membership on, or [`None`].
+    pub org_context: Option<String>,
+    /// When the token expires (the accept refuses a stale invite past this).
+    pub expires_at_unix_micros: i64,
+    /// When the invitation was created (the pagination key).
+    pub created_at_unix_micros: i64,
+    /// The last-mutation instant.
+    pub updated_at_unix_micros: i64,
+    /// When the invitation was redeemed, present only in the accepted state.
+    pub accepted_at_unix_micros: Option<i64>,
+    /// When the invitation was revoked, present only in the revoked state.
+    pub revoked_at_unix_micros: Option<i64>,
+}
+
+/// The management-plane invitation list filter (issue #60): by lifecycle state.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct InvitationListFilter {
+    /// Only invitations in this state, or [`None`] for all.
+    pub state: Option<InvitationState>,
+}
+
+/// Everything an invitation create needs, bundled so the repository method stays
+/// within the readable-argument-count lint (issue #60).
+#[derive(Debug, Clone, Copy)]
+pub struct NewInvitation<'a> {
+    /// The invitation id (minted by [`mint_invitation_token`] alongside the token).
+    pub id: &'a InvitationId,
+    /// The `pending_verification` user this invitation provisions (created through the
+    /// #52 admin-create repo BEFORE this row is written).
+    pub user_id: &'a UserId,
+    /// The invited identifier (sealed and blind-indexed here; the plaintext never
+    /// lands on a column).
+    pub target_identifier: &'a str,
+    /// The SHA-256 hex digest of the whole token; the plaintext token is never stored.
+    pub token_digest: &'a str,
+    /// The primary-login credential the invitee enrolls on accept.
+    pub credential_type: InvitationCredentialType,
+    /// The opaque org handle M10 layers membership on, or [`None`].
+    pub org_context: Option<&'a str>,
+    /// The token expiry, in microseconds since the Unix epoch (the clock seam).
+    pub expires_at_unix_micros: i64,
+}
+
+/// A pending invitation resolved from a presented token (issue #60): enough for the
+/// accept surface to authorize the invitee (the user the invitation activates) and to
+/// validate the request against the credential type. Never carries the token digest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingInvitation {
+    /// The invitation identifier.
+    pub id: InvitationId,
+    /// The `pending_verification` user the invitation activates on accept.
+    pub user_id: UserId,
+    /// The primary-login credential the invitee enrolls.
+    pub credential_type: InvitationCredentialType,
+}
+
+/// The outcome of a successful invitation accept (issue #60): the redeemed
+/// invitation and the user it activated.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcceptedInvitation {
+    /// The redeemed invitation's identifier.
+    pub id: InvitationId,
+    /// The activated user's identifier.
+    pub user_id: UserId,
+    /// The primary-login credential the invitation enrolled.
+    pub credential_type: InvitationCredentialType,
+}
+
+/// Reconstruct an [`InvitationAdminRecord`] from a `user_invitations` row, opening the
+/// sealed invited identifier under the row's DEK version. Runs inside the caller's
+/// open transaction.
+async fn invitation_record_from_row(
+    tx: &mut Transaction<'_, Postgres>,
+    scope: Scope,
+    master: &MasterKey,
+    row: &PgRow,
+) -> Result<InvitationAdminRecord, StoreError> {
+    let id = InvitationId::parse_in_scope(&row.get::<String, _>("id"), &scope)?;
+    let user_id = UserId::parse_in_scope(&row.get::<String, _>("user_id"), &scope)?;
+    let credential_type = InvitationCredentialType::parse(&row.get::<String, _>("credential_type"))
+        .ok_or(StoreError::Encryption)?;
+    let state =
+        InvitationState::from_wire(&row.get::<String, _>("state")).ok_or(StoreError::Encryption)?;
+    let dek_version: i32 = row.get("pii_dek_version");
+    let sealed: Vec<u8> = row.get("target_identifier_sealed");
+    let dek = fetch_dek_by_version(tx, scope, master, dek_version).await?;
+    let plaintext = dek.open(
+        &invitation_identifier_seal_aad(scope, dek_version),
+        &Sealed::from_bytes(sealed)?,
+    )?;
+    let target_identifier = String::from_utf8(plaintext).map_err(|_| StoreError::Encryption)?;
+    Ok(InvitationAdminRecord {
+        id,
+        user_id,
+        target_identifier,
+        credential_type,
+        state,
+        org_context: row.get::<Option<String>, _>("org_context"),
+        expires_at_unix_micros: row.get("expires_us"),
+        created_at_unix_micros: row.get("created_us"),
+        updated_at_unix_micros: row.get("updated_us"),
+        accepted_at_unix_micros: row.get("accepted_us"),
+        revoked_at_unix_micros: row.get("revoked_us"),
+    })
+}
+
+/// The set of columns the management read and the record reconstruction select from
+/// `user_invitations` (the timestamps as epoch microseconds). One constant so the
+/// get and list projections cannot drift.
+const INVITATION_SELECT_COLUMNS: &str = "id, user_id, credential_type, state, org_context, \
+     target_identifier_sealed, pii_dek_version, \
+     (EXTRACT(EPOCH FROM expires_at) * 1000000)::bigint AS expires_us, \
+     (EXTRACT(EPOCH FROM created_at) * 1000000)::bigint AS created_us, \
+     (EXTRACT(EPOCH FROM updated_at) * 1000000)::bigint AS updated_us, \
+     (EXTRACT(EPOCH FROM accepted_at) * 1000000)::bigint AS accepted_us, \
+     (EXTRACT(EPOCH FROM revoked_at) * 1000000)::bigint AS revoked_us";
+
+/// The read-only invitation repository (issue #60): resolve a presented token to its
+/// pending invitation (the accept path), and list / inspect invitations as management
+/// resources. Every read is scope-fenced.
+pub struct InvitationRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl InvitationRepo<'_> {
+    /// Parse an untrusted invitation identifier under this scope. A malformed id and
+    /// one minted in another scope both return the uniform not-found.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the identifier is malformed or out of scope.
+    pub fn parse_id(&self, raw: &str) -> Result<InvitationId, StoreError> {
+        Ok(InvitationId::parse_in_scope(raw, &self.scope)?)
+    }
+
+    /// Fetch one invitation by id, within scope, for the management surface. An
+    /// invitation absent in this scope (including a cross-scope id) is the uniform
+    /// [`StoreError::NotFound`].
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if no such invitation is visible in this scope;
+    /// [`StoreError::Encryption`] if no master key is configured or the sealed
+    /// identifier cannot be opened; [`StoreError::Database`] on a persistence failure.
+    pub async fn get(&self, id: &InvitationId) -> Result<InvitationAdminRecord, StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let master = self.store.master().ok_or(StoreError::Encryption)?;
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(&format!(
+            "SELECT {INVITATION_SELECT_COLUMNS} FROM user_invitations \
+             WHERE id = $1 AND tenant_id = $2 AND environment_id = $3"
+        ))
+        .bind(id.to_string())
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(row) = row else {
+            tx.commit().await?;
+            return Err(StoreError::NotFound);
+        };
+        let record = invitation_record_from_row(&mut tx, self.scope, master, &row).await?;
+        tx.commit().await?;
+        Ok(record)
+    }
+
+    /// One page of invitations matching `filter`, ordered by `(created_at, id)`,
+    /// starting strictly after `after`.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Encryption`] if no master key is configured or a sealed
+    /// identifier cannot be opened; [`StoreError::Database`] on a persistence failure.
+    pub async fn list(
+        &self,
+        filter: InvitationListFilter,
+        limit: i64,
+        after: Option<&CursorPosition>,
+    ) -> Result<Vec<InvitationAdminRecord>, StoreError> {
+        let master = self.store.master().ok_or(StoreError::Encryption)?;
+        let (after_micros, after_id) = split_cursor(after);
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let rows = sqlx::query(&format!(
+            "SELECT {INVITATION_SELECT_COLUMNS} FROM user_invitations \
+             WHERE tenant_id = $1 AND environment_id = $2 \
+             AND ($5::text IS NULL OR state = $5) \
+             AND ($3::bigint IS NULL OR (created_at, id) > \
+                  (TIMESTAMPTZ 'epoch' + ($3::text || ' microseconds')::interval, $4::text)) \
+             ORDER BY created_at, id LIMIT $6"
+        ))
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(after_micros)
+        .bind(after_id)
+        .bind(filter.state.map(|s| s.as_str()))
+        .bind(limit.clamp(0, MANAGEMENT_LIST_HARD_CAP + 1))
+        .fetch_all(&mut *tx)
+        .await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in &rows {
+            out.push(invitation_record_from_row(&mut tx, self.scope, master, row).await?);
+        }
+        tx.commit().await?;
+        Ok(out)
+    }
+
+    /// Resolve a presented token to its PENDING, unexpired invitation within scope
+    /// (issue #60): the accept surface reads this to authorize the invitee (the user
+    /// the invitation activates) and to validate the request against the credential
+    /// type, before it calls the atomic [`ActingInvitationRepo::accept`].
+    ///
+    /// Returns [`None`] when the token matches no pending, unexpired invitation in
+    /// this scope: a forged, expired, already-redeemed, revoked, or cross-scope token
+    /// all collapse to the SAME uniform absence (a non-enumerating error), so the
+    /// accept surface never becomes a token-guessing or existence oracle. The token is
+    /// matched by its digest, so a token from another tenant never resolves here.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure (treated as fail closed).
+    pub async fn resolve_pending(
+        &self,
+        presented_token: &str,
+        now_micros: i64,
+    ) -> Result<Option<PendingInvitation>, StoreError> {
+        let digest = invitation_token_digest(presented_token);
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT id, user_id, credential_type FROM user_invitations \
+             WHERE token_digest = $1 AND tenant_id = $2 AND environment_id = $3 \
+             AND state = 'pending' \
+             AND expires_at > TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval",
+        )
+        .bind(&digest)
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(now_micros)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let id = InvitationId::parse_in_scope(&row.get::<String, _>("id"), &self.scope)?;
+        let user_id = UserId::parse_in_scope(&row.get::<String, _>("user_id"), &self.scope)?;
+        let Some(credential_type) =
+            InvitationCredentialType::parse(&row.get::<String, _>("credential_type"))
+        else {
+            return Ok(None);
+        };
+        Ok(Some(PendingInvitation {
+            id,
+            user_id,
+            credential_type,
+        }))
+    }
+}
+
+/// The mutating invitation repository (issue #60): create, revoke, and resend an
+/// invitation (management plane), and accept one (data plane, token-authenticated).
+/// Every mutation carries the actor and correlation id into its audit row.
+pub struct ActingInvitationRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+    acting: ActingContext,
+}
+
+impl ActingInvitationRepo<'_> {
+    /// Ensure the scope has a live KEK and DEK to seal the invited identifier under,
+    /// provisioning each lazily on first use (idempotent). Mirrors the users-PII path.
+    async fn ensure_scope_keys(&self, env: &Env, master: &MasterKey) -> Result<(), StoreError> {
+        let envelope = ActingEnvelopeRepo {
+            store: self.store,
+            scope: self.scope,
+            acting: self.acting,
+        };
+        match envelope.provision_kek(env, master).await {
+            Ok(_) | Err(StoreError::Conflict) => {}
+            Err(error) => return Err(error),
+        }
+        match envelope.provision_dek(env, master).await {
+            Ok(_) | Err(StoreError::Conflict) => {}
+            Err(error) => return Err(error),
+        }
+        Ok(())
+    }
+
+    /// CREATE an invitation (issue #60): seal and blind-index the invited identifier
+    /// under the scope's DEK, store the token DIGEST (never the token), and write one
+    /// `invitation.create` audit row (its operator-safe `detail` records the credential
+    /// type) in the same transaction. The `pending_verification` user this invitation
+    /// activates is created SEPARATELY through the #52 admin-create repo before this.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Conflict`] on a digest collision (a 256-bit-entropy token, so
+    /// astronomically unlikely); [`StoreError::IdempotencyConflict`] if the
+    /// Idempotency-Key was already used with a different request;
+    /// [`StoreError::Encryption`] if no master key is configured;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn create(
+        &self,
+        env: &Env,
+        spec: NewInvitation<'_>,
+        created_at_micros: i64,
+        idempotency: Option<IdempotencyWrite<'_>>,
+    ) -> Result<InvitationId, StoreError> {
+        if spec.id.scope() != self.scope || spec.user_id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let master = self.store.master().ok_or(StoreError::Encryption)?;
+        self.ensure_scope_keys(env, master).await?;
+        let scope = self.scope;
+        let id = *spec.id;
+        let bidx = invitation_identifier_blind_index(master, scope, spec.target_identifier);
+        let detail = format!("credential_type={}", spec.credential_type.as_str());
+        write_audited_detailed(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::InvitationCreate,
+                target: &id,
+            },
+            async move |tx| {
+                let (dek_version, dek) = fetch_active_dek(tx, scope, master).await?;
+                let identifier_sealed = dek.seal(
+                    env.entropy(),
+                    &invitation_identifier_seal_aad(scope, dek_version),
+                    spec.target_identifier.as_bytes(),
+                );
+                let result = sqlx::query(
+                    "INSERT INTO user_invitations \
+                     (id, tenant_id, environment_id, user_id, token_digest, \
+                      target_identifier_sealed, target_identifier_bidx, pii_dek_version, \
+                      credential_type, state, org_context, expires_at, created_at, updated_at) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'pending', $10, \
+                             TIMESTAMPTZ 'epoch' + ($11::text || ' microseconds')::interval, \
+                             TIMESTAMPTZ 'epoch' + ($12::text || ' microseconds')::interval, \
+                             TIMESTAMPTZ 'epoch' + ($12::text || ' microseconds')::interval)",
+                )
+                .bind(id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(spec.user_id.to_string())
+                .bind(spec.token_digest)
+                .bind(identifier_sealed.into_bytes())
+                .bind(bidx.into_bytes())
+                .bind(dek_version)
+                .bind(spec.credential_type.as_str())
+                .bind(spec.org_context)
+                .bind(spec.expires_at_unix_micros)
+                .bind(created_at_micros)
+                .execute(&mut **tx)
+                .await;
+                match result {
+                    Ok(_) => {}
+                    Err(error) if is_unique_violation(&error) => return Err(StoreError::Conflict),
+                    Err(error) => return Err(error.into()),
+                }
+                // The Idempotency-Key row shares this transaction, so a replay of the
+                // POST returns the original response and writes no second audit row.
+                // The stored response body NEVER carries the raw token (only its digest
+                // is persisted anywhere), so a database dump yields nothing replayable.
+                insert_idempotency(tx, idempotency).await?;
+                Ok(())
+            },
+            false,
+            Some(&detail),
+        )
+        .await?;
+        Ok(id)
+    }
+
+    /// REVOKE a PENDING invitation (issue #60): a guarded pending -> revoked flip that
+    /// makes the token unredeemable, with one `invitation.revoke` audit row in the same
+    /// transaction. A repeat revoke (or a revoke of an accepted invitation) matches no
+    /// pending row and is the uniform not-found.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if no pending invitation matched in this scope;
+    /// [`StoreError::IdempotencyConflict`] if the Idempotency-Key was already used
+    /// with a different request; [`StoreError::Database`] on a persistence failure.
+    pub async fn revoke(
+        &self,
+        env: &Env,
+        id: &InvitationId,
+        idempotency: Option<IdempotencyWrite<'_>>,
+    ) -> Result<(), StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let now_micros = epoch_micros(env.clock().now_utc());
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::InvitationRevoke,
+                target: id,
+            },
+            async move |tx| {
+                let result = sqlx::query(
+                    "UPDATE user_invitations SET state = 'revoked', \
+                         revoked_at = TIMESTAMPTZ 'epoch' + ($1::text || ' microseconds')::interval, \
+                         updated_at = TIMESTAMPTZ 'epoch' + ($1::text || ' microseconds')::interval \
+                     WHERE id = $2 AND tenant_id = $3 AND environment_id = $4 AND state = 'pending'",
+                )
+                .bind(now_micros)
+                .bind(id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .execute(&mut **tx)
+                .await?;
+                if result.rows_affected() == 0 {
+                    return Err(StoreError::NotFound);
+                }
+                insert_idempotency(tx, idempotency).await?;
+                Ok(())
+            },
+            false,
+        )
+        .await
+    }
+
+    /// RESEND a PENDING invitation (issue #60): overwrite the token digest with a fresh
+    /// one (invalidating the prior token) and reset the expiry, with one
+    /// `invitation.resend` audit row in the same transaction. Guarded on the pending
+    /// state, so an accepted or revoked invitation cannot be resurrected; the caller
+    /// mints the fresh token and passes its digest and new expiry.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if no pending invitation matched in this scope;
+    /// [`StoreError::Conflict`] on a digest collision;
+    /// [`StoreError::IdempotencyConflict`] if the Idempotency-Key was already used
+    /// with a different request; [`StoreError::Database`] on a persistence failure.
+    pub async fn resend(
+        &self,
+        env: &Env,
+        id: &InvitationId,
+        new_token_digest: &str,
+        new_expires_at_micros: i64,
+        idempotency: Option<IdempotencyWrite<'_>>,
+    ) -> Result<(), StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let now_micros = epoch_micros(env.clock().now_utc());
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::InvitationResend,
+                target: id,
+            },
+            async move |tx| {
+                let result = sqlx::query(
+                    "UPDATE user_invitations SET token_digest = $1, \
+                         expires_at = TIMESTAMPTZ 'epoch' + ($2::text || ' microseconds')::interval, \
+                         updated_at = TIMESTAMPTZ 'epoch' + ($3::text || ' microseconds')::interval \
+                     WHERE id = $4 AND tenant_id = $5 AND environment_id = $6 AND state = 'pending'",
+                )
+                .bind(new_token_digest)
+                .bind(new_expires_at_micros)
+                .bind(now_micros)
+                .bind(id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .execute(&mut **tx)
+                .await;
+                match result {
+                    Ok(done) if done.rows_affected() == 0 => return Err(StoreError::NotFound),
+                    Ok(_) => {}
+                    Err(error) if is_unique_violation(&error) => return Err(StoreError::Conflict),
+                    Err(error) => return Err(error.into()),
+                }
+                // The stored idempotency response body never carries the fresh raw
+                // token (only its digest is persisted), so a dump yields nothing
+                // replayable even for a resend.
+                insert_idempotency(tx, idempotency).await?;
+                Ok(())
+            },
+            false,
+        )
+        .await
+    }
+
+    /// ACCEPT an invitation by its presented token (issue #60): in ONE transaction,
+    /// CONSUME the invitation (a guarded pending -> accepted flip, so a second accept
+    /// and a concurrent double-accept both lose the race and redeem at most once) and
+    /// ACTIVATE the invited user (a guarded `pending_verification` -> active flip that
+    /// sets the credential). `new_password_hash` is the precomputed Argon2id verifier
+    /// for a password invitation, or [`None`] for a passkey invitation (no password is
+    /// ever provisioned; the passkey ceremony enrolls the factor). One
+    /// `invitation.redeem` audit row targets the invitation.
+    ///
+    /// The token is matched by its digest under this scope, so a token minted in
+    /// another tenant never resolves here. An expired, already-redeemed, revoked, or
+    /// forged token matches no pending, unexpired row and is the uniform
+    /// [`StoreError::NotFound`]. The redeem re-checks the expiry against `now_micros`
+    /// inside the guarded update, so it can never resolve a token the resolve read a
+    /// moment before it expired.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the token matches no pending, unexpired invitation
+    /// in this scope; [`StoreError::Conflict`] if it lost a concurrent double-accept or
+    /// the user was not in `pending_verification`; [`StoreError::Database`] on a
+    /// persistence failure.
+    pub async fn accept(
+        &self,
+        env: &Env,
+        presented_token: &str,
+        new_password_hash: Option<&str>,
+        now_micros: i64,
+    ) -> Result<AcceptedInvitation, StoreError> {
+        let scope = self.scope;
+        let digest = invitation_token_digest(presented_token);
+        // Pre-read the pending, unexpired invitation under this scope's row-level
+        // security (the target of the audited write is known up front). The
+        // in-transaction guarded flip below re-checks pending + unexpired, so a
+        // concurrent accept or an expiry between here and there cannot slip through.
+        let mut pre = begin_scoped(self.store, scope).await?;
+        let row = sqlx::query(
+            "SELECT id, user_id, credential_type FROM user_invitations \
+             WHERE token_digest = $1 AND tenant_id = $2 AND environment_id = $3 \
+             AND state = 'pending' \
+             AND expires_at > TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval",
+        )
+        .bind(&digest)
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(now_micros)
+        .fetch_optional(&mut *pre)
+        .await?;
+        pre.commit().await?;
+        let Some(row) = row else {
+            return Err(StoreError::NotFound);
+        };
+        let id = InvitationId::parse_in_scope(&row.get::<String, _>("id"), &scope)?;
+        let user_id = UserId::parse_in_scope(&row.get::<String, _>("user_id"), &scope)?;
+        let credential_type =
+            InvitationCredentialType::parse(&row.get::<String, _>("credential_type"))
+                .ok_or(StoreError::NotFound)?;
+        let id_text = id.to_string();
+        let user_text = user_id.to_string();
+        let detail = format!("credential_type={}", credential_type.as_str());
+        write_audited_detailed(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::InvitationRedeem,
+                target: &id,
+            },
+            async move |tx| {
+                // Consume the invitation: the guarded pending -> accepted flip. A
+                // concurrent double-accept BLOCKS on this row's lock and then re-reads
+                // the committed `accepted` state, matching zero rows: at most one
+                // accept ever succeeds.
+                let consumed = sqlx::query(
+                    "UPDATE user_invitations SET state = 'accepted', \
+                         accepted_at = TIMESTAMPTZ 'epoch' + ($1::text || ' microseconds')::interval, \
+                         updated_at = TIMESTAMPTZ 'epoch' + ($1::text || ' microseconds')::interval \
+                     WHERE id = $2 AND tenant_id = $3 AND environment_id = $4 \
+                     AND state = 'pending' \
+                     AND expires_at > TIMESTAMPTZ 'epoch' + ($1::text || ' microseconds')::interval",
+                )
+                .bind(now_micros)
+                .bind(&id_text)
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .execute(&mut **tx)
+                .await?;
+                if consumed.rows_affected() == 0 {
+                    // Lost the race, or it expired between the pre-read and here.
+                    return Err(StoreError::Conflict);
+                }
+                // Activate the invited user: set the credential (password invitations
+                // only; a passkey leaves the unusable sentinel until the factor is
+                // enrolled) and flip pending_verification -> active, all guarded on the
+                // source state so a user already moved on is not clobbered.
+                let activated = sqlx::query(
+                    "UPDATE users SET \
+                         password_hash = COALESCE($1, password_hash), \
+                         state = 'active', \
+                         updated_at = TIMESTAMPTZ 'epoch' + ($2::text || ' microseconds')::interval \
+                     WHERE id = $3 AND tenant_id = $4 AND environment_id = $5 \
+                     AND state = 'pending_verification' AND deleted_at IS NULL",
+                )
+                .bind(new_password_hash)
+                .bind(now_micros)
+                .bind(&user_text)
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .execute(&mut **tx)
+                .await?;
+                if activated.rows_affected() == 0 {
+                    // The user was not in pending_verification (already activated,
+                    // deleted, or moved): refuse fail closed so a redeemed invitation
+                    // always corresponds to an activation.
+                    return Err(StoreError::Conflict);
+                }
+                Ok(())
+            },
+            false,
+            Some(&detail),
+        )
+        .await?;
+        Ok(AcceptedInvitation {
+            id,
+            user_id,
+            credential_type,
+        })
+    }
+}
+
 /// The mutating consent repository (issue #20).
 pub struct ActingConsentRepo<'a> {
     store: &'a Store,
@@ -15403,6 +16228,14 @@ const USER_EXTERNAL_ID_PURPOSE: &str = "external_id";
 /// value that is BOTH someone's login handle and another user's external id never
 /// produces a colliding index tag.
 const USER_EXTERNAL_ID_BIDX_LABEL: &str = "ironauth.envelope.user-external-id-bidx.v1";
+/// The AAD label domain-separating a sealed `user_invitations.target_identifier`
+/// (issue #60) from every other envelope context, so an invited-identifier seal
+/// never authenticates under the users-PII or secret-store context.
+const INVITATION_IDENTIFIER_SEAL_LABEL: &str = "ironauth.envelope.invitation-identifier.v1";
+/// The AAD label domain-separating the `user_invitations.target_identifier` blind
+/// index (issue #60) from every other keyed derivation, so the SAME identifier as an
+/// invite target and as a login handle never produces a colliding index tag.
+const INVITATION_IDENTIFIER_BIDX_LABEL: &str = "ironauth.envelope.invitation-identifier-bidx.v1";
 
 /// The associated data binding a wrapped KEK to its scope, version, and master
 /// key. A KEK wrapped under one context fails to unwrap under any other, so it
@@ -15511,6 +16344,40 @@ fn user_external_id_bidx_aad(scope: Scope, external_id: &str) -> Aad {
 /// `users.external_id_bidx`.
 fn user_external_id_blind_index(master: &MasterKey, scope: Scope, external_id: &str) -> BlindIndex {
     master.blind_index(&user_external_id_bidx_aad(scope, external_id))
+}
+
+/// The associated data binding a sealed `user_invitations.target_identifier` (the
+/// invited identifier, issue #60) to its scope and the DEK version that sealed it.
+fn invitation_identifier_seal_aad(scope: Scope, dek_version: i32) -> Aad {
+    Aad::builder()
+        .text(INVITATION_IDENTIFIER_SEAL_LABEL)
+        .text(&scope.tenant().to_string())
+        .text(&scope.environment().to_string())
+        .version(i64::from(dek_version))
+        .build()
+}
+
+/// The blind-index context for a `user_invitations.target_identifier` (issue #60):
+/// the label, the scope, and the identifier value, length-prefixed. The per-tenant
+/// HMAC key means the SAME identifier in two tenants maps to two different tags.
+fn invitation_identifier_bidx_aad(scope: Scope, identifier: &str) -> Aad {
+    Aad::builder()
+        .text(INVITATION_IDENTIFIER_BIDX_LABEL)
+        .text(&scope.tenant().to_string())
+        .text(&scope.environment().to_string())
+        .field(identifier.as_bytes())
+        .build()
+}
+
+/// The deterministic blind index for an invited `identifier` in `scope` under
+/// `master`, the value an equality lookup queries against
+/// `user_invitations.target_identifier_bidx`.
+fn invitation_identifier_blind_index(
+    master: &MasterKey,
+    scope: Scope,
+    identifier: &str,
+) -> BlindIndex {
+    master.blind_index(&invitation_identifier_bidx_aad(scope, identifier))
 }
 
 /// Reconstruct a [`UserAdminRecord`] from a management-plane `users` row, opening

@@ -28,6 +28,7 @@
 /t/{tenant_id}/e/{environment_id}/connect/register
 /t/{tenant_id}/e/{environment_id}/connect/register/{client_id}
 /t/{tenant_id}/e/{environment_id}/device
+/t/{tenant_id}/e/{environment_id}/invitations/accept
 /t/{tenant_id}/e/{environment_id}/jwks.json
 /token
 /userinfo
