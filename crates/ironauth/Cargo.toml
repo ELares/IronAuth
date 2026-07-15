@@ -24,7 +24,7 @@ ironauth-admin.workspace = true
 ironauth-oidc.workspace = true
 ironauth-jose.workspace = true
 axum = { workspace = true }
-tokio = { workspace = true, features = ["rt-multi-thread"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "time"] }
 tracing.workspace = true
 
 [features]

@@ -6,6 +6,16 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- The boot path now spawns the OIDC Back-Channel Logout delivery worker (issue #34) when
+  `oidc.enabled` AND `oidc.backchannel_logout_enabled` are set (off by default). The
+  worker drains the durable session-ended outbox per scope, builds one signed Logout Token
+  per participating relying party, and POSTs it through the SSRF-hardened outbound fetcher
+  with bounded-backoff retries and a dead-letter state. Scope enumeration is a
+  control-plane read (the data-plane role cannot see the non-RLS `environments` table), so
+  the worker connects both a data-plane store (to drain and sign) and a control-plane store
+  (to enumerate scopes); a missing control DSN or a connect/fetcher-setup failure is logged
+  and the worker is simply not spawned, leaving the rest of the server unaffected (the
+  queue is durable, so nothing is lost). Adds tokio's `time` feature to the binary.
 - The boot path now runs the strict feature-maturity gate (issue #4/#36): it validates
   `[features]` against the built-in registry and REFUSES to boot on a violation (an
   unknown feature, or an enabled experimental feature without an exact-version ack), and

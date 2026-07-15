@@ -17,8 +17,9 @@ use ironauth_config::{
 };
 use ironauth_env::Env;
 use ironauth_oidc::{
-    DiscoveryCapabilities, DiscoveryState, IssuerRegistry, IssuerState, JwksCacheWindow, OidcState,
-    discovery_router, issuer_router, oidc_router,
+    BackChannelLogoutWorker, DiscoveryCapabilities, DiscoveryState, FetchLogoutSender,
+    IssuerRegistry, IssuerState, JwksCacheWindow, OidcState, WorkerSettings, discovery_router,
+    issuer_router, oidc_router,
 };
 use ironauth_server::Server;
 use ironauth_store::Store;
@@ -128,6 +129,10 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
             None
         };
 
+        // Capture what the Back-Channel Logout delivery worker (issue #34) needs before
+        // config moves into the server (only when OIDC is mounted AND the switch is on).
+        let backchannel_inputs = backchannel_worker_inputs(&config, &env);
+
         let mut server = match Server::new(config, env) {
             Ok(server) => server,
             Err(error) => {
@@ -156,6 +161,13 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
         } else {
             tracing::info!("OIDC provider not mounted: oidc.enabled is false");
         }
+        // The OIDC Back-Channel Logout delivery worker (issue #34), spawned only when the
+        // OIDC provider is mounted AND its posture switch is on. Off by default (the
+        // covenant: no mandatory background infrastructure).
+        if let Some(inputs) = backchannel_inputs {
+            spawn_backchannel_logout_worker(inputs, server.base_url()).await;
+        }
+
         tracing::info!(base_url = %server.base_url(), "starting ironauth");
 
         match server.run(ironauth_server::shutdown_signal()).await {
@@ -302,6 +314,128 @@ async fn build_oidc_router(
          per-environment signing keys load lazily from the store on first use"
     );
     Some(oidc_router(state).merge(discovery).merge(jwks))
+}
+
+/// What the Back-Channel Logout delivery worker (issue #34) needs to start, captured
+/// before `config` moves into the server.
+struct BackChannelWorkerInputs {
+    /// The OIDC settings (the worker tuning knobs and the JWKS cache window).
+    oidc: OidcConfig,
+    /// The data-plane DSN the worker drains and signs through (the least-privilege
+    /// `ironauth_app` role in production).
+    data_plane_dsn: String,
+    /// The control-plane DSN the worker enumerates `(tenant, environment)` scopes on (the
+    /// non-RLS `environments` table only the control role can read); [`None`] disables the
+    /// worker, since without it the worker cannot discover the scopes to drain.
+    control_dsn: Option<String>,
+    /// The environment seam (deterministic clock and entropy).
+    env: Env,
+}
+
+/// Capture the Back-Channel Logout worker inputs from config (issue #34), or `None` when
+/// the OIDC provider is not mounted or the posture switch is off. Pulled out of `serve` so
+/// that function stays within the readable-length lint. The control-plane DSN is resolved
+/// here (the worker enumerates scopes on the control plane).
+fn backchannel_worker_inputs(config: &Config, env: &Env) -> Option<BackChannelWorkerInputs> {
+    if !(config.oidc.enabled && config.oidc.backchannel_logout_enabled) {
+        return None;
+    }
+    Some(BackChannelWorkerInputs {
+        oidc: config.oidc.clone(),
+        data_plane_dsn: config.database.url.expose().to_owned(),
+        control_dsn: select_control_dsn(config),
+        env: env.clone(),
+    })
+}
+
+/// Spawn the OIDC Back-Channel Logout delivery worker (issue #34) as a detached
+/// background task.
+///
+/// The worker drains the durable session-ended outbox per scope, builds one signed
+/// Logout Token per participating relying party, and POSTs it through the SSRF-hardened
+/// outbound fetcher, with bounded-backoff retries and a dead-letter state. Scope
+/// enumeration is a CONTROL-plane read (the data-plane role cannot see the non-RLS
+/// `environments` table), so the worker needs both a data-plane store (to drain and sign)
+/// and a control-plane store (to enumerate). Any failure to connect or a missing control
+/// DSN is logged and the worker is simply not spawned; the rest of the server runs
+/// unaffected (the delivery queue is provisional and deliberately minimal, per issue #34,
+/// and M11 migrates it onto the shared job-queue substrate).
+async fn spawn_backchannel_logout_worker(inputs: BackChannelWorkerInputs, issuer_base: String) {
+    let BackChannelWorkerInputs {
+        oidc,
+        data_plane_dsn,
+        control_dsn,
+        env,
+    } = inputs;
+
+    let Some(control_dsn) = control_dsn else {
+        tracing::error!(
+            "back-channel logout worker not started: no control-plane DSN to enumerate scopes \
+             (set admin.control_database_url, or run in dev_mode). The delivery queue is durable, \
+             so nothing is lost; enable the control plane to drain it."
+        );
+        return;
+    };
+
+    let data_store = match Store::connect(&data_plane_dsn).await {
+        Ok(store) => store,
+        Err(error) => {
+            tracing::error!(%error, "back-channel logout worker not started: data-plane connect failed");
+            return;
+        }
+    };
+    let control_store = match Store::connect(&control_dsn).await {
+        Ok(store) => store,
+        Err(error) => {
+            tracing::error!(%error, "back-channel logout worker not started: control-plane connect failed");
+            return;
+        }
+    };
+
+    let cache = JwksCacheWindow::clamped(oidc.jwks_cache_max_age_secs);
+    let registry = Arc::new(IssuerRegistry::store_backed(
+        issuer_base,
+        cache,
+        data_store.clone(),
+    ));
+    let request_timeout =
+        std::time::Duration::from_secs(oidc.backchannel_logout_request_timeout_secs);
+    let sender = match FetchLogoutSender::with_timeout(request_timeout) {
+        Ok(sender) => sender,
+        Err(error) => {
+            tracing::error!(%error, "back-channel logout worker not started: fetcher setup failed");
+            return;
+        }
+    };
+    let settings = WorkerSettings {
+        max_attempts: oidc.backchannel_logout_max_attempts,
+        retry_base: std::time::Duration::from_secs(oidc.backchannel_logout_retry_base_secs),
+        lease: std::time::Duration::from_secs(oidc.backchannel_logout_request_timeout_secs.max(30)),
+        batch: 64,
+    };
+    let poll = std::time::Duration::from_secs(oidc.backchannel_logout_poll_interval_secs);
+    let worker = BackChannelLogoutWorker::new(data_store, env, registry, sender, settings);
+
+    tracing::info!(
+        "back-channel logout delivery worker started; draining the session-ended outbox per scope"
+    );
+    tokio::spawn(async move {
+        loop {
+            match control_store.management().list_environment_scopes().await {
+                Ok(scopes) => {
+                    for scope in scopes {
+                        if let Err(error) = worker.run_once(scope).await {
+                            tracing::warn!(%error, "back-channel logout drain pass failed for a scope");
+                        }
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "back-channel logout worker could not enumerate scopes");
+                }
+            }
+            tokio::time::sleep(poll).await;
+        }
+    });
 }
 
 /// Choose the control-plane database DSN for the management store (D2).

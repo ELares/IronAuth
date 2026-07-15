@@ -392,6 +392,18 @@ required-features = ["testing"]
 name = "logout"
 path = "tests/logout.rs"
 required-features = ["testing"]
+# OIDC Back-Channel Logout (issue #34): the Logout Token claim set (the RP's OWN sid, the
+# events member, the logout+jwt typ, and NO nonce) verified under the environment key;
+# each participating RP getting its own token with no cross-client sid leak; delivery
+# routed through the SSRF-hardened fetcher (a loopback backchannel_logout_uri is refused);
+# the worker draining the outbox and marking delivered; a failing RP retried with a
+# manual-clock-driven backoff and dead-lettered after the cap without blocking a healthy
+# RP; and a tenant-A worker never sending tenant B's tokens. Over a real database with a
+# provisioned signing key.
+[[test]]
+name = "backchannel"
+path = "tests/backchannel.rs"
+required-features = ["testing"]
 # RFC 9700 (OAuth 2.0 Security BCP) as executable CI conformance invariants (issue
 # #38): one named test per applicable checklist item driving the LIVE endpoints, plus
 # an in-binary mutation harness proving every shared checker predicate rejects the
