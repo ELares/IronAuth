@@ -68,10 +68,9 @@ use crate::id::{
     BackChannelDeliveryId, ClientId, ClientSessionId, ConsentId, CorrelationId, CredentialId,
     CustomDomainId, DcrPolicyId, DekId, DeviceCodeId, EncryptedSecretId, EnvironmentId,
     EnvironmentSecretId, ExternalIssuerId, GrantId, InitialAccessTokenId, InvitationId,
-    IssuedTokenId, KekId,
-    ManagementKeyId, OperatorId, OrganizationId, PushedRequestId, RefreshFamilyId, RefreshTokenId,
-    ResourceServerId, ServiceAccountId, SessionEventId, SessionId, SigningKeyId, TenantId, UserId,
-    VariableId,
+    IssuedTokenId, KekId, ManagementKeyId, OperatorId, OrganizationId, PushedRequestId,
+    RefreshFamilyId, RefreshTokenId, ResourceServerId, ServiceAccountId, SessionEventId, SessionId,
+    SigningKeyId, TenantId, UserId, VariableId,
 };
 use crate::scope::Scope;
 use crate::store::Store;
@@ -12025,7 +12024,7 @@ pub fn mint_invitation_token_for(env: &Env, id: InvitationId) -> MintedInvitatio
 pub struct InvitationAdminRecord {
     /// The invitation identifier (an `inv_` id embedding its scope).
     pub id: InvitationId,
-    /// The pending_verification user (a `usr_` id) this invitation provisions.
+    /// The `pending_verification` user (a `usr_` id) this invitation provisions.
     pub user_id: UserId,
     /// The invited identifier, decrypted from its sealed column for display.
     pub target_identifier: String,
@@ -12060,7 +12059,7 @@ pub struct InvitationListFilter {
 pub struct NewInvitation<'a> {
     /// The invitation id (minted by [`mint_invitation_token`] alongside the token).
     pub id: &'a InvitationId,
-    /// The pending_verification user this invitation provisions (created through the
+    /// The `pending_verification` user this invitation provisions (created through the
     /// #52 admin-create repo BEFORE this row is written).
     pub user_id: &'a UserId,
     /// The invited identifier (sealed and blind-indexed here; the plaintext never
@@ -12083,7 +12082,7 @@ pub struct NewInvitation<'a> {
 pub struct PendingInvitation {
     /// The invitation identifier.
     pub id: InvitationId,
-    /// The pending_verification user the invitation activates on accept.
+    /// The `pending_verification` user the invitation activates on accept.
     pub user_id: UserId,
     /// The primary-login credential the invitee enrolls.
     pub credential_type: InvitationCredentialType,
@@ -12326,7 +12325,7 @@ impl ActingInvitationRepo<'_> {
     /// CREATE an invitation (issue #60): seal and blind-index the invited identifier
     /// under the scope's DEK, store the token DIGEST (never the token), and write one
     /// `invitation.create` audit row (its operator-safe `detail` records the credential
-    /// type) in the same transaction. The pending_verification user this invitation
+    /// type) in the same transaction. The `pending_verification` user this invitation
     /// activates is created SEPARATELY through the #52 admin-create repo before this.
     ///
     /// # Errors
@@ -12534,7 +12533,7 @@ impl ActingInvitationRepo<'_> {
     /// ACCEPT an invitation by its presented token (issue #60): in ONE transaction,
     /// CONSUME the invitation (a guarded pending -> accepted flip, so a second accept
     /// and a concurrent double-accept both lose the race and redeem at most once) and
-    /// ACTIVATE the invited user (a guarded pending_verification -> active flip that
+    /// ACTIVATE the invited user (a guarded `pending_verification` -> active flip that
     /// sets the credential). `new_password_hash` is the precomputed Argon2id verifier
     /// for a password invitation, or [`None`] for a passkey invitation (no password is
     /// ever provisioned; the passkey ceremony enrolls the factor). One

@@ -237,14 +237,14 @@ pub enum Action {
     /// re-run of the worker re-processes nothing.
     UserOffboardingExecute,
     /// A user invitation was CREATED through the management API (issue #60): an
-    /// admin invited a new identity, provisioning a pending_verification user and a
+    /// admin invited a new identity, provisioning a `pending_verification` user and a
     /// single-use, expiring, unguessable token. The token is never recorded on the
     /// audit row (only its digest is stored anywhere); the audit row's operator-safe
     /// `detail` records the enrolled credential type.
     InvitationCreate,
     /// A user invitation was REDEEMED (issue #60): the invitee presented a valid
     /// token, which was consumed atomically (pending -> accepted), and the invited
-    /// user was activated (pending_verification -> active) with a credential set.
+    /// user was activated (`pending_verification` -> active) with a credential set.
     InvitationRedeem,
     /// A pending user invitation was REVOKED through the management API (issue #60):
     /// an admin invalidated it before it was accepted, so its token can never be
@@ -498,6 +498,7 @@ pub enum Action {
 impl Action {
     /// The stable wire string for this action.
     #[must_use]
+    #[allow(clippy::too_many_lines)]
     pub fn as_str(&self) -> &'static str {
         match self {
             Action::ClientCreate => "client.create",

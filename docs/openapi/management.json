@@ -5031,7 +5031,7 @@
           },
           "identifier": {
             "type": "string",
-            "description": "The invited identifier (an email or other login handle), unique per scope: a\npending_verification user is provisioned for it. An identifier already in use\nby an existing user returns 409.",
+            "description": "The invited identifier (an email or other login handle), unique per scope: a\n`pending_verification` user is provisioned for it. An identifier already in use\nby an existing user returns 409.",
             "example": "ada@example.test"
           },
           "org_context": {
@@ -5585,7 +5585,7 @@
           },
           "user_id": {
             "type": "string",
-            "description": "The pending_verification user (`usr_...`) this invitation provisions and\nactivates on accept."
+            "description": "The `pending_verification` user (`usr_...`) this invitation provisions and\nactivates on accept."
           }
         }
       },

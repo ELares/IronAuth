@@ -4,8 +4,8 @@
 //!
 //! The invitee side of the admin-initiated invitation flow: a person who does not
 //! yet have a session presents the single-use token they received out of band and
-//! is enrolled onto a credential, which activates the pending_verification user the
-//! admin provisioned (pending_verification -> active). It mounts on the PUBLIC data
+//! is enrolled onto a credential, which activates the `pending_verification` user the
+//! admin provisioned (`pending_verification` -> active). It mounts on the PUBLIC data
 //! plane (never the management port), is scope-routed under the per-environment path
 //! so the redeem runs under the right row-level-security scope, and is authenticated
 //! by the TOKEN itself (never a session cookie, never an admin credential).
@@ -66,7 +66,7 @@ pub struct AcceptInvitationBody {
 }
 
 /// `POST /t/{tenant}/e/{environment}/invitations/accept`: redeem an invitation token
-/// and enroll the credential, activating the invited user (pending_verification ->
+/// and enroll the credential, activating the invited user (`pending_verification` ->
 /// active). Token-authenticated (no session), atomic and single-use, with uniform
 /// non-enumerating errors.
 pub async fn accept_invitation(

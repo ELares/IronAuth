@@ -25,14 +25,14 @@ use crate::views::{
     CreateEnvironmentRequest, CreateInitialAccessTokenRequest, CreateInvitationRequest,
     CreateManagementKeyRequest, CreateOrganizationRequest, CreateTenantRequest, CreateUserRequest,
     DcrPolicyList, DcrPolicyView, EnvironmentList, EnvironmentView, GuardrailView,
-    InitialAccessTokenCreated, InvitationCreatedView, InvitationCredentialTypeView,
-    InvitationList, InvitationStateChangeView, InvitationStateView, InvitationView,
-    LinkExternalIdRequest, ManagementKeyCreated, ManagementKeyList, ManagementKeyView,
-    OperatorList, OperatorView, OrganizationList, OrganizationView, RefreshFamilyList,
-    RefreshFamilyView, ResourceTypeView, ResourceTypesList, RevokeSessionsRequest, SessionList,
-    SessionRevocationView, SessionView, SetUserStateRequest, TenantCreated, TenantList,
-    TenantStatusView, TenantView, UpdateUserRequest, UserExternalIdView, UserList,
-    UserRevocationView, UserStateChangeView, UserStateView, UserView,
+    InitialAccessTokenCreated, InvitationCreatedView, InvitationCredentialTypeView, InvitationList,
+    InvitationStateChangeView, InvitationStateView, InvitationView, LinkExternalIdRequest,
+    ManagementKeyCreated, ManagementKeyList, ManagementKeyView, OperatorList, OperatorView,
+    OrganizationList, OrganizationView, RefreshFamilyList, RefreshFamilyView, ResourceTypeView,
+    ResourceTypesList, RevokeSessionsRequest, SessionList, SessionRevocationView, SessionView,
+    SetUserStateRequest, TenantCreated, TenantList, TenantStatusView, TenantView,
+    UpdateUserRequest, UserExternalIdView, UserList, UserRevocationView, UserStateChangeView,
+    UserStateView, UserView,
 };
 
 /// The management API's OpenAPI document. The handlers listed in `paths(...)`

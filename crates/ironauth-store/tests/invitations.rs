@@ -5,7 +5,7 @@
 //! Pins the acceptance criteria at the persistence layer: the single-use token is
 //! stored only as its digest (a database dump yields nothing replayable); accepting
 //! ATOMICALLY consumes the invitation and activates the invited user
-//! (pending_verification -> active) with a credential set, so a second accept and a
+//! (`pending_verification` -> active) with a credential set, so a second accept and a
 //! CONCURRENT double-accept storm redeem AT MOST ONCE (never two activations); a
 //! stale invite is refused against the clock; a revoked invitation is unacceptable;
 //! the invited identifier is envelope-encrypted (no plaintext dump) and never leaks
@@ -42,7 +42,7 @@ fn now_micros(env: &Env) -> i64 {
     .expect("fits i64")
 }
 
-/// Create a pending_verification user and an invitation for it in `scope`, returning
+/// Create a `pending_verification` user and an invitation for it in `scope`, returning
 /// the invitation id, the user id, and the raw one-time token.
 async fn create_invitation(
     db: &TestDatabase,
@@ -168,7 +168,10 @@ async fn accept_activates_the_user_sets_the_credential_and_is_single_use() {
     .await;
 
     // Before accept the user is pending_verification and has no usable credential.
-    assert_eq!(user_state(&db, scope, &user_id).await, UserState::PendingVerification);
+    assert_eq!(
+        user_state(&db, scope, &user_id).await,
+        UserState::PendingVerification
+    );
     assert_eq!(user_password_hash(&db, scope, &user_id).await, UNUSABLE);
 
     // Accepting activates the user and sets the credential.
@@ -342,13 +345,16 @@ async fn a_revoked_invitation_is_unacceptable() {
 
     // A repeat revoke matches no pending row: the uniform not-found.
     let repeat = db
-        .store()
+        .control_store()
         .scoped(scope)
         .acting(db.test_actor(&env), CorrelationId::generate(&env))
         .invitations()
         .revoke(&env, &id, None)
         .await;
-    assert!(matches!(repeat, Err(StoreError::NotFound)));
+    assert!(
+        matches!(repeat, Err(StoreError::NotFound)),
+        "a repeat revoke of an already-revoked invitation is the uniform not-found, got {repeat:?}"
+    );
 }
 
 #[tokio::test]

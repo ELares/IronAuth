@@ -1053,7 +1053,7 @@ pub struct InvitationView {
     pub tenant_id: String,
     /// The environment the invitation lives in (`env_...`).
     pub environment_id: String,
-    /// The pending_verification user (`usr_...`) this invitation provisions and
+    /// The `pending_verification` user (`usr_...`) this invitation provisions and
     /// activates on accept.
     pub user_id: String,
     /// The invited identifier (an email or login handle), decrypted for display.
@@ -1116,7 +1116,7 @@ pub struct InvitationList {
 #[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct CreateInvitationRequest {
     /// The invited identifier (an email or other login handle), unique per scope: a
-    /// pending_verification user is provisioned for it. An identifier already in use
+    /// `pending_verification` user is provisioned for it. An identifier already in use
     /// by an existing user returns 409.
     #[schema(example = "ada@example.test")]
     pub identifier: String,

@@ -159,5 +159,13 @@ name = "users"
 path = "tests/users.rs"
 required-features = ["testing"]
 
+# Admin user invitations over HTTP (issue #60): the one-time token is returned at
+# create/resend and never on a read or an idempotent replay, revoke makes a pending
+# invitation unacceptable, and every cross-scope probe is the uniform not-found.
+[[test]]
+name = "invitations"
+path = "tests/invitations.rs"
+required-features = ["testing"]
+
 [lints]
 workspace = true

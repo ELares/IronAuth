@@ -206,6 +206,16 @@ name = "account"
 path = "tests/account.rs"
 required-features = ["testing"]
 
+# The public invitation-accept endpoint (issue #60): a token-authenticated invitee
+# redeems a single-use, expiring, unguessable token to enroll a credential and
+# activate the pending-verification user; the redeem is atomic and single-use, a
+# forged/expired/redeemed/revoked/cross-tenant token is the uniform not-found, and a
+# passkey invitation activates without a password. Needs a real database.
+[[test]]
+name = "invitations"
+path = "tests/invitations.rs"
+required-features = ["testing"]
+
 # Secret-based client authentication: client_secret_basic and client_secret_post,
 # the registered-method enforcement, and spec-exact invalid_client (issue #20).
 [[test]]

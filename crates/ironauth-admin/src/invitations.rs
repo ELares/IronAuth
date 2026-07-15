@@ -3,7 +3,7 @@
 //! Admin user-invitation CRUD (issue #60).
 //!
 //! The management-plane surface over the `user_invitations` entity: create an
-//! invitation for a new identity (which provisions a pending_verification user
+//! invitation for a new identity (which provisions a `pending_verification` user
 //! through the #52 audited management repo and mints a single-use, expiring,
 //! unguessable token), list and inspect invitations, revoke a pending one, and
 //! resend (rotate the token on) a pending one. The token-authenticated ACCEPT that
@@ -143,6 +143,7 @@ fn state_change_body(id: &InvitationId, state: InvitationStateView) -> Result<St
         (status = 422, description = "Idempotency-Key reused with a different request", body = ErrorBody)
     )
 )]
+#[allow(clippy::too_many_lines)]
 pub async fn create_invitation(
     State(state): State<AdminState>,
     principal: Principal,
@@ -173,7 +174,9 @@ pub async fn create_invitation(
 
     let request: CreateInvitationRequest = parse_json(&body)?;
     let identifier = require_non_empty(&request.identifier, "identifier")?;
-    let credential_view = request.credential_type.unwrap_or(InvitationCredentialTypeView::Password);
+    let credential_view = request
+        .credential_type
+        .unwrap_or(InvitationCredentialTypeView::Password);
     let credential_type: InvitationCredentialType = credential_view.into();
     let org_context = match request.org_context.as_deref() {
         Some(value) => Some(require_non_empty(value, "org_context")?),
