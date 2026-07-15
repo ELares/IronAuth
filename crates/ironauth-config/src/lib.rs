@@ -876,6 +876,41 @@ pub struct OidcConfig {
     /// setting in spirit; the process value is the deployment default until
     /// per-environment overrides ride the M5 promotion pipeline.
     pub frontchannel_logout_enabled: bool,
+    /// Whether the OIDC Back-Channel Logout delivery worker runs (issue #34). OFF by
+    /// default (the covenant posture: no mandatory background infrastructure), so the
+    /// default build enqueues nothing and sends nothing. When enabled, the worker drains
+    /// the durable session-ended outbox, builds one signed Logout Token per participating
+    /// relying party (each carrying that RP's own `sid`), and POSTs it to the RP's
+    /// registered `backchannel_logout_uri` through the SSRF-hardened outbound fetcher,
+    /// with bounded-backoff retries and a dead-letter state. Discovery advertises
+    /// `backchannel_logout_supported` regardless (the OP supports the mechanism); this
+    /// switch governs only whether the delivery worker is scheduled.
+    pub backchannel_logout_enabled: bool,
+
+    /// The maximum number of delivery attempts the back-channel logout worker makes for
+    /// one relying party before it DEAD-LETTERS the delivery (issue #34). A slow or down
+    /// RP is retried with exponential backoff up to this cap, then given up on (recorded
+    /// with its last error) so it never retries unboundedly. The default (5) is
+    /// conservative. Must be at least 1.
+    pub backchannel_logout_max_attempts: u32,
+
+    /// The base delay in seconds for the back-channel logout worker's exponential backoff
+    /// between delivery retries (issue #34). The nth retry waits about
+    /// `base * 2^(n-1)` seconds plus jitter (both drawn from the deterministic clock and
+    /// entropy seams). The default (10) is conservative. Must be at least 1 and at most
+    /// `OIDC_MAX_LIFETIME_SECS`.
+    pub backchannel_logout_retry_base_secs: u64,
+
+    /// How often, in seconds, the back-channel logout worker polls the queue for due work
+    /// (issue #34). The default (5) is a responsive-yet-cheap cadence. Must be at least 1
+    /// and at most `OIDC_MAX_LIFETIME_SECS`.
+    pub backchannel_logout_poll_interval_secs: u64,
+
+    /// The per-delivery total time budget in seconds for one back-channel logout POST
+    /// (issue #34): the SSRF-hardened fetcher aborts a delivery that exceeds it, so a slow
+    /// RP cannot wedge the worker or block other RPs. The default (10) is conservative.
+    /// Must be at least 1 and at most `OIDC_MAX_LIFETIME_SECS`.
+    pub backchannel_logout_request_timeout_secs: u64,
 }
 
 impl Default for OidcConfig {
@@ -927,6 +962,11 @@ impl Default for OidcConfig {
             device_verification_rate_window_secs: 60,
             session_management_enabled: false,
             frontchannel_logout_enabled: false,
+            backchannel_logout_enabled: false,
+            backchannel_logout_max_attempts: 5,
+            backchannel_logout_retry_base_secs: 10,
+            backchannel_logout_poll_interval_secs: 5,
+            backchannel_logout_request_timeout_secs: 10,
         }
     }
 }
@@ -1153,8 +1193,50 @@ impl Config {
             });
         }
         validate_device_authorization(&self.oidc)?;
+        validate_backchannel_logout(&self.oidc)?;
         Ok(())
     }
+}
+
+/// Validate the back-channel logout worker settings (issue #34), kept out of
+/// [`Config::validate`] so each stays within the readable-length lint. The attempts cap
+/// must admit at least one attempt, and the backoff base, poll cadence, and per-delivery
+/// timeout are bounded like the other second-valued knobs: a zero is meaningless, and a
+/// value beyond the ceiling is a misconfiguration.
+fn validate_backchannel_logout(oidc: &OidcConfig) -> Result<(), ConfigError> {
+    if oidc.backchannel_logout_max_attempts < 1 {
+        return Err(ConfigError::Invalid {
+            message: "oidc.backchannel_logout_max_attempts must be at least 1".to_owned(),
+        });
+    }
+    for (name, value) in [
+        (
+            "oidc.backchannel_logout_retry_base_secs",
+            oidc.backchannel_logout_retry_base_secs,
+        ),
+        (
+            "oidc.backchannel_logout_poll_interval_secs",
+            oidc.backchannel_logout_poll_interval_secs,
+        ),
+        (
+            "oidc.backchannel_logout_request_timeout_secs",
+            oidc.backchannel_logout_request_timeout_secs,
+        ),
+    ] {
+        if value < 1 {
+            return Err(ConfigError::Invalid {
+                message: format!("{name} must be at least 1 second"),
+            });
+        }
+        if value > OIDC_MAX_LIFETIME_SECS {
+            return Err(ConfigError::Invalid {
+                message: format!(
+                    "{name} ({value}) must not exceed {OIDC_MAX_LIFETIME_SECS} seconds"
+                ),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Validate the device-authorization grant settings (issue #24, RFC 8628), kept out

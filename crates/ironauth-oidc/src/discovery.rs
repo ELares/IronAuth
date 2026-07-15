@@ -637,6 +637,13 @@ pub fn discovery_document(
             json!(true),
         );
     }
+    // OIDC Back-Channel Logout 1.0 (issue #34): the OP builds a signed Logout Token per
+    // participating relying party and delivers it out of band to the registered
+    // backchannel_logout_uri, so this is advertised TRUTHFULLY as supported. It is
+    // advertised unconditionally (the OP supports the mechanism); whether the delivery
+    // worker is actually scheduled is a deployment posture (oidc.backchannel_logout_enabled),
+    // not a protocol capability an RP negotiates on.
+    document.insert("backchannel_logout_supported".to_owned(), json!(true));
 
     Value::Object(document)
 }

@@ -69,6 +69,7 @@
 
 mod authn;
 mod authorize;
+mod backchannel;
 mod claims_request;
 mod client_auth;
 mod client_credentials;
@@ -118,6 +119,10 @@ use axum::routing::{get, post};
 pub use authn::{
     AuthMethod, AuthenticationEvent, achieved_acr, acr_values_supported, amr_values, methods_token,
     parse_methods,
+};
+pub use backchannel::{
+    BACKCHANNEL_LOGOUT_EVENT, BackChannelLogoutWorker, DrainStats, FetchLogoutSender,
+    LOGOUT_TOKEN_TYP, LogoutSender, SendFailure, WorkerSettings, build_logout_token_claims,
 };
 pub use client_auth::{
     AuthenticatedClient, ClientAuthError, ClientAuthInputs, ClientAuthMethod, ClientAuthParseError,

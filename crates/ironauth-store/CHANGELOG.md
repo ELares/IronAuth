@@ -26,6 +26,37 @@ range per docs/RELEASING.md.
   - The migration is additive (two `ALTER TABLE clients ADD COLUMN` plus a column-scoped
     grant), safe for the old binary; the DB-backed guard test now asserts a
     twenty-five-migration production chain and the two new columns.
+- Back-Channel Logout persistence (issue #34, migration 0025, expand). Lets the
+  back-channel logout delivery worker resolve participants and drive an at-least-once,
+  per-RP delivery queue on top of the #35 session-ended outbox.
+  - **Client registration columns.** Two additive `clients` columns:
+    `backchannel_logout_uri text` (the RP-controlled URL a signed Logout Token is POSTed
+    to; a client with none registered is not a participant) and
+    `backchannel_logout_session_required boolean NOT NULL DEFAULT false`. Written by the
+    new audited `ActingClientRepo::register_backchannel_logout` (the URI validated as an
+    https target before anything is stored; a `client.backchannel_logout.register` audit
+    row in the same transaction, a new `Action` variant). The data-plane write is a
+    COLUMN-SCOPED `GRANT UPDATE (backchannel_logout_uri, backchannel_logout_session_required)`
+    (the #31 lesson, never a table-wide UPDATE).
+  - **The per-RP delivery queue (`backchannel_logout_deliveries`).** A new tenant-scoped
+    table the worker EXPLODES each drained session-ended event into: one row per
+    participating RP, each carrying that client's OWN `sid` (never another client's) and a
+    snapshot of its `logout_uri`, with its own `attempts`, `next_attempt_at` backoff gate,
+    `claimed_at` lease, `last_error`, and the two terminal markers `delivered_at` /
+    `dead_lettered_at`. ENABLE + FORCE row-level security with the (tenant, environment)
+    isolation policy, the nonempty-scope CHECK, a UNIQUE (scope, event, client) idempotency
+    key, and COLUMN-SCOPED grants (the app role INSERTs and mutates only the six lifecycle
+    columns; the control role gets read-only SELECT for a future status surface).
+  - **The `BackChannelDeliveryRepo` (via `ScopedStore::backchannel_deliveries`).**
+    `enqueue_for_event` explodes an outbox event into per-RP rows idempotently (a join of
+    `client_sessions` and `clients` where a `backchannel_logout_uri` is registered);
+    `claim_due` leases due, not-yet-terminal rows `FOR UPDATE SKIP LOCKED` (multi-worker
+    safe); `mark_delivered` retires a row on a 2xx; `record_failure` schedules a bounded
+    backoff retry or dead-letters the row at the caller-decided attempts cap; `pending` and
+    `list` read the queue. A new `bld_` scoped id and a `LogoutDelivery` typed row.
+  - **`ManagementStore::list_environment_scopes`** enumerates every `(tenant, environment)`
+    scope on the control plane, so a per-scope background worker can iterate the scopes to
+    drain (a control-plane read of the non-RLS `environments` table).
 - RP-Initiated Logout persistence (issue #33, migration 0023, expand). Lets the OIDC
   `end_session` endpoint terminate an SSO session and, only on an exact match with a
   verifiable `id_token_hint`, redirect back to a client.

@@ -55,11 +55,11 @@ use sqlx::{Postgres, Row, Transaction};
 use crate::audit::{ActingContext, Action, ActorRef};
 use crate::error::StoreError;
 use crate::id::{
-    AssertionMappingId, AuditId, AuditTarget, AuthorizationCodeId, ClientId, ClientSessionId,
-    ConsentId, CorrelationId, DcrPolicyId, DeviceCodeId, EnvironmentId, ExternalIssuerId, GrantId,
-    InitialAccessTokenId, IssuedTokenId, ManagementKeyId, OperatorId, PushedRequestId,
-    RefreshFamilyId, RefreshTokenId, ResourceServerId, ServiceAccountId, SessionEventId, SessionId,
-    SigningKeyId, TenantId, UserId,
+    AssertionMappingId, AuditId, AuditTarget, AuthorizationCodeId, BackChannelDeliveryId, ClientId,
+    ClientSessionId, ConsentId, CorrelationId, DcrPolicyId, DeviceCodeId, EnvironmentId,
+    ExternalIssuerId, GrantId, InitialAccessTokenId, IssuedTokenId, ManagementKeyId, OperatorId,
+    PushedRequestId, RefreshFamilyId, RefreshTokenId, ResourceServerId, ServiceAccountId,
+    SessionEventId, SessionId, SigningKeyId, TenantId, UserId,
 };
 use crate::scope::Scope;
 use crate::store::Store;
@@ -153,6 +153,19 @@ impl<'a> ScopedStore<'a> {
     #[must_use]
     pub fn session_events(&self) -> SessionEventOutboxRepo<'a> {
         SessionEventOutboxRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
+    /// The per-RP back-channel-logout delivery queue for this scope (issue #34): the
+    /// at-least-once work queue the back-channel logout worker drains. Off the audited
+    /// path (delivery bookkeeping, like the outbox drain), even though its explode/claim/
+    /// mark mutate lifecycle columns: the durable record of the session end is the #35
+    /// outbox row and its audit sibling, not a delivery attempt.
+    #[must_use]
+    pub fn backchannel_deliveries(&self) -> BackChannelDeliveryRepo<'a> {
+        BackChannelDeliveryRepo {
             store: self.store,
             scope: self.scope,
         }
@@ -1774,6 +1787,73 @@ impl ActingClientRepo<'_> {
                 // A no-op update (nothing in scope matched) is a uniform not-found;
                 // erroring here short-circuits before the audit insert, so it leaves
                 // no audit row (we audit real mutations only).
+                if result.rows_affected() == 0 {
+                    return Err(StoreError::NotFound);
+                }
+                Ok(())
+            },
+            false,
+        )
+        .await
+    }
+
+    /// Register a client's Back-Channel Logout endpoint (issue #34): the
+    /// `backchannel_logout_uri` the OP POSTs a signed Logout Token to when the client's
+    /// session ends, and the `backchannel_logout_session_required` flag. The URI is
+    /// validated as an https target BEFORE anything is written (a back-channel POST is
+    /// outbound and must be https; the SSRF-hardened fetcher blocks a private resolved
+    /// address at delivery regardless). Passing `None` for the URI CLEARS the
+    /// registration, so the client stops being a participant. Writes one
+    /// `client.backchannel_logout.register` audit row in the same transaction.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::InvalidRedirectUri`] if a present URI is not an https URL (nothing
+    /// is written); [`StoreError::NotFound`] if the id is out of scope or no client
+    /// matches; [`StoreError::Database`] on a persistence failure.
+    pub async fn register_backchannel_logout(
+        &self,
+        env: &Env,
+        id: &ClientId,
+        uri: Option<&str>,
+        session_required: bool,
+    ) -> Result<(), StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        // A back-channel logout POST is outbound HTTPS: reject a non-https target at
+        // registration (defense in depth; the fetcher still blocks a private resolved
+        // address at delivery). An empty string is treated as absent.
+        let uri = uri.filter(|value| !value.is_empty());
+        if let Some(value) = uri {
+            if !value.starts_with("https://") {
+                return Err(StoreError::InvalidRedirectUri);
+            }
+        }
+        let owned = uri.map(str::to_owned);
+        let scope = self.scope;
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::ClientBackchannelLogoutRegister,
+                target: id,
+            },
+            async move |tx| {
+                let result = sqlx::query(
+                    "UPDATE clients \
+                     SET backchannel_logout_uri = $1, backchannel_logout_session_required = $2 \
+                     WHERE id = $3 AND tenant_id = $4 AND environment_id = $5",
+                )
+                .bind(owned.as_deref())
+                .bind(session_required)
+                .bind(id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .execute(&mut **tx)
+                .await?;
                 if result.rows_affected() == 0 {
                     return Err(StoreError::NotFound);
                 }
@@ -8591,6 +8671,369 @@ impl SessionEventOutboxRepo<'_> {
     }
 }
 
+/// One per-RP back-channel-logout delivery row (issue #34): the typed contract the
+/// worker drains off the delivery queue. It names WHAT to deliver to WHICH relying
+/// party (never any bearer secret): the outbox event it was exploded from, the ended
+/// SSO session, the target client, THAT client's own `sid` (never another client's),
+/// and the RP's registered `logout_uri`, plus the retry state (attempts, last error,
+/// and the two terminal markers).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LogoutDelivery {
+    /// The delivery id (a `bld_` id).
+    pub id: String,
+    /// The `sev_` session-ended outbox event this delivery was exploded from.
+    pub event_id: String,
+    /// The SSO session (a `ses_` id) that ended.
+    pub session_id: String,
+    /// The participating client this token targets.
+    pub client_id: String,
+    /// The per-(client, session) `sid` THIS client's logout token carries.
+    pub sid: String,
+    /// The RP's registered `backchannel_logout_uri`, snapshotted at explode time.
+    pub logout_uri: String,
+    /// The Logout Token `jti`, assigned once at explode time and reused across every
+    /// delivery attempt of this row, so a retry re-POSTs the SAME token and the RP dedups
+    /// on it.
+    pub jti: String,
+    /// The number of delivery attempts made so far.
+    pub attempts: i32,
+    /// The most recent failure reason, if any attempt has failed.
+    pub last_error: Option<String>,
+    /// When the delivery succeeded (a 2xx), if it did, in epoch microseconds.
+    pub delivered_at_unix_micros: Option<i64>,
+    /// When the delivery was given up on (the attempts cap), if it was, in epoch
+    /// microseconds.
+    pub dead_lettered_at_unix_micros: Option<i64>,
+}
+
+/// The columns every delivery read selects, in one place so the claim, the pending peek,
+/// and the full listing return the identical shape.
+const LOGOUT_DELIVERY_COLUMNS: &str = "id, event_id, session_id, client_id, sid, \
+     logout_uri, jti, attempts, last_error, \
+     (EXTRACT(EPOCH FROM delivered_at) * 1000000)::bigint AS delivered_us, \
+     (EXTRACT(EPOCH FROM dead_lettered_at) * 1000000)::bigint AS dead_us";
+
+/// Reconstruct a [`LogoutDelivery`] from a selected row.
+fn logout_delivery_from_row(row: &PgRow) -> LogoutDelivery {
+    LogoutDelivery {
+        id: row.get("id"),
+        event_id: row.get("event_id"),
+        session_id: row.get("session_id"),
+        client_id: row.get("client_id"),
+        sid: row.get("sid"),
+        logout_uri: row.get("logout_uri"),
+        jti: row.get("jti"),
+        attempts: row.get("attempts"),
+        last_error: row.get("last_error"),
+        delivered_at_unix_micros: row.get("delivered_us"),
+        dead_lettered_at_unix_micros: row.get("dead_us"),
+    }
+}
+
+/// The per-RP back-channel-logout delivery queue (issue #34): the at-least-once work
+/// queue the delivery worker drains, keyed to one scope.
+///
+/// A drained session-ended event (issue #35) is EXPLODED into one row per participating
+/// relying party (a client that registered a `backchannel_logout_uri`), each carrying
+/// that client's OWN `sid`. [`claim_due`](BackChannelDeliveryRepo::claim_due) leases a
+/// batch of due, not-yet-terminal rows (`FOR UPDATE SKIP LOCKED`, so multiple workers
+/// are safe), the worker POSTs each token, then either
+/// [`mark_delivered`](BackChannelDeliveryRepo::mark_delivered) on a 2xx or
+/// [`record_failure`](BackChannelDeliveryRepo::record_failure) to schedule a bounded
+/// backoff retry or dead-letter it once the attempts cap is reached.
+pub struct BackChannelDeliveryRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl BackChannelDeliveryRepo<'_> {
+    /// EXPLODE one drained session-ended `event_id` (for the ended `session_id`) into one
+    /// delivery row per participating relying party (issue #34), returning how many NEW
+    /// rows were queued.
+    ///
+    /// A participating RP is a client with a per-client session for `session_id` (so it
+    /// had an active login) that ALSO registered a non-empty `backchannel_logout_uri`.
+    /// Each row snapshots that client's OWN `sid` (never another client's) and its
+    /// `logout_uri`, and becomes immediately due (`next_attempt_at = now`). The insert is
+    /// idempotent per (event, client) via the unique key, so re-exploding a redelivered
+    /// outbox event queues nothing new (at-least-once delivery, dedup by the RP on `jti`).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence fault.
+    pub async fn enqueue_for_event(
+        &self,
+        env: &Env,
+        event_id: &str,
+        session_id: &str,
+    ) -> Result<u64, StoreError> {
+        let scope = self.scope;
+        let now_micros = epoch_micros(env.clock().now_utc());
+        let tenant = scope.tenant().to_string();
+        let environment = scope.environment().to_string();
+        let mut tx = begin_scoped(self.store, scope).await?;
+        // The participating RPs: a per-client session for this SSO session whose client
+        // registered a back-channel logout URI. The per-client session may itself be
+        // revoked by the session-end cascade; that is exactly WHY we notify, so no
+        // liveness filter on the per-client session here.
+        let participants = sqlx::query(
+            "SELECT cs.client_id AS client_id, cs.sid AS sid, \
+                    c.backchannel_logout_uri AS logout_uri \
+             FROM client_sessions cs \
+             JOIN clients c \
+               ON c.id = cs.client_id \
+              AND c.tenant_id = cs.tenant_id \
+              AND c.environment_id = cs.environment_id \
+             WHERE cs.session_id = $1 AND cs.tenant_id = $2 AND cs.environment_id = $3 \
+               AND c.backchannel_logout_uri IS NOT NULL AND c.backchannel_logout_uri <> ''",
+        )
+        .bind(session_id)
+        .bind(&tenant)
+        .bind(&environment)
+        .fetch_all(&mut *tx)
+        .await?;
+        let mut queued: u64 = 0;
+        for row in &participants {
+            let client_id: String = row.get("client_id");
+            let sid: String = row.get("sid");
+            let logout_uri: String = row.get("logout_uri");
+            let delivery_id = BackChannelDeliveryId::generate(env, &scope);
+            // The Logout Token jti, minted ONCE here at explode time and carried on the
+            // row, so every delivery ATTEMPT of this delivery re-POSTs the SAME token and
+            // the RP can dedup a retry on the jti (a fresh jti per attempt would defeat
+            // that at-least-once dedup).
+            let jti = IssuedTokenId::generate(env, &scope);
+            let inserted = sqlx::query(
+                "INSERT INTO backchannel_logout_deliveries \
+                 (id, tenant_id, environment_id, event_id, session_id, client_id, sid, \
+                  logout_uri, jti, next_attempt_at) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, \
+                         TIMESTAMPTZ 'epoch' + ($10::text || ' microseconds')::interval) \
+                 ON CONFLICT (tenant_id, environment_id, event_id, client_id) DO NOTHING",
+            )
+            .bind(delivery_id.to_string())
+            .bind(&tenant)
+            .bind(&environment)
+            .bind(event_id)
+            .bind(session_id)
+            .bind(&client_id)
+            .bind(&sid)
+            .bind(&logout_uri)
+            .bind(jti.to_string())
+            .bind(now_micros)
+            .execute(&mut *tx)
+            .await?;
+            queued += inserted.rows_affected();
+        }
+        tx.commit().await?;
+        Ok(queued)
+    }
+
+    /// Atomically CLAIM up to `limit` DUE, not-yet-terminal deliveries in this scope
+    /// (issue #34), stamping each with a visibility lease that expires `lease` from now.
+    /// A row is due when `next_attempt_at <= now` (the backoff gate) and it is neither
+    /// delivered nor dead-lettered; a row another worker holds an unexpired lease on is
+    /// SKIPPED (`FOR UPDATE SKIP LOCKED`), so two workers never double-deliver and never
+    /// block on each other. A crashed worker's row reappears once its lease lapses
+    /// (at-least-once).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence fault.
+    pub async fn claim_due(
+        &self,
+        env: &Env,
+        lease: Duration,
+        limit: i64,
+    ) -> Result<Vec<LogoutDelivery>, StoreError> {
+        let scope = self.scope;
+        let now_micros = epoch_micros(env.clock().now_utc());
+        let lease_micros = i64::try_from(lease.as_micros()).unwrap_or(i64::MAX);
+        let sql = format!(
+            "UPDATE backchannel_logout_deliveries \
+             SET claimed_at = TIMESTAMPTZ 'epoch' + ($1::text || ' microseconds')::interval \
+             WHERE id IN ( \
+                 SELECT id FROM backchannel_logout_deliveries \
+                 WHERE tenant_id = $2 AND environment_id = $3 \
+                 AND delivered_at IS NULL AND dead_lettered_at IS NULL \
+                 AND next_attempt_at <= TIMESTAMPTZ 'epoch' \
+                     + ($1::text || ' microseconds')::interval \
+                 AND (claimed_at IS NULL \
+                      OR claimed_at < TIMESTAMPTZ 'epoch' \
+                         + (($1::bigint - $4)::text || ' microseconds')::interval) \
+                 ORDER BY next_attempt_at \
+                 LIMIT $5 \
+                 FOR UPDATE SKIP LOCKED \
+             ) \
+             RETURNING {LOGOUT_DELIVERY_COLUMNS}"
+        );
+        let mut tx = begin_scoped(self.store, scope).await?;
+        let rows = sqlx::query(&sql)
+            .bind(now_micros)
+            .bind(scope.tenant().to_string())
+            .bind(scope.environment().to_string())
+            .bind(lease_micros)
+            .bind(limit)
+            .fetch_all(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(rows.iter().map(logout_delivery_from_row).collect())
+    }
+
+    /// Read up to `limit` not-yet-terminal deliveries in this scope, oldest gate first,
+    /// WITHOUT claiming them (issue #34): a read-only peek for diagnostics and tests.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence fault.
+    pub async fn pending(&self, limit: i64) -> Result<Vec<LogoutDelivery>, StoreError> {
+        let scope = self.scope;
+        let sql = format!(
+            "SELECT {LOGOUT_DELIVERY_COLUMNS} FROM backchannel_logout_deliveries \
+             WHERE tenant_id = $1 AND environment_id = $2 \
+             AND delivered_at IS NULL AND dead_lettered_at IS NULL \
+             ORDER BY next_attempt_at LIMIT $3"
+        );
+        let mut tx = begin_scoped(self.store, scope).await?;
+        let rows = sqlx::query(&sql)
+            .bind(scope.tenant().to_string())
+            .bind(scope.environment().to_string())
+            .bind(limit)
+            .fetch_all(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(rows.iter().map(logout_delivery_from_row).collect())
+    }
+
+    /// Read up to `limit` deliveries in this scope in ANY state (issue #34), newest
+    /// first: the full listing a management status surface and the tests read, including
+    /// the delivered and dead-lettered terminal rows the drain peek hides.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence fault.
+    pub async fn list(&self, limit: i64) -> Result<Vec<LogoutDelivery>, StoreError> {
+        let scope = self.scope;
+        let sql = format!(
+            "SELECT {LOGOUT_DELIVERY_COLUMNS} FROM backchannel_logout_deliveries \
+             WHERE tenant_id = $1 AND environment_id = $2 \
+             ORDER BY created_at DESC, id DESC LIMIT $3"
+        );
+        let mut tx = begin_scoped(self.store, scope).await?;
+        let rows = sqlx::query(&sql)
+            .bind(scope.tenant().to_string())
+            .bind(scope.environment().to_string())
+            .bind(limit)
+            .fetch_all(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(rows.iter().map(logout_delivery_from_row).collect())
+    }
+
+    /// Mark ONE claimed delivery DELIVERED by its `id` (issue #34), the terminal success
+    /// state, so it never drains again. Idempotent: it flips `delivered_at` only while it
+    /// is still non-terminal, so a double mark reports `false` the second time. A
+    /// foreign-scope or malformed id is a uniform no-op (`false`), never an oracle.
+    /// Returns whether THIS call flipped it.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence fault.
+    pub async fn mark_delivered(&self, env: &Env, id: &str) -> Result<bool, StoreError> {
+        let scope = self.scope;
+        let Ok(delivery_id) = BackChannelDeliveryId::parse_in_scope(id, &scope) else {
+            return Ok(false);
+        };
+        let now_micros = epoch_micros(env.clock().now_utc());
+        let mut tx = begin_scoped(self.store, scope).await?;
+        let flipped = sqlx::query(
+            "UPDATE backchannel_logout_deliveries \
+             SET delivered_at = TIMESTAMPTZ 'epoch' + ($1::text || ' microseconds')::interval \
+             WHERE id = $2 AND tenant_id = $3 AND environment_id = $4 \
+             AND delivered_at IS NULL AND dead_lettered_at IS NULL",
+        )
+        .bind(now_micros)
+        .bind(delivery_id.to_string())
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(flipped.rows_affected() > 0)
+    }
+
+    /// Record a FAILED delivery attempt on `id` (issue #34): set the new `attempts`
+    /// count and the `last_error` label, release the lease, and either schedule the next
+    /// backoff retry (`next_attempt_micros = Some`) or DEAD-LETTER the row
+    /// (`next_attempt_micros = None`) once the caller decided the attempts cap is reached.
+    /// The worker computes the backoff instant and the dead-letter decision from the
+    /// application clock and entropy seams, so the schedule is deterministic under a
+    /// manual clock; this method only persists that decision. A foreign-scope or
+    /// malformed id is a uniform no-op. Returns whether a row was updated.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence fault.
+    pub async fn record_failure(
+        &self,
+        env: &Env,
+        id: &str,
+        attempts: i32,
+        next_attempt_micros: Option<i64>,
+        last_error: &str,
+    ) -> Result<bool, StoreError> {
+        let scope = self.scope;
+        let Ok(delivery_id) = BackChannelDeliveryId::parse_in_scope(id, &scope) else {
+            return Ok(false);
+        };
+        let now_micros = epoch_micros(env.clock().now_utc());
+        let mut tx = begin_scoped(self.store, scope).await?;
+        // Either schedule the next retry, or dead-letter (give up) now. Both clear the
+        // lease so the row is not seen as in-flight; the backoff gate (or the terminal
+        // marker) governs re-eligibility.
+        let updated = match next_attempt_micros {
+            Some(next_micros) => {
+                sqlx::query(
+                    "UPDATE backchannel_logout_deliveries \
+                     SET attempts = $1, last_error = $2, claimed_at = NULL, \
+                         next_attempt_at = TIMESTAMPTZ 'epoch' \
+                             + ($3::text || ' microseconds')::interval \
+                     WHERE id = $4 AND tenant_id = $5 AND environment_id = $6 \
+                     AND delivered_at IS NULL AND dead_lettered_at IS NULL",
+                )
+                .bind(attempts)
+                .bind(last_error)
+                .bind(next_micros)
+                .bind(delivery_id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .execute(&mut *tx)
+                .await?
+            }
+            None => {
+                sqlx::query(
+                    "UPDATE backchannel_logout_deliveries \
+                     SET attempts = $1, last_error = $2, claimed_at = NULL, \
+                         dead_lettered_at = TIMESTAMPTZ 'epoch' \
+                             + ($3::text || ' microseconds')::interval \
+                     WHERE id = $4 AND tenant_id = $5 AND environment_id = $6 \
+                     AND delivered_at IS NULL AND dead_lettered_at IS NULL",
+                )
+                .bind(attempts)
+                .bind(last_error)
+                .bind(now_micros)
+                .bind(delivery_id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .execute(&mut *tx)
+                .await?
+            }
+        };
+        tx.commit().await?;
+        Ok(updated.rows_affected() > 0)
+    }
+}
+
 /// The fields a fresh SSO session carries at rotation/creation (issue #32).
 ///
 /// Times are microseconds since the Unix epoch, all from the application clock
@@ -10747,6 +11190,35 @@ impl<'a> ManagementStore<'a> {
             store: self.store,
             tenant,
         }
+    }
+
+    /// List every `(tenant, environment)` scope known to the control plane (issue #34):
+    /// the set a per-scope background worker (the back-channel logout delivery worker)
+    /// iterates to drain each scope's queue. Requires the control-plane role (it reads
+    /// the non-RLS `environments` table the data-plane role cannot see), so it belongs on
+    /// the management surface, not the scoped store. Rows whose stored identifiers do not
+    /// parse are skipped (defense in depth against a corrupt row).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence fault.
+    pub async fn list_environment_scopes(&self) -> Result<Vec<Scope>, StoreError> {
+        let rows = sqlx::query("SELECT id, tenant_id FROM environments ORDER BY tenant_id, id")
+            .fetch_all(self.store.pool())
+            .await?;
+        let mut scopes = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let environment_text: String = row.get("id");
+            let tenant_text: String = row.get("tenant_id");
+            let (Ok(tenant), Ok(environment)) = (
+                TenantId::parse(&tenant_text),
+                EnvironmentId::parse(&environment_text),
+            ) else {
+                continue;
+            };
+            scopes.push(Scope::new(tenant, environment));
+        }
+        Ok(scopes)
     }
 
     /// The read-only management-credential repository for `scope`.

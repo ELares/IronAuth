@@ -418,9 +418,15 @@ fn registry() -> Vec<Migration> {
         },
         Migration {
             version: 25,
+            name: "backchannel_logout",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0025_backchannel_logout.sql"),
+        },
+        Migration {
+            version: 26,
             name: "frontchannel_logout",
             phase: Phase::Expand,
-            sql: include_str!("../migrations/0025_frontchannel_logout.sql"),
+            sql: include_str!("../migrations/0026_frontchannel_logout.sql"),
         },
     ]
 }

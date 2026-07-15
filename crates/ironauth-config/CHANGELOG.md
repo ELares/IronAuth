@@ -19,6 +19,20 @@ range per docs/RELEASING.md.
     `frontchannel_logout_session_required`. Best-effort only; it never blocks or
     reorders the authoritative back-channel logout path. Off by default; enabling still
     requires the per-client registration.
+- Back-Channel Logout delivery worker settings (issue #34), all on `[oidc]`:
+  - `backchannel_logout_enabled` (default `false`): whether the delivery worker runs. Off
+    by default (the covenant: no mandatory background infrastructure). Discovery advertises
+    `backchannel_logout_supported` regardless; this switch governs only the worker.
+  - `backchannel_logout_max_attempts` (default `5`, at least 1): the attempts cap after
+    which a per-RP delivery is dead-lettered.
+  - `backchannel_logout_retry_base_secs` (default `10`): the base delay for the worker's
+    exponential backoff between retries.
+  - `backchannel_logout_poll_interval_secs` (default `5`): how often the worker polls the
+    queue for due work.
+  - `backchannel_logout_request_timeout_secs` (default `10`): the per-delivery time budget
+    the SSRF-hardened fetcher enforces, so a slow RP cannot wedge the worker.
+  - The three second-valued knobs are validated to be at least 1 and at most
+    `OIDC_MAX_LIFETIME_SECS`; the attempts cap must be at least 1.
 - Global Token Revocation, an EXPERIMENTAL receiver (issue #36).
   - The `global-token-revocation` feature is registered on the maturity ladder as
     Experimental: off by default, and enabling it requires an `ack` equal to the exact

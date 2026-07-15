@@ -695,4 +695,8 @@ async fn backchannel_logout_session_support_is_advertised_truthfully() {
         &DiscoveryCapabilities::default(),
     );
     assert_eq!(doc["backchannel_logout_session_supported"], json!(true));
+    // OIDC Back-Channel Logout 1.0 (issue #34): the OP builds a signed Logout Token per
+    // participating RP and delivers it out of band, so the mechanism itself is advertised
+    // truthfully too, alongside the sid support that makes it targetable.
+    assert_eq!(doc["backchannel_logout_supported"], json!(true));
 }
