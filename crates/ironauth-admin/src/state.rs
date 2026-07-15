@@ -54,6 +54,13 @@ struct Inner {
     bootstrap_operator_actor: ActorRef,
     default_page_size: u32,
     max_page_size: u32,
+    // The operator's configured data-residency region set (issue #46). A tenant's
+    // home_region and a per-environment region pin must be one of these; empty means
+    // residency pinning is unavailable and any pin on a create is refused.
+    allowed_regions: Vec<String>,
+    // The tenant-offboarding retention window in seconds (issue #46): the grace
+    // period a soft-deleted tenant can be restored within.
+    offboarding_retention_secs: u64,
 }
 
 impl AdminState {
@@ -109,8 +116,39 @@ impl AdminState {
                 )),
                 default_page_size,
                 max_page_size,
+                allowed_regions: config.allowed_regions.clone(),
+                offboarding_retention_secs: config.offboarding_retention_secs,
             }),
         })
+    }
+
+    /// Whether `region` is in the operator's configured data-residency region set
+    /// (issue #46). Always false when no region set is configured, so a residency
+    /// pin can be recorded only against an explicitly allowed value. Governs BOTH a
+    /// tenant's `home_region` and a per-environment `region` pin (the same set).
+    #[must_use]
+    pub fn region_is_allowed(&self, region: &str) -> bool {
+        self.inner
+            .allowed_regions
+            .iter()
+            .any(|allowed| allowed == region)
+    }
+
+    /// Whether `region` is a permitted tenant `home_region` (issue #46). An alias of
+    /// [`AdminState::region_is_allowed`]: the tenant home region and the
+    /// per-environment region pin validate against the same configured set.
+    #[must_use]
+    pub fn home_region_is_allowed(&self, region: &str) -> bool {
+        self.region_is_allowed(region)
+    }
+
+    /// The configured tenant-offboarding retention window (issue #46): the grace
+    /// period during which a soft-deleted tenant can be restored, after which the
+    /// terminal hard delete is due. A tunable with a safe default (see
+    /// [`ironauth_config::AdminConfig::offboarding_retention_secs`]).
+    #[must_use]
+    pub fn offboarding_retention(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.inner.offboarding_retention_secs)
     }
 
     /// The control-plane store.

@@ -83,7 +83,9 @@ async fn create_tenant_with_first_environment(
                 display_name: "first",
                 kind,
                 custom_domain,
+                region: None,
             },
+            None,
             key.as_new(),
             None,
         )
@@ -117,6 +119,7 @@ async fn create_environment(
                 display_name: "env",
                 kind,
                 custom_domain,
+                region: None,
             },
             key.as_new(),
             None,

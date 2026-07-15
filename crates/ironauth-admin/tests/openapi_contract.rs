@@ -73,8 +73,11 @@ fn operation_ids_are_the_stable_set() {
             "listResourceTypes",
             "listSessions",
             "listTenants",
+            "restoreTenant",
+            "resumeTenant",
             "revokeSession",
             "revokeUserSessions",
+            "suspendTenant",
             "verifyDcrClient",
         ]
     );
@@ -135,6 +138,9 @@ fn every_post_documents_the_idempotency_key_header() {
         "revokeSession",
         "bulkRevokeSessions",
         "revokeUserSessions",
+        "suspendTenant",
+        "resumeTenant",
+        "restoreTenant",
     ] {
         let params = find_operation(&doc, op)["parameters"]
             .as_array()
@@ -204,6 +210,9 @@ fn documented_paths_are_the_expected_set() {
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/sessions/revoke",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/sessions/{session_id}/revoke",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}/sessions/revoke",
+            "POST /v1/tenants/{tenant_id}/restore",
+            "POST /v1/tenants/{tenant_id}/resume",
+            "POST /v1/tenants/{tenant_id}/suspend",
         ]
     );
 }
@@ -242,7 +251,7 @@ fn committed_artifact_matches_generated_spec() {
 async fn served_routes_match_documented_routes() {
     let router = db_free_router();
     let documented = documented_method_paths();
-    assert_eq!(documented.len(), 31, "the documented route count is pinned");
+    assert_eq!(documented.len(), 34, "the documented route count is pinned");
 
     // 1. Every documented (method, path) is wired and auth-gated (401, not
     //    404/405). The unauthenticated probe rejects before any DB access.

@@ -6,6 +6,26 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Tenant lifecycle API and residency attributes (issue #46). Operators can suspend
+  and resume tenants and record data-residency regions through documented
+  operator-plane endpoints.
+  - **Lifecycle endpoints.** `POST /v1/tenants/{tenant_id}/suspend`, `.../resume`,
+    and `.../restore`, all Idempotency-Key honored and audited, returning the
+    tenant's new status as the post-condition. An invalid transition (for example
+    suspending an already-suspended tenant) is a loud `409`, distinct from the
+    anti-oracle `404`. A suspended tenant stays visible to control-plane reads.
+  - **Residency.** `CreateTenantRequest` gained an optional `home_region` and
+    `CreateEnvironmentRequest` gained an optional per-environment `region`, each
+    validated against the operator's configured region set (`admin.allowed_regions`)
+    and rejected with `400` when outside it or when no region set is configured.
+    `TenantView` carries `status` and `home_region`; `EnvironmentView` carries
+    `region`.
+  - **Offboarding pipeline.** `DELETE /v1/tenants/{tenant_id}` is now the GRACE
+    stage: it fences the tenant and keeps its keys intact, restorable within the
+    configured retention window (`admin.offboarding_retention_secs`). `POST
+    /v1/tenants/{tenant_id}/restore` restores a grace tenant in-window (`409` once
+    the window has elapsed). The delete no longer crypto-shreds; erasure is deferred
+    to the terminal hard-delete stage per issue #46's out-of-scope.
 - Typed environments with guardrails and scoped keys (issue #42). Environment
   creation is a single call that types the environment and provisions its identity.
   - **Typed create.** `POST /v1/tenants/{tenant_id}/environments` now takes a required

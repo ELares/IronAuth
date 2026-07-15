@@ -28,7 +28,7 @@ use crate::views::{
     ManagementKeyList, ManagementKeyView, OperatorList, OperatorView, OrganizationList,
     OrganizationView, RefreshFamilyList, RefreshFamilyView, ResourceTypeView, ResourceTypesList,
     RevokeSessionsRequest, SessionList, SessionRevocationView, SessionView, TenantCreated,
-    TenantList, TenantView, UserRevocationView,
+    TenantList, TenantStatusView, TenantView, UserRevocationView,
 };
 
 /// The management API's OpenAPI document. The handlers listed in `paths(...)`
@@ -71,6 +71,9 @@ use crate::views::{
         crate::tenants::create_tenant,
         crate::tenants::get_tenant,
         crate::tenants::delete_tenant,
+        crate::tenants::suspend_tenant,
+        crate::tenants::resume_tenant,
+        crate::tenants::restore_tenant,
         crate::environments::list_environments,
         crate::environments::create_environment,
         crate::environments::get_environment,
@@ -101,6 +104,7 @@ use crate::views::{
         TenantView,
         TenantCreated,
         TenantList,
+        TenantStatusView,
         CreateTenantRequest,
         EnvironmentView,
         GuardrailView,

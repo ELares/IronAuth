@@ -248,13 +248,13 @@ async fn expand_contract_example_chain_runs_all_three_phases_and_contract_remove
 // per real table); splitting it would not make it clearer.
 #[allow(clippy::too_many_lines)]
 #[tokio::test]
-async fn production_chain_is_only_the_twenty_nine_real_migrations_and_ships_no_demo_object() {
+async fn production_chain_is_only_the_thirty_real_migrations_and_ships_no_demo_object() {
     // TestDatabase::start runs Store::migrate() (the production chain) on a
     // fresh, empty database.
     let db = TestDatabase::start().await;
     let pool = db.owner_pool();
 
-    // Re-running is idempotent and reports exactly twenty-nine tracked migrations.
+    // Re-running is idempotent and reports exactly thirty tracked migrations.
     let report = MigrationRunner::new(pool)
         .run()
         .await
@@ -265,23 +265,23 @@ async fn production_chain_is_only_the_twenty_nine_real_migrations_and_ships_no_d
     );
     assert_eq!(
         report.already_applied(),
-        29,
-        "the production chain is exactly twenty-nine migrations (isolation, audit log, management \
+        30,
+        "the production chain is exactly thirty migrations (isolation, audit log, management \
          API, OIDC authorization, signing keys, login/consent, authentication context, redirect \
          registration, UserInfo claims, consent scope upsert, resource servers, opaque access \
          tokens, client auth suite, dynamic client registration, pushed authorization requests, \
          refresh tokens, client-credentials service accounts, DCR abuse controls, resource \
          indicators, JWT bearer assertion grant, device authorization, session model, RP-initiated \
          logout, session-ended events, back-channel logout, front-channel logout, resource-model \
-         APIs, envelope encryption, environment guardrails)"
+         APIs, envelope encryption, environment guardrails, tenant lifecycle)"
     );
 
-    // The ledger holds exactly versions 1 through 29.
+    // The ledger holds exactly versions 1 through 30.
     assert_eq!(
         applied_versions(pool).await,
         vec![
             1_i64, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
-            24, 25, 26, 27, 28, 29
+            24, 25, 26, 27, 28, 29, 30
         ]
     );
     let phase_of = |version: i64| async move {
@@ -361,6 +361,12 @@ async fn production_chain_is_only_the_twenty_nine_real_migrations_and_ships_no_d
     // set, and a GRANT INSERT on signing_keys to the control role (so environment
     // creation can provision the day-one key). Purely additive, so it is an expand.
     assert_eq!(phase_of(29).await, "expand");
+    // The tenant-lifecycle migration (issue #46): additive tenants.status,
+    // tenants.home_region, tenants.purged_at, and environments.region columns, a new
+    // environment_states scoped table with its policy and grants, and a
+    // control-plane crypto-shred grant on tenant_keks. All additive, so this is an
+    // expand too.
+    assert_eq!(phase_of(30).await, "expand");
 
     // The demo object never reaches a production database.
     assert!(
@@ -918,6 +924,44 @@ async fn production_chain_is_only_the_twenty_nine_real_migrations_and_ships_no_d
         assert!(
             column_exists(pool, "users", sealed).await,
             "users.{sealed} exists after 0027"
+        );
+    }
+
+    // The tenant lifecycle and residency attributes (issue #46): the reversible
+    // suspend/resume status and the recorded home_region on tenants, plus the new
+    // environment_states scoped table the data plane reads to fence a suspended
+    // scope. The plaintext PII invariant does not apply here: home_region is an
+    // operator-chosen region label, not end-user PII, and the serving status is a
+    // control-plane flag.
+    assert!(
+        column_exists(pool, "tenants", "status").await,
+        "tenants.status exists after 0030"
+    );
+    assert!(
+        column_exists(pool, "tenants", "home_region").await,
+        "tenants.home_region exists after 0030"
+    );
+    assert!(
+        column_exists(pool, "tenants", "purged_at").await,
+        "tenants.purged_at exists after 0030"
+    );
+    assert!(
+        column_exists(pool, "environments", "region").await,
+        "environments.region exists after 0030"
+    );
+    assert!(
+        table_exists(pool, "environment_states").await,
+        "environment_states exists after 0030"
+    );
+    for column in [
+        "tenant_id",
+        "environment_id",
+        "serving_status",
+        "updated_at",
+    ] {
+        assert!(
+            column_exists(pool, "environment_states", column).await,
+            "environment_states.{column} exists after 0030"
         );
     }
 }

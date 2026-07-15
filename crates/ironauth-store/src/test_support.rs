@@ -313,6 +313,35 @@ impl TestDatabase {
         Scope::new(tenant, environment)
     }
 
+    /// Set a scope's data-plane serving state directly, as the owner (issue #46):
+    /// the precondition a control-plane suspend/resume cascade writes into
+    /// `environment_states`. For tests (for example the OIDC data-plane fence) that
+    /// need to drive the fence from a serving state without reaching for the full
+    /// control-plane transition. `serving_status` is `active` or `suspended`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the upsert fails.
+    pub async fn set_environment_serving_state(&self, scope: Scope, serving_status: &str) {
+        // A test harness seeding a scoped table's serving-state precondition directly
+        // as the owner (bypassing RLS), exactly as it seeds the operator/tenant/
+        // environment level tables above. The inline SQL comment carries the
+        // query-audit-allow marker Postgres ignores.
+        sqlx::query(
+            "INSERT INTO environment_states /* query-audit-allow: owner test seed */ \
+             (tenant_id, environment_id, serving_status) \
+             VALUES ($1, $2, $3) \
+             ON CONFLICT (tenant_id, environment_id) \
+             DO UPDATE SET serving_status = EXCLUDED.serving_status",
+        )
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(serving_status)
+        .execute(&self.owner_pool)
+        .await
+        .expect("set environment serving state");
+    }
+
     /// Seed an additional environment for an existing tenant and return its id.
     ///
     /// # Panics

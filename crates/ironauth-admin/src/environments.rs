@@ -57,6 +57,7 @@ fn normalize_custom_domain(raw: Option<&str>) -> Option<String> {
         (status = 401, description = "Missing or invalid credential", body = ErrorBody),
         (status = 403, description = "Wrong plane or scope", body = ErrorBody),
         (status = 404, description = "Tenant not found", body = ErrorBody),
+        (status = 409, description = "Parent tenant is not active (suspended or offboarded)", body = ErrorBody),
         (status = 422, description = "Idempotency-Key reused with a different request", body = ErrorBody)
     )
 )]
@@ -115,6 +116,24 @@ pub async fn create_environment(
         return Err(ApiError::GuardrailViolation(report.into_violations()));
     }
 
+    // Residency (issue #46): a present region must be one of the operator's
+    // configured regions (the same set the tenant home_region validates against),
+    // checked BEFORE any write. A blank value is treated as omitted. A deployment
+    // with no region set rejects any region fail closed.
+    let region = request
+        .region
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned);
+    if let Some(region) = region.as_deref() {
+        if !state.region_is_allowed(region) {
+            return Err(ApiError::BadRequest(format!(
+                "region {region:?} is not one of the operator's configured data-residency regions"
+            )));
+        }
+    }
+
     let created_at_micros = state.now_unix_micros();
     let environment_id = EnvironmentId::generate(state.env());
     let scope = Scope::new(tenant, environment_id);
@@ -126,6 +145,7 @@ pub async fn create_environment(
         id: environment_id.to_string(),
         tenant_id: tenant.to_string(),
         display_name: display_name.clone(),
+        region: region.clone(),
         kind: kind.as_str().to_owned(),
         guardrail_class: kind.guardrail_class().as_str().to_owned(),
         custom_domain: custom_domain.clone(),
@@ -154,6 +174,7 @@ pub async fn create_environment(
                 display_name: &display_name,
                 kind,
                 custom_domain: custom_domain.as_deref(),
+                region: region.as_deref(),
             },
             signing_key.as_new(created_at_micros),
             Some(write),
@@ -165,6 +186,15 @@ pub async fn create_environment(
         Err(StoreError::IdempotencyConflict) => {
             idempotency::replay_after_conflict(&state, &credential_ref, &key, &fingerprint).await
         }
+        // The parent tenant exists and is visible to the control plane but is NOT
+        // active (suspended, or in the offboarding grace/terminal state), so it must
+        // not gain a fresh, unfenced environment (issue #46): a loud 409, distinct
+        // from the anti-oracle 404 an absent tenant returns.
+        Err(StoreError::Conflict) => Err(ApiError::Conflict(
+            "parent tenant is not active; a suspended or offboarded tenant cannot gain \
+             a new environment"
+                .to_owned(),
+        )),
         Err(error) => Err(error.into()),
     }
 }

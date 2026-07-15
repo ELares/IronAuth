@@ -346,6 +346,32 @@ pub struct AdminConfig {
     /// The page size a list endpoint uses when the caller supplies no `limit`.
     /// Clamped to `max_page_size`.
     pub default_page_size: u32,
+
+    /// The operator's configured data-residency region set (issue #46): the
+    /// allowed values for a tenant's `home_region` and (later) a per-environment
+    /// region pin. A tenant-create request that names a `home_region` outside this
+    /// set is rejected. Empty (the default) means the operator has configured no
+    /// region set, so residency pinning is unavailable and any `home_region` on a
+    /// create is refused; a deployment that wants residency pins lists its regions
+    /// here (for example `["eu-west", "us-east"]`). Nothing routes or replicates by
+    /// region yet; this only governs which values are recordable.
+    #[serde(default)]
+    pub allowed_regions: Vec<String>,
+
+    /// The tenant-offboarding retention window in seconds (issue #46): the grace
+    /// period during which a soft-deleted (offboarded) tenant can be RESTORED with no
+    /// data loss, after which the terminal hard deletion (crypto-shred) is due.
+    /// Tunable, with a safe default of 30 days (`2_592_000` seconds): long enough that
+    /// an accidental offboarding is recoverable, so the erasure is never a one-way
+    /// surprise. A restore is refused once the window elapses; a hard delete is
+    /// refused until it does.
+    #[serde(default = "default_offboarding_retention_secs")]
+    pub offboarding_retention_secs: u64,
+}
+
+/// The default tenant-offboarding retention window: 30 days in seconds (issue #46).
+fn default_offboarding_retention_secs() -> u64 {
+    2_592_000
 }
 
 impl Default for AdminConfig {
@@ -355,6 +381,8 @@ impl Default for AdminConfig {
             control_database_url: None,
             max_page_size: 200,
             default_page_size: 50,
+            allowed_regions: Vec::new(),
+            offboarding_retention_secs: default_offboarding_retention_secs(),
         }
     }
 }

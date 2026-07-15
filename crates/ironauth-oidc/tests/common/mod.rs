@@ -652,6 +652,13 @@ impl Harness {
         &self.state
     }
 
+    /// The underlying test database, for tests that need the owner or control pools
+    /// (for example the tenant-lifecycle data-plane fence, issue #46).
+    #[must_use]
+    pub fn db(&self) -> &TestDatabase {
+        &self.db
+    }
+
     /// The quota engine installed on the state (issue #50), for tests that assert
     /// the live bucket count stays bounded or drive the idle-bucket reaper.
     #[must_use]

@@ -29,6 +29,14 @@ pub struct TenantView {
     pub id: String,
     /// The human-facing display name.
     pub display_name: String,
+    /// The lifecycle status: `active` or `suspended` (issue #46). A suspended
+    /// tenant is fenced off the data plane but keeps all its data and stays visible
+    /// here.
+    pub status: String,
+    /// The recorded data-residency region (issue #46), or null when the deployment
+    /// pins no region. Immutable after create; nothing routes by it yet.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub home_region: Option<String>,
     /// Creation time, milliseconds since the Unix epoch.
     pub created_at_unix_ms: i64,
 }
@@ -38,6 +46,8 @@ impl From<TenantRecord> for TenantView {
         Self {
             id: record.id.to_string(),
             display_name: record.display_name,
+            status: record.status.as_str().to_owned(),
+            home_region: record.home_region,
             created_at_unix_ms: ms(record.created_at_unix_micros),
         }
     }
@@ -62,6 +72,11 @@ pub struct EnvironmentView {
     pub custom_domain: Option<String>,
     /// The typed guardrails this environment enforces, derived from its kind.
     pub guardrails: GuardrailView,
+    /// The recorded per-environment data-residency region pin (issue #46), or null
+    /// when the environment pins no region. Immutable after create; nothing routes
+    /// by it yet.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
     /// Creation time, milliseconds since the Unix epoch.
     pub created_at_unix_ms: i64,
 }
@@ -111,6 +126,7 @@ impl From<EnvironmentRecord> for EnvironmentView {
             guardrail_class: record.kind.guardrail_class().as_str().to_owned(),
             custom_domain: record.custom_domain,
             guardrails: record.kind.guardrails().into(),
+            region: record.region,
             created_at_unix_ms: ms(record.created_at_unix_micros),
         }
     }
@@ -156,6 +172,25 @@ pub struct CreateTenantRequest {
     /// `environment_kind` is `prod` (the production custom-domain guardrail).
     #[serde(default)]
     pub environment_custom_domain: Option<String>,
+    /// The tenant's data-residency region (issue #46). When present it must be one
+    /// of the operator's configured regions, is persisted immutably, and appears in
+    /// every read; when omitted the tenant records no region. Nothing routes or
+    /// replicates by it yet.
+    #[serde(default)]
+    #[schema(example = "eu-west")]
+    pub home_region: Option<String>,
+}
+
+/// The result of a tenant lifecycle transition (issue #46): the tenant id and its
+/// new status. It states the POST-CONDITION (what is true after the call), so the
+/// body is known before the write and stored verbatim for an Idempotency-Key
+/// replay, exactly like the session-revocation views.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct TenantStatusView {
+    /// The tenant identifier (`ten_...`).
+    pub id: String,
+    /// The tenant's status after the transition: `active` or `suspended`.
+    pub status: String,
 }
 
 /// The result of creating a tenant: the tenant and its first environment.
@@ -183,6 +218,14 @@ pub struct CreateEnvironmentRequest {
     /// production custom-domain guardrail); optional otherwise.
     #[serde(default)]
     pub custom_domain: Option<String>,
+    /// The environment's data-residency region pin (issue #46). When present it must
+    /// be one of the operator's configured regions (the same set the tenant
+    /// `home_region` validates against), is persisted immutably, and appears in every
+    /// read; when omitted the environment records no region. Nothing routes or
+    /// replicates by it yet.
+    #[serde(default)]
+    #[schema(example = "eu-west")]
+    pub region: Option<String>,
 }
 
 /// The body to mint a management API key in a `(tenant, environment)` scope.

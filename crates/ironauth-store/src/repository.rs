@@ -90,6 +90,38 @@ impl<'a> ScopedStore<'a> {
         }
     }
 
+    /// This scope's data-plane serving state (issue #46): whether the data plane
+    /// must serve or FENCE it. A scope the control plane has suspended, or a
+    /// deleted/offboarded tenant, reads [`EnvironmentServingState::Suspended`]; a
+    /// scope with no stored serving row reads [`EnvironmentServingState::Active`]
+    /// (the safe default). Read under this scope's forced row-level security, so a
+    /// scope can only ever observe its own serving state. The OIDC data-plane
+    /// issuer-load path consults this and refuses a suspended scope fail closed.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn environment_state(&self) -> Result<EnvironmentServingState, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT serving_status FROM environment_states \
+             WHERE tenant_id = $1 AND environment_id = $2",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        match row {
+            None => Ok(EnvironmentServingState::Active),
+            Some(row) => Ok(match row.get::<String, _>("serving_status").as_str() {
+                "suspended" => EnvironmentServingState::Suspended,
+                // Any other value (only 'active' passes the CHECK) is served.
+                _ => EnvironmentServingState::Active,
+            }),
+        }
+    }
+
     /// The read-only audit-log repository for this scope. The log is append-only:
     /// rows are written only by the audited-write primitive, and this reads them
     /// back within scope.
@@ -11334,8 +11366,77 @@ pub struct TenantRecord {
     pub operator_id: OperatorId,
     /// The human-facing display name.
     pub display_name: String,
+    /// The lifecycle status (issue #46): `Active` or `Suspended`. A live tenant is
+    /// always one of the two (a deleted tenant is not returned at all).
+    pub status: TenantStatus,
+    /// The recorded data-residency region (issue #46), or `None` when the
+    /// deployment pins no region. Immutable after create; nothing routes by it yet.
+    pub home_region: Option<String>,
     /// Creation time in microseconds since the Unix epoch (the pagination key).
     pub created_at_unix_micros: i64,
+}
+
+/// A tenant's lifecycle status (issue #46).
+///
+/// The reversible run-state of a live tenant. It is DISTINCT from deletion: a
+/// deleted (offboarded) tenant is a tombstone the reads never return, while a
+/// [`TenantStatus::Suspended`] tenant is live, keeps all its data, stays visible to
+/// the control plane, and is merely FENCED off the data plane until it is resumed.
+/// The valid transitions (active <-> suspended, and either into deletion) are
+/// enforced by [`ActingTenantRepo`]; this type only names the two live states.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TenantStatus {
+    /// The tenant serves its data plane normally.
+    Active,
+    /// The tenant is suspended: its data plane is fenced (a structured refusal),
+    /// its data is intact, and a resume restores service with no data loss.
+    Suspended,
+}
+
+impl TenantStatus {
+    /// The stable wire string stored in `tenants.status`.
+    #[must_use]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            TenantStatus::Active => "active",
+            TenantStatus::Suspended => "suspended",
+        }
+    }
+
+    /// Parse a stored status string. An unrecognized value decodes to `None`
+    /// (a corrupt row surfaces as a decode error rather than a silent default).
+    #[must_use]
+    pub fn from_wire(raw: &str) -> Option<Self> {
+        match raw {
+            "active" => Some(TenantStatus::Active),
+            "suspended" => Some(TenantStatus::Suspended),
+            _ => None,
+        }
+    }
+}
+
+/// A `(tenant, environment)`'s data-plane serving state (issue #46).
+///
+/// The data plane reads this (under its own row-level-security scope) to decide
+/// whether to serve or fence a scope. It mirrors the tenant lifecycle onto a
+/// scoped, data-plane-readable row because the data-plane role cannot read the
+/// control-plane tenant/environment level tables. A scope with no stored row reads
+/// as [`EnvironmentServingState::Active`] (the safe default: an environment
+/// provisioned before this state existed serves normally).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnvironmentServingState {
+    /// The data plane serves this scope.
+    Active,
+    /// The data plane fences this scope (a suspended or offboarded tenant).
+    Suspended,
+}
+
+impl EnvironmentServingState {
+    /// Whether the data plane must fence this scope (refuse to serve it).
+    #[must_use]
+    pub fn is_fenced(&self) -> bool {
+        matches!(self, EnvironmentServingState::Suspended)
+    }
 }
 
 /// An environment row (management plane).
@@ -11354,6 +11455,10 @@ pub struct EnvironmentRecord {
     /// configured; a production environment always has one (the custom-domain
     /// guardrail).
     pub custom_domain: Option<String>,
+    /// The recorded per-environment data-residency region pin (issue #46), or
+    /// `None` when the environment pins no region. Immutable after create; nothing
+    /// routes by it yet.
+    pub region: Option<String>,
     /// Creation time in microseconds since the Unix epoch (the pagination key).
     pub created_at_unix_micros: i64,
 }
@@ -11371,6 +11476,10 @@ pub struct NewEnvironment<'a> {
     /// The configured custom domain, if any (a production environment always has
     /// one; the guardrail is enforced before this struct is built).
     pub custom_domain: Option<&'a str>,
+    /// The recorded per-environment data-residency region pin (issue #46), or
+    /// `None` when the environment pins no region. Validated against the operator's
+    /// configured region set at the API layer; immutable after create.
+    pub region: Option<&'a str>,
 }
 
 /// A management API key row (metadata only; the secret is never stored).
@@ -11592,7 +11701,7 @@ impl TenantRepo<'_> {
     /// (absent, deactivated, or owned by another operator: indistinguishable).
     pub async fn get(&self, id: &TenantId) -> Result<TenantRecord, StoreError> {
         let row = sqlx::query(
-            "SELECT id, operator_id, display_name, \
+            "SELECT id, operator_id, display_name, status, home_region, \
              (EXTRACT(EPOCH FROM created_at) * 1000000)::bigint AS created_us \
              FROM tenants \
              WHERE id = $1 AND operator_id = $2 AND deleted_at IS NULL",
@@ -11618,7 +11727,7 @@ impl TenantRepo<'_> {
     ) -> Result<Vec<TenantRecord>, StoreError> {
         let (after_micros, after_id) = split_cursor(after);
         let rows = sqlx::query(
-            "SELECT id, operator_id, display_name, \
+            "SELECT id, operator_id, display_name, status, home_region, \
              (EXTRACT(EPOCH FROM created_at) * 1000000)::bigint AS created_us \
              FROM tenants \
              WHERE operator_id = $1 AND deleted_at IS NULL \
@@ -11662,7 +11771,7 @@ impl EnvironmentRepo<'_> {
     /// tenant.
     pub async fn get(&self, id: &EnvironmentId) -> Result<EnvironmentRecord, StoreError> {
         let row = sqlx::query(
-            "SELECT id, tenant_id, display_name, kind, custom_domain, \
+            "SELECT id, tenant_id, display_name, kind, custom_domain, region, \
              (EXTRACT(EPOCH FROM created_at) * 1000000)::bigint AS created_us \
              FROM environments \
              WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL",
@@ -11688,7 +11797,7 @@ impl EnvironmentRepo<'_> {
     ) -> Result<Vec<EnvironmentRecord>, StoreError> {
         let (after_micros, after_id) = split_cursor(after);
         let rows = sqlx::query(
-            "SELECT id, tenant_id, display_name, kind, custom_domain, \
+            "SELECT id, tenant_id, display_name, kind, custom_domain, region, \
              (EXTRACT(EPOCH FROM created_at) * 1000000)::bigint AS created_us \
              FROM environments \
              WHERE tenant_id = $1 AND deleted_at IS NULL \
@@ -12062,6 +12171,7 @@ impl ActingTenantRepo<'_> {
         operator_display_name: &str,
         tenant_display_name: &str,
         environment: NewEnvironment<'_>,
+        home_region: Option<&str>,
         signing_key: NewSigningKey<'_>,
         idempotency: Option<IdempotencyWrite<'_>>,
     ) -> Result<(), StoreError> {
@@ -12070,6 +12180,7 @@ impl ActingTenantRepo<'_> {
             return Err(StoreError::NotFound);
         }
         let operator = self.operator;
+        let home_region = home_region.map(str::to_owned);
         write_audited(
             AuditedWrite {
                 store: self.store,
@@ -12096,28 +12207,33 @@ impl ActingTenantRepo<'_> {
                 // database clock), so the response body built before the write
                 // matches the stored row exactly and paging stays deterministic
                 // under a manual clock in tests.
+                // The tenant lands 'active' (the column default) with its recorded
+                // home_region (issue #46). home_region is bound here on create and
+                // never updated after, so it is immutable for the tenant's life.
                 sqlx::query(
-                    "INSERT INTO tenants (id, operator_id, display_name, created_at) \
-                     VALUES ($1, $2, $3, \
-                             TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval)",
+                    "INSERT INTO tenants (id, operator_id, display_name, home_region, created_at) \
+                     VALUES ($1, $2, $3, $4, \
+                             TIMESTAMPTZ 'epoch' + ($5::text || ' microseconds')::interval)",
                 )
                 .bind(tenant_id.to_string())
                 .bind(operator.to_string())
                 .bind(tenant_display_name)
+                .bind(home_region.as_deref())
                 .bind(created_at_micros)
                 .execute(&mut **tx)
                 .await?;
                 sqlx::query(
                     "INSERT INTO environments \
-                     (id, tenant_id, display_name, kind, custom_domain, created_at) \
-                     VALUES ($1, $2, $3, $4, $5, \
-                             TIMESTAMPTZ 'epoch' + ($6::text || ' microseconds')::interval)",
+                     (id, tenant_id, display_name, kind, custom_domain, region, created_at) \
+                     VALUES ($1, $2, $3, $4, $5, $6, \
+                             TIMESTAMPTZ 'epoch' + ($7::text || ' microseconds')::interval)",
                 )
                 .bind(environment_id.to_string())
                 .bind(tenant_id.to_string())
                 .bind(environment.display_name)
                 .bind(environment.kind.as_str())
                 .bind(environment.custom_domain)
+                .bind(environment.region)
                 .bind(created_at_micros)
                 .execute(&mut **tx)
                 .await?;
@@ -12136,19 +12252,228 @@ impl ActingTenantRepo<'_> {
         .await
     }
 
-    /// Deactivate a tenant (soft delete) and CASCADE the deactivation to its
-    /// child environments and their management credentials, all in the audited
-    /// transaction so it stays atomic. Audited scoped to the tenant and its
-    /// oldest environment (which is retained, so the audit foreign key holds).
+    /// Suspend a live, ACTIVE tenant (issue #46): flip its status to `suspended`
+    /// and FENCE its data plane by marking every one of its environments'
+    /// serving state suspended, in one audited transaction. Reversible with
+    /// [`ActingTenantRepo::resume`], with no data loss.
     ///
-    /// The cascade is what makes a deleted tenant's environments stop listing and
-    /// its keys stop authenticating; the join in
+    /// State machine: only an active tenant may be suspended. An already-suspended
+    /// tenant is [`StoreError::Conflict`] (an invalid transition, refused fail
+    /// closed); an absent or deleted tenant is [`StoreError::NotFound`].
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if no live tenant matched under this operator;
+    /// [`StoreError::Conflict`] if the tenant is not currently active.
+    pub async fn suspend(
+        &self,
+        env: &Env,
+        id: &TenantId,
+        idempotency: Option<IdempotencyWrite<'_>>,
+    ) -> Result<(), StoreError> {
+        self.transition(
+            env,
+            id,
+            TenantStatus::Active,
+            TenantStatus::Suspended,
+            Action::TenantSuspend,
+            EnvironmentServingState::Suspended,
+            idempotency,
+        )
+        .await
+    }
+
+    /// Resume a live, SUSPENDED tenant (issue #46): flip its status back to
+    /// `active` and un-fence its data plane by marking every one of its
+    /// environments' serving state active, in one audited transaction. Restores
+    /// service with no data loss.
+    ///
+    /// State machine: only a suspended tenant may be resumed. An already-active
+    /// tenant is [`StoreError::Conflict`]; an absent or deleted tenant is
+    /// [`StoreError::NotFound`].
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if no live tenant matched under this operator;
+    /// [`StoreError::Conflict`] if the tenant is not currently suspended.
+    pub async fn resume(
+        &self,
+        env: &Env,
+        id: &TenantId,
+        idempotency: Option<IdempotencyWrite<'_>>,
+    ) -> Result<(), StoreError> {
+        self.transition(
+            env,
+            id,
+            TenantStatus::Suspended,
+            TenantStatus::Active,
+            Action::TenantResume,
+            EnvironmentServingState::Active,
+            idempotency,
+        )
+        .await
+    }
+
+    /// The shared body of [`ActingTenantRepo::suspend`] and
+    /// [`ActingTenantRepo::resume`]: validate the state-machine transition
+    /// `from -> to`, flip the tenant status, and cascade the data-plane serving
+    /// state to every environment, in one audited transaction.
+    #[allow(clippy::too_many_arguments)]
+    async fn transition(
+        &self,
+        env: &Env,
+        id: &TenantId,
+        from: TenantStatus,
+        to: TenantStatus,
+        action: Action,
+        serving: EnvironmentServingState,
+        idempotency: Option<IdempotencyWrite<'_>>,
+    ) -> Result<(), StoreError> {
+        let operator = self.operator;
+        // Pre-read the live tenant's status for the state-machine decision: an
+        // absent/deleted tenant is a clean NotFound, and a wrong current state is
+        // a Conflict (an invalid transition, refused fail closed). The in-transaction
+        // UPDATE below re-checks `status = from` so a concurrent change cannot slip
+        // an invalid transition through.
+        let status_row = sqlx::query(
+            "SELECT status FROM tenants \
+             WHERE id = $1 AND operator_id = $2 AND deleted_at IS NULL",
+        )
+        .bind(id.to_string())
+        .bind(operator.to_string())
+        .fetch_optional(self.store.pool())
+        .await?;
+        let Some(status_row) = status_row else {
+            return Err(StoreError::NotFound);
+        };
+        let current = TenantStatus::from_wire(&status_row.get::<String, _>("status"))
+            .ok_or(StoreError::NotFound)?;
+        if current != from {
+            return Err(StoreError::Conflict);
+        }
+
+        // The audit scope needs an environment of this tenant; pick the oldest
+        // (retained through soft delete, so its row satisfies the audit foreign key).
+        let scope_env = sqlx::query(
+            "SELECT id FROM environments WHERE tenant_id = $1 ORDER BY created_at, id LIMIT 1",
+        )
+        .bind(id.to_string())
+        .fetch_optional(self.store.pool())
+        .await?;
+        let Some(scope_env) = scope_env else {
+            return Err(StoreError::NotFound);
+        };
+        let environment = EnvironmentId::parse(&scope_env.get::<String, _>("id"))
+            .map_err(|e| StoreError::Database(sqlx::Error::Decode(Box::new(e))))?;
+        let scope = Scope::new(*id, environment);
+        let serving_status = serving_status_str(serving);
+
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action,
+                target: id,
+            },
+            async move |tx| {
+                let now_micros = epoch_micros(env.clock().now_utc());
+                // 1. Flip the tenant status, guarded on the source state so a
+                //    concurrent transition cannot double-apply. A level table (no
+                //    row-level security).
+                let result = sqlx::query(
+                    "UPDATE tenants SET status = $1 \
+                     WHERE id = $2 AND operator_id = $3 AND deleted_at IS NULL AND status = $4",
+                )
+                .bind(to.as_str())
+                .bind(id.to_string())
+                .bind(operator.to_string())
+                .bind(from.as_str())
+                .execute(&mut **tx)
+                .await?;
+                if result.rows_affected() == 0 {
+                    // Lost the race: the tenant changed state (or was deleted)
+                    // between the pre-read and here. Refuse fail closed.
+                    return Err(StoreError::Conflict);
+                }
+                // 2. Cascade the data-plane serving state to every environment.
+                //    environment_states carries forced row-level security keyed on
+                //    (tenant, environment), so re-scope per environment and UPSERT
+                //    its row (an environment provisioned before this table existed
+                //    has no row yet; the upsert creates it). This is what a
+                //    suspended tenant's data plane reads to fence, and a resumed
+                //    tenant's to serve again.
+                let env_rows = sqlx::query("SELECT id FROM environments WHERE tenant_id = $1")
+                    .bind(id.to_string())
+                    .fetch_all(&mut **tx)
+                    .await?;
+                for env_row in &env_rows {
+                    let env_id: String = env_row.get("id");
+                    sqlx::query("SELECT set_config('ironauth.environment_id', $1, true)")
+                        .bind(&env_id)
+                        .execute(&mut **tx)
+                        .await?;
+                    sqlx::query(
+                        "INSERT INTO environment_states \
+                         (tenant_id, environment_id, serving_status, updated_at) \
+                         VALUES ($1, $2, $3, \
+                                 TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval) \
+                         ON CONFLICT (tenant_id, environment_id) DO UPDATE \
+                         SET serving_status = EXCLUDED.serving_status, \
+                             updated_at = EXCLUDED.updated_at",
+                    )
+                    .bind(id.to_string())
+                    .bind(&env_id)
+                    .bind(serving_status)
+                    .bind(now_micros)
+                    .execute(&mut **tx)
+                    .await?;
+                }
+                // 3. Restore the audit scope's row-level-security variables so the
+                //    audited-write's audit row (and the idempotency insert) run under
+                //    (tenant, oldest environment), after the per-environment
+                //    re-scoping above.
+                sqlx::query("SELECT set_config('ironauth.tenant_id', $1, true)")
+                    .bind(scope.tenant().to_string())
+                    .execute(&mut **tx)
+                    .await?;
+                sqlx::query("SELECT set_config('ironauth.environment_id', $1, true)")
+                    .bind(scope.environment().to_string())
+                    .execute(&mut **tx)
+                    .await?;
+                // Store the idempotency replay row in the SAME transaction as the
+                // transition, so a replay returns the original response and writes no
+                // second audit row.
+                insert_idempotency(tx, idempotency).await?;
+                Ok(())
+            },
+            false,
+        )
+        .await
+    }
+
+    /// Deactivate a tenant (soft delete) and OFFBOARD it: cascade the
+    /// deactivation to its child environments and their management credentials and
+    /// FENCE every environment's data plane, all in one audited transaction. This is
+    /// the GRACE stage of the offboarding pipeline (issue #46): the tenant enters a
+    /// restorable soft-deleted state, its keys are LEFT INTACT (no crypto-shred here,
+    /// deferred to the terminal [`ActingTenantRepo::hard_delete`] per the issue's
+    /// out-of-scope), so [`ActingTenantRepo::restore`] inside the retention window
+    /// brings it back with no data loss. Audited scoped to the tenant and its oldest
+    /// environment (which is retained, so the audit foreign key holds).
+    ///
+    /// The credential and environment cascade is what makes a deleted tenant's
+    /// environments stop listing and its keys stop authenticating; the join in
     /// [`ManagementCredentialRepo::authenticate`] is the belt-and-suspenders
-    /// backstop for any create-after-delete race.
+    /// backstop for any create-after-delete race. The serving-state fence stops the
+    /// data plane serving the offboarded tenant. Nothing is crypto-shredded here: the
+    /// keys survive so a restore loses no data; erasure is the terminal purge's job.
     ///
     /// # Errors
     ///
     /// [`StoreError::NotFound`] if no live tenant matched under this operator.
+    #[allow(clippy::too_many_lines)]
     pub async fn delete(&self, env: &Env, id: &TenantId) -> Result<(), StoreError> {
         // The audit scope needs an environment of this tenant; pick the oldest
         // (it is retained through soft delete, so its row satisfies the audit
@@ -12218,6 +12543,27 @@ impl ActingTenantRepo<'_> {
                     .bind(&env_id)
                     .execute(&mut **tx)
                     .await?;
+                    // Fence the data plane for the offboarded tenant: mark every
+                    // environment's serving state suspended so the data-plane
+                    // issuer-load path refuses it (a deleted tenant must not serve).
+                    sqlx::query(
+                        "INSERT INTO environment_states \
+                         (tenant_id, environment_id, serving_status, updated_at) \
+                         VALUES ($1, $2, 'suspended', \
+                                 TIMESTAMPTZ 'epoch' + ($3::text || ' microseconds')::interval) \
+                         ON CONFLICT (tenant_id, environment_id) DO UPDATE \
+                         SET serving_status = 'suspended', updated_at = EXCLUDED.updated_at",
+                    )
+                    .bind(id.to_string())
+                    .bind(&env_id)
+                    .bind(deleted_micros)
+                    .execute(&mut **tx)
+                    .await?;
+                    // NO crypto-shred here (issue #46): the grace delete keeps every
+                    // KEK intact so a restore inside the retention window loses no
+                    // data. Erasure is deferred to the terminal hard_delete (purge),
+                    // which crypto-shreds through the same #48 envelope path once the
+                    // window elapses.
                 }
                 // 3. Cascade to the tenant's environments (a level table, no
                 //    row-level security), so reads stop returning them and the
@@ -12249,6 +12595,292 @@ impl ActingTenantRepo<'_> {
         )
         .await
     }
+
+    /// Restore a tenant from the GRACE stage of offboarding (issue #46): reverse the
+    /// grace delete while it is still INSIDE the configured `retention` window. Clears
+    /// the tenant's, its environments', and its management credentials' soft-delete
+    /// tombstones and un-fences every environment's data plane, in one audited
+    /// transaction, so the tenant serves again with NO data loss (the grace delete
+    /// never shredded a key).
+    ///
+    /// State machine: valid only for a tenant in GRACE (soft-deleted, not yet purged)
+    /// whose retention window has NOT elapsed. A tenant that was never deleted, was
+    /// already restored, or was terminally purged is [`StoreError::NotFound`]; a
+    /// tenant whose retention window has already elapsed is [`StoreError::Conflict`]
+    /// (restore is no longer offered; the terminal hard delete is due).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if no grace tenant matched under this operator;
+    /// [`StoreError::Conflict`] if the retention window has already elapsed.
+    #[allow(clippy::too_many_lines)]
+    pub async fn restore(
+        &self,
+        env: &Env,
+        id: &TenantId,
+        retention: Duration,
+        idempotency: Option<IdempotencyWrite<'_>>,
+    ) -> Result<(), StoreError> {
+        let operator = self.operator;
+        // Pre-read the grace tenant's deletion instant for the window decision. A row
+        // that is not in grace (never deleted, already restored, or purged) is a clean
+        // NotFound; a grace row whose window has elapsed is a Conflict (restore is no
+        // longer on offer). The in-transaction UPDATE re-checks the grace predicate.
+        let grace = sqlx::query(
+            "SELECT (EXTRACT(EPOCH FROM deleted_at) * 1000000)::bigint AS deleted_us \
+             FROM tenants \
+             WHERE id = $1 AND operator_id = $2 \
+             AND deleted_at IS NOT NULL AND purged_at IS NULL",
+        )
+        .bind(id.to_string())
+        .bind(operator.to_string())
+        .fetch_optional(self.store.pool())
+        .await?;
+        let Some(grace) = grace else {
+            return Err(StoreError::NotFound);
+        };
+        let deleted_micros: i64 = grace.get("deleted_us");
+        let now_micros = epoch_micros(env.clock().now_utc());
+        if now_micros.saturating_sub(deleted_micros) >= retention_micros(retention) {
+            // The window has elapsed: restore is no longer offered.
+            return Err(StoreError::Conflict);
+        }
+
+        let scope_env = sqlx::query(
+            "SELECT id FROM environments WHERE tenant_id = $1 ORDER BY created_at, id LIMIT 1",
+        )
+        .bind(id.to_string())
+        .fetch_optional(self.store.pool())
+        .await?;
+        let Some(scope_env) = scope_env else {
+            return Err(StoreError::NotFound);
+        };
+        let environment = EnvironmentId::parse(&scope_env.get::<String, _>("id"))
+            .map_err(|e| StoreError::Database(sqlx::Error::Decode(Box::new(e))))?;
+        let scope = Scope::new(*id, environment);
+
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::TenantRestore,
+                target: id,
+            },
+            async move |tx| {
+                let now_micros = epoch_micros(env.clock().now_utc());
+                // 1. Clear the tenant tombstone, guarded on the grace predicate so a
+                //    concurrent purge cannot be undone.
+                let result = sqlx::query(
+                    "UPDATE tenants SET deleted_at = NULL \
+                     WHERE id = $1 AND operator_id = $2 \
+                     AND deleted_at IS NOT NULL AND purged_at IS NULL",
+                )
+                .bind(id.to_string())
+                .bind(operator.to_string())
+                .execute(&mut **tx)
+                .await?;
+                if result.rows_affected() == 0 {
+                    return Err(StoreError::NotFound);
+                }
+                // 2. Per environment: un-fence the data plane and clear the grace
+                //    delete's credential tombstones, re-scoping to each environment
+                //    for the forced row-level security on management_credentials and
+                //    environment_states.
+                let env_rows = sqlx::query("SELECT id FROM environments WHERE tenant_id = $1")
+                    .bind(id.to_string())
+                    .fetch_all(&mut **tx)
+                    .await?;
+                for env_row in &env_rows {
+                    let env_id: String = env_row.get("id");
+                    sqlx::query("SELECT set_config('ironauth.environment_id', $1, true)")
+                        .bind(&env_id)
+                        .execute(&mut **tx)
+                        .await?;
+                    sqlx::query(
+                        "UPDATE management_credentials SET deleted_at = NULL \
+                         WHERE tenant_id = $1 AND environment_id = $2 AND deleted_at IS NOT NULL",
+                    )
+                    .bind(id.to_string())
+                    .bind(&env_id)
+                    .execute(&mut **tx)
+                    .await?;
+                    sqlx::query(
+                        "INSERT INTO environment_states \
+                         (tenant_id, environment_id, serving_status, updated_at) \
+                         VALUES ($1, $2, 'active', \
+                                 TIMESTAMPTZ 'epoch' + ($3::text || ' microseconds')::interval) \
+                         ON CONFLICT (tenant_id, environment_id) DO UPDATE \
+                         SET serving_status = 'active', updated_at = EXCLUDED.updated_at",
+                    )
+                    .bind(id.to_string())
+                    .bind(&env_id)
+                    .bind(now_micros)
+                    .execute(&mut **tx)
+                    .await?;
+                }
+                // 3. Clear the environments' tombstones (a level table).
+                sqlx::query(
+                    "UPDATE environments SET deleted_at = NULL \
+                     WHERE tenant_id = $1 AND deleted_at IS NOT NULL",
+                )
+                .bind(id.to_string())
+                .execute(&mut **tx)
+                .await?;
+                // 4. Restore the audit scope's row-level-security variables.
+                sqlx::query("SELECT set_config('ironauth.tenant_id', $1, true)")
+                    .bind(scope.tenant().to_string())
+                    .execute(&mut **tx)
+                    .await?;
+                sqlx::query("SELECT set_config('ironauth.environment_id', $1, true)")
+                    .bind(scope.environment().to_string())
+                    .execute(&mut **tx)
+                    .await?;
+                insert_idempotency(tx, idempotency).await?;
+                Ok(())
+            },
+            false,
+        )
+        .await
+    }
+
+    /// The TERMINAL hard-delete stage of the offboarding pipeline (issue #46):
+    /// permitted only AFTER the configured `retention` window has elapsed since the
+    /// grace delete. Crypto-shreds every environment's envelope KEK (the erasure,
+    /// through the #48 envelope path, gated strictly to this terminal stage) and
+    /// stamps `purged_at`, in one audited transaction, so the tenant's sealed PII
+    /// becomes cryptographically UNRECOVERABLE and the tenant can no longer be
+    /// restored. A sibling tenant is unaffected because every scope has its own KEK.
+    ///
+    /// State machine: valid only for a tenant in GRACE (soft-deleted, not yet purged)
+    /// whose retention window HAS elapsed. Still within the window is
+    /// [`StoreError::Conflict`] (the grace period must run first); a never-deleted or
+    /// already-purged tenant is [`StoreError::NotFound`].
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if no grace tenant matched under this operator;
+    /// [`StoreError::Conflict`] if the retention window has not yet elapsed.
+    #[allow(clippy::too_many_lines)]
+    pub async fn hard_delete(
+        &self,
+        env: &Env,
+        id: &TenantId,
+        retention: Duration,
+        idempotency: Option<IdempotencyWrite<'_>>,
+    ) -> Result<(), StoreError> {
+        let operator = self.operator;
+        // Pre-read the grace tenant's deletion instant for the window decision. Only a
+        // grace tenant whose window has elapsed may be purged; a grace tenant still
+        // within the window is a Conflict (the grace period must run first).
+        let grace = sqlx::query(
+            "SELECT (EXTRACT(EPOCH FROM deleted_at) * 1000000)::bigint AS deleted_us \
+             FROM tenants \
+             WHERE id = $1 AND operator_id = $2 \
+             AND deleted_at IS NOT NULL AND purged_at IS NULL",
+        )
+        .bind(id.to_string())
+        .bind(operator.to_string())
+        .fetch_optional(self.store.pool())
+        .await?;
+        let Some(grace) = grace else {
+            return Err(StoreError::NotFound);
+        };
+        let deleted_micros: i64 = grace.get("deleted_us");
+        let now_micros = epoch_micros(env.clock().now_utc());
+        if now_micros.saturating_sub(deleted_micros) < retention_micros(retention) {
+            // Still within the retention window: the grace period must run first.
+            return Err(StoreError::Conflict);
+        }
+
+        let scope_env = sqlx::query(
+            "SELECT id FROM environments WHERE tenant_id = $1 ORDER BY created_at, id LIMIT 1",
+        )
+        .bind(id.to_string())
+        .fetch_optional(self.store.pool())
+        .await?;
+        let Some(scope_env) = scope_env else {
+            return Err(StoreError::NotFound);
+        };
+        let environment = EnvironmentId::parse(&scope_env.get::<String, _>("id"))
+            .map_err(|e| StoreError::Database(sqlx::Error::Decode(Box::new(e))))?;
+        let scope = Scope::new(*id, environment);
+
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::TenantPurge,
+                target: id,
+            },
+            async move |tx| {
+                let purged_micros = epoch_micros(env.clock().now_utc());
+                // 1. Stamp the terminal marker, guarded on the grace predicate so a
+                //    concurrent restore/purge cannot double-apply.
+                let result = sqlx::query(
+                    "UPDATE tenants SET purged_at = \
+                     TIMESTAMPTZ 'epoch' + ($1::text || ' microseconds')::interval \
+                     WHERE id = $2 AND operator_id = $3 \
+                     AND deleted_at IS NOT NULL AND purged_at IS NULL",
+                )
+                .bind(purged_micros)
+                .bind(id.to_string())
+                .bind(operator.to_string())
+                .execute(&mut **tx)
+                .await?;
+                if result.rows_affected() == 0 {
+                    return Err(StoreError::NotFound);
+                }
+                // 2. Per environment: CRYPTO-SHRED the KEK (issue #46/#48). Overwrite
+                //    every not-yet-destroyed KEK version's wrapped bytes with an empty
+                //    blob and mark it destroyed, in this SAME audited transaction.
+                //    After commit the scope's DEKs can never be unwrapped, so all of
+                //    the tenant's envelope-protected PII is permanently unreadable. A
+                //    scope that never provisioned a KEK matches no row. The control
+                //    role holds exactly this column-scoped UPDATE on tenant_keks.
+                let env_rows = sqlx::query("SELECT id FROM environments WHERE tenant_id = $1")
+                    .bind(id.to_string())
+                    .fetch_all(&mut **tx)
+                    .await?;
+                for env_row in &env_rows {
+                    let env_id: String = env_row.get("id");
+                    sqlx::query("SELECT set_config('ironauth.environment_id', $1, true)")
+                        .bind(&env_id)
+                        .execute(&mut **tx)
+                        .await?;
+                    sqlx::query(
+                        "UPDATE tenant_keks \
+                         SET wrapped_kek = $3, status = 'destroyed', \
+                             destroyed_at = \
+                             TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval \
+                         WHERE tenant_id = $1 AND environment_id = $2 AND status <> 'destroyed'",
+                    )
+                    .bind(id.to_string())
+                    .bind(&env_id)
+                    .bind(Vec::<u8>::new())
+                    .bind(purged_micros)
+                    .execute(&mut **tx)
+                    .await?;
+                }
+                // 3. Restore the audit scope's row-level-security variables.
+                sqlx::query("SELECT set_config('ironauth.tenant_id', $1, true)")
+                    .bind(scope.tenant().to_string())
+                    .execute(&mut **tx)
+                    .await?;
+                sqlx::query("SELECT set_config('ironauth.environment_id', $1, true)")
+                    .bind(scope.environment().to_string())
+                    .execute(&mut **tx)
+                    .await?;
+                insert_idempotency(tx, idempotency).await?;
+                Ok(())
+            },
+            false,
+        )
+        .await
+    }
 }
 
 /// Mutating environments under one tenant.
@@ -12264,6 +12896,10 @@ impl ActingEnvironmentRepo<'_> {
     ///
     /// # Errors
     ///
+    /// [`StoreError::Conflict`] if the parent tenant is not ACTIVE (suspended, or in
+    /// the offboarding grace/terminal state): a non-active tenant must not gain a
+    /// fresh, unfenced environment (issue #46), the same lifecycle-precondition
+    /// convention the tenant transitions use;
     /// [`StoreError::IdempotencyConflict`] on a concurrent Idempotency-Key race;
     /// [`StoreError::Database`] on a persistence failure (including a missing
     /// tenant, which surfaces as the tenant foreign-key violation).
@@ -12291,17 +12927,47 @@ impl ActingEnvironmentRepo<'_> {
                 target: environment_id,
             },
             async move |tx| {
+                // Lifecycle precondition (issue #46): an environment must not be born
+                // under a non-ACTIVE parent tenant. The suspend/offboard cascade fences
+                // only the environments that exist at suspend time, and a fresh
+                // environment seeds no serving-state row (so it would read Active), so a
+                // new environment added under a suspended or grace/terminal-deleted
+                // tenant would hand it an unfenced serving surface while the tenant is
+                // meant to be off the data plane. Refuse it fail closed. The check
+                // shares this audited transaction with the insert below, so it is ATOMIC
+                // with it (no time-of-check/time-of-use gap) and nothing (no environment
+                // row, no audit row, no idempotency row) is written when it fires. A
+                // non-active parent is StoreError::Conflict, the lifecycle-precondition
+                // convention the tenant suspend/resume transitions already use, which the
+                // control plane maps to a loud 409. A tenant that does not exist AT ALL
+                // is left to the foreign-key rejection on the insert (the pre-existing
+                // behavior), so an absent parent stays distinct from a suspended one.
+                let parent = sqlx::query(
+                    "SELECT status, (deleted_at IS NULL AND purged_at IS NULL) AS live \
+                     FROM tenants WHERE id = $1",
+                )
+                .bind(tenant.to_string())
+                .fetch_optional(&mut **tx)
+                .await?;
+                if let Some(row) = parent {
+                    let active = row.get::<String, _>("status") == TenantStatus::Active.as_str();
+                    let live: bool = row.get("live");
+                    if !(active && live) {
+                        return Err(StoreError::Conflict);
+                    }
+                }
                 sqlx::query(
                     "INSERT INTO environments \
-                     (id, tenant_id, display_name, kind, custom_domain, created_at) \
-                     VALUES ($1, $2, $3, $4, $5, \
-                             TIMESTAMPTZ 'epoch' + ($6::text || ' microseconds')::interval)",
+                     (id, tenant_id, display_name, kind, custom_domain, region, created_at) \
+                     VALUES ($1, $2, $3, $4, $5, $6, \
+                             TIMESTAMPTZ 'epoch' + ($7::text || ' microseconds')::interval)",
                 )
                 .bind(environment_id.to_string())
                 .bind(tenant.to_string())
                 .bind(environment.display_name)
                 .bind(environment.kind.as_str())
                 .bind(environment.custom_domain)
+                .bind(environment.region)
                 .bind(created_at_micros)
                 .execute(&mut **tx)
                 .await?;
@@ -12368,6 +13034,26 @@ impl ActingEnvironmentRepo<'_> {
                 .bind(id.to_string())
                 .execute(&mut **tx)
                 .await?;
+                // Fence this environment's data plane (issue #46): a deleted
+                // environment must not serve.
+                sqlx::query(
+                    "INSERT INTO environment_states \
+                     (tenant_id, environment_id, serving_status, updated_at) \
+                     VALUES ($1, $2, 'suspended', \
+                             TIMESTAMPTZ 'epoch' + ($3::text || ' microseconds')::interval) \
+                     ON CONFLICT (tenant_id, environment_id) DO UPDATE \
+                     SET serving_status = 'suspended', updated_at = EXCLUDED.updated_at",
+                )
+                .bind(tenant.to_string())
+                .bind(id.to_string())
+                .bind(deleted_micros)
+                .execute(&mut **tx)
+                .await?;
+                // NO crypto-shred here (issue #46): an ordinary environment
+                // deactivation keeps its KEK intact. Erasure (the crypto-shred) is the
+                // erasure issue's job, reached through the terminal tenant hard_delete
+                // (purge) and #48's ActingEnvelopeRepo, never folded into an ordinary
+                // delete.
                 Ok(())
             },
             false,
@@ -12632,6 +13318,23 @@ fn is_idempotency_conflict(error: &sqlx::Error) -> bool {
     db.code().as_deref() == Some("23505") && db.constraint() == Some("idempotency_keys_pkey")
 }
 
+/// The retention window as epoch microseconds (issue #46), saturating to
+/// [`i64::MAX`] for a window too large to fit (which just means "effectively
+/// never elapses"). Used to compare a grace tenant's age against the configured
+/// offboarding retention window.
+fn retention_micros(retention: Duration) -> i64 {
+    i64::try_from(retention.as_micros()).unwrap_or(i64::MAX)
+}
+
+/// The stored `serving_status` wire string for a data-plane serving state (issue
+/// #46).
+fn serving_status_str(state: EnvironmentServingState) -> &'static str {
+    match state {
+        EnvironmentServingState::Active => "active",
+        EnvironmentServingState::Suspended => "suspended",
+    }
+}
+
 /// Split an optional cursor into its bound parameters (both `None` when absent).
 fn split_cursor(after: Option<&CursorPosition>) -> (Option<i64>, Option<String>) {
     match after {
@@ -12644,10 +13347,20 @@ fn split_cursor(after: Option<&CursorPosition>) -> (Option<i64>, Option<String>)
 fn tenant_from_row(row: &PgRow) -> Result<TenantRecord, StoreError> {
     let decode =
         |e: crate::id::IdParseError| StoreError::Database(sqlx::Error::Decode(Box::new(e)));
+    let status_text: String = row.get("status");
+    let status = TenantStatus::from_wire(&status_text).ok_or_else(|| {
+        // A stored status outside the CHECK set is a corrupt row; surface it as a
+        // decode error rather than silently defaulting.
+        StoreError::Database(sqlx::Error::Decode(
+            format!("unknown tenant status {status_text:?}").into(),
+        ))
+    })?;
     Ok(TenantRecord {
         id: TenantId::parse(&row.get::<String, _>("id")).map_err(decode)?,
         operator_id: OperatorId::parse(&row.get::<String, _>("operator_id")).map_err(decode)?,
         display_name: row.get("display_name"),
+        status,
+        home_region: row.get("home_region"),
         created_at_unix_micros: row.get("created_us"),
     })
 }
@@ -12668,6 +13381,7 @@ fn environment_from_row(row: &PgRow) -> Result<EnvironmentRecord, StoreError> {
         display_name: row.get("display_name"),
         kind,
         custom_domain: row.get("custom_domain"),
+        region: row.get("region"),
         created_at_unix_micros: row.get("created_us"),
     })
 }

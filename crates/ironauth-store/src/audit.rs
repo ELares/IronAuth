@@ -156,8 +156,26 @@ pub enum Action {
     ClientUpdated,
     /// A tenant was created (management plane, issue #11).
     TenantCreate,
-    /// A tenant was deactivated (management plane, issue #11).
+    /// A tenant was offboarded into the GRACE stage (management plane, issue
+    /// #46): a soft delete that fences the data plane and keeps every key INTACT,
+    /// so a restore inside the retention window loses no data. It does NOT
+    /// crypto-shred; erasure is the terminal purge's job.
     TenantDelete,
+    /// A tenant was RESTORED from the grace stage (management plane, issue #46):
+    /// the soft-delete tombstones are cleared and the data plane serves again with
+    /// no data loss.
+    TenantRestore,
+    /// A grace tenant was terminally HARD-DELETED (purged) after its retention
+    /// window elapsed (management plane, issue #46): the envelope keys are
+    /// crypto-shredded (through #48) so the tenant's PII is permanently
+    /// unrecoverable, and the tenant can no longer be restored.
+    TenantPurge,
+    /// A tenant was SUSPENDED (management plane, issue #46): a reversible fence
+    /// that stops it serving the data plane while keeping its data intact.
+    TenantSuspend,
+    /// A suspended tenant was RESUMED (management plane, issue #46): service is
+    /// restored with no data loss.
+    TenantResume,
     /// An environment was created (management plane, issue #11).
     EnvironmentCreate,
     /// An environment was deactivated (management plane, issue #11).
@@ -365,6 +383,10 @@ impl Action {
             Action::ClientUpdated => "client.updated",
             Action::TenantCreate => "tenant.create",
             Action::TenantDelete => "tenant.delete",
+            Action::TenantRestore => "tenant.restore",
+            Action::TenantPurge => "tenant.purge",
+            Action::TenantSuspend => "tenant.suspend",
+            Action::TenantResume => "tenant.resume",
             Action::EnvironmentCreate => "environment.create",
             Action::EnvironmentDelete => "environment.delete",
             Action::ManagementKeyCreate => "management_key.create",

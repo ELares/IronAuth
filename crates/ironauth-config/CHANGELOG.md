@@ -6,6 +6,13 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- `admin.allowed_regions`: the operator's configured data-residency region set
+  (issue #46). A tenant's `home_region` and a per-environment `region` pin must be
+  one of these; empty (the default) leaves residency pinning unavailable and refuses
+  any residency pin on a create.
+- `admin.offboarding_retention_secs`: the tenant-offboarding retention window in
+  seconds (issue #46), the grace period a soft-deleted tenant can be restored
+  within before the terminal hard deletion. Tunable, safe default 30 days.
 - Per-tenant and per-environment quota fairness settings (issue #50), on a new
   `[quota]` section consumed by the `ironauth-quota` engine.
   - `[quota.tenant]` and `[quota.environment]`: the two nested tiers, each with a
