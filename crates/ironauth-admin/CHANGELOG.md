@@ -6,6 +6,17 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Canonical secret-free config snapshot export (issue #43). New
+  `GET /v1/tenants/{tenant_id}/environments/{environment_id}/config/snapshot`
+  returns the environment's promotable configuration as a canonical, deterministic,
+  secret-free JSON document (the format defined in `docs/snapshot/`), the read half
+  of the config-promotion flagship. Environment-scoped authorization: the operator
+  plane, or the environment's own management key. Reads the three promotable
+  resource types through the control-plane scoped repositories, so a snapshot
+  exports only its own scope's config; a confidential client's secret appears as a
+  named reference, never a value. Applying a snapshot (issue #44) and resolving
+  secret references (issue #45) are separate.
+
 - Tenant lifecycle API and residency attributes (issue #46). Operators can suspend
   and resume tenants and record data-residency regions through documented
   operator-plane endpoints.

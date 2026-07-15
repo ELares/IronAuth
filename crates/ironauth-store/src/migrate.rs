@@ -454,9 +454,21 @@ fn registry() -> Vec<Migration> {
         },
         Migration {
             version: 31,
+            name: "byok_bindings",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0031_byok_bindings.sql"),
+        },
+        Migration {
+            version: 32,
+            name: "snapshot_export",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0032_snapshot_export.sql"),
+        },
+        Migration {
+            version: 33,
             name: "custom_domains",
             phase: Phase::Expand,
-            sql: include_str!("../migrations/0031_custom_domains.sql"),
+            sql: include_str!("../migrations/0033_custom_domains.sql"),
         },
     ]
 }

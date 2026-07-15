@@ -248,13 +248,13 @@ async fn expand_contract_example_chain_runs_all_three_phases_and_contract_remove
 // per real table); splitting it would not make it clearer.
 #[allow(clippy::too_many_lines)]
 #[tokio::test]
-async fn production_chain_is_only_the_thirty_one_real_migrations_and_ships_no_demo_object() {
+async fn production_chain_is_only_the_thirty_three_real_migrations_and_ships_no_demo_object() {
     // TestDatabase::start runs Store::migrate() (the production chain) on a
     // fresh, empty database.
     let db = TestDatabase::start().await;
     let pool = db.owner_pool();
 
-    // Re-running is idempotent and reports exactly thirty-one tracked migrations.
+    // Re-running is idempotent and reports exactly thirty-three tracked migrations.
     let report = MigrationRunner::new(pool)
         .run()
         .await
@@ -265,15 +265,16 @@ async fn production_chain_is_only_the_thirty_one_real_migrations_and_ships_no_de
     );
     assert_eq!(
         report.already_applied(),
-        31,
-        "the production chain is exactly thirty-one migrations (isolation, audit log, management \
+        33,
+        "the production chain is exactly thirty-three migrations (isolation, audit log, management \
          API, OIDC authorization, signing keys, login/consent, authentication context, redirect \
          registration, UserInfo claims, consent scope upsert, resource servers, opaque access \
          tokens, client auth suite, dynamic client registration, pushed authorization requests, \
          refresh tokens, client-credentials service accounts, DCR abuse controls, resource \
          indicators, JWT bearer assertion grant, device authorization, session model, RP-initiated \
          logout, session-ended events, back-channel logout, front-channel logout, resource-model \
-         APIs, envelope encryption, environment guardrails, tenant lifecycle, custom domains)"
+         APIs, envelope encryption, environment guardrails, tenant lifecycle, BYOK bindings, \
+         snapshot export, custom domains)"
     );
 
     // The ledger holds exactly versions 1 through 31.
@@ -281,7 +282,7 @@ async fn production_chain_is_only_the_thirty_one_real_migrations_and_ships_no_de
         applied_versions(pool).await,
         vec![
             1_i64, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
-            24, 25, 26, 27, 28, 29, 30, 31
+            24, 25, 26, 27, 28, 29, 30, 31, 32, 33
         ]
     );
     let phase_of = |version: i64| async move {
@@ -367,12 +368,22 @@ async fn production_chain_is_only_the_thirty_one_real_migrations_and_ships_no_de
     // control-plane crypto-shred grant on tenant_keks. All additive, so this is an
     // expand too.
     assert_eq!(phase_of(30).await, "expand");
+    // The BYOK-bindings migration (issue #49): one new tenant_byok_bindings scoped
+    // table with its index, isolation policy, nonempty-scope and value CHECKs, and
+    // column-scoped grants (data-plane SELECT/INSERT, control-plane SELECT plus a
+    // column-scoped sever UPDATE). Purely additive, so it is an expand too.
+    assert_eq!(phase_of(31).await, "expand");
+    // The snapshot-export migration (issue #43): a single GRANT SELECT on
+    // resource_servers to the control role, so the management-plane snapshot export
+    // can read the promotable resource-server registry. A pure grant, no schema
+    // change, so this is an expand too.
+    assert_eq!(phase_of(32).await, "expand");
     // The custom-domains migration (issue #47): two new tenant-scoped tables
     // (custom_domains and acme_challenges) with their indexes, policies, and
     // column-scoped grants, plus a global partial unique index that gives a
     // verified domain exactly one owner platform-wide. All additive, so it is an
     // expand.
-    assert_eq!(phase_of(31).await, "expand");
+    assert_eq!(phase_of(33).await, "expand");
 
     // The demo object never reaches a production database.
     assert!(
@@ -971,15 +982,37 @@ async fn production_chain_is_only_the_thirty_one_real_migrations_and_ships_no_de
         );
     }
 
+    // The BYOK bindings table (issue #49): the per-scope customer-managed-key
+    // binding, holding the driver, an opaque external key REFERENCE (never key
+    // material), and the binding's lifecycle status. The plaintext-PII invariant
+    // does not apply: key_ref is a non-secret handle, not a key or end-user PII.
+    assert!(
+        table_exists(pool, "tenant_byok_bindings").await,
+        "tenant_byok_bindings exists after 0031"
+    );
+    for column in [
+        "tenant_id",
+        "environment_id",
+        "provider",
+        "key_ref",
+        "status",
+        "created_at",
+        "destroyed_at",
+    ] {
+        assert!(
+            column_exists(pool, "tenant_byok_bindings", column).await,
+            "tenant_byok_bindings.{column} exists after 0031"
+        );
+    }
     // The per-environment custom-domain registry and the ACME challenge lifecycle
-    // (issue #47): the domains table and the challenges table, both new after 0031.
+    // (issue #47): the domains table and the challenges table, both new after 0033.
     assert!(
         table_exists(pool, "custom_domains").await,
-        "custom_domains exists after 0031"
+        "custom_domains exists after 0033"
     );
     assert!(
         table_exists(pool, "acme_challenges").await,
-        "acme_challenges exists after 0031"
+        "acme_challenges exists after 0033"
     );
     for column in [
         "domain_name",
@@ -990,7 +1023,7 @@ async fn production_chain_is_only_the_thirty_one_real_migrations_and_ships_no_de
     ] {
         assert!(
             column_exists(pool, "custom_domains", column).await,
-            "custom_domains.{column} exists after 0031"
+            "custom_domains.{column} exists after 0033"
         );
     }
     for column in [
@@ -1003,7 +1036,7 @@ async fn production_chain_is_only_the_thirty_one_real_migrations_and_ships_no_de
     ] {
         assert!(
             column_exists(pool, "acme_challenges", column).await,
-            "acme_challenges.{column} exists after 0031"
+            "acme_challenges.{column} exists after 0033"
         );
     }
     // A custom domain's certificate PRIVATE KEY is never stored on the domain row:

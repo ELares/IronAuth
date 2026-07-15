@@ -6,6 +6,12 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Add the `FetchPurpose::KmsRequest` label (issue #49): an external
+  customer-managed KMS/HSM call for BYOK key wrap/unwrap is outbound, so it rides
+  the same SSRF-hardened dispatcher as every other fetch. A KMS endpoint that
+  resolves to a loopback or otherwise internal address is refused exactly like
+  any other blocked destination; the new purpose only adds a bounded metric
+  label, never a policy exception.
 - Added the `FetchPurpose::AcmeDirectory` label (issue #47): the outbound purpose
   for talking to an ACME certificate authority (RFC 8555) when issuing a custom
   domain's certificate. The CA URL and the validated domain are untrusted, so the

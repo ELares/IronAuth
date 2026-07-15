@@ -57,6 +57,7 @@ mod migrate;
 mod redirect;
 mod repository;
 mod scope;
+pub mod snapshot;
 mod store;
 
 /// The reusable cross-tenant IDOR test harness. Present only under the
@@ -108,7 +109,7 @@ pub use repository::{
     ActingSessionRepo, ActingSigningKeyRepo, ActingStore, ActingTenantRepo, ActingUserRepo,
     ActiveDeviceFlow, ActiveOpaqueToken, ApprovedDeviceGrant, AssertionSubjectMappingRecord,
     AssertionSubjectMappingRepo, AuditRecord, AuditRepo, AuthorizationRepo,
-    BackChannelDeliveryRepo, ClientAssertionJtiRepo, ClientAuthDiagnosticReason,
+    BackChannelDeliveryRepo, ByokBinding, ClientAssertionJtiRepo, ClientAuthDiagnosticReason,
     ClientAuthDiagnosticRecord, ClientAuthDiagnosticsRepo, ClientAuthRecord,
     ClientCredentialsAccess, ClientRecord, ClientRepo, ClientResourcePolicy, ClientSessionRepo,
     CodeBindings, ConsentRepo, ConsumePushedRequest, ConsumedInitialAccessToken, CursorPosition,
@@ -137,4 +138,9 @@ pub use repository::{
     opaque_access_token_digest, refresh_token_digest, user_code_hash,
 };
 pub use scope::Scope;
+pub use snapshot::{
+    CLIENT_SECRET_REFERENCE, ClientSnapshot, DcrPolicySnapshot, ResourceServerSnapshot,
+    SNAPSHOT_RESOURCE_TYPES, SNAPSHOT_SCHEMA_VERSION, SecretRef, Snapshot, SnapshotResources,
+    SnapshotViolation, classification_coverage_gaps, export as export_snapshot, validate_document,
+};
 pub use store::Store;

@@ -42,6 +42,11 @@ sha2.workspace = true
 # the OIDC layer free of ad-hoc JSON handling for these columns. Already present
 # transitively, so no new crate enters the graph.
 serde_json.workspace = true
+# Derive the canonical snapshot document types (issue #43): the promotable-config
+# export/import shapes serialize and deserialize through serde. serde is already in
+# the tree (sqlx, serde_json, and every other crate depend on it), so this adds a
+# direct edge but no new crate; MSRV 1.85 and the musl static lane are unchanged.
+serde.workspace = true
 
 [features]
 # Default build is lean: no test-support surface. Production only ever needs the
@@ -60,6 +65,10 @@ testing = []
 # proves the isolation types reject misuse at compile time.
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 trybuild.workspace = true
+# The BYOK offboarding test (issue #49) uses the ironauth-kms driver seam to
+# label a binding and to demonstrate that revoking a customer root fails closed.
+# A dev-dependency only: the production store graph does not depend on it.
+ironauth-kms.workspace = true
 
 # RLS integration test: a low-privilege session cannot read another tenant's
 # rows even with the app-layer filter bypassed. Needs a real database
@@ -191,6 +200,17 @@ name = "envelope"
 path = "tests/envelope.rs"
 required-features = ["testing"]
 
+# BYOK and crypto-shredding offboarding (issue #49): a scope is enrolled in a
+# customer-managed-key binding (driver + opaque reference, never key material), the
+# terminal offboarding stage severs the binding in the SAME audited transaction
+# that crypto-shreds the platform KEK so the tenant's sealed PII is unrecoverable,
+# a sibling's binding and PII are untouched, revoking a customer root fails closed,
+# and an unknown driver label is refused. Needs a real database.
+[[test]]
+name = "byok_offboarding"
+path = "tests/byok_offboarding.rs"
+required-features = ["testing"]
+
 # The bootstrap users PII columns sealed at rest (issue #48): a database dump of a
 # registered user carries no plaintext handle or claims, login still resolves the
 # user through the blind index, claims round-trip, a duplicate handle conflicts, and
@@ -265,6 +285,13 @@ name = "tenant_lifecycle"
 path = "tests/tenant_lifecycle.rs"
 required-features = ["testing"]
 
+# The canonical secret-free config snapshot export (issue #43): a fully-populated
+# fixture environment exports byte-identically, carries no secret or key material,
+# is cross-scope isolated, and covers exactly the promotable classification. Needs
+# a real database (DATABASE_URL).
+[[test]]
+name = "config_snapshot"
+path = "tests/config_snapshot.rs"
 # Per-environment custom domains with built-in ACME (issue #47, EXPLORATORY):
 # registration opens a pending challenge, the challenge lifecycle moves through
 # validated and failed (with a deterministic backoff under a manual clock), an

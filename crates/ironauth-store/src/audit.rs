@@ -347,6 +347,12 @@ pub enum Action {
     /// DEKs can never be unwrapped again and all of its envelope-protected data is
     /// permanently unreadable. The productized offboarding flow is #49.
     EnvelopeKekDestroy,
+    /// A scope was enrolled in bring-your-own-key (issue #49): a BYOK binding was
+    /// recorded so a customer-managed root key (in an external KMS/HSM, or a
+    /// customer-supplied key) governs the scope's key hierarchy. The audit row
+    /// carries only the driver and the opaque external key reference, never key
+    /// material. The binding is severed at the terminal offboarding stage.
+    EnvelopeByokEnroll,
     /// A per-tenant envelope data-encryption key was provisioned (issue #48): a
     /// day-one DEK, generated and stored wrapped under the scope's active KEK.
     EnvelopeDekProvision,
@@ -459,6 +465,7 @@ impl Action {
             Action::EnvelopeKekProvision => "envelope.kek.provision",
             Action::EnvelopeKekRotate => "envelope.kek.rotate",
             Action::EnvelopeKekDestroy => "envelope.kek.destroy",
+            Action::EnvelopeByokEnroll => "envelope.byok.enroll",
             Action::EnvelopeDekProvision => "envelope.dek.provision",
             Action::EnvelopeDekRotate => "envelope.dek.rotate",
             Action::EncryptedSecretPut => "encrypted_secret.put",

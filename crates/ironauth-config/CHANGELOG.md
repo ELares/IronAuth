@@ -6,6 +6,11 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- `[byok]`: bring-your-own-key customer-managed encryption settings (issue #49),
+  EXPERIMENTAL and DEFAULT-OFF. `byok.enabled` (default false) leaves every BYOK
+  path unreachable; `byok.provider` (default `local`) selects the key-management
+  driver; `byok.endpoint` is the external KMS URL for an external provider,
+  outbound through the SSRF-hardened fetcher and owner/infra-gated.
 - Registered the `custom-domains-acme` EXPERIMENTAL feature flag (issue #47,
   EXPLORATORY): per-environment custom domains with built-in ACME. Off by default
   and ack-gated on `CUSTOM_DOMAINS_ACME_VERSION` (a live issuance needs a

@@ -122,6 +122,12 @@ pub enum FetchPurpose {
     /// path as every other outbound fetch; a directory or validation URL that
     /// resolves to a loopback or internal address is refused by the resolver.
     AcmeDirectory,
+    /// Calling out to an external customer-managed KMS/HSM to wrap or unwrap a
+    /// tenant key-encryption key (BYOK, issue #49). The endpoint is operator
+    /// configured and outbound, so it rides the same SSRF-hardened path as every
+    /// other external fetch: a KMS URL that resolves to an internal or loopback
+    /// address is refused exactly like any other blocked destination.
+    KmsRequest,
 }
 
 impl FetchPurpose {
@@ -135,6 +141,7 @@ impl FetchPurpose {
             FetchPurpose::WebhookDelivery => "webhook_delivery",
             FetchPurpose::Logo => "logo",
             FetchPurpose::AcmeDirectory => "acme_directory",
+            FetchPurpose::KmsRequest => "kms_request",
         }
     }
 }

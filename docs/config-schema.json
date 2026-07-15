@@ -61,6 +61,61 @@
       },
       "type": "object"
     },
+    "ByokConfig": {
+      "additionalProperties": false,
+      "description": "Bring-your-own-key (BYOK) customer-managed encryption settings (issue #49).\n\nEXPERIMENTAL and DEFAULT-OFF. When `enabled` is false (the default) no BYOK\npath is reachable and the platform envelope keys behave exactly as before. When\nenabled, a customer-managed root (selected by `provider`) wraps a tenant's\nkey-encryption key. The external-KMS `endpoint` is outbound and rides the\nSSRF-hardened fetcher; its live use is owner/infra-gated.",
+      "properties": {
+        "enabled": {
+          "default": false,
+          "description": "Whether BYOK is enabled at all. False (the default) leaves every BYOK path\nunreachable; enabling it is an explicit, exploratory opt-in.",
+          "type": "boolean"
+        },
+        "endpoint": {
+          "default": null,
+          "description": "The external KMS/HSM endpoint URL for an external `provider` (an https URL).\nOutbound and routed through the SSRF-hardened fetcher, so a loopback or\notherwise internal endpoint is refused. Unset for the `local` provider or\nwhen BYOK is disabled.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "provider": {
+          "$ref": "#/$defs/ByokProvider",
+          "default": "local",
+          "description": "Which key-management driver backs the customer root when BYOK is enabled.\nDefaults to `local` (a customer-supplied in-process root); the external\ndrivers are owner/infra-gated."
+        }
+      },
+      "type": "object"
+    },
+    "ByokProvider": {
+      "description": "Which BYOK key-management driver backs a customer root key (issue #49). A\nclosed set matching the `ironauth-kms` driver interface. `local` is a\ncustomer-SUPPLIED key held in process (the simplest BYOK form, no external\nservice); the other four reach an external KMS/HSM and are owner/infra-gated.",
+      "oneOf": [
+        {
+          "const": "local",
+          "description": "An in-process customer-supplied root key (the default when BYOK is enabled;\nno external service).",
+          "type": "string"
+        },
+        {
+          "const": "aws",
+          "description": "AWS Key Management Service (external, owner/infra-gated).",
+          "type": "string"
+        },
+        {
+          "const": "gcp",
+          "description": "Google Cloud KMS (external, owner/infra-gated).",
+          "type": "string"
+        },
+        {
+          "const": "azure",
+          "description": "Azure Key Vault (external, owner/infra-gated).",
+          "type": "string"
+        },
+        {
+          "const": "vault",
+          "description": "`HashiCorp` Vault transit (external, owner/infra-gated).",
+          "type": "string"
+        }
+      ]
+    },
     "ClientAssertionAudience": {
       "description": "The audience an inbound JWT client assertion (`private_key_jwt` /\n`client_secret_jwt`, issue #25) must be addressed to (RFC 7523 section 3, OIDC\nCore section 9). This is the SHARED audience knob the JWT bearer grant (#26)\nreuses: both surfaces validate an assertion's `aud` through it.\n\nThe default accepts the token-endpoint URL OR the per-environment issuer, which\nis the interoperable choice: real client libraries disagree on which they place\nin `aud`. The strict mode accepts ONLY the issuer, per rfc7523bis and FAPI 2.0,\nwhich reject a token-endpoint-audienced assertion.",
       "oneOf": [
@@ -749,6 +804,15 @@
         "offboarding_retention_secs": 2592000
       },
       "description": "Management API settings (issue #11)."
+    },
+    "byok": {
+      "$ref": "#/$defs/ByokConfig",
+      "default": {
+        "enabled": false,
+        "endpoint": null,
+        "provider": "local"
+      },
+      "description": "Bring-your-own-key (BYOK) customer-managed encryption settings (issue #49).\nEXPERIMENTAL and DEFAULT-OFF: an opt-in rung on the isolation ladder that\nlets a customer-managed root key (in an external KMS/HSM, or a\ncustomer-supplied key) wrap a tenant's key-encryption key, so the customer\ncontrols the root of the tenant's encryption and revoking it crypto-shreds\nthe tenant. Off by default; the external-KMS path is owner/infra-gated."
     },
     "database": {
       "$ref": "#/$defs/DatabaseConfig",

@@ -78,6 +78,14 @@ pub struct Config {
     /// (the single-tenant self-hoster posture).
     pub quota: QuotaConfig,
 
+    /// Bring-your-own-key (BYOK) customer-managed encryption settings (issue #49).
+    /// EXPERIMENTAL and DEFAULT-OFF: an opt-in rung on the isolation ladder that
+    /// lets a customer-managed root key (in an external KMS/HSM, or a
+    /// customer-supplied key) wrap a tenant's key-encryption key, so the customer
+    /// controls the root of the tenant's encryption and revoking it crypto-shreds
+    /// the tenant. Off by default; the external-KMS path is owner/infra-gated.
+    pub byok: ByokConfig,
+
     /// Feature toggles keyed by registered feature name. Enabling an
     /// experimental feature additionally requires `ack` equal to the
     /// feature's exact current version; see the feature reference in the
@@ -119,6 +127,53 @@ impl Default for ServerConfig {
             shutdown_grace_secs: 25,
         }
     }
+}
+
+/// Which BYOK key-management driver backs a customer root key (issue #49). A
+/// closed set matching the `ironauth-kms` driver interface. `local` is a
+/// customer-SUPPLIED key held in process (the simplest BYOK form, no external
+/// service); the other four reach an external KMS/HSM and are owner/infra-gated.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ByokProvider {
+    /// An in-process customer-supplied root key (the default when BYOK is enabled;
+    /// no external service).
+    #[default]
+    Local,
+    /// AWS Key Management Service (external, owner/infra-gated).
+    Aws,
+    /// Google Cloud KMS (external, owner/infra-gated).
+    Gcp,
+    /// Azure Key Vault (external, owner/infra-gated).
+    Azure,
+    /// `HashiCorp` Vault transit (external, owner/infra-gated).
+    Vault,
+}
+
+/// Bring-your-own-key (BYOK) customer-managed encryption settings (issue #49).
+///
+/// EXPERIMENTAL and DEFAULT-OFF. When `enabled` is false (the default) no BYOK
+/// path is reachable and the platform envelope keys behave exactly as before. When
+/// enabled, a customer-managed root (selected by `provider`) wraps a tenant's
+/// key-encryption key. The external-KMS `endpoint` is outbound and rides the
+/// SSRF-hardened fetcher; its live use is owner/infra-gated.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields, default)]
+pub struct ByokConfig {
+    /// Whether BYOK is enabled at all. False (the default) leaves every BYOK path
+    /// unreachable; enabling it is an explicit, exploratory opt-in.
+    pub enabled: bool,
+
+    /// Which key-management driver backs the customer root when BYOK is enabled.
+    /// Defaults to `local` (a customer-supplied in-process root); the external
+    /// drivers are owner/infra-gated.
+    pub provider: ByokProvider,
+
+    /// The external KMS/HSM endpoint URL for an external `provider` (an https URL).
+    /// Outbound and routed through the SSRF-hardened fetcher, so a loopback or
+    /// otherwise internal endpoint is refused. Unset for the `local` provider or
+    /// when BYOK is disabled.
+    pub endpoint: Option<String>,
 }
 
 /// Trusted-proxy policy.
@@ -1920,6 +1975,35 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("max_page_size"), "{msg}");
         assert!(msg.contains(&MANAGEMENT_LIST_HARD_CAP.to_string()), "{msg}");
+    }
+
+    #[test]
+    fn byok_is_disabled_by_default_and_rejects_unknown_keys() {
+        // BYOK is exploratory and DEFAULT-OFF: an empty config leaves it disabled,
+        // with the local (customer-supplied, no external service) driver selected
+        // and no external endpoint.
+        let config = Config::from_toml_str("", "<inline>").expect("valid").config;
+        assert!(!config.byok.enabled);
+        assert_eq!(config.byok.provider, ByokProvider::Local);
+        assert!(config.byok.endpoint.is_none());
+
+        // The section can be turned on explicitly and parses an external driver.
+        let input = "[byok]\nenabled = true\nprovider = \"aws\"\n\
+                     endpoint = \"https://kms.example.test/wrap\"\n";
+        let config = Config::from_toml_str(input, "<inline>")
+            .expect("valid")
+            .config;
+        assert!(config.byok.enabled);
+        assert_eq!(config.byok.provider, ByokProvider::Aws);
+        assert_eq!(
+            config.byok.endpoint.as_deref(),
+            Some("https://kms.example.test/wrap")
+        );
+
+        // A typo in the section is a hard startup failure, never silently ignored.
+        let err = Config::from_toml_str("[byok]\nenabld = true\n", "<inline>")
+            .expect_err("unknown key rejected");
+        assert!(format!("{err}").contains("enabld"), "{err}");
     }
 
     #[test]

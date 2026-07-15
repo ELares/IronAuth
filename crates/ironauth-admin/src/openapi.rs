@@ -56,6 +56,9 @@ use crate::views::{
                                                minimal per-environment shell (M10 adds membership)"),
         (name = "resource-model", description = "The resource-type classification catalog \
                                                 (promotable, runtime, environment-identity)"),
+        (name = "config-promotion", description = "Canonical secret-free config snapshot export: \
+                                                  the diffable, committable substrate the \
+                                                  config-promotion flagship consumes"),
         (name = "keys", description = "Environment-scoped management API keys"),
         (name = "dcr", description = "Dynamic Client Registration abuse controls: \
                                      policies, initial access tokens, client verification"),
@@ -86,6 +89,7 @@ use crate::views::{
         crate::keys::create_key,
         crate::keys::get_key,
         crate::keys::delete_key,
+        crate::config::export_config_snapshot,
         crate::dcr::create_dcr_policy,
         crate::dcr::list_dcr_policies,
         crate::dcr::create_initial_access_token,
