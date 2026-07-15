@@ -136,7 +136,11 @@ impl TestDatabase {
         let control_pool = PgPool::connect(&control_url)
             .await
             .expect("connect as low-privilege control role");
-        let control_store = Store::from_pool(control_pool.clone());
+        // The control plane manages users end to end (issue #52), which is a PII
+        // surface, so it carries the platform master key exactly as the data plane
+        // does: it seals, blind-indexes, and opens user PII through the envelope
+        // substrate. Without the key those paths fail closed (never plaintext).
+        let control_store = Store::from_pool(control_pool.clone()).with_master_key(master.clone());
 
         Self {
             owner_pool,

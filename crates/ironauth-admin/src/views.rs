@@ -13,6 +13,7 @@ use std::fmt;
 use ironauth_store::{
     EnvironmentRecord, GuardrailSet, ManagementCredentialRecord, OperatorRecord,
     OrganizationRecord, RefreshFamilySummary, ResourceType, SessionSummary, TenantRecord,
+    UserAdminRecord, UserState,
 };
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -789,4 +790,188 @@ pub struct UserRevocationView {
     /// Whether the user's `offline_access` refresh families were killed too. When
     /// false (the default) they SURVIVE the mass logout.
     pub hard_kill: bool,
+}
+
+/// A user's lifecycle state on the wire (issue #52). The stable, closed enum the
+/// management API exposes: state changes are explicit API operations validated
+/// against a state machine in the store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum UserStateView {
+    /// A live account that can authenticate.
+    Active,
+    /// Administratively blocked: cannot authenticate; sessions ended on entry.
+    Blocked,
+    /// Disabled: cannot authenticate; sessions ended on entry.
+    Disabled,
+    /// Created but not yet verified: cannot authenticate until activated.
+    PendingVerification,
+    /// Scheduled for offboarding at a recorded instant; still able to authenticate
+    /// until the worker executes it.
+    ScheduledOffboarding,
+}
+
+impl From<UserState> for UserStateView {
+    fn from(state: UserState) -> Self {
+        match state {
+            UserState::Active => UserStateView::Active,
+            UserState::Blocked => UserStateView::Blocked,
+            UserState::Disabled => UserStateView::Disabled,
+            UserState::PendingVerification => UserStateView::PendingVerification,
+            UserState::ScheduledOffboarding => UserStateView::ScheduledOffboarding,
+        }
+    }
+}
+
+impl From<UserStateView> for UserState {
+    fn from(view: UserStateView) -> Self {
+        match view {
+            UserStateView::Active => UserState::Active,
+            UserStateView::Blocked => UserState::Blocked,
+            UserStateView::Disabled => UserState::Disabled,
+            UserStateView::PendingVerification => UserState::PendingVerification,
+            UserStateView::ScheduledOffboarding => UserState::ScheduledOffboarding,
+        }
+    }
+}
+
+/// A user, as returned by the management API (issue #52). The identifier embeds its
+/// tenant and environment. NEVER carries the password hash (a management response
+/// must not return a stored credential, the #11 secret lesson).
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct UserView {
+    /// The user identifier (`usr_...`, embeds its scope).
+    pub id: String,
+    /// The tenant the user belongs to (`ten_...`).
+    pub tenant_id: String,
+    /// The environment the user lives in (`env_...`).
+    pub environment_id: String,
+    /// The login handle (decrypted for display).
+    pub identifier: String,
+    /// The lifecycle state.
+    pub state: UserStateView,
+    /// The external correlation id (decrypted for display), or null when none is
+    /// linked.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub external_id: Option<String>,
+    /// The scheduled-offboarding instant (milliseconds since the Unix epoch),
+    /// present only in the scheduled-offboarding state.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scheduled_offboarding_at_unix_ms: Option<i64>,
+    /// Creation time, milliseconds since the Unix epoch.
+    pub created_at_unix_ms: i64,
+    /// Last-mutation time, milliseconds since the Unix epoch.
+    pub updated_at_unix_ms: i64,
+}
+
+impl UserView {
+    /// Build a view from a stored record.
+    #[must_use]
+    pub fn from_record(record: UserAdminRecord) -> Self {
+        Self {
+            id: record.id.to_string(),
+            tenant_id: record.id.scope().tenant().to_string(),
+            environment_id: record.id.scope().environment().to_string(),
+            identifier: record.identifier,
+            state: record.state.into(),
+            external_id: record.external_id,
+            scheduled_offboarding_at_unix_ms: record.scheduled_offboarding_at_unix_micros.map(ms),
+            created_at_unix_ms: ms(record.created_at_unix_micros),
+            updated_at_unix_ms: ms(record.updated_at_unix_micros),
+        }
+    }
+}
+
+/// A page of users.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct UserList {
+    /// The users on this page, oldest first.
+    pub items: Vec<UserView>,
+    /// The opaque cursor for the next page, or null if this is the last page.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+/// The body to create a user (issue #52). Every field but `identifier` is optional.
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct CreateUserRequest {
+    /// An OPTIONAL caller-supplied user id (`usr_...`, in this scope). A supplied id
+    /// already taken in the scope returns 409; absent, a fresh id is minted.
+    #[serde(default)]
+    pub id: Option<String>,
+    /// The login handle, unique per scope.
+    #[schema(example = "ada@example.test")]
+    pub identifier: String,
+    /// An OPTIONAL precomputed Argon2id PHC verifier string. Absent, the user is
+    /// created without a usable credential and cannot log in until one is set.
+    #[serde(default)]
+    pub password_hash: Option<String>,
+    /// An OPTIONAL standard-claim JSON document (issue #15), stored verbatim.
+    #[serde(default)]
+    #[schema(value_type = Object)]
+    pub claims: Option<serde_json::Value>,
+    /// An OPTIONAL external correlation id to link at creation (unique per scope).
+    #[serde(default)]
+    pub external_id: Option<String>,
+    /// The OPTIONAL initial lifecycle state (default `active`). Must be a creatable
+    /// state (not `scheduled_offboarding`, which needs a timestamp).
+    #[serde(default)]
+    pub state: Option<UserStateView>,
+}
+
+/// The body to update a user (issue #52), applied as an RFC 7396 JSON Merge Patch
+/// over the mutable profile. Only the standard-claim document is updatable here;
+/// the lifecycle state and external id have their own explicit operations.
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct UpdateUserRequest {
+    /// The replacement standard-claim JSON document. Absent leaves the claims
+    /// unchanged.
+    #[serde(default)]
+    #[schema(value_type = Object)]
+    pub claims: Option<serde_json::Value>,
+}
+
+/// The body to transition a user's lifecycle state (issue #52).
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct SetUserStateRequest {
+    /// The target state.
+    pub state: UserStateView,
+    /// Required for and only for `scheduled_offboarding`: the instant the worker
+    /// executes the offboarding, in milliseconds since the Unix epoch.
+    #[serde(default)]
+    pub scheduled_offboarding_at_unix_ms: Option<i64>,
+    /// Whether a session-ending transition also kills the user's `offline_access`
+    /// refresh families (default false: they survive).
+    #[serde(default)]
+    pub hard_kill: bool,
+}
+
+/// A user's lifecycle state after a transition (issue #52). The deterministic
+/// post-condition returned by the state and delete operations.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct UserStateChangeView {
+    /// The user that was transitioned.
+    pub id: String,
+    /// The state the user is now in.
+    pub state: UserStateView,
+    /// Whether the transition killed the user's `offline_access` refresh families.
+    pub hard_kill: bool,
+}
+
+/// The body to link an external id to a user (issue #52).
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct LinkExternalIdRequest {
+    /// The external correlation id from the tenant's own systems (unique per scope).
+    #[schema(example = "crm-42")]
+    pub external_id: String,
+}
+
+/// A user's external id after a link or unlink (issue #52).
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct UserExternalIdView {
+    /// The user the external id belongs to.
+    pub id: String,
+    /// The linked external id, or null after an unlink.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub external_id: Option<String>,
 }

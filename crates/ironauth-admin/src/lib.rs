@@ -62,13 +62,14 @@ mod response;
 mod sessions;
 mod state;
 mod tenants;
+mod users;
 mod views;
 
 use axum::Router;
 use axum::http::StatusCode;
 use axum::middleware::from_fn;
 use axum::response::Response;
-use axum::routing::{get, post};
+use axum::routing::{get, post, put};
 
 pub use auth::Principal;
 pub use error::{ApiError, ErrorBody};
@@ -215,6 +216,27 @@ pub fn management_router(state: AdminState) -> Router {
         .route(
             "/v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}/sessions/revoke",
             post(sessions::revoke_user_sessions),
+        )
+        // Admin user CRUD, lifecycle, and external ids (issue #52). The static
+        // suffixes (`/state`, `/external-id`) are siblings of the parameterized
+        // `/users/{user_id}`; the router matches the static segments first.
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/users",
+            post(users::create_user).get(users::list_users),
+        )
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}",
+            get(users::get_user)
+                .patch(users::update_user)
+                .delete(users::delete_user),
+        )
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}/state",
+            post(users::set_user_state),
+        )
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}/external-id",
+            put(users::link_user_external_id).delete(users::unlink_user_external_id),
         )
         .route(
             "/v1/tenants/{tenant_id}/environments/{environment_id}/refresh-families",

@@ -6,6 +6,23 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- User lifecycle authentication fence (issue #52): the interactive login and the
+  device-verification login paths now consult the resolved user's lifecycle `state`
+  and REFUSE a user that cannot authenticate (blocked, disabled, or
+  pending-verification). The password is still verified (so a fenced account is
+  timing-indistinguishable from a wrong password) and the SAME generic failure is
+  returned, so there is no blocked-vs-wrong-password oracle. A soft-deleted user
+  resolves as absent.
+- Refresh-grant lifecycle re-check (issue #52, fence completeness): the
+  `refresh_token` grant now re-checks the token subject's user lifecycle state before
+  minting and FAILS CLOSED (`invalid_grant`) when the user cannot authenticate
+  (blocked, disabled, pending-verification) or is absent/deleted, treating a store
+  fault as fail-closed too. An `offline_access` family deliberately survives the
+  block/disable session cascade (issue #21), so without this re-check a user fenced
+  AFTER the family was opened could keep minting access tokens through that surviving
+  token. The invariant is now complete: after block/disable/delete a user obtains no
+  new tokens by ANY path (authorize, refresh, or an existing offline token). A normal
+  active user's refresh is unaffected. See `docs/design/USER-LIFECYCLE.md`.
 - Self-service end-user account API (issue #61). An API-first surface an
   AUTHENTICATED user manages their OWN account with, mounted on the public data plane
   and scope-routed under `/t/{tenant}/e/{environment}/account/...`, authenticated by

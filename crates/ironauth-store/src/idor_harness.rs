@@ -49,7 +49,7 @@ use crate::id::{
 };
 use crate::repository::{
     CredentialRemoveOutcome, RedeemOutcome, RefreshFamilyFleetFilter, SessionEndCause,
-    SessionFleetFilter, TokenStatus,
+    SessionFleetFilter, TokenStatus, UserListFilter, UserState,
 };
 use crate::scope::Scope;
 use crate::store::Store;
@@ -208,6 +208,25 @@ impl IdorHarness {
         self.register(Box::new(SessionRevokeProbe));
         self.register(Box::new(SessionBulkRevokeProbe));
         self.register(Box::new(UserSessionsRevokeAllProbe));
+        self
+    }
+
+    /// Register the admin user-management probes (issue #52): every management-plane
+    /// user surface that resolves a user by identifier. The set is the read surfaces
+    /// (`users.get`, `users.list`) and the mutating surfaces (`users.delete`,
+    /// `users.set_state`, `users.external_id.link`). A foreign user must be the
+    /// uniform not-found on every one, and the list surface must never leak a foreign
+    /// tenant's users. Run these with a store that carries the platform master key
+    /// (the user PII paths fail closed without it).
+    pub fn register_user_admin_probes(&mut self) -> &mut Self {
+        self.register(Box::new(UserAdminGetProbe));
+        self.register(Box::new(UserAdminListProbe));
+        self.register(Box::new(UserAdminByExternalIdProbe));
+        self.register(Box::new(UserAdminDeleteProbe));
+        self.register(Box::new(UserAdminStateChangeProbe));
+        self.register(Box::new(UserAdminUpdateClaimsProbe));
+        self.register(Box::new(UserAdminExternalIdLinkProbe));
+        self.register(Box::new(UserAdminExternalIdUnlinkProbe));
         self
     }
 
@@ -918,6 +937,292 @@ impl IsolationProbe for UserSessionsRevokeAllProbe {
                     ProbeOutcome::Leaked
                 }
                 Ok(_) | Err(_) => ProbeOutcome::Denied,
+            }
+        })
+    }
+}
+
+/// Built-in probe for `UserRepo::get` (issue #52): a user in another tenant or
+/// environment must never be readable under the caller's scope.
+struct UserAdminGetProbe;
+
+impl IsolationProbe for UserAdminGetProbe {
+    fn name(&self) -> &'static str {
+        "users.get"
+    }
+
+    fn probe<'a>(
+        &'a self,
+        store: &'a Store,
+        caller: Scope,
+        foreign_id: &'a str,
+    ) -> BoxProbeFuture<'a> {
+        Box::pin(async move {
+            let users = store.scoped(caller).users();
+            let Ok(id) = users.parse_id(foreign_id) else {
+                return ProbeOutcome::Denied;
+            };
+            match users.get(&id).await {
+                Ok(_) => ProbeOutcome::Leaked,
+                Err(_) => ProbeOutcome::Denied,
+            }
+        })
+    }
+}
+
+/// Built-in probe for `UserRepo::list` (issue #52): the list has no identifier to
+/// fence on, so it is where a broken isolation policy would leak an entire foreign
+/// tenant's users at once. A page must contain no foreign user.
+struct UserAdminListProbe;
+
+impl IsolationProbe for UserAdminListProbe {
+    fn name(&self) -> &'static str {
+        "users.list"
+    }
+
+    fn probe<'a>(
+        &'a self,
+        store: &'a Store,
+        caller: Scope,
+        foreign_id: &'a str,
+    ) -> BoxProbeFuture<'a> {
+        Box::pin(async move {
+            match store
+                .scoped(caller)
+                .users()
+                .list(UserListFilter::default(), PROBE_PAGE_LIMIT, None)
+                .await
+            {
+                Ok(rows) => {
+                    if rows
+                        .iter()
+                        .any(|record| record.id.to_string() == foreign_id)
+                    {
+                        ProbeOutcome::Leaked
+                    } else {
+                        ProbeOutcome::Denied
+                    }
+                }
+                Err(_) => ProbeOutcome::Denied,
+            }
+        })
+    }
+}
+
+/// Built-in probe for `ActingUserRepo::delete` (issue #52): deleting another
+/// tenant's user would be a cross-tenant offboarding, so it must be the uniform
+/// not-found.
+struct UserAdminDeleteProbe;
+
+impl IsolationProbe for UserAdminDeleteProbe {
+    fn name(&self) -> &'static str {
+        "users.delete"
+    }
+
+    fn probe<'a>(
+        &'a self,
+        store: &'a Store,
+        caller: Scope,
+        foreign_id: &'a str,
+    ) -> BoxProbeFuture<'a> {
+        Box::pin(async move {
+            let env = Env::system();
+            let Ok(id) = store.scoped(caller).users().parse_id(foreign_id) else {
+                return ProbeOutcome::Denied;
+            };
+            let actor = ActorRef::service(ServiceId::generate(&env));
+            let correlation = CorrelationId::generate(&env);
+            match store
+                .scoped(caller)
+                .acting(actor, correlation)
+                .users()
+                .delete(&env, &id, false, None)
+                .await
+            {
+                Ok(()) => ProbeOutcome::Leaked,
+                Err(_) => ProbeOutcome::Denied,
+            }
+        })
+    }
+}
+
+/// Built-in probe for `ActingUserRepo::set_state` (issue #52): flipping another
+/// tenant's user to a blocked state would be a cross-tenant lifecycle change, so it
+/// must be the uniform not-found.
+struct UserAdminStateChangeProbe;
+
+impl IsolationProbe for UserAdminStateChangeProbe {
+    fn name(&self) -> &'static str {
+        "users.set_state"
+    }
+
+    fn probe<'a>(
+        &'a self,
+        store: &'a Store,
+        caller: Scope,
+        foreign_id: &'a str,
+    ) -> BoxProbeFuture<'a> {
+        Box::pin(async move {
+            let env = Env::system();
+            let Ok(id) = store.scoped(caller).users().parse_id(foreign_id) else {
+                return ProbeOutcome::Denied;
+            };
+            let actor = ActorRef::service(ServiceId::generate(&env));
+            let correlation = CorrelationId::generate(&env);
+            match store
+                .scoped(caller)
+                .acting(actor, correlation)
+                .users()
+                .set_state(&env, &id, UserState::Blocked, None, false, None)
+                .await
+            {
+                Ok(()) => ProbeOutcome::Leaked,
+                Err(_) => ProbeOutcome::Denied,
+            }
+        })
+    }
+}
+
+/// Built-in probe for `ActingUserRepo::link_external_id` (issue #52): linking an
+/// external id onto another tenant's user would be a cross-tenant mutation, so it
+/// must be the uniform not-found.
+struct UserAdminExternalIdLinkProbe;
+
+impl IsolationProbe for UserAdminExternalIdLinkProbe {
+    fn name(&self) -> &'static str {
+        "users.external_id.link"
+    }
+
+    fn probe<'a>(
+        &'a self,
+        store: &'a Store,
+        caller: Scope,
+        foreign_id: &'a str,
+    ) -> BoxProbeFuture<'a> {
+        Box::pin(async move {
+            let env = Env::system();
+            let Ok(id) = store.scoped(caller).users().parse_id(foreign_id) else {
+                return ProbeOutcome::Denied;
+            };
+            let actor = ActorRef::service(ServiceId::generate(&env));
+            let correlation = CorrelationId::generate(&env);
+            match store
+                .scoped(caller)
+                .acting(actor, correlation)
+                .users()
+                .link_external_id(&env, &id, "idor-probe-external-id")
+                .await
+            {
+                Ok(()) => ProbeOutcome::Leaked,
+                Err(_) => ProbeOutcome::Denied,
+            }
+        })
+    }
+}
+
+/// Built-in probe for `UserRepo::by_external_id` (issue #52): a lookup by external
+/// id must never resolve ANOTHER tenant's user. The external id is a per-tenant
+/// blind index, so the read is twice fenced (the index is keyed with the caller's
+/// tenant key AND the query filters `tenant_id`/`environment_id`), and any hit on a
+/// foreign external-id value is a cross-tenant READ leak. The harness passes a
+/// victim's real external-id string as a `foreign_id`, so this probe hunts a foreign
+/// row of its own key type rather than being vacuous.
+struct UserAdminByExternalIdProbe;
+
+impl IsolationProbe for UserAdminByExternalIdProbe {
+    fn name(&self) -> &'static str {
+        "users.by_external_id"
+    }
+
+    fn probe<'a>(
+        &'a self,
+        store: &'a Store,
+        caller: Scope,
+        foreign_id: &'a str,
+    ) -> BoxProbeFuture<'a> {
+        Box::pin(async move {
+            match store
+                .scoped(caller)
+                .users()
+                .by_external_id(foreign_id)
+                .await
+            {
+                Ok(Some(_)) => ProbeOutcome::Leaked,
+                Ok(None) | Err(_) => ProbeOutcome::Denied,
+            }
+        })
+    }
+}
+
+/// Built-in probe for `ActingUserRepo::update_claims` (issue #52): patching another
+/// tenant's user claims would be a cross-tenant mutation of a PII surface, so it must
+/// be the uniform not-found.
+struct UserAdminUpdateClaimsProbe;
+
+impl IsolationProbe for UserAdminUpdateClaimsProbe {
+    fn name(&self) -> &'static str {
+        "users.update_claims"
+    }
+
+    fn probe<'a>(
+        &'a self,
+        store: &'a Store,
+        caller: Scope,
+        foreign_id: &'a str,
+    ) -> BoxProbeFuture<'a> {
+        Box::pin(async move {
+            let env = Env::system();
+            let Ok(id) = store.scoped(caller).users().parse_id(foreign_id) else {
+                return ProbeOutcome::Denied;
+            };
+            let actor = ActorRef::service(ServiceId::generate(&env));
+            let correlation = CorrelationId::generate(&env);
+            match store
+                .scoped(caller)
+                .acting(actor, correlation)
+                .users()
+                .update_claims(&env, &id, "{\"nickname\":\"idor-probe\"}")
+                .await
+            {
+                Ok(()) => ProbeOutcome::Leaked,
+                Err(_) => ProbeOutcome::Denied,
+            }
+        })
+    }
+}
+
+/// Built-in probe for `ActingUserRepo::unlink_external_id` (issue #52): clearing the
+/// external id off another tenant's user would be a cross-tenant mutation, so it must
+/// be the uniform not-found.
+struct UserAdminExternalIdUnlinkProbe;
+
+impl IsolationProbe for UserAdminExternalIdUnlinkProbe {
+    fn name(&self) -> &'static str {
+        "users.external_id.unlink"
+    }
+
+    fn probe<'a>(
+        &'a self,
+        store: &'a Store,
+        caller: Scope,
+        foreign_id: &'a str,
+    ) -> BoxProbeFuture<'a> {
+        Box::pin(async move {
+            let env = Env::system();
+            let Ok(id) = store.scoped(caller).users().parse_id(foreign_id) else {
+                return ProbeOutcome::Denied;
+            };
+            let actor = ActorRef::service(ServiceId::generate(&env));
+            let correlation = CorrelationId::generate(&env);
+            match store
+                .scoped(caller)
+                .acting(actor, correlation)
+                .users()
+                .unlink_external_id(&env, &id)
+                .await
+            {
+                Ok(()) => ProbeOutcome::Leaked,
+                Err(_) => ProbeOutcome::Denied,
             }
         })
     }

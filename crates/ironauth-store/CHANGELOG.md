@@ -6,6 +6,54 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Admin user CRUD, lifecycle states, and external IDs (issue #52, migration 0037,
+  expand): the foundational M6 promotion of the bootstrap `users` directory into a
+  full control-plane managed entity, with no weakening of its isolation or PII
+  guarantees.
+  - **Lifecycle state machine.** A first-class `UserState` (active, blocked,
+    disabled, `pending_verification`, `scheduled_offboarding`) with an explicit,
+    validated state machine (`can_transition_to`): a no-op and a move into
+    `pending_verification` are refused fail closed; every other move between live
+    states is permitted. `ActingUserRepo::set_state` transitions guarded on the
+    source state and audits `user.state_change` with the target on the operator-safe
+    detail. A session-ending target (block, disable) and `delete` cascade the user's
+    sessions and non-offline refresh families and publish to the session-ended
+    fan-out (issue #35), so a lifecycle change actually ends live sessions and
+    notifies relying parties (`hard_kill` also kills the offline families).
+  - **External IDs.** A per-tenant blind-index + sealed value (issue #48) so an
+    external correlation id is lookup-able (`UserRepo::by_external_id`) and filterable
+    without a plaintext column, unique per `(tenant, environment)` (a second claim is
+    refused), and cross-tenant isolated (the same string in two tenants is two
+    different users). `link_external_id` / `unlink_external_id`, audited.
+  - **CRUD.** `admin_create` (optional caller-supplied id, 409 on collision; optional
+    credential and external id; a chosen creatable initial state), `UserRepo::get` /
+    `list` (cursor paginated, filterable by state / external id / identifier),
+    `update_claims` (RFC 7396 profile patch, re-sealed under the row's DEK version),
+    and a soft-delete `delete` (a tombstone that reads as not-found and cascades).
+  - **Login fence.** `UserRecord` now carries `state`; the login read path
+    (`by_identifier`) reports it and skips a soft-deleted user, so a blocked, disabled,
+    or pending-verification user cannot authenticate (`UserState::can_authenticate`).
+  - **Scheduled offboarding.** `execute_scheduled_offboardings` disables every due
+    scheduled-offboarding user and cascades identically to a manual disable,
+    idempotently and audited (`user.offboarding.execute`).
+  - **Refresh-grant fence support.** `UserRepo::state_for_subject` resolves a live
+    user's lifecycle state by its subject (the `usr_` id a refresh family carries),
+    reading only the `state` column (no master key, no PII decrypt) and filtering the
+    soft-delete tombstone; an absent, cross-scope, deleted, or corrupt-state row reads
+    as `None` (fail closed). The OIDC `refresh_token` grant reads this to re-check the
+    token subject before minting, so a user fenced after a surviving `offline_access`
+    family was opened mints nothing. See `docs/design/USER-LIFECYCLE.md`.
+  - New `Action` variants (`user.create`/`update`/`delete`/`state_change`/
+    `external_id.link`/`external_id.unlink`/`offboarding.execute`); new public
+    `UserState`, `UserAdminRecord`, `UserListFilter`, `NewAdminUser` types; new
+    `IdorHarness::register_user_admin_probes`, now covering EVERY scope-embedding user
+    surface (`users.get`, `users.list`, `users.by_external_id`, `users.delete`,
+    `users.set_state`, `users.update_claims`, `users.external_id.link`,
+    `users.external_id.unlink`) so the IDOR harness proves uniform cross-tenant
+    not-found on the mutating and the reading surfaces alike. Migration 0037 grants
+    the control plane SELECT/INSERT + a column-scoped UPDATE on `users` and
+    SELECT/INSERT on the envelope key tables (it manages user PII), with a per-scope
+    partial unique index on the external-id blind index.
 - Self-service account management: sessions and credentials (issue #61, migration
   0036, expand). The store layer of the end-user account surface.
   - **Password change (`ActingUserRepo::change_password`).** Writes a fresh Argon2id

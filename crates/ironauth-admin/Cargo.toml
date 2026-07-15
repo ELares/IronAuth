@@ -150,5 +150,14 @@ name = "environments"
 path = "tests/environments.rs"
 required-features = ["testing"]
 
+# Admin user management over HTTP (issue #52): the Keycloak/FusionAuth paper-cut
+# checklist (caller-supplied id on create, accurate list pagination, PATCH), the
+# lifecycle state transitions with the session cascade, external-id link/unlink and
+# uniqueness, and the uniform not-found for every cross-scope probe.
+[[test]]
+name = "users"
+path = "tests/users.rs"
+required-features = ["testing"]
+
 [lints]
 workspace = true

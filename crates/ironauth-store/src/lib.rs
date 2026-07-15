@@ -138,8 +138,8 @@ pub use repository::{
     GrantOwner, GrantedConsent, IdempotencyRepo, IdempotencyWrite, InitialAccessTokenRepo,
     IssueClientCredentials, IssueCode, IssuedTokenRecord, JtiOutcome, LogoutDelivery,
     MANAGEMENT_LIST_HARD_CAP, ManagementCredentialRecord, ManagementCredentialRepo,
-    ManagementStore, NewAssertionSubjectMapping, NewClientAuthDiagnostic, NewDcrPolicy,
-    NewDeviceCode, NewDynamicClient, NewEnvironment, NewExternalAssertionIssuer,
+    ManagementStore, NewAdminUser, NewAssertionSubjectMapping, NewClientAuthDiagnostic,
+    NewDcrPolicy, NewDeviceCode, NewDynamicClient, NewEnvironment, NewExternalAssertionIssuer,
     NewInitialAccessToken, NewJwtAuthClient, NewOpaqueAccessToken, NewRefreshFamily,
     NewResourceServer, NewSession, NewSigningKey, OperatorRecord, OperatorRepo, OrganizationRecord,
     OrganizationRepo, PriorSessionOutcome, PushRequest, PushedRequestRepo, RedeemOutcome,
@@ -150,8 +150,8 @@ pub use repository::{
     SessionFleetRepo, SessionRecord, SessionRepo, SessionRevocation, SessionSummary,
     SigningKeyMaterial, SigningKeyMaterialKind, SigningKeyRecord, SigningKeyRepo,
     StoredIdempotentResponse, TenantRecord, TenantRepo, TenantStatus, TokenFormat, TokenKind,
-    TokenStatus, UserRecord, UserRepo, UserRevocation, device_code_digest,
-    opaque_access_token_digest, refresh_token_digest, user_code_hash,
+    TokenStatus, UserAdminRecord, UserListFilter, UserRecord, UserRepo, UserRevocation, UserState,
+    device_code_digest, opaque_access_token_digest, refresh_token_digest, user_code_hash,
 };
 pub use scope::Scope;
 pub use snapshot::{
