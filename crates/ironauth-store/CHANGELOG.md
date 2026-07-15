@@ -28,6 +28,40 @@ range per docs/RELEASING.md.
     resource-server registry) can read it. A pure grant, no schema change.
   - Adds a direct `serde` dependency (already in the tree; no new crate).
 
+- Per-environment custom domains with built-in ACME (issue #47, EXPLORATORY,
+  migration 0031, expand). Behind the default-off `custom-domains-acme` config flag.
+  - **Persistence.** Two new tenant-scoped, RLS-forced tables: `custom_domains` (a
+    domain per environment with its verification status, challenge type, an opaque
+    handle to its sealed certificate bundle, and the cert not-after) and
+    `acme_challenges` (the ACME challenge lifecycle rows with type, token, status,
+    and the retry/backoff bookkeeping). Column-scoped grants only (the #31 lesson);
+    the domain name and challenge type are immutable after registration.
+  - **Cross-tenant exclusivity.** A GLOBAL partial unique index on the domain name
+    of `verified` rows gives a verified domain exactly one owner platform-wide: a
+    second tenant's transition to verified for a name already verified elsewhere is
+    refused with `StoreError::Conflict`, enforced by the storage engine irrespective
+    of row-level security (a tenant cannot even see the row it collided with).
+  - **Cert key at rest.** A stored certificate's PRIVATE KEY is sealed under the
+    scope's envelope DEK (issue #48, `encrypted_secrets`) and the domain row carries
+    only the opaque secret handle; the key never touches a plaintext column and
+    never appears in a database dump. A custom domain is ENVIRONMENT-IDENTITY (new
+    `ResourceType::CustomDomain`, classified `environment-identity`), excluded from
+    every snapshot so a promotion never copies it.
+  - **Untrusted input.** A custom domain is tenant-controlled: `domain_is_registrable`
+    rejects an IP literal, an internal single-label name, or a value carrying a
+    scheme/port/path/whitespace before it is ever written (`StoreError::InvalidCustomDomain`),
+    and every outbound ACME/CA request rides the SSRF-hardened `ironauth-fetch` path.
+  - **Repositories.** `CustomDomainRepo` (reads) and `ActingCustomDomainRepo`
+    (`register`, `record_challenge_result`, `store_certificate`), new value types
+    (`ChallengeType`, `VerificationStatus`, `ChallengeStatus`, `ChallengeOutcome`,
+    `CustomDomainRecord`, `AcmeChallengeRecord`), new `cdom_`/`chal_` ids, and new
+    `custom_domain.*` audit actions. Challenge backoff is computed from the clock
+    seam, so the retry schedule is deterministic under a manual clock.
+  - **Deferred / infra-gated (be honest).** The live ACME handshake against a real
+    CA, renewal scheduling, multi-replica HTTP-01 answering, SNI serving, and the
+    management/admin API surface are NOT built here: they need a provisioned CA
+    account and a reachable domain (validate against a local test CA such as Pebble)
+    and are the exploratory graduation's remaining work.
 - Tenant lifecycle state machine, residency attributes, data-plane fence, and the
   offboarding pipeline (issue #46, migration 0029, expand).
   - **Lifecycle status.** `tenants.status` (`active`/`suspended`) plus

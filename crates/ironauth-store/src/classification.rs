@@ -121,6 +121,9 @@ pub enum ResourceType {
     DcrPolicy,
     /// A per-environment signing key (issuer key material).
     SigningKey,
+    /// A per-environment custom domain the environment is served under, with a
+    /// built-in-ACME certificate (issue #47).
+    CustomDomain,
     /// A bootstrap end user.
     User,
     /// An authenticated session.
@@ -131,7 +134,7 @@ impl ResourceType {
     /// Every resource type, in a stable order. The classification lint and the
     /// metadata endpoint both iterate this; a variant missing here is caught by
     /// the `all_lists_every_variant` test and by `scripts/classification-lint.sh`.
-    pub const ALL: [ResourceType; 11] = [
+    pub const ALL: [ResourceType; 12] = [
         ResourceType::Operator,
         ResourceType::Tenant,
         ResourceType::Environment,
@@ -141,6 +144,7 @@ impl ResourceType {
         ResourceType::ResourceServer,
         ResourceType::DcrPolicy,
         ResourceType::SigningKey,
+        ResourceType::CustomDomain,
         ResourceType::User,
         ResourceType::Session,
     ];
@@ -158,6 +162,7 @@ impl ResourceType {
             ResourceType::ResourceServer => "resource_server",
             ResourceType::DcrPolicy => "dcr_policy",
             ResourceType::SigningKey => "signing_key",
+            ResourceType::CustomDomain => "custom_domain",
             ResourceType::User => "user",
             ResourceType::Session => "session",
         }
@@ -177,6 +182,7 @@ impl ResourceType {
             | ResourceType::ResourceServer
             | ResourceType::DcrPolicy
             | ResourceType::SigningKey
+            | ResourceType::CustomDomain
             | ResourceType::User
             | ResourceType::Session => ResourceLevel::Environment,
         }
@@ -205,11 +211,14 @@ pub fn classify(resource: ResourceType) -> ResourceClassification {
 
         // Environment-intrinsic identity, excluded from every snapshot so a
         // promotion never copies one environment's identity onto another: the
-        // environment itself, its signing keys (issuer key material), and its
-        // per-environment management credentials.
+        // environment itself, its signing keys (issuer key material), its
+        // per-environment management credentials, and its custom domains (a
+        // domain and its certificate are what a specific environment is served
+        // under, never something a dev->prod promotion should copy).
         ResourceType::Environment
         | ResourceType::SigningKey
-        | ResourceType::ManagementCredential => EnvironmentIdentity,
+        | ResourceType::ManagementCredential
+        | ResourceType::CustomDomain => EnvironmentIdentity,
 
         // Structural resources above the per-environment data plane (operators,
         // tenants) and dynamic per-environment data (organizations as customer

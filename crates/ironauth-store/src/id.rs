@@ -340,6 +340,31 @@ impl ScopedKind for EncryptedSecretKind {
     const PREFIX: &'static str = "sec";
 }
 
+/// Marker for a per-environment custom domain (`cdom_`), a customer-owned
+/// hostname an environment is served under with a built-in-ACME certificate
+/// (issue #47). A tenant-scoped resource: the identifier embeds its
+/// `(tenant, environment)`, so a domain row can never be read across a tenant or
+/// environment boundary. The id is a public handle; the cert PRIVATE KEY never
+/// lives on the domain row (it is sealed in `encrypted_secrets`, issue #48). A
+/// custom domain is ENVIRONMENT-IDENTITY (issue #41), excluded from every
+/// snapshot so a promotion never copies one environment's domain onto another.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CustomDomainKind;
+impl ScopedKind for CustomDomainKind {
+    const PREFIX: &'static str = "cdom";
+}
+
+/// Marker for an ACME challenge (`chal_`), one verification attempt proving a
+/// tenant controls a custom domain before a certificate is issued (issue #47,
+/// RFC 8555). A tenant-scoped resource: the identifier embeds its
+/// `(tenant, environment)`. The challenge token it carries is a PUBLIC value the
+/// tenant serves or publishes, never a secret.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct AcmeChallengeKind;
+impl ScopedKind for AcmeChallengeKind {
+    const PREFIX: &'static str = "chal";
+}
+
 /// Marker for a service-account principal (`sva_`), the first-class machine
 /// identity every M2M-capable client maps to (issue #23). A tenant-scoped
 /// resource: the identifier embeds its `(tenant, environment)`, so a service
@@ -636,6 +661,12 @@ pub type DekId = ScopedId<DekKind>;
 /// An encrypted-secret identifier (`sec_...`), a stored secret value sealed under
 /// a scope's DEK (issue #48).
 pub type EncryptedSecretId = ScopedId<EncryptedSecretKind>;
+/// A custom-domain identifier (`cdom_...`), a customer-owned hostname an
+/// environment is served under with a built-in-ACME certificate (issue #47).
+pub type CustomDomainId = ScopedId<CustomDomainKind>;
+/// An ACME challenge identifier (`chal_...`), one domain-control verification
+/// attempt in the ACME issuance lifecycle (issue #47, RFC 8555).
+pub type AcmeChallengeId = ScopedId<AcmeChallengeKind>;
 /// A pushed-authorization-request identifier (`par_...`), the single-use reference
 /// the PAR endpoint returns and `/authorize` consumes (RFC 9126, issue #27). It is
 /// the reference portion of the `urn:ietf:params:oauth:request_uri:<id>` value.

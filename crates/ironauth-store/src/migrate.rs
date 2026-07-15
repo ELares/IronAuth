@@ -464,6 +464,12 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0032_snapshot_export.sql"),
         },
+        Migration {
+            version: 33,
+            name: "custom_domains",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0033_custom_domains.sql"),
+        },
     ]
 }
 

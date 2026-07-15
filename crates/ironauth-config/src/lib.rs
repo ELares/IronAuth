@@ -33,8 +33,9 @@ use serde::{Deserialize, Serialize};
 
 pub use dsn::{Dsn, DsnError, KNOWN_SCHEMES};
 pub use features::{
-    Feature, FeatureRegistry, FeatureValidationError, FeatureViolation,
-    GLOBAL_TOKEN_REVOCATION_DRAFT, GLOBAL_TOKEN_REVOCATION_FEATURE, Maturity,
+    CUSTOM_DOMAINS_ACME_FEATURE, CUSTOM_DOMAINS_ACME_VERSION, Feature, FeatureRegistry,
+    FeatureValidationError, FeatureViolation, GLOBAL_TOKEN_REVOCATION_DRAFT,
+    GLOBAL_TOKEN_REVOCATION_FEATURE, Maturity,
 };
 pub use secret::{REDACTED, Secret, SecretError, SecretString};
 

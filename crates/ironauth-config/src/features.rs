@@ -29,6 +29,18 @@ pub const GLOBAL_TOKEN_REVOCATION_DRAFT: &str = "draft-parecki-oauth-global-toke
 /// The registry name of the Global Token Revocation experimental feature (issue #36).
 pub const GLOBAL_TOKEN_REVOCATION_FEATURE: &str = "global-token-revocation";
 
+/// The registry name of the per-environment custom-domains-with-built-in-ACME
+/// experimental feature (issue #47).
+pub const CUSTOM_DOMAINS_ACME_FEATURE: &str = "custom-domains-acme";
+
+/// The experimental `ack` version for the custom-domains-with-ACME feature (issue
+/// #47). It is EXPLORATORY: the cert-management operational model (renewal
+/// scheduling, CA rate-limit budgeting, multi-replica challenge serving) is
+/// unproven in this codebase, and a live ACME handshake needs a provisioned CA
+/// account and a reachable domain (infra/owner-gated). Enabling the feature
+/// acknowledges this exact revision; a graduation that changes the shape bumps it.
+pub const CUSTOM_DOMAINS_ACME_VERSION: &str = "0.1.0-exp.1";
+
 /// How mature a feature is, and therefore what enabling it requires.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Maturity {
@@ -157,6 +169,7 @@ impl FeatureRegistry {
         let mut registry = Self::new();
         registry.register_sample_experimental();
         registry.register_global_token_revocation();
+        registry.register_custom_domains_acme();
         registry
     }
 
@@ -217,6 +230,27 @@ impl FeatureRegistry {
              yet WG-adopted and the wire shape may break between releases.",
             GLOBAL_TOKEN_REVOCATION_DRAFT,
             "crates/ironauth-oidc/CHANGELOG.md",
+        ));
+    }
+
+    /// Registers the per-environment custom-domains-with-built-in-ACME feature
+    /// (issue #47). It is EXPERIMENTAL and EXPLORATORY: it ships the persistence,
+    /// domain validation, encrypted certificate storage, and the SSRF-hardened
+    /// ACME/CA fetch path, but the live cert-management operational model (renewal
+    /// scheduling, CA rate-limit budgeting, multi-replica HTTP-01 answering, SNI
+    /// serving) is unproven, and a live issuance needs a provisioned CA account
+    /// and a reachable domain (infra/owner-gated). Off by default; enabling it
+    /// requires acknowledging the exact implemented revision.
+    pub fn register_custom_domains_acme(&mut self) {
+        self.register(Feature::experimental(
+            CUSTOM_DOMAINS_ACME_FEATURE,
+            "Per-environment custom domains with built-in ACME (RFC 8555): CNAME \
+             verification, HTTP-01/DNS-01 challenges, and encrypted-at-rest \
+             certificate storage. EXPLORATORY: the cert-management operational \
+             model is unproven and a live issuance is infra/owner-gated on a \
+             provisioned CA account and a reachable domain.",
+            CUSTOM_DOMAINS_ACME_VERSION,
+            "crates/ironauth-store/CHANGELOG.md",
         ));
     }
 
@@ -537,5 +571,38 @@ mod tests {
     fn duplicate_registration_panics() {
         let mut registry = FeatureRegistry::builtin();
         registry.register_sample_experimental();
+    }
+
+    #[test]
+    fn custom_domains_acme_is_experimental_and_off_by_default() {
+        // Issue #47 ships behind a default-off experimental flag: absent from
+        // [features] it resolves disabled, and enabling it without the exact ack
+        // refuses to boot.
+        let registry = FeatureRegistry::builtin();
+        let feature = registry
+            .get(CUSTOM_DOMAINS_ACME_FEATURE)
+            .expect("custom-domains-acme is registered");
+        assert!(matches!(feature.maturity(), Maturity::Experimental { .. }));
+        assert!(!feature.default_enabled());
+
+        let absent = config_with_features("");
+        registry.validate(&absent).expect("absent is fine");
+        assert!(
+            !registry.is_enabled(&absent, CUSTOM_DOMAINS_ACME_FEATURE),
+            "custom-domains-acme is off when absent from [features]"
+        );
+
+        // Enabled without an ack refuses to boot.
+        let no_ack = config_with_features("\"custom-domains-acme\" = { enabled = true }");
+        registry
+            .validate(&no_ack)
+            .expect_err("an experimental feature enabled without an ack must refuse to boot");
+
+        // Enabled WITH the exact ack boots and reports enabled.
+        let acked = config_with_features(&format!(
+            "\"custom-domains-acme\" = {{ enabled = true, ack = \"{CUSTOM_DOMAINS_ACME_VERSION}\" }}"
+        ));
+        registry.validate(&acked).expect("the exact ack boots");
+        assert!(registry.is_enabled(&acked, CUSTOM_DOMAINS_ACME_FEATURE));
     }
 }

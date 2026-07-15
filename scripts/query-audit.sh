@@ -117,13 +117,20 @@ cd "$(git rev-parse --show-toplevel)"
 # offboarding stage severs it in the same audited transaction that crypto-shreds the
 # platform KEK.
 #
+# custom_domains and acme_challenges (#47) are the per-environment custom-domain
+# registry and the ACME challenge lifecycle rows. Both are TENANT-SCOPED with forced
+# row-level security, so their SQL stays in the repository module too. A cert private
+# key is never stored on these tables (it lives sealed in encrypted_secrets, #48);
+# cross-tenant verified-domain exclusivity is a global partial unique index the
+# storage engine enforces across every row irrespective of row-level security.
+#
 # environment_guardrails (#42) is the scope-forced guardrail PROJECTION VIEW the
 # data plane reads to enforce the redirect guardrail (an http loopback is rejected
 # in a prod environment). It is not a base table (it is a definer view over the
 # environments level table whose WHERE clause pins the bound scope), but its SQL is
 # kept in the repository module for the same reason: no other file may name it, so
 # the scoped read stays in one place.
-SCOPED_TABLES='clients|organizations|audit_log|management_credentials|idempotency_keys|grants|authorization_codes|issued_tokens|signing_keys|users|sessions|consents|resource_servers|opaque_access_tokens|client_assertion_jtis|client_auth_diagnostics|pushed_authorization_requests|refresh_families|refresh_tokens|service_accounts|dcr_policies|dcr_initial_access_tokens|dcr_rate_counters|external_assertion_issuers|external_assertion_subject_mappings|external_assertion_jtis|device_codes|client_sessions|session_ended_events|backchannel_logout_deliveries|tenant_keks|tenant_deks|encrypted_secrets|environment_states|tenant_byok_bindings|environment_guardrails'
+SCOPED_TABLES='clients|organizations|audit_log|management_credentials|idempotency_keys|grants|authorization_codes|issued_tokens|signing_keys|users|sessions|consents|resource_servers|opaque_access_tokens|client_assertion_jtis|client_auth_diagnostics|pushed_authorization_requests|refresh_families|refresh_tokens|service_accounts|dcr_policies|dcr_initial_access_tokens|dcr_rate_counters|external_assertion_issuers|external_assertion_subject_mappings|external_assertion_jtis|device_codes|client_sessions|session_ended_events|backchannel_logout_deliveries|tenant_keks|tenant_deks|encrypted_secrets|environment_states|tenant_byok_bindings|environment_guardrails|custom_domains|acme_challenges'
 
 # The one module allowed to name a scoped table in SQL.
 REPO_MODULE='crates/ironauth-store/src/repository.rs'

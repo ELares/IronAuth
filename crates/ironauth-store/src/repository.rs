@@ -54,14 +54,19 @@ use sqlx::postgres::PgRow;
 use sqlx::{PgConnection, Postgres, Row, Transaction};
 
 use crate::audit::{ActingContext, Action, ActorRef};
+use crate::custom_domain::{
+    AcmeChallengeRecord, ChallengeOutcome, ChallengeStatus, ChallengeType, CustomDomainRecord,
+    VerificationStatus,
+};
 use crate::environment::{EnvironmentType, GuardrailSet};
 use crate::error::StoreError;
 use crate::id::{
-    AssertionMappingId, AuditId, AuditTarget, AuthorizationCodeId, BackChannelDeliveryId, ClientId,
-    ClientSessionId, ConsentId, CorrelationId, DcrPolicyId, DekId, DeviceCodeId, EncryptedSecretId,
-    EnvironmentId, ExternalIssuerId, GrantId, InitialAccessTokenId, IssuedTokenId, KekId,
-    ManagementKeyId, OperatorId, OrganizationId, PushedRequestId, RefreshFamilyId, RefreshTokenId,
-    ResourceServerId, ServiceAccountId, SessionEventId, SessionId, SigningKeyId, TenantId, UserId,
+    AcmeChallengeId, AssertionMappingId, AuditId, AuditTarget, AuthorizationCodeId,
+    BackChannelDeliveryId, ClientId, ClientSessionId, ConsentId, CorrelationId, CustomDomainId,
+    DcrPolicyId, DekId, DeviceCodeId, EncryptedSecretId, EnvironmentId, ExternalIssuerId, GrantId,
+    InitialAccessTokenId, IssuedTokenId, KekId, ManagementKeyId, OperatorId, OrganizationId,
+    PushedRequestId, RefreshFamilyId, RefreshTokenId, ResourceServerId, ServiceAccountId,
+    SessionEventId, SessionId, SigningKeyId, TenantId, UserId,
 };
 use crate::scope::Scope;
 use crate::store::Store;
@@ -445,6 +450,18 @@ impl<'a> ScopedStore<'a> {
         }
     }
 
+    /// The read-only custom-domain repository for this scope (issue #47): look a
+    /// domain up by name or id, list an environment's domains, and read a domain's
+    /// ACME challenges. Registration, challenge results, and certificate storage
+    /// (the audited mutations) live on [`ActingStore::custom_domains`].
+    #[must_use]
+    pub fn custom_domains(&self) -> CustomDomainRepo<'a> {
+        CustomDomainRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
     /// Enter an acting context (who is acting, and under which correlation id).
     /// The returned store hands out the *mutating* repositories, so every write
     /// carries an actor and a correlation id into its audit row.
@@ -546,6 +563,20 @@ impl<'a> ActingStore<'a> {
     #[must_use]
     pub fn envelope(&self) -> ActingEnvelopeRepo<'a> {
         ActingEnvelopeRepo {
+            store: self.store,
+            scope: self.scope,
+            acting: self.acting,
+        }
+    }
+
+    /// The mutating custom-domain repository for this scope and actor (issue #47):
+    /// register a domain and open its ACME challenge, record a challenge result
+    /// (verifying or failing the domain), and store an issued certificate (its
+    /// private key sealed under the scope's envelope DEK). Every mutation writes
+    /// its audit row in the same transaction.
+    #[must_use]
+    pub fn custom_domains(&self) -> ActingCustomDomainRepo<'a> {
+        ActingCustomDomainRepo {
             store: self.store,
             scope: self.scope,
             acting: self.acting,
@@ -14487,5 +14518,573 @@ impl ActingEnvelopeRepo<'_> {
         )
         .await?;
         Ok(true)
+    }
+}
+
+// ===========================================================================
+// Per-environment custom domains with built-in ACME (issue #47, EXPLORATORY).
+//
+// The persistence half of custom domains: a customer proves control of a domain
+// through an ACME challenge, a CA issues a certificate, and the cert plus its
+// PRIVATE KEY are stored sealed under the scope's envelope DEK (issue #48). All
+// SQL against `custom_domains` and `acme_challenges` lives here, in the one
+// scoped-SQL module. The outbound ACME/CA HTTP is NOT here: it is confined to the
+// SSRF-hardened `ironauth-fetch` path (the ACME directory client in
+// ironauth-oidc), because a custom domain is tenant-controlled and untrusted.
+//
+// Cross-tenant exclusivity (issue #47 acceptance: one tenant cannot claim
+// another tenant's verified domain) is enforced by the DATABASE: a global partial
+// unique index on the domain name of VERIFIED rows (migration 0031) is maintained
+// across every row irrespective of row-level security, so a second tenant's
+// transition to verified for a name already verified elsewhere is refused with a
+// unique violation, even though that tenant cannot see the conflicting row.
+
+/// The `encrypted_secrets` purpose under which a domain's sealed certificate
+/// bundle (cert chain plus private key) is stored. Bound per domain id so each
+/// domain's cert is a distinct sealed secret.
+fn cert_secret_purpose(domain: &CustomDomainId) -> String {
+    format!("custom_domain_cert:{domain}")
+}
+
+/// The deterministic retry backoff after a failed challenge attempt: a capped
+/// exponential in the attempt count, computed purely (no clock read), so the
+/// schedule a manual clock observes is reproducible. Attempt 0 waits the base
+/// interval, each further attempt doubles it, capped at one hour.
+fn challenge_backoff(attempts: i32) -> Duration {
+    const BASE_SECS: u64 = 60;
+    const CAP_SECS: u64 = 3600;
+    let shift = u32::try_from(attempts.max(0)).unwrap_or(u32::MAX).min(16);
+    let secs = BASE_SECS.saturating_mul(1_u64 << shift).min(CAP_SECS);
+    Duration::from_secs(secs)
+}
+
+/// Map one `custom_domains` row into a typed record, parsing its ids in scope and
+/// its wire-token columns into their enums.
+fn row_to_custom_domain(scope: Scope, row: &PgRow) -> Result<CustomDomainRecord, StoreError> {
+    let id = CustomDomainId::parse_in_scope(&row.get::<String, _>("id"), &scope)?;
+    let cert_secret_id = row
+        .get::<Option<String>, _>("cert_secret_id")
+        .map(|raw| EncryptedSecretId::parse_in_scope(&raw, &scope))
+        .transpose()?;
+    Ok(CustomDomainRecord {
+        id,
+        domain_name: row.get("domain_name"),
+        challenge_type: ChallengeType::parse(&row.get::<String, _>("challenge_type"))?,
+        verification_status: VerificationStatus::parse(
+            &row.get::<String, _>("verification_status"),
+        )?,
+        cert_secret_id,
+        cert_not_after_micros: row.get::<Option<i64>, _>("cert_not_after_us"),
+    })
+}
+
+/// Map one `acme_challenges` row into a typed record.
+fn row_to_acme_challenge(scope: Scope, row: &PgRow) -> Result<AcmeChallengeRecord, StoreError> {
+    let id = AcmeChallengeId::parse_in_scope(&row.get::<String, _>("id"), &scope)?;
+    let domain_id = CustomDomainId::parse_in_scope(&row.get::<String, _>("domain_id"), &scope)?;
+    Ok(AcmeChallengeRecord {
+        id,
+        domain_id,
+        challenge_type: ChallengeType::parse(&row.get::<String, _>("challenge_type"))?,
+        token: row.get("token"),
+        status: ChallengeStatus::parse(&row.get::<String, _>("status"))?,
+        attempts: row.get("attempts"),
+        next_attempt_at_micros: row.get::<Option<i64>, _>("next_attempt_us"),
+    })
+}
+
+/// The read-only custom-domain repository (issue #47). Reads need no actor.
+pub struct CustomDomainRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl CustomDomainRepo<'_> {
+    /// Fetch a registered domain by its (normalized) name in this scope.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if no such domain is registered in this scope;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn get_by_name(&self, domain_name: &str) -> Result<CustomDomainRecord, StoreError> {
+        // Look up by the same canonical form registration stored, so a query in
+        // any case or with a trailing root dot finds the one registered row.
+        let domain_name = crate::custom_domain::normalize_domain(domain_name);
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT id, domain_name, challenge_type, verification_status, cert_secret_id, \
+                    (EXTRACT(EPOCH FROM cert_not_after) * 1000000)::bigint AS cert_not_after_us \
+             FROM custom_domains \
+             WHERE tenant_id = $1 AND environment_id = $2 AND domain_name = $3",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(&domain_name)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        let row = row.ok_or(StoreError::NotFound)?;
+        row_to_custom_domain(self.scope, &row)
+    }
+
+    /// Fetch a registered domain by its id in this scope.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the id is out of scope or absent;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn get(&self, id: &CustomDomainId) -> Result<CustomDomainRecord, StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT id, domain_name, challenge_type, verification_status, cert_secret_id, \
+                    (EXTRACT(EPOCH FROM cert_not_after) * 1000000)::bigint AS cert_not_after_us \
+             FROM custom_domains \
+             WHERE tenant_id = $1 AND environment_id = $2 AND id = $3",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(id.to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        let row = row.ok_or(StoreError::NotFound)?;
+        row_to_custom_domain(self.scope, &row)
+    }
+
+    /// List every registered domain in this scope, newest first.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn list(&self) -> Result<Vec<CustomDomainRecord>, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let rows = sqlx::query(
+            "SELECT id, domain_name, challenge_type, verification_status, cert_secret_id, \
+                    (EXTRACT(EPOCH FROM cert_not_after) * 1000000)::bigint AS cert_not_after_us \
+             FROM custom_domains \
+             WHERE tenant_id = $1 AND environment_id = $2 \
+             ORDER BY created_at DESC, id DESC",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        rows.iter()
+            .map(|row| row_to_custom_domain(self.scope, row))
+            .collect()
+    }
+
+    /// Fetch an ACME challenge by its id in this scope.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the id is out of scope or absent;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn get_challenge(
+        &self,
+        id: &AcmeChallengeId,
+    ) -> Result<AcmeChallengeRecord, StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT id, domain_id, challenge_type, token, status, attempts, \
+                    (EXTRACT(EPOCH FROM next_attempt_at) * 1000000)::bigint AS next_attempt_us \
+             FROM acme_challenges \
+             WHERE tenant_id = $1 AND environment_id = $2 AND id = $3",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(id.to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        let row = row.ok_or(StoreError::NotFound)?;
+        row_to_acme_challenge(self.scope, &row)
+    }
+
+    /// List the ACME challenges of a domain in this scope, newest first.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn challenges_for(
+        &self,
+        domain_id: &CustomDomainId,
+    ) -> Result<Vec<AcmeChallengeRecord>, StoreError> {
+        if domain_id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let rows = sqlx::query(
+            "SELECT id, domain_id, challenge_type, token, status, attempts, \
+                    (EXTRACT(EPOCH FROM next_attempt_at) * 1000000)::bigint AS next_attempt_us \
+             FROM acme_challenges \
+             WHERE tenant_id = $1 AND environment_id = $2 AND domain_id = $3 \
+             ORDER BY created_at DESC, id DESC",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(domain_id.to_string())
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        rows.iter()
+            .map(|row| row_to_acme_challenge(self.scope, row))
+            .collect()
+    }
+}
+
+/// The mutating custom-domain repository (issue #47). Reachable only through
+/// [`ActingStore::custom_domains`], so every mutation carries an actor.
+pub struct ActingCustomDomainRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+    acting: ActingContext,
+}
+
+impl ActingCustomDomainRepo<'_> {
+    /// Register a custom domain and open its first ACME challenge, auditing
+    /// `custom_domain.register` in the same transaction. The domain starts
+    /// UNVERIFIED and is never served until a challenge proves control of it.
+    ///
+    /// The submitted `domain_name` is validated as a plain registrable hostname
+    /// before anything is written (see [`domain_is_registrable`]): a value that
+    /// could point at internal infrastructure is refused here, and every outbound
+    /// ACME/CA request that later mentions the name goes through the SSRF-hardened
+    /// fetch path.
+    ///
+    /// [`domain_is_registrable`]: crate::custom_domain::domain_is_registrable
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if either id is out of this scope;
+    /// [`StoreError::InvalidCustomDomain`] if `domain_name` is not a registrable
+    /// hostname; [`StoreError::Conflict`] if this environment already registered
+    /// the same domain; [`StoreError::Database`] on a persistence failure.
+    pub async fn register(
+        &self,
+        env: &Env,
+        domain: &CustomDomainId,
+        domain_name: &str,
+        challenge_type: ChallengeType,
+        challenge: &AcmeChallengeId,
+        token: &str,
+    ) -> Result<(), StoreError> {
+        if domain.scope() != self.scope || challenge.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        // Canonicalize BEFORE the registrability check and BEFORE storing: the
+        // cross-tenant exclusivity control is a byte-exact unique index on
+        // domain_name, so a raw value would let two tenants each claim the same
+        // DNS domain under a different case or a trailing root dot
+        // (example.com vs EXAMPLE.com vs example.com.). Normalizing to the
+        // canonical lowercase, root-dot-stripped form keys and indexes every
+        // registration on the one true name.
+        let domain_name = crate::custom_domain::normalize_domain(domain_name);
+        if !crate::custom_domain::domain_is_registrable(&domain_name) {
+            return Err(StoreError::InvalidCustomDomain);
+        }
+        let scope = self.scope;
+        // The freshly issued challenge is ready to poll now (from the clock seam).
+        let next_attempt_micros = epoch_micros(env.clock().now_utc());
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::CustomDomainRegister,
+                target: domain,
+            },
+            async move |tx| {
+                let insert_domain = sqlx::query(
+                    "INSERT INTO custom_domains \
+                     (id, tenant_id, environment_id, domain_name, challenge_type, \
+                      verification_status) \
+                     VALUES ($1, $2, $3, $4, $5, 'pending')",
+                )
+                .bind(domain.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(&domain_name)
+                .bind(challenge_type.as_str())
+                .execute(&mut **tx)
+                .await;
+                match insert_domain {
+                    Ok(_) => {}
+                    // A domain already registered in THIS environment is a
+                    // caller-facing conflict (the per-scope unique), not a
+                    // persistence fault. Rolls the whole audited write back.
+                    Err(error) if is_unique_violation(&error) => return Err(StoreError::Conflict),
+                    Err(error) => return Err(error.into()),
+                }
+                sqlx::query(
+                    "INSERT INTO acme_challenges \
+                     (id, tenant_id, environment_id, domain_id, challenge_type, token, status, \
+                      attempts, next_attempt_at) \
+                     VALUES ($1, $2, $3, $4, $5, $6, 'pending', 0, \
+                             TIMESTAMPTZ 'epoch' + ($7::text || ' microseconds')::interval)",
+                )
+                .bind(challenge.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(domain.to_string())
+                .bind(challenge_type.as_str())
+                .bind(token)
+                .bind(next_attempt_micros)
+                .execute(&mut **tx)
+                .await?;
+                Ok(())
+            },
+            false,
+        )
+        .await
+    }
+
+    /// Record the terminal result of an ACME challenge, moving both the challenge
+    /// and its domain to the corresponding state in one audited transaction.
+    ///
+    /// On [`ChallengeOutcome::Valid`] the challenge becomes valid and the domain
+    /// VERIFIES (audited `custom_domain.challenge.succeed`). This is the point
+    /// cross-tenant exclusivity is enforced: if another tenant already verified
+    /// the same domain, the verified-domain unique index refuses the transition
+    /// and the whole write rolls back with [`StoreError::Conflict`], leaving the
+    /// domain unverified. On [`ChallengeOutcome::Invalid`] the challenge becomes
+    /// invalid, its attempt count increments, a deterministic backoff schedules
+    /// the next attempt, and the domain moves to FAILED (audited
+    /// `custom_domain.challenge.fail`) so the failure surfaces.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if either id is out of scope, or the challenge or
+    /// domain is absent; [`StoreError::Conflict`] if the domain is already
+    /// verified by another tenant; [`StoreError::Database`] on a persistence
+    /// failure.
+    pub async fn record_challenge_result(
+        &self,
+        env: &Env,
+        challenge: &AcmeChallengeId,
+        domain: &CustomDomainId,
+        outcome: ChallengeOutcome,
+    ) -> Result<(), StoreError> {
+        if challenge.scope() != self.scope || domain.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let now = env.clock().now_utc();
+        let updated_micros = epoch_micros(now);
+        let action = match outcome {
+            ChallengeOutcome::Valid => Action::CustomDomainChallengeSucceed,
+            ChallengeOutcome::Invalid => Action::CustomDomainChallengeFail,
+        };
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action,
+                target: domain,
+            },
+            async move |tx| {
+                // Move the challenge to its terminal state (on a failure, bump the
+                // attempts and schedule the deterministic backoff; on success, clear
+                // it). Keyed on BOTH the challenge id and the passed `domain_id`, so a
+                // mismatched challenge/domain pair matches no row (NotFound).
+                let challenge_row = match outcome {
+                    ChallengeOutcome::Valid => sqlx::query(
+                        "UPDATE acme_challenges \
+                         SET status = 'valid', next_attempt_at = NULL, \
+                             updated_at = TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval \
+                         WHERE tenant_id = $1 AND environment_id = $2 \
+                               AND id = $3 AND domain_id = $5 RETURNING attempts",
+                    )
+                    .bind(scope.tenant().to_string())
+                    .bind(scope.environment().to_string())
+                    .bind(challenge.to_string())
+                    .bind(updated_micros)
+                    .bind(domain.to_string())
+                    .fetch_optional(&mut **tx)
+                    .await?,
+                    ChallengeOutcome::Invalid => {
+                        // Read the current attempt count to compute the next schedule.
+                        let current: Option<i32> = sqlx::query(
+                            "SELECT attempts FROM acme_challenges \
+                             WHERE tenant_id = $1 AND environment_id = $2 \
+                                   AND id = $3 AND domain_id = $4",
+                        )
+                        .bind(scope.tenant().to_string())
+                        .bind(scope.environment().to_string())
+                        .bind(challenge.to_string())
+                        .bind(domain.to_string())
+                        .fetch_optional(&mut **tx)
+                        .await?
+                        .map(|row| row.get::<i32, _>("attempts"));
+                        let Some(attempts) = current else {
+                            return Err(StoreError::NotFound);
+                        };
+                        let next_attempts = attempts.saturating_add(1);
+                        let backoff = challenge_backoff(attempts);
+                        let next_at = epoch_micros(now + backoff);
+                        sqlx::query(
+                            "UPDATE acme_challenges \
+                             SET status = 'invalid', attempts = $4, \
+                                 next_attempt_at = TIMESTAMPTZ 'epoch' + ($5::text || ' microseconds')::interval, \
+                                 updated_at = TIMESTAMPTZ 'epoch' + ($6::text || ' microseconds')::interval \
+                             WHERE tenant_id = $1 AND environment_id = $2 \
+                                   AND id = $3 AND domain_id = $7 RETURNING attempts",
+                        )
+                        .bind(scope.tenant().to_string())
+                        .bind(scope.environment().to_string())
+                        .bind(challenge.to_string())
+                        .bind(next_attempts)
+                        .bind(next_at)
+                        .bind(updated_micros)
+                        .bind(domain.to_string())
+                        .fetch_optional(&mut **tx)
+                        .await?
+                    }
+                };
+                challenge_row.ok_or(StoreError::NotFound)?;
+                // Move the domain to its corresponding verification state.
+                let domain_update = sqlx::query(
+                    "UPDATE custom_domains \
+                     SET verification_status = $4, \
+                         updated_at = TIMESTAMPTZ 'epoch' + ($5::text || ' microseconds')::interval \
+                     WHERE tenant_id = $1 AND environment_id = $2 AND id = $3 \
+                     RETURNING id",
+                )
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(domain.to_string())
+                .bind(outcome.verification_status().as_str())
+                .bind(updated_micros)
+                .fetch_optional(&mut **tx)
+                .await;
+                match domain_update {
+                    Ok(Some(_)) => Ok(()),
+                    Ok(None) => Err(StoreError::NotFound),
+                    // The verified-domain partial unique index refused this
+                    // transition: another tenant already holds this domain
+                    // verified. The whole write rolls back, so nothing changes.
+                    Err(error) if is_unique_violation(&error) => Err(StoreError::Conflict),
+                    Err(error) => Err(error.into()),
+                }
+            },
+            false,
+        )
+        .await
+    }
+
+    /// Store an issued certificate for a verified domain: seal the certificate
+    /// bundle (chain plus PRIVATE KEY) under the scope's envelope DEK (issue #48),
+    /// point the domain at the sealed secret, and record its not-after instant.
+    /// Audits `custom_domain.certificate.store`. The private key never touches a
+    /// plaintext column; it lives only as ciphertext in `encrypted_secrets`.
+    ///
+    /// The scope's KEK/DEK are provisioned lazily on first use (idempotent), so a
+    /// domain in a scope that never sealed a secret before still stores its cert.
+    ///
+    /// A certificate is only ever stored for a domain in the VERIFIED state (its
+    /// ownership challenge completed): storing one for a pending or failed domain
+    /// is refused with [`StoreError::Conflict`] BEFORE anything is sealed, so an
+    /// unverified domain never gains a certificate and no orphan secret is left
+    /// behind.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the domain id is out of scope or absent;
+    /// [`StoreError::Conflict`] if the domain is not in the verified state;
+    /// [`StoreError::Encryption`] if the scope's keys cannot seal the bundle;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn store_certificate(
+        &self,
+        env: &Env,
+        master: &MasterKey,
+        domain: &CustomDomainId,
+        cert_bundle_pem: &[u8],
+        not_after_micros: i64,
+    ) -> Result<EncryptedSecretId, StoreError> {
+        if domain.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        // A cert may only exist for a domain whose ownership challenge completed.
+        // Read the domain up front (NotFound if absent) and require Verified before
+        // sealing any key material, so a pending or failed domain is refused
+        // without leaving an orphan sealed secret behind.
+        let current = CustomDomainRepo {
+            store: self.store,
+            scope,
+        }
+        .get(domain)
+        .await?;
+        if current.verification_status != VerificationStatus::Verified {
+            return Err(StoreError::Conflict);
+        }
+        let envelope = ActingEnvelopeRepo {
+            store: self.store,
+            scope,
+            acting: self.acting,
+        };
+        // Provision the scope's KEK/DEK lazily (idempotent): a scope that never
+        // sealed a secret has no keys yet.
+        match envelope.provision_kek(env, master).await {
+            Ok(_) | Err(StoreError::Conflict) => {}
+            Err(error) => return Err(error),
+        }
+        match envelope.provision_dek(env, master).await {
+            Ok(_) | Err(StoreError::Conflict) => {}
+            Err(error) => return Err(error),
+        }
+        // Seal the cert bundle (including the private key) under the scope's DEK.
+        let purpose = cert_secret_purpose(domain);
+        let secret_id = envelope
+            .put_secret(env, master, &purpose, cert_bundle_pem)
+            .await?;
+        // Point the domain at the sealed bundle and record the not-after instant.
+        let updated_micros = epoch_micros(env.clock().now_utc());
+        let secret_for_row = secret_id.to_string();
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::CustomDomainCertificateStore,
+                target: domain,
+            },
+            async move |tx| {
+                let updated = sqlx::query(
+                    "UPDATE custom_domains \
+                     SET cert_secret_id = $4, \
+                         cert_not_after = TIMESTAMPTZ 'epoch' + ($5::text || ' microseconds')::interval, \
+                         updated_at = TIMESTAMPTZ 'epoch' + ($6::text || ' microseconds')::interval \
+                     WHERE tenant_id = $1 AND environment_id = $2 AND id = $3 \
+                     RETURNING id",
+                )
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(domain.to_string())
+                .bind(&secret_for_row)
+                .bind(not_after_micros)
+                .bind(updated_micros)
+                .fetch_optional(&mut **tx)
+                .await?;
+                if updated.is_none() {
+                    return Err(StoreError::NotFound);
+                }
+                Ok(())
+            },
+            false,
+        )
+        .await?;
+        Ok(secret_id)
     }
 }

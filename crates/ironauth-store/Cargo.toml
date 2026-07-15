@@ -292,6 +292,15 @@ required-features = ["testing"]
 [[test]]
 name = "config_snapshot"
 path = "tests/config_snapshot.rs"
+# Per-environment custom domains with built-in ACME (issue #47, EXPLORATORY):
+# registration opens a pending challenge, the challenge lifecycle moves through
+# validated and failed (with a deterministic backoff under a manual clock), an
+# issued cert private key is stored only as envelope ciphertext (no plaintext in a
+# dump), one tenant cannot verify another tenant's verified domain, and an unsafe
+# domain is refused. Needs a real database (DATABASE_URL).
+[[test]]
+name = "custom_domains"
+path = "tests/custom_domains.rs"
 required-features = ["testing"]
 
 [lints]

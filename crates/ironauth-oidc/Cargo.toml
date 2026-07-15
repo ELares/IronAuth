@@ -420,6 +420,13 @@ required-features = ["testing"]
 name = "backchannel"
 path = "tests/backchannel.rs"
 required-features = ["testing"]
+# The ACME directory client is confined to the SSRF-hardened fetch path (issue #47):
+# a CA/directory URL that is (or resolves to) a loopback, private, or cloud-metadata
+# address is refused with the uniform AcmeError::Blocked and never dialed. Database-free.
+[[test]]
+name = "acme_ssrf"
+path = "tests/acme_ssrf.rs"
+required-features = ["testing"]
 # RFC 9700 (OAuth 2.0 Security BCP) as executable CI conformance invariants (issue
 # #38): one named test per applicable checklist item driving the LIVE endpoints, plus
 # an in-binary mutation harness proving every shared checker predicate rejects the
