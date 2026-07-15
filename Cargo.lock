@@ -960,6 +960,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "ironauth-quota"
+version = "0.1.0"
+dependencies = [
+ "ironauth-config",
+ "ironauth-env",
+]
+
+[[package]]
 name = "ironauth-server"
 version = "0.1.0"
 dependencies = [

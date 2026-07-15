@@ -70,6 +70,13 @@ pub struct Config {
     /// OIDC provider settings (issue #12).
     pub oidc: OidcConfig,
 
+    /// Per-tenant and per-environment quota fairness settings (issue #50). The
+    /// operator-plane noisy-neighbor guard: nested token buckets that keep one
+    /// tenant or environment from starving another. Safe defaults, fully tunable
+    /// (the tunability principle); a burst of 0 for a dimension means unlimited
+    /// (the single-tenant self-hoster posture).
+    pub quota: QuotaConfig,
+
     /// Feature toggles keyed by registered feature name. Enabling an
     /// experimental feature additionally requires `ack` equal to the
     /// feature's exact current version; see the feature reference in the
@@ -982,6 +989,123 @@ impl Default for OidcConfig {
     }
 }
 
+/// The largest number of usage-threshold percentages the quota engine will emit
+/// webhooks for (issue #50). A short list (the default is two: an early-warning
+/// and the hard limit); the cap keeps the config bounded and the per-bucket
+/// threshold bookkeeping small.
+pub const QUOTA_MAX_USAGE_THRESHOLDS: usize = 16;
+
+/// Per-tenant and per-environment quota settings (issue #50).
+///
+/// The tenant-plane fairness layer. Two nested token-bucket tiers, one keyed by
+/// tenant and one by (tenant, environment), over three independently enforced
+/// dimensions (request rate, token issuance, hook execution seconds). An
+/// environment spend also draws from its tenant bucket, so an environment can
+/// never exceed its tenant and no tenant can starve another (the buckets are
+/// per-scope and isolated). Every limit is a setting with a safe default (the
+/// tunability principle); the full five-layer limiter with the edge and the
+/// IronCache-backed shared L2 lands in M15 on top of this process-local core.
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields, default)]
+pub struct QuotaConfig {
+    /// The per-tenant tier. Bounds the aggregate of all of a tenant's
+    /// environments; a single tenant cannot exceed it however many environments
+    /// it runs.
+    pub tenant: ScopeQuotaConfig,
+
+    /// The per-environment tier. Bounds one environment, nested under its
+    /// tenant: an environment spend draws from BOTH the environment bucket and
+    /// the tenant bucket, so it can never consume beyond its tenant's remaining
+    /// share.
+    pub environment: ScopeQuotaConfig,
+
+    /// The usage percentages (1 to 100) at which a saturation webhook fires per
+    /// dimension, so operators see pressure before the hard limit. The default
+    /// (`[80, 100]`) warns at 80 percent and again at the limit. An empty list
+    /// disables saturation webhooks. At most `QUOTA_MAX_USAGE_THRESHOLDS`
+    /// entries; each must be between 1 and 100.
+    pub usage_thresholds_percent: Vec<u8>,
+}
+
+impl Default for QuotaConfig {
+    fn default() -> Self {
+        Self {
+            // Safe operational defaults. The per-tenant aggregate is the larger
+            // envelope; each environment gets a smaller share nested under it.
+            // These are conservative starting points, not marketed tiers (the
+            // published tiers ride M15); tune per deployment.
+            tenant: ScopeQuotaConfig {
+                requests_per_second: 500,
+                requests_burst: 1_000,
+                token_issuance_per_second: 100,
+                token_issuance_burst: 200,
+                hook_seconds_per_second: 60,
+                hook_seconds_burst: 120,
+            },
+            environment: ScopeQuotaConfig {
+                requests_per_second: 100,
+                requests_burst: 200,
+                token_issuance_per_second: 50,
+                token_issuance_burst: 100,
+                hook_seconds_per_second: 30,
+                hook_seconds_burst: 60,
+            },
+            usage_thresholds_percent: vec![80, 100],
+        }
+    }
+}
+
+/// The limits for one quota tier (issue #50), over the three enforced
+/// dimensions. Each dimension is a token bucket with a sustained refill rate
+/// (`*_per_second`) and a burst capacity (`*_burst`); the dimensions enforce
+/// independently, so exhausting one does not affect another. A `*_burst` of 0
+/// disables that dimension (unlimited), which is how a single-tenant self-hoster
+/// expresses no quota.
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields, default)]
+pub struct ScopeQuotaConfig {
+    /// Sustained requests per second (the token bucket refill rate for the
+    /// request-rate dimension).
+    pub requests_per_second: u64,
+
+    /// Burst capacity for the request-rate dimension: the most requests that can
+    /// be admitted in an instantaneous spike before the sustained rate governs.
+    /// 0 means unlimited (the dimension is not enforced).
+    pub requests_burst: u64,
+
+    /// Sustained token issuance per second (the refill rate for the
+    /// token-issuance dimension: access, ID, and refresh tokens minted).
+    pub token_issuance_per_second: u64,
+
+    /// Burst capacity for the token-issuance dimension. 0 means unlimited.
+    pub token_issuance_burst: u64,
+
+    /// Sustained hook/webhook execution seconds admitted per wall second (the
+    /// refill rate for the hook-seconds dimension). Bounds how much outbound
+    /// hook execution time a scope may consume.
+    pub hook_seconds_per_second: u64,
+
+    /// Burst capacity for the hook-seconds dimension. 0 means unlimited.
+    pub hook_seconds_burst: u64,
+}
+
+impl Default for ScopeQuotaConfig {
+    fn default() -> Self {
+        // The per-environment defaults; `QuotaConfig::default` overrides the
+        // tenant tier with its larger envelope. A standalone default here keeps
+        // a partially specified `[quota.tenant]` or `[quota.environment]` table
+        // filling missing fields sensibly.
+        Self {
+            requests_per_second: 100,
+            requests_burst: 200,
+            token_issuance_per_second: 50,
+            token_issuance_burst: 100,
+            hook_seconds_per_second: 30,
+            hook_seconds_burst: 60,
+        }
+    }
+}
+
 /// One entry in the `[features]` table.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields, default)]
@@ -1205,8 +1329,50 @@ impl Config {
         }
         validate_device_authorization(&self.oidc)?;
         validate_backchannel_logout(&self.oidc)?;
+        validate_quota(&self.quota)?;
         Ok(())
     }
+}
+
+/// Validate the quota fairness settings (issue #50), kept out of
+/// [`Config::validate`] so each stays within the readable-length lint.
+///
+/// The limits themselves are free (a 0 burst is the documented unlimited form,
+/// and any sustained rate is admissible), so the only structural constraint is
+/// on the usage-threshold list: it is bounded in length, every entry is a real
+/// percentage (1 to 100, since 0 percent would fire immediately and above 100 is
+/// unreachable), and it carries no duplicates (a duplicate threshold would emit
+/// the same saturation webhook twice).
+fn validate_quota(quota: &QuotaConfig) -> Result<(), ConfigError> {
+    let thresholds = &quota.usage_thresholds_percent;
+    if thresholds.len() > QUOTA_MAX_USAGE_THRESHOLDS {
+        return Err(ConfigError::Invalid {
+            message: format!(
+                "quota.usage_thresholds_percent has {} entries; at most \
+                 {QUOTA_MAX_USAGE_THRESHOLDS} are allowed",
+                thresholds.len()
+            ),
+        });
+    }
+    let mut seen = Vec::with_capacity(thresholds.len());
+    for &threshold in thresholds {
+        if !(1..=100).contains(&threshold) {
+            return Err(ConfigError::Invalid {
+                message: format!(
+                    "quota.usage_thresholds_percent entry {threshold} must be between 1 and 100"
+                ),
+            });
+        }
+        if seen.contains(&threshold) {
+            return Err(ConfigError::Invalid {
+                message: format!(
+                    "quota.usage_thresholds_percent contains a duplicate entry {threshold}"
+                ),
+            });
+        }
+        seen.push(threshold);
+    }
+    Ok(())
 }
 
 /// Validate the back-channel logout worker settings (issue #34), kept out of
@@ -1592,6 +1758,43 @@ mod tests {
         assert_eq!(config.database.url.host(), "localhost");
         assert!(config.database.password.is_none());
         assert!(config.features.is_empty());
+    }
+
+    #[test]
+    fn quota_section_defaults_and_validates_thresholds() {
+        // Defaults: the per-tenant envelope is larger than the per-environment
+        // share, and the saturation webhooks fire at 80 and 100 percent.
+        let config = Config::from_toml_str("", "<inline>").expect("valid").config;
+        assert_eq!(config.quota.tenant.requests_per_second, 500);
+        assert_eq!(config.quota.tenant.requests_burst, 1_000);
+        assert_eq!(config.quota.environment.requests_per_second, 100);
+        assert_eq!(config.quota.environment.requests_burst, 200);
+        assert_eq!(config.quota.usage_thresholds_percent, vec![80, 100]);
+
+        // A burst of 0 is the documented unlimited form for a self-hoster.
+        let unlimited = "[quota.tenant]\nrequests_burst = 0\n";
+        let config = Config::from_toml_str(unlimited, "<inline>")
+            .expect("valid")
+            .config;
+        assert_eq!(config.quota.tenant.requests_burst, 0);
+
+        // A threshold outside 1..=100 is rejected.
+        let bad = "[quota]\nusage_thresholds_percent = [0, 80]\n";
+        let err = Config::from_toml_str(bad, "ironauth.toml").expect_err("bad threshold");
+        assert!(
+            err.to_string().contains("usage_thresholds_percent"),
+            "{err}"
+        );
+
+        // A duplicate threshold is rejected.
+        let dup = "[quota]\nusage_thresholds_percent = [80, 80]\n";
+        let err = Config::from_toml_str(dup, "ironauth.toml").expect_err("duplicate threshold");
+        assert!(err.to_string().contains("duplicate"), "{err}");
+
+        // Unknown quota keys abort with the accepted fields.
+        let err = Config::from_toml_str("[quota.tenant]\nrps = 5\n", "ironauth.toml")
+            .expect_err("unknown quota key");
+        assert!(err.to_string().contains("requests_per_second"), "{err}");
     }
 
     #[test]
