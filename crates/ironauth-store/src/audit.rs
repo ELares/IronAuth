@@ -363,6 +363,25 @@ pub enum Action {
     /// follows a DEK rotation. The plaintext never changes; only the sealing key
     /// version does.
     EncryptedSecretReencrypt,
+    /// A custom domain was registered for an environment (issue #47): a
+    /// customer-owned hostname claimed for later ACME verification and issuance.
+    /// The domain starts unverified and is never served until a challenge proves
+    /// control of it.
+    CustomDomainRegister,
+    /// A custom domain's ACME challenge SUCCEEDED (issue #47): a domain-control
+    /// verification (http-01 or dns-01) completed and the domain moved to
+    /// verified, so it is now eligible to be served. Refused (and NOT written) if
+    /// another tenant already verified the same domain.
+    CustomDomainChallengeSucceed,
+    /// A custom domain's ACME challenge FAILED (issue #47): a domain-control
+    /// verification could not be satisfied, so the domain stays unserved. The
+    /// failure surfaces to the operator rather than silently degrading.
+    CustomDomainChallengeFail,
+    /// A custom domain's issued certificate was stored (issue #47): the cert chain
+    /// and its PRIVATE KEY were sealed under the scope's envelope DEK (issue #48)
+    /// and the domain row was pointed at the sealed bundle. The key never touches
+    /// a plaintext column.
+    CustomDomainCertificateStore,
 }
 
 impl Action {
@@ -444,6 +463,10 @@ impl Action {
             Action::EnvelopeDekRotate => "envelope.dek.rotate",
             Action::EncryptedSecretPut => "encrypted_secret.put",
             Action::EncryptedSecretReencrypt => "encrypted_secret.reencrypt",
+            Action::CustomDomainRegister => "custom_domain.register",
+            Action::CustomDomainChallengeSucceed => "custom_domain.challenge.succeed",
+            Action::CustomDomainChallengeFail => "custom_domain.challenge.fail",
+            Action::CustomDomainCertificateStore => "custom_domain.certificate.store",
         }
     }
 }

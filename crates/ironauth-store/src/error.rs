@@ -78,6 +78,13 @@ pub enum StoreError {
     ///
     /// [`NotFound`]: StoreError::NotFound
     Encryption,
+    /// A custom-domain registration submitted a value that is not a plain
+    /// registrable hostname (issue #47): an IP literal, an internal single-label
+    /// name, or a value carrying a scheme, port, path, or whitespace. Rejected
+    /// before it is ever written, so a tenant-controlled domain can never be used
+    /// to point serving or an ACME/CA request at internal infrastructure. Carries
+    /// no tenant data.
+    InvalidCustomDomain,
 }
 
 impl fmt::Display for StoreError {
@@ -94,6 +101,7 @@ impl fmt::Display for StoreError {
             }
             StoreError::QuotaExceeded => f.write_str("registration quota exceeded"),
             StoreError::Encryption => f.write_str("envelope decryption failed"),
+            StoreError::InvalidCustomDomain => f.write_str("invalid custom domain"),
         }
     }
 }
@@ -107,7 +115,8 @@ impl std::error::Error for StoreError {
             | StoreError::InvalidRedirectUri
             | StoreError::GuardrailViolation(_)
             | StoreError::QuotaExceeded
-            | StoreError::Encryption => None,
+            | StoreError::Encryption
+            | StoreError::InvalidCustomDomain => None,
             StoreError::Database(source) => Some(source),
             StoreError::Migration(source) => Some(source),
         }
@@ -134,6 +143,22 @@ impl From<sqlx::Error> for StoreError {
 impl From<NotInScope> for StoreError {
     fn from(_: NotInScope) -> Self {
         StoreError::NotFound
+    }
+}
+
+impl From<crate::custom_domain::CustomDomainError> for StoreError {
+    fn from(source: crate::custom_domain::CustomDomainError) -> Self {
+        use crate::custom_domain::CustomDomainError;
+        match source {
+            // An unsafe or malformed submitted domain: a caller-facing validation
+            // failure the registration surface reports.
+            CustomDomainError::InvalidDomain => StoreError::InvalidCustomDomain,
+            // A stored wire token failed to decode. The schema CHECK constraints
+            // make this unreachable for a row the platform wrote; if it ever
+            // fires it is an internal invariant break, reported as the uniform
+            // not-found rather than becoming an existence oracle.
+            CustomDomainError::Decode => StoreError::NotFound,
+        }
     }
 }
 

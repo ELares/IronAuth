@@ -49,6 +49,7 @@
 
 pub mod audit;
 pub mod classification;
+pub mod custom_domain;
 pub mod environment;
 mod error;
 mod id;
@@ -70,46 +71,52 @@ pub mod test_support;
 
 pub use audit::{ActingContext, Action, ActorRef};
 pub use classification::{ResourceClassification, ResourceLevel, ResourceType, classify};
+pub use custom_domain::{
+    AcmeChallengeRecord, ChallengeOutcome, ChallengeStatus, ChallengeType, CustomDomainError,
+    CustomDomainRecord, VerificationStatus, domain_is_registrable, normalize_domain,
+};
 pub use environment::{
     EnvironmentType, Guardrail, GuardrailClass, GuardrailReport, GuardrailSet, GuardrailViolation,
     UnknownEnvironmentType,
 };
 pub use error::StoreError;
 pub use id::{
-    AgentId, AgentKind, AssertionMappingId, AssertionMappingKind, AuditId, AuditKind, AuditTarget,
-    AuthorizationCodeId, AuthorizationCodeKind, BackChannelDeliveryId, BackChannelDeliveryKind,
-    COMPONENT_BYTES, ClientId, ClientKind, ClientSessionId, ClientSessionKind, ConsentId,
-    ConsentKind, CorrelationId, CorrelationKind, DcrPolicyId, DcrPolicyKind, DekId, DekKind,
-    DeviceCodeId, DeviceCodeKind, EncryptedSecretId, EncryptedSecretKind, EnvironmentId,
-    EnvironmentKind, ExternalIssuerId, ExternalIssuerKind, GrantId, GrantKind, HumanId, HumanKind,
-    IdParseError, InitialAccessTokenId, InitialAccessTokenKind, IssuedTokenId, IssuedTokenKind,
-    KekId, KekKind, LevelId, LevelKind, ManagementKeyId, ManagementKeyKind, NotInScope, OperatorId,
-    OperatorKind, OrganizationId, OrganizationKind, PushedRequestId, PushedRequestKind,
-    RefreshFamilyId, RefreshFamilyKind, RefreshTokenId, RefreshTokenKind, ResourceServerId,
-    ResourceServerKind, ScopedId, ScopedKind, ServiceAccountId, ServiceAccountKind, ServiceId,
-    ServiceKind, SessionEventId, SessionEventKind, SessionId, SessionKind, SigningKeyId,
-    SigningKeyKind, TenantId, TenantKind, UserId, UserKind,
+    AcmeChallengeId, AcmeChallengeKind, AgentId, AgentKind, AssertionMappingId,
+    AssertionMappingKind, AuditId, AuditKind, AuditTarget, AuthorizationCodeId,
+    AuthorizationCodeKind, BackChannelDeliveryId, BackChannelDeliveryKind, COMPONENT_BYTES,
+    ClientId, ClientKind, ClientSessionId, ClientSessionKind, ConsentId, ConsentKind,
+    CorrelationId, CorrelationKind, CustomDomainId, CustomDomainKind, DcrPolicyId, DcrPolicyKind,
+    DekId, DekKind, DeviceCodeId, DeviceCodeKind, EncryptedSecretId, EncryptedSecretKind,
+    EnvironmentId, EnvironmentKind, ExternalIssuerId, ExternalIssuerKind, GrantId, GrantKind,
+    HumanId, HumanKind, IdParseError, InitialAccessTokenId, InitialAccessTokenKind, IssuedTokenId,
+    IssuedTokenKind, KekId, KekKind, LevelId, LevelKind, ManagementKeyId, ManagementKeyKind,
+    NotInScope, OperatorId, OperatorKind, OrganizationId, OrganizationKind, PushedRequestId,
+    PushedRequestKind, RefreshFamilyId, RefreshFamilyKind, RefreshTokenId, RefreshTokenKind,
+    ResourceServerId, ResourceServerKind, ScopedId, ScopedKind, ServiceAccountId,
+    ServiceAccountKind, ServiceId, ServiceKind, SessionEventId, SessionEventKind, SessionId,
+    SessionKind, SigningKeyId, SigningKeyKind, TenantId, TenantKind, UserId, UserKind,
 };
 pub use migrate::{Migration, MigrationError, MigrationReport, MigrationRunner, Phase};
 pub use redirect::{redirect_uri_is_registrable, redirect_uri_matches};
 pub use repository::{
     AccessTokenResolution, ActingAssertionSubjectMappingRepo, ActingAuthorizationRepo,
-    ActingClientRepo, ActingConsentRepo, ActingDcrPolicyRepo, ActingDeviceCodeRepo,
-    ActingEnvelopeRepo, ActingEnvironmentRepo, ActingExternalAssertionIssuerRepo,
-    ActingInitialAccessTokenRepo, ActingManagementCredentialRepo, ActingManagementStore,
-    ActingOrganizationRepo, ActingPushedRequestRepo, ActingRefreshRepo, ActingResourceServerRepo,
-    ActingServiceAccountRepo, ActingSessionRepo, ActingSigningKeyRepo, ActingStore,
-    ActingTenantRepo, ActingUserRepo, ActiveDeviceFlow, ActiveOpaqueToken, ApprovedDeviceGrant,
-    AssertionSubjectMappingRecord, AssertionSubjectMappingRepo, AuditRecord, AuditRepo,
-    AuthorizationRepo, BackChannelDeliveryRepo, ClientAssertionJtiRepo, ClientAuthDiagnosticReason,
+    ActingClientRepo, ActingConsentRepo, ActingCustomDomainRepo, ActingDcrPolicyRepo,
+    ActingDeviceCodeRepo, ActingEnvelopeRepo, ActingEnvironmentRepo,
+    ActingExternalAssertionIssuerRepo, ActingInitialAccessTokenRepo,
+    ActingManagementCredentialRepo, ActingManagementStore, ActingOrganizationRepo,
+    ActingPushedRequestRepo, ActingRefreshRepo, ActingResourceServerRepo, ActingServiceAccountRepo,
+    ActingSessionRepo, ActingSigningKeyRepo, ActingStore, ActingTenantRepo, ActingUserRepo,
+    ActiveDeviceFlow, ActiveOpaqueToken, ApprovedDeviceGrant, AssertionSubjectMappingRecord,
+    AssertionSubjectMappingRepo, AuditRecord, AuditRepo, AuthorizationRepo,
+    BackChannelDeliveryRepo, ClientAssertionJtiRepo, ClientAuthDiagnosticReason,
     ClientAuthDiagnosticRecord, ClientAuthDiagnosticsRepo, ClientAuthRecord,
     ClientCredentialsAccess, ClientRecord, ClientRepo, ClientResourcePolicy, ClientSessionRepo,
     CodeBindings, ConsentRepo, ConsumePushedRequest, ConsumedInitialAccessToken, CursorPosition,
-    DcrPolicyRecord, DcrPolicyRepo, DcrRateLimiterRepo, DeviceApproval, DeviceApproveOutcome,
-    DeviceAttemptOutcome, DeviceClientProfile, DeviceCodeRepo, DevicePollOutcome,
-    DeviceRedeemOutcome, DeviceUserCodeLookup, DynamicClientRecord, DynamicClientRegistration,
-    DynamicClientUpdate, EnvelopeRepo, EnvironmentGuardrailRepo, EnvironmentRecord,
-    EnvironmentRepo, EnvironmentServingState, ExternalAssertionIssuerRecord,
+    CustomDomainRepo, DcrPolicyRecord, DcrPolicyRepo, DcrRateLimiterRepo, DeviceApproval,
+    DeviceApproveOutcome, DeviceAttemptOutcome, DeviceClientProfile, DeviceCodeRepo,
+    DevicePollOutcome, DeviceRedeemOutcome, DeviceUserCodeLookup, DynamicClientRecord,
+    DynamicClientRegistration, DynamicClientUpdate, EnvelopeRepo, EnvironmentGuardrailRepo,
+    EnvironmentRecord, EnvironmentRepo, EnvironmentServingState, ExternalAssertionIssuerRecord,
     ExternalAssertionIssuerRepo, ExternalAssertionJtiRepo, FrontchannelLogoutParticipant,
     GrantOwner, GrantedConsent, IdempotencyRepo, IdempotencyWrite, InitialAccessTokenRepo,
     IssueClientCredentials, IssueCode, IssuedTokenRecord, JtiOutcome, LogoutDelivery,

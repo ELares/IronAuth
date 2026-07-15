@@ -119,5 +119,6 @@ enabled even when absent from `[features]`, and can be turned off with
 
 | Feature | Maturity | Default on | Version | Changelog | Description |
 |---------|----------|------------|---------|-----------|-------------|
+| `custom-domains-acme` | experimental | no | 0.1.0-exp.1 | crates/ironauth-store/CHANGELOG.md | Per-environment custom domains with built-in ACME (RFC 8555): CNAME verification, HTTP-01/DNS-01 challenges, and encrypted-at-rest certificate storage. EXPLORATORY: the cert-management operational model is unproven and a live issuance is infra/owner-gated on a provisioned CA account and a reachable domain. |
 | `global-token-revocation` | experimental | no | draft-parecki-oauth-global-token-revocation-01 | crates/ironauth-oidc/CHANGELOG.md | Global Token Revocation receiver (Okta Universal Logout shape, draft-parecki-oauth-global-token-revocation): a strongly-authenticated, subject-scoped revoke-everything endpoint. EXPERIMENTAL: the draft is not yet WG-adopted and the wire shape may break between releases. |
 | `sample-experimental` | experimental | no | 0.1.0-exp.1 | crates/ironauth-config/CHANGELOG.md | Sample experimental flag exercising the acknowledgment gate; gates no behavior. |

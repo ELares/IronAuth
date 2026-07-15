@@ -6,6 +6,10 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Added the `FetchPurpose::AcmeDirectory` label (issue #47): the outbound purpose
+  for talking to an ACME certificate authority (RFC 8555) when issuing a custom
+  domain's certificate. The CA URL and the validated domain are untrusted, so the
+  ACME exchange rides the same SSRF-hardened path as every other outbound fetch.
 - Initial SSRF-hardened outbound fetcher (issue #10): the single, hardened
   dispatcher for every server-side HTTP request IronAuth makes, so the SSRF
   class is closed structurally rather than per feature. See

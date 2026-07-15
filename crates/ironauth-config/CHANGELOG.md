@@ -6,6 +6,12 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Registered the `custom-domains-acme` EXPERIMENTAL feature flag (issue #47,
+  EXPLORATORY): per-environment custom domains with built-in ACME. Off by default
+  and ack-gated on `CUSTOM_DOMAINS_ACME_VERSION` (a live issuance needs a
+  provisioned CA account and a reachable domain, which is infra/owner-gated), so an
+  operator enabling it acknowledges the exact implemented revision. New public
+  `CUSTOM_DOMAINS_ACME_FEATURE` and `CUSTOM_DOMAINS_ACME_VERSION` constants.
 - `admin.allowed_regions`: the operator's configured data-residency region set
   (issue #46). A tenant's `home_region` and a per-environment `region` pin must be
   one of these; empty (the default) leaves residency pinning unavailable and refuses

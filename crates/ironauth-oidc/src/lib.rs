@@ -67,6 +67,7 @@
 //! router directly with a populated key store, exactly as the management-API tests
 //! build their router.
 
+mod acme;
 mod authn;
 mod authorize;
 mod backchannel;
@@ -117,6 +118,7 @@ mod wellknown;
 use axum::Router;
 use axum::routing::{get, post};
 
+pub use acme::{AcmeDirectory, AcmeDirectoryClient, AcmeError};
 pub use authn::{
     AuthMethod, AuthenticationEvent, achieved_acr, acr_values_supported, amr_values, methods_token,
     parse_methods,

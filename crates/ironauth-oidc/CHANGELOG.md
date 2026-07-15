@@ -6,6 +6,16 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- ACME certificate-authority DIRECTORY client for custom domains (issue #47,
+  EXPLORATORY): `AcmeDirectoryClient` fetches and parses a CA's directory (RFC 8555
+  7.1.1) ONLY through the SSRF-hardened `ironauth_fetch::Fetcher`, so a directory or
+  validation URL that is (or resolves to) a loopback, private, or cloud-metadata
+  address is refused with the uniform `AcmeError::Blocked` and never dialed. This
+  ships the entry point of the ACME flow and its SSRF confinement; the full order
+  lifecycle (account registration, order, challenge fulfilment, finalize, download)
+  is deferred and gated on a provisioned CA account and a reachable domain, and MUST
+  reuse this client's fetcher when built. New `AcmeDirectory`/`AcmeDirectoryClient`/
+  `AcmeError` public types.
 - Tenant lifecycle data-plane fence (issue #46). The store-backed issuer registry
   now consults each scope's data-plane serving state on EVERY resolution (in
   `IssuerRegistry::entry_for`, ahead of the cache), not only on a cold load, and

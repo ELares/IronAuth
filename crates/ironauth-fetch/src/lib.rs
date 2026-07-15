@@ -115,6 +115,13 @@ pub enum FetchPurpose {
     WebhookDelivery,
     /// Fetching a client `logo_uri` for a consent page.
     Logo,
+    /// Talking to an ACME certificate authority (RFC 8555) for a custom domain
+    /// (issue #47): fetching the CA's directory, and the order/authorization/
+    /// challenge/certificate requests that follow. The CA and the domain being
+    /// validated are outbound and SSRF-adjacent, so this rides the same hardened
+    /// path as every other outbound fetch; a directory or validation URL that
+    /// resolves to a loopback or internal address is refused by the resolver.
+    AcmeDirectory,
 }
 
 impl FetchPurpose {
@@ -127,6 +134,7 @@ impl FetchPurpose {
             FetchPurpose::ClientMetadata => "client_metadata",
             FetchPurpose::WebhookDelivery => "webhook_delivery",
             FetchPurpose::Logo => "logo",
+            FetchPurpose::AcmeDirectory => "acme_directory",
         }
     }
 }
