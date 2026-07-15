@@ -12761,6 +12761,10 @@ impl ActingEnvironmentRepo<'_> {
     ///
     /// # Errors
     ///
+    /// [`StoreError::Conflict`] if the parent tenant is not ACTIVE (suspended, or in
+    /// the offboarding grace/terminal state): a non-active tenant must not gain a
+    /// fresh, unfenced environment (issue #46), the same lifecycle-precondition
+    /// convention the tenant transitions use;
     /// [`StoreError::IdempotencyConflict`] on a concurrent Idempotency-Key race;
     /// [`StoreError::Database`] on a persistence failure (including a missing
     /// tenant, which surfaces as the tenant foreign-key violation).
@@ -12789,6 +12793,35 @@ impl ActingEnvironmentRepo<'_> {
                 target: environment_id,
             },
             async move |tx| {
+                // Lifecycle precondition (issue #46): an environment must not be born
+                // under a non-ACTIVE parent tenant. The suspend/offboard cascade fences
+                // only the environments that exist at suspend time, and a fresh
+                // environment seeds no serving-state row (so it would read Active), so a
+                // new environment added under a suspended or grace/terminal-deleted
+                // tenant would hand it an unfenced serving surface while the tenant is
+                // meant to be off the data plane. Refuse it fail closed. The check
+                // shares this audited transaction with the insert below, so it is ATOMIC
+                // with it (no time-of-check/time-of-use gap) and nothing (no environment
+                // row, no audit row, no idempotency row) is written when it fires. A
+                // non-active parent is StoreError::Conflict, the lifecycle-precondition
+                // convention the tenant suspend/resume transitions already use, which the
+                // control plane maps to a loud 409. A tenant that does not exist AT ALL
+                // is left to the foreign-key rejection on the insert (the pre-existing
+                // behavior), so an absent parent stays distinct from a suspended one.
+                let parent = sqlx::query(
+                    "SELECT status, (deleted_at IS NULL AND purged_at IS NULL) AS live \
+                     FROM tenants WHERE id = $1",
+                )
+                .bind(tenant.to_string())
+                .fetch_optional(&mut **tx)
+                .await?;
+                if let Some(row) = parent {
+                    let active = row.get::<String, _>("status") == TenantStatus::Active.as_str();
+                    let live: bool = row.get("live");
+                    if !(active && live) {
+                        return Err(StoreError::Conflict);
+                    }
+                }
                 sqlx::query(
                     "INSERT INTO environments (id, tenant_id, display_name, region, created_at) \
                      VALUES ($1, $2, $3, $4, \

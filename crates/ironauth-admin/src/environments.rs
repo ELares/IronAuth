@@ -43,6 +43,7 @@ use crate::views::{CreateEnvironmentRequest, EnvironmentList, EnvironmentView};
         (status = 401, description = "Missing or invalid credential", body = ErrorBody),
         (status = 403, description = "Wrong plane or scope", body = ErrorBody),
         (status = 404, description = "Tenant not found", body = ErrorBody),
+        (status = 409, description = "Parent tenant is not active (suspended or offboarded)", body = ErrorBody),
         (status = 422, description = "Idempotency-Key reused with a different request", body = ErrorBody)
     )
 )]
@@ -141,6 +142,15 @@ pub async fn create_environment(
         Err(StoreError::IdempotencyConflict) => {
             idempotency::replay_after_conflict(&state, &credential_ref, &key, &fingerprint).await
         }
+        // The parent tenant exists and is visible to the control plane but is NOT
+        // active (suspended, or in the offboarding grace/terminal state), so it must
+        // not gain a fresh, unfenced environment (issue #46): a loud 409, distinct
+        // from the anti-oracle 404 an absent tenant returns.
+        Err(StoreError::Conflict) => Err(ApiError::Conflict(
+            "parent tenant is not active; a suspended or offboarded tenant cannot gain \
+             a new environment"
+                .to_owned(),
+        )),
         Err(error) => Err(error.into()),
     }
 }

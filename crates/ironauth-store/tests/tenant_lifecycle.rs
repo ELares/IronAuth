@@ -159,16 +159,29 @@ impl Fixture {
     /// Create a second environment (with an optional region pin) under an existing
     /// tenant, through the acting environment repository, and return its scope.
     async fn create_environment(&self, tenant: TenantId, region: Option<&str>) -> Scope {
+        let (scope, result) = self.try_create_environment(tenant, region).await;
+        result.expect("create environment");
+        scope
+    }
+
+    /// Attempt to create a second environment under an existing tenant, returning the
+    /// candidate scope alongside the raw store result so a test can assert on a
+    /// refusal (for example a create under a non-active tenant).
+    async fn try_create_environment(
+        &self,
+        tenant: TenantId,
+        region: Option<&str>,
+    ) -> (Scope, Result<(), StoreError>) {
         let environment = EnvironmentId::generate(&self.env);
-        self.db
+        let result = self
+            .db
             .control_store()
             .management()
             .acting(self.actor, CorrelationId::generate(&self.env))
             .environments(tenant)
             .create(&self.env, &environment, 2_000_000, "staging", region, None)
-            .await
-            .expect("create environment");
-        Scope::new(tenant, environment)
+            .await;
+        (Scope::new(tenant, environment), result)
     }
 
     /// Read an environment's recorded region pin through a control-plane read.
@@ -590,6 +603,62 @@ async fn an_environment_records_and_returns_its_region_pin() {
         fx.environment_region(bare).await,
         None,
         "no region recorded when omitted"
+    );
+}
+
+#[tokio::test]
+async fn a_new_environment_is_refused_under_a_non_active_tenant() {
+    // The suspend/offboard fence covers only the environments that exist at suspend
+    // time; a fresh environment seeds no serving-state row, so it would read Active.
+    // A new environment must therefore not be born under a non-active parent tenant,
+    // or it would gain an unfenced serving surface while the tenant is off the data
+    // plane (issue #46). The create is refused fail closed for a suspended tenant AND
+    // for a grace-deleted one, and works again after a resume.
+    let fx = Fixture::start().await;
+    let scope = fx.create_tenant(None).await;
+    let tenant = scope.tenant();
+
+    // Under an ACTIVE tenant, a new environment is created and serves normally.
+    let active_env = fx.create_environment(tenant, None).await;
+    assert_eq!(
+        fx.serving_state(active_env).await,
+        EnvironmentServingState::Active,
+        "an environment under an active tenant serves its data plane"
+    );
+
+    // Suspend the tenant, then attempt to add an environment: refused fail closed
+    // with the lifecycle-precondition Conflict, and nothing is written.
+    fx.suspend(&tenant).await.expect("suspend");
+    let (would_be, refused) = fx.try_create_environment(tenant, None).await;
+    assert!(
+        matches!(refused, Err(StoreError::Conflict)),
+        "creating an environment under a suspended tenant is refused; got {refused:?}"
+    );
+    // The refused environment does not exist: a control-plane read is the uniform
+    // not-found (the create rolled back), so it never gained a serving surface.
+    assert!(
+        matches!(
+            fx.db
+                .control_store()
+                .management()
+                .environments(would_be.tenant())
+                .get(&would_be.environment())
+                .await,
+            Err(StoreError::NotFound)
+        ),
+        "the refused environment was never persisted"
+    );
+
+    // Resume restores the ability to add environments.
+    fx.resume(&tenant).await.expect("resume");
+    let _resumed_env = fx.create_environment(tenant, None).await;
+
+    // A grace-deleted (offboarding) tenant likewise cannot gain a new environment.
+    fx.delete(&tenant).await.expect("grace delete");
+    let (_deleted_scope, refused_deleted) = fx.try_create_environment(tenant, None).await;
+    assert!(
+        matches!(refused_deleted, Err(StoreError::Conflict)),
+        "creating an environment under a grace-deleted tenant is refused; got {refused_deleted:?}"
     );
 }
 

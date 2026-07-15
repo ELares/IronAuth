@@ -652,6 +652,16 @@
               }
             }
           },
+          "409": {
+            "description": "Parent tenant is not active (suspended or offboarded)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
           "422": {
             "description": "Idempotency-Key reused with a different request",
             "content": {

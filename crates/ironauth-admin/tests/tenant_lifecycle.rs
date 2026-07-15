@@ -252,3 +252,46 @@ async fn environment_create_records_and_validates_a_region_pin() {
         "a region outside the configured set is refused: {response}"
     );
 }
+
+#[tokio::test]
+async fn environment_create_is_refused_under_a_suspended_tenant() {
+    // A suspended tenant is fenced off the data plane; it must not gain a fresh,
+    // unfenced environment (issue #46). Adding an environment to a suspended tenant is
+    // a loud 409, and the ability returns after a resume.
+    let harness = Harness::start(50).await;
+    let (tenant_id, _env) = harness.create_tenant("Acme", "k-create").await;
+    let path = format!("/v1/tenants/{tenant_id}/environments");
+
+    // Under the ACTIVE tenant, a create works.
+    let body = serde_json::json!({ "display_name": "staging" }).to_string();
+    let (status, _, response) = harness.post(&path, "k-env-active", &body).await;
+    assert_eq!(status, StatusCode::CREATED, "active create: {response}");
+
+    // Suspend the tenant.
+    let (status, _, _) = harness
+        .post(&format!("/v1/tenants/{tenant_id}/suspend"), "k-susp", "{}")
+        .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // A create under the suspended tenant is refused with a loud 409, not the
+    // anti-oracle 404 (the tenant is visible to the control plane) and not a silent
+    // 201 that would hand the tenant an unfenced serving surface.
+    let (status, _, response) = harness.post(&path, "k-env-susp", &body).await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "creating an environment under a suspended tenant is 409: {response}"
+    );
+
+    // Resume restores the ability to add environments.
+    let (status, _, _) = harness
+        .post(&format!("/v1/tenants/{tenant_id}/resume"), "k-res", "{}")
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _, response) = harness.post(&path, "k-env-resumed", &body).await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "a resumed tenant can add environments again: {response}"
+    );
+}
