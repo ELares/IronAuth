@@ -65,6 +65,10 @@ testing = []
 # proves the isolation types reject misuse at compile time.
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 trybuild.workspace = true
+# The BYOK offboarding test (issue #49) uses the ironauth-kms driver seam to
+# label a binding and to demonstrate that revoking a customer root fails closed.
+# A dev-dependency only: the production store graph does not depend on it.
+ironauth-kms.workspace = true
 
 # RLS integration test: a low-privilege session cannot read another tenant's
 # rows even with the app-layer filter bypassed. Needs a real database
@@ -194,6 +198,17 @@ required-features = ["testing"]
 [[test]]
 name = "envelope"
 path = "tests/envelope.rs"
+required-features = ["testing"]
+
+# BYOK and crypto-shredding offboarding (issue #49): a scope is enrolled in a
+# customer-managed-key binding (driver + opaque reference, never key material), the
+# terminal offboarding stage severs the binding in the SAME audited transaction
+# that crypto-shreds the platform KEK so the tenant's sealed PII is unrecoverable,
+# a sibling's binding and PII are untouched, revoking a customer root fails closed,
+# and an unknown driver label is refused. Needs a real database.
+[[test]]
+name = "byok_offboarding"
+path = "tests/byok_offboarding.rs"
 required-features = ["testing"]
 
 # The bootstrap users PII columns sealed at rest (issue #48): a database dump of a

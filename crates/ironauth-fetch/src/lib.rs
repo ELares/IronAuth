@@ -115,6 +115,12 @@ pub enum FetchPurpose {
     WebhookDelivery,
     /// Fetching a client `logo_uri` for a consent page.
     Logo,
+    /// Calling out to an external customer-managed KMS/HSM to wrap or unwrap a
+    /// tenant key-encryption key (BYOK, issue #49). The endpoint is operator
+    /// configured and outbound, so it rides the same SSRF-hardened path as every
+    /// other external fetch: a KMS URL that resolves to an internal or loopback
+    /// address is refused exactly like any other blocked destination.
+    KmsRequest,
 }
 
 impl FetchPurpose {
@@ -127,6 +133,7 @@ impl FetchPurpose {
             FetchPurpose::ClientMetadata => "client_metadata",
             FetchPurpose::WebhookDelivery => "webhook_delivery",
             FetchPurpose::Logo => "logo",
+            FetchPurpose::KmsRequest => "kms_request",
         }
     }
 }

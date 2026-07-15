@@ -1,0 +1,43 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+[package]
+name = "ironauth-kms"
+version = "0.1.0"
+description = "IronAuth exploratory BYOK (bring-your-own-key) KMS seam: a pluggable customer-managed-key driver interface that wraps and unwraps a tenant key-encryption key under a customer-held root, with a fully working in-process local/test driver and an SSRF-hardened external-KMS seam routed through ironauth-fetch, so revoking or destroying the customer root crypto-shreds the tenant with no platform-key fallback (issue #49, default-off, experimental)"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# The determinism seam: every key byte and AEAD nonce the local driver draws
+# comes from the entropy seam, never an OS RNG directly, so the whole driver is
+# deterministic under a test entropy source (invariant 3).
+ironauth-env.workspace = true
+# The envelope crypto substrate (issue #48). A BYOK root is modeled as a
+# MasterKey whose wrap/unwrap seals the per-tenant Kek; the driver never invents
+# a cipher, it reuses the reviewed ring::aead envelope. Key material stays inside
+# ironauth-jose (Kek/MasterKey never expose their bytes), so this crate holds a
+# root and routes wrap/unwrap, never raw key bytes.
+ironauth-jose.workspace = true
+# The single SSRF-hardened outbound path. An external customer KMS/HSM endpoint
+# is outbound and operator-configured, so the external driver seam calls it ONLY
+# through ironauth-fetch: a loopback or otherwise internal KMS URL is refused
+# exactly like any other blocked destination, and the driver fails closed.
+ironauth-fetch.workspace = true
+
+[dev-dependencies]
+# The trait is async (the external driver awaits an outbound call), so the tests
+# drive it on a minimal tokio runtime. The external-seam test routes through the
+# fetcher, which arms a timer and a socket even though a blocked destination
+# never dials, so the current-thread runtime needs the time and net drivers.
+tokio = { workspace = true, features = ["rt", "macros", "time", "net"] }
+
+# The external-KMS seam over the real SSRF-hardened fetcher: a loopback or
+# private KMS endpoint is refused and the driver fails closed, proving the
+# outbound BYOK path carries no policy exception.
+[[test]]
+name = "external_seam"
+path = "tests/external_seam.rs"
+
+[lints]
+workspace = true
