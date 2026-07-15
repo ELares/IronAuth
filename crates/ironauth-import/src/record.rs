@@ -74,6 +74,38 @@ pub struct ImportRecord {
     /// path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub password_hash: Option<String>,
+    /// The user's enrolled MFA / login credentials (issue #58/#61): every passkey,
+    /// TOTP, or recovery-code enrollment the account holds, restored so the exit
+    /// export carries the credential REGISTRY, not merely the password. Absent (the
+    /// common case) when the user has enrolled none. When the M7 factor issues add the
+    /// concrete secret material (a TOTP seed, a passkey public key), it rides
+    /// [`ImportCredential`] as additional fields, a purely additive change that the
+    /// generalized field-coverage guard forces to be covered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credentials: Option<Vec<ImportCredential>>,
+}
+
+/// One enrolled credential to restore alongside a user (issue #58/#61): the
+/// (de)serialized shape the full identity export writes for each row of the
+/// `account_credentials` registry. The internal `crd_` id, the owning subject, the
+/// scope, and the sealing key version are NOT carried (re-minted / re-sealed against
+/// the destination), and `usable_for_login` is re-derived from `credential_type` at
+/// enrollment, so a credential is a small, additive record: `credential_type`, the
+/// friendly name, and an optional last-used instant.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ImportCredential {
+    /// The factor kind (`passkey`, `totp`, `recovery_code`). A value outside the
+    /// closed set fails the record, never silently drops the credential.
+    pub credential_type: String,
+    /// The user-authored friendly name (1 to 200 characters). Sealed at rest under
+    /// the destination scope's DEK through the restore path.
+    pub friendly_name: String,
+    /// When the factor was last used to authenticate in the source instance, in
+    /// microseconds since the Unix epoch, or [`None`] if it never was. Preserved
+    /// verbatim so the credential registry round-trips losslessly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_used_at: Option<i64>,
 }
 
 /// Serialize one [`ImportRecord`] into a single line of the import format (issue
@@ -182,6 +214,55 @@ mod tests {
     fn blank_lines_are_skipped() {
         assert!(parse_record_line("").expect("parse").is_none());
         assert!(parse_record_line("   \t ").expect("parse").is_none());
+    }
+
+    #[test]
+    fn credentials_round_trip_through_to_record_line_and_back() {
+        // A record carrying an enrolled credential registry serializes and re-parses
+        // symmetrically (issue #58): to_record_line writes exactly what
+        // parse_record_line reads, so the exit export round-trips the registry.
+        let record = ImportRecord {
+            identifier: "gina@b.test".to_owned(),
+            id: None,
+            external_id: None,
+            state: None,
+            claims: None,
+            traits: None,
+            traits_schema_version: None,
+            password_hash: Some("$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$aGFzaA".to_owned()),
+            credentials: Some(vec![
+                ImportCredential {
+                    credential_type: "passkey".to_owned(),
+                    friendly_name: "my laptop".to_owned(),
+                    last_used_at: None,
+                },
+                ImportCredential {
+                    credential_type: "totp".to_owned(),
+                    friendly_name: "authenticator".to_owned(),
+                    last_used_at: Some(1_710_000_000_000_000),
+                },
+            ]),
+        };
+        let line = to_record_line(&record).expect("serialize");
+        let parsed = parse_record_line(&line).expect("parse").expect("some");
+        let credentials = parsed.credentials.expect("credentials preserved");
+        assert_eq!(credentials.len(), 2);
+        assert_eq!(credentials[0].credential_type, "passkey");
+        assert_eq!(credentials[0].friendly_name, "my laptop");
+        assert_eq!(credentials[1].credential_type, "totp");
+        assert_eq!(credentials[1].last_used_at, Some(1_710_000_000_000_000));
+    }
+
+    #[test]
+    fn an_unknown_credential_field_is_rejected() {
+        // deny_unknown_fields on the nested credential shape: a typo cannot silently
+        // drop a credential's data.
+        assert!(
+            parse_record_line(
+                r#"{"identifier":"a","credentials":[{"credential_type":"totp","friendly_name":"x","lastused":1}]}"#
+            )
+            .is_err()
+        );
     }
 
     #[test]

@@ -16,7 +16,8 @@ use ironauth_env::Env;
 use ironauth_import::{ForeignHash, ImportContext, import_stream};
 use ironauth_store::test_support::TestDatabase;
 use ironauth_store::{
-    ActorRef, CorrelationId, HumanId, NewAdminUser, Scope, Store, UserRecord, UserState,
+    ActorRef, CorrelationId, CredentialType, HumanId, NewAdminUser, Scope, Store, UserId,
+    UserRecord, UserState,
 };
 
 /// A native Argon2id PHC verifier for `password`, exactly what the login path
@@ -316,65 +317,117 @@ async fn re_importing_into_the_same_scope_is_idempotent() {
     );
 }
 
-/// The field-coverage guard: enumerate the identity model (the `users` table
-/// columns) and fail on a column that is neither EXPORTED nor a documented
-/// non-exported field, so a future migration that adds a user field cannot silently
-/// escape the export.
+/// The export coverage of one identity-carrying table: every column is either
+/// EXPORTED (carried losslessly in the record), DERIVED (re-scoped / re-derived /
+/// re-sealed against the destination instance), or OPERATIONAL (a lifecycle column
+/// intentionally not exported). A column outside all three fails the guard.
+struct TableCoverage {
+    /// The identity-carrying table name.
+    table: &'static str,
+    /// Columns the export CARRIES in each record.
+    exported: &'static [&'static str],
+    /// Columns re-derived at the destination, not carried by design.
+    derived: &'static [&'static str],
+    /// Lifecycle columns intentionally not exported.
+    operational: &'static [&'static str],
+}
+
+/// The field-coverage guard (issue #58): enumerate the FULL identity model, not one
+/// table, and fail the build on a column of ANY identity-carrying table that is
+/// neither EXPORTED nor a documented non-exported field. This is what stops a future
+/// migration, including the M7 credential-secret columns (a TOTP seed, a passkey
+/// public key on `account_credentials`), from silently escaping the export: a new
+/// column is unclassified until it is either exported or explicitly justified here.
+///
+/// NOTE: the #54 `user_identifiers` table is not on this branch, so it is not
+/// covered here; it joins the guard when it merges.
 #[tokio::test]
-async fn every_users_column_is_exported_or_a_documented_non_exported_field() {
-    // Fields the export CARRIES in each record (losslessly).
-    const EXPORTED: &[&str] = &[
-        "identifier_sealed",     // -> identifier
-        "claims_sealed",         // -> claims
-        "traits_sealed",         // -> traits
-        "traits_schema_version", // -> traits_schema_version
-        "external_id_sealed",    // -> external_id
-        "state",                 // -> state
-        "password_hash",         // -> the credential (native)
-        "foreign_password_hash", // -> the credential (imported foreign)
-    ];
-    // Fields DERIVED on import: re-scoped, re-derived, or re-sealed against the
-    // TARGET instance, so they are not carried in the record by design.
-    const DERIVED: &[&str] = &[
-        "id",                      // re-minted per target scope (embeds the source scope)
-        "tenant_id",               // the target scope
-        "environment_id",          // the target scope
-        "identifier_bidx",         // re-derived from the plaintext under the target key
-        "external_id_bidx",        // re-derived from the plaintext under the target key
-        "pii_dek_version",         // re-sealed under the target active DEK
-        "external_id_dek_version", // re-sealed under the target active DEK
-        "traits_dek_version",      // re-sealed under the target active DEK
-        "foreign_password_algo",   // re-derived from the exported PHC string's tag
-        "created_at",              // set fresh at import
-        "updated_at",              // set fresh at import
-    ];
-    // Operational lifecycle columns intentionally not exported.
-    const OPERATIONAL: &[&str] = &[
-        "scheduled_offboarding_at", // an operational overlay; the account exports as active
-        "deleted_at",               // tombstone; deleted users are excluded from the export
+async fn every_identity_column_is_exported_or_a_documented_non_exported_field() {
+    let model: &[TableCoverage] = &[
+        // The users table: the core identity row.
+        TableCoverage {
+            table: "users",
+            exported: &[
+                "identifier_sealed",     // -> identifier
+                "claims_sealed",         // -> claims
+                "traits_sealed",         // -> traits
+                "traits_schema_version", // -> traits_schema_version
+                "external_id_sealed",    // -> external_id
+                "state",                 // -> state
+                "password_hash",         // -> the credential (native)
+                "foreign_password_hash", // -> the credential (imported foreign)
+            ],
+            derived: &[
+                "id",                      // re-minted per target scope (embeds the source scope)
+                "tenant_id",               // the target scope
+                "environment_id",          // the target scope
+                "identifier_bidx",         // re-derived from the plaintext under the target key
+                "external_id_bidx",        // re-derived from the plaintext under the target key
+                "pii_dek_version",         // re-sealed under the target active DEK
+                "external_id_dek_version", // re-sealed under the target active DEK
+                "traits_dek_version",      // re-sealed under the target active DEK
+                "foreign_password_algo",   // re-derived from the exported PHC string's tag
+                "created_at",              // set fresh at import
+                "updated_at",              // set fresh at import
+            ],
+            operational: &[
+                "scheduled_offboarding_at", // an operational overlay; exports as active
+                "deleted_at",               // tombstone; deleted users are excluded
+            ],
+        },
+        // The account_credentials registry (issue #61): a user's enrolled MFA / login
+        // credentials. Its metadata is exported today; the M7 secret-material columns
+        // (a TOTP seed, a passkey public key) will be UNCLASSIFIED here until they are
+        // added to the export, which is exactly the guard firing.
+        TableCoverage {
+            table: "account_credentials",
+            exported: &[
+                "credential_type",      // -> credentials[].credential_type
+                "friendly_name_sealed", // -> credentials[].friendly_name (opened)
+                "last_used_at",         // -> credentials[].last_used_at
+            ],
+            derived: &[
+                "id",               // re-minted per target scope (a fresh crd_ id)
+                "tenant_id",        // the target scope
+                "environment_id",   // the target scope
+                "subject",          // re-linked to the imported user's fresh usr_ id
+                "pii_dek_version",  // re-sealed under the target active DEK
+                "usable_for_login", // re-derived from credential_type at enrollment
+                "created_at",       // set fresh at import (re-enrollment time)
+            ],
+            operational: &[],
+        },
     ];
 
     let db = TestDatabase::start().await;
-    let columns: Vec<String> = sqlx::query_scalar(
-        "SELECT column_name FROM information_schema.columns \
-         WHERE table_schema = 'public' AND table_name = 'users' ORDER BY column_name",
-    )
-    .fetch_all(db.owner_pool())
-    .await
-    .expect("read users columns");
-    assert!(!columns.is_empty(), "the users table has columns");
-
-    for column in &columns {
-        let classified = EXPORTED.contains(&column.as_str())
-            || DERIVED.contains(&column.as_str())
-            || OPERATIONAL.contains(&column.as_str());
+    for coverage in model {
+        let columns: Vec<String> = sqlx::query_scalar(
+            "SELECT column_name FROM information_schema.columns \
+             WHERE table_schema = 'public' AND table_name = $1 ORDER BY column_name",
+        )
+        .bind(coverage.table)
+        .fetch_all(db.owner_pool())
+        .await
+        .expect("read table columns");
         assert!(
-            classified,
-            "users column '{column}' is unclassified: the identity model grew a field that the \
-             export does not cover. Add it to the export (EXPORTED) or document why it is not \
-             exported (DERIVED / OPERATIONAL) in crates/ironauth-admin/tests/export.rs and \
-             docs/exit-guide.md."
+            !columns.is_empty(),
+            "the {} table has columns",
+            coverage.table
         );
+
+        for column in &columns {
+            let classified = coverage.exported.contains(&column.as_str())
+                || coverage.derived.contains(&column.as_str())
+                || coverage.operational.contains(&column.as_str());
+            assert!(
+                classified,
+                "{} column '{column}' is unclassified: the identity model grew a field that the \
+                 export does not cover. Add it to the export (EXPORTED) or document why it is not \
+                 exported (DERIVED / OPERATIONAL) in crates/ironauth-admin/tests/export.rs and \
+                 docs/exit-guide.md.",
+                coverage.table
+            );
+        }
     }
 }
 
@@ -449,7 +502,8 @@ async fn outbound_verification_verifies_native_and_foreign_when_enabled() {
     let harness = Harness::start_with_outbound_verification(Some(OUTBOUND_TOKEN)).await;
     let env = Env::system();
     let store = harness.control_store();
-    let scope = harness.seed_scope().await;
+    // The outbound endpoint is bound to this scope; seed the users into it.
+    let scope = harness.outbound_scope();
 
     let native = argon2_hash("s3cret");
     seed_user(
@@ -579,5 +633,262 @@ async fn outbound_verification_verifies_native_and_foreign_when_enabled() {
     assert_eq!(
         verdict["verified"], false,
         "an unknown account does not verify: {body}"
+    );
+}
+
+/// Enroll a credential of `credential_type` named `friendly_name` for the user with
+/// `identifier` in `scope`, through the audited, subject-bound self-service path.
+async fn enroll_credential(
+    store: &Store,
+    scope: Scope,
+    env: &Env,
+    identifier: &str,
+    credential_type: CredentialType,
+    friendly_name: &str,
+) -> UserId {
+    let user = store
+        .scoped(scope)
+        .users()
+        .by_identifier(identifier)
+        .await
+        .expect("lookup")
+        .expect("user exists");
+    let actor = ActorRef::human(HumanId::generate(env));
+    store
+        .scoped(scope)
+        .acting(actor, CorrelationId::generate(env))
+        .account_credentials()
+        .enroll(env, &user.id, credential_type, friendly_name, "step_up")
+        .await
+        .expect("enroll credential");
+    user.id
+}
+
+/// The MFA / credential-registry round-trip (issue #58, HIGH): a user with enrolled
+/// credentials exports and re-imports into a FRESH scope with every enrollment
+/// preserved (factor kind and friendly name), so the exit-friendliness covenant
+/// carries the credential registry, not merely the password.
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // one linear seed -> enroll -> export -> import -> assert walk
+async fn enrolled_credentials_round_trip_through_the_export() {
+    let harness = Harness::start(100).await;
+    let env = Env::system();
+    let store = harness.control_store();
+    let source = harness.seed_scope().await;
+
+    // A user with a native credential AND two enrolled factors (a passkey and a TOTP).
+    let native = argon2_hash("pw");
+    seed_user(
+        store,
+        source,
+        &env,
+        NewAdminUser {
+            id: None,
+            identifier: "gina@exit.test",
+            password_hash: Some(&native),
+            claims_json: None,
+            external_id: None,
+            state: UserState::Active,
+            foreign_password_hash: None,
+            foreign_password_algo: None,
+            traits_json: None,
+            traits_schema_version: None,
+        },
+        1_000_000,
+    )
+    .await;
+    enroll_credential(
+        store,
+        source,
+        &env,
+        "gina@exit.test",
+        CredentialType::Passkey,
+        "my laptop",
+    )
+    .await;
+    enroll_credential(
+        store,
+        source,
+        &env,
+        "gina@exit.test",
+        CredentialType::Totp,
+        "authenticator app",
+    )
+    .await;
+
+    // Export through the management API.
+    let path = format!(
+        "/v1/tenants/{}/environments/{}/export",
+        source.tenant(),
+        source.environment()
+    );
+    let (status, _headers, body) = harness.get(&path).await;
+    assert_eq!(status, axum::http::StatusCode::OK, "export: {body}");
+    // The credential registry rides the record.
+    assert!(
+        body.contains("credentials") && body.contains("my laptop") && body.contains("passkey"),
+        "the export line carries the enrolled credential registry: {body}"
+    );
+    let lines: Vec<String> = body
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(str::to_owned)
+        .collect();
+
+    // Import into a FRESH scope through the real streaming import engine.
+    let target = harness.seed_scope().await;
+    let actor = harness.test_actor(&env);
+    let ctx = ImportContext {
+        store,
+        scope: target,
+        env: &env,
+        actor,
+    };
+    let report = import_stream(&ctx, lines, |_| {}).await;
+    assert_eq!(report.succeeded, 1, "the user re-imports: {report:?}");
+    assert_eq!(report.failed, 0, "no record fails: {report:?}");
+
+    // The enrolled credentials are preserved in the fresh instance.
+    let gina = store
+        .scoped(target)
+        .users()
+        .by_identifier("gina@exit.test")
+        .await
+        .expect("lookup")
+        .expect("gina imported");
+    let credentials = store
+        .scoped(target)
+        .account_credentials()
+        .list(&gina.id, 50, None)
+        .await
+        .expect("list credentials");
+    assert_eq!(
+        credentials.len(),
+        2,
+        "both enrolled credentials round-trip: {credentials:?}"
+    );
+    let passkey = credentials
+        .iter()
+        .find(|c| c.credential_type == "passkey")
+        .expect("passkey preserved");
+    assert_eq!(
+        passkey.friendly_name, "my laptop",
+        "the friendly name is preserved"
+    );
+    assert!(
+        passkey.usable_for_login,
+        "a passkey is re-derived as a primary login factor"
+    );
+    let totp = credentials
+        .iter()
+        .find(|c| c.credential_type == "totp")
+        .expect("totp preserved");
+    assert_eq!(totp.friendly_name, "authenticator app");
+    assert!(
+        !totp.usable_for_login,
+        "a TOTP factor is not a primary login factor"
+    );
+}
+
+/// The outbound endpoint is SCOPE-BOUND (issue #58, MEDIUM): configured and enabled
+/// for one (tenant, environment), a request to a DIFFERENT scope with the CORRECT
+/// token is the uniform 404 and verifies nothing, so the shared token can never
+/// verify credentials across tenants.
+#[tokio::test]
+async fn outbound_verification_is_bound_to_its_configured_scope() {
+    const OUTBOUND_TOKEN: &str = "successor-shared-secret";
+    let harness = Harness::start_with_outbound_verification(Some(OUTBOUND_TOKEN)).await;
+    let env = Env::system();
+    let store = harness.control_store();
+    let configured = harness.outbound_scope();
+
+    // Seed an authenticatable user in the CONFIGURED scope.
+    let native = argon2_hash("s3cret");
+    seed_user(
+        store,
+        configured,
+        &env,
+        NewAdminUser {
+            id: None,
+            identifier: "hank@exit.test",
+            password_hash: Some(&native),
+            claims_json: None,
+            external_id: None,
+            state: UserState::Active,
+            foreign_password_hash: None,
+            foreign_password_algo: None,
+            traits_json: None,
+            traits_schema_version: None,
+        },
+        1_000_000,
+    )
+    .await;
+
+    // The CONFIGURED scope verifies with the correct token (sanity: the endpoint works).
+    let ok_path = format!(
+        "/v1/tenants/{}/environments/{}/migration/verify-credential",
+        configured.tenant(),
+        configured.environment()
+    );
+    let (status, _h, body) = harness
+        .post_as(
+            &ok_path,
+            OUTBOUND_TOKEN,
+            "k1",
+            r#"{"identifier":"hank@exit.test","password":"s3cret"}"#,
+        )
+        .await;
+    assert_eq!(
+        status,
+        axum::http::StatusCode::OK,
+        "configured scope verifies: {body}"
+    );
+    let verdict: serde_json::Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(verdict["verified"], true, "the configured scope verifies");
+
+    // A DIFFERENT scope, with the CORRECT token, is the uniform 404: the token cannot
+    // verify credentials outside its one configured environment.
+    let other = harness.seed_scope().await;
+    let other_path = format!(
+        "/v1/tenants/{}/environments/{}/migration/verify-credential",
+        other.tenant(),
+        other.environment()
+    );
+    let (status, _h, body) = harness
+        .post_as(
+            &other_path,
+            OUTBOUND_TOKEN,
+            "k2",
+            r#"{"identifier":"hank@exit.test","password":"s3cret"}"#,
+        )
+        .await;
+    assert_eq!(
+        status,
+        axum::http::StatusCode::NOT_FOUND,
+        "a request to a non-configured scope is a uniform 404, even with the correct token: {body}"
+    );
+}
+
+/// The disabled endpoint is indistinguishable from an absent route to an
+/// unauthenticated probe (issue #58, LOW): a request carrying no `Authorization`
+/// header against a disabled endpoint returns 404, not 401, so the enablement gate is
+/// evaluated before the bearer check and the route's existence is not revealed.
+#[tokio::test]
+async fn disabled_outbound_endpoint_is_404_to_an_unauthenticated_probe() {
+    let harness = Harness::start(100).await;
+    let scope = harness.seed_scope().await;
+    let path = format!(
+        "/v1/tenants/{}/environments/{}/migration/verify-credential",
+        scope.tenant(),
+        scope.environment()
+    );
+    // No Authorization header at all against the (default-disabled) endpoint.
+    let (status, _headers, body) = harness
+        .post_unauthenticated(&path, r#"{"identifier":"x","password":"y"}"#)
+        .await;
+    assert_eq!(
+        status,
+        axum::http::StatusCode::NOT_FOUND,
+        "a disabled endpoint is a uniform 404 to an unauthenticated probe, not a 401: {body}"
     );
 }

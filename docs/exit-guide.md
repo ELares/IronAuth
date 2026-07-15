@@ -61,6 +61,7 @@ optional and omitted when empty.
 | `traits` | The identity-traits document (a JSON object), if any. |
 | `traits_schema_version` | The trait-schema version the traits last validated against, preserved verbatim. |
 | `password_hash` | The password verifier as an algorithm-tagged string (see below), if the account has a credential. |
+| `credentials` | The account's enrolled MFA / login credential registry (see below), if any: each passkey, TOTP, or recovery-code enrollment. |
 
 Example line (formatting added for readability; a real line is one physical line):
 
@@ -71,9 +72,34 @@ Example line (formatting added for readability; a real line is one physical line
   "claims": { "email": "bob@example.com" },
   "traits": { "department": "engineering" },
   "traits_schema_version": 3,
-  "password_hash": "$2b$06$Q9s...<bcrypt digest>"
+  "password_hash": "$2b$06$Q9s...<bcrypt digest>",
+  "credentials": [
+    { "credential_type": "passkey", "friendly_name": "my laptop" },
+    { "credential_type": "totp", "friendly_name": "authenticator app", "last_used_at": 1710000000000000 }
+  ]
 }
 ```
+
+### The credential registry
+
+The `credentials` array carries the account's enrolled MFA / login credentials from
+the credential registry, one object per enrollment, so the export carries the
+registry and not merely the primary password. Each object holds the non-secret
+metadata that the credential registry stores today:
+
+| Field | Meaning |
+| --- | --- |
+| `credential_type` | The factor kind: `passkey`, `totp`, or `recovery_code`. |
+| `friendly_name` | The user-authored label ("my laptop"). Sealed at rest; opened for export and re-sealed at the destination. |
+| `last_used_at` | When the factor was last used to authenticate, in microseconds since the Unix epoch, if ever. |
+
+On import each enrollment is re-created under the destination user with a fresh
+credential id, its friendly name re-sealed under the destination environment's key,
+and `usable_for_login` re-derived from the factor kind. Verifiable MFA SECRET
+material (a TOTP seed, a passkey public key) is not a registry column in this
+release; when those factor issues add the columns, the material joins this array
+automatically, because the field-coverage test fails the build the moment a
+credential-registry column is added without export coverage (see below).
 
 ### What is NOT in a record, and why
 
@@ -87,10 +113,15 @@ The export omits fields that are re-created at the destination rather than carri
 - Timestamps, blind-index lookup columns, and the encryption key versions that seal
   PII at rest are re-derived and re-sealed against the destination instance.
 - Soft-deleted (offboarded) users are excluded: a tombstone is not exported.
-- MFA enrollments (TOTP secrets, recovery-code state) are NOT in the current export
-  because the MFA data model does not exist yet in this release. When it lands, it
-  joins the export; a field-coverage test fails the build if any user field is added
-  without being covered by the export, so nothing can silently escape.
+- The account's enrolled MFA / login credential REGISTRY (passkey, TOTP, and
+  recovery-code enrollments) IS exported today, in the `credentials` array above: the
+  factor kind, the friendly name, and the last-used instant round-trip. What is not
+  yet a registry column, and so is not yet exported, is the verifiable MFA SECRET
+  material a factor verifies against (a TOTP seed, a passkey public key); those
+  columns land with the factor issues, and the field-coverage test fails the build
+  the moment a credential-registry (or user) column is added without export coverage,
+  so nothing can silently escape. The field-coverage test enumerates the FULL
+  identity model (`users` and `account_credentials`), not one table.
 
 ## Password hash formats
 
@@ -196,11 +227,21 @@ outbound_verification_enabled = true
 # The shared bearer token a successor system presents. A distinct credential from
 # the operator token and every management key; it authorizes ONLY this endpoint.
 outbound_verification_token = { env = "IRONAUTH_OUTBOUND_VERIFICATION_TOKEN" }
+# The ONE (tenant, environment) this endpoint is authorized for. The shared token
+# can only ever verify credentials in this one environment; a request to any other
+# tenant or environment is a uniform not-found, so the token never crosses tenants.
+outbound_verification_tenant = "ten_..."
+outbound_verification_environment = "env_..."
 ```
 
 When disabled, the endpoint is a uniform not-found. When enabled without a token, it
-authorizes nobody (fail closed). A request missing a bearer is unauthorized exactly
-as the rest of the management API is.
+authorizes nobody (fail closed). When enabled without a configured
+`(tenant, environment)` scope, it matches no request (fail closed). A request whose
+path scope does not match the configured scope is a uniform not-found REGARDLESS of
+the token, so the endpoint is invisible and inert outside its one authorized
+environment. A request missing a bearer against a DISABLED endpoint is itself a
+uniform not-found (the enablement gate is evaluated before the bearer check), so a
+disabled endpoint is indistinguishable from an absent route.
 
 ## The round-trip guarantee
 

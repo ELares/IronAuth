@@ -156,7 +156,7 @@ pub use issuer::{
 };
 pub use jwks::{IssuerState, issuer_router};
 pub use logout::LogoutParams;
-pub use password::{PasswordError, hash_password, verify_password};
+pub use password::{PasswordError, hash_password, verify_absent, verify_password};
 pub use registry::{
     GrantType, PkceMethod, PromptSet, PromptSetError, PromptValue, ResponseMode, ResponseType,
 };

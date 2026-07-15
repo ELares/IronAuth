@@ -7791,8 +7791,48 @@ pub struct UserExportRecord {
     pub foreign_password_hash: Option<String>,
     /// The non-secret algorithm tag of `foreign_password_hash`, or [`None`].
     pub foreign_password_algo: Option<String>,
+    /// The user's enrolled MFA / login credentials from the `account_credentials`
+    /// registry (issue #58/#61), opened for export: every passkey / TOTP /
+    /// recovery-code enrollment the user holds, so the exit-friendliness covenant
+    /// carries the credential registry, not merely the primary password. Empty when
+    /// the user has enrolled none. When the M7 factor issues add the concrete secret
+    /// material columns (a TOTP seed, a passkey public key), they ride this same list
+    /// as additional fields on [`ExportedCredential`], a purely additive change.
+    pub credentials: Vec<ExportedCredential>,
     /// Creation time (the pagination key).
     pub created_at_unix_micros: i64,
+}
+
+/// One enrolled credential from the `account_credentials` registry (issue #58/#61),
+/// opened for the full identity export. It carries the non-secret metadata that
+/// exists TODAY (the factor kind, the opened friendly name, and the last-used
+/// instant); the concrete secret factor material (a TOTP seed, a passkey public key)
+/// lands as additional fields here when the M7 factor issues add those columns, so
+/// the generalized field-coverage guard fails the build until they are covered.
+///
+/// The internal `crd_` id, the owning subject, the scope, and the sealing key
+/// version are NOT carried: like a user's `usr_` id they are re-minted / re-sealed
+/// against the destination instance at import, and `usable_for_login` is re-derived
+/// from `credential_type` at enrollment.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ExportedCredential {
+    /// The factor kind wire string (`passkey`, `totp`, `recovery_code`).
+    pub credential_type: String,
+    /// The user-authored friendly name, opened from its sealed column.
+    pub friendly_name: String,
+    /// When the factor was last used to authenticate, if ever recorded, in
+    /// microseconds since the Unix epoch.
+    pub last_used_at_unix_micros: Option<i64>,
+}
+
+impl fmt::Debug for ExportedCredential {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // The friendly name is user-authored PII; a struct dump spills only the
+        // non-secret factor kind, exactly like the redacting UserExportRecord Debug.
+        f.debug_struct("ExportedCredential")
+            .field("credential_type", &self.credential_type)
+            .finish_non_exhaustive()
+    }
 }
 
 impl fmt::Debug for UserExportRecord {
@@ -11892,6 +11932,12 @@ impl AccountCredentialRepo<'_> {
     }
 }
 
+/// The operator-safe step-up detail recorded on the audit row of a credential
+/// restored through the exit-import path (issue #58). The restore runs as a bulk
+/// management import, not an interactive step-up, so the detail names the path rather
+/// than a max-age policy.
+const EXIT_RESTORE_STEP_UP_DETAIL: &str = "exit_import_restore";
+
 /// The mutating account-credential repository (issue #61): enroll and remove a
 /// subject's own credentials, audited and subject-bound.
 pub struct ActingAccountCredentialRepo<'a> {
@@ -11941,6 +11987,65 @@ impl ActingAccountCredentialRepo<'_> {
         friendly_name: &str,
         step_up_detail: &str,
     ) -> Result<CredentialId, StoreError> {
+        // A live self-service enrollment records no last-used instant: the M7 verify
+        // path stamps it on first use.
+        self.enroll_with(
+            env,
+            subject,
+            credential_type,
+            friendly_name,
+            None,
+            step_up_detail,
+        )
+        .await
+    }
+
+    /// RESTORE an enrolled credential during an exit-import (issue #58), preserving
+    /// its `last_used_at` from the source instance so a full export round-trips the
+    /// credential registry losslessly. Mirrors [`ActingAccountCredentialRepo::enroll`]
+    /// (a fresh `crd_` id, the name sealed under the target scope's DEK, one audit
+    /// row) but carries the exported last-used instant rather than leaving it NULL.
+    /// The `usable_for_login` flag is re-derived from `credential_type`, exactly as a
+    /// live enrollment derives it, so an imported credential is indistinguishable from
+    /// a natively enrolled one.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if `subject` is out of this scope;
+    /// [`StoreError::Encryption`] if no platform master key is configured;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn enroll_restored(
+        &self,
+        env: &Env,
+        subject: &UserId,
+        credential_type: CredentialType,
+        friendly_name: &str,
+        last_used_at_unix_micros: Option<i64>,
+    ) -> Result<CredentialId, StoreError> {
+        self.enroll_with(
+            env,
+            subject,
+            credential_type,
+            friendly_name,
+            last_used_at_unix_micros,
+            EXIT_RESTORE_STEP_UP_DETAIL,
+        )
+        .await
+    }
+
+    /// The shared enrollment core (issue #61/#58): seal the friendly name, insert the
+    /// `account_credentials` row (optionally carrying a restored `last_used_at`), and
+    /// write one audit row. The live self-service path passes `last_used_at = None`;
+    /// the exit-import restore path passes the source instance's value.
+    async fn enroll_with(
+        &self,
+        env: &Env,
+        subject: &UserId,
+        credential_type: CredentialType,
+        friendly_name: &str,
+        last_used_at_unix_micros: Option<i64>,
+        step_up_detail: &str,
+    ) -> Result<CredentialId, StoreError> {
         if subject.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
@@ -11970,8 +12075,10 @@ impl ActingAccountCredentialRepo<'_> {
                 sqlx::query(
                     "INSERT INTO account_credentials \
                      (id, tenant_id, environment_id, subject, credential_type, \
-                      friendly_name_sealed, pii_dek_version, usable_for_login) \
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+                      friendly_name_sealed, pii_dek_version, usable_for_login, last_used_at) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, \
+                      CASE WHEN $9::bigint IS NULL THEN NULL \
+                           ELSE TIMESTAMPTZ 'epoch' + ($9::text || ' microseconds')::interval END)",
                 )
                 .bind(id.to_string())
                 .bind(scope.tenant().to_string())
@@ -11981,6 +12088,7 @@ impl ActingAccountCredentialRepo<'_> {
                 .bind(name_sealed.into_bytes())
                 .bind(dek_version)
                 .bind(usable_for_login)
+                .bind(last_used_at_unix_micros)
                 .execute(&mut **tx)
                 .await?;
                 Ok(())
@@ -16674,6 +16782,10 @@ async fn user_export_record_from_row(
     } else {
         Some(native)
     };
+    // The user's enrolled credential registry (issue #58): opened in the SAME scoped
+    // transaction, so the export carries every passkey / TOTP / recovery-code
+    // enrollment, not merely the password.
+    let credentials = user_exported_credentials_from_tx(tx, scope, master, &id.to_string()).await?;
     Ok(UserExportRecord {
         id,
         identifier,
@@ -16685,8 +16797,53 @@ async fn user_export_record_from_row(
         password_hash,
         foreign_password_hash: row.get("foreign_password_hash"),
         foreign_password_algo: row.get("foreign_password_algo"),
+        credentials,
         created_at_unix_micros: row.get("created_us"),
     })
+}
+
+/// Read a user's enrolled `account_credentials` (issue #58) inside the caller's
+/// scoped export transaction, opening each sealed friendly name. Ordered by
+/// `(created_at, id)` for a stable export. Mirrors [`AccountCredentialRepo::list`]
+/// but returns the export projection ([`ExportedCredential`]): the factor kind, the
+/// opened name, and the last-used instant, without the re-minted id / re-sealed key
+/// version. Bounded by the per-user credential count (a handful), so it does not
+/// break the export's page-bounded memory.
+async fn user_exported_credentials_from_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    scope: Scope,
+    master: &MasterKey,
+    subject: &str,
+) -> Result<Vec<ExportedCredential>, StoreError> {
+    let rows = sqlx::query(
+        "SELECT credential_type, friendly_name_sealed, pii_dek_version, \
+         (EXTRACT(EPOCH FROM last_used_at) * 1000000)::bigint AS last_used_us \
+         FROM account_credentials \
+         WHERE tenant_id = $1 AND environment_id = $2 AND subject = $3 \
+         ORDER BY created_at, id",
+    )
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .bind(subject)
+    .fetch_all(&mut **tx)
+    .await?;
+    let mut out = Vec::with_capacity(rows.len());
+    for row in &rows {
+        let dek_version: i32 = row.get("pii_dek_version");
+        let sealed: Vec<u8> = row.get("friendly_name_sealed");
+        let dek = fetch_dek_by_version(tx, scope, master, dek_version).await?;
+        let plaintext = dek.open(
+            &credential_pii_seal_aad(scope, dek_version),
+            &Sealed::from_bytes(sealed)?,
+        )?;
+        let friendly_name = String::from_utf8(plaintext).map_err(|_| StoreError::Encryption)?;
+        out.push(ExportedCredential {
+            credential_type: row.get("credential_type"),
+            friendly_name,
+            last_used_at_unix_micros: row.get("last_used_us"),
+        });
+    }
+    Ok(out)
 }
 
 /// Cascade a user's live sessions to ENDED inside an open transaction (issue #52),

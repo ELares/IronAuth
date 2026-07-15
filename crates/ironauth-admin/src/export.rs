@@ -36,7 +36,7 @@ use std::future::Future;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::Response;
-use ironauth_import::{ImportRecord, to_record_line};
+use ironauth_import::{ImportCredential, ImportRecord, to_record_line};
 use ironauth_store::{
     ActorRef, CorrelationId, CursorPosition, Scope, StoreError, UserExportRecord, UserState,
 };
@@ -122,13 +122,18 @@ pub async fn export_identities(
         |record| {
             // A serialization failure cannot occur for this concrete record shape;
             // the covenant is to emit every user, so a lost line is unacceptable.
-            // `to_record_line` returns a Result rather than panicking, and the map
-            // below turns the (impossible) error into a skipped line rather than a
-            // torn export; the field-coverage and round-trip tests assert every line
-            // is present.
-            if let Ok(line) = to_record_line(&export_record_to_import(record)) {
-                body.push_str(&line);
-                body.push('\n');
+            // `to_record_line` returns a Result rather than panicking, and the (impossible)
+            // error yields a non-emitted line rather than a torn export; the field-coverage
+            // and round-trip tests assert every line is present. Returning whether the line
+            // was emitted keeps the audited count equal to the number of lines actually
+            // written, never over-counting a skipped line.
+            match to_record_line(&export_record_to_import(record)) {
+                Ok(line) => {
+                    body.push_str(&line);
+                    body.push('\n');
+                    true
+                }
+                Err(_) => false,
             }
         },
     )
@@ -155,7 +160,9 @@ pub async fn export_identities(
 /// number of records emitted.
 ///
 /// Generic over the fetcher and the sink so the streaming / bounded-memory behavior
-/// is testable without a database, mirroring the import engine's `drive_import`.
+/// is testable without a database, mirroring the import engine's `drive_import`. The
+/// sink returns whether it EMITTED the record; the returned total counts only emitted
+/// records, so the audited count never exceeds the lines actually written.
 ///
 /// # Errors
 ///
@@ -168,7 +175,7 @@ async fn export_paged<Fetch, Fut, Sink>(
 where
     Fetch: FnMut(Option<CursorPosition>) -> Fut,
     Fut: Future<Output = Result<Vec<UserExportRecord>, StoreError>>,
-    Sink: FnMut(&UserExportRecord),
+    Sink: FnMut(&UserExportRecord) -> bool,
 {
     let mut after: Option<CursorPosition> = None;
     let mut total: u64 = 0;
@@ -179,8 +186,9 @@ where
         }
         let fetched = page.len();
         for record in &page {
-            sink(record);
-            total += 1;
+            if sink(record) {
+                total += 1;
+            }
         }
         // A short page is the last page: stop before an empty fetch.
         if i64::try_from(fetched).unwrap_or(i64::MAX) < page_limit {
@@ -227,6 +235,24 @@ fn export_record_to_import(record: &UserExportRecord) -> ImportRecord {
     };
     let claims = parse_object(&record.claims_json).filter(|value| !is_empty_object(value));
     let traits = record.traits_json.as_deref().and_then(parse_object);
+    // The enrolled credential registry (issue #58): each passkey / TOTP /
+    // recovery-code enrollment rides the record so the export carries the registry,
+    // not merely the password. An empty registry is omitted to keep the line minimal.
+    let credentials = if record.credentials.is_empty() {
+        None
+    } else {
+        Some(
+            record
+                .credentials
+                .iter()
+                .map(|credential| ImportCredential {
+                    credential_type: credential.credential_type.clone(),
+                    friendly_name: credential.friendly_name.clone(),
+                    last_used_at: credential.last_used_at_unix_micros,
+                })
+                .collect(),
+        )
+    };
     ImportRecord {
         identifier: record.identifier.clone(),
         id: None,
@@ -236,6 +262,7 @@ fn export_record_to_import(record: &UserExportRecord) -> ImportRecord {
         traits,
         traits_schema_version: record.traits_schema_version,
         password_hash,
+        credentials,
     }
 }
 
@@ -273,6 +300,7 @@ mod tests {
             password_hash: Some("$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$aGFzaA".to_owned()),
             foreign_password_hash: None,
             foreign_password_algo: None,
+            credentials: Vec::new(),
             created_at_unix_micros: i64::try_from(n).unwrap_or(i64::MAX),
         }
     }
@@ -328,6 +356,9 @@ mod tests {
             },
             move |_record| {
                 held_sink.fetch_sub(1, Ordering::SeqCst);
+                // Every synthetic record is emitted, so the sink always counts it: the
+                // returned total must equal TOTAL.
+                true
             },
         )
         .await

@@ -22,7 +22,7 @@ use std::time::SystemTime;
 use ironauth_config::{AdminConfig, SecretError, SecretString};
 use ironauth_env::Env;
 use ironauth_store::{
-    ActorRef, MANAGEMENT_LIST_HARD_CAP, ManagementKeyId, OperatorId, ServiceId, Store,
+    ActorRef, MANAGEMENT_LIST_HARD_CAP, ManagementKeyId, OperatorId, Scope, ServiceId, Store,
 };
 
 use crate::auth::Principal;
@@ -71,6 +71,14 @@ struct Inner {
     // constant-time comparison site. A distinct credential from the operator token
     // and management keys: it authorizes ONLY that one endpoint.
     outbound_verification_token: Option<SecretString>,
+    // The single (tenant, environment) the outbound verification endpoint is
+    // authorized for (issue #58), as the scoped-id strings that appear in the request
+    // path. Both must be set and must match the request's path scope, or the endpoint
+    // is a uniform not-found: the shared token can only ever verify credentials in its
+    // one configured environment, never across tenants. None (either unset) fails
+    // closed (matches nothing).
+    outbound_verification_tenant: Option<String>,
+    outbound_verification_environment: Option<String>,
 }
 
 impl AdminState {
@@ -144,6 +152,14 @@ impl AdminState {
                 offboarding_retention_secs: config.offboarding_retention_secs,
                 outbound_verification_enabled: config.outbound_verification_enabled,
                 outbound_verification_token,
+                outbound_verification_tenant: config
+                    .outbound_verification_tenant
+                    .clone()
+                    .filter(|value| !value.trim().is_empty()),
+                outbound_verification_environment: config
+                    .outbound_verification_environment
+                    .clone()
+                    .filter(|value| !value.trim().is_empty()),
             }),
         })
     }
@@ -171,6 +187,24 @@ impl AdminState {
             return false;
         }
         constant_time_eq(token.as_bytes(), configured.as_bytes())
+    }
+
+    /// Whether the outbound verification endpoint is authorized for `scope` (issue
+    /// #58): the request's path scope must equal the ONE configured
+    /// `(tenant, environment)`. Returns `false` when either half is unset (fail
+    /// closed: no configured scope, no access), so the shared token can only ever
+    /// verify credentials in its one configured environment and a request to any
+    /// other tenant or environment is a uniform not-found, never a cross-tenant
+    /// oracle.
+    #[must_use]
+    pub fn outbound_verification_scope_allows(&self, scope: Scope) -> bool {
+        let (Some(tenant), Some(environment)) = (
+            self.inner.outbound_verification_tenant.as_deref(),
+            self.inner.outbound_verification_environment.as_deref(),
+        ) else {
+            return false;
+        };
+        tenant == scope.tenant().to_string() && environment == scope.environment().to_string()
     }
 
     /// Whether `region` is in the operator's configured data-residency region set

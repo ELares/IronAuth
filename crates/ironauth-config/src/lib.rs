@@ -448,6 +448,26 @@ pub struct AdminConfig {
     /// `outbound_verification_enabled` is true (fail closed: no token, no access).
     /// Use the `file`/`env` secret indirection, never a literal, outside dev mode.
     pub outbound_verification_token: Option<Secret>,
+
+    /// The tenant id the OUTBOUND lazy-migration verification endpoint is authorized
+    /// for (issue #58). The endpoint is bound to exactly ONE `(tenant, environment)`:
+    /// a request whose path scope does not match this tenant AND
+    /// `outbound_verification_environment` is a uniform not-found, so the shared token
+    /// can only ever verify credentials in its one configured environment and never
+    /// leaks across tenants. Unset (the default) leaves the endpoint bound to no
+    /// scope, so it matches nothing and is a uniform not-found even when enabled and
+    /// credentialed (fail closed: no scope, no access). A larger per-environment
+    /// secret home rides the M5 promotion pipeline; this pins the authorized scope
+    /// today so the most sensitive new surface is never deployment-global.
+    #[serde(default)]
+    pub outbound_verification_tenant: Option<String>,
+
+    /// The environment id the OUTBOUND lazy-migration verification endpoint is
+    /// authorized for (issue #58), paired with `outbound_verification_tenant`. Both
+    /// must be set and must match the request's path scope, or the endpoint is a
+    /// uniform not-found. Unset (the default) is fail closed.
+    #[serde(default)]
+    pub outbound_verification_environment: Option<String>,
 }
 
 /// The default tenant-offboarding retention window: 30 days in seconds (issue #46).
@@ -466,6 +486,8 @@ impl Default for AdminConfig {
             offboarding_retention_secs: default_offboarding_retention_secs(),
             outbound_verification_enabled: false,
             outbound_verification_token: None,
+            outbound_verification_tenant: None,
+            outbound_verification_environment: None,
         }
     }
 }

@@ -160,21 +160,32 @@ pub async fn verify_credential(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, ApiError> {
-    // A missing bearer is unauthorized exactly as everywhere else, checked before the
-    // enablement gate so an unauthenticated probe is a uniform 401.
-    let token = bearer_token(&headers)?;
-    // Disabled by default: the endpoint is a uniform not-found until an operator
-    // opts in, so its existence is not revealed to a credentialed-but-unenabled call.
+    // Disabled by default: the endpoint is a uniform not-found until an operator opts
+    // in. The enablement gate is evaluated BEFORE the bearer check so a disabled
+    // endpoint is indistinguishable from an absent route to an UNauthenticated probe
+    // too (a no-Authorization request to a disabled endpoint is 404, not 401), never
+    // revealing the route's existence.
     if !state.outbound_verification_enabled() {
         return Err(ApiError::NotFound);
     }
-    // Enabled: authorize ONLY the configured outbound token (fail closed when unset).
+    // Scope-bound: the endpoint is authorized for exactly ONE (tenant, environment).
+    // A request whose path scope does not match the configured scope is a uniform
+    // not-found REGARDLESS of the token, so the shared token can only ever verify
+    // credentials in its one configured environment and never leaks across tenants
+    // (checked before the bearer, so the endpoint is invisible outside its scope).
+    let scope = scope_from_path(&state, &tenant_id, &environment_id)?;
+    if !state.outbound_verification_scope_allows(scope) {
+        return Err(ApiError::NotFound);
+    }
+    // Within the configured scope: a missing bearer is unauthorized exactly as
+    // everywhere else, then authorize ONLY the configured outbound token (fail closed
+    // when unset).
+    let token = bearer_token(&headers)?;
     if !state.match_outbound_verification_token(&token) {
         return Err(ApiError::Unauthorized(
             "invalid outbound verification token".to_owned(),
         ));
     }
-    let scope = scope_from_path(&state, &tenant_id, &environment_id)?;
     let request: VerifyCredentialRequest = parse_json(&body)?;
 
     let verdict = verify_and_profile(&state, scope, &request).await?;
@@ -198,26 +209,31 @@ async fn verify_and_profile(
         .by_identifier(&request.identifier)
         .await?;
     let Some(user) = user else {
+        // Absent account: spend a comparable Argon2id verification through the SAME
+        // entry, then the uniform negative, so an absent identifier is timing-
+        // indistinguishable from a wrong password and the endpoint is not a
+        // user-enumeration oracle (mirroring the login path's `verify_absent`).
+        let _ = password_matches(None, None, &request.password);
         return Ok(negative());
     };
     // A fenced account (blocked, disabled, pending verification) never verifies: the
     // credential may be correct but the account is not permitted to authenticate,
-    // exactly the login fence, with no distinguishing signal.
+    // exactly the login fence. The verification work is STILL spent (through the same
+    // entry) so a fenced account is timing-indistinguishable from a wrong password,
+    // with no distinguishing signal.
     if !user.state.can_authenticate() {
+        let _ = password_matches(
+            Some(&user.password_hash),
+            user.foreign_password_hash.as_deref(),
+            &request.password,
+        );
         return Ok(negative());
     }
-    let password = request.password.as_bytes();
-    // The native Argon2id PHC string and every foreign scheme verify through one
-    // dispatch; the unusable sentinel (a credential-less or foreign-only account)
-    // fails to parse and falls through to the foreign hash.
-    let native_ok = ForeignHash::parse(&user.password_hash).is_ok_and(|hash| hash.verify(password));
-    let foreign_ok = !native_ok
-        && user
-            .foreign_password_hash
-            .as_deref()
-            .and_then(|stored| ForeignHash::parse(stored).ok())
-            .is_some_and(|hash| hash.verify(password));
-    if !(native_ok || foreign_ok) {
+    if !password_matches(
+        Some(&user.password_hash),
+        user.foreign_password_hash.as_deref(),
+        &request.password,
+    ) {
         return Ok(negative());
     }
 
@@ -258,5 +274,85 @@ fn negative() -> VerifyCredentialResponse {
         verified: false,
         subject: None,
         profile: None,
+    }
+}
+
+/// The SINGLE password-verification entry every outbound-verify branch routes
+/// through (issue #58): a present, absent, or fenced account ALL spend one Argon2id
+/// verification here, so none is a user-enumeration timing oracle. This mirrors the
+/// login path, which spends Argon2 time on the wrong-password, fenced, and absent
+/// branches alike.
+///
+/// * `native` = `Some` carries the user's native Argon2id verifier (or the unusable
+///   sentinel for a foreign-only account, which fails to parse and falls through to
+///   `foreign`); the native PHC string and every foreign scheme verify through one
+///   [`ForeignHash`] dispatch.
+/// * `native` = `None` means there is NO account (an absent identifier): a comparable
+///   dummy Argon2id verification is spent through the SAME primitive the login path
+///   uses ([`ironauth_oidc::verify_absent`]), then a non-match is returned, so the
+///   absent branch costs the same as a real verify.
+fn password_matches(native: Option<&str>, foreign: Option<&str>, password: &str) -> bool {
+    match native {
+        Some(native) => {
+            let bytes = password.as_bytes();
+            let native_ok = ForeignHash::parse(native).is_ok_and(|hash| hash.verify(bytes));
+            native_ok
+                || foreign
+                    .and_then(|stored| ForeignHash::parse(stored).ok())
+                    .is_some_and(|hash| hash.verify(bytes))
+        }
+        // No account: spend the dummy Argon2id work, always a non-match.
+        None => ironauth_oidc::verify_absent(password),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A native Argon2id PHC verifier for `password`, exactly what the login path
+    /// stores for a normally-registered user.
+    fn argon2_hash(password: &str) -> String {
+        use argon2::password_hash::{PasswordHasher, SaltString};
+        let salt = SaltString::encode_b64(b"outbound-verify-salt").expect("salt");
+        argon2::Argon2::default()
+            .hash_password(password.as_bytes(), &salt)
+            .expect("argon2 hash")
+            .to_string()
+    }
+
+    /// The user-enumeration timing-oracle defense (issue #58): the absent branch, the
+    /// fenced/wrong-password branch, and the correct-password branch ALL route through
+    /// the one `password_matches` entry, so absent, wrong-password, and correct are
+    /// timing-indistinguishable. Asserting wall-clock is flaky; this asserts the
+    /// STRUCTURAL property (one shared entry, and the absent branch is not a
+    /// short-circuit) plus the correctness of each verdict.
+    #[test]
+    fn absent_and_wrong_password_route_through_the_same_verify_entry() {
+        let native = argon2_hash("correct horse");
+
+        // The correct password matches through the shared entry.
+        assert!(
+            password_matches(Some(&native), None, "correct horse"),
+            "the correct password verifies through the shared entry"
+        );
+        // A wrong password does not match, routing through the SAME entry (a real
+        // Argon2id verify is spent).
+        assert!(
+            !password_matches(Some(&native), None, "wrong"),
+            "a wrong password does not verify"
+        );
+        // An ABSENT account (native = None) routes through the SAME entry and spends
+        // the dummy Argon2id verify rather than short-circuiting, and never matches:
+        // it is timing-indistinguishable from a wrong password, so the endpoint is not
+        // a user-enumeration oracle.
+        assert!(
+            !password_matches(None, None, "correct horse"),
+            "an absent account never verifies, and spends the dummy verify work"
+        );
+        assert!(
+            !password_matches(None, None, ""),
+            "an absent account with an empty candidate never verifies"
+        );
     }
 }

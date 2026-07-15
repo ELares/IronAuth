@@ -31,7 +31,8 @@ use std::time::SystemTime;
 
 use ironauth_env::Env;
 use ironauth_store::{
-    ActorRef, CorrelationId, NewAdminUser, Scope, Store, StoreError, UserId, UserState,
+    ActorRef, CorrelationId, CredentialType, NewAdminUser, Scope, Store, StoreError, UserId,
+    UserState,
 };
 
 use crate::record::{ImportRecord, parse_record_line};
@@ -125,6 +126,17 @@ struct PreparedCreate {
     state: UserState,
     foreign_hash: Option<String>,
     foreign_algo: Option<&'static str>,
+    credentials: Vec<PreparedCredential>,
+}
+
+/// A validated MFA / login credential to restore alongside an imported user (issue
+/// #58): the factor kind parsed to the closed [`CredentialType`] set, the
+/// bounds-checked friendly name, and the preserved last-used instant.
+#[derive(Debug)]
+struct PreparedCredential {
+    credential_type: CredentialType,
+    friendly_name: String,
+    last_used_at: Option<i64>,
 }
 
 /// Stream a bulk import to completion, creating each user through the audited admin
@@ -189,16 +201,54 @@ async fn create_user(
             None,
         )
         .await;
-    match result {
-        Ok(id) => Ok(id.to_string()),
+    let id = match result {
+        Ok(id) => id,
         // A duplicate id / external id / login handle: the scope's unique
-        // constraints make a re-import idempotent (skip, never a second row).
-        Err(StoreError::Conflict) => Err(CreateError::Conflict),
-        Err(StoreError::NotFound) => Err(CreateError::Failed(
-            "user id is not in this scope".to_owned(),
-        )),
-        Err(_) => Err(CreateError::Failed("persistence failure".to_owned())),
+        // constraints make a re-import idempotent (skip, never a second row). The
+        // credentials are NOT re-enrolled on a skip, so a re-import cannot duplicate a
+        // user's credential registry.
+        Err(StoreError::Conflict) => return Err(CreateError::Conflict),
+        Err(StoreError::NotFound) => {
+            return Err(CreateError::Failed(
+                "user id is not in this scope".to_owned(),
+            ));
+        }
+        Err(_) => return Err(CreateError::Failed("persistence failure".to_owned())),
+    };
+    // Restore the user's enrolled credential registry (issue #58): each passkey /
+    // TOTP / recovery-code enrollment is re-enrolled under the fresh user, sealing
+    // the friendly name against the target scope's DEK and preserving the last-used
+    // instant, so the exit export round-trips the full credential registry.
+    restore_credentials(ctx, &id, &prepared.credentials).await?;
+    Ok(id.to_string())
+}
+
+/// Re-enroll an imported user's credential registry (issue #58) through the audited,
+/// subject-bound restore path. A credential-restore failure fails only THIS record
+/// (the user is already created); the stream continues.
+async fn restore_credentials(
+    ctx: &ImportContext<'_>,
+    subject: &UserId,
+    credentials: &[PreparedCredential],
+) -> Result<(), CreateError> {
+    for credential in credentials {
+        ctx.store
+            .scoped(ctx.scope)
+            .acting(ctx.actor, CorrelationId::generate(ctx.env))
+            .account_credentials()
+            .enroll_restored(
+                ctx.env,
+                subject,
+                credential.credential_type,
+                &credential.friendly_name,
+                credential.last_used_at,
+            )
+            .await
+            .map_err(|_| {
+                CreateError::Failed("credential enrollment failed on restore".to_owned())
+            })?;
     }
+    Ok(())
 }
 
 /// The pure streaming driver: pull lines lazily, parse and validate each, and hand a
@@ -303,6 +353,7 @@ fn prepare_record(record: ImportRecord, scope: Scope) -> Result<PreparedCreate, 
         ),
         Some(_) => return Err("traits must be a JSON object".to_owned()),
     };
+    let credentials = prepare_credentials(record.credentials)?;
     Ok(PreparedCreate {
         identifier: record.identifier,
         id,
@@ -313,7 +364,36 @@ fn prepare_record(record: ImportRecord, scope: Scope) -> Result<PreparedCreate, 
         state,
         foreign_hash,
         foreign_algo,
+        credentials,
     })
+}
+
+/// Validate the record's MFA / login credential enrollments (issue #58): every
+/// factor kind must be in the closed [`CredentialType`] set and every friendly name
+/// within 1 to 200 characters, exactly the bounds the live self-service enroll path
+/// enforces, so a restored credential can never carry an unknown type or an oversized
+/// name. An invalid credential fails ONLY its record, never the batch.
+fn prepare_credentials(
+    credentials: Option<Vec<crate::record::ImportCredential>>,
+) -> Result<Vec<PreparedCredential>, String> {
+    let Some(credentials) = credentials else {
+        return Ok(Vec::new());
+    };
+    let mut prepared = Vec::with_capacity(credentials.len());
+    for credential in credentials {
+        let credential_type = CredentialType::parse(&credential.credential_type)
+            .ok_or_else(|| format!("unknown credential type: {}", credential.credential_type))?;
+        let name = credential.friendly_name.trim();
+        if name.is_empty() || name.chars().count() > 200 {
+            return Err("credential friendly_name must be 1 to 200 characters".to_owned());
+        }
+        prepared.push(PreparedCredential {
+            credential_type,
+            friendly_name: name.to_owned(),
+            last_used_at: credential.last_used_at,
+        });
+    }
+    Ok(prepared)
 }
 
 /// Convert a seam-read wall-clock instant to microseconds since the Unix epoch.

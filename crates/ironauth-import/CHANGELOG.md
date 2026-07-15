@@ -6,6 +6,14 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Credential-registry round-trip (issue #58, review): `ImportRecord` gains an optional
+  `credentials` list (a new `ImportCredential`: factor kind, friendly name, optional
+  last-used instant), so the full identity export carries every passkey / TOTP /
+  recovery-code enrollment and the engine restores each one under the imported user
+  (validated to the closed credential-type set and the 1-to-200-character name bound,
+  per-record failure isolation preserved; a re-imported duplicate skips without
+  re-enrolling). The record shape is additive, so the M7 credential-secret material
+  rides the same list.
 - Export side of the record format (issue #58): `ImportRecord` now also derives
   `Serialize`, and `to_record_line` writes exactly what `parse_record_line` reads, so
   the full identity export (in `ironauth-admin`) produces the same line-delimited

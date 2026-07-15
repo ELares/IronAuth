@@ -35,6 +35,10 @@ pub struct Harness {
     // Held so the database and its pools outlive the router.
     db: TestDatabase,
     router: Router,
+    // The (tenant, environment) the OUTBOUND verification endpoint was configured for
+    // (issue #58), when built through `start_with_outbound_verification`. The endpoint
+    // is bound to exactly this scope; a request to any other scope is a uniform 404.
+    outbound_scope: Option<Scope>,
 }
 
 impl Harness {
@@ -60,15 +64,25 @@ impl Harness {
         let state = AdminState::new(db.control_store().clone(), Env::system(), &config)
             .expect("admin state builds");
         let router = management_router(state);
-        Self { db, router }
+        Self {
+            db,
+            router,
+            outbound_scope: None,
+        }
     }
 
     /// Start a fresh database and router with the OUTBOUND lazy-migration
-    /// credential-verification endpoint enabled and its shared token set (issue
-    /// #58). `token` is the bearer a successor system presents; `None` leaves the
-    /// endpoint enabled but unauthorized (fail-closed testing).
+    /// credential-verification endpoint enabled, its shared token set, and BOUND to a
+    /// freshly seeded `(tenant, environment)` scope (issue #58). `token` is the bearer
+    /// a successor system presents; `None` leaves the endpoint enabled but
+    /// unauthorized (fail-closed testing). The endpoint is authorized for exactly the
+    /// returned [`Harness::outbound_scope`]; a request to any other scope is a uniform
+    /// 404. Callers seed users into `outbound_scope`.
     pub async fn start_with_outbound_verification(token: Option<&str>) -> Self {
         let db = TestDatabase::start().await;
+        // Seed the authorized scope BEFORE building the state, so the outbound
+        // verification can be pinned to it (the endpoint is scope-bound, not global).
+        let scope = db.seed_scope(&Env::system()).await;
         let config = AdminConfig {
             bootstrap_operator_token: Some(Secret::Literal(SecretString::new(OPERATOR_TOKEN))),
             max_page_size: 200,
@@ -76,12 +90,27 @@ impl Harness {
             outbound_verification_enabled: true,
             outbound_verification_token: token
                 .map(|value| Secret::Literal(SecretString::new(value))),
+            outbound_verification_tenant: Some(scope.tenant().to_string()),
+            outbound_verification_environment: Some(scope.environment().to_string()),
             ..AdminConfig::default()
         };
         let state = AdminState::new(db.control_store().clone(), Env::system(), &config)
             .expect("admin state builds");
         let router = management_router(state);
-        Self { db, router }
+        Self {
+            db,
+            router,
+            outbound_scope: Some(scope),
+        }
+    }
+
+    /// The `(tenant, environment)` the OUTBOUND verification endpoint was configured
+    /// for (issue #58). Panics if the harness was not built through
+    /// [`Harness::start_with_outbound_verification`].
+    #[must_use]
+    pub fn outbound_scope(&self) -> Scope {
+        self.outbound_scope
+            .expect("harness built with outbound verification")
     }
 
     /// The control-plane store behind the router, for verifying audit rows.
@@ -351,6 +380,23 @@ impl Harness {
             .uri(path)
             .header(header::AUTHORIZATION, bearer(token))
             .header("idempotency-key", idempotency_key)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_owned()))
+            .expect("request builds");
+        self.send(request).await
+    }
+
+    /// A POST carrying NO Authorization header, for the enablement-gate-before-bearer
+    /// test (issue #58): a disabled endpoint must be a uniform 404 even to an
+    /// unauthenticated probe, never a 401 that reveals the route exists.
+    pub async fn post_unauthenticated(
+        &self,
+        path: &str,
+        body: &str,
+    ) -> (StatusCode, HeaderMap, String) {
+        let request = Request::builder()
+            .method("POST")
+            .uri(path)
             .header(header::CONTENT_TYPE, "application/json")
             .body(Body::from(body.to_owned()))
             .expect("request builds");

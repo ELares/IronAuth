@@ -6,6 +6,12 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- `[admin]` outbound verification SCOPE binding (issue #58, review):
+  `admin.outbound_verification_tenant` and `admin.outbound_verification_environment`
+  (both unset by default) pin the outbound credential-verification endpoint to exactly
+  one `(tenant, environment)`. A request whose path scope does not match is a uniform
+  not-found regardless of the token, so the shared token can never verify credentials
+  across tenants. Unset either half fails closed (matches nothing).
 - `[admin]` outbound lazy-migration verification settings (issue #58), DISABLED BY
   DEFAULT. `admin.outbound_verification_enabled` (default false) leaves the outbound
   credential-verification endpoint a uniform not-found; `admin.outbound_verification_token`

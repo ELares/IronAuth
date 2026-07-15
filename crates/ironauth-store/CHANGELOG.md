@@ -6,6 +6,15 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Exit-export credential registry (issue #58, review, migration 0041, expand):
+  `UserExportRecord` now carries the user's enrolled `account_credentials` (a new
+  `ExportedCredential` list: factor kind, opened friendly name, last-used instant),
+  and `ActingAccountCredentialRepo::enroll_restored` re-enrolls an exported credential
+  under a fresh user, preserving the last-used instant, for the exit-import restore.
+  Migration 0041 grants the control plane SELECT + INSERT on the existing
+  `account_credentials` table (least privilege: no UPDATE / DELETE) so the export
+  reads and the import restores the credential registry; it adds no table, column, or
+  policy.
 - Exit-friendliness covenant support (issue #58, no migration): the read and write
   halves of the full identity export. A new `UserRepo::export_page` reads every field
   the identity model holds one keyset-paginated, bounded page at a time (opening the

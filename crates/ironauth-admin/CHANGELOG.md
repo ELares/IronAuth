@@ -6,6 +6,20 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Exit-export hardening (issue #58, review): the export now carries the enrolled MFA
+  / login credential REGISTRY (`account_credentials`), not merely the password: each
+  passkey / TOTP / recovery-code enrollment (factor kind, opened friendly name,
+  last-used instant) rides the record and re-imports losslessly. The field-coverage
+  guard now enumerates the FULL identity model (`users` AND `account_credentials`),
+  so a new column on either table, including the M7 credential-secret columns, fails
+  the build until it is exported or explicitly justified. The outbound
+  verify-credential endpoint is now (a) not a user-enumeration timing oracle: an
+  absent or fenced account spends the same Argon2id work as a wrong password through
+  one shared verify entry; (b) SCOPE-BOUND to one configured `(tenant, environment)`,
+  so a request to any other scope, even with the correct token, is a uniform 404 and
+  never a cross-tenant oracle; and (c) evaluated enablement-first, so a disabled
+  endpoint is a uniform 404 even to an unauthenticated probe (indistinguishable from
+  an absent route). The audited export count now equals the lines actually emitted.
 - Exit-friendliness covenant (issue #58): the full identity export and the outbound
   lazy-migration hook. `GET .../export` streams every identity of an environment as
   the same newline-delimited record format the streaming bulk import consumes

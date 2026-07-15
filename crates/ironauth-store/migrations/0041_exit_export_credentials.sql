@@ -1,0 +1,38 @@
+-- SPDX-License-Identifier: MIT OR Apache-2.0
+--
+-- Exit-friendliness covenant: export the credential registry (issue #58).
+--
+-- The full identity export and its mirror import run on the MANAGEMENT plane
+-- (ironauth_control), exactly as the admin user create / lifecycle surface does
+-- (issue #52/#37): the control plane "now manages users", and the exit covenant
+-- requires it to manage the enrolled MFA / login credential REGISTRY too, so a full
+-- export carries every passkey / TOTP / recovery-code enrollment and a mirror import
+-- restores it into a fresh instance losslessly.
+--
+-- The account_credentials table (issue #61, migration 0036) already exists, is
+-- tenant-scoped with row-level security ENABLEd and FORCEd, carries its isolation
+-- policy and its nonempty-scope CHECK, and is registered in scripts/query-audit.sh.
+-- This migration adds NO table, NO column, NO policy, and NO backfill: it is a
+-- purely additive EXPAND that grants the control plane exactly the two privileges
+-- the export (read) and the import restore (create) need, and nothing more.
+--
+--   * SELECT: the export reads a subject's enrolled credentials inside the same
+--     scoped, RLS-forced transaction it reads the user row in, opening the sealed
+--     friendly name (the control plane already holds SELECT/INSERT on tenant_keks
+--     and tenant_deks from 0037, so it can open the row DEK).
+--
+--   * INSERT: the exit-restore path re-enrolls each exported credential under the
+--     freshly minted user in the destination scope, sealing the friendly name under
+--     the destination DEK and preserving the last-used instant, then writing one
+--     audit row (the control plane already holds INSERT on audit_log from 0003).
+--
+-- The control plane is deliberately granted NEITHER a table-wide UPDATE nor DELETE:
+-- the exit surface only reads and restores credentials, so it needs no mutation of
+-- an existing row (the #31 least-privilege lesson). The self-service data plane
+-- (ironauth_app) keeps its own SELECT/INSERT/DELETE and the column-scoped UPDATE from
+-- 0036; those grants are untouched.
+--
+-- Every statement is additive, so this migration is an EXPAND: no prior-release
+-- binary reads a column this adds (it adds none), and a rolling deploy is safe.
+
+GRANT SELECT, INSERT ON account_credentials TO ironauth_control;
