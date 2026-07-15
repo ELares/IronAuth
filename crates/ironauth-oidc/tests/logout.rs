@@ -19,6 +19,8 @@ mod common;
 
 use axum::body::Body;
 use axum::http::{HeaderMap, Request, StatusCode, header};
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use common::{
     Harness, PKCE_CHALLENGE, PKCE_VERIFIER, REDIRECT_URI, enc, form, json, location, location_param,
 };
@@ -27,7 +29,21 @@ use ironauth_store::{
     AuthorizationCodeId, ClientId, CorrelationId, GrantId, IssueCode, NewRefreshFamily, NewSession,
     RefreshFamilyId, RefreshTokenId, Scope, SessionId, refresh_token_digest,
 };
+use serde_json::Value;
 use std::time::Duration;
+
+/// Re-sign `hint`'s claims with the environment's LIVE signing key after DROPPING the
+/// `sid` claim: a validly-signed, correctly-audienced `id_token_hint` that carries no
+/// cryptographic tie to any specific session.
+async fn hint_without_sid(harness: &Harness, hint: &str) -> String {
+    let segment = hint.split('.').nth(1).expect("payload segment");
+    let bytes = URL_SAFE_NO_PAD.decode(segment).expect("base64url payload");
+    let mut claims: serde_json::Map<String, Value> =
+        serde_json::from_slice(&bytes).expect("claims json");
+    claims.remove("sid");
+    assert!(!claims.contains_key("sid"), "the sid claim is dropped");
+    harness.sign_at_jwt(&Value::Object(claims)).await
+}
 
 const SELF_ORIGIN: &str = "https://issuer.test";
 
@@ -466,6 +482,107 @@ async fn only_spec_parameters_are_accepted_a_proprietary_one_is_ignored() {
     assert!(
         loc.starts_with("https://client.test/after"),
         "the proprietary logout_uri is ignored, the registered spec uri wins: {loc}"
+    );
+}
+
+#[tokio::test]
+async fn an_attackers_valid_hint_cannot_log_out_a_co_scoped_victim() {
+    // The #33 logout-CSRF: an attacker mints their OWN valid id_token, then lures a
+    // co-scoped VICTIM (same client, same environment) into a top-level GET to
+    // /end_session carrying the ATTACKER's token. The victim's SameSite=Lax session
+    // cookie rides along, but the target is bound to the hint's own `sid` (the attacker's
+    // session), so the victim's session MUST survive.
+    let harness = Harness::start().await;
+    let client_id = harness.client_id().to_string();
+
+    let (_victim_id, victim_cookie) = seeded_session(&harness).await;
+    let (_attacker_id, attacker_cookie) = seeded_session(&harness).await;
+    let attacker_hint = mint_id_token(&harness, &client_id, &attacker_cookie).await;
+
+    // The victim is authenticated before the attack.
+    assert!(
+        session_still_authenticates(&harness, &victim_cookie).await,
+        "the victim starts authenticated"
+    );
+
+    // The exact reviewer probe: the victim's browser follows the crafted link.
+    let query = format!("id_token_hint={}", enc(&attacker_hint));
+    let (_status, _headers, _body) = get_end_session(&harness, &query, &victim_cookie).await;
+
+    assert!(
+        session_still_authenticates(&harness, &victim_cookie).await,
+        "an attacker's valid hint must NEVER end a co-scoped victim's session"
+    );
+}
+
+#[tokio::test]
+async fn an_attackers_registered_redirect_never_carries_the_victims_browser_away() {
+    // The phishing tail of the same chain: even with an attacker-registered exact
+    // post_logout_redirect_uri, the victim's browser (a different session than the hint's
+    // `sid`) is NOT redirected and its cookie is NOT cleared, so the crafted link cannot
+    // navigate the victim away or drop their cookie.
+    let harness = Harness::start().await;
+    let client_id = harness.client_id().to_string();
+    harness
+        .register_post_logout_redirects(harness.client_id(), &["https://attacker.test/land"])
+        .await;
+
+    let (_victim_id, victim_cookie) = seeded_session(&harness).await;
+    let (_attacker_id, attacker_cookie) = seeded_session(&harness).await;
+    let attacker_hint = mint_id_token(&harness, &client_id, &attacker_cookie).await;
+
+    let query = format!(
+        "id_token_hint={}&post_logout_redirect_uri={}&state=attackerstate",
+        enc(&attacker_hint),
+        enc("https://attacker.test/land"),
+    );
+    let (status, headers, body) = get_end_session(&harness, &query, &victim_cookie).await;
+
+    assert_ne!(
+        status,
+        StatusCode::SEE_OTHER,
+        "the victim's browser must not be redirected: {body}"
+    );
+    assert!(
+        location(&headers).is_none(),
+        "no Location to the attacker's landing page"
+    );
+    assert!(
+        headers.get(header::SET_COOKIE).is_none(),
+        "the victim's cookie must not be cleared"
+    );
+    assert!(
+        session_still_authenticates(&harness, &victim_cookie).await,
+        "the victim survives the attacker's redirect chain"
+    );
+}
+
+#[tokio::test]
+async fn a_verifiable_hint_with_no_sid_degrades_to_the_confirmation_prompt() {
+    // A validly-signed, correctly-audienced hint that carries NO `sid` has no tie to any
+    // specific session. On the attributed GET path it must NOT end the presenting cookie
+    // session (that would be logout-CSRF); it degrades to the same confirmation prompt an
+    // unattributable logout gets, changing nothing.
+    let harness = Harness::start().await;
+    let client_id = harness.client_id().to_string();
+    let (_session_id, cookie) = seeded_session(&harness).await;
+    let hint = mint_id_token(&harness, &client_id, &cookie).await;
+    let sidless = hint_without_sid(&harness, &hint).await;
+
+    let query = format!("id_token_hint={}", enc(&sidless));
+    let (status, headers, body) = get_end_session(&harness, &query, &cookie).await;
+    assert_eq!(status, StatusCode::OK, "confirmation page: {body}");
+    assert!(
+        body.contains("Sign out") && body.contains("<form"),
+        "a sid-less hint renders the confirmation form: {body}"
+    );
+    assert!(
+        location(&headers).is_none() && headers.get(header::SET_COOKIE).is_none(),
+        "the confirmation page performs NO state change (no redirect, no cookie clear)"
+    );
+    assert!(
+        session_still_authenticates(&harness, &cookie).await,
+        "a sid-less hint on GET must not end the session without confirmation"
     );
 }
 

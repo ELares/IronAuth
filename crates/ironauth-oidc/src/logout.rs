@@ -31,12 +31,28 @@
 //!   [`SessionLifecycleEvent`] fires on the revocation sink so the durable fan-out
 //!   (#35) and back-channel logout (#34) attach without touching this endpoint.
 //!
+//! - **The hint's own `sid` selects the session, never the cookie.** On the attributed
+//!   path the session to end is resolved STRICTLY from the `sid` the verified hint
+//!   carries (via [`ClientSessionRepo::session_for_sid`](ironauth_store::ClientSessionRepo)),
+//!   never from whatever session cookie the browser happened to present. An attacker can
+//!   only ever mint their OWN token, whose `sid` maps to their OWN session, so an
+//!   attributed logout can end only the hint owner's session, never a co-scoped victim's
+//!   (a crafted `GET /end_session?id_token_hint=<attacker token>` sends the victim's
+//!   `SameSite=Lax` cookie, but that cookie no longer selects the target). A hint that
+//!   carries NO `sid` has no tie to a specific session, so it degrades to the same
+//!   confirmation path an unattributable logout gets rather than ending the cookie. The
+//!   cookie is cleared and the redirect honored ONLY when the presenting browser IS the
+//!   session the `sid` names (compared, never preferred); a different browser is left
+//!   exactly as it was. `sub` is deliberately NOT used to select a session (it is a
+//!   pairwise/public subject, not a session identifier).
+//!
 //! - **The cookie is cleared.** Every logout response clears the session cookie
 //!   (`Max-Age=0`), so the browser drops it even before the row's lifetime elapses.
 //!
 //! - **Exact-match redirect, or no redirect.** `post_logout_redirect_uri` is honored
 //!   ONLY when it EXACTLY string-matches a value the client pre-registered AND the
-//!   request carried a verifiable hint that binds it to that client. No wildcards, no
+//!   request carried a verifiable hint that binds it to that client AND the presenting
+//!   browser is the very session the hint's `sid` names. No wildcards, no
 //!   normalization, no case folding (RFC 9700 section 2.1). A near miss, an
 //!   unregistered value, or an unattributable request gets NO redirect: a neutral
 //!   logged-out page is rendered instead, never a redirect to an attacker-supplied URI.
@@ -139,11 +155,58 @@ async fn handle(
         return unattributed(state, headers, params, is_post).await;
     };
 
-    // Attributable: end the SSO session synchronously, then decide the response.
-    end_session(state, headers, attributed.scope, attributed.sid.as_deref()).await;
+    // A verifiable hint attributes the request to a client, but only a hint that carries
+    // a `sid` cryptographically identifies WHICH session to end. Without a `sid` there is
+    // no tie to a specific session, so ending the browser's cookie session here would be
+    // the same logout-CSRF a bare GET is. Degrade to the same-origin-gated confirmation
+    // path (changes nothing on a GET, can never redirect).
+    let Some(sid) = attributed.sid.as_deref() else {
+        return unattributed(state, headers, params, is_post).await;
+    };
 
-    // A redirect happens ONLY on an exact registered-URI match (a verifiable hint bound
-    // the client). Anything else renders the neutral logged-out page, never a redirect.
+    // Resolve the target STRICTLY from the hint's own `sid`, never from the presenting
+    // cookie. An attacker can only ever mint their OWN token, whose `sid` maps to their
+    // OWN session, so this can end only the hint owner's session, never a co-scoped
+    // victim's (the #33 forced-logout defect). A `sid` that maps to no live session is a
+    // clean no-op.
+    let target = state
+        .store()
+        .scoped(attributed.scope)
+        .client_sessions()
+        .session_for_sid(sid)
+        .await
+        .ok()
+        .flatten();
+
+    // Whether the request came from the hint owner's OWN browser: only when the presented
+    // cookie resolves to the SAME SSO session the `sid` names (compared, never
+    // preferred). Only then was THIS browser logged out, so only then may the response
+    // clear its cookie and honor a post-logout redirect. A different (victim's) cookie,
+    // or none, leaves the presenting browser untouched.
+    let browser_is_hint_owner = match (&target, cookie_session_in_scope(headers, &attributed.scope))
+    {
+        (Some(target), Some(cookie)) => *target == cookie,
+        _ => false,
+    };
+
+    // End the hint owner's OWN session synchronously (a no-op when the `sid` mapped to no
+    // live session). This is always safe: the target is the hint owner's session, whoever
+    // the browser is.
+    if let Some(session_id) = &target {
+        revoke_and_signal(state, attributed.scope, session_id).await;
+    }
+
+    if !browser_is_hint_owner {
+        // The hint owner's session was ended, but the presenting browser is a DIFFERENT
+        // session (a cross-user logout attempt) or has no live cookie. Change NOTHING for
+        // it: no cookie clear, no redirect, so an attacker-supplied (even registered)
+        // `post_logout_redirect_uri` can never carry the victim's browser away.
+        return neutral_logged_out();
+    }
+
+    // The presenting browser IS the hint owner: a redirect happens ONLY on an exact
+    // registered-URI match, else the neutral logged-out page. Both clear this browser's
+    // cookie.
     match validated_redirect(state, &attributed, params).await {
         Some(location) => logout_redirect(state, &location),
         None => logged_out(state),
@@ -230,29 +293,6 @@ fn audience_client(hint: &str) -> Option<String> {
             .iter()
             .find_map(|item| item.as_str().map(str::to_owned)),
         _ => None,
-    }
-}
-
-/// End the SSO session an ATTRIBUTED logout targets, synchronously. The target is the
-/// session the browser presents (when its cookie is in the hint's scope), else the SSO
-/// session the hint's `sid` maps to (so the hint identifies the session even without a
-/// usable cookie). A no-op when neither resolves (nothing to end).
-async fn end_session(state: &OidcState, headers: &HeaderMap, scope: Scope, sid: Option<&str>) {
-    let mut target = cookie_session_in_scope(headers, &scope);
-    if target.is_none() {
-        if let Some(sid) = sid {
-            target = state
-                .store()
-                .scoped(scope)
-                .client_sessions()
-                .session_for_sid(sid)
-                .await
-                .ok()
-                .flatten();
-        }
-    }
-    if let Some(session_id) = target {
-        revoke_and_signal(state, scope, &session_id).await;
     }
 }
 
@@ -398,6 +438,16 @@ fn confirmation_prompt(params: &LogoutParams) -> Response {
         StatusCode::OK,
         pages::logout_confirm_page("/end_session", &carried),
     )
+}
+
+/// The neutral logged-out page that changes NOTHING for the presenting browser: no
+/// cookie clear and no redirect. Rendered on the attributed path when the request did
+/// NOT come from the hint owner's own browser (its cookie is a different session, or it
+/// has none). The hint owner's own session was already ended; the presenting browser is
+/// left exactly as it was, so a crafted cross-user logout can neither drop the victim's
+/// cookie nor navigate the victim away.
+fn neutral_logged_out() -> Response {
+    pages::secure_html(StatusCode::OK, pages::logged_out_page())
 }
 
 /// The neutral logged-out page, clearing the session cookie.
