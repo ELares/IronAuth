@@ -30,8 +30,8 @@ use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
 use ironauth_store::{
     AuthorizationCodeId, ClientId, ClientRecord, ConsumePushedRequest, CorrelationId, GrantId,
-    GrantedConsent, IssueCode, PushedRequestId, Scope, StoreError, redirect_uri_is_registrable,
-    redirect_uri_matches,
+    GrantedConsent, IssueCode, PushedRequestId, Scope, SessionId, StoreError,
+    redirect_uri_is_registrable, redirect_uri_matches,
 };
 use serde::{Deserialize, Serialize};
 
@@ -704,6 +704,34 @@ fn resolve_mode(
     Ok(mode)
 }
 
+/// Resolve the per-(client, session) `sid` for a FRONT-CHANNEL (implicit / hybrid) ID
+/// token (issue #32), from the SSO session that just authenticated this authorization.
+///
+/// This is the same `ensure_sid` on the same (client, session) pair the token endpoint
+/// calls, so the `sid` a client sees on an implicit ID token is IDENTICAL to the one it
+/// would see on a code-flow ID token for that session: back-channel logout can target
+/// the client either way, and the two flows never disagree about the OP session.
+///
+/// Fails CLOSED (`Err(())`, a `server_error`): a store failure must not silently emit
+/// an ID token with no `sid`, which would look like a success while quietly leaving the
+/// client untargetable by back-channel logout.
+async fn resolve_front_channel_sid(
+    state: &OidcState,
+    scope: Scope,
+    client_id: &str,
+    resolved: &Resolved<'_>,
+) -> Result<String, ()> {
+    let session_id = SessionId::parse_in_scope(resolved.session_ref, &scope).map_err(|_| ())?;
+    let now_micros = epoch_micros(state.now());
+    state
+        .store()
+        .scoped(scope)
+        .client_sessions()
+        .ensure_sid(state.env(), &session_id, client_id, now_micros)
+        .await
+        .map_err(|_| ())
+}
+
 /// Mint the front-channel ID token for the implicit and hybrid flows (issue #17),
 /// reusing the token endpoint's EXACT claim assembly and signing path
 /// ([`tokens::mint_id_token`]); it never mints an access token. The hybrid flow
@@ -729,6 +757,16 @@ async fn mint_front_channel_id_token(
     // returns for the same client and user.
     let subject = state.resolve_public_subject(resolved.subject);
     let client_id_str = client_id.to_string();
+    // The per-client `sid` (issue #32), resolved from the SAME authenticating SSO
+    // session and through the SAME (client, session) row the token endpoint uses, so an
+    // implicit/hybrid ID token carries the SAME sid the code flow would issue for this
+    // pair. Discovery advertises backchannel_logout_session_supported unconditionally;
+    // omitting sid here would make that advertisement FALSE for every legacy
+    // response_type and leave those clients untargetable by back-channel logout.
+    //
+    // Fails CLOSED: a store error is Err(()) (a server_error through the negotiated
+    // response mode), never a silently session-less ID token.
+    let sid = resolve_front_channel_sid(state, scope, &client_id_str, resolved).await?;
     // c_hash binds the issued code to the hybrid ID token; a pure id_token carries
     // none, and neither ever carries at_hash (no access token is issued here).
     let c_hash = match (response_type, code) {
@@ -754,6 +792,7 @@ async fn mint_front_channel_id_token(
         oauth_scope: resolved.oauth_scope,
         auth_methods: resolved.auth_methods,
         auth_time_unix_micros: resolved.auth_time_micros,
+        sid: Some(sid.as_str()),
         at_hash: None,
         c_hash: c_hash.as_deref(),
         extra_claims: &extra_claims,
@@ -1282,7 +1321,6 @@ async fn resolve_gate(
 ) -> Result<Gate, AuthorizeError> {
     // The scope is the one the client_id declares (fixed at validation).
     let scope = client_id.scope();
-    let cookie = interaction::cookie_header(headers);
     let prompt_none = prompt.contains(PromptValue::None);
     // A negotiated-mode redirect error (redirect_uri is already validated), used for
     // the prompt=none surfaces so an interaction need becomes an error, never a page.
@@ -1295,7 +1333,7 @@ async fn resolve_gate(
         mode,
     };
 
-    let Some(session) = interaction::resolve_session(state, scope, cookie).await else {
+    let Some(session) = interaction::resolve_session(state, scope, headers).await else {
         // No usable session (absent, expired, or cross-scope).
         if prompt_none {
             return Err(gate_error(

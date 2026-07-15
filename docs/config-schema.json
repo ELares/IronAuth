@@ -376,9 +376,31 @@
           "minimum": 0,
           "type": "integer"
         },
+        "session_device_binding": {
+          "default": false,
+          "description": "Bind the session to the device / user agent it was established from (issue\n#32). The safe default (`false`) leaves it OFF (the tunability principle).\nEnable it to fail closed when the device/user-agent fingerprint changes.",
+          "type": "boolean"
+        },
+        "session_idle_ttl_secs": {
+          "default": 3600,
+          "description": "Session IDLE timeout in seconds (issue #32): a session unused for longer than\nthis stops resolving, independently of the absolute cap `session_ttl_secs`.\nThe default (3600) equals the absolute cap, so the default behavior matches\nthe single-lifetime bootstrap; lower it to expire idle sessions sooner. Must\nbe at least 1, at most `OIDC_MAX_SESSION_TTL_SECS`, and at most\n`session_ttl_secs` (an idle timeout beyond the absolute cap is meaningless).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "session_partitioned_cookie": {
+          "default": false,
+          "description": "Add the CHIPS `Partitioned` attribute to session cookies (issue #32). The safe\ndefault (`false`) leaves it OFF: the cookie is the standard\n`__Host-`/`Secure`/`HttpOnly`/`SameSite=Lax` cookie. Set it to `true` for\nembedded-widget (cross-site) scenarios so the browser gives each top-level\nsite its own partitioned session cookie; enabling it NEVER drops `SameSite`\nand NEVER breaks the `__Host-` prefix, it only ADDS `Partitioned`.",
+          "type": "boolean"
+        },
+        "session_peer_ip_binding": {
+          "default": false,
+          "description": "Bind the session to the peer IP it was established from (issue #32). The safe\ndefault (`false`) leaves it OFF (the tunability principle: env-dependent\nbehavior is config, never a baked-in one-way choice), so a NAT or a mobile IP\nchange never logs a user out. Enable it only where clients have stable IPs; it\nthen fails closed (a session presented from a different peer IP does not\nresolve).",
+          "type": "boolean"
+        },
         "session_ttl_secs": {
           "default": 3600,
-          "description": "Bootstrap session lifetime in seconds (issue #20). The opaque `__Host-`\nsession cookie established at login or registration is valid for this long;\na request presenting an expired session re-authenticates. The default\n(3600) is a conservative one hour. Must be at least 1 and at most\n`OIDC_MAX_SESSION_TTL_SECS`. The real two-tier session model (M4) replaces\nthis bootstrap session.",
+          "description": "Session ABSOLUTE hard-cap lifetime in seconds (issue #20, extended by issue\n#32). The opaque `__Host-` session cookie established at login is valid for at\nmost this long however active; a request presenting an expired session\nre-authenticates. The default (3600) is a conservative one hour. Must be at\nleast 1 and at most `OIDC_MAX_SESSION_TTL_SECS`. Pairs with\n`session_idle_ttl_secs` (the idle timeout).",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
@@ -611,6 +633,10 @@
         "require_pkce_for_confidential_clients": true,
         "require_pushed_authorization_requests": false,
         "reuse_grace_secs": 10,
+        "session_device_binding": false,
+        "session_idle_ttl_secs": 3600,
+        "session_partitioned_cookie": false,
+        "session_peer_ip_binding": false,
         "session_ttl_secs": 3600,
         "userinfo_cors_origins": []
       },

@@ -45,6 +45,7 @@ fn operation_ids_are_the_stable_set() {
     assert_eq!(
         ids,
         vec![
+            "bulkRevokeSessions",
             "createDcrInitialAccessToken",
             "createDcrPolicy",
             "createEnvironment",
@@ -56,11 +57,17 @@ fn operation_ids_are_the_stable_set() {
             "getDcrClient",
             "getEnvironment",
             "getManagementKey",
+            "getRefreshFamily",
+            "getSession",
             "getTenant",
             "listDcrPolicies",
             "listEnvironments",
             "listManagementKeys",
+            "listRefreshFamilies",
+            "listSessions",
             "listTenants",
+            "revokeSession",
+            "revokeUserSessions",
             "verifyDcrClient",
         ]
     );
@@ -87,6 +94,8 @@ fn every_list_endpoint_documents_cursor_pagination() {
         "listEnvironments",
         "listManagementKeys",
         "listDcrPolicies",
+        "listSessions",
+        "listRefreshFamilies",
     ] {
         let params = find_operation(&doc, op)["parameters"]
             .as_array()
@@ -113,6 +122,9 @@ fn every_post_documents_the_idempotency_key_header() {
         "createDcrPolicy",
         "createDcrInitialAccessToken",
         "verifyDcrClient",
+        "revokeSession",
+        "bulkRevokeSessions",
+        "revokeUserSessions",
     ] {
         let params = find_operation(&doc, op)["parameters"]
             .as_array()
@@ -162,12 +174,19 @@ fn documented_paths_are_the_expected_set() {
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/dcr/policies",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/keys",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/keys/{key_id}",
+            "GET /v1/tenants/{tenant_id}/environments/{environment_id}/refresh-families",
+            "GET /v1/tenants/{tenant_id}/environments/{environment_id}/refresh-families/{family_id}",
+            "GET /v1/tenants/{tenant_id}/environments/{environment_id}/sessions",
+            "GET /v1/tenants/{tenant_id}/environments/{environment_id}/sessions/{session_id}",
             "POST /v1/tenants",
             "POST /v1/tenants/{tenant_id}/environments",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/clients/{client_id}/verify",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/dcr/initial-access-tokens",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/dcr/policies",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/keys",
+            "POST /v1/tenants/{tenant_id}/environments/{environment_id}/sessions/revoke",
+            "POST /v1/tenants/{tenant_id}/environments/{environment_id}/sessions/{session_id}/revoke",
+            "POST /v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}/sessions/revoke",
         ]
     );
 }
@@ -206,7 +225,7 @@ fn committed_artifact_matches_generated_spec() {
 async fn served_routes_match_documented_routes() {
     let router = db_free_router();
     let documented = documented_method_paths();
-    assert_eq!(documented.len(), 17, "the documented route count is pinned");
+    assert_eq!(documented.len(), 24, "the documented route count is pinned");
 
     // 1. Every documented (method, path) is wired and auth-gated (401, not
     //    404/405). The unauthenticated probe rejects before any DB access.

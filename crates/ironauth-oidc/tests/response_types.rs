@@ -473,3 +473,77 @@ async fn form_post_delivers_a_front_channel_id_token_in_the_form_body_only() {
     assert_eq!(claims["nonce"], "n-fp");
     assert_eq!(common::form_field(&body, "state").as_deref(), Some("s-fp"));
 }
+
+/// The stored per-(client, session) sid the code flow would issue for this pair, read
+/// through the same `ensure_sid` the token endpoint calls (idempotent, so this returns
+/// the value already stored rather than minting a divergent one).
+async fn code_flow_sid(
+    harness: &Harness,
+    session: &ironauth_store::SessionId,
+    client: &str,
+) -> String {
+    harness
+        .store()
+        .scoped(harness.scope())
+        .client_sessions()
+        .ensure_sid(harness.env(), session, client, 0)
+        .await
+        .expect("ensure sid")
+}
+
+#[tokio::test]
+async fn the_implicit_and_hybrid_id_tokens_carry_the_same_sid_the_code_flow_issues() {
+    // Discovery advertises backchannel_logout_session_supported UNCONDITIONALLY and
+    // lists `sid` in claims_supported. That advertisement is a LIE for any config with
+    // the legacy response types enabled unless the front-channel mints thread the sid
+    // through too: a client on the implicit or hybrid flow could not be targeted by
+    // back-channel logout. So both front-channel ID tokens must carry a sid, and it must
+    // be the SAME sid the code flow issues for that (client, session) pair.
+    let harness = Harness::start_with(legacy_enabled()).await;
+    let client_id = harness.client_id().to_string();
+    let subject = harness.seed_unique_user().await;
+    harness.grant_consent(&subject, &client_id).await;
+    let (session_id, cookie) = harness.session_with_id(&subject, "pwd", 0).await;
+
+    // The sid the code flow would issue for this exact (client, session).
+    let expected_sid = code_flow_sid(&harness, &session_id, &client_id).await;
+    assert!(!expected_sid.is_empty());
+    // Never the session id itself (that would be the cross-client correlation handle).
+    assert_ne!(expected_sid, session_id.to_string());
+
+    // The PURE IMPLICIT id_token carries that sid.
+    let implicit_query = format!(
+        "response_type=id_token&client_id={client_id}&redirect_uri={}&nonce=n-i&state=s-i",
+        enc(REDIRECT_URI),
+    );
+    let (status, headers, body) = harness
+        .authorize_with_cookie(&implicit_query, &cookie)
+        .await;
+    assert_eq!(status, StatusCode::SEE_OTHER, "implicit redirect: {body}");
+    let implicit_token =
+        location_fragment_param(&headers, "id_token").expect("implicit id_token in fragment");
+    let implicit_claims = verified_claims(&harness, &client_id, &implicit_token);
+    assert_eq!(
+        implicit_claims["sid"].as_str(),
+        Some(expected_sid.as_str()),
+        "the implicit id_token must carry the code flow's sid: {implicit_claims}"
+    );
+
+    // The HYBRID code id_token carries that sid too.
+    let hybrid_query = format!(
+        "response_type={}&client_id={client_id}&redirect_uri={}&nonce=n-h&state=s-h&\
+         code_challenge={PKCE_CHALLENGE}&code_challenge_method=S256",
+        enc("code id_token"),
+        enc(REDIRECT_URI),
+    );
+    let (status, headers, body) = harness.authorize_with_cookie(&hybrid_query, &cookie).await;
+    assert_eq!(status, StatusCode::SEE_OTHER, "hybrid redirect: {body}");
+    let hybrid_token =
+        location_fragment_param(&headers, "id_token").expect("hybrid id_token in fragment");
+    let hybrid_claims = verified_claims(&harness, &client_id, &hybrid_token);
+    assert_eq!(
+        hybrid_claims["sid"].as_str(),
+        Some(expected_sid.as_str()),
+        "the hybrid id_token must carry the code flow's sid: {hybrid_claims}"
+    );
+}

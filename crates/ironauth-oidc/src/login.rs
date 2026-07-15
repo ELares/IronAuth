@@ -103,8 +103,18 @@ pub async fn login_post(
             // `pwd`) at the current clock instant. The ID token's auth_time, amr,
             // and acr all derive from it (issue #14).
             let event = AuthenticationEvent::password(epoch_micros(state.now()));
-            match interaction::establish_session(&state, resume.scope, &subject, &event, actor)
-                .await
+            // Session-fixation defense (issue #32): establish_session rotates away
+            // any session the browser already presented (read from `headers`),
+            // invalidating it in the same transaction as the fresh one.
+            match interaction::establish_session(
+                &state,
+                resume.scope,
+                &subject,
+                &event,
+                actor,
+                &headers,
+            )
+            .await
             {
                 Ok(cookie) => interaction::redirect_setting_cookie(&resume.return_to, &cookie),
                 Err(_) => interaction::server_error_page(),

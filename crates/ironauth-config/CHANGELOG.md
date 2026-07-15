@@ -6,6 +6,22 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Session-model settings (issue #32).
+  - `oidc.session_idle_ttl_secs`: the session IDLE timeout, alongside `session_ttl_secs`
+    (now documented as the ABSOLUTE hard cap). Validated to be at least 1 second, at most
+    `OIDC_MAX_SESSION_TTL_SECS`, and never larger than the absolute cap (an idle timeout
+    beyond the cap could never fire, so accepting it would mislead an operator).
+  - `oidc.session_partitioned_cookie`: off by default; ADDS the CHIPS `Partitioned`
+    attribute for embedded-widget scenarios without dropping `SameSite` or breaking the
+    `__Host-` prefix.
+  - `oidc.session_peer_ip_binding` and `oidc.session_device_binding`: both off by default
+    (the tunability principle), so a NAT or a mobile IP change never logs a user out
+    unless an operator opts in.
+  - `PEER_IP_HEADER`: the internal header on which the server stamps the POLICY-RESOLVED
+    client IP for the peer-IP binding. It lives here, in the crate both the server and the
+    OIDC provider depend on, so the two agree on the name without the server taking a
+    dependency on the OIDC crate.
+
 - Add a conformance cert-config confinement test (issue #37):
   `tests/conformance_cert_config.rs` loads both `deploy/ironauth.toml` and
   `deploy/conformance/ironauth.toml` through the strict loader and asserts the

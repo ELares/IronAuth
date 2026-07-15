@@ -372,6 +372,15 @@ name = "device"
 path = "tests/device.rs"
 required-features = ["testing"]
 
+# The session model on the OIDC surface (issue #32): the per-(client, session) `sid`
+# claim (stable across issuances for one pair, distinct across two clients of the same
+# SSO session, never the session id itself) and the immediate effect of a revocation
+# (a revoked session stops authenticating the authorization endpoint at once). Needs a
+# real database.
+[[test]]
+name = "sessions"
+path = "tests/sessions.rs"
+required-features = ["testing"]
 # RFC 9700 (OAuth 2.0 Security BCP) as executable CI conformance invariants (issue
 # #38): one named test per applicable checklist item driving the LIVE endpoints, plus
 # an in-binary mutation harness proving every shared checker predicate rejects the

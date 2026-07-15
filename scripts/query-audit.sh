@@ -87,7 +87,12 @@ cd "$(git rev-parse --show-toplevel)"
 # human approves. TENANT-SCOPED with forced row-level security, so its SQL stays in
 # the repository module too. Its per-source verification rate limiting reuses the
 # generic dcr_rate_counters fixed-window counter (a device_verify: key namespace).
-SCOPED_TABLES='clients|organizations|audit_log|management_credentials|idempotency_keys|grants|authorization_codes|issued_tokens|signing_keys|users|sessions|consents|resource_servers|opaque_access_tokens|client_assertion_jtis|client_auth_diagnostics|pushed_authorization_requests|refresh_families|refresh_tokens|service_accounts|dcr_policies|dcr_initial_access_tokens|dcr_rate_counters|external_assertion_issuers|external_assertion_subject_mappings|external_assertion_jtis|device_codes'
+#
+# client_sessions (#32) is the per-client tier of the two-tier session model: the
+# per-(client, session) sid store, keyed to one SSO session. TENANT-SCOPED with
+# forced row-level security, so its SQL stays in the repository module too. The SSO
+# tier reuses the expanded sessions table above.
+SCOPED_TABLES='clients|organizations|audit_log|management_credentials|idempotency_keys|grants|authorization_codes|issued_tokens|signing_keys|users|sessions|consents|resource_servers|opaque_access_tokens|client_assertion_jtis|client_auth_diagnostics|pushed_authorization_requests|refresh_families|refresh_tokens|service_accounts|dcr_policies|dcr_initial_access_tokens|dcr_rate_counters|external_assertion_issuers|external_assertion_subject_mappings|external_assertion_jtis|device_codes|client_sessions'
 
 # The one module allowed to name a scoped table in SQL.
 REPO_MODULE='crates/ironauth-store/src/repository.rs'

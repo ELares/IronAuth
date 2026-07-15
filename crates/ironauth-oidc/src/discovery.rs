@@ -128,6 +128,11 @@ pub const ID_TOKEN_CLAIMS_SUPPORTED: &[&str] = &[
     "auth_time",
     "acr",
     "amr",
+    // The OP session identifier (issue #32): every authorization-code ID token
+    // carries it, stable per (client, session) and distinct across pairs, so it is
+    // the join key OIDC Back-Channel Logout targets. Advertised here so
+    // claims_supported never understates what a minted ID token actually carries.
+    "sid",
 ];
 
 /// The `claims_supported` array the discovery document advertises: every claim
@@ -555,6 +560,16 @@ pub fn discovery_document(
     document.insert(
         "require_pushed_authorization_requests".to_owned(),
         json!(capabilities.require_pushed_authorization_requests),
+    );
+
+    // OIDC Back-Channel Logout 1.0 (issue #32): every authorization-code ID token
+    // carries a per-(client, session) `sid`, stable per pair and distinct across
+    // pairs, so this is advertised TRUTHFULLY as supported. It is the join key a
+    // relying party needs to correlate a back-channel logout to its OP session; the
+    // logout endpoint that consumes it lands in a later M4 issue.
+    document.insert(
+        "backchannel_logout_session_supported".to_owned(),
+        json!(true),
     );
 
     Value::Object(document)

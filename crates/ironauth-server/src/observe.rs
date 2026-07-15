@@ -14,11 +14,11 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use axum::extract::{ConnectInfo, FromRequestParts, MatchedPath, Request, State};
-use axum::http::Method;
-use axum::http::StatusCode;
 use axum::http::request::Parts;
+use axum::http::{HeaderValue, Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::Response;
+use ironauth_config::PEER_IP_HEADER;
 use tracing::Instrument;
 
 use crate::AppState;
@@ -87,6 +87,16 @@ pub async fn observe(State(state): State<AppState>, mut req: Request, next: Next
         host: state.site.authority().to_owned(),
         forward_decision: resolution.decision,
     });
+
+    // Stamp the POLICY-RESOLVED client IP for the OFF-BY-DEFAULT peer-IP session
+    // binding (issue #32). `insert` REPLACES every value already on the request, so
+    // a client that tried to supply this header cannot spoof its own peer IP: what
+    // downstream reads is always what the trusted-proxy policy resolved.
+    if let Ok(value) = HeaderValue::from_str(&client_ip.to_string()) {
+        req.headers_mut().insert(PEER_IP_HEADER, value);
+    } else {
+        req.headers_mut().remove(PEER_IP_HEADER);
+    }
 
     let span = tracing::info_span!(
         "http_request",

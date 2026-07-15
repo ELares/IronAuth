@@ -143,7 +143,7 @@ pub async fn device_post(
     if form.decision.is_some() {
         device_decision(&state, scope, &action, &headers, &form).await
     } else if form.identifier.is_some() || form.password.is_some() {
-        device_login(&state, scope, &action, &form).await
+        device_login(&state, scope, &action, &headers, &form).await
     } else {
         device_enter(&state, scope, &action, peer, &headers, &form).await
     }
@@ -205,9 +205,7 @@ async fn device_enter(
             // Require an authenticated session; escalate into the M2 login otherwise.
             // The GET is prefill-only, so this handler (not a bounced GET) renders the
             // next step directly.
-            match interaction::resolve_session(state, scope, interaction::cookie_header(headers))
-                .await
-            {
+            match interaction::resolve_session(state, scope, headers).await {
                 Some(_) => render_confirm(state, scope, action, raw_code, &flow).await,
                 None => pages::secure_html(
                     StatusCode::OK,
@@ -226,6 +224,7 @@ async fn device_login(
     state: &OidcState,
     scope: Scope,
     action: &str,
+    headers: &HeaderMap,
     form: &DeviceForm,
 ) -> Response {
     let raw_code = form
@@ -252,7 +251,11 @@ async fn device_login(
             let actor = interaction::user_actor(&user.id);
             let subject = user.id.to_string();
             let event = AuthenticationEvent::password(epoch_micros(state.now()));
-            match interaction::establish_session(state, scope, &subject, &event, actor).await {
+            // A privilege transition (issue #32): establish_session mints a fresh
+            // session id and rotates away any prior one the request presented.
+            match interaction::establish_session(state, scope, &subject, &event, actor, headers)
+                .await
+            {
                 // The GET is prefill-only, so we cannot bounce through it to render the
                 // next step; render the confirmation directly and set the freshly
                 // established session cookie on that same response.
@@ -284,9 +287,7 @@ async fn device_decision(
     headers: &HeaderMap,
     form: &DeviceForm,
 ) -> Response {
-    let Some(session) =
-        interaction::resolve_session(state, scope, interaction::cookie_header(headers)).await
-    else {
+    let Some(session) = interaction::resolve_session(state, scope, headers).await else {
         // No session: fall back to the sign-in step for this code.
         let raw_code = form.user_code.as_deref().unwrap_or_default();
         return pages::secure_html(
@@ -382,6 +383,13 @@ async fn approve_flow(
 
     let grant_id = GrantId::generate(state.env(), &scope);
     let now = epoch_micros(state.now());
+    // Record the APPROVING human's SSO session on the grant (issue #32). The device
+    // flow does authenticate a human (right here, at the verification page), so its
+    // grant has a real authenticating session exactly like the code flow's, and its ID
+    // token can therefore carry the per-(client, session) `sid` that back-channel
+    // logout targets. Without this the sid would be unresolvable at redeem and the
+    // device flow would be the hole in the sid advertisement.
+    let session_ref = session.session_id.to_string();
     let result = state
         .store()
         .scoped(scope)
@@ -394,6 +402,7 @@ async fn approve_flow(
                 grant_id: &grant_id,
                 subject: &session.subject,
                 consent_ref: Some(&consent_id),
+                session_ref: Some(&session_ref),
                 auth_methods: &session.auth_methods,
                 auth_time_unix_micros: Some(session.auth_time_unix_micros),
                 created_at_unix_micros: now,

@@ -277,6 +277,15 @@ pub struct MintRequest<'a> {
     /// The recorded authentication instant in epoch microseconds, present ONLY
     /// when the ID token must carry `auth_time`; [`None`] omits the claim.
     pub auth_time_unix_micros: Option<i64>,
+    /// The per-(client, session) `sid` claim (issue #32): the OP session identifier
+    /// the ID token carries, stable for the lifetime of the (client, session) pair
+    /// and distinct across pairs, so OIDC Back-Channel Logout can target exactly this
+    /// (client, session). The token endpoint resolves it from the authenticating SSO
+    /// session through the per-client session store, so it is emitted here as a
+    /// LEGITIMATE issuer claim (a self-asserted custom claim named `sid` is still
+    /// blocklisted; see [`PROTECTED_ACCESS_TOKEN_CLAIMS`]). [`None`] when no session
+    /// backed the exchange (no `sid` is then emitted).
+    pub sid: Option<&'a str>,
     /// The access-token hash for a front-channel ID token (issue #17). The token
     /// endpoint always passes [`None`]: a token-endpoint ID token never carries
     /// `at_hash`.
@@ -361,6 +370,16 @@ pub(crate) fn build_id_token_claims(
     // auth_time, so it is emitted here truthfully.
     if let Some(auth_micros) = request.auth_time_unix_micros {
         claims["auth_time"] = json!(auth_micros.div_euclid(1_000_000));
+    }
+
+    // sid (issue #32): the OP session identifier, present in EVERY code-flow ID
+    // token (the token endpoint resolves it from the authenticating SSO session
+    // through the per-client session store). It is stable per (client, session) and
+    // distinct across clients, so it is the join key OIDC Back-Channel Logout targets
+    // and the reason discovery can truthfully advertise
+    // backchannel_logout_session_supported. Emitted here as a legitimate issuer claim.
+    if let Some(sid) = request.sid {
+        claims["sid"] = json!(sid);
     }
 
     // at_hash / c_hash: dormant seams for the front-channel/hybrid path (#17).
@@ -895,6 +914,7 @@ mod tests {
             oauth_scope: None,
             auth_methods,
             auth_time_unix_micros: None,
+            sid: None,
             at_hash: None,
             c_hash: None,
             extra_claims: empty_extra(),

@@ -6,6 +6,75 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- The authoritative two-tier session model with fleet operations (issue #32, migration
+  0022, expand). Closes the M4 slice of tracking issue #206: this model SUPERSEDES the
+  #20 bootstrap session.
+  - **Two tiers, authoritative in Postgres.** The `sessions` table is EXPANDED (never
+    replaced) with revocation state (`revoked_at`, `revoke_reason`), rotation lineage
+    (`superseded_by`), the session-expiry columns this issue OWNS (`idle_expires_at`,
+    `absolute_expires_at`, `ended_at`, `end_cause`; a later issue must not re-add them),
+    and the fleet metadata (`last_seen_at`, plus the OFF-BY-DEFAULT binding inputs
+    `user_agent` and `peer_ip`). The NEW `client_sessions` table is tier two: one row per
+    (SSO session, client), carrying the STORED per-(client, session) `sid`. No
+    in-memory-only authoritative state, so a rolling restart loses no session.
+  - **IMMEDIATE revocation.** `SessionRepo::get` refuses a session whose `revoked_at`,
+    `ended_at`, or `superseded_by` is set REGARDLESS of expiry, so a revoked or rotated
+    session stops resolving at once. An expiry-only guard would have let every logout
+    silently no-op until the lifetime elapsed.
+  - **The sid tier.** `ClientSessionRepo::ensure_sid` gets-or-creates the per-(client,
+    session) row and returns its STORED `sid` (an independent 128-bit value from the
+    entropy seam, never `sid = session_id`), so the claim is stable across refreshes for
+    one pair and distinct across two clients of the same SSO session: colluding relying
+    parties cannot correlate the user, and back-channel logout can target one client.
+  - **Rotation and revocation, each one audited transaction.**
+    `ActingSessionRepo::rotate` mints a fresh id and invalidates the prior one in the
+    SAME transaction (session-fixation defense; audits `session.rotate` distinctly from
+    `session.create`). `revoke`, `bulk_revoke`, and `revoke_all_for_user` flip the
+    session, end its per-client sessions, and cascade to the refresh families in one
+    transaction with the audit row (and the optional Idempotency-Key record). A
+    forced-rollback test proves the data change and its audit row are joint.
+  - **Offline-preserving cascade.** The cascade revokes the session-bound refresh
+    families and PRESERVES the `offline_access` families (issue #21's
+    offline-survives-logout semantic); an explicit `hard_kill` flag also revokes the
+    offline families AND their grants, so their access tokens die immediately.
+  - **Scope-fenced fleet surfaces.** `SessionFleetRepo` and `RefreshFamilyFleetRepo`
+    list and inspect sessions and refresh families (searchable by user and by client
+    within the environment scope). A bulk revoke silently skips a foreign-scope id
+    rather than reaching across the boundary. All seven surfaces register an
+    `IsolationProbe` (`register_session_fleet_probes`) and run under forced RLS.
+  - **Column-scoped grants (no table-wide UPDATE).** `ironauth_app` and
+    `ironauth_control` each get only the COLUMN-SCOPED `UPDATE` the surfaces need on
+    `sessions`, `client_sessions`, `refresh_families`, and `grants`.
+  - **New audit actions.** `session.rotate`, `session.revoke`, `sessions.bulk_revoke`,
+    and `user.sessions.revoke_all`.
+  - **Rotation carries or terminates the prior lineage (never orphans it).** A rotation
+    now reconciles the prior session INSIDE its existing transaction and returns a
+    `PriorSessionOutcome`. When the prior session is the SAME subject (a re-authentication
+    in the same browser) its per-client sessions and refresh families are RE-POINTED onto
+    the successor, so the `sid` stays stable and a later revoke/logout still cascades to
+    everything the earlier lineage segment opened. When it is a DIFFERENT subject (a login
+    while presenting somebody else's cookie) the prior session is TERMINALLY revoked with
+    the full cascade and the incoming user inherits nothing, with a distinct
+    `replaced_by_other_subject` end cause. Previously the supersede moved only the
+    `sessions` row, orphaning the prior lineage's families and per-client sessions so a
+    logout of the successor never revoked them.
+  - **Idle timeout actually slides.** `SessionRepo::get` now takes the configured idle
+    window and, on a successful resolve past roughly half of it, rewrites
+    `idle_expires_at`/`last_seen_at` (re-asserting the full liveness guard, so a revoked
+    session is never resurrected). Previously nothing slid the window after insert, so a
+    continuously active session was killed at the idle TTL as if it were a second
+    absolute cap.
+  - **`ensure_sid` refuses a dead session.** The per-client session is inserted only if
+    the SSO session still resolves live (same guard as the read path), so a code minted
+    before a revoke and redeemed after it can never mint a fresh live `sid` bound to a
+    dead session. Returns `NotFound` for a dead session.
+  - **Fleet LIST isolation probes.** `session_fleet.list` and `refresh_family_fleet.list`
+    now register `IsolationProbe`s too (the list surfaces, where a broken policy would
+    leak a whole tenant at once rather than one row).
+  - **Removed.** `ActingSessionRepo::create` (the bootstrap create path): `rotate` with
+    no prior session is now the single create path, so no session can be created that
+    skips the rotation seam.
+
 - Device authorization grant persistence (issue #24, migration 0021, expand).
   - **New scoped table.** `device_codes` holds a device-authorization flow keyed by the
     SHA-256 digest of the WHOLE device code (never the code itself): the non-secret

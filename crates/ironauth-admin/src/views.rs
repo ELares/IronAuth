@@ -10,7 +10,10 @@
 
 use std::fmt;
 
-use ironauth_store::{EnvironmentRecord, ManagementCredentialRecord, TenantRecord};
+use ironauth_store::{
+    EnvironmentRecord, ManagementCredentialRecord, RefreshFamilySummary, SessionSummary,
+    TenantRecord,
+};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
@@ -326,4 +329,225 @@ pub struct ClientVerificationView {
     /// never verified.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub verified_at_unix_ms: Option<i64>,
+}
+
+/// A session, as the fleet-operations surface reports it (issue #32).
+///
+/// Sessions are first-class, searchable, metadata-carrying fleet resources rather
+/// than an opaque internal table. The view deliberately reports REVOKED, ROTATED, and
+/// ENDED sessions too (not just live ones), so an operator can inspect the whole
+/// lifecycle: `ended_at` plus `end_cause` say when and why, and `superseded_by` names
+/// the successor when the session was rotated away at a privilege transition.
+///
+/// `user_agent` and `peer_ip` are present only when the operator enabled the
+/// corresponding OFF-BY-DEFAULT binding knob, so the safe default records neither.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct SessionView {
+    /// The session identifier (`ses_...`).
+    pub id: String,
+    /// The authenticated end-user subject (`usr_...`).
+    pub subject: String,
+    /// The recorded authentication methods (space-separated RFC 8176 values).
+    pub auth_methods: String,
+    /// Creation time, milliseconds since the Unix epoch.
+    pub created_at_unix_ms: i64,
+    /// When the session was last seen, milliseconds since the Unix epoch.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_seen_at_unix_ms: Option<i64>,
+    /// The idle timeout, milliseconds since the Unix epoch.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub idle_expires_at_unix_ms: Option<i64>,
+    /// The absolute hard-cap expiry, milliseconds since the Unix epoch.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub absolute_expires_at_unix_ms: Option<i64>,
+    /// When the session was revoked, milliseconds since the Unix epoch, or null.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub revoked_at_unix_ms: Option<i64>,
+    /// When the session ended (revoked or rotated away), or null if it is live.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ended_at_unix_ms: Option<i64>,
+    /// Why the session ended (`revoked`, `bulk_revoked`, `user_revoked_all`,
+    /// `logged_out`, or `rotated`), or null if it is live.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end_cause: Option<String>,
+    /// The successor session id when this one was ROTATED away, or null. Its presence
+    /// is what distinguishes a rotation from a terminal end.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub superseded_by: Option<String>,
+    /// The recorded user agent (only when the device binding knob is on).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_agent: Option<String>,
+    /// The recorded peer IP (only when the peer-IP binding knob is on).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub peer_ip: Option<String>,
+}
+
+impl From<SessionSummary> for SessionView {
+    fn from(record: SessionSummary) -> Self {
+        Self {
+            id: record.id,
+            subject: record.subject,
+            auth_methods: record.auth_methods,
+            created_at_unix_ms: ms(record.created_at_unix_micros),
+            last_seen_at_unix_ms: record.last_seen_at_unix_micros.map(ms),
+            idle_expires_at_unix_ms: record.idle_expires_at_unix_micros.map(ms),
+            absolute_expires_at_unix_ms: record.absolute_expires_at_unix_micros.map(ms),
+            revoked_at_unix_ms: record.revoked_at_unix_micros.map(ms),
+            ended_at_unix_ms: record.ended_at_unix_micros.map(ms),
+            end_cause: record.end_cause,
+            superseded_by: record.superseded_by,
+            user_agent: record.user_agent,
+            peer_ip: record.peer_ip,
+        }
+    }
+}
+
+/// A page of sessions.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct SessionList {
+    /// The sessions in this page.
+    pub items: Vec<SessionView>,
+    /// The cursor for the next page, or null when this is the last page.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+/// A refresh-token family, as the fleet-operations surface reports it (issue #32).
+/// Families are searchable fleet resources alongside sessions, so an operator can see
+/// exactly which long-lived credential chains a user or a client holds.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct RefreshFamilyView {
+    /// The family identifier (`rff_...`).
+    pub id: String,
+    /// The authenticated end-user subject the family's tokens are minted for.
+    pub subject: String,
+    /// The OAuth client the family belongs to.
+    pub client_id: String,
+    /// The granted OAuth scope the family was issued against.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
+    /// The authenticating SSO session (`ses_...`), when a session backed the grant.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_ref: Option<String>,
+    /// Whether this is an `offline_access` family. An offline family SURVIVES a
+    /// logout and a session revocation (issue #21); only an explicit hard kill ends
+    /// it.
+    pub offline: bool,
+    /// Creation time, milliseconds since the Unix epoch.
+    pub created_at_unix_ms: i64,
+    /// The absolute hard cap on the family's rotated lifetime.
+    pub absolute_expires_at_unix_ms: i64,
+    /// When the family was revoked, milliseconds since the Unix epoch, or null.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub revoked_at_unix_ms: Option<i64>,
+}
+
+impl From<RefreshFamilySummary> for RefreshFamilyView {
+    fn from(record: RefreshFamilySummary) -> Self {
+        Self {
+            id: record.id,
+            subject: record.subject,
+            client_id: record.client_id,
+            scope: record.scope,
+            session_ref: record.session_ref,
+            offline: record.offline,
+            created_at_unix_ms: ms(record.created_at_unix_micros),
+            absolute_expires_at_unix_ms: ms(record.absolute_expires_at_unix_micros),
+            revoked_at_unix_ms: record.revoked_at_unix_micros.map(ms),
+        }
+    }
+}
+
+/// A page of refresh-token families.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct RefreshFamilyList {
+    /// The families in this page.
+    pub items: Vec<RefreshFamilyView>,
+    /// The cursor for the next page, or null when this is the last page.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+/// The body of a single-session or revoke-everything-for-a-user revocation (issue
+/// #32). Both fields are optional, so an empty body is a plain, offline-preserving
+/// revoke.
+#[derive(Debug, Clone, Default, Deserialize, ToSchema)]
+pub struct RevokeSessionsRequest {
+    /// Also revoke the user's `offline_access` refresh families AND their grants, so
+    /// every already-issued access token dies immediately (a HARD KILL).
+    ///
+    /// The default (`false`) PRESERVES the `offline_access` families, which is the
+    /// documented offline-survives-logout semantic (issue #21): a background job
+    /// holding an offline token keeps working when the user's browser session is
+    /// revoked. Set this only when the intent is to cut a compromised principal off
+    /// from everything.
+    #[serde(default)]
+    pub hard_kill: bool,
+}
+
+/// The body of a BULK session revocation (issue #32).
+#[derive(Debug, Clone, Default, Deserialize, ToSchema)]
+pub struct BulkRevokeSessionsRequest {
+    /// The sessions to revoke. Every id is scope-FENCED: one belonging to another
+    /// tenant or environment is a uniform no-op (never an error that would confirm
+    /// its existence), so a batch can never reach across a scope boundary.
+    #[serde(default)]
+    pub session_ids: Vec<String>,
+    /// Also revoke the `offline_access` families and their grants (a HARD KILL). The
+    /// default preserves them; see [`RevokeSessionsRequest::hard_kill`].
+    #[serde(default)]
+    pub hard_kill: bool,
+}
+
+/// The result of revoking one session (issue #32).
+///
+/// Every revocation view states the POST-CONDITION (what is true now), never a delta
+/// (how many rows this particular call happened to flip). That is deliberate, and it
+/// is what makes the two cross-cutting contracts hold at once:
+///
+/// - **Idempotency-Key replay.** The stored response is written in the SAME
+///   transaction as the revocation, so its body must be known before the write. A
+///   post-condition is; a row count is not.
+/// - **The anti-oracle.** An absent session, a session in ANOTHER tenant, and an
+///   already-revoked session all produce the identical response, so the surface never
+///   confirms which sessions exist.
+///
+/// The actual cascade is observable where it belongs: the refresh-family fleet list,
+/// which shows exactly which families were revoked and which `offline_access`
+/// families survived.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct SessionRevocationView {
+    /// The session that was targeted.
+    pub id: String,
+    /// Always true: after this call the session does not resolve, whether it was live,
+    /// already revoked, or absent (the anti-oracle).
+    pub revoked: bool,
+    /// Whether the `offline_access` refresh families were killed too. When false (the
+    /// default) they SURVIVE, which is issue #21's offline-survives-logout semantic.
+    pub hard_kill: bool,
+}
+
+/// The result of a BULK session revocation (issue #32). States the post-condition; see
+/// [`SessionRevocationView`] for why.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct BulkRevocationView {
+    /// How many of the named sessions were IN SCOPE and therefore targeted. Ids that
+    /// were malformed or belonged to another tenant or environment are silently
+    /// dropped (scope fence), so this can be lower than the number of ids sent.
+    pub sessions_targeted: u64,
+    /// Whether the `offline_access` refresh families were killed too.
+    pub hard_kill: bool,
+}
+
+/// The result of revoking every session of one user (issue #32). States the
+/// post-condition; see [`SessionRevocationView`] for why.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct UserRevocationView {
+    /// The user that was targeted.
+    pub subject: String,
+    /// Always true: after this call none of the user's sessions resolve.
+    pub revoked: bool,
+    /// Whether the user's `offline_access` refresh families were killed too. When
+    /// false (the default) they SURVIVE the mass logout.
+    pub hard_kill: bool,
 }

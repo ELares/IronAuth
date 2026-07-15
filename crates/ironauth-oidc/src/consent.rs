@@ -68,8 +68,7 @@ pub async fn consent_get(
     let Some(resume) = parse_resume(query.return_to.as_deref()) else {
         return interaction::invalid_link_page();
     };
-    let cookie = interaction::cookie_header(&headers);
-    if interaction::resolve_session(&state, resume.scope, cookie)
+    if interaction::resolve_session(&state, resume.scope, &headers)
         .await
         .is_none()
     {
@@ -111,8 +110,7 @@ pub async fn consent_post(
     let Some(resume) = parse_resume(form.return_to.as_deref()) else {
         return interaction::invalid_link_page();
     };
-    let cookie = interaction::cookie_header(&headers);
-    let Some(auth) = interaction::resolve_session(&state, resume.scope, cookie).await else {
+    let Some(auth) = interaction::resolve_session(&state, resume.scope, &headers).await else {
         return interaction::login_redirect(&resume.return_to);
     };
 

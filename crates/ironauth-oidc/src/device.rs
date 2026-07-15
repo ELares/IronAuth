@@ -37,7 +37,7 @@ use ironauth_env::Env;
 use ironauth_store::{
     ApprovedDeviceGrant, ClientId, CorrelationId, DeviceCodeId, DevicePollOutcome,
     DeviceRedeemOutcome, IssuedTokenRecord, NewDeviceCode, NewOpaqueAccessToken, NewRefreshFamily,
-    RefreshFamilyId, Scope, StoreError, TokenKind,
+    RefreshFamilyId, RefreshFamilyOpenOutcome, Scope, SessionId, StoreError, TokenKind,
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -368,7 +368,7 @@ pub async fn device_code_grant(
             if grant.client_id != authenticated.client_id {
                 return Err(TokenError::InvalidGrant);
             }
-            issue_device_tokens(state, scope, grant).await
+            issue_device_tokens(state, scope, *grant).await
         }
     }
 }
@@ -438,7 +438,7 @@ async fn issue_device_tokens(
 
     match outcome {
         DeviceRedeemOutcome::Redeemed => {
-            let refresh = issue_device_refresh(state, scope, &grant).await;
+            let refresh = issue_device_refresh(state, scope, &grant).await?;
             Ok(device_token_response(
                 &minted,
                 grant.requested_scope.as_deref(),
@@ -451,10 +451,51 @@ async fn issue_device_tokens(
     }
 }
 
+/// Resolve the per-(client, session) `sid` for an approved device flow (issue #32),
+/// from the SSO session of the human who approved it at the verification page.
+///
+/// Returns [`None`] only for a grant approved BEFORE the approving session was recorded
+/// (there is genuinely no session to resolve), so an in-flight upgrade keeps working:
+/// such a flow simply mints without a `sid`, exactly as it did before.
+///
+/// If the approving human's session is no longer LIVE (they logged out, or an operator
+/// revoked it, between approving the device and the device polling for its tokens), the
+/// store refuses to hang a per-client session off a dead SSO session and this is a
+/// uniform `invalid_grant`: the same rule the code exchange enforces, so a revoked
+/// session cannot be laundered into fresh live tokens through the slower flow.
+///
+/// A genuine store fault fails CLOSED as a `server_error`, never a silently
+/// session-less ID token.
+async fn resolve_device_sid(
+    state: &OidcState,
+    scope: Scope,
+    grant: &ApprovedDeviceGrant,
+) -> Result<Option<String>, TokenError> {
+    let Some(session_ref) = grant.session_ref.as_deref() else {
+        return Ok(None);
+    };
+    let session_id =
+        SessionId::parse_in_scope(session_ref, &scope).map_err(|_| TokenError::InvalidGrant)?;
+    let now_micros = epoch_micros(state.now());
+    match state
+        .store()
+        .scoped(scope)
+        .client_sessions()
+        .ensure_sid(state.env(), &session_id, &grant.client_id, now_micros)
+        .await
+    {
+        Ok(sid) => Ok(Some(sid)),
+        // The store's live-session guard found no live SSO session to bind to.
+        Err(StoreError::NotFound) => Err(TokenError::InvalidGrant),
+        Err(_) => Err(TokenError::ServerError),
+    }
+}
+
 /// Mint the ID and access tokens for an approved device flow (issue #24). Reuses the
 /// SAME pure minting core as the code grant; the auth-context claims derive from the
 /// approving human's session, frozen onto the flow at approval. A device flow has no
-/// `nonce` (RFC 8628 carries none), so the ID token omits it.
+/// `nonce` (RFC 8628 carries none), so the ID token omits it. The ID token carries the
+/// per-(client, session) `sid` (issue #32) of the approving human's SSO session.
 async fn mint_device_tokens(
     state: &OidcState,
     scope: Scope,
@@ -472,6 +513,15 @@ async fn mint_device_tokens(
         .await
         .map_err(|_| TokenError::ServerError)?;
     let extra_claims = serde_json::Map::new();
+    // The per-client `sid` (issue #32), resolved from the SSO session of the human who
+    // APPROVED this flow at the verification page, through the same (client, session)
+    // row the code flow uses. So a device-flow ID token carries the SAME sid the code
+    // flow would issue for that pair, and discovery's
+    // backchannel_logout_session_supported is true for the device flow too.
+    //
+    // Fails CLOSED: a store error is a server_error, never a silently session-less ID
+    // token that no back-channel logout could target.
+    let sid = resolve_device_sid(state, scope, grant).await?;
     tokens::mint(
         state,
         signer,
@@ -485,6 +535,7 @@ async fn mint_device_tokens(
             oauth_scope: grant.requested_scope.as_deref(),
             auth_methods: &grant.auth_methods,
             auth_time_unix_micros: grant.auth_time_unix_micros,
+            sid: sid.as_deref(),
             at_hash: None,
             c_hash: None,
             extra_claims: &extra_claims,
@@ -496,8 +547,12 @@ async fn mint_device_tokens(
 }
 
 /// Open a refresh-token family for an approved device flow, if the environment issues
-/// refresh tokens (issue #24, #21). A failure only costs this exchange its refresh
-/// token (logged), never the whole exchange, exactly like the code grant.
+/// refresh tokens (issue #24, #21). A store fault only costs this exchange its refresh
+/// token (logged), never the whole exchange, exactly like the code grant. But a
+/// session-bound (non-offline) open REFUSED because the approving human's SSO session
+/// was revoked in the open window (issue #32) is a hard `invalid_grant`: no family is
+/// created, so a logout that already cascaded cannot be outlived by a family opened
+/// just after it (the same rule the code grant enforces).
 ///
 /// DELIBERATE decision (issue #24): the device grant issues a refresh token whenever
 /// the environment issues them AT ALL, regardless of whether `offline_access` was
@@ -512,9 +567,9 @@ async fn issue_device_refresh(
     state: &OidcState,
     scope: Scope,
     grant: &ApprovedDeviceGrant,
-) -> Option<String> {
+) -> Result<Option<String>, TokenError> {
     if !state.issue_refresh_tokens() {
-        return None;
+        return Ok(None);
     }
     let offline = grant.requested_scope.as_deref().is_some_and(|value| {
         value
@@ -534,7 +589,7 @@ async fn issue_device_refresh(
             .unwrap_or(now),
     );
     let Ok(client_id) = ClientId::parse_in_scope(&grant.client_id, &scope) else {
-        return None;
+        return Ok(None);
     };
     let actor = client_service_actor(&client_id);
     let correlation = CorrelationId::generate(state.env());
@@ -562,10 +617,13 @@ async fn issue_device_refresh(
         )
         .await;
     match result {
-        Ok(()) => Some(minted.token),
+        Ok(RefreshFamilyOpenOutcome::Opened) => Ok(Some(minted.token)),
+        // The approving human's SSO session was revoked in the open window, so no
+        // session-bound family was created: fail the exchange closed.
+        Ok(RefreshFamilyOpenOutcome::SessionNotLive) => Err(TokenError::InvalidGrant),
         Err(error) => {
             tracing::warn!(%error, "could not open a refresh-token family for a device flow");
-            None
+            Ok(None)
         }
     }
 }

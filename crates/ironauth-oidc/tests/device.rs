@@ -24,6 +24,7 @@ use std::time::Duration;
 
 use axum::http::StatusCode;
 use common::{Harness, REDIRECT_URI, enc, form, form_field, json};
+use ironauth_jose::verify;
 use ironauth_store::{
     DeviceAttemptOutcome, DevicePollOutcome, DeviceUserCodeLookup, device_code_digest,
     user_code_hash,
@@ -803,4 +804,131 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for BufferWriter {
     fn make_writer(&'a self) -> Self::Writer {
         self.clone()
     }
+}
+
+/// Approve the flow for `user_code` as the given (session cookie), so the test knows
+/// exactly which SSO session authenticated the approval. Mirrors `approve_via_page`
+/// but with a caller-supplied, known session instead of an anonymous fresh one.
+async fn approve_as(harness: &Harness, user_code: &str, cookie: &str) {
+    let path = device_path(harness);
+    let enter = form(&[("user_code", user_code)]);
+    let (status, _h, html) = harness.post_form(&path, &enter, Some(cookie)).await;
+    assert_eq!(status, StatusCode::OK, "confirm page: {html}");
+    let device_code_id =
+        form_field(&html, "device_code_id").expect("confirm page carries the flow handle");
+    let body = form(&[
+        ("decision", "allow"),
+        ("device_code_id", &device_code_id),
+        ("user_code", user_code),
+    ]);
+    let (status, _h, body) = harness.post_form(&path, &body, Some(cookie)).await;
+    assert_eq!(status, StatusCode::OK, "approve: {body}");
+}
+
+#[tokio::test]
+async fn the_device_flow_id_token_carries_the_approving_sessions_sid() {
+    // The device flow DOES authenticate a human (at the verification page), so its ID
+    // token must carry the per-(client, session) sid like every other flow's, or
+    // discovery's backchannel_logout_session_supported is a lie for any config with the
+    // device flow enabled. The sid must be the SAME one the code flow would issue for
+    // the approving (client, session) pair.
+    let harness = Harness::start().await;
+    let client = *harness.client_id();
+    harness
+        .enable_device_grant(&client, DEVICE_GRANTS, Some(TEST_LOGO))
+        .await;
+    let client_str = client.to_string();
+
+    let start = start_flow(&harness, &client_str, Some("openid")).await;
+    let device_code = start["device_code"].as_str().unwrap().to_owned();
+    let user_code = start["user_code"].as_str().unwrap().to_owned();
+
+    // A specific, KNOWN human session approves the flow.
+    let subject = harness.seed_unique_user().await;
+    harness.grant_consent(&subject, &client_str).await;
+    let (session_id, cookie) = harness.session_with_id(&subject, "pwd", 0).await;
+    approve_as(&harness, &user_code, &cookie).await;
+
+    // Poll for the tokens.
+    harness
+        .clock()
+        .advance(Duration::from_secs(INTERVAL_SECS + 1));
+    let (status, body) = poll(&harness, &device_code, &client_str).await;
+    assert_eq!(status, StatusCode::OK, "post-approval poll: {body:?}");
+    let id_token = body["id_token"]
+        .as_str()
+        .expect("device id_token")
+        .to_owned();
+
+    // The device ID token carries a sid, and it is the SAME sid the code flow would
+    // issue for the approving (client, session) pair.
+    let policy = harness.policy(&client_str);
+    let verified = verify(&id_token, &policy, &common::verify_clock()).expect("id token verifies");
+    let claims = verified.claims().raw();
+    let expected_sid = harness
+        .store()
+        .scoped(harness.scope())
+        .client_sessions()
+        .ensure_sid(harness.env(), &session_id, &client_str, 0)
+        .await
+        .expect("ensure sid");
+    assert_ne!(expected_sid, session_id.to_string());
+    assert_eq!(
+        claims["sid"].as_str(),
+        Some(expected_sid.as_str()),
+        "the device id_token must carry the approving session's sid: {claims:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_device_flow_whose_approving_session_was_revoked_before_redeem_is_invalid_grant() {
+    // The same liveness rule the code exchange enforces, on the slower device flow: a
+    // session revoked between approval and the device polling for its tokens must not be
+    // laundered into fresh live tokens.
+    let harness = Harness::start().await;
+    let client = *harness.client_id();
+    harness
+        .enable_device_grant(&client, DEVICE_GRANTS, Some(TEST_LOGO))
+        .await;
+    let client_str = client.to_string();
+
+    let start = start_flow(&harness, &client_str, Some("openid")).await;
+    let device_code = start["device_code"].as_str().unwrap().to_owned();
+    let user_code = start["user_code"].as_str().unwrap().to_owned();
+
+    let subject = harness.seed_unique_user().await;
+    harness.grant_consent(&subject, &client_str).await;
+    let (session_id, cookie) = harness.session_with_id(&subject, "pwd", 0).await;
+    approve_as(&harness, &user_code, &cookie).await;
+
+    // The approving human logs out BEFORE the device polls.
+    let env = harness.env().clone();
+    harness
+        .store()
+        .scoped(harness.scope())
+        .acting(
+            ironauth_store::ActorRef::service(ironauth_store::ServiceId::generate(&env)),
+            ironauth_store::CorrelationId::generate(&env),
+        )
+        .sessions()
+        .revoke(
+            &env,
+            &session_id,
+            ironauth_store::SessionEndCause::LoggedOut,
+            false,
+            None,
+        )
+        .await
+        .expect("revoke");
+
+    harness
+        .clock()
+        .advance(Duration::from_secs(INTERVAL_SECS + 1));
+    let (status, body) = poll(&harness, &device_code, &client_str).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a device flow bound to a dead session must not mint tokens: {body:?}"
+    );
+    assert_eq!(body["error"], "invalid_grant");
 }

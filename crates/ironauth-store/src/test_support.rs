@@ -29,6 +29,7 @@
 
 use ironauth_env::Env;
 use sqlx::PgPool;
+use sqlx::postgres::PgPoolOptions;
 
 use crate::audit::ActorRef;
 use crate::id::{EnvironmentId, HumanId, OperatorId, TenantId};
@@ -44,12 +45,22 @@ const APP_ROLE: &str = "ironauth_app";
 const CONTROL_ROLE: &str = "ironauth_control";
 
 /// A fresh, isolated database plus the handles the isolation tests need.
+///
+/// Cloning shares the same throwaway database and the same pools (every pool handle is
+/// `Arc`-backed), which is what lets a test hold the database across a simulated
+/// process restart. The database itself is torn down by the harness script, not by a
+/// `Drop`, so a clone can never pull it out from under a live handle.
+#[derive(Clone)]
 pub struct TestDatabase {
     owner_pool: PgPool,
     app_pool: PgPool,
     control_pool: PgPool,
     store: Store,
     control_store: Store,
+    /// The data-plane connection URL, kept so a test can open a BRAND-NEW pool against
+    /// the SAME database and rebuild its process-level state from nothing: the
+    /// rolling-restart simulation (issue #32 AC 1).
+    app_url: String,
 }
 
 impl TestDatabase {
@@ -117,7 +128,26 @@ impl TestDatabase {
             control_pool,
             store,
             control_store,
+            app_url,
         }
+    }
+
+    /// Open a BRAND-NEW data-plane pool against the SAME database and wrap it in a NEW
+    /// [`Store`]: a node restart, simulated.
+    ///
+    /// Nothing in-process survives this (new pool, new connections, new `Store`), while
+    /// Postgres keeps every row. It is what lets a test prove the milestone's first
+    /// acceptance criterion: sessions are AUTHORITATIVE in Postgres, with no
+    /// in-memory-only authoritative state, so a rolling restart loses no sessions.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the new connection cannot be established.
+    pub async fn restart_app_store(&self) -> Store {
+        let pool = PgPool::connect(&self.app_url)
+            .await
+            .expect("reconnect as low-privilege app role after a simulated restart");
+        Store::from_pool(pool)
     }
 
     /// The store bound to the low-privilege application role. Repository
@@ -125,6 +155,28 @@ impl TestDatabase {
     #[must_use]
     pub fn store(&self) -> &Store {
         &self.store
+    }
+
+    /// A data-plane [`Store`] over a FRESH pool sized for a concurrency storm.
+    ///
+    /// The default per-run pool (10 connections) would serialize a many-way storm of
+    /// concurrent writers and blunt the very race the concurrency tests exist to catch,
+    /// so those tests build a WIDER pool (still well under the server's connection cap)
+    /// and share it: the pool is `Arc`-backed, so cloning the returned [`Store`] into
+    /// each spawned task hands out connections from the SAME bounded set rather than
+    /// opening a new pool per task. Authenticates as the same low-privilege app role as
+    /// [`TestDatabase::store`], so forced row-level security still applies.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the wider pool cannot be established.
+    pub async fn app_store_with_pool(&self, max_connections: u32) -> Store {
+        let pool = PgPoolOptions::new()
+            .max_connections(max_connections)
+            .connect(&self.app_url)
+            .await
+            .expect("build a wider data-plane pool for the concurrency storm");
+        Store::from_pool(pool)
     }
 
     /// The store bound to the low-privilege control-plane role (issue #11).

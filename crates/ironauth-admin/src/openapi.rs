@@ -21,11 +21,12 @@ use utoipa::{Modify, OpenApi};
 
 use crate::error::ErrorBody;
 use crate::views::{
-    ClientVerificationView, CreateDcrPolicyRequest, CreateEnvironmentRequest,
-    CreateInitialAccessTokenRequest, CreateManagementKeyRequest, CreateTenantRequest,
-    DcrPolicyList, DcrPolicyView, EnvironmentList, EnvironmentView, InitialAccessTokenCreated,
-    ManagementKeyCreated, ManagementKeyList, ManagementKeyView, TenantCreated, TenantList,
-    TenantView,
+    BulkRevocationView, BulkRevokeSessionsRequest, ClientVerificationView, CreateDcrPolicyRequest,
+    CreateEnvironmentRequest, CreateInitialAccessTokenRequest, CreateManagementKeyRequest,
+    CreateTenantRequest, DcrPolicyList, DcrPolicyView, EnvironmentList, EnvironmentView,
+    InitialAccessTokenCreated, ManagementKeyCreated, ManagementKeyList, ManagementKeyView,
+    RefreshFamilyList, RefreshFamilyView, RevokeSessionsRequest, SessionList,
+    SessionRevocationView, SessionView, TenantCreated, TenantList, TenantView, UserRevocationView,
 };
 
 /// The management API's OpenAPI document. The handlers listed in `paths(...)`
@@ -49,7 +50,10 @@ use crate::views::{
         (name = "environments", description = "Environment CRUD under a tenant"),
         (name = "keys", description = "Environment-scoped management API keys"),
         (name = "dcr", description = "Dynamic Client Registration abuse controls: \
-                                     policies, initial access tokens, client verification")
+                                     policies, initial access tokens, client verification"),
+        (name = "sessions", description = "Session and refresh-family fleet operations: \
+                                          search, inspect, revoke (single, bulk, and \
+                                          everything-for-a-user with a token-family cascade)")
     ),
     paths(
         crate::tenants::list_tenants,
@@ -69,6 +73,13 @@ use crate::views::{
         crate::dcr::create_initial_access_token,
         crate::dcr::get_dcr_client,
         crate::dcr::verify_dcr_client,
+        crate::sessions::list_sessions,
+        crate::sessions::get_session,
+        crate::sessions::revoke_session,
+        crate::sessions::bulk_revoke_sessions,
+        crate::sessions::revoke_user_sessions,
+        crate::sessions::list_refresh_families,
+        crate::sessions::get_refresh_family,
     ),
     components(schemas(
         ErrorBody,
@@ -89,6 +100,15 @@ use crate::views::{
         CreateInitialAccessTokenRequest,
         InitialAccessTokenCreated,
         ClientVerificationView,
+        SessionView,
+        SessionList,
+        RefreshFamilyView,
+        RefreshFamilyList,
+        RevokeSessionsRequest,
+        BulkRevokeSessionsRequest,
+        SessionRevocationView,
+        BulkRevocationView,
+        UserRevocationView,
     ))
 )]
 struct ApiDoc;

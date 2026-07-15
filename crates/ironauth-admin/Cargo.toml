@@ -108,5 +108,14 @@ name = "dcr"
 path = "tests/dcr.rs"
 required-features = ["testing"]
 
+# Session and refresh-family fleet operations (issue #32): searchable sessions and
+# refresh families, the immediate revoke, the offline-preserving cascade and its
+# hard-kill override, the scope-fenced bulk revoke, and the uniform not-found for every
+# foreign id.
+[[test]]
+name = "sessions"
+path = "tests/sessions.rs"
+required-features = ["testing"]
+
 [lints]
 workspace = true

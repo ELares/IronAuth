@@ -57,8 +57,9 @@ use ironauth_jose::JwsAlgorithm;
 use ironauth_store::{
     ActorRef, AuthorizationCodeId, ClientAuthRecord, ClientId, CodeBindings, CorrelationId,
     IssuedTokenRecord, NewOpaqueAccessToken, NewRefreshFamily, RedeemOutcome, RefreshFamilyId,
-    RefreshRedeem, RefreshRedeemOutcome, RefreshTokenId, RefreshTokenResolution,
-    RotatedRefreshToken, Scope, ServiceId, StoreError, TokenKind,
+    RefreshFamilyOpenOutcome, RefreshRedeem, RefreshRedeemOutcome, RefreshTokenId,
+    RefreshTokenResolution, RotatedRefreshToken, Scope, ServiceId, SessionId, StoreError,
+    TokenKind,
 };
 use serde::Deserialize;
 
@@ -359,7 +360,7 @@ async fn authorization_code_grant(
         // the family degrades to an access+ID response without a refresh token
         // (logged), rather than failing an otherwise-successful exchange.
         Ok(RedeemOutcome::Consumed) => {
-            let refresh = issue_refresh_for_code(state, scope, &bindings).await;
+            let refresh = issue_refresh_for_code(state, scope, &bindings).await?;
             Ok(token_response(&minted, &bindings, refresh.as_deref()))
         }
         // A benign within-grace retry or an expired/absent code: plain
@@ -462,6 +463,66 @@ async fn authenticate_client(
 /// or a signing failure is an opaque `server_error`; because this runs before the
 /// consume, that failure leaves the code live for a retry.
 ///
+/// Resolve the per-client `sid` (issue #32) for a code exchange from the code's
+/// authenticating SSO session, and, in doing so, ENFORCE that the SSO session is still
+/// LIVE at redemption.
+///
+/// # Why the liveness check lives here
+///
+/// An authorization code is minted at the authorize endpoint and redeemed later at the
+/// token endpoint. A session revoke (a logout, an operator revoke) can land IN BETWEEN.
+/// Without this check the exchange would mint a brand-new LIVE refresh family, and a
+/// fresh `sid`, bound to a session that is already DEAD: no cascade would ever reach
+/// them (they hang off a session nothing revokes twice), so a logout would silently
+/// fail to revoke the tokens minted right after it. So the code's `session_ref` is
+/// resolved through the SAME authoritative read guard the authentication path uses
+/// (revoked / ended / superseded / expired all refuse), BEFORE anything is minted, and
+/// a session that no longer resolves is a uniform `invalid_grant`.
+///
+/// # Fail CLOSED
+///
+/// A store error is a `server_error`, never a silently session-less ID token. Dropping
+/// the `sid` on a store hiccup would emit an ID token that a relying party cannot
+/// correlate to any OP session, which quietly breaks back-channel logout for that
+/// token while looking like a success.
+///
+/// A grant with NO `session_ref` at all (not an interactive code flow) legitimately has
+/// no SSO session and resolves to [`None`]: no session to check, no `sid` to emit.
+async fn resolve_code_exchange_sid(
+    state: &OidcState,
+    scope: Scope,
+    bindings: &CodeBindings,
+) -> Result<Option<String>, TokenError> {
+    let Some(session_ref) = bindings.session_ref.as_deref() else {
+        return Ok(None);
+    };
+    // A session_ref that does not parse in the exchange scope names no session we could
+    // ever resolve: the grant is not redeemable.
+    let session_id =
+        SessionId::parse_in_scope(session_ref, &scope).map_err(|_| TokenError::InvalidGrant)?;
+    let now_micros = epoch_micros(state.now());
+    let idle_ttl = i64::try_from(state.session_idle_ttl().as_micros()).unwrap_or(i64::MAX);
+    let session = state
+        .store()
+        .scoped(scope)
+        .sessions()
+        .get(&session_id, now_micros, idle_ttl)
+        .await
+        .map_err(|_| TokenError::ServerError)?;
+    if session.is_none() {
+        // Revoked, logged out, rotated away, or expired since the code was issued.
+        return Err(TokenError::InvalidGrant);
+    }
+    let sid = state
+        .store()
+        .scoped(scope)
+        .client_sessions()
+        .ensure_sid(state.env(), &session_id, &bindings.client_id, now_micros)
+        .await
+        .map_err(|_| TokenError::ServerError)?;
+    Ok(Some(sid))
+}
+
 /// Resolves the environment's issuer entry (its signer and algorithm policy)
 /// through the shared registry, then hands the borrowed signer and policy into the
 /// pure, synchronous [`tokens::mint`]: the async key resolution is confined here,
@@ -473,6 +534,13 @@ async fn mint_tokens(
     extra_claims: &serde_json::Map<String, serde_json::Value>,
     target: &AccessTokenTarget,
 ) -> Result<IssuedTokens, TokenError> {
+    // Resolve the per-client `sid` (issue #32) from the code's authenticating SSO
+    // session BEFORE signing, so the ID token carries a `sid` that is stable per
+    // (client, session) and distinct across clients. This ALSO enforces that the SSO
+    // session is still live: a code minted before a revoke and redeemed after it is an
+    // invalid_grant, never a live token bound to a dead session.
+    let sid = resolve_code_exchange_sid(state, scope, bindings).await?;
+    let sid = sid.as_deref();
     let entry = state
         .issuer_entry(&scope)
         .await
@@ -516,6 +584,10 @@ async fn mint_tokens(
             // the code at issuance, never from the token request.
             auth_methods: &bindings.auth_methods,
             auth_time_unix_micros: bindings.auth_time_unix_micros,
+            // The per-client `sid` (issue #32), resolved from the authenticating SSO
+            // session through the per-client session store: stable per (client,
+            // session), distinct across clients.
+            sid,
             // A token-endpoint ID token never carries at_hash, and the code flow
             // never carries c_hash; the front-channel/hybrid path (#17) supplies
             // them. Both are absent here by construction.
@@ -759,9 +831,9 @@ pub(crate) fn map_store_error(error: StoreError) -> TokenError {
 // ===========================================================================
 
 /// Open a refresh-token family for a just-consumed code (issue #21), returning the
-/// plaintext refresh token to hand to the client. Returns [`None`] when the
+/// plaintext refresh token to hand to the client. Returns `Ok(None)` when the
 /// environment does not issue refresh tokens, or (fail-soft) when opening the
-/// family failed: a failure only costs the client a refresh token on this
+/// family faulted: such a fault only costs the client a refresh token on this
 /// exchange, never the whole exchange, so it is logged and swallowed.
 ///
 /// The family is OFFLINE when the granted scope carried `offline_access` (so it
@@ -769,13 +841,20 @@ pub(crate) fn map_store_error(error: StoreError) -> TokenError {
 /// session-bound (revoked when the RP session is logged out). `offline_access` is
 /// honored here because the code grant IS the flow that returns an authorization
 /// code; the consent for it was enforced at the authorization endpoint.
+///
+/// A session-bound open is REFUSED (issue #32) when the SSO session it would hang
+/// off was revoked in the window between the redeem's liveness read and this open:
+/// no family is created and this returns `Err(TokenError::InvalidGrant)`, so a
+/// logout that already cascaded cannot be outlived by a family opened just after
+/// it. That is a hard failure, not a fail-soft, because a session-bound token that
+/// escaped its logout is the exact invariant this milestone protects.
 async fn issue_refresh_for_code(
     state: &OidcState,
     scope: Scope,
     bindings: &CodeBindings,
-) -> Option<String> {
+) -> Result<Option<String>, TokenError> {
     if !state.issue_refresh_tokens() {
-        return None;
+        return Ok(None);
     }
     let offline = scope_contains(bindings.oauth_scope.as_deref(), OFFLINE_ACCESS_SCOPE);
     let minted = tokens::mint_refresh_token(state, &scope);
@@ -816,10 +895,14 @@ async fn issue_refresh_for_code(
         )
         .await;
     match result {
-        Ok(()) => Some(minted.token),
+        Ok(RefreshFamilyOpenOutcome::Opened) => Ok(Some(minted.token)),
+        // The bound SSO session was revoked in the open window, so no session-bound
+        // family was created: fail the exchange closed rather than hand back a token
+        // no logout could ever reach.
+        Ok(RefreshFamilyOpenOutcome::SessionNotLive) => Err(TokenError::InvalidGrant),
         Err(error) => {
             tracing::warn!(%error, "could not open a refresh-token family; issuing without a refresh token");
-            None
+            Ok(None)
         }
     }
 }
@@ -1069,6 +1152,9 @@ async fn mint_refresh_access(
             oauth_scope: resolution.scope.as_deref(),
             auth_methods: &resolution.auth_methods,
             auth_time_unix_micros: None,
+            // The refresh path mints only an access token (no ID token), so `sid`
+            // (issue #32, an ID-token claim) is inert here.
+            sid: None,
             at_hash: None,
             c_hash: None,
             extra_claims: &extra_claims,

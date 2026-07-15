@@ -6,6 +6,58 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- The session model on the OIDC surface (issue #32).
+  - **`sid` in EVERY flow's ID token (not just the code flow).** The token endpoint
+    resolves the per-(client, session) `sid` from the code's authenticating SSO session
+    and emits it as a legitimate issuer claim; `claims_supported` advertises it. The
+    front-channel implicit/hybrid mints (`authorize.rs`) and the device-flow mint
+    (`device.rs`) now thread the SAME `sid` through, resolved from the authenticating SSO
+    session exactly as the code flow does, so `backchannel_logout_session_supported = true`
+    is truthful for EVERY enabled flow, not only the code flow (previously those mints
+    passed `sid: None`, making the advertisement a lie whenever a legacy response type or
+    the device flow was enabled).
+  - **The token endpoint checks SSO-session liveness.** A code redeemed AFTER its session
+    was revoked is now a uniform `invalid_grant` and mints nothing: the code-exchange path
+    resolves `session_ref` through the authoritative read guard before minting, so a code
+    minted before a revoke can no longer produce a fresh live refresh family and `sid`
+    bound to a dead session. `sid` resolution now fails CLOSED (a store error fails the
+    exchange rather than silently emitting a session-less ID token).
+  - **Session-fixation defense.** `interaction::establish_session` now takes the request
+    headers and ROTATES the session id at every privilege transition (login,
+    registration, device-verification login): a fresh entropy-seam id, with the prior
+    one invalidated in the SAME transaction, so no call site can forget to rotate.
+  - **Immediate revocation on the read path.** `interaction::resolve_session` takes the
+    headers too and refuses a revoked or rotated session at once (the store's read guard
+    is authoritative), so a logout can never silently no-op.
+  - **Hardened cookies.** The session cookie keeps `__Host-` + `Secure` + `HttpOnly` +
+    `SameSite=Lax` and carries a SMALL OPAQUE id (a size-bounding test keeps the
+    multi-KB-cookie 431 class structurally impossible). New: an off-by-default CHIPS
+    toggle that emits the REAL CHIPS shape `Secure; SameSite=None; Partitioned` (the
+    `__Host-` prefix stays valid), so the cookie actually rides the cross-site embedded
+    subrequests CHIPS exists to serve; a `Lax` cookie with `Partitioned` merely appended
+    would have been withheld from exactly those subrequests. `clear_set_cookie` mirrors
+    the same shape so a logout targets the same jar.
+  - **Idle timeout slides on the read path.** `resolve_session` passes the configured idle
+    window to the store read, which slides `idle_expires_at` on an active session (past
+    roughly half the window), so a continuously active session is no longer killed at the
+    idle TTL as if it were a second absolute cap.
+  - **Off-by-default binding knobs.** Peer-IP and device/user-agent session binding, each
+    inert unless an operator enables it (the tunability principle) and each failing
+    CLOSED when enabled. The peer IP is the POLICY-RESOLVED client IP the server stamps
+    on `PEER_IP_HEADER`, never a client-supplied header.
+  - **Session lifecycle signal.** `SessionLifecycleEvent` and `SessionSignalCause` on the
+    existing `RevocationEventSink` seam (a default no-op method, so existing sinks keep
+    compiling), for the #35 fan-out to consume. A ROTATION carries a successor and is
+    explicitly NON-terminal (`is_terminal()`), so a naive consumer cannot mistake it for
+    a logout. When a login TERMINALLY replaces a different user's session on the same
+    browser, the signal is the new NON-rotation `ReplacedByOtherSubject` cause with NO
+    successor, so a consumer never reads the outgoing user's session as living on as the
+    incoming user's.
+  - **Rolling-restart acceptance test.** An integration test rebuilds all process-level
+    state from scratch against the same Postgres and re-drives authorize with the same
+    cookie, asserting the session still authenticates and the `sid` is unchanged: the
+    "authoritative in Postgres, no in-memory-only state" claim is now proven.
+
 - RFC 9700 (OAuth 2.0 Security BCP) checklist encoded as CI conformance invariants
   (issue #38).
   - **Conformance suite.** A new registered test target `tests/rfc9700.rs` drives the

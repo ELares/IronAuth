@@ -6,7 +6,13 @@
 use ironauth_env::Env;
 use ironauth_store::idor_harness::IdorHarness;
 use ironauth_store::test_support::TestDatabase;
-use ironauth_store::{ClientId, CorrelationId, Scope, StoreError};
+use ironauth_store::{
+    AuthorizationCodeId, ClientId, CorrelationId, GrantId, IssueCode, NewRefreshFamily, NewSession,
+    RefreshFamilyId, RefreshTokenId, Scope, SessionId, StoreError, UserId, refresh_token_digest,
+};
+
+/// A timestamp far past any test's clock, so a planted fixture never expires mid-test.
+const FAR_FUTURE_MICROS: i64 = 4_102_444_800_000_000;
 
 #[tokio::test]
 async fn idor_harness_denies_cross_tenant_and_cross_environment_uniformly() {
@@ -108,4 +114,173 @@ async fn idor_harness_denies_cross_tenant_and_cross_environment_uniformly() {
         ),
         "cross-environment identifier must parse to the uniform NotFound"
     );
+}
+
+#[tokio::test]
+async fn session_fleet_surfaces_are_cross_tenant_and_cross_environment_isolated() {
+    // Every fleet-operations surface of the two-tier session model (issue #32) is
+    // registered with the harness and must deny a foreign identifier uniformly: the
+    // authentication read path, the per-client sid store, the fleet read surfaces
+    // (by-id AND list), and the three mutating revoke surfaces. The bulk revoke is the
+    // sharp MUTATING one (a foreign session smuggled into an otherwise valid batch must
+    // be a no-op); the two LIST surfaces are the sharp READING ones, because a list has
+    // no identifier to fence on and would leak a whole foreign tenant at once.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+
+    let scope_a = db.seed_scope(&env).await;
+    let scope_b = db.seed_scope(&env).await;
+    let env_a2 = db.seed_environment(&env, scope_a.tenant()).await;
+    let scope_a2 = Scope::new(scope_a.tenant(), env_a2);
+
+    // Plant a victim session (and a per-client session on it) in each foreign scope.
+    let victim_b = plant_session(&db, &env, scope_b).await;
+    let victim_a2 = plant_session(&db, &env, scope_a2).await;
+    // Plant a victim refresh FAMILY too, so the refresh-family probes have a real
+    // foreign row of their OWN type to hunt for: without one, every rff_ probe would
+    // trivially pass on a ses_ id that cannot even parse as a family id, and the family
+    // list probe would be vacuous.
+    let victim_family_b = plant_refresh_family(&db, &env, scope_b, &victim_b).await;
+
+    let mut harness = IdorHarness::new();
+    harness.register_session_fleet_probes();
+    assert_eq!(
+        harness.probe_names(),
+        vec![
+            "sessions.get",
+            "client_sessions.ensure_sid",
+            "session_fleet.get",
+            "session_fleet.list",
+            "refresh_family_fleet.get",
+            "refresh_family_fleet.list",
+            "sessions.revoke",
+            "sessions.bulk_revoke",
+            "sessions.revoke_all",
+        ],
+        "every session fleet-ops surface is registered with the harness"
+    );
+
+    let absent_in_a = SessionId::generate(&env, &scope_a).to_string();
+    let foreign = [
+        victim_b.to_string(),
+        victim_a2.to_string(),
+        victim_family_b.to_string(),
+        // A user id of another tenant, for the revoke-everything-for-a-user probe.
+        UserId::generate(&env, &scope_b).to_string(),
+        absent_in_a,
+    ];
+    let refs: Vec<&str> = foreign.iter().map(String::as_str).collect();
+    let leaks = harness.run(db.store(), scope_a, &refs).await;
+    assert!(leaks.is_empty(), "cross-scope leak detected: {leaks:?}");
+
+    // Neither victim was revoked by any probe: both still resolve in their own scope.
+    for (scope, victim) in [(scope_b, &victim_b), (scope_a2, &victim_a2)] {
+        assert!(
+            db.store()
+                .scoped(scope)
+                .sessions()
+                .get(victim, 0, 0)
+                .await
+                .expect("read")
+                .is_some(),
+            "a foreign session must survive every probe"
+        );
+    }
+}
+
+/// Plant a live session in `scope` (with a far-future lifetime), for the fleet probes.
+async fn plant_session(db: &TestDatabase, env: &Env, scope: Scope) -> SessionId {
+    let id = SessionId::generate(env, &scope);
+    db.store()
+        .scoped(scope)
+        .acting(db.test_actor(env), CorrelationId::generate(env))
+        .sessions()
+        .rotate(
+            env,
+            &id,
+            None,
+            NewSession {
+                subject: &UserId::generate(env, &scope).to_string(),
+                auth_methods: "pwd",
+                auth_time_micros: 0,
+                idle_expires_micros: FAR_FUTURE_MICROS,
+                absolute_expires_micros: FAR_FUTURE_MICROS,
+                user_agent: None,
+                peer_ip: None,
+            },
+        )
+        .await
+        .expect("plant session");
+    id
+}
+
+/// Plant a live refresh family on `session` in `scope`, so the refresh-family fleet
+/// probes have a foreign row of their OWN type to hunt for.
+async fn plant_refresh_family(
+    db: &TestDatabase,
+    env: &Env,
+    scope: Scope,
+    session: &SessionId,
+) -> RefreshFamilyId {
+    let subject = UserId::generate(env, &scope).to_string();
+    let code_id = AuthorizationCodeId::generate(env, &scope);
+    let grant_id = GrantId::generate(env, &scope);
+    let client_id = ClientId::generate(env, &scope);
+    let session_text = session.to_string();
+    db.store()
+        .scoped(scope)
+        .acting(db.test_actor(env), CorrelationId::generate(env))
+        .authorization()
+        .issue(
+            env,
+            IssueCode {
+                code_id: &code_id,
+                grant_id: &grant_id,
+                client_id: &client_id,
+                redirect_uri: "https://client.test/cb",
+                nonce: None,
+                code_challenge: None,
+                code_challenge_method: None,
+                subject: &subject,
+                oauth_scope: Some("openid"),
+                auth_methods: "pwd",
+                auth_time_micros: None,
+                session_ref: Some(&session_text),
+                consent_ref: None,
+                claims_request: None,
+                granted_resources: &[],
+                expires_at_micros: FAR_FUTURE_MICROS,
+                created_at_micros: 0,
+            },
+        )
+        .await
+        .expect("plant grant");
+
+    let family_id = RefreshFamilyId::generate(env, &scope);
+    let jti = RefreshTokenId::generate(env, &scope);
+    let digest = refresh_token_digest(&format!("ira_rt_{jti}~seed"));
+    db.store()
+        .scoped(scope)
+        .acting(db.test_actor(env), CorrelationId::generate(env))
+        .refresh()
+        .issue(
+            env,
+            NewRefreshFamily {
+                family_id: &family_id,
+                token_jti: &jti,
+                token_digest: &digest,
+                grant_id: &grant_id,
+                subject: &subject,
+                client_id: "cli_family",
+                scope: Some("openid"),
+                auth_methods: "pwd",
+                offline: false,
+                created_at_unix_micros: 0,
+                idle_expires_at_unix_micros: FAR_FUTURE_MICROS,
+                absolute_expires_at_unix_micros: FAR_FUTURE_MICROS,
+            },
+        )
+        .await
+        .expect("plant refresh family");
+    family_id
 }

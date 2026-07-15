@@ -234,6 +234,18 @@ impl ScopedKind for SessionKind {
     const REDACT_DEBUG: bool = true;
 }
 
+/// Marker for a per-client session (`cse_`), the tier-two row of the two-tier
+/// session model that carries the per-(client, session) `sid` claim (issue #32). A
+/// tenant-scoped resource: the identifier embeds its `(tenant, environment)`, so a
+/// per-client session minted in one scope parses as a uniform not-found under
+/// another. It is an INTERNAL tracking row (never a bearer credential and never
+/// presented by a caller); the `sid` it carries is a separate opaque value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ClientSessionKind;
+impl ScopedKind for ClientSessionKind {
+    const PREFIX: &'static str = "cse";
+}
+
 /// Marker for a recorded consent decision (`con_`), the row that means a subject
 /// authorized a client (issue #20). Tenant scoped like every other resource; the
 /// grant's `consent_ref` seam references it.
@@ -535,6 +547,9 @@ pub type UserId = ScopedId<UserKind>;
 /// A bootstrap session identifier (`ses_...`), the opaque `__Host-` cookie value
 /// (issue #20).
 pub type SessionId = ScopedId<SessionKind>;
+/// A per-client session identifier (`cse_...`), the tier-two row that carries the
+/// per-(client, session) `sid` claim of the two-tier session model (issue #32).
+pub type ClientSessionId = ScopedId<ClientSessionKind>;
 /// A recorded-consent identifier (`con_...`), the decision row a grant references
 /// (issue #20).
 pub type ConsentId = ScopedId<ConsentKind>;
