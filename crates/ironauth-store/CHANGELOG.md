@@ -36,13 +36,24 @@ range per docs/RELEASING.md.
   - **Scheduled offboarding.** `execute_scheduled_offboardings` disables every due
     scheduled-offboarding user and cascades identically to a manual disable,
     idempotently and audited (`user.offboarding.execute`).
+  - **Refresh-grant fence support.** `UserRepo::state_for_subject` resolves a live
+    user's lifecycle state by its subject (the `usr_` id a refresh family carries),
+    reading only the `state` column (no master key, no PII decrypt) and filtering the
+    soft-delete tombstone; an absent, cross-scope, deleted, or corrupt-state row reads
+    as `None` (fail closed). The OIDC `refresh_token` grant reads this to re-check the
+    token subject before minting, so a user fenced after a surviving `offline_access`
+    family was opened mints nothing. See `docs/design/USER-LIFECYCLE.md`.
   - New `Action` variants (`user.create`/`update`/`delete`/`state_change`/
     `external_id.link`/`external_id.unlink`/`offboarding.execute`); new public
     `UserState`, `UserAdminRecord`, `UserListFilter`, `NewAdminUser` types; new
-    `IdorHarness::register_user_admin_probes`. Migration 0036 grants the control
-    plane SELECT/INSERT + a column-scoped UPDATE on `users` and SELECT/INSERT on the
-    envelope key tables (it manages user PII), with a per-scope partial unique index
-    on the external-id blind index.
+    `IdorHarness::register_user_admin_probes`, now covering EVERY scope-embedding user
+    surface (`users.get`, `users.list`, `users.by_external_id`, `users.delete`,
+    `users.set_state`, `users.update_claims`, `users.external_id.link`,
+    `users.external_id.unlink`) so the IDOR harness proves uniform cross-tenant
+    not-found on the mutating and the reading surfaces alike. Migration 0036 grants
+    the control plane SELECT/INSERT + a column-scoped UPDATE on `users` and
+    SELECT/INSERT on the envelope key tables (it manages user PII), with a per-scope
+    partial unique index on the external-id blind index.
 - Server-side config promotion: diff, plan, and apply (issue #44, migration 0035,
   expand). The flagship differentiator, at the store layer.
   - **Engine (`promotion` module, pure and deterministic).** `diff` compares a

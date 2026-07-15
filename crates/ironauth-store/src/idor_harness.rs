@@ -221,9 +221,12 @@ impl IdorHarness {
     pub fn register_user_admin_probes(&mut self) -> &mut Self {
         self.register(Box::new(UserAdminGetProbe));
         self.register(Box::new(UserAdminListProbe));
+        self.register(Box::new(UserAdminByExternalIdProbe));
         self.register(Box::new(UserAdminDeleteProbe));
         self.register(Box::new(UserAdminStateChangeProbe));
+        self.register(Box::new(UserAdminUpdateClaimsProbe));
         self.register(Box::new(UserAdminExternalIdLinkProbe));
+        self.register(Box::new(UserAdminExternalIdUnlinkProbe));
         self
     }
 
@@ -1099,6 +1102,114 @@ impl IsolationProbe for UserAdminExternalIdLinkProbe {
                 .acting(actor, correlation)
                 .users()
                 .link_external_id(&env, &id, "idor-probe-external-id")
+                .await
+            {
+                Ok(()) => ProbeOutcome::Leaked,
+                Err(_) => ProbeOutcome::Denied,
+            }
+        })
+    }
+}
+
+/// Built-in probe for `UserRepo::by_external_id` (issue #52): a lookup by external
+/// id must never resolve ANOTHER tenant's user. The external id is a per-tenant
+/// blind index, so the read is twice fenced (the index is keyed with the caller's
+/// tenant key AND the query filters `tenant_id`/`environment_id`), and any hit on a
+/// foreign external-id value is a cross-tenant READ leak. The harness passes a
+/// victim's real external-id string as a `foreign_id`, so this probe hunts a foreign
+/// row of its own key type rather than being vacuous.
+struct UserAdminByExternalIdProbe;
+
+impl IsolationProbe for UserAdminByExternalIdProbe {
+    fn name(&self) -> &'static str {
+        "users.by_external_id"
+    }
+
+    fn probe<'a>(
+        &'a self,
+        store: &'a Store,
+        caller: Scope,
+        foreign_id: &'a str,
+    ) -> BoxProbeFuture<'a> {
+        Box::pin(async move {
+            match store
+                .scoped(caller)
+                .users()
+                .by_external_id(foreign_id)
+                .await
+            {
+                Ok(Some(_)) => ProbeOutcome::Leaked,
+                Ok(None) | Err(_) => ProbeOutcome::Denied,
+            }
+        })
+    }
+}
+
+/// Built-in probe for `ActingUserRepo::update_claims` (issue #52): patching another
+/// tenant's user claims would be a cross-tenant mutation of a PII surface, so it must
+/// be the uniform not-found.
+struct UserAdminUpdateClaimsProbe;
+
+impl IsolationProbe for UserAdminUpdateClaimsProbe {
+    fn name(&self) -> &'static str {
+        "users.update_claims"
+    }
+
+    fn probe<'a>(
+        &'a self,
+        store: &'a Store,
+        caller: Scope,
+        foreign_id: &'a str,
+    ) -> BoxProbeFuture<'a> {
+        Box::pin(async move {
+            let env = Env::system();
+            let Ok(id) = store.scoped(caller).users().parse_id(foreign_id) else {
+                return ProbeOutcome::Denied;
+            };
+            let actor = ActorRef::service(ServiceId::generate(&env));
+            let correlation = CorrelationId::generate(&env);
+            match store
+                .scoped(caller)
+                .acting(actor, correlation)
+                .users()
+                .update_claims(&env, &id, "{\"nickname\":\"idor-probe\"}")
+                .await
+            {
+                Ok(()) => ProbeOutcome::Leaked,
+                Err(_) => ProbeOutcome::Denied,
+            }
+        })
+    }
+}
+
+/// Built-in probe for `ActingUserRepo::unlink_external_id` (issue #52): clearing the
+/// external id off another tenant's user would be a cross-tenant mutation, so it must
+/// be the uniform not-found.
+struct UserAdminExternalIdUnlinkProbe;
+
+impl IsolationProbe for UserAdminExternalIdUnlinkProbe {
+    fn name(&self) -> &'static str {
+        "users.external_id.unlink"
+    }
+
+    fn probe<'a>(
+        &'a self,
+        store: &'a Store,
+        caller: Scope,
+        foreign_id: &'a str,
+    ) -> BoxProbeFuture<'a> {
+        Box::pin(async move {
+            let env = Env::system();
+            let Ok(id) = store.scoped(caller).users().parse_id(foreign_id) else {
+                return ProbeOutcome::Denied;
+            };
+            let actor = ActorRef::service(ServiceId::generate(&env));
+            let correlation = CorrelationId::generate(&env);
+            match store
+                .scoped(caller)
+                .acting(actor, correlation)
+                .users()
+                .unlink_external_id(&env, &id)
                 .await
             {
                 Ok(()) => ProbeOutcome::Leaked,

@@ -907,6 +907,38 @@ async fn issue_refresh_for_code(
     }
 }
 
+/// Re-check a refresh token subject's USER LIFECYCLE state before minting (issue
+/// #52, fence completeness). The lifecycle machine says a blocked/disabled/deleted
+/// user cannot authenticate, and block/disable cascades the user's sessions and
+/// non-offline refresh families; but an `offline_access` family DELIBERATELY survives
+/// that cascade (issue #21), so without this re-check a user fenced AFTER the family
+/// was opened could keep minting fresh access tokens through the surviving token, and
+/// the account would not actually be fenced. This is the authoritative single-point
+/// fence: the invariant is that after block/disable/delete a user obtains NO new
+/// tokens by ANY path (authorize, refresh, or an existing offline token).
+///
+/// Fails CLOSED (`invalid_grant`) when the subject is not authenticatable (blocked,
+/// disabled, pending-verification) or is absent/deleted, and treats a store fault as
+/// fail-closed too, never fail-open. A NORMAL active (or scheduled-offboarding) user
+/// is authenticatable, so an ordinary refresh is unaffected.
+async fn ensure_subject_can_authenticate(
+    state: &OidcState,
+    scope: Scope,
+    subject: &str,
+) -> Result<(), TokenError> {
+    match state
+        .store()
+        .scoped(scope)
+        .users()
+        .state_for_subject(subject)
+        .await
+    {
+        Ok(Some(user_state)) if user_state.can_authenticate() => Ok(()),
+        Ok(_) => Err(TokenError::InvalidGrant),
+        Err(error) => Err(map_store_error(error)),
+    }
+}
+
 /// The `refresh_token` grant (RFC 6749 6, issue #21): exchange a rotating refresh
 /// token for a fresh access token, applying the graduated rotation policy and
 /// reuse detection.
@@ -955,6 +987,12 @@ async fn refresh_token_grant(
     if authenticated_client.client_id != resolution.client_id || !resolution.active {
         return Err(TokenError::InvalidGrant);
     }
+
+    // 4b. Re-check the token subject's USER LIFECYCLE state (issue #52) before minting
+    //     anything: a user blocked, disabled, or deleted AFTER a SURVIVING
+    //     offline_access family was opened (issue #21) must not keep minting. Fail
+    //     closed (including on a store fault); a normal active user is unaffected.
+    ensure_subject_can_authenticate(state, scope, &resolution.subject).await?;
 
     // 5. Resolve the client's posture and rotation override to decide whether a live
     //    token rotates (public/unbound: always; confidential/bound: past the TTL

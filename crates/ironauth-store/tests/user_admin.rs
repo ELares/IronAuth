@@ -568,6 +568,100 @@ async fn disabling_and_deleting_a_user_cascades_the_users_sessions() {
 }
 
 #[tokio::test]
+async fn state_for_subject_reports_the_live_state_and_fails_closed_after_delete() {
+    // The refresh-grant fence (issue #52) resolves a token subject's lifecycle state
+    // by id: an active user is authenticatable; block/disable report a
+    // non-authenticatable state; a soft-deleted user reads as absent (fail closed).
+    let db = TestDatabase::start().await;
+    let (env, _clock) = Env::deterministic(std::time::SystemTime::UNIX_EPOCH, 0x5c);
+    let scope = db.seed_scope(&env).await;
+
+    let user = create_user(
+        &db,
+        &env,
+        scope,
+        "state@example.test",
+        None,
+        UserState::Active,
+        1_000,
+    )
+    .await
+    .expect("create");
+    let subject = user.to_string();
+
+    let active = db
+        .store()
+        .scoped(scope)
+        .users()
+        .state_for_subject(&subject)
+        .await
+        .expect("read state");
+    assert_eq!(
+        active,
+        Some(UserState::Active),
+        "an active user reports active"
+    );
+    assert!(
+        active.expect("state").can_authenticate(),
+        "an active user is authenticatable"
+    );
+
+    for fenced in [UserState::Blocked, UserState::Disabled] {
+        db.store()
+            .scoped(scope)
+            .acting(db.test_actor(&env), CorrelationId::generate(&env))
+            .users()
+            .set_state(&env, &user, fenced, None, false, None)
+            .await
+            .expect("transition");
+        let state = db
+            .store()
+            .scoped(scope)
+            .users()
+            .state_for_subject(&subject)
+            .await
+            .expect("read state");
+        assert_eq!(state, Some(fenced), "the fenced state is reported");
+        assert!(
+            !state.expect("state").can_authenticate(),
+            "a {fenced:?} user is not authenticatable"
+        );
+    }
+
+    // A well-formed but absent subject in this scope is None (fail closed).
+    let absent = UserId::generate(&env, &scope).to_string();
+    assert_eq!(
+        db.store()
+            .scoped(scope)
+            .users()
+            .state_for_subject(&absent)
+            .await
+            .expect("read state"),
+        None,
+        "an absent subject reads as None"
+    );
+
+    // A soft-deleted user reads as None: the tombstone is fenced, not authenticatable.
+    db.store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .users()
+        .delete(&env, &user, false, None)
+        .await
+        .expect("delete");
+    assert_eq!(
+        db.store()
+            .scoped(scope)
+            .users()
+            .state_for_subject(&subject)
+            .await
+            .expect("read state"),
+        None,
+        "a deleted user's subject reads as None (fail closed)"
+    );
+}
+
+#[tokio::test]
 async fn external_ids_are_unique_per_scope_isolated_across_tenants_and_lookup_able() {
     let db = TestDatabase::start().await;
     let (env, _clock) = Env::deterministic(std::time::SystemTime::UNIX_EPOCH, 0x57);
@@ -840,7 +934,7 @@ async fn idor_harness_denies_cross_scope_user_surfaces_uniformly() {
         &env,
         scope_b,
         "vb@example.test",
-        None,
+        Some("vb-external-id"),
         UserState::Active,
         1_000,
     )
@@ -867,18 +961,43 @@ async fn idor_harness_denies_cross_scope_user_surfaces_uniformly() {
         vec![
             "users.get",
             "users.list",
+            "users.by_external_id",
             "users.delete",
             "users.set_state",
+            "users.update_claims",
             "users.external_id.link",
+            "users.external_id.unlink",
         ],
-        "every admin user resolve-by-id surface is registered"
+        "every scope-embedding admin user surface is registered"
     );
 
-    let foreign = [victim_b.to_string(), victim_a2.to_string(), absent_in_a];
+    // The foreign references include victim B's REAL external-id value, so the
+    // by_external_id probe hunts a foreign row of its own key type (a cross-tenant
+    // lookup must resolve none) rather than being vacuous.
+    let foreign = [
+        victim_b.to_string(),
+        victim_a2.to_string(),
+        "vb-external-id".to_owned(),
+        absent_in_a,
+    ];
     let foreign_refs: Vec<&str> = foreign.iter().map(String::as_str).collect();
     let leaks = harness.run(db.store(), scope_a, &foreign_refs).await;
     assert!(
         leaks.is_empty(),
         "cross-scope user leak detected: {leaks:?}"
+    );
+
+    // Positive control: the by_external_id probe is not vacuous. Tenant B CAN resolve
+    // its own user by the same external-id value, so a caller with the RIGHT scope
+    // finds it while the cross-tenant caller above found nothing.
+    assert!(
+        db.store()
+            .scoped(scope_b)
+            .users()
+            .by_external_id("vb-external-id")
+            .await
+            .expect("read")
+            .is_some(),
+        "tenant B resolves its own user by external id (the probe hunts a real row)"
     );
 }

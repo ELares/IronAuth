@@ -24,6 +24,13 @@ range per docs/RELEASING.md.
   `SetUserStateRequest`, `UserStateChangeView`, `LinkExternalIdRequest`,
   `UserExternalIdView`) in the committed OpenAPI document. The control-plane store
   now carries the platform master key so it seals/opens user PII (issue #48).
+  DEFERRED out of #52 met-scope (documented, not stubbed, in
+  `docs/design/USER-LIFECYCLE.md`): assigning roles/groups at user creation depends on
+  the RBAC model, a separate M6 issue that builds on this one, so `POST /users`
+  carries no role/group field yet; and emitting `external_id` in webhook / event
+  payloads depends on the M11 eventing surface, which does not exist yet (the external
+  id is stored, blind-indexed, and readable now, but there is no event channel to
+  carry it). Both are tracked against their owning milestones.
 - Server-side config promotion (issue #44): the write half of the flagship. Two
   operator-plane POSTs on the target environment scope:
   `POST .../config/promotion/plan` dry-runs a promotion of a submitted source

@@ -671,3 +671,135 @@ async fn a_remembered_consent_lapses_after_its_ttl() {
     assert!(code.is_none(), "an expired remembered consent re-prompts");
     assert!(loc.starts_with("/consent?return_to="), "to consent: {loc}");
 }
+
+/// Issue a LIVE `offline_access` refresh token for a fresh, active user against a
+/// trusted first-party (implicit-consent) confidential client, returning
+/// `(subject, client_id, secret, refresh_token)`. The `offline_access` family
+/// SURVIVES an RP logout / session cascade by construction (issue #21), so it is
+/// exactly the token a lifecycle fence must still stop from minting (issue #52).
+async fn offline_refresh_token_for_new_user(harness: &Harness) -> (String, String, String, String) {
+    let (client, secret) = harness
+        .create_confidential_client(ClientAuthMethod::Basic)
+        .await;
+    let client_id = client.to_string();
+    // A trusted first-party client auto-grants, so offline_access needs no consent
+    // screen and the code issues straight away.
+    harness
+        .configure_client_policy(&client, "implicit", false, true, None)
+        .await;
+    let subject = harness.seed_unique_user().await;
+    let cookie = harness.session_cookie(&subject).await;
+    let (status, _loc, code) =
+        authorize_scope(harness, &client_id, "openid offline_access", &cookie).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    let code = code.expect("a first-party offline_access authorization issues a code");
+    let auth = basic_header(&client_id, &secret);
+    let exchange = form(&[
+        ("grant_type", "authorization_code"),
+        ("code", &code),
+        ("redirect_uri", REDIRECT_URI),
+    ]);
+    let (status, _, body) = harness.token_with_auth(&exchange, Some(&auth)).await;
+    assert_eq!(status, StatusCode::OK, "offline code exchange: {body}");
+    let refresh = json(&body)["refresh_token"]
+        .as_str()
+        .expect("an offline_access code exchange issues a refresh token")
+        .to_owned();
+    (subject, client_id, secret, refresh)
+}
+
+#[tokio::test]
+async fn a_fenced_user_cannot_mint_new_tokens_through_a_surviving_offline_token() {
+    // Issue #52 (the milestone-core fence-completeness property): block/disable/delete
+    // must stop a user from obtaining new tokens by ANY path, including a SURVIVING
+    // offline_access refresh family (which the block/disable cascade deliberately
+    // leaves live, issue #21). Without the refresh-grant's user-lifecycle re-check a
+    // blocked user keeps minting fresh access tokens through that token, so the account
+    // is not actually fenced. The refresh grant re-checks the subject's lifecycle and
+    // fails closed BEFORE minting.
+    let harness = Harness::start().await;
+    let (subject, client_id, secret, refresh) = offline_refresh_token_for_new_user(&harness).await;
+    let auth = basic_header(&client_id, &secret);
+    let refresh_body = form(&[("grant_type", "refresh_token"), ("refresh_token", &refresh)]);
+
+    // NORMAL active user: the offline token refreshes and mints a fresh access token.
+    // A confidential client under the rotation threshold (frozen clock, 0% elapsed)
+    // keeps the SAME refresh token, so it stays live for the fence checks below.
+    let (status, _, body) = harness.token_with_auth(&refresh_body, Some(&auth)).await;
+    assert_eq!(status, StatusCode::OK, "active user refresh: {body}");
+    assert!(
+        json(&body)["access_token"].is_string(),
+        "a normal active user's offline refresh mints an access token"
+    );
+    assert_eq!(
+        json(&body)["refresh_token"].as_str(),
+        Some(refresh.as_str()),
+        "the confidential client keeps the same refresh token under the threshold"
+    );
+
+    // BLOCKED: the same offline token now mints NOTHING.
+    harness
+        .set_user_state(&subject, ironauth_store::UserState::Blocked)
+        .await;
+    let (status, _, body) = harness.token_with_auth(&refresh_body, Some(&auth)).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "blocked user refresh: {body}"
+    );
+    assert_eq!(json(&body)["error"], "invalid_grant");
+    assert!(
+        json(&body).get("access_token").is_none(),
+        "a blocked user's refresh mints no access token"
+    );
+
+    // DISABLED (a distinct, non-authenticatable state): still fenced.
+    harness
+        .set_user_state(&subject, ironauth_store::UserState::Disabled)
+        .await;
+    let (status, _, body) = harness.token_with_auth(&refresh_body, Some(&auth)).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "disabled user refresh: {body}"
+    );
+    assert_eq!(json(&body)["error"], "invalid_grant");
+    assert!(
+        json(&body).get("access_token").is_none(),
+        "a disabled user's refresh mints no access token"
+    );
+
+    // DELETED (a soft-delete tombstone that reads as absent): still fenced, fail closed.
+    harness.delete_user(&subject).await;
+    let (status, _, body) = harness.token_with_auth(&refresh_body, Some(&auth)).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "deleted user refresh: {body}"
+    );
+    assert_eq!(json(&body)["error"], "invalid_grant");
+    assert!(
+        json(&body).get("access_token").is_none(),
+        "a deleted user's refresh mints no access token"
+    );
+
+    // A SEPARATE, untouched active user's offline token still refreshes: the fence is
+    // targeted, not a blanket break of the refresh grant.
+    let (_other, other_client, other_secret, other_refresh) =
+        offline_refresh_token_for_new_user(&harness).await;
+    let other_body = form(&[
+        ("grant_type", "refresh_token"),
+        ("refresh_token", &other_refresh),
+    ]);
+    let (status, _, body) = harness
+        .token_with_auth(
+            &other_body,
+            Some(&basic_header(&other_client, &other_secret)),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "untouched user refresh: {body}");
+    assert!(
+        json(&body)["access_token"].is_string(),
+        "a normal active user's refresh is unaffected by another user's fence"
+    );
+}

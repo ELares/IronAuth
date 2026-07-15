@@ -949,6 +949,35 @@ impl Harness {
         )
     }
 
+    /// Transition a seeded user's lifecycle state (issue #52) through the acting
+    /// store, so a test can drive the block/disable fence over the token endpoint.
+    /// `subject` is the `usr_` id string [`seed_unique_user`](Self::seed_unique_user)
+    /// returned.
+    pub async fn set_user_state(&self, subject: &str, state: ironauth_store::UserState) {
+        let (actor, corr) = self.seeding_actor();
+        let scoped = self.store().scoped(self.scope);
+        let id = scoped.users().parse_id(subject).expect("parse subject id");
+        scoped
+            .acting(actor, corr)
+            .users()
+            .set_state(&self.env, &id, state, None, false, None)
+            .await
+            .expect("set user state");
+    }
+
+    /// Soft-delete a seeded user (issue #52) through the acting store.
+    pub async fn delete_user(&self, subject: &str) {
+        let (actor, corr) = self.seeding_actor();
+        let scoped = self.store().scoped(self.scope);
+        let id = scoped.users().parse_id(subject).expect("parse subject id");
+        scoped
+            .acting(actor, corr)
+            .users()
+            .delete(&self.env, &id, false, None)
+            .await
+            .expect("delete user");
+    }
+
     /// Register a bootstrap user in the harness scope and return its subject (the
     /// `usr_` id string).
     pub async fn seed_user(&self, identifier: &str, password: &str) -> String {

@@ -13,6 +13,16 @@ range per docs/RELEASING.md.
   timing-indistinguishable from a wrong password) and the SAME generic failure is
   returned, so there is no blocked-vs-wrong-password oracle. A soft-deleted user
   resolves as absent.
+- Refresh-grant lifecycle re-check (issue #52, fence completeness): the
+  `refresh_token` grant now re-checks the token subject's user lifecycle state before
+  minting and FAILS CLOSED (`invalid_grant`) when the user cannot authenticate
+  (blocked, disabled, pending-verification) or is absent/deleted, treating a store
+  fault as fail-closed too. An `offline_access` family deliberately survives the
+  block/disable session cascade (issue #21), so without this re-check a user fenced
+  AFTER the family was opened could keep minting access tokens through that surviving
+  token. The invariant is now complete: after block/disable/delete a user obtains no
+  new tokens by ANY path (authorize, refresh, or an existing offline token). A normal
+  active user's refresh is unaffected. See `docs/design/USER-LIFECYCLE.md`.
 - ACME certificate-authority DIRECTORY client for custom domains (issue #47,
   EXPLORATORY): `AcmeDirectoryClient` fetches and parses a CA's directory (RFC 8555
   7.1.1) ONLY through the SSRF-hardened `ironauth_fetch::Fetcher`, so a directory or

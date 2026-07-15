@@ -7788,6 +7788,42 @@ impl UserRepo<'_> {
         }))
     }
 
+    /// Resolve the lifecycle state of a LIVE user by its subject (the `usr_` id
+    /// string a refresh-token family carries), within scope (issue #52). Reads ONLY
+    /// the `state` column, so it needs no platform master key and decrypts no PII,
+    /// and it filters out the soft-delete tombstone (`deleted_at IS NULL`).
+    ///
+    /// Returns [`None`] when no live user with that subject exists in this scope: an
+    /// absent user, a cross-scope subject, a soft-deleted one, or a corrupt/unknown
+    /// state tag ([`UserState::from_wire`] rejects the `deleted` tombstone and any
+    /// unknown value). The caller treats [`None`] as FAIL CLOSED.
+    ///
+    /// The refresh-token grant reads this to RE-CHECK the token subject's lifecycle
+    /// before minting a fresh access token: a user blocked, disabled, or deleted
+    /// AFTER a refresh family was opened must not keep minting tokens, including
+    /// through a surviving `offline_access` family (issue #21). This is the
+    /// authoritative fence-completeness guarantee, the same class as the issuer
+    /// live-fence (a suspended subject must stop authenticating on the NEXT request).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure (which the caller also
+    /// treats as fail closed, never fail open).
+    pub async fn state_for_subject(&self, subject: &str) -> Result<Option<UserState>, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT state FROM users \
+             WHERE id = $1 AND tenant_id = $2 AND environment_id = $3 AND deleted_at IS NULL",
+        )
+        .bind(subject)
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(row.and_then(|row| UserState::from_wire(&row.get::<String, _>("state"))))
+    }
+
     /// Parse an untrusted user identifier under this scope (issue #52). A malformed
     /// identifier and one minted in another scope both return the uniform not-found.
     ///
