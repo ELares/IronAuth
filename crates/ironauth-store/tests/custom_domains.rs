@@ -410,6 +410,246 @@ async fn an_unsafe_or_malformed_domain_is_refused_before_it_is_written() {
     assert!(listed.is_empty(), "no unsafe domain was persisted");
 }
 
+#[tokio::test]
+async fn cross_tenant_exclusivity_is_case_and_trailing_dot_insensitive() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    // Three distinct tenants, each with its own environment.
+    let scope_a = db.seed_scope(&env).await;
+    let scope_b = db.seed_scope(&env).await;
+    let scope_c = db.seed_scope(&env).await;
+    assert_ne!(scope_a.tenant(), scope_b.tenant(), "distinct tenants");
+    assert_ne!(scope_a.tenant(), scope_c.tenant(), "distinct tenants");
+
+    // Tenant A registers with a mixed-case, trailing-dot input; it is stored in
+    // the canonical normalized form, then verified.
+    let (domain_a, challenge_a) =
+        register(&db, &env, scope_a, "Example.COM.", ChallengeType::Http01).await;
+    let a_read = db
+        .store()
+        .scoped(scope_a)
+        .custom_domains()
+        .get(&domain_a)
+        .await
+        .expect("read A domain");
+    assert_eq!(
+        a_read.domain_name, "example.com",
+        "the domain is stored normalized (lowercase, no root dot)"
+    );
+    db.store()
+        .scoped(scope_a)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .custom_domains()
+        .record_challenge_result(&env, &challenge_a, &domain_a, ChallengeOutcome::Valid)
+        .await
+        .expect("tenant A verifies");
+
+    // A lookup in any case, with surrounding whitespace or a trailing dot, finds
+    // the same registered row.
+    for query in [
+        "example.com",
+        "EXAMPLE.COM",
+        "Example.Com.",
+        "  example.com.  ",
+    ] {
+        let found = db
+            .store()
+            .scoped(scope_a)
+            .custom_domains()
+            .get_by_name(query)
+            .await
+            .unwrap_or_else(|error| {
+                panic!("lookup by {query:?} should find the domain: {error:?}")
+            });
+        assert_eq!(
+            found.id, domain_a,
+            "lookup by {query:?} finds the same domain"
+        );
+    }
+
+    // Tenant B verifying the same DNS domain in a DIFFERENT case is refused by the
+    // cross-tenant verified-domain unique index (the byte-exact index can no
+    // longer be bypassed by case, because both rows are normalized).
+    let (domain_b, challenge_b) =
+        register(&db, &env, scope_b, "EXAMPLE.com", ChallengeType::Http01).await;
+    assert_eq!(
+        db.store()
+            .scoped(scope_b)
+            .custom_domains()
+            .get(&domain_b)
+            .await
+            .expect("read B domain")
+            .domain_name,
+        "example.com",
+        "tenant B's registration is normalized to the same canonical name"
+    );
+    let err = db
+        .store()
+        .scoped(scope_b)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .custom_domains()
+        .record_challenge_result(&env, &challenge_b, &domain_b, ChallengeOutcome::Valid)
+        .await
+        .expect_err("a case-variant cross-tenant claim must be refused");
+    assert!(matches!(err, StoreError::Conflict), "got {err:?}");
+
+    // Tenant C claiming the same domain with a trailing root dot is likewise
+    // refused: the trailing-dot form normalizes to the one true name.
+    let (domain_c, challenge_c) =
+        register(&db, &env, scope_c, "example.com.", ChallengeType::Http01).await;
+    let err = db
+        .store()
+        .scoped(scope_c)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .custom_domains()
+        .record_challenge_result(&env, &challenge_c, &domain_c, ChallengeOutcome::Valid)
+        .await
+        .expect_err("a trailing-dot cross-tenant claim must be refused");
+    assert!(matches!(err, StoreError::Conflict), "got {err:?}");
+
+    // Tenant A keeps sole ownership.
+    assert_eq!(
+        db.store()
+            .scoped(scope_a)
+            .custom_domains()
+            .get(&domain_a)
+            .await
+            .expect("read A domain")
+            .verification_status,
+        VerificationStatus::Verified
+    );
+}
+
+#[tokio::test]
+async fn record_challenge_result_refuses_a_challenge_domain_mismatch() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    // Two domains in the same scope, each with its own challenge.
+    let (domain_one, _challenge_one) =
+        register(&db, &env, scope, "one.example.com", ChallengeType::Http01).await;
+    let (domain_two, challenge_two) =
+        register(&db, &env, scope, "two.example.com", ChallengeType::Http01).await;
+
+    // Pairing domain_two's challenge with domain_one's id is refused for BOTH the
+    // valid and the invalid paths, before any state is touched.
+    for outcome in [ChallengeOutcome::Valid, ChallengeOutcome::Invalid] {
+        let err = db
+            .store()
+            .scoped(scope)
+            .acting(db.test_actor(&env), CorrelationId::generate(&env))
+            .custom_domains()
+            .record_challenge_result(&env, &challenge_two, &domain_one, outcome)
+            .await
+            .expect_err("a challenge/domain mismatch must be refused");
+        assert!(matches!(err, StoreError::NotFound), "got {err:?}");
+    }
+
+    // Nothing moved: both domains are still pending and the challenge is untouched.
+    assert_eq!(
+        db.store()
+            .scoped(scope)
+            .custom_domains()
+            .get(&domain_one)
+            .await
+            .expect("read domain one")
+            .verification_status,
+        VerificationStatus::Pending
+    );
+    assert_eq!(
+        db.store()
+            .scoped(scope)
+            .custom_domains()
+            .get(&domain_two)
+            .await
+            .expect("read domain two")
+            .verification_status,
+        VerificationStatus::Pending
+    );
+    let ch = db
+        .store()
+        .scoped(scope)
+        .custom_domains()
+        .get_challenge(&challenge_two)
+        .await
+        .expect("read challenge two");
+    assert_eq!(ch.status, ChallengeStatus::Pending);
+    assert_eq!(
+        ch.attempts, 0,
+        "the mismatched result never bumped attempts"
+    );
+
+    // The matching (challenge_two, domain_two) pair still works.
+    db.store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .custom_domains()
+        .record_challenge_result(&env, &challenge_two, &domain_two, ChallengeOutcome::Valid)
+        .await
+        .expect("the correctly-paired result succeeds");
+    assert_eq!(
+        db.store()
+            .scoped(scope)
+            .custom_domains()
+            .get(&domain_two)
+            .await
+            .expect("read domain two")
+            .verification_status,
+        VerificationStatus::Verified
+    );
+}
+
+#[tokio::test]
+async fn store_certificate_refuses_an_unverified_domain() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let master = master_key(&env);
+    let scope = db.seed_scope(&env).await;
+    // Registered but NOT verified (still pending: no challenge succeeded).
+    let (domain, _challenge) = register(
+        &db,
+        &env,
+        scope,
+        "pending.example.com",
+        ChallengeType::Http01,
+    )
+    .await;
+
+    let bundle =
+        b"-----BEGIN PRIVATE KEY-----\nUNVERIFIED-CDOM-KEY\n-----END PRIVATE KEY-----".to_vec();
+    let not_after = i64::try_from(Duration::from_secs(90 * 24 * 3600).as_micros()).unwrap();
+    let err = db
+        .store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .custom_domains()
+        .store_certificate(&env, &master, &domain, &bundle, not_after)
+        .await
+        .expect_err("a certificate for an unverified domain must be refused");
+    assert!(matches!(err, StoreError::Conflict), "got {err:?}");
+
+    // The domain still carries no certificate handle, and no orphan secret was
+    // sealed (the gate rejects BEFORE sealing any key material).
+    let read = db
+        .store()
+        .scoped(scope)
+        .custom_domains()
+        .get(&domain)
+        .await
+        .expect("read domain");
+    assert!(
+        read.cert_secret_id.is_none(),
+        "an unverified domain gains no certificate"
+    );
+    let opened = db
+        .store()
+        .scoped(scope)
+        .envelope()
+        .open_secret(&master, &format!("custom_domain_cert:{domain}"))
+        .await;
+    assert!(opened.is_err(), "no orphan sealed secret should exist");
+}
+
 /// Whether `haystack` contains `needle` as a contiguous subslice.
 fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
     if needle.is_empty() || needle.len() > haystack.len() {

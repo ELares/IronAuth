@@ -14400,6 +14400,9 @@ impl CustomDomainRepo<'_> {
     /// [`StoreError::NotFound`] if no such domain is registered in this scope;
     /// [`StoreError::Database`] on a persistence failure.
     pub async fn get_by_name(&self, domain_name: &str) -> Result<CustomDomainRecord, StoreError> {
+        // Look up by the same canonical form registration stored, so a query in
+        // any case or with a trailing root dot finds the one registered row.
+        let domain_name = crate::custom_domain::normalize_domain(domain_name);
         let mut tx = begin_scoped(self.store, self.scope).await?;
         let row = sqlx::query(
             "SELECT id, domain_name, challenge_type, verification_status, cert_secret_id, \
@@ -14409,7 +14412,7 @@ impl CustomDomainRepo<'_> {
         )
         .bind(self.scope.tenant().to_string())
         .bind(self.scope.environment().to_string())
-        .bind(domain_name)
+        .bind(&domain_name)
         .fetch_optional(&mut *tx)
         .await?;
         tx.commit().await?;
@@ -14569,11 +14572,18 @@ impl ActingCustomDomainRepo<'_> {
         if domain.scope() != self.scope || challenge.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
-        if !crate::custom_domain::domain_is_registrable(domain_name) {
+        // Canonicalize BEFORE the registrability check and BEFORE storing: the
+        // cross-tenant exclusivity control is a byte-exact unique index on
+        // domain_name, so a raw value would let two tenants each claim the same
+        // DNS domain under a different case or a trailing root dot
+        // (example.com vs EXAMPLE.com vs example.com.). Normalizing to the
+        // canonical lowercase, root-dot-stripped form keys and indexes every
+        // registration on the one true name.
+        let domain_name = crate::custom_domain::normalize_domain(domain_name);
+        if !crate::custom_domain::domain_is_registrable(&domain_name) {
             return Err(StoreError::InvalidCustomDomain);
         }
         let scope = self.scope;
-        let domain_name = domain_name.to_string();
         // The freshly issued challenge is ready to poll now (from the clock seam).
         let next_attempt_micros = epoch_micros(env.clock().now_utc());
         write_audited(
@@ -14676,32 +14686,36 @@ impl ActingCustomDomainRepo<'_> {
                 target: domain,
             },
             async move |tx| {
-                // Move the challenge to its terminal state. On a failure, bump the
-                // attempt count and schedule the next attempt from the clock seam
-                // plus the deterministic backoff; on success, clear the schedule.
+                // Move the challenge to its terminal state (on a failure, bump the
+                // attempts and schedule the deterministic backoff; on success, clear
+                // it). Keyed on BOTH the challenge id and the passed `domain_id`, so a
+                // mismatched challenge/domain pair matches no row (NotFound).
                 let challenge_row = match outcome {
                     ChallengeOutcome::Valid => sqlx::query(
                         "UPDATE acme_challenges \
                          SET status = 'valid', next_attempt_at = NULL, \
                              updated_at = TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval \
-                         WHERE tenant_id = $1 AND environment_id = $2 AND id = $3 \
-                         RETURNING attempts",
+                         WHERE tenant_id = $1 AND environment_id = $2 \
+                               AND id = $3 AND domain_id = $5 RETURNING attempts",
                     )
                     .bind(scope.tenant().to_string())
                     .bind(scope.environment().to_string())
                     .bind(challenge.to_string())
                     .bind(updated_micros)
+                    .bind(domain.to_string())
                     .fetch_optional(&mut **tx)
                     .await?,
                     ChallengeOutcome::Invalid => {
                         // Read the current attempt count to compute the next schedule.
                         let current: Option<i32> = sqlx::query(
                             "SELECT attempts FROM acme_challenges \
-                             WHERE tenant_id = $1 AND environment_id = $2 AND id = $3",
+                             WHERE tenant_id = $1 AND environment_id = $2 \
+                                   AND id = $3 AND domain_id = $4",
                         )
                         .bind(scope.tenant().to_string())
                         .bind(scope.environment().to_string())
                         .bind(challenge.to_string())
+                        .bind(domain.to_string())
                         .fetch_optional(&mut **tx)
                         .await?
                         .map(|row| row.get::<i32, _>("attempts"));
@@ -14716,8 +14730,8 @@ impl ActingCustomDomainRepo<'_> {
                              SET status = 'invalid', attempts = $4, \
                                  next_attempt_at = TIMESTAMPTZ 'epoch' + ($5::text || ' microseconds')::interval, \
                                  updated_at = TIMESTAMPTZ 'epoch' + ($6::text || ' microseconds')::interval \
-                             WHERE tenant_id = $1 AND environment_id = $2 AND id = $3 \
-                             RETURNING attempts",
+                             WHERE tenant_id = $1 AND environment_id = $2 \
+                                   AND id = $3 AND domain_id = $7 RETURNING attempts",
                         )
                         .bind(scope.tenant().to_string())
                         .bind(scope.environment().to_string())
@@ -14725,13 +14739,12 @@ impl ActingCustomDomainRepo<'_> {
                         .bind(next_attempts)
                         .bind(next_at)
                         .bind(updated_micros)
+                        .bind(domain.to_string())
                         .fetch_optional(&mut **tx)
                         .await?
                     }
                 };
-                if challenge_row.is_none() {
-                    return Err(StoreError::NotFound);
-                }
+                challenge_row.ok_or(StoreError::NotFound)?;
                 // Move the domain to its corresponding verification state.
                 let domain_update = sqlx::query(
                     "UPDATE custom_domains \
@@ -14771,9 +14784,16 @@ impl ActingCustomDomainRepo<'_> {
     /// The scope's KEK/DEK are provisioned lazily on first use (idempotent), so a
     /// domain in a scope that never sealed a secret before still stores its cert.
     ///
+    /// A certificate is only ever stored for a domain in the VERIFIED state (its
+    /// ownership challenge completed): storing one for a pending or failed domain
+    /// is refused with [`StoreError::Conflict`] BEFORE anything is sealed, so an
+    /// unverified domain never gains a certificate and no orphan secret is left
+    /// behind.
+    ///
     /// # Errors
     ///
     /// [`StoreError::NotFound`] if the domain id is out of scope or absent;
+    /// [`StoreError::Conflict`] if the domain is not in the verified state;
     /// [`StoreError::Encryption`] if the scope's keys cannot seal the bundle;
     /// [`StoreError::Database`] on a persistence failure.
     pub async fn store_certificate(
@@ -14788,6 +14808,19 @@ impl ActingCustomDomainRepo<'_> {
             return Err(StoreError::NotFound);
         }
         let scope = self.scope;
+        // A cert may only exist for a domain whose ownership challenge completed.
+        // Read the domain up front (NotFound if absent) and require Verified before
+        // sealing any key material, so a pending or failed domain is refused
+        // without leaving an orphan sealed secret behind.
+        let current = CustomDomainRepo {
+            store: self.store,
+            scope,
+        }
+        .get(domain)
+        .await?;
+        if current.verification_status != VerificationStatus::Verified {
+            return Err(StoreError::Conflict);
+        }
         let envelope = ActingEnvelopeRepo {
             store: self.store,
             scope,
