@@ -36,9 +36,15 @@
 --
 -- A creation or update whose canonical form collides within the configured scope is
 -- refused by this index as a unique violation, mapped to the deterministic
--- StoreError::Conflict. Changing the mode on a populated environment recomputes the
--- keys (a validation pass reports collisions before the change applies), which is
--- why the key is a normal updatable column rather than a generated one.
+-- StoreError::Conflict. Changing the mode on a populated environment is a two-part
+-- operation the application performs (ActingUserIdentifierRepo::apply_uniqueness_mode):
+-- it first refuses the change while collisions_for_mode reports any post-canonicalization
+-- collision the new mode would enforce, then, in the SAME transaction, RECOMPUTES every
+-- row's uniqueness_key under the new mode (the environment-wide constant, the org-keyed
+-- value, or NULL). Recomputing the keys is what makes a tightening actually take effect:
+-- a pre-existing NULL-keyed row would otherwise stay exempt from the partial index. This
+-- is why uniqueness_key is a normal updatable column (column-scoped UPDATE grant below)
+-- rather than a generated one.
 --
 -- Migration safety obligation (see migrate.rs): the new tenant-scoped table ENABLEs
 -- and FORCEs row-level security, adds the (tenant, environment) isolation policy and

@@ -46,6 +46,70 @@ async fn column_exists(pool: &sqlx::PgPool, table: &str, column: &str) -> bool {
     .get("present")
 }
 
+/// Whether `table` has BOTH `ENABLE` and `FORCE` row-level security on (`pg_class`).
+async fn rls_enabled_and_forced(pool: &sqlx::PgPool, table: &str) -> bool {
+    sqlx::query(
+        "SELECT (relrowsecurity AND relforcerowsecurity) AS present \
+         FROM pg_catalog.pg_class WHERE oid = $1::regclass",
+    )
+    .bind(table)
+    .fetch_one(pool)
+    .await
+    .expect("rls lookup")
+    .get("present")
+}
+
+/// Whether a row-level-security policy named `policy` exists on `table`.
+async fn policy_exists(pool: &sqlx::PgPool, table: &str, policy: &str) -> bool {
+    sqlx::query(
+        "SELECT EXISTS ( \
+            SELECT 1 FROM pg_catalog.pg_policies \
+            WHERE tablename = $1 AND policyname = $2 \
+         ) AS present",
+    )
+    .bind(table)
+    .bind(policy)
+    .fetch_one(pool)
+    .await
+    .expect("policy lookup")
+    .get("present")
+}
+
+/// Whether a CHECK constraint named `constraint_name` exists on `table`.
+async fn check_constraint_exists(pool: &sqlx::PgPool, table: &str, constraint_name: &str) -> bool {
+    sqlx::query(
+        "SELECT EXISTS ( \
+            SELECT 1 FROM pg_catalog.pg_constraint \
+            WHERE conrelid = $1::regclass AND contype = 'c' AND conname = $2 \
+         ) AS present",
+    )
+    .bind(table)
+    .bind(constraint_name)
+    .fetch_one(pool)
+    .await
+    .expect("check constraint lookup")
+    .get("present")
+}
+
+/// Whether a PARTIAL UNIQUE index named `index` exists on `table` (unique with a
+/// `WHERE` predicate).
+async fn partial_unique_index_exists(pool: &sqlx::PgPool, table: &str, index: &str) -> bool {
+    sqlx::query(
+        "SELECT EXISTS ( \
+            SELECT 1 FROM pg_catalog.pg_index i \
+            JOIN pg_catalog.pg_class c ON c.oid = i.indexrelid \
+            WHERE i.indrelid = $1::regclass AND c.relname = $2 \
+              AND i.indisunique AND i.indpred IS NOT NULL \
+         ) AS present",
+    )
+    .bind(table)
+    .bind(index)
+    .fetch_one(pool)
+    .await
+    .expect("partial unique index lookup")
+    .get("present")
+}
+
 #[tokio::test]
 async fn in_order_apply_records_each_and_is_idempotent() {
     let pool = TestDatabase::fresh_owner_pool().await;
@@ -1371,6 +1435,38 @@ async fn production_chain_is_only_the_forty_one_real_migrations_and_ships_no_dem
             "user_identifiers must have no plaintext identifier column ({forbidden})"
         );
     }
+    // The tenant-scoped-table obligations (migrate.rs checklist), asserted structurally
+    // against pg_catalog: forced row-level security, the (tenant, environment) isolation
+    // policy, the nonempty-scope and closed-type CHECK constraints, and the partial
+    // UNIQUE index that enforces uniqueness-as-configuration. A future edit that drops
+    // any of these silently reopens a cross-tenant leak or the uniqueness gap; this
+    // fails the build instead.
+    assert!(
+        rls_enabled_and_forced(pool, "user_identifiers").await,
+        "user_identifiers must ENABLE and FORCE row-level security"
+    );
+    assert!(
+        policy_exists(
+            pool,
+            "user_identifiers",
+            "user_identifiers_tenant_isolation"
+        )
+        .await,
+        "the (tenant, environment) isolation policy must exist on user_identifiers"
+    );
+    for constraint in [
+        "user_identifiers_scope_nonempty",
+        "user_identifiers_type_known",
+    ] {
+        assert!(
+            check_constraint_exists(pool, "user_identifiers", constraint).await,
+            "user_identifiers must carry the {constraint} CHECK constraint"
+        );
+    }
+    assert!(
+        partial_unique_index_exists(pool, "user_identifiers", "user_identifiers_uniqueness").await,
+        "the partial UNIQUE index user_identifiers_uniqueness must exist"
+    );
 }
 
 #[tokio::test]

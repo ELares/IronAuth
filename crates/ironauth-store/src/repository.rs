@@ -9172,6 +9172,47 @@ pub struct IdentifierCollision {
     pub count: i64,
 }
 
+/// The SQL expression that computes a row's TARGET uniqueness discriminator under
+/// `mode` (issue #54). It is a fixed, code-owned constant per mode (never
+/// attacker-controlled), so interpolating it into a query is safe. Sharing ONE
+/// expression between the collision scan ([`UserIdentifierRepo::collisions_for_mode`])
+/// and the recompute ([`ActingUserIdentifierRepo::apply_uniqueness_mode`]) is what
+/// keeps them consistent: the scan groups by exactly the key the recompute will write,
+/// so a mode that the scan reports collision-free cannot then violate the partial
+/// unique index mid-recompute.
+///
+///   * [`UniquenessMode::EnvironmentWide`]: the constant `'env'` for every row, so the
+///     partial unique index collapses to per-(scope, type, canonical) uniqueness.
+///   * [`UniquenessMode::OrgScoped`]: preserve an app-supplied `org:<id>` key, else the
+///     environment fallback `'env'` (the membership-free reality until M10 org
+///     membership ships; see the M10 caveat in the module docs).
+///   * [`UniquenessMode::NonUnique`]: `NULL`, which the partial unique index excludes,
+///     so duplicates are allowed.
+fn mode_target_key_sql(mode: UniquenessMode) -> &'static str {
+    match mode {
+        UniquenessMode::EnvironmentWide => "'env'",
+        UniquenessMode::OrgScoped => {
+            "CASE WHEN uniqueness_key LIKE 'org:%' THEN uniqueness_key ELSE 'env' END"
+        }
+        UniquenessMode::NonUnique => "NULL",
+    }
+}
+
+/// The extra GROUP BY term for the collision scan under `mode`, or [`None`] when the
+/// target key is a per-mode CONSTANT for every row. Grouping the collision scan by
+/// [`mode_target_key_sql`] directly would embed a bare constant in `GROUP BY` (which
+/// Postgres rejects, and which is a redundant no-op anyway); this returns the extra
+/// term ONLY for the org-scoped mode, whose per-row `CASE` discriminator genuinely
+/// partitions rows (different orgs into different groups). Environment-wide (constant
+/// `'env'`) and non-unique (no scan) return [`None`], so the scan groups by
+/// `(identifier_type, canonical_bidx)` alone, and every same-canonical pair collides.
+fn mode_group_key_sql(mode: UniquenessMode) -> Option<&'static str> {
+    match mode {
+        UniquenessMode::OrgScoped => Some(mode_target_key_sql(mode)),
+        UniquenessMode::EnvironmentWide | UniquenessMode::NonUnique => None,
+    }
+}
+
 /// The read-only flexible-identifier repository (issue #54).
 pub struct UserIdentifierRepo<'a> {
     store: &'a Store,
@@ -9201,6 +9242,13 @@ impl UserIdentifierRepo<'_> {
         let master = self.store.master().ok_or(StoreError::Encryption)?;
         // Canonicalize EXACTLY ONCE, at this boundary, before any comparison.
         let canonical = canonicalize_identifier(kind, raw);
+        // A degenerate (empty) canonical form is never a real identifier: the write
+        // boundary refuses to store one, so nothing legitimately matches it. Return
+        // an empty result WITHOUT querying, so an all-invisible / shapeless submission
+        // is a clean miss and never an oracle for the empty slot.
+        if canonical.is_empty() {
+            return Ok(Vec::new());
+        }
         let bidx = flexible_identifier_blind_index(master, self.scope, &canonical);
         let mut tx = begin_scoped(self.store, self.scope).await?;
         let rows = sqlx::query(
@@ -9305,20 +9353,27 @@ impl UserIdentifierRepo<'_> {
         &self,
         mode: UniquenessMode,
     ) -> Result<Vec<IdentifierCollision>, StoreError> {
-        // Without org membership (M10), every user resolves to the environment
-        // scope, so environment-wide and org-scoped share one collision test and
-        // non-unique has none.
+        // Non-unique mode enforces no uniqueness, so it never collides.
         if matches!(mode, UniquenessMode::NonUnique) {
             return Ok(Vec::new());
         }
+        // Group by the SAME discriminator the partial unique index (and `add`) would
+        // enforce under `mode`: (type, canonical, target-key). For environment-wide
+        // the target key is a constant, so grouping collapses to (type, canonical) and
+        // any two same-canonical rows collide REGARDLESS of their current org key. For
+        // org-scoped the target key preserves an app-supplied `org:<id>` (else the
+        // environment fallback), so two same-canonical identifiers in DIFFERENT orgs
+        // land in different groups and are NOT a collision, exactly as `add` allows.
+        // This is the fix for the org-ignoring disagreement with `add`.
+        let group_extra = mode_group_key_sql(mode).map_or_else(String::new, |e| format!(", ({e})"));
         let mut tx = begin_scoped(self.store, self.scope).await?;
-        let rows = sqlx::query(
+        let rows = sqlx::query(&format!(
             "SELECT identifier_type, count(*) AS n FROM user_identifiers \
              WHERE tenant_id = $1 AND environment_id = $2 \
-             GROUP BY identifier_type, canonical_bidx \
+             GROUP BY identifier_type, canonical_bidx{group_extra} \
              HAVING count(*) > 1 \
-             ORDER BY identifier_type",
-        )
+             ORDER BY identifier_type"
+        ))
         .bind(self.scope.tenant().to_string())
         .bind(self.scope.environment().to_string())
         .fetch_all(&mut *tx)
@@ -9404,6 +9459,16 @@ impl ActingUserIdentifierRepo<'_> {
         // Canonicalize EXACTLY ONCE at this boundary; everything downstream keys on
         // the canonical form.
         let canonical = canonicalize_identifier(kind, raw);
+        // Refuse a degenerate (empty) canonical form deterministically, BEFORE any
+        // write and independent of any existing row. An all-invisible / whitespace-only
+        // submission, or an email with no usable `@` shape (which canonicalizes to the
+        // empty form), would otherwise squat the "empty" slot and resolve to this
+        // account, or be stored as a username-like fold. This is not an existence
+        // probe, so it is a caller-facing validation error, never the uniform
+        // not-found.
+        if canonical.is_empty() {
+            return Err(StoreError::InvalidIdentifier);
+        }
         let bidx = flexible_identifier_blind_index(master, scope, &canonical);
         let uniqueness_key = mode.uniqueness_key(org);
         write_audited(
@@ -9454,6 +9519,97 @@ impl ActingUserIdentifierRepo<'_> {
         )
         .await?;
         Ok(id)
+    }
+
+    /// Apply a uniqueness-mode change to a populated environment (issue #54): recompute
+    /// every identifier row's `uniqueness_key` under `mode`, in ONE scope-fenced,
+    /// audited transaction, AFTER refusing the change while a post-canonicalization
+    /// collision the new mode would enforce still exists.
+    ///
+    /// This is the step the 0041 migration comment described but the original
+    /// implementation never shipped: without it, switching (for example) from
+    /// non-unique to environment-wide left pre-existing NULL-keyed rows exempt from the
+    /// partial unique index, so a later environment-wide `add` of the same identifier
+    /// SUCCEEDED and produced a "unique" three-way collision. Recomputing the keys in
+    /// the same transaction closes that gap: after a successful apply every row carries
+    /// the discriminator the new mode enforces, so a subsequent duplicate `add` is the
+    /// deterministic [`StoreError::Conflict`].
+    ///
+    /// Fail-closed ordering: the collision scan and the recompute run in the SAME
+    /// transaction and share [`mode_target_key_sql`], so the set of rows checked is
+    /// exactly the set rewritten. If any collision the new mode would enforce exists
+    /// the whole transaction rolls back (no key is rewritten, no audit row is
+    /// committed) and the call returns [`StoreError::Conflict`]; the operator resolves
+    /// the reported collisions (see [`UserIdentifierRepo::collisions_for_mode`]) and
+    /// retries.
+    ///
+    /// The M10 caveat (module docs) applies: the org discriminator is app-supplied with
+    /// no database membership tie, and this recompute PRESERVES an existing `org:<id>`
+    /// key rather than deriving membership, so it does not repair an org key after a
+    /// membership change (a pre-M10 follow-up).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Conflict`] if a collision the new mode would enforce still exists
+    /// (nothing is changed); [`StoreError::Database`] on a persistence failure.
+    pub async fn apply_uniqueness_mode(
+        &self,
+        env: &Env,
+        mode: UniquenessMode,
+    ) -> Result<(), StoreError> {
+        let scope = self.scope;
+        let environment = scope.environment();
+        let target_key = mode_target_key_sql(mode);
+        // The collision scan (skipped for non-unique, which enforces nothing) and the
+        // recompute share one target-key expression and one transaction. The scan's
+        // GROUP BY uses the same conditional term as `collisions_for_mode` so the set
+        // of rows it checks is exactly the set the recompute rewrites.
+        let group_extra = mode_group_key_sql(mode).map_or_else(String::new, |e| format!(", ({e})"));
+        let collision_check = !matches!(mode, UniquenessMode::NonUnique);
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::UserIdentifierApplyUniquenessMode,
+                target: &environment,
+            },
+            async move |tx| {
+                if collision_check {
+                    // Any (type, canonical, target-key) group of two or more rows is a
+                    // collision the new mode would enforce: refuse before rewriting.
+                    let colliding = sqlx::query(&format!(
+                        "SELECT 1 FROM user_identifiers \
+                         WHERE tenant_id = $1 AND environment_id = $2 \
+                         GROUP BY identifier_type, canonical_bidx{group_extra} \
+                         HAVING count(*) > 1 \
+                         LIMIT 1"
+                    ))
+                    .bind(scope.tenant().to_string())
+                    .bind(scope.environment().to_string())
+                    .fetch_optional(&mut **tx)
+                    .await?;
+                    if colliding.is_some() {
+                        return Err(StoreError::Conflict);
+                    }
+                }
+                // Recompute every row's discriminator under the new mode. The UPDATE is
+                // column-scoped to (uniqueness_key, updated_at), within the grant.
+                sqlx::query(&format!(
+                    "UPDATE user_identifiers \
+                     SET uniqueness_key = ({target_key}), updated_at = now() \
+                     WHERE tenant_id = $1 AND environment_id = $2"
+                ))
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .execute(&mut **tx)
+                .await?;
+                Ok(())
+            },
+            false,
+        )
+        .await
     }
 }
 

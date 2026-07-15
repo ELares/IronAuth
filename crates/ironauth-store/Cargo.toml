@@ -36,6 +36,19 @@ base64.workspace = true
 # one canonical form. Already present transitively via sqlx (url -> idna), so this
 # is a direct path edge, not a new crate; MSRV 1.85 and the musl static lane hold.
 unicode-normalization.workspace = true
+# Unicode General_Category lookup for the canonicalization seam (issue #54): step 1
+# strips invisible / control / format / separator characters by PROPERTY (Cc, Cf,
+# Zl, Zp), not a hand-curated code-point list with gaps. Already present transitively
+# via sqlx (-> stringprep), so no new crate enters the graph; MSRV 1.85 and the musl
+# static lane hold.
+unicode-properties.workspace = true
+# Full Unicode Default Case Folding for the canonicalization seam (issue #54): folds
+# the case pairs where simple lowercasing diverges (the German sharp s, the Greek
+# final sigma) so a mixed-case enumeration variant of a login handle canonicalizes to
+# one form. A standard unicode-rs crate (MIT), pure Rust, no build script, depending
+# only on unicode-normalization (already in the tree); MSRV 1.85 and the musl static
+# lane hold, and cargo-deny passes.
+caseless.workspace = true
 # SHA-256 over migration text for the expand-contract runner's checksums (drift
 # and tamper detection). Pure Rust, permissive, already present transitively via
 # sqlx, so no new crate enters the graph; keeps MSRV 1.85 and musl clean.

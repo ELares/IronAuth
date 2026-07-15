@@ -28,18 +28,29 @@
 //! property tests below and the `canonicalize_identifier` fuzz target. It applies,
 //! in order:
 //!
-//!   1. Strip Unicode invisible and control characters everywhere in the input:
-//!      every C0/C1 control, plus the zero-width, bidirectional-format, and
-//!      default-ignorable code points a homoglyph or direction-override attack
-//!      hides in a handle (see [`is_invisible_or_control`]). A tab, a newline, a
-//!      zero-width joiner, and a right-to-left override all vanish, so two handles
+//!   1. Strip Unicode invisible and control characters everywhere in the input by
+//!      Unicode PROPERTY, not a hand-curated code-point list. A character is removed
+//!      when its `General_Category` is Control (Cc), Format (Cf), `Line_Separator`
+//!      (Zl), or `Paragraph_Separator` (Zp), OR when it carries the derived
+//!      `Default_Ignorable_Code_Point` property (see [`is_invisible_or_control`]). This
+//!      is a property predicate over the whole Unicode range rather than a list with
+//!      gaps, so every zero-width joiner, bidirectional override, combining grapheme
+//!      joiner (U+034F), reserved default-ignorable (U+2065), line/paragraph
+//!      separator (U+2028/U+2029), and variation selector vanishes, and two handles
 //!      that differ only by invisible padding are ONE identifier.
 //!   2. Apply Unicode NFKC (Normalization Form KC): compatibility decomposition
 //!      then canonical composition. This folds the large confusable class of
 //!      compatibility variants (fullwidth ASCII, circled and superscript forms,
-//!      ligatures) onto their ordinary forms, and composes combining sequences, so
-//!      `Ａ` and `A` are the same starter.
-//!   3. Trim leading and trailing Unicode whitespace.
+//!      ligatures) onto their ordinary forms, composes combining sequences (so `Ａ`
+//!      and `A` are the same starter), and maps compatibility spaces (a no-break
+//!      space U+00A0, a figure space U+2007) onto the ordinary space so step 3 can
+//!      remove them.
+//!   3. Strip ALL whitespace everywhere in the value, not merely at the ends: any
+//!      character with the Unicode `White_Space` property (Zs plus the ASCII
+//!      whitespace controls) is removed. A login identifier has no legitimate
+//!      internal whitespace, so `ad min` and `admin` are ONE identifier; removing
+//!      interior whitespace (rather than trimming only the ends) closes the
+//!      internal-space smuggling variant that a trim-only pass leaves open.
 //!   4. Apply the per-type policy (see below).
 //!
 //! ### Per-type case folding and shape (RFC 8264 / RFC 8265 PRECIS, informative)
@@ -51,26 +62,46 @@
 //!     case-sensitive local parts, but every mainstream mailbox provider treats
 //!     them case-insensitively, and a case-sensitive login handle is a canonical
 //!     enumeration / duplicate-account footgun, so IronAuth folds it. An input with
-//!     no usable `@` shape falls back to a whole-string fold (still total).
+//!     no usable `@` shape yields an EMPTY canonical form and is refused at the write
+//!     boundary (`ActingUserIdentifierRepo::add`): an email must have an `@` shape, and
+//!     a shapeless value must not be stored as a username-like fold.
 //!   * `username`: Unicode case-fold the whole value (the PRECIS
-//!     `UsernameCaseMapped` profile's case-mapping rule, approximated by Unicode
-//!     lowercase, which is deterministic and idempotent).
+//!     `UsernameCaseMapped` profile's case-mapping rule).
 //!   * `phone`: STRUCTURAL E.164 (ITU-T E.164) normalization: keep only ASCII
 //!     digits and emit `+<digits>`. This strips every visual separator (spaces,
 //!     hyphens, parentheses, the fullwidth digits already folded by NFKC) so
 //!     `+1 (415) 555-0100` and `+14155550100` are one identifier. It does NOT infer
 //!     a country code from a national number (that needs a region context and a
 //!     libphonenumber-scale table, out of scope here and a heavy dependency): a
-//!     caller submits an already-international number. An input with no digits folds
-//!     as a plain string so it stays distinct rather than collapsing to `+`.
+//!     caller submits an already-international number. An input with no digits yields
+//!     an EMPTY canonical form (refused at the write boundary) rather than a bare `+`.
 //!
-//! Case folding uses Unicode lowercase (`str::to_lowercase`) rather than full
-//! Unicode case folding: lowercase is in the standard library (no new dependency),
-//! is deterministic, and is idempotent, and it collapses the mixed-case
-//! enumeration class the named CVEs exploit. Full caseless matching of the rare
-//! characters where lowercase and case-fold diverge is a later refinement.
+//! Case folding uses full Unicode Default Case Folding
+//! (`caseless::default_case_fold_str`, the Unicode 3.13 default case-fold mapping),
+//! re-normalized to NFKC afterward for idempotence. This is stronger than
+//! `str::to_lowercase`: it folds the case pairs where simple lowercasing diverges,
+//! so the German sharp s (`STRASSE` and `straße`), the Greek final sigma (`ΟΔΟΣ` and
+//! `οδοσ`), and the other full-fold expansions collapse to ONE canonical form rather
+//! than staying two distinct login handles.
+//!
+//! ### Documented structural limitations (NOT bugs; out of scope for this seam)
+//!
+//!   * Cross-script CONFUSABLES (a Cyrillic `а` U+0430 vs a Latin `a` U+0061, and
+//!     the like) are NOT folded: that needs a UTS-39 confusable-skeleton mapping,
+//!     which is a separate, deliberately-scoped-out mechanism. Two visually
+//!     identical handles in different scripts remain distinct canonical forms here.
+//!   * NFKC OVER-folds a few compatibility pairs (the `ﬁ` ligature to `fi`, some
+//!     circled and stylistic forms): distinct source strings can share one canonical
+//!     form. This is the accepted cost of compatibility normalization; it errs toward
+//!     collapsing rather than splitting an identity, which is the safe direction for
+//!     a login handle.
+//!   * The phone policy MERGES a number and the same number with an extension (the
+//!     extension digits are not separated), because structural E.164 keeps only the
+//!     digits. A caller that must distinguish an extension carries it out of band.
 
+use caseless::default_case_fold_str;
 use unicode_normalization::UnicodeNormalization;
+use unicode_properties::{GeneralCategory, UnicodeGeneralCategory};
 
 /// The kind of a login identifier (issue #54). Each kind has its own canonical
 /// form and case-folding policy; the kind is bound into the blind index so the
@@ -140,6 +171,21 @@ impl CanonicalIdentifier {
     pub fn as_str(&self) -> &str {
         &self.value
     }
+
+    /// Whether the canonical form is EMPTY (a degenerate identifier): the input was
+    /// all whitespace / all invisible characters, or (for an email) carried no `@`
+    /// shape and no usable content. An empty canonical form is not a real identifier:
+    /// the write boundary refuses to store one (so an all-invisible submission cannot
+    /// squat the empty slot), and resolution of one returns nothing rather than
+    /// matching a row. See [`ActingUserIdentifierRepo::add`] and
+    /// [`UserIdentifierRepo::resolve`].
+    ///
+    /// [`ActingUserIdentifierRepo::add`]: crate::ActingUserIdentifierRepo::add
+    /// [`UserIdentifierRepo::resolve`]: crate::UserIdentifierRepo::resolve
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.value.is_empty()
+    }
 }
 
 /// The one canonicalization seam (issue #54): produce the canonical form of a raw
@@ -152,84 +198,108 @@ impl CanonicalIdentifier {
 /// See the module documentation for the full, per-type policy.
 #[must_use]
 pub fn canonicalize_identifier(kind: IdentifierType, raw: &str) -> CanonicalIdentifier {
-    // 1. Strip invisible and control characters everywhere.
+    // 1. Strip invisible / control / format / separator / default-ignorable
+    //    characters everywhere, by Unicode property.
     let stripped: String = raw
         .chars()
         .filter(|&c| !is_invisible_or_control(c))
         .collect();
-    // 2. NFKC compatibility normalization, then 3. trim surrounding whitespace.
+    // 2. NFKC compatibility normalization (also maps compatibility spaces onto the
+    //    ordinary space so step 3 removes them).
     let normalized: String = stripped.nfkc().collect();
-    let base = normalized.trim();
+    // 3. Strip ALL whitespace, interior included: a login identifier carries no
+    //    legitimate whitespace, so `ad min` and `admin` are one identifier.
+    let base: String = normalized.chars().filter(|c| !c.is_whitespace()).collect();
     // 4. Per-type shape and case folding.
     let value = match kind {
-        IdentifierType::Email => canonical_email(base),
-        IdentifierType::Username => case_fold(base),
-        IdentifierType::Phone => canonical_phone(base),
+        IdentifierType::Email => canonical_email(&base),
+        IdentifierType::Username => case_fold(&base),
+        IdentifierType::Phone => canonical_phone(&base),
     };
     CanonicalIdentifier { kind, value }
 }
 
-/// Unicode case-fold approximated by lowercase, re-normalized to NFKC so the output
-/// is stable under a second pass. Lowercasing an NFKC string can, for a few code
-/// points, yield a non-NFKC sequence; the trailing NFKC restores the form without
-/// changing case, so `case_fold(case_fold(x)) == case_fold(x)`.
+/// Full Unicode Default Case Folding (`caseless::default_case_fold_str`), then
+/// re-normalized to NFKC so the output is stable under a second pass. Full folding
+/// (not simple lowercase) collapses the case pairs where lowercasing diverges, so
+/// the sharp s folds to `ss` and the Greek final sigma folds to a medial sigma;
+/// the trailing NFKC restores the normalization form without changing case, so
+/// `case_fold(case_fold(x)) == case_fold(x)`.
 fn case_fold(value: &str) -> String {
-    value.to_lowercase().nfkc().collect()
+    default_case_fold_str(value).nfkc().collect()
 }
 
 /// The canonical email form: fold the local part and the domain independently and
 /// recombine. Splitting on the LAST `@` keeps a quoted `@` inside the local part
 /// with the local part, and folding never introduces or moves an `@`, so the split
-/// is stable under a second pass (idempotence).
+/// is stable under a second pass (idempotence). An input with no usable `@` shape
+/// (no `@`, or an empty local part or domain) yields an EMPTY canonical form rather
+/// than a whole-string fold: the write boundary refuses to store a shapeless value
+/// as an email, so a username-like fold cannot masquerade as an email row.
 fn canonical_email(base: &str) -> String {
     match base.rsplit_once('@') {
         Some((local, domain)) if !local.is_empty() && !domain.is_empty() => {
             format!("{}@{}", case_fold(local), case_fold(domain))
         }
-        // No usable `@` shape: fold the whole value so it stays a distinct
-        // identifier rather than being silently reshaped.
-        _ => case_fold(base),
+        _ => String::new(),
     }
 }
 
 /// The canonical phone form: structural E.164. Keep only ASCII digits and prefix a
-/// single `+`. An input with no digits is folded as a plain string so two distinct
-/// non-numeric inputs stay distinct (they do not both collapse to a bare `+`).
+/// single `+`. An input with no digits yields an EMPTY canonical form (refused at
+/// the write boundary) rather than a bare `+` or a plain-string fold.
 fn canonical_phone(base: &str) -> String {
     let digits: String = base.chars().filter(char::is_ascii_digit).collect();
     if digits.is_empty() {
-        case_fold(base)
+        String::new()
     } else {
         format!("+{digits}")
     }
 }
 
-/// Whether a character is stripped as an invisible or control character (step 1 of
-/// canonicalization). Covers every Unicode control character (C0, C1, DEL, and the
-/// line/paragraph separators, via [`char::is_control`]) plus the curated set of
-/// zero-width, bidirectional-format, and default-ignorable code points that carry
-/// no visible glyph and exist mainly to smuggle a difference past a naive
-/// comparator. The set is explicit (not a Unicode-category lookup) so it needs no
-/// property-table dependency and every stripped code point is auditable here.
+/// Whether a character is stripped in step 1 of canonicalization, decided by Unicode
+/// PROPERTY rather than a hand-maintained code-point list. A character is stripped
+/// when its `General_Category` is Control (Cc), Format (Cf), `Line_Separator` (Zl),
+/// or `Paragraph_Separator` (Zp), OR when it carries the derived `Default_Ignorable`
+/// property. This is a total predicate over the whole Unicode range, so a homoglyph
+/// or direction-override attack cannot exploit a gap in a curated list: every
+/// zero-width joiner, bidirectional control, combining grapheme joiner, reserved
+/// default-ignorable code point, and variation selector is removed.
 fn is_invisible_or_control(c: char) -> bool {
-    if c.is_control() {
-        return true;
-    }
+    matches!(
+        c.general_category(),
+        GeneralCategory::Control
+            | GeneralCategory::Format
+            | GeneralCategory::LineSeparator
+            | GeneralCategory::ParagraphSeparator
+    ) || is_default_ignorable(c)
+}
+
+/// Whether a character carries the Unicode `Default_Ignorable_Code_Point` derived
+/// property (`DerivedCoreProperties`). These are code points meant to have no visible
+/// rendering when unsupported (the combining grapheme joiner U+034F, the Hangul and
+/// Mongolian fillers, the variation selectors, the reserved-but-ignorable ranges
+/// such as U+2065, U+FFF0..U+FFF8, and the tag/variation-selector supplement). Many
+/// are NOT Cf/Cc (U+034F is a combining mark, the fillers are letters, the reserved
+/// ones are unassigned), so category alone misses them; this predicate is the exact
+/// derived-property range set from the Unicode data file (authoritative, not a
+/// best-effort list) rather than a curated guess.
+fn is_default_ignorable(c: char) -> bool {
     matches!(c,
         '\u{00AD}'                       // SOFT HYPHEN
+        | '\u{034F}'                     // COMBINING GRAPHEME JOINER
         | '\u{061C}'                     // ARABIC LETTER MARK
-        | '\u{115F}' | '\u{1160}'        // HANGUL CHOSEONG / JUNGSEONG FILLER
-        | '\u{17B4}' | '\u{17B5}'        // KHMER vowel inherent AQ / AA
-        | '\u{180B}'..='\u{180F}'        // MONGOLIAN free variation / vowel separators
+        | '\u{115F}'..='\u{1160}'        // HANGUL CHOSEONG / JUNGSEONG FILLER
+        | '\u{17B4}'..='\u{17B5}'        // KHMER vowel inherent AQ / AA
+        | '\u{180B}'..='\u{180F}'        // MONGOLIAN variation selectors / vowel separator
         | '\u{200B}'..='\u{200F}'        // ZERO WIDTH SPACE .. RIGHT-TO-LEFT MARK
         | '\u{202A}'..='\u{202E}'        // bidi embeddings and overrides
-        | '\u{2060}'..='\u{2064}'        // WORD JOINER .. INVISIBLE PLUS
-        | '\u{2066}'..='\u{206F}'        // bidi isolates and deprecated format
+        | '\u{2060}'..='\u{206F}'        // WORD JOINER .. deprecated format (incl. U+2065)
         | '\u{3164}'                     // HANGUL FILLER
         | '\u{FE00}'..='\u{FE0F}'        // variation selectors 1..16
         | '\u{FEFF}'                     // ZERO WIDTH NO-BREAK SPACE / BOM
         | '\u{FFA0}'                     // HALFWIDTH HANGUL FILLER
-        | '\u{FFF9}'..='\u{FFFB}'        // interlinear annotation anchors
+        | '\u{FFF0}'..='\u{FFF8}'        // reserved default-ignorable
         | '\u{1BCA0}'..='\u{1BCA3}'      // Shorthand format controls
         | '\u{1D173}'..='\u{1D17A}'      // musical beam/slur/phrase format
         | '\u{E0000}'..='\u{E0FFF}'      // Tags and variation selectors supplement
@@ -388,6 +458,17 @@ mod tests {
             "no-at-sign",
             "  spaced out  ",
             "ﬁligature",
+            "adm\u{034F}in",
+            "gap\u{2065}handle",
+            "line\u{2028}sep",
+            "para\u{2029}sep",
+            "nb\u{00A0}sp@ex\u{2007}ample.com",
+            "STRASSE",
+            "straße",
+            "ΟΔΟΣ",
+            "οδο\u{03C3}",
+            "ADMİN",
+            "ad min",
         ];
         for kind in [
             IdentifierType::Email,
@@ -433,6 +514,118 @@ mod tests {
             UniquenessMode::NonUnique.uniqueness_key(Some("org_x")),
             None
         );
+    }
+
+    /// The three identifier kinds, for looping an assertion over every one.
+    const ALL_KINDS: [IdentifierType; 3] = [
+        IdentifierType::Email,
+        IdentifierType::Username,
+        IdentifierType::Phone,
+    ];
+
+    #[test]
+    fn property_based_strip_removes_the_curated_list_survivors() {
+        // HIGH 1: the code points that survived the old curated `matches!` list and
+        // made "admin" and an invisibly-padded spelling DIFFERENT canonical forms.
+        // U+034F (combining grapheme joiner, category Mn, NOT Cf), U+2065 (the gap in
+        // the 2060..2064 / 2066..206F list, category Cn), U+2028 (Zl) and U+2029 (Zp)
+        // are line/paragraph separators (NOT is_control), and an internal no-break
+        // space (NFKC-mapped to a regular space that a trim-only pass leaves interior).
+        // Each must vanish, so the padded handle equals the clean one for EVERY kind.
+        for pad in [
+            '\u{034F}', // COMBINING GRAPHEME JOINER
+            '\u{2065}', // reserved default-ignorable (list gap)
+            '\u{2028}', // LINE SEPARATOR (Zl)
+            '\u{2029}', // PARAGRAPH SEPARATOR (Zp)
+            '\u{00A0}', // NO-BREAK SPACE (internal)
+            '\u{2007}', // FIGURE SPACE (internal)
+        ] {
+            let padded = format!("adm{pad}in");
+            for kind in ALL_KINDS {
+                assert_eq!(
+                    canon(kind, &padded),
+                    canon(kind, "admin"),
+                    "{kind:?}: {pad:?} must be stripped so the padded handle equals the clean one",
+                );
+            }
+            // For a username the clean canonical form is the non-empty "admin", so
+            // this proves the character was removed, not that both sides collapsed to
+            // an empty degenerate form.
+            assert_eq!(canon(IdentifierType::Username, &padded), "admin");
+        }
+    }
+
+    #[test]
+    fn internal_whitespace_is_stripped_not_only_trimmed() {
+        // A login identifier has no legitimate interior whitespace: "ad min" and
+        // "admin" are one identifier, closing the internal-space smuggling variant a
+        // trim-only pass leaves open.
+        assert_eq!(canon(IdentifierType::Username, "ad min"), "admin");
+        assert_eq!(
+            canon(IdentifierType::Email, "a d@ex ample.com"),
+            "ad@example.com"
+        );
+    }
+
+    #[test]
+    fn case_folding_is_full_default_fold_not_simple_lowercase() {
+        // MEDIUM 2: full Unicode Default Case Folding folds the case pairs where
+        // `str::to_lowercase` diverges. Each pair below is DISTINCT under the old
+        // lowercase policy and ONE identifier under full folding.
+
+        // German sharp s: lowercase leaves "ß" untouched (so "straße" stays "straße",
+        // distinct from "strasse"); full folding maps "ß" -> "ss".
+        assert_eq!(
+            canon(IdentifierType::Username, "STRASSE"),
+            canon(IdentifierType::Username, "straße"),
+        );
+        assert_eq!(canon(IdentifierType::Username, "straße"), "strasse");
+
+        // Greek sigma: a medial sigma and a final sigma fold to one letter. "ΟΔΟΣ"
+        // lowercases (context-sensitively) to a FINAL sigma "οδος", which is distinct
+        // from the medial-sigma spelling "οδοσ"; full folding maps both to the medial
+        // sigma, so the two are one identifier.
+        assert_eq!(
+            canon(IdentifierType::Username, "ΟΔΟΣ"),
+            canon(IdentifierType::Username, "οδο\u{03C3}"), // medial sigma
+        );
+
+        // Turkish dotted capital I folds to "i" + COMBINING DOT ABOVE under the
+        // default (non-tailored) mapping, identically to its decomposed spelling, and
+        // (correctly) stays DISTINCT from a plain ASCII "admin" (the dot is a real
+        // difference). Folding and lowercasing agree on this code point; it is
+        // asserted for completeness of the named vectors.
+        assert_eq!(
+            canon(IdentifierType::Username, "ADMİN"),
+            canon(IdentifierType::Username, "admi\u{0307}n"),
+        );
+        assert_ne!(
+            canon(IdentifierType::Username, "ADMİN"),
+            canon(IdentifierType::Username, "admin"),
+        );
+    }
+
+    #[test]
+    fn degenerate_inputs_canonicalize_to_an_empty_form() {
+        // MEDIUM 3: an all-invisible / whitespace-only input, an email with no `@`
+        // shape, and a phone with no digits all canonicalize to the EMPTY form, which
+        // the write boundary refuses to store (so it cannot squat the empty slot).
+        for kind in ALL_KINDS {
+            assert!(canonicalize_identifier(kind, "").is_empty());
+            assert!(canonicalize_identifier(kind, "   \t\n  ").is_empty());
+            assert!(canonicalize_identifier(kind, "\u{200B}\u{2065}\u{FEFF}").is_empty());
+        }
+        // An email with no usable `@` shape is empty (not a username-like whole-string
+        // fold).
+        assert!(canonicalize_identifier(IdentifierType::Email, "no-at-sign").is_empty());
+        assert!(canonicalize_identifier(IdentifierType::Email, "local@").is_empty());
+        assert!(canonicalize_identifier(IdentifierType::Email, "@domain.test").is_empty());
+        // A phone with no digits is empty (not a bare "+").
+        assert!(canonicalize_identifier(IdentifierType::Phone, "not-a-number").is_empty());
+        // A real value is NOT empty.
+        assert!(!canonicalize_identifier(IdentifierType::Email, "a@b.test").is_empty());
+        assert!(!canonicalize_identifier(IdentifierType::Username, "u").is_empty());
+        assert!(!canonicalize_identifier(IdentifierType::Phone, "+123").is_empty());
     }
 
     #[test]
