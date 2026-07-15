@@ -6,6 +6,47 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Envelope-encryption AEAD primitive (issue #48), a new `envelope` module. The
+  DEK/KEK envelope scheme for per-tenant PII and secret encryption at rest lives
+  here because the workspace lets exactly one crate name `ring` directly
+  (`scripts/jose-audit.sh`); `ironauth-store` consumes it and owns the key tables.
+  - **Standard AEAD, no novel cipher.** Built on `ring::aead` AES-256-GCM (NIST SP
+    800-38D). Three 256-bit key tiers: a platform `MasterKey` (wraps per-tenant
+    KEKs), a per-tenant `Kek` (wraps that tenant's DEKs), and a per-tenant `Dek`
+    (seals the actual payloads). Wrapping is itself an AEAD seal of the child key's
+    32 bytes, so there is one reviewed construction at every tier.
+  - **Context binding.** `Aad::builder()` length-prefixes each field (tenant,
+    environment, purpose/column, key version) so a ciphertext lifted to another
+    row, tenant, environment, or column fails authenticated decryption. The
+    `MasterKey` carries a stable id bound into every wrapped KEK's AAD.
+  - **Entropy seam.** Every key and every 96-bit nonce comes from
+    `ironauth_env::Entropy` (invariant 3), never an OS RNG directly, so the whole
+    scheme is deterministic under a test entropy source; a fresh nonce is drawn per
+    seal and never reused under one key.
+  - **Key material never leaks.** `MasterKey`, `Kek`, and `Dek` never `Display`,
+    render bytes in `Debug` (`<redacted>`), or serialize, and their bytes are
+    best-effort zeroed on drop. `EnvelopeError` carries no key material or
+    plaintext and distinguishes a decryption failure from a malformed blob.
+  - **Blind index for searchable encrypted columns.** `MasterKey::blind_index`
+    computes a deterministic keyed HMAC-SHA256 of an `Aad` context, keyed by a
+    subkey derived (domain-separated) from the master key, so an AEAD-sealed lookup
+    column (a login handle) stays equality-searchable without a plaintext column,
+    while the caller binding the tenant into the context makes the tag per-tenant
+    (an index collision cannot leak across tenants) and never a bare unsalted hash.
+    Returned as a `BlindIndex` whose `Debug` is byte-free.
+  - **Key derivation from a configured secret.** `MasterKey::derive(id, ikm)`
+    derives the 32-byte master key deterministically (a domain-separated HMAC) from
+    any-length high-entropy key material, so an operator supplies a secret rather
+    than exactly 32 raw bytes and the same secret is stable across restarts.
+  - **Zeroization of transient key/plaintext buffers.** The intermediate unwrapped
+    key bytes in `unwrap_kek`/`unwrap_dek` and the working plaintext buffer in the
+    AEAD open path are wiped (fill + `black_box`) once copied out, matching the
+    on-drop key wipe, so no key material or decrypted plaintext lingers in freed
+    heap.
+  - Fourteen module unit tests: round-trip, wrong-context/wrong-key failure, nonce
+    freshness, KEK/DEK wrap round-trips, a master-key crypto-shred, a
+    Debug-redaction proof, blind-index determinism/per-tenant separation, and
+    derive stability.
 - `VerificationPolicy::allow_expired(bool)` (issue #33): an opt-in, default-OFF
   policy setter that waives ONLY the "now past exp" rejection, so a well-formed
   but EXPIRED token still verifies. Every other check is untouched: `exp` is still

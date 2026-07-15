@@ -16,6 +16,13 @@ autotests = false
 
 [dependencies]
 ironauth-env.workspace = true
+# Per-tenant envelope encryption for PII and secrets at rest (issue #48). The
+# AEAD envelope primitive (a standard ring::aead AES-256-GCM DEK/KEK scheme) lives
+# in ironauth-jose because the workspace lets exactly ONE crate name `ring`
+# directly (scripts/jose-audit.sh); the store consumes that primitive and owns the
+# key tables, lifecycle, and the encrypted columns. This is a path edge to an
+# in-tree crate: no new external crate, no license change, MSRV/musl unchanged.
+ironauth-jose.workspace = true
 
 # Runtime query API only (no `query!`/`query_as!`): keeps every compile-time
 # lane database-free. rustls + ring, no native-tls/openssl (musl static).
@@ -157,6 +164,29 @@ required-features = ["testing"]
 [[test]]
 name = "pushed_authorization_requests"
 path = "tests/pushed_authorization_requests.rs"
+required-features = ["testing"]
+
+# Per-tenant envelope encryption for PII and secrets (issue #48): the DEK/KEK
+# envelope round-trips through a scoped repository, cross-tenant and cross-context
+# ciphertext fails authenticated decryption, KEK rotation re-wraps DEKs with no
+# payload rewrite (old ciphertext still reads), DEK rotation versions new writes
+# while old versions stay readable with observable background re-encryption,
+# crypto-shredding a tenant KEK makes its data unrecoverable while a sibling tenant
+# still decrypts, and a database dump of the encrypted columns yields no plaintext
+# and nothing replayable across rows or tenants. Needs a real database.
+[[test]]
+name = "envelope"
+path = "tests/envelope.rs"
+required-features = ["testing"]
+
+# The bootstrap users PII columns sealed at rest (issue #48): a database dump of a
+# registered user carries no plaintext handle or claims, login still resolves the
+# user through the blind index, claims round-trip, a duplicate handle conflicts, and
+# neither the sealed values nor the per-tenant blind index leak across tenants. Needs
+# a real database.
+[[test]]
+name = "user_pii"
+path = "tests/user_pii.rs"
 required-features = ["testing"]
 
 # Compile-fail proofs. Database-free, so it runs on every lane (including MSRV).

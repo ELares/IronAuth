@@ -80,6 +80,18 @@
       "additionalProperties": false,
       "description": "Primary database settings.",
       "properties": {
+        "master_key": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Secret"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "The platform envelope master key (issue #48): a high-entropy secret from\nwhich the per-tenant key hierarchy that seals classified PII columns\n(login handles, standard claims) at rest is derived. Supply it out of\nband (`{ env = \"IRONAUTH_MASTER_KEY\" }` or `{ file = \"...\" }`); a stable\nvalue is required across restarts, because every wrapped tenant key\ndepends on it. Unset leaves the encrypted-PII paths (registration, login,\n`UserInfo`) failing closed rather than storing plaintext; a production\ndeployment must set it."
+        },
         "password": {
           "anyOf": [
             {
@@ -623,6 +635,7 @@
     "database": {
       "$ref": "#/$defs/DatabaseConfig",
       "default": {
+        "master_key": null,
         "password": null,
         "url": "postgres://ironauth@localhost:5432/ironauth"
       },

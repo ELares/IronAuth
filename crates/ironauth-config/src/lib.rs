@@ -270,6 +270,16 @@ pub struct DatabaseConfig {
     /// Database password supplied out of band, overriding any password
     /// embedded in `url`.
     pub password: Option<Secret>,
+
+    /// The platform envelope master key (issue #48): a high-entropy secret from
+    /// which the per-tenant key hierarchy that seals classified PII columns
+    /// (login handles, standard claims) at rest is derived. Supply it out of
+    /// band (`{ env = "IRONAUTH_MASTER_KEY" }` or `{ file = "..." }`); a stable
+    /// value is required across restarts, because every wrapped tenant key
+    /// depends on it. Unset leaves the encrypted-PII paths (registration, login,
+    /// `UserInfo`) failing closed rather than storing plaintext; a production
+    /// deployment must set it.
+    pub master_key: Option<Secret>,
 }
 
 impl Default for DatabaseConfig {
@@ -278,6 +288,7 @@ impl Default for DatabaseConfig {
             url: Dsn::parse("postgres://ironauth@localhost:5432/ironauth")
                 .expect("default DSN is valid by construction (covered by test)"),
             password: None,
+            master_key: None,
         }
     }
 }

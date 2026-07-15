@@ -311,6 +311,34 @@ pub enum Action {
     /// was invalidated after exhausting its bounded failed-match budget (RFC 8628
     /// section 5.1). A subsequent poll at the token endpoint yields `access_denied`.
     DeviceCodeDeny,
+    /// A per-tenant envelope key-encryption key was provisioned (issue #48): a
+    /// day-one KEK, generated and stored wrapped under the platform master key.
+    EnvelopeKekProvision,
+    /// A per-tenant envelope KEK was rotated (issue #48): a fresh KEK version was
+    /// generated and every one of the scope's DEKs was re-wrapped under it in the
+    /// same transaction, with NO record-payload rewrite. Online and cheap.
+    EnvelopeKekRotate,
+    /// A per-tenant envelope KEK was DESTROYED (issue #48): the crypto-shred. Every
+    /// KEK version of the scope is overwritten and marked destroyed, so the scope's
+    /// DEKs can never be unwrapped again and all of its envelope-protected data is
+    /// permanently unreadable. The productized offboarding flow is #49.
+    EnvelopeKekDestroy,
+    /// A per-tenant envelope data-encryption key was provisioned (issue #48): a
+    /// day-one DEK, generated and stored wrapped under the scope's active KEK.
+    EnvelopeDekProvision,
+    /// A per-tenant envelope DEK was rotated (issue #48): a fresh DEK version was
+    /// generated for new writes and the prior version was retired but stays
+    /// readable for background re-encryption of old rows.
+    EnvelopeDekRotate,
+    /// An encrypted secret value was written (issue #48): a plaintext secret was
+    /// sealed under the scope's active DEK with its column context bound as
+    /// associated data, and stored as ciphertext.
+    EncryptedSecretPut,
+    /// An encrypted secret value was re-encrypted from an older DEK version to the
+    /// active one (issue #48): the observable background re-encryption step that
+    /// follows a DEK rotation. The plaintext never changes; only the sealing key
+    /// version does.
+    EncryptedSecretReencrypt,
 }
 
 impl Action {
@@ -379,6 +407,13 @@ impl Action {
             Action::DeviceCodeIssue => "device_code.issue",
             Action::DeviceCodeApprove => "device_code.approve",
             Action::DeviceCodeDeny => "device_code.deny",
+            Action::EnvelopeKekProvision => "envelope.kek.provision",
+            Action::EnvelopeKekRotate => "envelope.kek.rotate",
+            Action::EnvelopeKekDestroy => "envelope.kek.destroy",
+            Action::EnvelopeDekProvision => "envelope.dek.provision",
+            Action::EnvelopeDekRotate => "envelope.dek.rotate",
+            Action::EncryptedSecretPut => "encrypted_secret.put",
+            Action::EncryptedSecretReencrypt => "encrypted_secret.reencrypt",
         }
     }
 }

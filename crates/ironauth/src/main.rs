@@ -16,6 +16,7 @@ use ironauth_config::{
     Config, FeatureRegistry, GLOBAL_TOKEN_REVOCATION_FEATURE, Loaded, OidcConfig,
 };
 use ironauth_env::Env;
+use ironauth_jose::MasterKey;
 use ironauth_oidc::{
     BackChannelLogoutWorker, DiscoveryCapabilities, DiscoveryState, FetchLogoutSender,
     IssuerRegistry, IssuerState, JwksCacheWindow, OidcState, WorkerSettings, discovery_router,
@@ -124,6 +125,7 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
                 config.oidc.clone(),
                 config.database.url.expose().to_owned(),
                 env.clone(),
+                resolve_master_key(&config),
             ))
         } else {
             None
@@ -145,7 +147,7 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
         }
         // Mount the OIDC provider on the PUBLIC plane when enabled. The issuer root
         // is the server's config-derived base URL, so issuers are per environment.
-        if let Some((oidc_config, dsn, oidc_env)) = oidc_inputs {
+        if let Some((oidc_config, dsn, oidc_env, master_key)) = oidc_inputs {
             let issuer_base = server.base_url();
             if let Some(router) = build_oidc_router(
                 &oidc_config,
@@ -153,6 +155,7 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
                 oidc_env,
                 issuer_base,
                 global_revocation_enabled,
+                master_key,
             )
             .await
             {
@@ -259,6 +262,7 @@ async fn build_oidc_router(
     env: Env,
     issuer_base: String,
     global_revocation_enabled: bool,
+    master_key: Option<Arc<MasterKey>>,
 ) -> Option<Router> {
     let store = match Store::connect(data_plane_dsn).await {
         Ok(store) => store,
@@ -269,6 +273,14 @@ async fn build_oidc_router(
             );
             return None;
         }
+    };
+    // Attach the platform envelope master key so the login, registration, and
+    // UserInfo surfaces can seal and open the classified PII columns (issue #48).
+    // Without it those paths fail closed (never plaintext); resolve_master_key has
+    // already logged when it is unset or unreadable.
+    let store = match master_key {
+        Some(master) => store.with_master_key(master),
+        None => store,
     };
 
     // The JWKS cache window from config (validated into the 300..=900s range, so
@@ -475,6 +487,39 @@ fn select_control_dsn(config: &Config) -> Option<String> {
          ironauth_control, not the data-plane role)."
     );
     None
+}
+
+/// Resolve the platform envelope master key from config (issue #48).
+///
+/// Returns the derived key when `database.master_key` is set and readable, so the
+/// OIDC store can seal and open classified PII columns. When the secret is unset
+/// or unreadable, logs and returns `None`; the encrypted-PII paths then fail
+/// closed (never plaintext) and a production deployment must set the key. The key
+/// is DERIVED from the secret (a domain-separated HMAC), so any-length
+/// high-entropy secret works and the same secret always yields the same key
+/// (stable across restarts, which every wrapped tenant key depends on).
+fn resolve_master_key(config: &Config) -> Option<Arc<MasterKey>> {
+    let Some(secret) = &config.database.master_key else {
+        tracing::warn!(
+            "database.master_key is unset: the encrypted-PII paths (registration, login, \
+             UserInfo) will fail closed rather than store plaintext. Set database.master_key to a \
+             high-entropy secret (kept stable across restarts) before production."
+        );
+        return None;
+    };
+    match secret.resolve() {
+        Ok(material) => Some(Arc::new(MasterKey::derive(
+            "master-1",
+            material.expose().as_bytes(),
+        ))),
+        Err(error) => {
+            tracing::error!(
+                %error,
+                "cannot resolve database.master_key: the encrypted-PII paths will fail closed"
+            );
+            None
+        }
+    }
 }
 
 /// Parse `--config PATH` (or `--config=PATH`) out of the serve arguments.

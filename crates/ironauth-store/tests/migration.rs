@@ -242,19 +242,19 @@ async fn expand_contract_example_chain_runs_all_three_phases_and_contract_remove
     );
 }
 
-/// The PRODUCTION chain (`MigrationRunner::new`) contains exactly the twenty-one
+/// The PRODUCTION chain (`MigrationRunner::new`) contains exactly the twenty-seven
 /// real migrations and leaves no throwaway demo object in a real database.
 // A long but linear ledger-and-table assertion sweep (one line per migration and
 // per real table); splitting it would not make it clearer.
 #[allow(clippy::too_many_lines)]
 #[tokio::test]
-async fn production_chain_is_only_the_twenty_six_real_migrations_and_ships_no_demo_object() {
+async fn production_chain_is_only_the_twenty_seven_real_migrations_and_ships_no_demo_object() {
     // TestDatabase::start runs Store::migrate() (the production chain) on a
     // fresh, empty database.
     let db = TestDatabase::start().await;
     let pool = db.owner_pool();
 
-    // Re-running is idempotent and reports exactly twenty-one tracked migrations.
+    // Re-running is idempotent and reports exactly twenty-seven tracked migrations.
     let report = MigrationRunner::new(pool)
         .run()
         .await
@@ -265,22 +265,23 @@ async fn production_chain_is_only_the_twenty_six_real_migrations_and_ships_no_de
     );
     assert_eq!(
         report.already_applied(),
-        26,
-        "the production chain is exactly twenty-six migrations (isolation, audit log, management \
+        27,
+        "the production chain is exactly twenty-seven migrations (isolation, audit log, management \
          API, OIDC authorization, signing keys, login/consent, authentication context, redirect \
          registration, UserInfo claims, consent scope upsert, resource servers, opaque access \
          tokens, client auth suite, dynamic client registration, pushed authorization requests, \
          refresh tokens, client-credentials service accounts, DCR abuse controls, resource \
          indicators, JWT bearer assertion grant, device authorization, session model, RP-initiated \
-         logout, session-ended events, back-channel logout, front-channel logout)"
+         logout, session-ended events, back-channel logout, front-channel logout, envelope \
+         encryption)"
     );
 
-    // The ledger holds exactly versions 1 through 26.
+    // The ledger holds exactly versions 1 through 27.
     assert_eq!(
         applied_versions(pool).await,
         vec![
             1_i64, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
-            24, 25, 26
+            24, 25, 26, 27
         ]
     );
     let phase_of = |version: i64| async move {
@@ -342,6 +343,13 @@ async fn production_chain_is_only_the_twenty_six_real_migrations_and_ships_no_de
     // COLUMNs (frontchannel_logout_uri, frontchannel_logout_session_required) plus a
     // column-scoped grant are all expands.
     assert_eq!(phase_of(26).await, "expand");
+    // The envelope-encryption migration (issue #48): three new CREATE TABLEs
+    // (tenant_keks, tenant_deks, encrypted_secrets) with their indexes, policies,
+    // and column-scoped grants, PLUS the conversion of the two plaintext users PII
+    // columns to sealed envelope columns (a full expand-contract folded in, since
+    // the pre-1.0 bootstrap users table has no cross-release contract to protect).
+    // The predominant shape is additive, so it is registered as an expand.
+    assert_eq!(phase_of(27).await, "expand");
 
     // The demo object never reaches a production database.
     assert!(
@@ -403,14 +411,12 @@ async fn production_chain_is_only_the_twenty_six_real_migrations_and_ships_no_de
         column_exists(pool, "clients", "redirect_uris").await,
         "clients.redirect_uris exists"
     );
-    // The UserInfo standard-claim store (issue #15): the additive users.claims
-    // column backing the scope-derived and claims-parameter-selected claim sets,
-    // plus the persisted `claims` request parameter frozen onto the grant (read by
-    // UserInfo) and the code (read at the token endpoint).
-    assert!(
-        column_exists(pool, "users", "claims").await,
-        "users.claims exists"
-    );
+    // The UserInfo standard-claim store (issue #15) is now SEALED, not plaintext
+    // (issue #48): migration 0027 replaced the plaintext users.claims text column
+    // with the sealed claims_sealed ciphertext (asserted with the other users PII
+    // columns below). The persisted `claims` request parameter (which claim NAMES
+    // to release, not values) stays plaintext on the grant (read by UserInfo) and
+    // the code (read at the token endpoint).
     assert!(
         column_exists(pool, "grants", "claims_request").await,
         "grants.claims_request exists"
@@ -808,6 +814,74 @@ async fn production_chain_is_only_the_twenty_six_real_migrations_and_ships_no_de
         assert!(
             column_exists(pool, "clients", column).await,
             "clients.{column} exists"
+        );
+    }
+    // The per-tenant envelope-encryption tables (issue #48): the wrapped
+    // key-encryption keys, the wrapped data-encryption keys, and the transparent
+    // encrypted-secret store.
+    assert!(
+        table_exists(pool, "tenant_keks").await,
+        "tenant_keks exists"
+    );
+    assert!(
+        table_exists(pool, "tenant_deks").await,
+        "tenant_deks exists"
+    );
+    assert!(
+        table_exists(pool, "encrypted_secrets").await,
+        "encrypted_secrets exists"
+    );
+    // A KEK/DEK row stores only WRAPPED key material, never a plaintext key.
+    assert!(
+        column_exists(pool, "tenant_keks", "wrapped_kek").await,
+        "tenant_keks stores a wrapped KEK"
+    );
+    assert!(
+        column_exists(pool, "tenant_deks", "wrapped_dek").await,
+        "tenant_deks stores a wrapped DEK"
+    );
+    for forbidden in ["key", "key_material", "plaintext", "secret"] {
+        assert!(
+            !column_exists(pool, "tenant_keks", forbidden).await,
+            "tenant_keks must have no plaintext-key column ({forbidden})"
+        );
+        assert!(
+            !column_exists(pool, "tenant_deks", forbidden).await,
+            "tenant_deks must have no plaintext-key column ({forbidden})"
+        );
+    }
+    // The encrypted-secret store holds ONLY ciphertext, never a plaintext column.
+    assert!(
+        column_exists(pool, "encrypted_secrets", "ciphertext").await,
+        "encrypted_secrets stores ciphertext"
+    );
+    for forbidden in ["plaintext", "secret_value", "value", "secret"] {
+        assert!(
+            !column_exists(pool, "encrypted_secrets", forbidden).await,
+            "encrypted_secrets must have no plaintext column ({forbidden})"
+        );
+    }
+
+    // The bootstrap users directory now routes its two PII columns through the
+    // envelope substrate (issue #48): the plaintext identifier and claims columns
+    // are GONE, replaced by a blind index for lookup, a sealed identifier, a sealed
+    // claim document, and the DEK version that sealed them. A database dump of the
+    // users table therefore carries neither the login handle nor the claim values.
+    for forbidden in ["identifier", "claims"] {
+        assert!(
+            !column_exists(pool, "users", forbidden).await,
+            "users must have no plaintext PII column ({forbidden}) after 0027"
+        );
+    }
+    for sealed in [
+        "identifier_bidx",
+        "identifier_sealed",
+        "claims_sealed",
+        "pii_dek_version",
+    ] {
+        assert!(
+            column_exists(pool, "users", sealed).await,
+            "users.{sealed} exists after 0027"
         );
     }
 }

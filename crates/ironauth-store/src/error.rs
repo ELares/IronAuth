@@ -54,6 +54,17 @@ pub enum StoreError {
     /// when it fires. The registration endpoint maps it to a typed refusal and a
     /// `dcr.quota_hit` audit event.
     QuotaExceeded,
+    /// An envelope-encryption operation failed (issue #48): a wrapped key or a
+    /// sealed payload could not be authenticated and decrypted. This is
+    /// DELIBERATELY distinct from [`NotFound`]: a caller can tell "this ciphertext
+    /// did not authenticate" (a wrong or crypto-shredded tenant key, a tampered
+    /// blob, or a ciphertext replayed from another row/tenant/column) apart from
+    /// "there is no such record". It carries no key material, plaintext, or
+    /// ciphertext, so it is safe to log. A crypto-shredded tenant's data surfaces
+    /// here (its KEK is unrecoverable), never as recovered plaintext.
+    ///
+    /// [`NotFound`]: StoreError::NotFound
+    Encryption,
 }
 
 impl fmt::Display for StoreError {
@@ -66,6 +77,7 @@ impl fmt::Display for StoreError {
             StoreError::Conflict => f.write_str("uniqueness conflict"),
             StoreError::InvalidRedirectUri => f.write_str("invalid redirect uri"),
             StoreError::QuotaExceeded => f.write_str("registration quota exceeded"),
+            StoreError::Encryption => f.write_str("envelope decryption failed"),
         }
     }
 }
@@ -77,7 +89,8 @@ impl std::error::Error for StoreError {
             | StoreError::IdempotencyConflict
             | StoreError::Conflict
             | StoreError::InvalidRedirectUri
-            | StoreError::QuotaExceeded => None,
+            | StoreError::QuotaExceeded
+            | StoreError::Encryption => None,
             StoreError::Database(source) => Some(source),
             StoreError::Migration(source) => Some(source),
         }
@@ -104,5 +117,15 @@ impl From<sqlx::Error> for StoreError {
 impl From<NotInScope> for StoreError {
     fn from(_: NotInScope) -> Self {
         StoreError::NotFound
+    }
+}
+
+impl From<ironauth_jose::EnvelopeError> for StoreError {
+    fn from(_: ironauth_jose::EnvelopeError) -> Self {
+        // Collapse the envelope primitive's Format/Decrypt distinction to the one
+        // store-facing encryption error: a caller never learns WHY a ciphertext
+        // failed to authenticate, only that it did (never an oracle), and the
+        // envelope error carries no key material or plaintext to forward.
+        StoreError::Encryption
     }
 }
