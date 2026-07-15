@@ -476,6 +476,12 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0034_environment_secrets_variables.sql"),
         },
+        Migration {
+            version: 35,
+            name: "config_promotion",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0035_config_promotion.sql"),
+        },
     ]
 }
 

@@ -55,6 +55,7 @@ mod error;
 pub mod esv;
 mod id;
 mod migrate;
+pub mod promotion;
 mod redirect;
 mod repository;
 mod scope;
@@ -104,6 +105,11 @@ pub use id::{
     VariableId, VariableKind,
 };
 pub use migrate::{Migration, MigrationError, MigrationReport, MigrationRunner, Phase};
+pub use promotion::{
+    ChangeKind, ConfigDiff, PROMOTED_RESOURCE_TYPES, Plan, PlanError, PromotionApplyError,
+    PromotionOutcome, ResourceChange, collect_references, diff as diff_snapshots, evaluate_plan,
+    plan_promotion, revision as promotion_revision,
+};
 pub use redirect::{redirect_uri_is_registrable, redirect_uri_matches};
 pub use repository::{
     AccessTokenResolution, ActingAssertionSubjectMappingRepo, ActingAuthorizationRepo,

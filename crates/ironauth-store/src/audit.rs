@@ -401,6 +401,14 @@ pub enum Action {
     EnvironmentSecretPut,
     /// An environment SECRET was deleted through the management API (issue #45).
     EnvironmentSecretDelete,
+    /// A server-side config PROMOTION was applied (issue #44): a source snapshot's
+    /// promotable configuration was transactionally applied onto a target
+    /// environment. The row targets the environment and is written in the SAME
+    /// transaction as every resource change the apply makes, so a promotion without
+    /// its audit row is structurally impossible and a rolled-back apply leaves no
+    /// row. The operator-safe `detail` records the change counts (create, update,
+    /// delete); no promoted value or secret is recorded.
+    ConfigPromotionApply,
 }
 
 impl Action {
@@ -491,6 +499,7 @@ impl Action {
             Action::EnvironmentVariableDelete => "environment_variable.delete",
             Action::EnvironmentSecretPut => "environment_secret.put",
             Action::EnvironmentSecretDelete => "environment_secret.delete",
+            Action::ConfigPromotionApply => "config_promotion.apply",
         }
     }
 }

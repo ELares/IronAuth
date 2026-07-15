@@ -1022,6 +1022,233 @@
         ]
       }
     },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/config/promotion/apply": {
+      "post": {
+        "tags": [
+          "config-promotion"
+        ],
+        "summary": "Transactionally apply a promotion plan onto the target environment.",
+        "operationId": "applyConfigPromotion",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The target tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The target environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Optional. Apply is idempotent by construction: re-applying an already-applied plan is a no-op.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ApplyConfigPromotionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The plan was applied (the applied diff) or was already applied (a no-op).",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "400": {
+            "description": "The source snapshot document is invalid",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Target environment not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The target drifted since the plan was computed (a structured drift error); nothing was changed.",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "422": {
+            "description": "A reference does not resolve in the target environment at apply time; nothing was changed.",
+            "content": {
+              "application/json": {}
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/config/promotion/plan": {
+      "post": {
+        "tags": [
+          "config-promotion"
+        ],
+        "summary": "Dry-run a promotion into the target environment, returning a reviewable plan.",
+        "operationId": "planConfigPromotion",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The target tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The target environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Optional. A plan is a pure dry run and changes nothing, so a replay is inherently safe.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "requestBody": {
+          "description": "The source config snapshot document (canonical, secret-free JSON), the same shape the snapshot export returns.",
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "string"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The reviewable promotion plan: a stable plan id, the target's base and result revisions, the resolved references, and the structured diff (per resource: create, update, or delete with before and after).",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "400": {
+            "description": "The source snapshot document is invalid",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Target environment not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "One or more references do not resolve in the target environment (the plan fails closed)",
+            "content": {
+              "application/json": {}
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/v1/tenants/{tenant_id}/environments/{environment_id}/config/snapshot": {
       "get": {
         "tags": [
@@ -3230,6 +3457,24 @@
   },
   "components": {
     "schemas": {
+      "ApplyConfigPromotionRequest": {
+        "type": "object",
+        "description": "The apply request body: the source snapshot to promote, plus the plan's captured\n`base_revision` precondition (issue #44).",
+        "required": [
+          "source",
+          "base_revision"
+        ],
+        "properties": {
+          "base_revision": {
+            "type": "string",
+            "description": "The target's promotable-config revision the plan captured\n(`base_revision`). Apply proceeds only if the target still carries it;\notherwise it fails with a drift error and changes nothing."
+          },
+          "source": {
+            "type": "object",
+            "description": "The source config snapshot document (the same canonical, secret-free shape\nthe snapshot export returns). Validated before anything is applied."
+          }
+        }
+      },
       "BulkRevocationView": {
         "type": "object",
         "description": "The result of a BULK session revocation (issue #32). States the post-condition; see\n[`SessionRevocationView`] for why.",
