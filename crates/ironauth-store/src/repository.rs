@@ -12864,6 +12864,27 @@ impl ActingTenantRepo<'_> {
                     .bind(purged_micros)
                     .execute(&mut **tx)
                     .await?;
+                    // 2b. SEVER any BYOK binding for this environment (issue #49) in
+                    //     the SAME audited transaction: flip it to 'destroyed', clear
+                    //     the external key reference, and stamp destroyed_at. For a
+                    //     BYOK scope the customer root is what wrapped the KEK, so
+                    //     destroying the platform KEK above AND severing the binding
+                    //     here leaves the tenant with no recoverable key by either
+                    //     path; the row is retained as erasure evidence. A scope not
+                    //     enrolled in BYOK matches no row. The control role holds
+                    //     exactly this column-scoped sever UPDATE on the table.
+                    sqlx::query(
+                        "UPDATE tenant_byok_bindings \
+                         SET status = 'destroyed', key_ref = '', \
+                             destroyed_at = \
+                             TIMESTAMPTZ 'epoch' + ($3::text || ' microseconds')::interval \
+                         WHERE tenant_id = $1 AND environment_id = $2 AND status <> 'destroyed'",
+                    )
+                    .bind(id.to_string())
+                    .bind(&env_id)
+                    .bind(purged_micros)
+                    .execute(&mut **tx)
+                    .await?;
                 }
                 // 3. Restore the audit scope's row-level-security variables.
                 sqlx::query("SELECT set_config('ironauth.tenant_id', $1, true)")
@@ -13688,6 +13709,41 @@ async fn max_dek_version(conn: &mut PgConnection, scope: Scope) -> Result<Option
     Ok(row.get::<Option<i32>, _>("v"))
 }
 
+/// The closed set of BYOK KMS driver labels the store accepts, mirroring the
+/// migration CHECK and the `ironauth-kms` `KmsProviderKind`. Kept here so an
+/// enroll can fail closed on a typo before a raw CHECK violation, and no
+/// unroutable binding is ever stored.
+const BYOK_PROVIDERS: [&str; 5] = ["local", "aws", "gcp", "azure", "vault"];
+
+/// Whether a BYOK binding row already exists for `scope` (in any status), so a
+/// second enroll is a Conflict rather than a silent overwrite.
+async fn byok_binding_exists(conn: &mut PgConnection, scope: Scope) -> Result<bool, StoreError> {
+    let row = sqlx::query(
+        "SELECT 1 AS present FROM tenant_byok_bindings \
+         WHERE tenant_id = $1 AND environment_id = $2",
+    )
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .fetch_optional(&mut *conn)
+    .await?;
+    Ok(row.is_some())
+}
+
+/// A scope's bring-your-own-key binding as read back (issue #49): the KMS driver
+/// label, the OPAQUE external key reference (never key material), and the
+/// lifecycle status ('active' or 'destroyed'). A severed binding reads status
+/// 'destroyed' with an empty `key_ref`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ByokBinding {
+    /// The KMS driver label (one of the closed BYOK provider set).
+    pub provider: String,
+    /// The opaque external key handle (an ARN, resource name, or key URI). A
+    /// non-secret reference, cleared to empty when the binding is severed.
+    pub key_ref: String,
+    /// The binding lifecycle status: 'active' or 'destroyed'.
+    pub status: String,
+}
+
 /// The read-only envelope-encryption repository (issue #48): decrypt an encrypted
 /// secret and inspect the scope's active key versions. Every query is scope
 /// filtered and runs under the row-level-security session variables.
@@ -13756,6 +13812,32 @@ impl EnvelopeRepo<'_> {
         tx.commit().await?;
         row.map(|r| r.get::<i32, _>("dek_version"))
             .ok_or(StoreError::NotFound)
+    }
+
+    /// The scope's bring-your-own-key binding, or `None` if the scope is not
+    /// enrolled in BYOK (issue #49). A severed binding reads status 'destroyed'
+    /// with an empty key reference (retained as erasure evidence). Carries the
+    /// opaque reference only, never key material.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn byok_binding(&self) -> Result<Option<ByokBinding>, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT provider, key_ref, status FROM tenant_byok_bindings \
+             WHERE tenant_id = $1 AND environment_id = $2",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(row.map(|r| ByokBinding {
+            provider: r.get("provider"),
+            key_ref: r.get("key_ref"),
+            status: r.get("status"),
+        }))
     }
 
     /// The scope's active KEK version, or `None` if the scope has no live KEK
@@ -13838,6 +13920,78 @@ impl ActingEnvelopeRepo<'_> {
         )
         .await?;
         Ok(id)
+    }
+
+    /// Enroll this scope in bring-your-own-key (issue #49): record a BYOK binding
+    /// so a customer-managed root key (in an external KMS/HSM, or a
+    /// customer-supplied key) governs the scope's key hierarchy. `provider` is the
+    /// KMS driver label (one of the closed set the store CHECK enforces) and
+    /// `key_ref` is the OPAQUE external key handle (an ARN, a resource name, a key
+    /// URI); NEITHER is key material, and no customer root key is ever persisted.
+    /// The actual wrap/unwrap of the tenant KEK under the customer root is the
+    /// `ironauth-kms` driver seam's job; this only records the binding. Audited as
+    /// `envelope.byok.enroll`.
+    ///
+    /// BYOK is EXPERIMENTAL and DEFAULT-OFF; a caller reaches this only when the
+    /// operator has enabled it.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Conflict`] if the scope is already enrolled;
+    /// [`StoreError::Encryption`] if `provider` is not a known KMS driver label
+    /// (fail closed rather than store an unroutable binding);
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn enroll_byok(
+        &self,
+        env: &Env,
+        provider: &str,
+        key_ref: &str,
+    ) -> Result<(), StoreError> {
+        // Fail closed on an unknown driver label before touching the database, so a
+        // typo never lands as a raw CHECK violation and no unroutable binding is
+        // stored. The set mirrors the migration CHECK and the ironauth-kms drivers.
+        if !BYOK_PROVIDERS.contains(&provider) {
+            return Err(StoreError::Encryption);
+        }
+        let scope = self.scope;
+        let environment = scope.environment();
+        // The provider and key reference are moved into the audited closure.
+        let provider = provider.to_owned();
+        let key_ref = key_ref.to_owned();
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::EnvelopeByokEnroll,
+                target: &environment,
+            },
+            async move |tx| {
+                let created_micros = epoch_micros(env.clock().now_utc());
+                // One binding per scope: a second enroll is a Conflict, surfaced from
+                // the primary-key violation rather than a silent overwrite.
+                if byok_binding_exists(tx, scope).await? {
+                    return Err(StoreError::Conflict);
+                }
+                sqlx::query(
+                    "INSERT INTO tenant_byok_bindings \
+                     (tenant_id, environment_id, provider, key_ref, status, created_at) \
+                     VALUES ($1, $2, $3, $4, 'active', \
+                             TIMESTAMPTZ 'epoch' + ($5::text || ' microseconds')::interval)",
+                )
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(&provider)
+                .bind(&key_ref)
+                .bind(created_micros)
+                .execute(&mut **tx)
+                .await?;
+                Ok(())
+            },
+            false,
+        )
+        .await
     }
 
     /// Provision the scope's day-one DEK: generate a fresh DEK, wrap it under the
