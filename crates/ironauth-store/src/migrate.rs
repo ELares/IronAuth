@@ -513,10 +513,10 @@ fn registry() -> Vec<Migration> {
             sql: include_str!("../migrations/0040_user_invitations.sql"),
         },
         Migration {
-            version: 41,
+            version: 42,
             name: "exit_export_credentials",
             phase: Phase::Expand,
-            sql: include_str!("../migrations/0041_exit_export_credentials.sql"),
+            sql: include_str!("../migrations/0042_exit_export_credentials.sql"),
         },
     ]
 }
