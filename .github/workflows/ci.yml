@@ -3,7 +3,17 @@
 # The merge gate. Every lane here is required before merge once branch
 # protection lists them; scripts/gate.sh runs the locally runnable subset in
 # the same order. Lanes: fmt, clippy (pedantic, -D warnings), test, msrv,
-# musl static build, cargo-deny, invariant lints, dash scan, compat matrix.
+# musl static build, cargo-deny, invariant lints (including the conformance
+# harness static checks), dash scan, compat matrix.
+#
+# The OIDF conformance harness (issue #37) is split in two on purpose:
+#   - its STATIC half runs in the `invariants` job on every PR, gated by no
+#     repository variable, and is a real required check today;
+#   - its LIVE half (`conformance-live`) needs an owner-provisioned suite runner.
+#     That job always RUNS but is explicitly ADVISORY and named so it cannot be
+#     mistaken for a gate: it is not gated by a job-level `if:`, because GitHub
+#     reports a skipped job to branch protection as SUCCESS, which would let one
+#     unset repository variable turn a required conformance check silently green.
 name: ci
 
 on:
@@ -134,6 +144,17 @@ jobs:
       # openapi-check / config-schema freshness steps; cache the build so those
       # do not pay a cold compile on every run.
       - uses: Swatinem/rust-cache@v2
+      # The conformance static checks parse the profile matrix and RENDER the
+      # runner's plan config, so they need PyYAML. Pin the interpreter (the
+      # hash-pinned requirements are resolved for CPython 3.12 on linux) and
+      # install with --require-hashes, so this lane installs exactly the reviewed
+      # bits or fails. Without this the deep matrix and plan-config checks would
+      # silently take their degraded fallback path and enforce less than they say.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: provision the conformance static-check python deps (hash pinned)
+        run: python3 -m pip install --require-hashes -r deploy/conformance/requirements.txt
       - name: invariant lints
         run: scripts/invariant-lints.sh
       - name: query audit (no scoped-table SQL outside the repository module)
@@ -146,6 +167,17 @@ jobs:
         run: scripts/dash-scan.sh
       - name: discovery scan (no static discovery JSON; generated at serve time)
         run: scripts/discovery-scan.sh
+      - name: conformance harness static checks (results gate, matrix, digest pins, plan config, downgrade confinement)
+        # THIS is the conformance enforcement that is real today. It is always-on,
+        # runner-independent, gated by NO repository variable, and required on
+        # every PR: the results-gate unit tests, the profile matrix and compose
+        # shape, that every image reference anywhere under deploy/conformance is
+        # pinned by digest, that the runner's plan config actually renders from
+        # the matrix, that the harness cannot fail open, and that the cert-only
+        # downgrades stay out of the shipped default. The LIVE suite drive is a
+        # separate lane below and, until an owner provisions the runner, it
+        # enforces nothing and does not pretend to.
+        run: scripts/conformance-check.sh
       - name: compatibility matrix freshness
         run: |
           scripts/compat-matrix.sh
@@ -186,3 +218,93 @@ jobs:
               sys.exit(f'security.txt Expires more than ~13 months out: {expires}')
           print('security.txt: valid, expires', expires)
           EOF
+
+  # The LIVE OIDF suite drive. Read the name: this job is NOT a merge gate and
+  # must NOT be added to branch protection while it is unprovisioned.
+  #
+  # It deliberately has NO job-level `if:`. A job skipped by an `if:` is reported
+  # to branch protection as SUCCESS, so gating a REQUIRED check on
+  # `vars.CONFORMANCE_ENABLED` would mean unsetting or typo-ing one repository
+  # variable silently turns the conformance gate GREEN. A merge gate that can be
+  # skipped into a pass is worse than no gate: it asserts a guarantee it is not
+  # providing. So the job always runs and says, out loud and in its own name,
+  # whether it is enforcing anything.
+  #
+  # Today the live suite is NOT provisioned (real image digests, the suite's trust
+  # of the OP CA, and the OIDF runner are all owner/infra actions), so this lane
+  # cannot enforce and does not pretend to: it prints a NOT ENFORCING banner. The
+  # conformance enforcement that IS real today is the always-on static lane in the
+  # `invariants` job, which no variable gates.
+  #
+  # Once an owner provisions the runner and sets CONFORMANCE_ENABLED=true, this
+  # job drives the merge-gate profile subset and FAILS CLOSED: run-conformance.sh
+  # exits non-zero if the runner is missing, if the selection is empty, if the
+  # selector crashed, or on any non-PASS module. It cannot be vacuously green.
+  conformance-live:
+    name: OIDF conformance live suite (advisory until provisioned; NOT a gate)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    # Least privilege: nothing here writes.
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Report whether this lane is enforcing anything
+        id: status
+        env:
+          ENABLED: ${{ vars.CONFORMANCE_ENABLED }}
+        run: |
+          set -euo pipefail
+          if [ "${ENABLED:-}" = "true" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+            echo "ENFORCING: the live OIDF suite runs below and fails closed on any non-PASS."
+            exit 0
+          fi
+          echo "enabled=false" >> "$GITHUB_OUTPUT"
+          cat <<'BANNER'
+          ================================================================
+          NOT ENFORCING: conformance suite not provisioned.
+          ================================================================
+          This job verified NOTHING about OIDC conformance. It is green
+          because it had nothing to run, not because the provider conforms.
+
+          Outstanding owner/infra actions (docs/conformance/RUNBOOK.md):
+            - resolve the real suite image digests in SUITE_VERSION
+              (they are all-zero placeholders that fail closed today);
+            - wire the suite's trust of the OP self-signed CA;
+            - provide the OIDF runner (run-test-plan.py);
+            - set the repository variable CONFORMANCE_ENABLED=true.
+
+          Do NOT add this check to branch protection until it is enabled:
+          an advisory check promoted to required is a gate that guarantees
+          nothing. The conformance checks that DO enforce on every PR are
+          in the `invariants` job (scripts/conformance-check.sh), gated by
+          no variable at all.
+          BANNER
+      # Pin the interpreter and install exactly the reviewed, hash-pinned deps.
+      # Without this the runner's own dependencies would be absent and the lane
+      # could never drive a plan; run-conformance.sh would then (correctly) go RED
+      # rather than pass vacuously, which is why provisioning it here matters.
+      - uses: actions/setup-python@v5
+        if: ${{ steps.status.outputs.enabled == 'true' }}
+        with:
+          python-version: "3.12"
+      - name: Provision the OIDF runner dependencies (hash pinned)
+        if: ${{ steps.status.outputs.enabled == 'true' }}
+        run: python3 -m pip install --require-hashes -r deploy/conformance/requirements.txt
+      - name: Run the merge-gate profile subset (fails closed)
+        if: ${{ steps.status.outputs.enabled == 'true' }}
+        # Brings up the pinned stack, seeds the deterministic user, generates each
+        # plan config from the matrix, drives the Basic / Config / Dynamic / Form
+        # Post plans, and fails on any non-PASS (parse_results.py treats
+        # WARNING/REVIEW/FAILED/SKIPPED and unfinished as blocking). It also fails
+        # if it cannot drive a plan at all. See docs/conformance/RUNBOOK.md.
+        working-directory: deploy/conformance
+        run: ./run-conformance.sh --trigger merge-gate --up
+      - name: Archive suite logs for certification submission
+        if: ${{ always() && steps.status.outputs.enabled == 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: conformance-logs-merge-gate
+          path: deploy/conformance/results/
+          if-no-files-found: ignore

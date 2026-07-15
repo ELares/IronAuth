@@ -6,6 +6,18 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Add `tests/conformance_seed.rs` (issue #37). The OIDF harness's `seed.sh` used
+  to compute the cert user's Argon2id hash at run time by pulling a MUTABLE
+  `alpine:3.20` tag and installing a package FROM THE NETWORK inside the gate
+  lane. The hash is committed instead (`deploy/conformance/cert-user-password.phc`),
+  so seeding pulls no image and reaches no network. This test re-derives the
+  claim rather than taking it on trust: it verifies the committed PHC string
+  against the committed cert password through the product's own
+  `verify_password` (the code path a real login takes), checks it rejects a wrong
+  password, and asserts the harness scripts have not drifted from the password
+  the hash was made for. A wrong hash would otherwise surface as every
+  conformance plan failing at its login step, far from the cause. Database-free;
+  no library change.
 - RFC 8628 device authorization grant with cross-device BCP mitigations (issue #24).
   - **Device-authorization endpoint.** `POST /device_authorization` authenticates the
     client (self-scoped, exactly like the token endpoint), gates on the per-client

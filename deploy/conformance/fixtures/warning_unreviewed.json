@@ -1,0 +1,8 @@
+{
+  "plan_name": "oidcc-config-certification-test-plan",
+  "plan_id": "example-warning",
+  "modules": [
+    {"name": "oidcc-server", "id": "m1", "status": "FINISHED", "result": "PASSED"},
+    {"name": "oidcc-discovery-endpoint-verification", "id": "m2", "status": "FINISHED", "result": "WARNING"}
+  ]
+}

@@ -38,6 +38,9 @@ scripts/dash-scan.sh
 echo "==> discovery scan (no static discovery JSON; generated at serve time)"
 scripts/discovery-scan.sh
 
+echo "==> conformance harness static checks (results gate, matrix, plan config, digest pins, fail-closed wiring, downgrade confinement)"
+scripts/conformance-check.sh
+
 echo "==> compatibility matrix freshness"
 scripts/compat-matrix.sh
 git diff --exit-code docs/COMPATIBILITY.md
