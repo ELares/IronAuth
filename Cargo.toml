@@ -80,6 +80,33 @@ sqlx = { version = "0.8", default-features = false, features = [
     "postgres",
 ] }
 base64 = "0.22"
+# Unicode NFKC normalization for the central identifier canonicalization seam
+# (crates/ironauth-store, issue #54). NFKC folds the compatibility-confusable class
+# (fullwidth ASCII, ligatures, circled forms) onto ordinary forms so a homoglyph
+# spoof of a login handle canonicalizes to the same value as the real one. Pure
+# Rust, permissive (MIT OR Apache-2.0), and ALREADY in the tree transitively (sqlx
+# -> url -> idna -> idna_adapter -> unicode-normalization), so this adds a direct
+# edge, not a new crate: the dependency graph, licenses, MSRV 1.85, and the musl
+# static lane are unchanged.
+unicode-normalization = "0.1"
+# Unicode General_Category lookup for the identifier canonicalization seam
+# (crates/ironauth-store, issue #54): step 1 strips invisible / control / format /
+# separator characters by PROPERTY (Cc/Cf/Zl/Zp) rather than a hand-curated
+# code-point list with gaps. Pure Rust, permissive (MIT OR Apache-2.0), and ALREADY
+# in the tree transitively (sqlx -> ... -> stringprep -> unicode-properties), so this
+# adds a direct edge, not a new crate; MSRV 1.85 and the musl static lane hold. Only
+# the general-category table is pulled (default emoji feature disabled).
+unicode-properties = { version = "0.1", default-features = false, features = [
+    "general-category",
+] }
+# Full Unicode Default Case Folding for the identifier canonicalization seam
+# (crates/ironauth-store, issue #54): folds the case pairs where simple lowercasing
+# diverges (the German sharp s, the Greek final sigma), so a mixed-case enumeration
+# variant of a login handle canonicalizes to one form. A standard unicode-rs crate,
+# permissive (MIT), pure Rust with no build script, depending only on
+# unicode-normalization (already in the tree). MSRV 1.85 and the musl static lane
+# hold; cargo-deny passes.
+caseless = "0.2"
 # Argon2id password hashing for the bootstrap login/registration surface
 # (issue #20), at the OWASP default parameters. Pure Rust (RustCrypto), permissive
 # (MIT OR Apache-2.0), no C dependency, so the tree stays musl-static clean and

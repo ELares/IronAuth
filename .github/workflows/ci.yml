@@ -161,6 +161,8 @@ jobs:
         run: scripts/query-audit.sh
       - name: classification lint (every resource type is classified; all three classes used)
         run: scripts/classification-lint.sh
+      - name: canonicalization seam (every identifier comparison routes through the one seam)
+        run: scripts/canonicalization-seam.sh
       - name: http audit (no outbound HTTP client outside the fetch dispatcher)
         run: scripts/http-audit.sh
       - name: no M2M metering (no metering/billing/quota hook on the client-credentials path)

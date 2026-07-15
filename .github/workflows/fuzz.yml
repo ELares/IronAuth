@@ -36,6 +36,8 @@ jobs:
             target: fetch_validation
           - crate: ironauth-store
             target: redirect_match
+          - crate: ironauth-store
+            target: canonicalize_identifier
     steps:
       - uses: actions/checkout@v4
       # cargo-fuzz needs a nightly toolchain for the sanitizer build. The

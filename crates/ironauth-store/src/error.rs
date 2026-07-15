@@ -90,6 +90,14 @@ pub enum StoreError {
     /// outside the reference-name alphabet, so a config field could never name it.
     /// Rejected before it is written. Carries no tenant data.
     InvalidName,
+    /// A login identifier was submitted whose canonical form is not storable (issue
+    /// #54): an all-invisible / whitespace-only value that canonicalizes to the EMPTY
+    /// form (which would squat the degenerate "empty" slot and resolve to that
+    /// account), or an email with no usable `@` shape (which must not be stored as a
+    /// username-like fold). Rejected at the write boundary before anything is
+    /// persisted, deterministically and independent of any existing row (so it is
+    /// never an existence oracle). Carries no tenant data.
+    InvalidIdentifier,
     /// A submitted trait schema is not a well-formed JSON Schema of the supported
     /// draft 2020-12 vocabulary (issue #53): a malformed keyword, a non-object
     /// sub-schema, or a nesting past the depth bound. Carries the offending location
@@ -134,6 +142,7 @@ impl fmt::Display for StoreError {
             StoreError::Encryption => f.write_str("envelope decryption failed"),
             StoreError::InvalidCustomDomain => f.write_str("invalid custom domain"),
             StoreError::InvalidName => f.write_str("invalid secret or variable name"),
+            StoreError::InvalidIdentifier => f.write_str("invalid login identifier"),
             StoreError::SchemaMalformed(error) => write!(f, "malformed trait schema: {error}"),
             StoreError::TraitsInvalid(failures) => {
                 write!(f, "traits failed validation ({} failures)", failures.len())
@@ -159,6 +168,7 @@ impl std::error::Error for StoreError {
             | StoreError::Encryption
             | StoreError::InvalidCustomDomain
             | StoreError::InvalidName
+            | StoreError::InvalidIdentifier
             | StoreError::TraitsInvalid(_)
             | StoreError::CutoverBlocked { .. }
             | StoreError::NoActiveTraitSchema => None,

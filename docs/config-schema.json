@@ -210,6 +210,38 @@
       },
       "type": "object"
     },
+    "IdentifierUniqueness": {
+      "description": "The per-environment login-identifier UNIQUENESS mode (issue #54).\n\nUniqueness is a POLICY, not a fixed schema rule: a greenfield identity model\nbakes scoped uniqueness in on day one rather than retrofitting it later (Zitadel\n#9535, Auth0's multi-year path to non-unique emails). The safe default\n(`environment_wide`) gives one canonical identifier at most one user per\n(tenant, environment). `org_scoped` makes an identifier unique only within an\norganization (meaningful once M10 org membership ships; a membership-free user\nfalls back to the environment scope). `non_unique` allows several accounts to\nshare one identifier (identifier-first login still resolves deterministically:\nthe M7 factor step disambiguates). Changing the mode on a POPULATED environment\nrequires a validation pass that reports post-canonicalization collisions before\nthe change applies. This is a promotable per-environment setting in spirit; the\nprocess value is the deployment default until per-environment overrides ride the\nM5 promotion pipeline.",
+      "oneOf": [
+        {
+          "const": "environment_wide",
+          "description": "A canonical identifier maps to at most one user per (tenant, environment).\nThe safe default.",
+          "type": "string"
+        },
+        {
+          "const": "org_scoped",
+          "description": "A canonical identifier is unique within an organization; users in different\norgs may share one. Falls back to the environment scope for a user with no\norg membership.",
+          "type": "string"
+        },
+        {
+          "const": "non_unique",
+          "description": "Multiple users may share one canonical identifier.",
+          "type": "string"
+        }
+      ]
+    },
+    "IdentifiersConfig": {
+      "additionalProperties": false,
+      "description": "Flexible-identifier settings (issue #54): the per-environment uniqueness policy\nfor typed login identifiers (email, username, phone).",
+      "properties": {
+        "uniqueness": {
+          "$ref": "#/$defs/IdentifierUniqueness",
+          "default": "environment_wide",
+          "description": "The uniqueness mode for login identifiers. Safe default: environment-wide."
+        }
+      },
+      "type": "object"
+    },
     "LogFormat": {
       "description": "Structured-log output format.",
       "oneOf": [
@@ -835,6 +867,13 @@
       "default": {},
       "description": "Feature toggles keyed by registered feature name. Enabling an\nexperimental feature additionally requires `ack` equal to the\nfeature's exact current version; see the feature reference in the\ngenerated docs/CONFIG.md.",
       "type": "object"
+    },
+    "identifiers": {
+      "$ref": "#/$defs/IdentifiersConfig",
+      "default": {
+        "uniqueness": "environment_wide"
+      },
+      "description": "Flexible-identifier settings (issue #54): the per-environment uniqueness\npolicy for typed login identifiers. Safe default: environment-wide uniqueness."
     },
     "oidc": {
       "$ref": "#/$defs/OidcConfig",

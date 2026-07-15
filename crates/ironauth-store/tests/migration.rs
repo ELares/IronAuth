@@ -46,6 +46,70 @@ async fn column_exists(pool: &sqlx::PgPool, table: &str, column: &str) -> bool {
     .get("present")
 }
 
+/// Whether `table` has BOTH `ENABLE` and `FORCE` row-level security on (`pg_class`).
+async fn rls_enabled_and_forced(pool: &sqlx::PgPool, table: &str) -> bool {
+    sqlx::query(
+        "SELECT (relrowsecurity AND relforcerowsecurity) AS present \
+         FROM pg_catalog.pg_class WHERE oid = $1::regclass",
+    )
+    .bind(table)
+    .fetch_one(pool)
+    .await
+    .expect("rls lookup")
+    .get("present")
+}
+
+/// Whether a row-level-security policy named `policy` exists on `table`.
+async fn policy_exists(pool: &sqlx::PgPool, table: &str, policy: &str) -> bool {
+    sqlx::query(
+        "SELECT EXISTS ( \
+            SELECT 1 FROM pg_catalog.pg_policies \
+            WHERE tablename = $1 AND policyname = $2 \
+         ) AS present",
+    )
+    .bind(table)
+    .bind(policy)
+    .fetch_one(pool)
+    .await
+    .expect("policy lookup")
+    .get("present")
+}
+
+/// Whether a CHECK constraint named `constraint_name` exists on `table`.
+async fn check_constraint_exists(pool: &sqlx::PgPool, table: &str, constraint_name: &str) -> bool {
+    sqlx::query(
+        "SELECT EXISTS ( \
+            SELECT 1 FROM pg_catalog.pg_constraint \
+            WHERE conrelid = $1::regclass AND contype = 'c' AND conname = $2 \
+         ) AS present",
+    )
+    .bind(table)
+    .bind(constraint_name)
+    .fetch_one(pool)
+    .await
+    .expect("check constraint lookup")
+    .get("present")
+}
+
+/// Whether a PARTIAL UNIQUE index named `index` exists on `table` (unique with a
+/// `WHERE` predicate).
+async fn partial_unique_index_exists(pool: &sqlx::PgPool, table: &str, index: &str) -> bool {
+    sqlx::query(
+        "SELECT EXISTS ( \
+            SELECT 1 FROM pg_catalog.pg_index i \
+            JOIN pg_catalog.pg_class c ON c.oid = i.indexrelid \
+            WHERE i.indrelid = $1::regclass AND c.relname = $2 \
+              AND i.indisunique AND i.indpred IS NOT NULL \
+         ) AS present",
+    )
+    .bind(table)
+    .bind(index)
+    .fetch_one(pool)
+    .await
+    .expect("partial unique index lookup")
+    .get("present")
+}
+
 #[tokio::test]
 async fn in_order_apply_records_each_and_is_idempotent() {
     let pool = TestDatabase::fresh_owner_pool().await;
@@ -248,7 +312,7 @@ async fn expand_contract_example_chain_runs_all_three_phases_and_contract_remove
 // per real table); splitting it would not make it clearer.
 #[allow(clippy::too_many_lines)]
 #[tokio::test]
-async fn production_chain_is_only_the_forty_real_migrations_and_ships_no_demo_object() {
+async fn production_chain_is_only_the_forty_one_real_migrations_and_ships_no_demo_object() {
     // TestDatabase::start runs Store::migrate() (the production chain) on a
     // fresh, empty database.
     let db = TestDatabase::start().await;
@@ -265,8 +329,8 @@ async fn production_chain_is_only_the_forty_real_migrations_and_ships_no_demo_ob
     );
     assert_eq!(
         report.already_applied(),
-        40,
-        "the production chain is exactly forty migrations (isolation, audit log, management \
+        41,
+        "the production chain is exactly forty-one migrations (isolation, audit log, management \
          API, OIDC authorization, signing keys, login/consent, authentication context, redirect \
          registration, UserInfo claims, consent scope upsert, resource servers, opaque access \
          tokens, client auth suite, dynamic client registration, pushed authorization requests, \
@@ -276,15 +340,15 @@ async fn production_chain_is_only_the_forty_real_migrations_and_ships_no_demo_ob
          APIs, envelope encryption, environment guardrails, tenant lifecycle, BYOK bindings, \
          snapshot export, custom domains, environment secrets and variables, config promotion, \
          self-service account, admin user lifecycle, identity traits, foreign password \
-         import, user invitations)"
+         import, user invitations, flexible identifiers)"
     );
 
-    // The ledger holds exactly versions 1 through 38.
+    // The ledger holds exactly versions 1 through 41.
     assert_eq!(
         applied_versions(pool).await,
         vec![
             1_i64, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
-            24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40
+            24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41
         ]
     );
     let phase_of = |version: i64| async move {
@@ -428,6 +492,12 @@ async fn production_chain_is_only_the_forty_real_migrations_and_ships_no_demo_ob
     // column-scoped grants (control-plane SELECT/INSERT plus a lifecycle UPDATE,
     // data-plane SELECT plus an accept UPDATE). All additive, so it is an expand too.
     assert_eq!(phase_of(40).await, "expand");
+    // The flexible-identifiers migration (issue #54): one new user_identifiers scoped
+    // table with its resolution and per-user indexes, the partial uniqueness index on
+    // the mode discriminator, isolation policy, nonempty-scope / closed-type CHECKs,
+    // and column-scoped grants. The identifier value is sealed and blind-indexed (no
+    // plaintext PII column). All additive, so it is an expand too.
+    assert_eq!(phase_of(41).await, "expand");
 
     // The demo object never reaches a production database.
     assert!(
@@ -1320,6 +1390,83 @@ async fn production_chain_is_only_the_forty_real_migrations_and_ships_no_demo_ob
             "user_invitations must have no plaintext identifier column ({forbidden})"
         );
     }
+
+    // The flexible-identifiers table (issue #54): one new user_identifiers scoped
+    // table with the owning user, the closed identifier kind, the CANONICAL blind
+    // index and the RAW sealed value (user PII never lands on a plaintext column),
+    // its DEK version, the per-identifier verified flag, the uniqueness-mode
+    // discriminator, and the terminal timestamps.
+    assert!(
+        table_exists(pool, "user_identifiers").await,
+        "user_identifiers exists after 0041"
+    );
+    for column in [
+        "id",
+        "tenant_id",
+        "environment_id",
+        "user_id",
+        "identifier_type",
+        "canonical_bidx",
+        "raw_sealed",
+        "pii_dek_version",
+        "verified",
+        "uniqueness_key",
+        "created_at",
+        "updated_at",
+    ] {
+        assert!(
+            column_exists(pool, "user_identifiers", column).await,
+            "user_identifiers.{column} exists after 0041"
+        );
+    }
+    // The identifier value is user PII, stored ONLY as the sealed raw value and the
+    // canonical blind index (issue #48): no plaintext identifier / email / phone /
+    // canonical column ever lands in the schema.
+    for forbidden in [
+        "identifier",
+        "email",
+        "phone",
+        "phone_number",
+        "canonical",
+        "raw",
+    ] {
+        assert!(
+            !column_exists(pool, "user_identifiers", forbidden).await,
+            "user_identifiers must have no plaintext identifier column ({forbidden})"
+        );
+    }
+    // The tenant-scoped-table obligations (migrate.rs checklist), asserted structurally
+    // against pg_catalog: forced row-level security, the (tenant, environment) isolation
+    // policy, the nonempty-scope and closed-type CHECK constraints, and the partial
+    // UNIQUE index that enforces uniqueness-as-configuration. A future edit that drops
+    // any of these silently reopens a cross-tenant leak or the uniqueness gap; this
+    // fails the build instead.
+    assert!(
+        rls_enabled_and_forced(pool, "user_identifiers").await,
+        "user_identifiers must ENABLE and FORCE row-level security"
+    );
+    assert!(
+        policy_exists(
+            pool,
+            "user_identifiers",
+            "user_identifiers_tenant_isolation"
+        )
+        .await,
+        "the (tenant, environment) isolation policy must exist on user_identifiers"
+    );
+    for constraint in [
+        "user_identifiers_scope_nonempty",
+        "user_identifiers_type_known",
+    ] {
+        assert!(
+            check_constraint_exists(pool, "user_identifiers", constraint).await,
+            "user_identifiers must carry the {constraint} CHECK constraint"
+        );
+    }
+    assert!(
+        partial_unique_index_exists(pool, "user_identifiers", "user_identifiers_uniqueness").await,
+        "the partial UNIQUE index user_identifiers_uniqueness must exist"
+    );
 }
 
 #[tokio::test]

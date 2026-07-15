@@ -54,6 +54,7 @@ pub mod environment;
 mod error;
 pub mod esv;
 mod id;
+pub mod identifier;
 mod migrate;
 pub mod promotion;
 mod redirect;
@@ -104,8 +105,11 @@ pub use id::{
     RefreshTokenId, RefreshTokenKind, ResourceServerId, ResourceServerKind, ScopedId, ScopedKind,
     ServiceAccountId, ServiceAccountKind, ServiceId, ServiceKind, SessionEventId, SessionEventKind,
     SessionId, SessionKind, SigningKeyId, SigningKeyKind, TenantId, TenantKind,
-    TraitMigrationJobId, TraitMigrationJobKind, TraitSchemaId, TraitSchemaKind, UserId, UserKind,
-    VariableId, VariableKind,
+    TraitMigrationJobId, TraitMigrationJobKind, TraitSchemaId, TraitSchemaKind, UserId,
+    UserIdentifierId, UserIdentifierKind, UserKind, VariableId, VariableKind,
+};
+pub use identifier::{
+    CanonicalIdentifier, IdentifierType, UniquenessMode, canonicalize_identifier,
 };
 pub use migrate::{Migration, MigrationError, MigrationReport, MigrationRunner, Phase};
 pub use promotion::{
@@ -123,13 +127,13 @@ pub use repository::{
     ActingInvitationRepo, ActingManagementCredentialRepo, ActingManagementStore,
     ActingOrganizationRepo, ActingPushedRequestRepo, ActingRefreshRepo, ActingResourceServerRepo,
     ActingServiceAccountRepo, ActingSessionRepo, ActingSigningKeyRepo, ActingStore,
-    ActingTenantRepo, ActingTraitMigrationJobRepo, ActingTraitSchemaRepo, ActingUserRepo,
-    ActiveDeviceFlow, ActiveOpaqueToken, ApprovedDeviceGrant, AssertionSubjectMappingRecord,
-    AssertionSubjectMappingRepo, AuditRecord, AuditRepo, AuthorizationRepo,
-    BackChannelDeliveryRepo, ByokBinding, ClientAssertionJtiRepo, ClientAuthDiagnosticReason,
-    ClientAuthDiagnosticRecord, ClientAuthDiagnosticsRepo, ClientAuthRecord,
-    ClientCredentialsAccess, ClientRecord, ClientRepo, ClientResourcePolicy, ClientSessionRepo,
-    CodeBindings, ConsentRepo, ConsumePushedRequest, ConsumedInitialAccessToken,
+    ActingTenantRepo, ActingTraitMigrationJobRepo, ActingTraitSchemaRepo, ActingUserIdentifierRepo,
+    ActingUserRepo, ActiveDeviceFlow, ActiveOpaqueToken, ApprovedDeviceGrant,
+    AssertionSubjectMappingRecord, AssertionSubjectMappingRepo, AuditRecord, AuditRepo,
+    AuthorizationRepo, BackChannelDeliveryRepo, ByokBinding, ClientAssertionJtiRepo,
+    ClientAuthDiagnosticReason, ClientAuthDiagnosticRecord, ClientAuthDiagnosticsRepo,
+    ClientAuthRecord, ClientCredentialsAccess, ClientRecord, ClientRepo, ClientResourcePolicy,
+    ClientSessionRepo, CodeBindings, ConsentRepo, ConsumePushedRequest, ConsumedInitialAccessToken,
     CredentialRemoveOutcome, CredentialType, CursorPosition, CustomDomainRepo, DcrPolicyRecord,
     DcrPolicyRepo, DcrRateLimiterRepo, DeviceApproval, DeviceApproveOutcome, DeviceAttemptOutcome,
     DeviceClientProfile, DeviceCodeRepo, DevicePollOutcome, DeviceRedeemOutcome,
@@ -139,27 +143,28 @@ pub use repository::{
     EnvironmentVariableRecord, EnvironmentVariableRepo, ExternalAssertionIssuerRecord,
     ExternalAssertionIssuerRepo, ExternalAssertionJtiRepo, FrontchannelLogoutParticipant,
     GrantOwner, GrantedConsent, INVITATION_TOKEN_PREFIX, IdempotencyRepo, IdempotencyWrite,
-    InitialAccessTokenRepo, InvitationAdminRecord, InvitationCredentialType, InvitationListFilter,
-    InvitationRepo, InvitationState, IssueClientCredentials, IssueCode, IssuedTokenRecord,
-    JtiOutcome, LogoutDelivery, MANAGEMENT_LIST_HARD_CAP, ManagementCredentialRecord,
-    ManagementCredentialRepo, ManagementStore, MintedInvitationToken, NewAdminUser,
-    NewAssertionSubjectMapping, NewClientAuthDiagnostic, NewDcrPolicy, NewDeviceCode,
-    NewDynamicClient, NewEnvironment, NewExternalAssertionIssuer, NewInitialAccessToken,
-    NewInvitation, NewJwtAuthClient, NewOpaqueAccessToken, NewRefreshFamily, NewResourceServer,
-    NewSession, NewSigningKey, NewTraitMigrationJob, OperatorRecord, OperatorRepo,
-    OrganizationRecord, OrganizationRepo, PendingInvitation, PriorSessionOutcome, PushRequest,
-    PushedRequestRepo, RecordFailure, RedeemOutcome, RefreshFamilyFleetFilter,
-    RefreshFamilyFleetRepo, RefreshFamilyOpenOutcome, RefreshFamilySummary, RefreshRedeem,
-    RefreshRedeemOutcome, RefreshRepo, RefreshTokenResolution, ResourceServerRecord,
-    ResourceServerRepo, RotatedRefreshToken, ScopedStore, ServiceAccountRepo, SessionEndCause,
-    SessionEndedEvent, SessionEventOutboxRepo, SessionFleetFilter, SessionFleetRepo, SessionRecord,
-    SessionRepo, SessionRevocation, SessionSummary, SigningKeyMaterial, SigningKeyMaterialKind,
+    IdentifierCollision, IdentifierResolution, InitialAccessTokenRepo, InvitationAdminRecord,
+    InvitationCredentialType, InvitationListFilter, InvitationRepo, InvitationState,
+    IssueClientCredentials, IssueCode, IssuedTokenRecord, JtiOutcome, LoginMethod, LogoutDelivery,
+    MANAGEMENT_LIST_HARD_CAP, ManagementCredentialRecord, ManagementCredentialRepo,
+    ManagementStore, MintedInvitationToken, NewAdminUser, NewAssertionSubjectMapping,
+    NewClientAuthDiagnostic, NewDcrPolicy, NewDeviceCode, NewDynamicClient, NewEnvironment,
+    NewExternalAssertionIssuer, NewInitialAccessToken, NewInvitation, NewJwtAuthClient,
+    NewOpaqueAccessToken, NewRefreshFamily, NewResourceServer, NewSession, NewSigningKey,
+    NewTraitMigrationJob, NewUserIdentifier, OperatorRecord, OperatorRepo, OrganizationRecord,
+    OrganizationRepo, PendingInvitation, PriorSessionOutcome, PushRequest, PushedRequestRepo,
+    RecordFailure, RedeemOutcome, RefreshFamilyFleetFilter, RefreshFamilyFleetRepo,
+    RefreshFamilyOpenOutcome, RefreshFamilySummary, RefreshRedeem, RefreshRedeemOutcome,
+    RefreshRepo, RefreshTokenResolution, ResourceServerRecord, ResourceServerRepo,
+    RotatedRefreshToken, ScopedStore, ServiceAccountRepo, SessionEndCause, SessionEndedEvent,
+    SessionEventOutboxRepo, SessionFleetFilter, SessionFleetRepo, SessionRecord, SessionRepo,
+    SessionRevocation, SessionSummary, SigningKeyMaterial, SigningKeyMaterialKind,
     SigningKeyRecord, SigningKeyRepo, StoredIdempotentResponse, TenantRecord, TenantRepo,
     TenantStatus, TokenFormat, TokenKind, TokenStatus, TraitJobKind, TraitJobStatus,
     TraitMigrationJob, TraitMigrationJobRepo, TraitSchemaRepo, TraitSchemaVersion, UserAdminRecord,
-    UserListFilter, UserRecord, UserRepo, UserRevocation, UserState, device_code_digest,
-    invitation_token_digest, mint_invitation_token, mint_invitation_token_for,
-    opaque_access_token_digest, refresh_token_digest, user_code_hash,
+    UserIdentifierRecord, UserIdentifierRepo, UserListFilter, UserRecord, UserRepo, UserRevocation,
+    UserState, device_code_digest, invitation_token_digest, mint_invitation_token,
+    mint_invitation_token_for, opaque_access_token_digest, refresh_token_digest, user_code_hash,
 };
 pub use scope::Scope;
 pub use snapshot::{

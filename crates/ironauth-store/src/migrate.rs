@@ -512,6 +512,12 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0040_user_invitations.sql"),
         },
+        Migration {
+            version: 41,
+            name: "flexible_identifiers",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0041_flexible_identifiers.sql"),
+        },
     ]
 }
 
