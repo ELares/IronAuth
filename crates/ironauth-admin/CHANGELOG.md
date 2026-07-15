@@ -6,6 +6,19 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Server-side config promotion (issue #44): the write half of the flagship. Two
+  operator-plane POSTs on the target environment scope:
+  `POST .../config/promotion/plan` dry-runs a promotion of a submitted source
+  snapshot document into the target and returns a reviewable plan (a stable plan id,
+  the base and result revisions, the resolved references, and the structured diff),
+  failing closed (422) on a reference the target cannot resolve;
+  `POST .../config/promotion/apply` transactionally applies a plan's source snapshot
+  onto the target all-or-nothing, gated on the plan's `base_revision` (a target that
+  drifted fails 409 with a structured drift error and changes nothing; an
+  already-applied plan is an idempotent no-op). Both validate the source document
+  (secret-free) before doing anything and run under the target scope's forced
+  row-level security; apply audits in the same transaction as the changes.
+
 - Canonical secret-free config snapshot export (issue #43). New
   `GET /v1/tenants/{tenant_id}/environments/{environment_id}/config/snapshot`
   returns the environment's promotable configuration as a canonical, deterministic,

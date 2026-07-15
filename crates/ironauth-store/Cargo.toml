@@ -106,6 +106,15 @@ name = "atomicity"
 path = "tests/atomicity.rs"
 required-features = ["testing"]
 
+# Server-side config promotion (issue #44): diff/plan/apply over a real database.
+# The transactional apply (drift guard, idempotency, atomic rollback, audited),
+# plan fail-closed on a missing reference, per-target reference resolution, and
+# cross-scope isolation plus environment-identity exclusion. Needs a real database.
+[[test]]
+name = "config_promotion"
+path = "tests/config_promotion.rs"
+required-features = ["testing"]
+
 # Append-only enforcement: as the low-privilege app role, UPDATE and DELETE on
 # audit rows are denied while INSERT/SELECT in scope work. Needs a real database.
 [[test]]

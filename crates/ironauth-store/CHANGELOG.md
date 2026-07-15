@@ -6,6 +6,38 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Server-side config promotion: diff, plan, and apply (issue #44, migration 0035,
+  expand). The flagship differentiator, at the store layer.
+  - **Engine (`promotion` module, pure and deterministic).** `diff` compares a
+    source snapshot against a target snapshot and produces a structured, ordered
+    per-resource difference (create, update, or delete with before and after);
+    `evaluate_plan` turns a diff into a reviewable `Plan` with a stable,
+    content-derived id, the target's base and result revisions (a content hash over
+    the promotable projection, the optimistic-concurrency token), and the resolved
+    references, failing closed on any reference the target cannot resolve. The
+    engine operates on the promotable types with a SCOPE-INDEPENDENT natural key
+    (resource server by `audience`, DCR policy by `name`, variable by `name`);
+    environment-identity never enters a snapshot (issue #41/#43), so it is never
+    promoted. Clients are carried in the snapshot for review but not promoted: a
+    client identifier embeds its `(tenant, environment)`, so a client's key cannot
+    address the same logical client across environments (a follow-up).
+  - **Transactional apply (`ActingStore::apply_promotion`).** All-or-nothing in one
+    scoped transaction: it re-derives the target's revision inside the transaction
+    (no TOCTOU), is a NO-OP when the target already matches (idempotent re-apply),
+    fails with a structured DRIFT error when the target changed since the plan, and
+    re-validates every reference (fail closed). Every resource change and one
+    `config_promotion.apply` audit row commit together, or none do; a mid-apply
+    failure rolls back completely (proven by a fault-injection test comparing the
+    target's byte-for-byte export before and after).
+  - **Grants (migration 0035).** The control role (promotion is a control-plane
+    operation) is granted exactly the apply privileges on the promoted tables:
+    create, column-scoped overwrite, and remove on `resource_servers`,
+    `dcr_policies`, and `environment_variables`, plus SELECT on `environment_secrets`
+    for the reference presence check. Least privilege preserved: every UPDATE is
+    column-scoped, and the control role holds no master key so a secret VALUE stays
+    unreachable through the control plane. A pure-grant additive expand.
+  - **Audit.** New `Action::ConfigPromotionApply` (`config_promotion.apply`).
+
 - Environment-scoped secrets and variables (issue #45, migration 0034, expand).
   - **Persistence.** Two new tenant-scoped, RLS-forced tables. `environment_variables`
     holds non-secret promotable config (name to plaintext value, readable);

@@ -54,6 +54,7 @@ mod openapi;
 mod operators;
 mod organizations;
 mod pagination;
+mod promotion;
 mod provision;
 mod ratelimit;
 mod resource_types;
@@ -148,6 +149,17 @@ pub fn management_router(state: AdminState) -> Router {
         .route(
             "/v1/tenants/{tenant_id}/environments/{environment_id}/config/snapshot",
             get(config::export_config_snapshot),
+        )
+        // Server-side config promotion (issue #44): the write half of the flagship.
+        // A dry-run PLAN and a transactional APPLY into the target environment.
+        // Static suffixes, matched before the parameterized keys/organizations routes.
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/config/promotion/plan",
+            post(promotion::plan_config_promotion),
+        )
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/config/promotion/apply",
+            post(promotion::apply_config_promotion),
         )
         .route(
             "/v1/tenants/{tenant_id}/environments/{environment_id}/keys/{key_id}",

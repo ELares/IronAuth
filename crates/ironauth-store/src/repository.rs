@@ -54,6 +54,7 @@ use sqlx::postgres::PgRow;
 use sqlx::{PgConnection, Postgres, Row, Transaction};
 
 use crate::audit::{ActingContext, Action, ActorRef};
+use crate::classification::ResourceType;
 use crate::custom_domain::{
     AcmeChallengeRecord, ChallengeOutcome, ChallengeStatus, ChallengeType, CustomDomainRecord,
     VerificationStatus,
@@ -15881,5 +15882,491 @@ impl ActingCustomDomainRepo<'_> {
         )
         .await?;
         Ok(secret_id)
+    }
+}
+
+// ===========================================================================
+// Server-side config promotion apply (issue #44).
+//
+// The DIFF and PLAN are pure engine logic in `crate::promotion`; the APPLY is
+// here because it is the one step that mutates scoped tables and must write its
+// audit trail in the SAME transaction as the changes. Everything runs in a single
+// `begin_scoped` transaction so a mid-apply failure rolls back COMPLETELY: no
+// partial promotion, ever. The target's promotable-config revision is re-derived
+// inside that transaction and checked against the plan's captured revision, so a
+// target that drifted since the plan fails cleanly and changes nothing (optimistic
+// concurrency, no tenant-wide lock).
+// ===========================================================================
+
+impl ActingStore<'_> {
+    /// Transactionally APPLY a promotion plan's source snapshot onto this target
+    /// environment (issue #44): all-or-nothing.
+    ///
+    /// `base_revision` is the plan's captured target revision (from
+    /// [`crate::Plan::base_revision`]); apply proceeds only if the target still
+    /// carries it. The apply is:
+    ///
+    /// - IDEMPOTENT: if the target already matches the source's promotable
+    ///   configuration (its revision equals the source's), apply changes nothing and
+    ///   returns [`PromotionOutcome::NoOp`].
+    /// - DRIFT-GUARDED: if the target's current revision is neither the source's nor
+    ///   `base_revision`, the plan is stale; apply returns
+    ///   [`PromotionApplyError::Drift`] and changes nothing.
+    /// - FAIL-CLOSED on references: every reference the source carries is re-checked
+    ///   for existence in the target inside the transaction; a missing one is
+    ///   [`PromotionApplyError::UnresolvedReference`] and the transaction rolls back.
+    /// - ATOMIC and AUDITED: every resource change and one `config_promotion.apply`
+    ///   audit row commit together, or none do.
+    ///
+    /// `poison_after_audit` is `false` on every production path; the atomicity test
+    /// sets it to force a guaranteed in-transaction failure AFTER the changes and
+    /// the audit row are staged, proving they roll back together.
+    ///
+    /// # Errors
+    ///
+    /// [`PromotionApplyError::Drift`] on a stale plan;
+    /// [`PromotionApplyError::UnresolvedReference`] on a reference absent in the
+    /// target; [`PromotionApplyError::Store`] on a persistence fault.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the single-transaction apply keeps the drift check, the reference \
+                  re-validation, every resource mutation, and the audit write in one \
+                  place so their all-or-nothing rollback is legible as one unit"
+    )]
+    pub async fn apply_promotion(
+        &self,
+        env: &Env,
+        source: &crate::snapshot::Snapshot,
+        base_revision: &str,
+        poison_after_audit: bool,
+    ) -> Result<crate::promotion::PromotionOutcome, crate::promotion::PromotionApplyError> {
+        use crate::promotion::{ChangeKind, PromotionApplyError, PromotionOutcome};
+
+        let scope = self.scope;
+        let result_revision = crate::promotion::revision(source)?;
+
+        let mut tx = begin_scoped(self.store, scope).await?;
+
+        // Re-derive the target's current promotable configuration and revision
+        // INSIDE the transaction, so the drift check has no TOCTOU window.
+        let current = read_promoted_snapshot(&mut tx, scope).await?;
+        let current_revision = crate::promotion::revision(&current)?;
+
+        // Idempotent: the target already matches the source's promotable config.
+        if current_revision == result_revision {
+            tx.commit().await?;
+            return Ok(PromotionOutcome::NoOp);
+        }
+        // Drift: the target changed since the plan was computed.
+        if current_revision != base_revision {
+            // Dropping `tx` without commit rolls back; nothing was written anyway.
+            return Err(PromotionApplyError::Drift {
+                expected: base_revision.to_owned(),
+                found: current_revision,
+            });
+        }
+
+        // Re-validate every reference the source carries against the target, inside
+        // the transaction, so apply never half-completes on a reference that vanished
+        // since the plan (a secret is outside the revision, so its removal is not a
+        // drift). A variable reference is satisfied by an existing target variable OR
+        // one the source promotes; a secret reference must pre-exist in the target.
+        for reference in crate::promotion::collect_references(source) {
+            let resolved = match reference.kind {
+                crate::esv::ReferenceKind::Variable => {
+                    source
+                        .resources
+                        .variable
+                        .iter()
+                        .any(|variable| variable.name == reference.name)
+                        || current
+                            .resources
+                            .variable
+                            .iter()
+                            .any(|variable| variable.name == reference.name)
+                }
+                crate::esv::ReferenceKind::Secret => {
+                    secret_exists_tx(&mut tx, scope, &reference.name).await?
+                }
+            };
+            if !resolved {
+                return Err(PromotionApplyError::UnresolvedReference(reference));
+            }
+        }
+
+        // The diff is computed against the just-read current state, so it is exactly
+        // the plan's diff (the drift check proved current == base).
+        let plan_diff = crate::promotion::diff(source, &current);
+        let now_micros = epoch_micros(env.clock().now_utc());
+        let (mut creates, mut updates, mut deletes) = (0_u32, 0_u32, 0_u32);
+
+        for change in plan_diff.changes() {
+            match change.kind {
+                ChangeKind::Create => creates += 1,
+                ChangeKind::Update => updates += 1,
+                ChangeKind::Delete => deletes += 1,
+            }
+            apply_change(&mut tx, scope, env, source, change, now_micros).await?;
+        }
+
+        // One audit row, naming the environment and the change counts (operator-safe;
+        // no promoted value or secret), written in the SAME transaction.
+        let environment_id = scope.environment();
+        let detail = format!("create={creates},update={updates},delete={deletes}");
+        let spec = AuditedWrite {
+            store: self.store,
+            scope,
+            acting: &self.acting,
+            env,
+            action: Action::ConfigPromotionApply,
+            target: &environment_id,
+        };
+        insert_audit_row(&mut tx, &spec, Some(&detail)).await?;
+
+        if poison_after_audit {
+            // Testing seam only: force a guaranteed error after the changes and the
+            // audit row are staged, so their joint rollback proves atomicity.
+            sqlx::query("SELECT 1 / 0").execute(&mut *tx).await?;
+        }
+
+        tx.commit().await?;
+        Ok(PromotionOutcome::Applied(plan_diff))
+    }
+}
+
+/// Read the target's promotable configuration (the promoted resource types only)
+/// as a [`crate::snapshot::Snapshot`], INSIDE the caller's transaction (issue #44).
+///
+/// Mirrors the ordering the canonical export uses (each array sorted by its natural
+/// key in Rust, collation-independent), so the revision computed from this matches
+/// the revision the plan captured from the canonical export. The `client` set is
+/// left empty: clients are not promoted.
+async fn read_promoted_snapshot(
+    tx: &mut Transaction<'_, Postgres>,
+    scope: Scope,
+) -> Result<crate::snapshot::Snapshot, StoreError> {
+    let mut resource_server: Vec<crate::snapshot::ResourceServerSnapshot> = sqlx::query(
+        "SELECT audience, token_format, access_token_ttl_secs FROM resource_servers \
+         WHERE tenant_id = $1 AND environment_id = $2",
+    )
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .fetch_all(&mut **tx)
+    .await?
+    .iter()
+    .map(|row| crate::snapshot::ResourceServerSnapshot {
+        audience: row.get("audience"),
+        token_format: row.get("token_format"),
+        access_token_ttl_secs: row.get("access_token_ttl_secs"),
+    })
+    .collect();
+    resource_server.sort_by(|a, b| a.audience.cmp(&b.audience));
+
+    let mut dcr_policy = Vec::new();
+    for row in sqlx::query(
+        "SELECT name, primitives FROM dcr_policies \
+         WHERE tenant_id = $1 AND environment_id = $2",
+    )
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .fetch_all(&mut **tx)
+    .await?
+    {
+        let primitives_text: String = row.get("primitives");
+        let primitives: serde_json::Value = serde_json::from_str(&primitives_text)
+            .map_err(|error| StoreError::Database(sqlx::Error::Decode(Box::new(error))))?;
+        dcr_policy.push(crate::snapshot::DcrPolicySnapshot {
+            name: row.get("name"),
+            primitives,
+        });
+    }
+    dcr_policy.sort_by(|a, b| a.name.cmp(&b.name));
+
+    let mut variable: Vec<crate::snapshot::VariableSnapshot> = sqlx::query(
+        "SELECT name, value FROM environment_variables \
+         WHERE tenant_id = $1 AND environment_id = $2",
+    )
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .fetch_all(&mut **tx)
+    .await?
+    .iter()
+    .map(|row| crate::snapshot::VariableSnapshot {
+        name: row.get("name"),
+        value: row.get("value"),
+    })
+    .collect();
+    variable.sort_by(|a, b| a.name.cmp(&b.name));
+
+    Ok(crate::snapshot::Snapshot {
+        schema_version: crate::snapshot::SNAPSHOT_SCHEMA_VERSION.to_owned(),
+        resources: crate::snapshot::SnapshotResources {
+            client: Vec::new(),
+            resource_server,
+            dcr_policy,
+            variable,
+        },
+    })
+}
+
+/// Whether a secret of `name` exists in `scope`, read inside the caller's
+/// transaction (the apply-time reference re-check; opens no ciphertext).
+async fn secret_exists_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    scope: Scope,
+    name: &str,
+) -> Result<bool, StoreError> {
+    let row = sqlx::query(
+        "SELECT 1 AS present FROM environment_secrets \
+         WHERE tenant_id = $1 AND environment_id = $2 AND name = $3",
+    )
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .bind(name)
+    .fetch_optional(&mut **tx)
+    .await?;
+    Ok(row.is_some())
+}
+
+/// Apply one promotion change to the target, inside the caller's transaction
+/// (issue #44). Creates mint a fresh target-scoped identifier; updates and deletes
+/// match the existing target row by its scope-independent natural key.
+async fn apply_change(
+    tx: &mut Transaction<'_, Postgres>,
+    scope: Scope,
+    env: &Env,
+    source: &crate::snapshot::Snapshot,
+    change: &crate::promotion::ResourceChange,
+    now_micros: i64,
+) -> Result<(), StoreError> {
+    match change.resource_type {
+        ResourceType::ResourceServer => {
+            apply_resource_server_change(tx, scope, env, source, change).await
+        }
+        ResourceType::DcrPolicy => {
+            apply_dcr_policy_change(tx, scope, env, source, change, now_micros).await
+        }
+        ResourceType::Variable => {
+            apply_variable_change(tx, scope, env, source, change, now_micros).await
+        }
+        // The promotion engine only ever emits changes for the promoted resource
+        // types; any other type is a programmer error, surfaced as a not-found
+        // rather than a silent skip.
+        _ => Err(StoreError::NotFound),
+    }
+}
+
+/// Apply a resource-server create/update/delete, matched by `audience`.
+async fn apply_resource_server_change(
+    tx: &mut Transaction<'_, Postgres>,
+    scope: Scope,
+    env: &Env,
+    source: &crate::snapshot::Snapshot,
+    change: &crate::promotion::ResourceChange,
+) -> Result<(), StoreError> {
+    use crate::promotion::ChangeKind;
+    match change.kind {
+        ChangeKind::Create => {
+            let server = source
+                .resources
+                .resource_server
+                .iter()
+                .find(|server| server.audience == change.key)
+                .ok_or(StoreError::NotFound)?;
+            let id = ResourceServerId::generate(env, &scope);
+            sqlx::query(
+                "INSERT INTO resource_servers \
+                 (id, tenant_id, environment_id, audience, token_format, access_token_ttl_secs) \
+                 VALUES ($1, $2, $3, $4, $5, $6)",
+            )
+            .bind(id.to_string())
+            .bind(scope.tenant().to_string())
+            .bind(scope.environment().to_string())
+            .bind(&server.audience)
+            .bind(&server.token_format)
+            .bind(server.access_token_ttl_secs)
+            .execute(&mut **tx)
+            .await?;
+            Ok(())
+        }
+        ChangeKind::Update => {
+            let server = source
+                .resources
+                .resource_server
+                .iter()
+                .find(|server| server.audience == change.key)
+                .ok_or(StoreError::NotFound)?;
+            sqlx::query(
+                "UPDATE resource_servers \
+                 SET token_format = $1, access_token_ttl_secs = $2 \
+                 WHERE tenant_id = $3 AND environment_id = $4 AND audience = $5",
+            )
+            .bind(&server.token_format)
+            .bind(server.access_token_ttl_secs)
+            .bind(scope.tenant().to_string())
+            .bind(scope.environment().to_string())
+            .bind(&server.audience)
+            .execute(&mut **tx)
+            .await?;
+            Ok(())
+        }
+        ChangeKind::Delete => {
+            sqlx::query(
+                "DELETE FROM resource_servers \
+                 WHERE tenant_id = $1 AND environment_id = $2 AND audience = $3",
+            )
+            .bind(scope.tenant().to_string())
+            .bind(scope.environment().to_string())
+            .bind(&change.key)
+            .execute(&mut **tx)
+            .await?;
+            Ok(())
+        }
+    }
+}
+
+/// Apply a DCR-policy create/update/delete, matched by `name`.
+async fn apply_dcr_policy_change(
+    tx: &mut Transaction<'_, Postgres>,
+    scope: Scope,
+    env: &Env,
+    source: &crate::snapshot::Snapshot,
+    change: &crate::promotion::ResourceChange,
+    now_micros: i64,
+) -> Result<(), StoreError> {
+    use crate::promotion::ChangeKind;
+    match change.kind {
+        ChangeKind::Create => {
+            let policy = source
+                .resources
+                .dcr_policy
+                .iter()
+                .find(|policy| policy.name == change.key)
+                .ok_or(StoreError::NotFound)?;
+            let primitives = serde_json::to_string(&policy.primitives)
+                .map_err(|error| StoreError::Database(sqlx::Error::Decode(Box::new(error))))?;
+            let id = DcrPolicyId::generate(env, &scope);
+            sqlx::query(
+                "INSERT INTO dcr_policies \
+                 (id, tenant_id, environment_id, name, primitives, created_at) \
+                 VALUES ($1, $2, $3, $4, $5, \
+                         TIMESTAMPTZ 'epoch' + ($6::text || ' microseconds')::interval)",
+            )
+            .bind(id.to_string())
+            .bind(scope.tenant().to_string())
+            .bind(scope.environment().to_string())
+            .bind(&policy.name)
+            .bind(&primitives)
+            .bind(now_micros)
+            .execute(&mut **tx)
+            .await?;
+            Ok(())
+        }
+        ChangeKind::Update => {
+            let policy = source
+                .resources
+                .dcr_policy
+                .iter()
+                .find(|policy| policy.name == change.key)
+                .ok_or(StoreError::NotFound)?;
+            let primitives = serde_json::to_string(&policy.primitives)
+                .map_err(|error| StoreError::Database(sqlx::Error::Decode(Box::new(error))))?;
+            sqlx::query(
+                "UPDATE dcr_policies SET primitives = $1 \
+                 WHERE tenant_id = $2 AND environment_id = $3 AND name = $4",
+            )
+            .bind(&primitives)
+            .bind(scope.tenant().to_string())
+            .bind(scope.environment().to_string())
+            .bind(&policy.name)
+            .execute(&mut **tx)
+            .await?;
+            Ok(())
+        }
+        ChangeKind::Delete => {
+            sqlx::query(
+                "DELETE FROM dcr_policies \
+                 WHERE tenant_id = $1 AND environment_id = $2 AND name = $3",
+            )
+            .bind(scope.tenant().to_string())
+            .bind(scope.environment().to_string())
+            .bind(&change.key)
+            .execute(&mut **tx)
+            .await?;
+            Ok(())
+        }
+    }
+}
+
+/// Apply an environment-variable create/update/delete, matched by `name`.
+async fn apply_variable_change(
+    tx: &mut Transaction<'_, Postgres>,
+    scope: Scope,
+    env: &Env,
+    source: &crate::snapshot::Snapshot,
+    change: &crate::promotion::ResourceChange,
+    now_micros: i64,
+) -> Result<(), StoreError> {
+    use crate::promotion::ChangeKind;
+    match change.kind {
+        ChangeKind::Create => {
+            let variable = source
+                .resources
+                .variable
+                .iter()
+                .find(|variable| variable.name == change.key)
+                .ok_or(StoreError::NotFound)?;
+            let id = VariableId::generate(env, &scope);
+            sqlx::query(
+                "INSERT INTO environment_variables \
+                 (id, tenant_id, environment_id, name, value, version, created_at, updated_at) \
+                 VALUES ($1, $2, $3, $4, $5, 1, \
+                         TIMESTAMPTZ 'epoch' + ($6::text || ' microseconds')::interval, \
+                         TIMESTAMPTZ 'epoch' + ($6::text || ' microseconds')::interval)",
+            )
+            .bind(id.to_string())
+            .bind(scope.tenant().to_string())
+            .bind(scope.environment().to_string())
+            .bind(&variable.name)
+            .bind(&variable.value)
+            .bind(now_micros)
+            .execute(&mut **tx)
+            .await?;
+            Ok(())
+        }
+        ChangeKind::Update => {
+            let variable = source
+                .resources
+                .variable
+                .iter()
+                .find(|variable| variable.name == change.key)
+                .ok_or(StoreError::NotFound)?;
+            sqlx::query(
+                "UPDATE environment_variables \
+                 SET value = $1, version = version + 1, \
+                     updated_at = TIMESTAMPTZ 'epoch' + ($2::text || ' microseconds')::interval \
+                 WHERE tenant_id = $3 AND environment_id = $4 AND name = $5",
+            )
+            .bind(&variable.value)
+            .bind(now_micros)
+            .bind(scope.tenant().to_string())
+            .bind(scope.environment().to_string())
+            .bind(&variable.name)
+            .execute(&mut **tx)
+            .await?;
+            Ok(())
+        }
+        ChangeKind::Delete => {
+            sqlx::query(
+                "DELETE FROM environment_variables \
+                 WHERE tenant_id = $1 AND environment_id = $2 AND name = $3",
+            )
+            .bind(scope.tenant().to_string())
+            .bind(scope.environment().to_string())
+            .bind(&change.key)
+            .execute(&mut **tx)
+            .await?;
+            Ok(())
+        }
     }
 }
