@@ -49,6 +49,7 @@ mod error;
 mod hash;
 mod idempotency;
 mod input;
+mod invitations;
 mod keys;
 mod openapi;
 mod operators;
@@ -237,6 +238,28 @@ pub fn management_router(state: AdminState) -> Router {
         .route(
             "/v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}/external-id",
             put(users::link_user_external_id).delete(users::unlink_user_external_id),
+        )
+        // Admin user-invitation CRUD (issue #60): create (provisioning a
+        // pending_verification user and a single-use, expiring, unguessable token),
+        // list, get, and the static-suffix revoke / resend POSTs (siblings of the
+        // parameterized `/invitations/{invitation_id}`; the router matches the static
+        // segments first). The token-authenticated ACCEPT is an invitee action on the
+        // public data plane (ironauth-oidc), not here.
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/invitations",
+            post(invitations::create_invitation).get(invitations::list_invitations),
+        )
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/invitations/{invitation_id}",
+            get(invitations::get_invitation),
+        )
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/invitations/{invitation_id}/revoke",
+            post(invitations::revoke_invitation),
+        )
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/invitations/{invitation_id}/resend",
+            post(invitations::resend_invitation),
         )
         .route(
             "/v1/tenants/{tenant_id}/environments/{environment_id}/refresh-families",

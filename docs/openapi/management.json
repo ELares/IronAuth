@@ -1665,6 +1665,527 @@
         ]
       }
     },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/invitations": {
+      "get": {
+        "tags": [
+          "invitations"
+        ],
+        "summary": "List invitations under an environment (cursor paginated), filterable by state.",
+        "operationId": "listInvitations",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "state",
+            "in": "query",
+            "description": "Only invitations in this lifecycle state.",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/InvitationStateView"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "The desired page size, a positive integer. Clamped to\n`[1, max_page_size]`; defaults to the configured default when absent.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "The opaque cursor from a previous page's `next_cursor`. Absent for the\nfirst page (keyset pagination; there is no offset).",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "A page of invitations",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InvitationList"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed cursor",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      },
+      "post": {
+        "tags": [
+          "invitations"
+        ],
+        "summary": "Create an invitation for a new identity.",
+        "operationId": "createInvitation",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Required. Replaying a POST with the same key returns the original response (WITHOUT the one-time token) without re-executing.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateInvitationRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Created; the one-time token is returned once",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InvitationCreatedView"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Environment not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The invited identifier is already in use",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency-Key reused with a different request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/invitations/{invitation_id}": {
+      "get": {
+        "tags": [
+          "invitations"
+        ],
+        "summary": "Get one invitation.",
+        "operationId": "getInvitation",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "invitation_id",
+            "in": "path",
+            "description": "The invitation identifier (inv_...)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The invitation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InvitationView"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found (absent or in another scope)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/invitations/{invitation_id}/resend": {
+      "post": {
+        "tags": [
+          "invitations"
+        ],
+        "summary": "Resend a pending invitation: invalidate the prior token and issue a fresh one.",
+        "operationId": "resendInvitation",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "invitation_id",
+            "in": "path",
+            "description": "The invitation identifier (inv_...)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Required. Replaying a POST with the same key returns the original response (WITHOUT the fresh token) without re-executing.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "A fresh token was issued; it is returned once",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InvitationCreatedView"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found (absent, not pending, or in another scope)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency-Key reused with a different request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/invitations/{invitation_id}/revoke": {
+      "post": {
+        "tags": [
+          "invitations"
+        ],
+        "summary": "Revoke a pending invitation (its token becomes unredeemable).",
+        "operationId": "revokeInvitation",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "invitation_id",
+            "in": "path",
+            "description": "The invitation identifier (inv_...)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Required. Replaying a POST with the same key returns the original response without re-executing.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The invitation is revoked",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InvitationStateChangeView"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found (absent, not pending, or in another scope)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency-Key reused with a different request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/v1/tenants/{tenant_id}/environments/{environment_id}/keys": {
       "get": {
         "tags": [
@@ -4481,6 +5002,47 @@
           }
         }
       },
+      "CreateInvitationRequest": {
+        "type": "object",
+        "description": "The body to create an invitation (issue #60). The invited `identifier` is\nrequired; every other field has a safe default.",
+        "required": [
+          "identifier"
+        ],
+        "properties": {
+          "credential_type": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/InvitationCredentialTypeView",
+                "description": "The OPTIONAL primary-login credential the invitee enrolls on accept (default\n`password`). A `passkey` invitation provisions no password."
+              }
+            ]
+          },
+          "expires_in_secs": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "The OPTIONAL token lifetime in seconds (default: the configured invitation\nTTL). Bounds how long the invite link stays acceptable.",
+            "minimum": 0
+          },
+          "identifier": {
+            "type": "string",
+            "description": "The invited identifier (an email or other login handle), unique per scope: a\npending_verification user is provisioned for it. An identifier already in use\nby an existing user returns 409.",
+            "example": "ada@example.test"
+          },
+          "org_context": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "An OPTIONAL opaque org handle M10 layers membership semantics on. Carried,\nnot interpreted here."
+          }
+        }
+      },
       "CreateManagementKeyRequest": {
         "type": "object",
         "description": "The body to mint a management API key in a `(tenant, environment)` scope.",
@@ -4862,6 +5424,168 @@
           "token_already_issued": {
             "type": "boolean",
             "description": "True on an idempotent replay, when the token has already been issued and is\nnot repeated."
+          }
+        }
+      },
+      "InvitationCreatedView": {
+        "type": "object",
+        "description": "The result of creating (or resending) an invitation (issue #60): the durable\ninvitation, PLUS the raw single-use token returned exactly ONCE for out-of-band\ndelivery. The token is NEVER readable again and is never persisted (only its\ndigest is stored), so an idempotent replay of the POST returns the invitation\nWITHOUT the token.",
+        "required": [
+          "invitation"
+        ],
+        "properties": {
+          "invitation": {
+            "$ref": "#/components/schemas/InvitationView",
+            "description": "The created (or resent) invitation."
+          },
+          "token": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The raw `ira_inv_...` single-use token, returned ONCE at creation/resend for\nout-of-band delivery to the invitee. Absent on an idempotent replay (the\ntoken is shown only at the original creation). Compose the accept link by\npresenting this token to the public invitation-accept endpoint."
+          }
+        }
+      },
+      "InvitationCredentialTypeView": {
+        "type": "string",
+        "description": "The primary-login credential an invitation enrolls on accept (issue #60): a\npassword (the #20 Argon2id path) or a passkey deep link (the Zitadel enrollment\npattern). The stable, closed wire enum the management API exposes.",
+        "enum": [
+          "password",
+          "passkey"
+        ]
+      },
+      "InvitationList": {
+        "type": "object",
+        "description": "A page of invitations.",
+        "required": [
+          "items"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/InvitationView"
+            },
+            "description": "The invitations on this page, oldest first."
+          },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The opaque cursor for the next page, or null if this is the last page."
+          }
+        }
+      },
+      "InvitationStateChangeView": {
+        "type": "object",
+        "description": "An invitation's lifecycle state after a revoke (issue #60): the deterministic\npost-condition, so an Idempotency-Key replay is byte-identical.",
+        "required": [
+          "id",
+          "state"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "The invitation that was transitioned."
+          },
+          "state": {
+            "$ref": "#/components/schemas/InvitationStateView",
+            "description": "The state the invitation is now in."
+          }
+        }
+      },
+      "InvitationStateView": {
+        "type": "string",
+        "description": "An invitation's lifecycle state on the wire (issue #60): pending until it is\nredeemed (accepted) or invalidated (revoked). Both terminal states make the\ntoken unredeemable.",
+        "enum": [
+          "pending",
+          "accepted",
+          "revoked"
+        ]
+      },
+      "InvitationView": {
+        "type": "object",
+        "description": "An invitation, as returned by the management API (issue #60). This is the\nDURABLE representation: it NEVER carries the token or its digest (the raw token\nis delivered ONCE at create/resend and only its digest is ever stored, so a\ndatabase dump yields nothing replayable). The invited identifier is decrypted\nfrom its sealed column for display.",
+        "required": [
+          "id",
+          "tenant_id",
+          "environment_id",
+          "user_id",
+          "target_identifier",
+          "credential_type",
+          "state",
+          "expires_at_unix_ms",
+          "created_at_unix_ms",
+          "updated_at_unix_ms"
+        ],
+        "properties": {
+          "accepted_at_unix_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "When the invitation was redeemed, present only in the accepted state."
+          },
+          "created_at_unix_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Creation time, milliseconds since the Unix epoch."
+          },
+          "credential_type": {
+            "$ref": "#/components/schemas/InvitationCredentialTypeView",
+            "description": "The primary-login credential the invitee enrolls on accept."
+          },
+          "environment_id": {
+            "type": "string",
+            "description": "The environment the invitation lives in (`env_...`)."
+          },
+          "expires_at_unix_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "When the token expires, milliseconds since the Unix epoch."
+          },
+          "id": {
+            "type": "string",
+            "description": "The invitation identifier (`inv_...`, embeds its scope)."
+          },
+          "org_context": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The opaque org handle M10 layers membership on, or null when none."
+          },
+          "revoked_at_unix_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "When the invitation was revoked, present only in the revoked state."
+          },
+          "state": {
+            "$ref": "#/components/schemas/InvitationStateView",
+            "description": "The lifecycle state."
+          },
+          "target_identifier": {
+            "type": "string",
+            "description": "The invited identifier (an email or login handle), decrypted for display."
+          },
+          "tenant_id": {
+            "type": "string",
+            "description": "The tenant the invitation belongs to (`ten_...`)."
+          },
+          "updated_at_unix_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Last-mutation time, milliseconds since the Unix epoch."
+          },
+          "user_id": {
+            "type": "string",
+            "description": "The pending_verification user (`usr_...`) this invitation provisions and\nactivates on accept."
           }
         }
       },
@@ -5687,6 +6411,10 @@
     {
       "name": "users",
       "description": "Admin user CRUD, lifecycle state transitions, and external-id correlation, with a session cascade on the session-ending transitions"
+    },
+    {
+      "name": "invitations",
+      "description": "Admin user-invitation CRUD: create (provisioning a pending-verification user and a single-use, expiring, hashed-at-rest token), list, get, revoke, and resend"
     }
   ]
 }

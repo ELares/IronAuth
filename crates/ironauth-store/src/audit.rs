@@ -236,6 +236,24 @@ pub enum Action {
     /// disable. Idempotent: once executed the user is no longer scheduled, so a
     /// re-run of the worker re-processes nothing.
     UserOffboardingExecute,
+    /// A user invitation was CREATED through the management API (issue #60): an
+    /// admin invited a new identity, provisioning a pending_verification user and a
+    /// single-use, expiring, unguessable token. The token is never recorded on the
+    /// audit row (only its digest is stored anywhere); the audit row's operator-safe
+    /// `detail` records the enrolled credential type.
+    InvitationCreate,
+    /// A user invitation was REDEEMED (issue #60): the invitee presented a valid
+    /// token, which was consumed atomically (pending -> accepted), and the invited
+    /// user was activated (pending_verification -> active) with a credential set.
+    InvitationRedeem,
+    /// A pending user invitation was REVOKED through the management API (issue #60):
+    /// an admin invalidated it before it was accepted, so its token can never be
+    /// redeemed.
+    InvitationRevoke,
+    /// A pending user invitation was RESENT through the management API (issue #60):
+    /// the prior token was invalidated (its digest overwritten) and a fresh
+    /// single-use token with a reset expiry was issued for the same invitation.
+    InvitationResend,
     /// A bootstrap session was established at login or registration (issue #20).
     SessionCreate,
     /// An SSO session identifier was ROTATED at a privilege transition (issue #32):
@@ -517,6 +535,10 @@ impl Action {
             Action::UserExternalIdLink => "user.external_id.link",
             Action::UserExternalIdUnlink => "user.external_id.unlink",
             Action::UserOffboardingExecute => "user.offboarding.execute",
+            Action::InvitationCreate => "invitation.create",
+            Action::InvitationRedeem => "invitation.redeem",
+            Action::InvitationRevoke => "invitation.revoke",
+            Action::InvitationResend => "invitation.resend",
             Action::SessionCreate => "session.create",
             Action::SessionRotate => "session.rotate",
             Action::SessionRevoke => "session.revoke",

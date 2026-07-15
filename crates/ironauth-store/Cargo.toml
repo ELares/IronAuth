@@ -241,6 +241,17 @@ name = "user_admin"
 path = "tests/user_admin.rs"
 required-features = ["testing"]
 
+# User invitations (issue #60): the single-use, expiring, unguessable token whose
+# only its digest is stored (a dump yields nothing replayable), the atomic
+# consume-and-activate (a concurrent double-accept redeems at most once, never two
+# activations), expiry and revoke refusal, the envelope-encrypted invited
+# identifier, cross-tenant isolation, and audited create/redeem/revoke. Needs a
+# real database.
+[[test]]
+name = "invitations"
+path = "tests/invitations.rs"
+required-features = ["testing"]
+
 # Compile-fail proofs. Database-free, so it runs on every lane (including MSRV).
 [[test]]
 name = "compile_fail"

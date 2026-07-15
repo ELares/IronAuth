@@ -6,6 +6,29 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- User invitation persistence (issue #60, migration 0038, expand): the one new
+  piece of durable state the admin-initiated invitation flow needs, a tenant-scoped
+  `user_invitations` table with RLS forced and the (tenant, environment) isolation
+  policy. Everything else reuses existing state (the invited identity is a normal
+  `users` row created and activated through the #52 repos; the credential is the
+  #20 Argon2id verifier).
+  - **Digest-only, single-use token.** Only the SHA-256 digest of the whole
+    `ira_inv_<inv-id>~<secret>` token is stored (the #21/#29 reference-credential
+    form), so a database dump yields nothing replayable. A partial unique index on
+    (scope, digest) keeps resolve and resend unambiguous.
+  - **PII-sealed invited identifier.** `target_identifier_sealed` (the AEAD-sealed
+    value under the scope DEK, issue #48) plus `target_identifier_bidx` (per-tenant
+    keyed blind index for the resend-by-identifier lookup); the plaintext identifier
+    never lands on a column.
+  - **Guarded atomic accept.** `InvitationRepo::accept` consumes the invitation in
+    one transaction (a guarded `pending -> accepted` flip that also activates the
+    invited user `pending_verification -> active` and, for a password invitation,
+    writes the Argon2id verifier), so a second accept or a concurrent double-accept
+    redeems AT MOST ONCE. `resolve_pending`, `create`, `revoke`, and `resend` (a
+    fresh digest and expiry on a still-pending invite) round it out; every mutation
+    audits. Column-scoped grants only (the #31 lesson): control plane
+    creates/lists/revokes/resends, the data plane accepts.
+
 - Admin user CRUD, lifecycle states, and external IDs (issue #52, migration 0037,
   expand): the foundational M6 promotion of the bootstrap `users` directory into a
   full control-plane managed entity, with no weakening of its isolation or PII

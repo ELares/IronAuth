@@ -22,9 +22,11 @@ use utoipa::{Modify, OpenApi};
 use crate::error::ErrorBody;
 use crate::views::{
     BulkRevocationView, BulkRevokeSessionsRequest, ClientVerificationView, CreateDcrPolicyRequest,
-    CreateEnvironmentRequest, CreateInitialAccessTokenRequest, CreateManagementKeyRequest,
-    CreateOrganizationRequest, CreateTenantRequest, CreateUserRequest, DcrPolicyList,
-    DcrPolicyView, EnvironmentList, EnvironmentView, GuardrailView, InitialAccessTokenCreated,
+    CreateEnvironmentRequest, CreateInitialAccessTokenRequest, CreateInvitationRequest,
+    CreateManagementKeyRequest, CreateOrganizationRequest, CreateTenantRequest, CreateUserRequest,
+    DcrPolicyList, DcrPolicyView, EnvironmentList, EnvironmentView, GuardrailView,
+    InitialAccessTokenCreated, InvitationCreatedView, InvitationCredentialTypeView,
+    InvitationList, InvitationStateChangeView, InvitationStateView, InvitationView,
     LinkExternalIdRequest, ManagementKeyCreated, ManagementKeyList, ManagementKeyView,
     OperatorList, OperatorView, OrganizationList, OrganizationView, RefreshFamilyList,
     RefreshFamilyView, ResourceTypeView, ResourceTypesList, RevokeSessionsRequest, SessionList,
@@ -69,7 +71,10 @@ use crate::views::{
                                           everything-for-a-user with a token-family cascade)"),
         (name = "users", description = "Admin user CRUD, lifecycle state transitions, and \
                                        external-id correlation, with a session cascade on the \
-                                       session-ending transitions")
+                                       session-ending transitions"),
+        (name = "invitations", description = "Admin user-invitation CRUD: create (provisioning a \
+                                             pending-verification user and a single-use, expiring, \
+                                             hashed-at-rest token), list, get, revoke, and resend")
     ),
     paths(
         crate::operators::list_operators,
@@ -117,6 +122,11 @@ use crate::views::{
         crate::users::set_user_state,
         crate::users::link_user_external_id,
         crate::users::unlink_user_external_id,
+        crate::invitations::create_invitation,
+        crate::invitations::list_invitations,
+        crate::invitations::get_invitation,
+        crate::invitations::revoke_invitation,
+        crate::invitations::resend_invitation,
     ),
     components(schemas(
         ErrorBody,
@@ -165,6 +175,13 @@ use crate::views::{
         UserStateChangeView,
         LinkExternalIdRequest,
         UserExternalIdView,
+        InvitationCredentialTypeView,
+        InvitationStateView,
+        InvitationView,
+        InvitationList,
+        CreateInvitationRequest,
+        InvitationCreatedView,
+        InvitationStateChangeView,
     ))
 )]
 struct ApiDoc;

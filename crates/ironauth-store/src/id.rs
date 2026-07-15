@@ -259,6 +259,21 @@ impl ScopedKind for CredentialKind {
     const PREFIX: &'static str = "crd";
 }
 
+/// Marker for a user invitation (`inv_`), one pending invitation row (issue #60).
+/// A tenant-scoped resource: the identifier embeds its `(tenant, environment)`, so
+/// an invitation id minted in one scope parses as a uniform not-found under
+/// another. The id doubles as the routing handle embedded in the invite token wire
+/// form (`ira_inv_<inv-id>~<secret>`); because that token is a live bearer
+/// credential, its debug form REDACTS the payload (like an issued token's `jti` and
+/// a refresh token's handle), so an invite id is never rendered into a log line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct InvitationKind;
+impl ScopedKind for InvitationKind {
+    const PREFIX: &'static str = "inv";
+    // The `inv_` id is embedded in the presented invite token; keep it out of logs.
+    const REDACT_DEBUG: bool = true;
+}
+
 /// Marker for a session-ended outbox event (`sev_`), the durable row the session
 /// domain enqueues on EVERY terminal session end (issue #35). The transactional-outbox
 /// substrate the back-channel logout worker (#34) and the external webhooks (M11)
@@ -680,6 +695,9 @@ pub type ClientSessionId = ScopedId<ClientSessionKind>;
 /// An account-credential identifier (`crd_...`), one enrolled credential in a
 /// user's self-service credential registry (issue #61).
 pub type CredentialId = ScopedId<CredentialKind>;
+/// A user-invitation identifier (`inv_...`), one pending invitation and the routing
+/// handle embedded in its single-use token (issue #60).
+pub type InvitationId = ScopedId<InvitationKind>;
 /// A session-ended outbox event identifier (`sev_...`), the durable row enqueued on
 /// every terminal session end and the idempotency key a consumer dedups on (issue #35).
 pub type SessionEventId = ScopedId<SessionEventKind>;

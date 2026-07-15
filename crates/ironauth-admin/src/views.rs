@@ -11,9 +11,9 @@
 use std::fmt;
 
 use ironauth_store::{
-    EnvironmentRecord, GuardrailSet, ManagementCredentialRecord, OperatorRecord,
-    OrganizationRecord, RefreshFamilySummary, ResourceType, SessionSummary, TenantRecord,
-    UserAdminRecord, UserState,
+    EnvironmentRecord, GuardrailSet, InvitationAdminRecord, InvitationCredentialType,
+    InvitationState, ManagementCredentialRecord, OperatorRecord, OrganizationRecord,
+    RefreshFamilySummary, ResourceType, SessionSummary, TenantRecord, UserAdminRecord, UserState,
 };
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -974,4 +974,189 @@ pub struct UserExternalIdView {
     /// The linked external id, or null after an unlink.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub external_id: Option<String>,
+}
+
+/// The primary-login credential an invitation enrolls on accept (issue #60): a
+/// password (the #20 Argon2id path) or a passkey deep link (the Zitadel enrollment
+/// pattern). The stable, closed wire enum the management API exposes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum InvitationCredentialTypeView {
+    /// The invitee sets a password (an Argon2id verifier) on accept.
+    Password,
+    /// The invitee enrolls a passkey; no password is ever provisioned.
+    Passkey,
+}
+
+impl From<InvitationCredentialType> for InvitationCredentialTypeView {
+    fn from(kind: InvitationCredentialType) -> Self {
+        match kind {
+            InvitationCredentialType::Password => InvitationCredentialTypeView::Password,
+            InvitationCredentialType::Passkey => InvitationCredentialTypeView::Passkey,
+        }
+    }
+}
+
+impl From<InvitationCredentialTypeView> for InvitationCredentialType {
+    fn from(view: InvitationCredentialTypeView) -> Self {
+        match view {
+            InvitationCredentialTypeView::Password => InvitationCredentialType::Password,
+            InvitationCredentialTypeView::Passkey => InvitationCredentialType::Passkey,
+        }
+    }
+}
+
+/// An invitation's lifecycle state on the wire (issue #60): pending until it is
+/// redeemed (accepted) or invalidated (revoked). Both terminal states make the
+/// token unredeemable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum InvitationStateView {
+    /// Awaiting redemption: the token can still be accepted until it expires.
+    Pending,
+    /// Redeemed: the invitee accepted it and the user was activated. Terminal.
+    Accepted,
+    /// Revoked by an admin before acceptance. Terminal.
+    Revoked,
+}
+
+impl From<InvitationState> for InvitationStateView {
+    fn from(state: InvitationState) -> Self {
+        match state {
+            InvitationState::Pending => InvitationStateView::Pending,
+            InvitationState::Accepted => InvitationStateView::Accepted,
+            InvitationState::Revoked => InvitationStateView::Revoked,
+        }
+    }
+}
+
+impl From<InvitationStateView> for InvitationState {
+    fn from(view: InvitationStateView) -> Self {
+        match view {
+            InvitationStateView::Pending => InvitationState::Pending,
+            InvitationStateView::Accepted => InvitationState::Accepted,
+            InvitationStateView::Revoked => InvitationState::Revoked,
+        }
+    }
+}
+
+/// An invitation, as returned by the management API (issue #60). This is the
+/// DURABLE representation: it NEVER carries the token or its digest (the raw token
+/// is delivered ONCE at create/resend and only its digest is ever stored, so a
+/// database dump yields nothing replayable). The invited identifier is decrypted
+/// from its sealed column for display.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct InvitationView {
+    /// The invitation identifier (`inv_...`, embeds its scope).
+    pub id: String,
+    /// The tenant the invitation belongs to (`ten_...`).
+    pub tenant_id: String,
+    /// The environment the invitation lives in (`env_...`).
+    pub environment_id: String,
+    /// The pending_verification user (`usr_...`) this invitation provisions and
+    /// activates on accept.
+    pub user_id: String,
+    /// The invited identifier (an email or login handle), decrypted for display.
+    pub target_identifier: String,
+    /// The primary-login credential the invitee enrolls on accept.
+    pub credential_type: InvitationCredentialTypeView,
+    /// The lifecycle state.
+    pub state: InvitationStateView,
+    /// The opaque org handle M10 layers membership on, or null when none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub org_context: Option<String>,
+    /// When the token expires, milliseconds since the Unix epoch.
+    pub expires_at_unix_ms: i64,
+    /// Creation time, milliseconds since the Unix epoch.
+    pub created_at_unix_ms: i64,
+    /// Last-mutation time, milliseconds since the Unix epoch.
+    pub updated_at_unix_ms: i64,
+    /// When the invitation was redeemed, present only in the accepted state.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub accepted_at_unix_ms: Option<i64>,
+    /// When the invitation was revoked, present only in the revoked state.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub revoked_at_unix_ms: Option<i64>,
+}
+
+impl InvitationView {
+    /// Build a view from a stored record.
+    #[must_use]
+    pub fn from_record(record: InvitationAdminRecord) -> Self {
+        Self {
+            id: record.id.to_string(),
+            tenant_id: record.id.scope().tenant().to_string(),
+            environment_id: record.id.scope().environment().to_string(),
+            user_id: record.user_id.to_string(),
+            target_identifier: record.target_identifier,
+            credential_type: record.credential_type.into(),
+            state: record.state.into(),
+            org_context: record.org_context,
+            expires_at_unix_ms: ms(record.expires_at_unix_micros),
+            created_at_unix_ms: ms(record.created_at_unix_micros),
+            updated_at_unix_ms: ms(record.updated_at_unix_micros),
+            accepted_at_unix_ms: record.accepted_at_unix_micros.map(ms),
+            revoked_at_unix_ms: record.revoked_at_unix_micros.map(ms),
+        }
+    }
+}
+
+/// A page of invitations.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct InvitationList {
+    /// The invitations on this page, oldest first.
+    pub items: Vec<InvitationView>,
+    /// The opaque cursor for the next page, or null if this is the last page.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+/// The body to create an invitation (issue #60). The invited `identifier` is
+/// required; every other field has a safe default.
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct CreateInvitationRequest {
+    /// The invited identifier (an email or other login handle), unique per scope: a
+    /// pending_verification user is provisioned for it. An identifier already in use
+    /// by an existing user returns 409.
+    #[schema(example = "ada@example.test")]
+    pub identifier: String,
+    /// The OPTIONAL primary-login credential the invitee enrolls on accept (default
+    /// `password`). A `passkey` invitation provisions no password.
+    #[serde(default)]
+    pub credential_type: Option<InvitationCredentialTypeView>,
+    /// An OPTIONAL opaque org handle M10 layers membership semantics on. Carried,
+    /// not interpreted here.
+    #[serde(default)]
+    pub org_context: Option<String>,
+    /// The OPTIONAL token lifetime in seconds (default: the configured invitation
+    /// TTL). Bounds how long the invite link stays acceptable.
+    #[serde(default)]
+    pub expires_in_secs: Option<u64>,
+}
+
+/// The result of creating (or resending) an invitation (issue #60): the durable
+/// invitation, PLUS the raw single-use token returned exactly ONCE for out-of-band
+/// delivery. The token is NEVER readable again and is never persisted (only its
+/// digest is stored), so an idempotent replay of the POST returns the invitation
+/// WITHOUT the token.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct InvitationCreatedView {
+    /// The created (or resent) invitation.
+    pub invitation: InvitationView,
+    /// The raw `ira_inv_...` single-use token, returned ONCE at creation/resend for
+    /// out-of-band delivery to the invitee. Absent on an idempotent replay (the
+    /// token is shown only at the original creation). Compose the accept link by
+    /// presenting this token to the public invitation-accept endpoint.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
+}
+
+/// An invitation's lifecycle state after a revoke (issue #60): the deterministic
+/// post-condition, so an Idempotency-Key replay is byte-identical.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct InvitationStateChangeView {
+    /// The invitation that was transitioned.
+    pub id: String,
+    /// The state the invitation is now in.
+    pub state: InvitationStateView,
 }
