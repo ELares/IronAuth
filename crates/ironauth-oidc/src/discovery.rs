@@ -173,8 +173,8 @@ pub struct DiscoveryEndpoint {
 /// required top-level field handled directly by the generator, and its serving
 /// (the JWKS surface) is mounted by issue #194 once keys load.
 ///
-/// The remaining M3/M4 endpoint (`end_session_endpoint`) joins this list when its
-/// issue lands; `userinfo_endpoint` landed with issue #15, and the RFC 7009
+/// The RP-Initiated Logout `end_session_endpoint` (issue #33) is now here;
+/// `userinfo_endpoint` landed with issue #15, and the RFC 7009
 /// `revocation_endpoint` and RFC 7662 `introspection_endpoint` with issue #22.
 /// `registration_endpoint` (issue #30) is NOT here: it is PER ENVIRONMENT (served
 /// under the issuer path, like `jwks_uri`), so the generator emits it directly as
@@ -212,6 +212,16 @@ pub const ADVERTISED_ENDPOINTS: &[DiscoveryEndpoint] = &[
     DiscoveryEndpoint {
         metadata_key: "device_authorization_endpoint",
         path: "/device_authorization",
+    },
+    // OIDC RP-Initiated Logout 1.0 end_session_endpoint (issue #33). A deployment-root
+    // endpoint like /revoke: a top-level browser navigation carrying id_token_hint,
+    // post_logout_redirect_uri, state, client_id, logout_hint, and ui_locales, which
+    // ends the SSO session and (only on an exact registered-URI match with a verifiable
+    // hint) redirects back to the relying party. This metadata key must live ONLY in
+    // this generator module (scripts/discovery-scan.sh forbids the substring elsewhere).
+    DiscoveryEndpoint {
+        metadata_key: "end_session_endpoint",
+        path: "/end_session",
     },
 ];
 

@@ -1022,6 +1022,59 @@ impl OidcState {
             .map_err(|_| ())?;
         verify(token, &policy, self.inner.env.clock()).map_err(|_| ())
     }
+
+    /// Verify an RP-Initiated Logout `id_token_hint` (issue #33): an id token THIS OP
+    /// minted, presented at `end_session` ONLY to identify the session to end.
+    ///
+    /// It is verified through the SAME hardened [`ironauth_jose::verify`] path as an
+    /// access token, against the environment's published signing keys, the
+    /// per-environment issuer, and `audience` (the client the hint names in `aud`), with
+    /// exactly ONE relaxation: [`VerificationPolicy::allow_expired`] accepts a PAST
+    /// `exp`. That is mandated by the RP-Initiated Logout spec (a logout hint is
+    /// routinely stale) and confers no access, since the hint only NAMES a session. A
+    /// rotated-out key still verifies because `published_signing_keys` keeps the
+    /// verification-retained keys. Every OTHER check stays: the signature over the
+    /// environment's own keys, the algorithm allowlist, the exact issuer, the exact
+    /// audience, `nbf`, and `iat`. A hint signed by a FOREIGN issuer, or tampered, fails
+    /// the signature or issuer check and returns `Err(())`, so a logout never acts on an
+    /// unverifiable or foreign hint.
+    ///
+    /// # Errors
+    ///
+    /// `Err(())` if no signing key is provisioned for the scope's environment, or the
+    /// hint does not verify under the built policy (bad signature, wrong issuer or
+    /// audience, non-allowlisted algorithm, missing `exp`, future `nbf`/`iat`,
+    /// malformed).
+    pub(crate) async fn verify_logout_hint(
+        &self,
+        scope: &Scope,
+        audience: &str,
+        token: &str,
+    ) -> Result<VerifiedToken, ()> {
+        let entry = self.issuer_entry(scope).await.ok_or(())?;
+        let keys = entry.keyset().published_signing_keys(self.now());
+        if keys.is_empty() {
+            return Err(());
+        }
+        let trusted: Vec<TrustedKey> = keys
+            .iter()
+            .filter_map(|key| key.verifying_key().ok())
+            .collect();
+        if trusted.is_empty() {
+            return Err(());
+        }
+        let mut algorithms: Vec<JwsAlgorithm> = Vec::new();
+        for key in &keys {
+            if !algorithms.contains(&key.algorithm()) {
+                algorithms.push(key.algorithm());
+            }
+        }
+        let issuer = self.issuer_for(scope);
+        let policy = VerificationPolicy::new(algorithms, trusted, issuer, audience.to_owned())
+            .map_err(|_| ())?
+            .allow_expired(true);
+        verify(token, &policy, self.inner.env.clock()).map_err(|_| ())
+    }
 }
 
 impl std::fmt::Debug for OidcState {

@@ -94,7 +94,7 @@ pub(crate) fn parse_and_enforce(
 
     let skew = i64::try_from(policy.max_skew.as_secs()).unwrap_or(i64::MAX);
 
-    let expiration = enforce_exp(&raw, now_secs, skew)?;
+    let expiration = enforce_exp(&raw, now_secs, skew, policy.allow_expired)?;
     let not_before = enforce_nbf(&raw, now_secs, skew)?;
     let issued_at = enforce_iat(&raw, now_secs, skew, policy.require_iat)?;
 
@@ -215,14 +215,20 @@ fn enforce_exp(
     raw: &Map<String, Value>,
     now_secs: i64,
     skew: i64,
+    allow_expired: bool,
 ) -> Result<Option<i64>, RejectReason> {
     match raw.get("exp") {
-        // exp is required by default: a token without an expiry is refused.
+        // exp is required regardless: a token without an expiry is refused even when
+        // allow_expired is set, so the relaxation admits only a well-formed PAST exp,
+        // never a token that simply omits one.
         None | Some(Value::Null) => Err(RejectReason::ClaimMissing),
         Some(value) => {
             let exp = numeric_date(value)?;
-            // Rejected once now has passed exp plus the tolerated skew.
-            if now_secs > exp.saturating_add(skew) {
+            // Rejected once now has passed exp plus the tolerated skew, UNLESS the
+            // caller opted into accepting a past expiry (RP-Initiated Logout's
+            // id_token_hint, VerificationPolicy::allow_expired). The claim is still
+            // parsed and returned; only the "now > exp" rejection is waived.
+            if !allow_expired && now_secs > exp.saturating_add(skew) {
                 Err(RejectReason::Expired)
             } else {
                 Ok(Some(exp))
