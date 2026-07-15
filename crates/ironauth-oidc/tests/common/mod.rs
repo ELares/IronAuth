@@ -217,6 +217,9 @@ pub struct Harness {
     // A clone of the OidcState the router was built from, so a test can call the
     // state directly (for example the access-token target resolution, issue #29).
     state: OidcState,
+    // The quota engine installed on the state, retained so a test can inspect the
+    // live bucket count and drive the idle-bucket reaper (issue #50).
+    quota: Option<Arc<QuotaEnforcer>>,
     router: Router,
 }
 
@@ -310,12 +313,15 @@ impl Harness {
         // Install the tenant/environment quota engine over the SAME deterministic
         // clock when the test asked for it (issue #50), so an over-quota scope on the
         // real request path short-circuits with a 429 and refill is clock-driven.
-        let state = match quota_config {
+        let (state, quota) = match quota_config {
             Some(quota_config) => {
                 let enforcer = Arc::new(QuotaEnforcer::from_config(&quota_config, env.clock_arc()));
-                state.with_quota_enforcer(enforcer)
+                (
+                    state.with_quota_enforcer(Arc::clone(&enforcer)),
+                    Some(enforcer),
+                )
             }
-            None => state,
+            None => (state, None),
         };
         let issuer = state.issuer_for(&scope);
         let router = oidc_router(state.clone());
@@ -330,6 +336,7 @@ impl Harness {
             issuer,
             registry,
             state,
+            quota,
             router,
         }
     }
@@ -391,6 +398,7 @@ impl Harness {
             issuer,
             registry,
             state,
+            quota: None,
             router,
         }
     }
@@ -505,6 +513,7 @@ impl Harness {
             issuer,
             registry,
             state,
+            quota: None,
             router,
         }
     }
@@ -555,6 +564,7 @@ impl Harness {
             issuer: self.issuer.clone(),
             registry,
             state,
+            quota: None,
             router,
         }
     }
@@ -599,6 +609,15 @@ impl Harness {
     #[must_use]
     pub fn state(&self) -> &OidcState {
         &self.state
+    }
+
+    /// The quota engine installed on the state (issue #50), for tests that assert
+    /// the live bucket count stays bounded or drive the idle-bucket reaper.
+    #[must_use]
+    pub fn quota_enforcer(&self) -> &Arc<QuotaEnforcer> {
+        self.quota
+            .as_ref()
+            .expect("harness was started with a quota engine")
     }
 
     /// The seeded scope.

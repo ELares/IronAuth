@@ -12,19 +12,29 @@ range per docs/RELEASING.md.
   previously inert quota engine live.
   - **Enforcement point (`quota.rs`, `authorize.rs`).** `/authorize` charges the
     request-rate quota for the `(tenant, environment)` the `client_id` declares,
-    right after the scope is known and BEFORE the client store lookup, so an
-    over-quota scope is shed at the cheapest point and never touches the database.
-    An over-quota spend short-circuits with an RFC 6585 `429` carrying the
-    structured `RateLimit`/`RateLimit-Policy` headers, the legacy `X-RateLimit-*`
-    triplet, `Retry-After`, the `x-ratelimit-block` signal header, and the
-    `__Host-ira-rl-block` cookie for a cookie-gating WAF. A scope under quota passes
-    through untouched.
+    only AFTER the client store lookup confirms the client exists in that scope, so a
+    spend is only ever drawn on a VERIFIED, real scope. A well-formed but
+    unregistered `client_id` (whose declared scope is attacker-chosen and
+    unauthenticated: any random bytes decode to a valid-looking scope) is rejected by
+    the not-found path and NEVER reaches a spend. This restores the engine's "an
+    unknown scope is rejected before it reaches a spend" invariant and closes an
+    unauthenticated unbounded-bucket-allocation memory-exhaustion vector and a
+    spoofed-victim-tenant throttling vector (the fix for the pre-verification spend
+    the re-review flagged). An over-quota spend short-circuits with an RFC 6585 `429`
+    carrying the structured `RateLimit`/`RateLimit-Policy` headers, the legacy
+    `X-RateLimit-*` triplet, `Retry-After`, the `x-ratelimit-block` signal header,
+    and the `__Host-ira-rl-block` cookie for a cookie-gating WAF. A scope under quota
+    passes through untouched.
   - **Fairness.** The spend draws from the environment bucket and, by nesting, its
     tenant bucket, and the buckets are per-scope: one tenant flooding its own quota
     never throttles another tenant. Proven end to end over the live router in
     `tests/quota.rs` (at-quota 429 with headers, under-quota passes, noisy-vs-quiet
     fairness, the configured tier governing the limit, and a concurrency storm that
-    never oversells the burst).
+    never oversells the burst) over REGISTERED clients on the verified-scope path.
+    Three further tests prove the enforcement point is safe: a flood of unregistered
+    `client_id`s allocates zero buckets, a spoofed victim-tenant scope cannot drain
+    the victim's shared bucket, and an idle bucket is reaped after the configured
+    window.
   - **State wiring (`state.rs`).** `OidcState::with_quota_enforcer` installs the
     enforcer; with none installed the data plane admits every request (the default,
     and the self-hoster's unlimited posture), so the existing DB-only tests are

@@ -1025,6 +1025,18 @@ pub struct QuotaConfig {
     /// disables saturation webhooks. At most `QUOTA_MAX_USAGE_THRESHOLDS`
     /// entries; each must be between 1 and 100.
     pub usage_thresholds_percent: Vec<u8>,
+
+    /// How long (in seconds) an idle per-tenant or per-environment token bucket is
+    /// retained before the reaper evicts it, bounding the in-memory footprint under
+    /// legitimate scope churn (an environment deleted, a tenant offboarded). A
+    /// bucket untouched for this long is dropped; it is re-created full on the next
+    /// spend, exactly as a never-seen scope would be, so eviction is behaviorally
+    /// transparent (a scope idle this long has already refilled to full under any
+    /// normal rate). The default (3600) is one hour. Set it to 0 to disable the
+    /// reaper (buckets then live for the process lifetime); the key space is still
+    /// bounded by real tenancy, because only a verified, existing scope ever
+    /// allocates a bucket.
+    pub idle_bucket_ttl_secs: u64,
 }
 
 impl Default for QuotaConfig {
@@ -1051,6 +1063,7 @@ impl Default for QuotaConfig {
                 hook_seconds_burst: 60,
             },
             usage_thresholds_percent: vec![80, 100],
+            idle_bucket_ttl_secs: 3600,
         }
     }
 }
@@ -1770,6 +1783,8 @@ mod tests {
         assert_eq!(config.quota.environment.requests_per_second, 100);
         assert_eq!(config.quota.environment.requests_burst, 200);
         assert_eq!(config.quota.usage_thresholds_percent, vec![80, 100]);
+        // The idle-bucket reaper defaults to a one-hour window (issue #50).
+        assert_eq!(config.quota.idle_bucket_ttl_secs, 3600);
 
         // A burst of 0 is the documented unlimited form for a self-hoster.
         let unlimited = "[quota.tenant]\nrequests_burst = 0\n";
@@ -1777,6 +1792,14 @@ mod tests {
             .expect("valid")
             .config;
         assert_eq!(config.quota.tenant.requests_burst, 0);
+
+        // The reaper is disable-able (0) for operators who want process-lifetime
+        // buckets; the key space is still bounded by verified tenancy.
+        let no_reaper = "[quota]\nidle_bucket_ttl_secs = 0\n";
+        let config = Config::from_toml_str(no_reaper, "<inline>")
+            .expect("valid")
+            .config;
+        assert_eq!(config.quota.idle_bucket_ttl_secs, 0);
 
         // A threshold outside 1..=100 is rejected.
         let bad = "[quota]\nusage_thresholds_percent = [0, 80]\n";

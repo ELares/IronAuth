@@ -18,6 +18,11 @@ range per docs/RELEASING.md.
     percentages at which a saturation webhook fires per dimension. Validated to
     be at most `QUOTA_MAX_USAGE_THRESHOLDS` entries, each 1..=100, with no
     duplicates; an empty list disables saturation webhooks.
+  - `quota.idle_bucket_ttl_secs` (default `3600`): how long an idle per-tenant or
+    per-environment token bucket is retained before the reaper evicts it, bounding
+    the in-memory footprint under legitimate scope churn. `0` disables the reaper
+    (buckets live for the process lifetime); the key space is still bounded by real
+    tenancy, because only a verified, existing scope ever allocates a bucket.
 - Session Management 1.0 and Front-Channel Logout 1.0, behind default-off flags for
   certification completeness (issue #39).
   - `oidc.session_management_enabled` (default `false`): when set, the OP serves the

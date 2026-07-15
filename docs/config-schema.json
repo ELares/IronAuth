@@ -511,6 +511,13 @@
           },
           "description": "The per-environment tier. Bounds one environment, nested under its\ntenant: an environment spend draws from BOTH the environment bucket and\nthe tenant bucket, so it can never consume beyond its tenant's remaining\nshare."
         },
+        "idle_bucket_ttl_secs": {
+          "default": 3600,
+          "description": "How long (in seconds) an idle per-tenant or per-environment token bucket is\nretained before the reaper evicts it, bounding the in-memory footprint under\nlegitimate scope churn (an environment deleted, a tenant offboarded). A\nbucket untouched for this long is dropped; it is re-created full on the next\nspend, exactly as a never-seen scope would be, so eviction is behaviorally\ntransparent (a scope idle this long has already refilled to full under any\nnormal rate). The default (3600) is one hour. Set it to 0 to disable the\nreaper (buckets then live for the process lifetime); the key space is still\nbounded by real tenancy, because only a verified, existing scope ever\nallocates a bucket.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
         "tenant": {
           "$ref": "#/$defs/ScopeQuotaConfig",
           "default": {
@@ -824,6 +831,7 @@
           "token_issuance_burst": 100,
           "token_issuance_per_second": 50
         },
+        "idle_bucket_ttl_secs": 3600,
         "tenant": {
           "hook_seconds_burst": 120,
           "hook_seconds_per_second": 60,

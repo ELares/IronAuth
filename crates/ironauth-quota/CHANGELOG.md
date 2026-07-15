@@ -45,9 +45,18 @@ range per docs/RELEASING.md.
     request path, short-circuiting an over-quota `(tenant, environment)` with a
     `429` and the RateLimit headers plus block signal. See the `ironauth-oidc`
     changelog.
+  - Idle-bucket reaper (defense in depth for the bounded map). A bucket untouched
+    for `idle_bucket_ttl_secs` (configurable, default one hour; `0` disables) is
+    evicted, driven by the same `ironauth-env` monotonic clock so it is
+    deterministically testable. Reaping runs opportunistically on `admit` (amortized
+    to at most one scan per window) and can be forced with `reap_idle_buckets`;
+    `bucket_count` exposes the live count. Eviction is safe by construction (a
+    re-created bucket starts full exactly as a never-seen scope would). This bounds
+    memory under legitimate scope churn; the primary bound remains that only a
+    verified, existing scope ever allocates a bucket.
   - Scope note: this crate is the process-local core. Still riding M15 on top of
-    it: the per-IP/per-user/per-client layers, the IronCache-backed shared L2, an
-    idle-bucket reaper, per-scope metric export as labelled series, the
-    usage-threshold webhook delivery surface (the events are produced here; there
-    is no platform eventing surface yet to route them to), and the audited
-    management-API surface for adjusting a tenant's quota at runtime.
+    it: the per-IP/per-user/per-client layers, the IronCache-backed shared L2,
+    per-scope metric export as labelled series, the usage-threshold webhook delivery
+    surface (the events are produced here; there is no platform eventing surface yet
+    to route them to), and the audited management-API surface for adjusting a
+    tenant's quota at runtime.

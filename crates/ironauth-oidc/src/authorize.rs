@@ -424,18 +424,6 @@ async fn issue_code(
         .map_err(|_| AuthorizeError::page("the client_id is malformed or unknown"))?;
     let scope = client_id.scope();
 
-    // 1b. Tenant/environment quota (issue #50). The client_id declares its scope, so
-    //     the (tenant, environment) is known here WITHOUT a store read: charge the
-    //     request-rate quota now, BEFORE the client lookup, so an over-quota scope is
-    //     shed at the cheapest point and never touches the database. A denied spend
-    //     short-circuits with a 429 carrying the RateLimit headers and block signal;
-    //     nesting means an environment draws from its tenant too, and the buckets are
-    //     per-scope, so one tenant's flood never starves another's login. Under quota
-    //     (or with no enforcer installed) the request proceeds untouched.
-    if let Some(response) = state.enforce_request_quota(&scope) {
-        return Ok(response);
-    }
-
     // 2. The client must exist in its declared scope. This lookup is BEFORE any
     //    redirect, so an unknown client renders a page and never redirects. A
     //    store failure here also fails closed to a page (we cannot safely redirect
@@ -456,6 +444,25 @@ async fn issue_code(
             ));
         }
     };
+
+    // 2a. Tenant/environment quota (issue #50). The quota is charged ONLY here, AFTER
+    //     the client has been confirmed to exist in its declared scope, so a spend
+    //     draws exclusively on a VERIFIED, real (tenant, environment). A well-formed
+    //     but unregistered client_id (whose declared scope is attacker-chosen and
+    //     unauthenticated: any random bytes decode to a valid-looking scope) is
+    //     rejected by the not-found path above and NEVER reaches a spend. Charging
+    //     only a verified scope restores the engine's "an unknown scope is rejected
+    //     before it reaches a spend" invariant, so an attacker cannot (a) allocate an
+    //     unbounded set of buckets with random scopes (a memory-exhaustion DoS), nor
+    //     (b) drain a victim tenant's shared bucket by spoofing the victim's tenant id
+    //     with fabricated environments. A denied spend short-circuits with a 429
+    //     carrying the RateLimit headers and block signal; nesting means an
+    //     environment draws from its tenant too, and the buckets are per-scope, so one
+    //     tenant's flood never starves another's login. Under quota (or with no
+    //     enforcer installed) the request proceeds untouched.
+    if let Some(response) = state.enforce_request_quota(&scope) {
+        return Ok(response);
+    }
 
     // 2b. require-PAR gate (RFC 9126 sections 5 and 6, issue #27). When the
     //     environment-wide switch OR this client's registration flag requires a

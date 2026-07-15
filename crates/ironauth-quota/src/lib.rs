@@ -51,19 +51,30 @@
 //!
 //! # Bucket lifetime
 //!
-//! A bucket is created lazily on the first spend for a `(scope, dimension)` and
-//! then lives for the process lifetime; there is no reaper yet. The key space is
-//! bounded by the number of live `(tenant, environment)` scopes, which is an
-//! operator-provisioned quantity (not attacker-controlled: an unknown scope is
-//! rejected upstream before it reaches a spend), so the footprint is proportional
-//! to real tenancy. Idle-bucket eviction is tracked as an M15-adjacent follow-up
-//! alongside the shared L2 counter plane; it is a footprint optimization, not a
-//! correctness gap, because a re-created bucket starts full exactly as a never-seen
-//! scope would.
+//! A bucket is created lazily on the first spend for a `(scope, dimension)`. The
+//! key space is bounded FIRST by enforcement discipline: a spend is only ever
+//! charged on a VERIFIED, existing `(tenant, environment)` (the request path
+//! resolves the client, and therefore its scope, against the store before it
+//! calls in here), so an unknown or attacker-fabricated scope is rejected upstream
+//! and never allocates a bucket. The live key space is therefore proportional to
+//! real, operator-provisioned tenancy, not to attacker-controlled input.
+//!
+//! As defense in depth against legitimate scope churn (an environment deleted, a
+//! tenant offboarded), the map is ALSO bounded by an idle-bucket reaper: a bucket
+//! that has not been touched for `idle_bucket_ttl_secs` (the configurable window,
+//! default one hour; `0` disables the reaper) is evicted, driven by the same
+//! [`ironauth_env`] monotonic clock so it is deterministically testable. Eviction
+//! is safe by construction: a re-created bucket starts full exactly as a
+//! never-seen scope would, and a scope idle for the whole window has (under any
+//! normal refill rate) already refilled to full, so reaping it grants no capacity
+//! it would not already have. Reaping runs opportunistically on the admission path
+//! (amortized, at most once per window) and can be forced with
+//! [`QuotaEnforcer::reap_idle_buckets`]; the live count is observable through
+//! [`QuotaEnforcer::bucket_count`].
 
 use std::collections::HashMap;
 use std::sync::Mutex;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use ironauth_config::{QuotaConfig, ScopeQuotaConfig};
 use ironauth_env::Clock;
@@ -496,6 +507,9 @@ struct State {
     environment_buckets: HashMap<(String, String, QuotaDimension), Bucket>,
     tenant_overrides: HashMap<String, ScopeLimits>,
     environment_overrides: HashMap<(String, String), ScopeLimits>,
+    /// The monotonic instant of the last opportunistic idle-bucket sweep, so the
+    /// reaper amortizes to at most one full scan per idle window on the hot path.
+    last_reap: Instant,
 }
 
 /// The per-tenant and per-environment quota enforcer.
@@ -508,6 +522,9 @@ pub struct QuotaEnforcer {
     tiers: Tiers,
     /// Ascending, de-duplicated usage thresholds (1..=100).
     thresholds: Vec<u8>,
+    /// The idle window after which an untouched bucket is evicted, or `None` when
+    /// the reaper is disabled (`idle_bucket_ttl_secs == 0`).
+    idle_ttl: Option<Duration>,
     state: Mutex<State>,
 }
 
@@ -527,15 +544,20 @@ impl QuotaEnforcer {
         let mut thresholds = config.usage_thresholds_percent.clone();
         thresholds.sort_unstable();
         thresholds.dedup();
+        let idle_ttl = (config.idle_bucket_ttl_secs > 0)
+            .then(|| Duration::from_secs(config.idle_bucket_ttl_secs));
+        let now = clock.monotonic();
         Self {
             clock,
             tiers: Tiers::from_config(config),
             thresholds,
+            idle_ttl,
             state: Mutex::new(State {
                 tenant_buckets: HashMap::new(),
                 environment_buckets: HashMap::new(),
                 tenant_overrides: HashMap::new(),
                 environment_overrides: HashMap::new(),
+                last_reap: now,
             }),
         }
     }
@@ -600,6 +622,17 @@ impl QuotaEnforcer {
         let cost = cost.max(0.0);
         let now = self.clock.monotonic();
         let mut state = self.lock();
+
+        // Defense in depth: opportunistically evict idle buckets so even legitimate
+        // scope churn cannot grow the map without bound. Amortized to at most one
+        // scan per idle window, and it runs BEFORE this scope's buckets are
+        // resolved, so a stale bucket for THIS scope is simply reaped and then
+        // re-created full below (identical to a never-seen scope).
+        if let Some(ttl) = self.idle_ttl {
+            if now.saturating_duration_since(state.last_reap) >= ttl {
+                reap_idle_locked(&mut state, ttl, now);
+            }
+        }
 
         // Resolve and refill every bucket on this scope's path.
         let mut evals: Vec<Eval> = Vec::with_capacity(2);
@@ -681,6 +714,30 @@ impl QuotaEnforcer {
             });
         }
         samples
+    }
+
+    /// Evict every bucket idle past the configured idle window, driven by the
+    /// monotonic clock, and return how many were removed. A no-op (returns `0`)
+    /// when the reaper is disabled (`idle_bucket_ttl_secs == 0`). The admission
+    /// path also invokes this opportunistically; it is exposed so an operator (or
+    /// a deterministic test) can force a sweep. Eviction is safe by construction:
+    /// a re-created bucket starts full exactly as a never-seen scope would.
+    pub fn reap_idle_buckets(&self) -> usize {
+        let Some(ttl) = self.idle_ttl else {
+            return 0;
+        };
+        let now = self.clock.monotonic();
+        let mut state = self.lock();
+        reap_idle_locked(&mut state, ttl, now)
+    }
+
+    /// The number of live buckets across both tiers and all dimensions. Bounded by
+    /// real tenancy (only a verified scope ever allocates a bucket) and further by
+    /// the idle reaper; exposed so a test can assert the map stays bounded.
+    #[must_use]
+    pub fn bucket_count(&self) -> usize {
+        let state = self.lock();
+        state.tenant_buckets.len() + state.environment_buckets.len()
     }
 
     /// Lock the state, treating a poisoned lock as fatal (it only poisons after
@@ -809,6 +866,23 @@ impl QuotaEnforcer {
         }
         bucket.emitted_level = current_level;
     }
+}
+
+/// Evict every bucket whose last refill is older than `ttl` relative to `now`,
+/// record the sweep time, and return how many buckets were removed. A bucket's
+/// `last` advances only when the bucket is evaluated (a spend on its scope), so it
+/// is an exact idle marker: a scope with no traffic for the window is reaped, and
+/// an actively hit scope keeps its buckets fresh.
+fn reap_idle_locked(state: &mut State, ttl: Duration, now: Instant) -> usize {
+    let before = state.tenant_buckets.len() + state.environment_buckets.len();
+    state
+        .tenant_buckets
+        .retain(|_, bucket| now.saturating_duration_since(bucket.last) < ttl);
+    state
+        .environment_buckets
+        .retain(|_, bucket| now.saturating_duration_since(bucket.last) < ttl);
+    state.last_reap = now;
+    before - (state.tenant_buckets.len() + state.environment_buckets.len())
 }
 
 /// The mutable bucket an eval refers to (it was created during evaluation, so it
@@ -981,6 +1055,7 @@ mod tests {
             },
             environment: scope,
             usage_thresholds_percent: vec![80, 100],
+            idle_bucket_ttl_secs: 0,
         }
     }
 
@@ -1071,6 +1146,7 @@ mod tests {
                 ..ScopeQuotaConfig::default()
             },
             usage_thresholds_percent: vec![100],
+            idle_bucket_ttl_secs: 0,
         };
         let (enforcer, _clock) = enforcer_with(&config);
         let scope = env("acme", "prod");
@@ -1099,6 +1175,7 @@ mod tests {
                 ..ScopeQuotaConfig::default()
             },
             usage_thresholds_percent: vec![100],
+            idle_bucket_ttl_secs: 0,
         };
         let (enforcer, clock) = enforcer_with(&config);
         let scope = env("acme", "prod");
@@ -1149,6 +1226,7 @@ mod tests {
                 ..ScopeQuotaConfig::default()
             },
             usage_thresholds_percent: vec![100],
+            idle_bucket_ttl_secs: 0,
         };
         let (enforcer, _clock) = enforcer_with(&config);
         let scope = env("acme", "prod");
@@ -1187,6 +1265,7 @@ mod tests {
             },
             environment: ScopeQuotaConfig::default(),
             usage_thresholds_percent: vec![100],
+            idle_bucket_ttl_secs: 0,
         };
         let (enforcer, _clock) = enforcer_with(&config);
         let scope = tenant("acme");
@@ -1218,6 +1297,7 @@ mod tests {
             },
             environment: ScopeQuotaConfig::default(),
             usage_thresholds_percent: vec![100],
+            idle_bucket_ttl_secs: 0,
         };
         let (enforcer, clock) = enforcer_with(&config);
         let scope = tenant("acme");
@@ -1298,6 +1378,7 @@ mod tests {
             },
             environment: ScopeQuotaConfig::default(),
             usage_thresholds_percent: vec![100],
+            idle_bucket_ttl_secs: 0,
         };
         let (enforcer, _clock) = enforcer_with(&config);
         let enforcer = Arc::new(enforcer);
@@ -1337,6 +1418,7 @@ mod tests {
             },
             environment: ScopeQuotaConfig::default(),
             usage_thresholds_percent: vec![80, 100],
+            idle_bucket_ttl_secs: 0,
         };
         let (enforcer, _clock) = enforcer_with(&config);
         let scope = tenant("acme");
@@ -1366,6 +1448,7 @@ mod tests {
             },
             environment: ScopeQuotaConfig::default(),
             usage_thresholds_percent: vec![100],
+            idle_bucket_ttl_secs: 0,
         };
         let (enforcer, clock) = enforcer_with(&config);
         let scope = tenant("acme");
@@ -1423,6 +1506,7 @@ mod tests {
                 ..ScopeQuotaConfig::default()
             },
             usage_thresholds_percent: vec![100],
+            idle_bucket_ttl_secs: 0,
         };
         let (enforcer, _clock) = enforcer_with(&config);
         let scope = env("acme", "prod");
@@ -1431,5 +1515,85 @@ mod tests {
             assert!(outcome.decision.is_admitted());
             assert!(outcome.snapshot.headers().is_empty());
         }
+    }
+
+    fn reaping_config(idle_secs: u64) -> QuotaConfig {
+        let mut config = test_config();
+        config.idle_bucket_ttl_secs = idle_secs;
+        config
+    }
+
+    #[test]
+    fn reap_idle_buckets_evicts_a_bucket_idle_past_the_window() {
+        let (enforcer, clock) = enforcer_with(&reaping_config(60));
+        assert!(
+            enforcer
+                .admit_request(&env("acme", "prod"))
+                .decision
+                .is_admitted()
+        );
+        assert_eq!(
+            enforcer.bucket_count(),
+            2,
+            "a spend allocates the environment and tenant buckets"
+        );
+
+        clock.advance(Duration::from_secs(61));
+        assert_eq!(
+            enforcer.reap_idle_buckets(),
+            2,
+            "both buckets are idle past the window and are reaped"
+        );
+        assert_eq!(enforcer.bucket_count(), 0);
+    }
+
+    #[test]
+    fn the_reaper_keeps_a_bucket_within_its_idle_window() {
+        let (enforcer, clock) = enforcer_with(&reaping_config(60));
+        let _ = enforcer.admit_request(&env("acme", "prod"));
+        clock.advance(Duration::from_secs(30)); // still within the idle window.
+        assert_eq!(
+            enforcer.reap_idle_buckets(),
+            0,
+            "a bucket touched within the window is retained"
+        );
+        assert_eq!(enforcer.bucket_count(), 2);
+    }
+
+    #[test]
+    fn a_disabled_reaper_never_evicts() {
+        let (enforcer, clock) = enforcer_with(&reaping_config(0));
+        let _ = enforcer.admit_request(&env("acme", "prod"));
+        clock.advance(Duration::from_secs(86_400)); // a full day idle.
+        assert_eq!(
+            enforcer.reap_idle_buckets(),
+            0,
+            "idle_bucket_ttl_secs == 0 disables the reaper"
+        );
+        assert_eq!(
+            enforcer.bucket_count(),
+            2,
+            "with the reaper off, buckets live for the process lifetime"
+        );
+    }
+
+    #[test]
+    fn the_admission_path_reaps_idle_buckets_opportunistically() {
+        // Without any explicit reap call: an idle scope's buckets are swept the next
+        // time ANY scope is admitted past the window, so the map stays bounded on the
+        // hot path alone.
+        let (enforcer, clock) = enforcer_with(&reaping_config(60));
+        let _ = enforcer.admit_request(&env("idle-tenant", "prod"));
+        assert_eq!(enforcer.bucket_count(), 2);
+
+        clock.advance(Duration::from_secs(61));
+        // A spend for a DIFFERENT scope triggers the opportunistic sweep, evicting the
+        // now-idle first scope and leaving only the active scope's two buckets.
+        let _ = enforcer.admit_request(&env("active-tenant", "prod"));
+        assert_eq!(
+            enforcer.bucket_count(),
+            2,
+            "the opportunistic reap drops the idle scope, keeping only the active one"
+        );
     }
 }
