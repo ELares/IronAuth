@@ -14,7 +14,7 @@
 
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use ironauth_store::StoreError;
+use ironauth_store::{GuardrailViolation, StoreError};
 use serde::Serialize;
 use utoipa::ToSchema;
 
@@ -37,6 +37,11 @@ pub struct ErrorBody {
     /// Present only on a wrong-scope error: the scope the request targeted.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub actual_scope: Option<String>,
+    /// Present only on a guardrail-violation error (issue #42): the stable code of
+    /// every guardrail the request failed, so the caller learns each failure at
+    /// once (for example `["custom_domain_required", "https_only_redirect_uris"]`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failed_guardrails: Option<Vec<String>>,
 }
 
 /// A management API error.
@@ -69,6 +74,12 @@ pub enum ApiError {
     Conflict(String),
     /// An Idempotency-Key was replayed with a DIFFERENT request. Renders 422.
     IdempotencyKeyConflict,
+    /// A config write failed one or more typed environment guardrails (issue #42):
+    /// for example creating a production environment with no custom domain. Renders
+    /// 422 with the stable code of every failed guardrail. Distinct from a plain
+    /// bad request because the request is well-formed but violates the environment's
+    /// enforced guardrail class.
+    GuardrailViolation(Vec<GuardrailViolation>),
     /// An unexpected internal failure. Renders 500; never leaks detail.
     Internal,
 }
@@ -82,7 +93,9 @@ impl ApiError {
             ApiError::WrongScope { .. } => StatusCode::FORBIDDEN,
             ApiError::NotFound => StatusCode::NOT_FOUND,
             ApiError::Conflict(_) => StatusCode::CONFLICT,
-            ApiError::IdempotencyKeyConflict => StatusCode::UNPROCESSABLE_ENTITY,
+            ApiError::IdempotencyKeyConflict | ApiError::GuardrailViolation(_) => {
+                StatusCode::UNPROCESSABLE_ENTITY
+            }
             ApiError::Internal => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -95,12 +108,14 @@ impl ApiError {
                 message: message.clone(),
                 expected_scope: None,
                 actual_scope: None,
+                failed_guardrails: None,
             },
             ApiError::Unauthorized(message) => ErrorBody {
                 error: "unauthorized".to_owned(),
                 message: message.clone(),
                 expected_scope: None,
                 actual_scope: None,
+                failed_guardrails: None,
             },
             ApiError::WrongScope {
                 expected,
@@ -111,33 +126,59 @@ impl ApiError {
                 message: message.clone(),
                 expected_scope: Some(expected.clone()),
                 actual_scope: Some(actual.clone()),
+                failed_guardrails: None,
             },
             ApiError::NotFound => ErrorBody {
                 error: "not_found".to_owned(),
                 message: "resource not found".to_owned(),
                 expected_scope: None,
                 actual_scope: None,
+                failed_guardrails: None,
             },
             ApiError::Conflict(message) => ErrorBody {
                 error: "conflict".to_owned(),
                 message: message.clone(),
                 expected_scope: None,
                 actual_scope: None,
+                failed_guardrails: None,
             },
             ApiError::IdempotencyKeyConflict => ErrorBody {
                 error: "idempotency_key_conflict".to_owned(),
                 message: "the Idempotency-Key was reused with a different request".to_owned(),
                 expected_scope: None,
                 actual_scope: None,
+                failed_guardrails: None,
+            },
+            ApiError::GuardrailViolation(violations) => ErrorBody {
+                error: "guardrail_violation".to_owned(),
+                message: guardrail_message(violations),
+                expected_scope: None,
+                actual_scope: None,
+                failed_guardrails: Some(violations.iter().map(|v| v.code().to_owned()).collect()),
             },
             ApiError::Internal => ErrorBody {
                 error: "internal".to_owned(),
                 message: "internal server error".to_owned(),
                 expected_scope: None,
                 actual_scope: None,
+                failed_guardrails: None,
             },
         }
     }
+}
+
+/// A single-line summary of the failed guardrails, listing each one's message so
+/// an operator reading only the message learns every failure.
+fn guardrail_message(violations: &[GuardrailViolation]) -> String {
+    if violations.is_empty() {
+        return "the environment guardrails were violated".to_owned();
+    }
+    let joined = violations
+        .iter()
+        .map(GuardrailViolation::to_string)
+        .collect::<Vec<_>>()
+        .join("; ");
+    format!("the environment guardrails were violated: {joined}")
 }
 
 impl IntoResponse for ApiError {

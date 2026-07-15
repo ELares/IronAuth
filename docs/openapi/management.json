@@ -2952,12 +2952,25 @@
         "type": "object",
         "description": "The body to create an environment under a tenant.",
         "required": [
-          "display_name"
+          "display_name",
+          "kind"
         ],
         "properties": {
+          "custom_domain": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The custom domain to configure. Required when `kind` is `prod` (the\nproduction custom-domain guardrail); optional otherwise."
+          },
           "display_name": {
             "type": "string",
             "description": "The environment's display name.",
+            "example": "staging"
+          },
+          "kind": {
+            "type": "string",
+            "description": "The environment kind: `dev`, `staging`, or `prod` (issue #42). Required;\nan unknown value is rejected. The kind fixes the environment's guardrail\nclass (dev and staging inherit the relaxed non-production set; prod gets\nthe hard production set).",
             "example": "staging"
           }
         }
@@ -3034,12 +3047,27 @@
             "description": "The tenant's display name.",
             "example": "Acme, Inc."
           },
+          "environment_custom_domain": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The first environment's custom domain, if any. Required only when\n`environment_kind` is `prod` (the production custom-domain guardrail)."
+          },
           "environment_display_name": {
             "type": [
               "string",
               "null"
             ],
-            "description": "The first environment's display name. Defaults to `production`."
+            "description": "The first environment's display name. Defaults to `development`."
+          },
+          "environment_kind": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The first environment's kind: `dev`, `staging`, or `prod` (issue #42).\nDefaults to `dev`, the relaxed non-production kind that requires no custom\ndomain, so a tenant is always creatable in one call with sane defaults.",
+            "example": "dev"
           }
         }
       },
@@ -3126,6 +3154,9 @@
           "id",
           "tenant_id",
           "display_name",
+          "kind",
+          "guardrail_class",
+          "guardrails",
           "created_at_unix_ms"
         ],
         "properties": {
@@ -3134,13 +3165,32 @@
             "format": "int64",
             "description": "Creation time, milliseconds since the Unix epoch."
           },
+          "custom_domain": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The configured custom domain, if any. A production environment always has\none (the custom-domain guardrail); a non-production environment may omit it."
+          },
           "display_name": {
             "type": "string",
             "description": "The human-facing display name."
           },
+          "guardrail_class": {
+            "type": "string",
+            "description": "The guardrail class the kind maps onto: `non-production` or `production`."
+          },
+          "guardrails": {
+            "$ref": "#/components/schemas/GuardrailView",
+            "description": "The typed guardrails this environment enforces, derived from its kind."
+          },
           "id": {
             "type": "string",
             "description": "The environment identifier (`env_...`)."
+          },
+          "kind": {
+            "type": "string",
+            "description": "The typed environment kind: `dev`, `staging`, or `prod` (issue #42)."
           },
           "tenant_id": {
             "type": "string",
@@ -3175,10 +3225,58 @@
             ],
             "description": "Present only on a wrong-scope error: the scope the credential is\nauthorized for."
           },
+          "failed_guardrails": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "description": "Present only on a guardrail-violation error (issue #42): the stable code of\nevery guardrail the request failed, so the caller learns each failure at\nonce (for example `[\"custom_domain_required\", \"https_only_redirect_uris\"]`)."
+          },
           "message": {
             "type": "string",
             "description": "A human-readable message. Never carries a secret; for a wrong-scope error\nit names only the scope identifiers the caller already presented.",
             "example": "resource not found"
+          }
+        }
+      },
+      "GuardrailView": {
+        "type": "object",
+        "description": "The typed guardrails an environment enforces (issue #42), derived purely from\nits kind so the production asymmetry can never drift.",
+        "required": [
+          "allow_insecure_redirect_uris",
+          "require_https_redirect_uris",
+          "require_custom_domain",
+          "one_time_view_secrets",
+          "hosted_pages_noindex",
+          "show_environment_banner"
+        ],
+        "properties": {
+          "allow_insecure_redirect_uris": {
+            "type": "boolean",
+            "description": "Whether an `http` loopback redirect URI is registrable (true for\nnon-production, false for production)."
+          },
+          "hosted_pages_noindex": {
+            "type": "boolean",
+            "description": "Whether hosted pages carry a `noindex` marker (true for non-production only)."
+          },
+          "one_time_view_secrets": {
+            "type": "boolean",
+            "description": "Whether secret values are one-time-view (true for production only)."
+          },
+          "require_custom_domain": {
+            "type": "boolean",
+            "description": "Whether a configured custom domain is required (true for production only)."
+          },
+          "require_https_redirect_uris": {
+            "type": "boolean",
+            "description": "Whether every redirect URI must be `https` (true for production only)."
+          },
+          "show_environment_banner": {
+            "type": "boolean",
+            "description": "Whether a visible environment banner is shown (true for non-production only)."
           }
         }
       },

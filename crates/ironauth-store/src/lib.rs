@@ -49,6 +49,7 @@
 
 pub mod audit;
 pub mod classification;
+pub mod environment;
 mod error;
 mod id;
 mod migrate;
@@ -69,6 +70,10 @@ pub mod test_support;
 
 pub use audit::{ActingContext, Action, ActorRef};
 pub use classification::{ResourceClassification, ResourceLevel, ResourceType, classify};
+pub use environment::{
+    EnvironmentType, Guardrail, GuardrailClass, GuardrailReport, GuardrailSet, GuardrailViolation,
+    UnknownEnvironmentType,
+};
 pub use error::StoreError;
 pub use id::{
     AgentId, AgentKind, AssertionMappingId, AssertionMappingKind, AuditId, AuditKind, AuditTarget,
@@ -103,13 +108,14 @@ pub use repository::{
     DcrPolicyRecord, DcrPolicyRepo, DcrRateLimiterRepo, DeviceApproval, DeviceApproveOutcome,
     DeviceAttemptOutcome, DeviceClientProfile, DeviceCodeRepo, DevicePollOutcome,
     DeviceRedeemOutcome, DeviceUserCodeLookup, DynamicClientRecord, DynamicClientRegistration,
-    DynamicClientUpdate, EnvelopeRepo, EnvironmentRecord, EnvironmentRepo,
-    ExternalAssertionIssuerRecord, ExternalAssertionIssuerRepo, ExternalAssertionJtiRepo,
-    FrontchannelLogoutParticipant, GrantOwner, GrantedConsent, IdempotencyRepo, IdempotencyWrite,
-    InitialAccessTokenRepo, IssueClientCredentials, IssueCode, IssuedTokenRecord, JtiOutcome,
-    LogoutDelivery, MANAGEMENT_LIST_HARD_CAP, ManagementCredentialRecord, ManagementCredentialRepo,
-    ManagementStore, NewAssertionSubjectMapping, NewClientAuthDiagnostic, NewDcrPolicy,
-    NewDeviceCode, NewDynamicClient, NewExternalAssertionIssuer, NewInitialAccessToken,
+    DynamicClientUpdate, EnvelopeRepo, EnvironmentGuardrailRepo, EnvironmentRecord,
+    EnvironmentRepo, ExternalAssertionIssuerRecord, ExternalAssertionIssuerRepo,
+    ExternalAssertionJtiRepo, FrontchannelLogoutParticipant, GrantOwner, GrantedConsent,
+    IdempotencyRepo, IdempotencyWrite, InitialAccessTokenRepo, IssueClientCredentials, IssueCode,
+    IssuedTokenRecord, JtiOutcome, LogoutDelivery, MANAGEMENT_LIST_HARD_CAP,
+    ManagementCredentialRecord, ManagementCredentialRepo, ManagementStore,
+    NewAssertionSubjectMapping, NewClientAuthDiagnostic, NewDcrPolicy, NewDeviceCode,
+    NewDynamicClient, NewEnvironment, NewExternalAssertionIssuer, NewInitialAccessToken,
     NewJwtAuthClient, NewOpaqueAccessToken, NewRefreshFamily, NewResourceServer, NewSession,
     NewSigningKey, OperatorRecord, OperatorRepo, OrganizationRecord, OrganizationRepo,
     PriorSessionOutcome, PushRequest, PushedRequestRepo, RedeemOutcome, RefreshFamilyFleetFilter,

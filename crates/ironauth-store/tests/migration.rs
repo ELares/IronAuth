@@ -248,13 +248,13 @@ async fn expand_contract_example_chain_runs_all_three_phases_and_contract_remove
 // per real table); splitting it would not make it clearer.
 #[allow(clippy::too_many_lines)]
 #[tokio::test]
-async fn production_chain_is_only_the_twenty_eight_real_migrations_and_ships_no_demo_object() {
+async fn production_chain_is_only_the_twenty_nine_real_migrations_and_ships_no_demo_object() {
     // TestDatabase::start runs Store::migrate() (the production chain) on a
     // fresh, empty database.
     let db = TestDatabase::start().await;
     let pool = db.owner_pool();
 
-    // Re-running is idempotent and reports exactly twenty-eight tracked migrations.
+    // Re-running is idempotent and reports exactly twenty-nine tracked migrations.
     let report = MigrationRunner::new(pool)
         .run()
         .await
@@ -265,23 +265,23 @@ async fn production_chain_is_only_the_twenty_eight_real_migrations_and_ships_no_
     );
     assert_eq!(
         report.already_applied(),
-        28,
-        "the production chain is exactly twenty-eight migrations (isolation, audit log, management \
+        29,
+        "the production chain is exactly twenty-nine migrations (isolation, audit log, management \
          API, OIDC authorization, signing keys, login/consent, authentication context, redirect \
          registration, UserInfo claims, consent scope upsert, resource servers, opaque access \
          tokens, client auth suite, dynamic client registration, pushed authorization requests, \
          refresh tokens, client-credentials service accounts, DCR abuse controls, resource \
          indicators, JWT bearer assertion grant, device authorization, session model, RP-initiated \
          logout, session-ended events, back-channel logout, front-channel logout, resource-model \
-         APIs, envelope encryption)"
+         APIs, envelope encryption, environment guardrails)"
     );
 
-    // The ledger holds exactly versions 1 through 28.
+    // The ledger holds exactly versions 1 through 29.
     assert_eq!(
         applied_versions(pool).await,
         vec![
             1_i64, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
-            24, 25, 26, 27, 28
+            24, 25, 26, 27, 28, 29
         ]
     );
     let phase_of = |version: i64| async move {
@@ -356,6 +356,11 @@ async fn production_chain_is_only_the_twenty_eight_real_migrations_and_ships_no_
     // the pre-1.0 bootstrap users table has no cross-release contract to protect).
     // The predominant shape is additive, so it is registered as an expand.
     assert_eq!(phase_of(28).await, "expand");
+    // The environment-guardrails expand (issue #42): two additive environments
+    // ALTER ADD COLUMNs (kind, custom_domain), one CHECK pinning the closed kind
+    // set, and a GRANT INSERT on signing_keys to the control role (so environment
+    // creation can provision the day-one key). Purely additive, so it is an expand.
+    assert_eq!(phase_of(29).await, "expand");
 
     // The demo object never reaches a production database.
     assert!(
@@ -388,6 +393,17 @@ async fn production_chain_is_only_the_twenty_eight_real_migrations_and_ships_no_
     assert!(
         table_exists(pool, "signing_keys").await,
         "signing_keys exists"
+    );
+    // The typed-environment columns (issue #42): the environment kind (dev,
+    // staging, prod) that drives the guardrail asymmetry, and the configured
+    // custom domain the production custom-domain guardrail requires.
+    assert!(
+        column_exists(pool, "environments", "kind").await,
+        "environments.kind exists"
+    );
+    assert!(
+        column_exists(pool, "environments", "custom_domain").await,
+        "environments.custom_domain exists"
     );
     // The bootstrap login/consent/session tables (issue #20) exist.
     assert!(table_exists(pool, "users").await, "users exists");

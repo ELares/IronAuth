@@ -28,7 +28,7 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime};
 
 use ironauth_jose::{JwsAlgorithm, KeyFamily, KeySet, SigningKey, SigningKeyError, SigningPolicy};
-use ironauth_store::{Scope, SigningKeyMaterialKind, SigningKeyRecord, Store};
+use ironauth_store::{GuardrailSet, Scope, SigningKeyMaterialKind, SigningKeyRecord, Store};
 
 use crate::subject::PairwiseSalt;
 
@@ -119,22 +119,37 @@ impl std::fmt::Display for JwksCacheError {
 
 impl std::error::Error for JwksCacheError {}
 
-/// One environment's issuer state: its keys, its algorithm policy, and its
-/// pairwise salt.
+/// One environment's issuer state: its keys, its algorithm policy, its pairwise
+/// salt, and its typed guardrail set.
 pub struct IssuerEntry {
     keyset: KeySet,
     policy: SigningPolicy,
     salt: PairwiseSalt,
+    // The environment's TYPED guardrails (issue #42), derived from its KIND. The
+    // registry is the per-scope data-plane cache the mint and the client
+    // registration paths already consult, so riding the guardrail set here lets the
+    // data plane enforce the two-class asymmetry (an http loopback redirect is
+    // registrable in dev/staging and rejected in prod) WITHOUT reading the
+    // environments level table it has no grant on. The kind never changes after
+    // creation, so caching the derived set on the entry cannot go stale.
+    guardrails: GuardrailSet,
 }
 
 impl IssuerEntry {
-    /// Build an entry from a key set, an algorithm policy, and a pairwise salt.
+    /// Build an entry from a key set, an algorithm policy, a pairwise salt, and the
+    /// environment's typed guardrail set (issue #42).
     #[must_use]
-    pub fn new(keyset: KeySet, policy: SigningPolicy, salt: PairwiseSalt) -> Self {
+    pub fn new(
+        keyset: KeySet,
+        policy: SigningPolicy,
+        salt: PairwiseSalt,
+        guardrails: GuardrailSet,
+    ) -> Self {
         Self {
             keyset,
             policy,
             salt,
+            guardrails,
         }
     }
 
@@ -142,6 +157,12 @@ impl IssuerEntry {
     #[must_use]
     pub fn keyset(&self) -> &KeySet {
         &self.keyset
+    }
+
+    /// The environment's typed guardrail set (issue #42), derived from its kind.
+    #[must_use]
+    pub fn guardrails(&self) -> GuardrailSet {
+        self.guardrails
     }
 
     /// The environment's algorithm policy.
@@ -367,7 +388,18 @@ async fn load_issuer_entry(store: &Store, scope: &Scope) -> Option<IssuerEntry> 
     // path resolves PUBLIC subjects, which never consult a salt, see
     // OidcState::resolve_public_subject). An empty salt is the honest placeholder.
     let salt = PairwiseSalt::new(Vec::new());
-    Some(IssuerEntry::new(keyset, policy, salt))
+    // The environment's TYPED guardrails (issue #42), read from the scope-forced
+    // projection the data plane CAN see (the environments level table it cannot).
+    // The environment has a provisioned key (records is non-empty), so its guardrail
+    // row exists; a read failure fails CLOSED (the whole entry resolves to None, a
+    // 404), never silently defaulting to the relaxed non-production set.
+    let guardrails = store
+        .scoped(*scope)
+        .environment_guardrails()
+        .guardrails()
+        .await
+        .ok()?;
+    Some(IssuerEntry::new(keyset, policy, salt, guardrails))
 }
 
 /// Convert an epoch-microseconds instant (as stored on a signing-key row) to a

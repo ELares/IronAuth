@@ -54,6 +54,7 @@ use sqlx::postgres::PgRow;
 use sqlx::{PgConnection, Postgres, Row, Transaction};
 
 use crate::audit::{ActingContext, Action, ActorRef};
+use crate::environment::{EnvironmentType, GuardrailSet};
 use crate::error::StoreError;
 use crate::id::{
     AssertionMappingId, AuditId, AuditTarget, AuthorizationCodeId, BackChannelDeliveryId, ClientId,
@@ -212,6 +213,20 @@ impl<'a> ScopedStore<'a> {
     #[must_use]
     pub fn signing_keys(&self) -> SigningKeyRepo<'a> {
         SigningKeyRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
+    /// The read-only environment-guardrail repository for this scope (issue #42).
+    /// Resolves the environment's typed [`GuardrailSet`] from the scope-forced
+    /// `environment_guardrails` projection, so the data plane can enforce the
+    /// redirect guardrail (an `http` loopback is rejected in a `prod` environment)
+    /// without reading the environments level table. The scope is fixed here, so a
+    /// request can only ever read its own environment's guardrails.
+    #[must_use]
+    pub fn environment_guardrails(&self) -> EnvironmentGuardrailRepo<'a> {
+        EnvironmentGuardrailRepo {
             store: self.store,
             scope: self.scope,
         }
@@ -1640,6 +1655,22 @@ impl ActingClientRepo<'_> {
         for uri in uris {
             if !crate::redirect::redirect_uri_is_registrable(uri) {
                 return Err(StoreError::InvalidRedirectUri);
+            }
+        }
+        // The environment's TYPED guardrail (issue #42): a PROD environment
+        // hard-requires https redirect URIs, so an http loopback that a dev/staging
+        // environment accepts is rejected here BEFORE it enters the registered set.
+        // Registrability is already established above, so the only remaining
+        // guardrail failure is the production https-only rule.
+        let guardrails = self
+            .store
+            .scoped(self.scope)
+            .environment_guardrails()
+            .guardrails()
+            .await?;
+        for uri in uris {
+            if let Err(violation) = guardrails.check_redirect_uri(uri) {
+                return Err(StoreError::GuardrailViolation(violation));
             }
         }
         let owned: Vec<String> = uris.iter().map(|uri| (*uri).to_owned()).collect();
@@ -4861,6 +4892,56 @@ impl SigningKeyRepo<'_> {
     }
 }
 
+/// The read-only environment-guardrail repository for one scope (issue #42).
+///
+/// Reads the environment's typed [`GuardrailSet`] from the scope-forced
+/// `environment_guardrails` projection (a definer view keyed on the same scope
+/// session variables the repository binds), so the data-plane registration paths
+/// enforce the two-class guardrail asymmetry (an `http` loopback redirect is
+/// registrable in a `dev`/`staging` environment and rejected in `prod`) WITHOUT a
+/// direct grant on the environments level table.
+pub struct EnvironmentGuardrailRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl EnvironmentGuardrailRepo<'_> {
+    /// Resolve this environment's typed guardrail set, derived from its persisted
+    /// `kind`.
+    ///
+    /// The read is scope-bound: the projection returns only the row whose
+    /// `(tenant, environment)` matches the bound scope, so a request can never read
+    /// another environment's kind. A `kind` outside the closed set (impossible under
+    /// the column CHECK) fails closed as a database error rather than a coerced
+    /// default.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the environment has no projection row in scope
+    /// (an unprovisioned or cross-scope environment); [`StoreError::Database`] on a
+    /// persistence fault or an unparseable stored kind.
+    pub async fn guardrails(&self) -> Result<GuardrailSet, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT kind FROM environment_guardrails \
+             WHERE tenant_id = $1 AND environment_id = $2",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        let row = row.ok_or(StoreError::NotFound)?;
+        let kind_text: String = row.get("kind");
+        let kind = EnvironmentType::parse(&kind_text).map_err(|e| {
+            StoreError::Database(sqlx::Error::Decode(
+                format!("unknown environment kind: {}", e.value).into(),
+            ))
+        })?;
+        Ok(GuardrailSet::for_kind(kind))
+    }
+}
+
 /// The mutating signing-key repository (issue #19). Reachable only through
 /// [`ScopedStore::acting`], so every provision carries an actor and correlation
 /// id, and routes through the module's single audited-write primitive.
@@ -4892,37 +4973,50 @@ impl ActingSigningKeyRepo<'_> {
                 action: Action::SigningKeyProvision,
                 target: key.id,
             },
-            async move |tx| {
-                sqlx::query(
-                    "INSERT INTO signing_keys \
-                     (id, tenant_id, environment_id, algorithm, material_kind, key_material, \
-                      publish_at, activate_at, retire_at, expire_at) \
-                     VALUES ($1, $2, $3, $4, $5, $6, \
-                             TIMESTAMPTZ 'epoch' + ($7::text || ' microseconds')::interval, \
-                             TIMESTAMPTZ 'epoch' + ($8::text || ' microseconds')::interval, \
-                             CASE WHEN $9::bigint IS NULL THEN NULL ELSE \
-                                 TIMESTAMPTZ 'epoch' + ($9::text || ' microseconds')::interval END, \
-                             CASE WHEN $10::bigint IS NULL THEN NULL ELSE \
-                                 TIMESTAMPTZ 'epoch' + ($10::text || ' microseconds')::interval END)",
-                )
-                .bind(key.id.to_string())
-                .bind(scope.tenant().to_string())
-                .bind(scope.environment().to_string())
-                .bind(key.algorithm)
-                .bind(key.material_kind.as_str())
-                .bind(key.material)
-                .bind(key.publish_at_micros)
-                .bind(key.activate_at_micros)
-                .bind(key.retire_at_micros)
-                .bind(key.expire_at_micros)
-                .execute(&mut **tx)
-                .await?;
-                Ok(())
-            },
+            async move |tx| insert_signing_key_row(tx, &scope, &key).await,
             false,
         )
         .await
     }
+}
+
+/// Insert one signing key row into the CURRENT scoped transaction. The
+/// transaction must already be bound to `scope` (the row-level-security policy on
+/// `signing_keys` keys on it), and `key.id` must belong to `scope`.
+///
+/// Shared by the manual [`ActingSigningKeyRepo::provision`] path and the day-one
+/// key provisioned inside environment creation (issue #42), so the two never
+/// drift.
+async fn insert_signing_key_row(
+    tx: &mut Transaction<'_, Postgres>,
+    scope: &Scope,
+    key: &NewSigningKey<'_>,
+) -> Result<(), StoreError> {
+    sqlx::query(
+        "INSERT INTO signing_keys \
+         (id, tenant_id, environment_id, algorithm, material_kind, key_material, \
+          publish_at, activate_at, retire_at, expire_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, \
+                 TIMESTAMPTZ 'epoch' + ($7::text || ' microseconds')::interval, \
+                 TIMESTAMPTZ 'epoch' + ($8::text || ' microseconds')::interval, \
+                 CASE WHEN $9::bigint IS NULL THEN NULL ELSE \
+                     TIMESTAMPTZ 'epoch' + ($9::text || ' microseconds')::interval END, \
+                 CASE WHEN $10::bigint IS NULL THEN NULL ELSE \
+                     TIMESTAMPTZ 'epoch' + ($10::text || ' microseconds')::interval END)",
+    )
+    .bind(key.id.to_string())
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .bind(key.algorithm)
+    .bind(key.material_kind.as_str())
+    .bind(key.material)
+    .bind(key.publish_at_micros)
+    .bind(key.activate_at_micros)
+    .bind(key.retire_at_micros)
+    .bind(key.expire_at_micros)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
 }
 
 /// Reconstruct a [`SigningKeyRecord`] from a row read within scope.
@@ -11253,8 +11347,30 @@ pub struct EnvironmentRecord {
     pub tenant_id: TenantId,
     /// The human-facing display name.
     pub display_name: String,
+    /// The environment's typed kind (dev, staging, or prod), driving its
+    /// guardrail class (issue #42).
+    pub kind: EnvironmentType,
+    /// The configured custom domain, if any. Absent (`None`) when none is
+    /// configured; a production environment always has one (the custom-domain
+    /// guardrail).
+    pub custom_domain: Option<String>,
     /// Creation time in microseconds since the Unix epoch (the pagination key).
     pub created_at_unix_micros: i64,
+}
+
+/// The typed attributes of an environment to create (issue #42): its display
+/// name, its kind (which drives its guardrail class), and its optional configured
+/// custom domain. The management API validates the kind and the guardrails before
+/// building this; the store persists it verbatim.
+#[derive(Debug, Clone, Copy)]
+pub struct NewEnvironment<'a> {
+    /// The human-facing display name.
+    pub display_name: &'a str,
+    /// The environment's typed kind (dev, staging, or prod).
+    pub kind: EnvironmentType,
+    /// The configured custom domain, if any (a production environment always has
+    /// one; the guardrail is enforced before this struct is built).
+    pub custom_domain: Option<&'a str>,
 }
 
 /// A management API key row (metadata only; the secret is never stored).
@@ -11546,7 +11662,7 @@ impl EnvironmentRepo<'_> {
     /// tenant.
     pub async fn get(&self, id: &EnvironmentId) -> Result<EnvironmentRecord, StoreError> {
         let row = sqlx::query(
-            "SELECT id, tenant_id, display_name, \
+            "SELECT id, tenant_id, display_name, kind, custom_domain, \
              (EXTRACT(EPOCH FROM created_at) * 1000000)::bigint AS created_us \
              FROM environments \
              WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL",
@@ -11572,7 +11688,7 @@ impl EnvironmentRepo<'_> {
     ) -> Result<Vec<EnvironmentRecord>, StoreError> {
         let (after_micros, after_id) = split_cursor(after);
         let rows = sqlx::query(
-            "SELECT id, tenant_id, display_name, \
+            "SELECT id, tenant_id, display_name, kind, custom_domain, \
              (EXTRACT(EPOCH FROM created_at) * 1000000)::bigint AS created_us \
              FROM environments \
              WHERE tenant_id = $1 AND deleted_at IS NULL \
@@ -11945,10 +12061,14 @@ impl ActingTenantRepo<'_> {
         created_at_micros: i64,
         operator_display_name: &str,
         tenant_display_name: &str,
-        environment_display_name: &str,
+        environment: NewEnvironment<'_>,
+        signing_key: NewSigningKey<'_>,
         idempotency: Option<IdempotencyWrite<'_>>,
     ) -> Result<(), StoreError> {
         let scope = Scope::new(*tenant_id, *environment_id);
+        if signing_key.id.scope() != scope {
+            return Err(StoreError::NotFound);
+        }
         let operator = self.operator;
         write_audited(
             AuditedWrite {
@@ -11988,16 +12108,26 @@ impl ActingTenantRepo<'_> {
                 .execute(&mut **tx)
                 .await?;
                 sqlx::query(
-                    "INSERT INTO environments (id, tenant_id, display_name, created_at) \
-                     VALUES ($1, $2, $3, \
-                             TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval)",
+                    "INSERT INTO environments \
+                     (id, tenant_id, display_name, kind, custom_domain, created_at) \
+                     VALUES ($1, $2, $3, $4, $5, \
+                             TIMESTAMPTZ 'epoch' + ($6::text || ' microseconds')::interval)",
                 )
                 .bind(environment_id.to_string())
                 .bind(tenant_id.to_string())
-                .bind(environment_display_name)
+                .bind(environment.display_name)
+                .bind(environment.kind.as_str())
+                .bind(environment.custom_domain)
                 .bind(created_at_micros)
                 .execute(&mut **tx)
                 .await?;
+                // Provision the environment's day-one signing key in the SAME
+                // transaction (issue #42): the (tenant, environment) scope is
+                // already bound (this audited write is scoped to the new pair), so
+                // the row-level-security policy on signing_keys is satisfied. The
+                // key is the environment's own identity, so a fresh environment
+                // serves discovery with its own issuer and disjoint JWKS at once.
+                insert_signing_key_row(tx, &scope, &signing_key).await?;
                 insert_idempotency(tx, idempotency).await?;
                 Ok(())
             },
@@ -12142,10 +12272,14 @@ impl ActingEnvironmentRepo<'_> {
         env: &Env,
         environment_id: &EnvironmentId,
         created_at_micros: i64,
-        display_name: &str,
+        environment: NewEnvironment<'_>,
+        signing_key: NewSigningKey<'_>,
         idempotency: Option<IdempotencyWrite<'_>>,
     ) -> Result<(), StoreError> {
         let scope = Scope::new(self.tenant, *environment_id);
+        if signing_key.id.scope() != scope {
+            return Err(StoreError::NotFound);
+        }
         let tenant = self.tenant;
         write_audited(
             AuditedWrite {
@@ -12158,16 +12292,24 @@ impl ActingEnvironmentRepo<'_> {
             },
             async move |tx| {
                 sqlx::query(
-                    "INSERT INTO environments (id, tenant_id, display_name, created_at) \
-                     VALUES ($1, $2, $3, \
-                             TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval)",
+                    "INSERT INTO environments \
+                     (id, tenant_id, display_name, kind, custom_domain, created_at) \
+                     VALUES ($1, $2, $3, $4, $5, \
+                             TIMESTAMPTZ 'epoch' + ($6::text || ' microseconds')::interval)",
                 )
                 .bind(environment_id.to_string())
                 .bind(tenant.to_string())
-                .bind(display_name)
+                .bind(environment.display_name)
+                .bind(environment.kind.as_str())
+                .bind(environment.custom_domain)
                 .bind(created_at_micros)
                 .execute(&mut **tx)
                 .await?;
+                // The environment's day-one signing key, provisioned in the same
+                // transaction and scope (issue #42), so the new environment serves
+                // discovery with its own issuer and disjoint JWKS immediately and
+                // its keys are its own identity from creation.
+                insert_signing_key_row(tx, &scope, &signing_key).await?;
                 insert_idempotency(tx, idempotency).await?;
                 Ok(())
             },
@@ -12514,10 +12656,18 @@ fn tenant_from_row(row: &PgRow) -> Result<TenantRecord, StoreError> {
 fn environment_from_row(row: &PgRow) -> Result<EnvironmentRecord, StoreError> {
     let decode =
         |e: crate::id::IdParseError| StoreError::Database(sqlx::Error::Decode(Box::new(e)));
+    let kind_text: String = row.get("kind");
+    let kind = EnvironmentType::parse(&kind_text).map_err(|e| {
+        StoreError::Database(sqlx::Error::Decode(
+            format!("unknown environment kind in row: {e}").into(),
+        ))
+    })?;
     Ok(EnvironmentRecord {
         id: EnvironmentId::parse(&row.get::<String, _>("id")).map_err(decode)?,
         tenant_id: TenantId::parse(&row.get::<String, _>("tenant_id")).map_err(decode)?,
         display_name: row.get("display_name"),
+        kind,
+        custom_domain: row.get("custom_domain"),
         created_at_unix_micros: row.get("created_us"),
     })
 }

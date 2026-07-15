@@ -26,7 +26,7 @@ use ironauth_config::{
 };
 use ironauth_env::Env;
 use ironauth_jose::{JwsAlgorithm, TrustedKey, VerificationPolicy, VerifiedToken, verify};
-use ironauth_store::{Scope, Store, TokenFormat};
+use ironauth_store::{GuardrailSet, Scope, Store, TokenFormat};
 
 use crate::client_keys::ClientKeyResolver;
 use crate::introspection::{IntrospectionSerializer, default_serializer};
@@ -941,6 +941,32 @@ impl OidcState {
     /// and policy into the pure, synchronous mint functions.
     pub(crate) async fn issuer_entry(&self, scope: &Scope) -> Option<Arc<IssuerEntry>> {
         self.inner.issuers.entry_for(scope).await
+    }
+
+    /// Resolve the environment's TYPED guardrail set for `scope` (issue #42),
+    /// derived from its kind through the same shared registry the mint reads.
+    ///
+    /// `None` when the environment has no provisioned issuer entry (unprovisioned or
+    /// cross-tenant, which fails closed). The client-registration paths consult this
+    /// to enforce the two-class asymmetry (an `http` loopback redirect is
+    /// registrable in a `dev`/`staging` environment and rejected in `prod`) without
+    /// reading the environments level table the data plane has no grant on.
+    pub(crate) async fn environment_guardrails(&self, scope: &Scope) -> Option<GuardrailSet> {
+        self.issuer_entry(scope)
+            .await
+            .map(|entry| entry.guardrails())
+    }
+
+    /// The environment banner label to show on hosted pages for `scope` (issue #42),
+    /// or `None` for a production environment (which shows no banner and is
+    /// search-indexable). A non-production environment returns its guardrail class
+    /// label (`non-production`), and the hosted pages additionally mark themselves
+    /// `noindex`. `None` also when the environment has no provisioned issuer entry.
+    pub(crate) async fn environment_banner(&self, scope: &Scope) -> Option<&'static str> {
+        let guardrails = self.environment_guardrails(scope).await?;
+        guardrails
+            .show_environment_banner
+            .then(|| guardrails.class.as_str())
     }
 
     /// Whether this environment copies the scope-derived claims into the ID token
