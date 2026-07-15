@@ -6,6 +6,12 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- `ActingSessionRepo::revoke_all_for_user` now returns the ids of the sessions it
+  actually revoked, in the new `UserRevocation::revoked_session_ids` field (issue #36).
+  Captured with `RETURNING` in the same transaction, it lets a caller (the Global Token
+  Revocation receiver) fan a terminal session-ended signal out per truly-revoked session
+  with no list-then-revoke race and no spurious signal for an already-revoked one.
+  `UserRevocation` is no longer `Copy` (it now owns a `Vec`); no migration.
 - The authoritative two-tier session model with fleet operations (issue #32, migration
   0022, expand). Closes the M4 slice of tracking issue #206: this model SUPERSEDES the
   #20 bootstrap session.

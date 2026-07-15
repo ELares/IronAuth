@@ -32,7 +32,10 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 pub use dsn::{Dsn, DsnError, KNOWN_SCHEMES};
-pub use features::{Feature, FeatureRegistry, FeatureValidationError, FeatureViolation, Maturity};
+pub use features::{
+    Feature, FeatureRegistry, FeatureValidationError, FeatureViolation,
+    GLOBAL_TOKEN_REVOCATION_DRAFT, GLOBAL_TOKEN_REVOCATION_FEATURE, Maturity,
+};
 pub use secret::{REDACTED, Secret, SecretError, SecretString};
 
 /// The root of the IronAuth process configuration.
@@ -783,6 +786,18 @@ pub struct OidcConfig {
     /// until per-environment overrides ride the M5 promotion pipeline.
     pub client_credentials_default_audience: ClientCredentialsAudience,
 
+    /// Whether the Global Token Revocation receiver (issue #36) HARD-KILLS the
+    /// subject's `offline_access` refresh families too, not only the session-bound
+    /// ones. This has effect ONLY when the experimental `global-token-revocation`
+    /// feature is enabled (the endpoint is otherwise unmounted). The SAFE default
+    /// (`false`) matches the platform-wide revoke-everything semantic: offline
+    /// (consented long-lived) grants survive a revoke unless a hard kill is asked for
+    /// (issue #21/#32), so a routine global revoke does not silently strip a user's
+    /// standing offline authorizations. Set it to `true` for an account-takeover
+    /// posture, where a global revoke must terminate absolutely everything the subject
+    /// holds, offline grants included, so every already-issued token dies at once.
+    pub global_token_revocation_hard_kill: bool,
+
     /// The device-authorization flow lifetime in seconds (RFC 8628 section 3.2, issue
     /// #24). Both the device code and the user code expire after this; a poll after it
     /// yields `expired_token` and the verification page shows a safe error. A short TTL
@@ -868,6 +883,7 @@ impl Default for OidcConfig {
             registration_rate_limit: 20,
             registration_rate_window_secs: 60,
             client_credentials_default_audience: ClientCredentialsAudience::ClientId,
+            global_token_revocation_hard_kill: false,
             device_code_ttl_secs: 600,
             device_poll_interval_secs: 5,
             device_slow_down_increment_secs: 5,

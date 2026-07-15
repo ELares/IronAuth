@@ -80,6 +80,7 @@ mod device;
 mod device_verify;
 mod discovery;
 mod error;
+mod global_revocation;
 mod hints;
 mod interaction;
 mod introspection;
@@ -132,6 +133,7 @@ pub use discovery::{
     claims_supported, discovery_document, discovery_router, id_token_signing_alg_values,
 };
 pub use error::{AuthorizeError, AuthzErrorCode, TokenError};
+pub use global_revocation::GLOBAL_TOKEN_REVOCATION_PATH;
 pub use hints::{Display, InteractionHints};
 pub use introspection::{
     IntrospectionClaims, IntrospectionSerializer, JsonIntrospectionSerializer,
@@ -243,6 +245,18 @@ pub fn oidc_router(state: OidcState) -> Router {
                     .put(client_registration::update)
                     .delete(client_registration::delete),
             );
+    }
+
+    // Global Token Revocation receiver (issue #36), mounted ONLY when the experimental
+    // `global-token-revocation` feature is enabled and acknowledged (the boot path
+    // resolves the gate from the strict config feature ladder). A strongly-authenticated
+    // confidential client revokes EVERYTHING one subject holds in its own scope. The
+    // draft is not WG-adopted, so the endpoint is unmounted by default.
+    if state.global_token_revocation_enabled() {
+        router = router.route(
+            global_revocation::GLOBAL_TOKEN_REVOCATION_PATH,
+            post(global_revocation::global_token_revocation),
+        );
     }
 
     router.with_state(state)
