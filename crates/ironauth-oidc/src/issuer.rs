@@ -255,11 +255,30 @@ impl IssuerRegistry {
     /// same scope may both load, which is idempotent (both build from the same
     /// RLS-scoped rows) and the first insert wins.
     ///
+    /// The data-plane suspension fence (issue #46) is AUTHORITATIVE on EVERY
+    /// resolution for a store-backed registry, not only on a cold load: the
+    /// serving-state row is re-read per call BEFORE the cache is consulted, so a
+    /// tenant the control plane suspends or offboards stops serving on the very NEXT
+    /// request, with no process restart and no cache eviction. A previously cached
+    /// (already-served) entry is therefore never handed back once its scope is
+    /// fenced. A store error reading the fence FAILS CLOSED (denies serving), never
+    /// open. (This per-request re-fence closes the never-invalidated registry-cache
+    /// class tracked as #204 for the serving-state dimension: a stale cached entry
+    /// can no longer outlive a suspend, delete, or resume.)
+    ///
     /// # Panics
     ///
     /// Panics only if the internal lock is poisoned, which happens after a panic
     /// while another thread held it (never in normal operation).
     pub async fn entry_for(&self, scope: &Scope) -> Option<Arc<IssuerEntry>> {
+        // The fence is consulted FIRST, ahead of the cache, so it governs the fast
+        // path too. A pre-populated (loader-less) registry has no serving state to
+        // read and is never fenced here (the store-free test path).
+        if let Some(store) = self.loader.as_ref() {
+            if scope_is_fenced(store, scope).await {
+                return None;
+            }
+        }
         // Fast path: an already-cached entry (pre-populated or previously loaded).
         if let Some(entry) = self
             .entries
@@ -325,6 +344,21 @@ impl IssuerRegistry {
     }
 }
 
+/// Whether `scope` is fenced off the data plane right now (issue #46): the
+/// serving-state fence read, FAIL CLOSED. A suspended or offboarded scope reads a
+/// suspended serving state and is fenced; a store error reading the
+/// state is ALSO treated as fenced (deny serving), so a transient failure can never
+/// let a suspended scope keep serving. Read under the scope's forced row-level
+/// security. Consulted on EVERY resolution so a control-plane suspend/delete takes
+/// effect on the next request without a restart or a cache eviction.
+async fn scope_is_fenced(store: &Store, scope: &Scope) -> bool {
+    match store.scoped(*scope).environment_state().await {
+        Ok(state) => state.is_fenced(),
+        // Fail closed: a state-read error denies serving rather than permitting it.
+        Err(_) => true,
+    }
+}
+
 /// Load one environment's live issuer entry from the store, scoped (RLS-forced) to
 /// `scope`.
 ///
@@ -334,6 +368,9 @@ impl IssuerRegistry {
 /// environment under the wrong tenant loads zero rows here (RLS), so it too
 /// resolves to `None`: a self-consistent bogus issuer can never resolve.
 async fn load_issuer_entry(store: &Store, scope: &Scope) -> Option<IssuerEntry> {
+    // The data-plane suspension fence (issue #46) is enforced by the caller,
+    // `IssuerRegistry::entry_for`, on EVERY resolution (see `scope_is_fenced`), so it
+    // governs both this cold load and the cached fast path. It is not re-checked here.
     let records = store.scoped(*scope).signing_keys().list().await.ok()?;
     if records.is_empty() {
         return None;

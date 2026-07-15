@@ -6,6 +6,37 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Tenant lifecycle state machine, residency attributes, data-plane fence, and the
+  offboarding pipeline (issue #46, migration 0029, expand).
+  - **Lifecycle status.** `tenants.status` (`active`/`suspended`) plus
+    `TenantStatus` on `TenantRecord`. New `ActingTenantRepo::suspend`/`resume`
+    enforce the state machine (only `active -> suspended` and `suspended -> active`
+    are valid; every other transition is refused fail closed with
+    `StoreError::Conflict`, and a deleted tenant is a uniform `NotFound`). New
+    `Action::TenantSuspend`/`TenantResume` audit variants.
+  - **Residency.** `tenants.home_region` AND a per-environment `environments.region`
+    pin, both recorded on create, returned on reads, and IMMUTABLE after create:
+    migration 0029 narrows the control role's table-wide UPDATE on `tenants` and
+    `environments` to a COLUMN-SCOPED grant that excludes the residency columns, so
+    Postgres itself refuses a rewrite. `ActingTenantRepo::create` gained a
+    `home_region` argument; `ActingEnvironmentRepo::create` gained a `region`
+    argument; `EnvironmentRecord` gained `region`.
+  - **Data-plane fence.** New tenant-scoped `environment_states` table records each
+    scope's serving status; a tenant suspend/resume/delete cascades it per
+    environment. New `ScopedStore::environment_state` (data-plane read) returns
+    `EnvironmentServingState` so a suspended or offboarded scope can be fenced.
+  - **Offboarding pipeline.** A tenant delete is now the GRACE stage: it fences
+    every environment but keeps all keys INTACT (no crypto-shred), so a restore
+    inside the configured retention window loses no data. New
+    `ActingTenantRepo::restore` (in-window) and `ActingTenantRepo::hard_delete`
+    (terminal, only after the window elapses), each taking the retention window and
+    gated by it (`Conflict` on the wrong side of the boundary). Only the terminal
+    hard delete crypto-shreds each environment's envelope KEK (reusing the #48
+    substrate), permanently, while a sibling tenant is untouched; migration 0029
+    grants `ironauth_control` exactly the column-scoped crypto-shred UPDATE on
+    `tenant_keks`. The ordinary tenant and environment deletes no longer shred (the
+    crypto-shred erasure mechanism is deferred to a later erasure issue per #46's
+    out-of-scope). New `Action::TenantRestore`/`TenantPurge` audit variants.
 - The four-level resource model as public APIs (issue #41, migration 0027, expand).
   Completes the operator > tenant > environment > organization hierarchy at the store
   layer so the management API can expose all four levels as first-class resources.

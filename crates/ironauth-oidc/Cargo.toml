@@ -254,6 +254,13 @@ name = "live_wiring"
 path = "tests/live_wiring.rs"
 required-features = ["testing"]
 
+# The tenant-lifecycle data-plane fence (issue #46): a suspended scope is fenced off
+# the mounted JWKS surface (404) and serves again once resumed. Over a real database.
+[[test]]
+name = "lifecycle_fence"
+path = "tests/lifecycle_fence.rs"
+required-features = ["testing"]
+
 # JWT (RFC 9068) and opaque access tokens with per-resource-server format selection
 # (issue #29): the per-RS format choice from one environment, RFC 9068 typ/claims,
 # acr/auth_time from an authenticated flow, opaque tokens that resolve only via the

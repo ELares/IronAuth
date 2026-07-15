@@ -2856,6 +2856,294 @@
           }
         ]
       }
+    },
+    "/v1/tenants/{tenant_id}/restore": {
+      "post": {
+        "tags": [
+          "tenants"
+        ],
+        "summary": "Restore a soft-deleted (offboarded) tenant inside its retention window.",
+        "operationId": "restoreTenant",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Required. Replaying a POST with the same key returns the original response without re-executing.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Restored (post-condition)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TenantStatusView"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found (never offboarded, already restored, or purged)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Retention window elapsed; restore no longer offered",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency-Key reused with a different request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/tenants/{tenant_id}/resume": {
+      "post": {
+        "tags": [
+          "tenants"
+        ],
+        "summary": "Resume a suspended tenant (restore data-plane service; no data loss).",
+        "operationId": "resumeTenant",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Required. Replaying a POST with the same key returns the original response without re-executing.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Resumed (post-condition)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TenantStatusView"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Invalid lifecycle transition (not currently suspended)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency-Key reused with a different request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/tenants/{tenant_id}/suspend": {
+      "post": {
+        "tags": [
+          "tenants"
+        ],
+        "summary": "Suspend a tenant (fence its data plane; reversible).",
+        "operationId": "suspendTenant",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Required. Replaying a POST with the same key returns the original response without re-executing.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Suspended (post-condition)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TenantStatusView"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Invalid lifecycle transition (not currently active)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency-Key reused with a different request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
     }
   },
   "components": {
@@ -2959,6 +3247,14 @@
             "type": "string",
             "description": "The environment's display name.",
             "example": "staging"
+          },
+          "region": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The environment's data-residency region pin (issue #46). When present it must\nbe one of the operator's configured regions (the same set the tenant\n`home_region` validates against), is persisted immutably, and appears in every\nread; when omitted the environment records no region. Nothing routes or\nreplicates by it yet.",
+            "example": "eu-west"
           }
         }
       },
@@ -3040,6 +3336,14 @@
               "null"
             ],
             "description": "The first environment's display name. Defaults to `production`."
+          },
+          "home_region": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The tenant's data-residency region (issue #46). When present it must be one\nof the operator's configured regions, is persisted immutably, and appears in\nevery read; when omitted the tenant records no region. Nothing routes or\nreplicates by it yet.",
+            "example": "eu-west"
           }
         }
       },
@@ -3141,6 +3445,13 @@
           "id": {
             "type": "string",
             "description": "The environment identifier (`env_...`)."
+          },
+          "region": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The recorded per-environment data-residency region pin (issue #46), or null\nwhen the environment pins no region. Immutable after create; nothing routes\nby it yet."
           },
           "tenant_id": {
             "type": "string",
@@ -3738,12 +4049,31 @@
           }
         }
       },
+      "TenantStatusView": {
+        "type": "object",
+        "description": "The result of a tenant lifecycle transition (issue #46): the tenant id and its\nnew status. It states the POST-CONDITION (what is true after the call), so the\nbody is known before the write and stored verbatim for an Idempotency-Key\nreplay, exactly like the session-revocation views.",
+        "required": [
+          "id",
+          "status"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "The tenant identifier (`ten_...`)."
+          },
+          "status": {
+            "type": "string",
+            "description": "The tenant's status after the transition: `active` or `suspended`."
+          }
+        }
+      },
       "TenantView": {
         "type": "object",
         "description": "A tenant, as returned by the management API.",
         "required": [
           "id",
           "display_name",
+          "status",
           "created_at_unix_ms"
         ],
         "properties": {
@@ -3756,9 +4086,20 @@
             "type": "string",
             "description": "The human-facing display name."
           },
+          "home_region": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The recorded data-residency region (issue #46), or null when the deployment\npins no region. Immutable after create; nothing routes by it yet."
+          },
           "id": {
             "type": "string",
             "description": "The tenant identifier (`ten_...`)."
+          },
+          "status": {
+            "type": "string",
+            "description": "The lifecycle status: `active` or `suspended` (issue #46). A suspended\ntenant is fenced off the data plane but keeps all its data and stays visible\nhere."
           }
         }
       },

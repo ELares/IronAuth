@@ -5,6 +5,14 @@
       "additionalProperties": false,
       "description": "Management API settings (issue #11).\n\nThe management API is the OpenAPI-first control plane on the management port.\nIt authorizes the operator plane (tenant CRUD) in M1 with a single config\nbootstrap operator token; the full operator-plane credential class lands in\nM5. Page-size limits are configurable (the tunability principle) with safe\ndefaults, never a baked-in one-way choice.",
       "properties": {
+        "allowed_regions": {
+          "default": [],
+          "description": "The operator's configured data-residency region set (issue #46): the\nallowed values for a tenant's `home_region` and (later) a per-environment\nregion pin. A tenant-create request that names a `home_region` outside this\nset is rejected. Empty (the default) means the operator has configured no\nregion set, so residency pinning is unavailable and any `home_region` on a\ncreate is refused; a deployment that wants residency pins lists its regions\nhere (for example `[\"eu-west\", \"us-east\"]`). Nothing routes or replicates by\nregion yet; this only governs which values are recordable.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
         "bootstrap_operator_token": {
           "anyOf": [
             {
@@ -40,6 +48,13 @@
           "default": 200,
           "description": "The largest page a list endpoint will return, regardless of a larger\ncaller-supplied `limit`. A ceiling that bounds any one response so a\ncaller cannot request an unbounded scan. Config load rejects a value above\nthe management list hard cap (1000).",
           "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "offboarding_retention_secs": {
+          "default": 2592000,
+          "description": "The tenant-offboarding retention window in seconds (issue #46): the grace\nperiod during which a soft-deleted (offboarded) tenant can be RESTORED with no\ndata loss, after which the terminal hard deletion (crypto-shred) is due.\nTunable, with a safe default of 30 days (`2_592_000` seconds): long enough that\nan accidental offboarding is recoverable, so the erasure is never a one-way\nsurprise. A restore is refused once the window elapses; a hard delete is\nrefused until it does.",
+          "format": "uint64",
           "minimum": 0,
           "type": "integer"
         }
@@ -625,10 +640,12 @@
     "admin": {
       "$ref": "#/$defs/AdminConfig",
       "default": {
+        "allowed_regions": [],
         "bootstrap_operator_token": null,
         "control_database_url": null,
         "default_page_size": 50,
-        "max_page_size": 200
+        "max_page_size": 200,
+        "offboarding_retention_secs": 2592000
       },
       "description": "Management API settings (issue #11)."
     },

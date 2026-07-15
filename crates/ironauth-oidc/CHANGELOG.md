@@ -6,6 +6,13 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Tenant lifecycle data-plane fence (issue #46). The store-backed issuer registry
+  now consults each scope's data-plane serving state on EVERY resolution (in
+  `IssuerRegistry::entry_for`, ahead of the cache), not only on a cold load, and
+  fails closed (no issuer entry, so JWKS/discovery and signing all 404) for a
+  suspended or offboarded tenant. A suspend or delete therefore stops serving on the
+  very next request with no process restart, and a resume serves again with no data
+  loss. A store error reading the fence fails closed (denies serving).
 - Session Management 1.0 and Front-Channel Logout 1.0, behind default-off flags for
   certification completeness (issue #39). Both iframe mechanisms are degraded under
   third-party-cookie partitioning (Session Management 1.0 section 5.1), so they ship

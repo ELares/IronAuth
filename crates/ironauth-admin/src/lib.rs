@@ -107,6 +107,23 @@ pub fn management_router(state: AdminState) -> Router {
             "/v1/tenants/{tenant_id}",
             get(tenants::get_tenant).delete(tenants::delete_tenant),
         )
+        // Tenant lifecycle transitions (issue #46): reversible suspend/resume as
+        // documented operator-plane POSTs. Static suffixes, so they are matched
+        // before the parameterized environments/keys routes below.
+        .route(
+            "/v1/tenants/{tenant_id}/suspend",
+            post(tenants::suspend_tenant),
+        )
+        .route(
+            "/v1/tenants/{tenant_id}/resume",
+            post(tenants::resume_tenant),
+        )
+        // Restore a soft-deleted (offboarded) tenant inside its retention window
+        // (issue #46). A static suffix, matched before the parameterized routes.
+        .route(
+            "/v1/tenants/{tenant_id}/restore",
+            post(tenants::restore_tenant),
+        )
         .route(
             "/v1/tenants/{tenant_id}/environments",
             post(environments::create_environment).get(environments::list_environments),

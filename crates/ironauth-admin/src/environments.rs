@@ -85,12 +85,31 @@ pub async fn create_environment(
     let request: CreateEnvironmentRequest = parse_json(&body)?;
     let display_name = require_non_empty(&request.display_name, "display_name")?;
 
+    // Residency (issue #46): a present region must be one of the operator's
+    // configured regions (the same set the tenant home_region validates against),
+    // checked BEFORE any write. A blank value is treated as omitted. A deployment
+    // with no region set rejects any region fail closed.
+    let region = request
+        .region
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned);
+    if let Some(region) = region.as_deref() {
+        if !state.region_is_allowed(region) {
+            return Err(ApiError::BadRequest(format!(
+                "region {region:?} is not one of the operator's configured data-residency regions"
+            )));
+        }
+    }
+
     let created_at_micros = state.now_unix_micros();
     let environment_id = EnvironmentId::generate(state.env());
     let view = EnvironmentView {
         id: environment_id.to_string(),
         tenant_id: tenant.to_string(),
         display_name: display_name.clone(),
+        region: region.clone(),
         created_at_unix_ms: created_at_micros / 1000,
     };
     let body_string = serde_json::to_string(&view).map_err(|_| ApiError::Internal)?;
@@ -112,6 +131,7 @@ pub async fn create_environment(
             &environment_id,
             created_at_micros,
             &display_name,
+            region.as_deref(),
             Some(write),
         )
         .await;

@@ -246,5 +246,12 @@ name = "organization_grants"
 path = "tests/organization_grants.rs"
 required-features = ["testing"]
 
+# The tenant lifecycle state machine, residency attributes, data-plane fence, and
+# crypto-shredding offboarding (#46). Needs a real database (DATABASE_URL).
+[[test]]
+name = "tenant_lifecycle"
+path = "tests/tenant_lifecycle.rs"
+required-features = ["testing"]
+
 [lints]
 workspace = true

@@ -126,5 +126,11 @@ name = "sessions"
 path = "tests/sessions.rs"
 required-features = ["testing"]
 
+# The tenant lifecycle API and residency attributes over HTTP (#46).
+[[test]]
+name = "tenant_lifecycle"
+path = "tests/tenant_lifecycle.rs"
+required-features = ["testing"]
+
 [lints]
 workspace = true

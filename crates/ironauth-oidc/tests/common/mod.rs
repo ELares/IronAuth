@@ -578,6 +578,13 @@ impl Harness {
         &self.state
     }
 
+    /// The underlying test database, for tests that need the owner or control pools
+    /// (for example the tenant-lifecycle data-plane fence, issue #46).
+    #[must_use]
+    pub fn db(&self) -> &TestDatabase {
+        &self.db
+    }
+
     /// The seeded scope.
     #[must_use]
     pub fn scope(&self) -> Scope {

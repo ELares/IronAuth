@@ -103,7 +103,7 @@ pub use repository::{
     DcrPolicyRecord, DcrPolicyRepo, DcrRateLimiterRepo, DeviceApproval, DeviceApproveOutcome,
     DeviceAttemptOutcome, DeviceClientProfile, DeviceCodeRepo, DevicePollOutcome,
     DeviceRedeemOutcome, DeviceUserCodeLookup, DynamicClientRecord, DynamicClientRegistration,
-    DynamicClientUpdate, EnvelopeRepo, EnvironmentRecord, EnvironmentRepo,
+    DynamicClientUpdate, EnvelopeRepo, EnvironmentRecord, EnvironmentRepo, EnvironmentServingState,
     ExternalAssertionIssuerRecord, ExternalAssertionIssuerRepo, ExternalAssertionJtiRepo,
     FrontchannelLogoutParticipant, GrantOwner, GrantedConsent, IdempotencyRepo, IdempotencyWrite,
     InitialAccessTokenRepo, IssueClientCredentials, IssueCode, IssuedTokenRecord, JtiOutcome,
@@ -119,8 +119,8 @@ pub use repository::{
     SessionEndedEvent, SessionEventOutboxRepo, SessionFleetFilter, SessionFleetRepo, SessionRecord,
     SessionRepo, SessionRevocation, SessionSummary, SigningKeyMaterial, SigningKeyMaterialKind,
     SigningKeyRecord, SigningKeyRepo, StoredIdempotentResponse, TenantRecord, TenantRepo,
-    TokenFormat, TokenKind, TokenStatus, UserRecord, UserRepo, UserRevocation, device_code_digest,
-    opaque_access_token_digest, refresh_token_digest, user_code_hash,
+    TenantStatus, TokenFormat, TokenKind, TokenStatus, UserRecord, UserRepo, UserRevocation,
+    device_code_digest, opaque_access_token_digest, refresh_token_digest, user_code_hash,
 };
 pub use scope::Scope;
 pub use store::Store;

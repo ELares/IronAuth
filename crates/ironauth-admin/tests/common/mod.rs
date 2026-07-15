@@ -42,11 +42,19 @@ impl Harness {
     ///
     /// `default_page_size` sets the page size used when a request omits `limit`.
     pub async fn start(default_page_size: u32) -> Self {
+        Self::start_with_regions(default_page_size, Vec::new()).await
+    }
+
+    /// Start a fresh database and router with a configured data-residency region set
+    /// (issue #46), for the tenant-lifecycle residency tests. An empty set (the
+    /// default via [`Harness::start`]) leaves residency pinning unavailable.
+    pub async fn start_with_regions(default_page_size: u32, allowed_regions: Vec<String>) -> Self {
         let db = TestDatabase::start().await;
         let config = AdminConfig {
             bootstrap_operator_token: Some(Secret::Literal(SecretString::new(OPERATOR_TOKEN))),
             max_page_size: 200,
             default_page_size,
+            allowed_regions,
             ..AdminConfig::default()
         };
         let state = AdminState::new(db.control_store().clone(), Env::system(), &config)

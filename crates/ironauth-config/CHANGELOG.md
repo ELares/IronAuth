@@ -6,6 +6,13 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- `admin.allowed_regions`: the operator's configured data-residency region set
+  (issue #46). A tenant's `home_region` and a per-environment `region` pin must be
+  one of these; empty (the default) leaves residency pinning unavailable and refuses
+  any residency pin on a create.
+- `admin.offboarding_retention_secs`: the tenant-offboarding retention window in
+  seconds (issue #46), the grace period a soft-deleted tenant can be restored
+  within before the terminal hard deletion. Tunable, safe default 30 days.
 - Session Management 1.0 and Front-Channel Logout 1.0, behind default-off flags for
   certification completeness (issue #39).
   - `oidc.session_management_enabled` (default `false`): when set, the OP serves the
