@@ -6,7 +6,33 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
-- The durable session-ended event fan-out substrate (issue #35, migration 0023, expand).
+- RP-Initiated Logout persistence (issue #33, migration 0023, expand). Lets the OIDC
+  `end_session` endpoint terminate an SSO session and, only on an exact match with a
+  verifiable `id_token_hint`, redirect back to a client.
+  - **Registered post-logout redirect set.** A new additive `clients` column
+    `post_logout_redirect_uris text[]` (default `{}`), the exact-string set the
+    `end_session` endpoint matches a presented `post_logout_redirect_uri` against
+    (RFC 9700 section 2.1, the same discipline `redirect_uris` uses). It is read into
+    `ClientRecord::post_logout_redirect_uris` and written by the new audited
+    `ActingClientRepo::register_post_logout_redirect_uris` (each entry validated as a
+    registrable RFC 8252 target before anything is stored; a
+    `client.post_logout_redirect_uris.register` audit row in the same transaction). The
+    data-plane write is a COLUMN-SCOPED `GRANT UPDATE (post_logout_redirect_uris)` (the
+    #31 lesson: never a table-wide UPDATE).
+  - **`sid` to session reverse lookup.** `ClientSessionRepo::session_for_sid(sid)` maps
+    the per-(client, session) `sid` an `id_token_hint` carries back to the tier-one SSO
+    `session_id` the logout ends, so the hint (not merely the browser cookie) identifies
+    the session to terminate. Scope-fenced: a `sid` from another tenant loads zero rows.
+  - The SSO session termination itself reuses `ActingSessionRepo::revoke` with
+    `SessionEndCause::LoggedOut` and `hard_kill = false`, which already preserves the
+    `offline_access` families (issue #21), so an offline token survives an RP logout.
+- `ActingSessionRepo::revoke_all_for_user` now returns the ids of the sessions it
+  actually revoked, in the new `UserRevocation::revoked_session_ids` field (issue #36).
+  Captured with `RETURNING` in the same transaction, it lets a caller (the Global Token
+  Revocation receiver) fan a terminal session-ended signal out per truly-revoked session
+  with no list-then-revoke race and no spurious signal for an already-revoked one.
+  `UserRevocation` is no longer `Copy` (it now owns a `Vec`); no migration.
+- The durable session-ended event fan-out substrate (issue #35, migration 0024, expand).
   The transactional-outbox seam the back-channel logout worker (#34) and the external
   webhooks (M11) drain the session-ended signal off, closing the field's most-reported
   logout gap (missing PROPAGATION) structurally: ONE internal event, EVERY terminal

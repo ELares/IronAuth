@@ -76,6 +76,94 @@ fn expired_within_skew_is_accepted() {
 }
 
 #[test]
+fn allow_expired_accepts_a_past_exp_but_still_requires_every_other_check() {
+    // RP-Initiated Logout's id_token_hint is a PAST id token accepted ONLY to target
+    // a session. allow_expired waives the "now > exp" rejection and nothing else.
+    let signer = common::Ed25519Signer::new();
+    let key = TrustedKey::ed25519(None, signer.public_key()).expect("valid key");
+    let policy = || {
+        VerificationPolicy::new(
+            vec![JwsAlgorithm::EdDsa],
+            vec![key.clone()],
+            common::ISS,
+            common::AUD,
+        )
+        .expect("valid policy")
+        .with_skew(Duration::from_secs(60))
+        .allow_expired(true)
+    };
+
+    let aud = r#""client-abc""#;
+
+    // A deeply expired token (exp far past the skew) now VERIFIES.
+    let expired = token(
+        &signer,
+        &common::claims_with(
+            common::ISS,
+            aud,
+            NOW_I - 100_000,
+            NOW_I - 200_000,
+            NOW_I - 200_000,
+        ),
+    );
+    assert!(
+        verify(&expired, &policy(), &common::now_clock()).is_ok(),
+        "allow_expired must accept a past exp"
+    );
+
+    // exp is STILL required: a token that omits it is refused even with allow_expired.
+    let no_exp = token(
+        &signer,
+        &format!(
+            r#"{{"iss":"{}","aud":"{}","nbf":{},"iat":{}}}"#,
+            common::ISS,
+            common::AUD,
+            NOW_I - 60,
+            NOW_I - 60
+        ),
+    );
+    assert_eq!(
+        verify(&no_exp, &policy(), &common::now_clock())
+            .map(|_| ())
+            .map_err(|e| e.reason()),
+        Err(RejectReason::ClaimMissing),
+        "exp remains required under allow_expired"
+    );
+
+    // A WRONG issuer is still rejected: allow_expired relaxes exp alone.
+    let wrong_iss = token(
+        &signer,
+        &common::claims_with(
+            "https://evil.example",
+            aud,
+            NOW_I - 100_000,
+            NOW_I - 200_000,
+            NOW_I - 200_000,
+        ),
+    );
+    assert_eq!(
+        verify(&wrong_iss, &policy(), &common::now_clock())
+            .map(|_| ())
+            .map_err(|e| e.reason()),
+        Err(RejectReason::IssuerMismatch),
+        "issuer is still enforced under allow_expired"
+    );
+
+    // A future nbf (not yet valid) is still rejected: allow_expired never touches nbf.
+    let future_nbf = token(
+        &signer,
+        &common::claims_with(common::ISS, aud, NOW_I - 100, NOW_I + 100_000, NOW_I - 200),
+    );
+    assert_eq!(
+        verify(&future_nbf, &policy(), &common::now_clock())
+            .map(|_| ())
+            .map_err(|e| e.reason()),
+        Err(RejectReason::NotYetValid),
+        "nbf is still enforced under allow_expired"
+    );
+}
+
+#[test]
 fn exp_exactly_at_skew_boundary_is_accepted() {
     // now == exp + skew: not yet strictly past, so accepted.
     let claims = common::claims_with(

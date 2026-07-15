@@ -6,6 +6,14 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- `VerificationPolicy::allow_expired(bool)` (issue #33): an opt-in, default-OFF
+  policy setter that waives ONLY the "now past exp" rejection, so a well-formed
+  but EXPIRED token still verifies. Every other check is untouched: `exp` is still
+  required to be present and well formed, and the signature, algorithm allowlist,
+  key selection, issuer, audience, `nbf`, and `iat` checks all remain fully
+  enforced. The one caller is OIDC RP-Initiated Logout, whose `id_token_hint` is a
+  past id token presented ONLY to identify a session to end (it confers no access),
+  which the spec requires to still validate for logout targeting.
 - `trusted_keys_from_jwks(json)` (issue #25): parse a JWK Set document into the
   `TrustedKey`s the verify core accepts, for authenticating a client's
   `private_key_jwt` assertion against its registered `jwks`/`jwks_uri`. Fails

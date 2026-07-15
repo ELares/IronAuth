@@ -64,6 +64,13 @@ pub struct OidcState {
     // response (M16) slots in as a new serializer without touching the endpoint.
     // Default: the RFC 7662 plain-JSON serializer.
     introspection_serializer: Arc<dyn IntrospectionSerializer>,
+    // Whether the experimental Global Token Revocation receiver (issue #36) is
+    // mounted. Kept OUTSIDE `Inner` and set through the builder because it is NOT a
+    // plain `OidcConfig` toggle an operator can flip directly (that would bypass the
+    // experimental acknowledgment gate): the ONLY writer is the boot path, which
+    // resolves it from the strict config feature ladder (feature enabled AND acked)
+    // and sets it here. Default: false (the endpoint is unmounted).
+    global_token_revocation_enabled: bool,
 }
 
 // The per-environment policy flags each mirror an independent, individually
@@ -195,6 +202,11 @@ struct Inner {
     device_user_code_max_attempts: u32,
     device_verification_rate_limit: u32,
     device_verification_rate_window: Duration,
+    // Whether the Global Token Revocation receiver (issue #36) hard-kills the
+    // subject's offline_access families too, not only the session-bound ones. Effect
+    // only when the endpoint is mounted; the safe default (false) preserves offline
+    // grants (issue #21/#32).
+    global_token_revocation_hard_kill: bool,
 }
 
 impl OidcState {
@@ -295,9 +307,11 @@ impl OidcState {
                 device_verification_rate_window: Duration::from_secs(
                     config.device_verification_rate_window_secs,
                 ),
+                global_token_revocation_hard_kill: config.global_token_revocation_hard_kill,
             }),
             revocation_sink: default_sink(),
             introspection_serializer: default_serializer(),
+            global_token_revocation_enabled: false,
         }
     }
 
@@ -308,6 +322,34 @@ impl OidcState {
     pub fn with_revocation_sink(mut self, sink: Arc<dyn RevocationEventSink>) -> Self {
         self.revocation_sink = sink;
         self
+    }
+
+    /// Mount (or not) the experimental Global Token Revocation receiver (issue #36).
+    ///
+    /// The boot path is the ONLY caller: it resolves `enabled` from the strict config
+    /// feature ladder (the `global-token-revocation` experimental feature enabled AND
+    /// acknowledged at the exact draft revision) and passes the result here. It is a
+    /// builder rather than an `OidcConfig` field precisely so an operator cannot arm
+    /// the endpoint from the `[oidc]` table and bypass the experimental ack gate:
+    /// enabling is only ever reachable through the ladder.
+    #[must_use]
+    pub fn with_global_token_revocation_enabled(mut self, enabled: bool) -> Self {
+        self.global_token_revocation_enabled = enabled;
+        self
+    }
+
+    /// Whether the experimental Global Token Revocation receiver is mounted (issue
+    /// #36). The router mounts `POST /global-token-revocation` only when this is true.
+    #[must_use]
+    pub fn global_token_revocation_enabled(&self) -> bool {
+        self.global_token_revocation_enabled
+    }
+
+    /// Whether a Global Token Revocation hard-kills the subject's `offline_access`
+    /// families too (issue #36). False (the safe default) preserves offline grants.
+    #[must_use]
+    pub(crate) fn global_token_revocation_hard_kill(&self) -> bool {
+        self.inner.global_token_revocation_hard_kill
     }
 
     /// Install a custom introspection-response serializer (issue #22), replacing the
@@ -978,6 +1020,59 @@ impl OidcState {
         let issuer = self.issuer_for(scope);
         let policy = VerificationPolicy::new(algorithms, trusted, issuer, audience.to_owned())
             .map_err(|_| ())?;
+        verify(token, &policy, self.inner.env.clock()).map_err(|_| ())
+    }
+
+    /// Verify an RP-Initiated Logout `id_token_hint` (issue #33): an id token THIS OP
+    /// minted, presented at `end_session` ONLY to identify the session to end.
+    ///
+    /// It is verified through the SAME hardened [`ironauth_jose::verify`] path as an
+    /// access token, against the environment's published signing keys, the
+    /// per-environment issuer, and `audience` (the client the hint names in `aud`), with
+    /// exactly ONE relaxation: [`VerificationPolicy::allow_expired`] accepts a PAST
+    /// `exp`. That is mandated by the RP-Initiated Logout spec (a logout hint is
+    /// routinely stale) and confers no access, since the hint only NAMES a session. A
+    /// rotated-out key still verifies because `published_signing_keys` keeps the
+    /// verification-retained keys. Every OTHER check stays: the signature over the
+    /// environment's own keys, the algorithm allowlist, the exact issuer, the exact
+    /// audience, `nbf`, and `iat`. A hint signed by a FOREIGN issuer, or tampered, fails
+    /// the signature or issuer check and returns `Err(())`, so a logout never acts on an
+    /// unverifiable or foreign hint.
+    ///
+    /// # Errors
+    ///
+    /// `Err(())` if no signing key is provisioned for the scope's environment, or the
+    /// hint does not verify under the built policy (bad signature, wrong issuer or
+    /// audience, non-allowlisted algorithm, missing `exp`, future `nbf`/`iat`,
+    /// malformed).
+    pub(crate) async fn verify_logout_hint(
+        &self,
+        scope: &Scope,
+        audience: &str,
+        token: &str,
+    ) -> Result<VerifiedToken, ()> {
+        let entry = self.issuer_entry(scope).await.ok_or(())?;
+        let keys = entry.keyset().published_signing_keys(self.now());
+        if keys.is_empty() {
+            return Err(());
+        }
+        let trusted: Vec<TrustedKey> = keys
+            .iter()
+            .filter_map(|key| key.verifying_key().ok())
+            .collect();
+        if trusted.is_empty() {
+            return Err(());
+        }
+        let mut algorithms: Vec<JwsAlgorithm> = Vec::new();
+        for key in &keys {
+            if !algorithms.contains(&key.algorithm()) {
+                algorithms.push(key.algorithm());
+            }
+        }
+        let issuer = self.issuer_for(scope);
+        let policy = VerificationPolicy::new(algorithms, trusted, issuer, audience.to_owned())
+            .map_err(|_| ())?
+            .allow_expired(true);
         verify(token, &policy, self.inner.env.clock()).map_err(|_| ())
     }
 }

@@ -289,3 +289,103 @@ async fn consent_grant_audit_target_joins_the_persisted_consent_row() {
         "the re-consent updated in place rather than inserting a second row"
     );
 }
+
+#[tokio::test]
+async fn post_logout_redirect_uris_register_read_and_validate() {
+    // RP-Initiated Logout (issue #33): a client's post_logout_redirect_uris are an
+    // exact-match set the end_session endpoint checks against. Default empty, registered
+    // wholesale, validated as registrable targets, and scope-fenced.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let reader = db.store().scoped(scope).clients();
+    let writer = || {
+        db.store()
+            .scoped(scope)
+            .acting(db.test_actor(&env), CorrelationId::generate(&env))
+            .clients()
+    };
+
+    let id = writer()
+        .create(&env, "logout client")
+        .await
+        .expect("create");
+
+    // Default: a fresh client registers NO post-logout redirect URIs.
+    let record = reader.get(&id).await.expect("get");
+    assert!(
+        record.post_logout_redirect_uris.is_empty(),
+        "a fresh client has an empty post-logout redirect set"
+    );
+
+    // Register a set; it reads back verbatim (exact-string, no normalization).
+    writer()
+        .register_post_logout_redirect_uris(
+            &env,
+            &id,
+            &["https://client.test/after", "https://client.test/home"],
+        )
+        .await
+        .expect("register post-logout uris");
+    let record = reader.get(&id).await.expect("get");
+    assert_eq!(
+        record.post_logout_redirect_uris,
+        vec![
+            "https://client.test/after".to_owned(),
+            "https://client.test/home".to_owned()
+        ],
+        "the registered set reads back exactly"
+    );
+
+    // Re-registering REPLACES the set wholesale.
+    writer()
+        .register_post_logout_redirect_uris(&env, &id, &["https://client.test/only"])
+        .await
+        .expect("re-register");
+    assert_eq!(
+        reader
+            .get(&id)
+            .await
+            .expect("get")
+            .post_logout_redirect_uris,
+        vec!["https://client.test/only".to_owned()]
+    );
+
+    // A malformed (non-registrable) target rejects the WHOLE set; nothing is stored.
+    assert!(matches!(
+        writer()
+            .register_post_logout_redirect_uris(
+                &env,
+                &id,
+                &["https://client.test/good", "javascript:alert(1)"]
+            )
+            .await,
+        Err(StoreError::InvalidRedirectUri)
+    ));
+    assert_eq!(
+        reader
+            .get(&id)
+            .await
+            .expect("get")
+            .post_logout_redirect_uris,
+        vec!["https://client.test/only".to_owned()],
+        "a rejected registration leaves the prior set untouched"
+    );
+
+    // A client id from another scope is the uniform not-found (never a cross-tenant write).
+    let other_scope = db.seed_scope(&env).await;
+    let foreign = db
+        .store()
+        .scoped(other_scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .clients()
+        .create(&env, "other-tenant client")
+        .await
+        .expect("create foreign");
+    assert!(matches!(
+        writer()
+            .register_post_logout_redirect_uris(&env, &foreign, &["https://client.test/x"])
+            .await,
+        Err(StoreError::NotFound)
+    ));
+}

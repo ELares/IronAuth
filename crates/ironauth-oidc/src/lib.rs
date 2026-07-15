@@ -80,6 +80,7 @@ mod device;
 mod device_verify;
 mod discovery;
 mod error;
+mod global_revocation;
 mod hints;
 mod interaction;
 mod introspection;
@@ -87,6 +88,7 @@ mod issuer;
 mod jwks;
 mod jwt_bearer;
 mod login;
+mod logout;
 mod pages;
 mod par;
 mod password;
@@ -132,6 +134,7 @@ pub use discovery::{
     claims_supported, discovery_document, discovery_router, id_token_signing_alg_values,
 };
 pub use error::{AuthorizeError, AuthzErrorCode, TokenError};
+pub use global_revocation::GLOBAL_TOKEN_REVOCATION_PATH;
 pub use hints::{Display, InteractionHints};
 pub use introspection::{
     IntrospectionClaims, IntrospectionSerializer, JsonIntrospectionSerializer,
@@ -141,6 +144,7 @@ pub use issuer::{
     IssuerEntry, IssuerError, IssuerRegistry, JwksCacheError, JwksCacheWindow, load_signing_key,
 };
 pub use jwks::{IssuerState, issuer_router};
+pub use logout::LogoutParams;
 pub use password::{PasswordError, hash_password, verify_password};
 pub use registry::{
     GrantType, PkceMethod, PromptSet, PromptSetError, PromptValue, ResponseMode, ResponseType,
@@ -191,6 +195,16 @@ pub fn oidc_router(state: OidcState) -> Router {
         // token's active state and metadata. Advertised in discovery as
         // introspection_endpoint at this exact path.
         .route("/introspect", post(introspection::introspect))
+        // RP-Initiated Logout (OIDC RP-Initiated Logout 1.0, issue #33): a top-level
+        // browser navigation that ends the SSO session and, only on an exact registered
+        // post_logout_redirect_uri match with a verifiable id_token_hint, redirects back
+        // to the client. Advertised in discovery as end_session_endpoint at this exact
+        // path. GET is the RP-initiated navigation; POST is the confirmation submit for
+        // an unattributable request (behind the same-origin CSRF check).
+        .route(
+            "/end_session",
+            get(logout::end_session_get).post(logout::end_session_post),
+        )
         // UserInfo (OIDC Core 5.3): GET and POST with header Bearer auth, plus the
         // OPTIONS preflight for the CORS SPA origins (issue #15). CORS is applied on
         // this endpoint ONLY; the authorization endpoint above never gets it.
@@ -243,6 +257,18 @@ pub fn oidc_router(state: OidcState) -> Router {
                     .put(client_registration::update)
                     .delete(client_registration::delete),
             );
+    }
+
+    // Global Token Revocation receiver (issue #36), mounted ONLY when the experimental
+    // `global-token-revocation` feature is enabled and acknowledged (the boot path
+    // resolves the gate from the strict config feature ladder). A strongly-authenticated
+    // confidential client revokes EVERYTHING one subject holds in its own scope. The
+    // draft is not WG-adopted, so the endpoint is unmounted by default.
+    if state.global_token_revocation_enabled() {
+        router = router.route(
+            global_revocation::GLOBAL_TOKEN_REVOCATION_PATH,
+            post(global_revocation::global_token_revocation),
+        );
     }
 
     router.with_state(state)

@@ -433,6 +433,7 @@ pub struct VerificationPolicy {
     pub(crate) max_skew: Duration,
     pub(crate) caps: VerificationCaps,
     pub(crate) require_iat: bool,
+    pub(crate) allow_expired: bool,
 }
 
 impl VerificationPolicy {
@@ -479,6 +480,7 @@ impl VerificationPolicy {
             max_skew: Self::DEFAULT_SKEW,
             caps: VerificationCaps::DEFAULT,
             require_iat: false,
+            allow_expired: false,
         })
     }
 
@@ -501,6 +503,23 @@ impl VerificationPolicy {
     #[must_use]
     pub fn require_iat(mut self, required: bool) -> Self {
         self.require_iat = required;
+        self
+    }
+
+    /// Accept a token whose `exp` is in the PAST (opt-in, default OFF).
+    ///
+    /// This relaxes ONE check and nothing else: the `exp` claim is still REQUIRED to
+    /// be present and well formed (a missing or absurd `exp` still rejects), and the
+    /// signature, algorithm allowlist, key selection, issuer, audience, `nbf`, and
+    /// `iat` checks all remain fully enforced. The single legitimate caller is OIDC
+    /// RP-Initiated Logout, whose `id_token_hint` is a PAST id token presented ONLY to
+    /// IDENTIFY a session to end, never to authorize access: the spec requires an
+    /// expired hint to still validate for logout targeting. It confers no access, so
+    /// accepting a past `exp` here cannot extend a token's usable lifetime anywhere a
+    /// token grants a capability. Left OFF, `exp` is enforced exactly as before.
+    #[must_use]
+    pub fn allow_expired(mut self, allow: bool) -> Self {
+        self.allow_expired = allow;
         self
     }
 

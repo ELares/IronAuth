@@ -406,9 +406,15 @@ fn registry() -> Vec<Migration> {
         },
         Migration {
             version: 23,
+            name: "rp_logout",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0023_rp_logout.sql"),
+        },
+        Migration {
+            version: 24,
             name: "session_ended_events",
             phase: Phase::Expand,
-            sql: include_str!("../migrations/0023_session_ended_events.sql"),
+            sql: include_str!("../migrations/0024_session_ended_events.sql"),
         },
     ]
 }

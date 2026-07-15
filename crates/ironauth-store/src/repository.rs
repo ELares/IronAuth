@@ -606,6 +606,13 @@ pub struct ClientRecord {
     /// Empty for a client that registered none (which therefore cannot complete an
     /// authorization request until it registers one).
     pub redirect_uris: Vec<String>,
+    /// The client's registered POST-LOGOUT redirect URIs (issue #33): the set the
+    /// RP-Initiated Logout `end_session` endpoint matches a presented
+    /// `post_logout_redirect_uri` against by exact string (RFC 9700 section 2.1),
+    /// honoring a redirect ONLY on an exact match with a verifiable `id_token_hint`.
+    /// Empty for a client that registered none (which therefore never gets a
+    /// post-logout redirect; the logout renders a neutral logged-out page instead).
+    pub post_logout_redirect_uris: Vec<String>,
     /// The client's consent mode (issue #21): the stored `consent_mode` string
     /// (`explicit`, `implicit`, or `remembered`). Drives whether the authorization
     /// endpoint prompts for consent, skips it (first-party), or honors a remembered
@@ -934,7 +941,8 @@ impl ClientRepo<'_> {
         let mut tx = begin_scoped(self.store, self.scope).await?;
         let row = sqlx::query(
             "SELECT id, display_name, require_auth_time, token_endpoint_auth_method, \
-             redirect_uris, consent_mode, skip_consent, store_skipped_consent, \
+             redirect_uris, post_logout_redirect_uris, consent_mode, skip_consent, \
+             store_skipped_consent, \
              require_pushed_authorization_requests, quarantined FROM clients \
              WHERE id = $1 AND tenant_id = $2 AND environment_id = $3",
         )
@@ -957,7 +965,8 @@ impl ClientRepo<'_> {
         let mut tx = begin_scoped(self.store, self.scope).await?;
         let rows = sqlx::query(
             "SELECT id, display_name, require_auth_time, token_endpoint_auth_method, \
-             redirect_uris, consent_mode, skip_consent, store_skipped_consent, \
+             redirect_uris, post_logout_redirect_uris, consent_mode, skip_consent, \
+             store_skipped_consent, \
              require_pushed_authorization_requests, quarantined FROM clients \
              WHERE tenant_id = $1 AND environment_id = $2 ORDER BY created_at, id",
         )
@@ -1216,6 +1225,7 @@ impl ClientRepo<'_> {
             require_auth_time: row.get("require_auth_time"),
             auth_method: row.get("token_endpoint_auth_method"),
             redirect_uris: row.get("redirect_uris"),
+            post_logout_redirect_uris: row.get("post_logout_redirect_uris"),
             consent_mode: row.get("consent_mode"),
             skip_consent: row.get("skip_consent"),
             store_skipped_consent: row.get("store_skipped_consent"),
@@ -1581,6 +1591,76 @@ impl ActingClientRepo<'_> {
                 // A no-op update (nothing in scope matched) is a uniform not-found;
                 // erroring here short-circuits before the audit insert, so it
                 // leaves no audit row (we audit real mutations only).
+                if result.rows_affected() == 0 {
+                    return Err(StoreError::NotFound);
+                }
+                Ok(())
+            },
+            false,
+        )
+        .await
+    }
+
+    /// Register a client's POST-LOGOUT redirect URIs (issue #33), replacing the set
+    /// wholesale. Each entry is validated as an RFC 8252 redirect target by the SAME
+    /// registrability rule the authorization redirect URIs use (a claimed https URL,
+    /// an http loopback IP-literal, or a reverse-domain private-use scheme) BEFORE
+    /// anything is written, so a malformed scheme is rejected at registration time and
+    /// never enters the set. On success the client's `post_logout_redirect_uris` become
+    /// exactly `uris`, and a `client.post_logout_redirect_uris.register` audit row is
+    /// written in the same transaction.
+    ///
+    /// The RP-Initiated Logout endpoint honors a presented `post_logout_redirect_uri`
+    /// only on an EXACT string match against this set AND only with a verifiable
+    /// `id_token_hint`, so registering here is what lets a redirect ever happen; a
+    /// client that registers none never gets a post-logout redirect.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::InvalidRedirectUri`] if any entry is not a registrable redirect
+    /// target (nothing is written); [`StoreError::NotFound`] if no such client is
+    /// visible in this scope; [`StoreError::Database`] on a persistence failure.
+    pub async fn register_post_logout_redirect_uris(
+        &self,
+        env: &Env,
+        id: &ClientId,
+        uris: &[&str],
+    ) -> Result<(), StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        // Validate the whole set before touching the database, so a malformed entry
+        // rejects the registration wholesale rather than storing a partial set.
+        for uri in uris {
+            if !crate::redirect::redirect_uri_is_registrable(uri) {
+                return Err(StoreError::InvalidRedirectUri);
+            }
+        }
+        let owned: Vec<String> = uris.iter().map(|uri| (*uri).to_owned()).collect();
+        let scope = self.scope;
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::ClientPostLogoutRedirectUrisRegister,
+                target: id,
+            },
+            async move |tx| {
+                let result = sqlx::query(
+                    "UPDATE clients SET post_logout_redirect_uris = $1 \
+                     WHERE id = $2 AND tenant_id = $3 AND environment_id = $4",
+                )
+                .bind(&owned)
+                .bind(id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .execute(&mut **tx)
+                .await?;
+                // A no-op update (nothing in scope matched) is a uniform not-found;
+                // erroring here short-circuits before the audit insert, so it leaves
+                // no audit row (we audit real mutations only).
                 if result.rows_affected() == 0 {
                     return Err(StoreError::NotFound);
                 }
@@ -7665,8 +7745,10 @@ impl ActingSessionRepo<'_> {
                 insert_idempotency(tx, idempotency).await?;
                 // RETURNING id hands back EVERY session that actually flipped (an
                 // already-ended one returns no row), so exactly one durable session-ended
-                // event is enqueued per terminal end, below, in this same transaction.
-                let flipped = sqlx::query(
+                // event is enqueued per terminal end (issue #35) and the same ids are
+                // handed to the Global Token Revocation receiver (issue #36), below, in
+                // this same transaction.
+                let revoked = sqlx::query(
                     "UPDATE sessions \
                      SET revoked_at = \
                              TIMESTAMPTZ 'epoch' + ($1::text || ' microseconds')::interval, \
@@ -7684,8 +7766,12 @@ impl ActingSessionRepo<'_> {
                 .bind(scope.environment().to_string())
                 .fetch_all(&mut **tx)
                 .await?;
-                out.sessions_revoked = flipped.len() as u64;
-                for row in &flipped {
+                out.revoked_session_ids = revoked
+                    .iter()
+                    .map(|row| row.get::<String, _>("id"))
+                    .collect();
+                out.sessions_revoked = out.revoked_session_ids.len() as u64;
+                for row in &revoked {
                     let session_text: String = row.get("id");
                     enqueue_session_ended_event(
                         tx,
@@ -8511,12 +8597,22 @@ pub struct SessionRevocation {
 }
 
 /// The outcome of revoking every session of one user (issue #32).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+///
+/// [`revoked_session_ids`](Self::revoked_session_ids) names EXACTLY the sessions this
+/// call flipped live -> revoked (captured with `RETURNING` in the same transaction),
+/// so a caller that must fan a terminal session-ended signal out per session (the
+/// global-token-revocation receiver, issue #36) emits one signal per truly-revoked
+/// session with no list-then-revoke race and no spurious signal for an
+/// already-revoked one.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct UserRevocation {
     /// How many of the user's live sessions were revoked.
     pub sessions_revoked: u64,
     /// How many of the user's refresh families were revoked by the cascade.
     pub families_revoked: u64,
+    /// The ids of the sessions this call actually revoked (`ses_...`), in no
+    /// guaranteed order. Empty when the subject had no live session.
+    pub revoked_session_ids: Vec<String>,
 }
 
 /// Revoke a user's refresh families inside an OPEN transaction (issue #32): the
@@ -8662,6 +8758,40 @@ impl ClientSessionRepo<'_> {
         // off, so nothing was inserted and no conflict fired: the session is dead.
         row.map(|row| row.get::<String, _>("sid"))
             .ok_or(StoreError::NotFound)
+    }
+
+    /// Resolve the SSO session bound to a per-client `sid` within scope (issue #33),
+    /// returning [`None`] when no per-client session in scope carries that `sid`.
+    ///
+    /// RP-Initiated Logout's `id_token_hint` carries the per-(client, session) `sid`
+    /// the ID token was minted with; this maps it back to the tier-one SSO `session_id`
+    /// the logout then ends, so the hint is what identifies the session to terminate
+    /// (not merely the browser cookie). The `sid` is a random per-pair value, so at
+    /// most one row matches; the stored `session_id` came back through the row-level
+    /// security scope filter, so it is in scope by construction and is re-parsed to the
+    /// typed identifier. A `sid` from another tenant simply loads zero rows.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn session_for_sid(&self, sid: &str) -> Result<Option<SessionId>, StoreError> {
+        let scope = self.scope;
+        let mut tx = begin_scoped(self.store, scope).await?;
+        let row = sqlx::query(
+            "SELECT session_id FROM client_sessions \
+             WHERE sid = $1 AND tenant_id = $2 AND environment_id = $3",
+        )
+        .bind(sid)
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let session_text: String = row.get("session_id");
+        Ok(SessionId::parse_in_scope(&session_text, &scope).ok())
     }
 
     /// Count the per-client session rows in scope (issue #32). A test uses it to prove a

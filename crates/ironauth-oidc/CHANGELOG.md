@@ -6,6 +6,72 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- RP-Initiated Logout: the `end_session` endpoint (OIDC RP-Initiated Logout 1.0, issue
+  #33). A top-level browser navigation that ends the OP session and, only when it is
+  cryptographically attributable, redirects back to the relying party.
+  - **The endpoint (`logout.rs`), GET and POST at `/end_session`.** Accepts ONLY the
+    spec parameters (`id_token_hint`, `client_id`, `logout_hint`, `state`, `ui_locales`,
+    `post_logout_redirect_uri`); nothing proprietary (no Cognito-style `logout_uri`).
+    Advertised in discovery as `end_session_endpoint`.
+  - **Hint verification through the JOSE core.** The `id_token_hint` is verified by the
+    new `OidcState::verify_logout_hint` against the environment's own published keys
+    (rotated-out verification keys retained), accepting a PAST `exp` (the new
+    `VerificationPolicy::allow_expired`, mandated by the spec for a stale hint) while
+    still enforcing the signature, algorithm allowlist, exact issuer, exact audience,
+    `nbf`, and `iat`. The scope is recovered from the client the `aud` names; a foreign
+    or unverifiable hint does NOT attribute the request.
+  - **Synchronous termination (the hydra#4070 race).** An attributed logout ends the SSO
+    session via `ActingSessionRepo::revoke` (cause `LoggedOut`, `hard_kill = false`)
+    BEFORE the response, so the immediate-revocation read guard refuses it on the very
+    next request; `offline_access` families survive. The terminal `SessionLifecycleEvent`
+    fires on the revocation sink for the #35/#34 fan-out. The session cookie is cleared
+    (`Max-Age=0`).
+  - **Exact-match redirect, or none.** `post_logout_redirect_uri` is honored only on an
+    EXACT string match against the client's registered set AND with a verifiable hint
+    (RFC 9700 section 2.1: no wildcards, normalization, or case folding); `state`
+    round-trips only then. A near miss, an unregistered value, or an unattributable
+    request renders a neutral logged-out page, never an open redirect.
+  - **CSRF: confirm an unattributable logout.** Without a verifiable hint a GET renders a
+    confirmation prompt and changes nothing; the confirm POST ends the session behind the
+    `same_origin_ok` check (issue #196). New `pages::logout_confirm_page` /
+    `pages::logged_out_page`; `LogoutParams` is exported.
+- The Global Token Revocation receiver, EXPERIMENTAL (issue #36): `POST
+  /global-token-revocation`, the Okta Universal Logout shape of the individual
+  Internet-Draft `draft-parecki-oauth-global-token-revocation` (NOT WG-adopted, so the
+  wire shape may change between releases; the endpoint ships behind the config maturity
+  ladder's experimental ack gate and is unmounted by default).
+  - **What it does.** A single subject-scoped call ends ALL of one subject's sessions and
+    revokes ALL of its refresh-token families in one environment (the account-takeover
+    panic button), reusing `ActingSessionRepo::revoke_all_for_user`. It then publishes a
+    TERMINAL `SessionLifecycleEvent` (cause `user_revoked_all`, no successor) per revoked
+    session on the `RevocationEventSink` seam, so the #35 logout fan-out terminates every
+    relying party's view of the subject. The request is the draft JSON shape, an RFC 9493
+    Subject Identifier under `sub_id`; the `opaque` format maps to the local `usr_`
+    subject (other formats return a clean 400, never a false 204). `204 No Content` on
+    success, idempotent (a repeat flips nothing and publishes no spurious signal).
+  - **Authorized strongly, fails closed.** The caller authenticates as a CONFIDENTIAL
+    client through the `Authorization` header (the same client-auth suite the token
+    endpoint uses); a public `none` client and an unauthenticated caller both get a
+    uniform 401 (a `client_id` is not a secret), mirroring the RFC 7662 introspection
+    restriction. Authentication fixes the `(tenant, environment)` scope from the client's
+    own id and the subject is parsed WITHIN it, so a global revoke can NEVER reach a
+    subject in another tenant (a foreign-scope id is a uniform 400, no cross-tenant
+    oracle). A store fault is a 500, never a false 204.
+  - **Offline handling per flag.** By default `offline_access` families survive a global
+    revoke (issue #21/#32 semantic); `oidc.global_token_revocation_hard_kill` revokes
+    those too for an account-takeover posture. `OidcState::with_global_token_revocation_enabled`
+    is the ONLY way to arm the endpoint, set by the boot path from the feature ladder so
+    the experimental ack can never be bypassed from `[oidc]`.
+  - **Not yet built** (honest scope): the TRANSMITTER side (emitting Global Token
+    Revocation calls to downstream receivers) needs the #35 delivery-worker fan-out, which
+    is not merged; only the RECEIVER ships here. The terminal session-ended signals are
+    produced on the shared `RevocationEventSink` seam, but the DEFAULT sink is a no-op, so
+    the durable relying-party logout landing arrives only once #35 wires a real sink via
+    `OidcState::with_revocation_sink`. Subject-identifier formats beyond `opaque`
+    (`email`, `iss_sub`, ...) are recognized but not yet mapped to a local subject. The
+    external-interop acceptance criterion (a recorded run against an outside receiver such
+    as Okta or Auth0) is infra-gated and NOT done; nothing here claims verified
+    conformance against another implementation, only the pinned draft revision.
 - The session model on the OIDC surface (issue #32).
   - **`sid` in EVERY flow's ID token (not just the code flow).** The token endpoint
     resolves the per-(client, session) `sid` from the code's authenticating SSO session
