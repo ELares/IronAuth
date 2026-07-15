@@ -6,6 +6,11 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- `[byok]`: bring-your-own-key customer-managed encryption settings (issue #49),
+  EXPERIMENTAL and DEFAULT-OFF. `byok.enabled` (default false) leaves every BYOK
+  path unreachable; `byok.provider` (default `local`) selects the key-management
+  driver; `byok.endpoint` is the external KMS URL for an external provider,
+  outbound through the SSRF-hardened fetcher and owner/infra-gated.
 - `admin.allowed_regions`: the operator's configured data-residency region set
   (issue #46). A tenant's `home_region` and a per-environment `region` pin must be
   one of these; empty (the default) leaves residency pinning unavailable and refuses

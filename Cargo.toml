@@ -19,6 +19,7 @@ members = [
     "crates/ironauth-store",
     "crates/ironauth-fetch",
     "crates/ironauth-jose",
+    "crates/ironauth-kms",
     "crates/ironauth-admin",
     "crates/ironauth-oidc",
     "crates/ironauth-quota",
@@ -38,6 +39,7 @@ ironauth-server = { path = "crates/ironauth-server", version = "0.1.0" }
 ironauth-store = { path = "crates/ironauth-store", version = "0.1.0" }
 ironauth-fetch = { path = "crates/ironauth-fetch", version = "0.1.0" }
 ironauth-jose = { path = "crates/ironauth-jose", version = "0.1.0" }
+ironauth-kms = { path = "crates/ironauth-kms", version = "0.1.0" }
 ironauth-admin = { path = "crates/ironauth-admin", version = "0.1.0" }
 ironauth-oidc = { path = "crates/ironauth-oidc", version = "0.1.0" }
 ironauth-quota = { path = "crates/ironauth-quota", version = "0.1.0" }
