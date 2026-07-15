@@ -495,10 +495,10 @@ fn registry() -> Vec<Migration> {
             sql: include_str!("../migrations/0037_admin_user_lifecycle.sql"),
         },
         Migration {
-            version: 38,
+            version: 40,
             name: "user_invitations",
             phase: Phase::Expand,
-            sql: include_str!("../migrations/0038_user_invitations.sql"),
+            sql: include_str!("../migrations/0040_user_invitations.sql"),
         },
     ]
 }
