@@ -42,6 +42,7 @@
 //! `ironauth_store::Store::management` and `docs/adr/0005-management-api.md`.
 
 mod auth;
+mod config;
 mod dcr;
 mod environments;
 mod error;
@@ -87,6 +88,10 @@ pub use state::{AdminState, StateError};
 /// Each route path here is the same string as the corresponding handler's
 /// `#[utoipa::path]`; the `documented_paths_are_the_expected_set` contract test
 /// pins that documented set, so the router and the spec cannot silently diverge.
+// This is a single flat route-registration list, one `.route(...)` per endpoint;
+// it grows by one line per endpoint and reads top-to-bottom as the URL map. There
+// is no logic to extract, so the length lint is not meaningful here.
+#[allow(clippy::too_many_lines)]
 pub fn management_router(state: AdminState) -> Router {
     Router::new()
         // The operator plane: the root of the four-level resource model (issue
@@ -136,6 +141,13 @@ pub fn management_router(state: AdminState) -> Router {
         .route(
             "/v1/tenants/{tenant_id}/environments/{environment_id}/keys",
             post(keys::create_key).get(keys::list_keys),
+        )
+        // Canonical secret-free config snapshot export (issue #43): the read half
+        // of the config-promotion flagship. A static suffix, matched before the
+        // parameterized keys/organizations routes.
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/config/snapshot",
+            get(config::export_config_snapshot),
         )
         .route(
             "/v1/tenants/{tenant_id}/environments/{environment_id}/keys/{key_id}",

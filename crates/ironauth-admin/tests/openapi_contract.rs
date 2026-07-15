@@ -56,6 +56,7 @@ fn operation_ids_are_the_stable_set() {
             "deleteManagementKey",
             "deleteOrganization",
             "deleteTenant",
+            "exportConfigSnapshot",
             "getDcrClient",
             "getEnvironment",
             "getManagementKey",
@@ -191,6 +192,7 @@ fn documented_paths_are_the_expected_set() {
             "GET /v1/tenants/{tenant_id}/environments",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/clients/{client_id}",
+            "GET /v1/tenants/{tenant_id}/environments/{environment_id}/config/snapshot",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/dcr/policies",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/keys",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/keys/{key_id}",
@@ -251,7 +253,7 @@ fn committed_artifact_matches_generated_spec() {
 async fn served_routes_match_documented_routes() {
     let router = db_free_router();
     let documented = documented_method_paths();
-    assert_eq!(documented.len(), 34, "the documented route count is pinned");
+    assert_eq!(documented.len(), 35, "the documented route count is pinned");
 
     // 1. Every documented (method, path) is wired and auth-gated (401, not
     //    404/405). The unauthenticated probe rejects before any DB access.

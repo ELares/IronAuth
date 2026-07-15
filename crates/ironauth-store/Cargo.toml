@@ -42,6 +42,11 @@ sha2.workspace = true
 # the OIDC layer free of ad-hoc JSON handling for these columns. Already present
 # transitively, so no new crate enters the graph.
 serde_json.workspace = true
+# Derive the canonical snapshot document types (issue #43): the promotable-config
+# export/import shapes serialize and deserialize through serde. serde is already in
+# the tree (sqlx, serde_json, and every other crate depend on it), so this adds a
+# direct edge but no new crate; MSRV 1.85 and the musl static lane are unchanged.
+serde.workspace = true
 
 [features]
 # Default build is lean: no test-support surface. Production only ever needs the
@@ -263,6 +268,15 @@ required-features = ["testing"]
 [[test]]
 name = "tenant_lifecycle"
 path = "tests/tenant_lifecycle.rs"
+required-features = ["testing"]
+
+# The canonical secret-free config snapshot export (issue #43): a fully-populated
+# fixture environment exports byte-identically, carries no secret or key material,
+# is cross-scope isolated, and covers exactly the promotable classification. Needs
+# a real database (DATABASE_URL).
+[[test]]
+name = "config_snapshot"
+path = "tests/config_snapshot.rs"
 required-features = ["testing"]
 
 [lints]

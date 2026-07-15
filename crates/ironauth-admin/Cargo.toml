@@ -72,6 +72,14 @@ name = "pagination"
 path = "tests/pagination.rs"
 required-features = ["testing"]
 
+# Config snapshot export endpoint (issue #43): the operator and the environment's
+# own management key export a canonical secret-free snapshot; a cross-environment
+# key is refused. Needs a real database (DATABASE_URL).
+[[test]]
+name = "config_snapshot"
+path = "tests/config_snapshot.rs"
+required-features = ["testing"]
+
 # Idempotency-Key replay: a replay returns the original response and writes no
 # second audit row (verified against the audit log).
 [[test]]

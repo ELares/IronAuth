@@ -998,6 +998,7 @@ dependencies = [
  "base64",
  "ironauth-env",
  "ironauth-jose",
+ "serde",
  "serde_json",
  "sha2",
  "sqlx",
