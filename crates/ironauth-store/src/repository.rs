@@ -15892,10 +15892,13 @@ impl ActingCustomDomainRepo<'_> {
 // here because it is the one step that mutates scoped tables and must write its
 // audit trail in the SAME transaction as the changes. Everything runs in a single
 // `begin_scoped` transaction so a mid-apply failure rolls back COMPLETELY: no
-// partial promotion, ever. The target's promotable-config revision is re-derived
-// inside that transaction and checked against the plan's captured revision, so a
-// target that drifted since the plan fails cleanly and changes nothing (optimistic
-// concurrency, no tenant-wide lock).
+// partial promotion, ever. Concurrent applies to the SAME target are serialized by a
+// transaction-scoped advisory lock taken before the revision read, so the target's
+// promotable-config revision is re-derived inside that transaction and checked
+// against the plan's captured revision with no lost-update window: a target that
+// drifted since the plan (including a concurrent apply that just committed) fails
+// cleanly and changes nothing. The lock is per TARGET, not tenant-wide, so applies
+// to different environments never contend.
 // ===========================================================================
 
 impl ActingStore<'_> {
@@ -15946,6 +15949,24 @@ impl ActingStore<'_> {
         let result_revision = crate::promotion::revision(source)?;
 
         let mut tx = begin_scoped(self.store, scope).await?;
+
+        // Serialize concurrent applies to the SAME target (tenant, environment) with a
+        // TRANSACTION-scoped Postgres advisory lock, taken BEFORE the revision read so
+        // the drift gate is authoritative under concurrency. `begin_scoped` pins READ
+        // COMMITTED and the apply takes no row lock, so without this two applies sharing
+        // the same `base_revision` would both read that revision, both pass the drift
+        // gate, and both commit: a LOST UPDATE leaving the target in a state no single
+        // plan enumerated. Holding this lock, the second apply blocks until the first
+        // commits, then re-reads the NOW-CHANGED revision and correctly returns
+        // `Drift`, changing nothing. `pg_advisory_xact_lock` auto-releases at
+        // commit/rollback; the lock is per TARGET (keyed on the two scope strings,
+        // mirroring the DCR-quota path above), so applies to DIFFERENT environments
+        // still run fully concurrently.
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))")
+            .bind(scope.tenant().to_string())
+            .bind(scope.environment().to_string())
+            .execute(&mut *tx)
+            .await?;
 
         // Re-derive the target's current promotable configuration and revision
         // INSIDE the transaction, so the drift check has no TOCTOU window.

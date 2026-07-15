@@ -467,6 +467,133 @@ async fn promotion_is_scope_isolated_and_never_copies_client_identity() {
     );
 }
 
+/// Two concurrent applies to the SAME (tenant, environment) sharing one base
+/// revision must NOT both commit: the drift gate has to be authoritative under real
+/// concurrency, not merely sequentially. Against the lock-free apply this fails --
+/// both applies read the empty target's base revision, both pass the optimistic
+/// drift gate, and both commit, leaving the target with BOTH variables (a state no
+/// single plan enumerated). With the per-target advisory lock the second apply
+/// blocks until the first commits, re-reads the now-changed revision, and returns
+/// `Drift`, so EXACTLY one plan lands.
+#[tokio::test]
+async fn concurrent_applies_to_one_target_do_not_lose_an_update() {
+    // A storm of concurrent applies onto ONE empty target, each promoting a DIFFERENT
+    // single variable and all sharing the same empty-target base revision. Several
+    // racers (not just two) so the lock-free path cannot pass by luck: for it to
+    // avoid a lost update EVERY racer would have to serialize perfectly, which under a
+    // real overlap it does not.
+    const RACERS: usize = 8;
+
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let tenant = db.seed_scope(&env).await.tenant();
+    let target = Scope::new(tenant, db.seed_environment(&env, tenant).await);
+
+    // Build one distinct source snapshot per racer, each a single uniquely named
+    // variable. All plans are computed against the same empty target, so they all
+    // capture the same base revision.
+    let mut snapshots = Vec::with_capacity(RACERS);
+    let mut base_revision: Option<String> = None;
+    for index in 0..RACERS {
+        let source = Scope::new(tenant, db.seed_environment(&env, tenant).await);
+        let name = format!("var_{index}");
+        set_var(&db, &env, source, &name, "value").await;
+        let snapshot = export(&db, source).await;
+        let plan = plan_promotion(&control(&db).scoped(target), &snapshot)
+            .await
+            .expect("plan db")
+            .expect("plan builds");
+        match &base_revision {
+            None => base_revision = Some(plan.base_revision().to_owned()),
+            Some(base) => assert_eq!(
+                base,
+                plan.base_revision(),
+                "every plan must capture the same empty-target base revision"
+            ),
+        }
+        snapshots.push((name, snapshot));
+    }
+    let base_revision = base_revision.expect("at least one racer");
+
+    // Pre-warm the pool to RACERS live connections with a concurrent round of cheap
+    // reads, so the storm's overlap is governed by the applies themselves and not by
+    // one-time connection establishment serializing them.
+    let warmup: Vec<_> = (0..RACERS)
+        .map(|_| {
+            let db = db.clone();
+            tokio::spawn(async move { apply_audit_count(&db, target).await })
+        })
+        .collect();
+    for handle in warmup {
+        handle.await.expect("warmup join");
+    }
+
+    // Release every apply together so their transactions genuinely overlap on the
+    // real Postgres (each on its own pooled connection).
+    let gate = std::sync::Arc::new(tokio::sync::Barrier::new(RACERS));
+    let handles: Vec<_> = snapshots
+        .into_iter()
+        .map(|(_, snapshot)| {
+            let db = db.clone();
+            let env = env.clone();
+            let base = base_revision.clone();
+            let gate = std::sync::Arc::clone(&gate);
+            tokio::spawn(async move {
+                let (actor, corr) = acting(&db, &env);
+                gate.wait().await;
+                db.control_store()
+                    .scoped(target)
+                    .acting(actor, corr)
+                    .apply_promotion(&env, &snapshot, &base, false)
+                    .await
+            })
+        })
+        .collect();
+
+    let mut results = Vec::with_capacity(RACERS);
+    for handle in handles {
+        results.push(handle.await.expect("apply join"));
+    }
+
+    // EXACTLY one apply commits; every other is refused as drift (which one wins is a
+    // race, so accept any single winner).
+    let applied = results
+        .iter()
+        .filter(|r| matches!(r, Ok(PromotionOutcome::Applied(_))))
+        .count();
+    let drifted = results
+        .iter()
+        .filter(|r| matches!(r, Err(PromotionApplyError::Drift { .. })))
+        .count();
+    assert_eq!(
+        applied, 1,
+        "exactly one concurrent apply may commit: {results:?}"
+    );
+    assert_eq!(
+        drifted,
+        RACERS - 1,
+        "every losing concurrent apply must be refused as drift: {results:?}"
+    );
+
+    // The target carries the result of EXACTLY ONE plan, NEVER a merge of several: a
+    // lost update would leave it with more than one variable.
+    let target_after = export(&db, target).await;
+    let names: Vec<&str> = target_after
+        .resources
+        .variable
+        .iter()
+        .map(|variable| variable.name.as_str())
+        .collect();
+    assert_eq!(
+        names.len(),
+        1,
+        "the target must carry exactly one plan's result, never a merge: got {names:?}"
+    );
+
+    // Exactly one promotion was audited: every drift-refused apply wrote nothing.
+    assert_eq!(apply_audit_count(&db, target).await, 1);
+}
+
 /// A hand-built (submitted) snapshot is a first-class promotion source, exactly
 /// like an exported one.
 #[tokio::test]
