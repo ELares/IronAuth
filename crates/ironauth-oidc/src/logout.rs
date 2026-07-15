@@ -78,6 +78,7 @@ use crate::interaction::{cookie_header, forbidden_page, same_origin_ok};
 use crate::pages;
 use crate::revocation::{SessionLifecycleEvent, SessionSignalCause};
 use crate::session;
+use crate::session_mgmt::{self, FrontChannelParticipant};
 use crate::state::OidcState;
 use crate::token_credential::peek_claim;
 use crate::util::append_query;
@@ -205,12 +206,79 @@ async fn handle(
     }
 
     // The presenting browser IS the hint owner: a redirect happens ONLY on an exact
-    // registered-URI match, else the neutral logged-out page. Both clear this browser's
-    // cookie.
+    // registered-URI match, else the (front-channel or neutral) logged-out page. Both
+    // clear this browser's cookie. A post-logout redirect is the explicit RP-initiated
+    // behavior and takes precedence; front-channel logout is best-effort and yields to
+    // it (it never blocks, replaces, or reorders the authoritative paths).
     match validated_redirect(state, &attributed, params).await {
         Some(location) => logout_redirect(state, &location),
-        None => logged_out(state),
+        None => finish_logout(state, attributed.scope, target.as_ref()).await,
     }
+}
+
+/// The terminal logout page for the presenting browser once its session was ended:
+/// the OIDC Front-Channel Logout 1.0 page (hidden per-RP iframes) when the feature is
+/// enabled AND the ended session had participating RPs, else the neutral logged-out
+/// page. Either way the session cookie is cleared. Front-channel delivery is
+/// best-effort: a store error gathering participants degrades silently to the neutral
+/// page rather than failing the logout.
+async fn finish_logout(
+    state: &OidcState,
+    scope: Scope,
+    session_id: Option<&SessionId>,
+) -> Response {
+    if state.frontchannel_logout_enabled() {
+        if let Some(session_id) = session_id {
+            if let Some(mut response) = frontchannel_logout_page(state, scope, session_id).await {
+                set_clear_cookie(state, &mut response);
+                return response;
+            }
+        }
+    }
+    logged_out(state)
+}
+
+/// Build the front-channel logout page for `session_id` (issue #39), or [`None`] when
+/// no client of the session opted in (so the caller renders the neutral page).
+///
+/// Each participating RP's iframe URL carries `iss` and the RP's OWN `sid` exactly when
+/// it registered `frontchannel_logout_session_required`
+/// ([`session_mgmt::frontchannel_logout_iframe_url`]); the per-response CSP `frame-src`
+/// is EXACTLY the participating origins. A store error degrades to [`None`] (best-effort).
+async fn frontchannel_logout_page(
+    state: &OidcState,
+    scope: Scope,
+    session_id: &SessionId,
+) -> Option<Response> {
+    let participants = state
+        .store()
+        .scoped(scope)
+        .client_sessions()
+        .frontchannel_participants(session_id)
+        .await
+        .ok()?;
+    if participants.is_empty() {
+        return None;
+    }
+    let issuer = state.issuer_for(&scope);
+    let mut iframe_urls = Vec::with_capacity(participants.len());
+    let mut frame_origins = Vec::with_capacity(participants.len());
+    for participant in participants {
+        let uri = participant.frontchannel_logout_uri;
+        frame_origins.push(session_mgmt::origin_of(&uri));
+        let built = FrontChannelParticipant {
+            uri,
+            sid: participant.sid,
+            session_required: participant.session_required,
+        };
+        iframe_urls.push(session_mgmt::frontchannel_logout_iframe_url(
+            &built, &issuer,
+        ));
+    }
+    Some(pages::frontchannel_logout_response(
+        &iframe_urls,
+        &frame_origins,
+    ))
 }
 
 /// The path for a request the hint did NOT attribute (absent, malformed, unverifiable,
@@ -238,6 +306,7 @@ async fn unattributed(
     // embedded in the cookie value itself).
     if let Some(session_id) = cookie_session_declared(headers) {
         revoke_and_signal(state, session_id.scope(), &session_id).await;
+        return finish_logout(state, session_id.scope(), Some(&session_id)).await;
     }
     logged_out(state)
 }

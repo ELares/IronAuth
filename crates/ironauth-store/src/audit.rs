@@ -131,6 +131,11 @@ pub enum Action {
     /// [`Action::ClientRedirectUrisRegister`] so the two registered sets are legible
     /// apart in the audit trail.
     ClientPostLogoutRedirectUrisRegister,
+    /// A client's OIDC Front-Channel Logout 1.0 registration was set (issue #39):
+    /// its `frontchannel_logout_uri` and `frontchannel_logout_session_required`
+    /// flag, the per-client opt-in the `end_session` flow reads when the environment
+    /// feature is enabled.
+    ClientFrontchannelLogoutRegister,
     /// A client's consent mode and refresh-rotation policy were configured (issue
     /// #21): the consent mode, the skip and no-store consent knobs, and the optional
     /// per-client rotation override.
@@ -314,6 +319,7 @@ impl Action {
             Action::ClientPostLogoutRedirectUrisRegister => {
                 "client.post_logout_redirect_uris.register"
             }
+            Action::ClientFrontchannelLogoutRegister => "client.frontchannel_logout.register",
             Action::ClientConfigure => "client.configure",
             Action::ClientRegistered => "client.registered",
             Action::ClientUpdated => "client.updated",

@@ -841,6 +841,41 @@ pub struct OidcConfig {
     /// (issue #24). The default (60) is one minute. Must be at least 1 and at most
     /// `OIDC_MAX_LIFETIME_SECS`.
     pub device_verification_rate_window_secs: u64,
+
+    /// Enable OIDC Session Management 1.0 for this environment (issue #39). The
+    /// SAFE default (`false`) leaves it OFF: no `check_session_iframe` is mounted,
+    /// discovery omits `check_session_iframe`, and no `session_state` is emitted on
+    /// authorization responses. When `true`, the OP serves the
+    /// `check_session_iframe` (framable cross-origin by design, the one page exempt
+    /// from the platform anti-clickjacking posture) and every authorization
+    /// response for a participating client carries `session_state`. This mechanism
+    /// is functionally degraded under 2026 third-party-cookie partitioning (OIDC
+    /// Session Management 1.0 section 5.1 warns a blocked poll can loop
+    /// re-authentication); it ships ONLY for certification completeness, never as a
+    /// recommended mechanism, and integrators are steered to back-channel logout.
+    /// Enabling it requires BOTH this environment flag AND per-client opt-in, so it
+    /// can never turn on globally by accident. This is a promotable per-environment
+    /// setting in spirit; the process value is the deployment default until
+    /// per-environment overrides ride the M5 promotion pipeline.
+    pub session_management_enabled: bool,
+
+    /// Enable OIDC Front-Channel Logout 1.0 for this environment (issue #39). The
+    /// SAFE default (`false`) leaves it OFF: discovery omits
+    /// `frontchannel_logout_supported` and `frontchannel_logout_session_supported`,
+    /// and RP-initiated logout renders no front-channel iframes. When `true`, the
+    /// `end_session` flow renders a page embedding a hidden iframe per participating
+    /// RP that registered a `frontchannel_logout_uri`, passing `iss` and the RP's
+    /// OWN per-(client, session) `sid` when it registered
+    /// `frontchannel_logout_session_required`. Front-channel delivery is best-effort
+    /// by construction: it never blocks, replaces, or reorders the authoritative
+    /// back-channel logout path. Like Session Management, this iframe mechanism is
+    /// degraded under third-party-cookie partitioning and ships ONLY for
+    /// certification completeness. Enabling it requires BOTH this environment flag
+    /// AND per-client opt-in (a registered `frontchannel_logout_uri`), so it can
+    /// never turn on globally by accident. This is a promotable per-environment
+    /// setting in spirit; the process value is the deployment default until
+    /// per-environment overrides ride the M5 promotion pipeline.
+    pub frontchannel_logout_enabled: bool,
 }
 
 impl Default for OidcConfig {
@@ -890,6 +925,8 @@ impl Default for OidcConfig {
             device_user_code_max_attempts: 5,
             device_verification_rate_limit: 10,
             device_verification_rate_window_secs: 60,
+            session_management_enabled: false,
+            frontchannel_logout_enabled: false,
         }
     }
 }

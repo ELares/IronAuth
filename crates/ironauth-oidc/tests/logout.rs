@@ -24,6 +24,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use common::{
     Harness, PKCE_CHALLENGE, PKCE_VERIFIER, REDIRECT_URI, enc, form, json, location, location_param,
 };
+use ironauth_config::OidcConfig;
 use ironauth_oidc::SESSION_COOKIE;
 use ironauth_store::{
     AuthorizationCodeId, ClientId, CorrelationId, GrantId, IssueCode, NewRefreshFamily, NewSession,
@@ -365,6 +366,152 @@ async fn a_same_origin_confirmation_post_ends_the_session() {
     assert!(
         !session_still_authenticates(&harness, &cookie).await,
         "a confirmed logout ends the session"
+    );
+}
+
+/// Start a harness with Front-Channel Logout 1.0 enabled (issue #39). `enabled: true`
+/// keeps the OIDC provider mounted; the front-channel flag arms the feature.
+async fn frontchannel_harness() -> Harness {
+    Harness::start_with(OidcConfig {
+        enabled: true,
+        frontchannel_logout_enabled: true,
+        ..OidcConfig::default()
+    })
+    .await
+}
+
+#[tokio::test]
+async fn check_session_iframe_is_mounted_and_framable_only_when_enabled() {
+    // Issue #39: with session management OFF (the default) the check_session_iframe is
+    // NOT mounted (a uniform 404). With it enabled the iframe is served with the
+    // deliberate framing carve-out: no X-Frame-Options, and a CSP that does not deny
+    // framing, so an RP can embed it cross-origin.
+    let off = Harness::start().await;
+    let (status, _headers, _body) = off.get_with_cookie("/connect/check_session", None).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "check_session_iframe is unmounted by default"
+    );
+
+    let on = Harness::start_with(OidcConfig {
+        enabled: true,
+        session_management_enabled: true,
+        ..OidcConfig::default()
+    })
+    .await;
+    let (status, headers, body) = on.get_with_cookie("/connect/check_session", None).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "check_session_iframe served: {body}"
+    );
+    assert!(
+        headers.get(header::X_FRAME_OPTIONS).is_none(),
+        "the iframe must be framable: no X-Frame-Options"
+    );
+    let csp = headers
+        .get(header::CONTENT_SECURITY_POLICY)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+    assert!(
+        !csp.contains("frame-ancestors"),
+        "the carve-out must not deny framing: {csp}"
+    );
+    assert!(
+        body.contains("addEventListener") && body.contains("check_session"),
+        "serves the session-management iframe: {body}"
+    );
+}
+
+#[tokio::test]
+async fn frontchannel_logout_renders_the_rp_iframe_with_iss_and_own_sid() {
+    // Issue #39: with the feature enabled and the client opted in with
+    // frontchannel_logout_session_required, a confirmed logout renders the
+    // front-channel logout page with a hidden iframe pointing at the RP's registered
+    // frontchannel_logout_uri, carrying iss and the RP's OWN sid.
+    let harness = frontchannel_harness().await;
+    let client_id = harness.client_id().to_string();
+    let (_session_id, cookie) = seeded_session(&harness).await;
+    // Minting an id token creates the per-(client, session) sid the front-channel
+    // iframe will carry.
+    let hint = mint_id_token(&harness, &client_id, &cookie).await;
+    let sid = {
+        let segment = hint.split('.').nth(1).expect("payload");
+        let bytes = URL_SAFE_NO_PAD.decode(segment).expect("b64");
+        let claims: Value = serde_json::from_slice(&bytes).expect("claims");
+        claims["sid"].as_str().expect("sid").to_owned()
+    };
+    harness
+        .register_frontchannel_logout(
+            harness.client_id(),
+            Some("https://rp.test/frontchannel"),
+            true,
+        )
+        .await;
+
+    // A same-origin confirmation POST ends the session and renders the front-channel
+    // page.
+    let (status, headers, body) = post_end_session(
+        &harness,
+        "",
+        Some(&cookie),
+        Some(SELF_ORIGIN),
+        Some("same-origin"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "front-channel logout page: {body}");
+    assert_cookie_cleared(&headers);
+    // Exactly one RP iframe, carrying the registered URI, iss, and the RP's OWN sid.
+    assert!(
+        body.contains("<iframe") && body.contains("https://rp.test/frontchannel"),
+        "renders the RP logout iframe: {body}"
+    );
+    assert!(body.contains("iss="), "the iframe carries iss: {body}");
+    assert!(
+        body.contains(&format!("sid={sid}")),
+        "the iframe carries the RP's OWN sid: {body}"
+    );
+    // The page keeps its anti-clickjacking posture and scopes frame-src to the RP.
+    let csp = headers
+        .get(header::CONTENT_SECURITY_POLICY)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+    assert!(csp.contains("frame-ancestors 'none'"), "csp: {csp}");
+    assert!(csp.contains("frame-src https://rp.test"), "csp: {csp}");
+    assert_eq!(headers.get(header::X_FRAME_OPTIONS).unwrap(), "DENY");
+}
+
+#[tokio::test]
+async fn frontchannel_logout_off_by_default_renders_the_neutral_page() {
+    // Issue #39: with the feature DISABLED (the default) a confirmed logout renders the
+    // plain logged-out page even when a client registered a frontchannel_logout_uri:
+    // the environment flag must also be on. No iframe is emitted.
+    let harness = Harness::start().await;
+    let client_id = harness.client_id().to_string();
+    let (_session_id, cookie) = seeded_session(&harness).await;
+    let _hint = mint_id_token(&harness, &client_id, &cookie).await;
+    harness
+        .register_frontchannel_logout(
+            harness.client_id(),
+            Some("https://rp.test/frontchannel"),
+            true,
+        )
+        .await;
+
+    let (status, headers, body) = post_end_session(
+        &harness,
+        "",
+        Some(&cookie),
+        Some(SELF_ORIGIN),
+        Some("same-origin"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "neutral page: {body}");
+    assert_cookie_cleared(&headers);
+    assert!(
+        !body.contains("<iframe"),
+        "no front-channel iframe when the feature is off: {body}"
     );
 }
 

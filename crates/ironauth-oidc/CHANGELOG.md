@@ -6,6 +6,32 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Session Management 1.0 and Front-Channel Logout 1.0, behind default-off flags for
+  certification completeness (issue #39). Both iframe mechanisms are degraded under
+  third-party-cookie partitioning (Session Management 1.0 section 5.1), so they ship
+  opt-in and honestly documented; see `docs/design/IFRAME-LOGOUT-CAVEAT.md`.
+  - **`session_state` (`session_mgmt.rs`).** A one-way keyed digest of the client id,
+    the RP origin, and the OP browser state, where the OP browser state is itself a
+    one-way digest of the session id: `session_state` NEVER carries the session id. It
+    is stable per (client, origin, session, salt) and changes when the session changes.
+    Emitted on authorization responses (a new `session_state` slot in
+    `response::success_params`) ONLY when `oidc.session_management_enabled` is set.
+  - **`check_session_iframe`.** Served at `/connect/check_session`, mounted and
+    advertised in discovery ONLY when session management is enabled. It is the ONE page
+    served with a framing carve-out (no `X-Frame-Options`, no `frame-ancestors 'none'`)
+    so an RP can embed it cross-origin; its inline script is SHA-256 hash-pinned by CSP
+    and replies ONLY to the sender's exact `postMessage` origin (never `*`), folding
+    that origin into the recomputed value.
+  - **Front-Channel Logout.** When `oidc.frontchannel_logout_enabled` is set, the
+    `end_session` flow renders a page embedding one hidden iframe per participating RP
+    (`pages::frontchannel_logout_response`), each carrying `iss` and the RP's OWN `sid`
+    when it registered `frontchannel_logout_session_required`. The page keeps its
+    anti-clickjacking posture and scopes `frame-src` to exactly the participating RP
+    origins. A post-logout redirect still takes precedence; front-channel delivery is
+    best-effort and never blocks or reorders back-channel logout.
+  - **Discovery.** `check_session_iframe`, `frontchannel_logout_supported`, and
+    `frontchannel_logout_session_supported` are advertised only when their feature is
+    enabled, and truthfully; with the flags off the document is unchanged.
 - RP-Initiated Logout: the `end_session` endpoint (OIDC RP-Initiated Logout 1.0, issue
   #33). A top-level browser navigation that ends the OP session and, only when it is
   cryptographically attributable, redirects back to the relying party.

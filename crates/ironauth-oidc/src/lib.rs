@@ -101,6 +101,7 @@ mod revocation;
 mod scope_claims;
 mod sector;
 mod session;
+mod session_mgmt;
 mod state;
 mod subject;
 mod token;
@@ -257,6 +258,16 @@ pub fn oidc_router(state: OidcState) -> Router {
                     .put(client_registration::update)
                     .delete(client_registration::delete),
             );
+    }
+
+    // OIDC Session Management 1.0 check_session_iframe (issue #39), mounted ONLY when
+    // session management is enabled for this deployment (default off). It is the ONE
+    // page deliberately framable cross-origin (an RP embeds it), so it is served with a
+    // framing carve-out; with the flag off it is never mounted and discovery omits
+    // check_session_iframe. The route literal is unconditional here so the RFC 9700
+    // endpoint-inventory lint sees it.
+    if state.session_management_enabled() {
+        router = router.route("/connect/check_session", get(session_mgmt::check_session));
     }
 
     // Global Token Revocation receiver (issue #36), mounted ONLY when the experimental

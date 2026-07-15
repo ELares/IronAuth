@@ -47,6 +47,7 @@ use crate::registry::{PkceMethod, PromptSet, PromptValue, ResponseMode, Response
 use crate::resource;
 use crate::response;
 use crate::scope_claims::{assemble_claims, parse_scope_set};
+use crate::session_mgmt;
 use crate::state::{OidcState, ResourceTargetError};
 use crate::token_hash;
 use crate::tokens::{self, MintRequest};
@@ -668,7 +669,28 @@ async fn issue_code(
         None
     };
 
-    let params = response::success_params(code.as_deref(), id_token.as_deref(), state_echo, &iss);
+    // OIDC Session Management 1.0 (issue #39): emit session_state ONLY when session
+    // management is enabled for this deployment. It is a one-way keyed digest of the
+    // client, the RP origin, and the session (never the session id itself), so the RP
+    // can seed its check_session_iframe poll. Off by default: the parameter is absent
+    // and the response is byte-identical to before the feature.
+    let session_state_value = state.session_management_enabled().then(|| {
+        session_mgmt::authorization_session_state(
+            state,
+            &iss,
+            &client_id.to_string(),
+            redirect_uri,
+            &session_ref,
+        )
+    });
+
+    let params = response::success_params(
+        code.as_deref(),
+        id_token.as_deref(),
+        state_echo,
+        &iss,
+        session_state_value.as_deref(),
+    );
     Ok(response::render(mode, redirect_uri, &params))
 }
 

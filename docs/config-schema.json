@@ -255,6 +255,11 @@
           "description": "Whether to mount the public OIDC endpoints (`/authorize`, `/token`). Off\nby default so the default boot serves only the skeleton and needs no\ndatabase. When on, the provider connects the data-plane store using\n`database.url`.",
           "type": "boolean"
         },
+        "frontchannel_logout_enabled": {
+          "default": false,
+          "description": "Enable OIDC Front-Channel Logout 1.0 for this environment (issue #39). The\nSAFE default (`false`) leaves it OFF: discovery omits\n`frontchannel_logout_supported` and `frontchannel_logout_session_supported`,\nand RP-initiated logout renders no front-channel iframes. When `true`, the\n`end_session` flow renders a page embedding a hidden iframe per participating\nRP that registered a `frontchannel_logout_uri`, passing `iss` and the RP's\nOWN per-(client, session) `sid` when it registered\n`frontchannel_logout_session_required`. Front-channel delivery is best-effort\nby construction: it never blocks, replaces, or reorders the authoritative\nback-channel logout path. Like Session Management, this iframe mechanism is\ndegraded under third-party-cookie partitioning and ships ONLY for\ncertification completeness. Enabling it requires BOTH this environment flag\nAND per-client opt-in (a registered `frontchannel_logout_uri`), so it can\nnever turn on globally by accident. This is a promotable per-environment\nsetting in spirit; the process value is the deployment default until\nper-environment overrides ride the M5 promotion pipeline.",
+          "type": "boolean"
+        },
         "global_token_revocation_hard_kill": {
           "default": false,
           "description": "Whether the Global Token Revocation receiver (issue #36) HARD-KILLS the\nsubject's `offline_access` refresh families too, not only the session-bound\nones. This has effect ONLY when the experimental `global-token-revocation`\nfeature is enabled (the endpoint is otherwise unmounted). The SAFE default\n(`false`) matches the platform-wide revoke-everything semantic: offline\n(consented long-lived) grants survive a revoke unless a hard kill is asked for\n(issue #21/#32), so a routine global revoke does not silently strip a user's\nstanding offline authorizations. Set it to `true` for an account-takeover\nposture, where a global revoke must terminate absolutely everything the subject\nholds, offline grants included, so every already-issued token dies at once.",
@@ -392,6 +397,11 @@
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
+        },
+        "session_management_enabled": {
+          "default": false,
+          "description": "Enable OIDC Session Management 1.0 for this environment (issue #39). The\nSAFE default (`false`) leaves it OFF: no `check_session_iframe` is mounted,\ndiscovery omits `check_session_iframe`, and no `session_state` is emitted on\nauthorization responses. When `true`, the OP serves the\n`check_session_iframe` (framable cross-origin by design, the one page exempt\nfrom the platform anti-clickjacking posture) and every authorization\nresponse for a participating client carries `session_state`. This mechanism\nis functionally degraded under 2026 third-party-cookie partitioning (OIDC\nSession Management 1.0 section 5.1 warns a blocked poll can loop\nre-authentication); it ships ONLY for certification completeness, never as a\nrecommended mechanism, and integrators are steered to back-channel logout.\nEnabling it requires BOTH this environment flag AND per-client opt-in, so it\ncan never turn on globally by accident. This is a promotable per-environment\nsetting in spirit; the process value is the deployment default until\nper-environment overrides ride the M5 promotion pipeline.",
+          "type": "boolean"
         },
         "session_partitioned_cookie": {
           "default": false,
@@ -619,6 +629,7 @@
         "enable_response_type_id_token": false,
         "enable_response_type_none": false,
         "enabled": false,
+        "frontchannel_logout_enabled": false,
         "global_token_revocation_hard_kill": false,
         "issue_refresh_tokens": true,
         "jwks_cache_max_age_secs": 600,
@@ -641,6 +652,7 @@
         "reuse_grace_secs": 10,
         "session_device_binding": false,
         "session_idle_ttl_secs": 3600,
+        "session_management_enabled": false,
         "session_partitioned_cookie": false,
         "session_peer_ip_binding": false,
         "session_ttl_secs": 3600,

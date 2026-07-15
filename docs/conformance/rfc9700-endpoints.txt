@@ -9,6 +9,7 @@
 /.well-known/oauth-authorization-server/t/{tenant_id}/e/{environment_id}
 /.well-known/openid-configuration/t/{tenant_id}/e/{environment_id}
 /authorize
+/connect/check_session
 /consent
 /device_authorization
 /end_session

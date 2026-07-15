@@ -147,6 +147,14 @@ struct Inner {
     // whose real gating (quotas, quarantine, initial-access-token policy) is owned
     // by issue #31; this flag is the plain on/off switch #31 layers policy onto.
     registration_enabled: bool,
+    // OIDC Session Management 1.0 and Front-Channel Logout 1.0 (issue #39). Both
+    // default OFF: these iframe mechanisms are degraded under third-party-cookie
+    // partitioning and ship ONLY for certification completeness. When on, session
+    // management mounts the check_session_iframe and emits session_state; front-channel
+    // logout renders per-RP hidden logout iframes during end_session. Each still
+    // requires a per-client opt-in, so neither turns on globally by accident.
+    session_management_enabled: bool,
+    frontchannel_logout_enabled: bool,
     // The DCR abuse controls (issue #31): the exposure switch (closed / token_gated
     // / open), the per-environment registered-client quota, and the endpoint-local
     // rate limit (max registrations per source or IAT per window). Safe defaults:
@@ -284,6 +292,8 @@ impl OidcState {
                 enable_response_type_none: config.enable_response_type_none,
                 enable_response_mode_form_post: config.enable_response_mode_form_post,
                 registration_enabled: config.registration_enabled,
+                session_management_enabled: config.session_management_enabled,
+                frontchannel_logout_enabled: config.frontchannel_logout_enabled,
                 registration_mode: config.registration_mode,
                 registration_max_clients: config.registration_max_clients,
                 registration_rate_limit: config.registration_rate_limit,
@@ -815,6 +825,27 @@ impl OidcState {
     #[must_use]
     pub fn registration_enabled(&self) -> bool {
         self.inner.registration_enabled
+    }
+
+    /// Whether OIDC Session Management 1.0 is enabled for this deployment (issue #39).
+    /// Default OFF: only when set does [`crate::oidc_router`] mount the
+    /// `check_session_iframe`, discovery advertise `check_session_iframe`, and the
+    /// authorization response carry `session_state`. Still requires a per-client
+    /// opt-in, so it can never turn on globally by accident.
+    #[must_use]
+    pub fn session_management_enabled(&self) -> bool {
+        self.inner.session_management_enabled
+    }
+
+    /// Whether OIDC Front-Channel Logout 1.0 is enabled for this deployment (issue
+    /// #39). Default OFF: only when set does discovery advertise
+    /// `frontchannel_logout_supported`/`_session_supported` and the `end_session` flow
+    /// render per-RP hidden logout iframes. Still requires a per-client opt-in (a
+    /// registered `frontchannel_logout_uri`), so it can never turn on globally by
+    /// accident.
+    #[must_use]
+    pub fn frontchannel_logout_enabled(&self) -> bool {
+        self.inner.frontchannel_logout_enabled
     }
 
     /// The Dynamic Client Registration exposure switch for this environment (issue

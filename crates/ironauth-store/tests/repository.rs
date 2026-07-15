@@ -389,3 +389,84 @@ async fn post_logout_redirect_uris_register_read_and_validate() {
         Err(StoreError::NotFound)
     ));
 }
+
+#[tokio::test]
+async fn frontchannel_logout_register_read_and_validate() {
+    // Front-Channel Logout (issue #39): a client's frontchannel_logout_uri and
+    // session_required flag are the per-client opt-in the end_session flow reads.
+    // Default absent, registered as one https URI, https-validated, clearable, and
+    // scope-fenced.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let reader = db.store().scoped(scope).clients();
+    let writer = || {
+        db.store()
+            .scoped(scope)
+            .acting(db.test_actor(&env), CorrelationId::generate(&env))
+            .clients()
+    };
+
+    let id = writer()
+        .create(&env, "frontchannel client")
+        .await
+        .expect("create");
+
+    // Default: a fresh client has registered no front-channel logout URI, and its
+    // session_required flag is false.
+    let record = reader.get(&id).await.expect("get");
+    assert_eq!(record.frontchannel_logout_uri, None);
+    assert!(!record.frontchannel_logout_session_required);
+
+    // Register a URI with session_required; it reads back verbatim.
+    writer()
+        .register_frontchannel_logout(&env, &id, Some("https://rp.test/frontchannel"), true)
+        .await
+        .expect("register frontchannel logout");
+    let record = reader.get(&id).await.expect("get");
+    assert_eq!(
+        record.frontchannel_logout_uri.as_deref(),
+        Some("https://rp.test/frontchannel")
+    );
+    assert!(record.frontchannel_logout_session_required);
+
+    // A non-https URI rejects the registration; the prior value is untouched.
+    assert!(matches!(
+        writer()
+            .register_frontchannel_logout(&env, &id, Some("http://rp.test/insecure"), false)
+            .await,
+        Err(StoreError::InvalidRedirectUri)
+    ));
+    let record = reader.get(&id).await.expect("get");
+    assert_eq!(
+        record.frontchannel_logout_uri.as_deref(),
+        Some("https://rp.test/frontchannel"),
+        "a rejected registration leaves the prior value untouched"
+    );
+
+    // Passing None clears the registration wholesale.
+    writer()
+        .register_frontchannel_logout(&env, &id, None, false)
+        .await
+        .expect("clear frontchannel logout");
+    let record = reader.get(&id).await.expect("get");
+    assert_eq!(record.frontchannel_logout_uri, None);
+    assert!(!record.frontchannel_logout_session_required);
+
+    // A client id from another scope is the uniform not-found.
+    let other_scope = db.seed_scope(&env).await;
+    let foreign = db
+        .store()
+        .scoped(other_scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .clients()
+        .create(&env, "other-tenant client")
+        .await
+        .expect("create foreign");
+    assert!(matches!(
+        writer()
+            .register_frontchannel_logout(&env, &foreign, Some("https://rp.test/x"), false)
+            .await,
+        Err(StoreError::NotFound)
+    ));
+}

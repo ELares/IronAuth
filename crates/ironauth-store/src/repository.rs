@@ -613,6 +613,17 @@ pub struct ClientRecord {
     /// Empty for a client that registered none (which therefore never gets a
     /// post-logout redirect; the logout renders a neutral logged-out page instead).
     pub post_logout_redirect_uris: Vec<String>,
+    /// The client's registered OIDC Front-Channel Logout 1.0 URI (issue #39): the
+    /// endpoint the OP loads in a hidden iframe during logout so the RP clears its
+    /// own session. [`None`] means the client did NOT opt in and participates in no
+    /// front-channel logout (the per-client half of the two-part gate; the
+    /// environment `frontchannel_logout_enabled` flag is the other).
+    pub frontchannel_logout_uri: Option<String>,
+    /// Whether the OP MUST append `iss` and this client's OWN per-(client, session)
+    /// `sid` to its `frontchannel_logout_uri` (issue #39, OIDC Front-Channel Logout
+    /// 1.0 `frontchannel_logout_session_required`). `false` (the default) appends
+    /// neither. It never carries another client's `sid`.
+    pub frontchannel_logout_session_required: bool,
     /// The client's consent mode (issue #21): the stored `consent_mode` string
     /// (`explicit`, `implicit`, or `remembered`). Drives whether the authorization
     /// endpoint prompts for consent, skips it (first-party), or honors a remembered
@@ -637,6 +648,23 @@ pub struct ClientRecord {
     /// shown) and RESTRICTS its effective redirect-URI set to the https subset,
     /// until an admin verifies it. Defaults to false for every non-DCR client.
     pub quarantined: bool,
+}
+
+/// One relying party that participates in a front-channel logout for a given SSO
+/// session (issue #39): the join of a live `client_sessions` row to its `clients` row
+/// where the client registered a `frontchannel_logout_uri`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FrontchannelLogoutParticipant {
+    /// The client's registered `frontchannel_logout_uri` (an `https` URL): the endpoint
+    /// the OP loads in a hidden iframe on logout.
+    pub frontchannel_logout_uri: String,
+    /// Whether `iss` and this client's OWN `sid` must be appended
+    /// (`frontchannel_logout_session_required`).
+    pub session_required: bool,
+    /// The client's OWN per-(client, session) `sid` for the session being ended. It is
+    /// this client's row's `sid`, so a participant only ever learns its own `sid`, never
+    /// another client's.
+    pub sid: String,
 }
 
 /// A client's RFC 8707 resource-indicator policy, read within scope (issue #28).
@@ -941,7 +969,9 @@ impl ClientRepo<'_> {
         let mut tx = begin_scoped(self.store, self.scope).await?;
         let row = sqlx::query(
             "SELECT id, display_name, require_auth_time, token_endpoint_auth_method, \
-             redirect_uris, post_logout_redirect_uris, consent_mode, skip_consent, \
+             redirect_uris, post_logout_redirect_uris, \
+             frontchannel_logout_uri, frontchannel_logout_session_required, \
+             consent_mode, skip_consent, \
              store_skipped_consent, \
              require_pushed_authorization_requests, quarantined FROM clients \
              WHERE id = $1 AND tenant_id = $2 AND environment_id = $3",
@@ -965,7 +995,9 @@ impl ClientRepo<'_> {
         let mut tx = begin_scoped(self.store, self.scope).await?;
         let rows = sqlx::query(
             "SELECT id, display_name, require_auth_time, token_endpoint_auth_method, \
-             redirect_uris, post_logout_redirect_uris, consent_mode, skip_consent, \
+             redirect_uris, post_logout_redirect_uris, \
+             frontchannel_logout_uri, frontchannel_logout_session_required, \
+             consent_mode, skip_consent, \
              store_skipped_consent, \
              require_pushed_authorization_requests, quarantined FROM clients \
              WHERE tenant_id = $1 AND environment_id = $2 ORDER BY created_at, id",
@@ -1226,6 +1258,8 @@ impl ClientRepo<'_> {
             auth_method: row.get("token_endpoint_auth_method"),
             redirect_uris: row.get("redirect_uris"),
             post_logout_redirect_uris: row.get("post_logout_redirect_uris"),
+            frontchannel_logout_uri: row.get("frontchannel_logout_uri"),
+            frontchannel_logout_session_required: row.get("frontchannel_logout_session_required"),
             consent_mode: row.get("consent_mode"),
             skip_consent: row.get("skip_consent"),
             store_skipped_consent: row.get("store_skipped_consent"),
@@ -1653,6 +1687,85 @@ impl ActingClientRepo<'_> {
                      WHERE id = $2 AND tenant_id = $3 AND environment_id = $4",
                 )
                 .bind(&owned)
+                .bind(id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .execute(&mut **tx)
+                .await?;
+                // A no-op update (nothing in scope matched) is a uniform not-found;
+                // erroring here short-circuits before the audit insert, so it leaves
+                // no audit row (we audit real mutations only).
+                if result.rows_affected() == 0 {
+                    return Err(StoreError::NotFound);
+                }
+                Ok(())
+            },
+            false,
+        )
+        .await
+    }
+
+    /// Register a client's OIDC Front-Channel Logout 1.0 opt-in (issue #39): its
+    /// `frontchannel_logout_uri` (the endpoint the OP loads in a hidden iframe on
+    /// logout so the RP clears its own session) and whether `iss` and the RP's OWN
+    /// per-(client, session) `sid` must be appended
+    /// (`frontchannel_logout_session_required`). Passing `uri = None` CLEARS the
+    /// registration (the client then participates in no front-channel logout).
+    ///
+    /// A `Some` URI MUST be an `https` URL: OIDC Front-Channel Logout 1.0 requires it,
+    /// and the value is loaded cross-origin in the end user's browser. It is validated
+    /// BEFORE anything is written, so a non-`https` scheme is rejected at registration
+    /// time and never enters the row. On success a
+    /// `client.frontchannel_logout.register` audit row is written in the same
+    /// transaction.
+    ///
+    /// This is the per-client half of the two-part gate; the environment
+    /// `frontchannel_logout_enabled` flag is the other. With NO registered URI, the
+    /// `end_session` flow never sends this client a front-channel iframe, even where
+    /// the environment feature is enabled.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::InvalidRedirectUri`] if `uri` is `Some` and not an `https` URL
+    /// (nothing is written); [`StoreError::NotFound`] if no such client is visible in
+    /// this scope; [`StoreError::Database`] on a persistence failure.
+    pub async fn register_frontchannel_logout(
+        &self,
+        env: &Env,
+        id: &ClientId,
+        uri: Option<&str>,
+        session_required: bool,
+    ) -> Result<(), StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        // A registered front-channel logout URI MUST be https (OIDC Front-Channel
+        // Logout 1.0 section 2): it is loaded cross-origin in the end user's browser,
+        // so a plaintext or non-http scheme is refused before anything is written.
+        if let Some(uri) = uri {
+            if !uri.starts_with("https://") {
+                return Err(StoreError::InvalidRedirectUri);
+            }
+        }
+        let owned_uri: Option<String> = uri.map(str::to_owned);
+        let scope = self.scope;
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::ClientFrontchannelLogoutRegister,
+                target: id,
+            },
+            async move |tx| {
+                let result = sqlx::query(
+                    "UPDATE clients SET frontchannel_logout_uri = $1, \
+                     frontchannel_logout_session_required = $2 \
+                     WHERE id = $3 AND tenant_id = $4 AND environment_id = $5",
+                )
+                .bind(owned_uri.as_deref())
+                .bind(session_required)
                 .bind(id.to_string())
                 .bind(scope.tenant().to_string())
                 .bind(scope.environment().to_string())
@@ -8792,6 +8905,57 @@ impl ClientSessionRepo<'_> {
         };
         let session_text: String = row.get("session_id");
         Ok(SessionId::parse_in_scope(&session_text, &scope).ok())
+    }
+
+    /// The relying parties that participate in a front-channel logout for `session_id`
+    /// (issue #39): every per-client session of this SSO session whose client registered
+    /// a `frontchannel_logout_uri`, joined to that client's registration. Each row
+    /// carries the client's OWN `sid`, so the caller can build a per-RP logout iframe URL
+    /// that only ever carries that RP's own `sid` (never a co-scoped client's).
+    ///
+    /// The result is empty for a session with no participating clients (the common case,
+    /// and always when no client opted in), so the caller renders no front-channel
+    /// iframes. Ordered by `sid` for a deterministic page.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if `session_id` is out of this scope;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn frontchannel_participants(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Vec<FrontchannelLogoutParticipant>, StoreError> {
+        if session_id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let mut tx = begin_scoped(self.store, scope).await?;
+        let rows = sqlx::query(
+            "SELECT c.frontchannel_logout_uri AS uri, \
+             c.frontchannel_logout_session_required AS session_required, cs.sid AS sid \
+             FROM client_sessions cs \
+             JOIN clients c \
+               ON c.id = cs.client_id \
+              AND c.tenant_id = cs.tenant_id \
+              AND c.environment_id = cs.environment_id \
+             WHERE cs.session_id = $1 AND cs.tenant_id = $2 AND cs.environment_id = $3 \
+               AND c.frontchannel_logout_uri IS NOT NULL \
+             ORDER BY cs.sid",
+        )
+        .bind(session_id.to_string())
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(rows
+            .iter()
+            .map(|row| FrontchannelLogoutParticipant {
+                frontchannel_logout_uri: row.get("uri"),
+                session_required: row.get("session_required"),
+                sid: row.get("sid"),
+            })
+            .collect())
     }
 
     /// Count the per-client session rows in scope (issue #32). A test uses it to prove a

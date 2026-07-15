@@ -1184,6 +1184,24 @@ impl Harness {
             .expect("register post-logout redirect uris");
     }
 
+    /// Register a client's OIDC Front-Channel Logout 1.0 opt-in (issue #39): its
+    /// `frontchannel_logout_uri` and whether `iss`/`sid` must be appended.
+    pub async fn register_frontchannel_logout(
+        &self,
+        client_id: &ClientId,
+        uri: Option<&str>,
+        session_required: bool,
+    ) {
+        let (actor, corr) = self.seeding_actor();
+        self.store()
+            .scoped(self.scope)
+            .acting(actor, corr)
+            .clients()
+            .register_frontchannel_logout(&self.env, client_id, uri, session_required)
+            .await
+            .expect("register frontchannel logout");
+    }
+
     /// Register the harness redirect URI for `client_id`, so the authorization
     /// endpoint's exact-string redirect match (issue #13) accepts it.
     pub async fn register_default_redirect(&self, client_id: &ClientId) {
