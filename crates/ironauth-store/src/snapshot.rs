@@ -552,7 +552,11 @@ const FORBIDDEN_SECRET_KEYS: [&str; 5] = [
 /// The private JWK parameters that must never appear in a snapshot: a `jwks`
 /// carrying any of these holds a PRIVATE key, not a public verification key
 /// (issue #43). Covers the RSA/EC private components and the symmetric key.
-const PRIVATE_JWK_PARAMS: [&str; 7] = ["d", "p", "q", "dp", "dq", "qi", "k"];
+// Every RFC 7518 private JWK parameter. `oth` is the multi-prime RSA array of
+// additional {r, d, t} factors (RFC 7518 6.3.2.7): `r` is a prime factor of the
+// modulus and is as secret as `p`/`q`, so the whole `oth` array is stripped on
+// export and rejected on import (the array's nested `d`/`t` go with it).
+const PRIVATE_JWK_PARAMS: [&str; 8] = ["d", "p", "q", "dp", "dq", "qi", "k", "oth"];
 
 /// Validate a snapshot document against the published format, enumerating EVERY
 /// violation with its JSON Pointer path, WITHOUT applying anything (issue #43).
@@ -1081,6 +1085,19 @@ mod tests {
             violations.iter().any(|v| v.path.ends_with("/d")),
             "a private JWK parameter must be rejected: {violations:?}"
         );
+
+        // A multi-prime RSA `oth` array carries prime factors and CRT coefficients
+        // (RFC 7518 6.3.2.7) and is just as private as d/p/q; the import validator
+        // must reject it too (the same shared definition of private the export strips).
+        let oth = r#"{"keys":[{"kty":"RSA","n":"abc","e":"AQAB","oth":[{"r":"PRIME","d":"X","t":"CRT"}]}]}"#;
+        let oth_doc = format!(
+            r#"{{"schema_version":"{SNAPSHOT_SCHEMA_VERSION}","resources":{{"client":[{{"client_id":"cli_x","display_name":"X","token_endpoint_auth_method":"private_key_jwt","redirect_uris":[],"post_logout_redirect_uris":[],"frontchannel_logout_session_required":false,"consent_mode":"explicit","skip_consent":false,"store_skipped_consent":false,"require_pushed_authorization_requests":false,"require_auth_time":false,"jwks":{oth:?}}}]}}}}"#
+        );
+        let oth_violations = validate_document(oth_doc.as_bytes()).expect_err("rejected");
+        assert!(
+            oth_violations.iter().any(|v| v.path.ends_with("/oth")),
+            "a multi-prime RSA oth array must be rejected: {oth_violations:?}"
+        );
     }
 
     #[test]
@@ -1125,10 +1142,13 @@ mod tests {
         // key (d) alongside their public halves. The stored `jwks` column can hold
         // exactly this: `jose`'s trusted-key parse ignores private members, so a
         // private-bearing set is accepted and persisted verbatim.
+        // The RSA key also carries `oth` (RFC 7518 6.3.2.7 multi-prime): each entry's
+        // `r` is an additional PRIME FACTOR of the modulus and is as secret as p/q.
         let private = r#"{"keys":[
             {"kty":"RSA","kid":"r1","use":"sig","alg":"RS256","n":"PUB-N","e":"AQAB",
              "d":"RSA-D-SECRET","p":"RSA-P-SECRET","q":"RSA-Q-SECRET",
-             "dp":"RSA-DP-SECRET","dq":"RSA-DQ-SECRET","qi":"RSA-QI-SECRET"},
+             "dp":"RSA-DP-SECRET","dq":"RSA-DQ-SECRET","qi":"RSA-QI-SECRET",
+             "oth":[{"r":"OTH-R-SECRET","d":"OTH-D-SECRET","t":"OTH-T-SECRET"}]},
             {"kty":"EC","kid":"e1","crv":"P-256","x":"EC-X","y":"EC-Y","d":"EC-D-SECRET"}
         ]}"#;
 
@@ -1146,6 +1166,9 @@ mod tests {
             "RSA-DP-SECRET",
             "RSA-DQ-SECRET",
             "RSA-QI-SECRET",
+            "OTH-R-SECRET",
+            "OTH-D-SECRET",
+            "OTH-T-SECRET",
             "EC-D-SECRET",
         ] {
             assert!(
