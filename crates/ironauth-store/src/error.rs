@@ -90,6 +90,32 @@ pub enum StoreError {
     /// outside the reference-name alphabet, so a config field could never name it.
     /// Rejected before it is written. Carries no tenant data.
     InvalidName,
+    /// A submitted trait schema is not a well-formed JSON Schema of the supported
+    /// draft 2020-12 vocabulary (issue #53): a malformed keyword, a non-object
+    /// sub-schema, or a nesting past the depth bound. Carries the offending location
+    /// and a stable reason (never attacker-controlled instance data), so the
+    /// management surface can report exactly what is malformed.
+    SchemaMalformed(crate::trait_schema::SchemaError),
+    /// A user's traits do not validate against the active trait-schema version
+    /// (issue #53). Carries the per-field failures, each an RFC 6901 JSON Pointer to
+    /// the offending location and a stable reason (never the offending value, so no
+    /// trait PII is carried). The write is refused before anything is persisted.
+    TraitsInvalid(Vec<crate::trait_schema::ValidationFailure>),
+    /// A trait-schema version cannot become the active default because a dry-run or
+    /// migration still reports unresolved invalid identities (issue #53): the cutover
+    /// rule. Carries the count of identities that fail the target schema. No mutation
+    /// happens when it fires.
+    CutoverBlocked {
+        /// The number of existing identities whose traits fail the target schema.
+        invalid_identities: i64,
+    },
+    /// A trait write or a migration job targeted a scope with no active trait schema
+    /// version (issue #53): there is nothing to validate against. Distinct from
+    /// [`NotFound`] so the management surface can tell the operator to register and
+    /// activate a schema first.
+    ///
+    /// [`NotFound`]: StoreError::NotFound
+    NoActiveTraitSchema,
 }
 
 impl fmt::Display for StoreError {
@@ -108,6 +134,15 @@ impl fmt::Display for StoreError {
             StoreError::Encryption => f.write_str("envelope decryption failed"),
             StoreError::InvalidCustomDomain => f.write_str("invalid custom domain"),
             StoreError::InvalidName => f.write_str("invalid secret or variable name"),
+            StoreError::SchemaMalformed(error) => write!(f, "malformed trait schema: {error}"),
+            StoreError::TraitsInvalid(failures) => {
+                write!(f, "traits failed validation ({} failures)", failures.len())
+            }
+            StoreError::CutoverBlocked { invalid_identities } => write!(
+                f,
+                "activation blocked: {invalid_identities} identities fail the target schema"
+            ),
+            StoreError::NoActiveTraitSchema => f.write_str("no active trait schema"),
         }
     }
 }
@@ -123,10 +158,20 @@ impl std::error::Error for StoreError {
             | StoreError::QuotaExceeded
             | StoreError::Encryption
             | StoreError::InvalidCustomDomain
-            | StoreError::InvalidName => None,
+            | StoreError::InvalidName
+            | StoreError::TraitsInvalid(_)
+            | StoreError::CutoverBlocked { .. }
+            | StoreError::NoActiveTraitSchema => None,
             StoreError::Database(source) => Some(source),
             StoreError::Migration(source) => Some(source),
+            StoreError::SchemaMalformed(source) => Some(source),
         }
+    }
+}
+
+impl From<crate::trait_schema::SchemaError> for StoreError {
+    fn from(source: crate::trait_schema::SchemaError) -> Self {
+        StoreError::SchemaMalformed(source)
     }
 }
 

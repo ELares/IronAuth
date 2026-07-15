@@ -6,6 +6,49 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- JSON Schema identity traits with versioning and migration jobs (issue #53,
+  migration 0038, expand): custom user profile fields (traits) beyond the standard
+  OIDC claims, validated against a per (tenant, environment) JSON Schema (draft
+  2020-12), with immutable schema versioning and a Postgres-backed migration/dry-run
+  job substrate.
+  - **Self-contained validator (`trait_schema`).** A purpose-built draft 2020-12
+    validator over `serde_json` (no new external dependency): `type`, `properties`,
+    `required`, `additionalProperties`, `items`/`prefixItems`, `enum`, and the
+    length/size/range assertions. Validation failures carry an RFC 6901 JSON Pointer
+    to the exact failing location; schema compilation and instance validation are
+    DEPTH BOUNDED (`MAX_DEPTH`) so a hostile deeply nested schema or payload cannot
+    exhaust the stack (the fuzz obligation). Arrays and nested objects are
+    first-class (the named Ory Kratos regression is a unit test). The IronAuth
+    behavior vocabulary (`x-ironauth`: login identifier, verification address,
+    recovery channel, admin-only visibility) parses off the schema, and the
+    admin-only visibility split is enforced by `TraitAnnotations::redact_for_user`.
+    A declarative transform (`rename`/`default`/`drop`) applies deterministically.
+  - **Versioned registry (`trait_schemas`).** `ActingTraitSchemaRepo::create_version`
+    (a malformed schema is refused before anything is written) mints an immutable
+    per-scope `candidate` version; `activate_version` is the cutover, REFUSED while
+    any identity's traits fail the target schema (`CutoverBlocked`), and at most one
+    `active` version per scope (a partial unique index). `TraitSchemaRepo` reads the
+    active version, a specific version, and the full list.
+  - **Sealed per-user traits.** `users` gains `traits_sealed` (the trait document
+    sealed under the scope's envelope DEK, issue #48: trait data is user profile PII
+    and never lands on a plaintext column), `traits_dek_version`, and
+    `traits_schema_version`. `ActingUserRepo::set_traits` validates against the active
+    schema at write (an invalid document is refused with per-field JSON Pointer
+    failures and nothing is persisted), seals, and records the version; `UserRepo::traits`
+    and `traits_user_visible` read it back (the latter with admin-only fields stripped).
+  - **Migration / dry-run jobs (`trait_migration_jobs`).** `ActingTraitMigrationJobRepo::create`
+    (dry-run or migrate) counts the candidate population and queues the job;
+    `advance` runs one bounded batch, deterministically (identities ascending by id),
+    idempotently (a terminal job is a no-op and a migrated identity is filtered out,
+    so re-running double-migrates nothing), resumably (the cursor commits per batch),
+    and per (tenant, environment) scoped. Per-record failures are reported by subject
+    and JSON Pointer reason (never a trait value, so a job carries no PII). Every
+    mutation audits (`trait_schema.create`/`activate`, `user.traits.update`,
+    `trait_migration_job.create`/`advance`).
+  - Deferred to a follow-up: the `ironauth-admin` HTTP control-plane surface over
+    these repositories (set/get schema, trigger/inspect a job) and its OpenAPI
+    contract; the store seam #54 (flexible identifiers) and #59 build on is complete.
+
 - Admin user CRUD, lifecycle states, and external IDs (issue #52, migration 0037,
   expand): the foundational M6 promotion of the bootstrap `users` directory into a
   full control-plane managed entity, with no weakening of its isolation or PII
