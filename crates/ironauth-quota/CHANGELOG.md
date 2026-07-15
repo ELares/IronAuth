@@ -34,7 +34,20 @@ range per docs/RELEASING.md.
     burst of 0.
   - `metrics()` exports per-scope, per-dimension admitted and denied counters for
     the metrics surface.
-  - Scope note: this is the process-local core. The per-IP/per-user/per-client
-    layers, the IronCache-backed shared L2, the request-path middleware wiring,
-    and the audited management-API surface for adjusting quotas ride M15 on top
-    of this crate.
+  - A denial is attributed only to the bucket that actually lacked capacity: a
+    spend rejected by the TENANT ceiling no longer increments the nested
+    ENVIRONMENT bucket's denied counter (that bucket had room and denied nothing).
+  - The denied `reset` header reports the time for the binding bucket to refill to
+    full FROM ITS CURRENT (uncharged) level, not over-counted by the rejected
+    cost; `Retry-After` still reports the time to accrue the requested cost.
+  - Wired onto the data plane (NOT deferred): the OIDC provider constructs one
+    `QuotaEnforcer` from the `[quota]` config and spends it on the `/authorize`
+    request path, short-circuiting an over-quota `(tenant, environment)` with a
+    `429` and the RateLimit headers plus block signal. See the `ironauth-oidc`
+    changelog.
+  - Scope note: this crate is the process-local core. Still riding M15 on top of
+    it: the per-IP/per-user/per-client layers, the IronCache-backed shared L2, an
+    idle-bucket reaper, per-scope metric export as labelled series, the
+    usage-threshold webhook delivery surface (the events are produced here; there
+    is no platform eventing surface yet to route them to), and the audited
+    management-API surface for adjusting a tenant's quota at runtime.

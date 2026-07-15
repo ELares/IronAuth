@@ -48,6 +48,18 @@
 //! `X-RateLimit-*` triplet, and a machine-readable block signal (a documented
 //! header and an optional cookie) so an edge or WAF can offload continued
 //! blocking without parsing bodies.
+//!
+//! # Bucket lifetime
+//!
+//! A bucket is created lazily on the first spend for a `(scope, dimension)` and
+//! then lives for the process lifetime; there is no reaper yet. The key space is
+//! bounded by the number of live `(tenant, environment)` scopes, which is an
+//! operator-provisioned quantity (not attacker-controlled: an unknown scope is
+//! rejected upstream before it reaches a spend), so the footprint is proportional
+//! to real tenancy. Idle-bucket eviction is tracked as an M15-adjacent follow-up
+//! alongside the shared L2 counter plane; it is a footprint optimization, not a
+//! correctness gap, because a re-created bucket starts full exactly as a never-seen
+//! scope would.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -467,6 +479,10 @@ struct Eval {
     scope: Scope,
     dimension: QuotaDimension,
     limit: Limit,
+    /// Tokens available in the bucket BEFORE the spend (post-refill). On a denied
+    /// spend nothing is charged, so this is the level the reset-to-full time is
+    /// measured from.
+    tokens_before: f64,
     /// Tokens that would remain if the spend is charged.
     tokens_after: f64,
     /// Whether this bucket alone has capacity for the cost.
@@ -615,8 +631,15 @@ impl QuotaEnforcer {
                 self.charge(&mut state, eval, now, &mut events);
             }
         } else {
+            // Attribute the denial only to the bucket(s) that actually lacked
+            // capacity. A spend rejected by the TENANT ceiling must NOT increment
+            // the nested ENVIRONMENT bucket's denied counter: the environment
+            // bucket had room and denied nothing, so counting it would overstate
+            // that environment's rejections.
             for eval in &evals {
-                bucket_mut(&mut state, eval).denied += 1;
+                if !eval.has_capacity {
+                    bucket_mut(&mut state, eval).denied += 1;
+                }
             }
         }
         let snapshot = binding_snapshot(&evals, admit);
@@ -719,6 +742,7 @@ impl QuotaEnforcer {
             scope: Scope::Tenant(tenant.clone()),
             dimension,
             limit,
+            tokens_before: bucket.tokens,
             tokens_after: bucket.tokens - cost,
             has_capacity: bucket.tokens >= cost,
         })
@@ -746,6 +770,7 @@ impl QuotaEnforcer {
             scope: Scope::Environment(tenant.clone(), environment.clone()),
             dimension,
             limit,
+            tokens_before: bucket.tokens,
             tokens_after: bucket.tokens - cost,
             has_capacity: bucket.tokens >= cost,
         })
@@ -833,8 +858,11 @@ fn binding_snapshot(evals: &[Eval], admitted: bool) -> RateLimitSnapshot {
     let deficit = if admitted {
         (burst - remaining_tokens).max(0.0)
     } else {
-        // Time to accumulate enough for the requested cost again.
-        (burst - eval.tokens_after).max(0.0)
+        // Denied: nothing was charged, so the bucket sits at `tokens_before`.
+        // `reset` is the time to refill to full FROM THAT LEVEL; measuring from
+        // `tokens_after` (which subtracts the never-charged cost) would over-count
+        // the reset by the cost.
+        (burst - eval.tokens_before).max(0.0)
     };
     let reset_secs = seconds_to_refill(deficit, eval.limit.refill_per_sec);
     let retry_after_secs = if admitted {
@@ -1102,6 +1130,81 @@ mod tests {
             }
         }
         assert_eq!(admitted, 3, "environment budget must be the untouched 3");
+    }
+
+    #[test]
+    fn denial_by_the_tenant_ceiling_is_not_counted_against_the_environment() {
+        // A spend rejected by the TENANT ceiling must attribute the denial to the
+        // tenant bucket only; the nested environment bucket had room and denied
+        // nothing, so its denied counter must stay zero (the LOW fix).
+        let config = QuotaConfig {
+            tenant: ScopeQuotaConfig {
+                requests_per_second: 0,
+                requests_burst: 1, // the limiter.
+                ..ScopeQuotaConfig::default()
+            },
+            environment: ScopeQuotaConfig {
+                requests_per_second: 0,
+                requests_burst: 10, // ample room.
+                ..ScopeQuotaConfig::default()
+            },
+            usage_thresholds_percent: vec![100],
+        };
+        let (enforcer, _clock) = enforcer_with(&config);
+        let scope = env("acme", "prod");
+
+        // One admission drains the tenant; the next is denied by the tenant.
+        assert!(enforcer.admit_request(&scope).decision.is_admitted());
+        assert!(enforcer.admit_request(&scope).decision.is_denied());
+
+        let metrics = enforcer.metrics();
+        let tenant_sample = metrics
+            .iter()
+            .find(|m| m.scope == tenant("acme") && m.dimension == QuotaDimension::Requests)
+            .expect("tenant bucket");
+        let env_sample = metrics
+            .iter()
+            .find(|m| m.scope == scope && m.dimension == QuotaDimension::Requests)
+            .expect("environment bucket");
+        assert_eq!(tenant_sample.denied, 1, "the tenant denied the spend");
+        assert_eq!(
+            env_sample.denied, 0,
+            "the environment had room and must not be charged a denial"
+        );
+    }
+
+    #[test]
+    fn denied_reset_reports_time_to_full_without_over_counting_the_cost() {
+        // reset_secs is the time for the binding bucket to refill to full FROM ITS
+        // CURRENT (uncharged) level, not from a hypothetical post-charge level. With
+        // a drained burst of 10 at 1 token/sec, reset is 10s (not 11s), and the
+        // retry-after for the one denied token is 1s (the LOW fix).
+        let config = QuotaConfig {
+            tenant: ScopeQuotaConfig {
+                requests_per_second: 1,
+                requests_burst: 10,
+                ..ScopeQuotaConfig::default()
+            },
+            environment: ScopeQuotaConfig::default(),
+            usage_thresholds_percent: vec![100],
+        };
+        let (enforcer, _clock) = enforcer_with(&config);
+        let scope = tenant("acme");
+
+        for _ in 0..10 {
+            assert!(enforcer.admit_request(&scope).decision.is_admitted());
+        }
+        let denied = enforcer.admit_request(&scope);
+        assert!(denied.decision.is_denied());
+        assert_eq!(
+            denied.snapshot.reset_secs, 10,
+            "reset is time to full from the drained level, not over-counted by the cost"
+        );
+        assert_eq!(
+            denied.snapshot.retry_after_secs,
+            Some(1),
+            "retry-after is the time to accrue the one denied token"
+        );
     }
 
     #[test]

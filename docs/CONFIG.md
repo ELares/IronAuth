@@ -88,12 +88,12 @@ at the top of the file, or map it in `.taplo.toml`).
 | `quota.environment.token_issuance_burst` | integer | `100` | Burst capacity for the token-issuance dimension. 0 means unlimited. |
 | `quota.environment.token_issuance_per_second` | integer | `50` | Sustained token issuance per second (the refill rate for the token-issuance dimension: access, ID, and refresh tokens minted). |
 | `quota.tenant` | table | see fields | The per-tenant tier. Bounds the aggregate of all of a tenant's environments; a single tenant cannot exceed it however many environments it runs. |
-| `quota.tenant.hook_seconds_burst` | integer | `60` | Burst capacity for the hook-seconds dimension. 0 means unlimited. |
-| `quota.tenant.hook_seconds_per_second` | integer | `30` | Sustained hook/webhook execution seconds admitted per wall second (the refill rate for the hook-seconds dimension). Bounds how much outbound hook execution time a scope may consume. |
-| `quota.tenant.requests_burst` | integer | `200` | Burst capacity for the request-rate dimension: the most requests that can be admitted in an instantaneous spike before the sustained rate governs. 0 means unlimited (the dimension is not enforced). |
-| `quota.tenant.requests_per_second` | integer | `100` | Sustained requests per second (the token bucket refill rate for the request-rate dimension). |
-| `quota.tenant.token_issuance_burst` | integer | `100` | Burst capacity for the token-issuance dimension. 0 means unlimited. |
-| `quota.tenant.token_issuance_per_second` | integer | `50` | Sustained token issuance per second (the refill rate for the token-issuance dimension: access, ID, and refresh tokens minted). |
+| `quota.tenant.hook_seconds_burst` | integer | `120` | Burst capacity for the hook-seconds dimension. 0 means unlimited. |
+| `quota.tenant.hook_seconds_per_second` | integer | `60` | Sustained hook/webhook execution seconds admitted per wall second (the refill rate for the hook-seconds dimension). Bounds how much outbound hook execution time a scope may consume. |
+| `quota.tenant.requests_burst` | integer | `1000` | Burst capacity for the request-rate dimension: the most requests that can be admitted in an instantaneous spike before the sustained rate governs. 0 means unlimited (the dimension is not enforced). |
+| `quota.tenant.requests_per_second` | integer | `500` | Sustained requests per second (the token bucket refill rate for the request-rate dimension). |
+| `quota.tenant.token_issuance_burst` | integer | `200` | Burst capacity for the token-issuance dimension. 0 means unlimited. |
+| `quota.tenant.token_issuance_per_second` | integer | `100` | Sustained token issuance per second (the refill rate for the token-issuance dimension: access, ID, and refresh tokens minted). |
 | `quota.usage_thresholds_percent` | array | `[80, 100]` | The usage percentages (1 to 100) at which a saturation webhook fires per dimension, so operators see pressure before the hard limit. The default (`[80, 100]`) warns at 80 percent and again at the limit. An empty list disables saturation webhooks. At most `QUOTA_MAX_USAGE_THRESHOLDS` entries; each must be between 1 and 100. |
 | `server` | table | see fields | HTTP server settings. |
 | `server.bind` | string | `"127.0.0.1:8443"` | Socket address the public data plane listens on. This plane serves the protocol and hosted-page surfaces; health, readiness, and metrics are never exposed here. |

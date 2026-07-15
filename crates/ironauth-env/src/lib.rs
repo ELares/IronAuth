@@ -206,6 +206,16 @@ impl Env {
         self.clock.as_ref()
     }
 
+    /// A shared handle to the clock capability, for a long-lived component that
+    /// must hold the SAME clock seam (for example the quota engine's token
+    /// buckets, which refill from the monotonic clock). Cloning the `Arc` shares
+    /// the one clock, so a deterministic `ManualClock` an environment was built
+    /// with still drives the component under test.
+    #[must_use]
+    pub fn clock_arc(&self) -> Arc<dyn Clock> {
+        Arc::clone(&self.clock)
+    }
+
     /// The entropy capability.
     #[must_use]
     pub fn entropy(&self) -> &dyn Entropy {

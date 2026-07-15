@@ -424,6 +424,18 @@ async fn issue_code(
         .map_err(|_| AuthorizeError::page("the client_id is malformed or unknown"))?;
     let scope = client_id.scope();
 
+    // 1b. Tenant/environment quota (issue #50). The client_id declares its scope, so
+    //     the (tenant, environment) is known here WITHOUT a store read: charge the
+    //     request-rate quota now, BEFORE the client lookup, so an over-quota scope is
+    //     shed at the cheapest point and never touches the database. A denied spend
+    //     short-circuits with a 429 carrying the RateLimit headers and block signal;
+    //     nesting means an environment draws from its tenant too, and the buckets are
+    //     per-scope, so one tenant's flood never starves another's login. Under quota
+    //     (or with no enforcer installed) the request proceeds untouched.
+    if let Some(response) = state.enforce_request_quota(&scope) {
+        return Ok(response);
+    }
+
     // 2. The client must exist in its declared scope. This lookup is BEFORE any
     //    redirect, so an unknown client renders a page and never redirects. A
     //    store failure here also fails closed to a page (we cannot safely redirect
