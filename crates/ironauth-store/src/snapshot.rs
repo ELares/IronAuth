@@ -73,10 +73,11 @@ pub const CLIENT_SECRET_REFERENCE: &str = "client_secret";
 /// (and by the export), and an environment-identity or runtime type can never be
 /// added without failing it. This is the live binding between the snapshot and the
 /// single source of truth, not a hand-maintained parallel list.
-pub const SNAPSHOT_RESOURCE_TYPES: [ResourceType; 3] = [
+pub const SNAPSHOT_RESOURCE_TYPES: [ResourceType; 4] = [
     ResourceType::Client,
     ResourceType::ResourceServer,
     ResourceType::DcrPolicy,
+    ResourceType::Variable,
 ];
 
 /// A named reference to a secret in the environment-scoped secret store (issue
@@ -184,6 +185,21 @@ pub struct DcrPolicySnapshot {
     pub primitives: serde_json::Value,
 }
 
+/// The secret-free projection of one environment variable (issue #45). A variable
+/// is NON-secret promotable config (name -> value): both its name and its value
+/// travel in the snapshot, so a target environment may override the value at apply
+/// time. A field elsewhere in the snapshot may carry a `${var:NAME}` reference to
+/// it (resolved per target environment); the variable itself is a plain value.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VariableSnapshot {
+    /// The variable name, unique per scope: the stable natural key the export
+    /// orders by and the key a `${var:NAME}` reference resolves against.
+    pub name: String,
+    /// The non-secret configuration value. A variable value is never a secret
+    /// (a secret value never appears in a snapshot at all).
+    pub value: String,
+}
+
 /// The promotable resources a snapshot carries, keyed by resource-type wire name
 /// (issue #41 classification). Each array is ordered by its type's stable natural
 /// key, so the collection order is deterministic and documented.
@@ -198,6 +214,10 @@ pub struct SnapshotResources {
     /// The environment's DCR policies (`dcr_policy`).
     #[serde(default)]
     pub dcr_policy: Vec<DcrPolicySnapshot>,
+    /// The environment's non-secret configuration variables (`variable`). A
+    /// secret value never appears here; only a variable's plain value does.
+    #[serde(default)]
+    pub variable: Vec<VariableSnapshot>,
 }
 
 /// A canonical, deterministic, secret-free snapshot of one environment's
@@ -403,12 +423,30 @@ pub async fn export(scoped: &ScopedStore<'_>) -> Result<Snapshot, StoreError> {
     // collation-dependent and must not decide the canonical byte order.
     dcr_policy.sort_by(|a, b| a.name.cmp(&b.name));
 
+    // Environment variables (issue #45): non-secret promotable config, carried
+    // name AND value. Secrets are NEVER read here (their value never travels; only
+    // a reference does), so the export stays secret-free by construction.
+    let mut variable: Vec<VariableSnapshot> = scoped
+        .environment_variables()
+        .list_all()
+        .await?
+        .into_iter()
+        .map(|record| VariableSnapshot {
+            name: record.name,
+            value: record.value,
+        })
+        .collect();
+    // Re-sort by the stable natural key in Rust (collation-independent), exactly as
+    // the resource servers and policies above.
+    variable.sort_by(|a, b| a.name.cmp(&b.name));
+
     Ok(Snapshot {
         schema_version: SNAPSHOT_SCHEMA_VERSION.to_string(),
         resources: SnapshotResources {
             client: clients,
             resource_server,
             dcr_policy,
+            variable,
         },
     })
 }
@@ -532,6 +570,9 @@ const RESOURCE_SERVER_KEYS: [&str; 3] = ["audience", "token_format", "access_tok
 
 /// Every key a snapshot `dcr_policy` element may carry.
 const DCR_POLICY_KEYS: [&str; 2] = ["name", "primitives"];
+
+/// Every key a snapshot `variable` element may carry (issue #45).
+const VARIABLE_KEYS: [&str; 2] = ["name", "value"];
 
 /// Object keys that would carry RAW secret material and must never appear in a
 /// snapshot: the presence of any is a hard rejection (issue #43, "an import
@@ -731,6 +772,24 @@ fn validate_resource(
                 None => violations.push(SnapshotViolation::new(
                     format!("{path}/primitives"),
                     "missing required array field",
+                )),
+            }
+        }
+        ResourceType::Variable => {
+            // A variable is a non-secret name -> value pair (issue #45). The value
+            // is a plain string; the forbidden-secret-key scan above already
+            // guarantees no secret-shaped material rides along under a novel key.
+            reject_unknown_keys(object, &VARIABLE_KEYS, None, path, violations);
+            require_nonempty_string(object, "name", path, violations);
+            match object.get("value") {
+                Some(serde_json::Value::String(_)) => {}
+                Some(_) => violations.push(SnapshotViolation::new(
+                    format!("{path}/value"),
+                    "must be a JSON string",
+                )),
+                None => violations.push(SnapshotViolation::new(
+                    format!("{path}/value"),
+                    "missing required string field",
                 )),
             }
         }
@@ -1013,10 +1072,12 @@ mod tests {
     fn canonical_form_sorts_keys_and_is_whitespace_free() {
         let bytes = empty_snapshot().to_canonical_bytes().expect("canonicalize");
         let text = String::from_utf8(bytes).expect("utf8");
-        // Keys sorted: resources before schema_version.
+        // Keys sorted: resources before schema_version, and within resources the
+        // resource-type keys are sorted (client, dcr_policy, resource_server,
+        // variable) regardless of struct field order.
         assert_eq!(
             text,
-            "{\"resources\":{\"client\":[],\"dcr_policy\":[],\"resource_server\":[]},\
+            "{\"resources\":{\"client\":[],\"dcr_policy\":[],\"resource_server\":[],\"variable\":[]},\
              \"schema_version\":\"ironauth.config-snapshot/v1\"}"
         );
     }

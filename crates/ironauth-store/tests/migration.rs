@@ -248,7 +248,7 @@ async fn expand_contract_example_chain_runs_all_three_phases_and_contract_remove
 // per real table); splitting it would not make it clearer.
 #[allow(clippy::too_many_lines)]
 #[tokio::test]
-async fn production_chain_is_only_the_thirty_three_real_migrations_and_ships_no_demo_object() {
+async fn production_chain_is_only_the_thirty_four_real_migrations_and_ships_no_demo_object() {
     // TestDatabase::start runs Store::migrate() (the production chain) on a
     // fresh, empty database.
     let db = TestDatabase::start().await;
@@ -265,8 +265,8 @@ async fn production_chain_is_only_the_thirty_three_real_migrations_and_ships_no_
     );
     assert_eq!(
         report.already_applied(),
-        33,
-        "the production chain is exactly thirty-three migrations (isolation, audit log, management \
+        34,
+        "the production chain is exactly thirty-four migrations (isolation, audit log, management \
          API, OIDC authorization, signing keys, login/consent, authentication context, redirect \
          registration, UserInfo claims, consent scope upsert, resource servers, opaque access \
          tokens, client auth suite, dynamic client registration, pushed authorization requests, \
@@ -274,15 +274,15 @@ async fn production_chain_is_only_the_thirty_three_real_migrations_and_ships_no_
          indicators, JWT bearer assertion grant, device authorization, session model, RP-initiated \
          logout, session-ended events, back-channel logout, front-channel logout, resource-model \
          APIs, envelope encryption, environment guardrails, tenant lifecycle, BYOK bindings, \
-         snapshot export, custom domains)"
+         snapshot export, custom domains, environment secrets and variables)"
     );
 
-    // The ledger holds exactly versions 1 through 31.
+    // The ledger holds exactly versions 1 through 34.
     assert_eq!(
         applied_versions(pool).await,
         vec![
             1_i64, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
-            24, 25, 26, 27, 28, 29, 30, 31, 32, 33
+            24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34
         ]
     );
     let phase_of = |version: i64| async move {
@@ -384,6 +384,12 @@ async fn production_chain_is_only_the_thirty_three_real_migrations_and_ships_no_
     // verified domain exactly one owner platform-wide. All additive, so it is an
     // expand.
     assert_eq!(phase_of(33).await, "expand");
+    // The environment secrets and variables migration (issue #45): two new
+    // tenant-scoped tables (environment_variables and environment_secrets) with
+    // their indexes, isolation policies, nonempty-scope CHECKs, and column-scoped
+    // grants (a control-plane SELECT on variables for the snapshot export). All
+    // additive, so it is an expand too.
+    assert_eq!(phase_of(34).await, "expand");
 
     // The demo object never reaches a production database.
     assert!(
@@ -1053,6 +1059,45 @@ async fn production_chain_is_only_the_thirty_three_real_migrations_and_ships_no_
         assert!(
             !column_exists(pool, "custom_domains", forbidden).await,
             "custom_domains must have no plaintext key/cert column ({forbidden})"
+        );
+    }
+    // The per-environment secrets and variables store (issue #45): two new tables
+    // after 0034. Variables carry a plaintext value (promotable, non-secret);
+    // secrets carry ONLY sealed ciphertext, never a plaintext value column.
+    assert!(
+        table_exists(pool, "environment_variables").await,
+        "environment_variables exists after 0034"
+    );
+    assert!(
+        table_exists(pool, "environment_secrets").await,
+        "environment_secrets exists after 0034"
+    );
+    for column in ["name", "value", "version", "created_at", "updated_at"] {
+        assert!(
+            column_exists(pool, "environment_variables", column).await,
+            "environment_variables.{column} exists after 0034"
+        );
+    }
+    for column in [
+        "name",
+        "dek_version",
+        "ciphertext",
+        "version",
+        "created_at",
+        "updated_at",
+    ] {
+        assert!(
+            column_exists(pool, "environment_secrets", column).await,
+            "environment_secrets.{column} exists after 0034"
+        );
+    }
+    // A secret VALUE is never stored in the clear: environment_secrets carries only
+    // the sealed ciphertext, never a plaintext value / secret column. A dump of the
+    // table therefore reveals no secret.
+    for forbidden in ["value", "plaintext", "secret", "secret_value"] {
+        assert!(
+            !column_exists(pool, "environment_secrets", forbidden).await,
+            "environment_secrets must have no plaintext secret column ({forbidden})"
         );
     }
 }

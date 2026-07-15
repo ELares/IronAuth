@@ -303,5 +303,18 @@ name = "custom_domains"
 path = "tests/custom_domains.rs"
 required-features = ["testing"]
 
+# Environment-scoped secrets and variables (issue #45): a secret is sealed at rest
+# (a raw column probe yields no plaintext) and never returns its value while it
+# opens back exactly under the master key, a variable round-trips its value, both
+# are cross-tenant and cross-environment isolated, resolution reads the right
+# environment's value (and an unresolved reference is reported without an apply), a
+# snapshot carries variables and secret references but never a secret value, every
+# mutation is audited, and a referenced secret or variable cannot be deleted while
+# an unreferenced one can. Needs a real database (DATABASE_URL).
+[[test]]
+name = "environment_secrets_variables"
+path = "tests/environment_secrets_variables.rs"
+required-features = ["testing"]
+
 [lints]
 workspace = true

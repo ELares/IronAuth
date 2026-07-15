@@ -63,10 +63,10 @@ use crate::error::StoreError;
 use crate::id::{
     AcmeChallengeId, AssertionMappingId, AuditId, AuditTarget, AuthorizationCodeId,
     BackChannelDeliveryId, ClientId, ClientSessionId, ConsentId, CorrelationId, CustomDomainId,
-    DcrPolicyId, DekId, DeviceCodeId, EncryptedSecretId, EnvironmentId, ExternalIssuerId, GrantId,
-    InitialAccessTokenId, IssuedTokenId, KekId, ManagementKeyId, OperatorId, OrganizationId,
-    PushedRequestId, RefreshFamilyId, RefreshTokenId, ResourceServerId, ServiceAccountId,
-    SessionEventId, SessionId, SigningKeyId, TenantId, UserId,
+    DcrPolicyId, DekId, DeviceCodeId, EncryptedSecretId, EnvironmentId, EnvironmentSecretId,
+    ExternalIssuerId, GrantId, InitialAccessTokenId, IssuedTokenId, KekId, ManagementKeyId,
+    OperatorId, OrganizationId, PushedRequestId, RefreshFamilyId, RefreshTokenId, ResourceServerId,
+    ServiceAccountId, SessionEventId, SessionId, SigningKeyId, TenantId, UserId, VariableId,
 };
 use crate::scope::Scope;
 use crate::store::Store;
@@ -462,6 +462,31 @@ impl<'a> ScopedStore<'a> {
         }
     }
 
+    /// The read-only environment-variable repository for this scope (issue #45):
+    /// read a non-secret named config value, list an environment's variables, and
+    /// find the variables that REFERENCE a given name (the referent check a delete
+    /// consults). Writes (set, delete) live on [`ActingStore::environment_variables`].
+    #[must_use]
+    pub fn environment_variables(&self) -> EnvironmentVariableRepo<'a> {
+        EnvironmentVariableRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
+    /// The read-only environment-secret repository for this scope (issue #45): read
+    /// a secret's METADATA (name, version, updated-at, never the value), list an
+    /// environment's secrets, and OPEN a secret's sealed value under the platform
+    /// master key (the apply-time resolution path). Writes (put, delete) live on
+    /// [`ActingStore::environment_secrets`].
+    #[must_use]
+    pub fn environment_secrets(&self) -> EnvironmentSecretRepo<'a> {
+        EnvironmentSecretRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
     /// Enter an acting context (who is acting, and under which correlation id).
     /// The returned store hands out the *mutating* repositories, so every write
     /// carries an actor and a correlation id into its audit row.
@@ -577,6 +602,33 @@ impl<'a> ActingStore<'a> {
     #[must_use]
     pub fn custom_domains(&self) -> ActingCustomDomainRepo<'a> {
         ActingCustomDomainRepo {
+            store: self.store,
+            scope: self.scope,
+            acting: self.acting,
+        }
+    }
+
+    /// The mutating environment-variable repository for this scope and actor (issue
+    /// #45): set a non-secret named config value (a first write or an overwrite,
+    /// optionally under an Idempotency-Key) and delete one (rejected while a live
+    /// variable value still references it). Every mutation writes its audit row in
+    /// the same transaction.
+    #[must_use]
+    pub fn environment_variables(&self) -> ActingEnvironmentVariableRepo<'a> {
+        ActingEnvironmentVariableRepo {
+            store: self.store,
+            scope: self.scope,
+            acting: self.acting,
+        }
+    }
+
+    /// The mutating environment-secret repository for this scope and actor (issue
+    /// #45): put a secret (its plaintext value sealed under the scope's envelope
+    /// DEK, issue #48, write-only) and delete one. Every mutation writes its audit
+    /// row in the same transaction, and no secret value is ever recorded in it.
+    #[must_use]
+    pub fn environment_secrets(&self) -> ActingEnvironmentSecretRepo<'a> {
+        ActingEnvironmentSecretRepo {
             store: self.store,
             scope: self.scope,
             acting: self.acting,
@@ -14518,6 +14570,749 @@ impl ActingEnvelopeRepo<'_> {
         )
         .await?;
         Ok(true)
+    }
+}
+
+// ===========================================================================
+// Environment-scoped secrets and variables (issue #45).
+//
+// The per-(tenant, environment) store the config-promotion flagship resolves
+// references against. Two tenant-scoped tables, isolated exactly like every other
+// scoped table (forced row-level security on the (tenant, environment) session
+// variables, reached only through this module). VARIABLES are non-secret
+// promotable config (name -> plaintext value, readable). SECRETS are write-only:
+// the plaintext is sealed under the scope's envelope DEK (issue #48, the same
+// AEAD substrate that seals the users PII columns) and stored as ciphertext on the
+// environment_secrets table; a read returns metadata only (name, version,
+// updated-at), never the value. The tenant, environment, secret name, and DEK
+// version are bound as associated data, so a ciphertext cannot be replayed across
+// a row, tenant, environment, secret, or key version.
+// ===========================================================================
+
+/// The envelope seal PURPOSE under which an environment secret's value is sealed
+/// (issue #45): the secret's name, namespaced so it can never collide with any
+/// other envelope purpose (the custom-domain certificate purpose, a users PII
+/// purpose). Bound into the seal associated data, so a ciphertext sealed for one
+/// secret name never authenticates for another.
+fn env_secret_seal_purpose(name: &str) -> String {
+    format!("env_secret:{name}")
+}
+
+/// One environment variable as read back (issue #45): the non-secret value plus
+/// its metadata. A variable value IS readable (it is promotable config), unlike a
+/// secret value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnvironmentVariableRecord {
+    /// The variable identifier (`var_...`, embeds its `(tenant, environment)`).
+    pub id: VariableId,
+    /// The variable name (the reference key), unique per scope.
+    pub name: String,
+    /// The non-secret configuration value.
+    pub value: String,
+    /// The monotonic write version, bumped on every overwrite.
+    pub version: i32,
+    /// Creation time in microseconds since the Unix epoch (the pagination key).
+    pub created_at_unix_micros: i64,
+    /// Last-write time in microseconds since the Unix epoch.
+    pub updated_at_unix_micros: i64,
+}
+
+/// One environment secret's METADATA as read back (issue #45): NEVER the value.
+/// A read of a secret returns presence and these fields only, the write-only
+/// discipline (the #11 secret lesson: a management API that returns a live secret
+/// is a leak).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnvironmentSecretMetadata {
+    /// The secret identifier (`esec_...`, embeds its `(tenant, environment)`).
+    pub id: EnvironmentSecretId,
+    /// The secret name (the reference key), unique per scope.
+    pub name: String,
+    /// The monotonic write version, bumped on every overwrite.
+    pub version: i32,
+    /// Creation time in microseconds since the Unix epoch (the pagination key).
+    pub created_at_unix_micros: i64,
+    /// Last-write time in microseconds since the Unix epoch.
+    pub updated_at_unix_micros: i64,
+}
+
+/// Reconstruct an [`EnvironmentVariableRecord`] from a row read within scope.
+fn environment_variable_from_row(
+    row: &PgRow,
+    scope: &Scope,
+) -> Result<EnvironmentVariableRecord, StoreError> {
+    let id = VariableId::parse_in_scope(&row.get::<String, _>("id"), scope)?;
+    Ok(EnvironmentVariableRecord {
+        id,
+        name: row.get("name"),
+        value: row.get("value"),
+        version: row.get("version"),
+        created_at_unix_micros: row.get("created_us"),
+        updated_at_unix_micros: row.get("updated_us"),
+    })
+}
+
+/// Reconstruct an [`EnvironmentSecretMetadata`] from a row read within scope. The
+/// ciphertext column is deliberately NOT selected into this metadata view.
+fn environment_secret_metadata_from_row(
+    row: &PgRow,
+    scope: &Scope,
+) -> Result<EnvironmentSecretMetadata, StoreError> {
+    let id = EnvironmentSecretId::parse_in_scope(&row.get::<String, _>("id"), scope)?;
+    Ok(EnvironmentSecretMetadata {
+        id,
+        name: row.get("name"),
+        version: row.get("version"),
+        created_at_unix_micros: row.get("created_us"),
+        updated_at_unix_micros: row.get("updated_us"),
+    })
+}
+
+/// Read-only environment variables for one scope (issue #45).
+pub struct EnvironmentVariableRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl EnvironmentVariableRepo<'_> {
+    /// Fetch a variable by name (its value and metadata), within scope.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if no variable of that name exists in this scope.
+    pub async fn get(&self, name: &str) -> Result<EnvironmentVariableRecord, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT id, name, value, version, \
+             (EXTRACT(EPOCH FROM created_at) * 1000000)::bigint AS created_us, \
+             (EXTRACT(EPOCH FROM updated_at) * 1000000)::bigint AS updated_us \
+             FROM environment_variables \
+             WHERE tenant_id = $1 AND environment_id = $2 AND name = $3",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(name)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        let row = row.ok_or(StoreError::NotFound)?;
+        environment_variable_from_row(&row, &self.scope)
+    }
+
+    /// Whether a variable of `name` exists in this scope (the plan-time resolution
+    /// check; reads no value).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn exists(&self, name: &str) -> Result<bool, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT 1 AS present FROM environment_variables \
+             WHERE tenant_id = $1 AND environment_id = $2 AND name = $3",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(name)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(row.is_some())
+    }
+
+    /// One page of variables in this scope, ordered by `(created_at, id)`.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn list(
+        &self,
+        limit: i64,
+        after: Option<&CursorPosition>,
+    ) -> Result<Vec<EnvironmentVariableRecord>, StoreError> {
+        let (after_micros, after_id) = split_cursor(after);
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let rows = sqlx::query(
+            "SELECT id, name, value, version, \
+             (EXTRACT(EPOCH FROM created_at) * 1000000)::bigint AS created_us, \
+             (EXTRACT(EPOCH FROM updated_at) * 1000000)::bigint AS updated_us \
+             FROM environment_variables \
+             WHERE tenant_id = $1 AND environment_id = $2 \
+             AND ($3::bigint IS NULL OR (created_at, id) > \
+                  (TIMESTAMPTZ 'epoch' + ($3::text || ' microseconds')::interval, $4::text)) \
+             ORDER BY created_at, id LIMIT $5",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(after_micros)
+        .bind(after_id)
+        .bind(limit.clamp(0, MANAGEMENT_LIST_HARD_CAP + 1))
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        rows.iter()
+            .map(|row| environment_variable_from_row(row, &self.scope))
+            .collect()
+    }
+
+    /// EVERY variable in this scope (no pagination), ordered by name: the set the
+    /// snapshot export (issue #43) projects. A variable is promotable config, so
+    /// its name and value both travel in the snapshot.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn list_all(&self) -> Result<Vec<EnvironmentVariableRecord>, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let rows = sqlx::query(
+            "SELECT id, name, value, version, \
+             (EXTRACT(EPOCH FROM created_at) * 1000000)::bigint AS created_us, \
+             (EXTRACT(EPOCH FROM updated_at) * 1000000)::bigint AS updated_us \
+             FROM environment_variables \
+             WHERE tenant_id = $1 AND environment_id = $2 ORDER BY name",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        rows.iter()
+            .map(|row| environment_variable_from_row(row, &self.scope))
+            .collect()
+    }
+
+    /// The names of the variables in this scope whose VALUE is a live reference to
+    /// `reference` (issue #45): the referent list a delete of the referenced
+    /// variable or secret is rejected with. A variable's own row is never its own
+    /// referent (a degenerate self-reference does not block deleting it). A config
+    /// field is a referent only when its whole value parses as that exact
+    /// reference, never on a literal that merely contains the syntax.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn referents(
+        &self,
+        reference: &crate::esv::Reference,
+    ) -> Result<Vec<String>, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let rows = sqlx::query(
+            "SELECT name, value FROM environment_variables \
+             WHERE tenant_id = $1 AND environment_id = $2 ORDER BY name",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        let mut referents = Vec::new();
+        for row in &rows {
+            let name: String = row.get("name");
+            let value: String = row.get("value");
+            // A variable referencing ITSELF is not a blocker for its own delete.
+            if reference.kind == crate::esv::ReferenceKind::Variable && name == reference.name {
+                continue;
+            }
+            if matches!(
+                crate::esv::Reference::parse(&value),
+                Ok(parsed) if parsed == *reference
+            ) {
+                referents.push(name);
+            }
+        }
+        Ok(referents)
+    }
+}
+
+/// Read-only environment secrets for one scope (issue #45). Reads metadata and, on
+/// the resolution path, opens a sealed value under the platform master key.
+pub struct EnvironmentSecretRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl EnvironmentSecretRepo<'_> {
+    /// Fetch a secret's METADATA by name (never its value), within scope.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if no secret of that name exists in this scope.
+    pub async fn metadata(&self, name: &str) -> Result<EnvironmentSecretMetadata, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT id, name, version, \
+             (EXTRACT(EPOCH FROM created_at) * 1000000)::bigint AS created_us, \
+             (EXTRACT(EPOCH FROM updated_at) * 1000000)::bigint AS updated_us \
+             FROM environment_secrets \
+             WHERE tenant_id = $1 AND environment_id = $2 AND name = $3",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(name)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        let row = row.ok_or(StoreError::NotFound)?;
+        environment_secret_metadata_from_row(&row, &self.scope)
+    }
+
+    /// Whether a secret of `name` exists in this scope (the plan-time resolution
+    /// check; reads no value and opens no ciphertext).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn exists(&self, name: &str) -> Result<bool, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT 1 AS present FROM environment_secrets \
+             WHERE tenant_id = $1 AND environment_id = $2 AND name = $3",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(name)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(row.is_some())
+    }
+
+    /// One page of secret METADATA in this scope, ordered by `(created_at, id)`.
+    /// No page ever carries a secret value.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn list(
+        &self,
+        limit: i64,
+        after: Option<&CursorPosition>,
+    ) -> Result<Vec<EnvironmentSecretMetadata>, StoreError> {
+        let (after_micros, after_id) = split_cursor(after);
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let rows = sqlx::query(
+            "SELECT id, name, version, \
+             (EXTRACT(EPOCH FROM created_at) * 1000000)::bigint AS created_us, \
+             (EXTRACT(EPOCH FROM updated_at) * 1000000)::bigint AS updated_us \
+             FROM environment_secrets \
+             WHERE tenant_id = $1 AND environment_id = $2 \
+             AND ($3::bigint IS NULL OR (created_at, id) > \
+                  (TIMESTAMPTZ 'epoch' + ($3::text || ' microseconds')::interval, $4::text)) \
+             ORDER BY created_at, id LIMIT $5",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(after_micros)
+        .bind(after_id)
+        .bind(limit.clamp(0, MANAGEMENT_LIST_HARD_CAP + 1))
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        rows.iter()
+            .map(|row| environment_secret_metadata_from_row(row, &self.scope))
+            .collect()
+    }
+
+    /// Open (decrypt) the secret stored under `name`, under the platform master
+    /// key (issue #45): the apply-time value resolution. This is the ONLY read
+    /// path that ever returns a secret value, and it is never reached by a list, a
+    /// metadata read, the snapshot export, or any audit record.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if no secret of that name exists in this scope;
+    /// [`StoreError::Encryption`] if the ciphertext cannot be authenticated and
+    /// decrypted (a crypto-shredded scope, a tampered blob); [`StoreError::Database`]
+    /// on a persistence failure.
+    pub async fn open_value(&self, master: &MasterKey, name: &str) -> Result<Vec<u8>, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT dek_version, ciphertext FROM environment_secrets \
+             WHERE tenant_id = $1 AND environment_id = $2 AND name = $3",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(name)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(row) = row else {
+            tx.commit().await?;
+            return Err(StoreError::NotFound);
+        };
+        let dek_version: i32 = row.get("dek_version");
+        let ciphertext: Vec<u8> = row.get("ciphertext");
+        let dek = fetch_dek_by_version(&mut tx, self.scope, master, dek_version).await?;
+        let plaintext = dek.open(
+            &secret_seal_aad(self.scope, &env_secret_seal_purpose(name), dek_version),
+            &Sealed::from_bytes(ciphertext)?,
+        )?;
+        tx.commit().await?;
+        Ok(plaintext)
+    }
+}
+
+/// The mutating environment-variable repository for one scope and actor (issue #45).
+pub struct ActingEnvironmentVariableRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+    acting: ActingContext,
+}
+
+impl ActingEnvironmentVariableRepo<'_> {
+    /// Set a variable (a first write or an overwrite) and audit
+    /// `environment_variable.set` in the same transaction. One value per (scope,
+    /// name): a repeat write to the same name overwrites the value in place and
+    /// bumps its version, reusing the row's id (a stable audit target across
+    /// overwrites). Optionally records an Idempotency-Key in the same transaction.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::InvalidName`] if `name` is not a valid reference key;
+    /// [`StoreError::IdempotencyConflict`] on a concurrent Idempotency-Key race;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn set(
+        &self,
+        env: &Env,
+        name: &str,
+        value: &str,
+        idempotency: Option<IdempotencyWrite<'_>>,
+    ) -> Result<VariableId, StoreError> {
+        if !crate::esv::name_is_valid(name) {
+            return Err(StoreError::InvalidName);
+        }
+        let scope = self.scope;
+        let id = self.existing_variable_id_or_new(env, name).await?;
+        let now_micros = epoch_micros(env.clock().now_utc());
+        let name_owned = name.to_string();
+        let value_owned = value.to_string();
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::EnvironmentVariableSet,
+                target: &id,
+            },
+            async move |tx| {
+                sqlx::query(
+                    "INSERT INTO environment_variables \
+                     (id, tenant_id, environment_id, name, value, version, created_at, updated_at) \
+                     VALUES ($1, $2, $3, $4, $5, 1, \
+                             TIMESTAMPTZ 'epoch' + ($6::text || ' microseconds')::interval, \
+                             TIMESTAMPTZ 'epoch' + ($6::text || ' microseconds')::interval) \
+                     ON CONFLICT (tenant_id, environment_id, name) DO UPDATE \
+                     SET value = EXCLUDED.value, \
+                         version = environment_variables.version + 1, \
+                         updated_at = EXCLUDED.updated_at",
+                )
+                .bind(id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(&name_owned)
+                .bind(&value_owned)
+                .bind(now_micros)
+                .execute(&mut **tx)
+                .await?;
+                insert_idempotency(tx, idempotency).await?;
+                Ok(())
+            },
+            false,
+        )
+        .await?;
+        Ok(id)
+    }
+
+    /// Delete a variable and audit `environment_variable.delete` in the same
+    /// transaction (issue #45). REJECTED while a live variable value in the scope
+    /// still references it (a rename is create-plus-delete, and the delete is
+    /// protected by the referent check); the caller enumerates the referents with
+    /// [`EnvironmentVariableRepo::referents`].
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if no variable of that name exists in this scope;
+    /// [`StoreError::Conflict`] if the variable is still referenced;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn delete(&self, env: &Env, name: &str) -> Result<(), StoreError> {
+        let scope = self.scope;
+        // Load the row's id up front (a stable audit target) and fail closed if it
+        // is absent.
+        let id = self.variable_id(name).await?;
+        let reference = crate::esv::Reference {
+            kind: crate::esv::ReferenceKind::Variable,
+            name: name.to_string(),
+        };
+        let referents = EnvironmentVariableRepo {
+            store: self.store,
+            scope,
+        }
+        .referents(&reference)
+        .await?;
+        if !referents.is_empty() {
+            return Err(StoreError::Conflict);
+        }
+        let name_owned = name.to_string();
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::EnvironmentVariableDelete,
+                target: &id,
+            },
+            async move |tx| {
+                let result = sqlx::query(
+                    "DELETE FROM environment_variables \
+                     WHERE tenant_id = $1 AND environment_id = $2 AND name = $3",
+                )
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(&name_owned)
+                .execute(&mut **tx)
+                .await?;
+                if result.rows_affected() == 0 {
+                    return Err(StoreError::NotFound);
+                }
+                Ok(())
+            },
+            false,
+        )
+        .await
+    }
+
+    /// The id of an existing variable by name, reused so an overwrite keeps a
+    /// stable audit target; a fresh id for a first write.
+    async fn existing_variable_id_or_new(
+        &self,
+        env: &Env,
+        name: &str,
+    ) -> Result<VariableId, StoreError> {
+        match self.variable_id(name).await {
+            Ok(id) => Ok(id),
+            Err(StoreError::NotFound) => Ok(VariableId::generate(env, &self.scope)),
+            Err(other) => Err(other),
+        }
+    }
+
+    /// The stored id of the variable named `name`, or [`StoreError::NotFound`].
+    async fn variable_id(&self, name: &str) -> Result<VariableId, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT id FROM environment_variables \
+             WHERE tenant_id = $1 AND environment_id = $2 AND name = $3",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(name)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        let row = row.ok_or(StoreError::NotFound)?;
+        Ok(VariableId::parse_in_scope(
+            &row.get::<String, _>("id"),
+            &self.scope,
+        )?)
+    }
+}
+
+/// The mutating environment-secret repository for one scope and actor (issue #45).
+pub struct ActingEnvironmentSecretRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+    acting: ActingContext,
+}
+
+impl ActingEnvironmentSecretRepo<'_> {
+    /// Put a secret (a first write or an overwrite): seal `plaintext` under the
+    /// scope's active envelope DEK (issue #48), store it as ciphertext, and audit
+    /// `environment_secret.put` in the same transaction (issue #45). WRITE-ONLY:
+    /// the plaintext is never recorded, not in the row (only ciphertext), not in
+    /// the audit envelope, not in any response. One value per (scope, name): a
+    /// repeat write overwrites in place, bumps the version, and reuses the row's id.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::InvalidName`] if `name` is not a valid reference key;
+    /// [`StoreError::Encryption`] if the scope has no key hierarchy to seal under
+    /// and one cannot be provisioned; [`StoreError::IdempotencyConflict`] on a
+    /// concurrent Idempotency-Key race; [`StoreError::Database`] on a persistence
+    /// failure.
+    pub async fn put(
+        &self,
+        env: &Env,
+        master: &MasterKey,
+        name: &str,
+        plaintext: &[u8],
+        idempotency: Option<IdempotencyWrite<'_>>,
+    ) -> Result<EnvironmentSecretId, StoreError> {
+        if !crate::esv::name_is_valid(name) {
+            return Err(StoreError::InvalidName);
+        }
+        let scope = self.scope;
+        // The scope needs a live KEK/DEK before the first secret seal; provision
+        // them lazily (idempotent) outside the put transaction, exactly as the
+        // users PII path does.
+        self.ensure_scope_keys(env, master).await?;
+        let id = self.existing_secret_id_or_new(env, name).await?;
+        let now_micros = epoch_micros(env.clock().now_utc());
+        let name_owned = name.to_string();
+        let plaintext = plaintext.to_vec();
+        let purpose = env_secret_seal_purpose(name);
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::EnvironmentSecretPut,
+                target: &id,
+            },
+            async move |tx| {
+                let (dek_version, dek) = fetch_active_dek(tx, scope, master).await?;
+                let sealed = dek.seal(
+                    env.entropy(),
+                    &secret_seal_aad(scope, &purpose, dek_version),
+                    &plaintext,
+                );
+                sqlx::query(
+                    "INSERT INTO environment_secrets \
+                     (id, tenant_id, environment_id, name, dek_version, ciphertext, version, \
+                      created_at, updated_at) \
+                     VALUES ($1, $2, $3, $4, $5, $6, 1, \
+                             TIMESTAMPTZ 'epoch' + ($7::text || ' microseconds')::interval, \
+                             TIMESTAMPTZ 'epoch' + ($7::text || ' microseconds')::interval) \
+                     ON CONFLICT (tenant_id, environment_id, name) DO UPDATE \
+                     SET ciphertext = EXCLUDED.ciphertext, dek_version = EXCLUDED.dek_version, \
+                         version = environment_secrets.version + 1, \
+                         updated_at = EXCLUDED.updated_at",
+                )
+                .bind(id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(&name_owned)
+                .bind(dek_version)
+                .bind(sealed.into_bytes())
+                .bind(now_micros)
+                .execute(&mut **tx)
+                .await?;
+                insert_idempotency(tx, idempotency).await?;
+                Ok(())
+            },
+            false,
+        )
+        .await?;
+        Ok(id)
+    }
+
+    /// Delete a secret and audit `environment_secret.delete` in the same
+    /// transaction (issue #45). REJECTED while a live variable value in the scope
+    /// still references it (the same referent protection variables have); the
+    /// caller enumerates the referents with [`EnvironmentVariableRepo::referents`].
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if no secret of that name exists in this scope;
+    /// [`StoreError::Conflict`] if the secret is still referenced;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn delete(&self, env: &Env, name: &str) -> Result<(), StoreError> {
+        let scope = self.scope;
+        let id = self.secret_id(name).await?;
+        let reference = crate::esv::Reference {
+            kind: crate::esv::ReferenceKind::Secret,
+            name: name.to_string(),
+        };
+        let referents = EnvironmentVariableRepo {
+            store: self.store,
+            scope,
+        }
+        .referents(&reference)
+        .await?;
+        if !referents.is_empty() {
+            return Err(StoreError::Conflict);
+        }
+        let name_owned = name.to_string();
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::EnvironmentSecretDelete,
+                target: &id,
+            },
+            async move |tx| {
+                let result = sqlx::query(
+                    "DELETE FROM environment_secrets \
+                     WHERE tenant_id = $1 AND environment_id = $2 AND name = $3",
+                )
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(&name_owned)
+                .execute(&mut **tx)
+                .await?;
+                if result.rows_affected() == 0 {
+                    return Err(StoreError::NotFound);
+                }
+                Ok(())
+            },
+            false,
+        )
+        .await
+    }
+
+    /// Ensure the scope has a live KEK and DEK to seal a secret under, provisioning
+    /// each lazily on first use. Idempotent (a Conflict from an already-provisioned
+    /// key is swallowed), exactly as the users PII path does.
+    async fn ensure_scope_keys(&self, env: &Env, master: &MasterKey) -> Result<(), StoreError> {
+        let envelope = ActingEnvelopeRepo {
+            store: self.store,
+            scope: self.scope,
+            acting: self.acting,
+        };
+        match envelope.provision_kek(env, master).await {
+            Ok(_) | Err(StoreError::Conflict) => {}
+            Err(error) => return Err(error),
+        }
+        match envelope.provision_dek(env, master).await {
+            Ok(_) | Err(StoreError::Conflict) => {}
+            Err(error) => return Err(error),
+        }
+        Ok(())
+    }
+
+    /// The id of an existing secret by name, reused so an overwrite keeps a stable
+    /// audit target; a fresh id for a first write.
+    async fn existing_secret_id_or_new(
+        &self,
+        env: &Env,
+        name: &str,
+    ) -> Result<EnvironmentSecretId, StoreError> {
+        match self.secret_id(name).await {
+            Ok(id) => Ok(id),
+            Err(StoreError::NotFound) => Ok(EnvironmentSecretId::generate(env, &self.scope)),
+            Err(other) => Err(other),
+        }
+    }
+
+    /// The stored id of the secret named `name`, or [`StoreError::NotFound`].
+    async fn secret_id(&self, name: &str) -> Result<EnvironmentSecretId, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT id FROM environment_secrets \
+             WHERE tenant_id = $1 AND environment_id = $2 AND name = $3",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(name)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        let row = row.ok_or(StoreError::NotFound)?;
+        Ok(EnvironmentSecretId::parse_in_scope(
+            &row.get::<String, _>("id"),
+            &self.scope,
+        )?)
     }
 }
 

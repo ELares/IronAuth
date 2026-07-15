@@ -52,6 +52,7 @@ pub mod classification;
 pub mod custom_domain;
 pub mod environment;
 mod error;
+pub mod esv;
 mod id;
 mod migrate;
 mod redirect;
@@ -81,6 +82,10 @@ pub use environment::{
     UnknownEnvironmentType,
 };
 pub use error::StoreError;
+pub use esv::{
+    MAX_NAME_LEN, Reference, ReferenceError, ReferenceKind, ResolveError, Resolved, name_is_valid,
+    reference_resolves, resolve_value,
+};
 pub use id::{
     AcmeChallengeId, AcmeChallengeKind, AgentId, AgentKind, AssertionMappingId,
     AssertionMappingKind, AuditId, AuditKind, AuditTarget, AuthorizationCodeId,
@@ -88,22 +93,23 @@ pub use id::{
     ClientId, ClientKind, ClientSessionId, ClientSessionKind, ConsentId, ConsentKind,
     CorrelationId, CorrelationKind, CustomDomainId, CustomDomainKind, DcrPolicyId, DcrPolicyKind,
     DekId, DekKind, DeviceCodeId, DeviceCodeKind, EncryptedSecretId, EncryptedSecretKind,
-    EnvironmentId, EnvironmentKind, ExternalIssuerId, ExternalIssuerKind, GrantId, GrantKind,
-    HumanId, HumanKind, IdParseError, InitialAccessTokenId, InitialAccessTokenKind, IssuedTokenId,
-    IssuedTokenKind, KekId, KekKind, LevelId, LevelKind, ManagementKeyId, ManagementKeyKind,
-    NotInScope, OperatorId, OperatorKind, OrganizationId, OrganizationKind, PushedRequestId,
-    PushedRequestKind, RefreshFamilyId, RefreshFamilyKind, RefreshTokenId, RefreshTokenKind,
-    ResourceServerId, ResourceServerKind, ScopedId, ScopedKind, ServiceAccountId,
-    ServiceAccountKind, ServiceId, ServiceKind, SessionEventId, SessionEventKind, SessionId,
-    SessionKind, SigningKeyId, SigningKeyKind, TenantId, TenantKind, UserId, UserKind,
+    EnvironmentId, EnvironmentKind, EnvironmentSecretId, EnvironmentSecretKind, ExternalIssuerId,
+    ExternalIssuerKind, GrantId, GrantKind, HumanId, HumanKind, IdParseError, InitialAccessTokenId,
+    InitialAccessTokenKind, IssuedTokenId, IssuedTokenKind, KekId, KekKind, LevelId, LevelKind,
+    ManagementKeyId, ManagementKeyKind, NotInScope, OperatorId, OperatorKind, OrganizationId,
+    OrganizationKind, PushedRequestId, PushedRequestKind, RefreshFamilyId, RefreshFamilyKind,
+    RefreshTokenId, RefreshTokenKind, ResourceServerId, ResourceServerKind, ScopedId, ScopedKind,
+    ServiceAccountId, ServiceAccountKind, ServiceId, ServiceKind, SessionEventId, SessionEventKind,
+    SessionId, SessionKind, SigningKeyId, SigningKeyKind, TenantId, TenantKind, UserId, UserKind,
+    VariableId, VariableKind,
 };
 pub use migrate::{Migration, MigrationError, MigrationReport, MigrationRunner, Phase};
 pub use redirect::{redirect_uri_is_registrable, redirect_uri_matches};
 pub use repository::{
     AccessTokenResolution, ActingAssertionSubjectMappingRepo, ActingAuthorizationRepo,
     ActingClientRepo, ActingConsentRepo, ActingCustomDomainRepo, ActingDcrPolicyRepo,
-    ActingDeviceCodeRepo, ActingEnvelopeRepo, ActingEnvironmentRepo,
-    ActingExternalAssertionIssuerRepo, ActingInitialAccessTokenRepo,
+    ActingDeviceCodeRepo, ActingEnvelopeRepo, ActingEnvironmentRepo, ActingEnvironmentSecretRepo,
+    ActingEnvironmentVariableRepo, ActingExternalAssertionIssuerRepo, ActingInitialAccessTokenRepo,
     ActingManagementCredentialRepo, ActingManagementStore, ActingOrganizationRepo,
     ActingPushedRequestRepo, ActingRefreshRepo, ActingResourceServerRepo, ActingServiceAccountRepo,
     ActingSessionRepo, ActingSigningKeyRepo, ActingStore, ActingTenantRepo, ActingUserRepo,
@@ -117,11 +123,12 @@ pub use repository::{
     DeviceApproveOutcome, DeviceAttemptOutcome, DeviceClientProfile, DeviceCodeRepo,
     DevicePollOutcome, DeviceRedeemOutcome, DeviceUserCodeLookup, DynamicClientRecord,
     DynamicClientRegistration, DynamicClientUpdate, EnvelopeRepo, EnvironmentGuardrailRepo,
-    EnvironmentRecord, EnvironmentRepo, EnvironmentServingState, ExternalAssertionIssuerRecord,
-    ExternalAssertionIssuerRepo, ExternalAssertionJtiRepo, FrontchannelLogoutParticipant,
-    GrantOwner, GrantedConsent, IdempotencyRepo, IdempotencyWrite, InitialAccessTokenRepo,
-    IssueClientCredentials, IssueCode, IssuedTokenRecord, JtiOutcome, LogoutDelivery,
-    MANAGEMENT_LIST_HARD_CAP, ManagementCredentialRecord, ManagementCredentialRepo,
+    EnvironmentRecord, EnvironmentRepo, EnvironmentSecretMetadata, EnvironmentSecretRepo,
+    EnvironmentServingState, EnvironmentVariableRecord, EnvironmentVariableRepo,
+    ExternalAssertionIssuerRecord, ExternalAssertionIssuerRepo, ExternalAssertionJtiRepo,
+    FrontchannelLogoutParticipant, GrantOwner, GrantedConsent, IdempotencyRepo, IdempotencyWrite,
+    InitialAccessTokenRepo, IssueClientCredentials, IssueCode, IssuedTokenRecord, JtiOutcome,
+    LogoutDelivery, MANAGEMENT_LIST_HARD_CAP, ManagementCredentialRecord, ManagementCredentialRepo,
     ManagementStore, NewAssertionSubjectMapping, NewClientAuthDiagnostic, NewDcrPolicy,
     NewDeviceCode, NewDynamicClient, NewEnvironment, NewExternalAssertionIssuer,
     NewInitialAccessToken, NewJwtAuthClient, NewOpaqueAccessToken, NewRefreshFamily,
@@ -141,6 +148,7 @@ pub use scope::Scope;
 pub use snapshot::{
     CLIENT_SECRET_REFERENCE, ClientSnapshot, DcrPolicySnapshot, ResourceServerSnapshot,
     SNAPSHOT_RESOURCE_TYPES, SNAPSHOT_SCHEMA_VERSION, SecretRef, Snapshot, SnapshotResources,
-    SnapshotViolation, classification_coverage_gaps, export as export_snapshot, validate_document,
+    SnapshotViolation, VariableSnapshot, classification_coverage_gaps, export as export_snapshot,
+    validate_document,
 };
 pub use store::Store;
