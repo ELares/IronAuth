@@ -6,6 +6,17 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- The binary now dispatches the config-as-code subcommands `validate`, `plan`,
+  `apply`, and `drift` (issue #51, CLI half) into the new `ironauth-apply` crate.
+  They are a THIN client of the management API: `validate` checks a document
+  against the snapshot format locally; `plan` and `apply --dry-run` render the
+  server-computed promotion plan; `apply` applies transactionally (a re-apply of
+  an unchanged target is a no-op, a target drifted from an expected revision
+  exits nonzero and changes nothing); `drift` reports drift with CI-gate exit
+  codes. Run `ironauth <subcommand> --help` for usage. The outbound HTTP the CLI
+  needs lives entirely in `ironauth-apply`, so this binary crate stays free of an
+  HTTP-client dependency (scripts/http-audit.sh). The Terraform-provider and
+  dogfooding halves of issue #51 are deferred; the issue stays open.
 - The boot path now spawns the OIDC Back-Channel Logout delivery worker (issue #34) when
   `oidc.enabled` AND `oidc.backchannel_logout_enabled` are set (off by default). The
   worker drains the durable session-ended outbox per scope, builds one signed Logout Token

@@ -27,6 +27,12 @@ ironauth-jose.workspace = true
 # enforcer from the [quota] config and hands it to the OIDC data plane. Pure,
 # in-memory token buckets with no persistence or network dependency.
 ironauth-quota.workspace = true
+# The config-as-code CLI (issue #51): the `validate`/`plan`/`apply`/`drift`
+# subcommands dispatch into this crate. It is a THIN client of the management API
+# and owns its own control-plane HTTP client (the outbound-HTTP dependency lives
+# there, not in this server-wiring binary, so scripts/http-audit.sh keeps this
+# crate free of an HTTP-client dependency).
+ironauth-apply.workspace = true
 axum = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "time"] }
 tracing.workspace = true

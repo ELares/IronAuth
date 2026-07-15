@@ -856,6 +856,7 @@ version = "0.1.0"
 dependencies = [
  "axum 0.8.9",
  "ironauth-admin",
+ "ironauth-apply",
  "ironauth-config",
  "ironauth-env",
  "ironauth-jose",
@@ -887,6 +888,26 @@ dependencies = [
  "tower 0.5.3",
  "tracing",
  "utoipa",
+]
+
+[[package]]
+name = "ironauth-apply"
+version = "0.1.0"
+dependencies = [
+ "axum 0.8.9",
+ "bytes",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "ironauth-admin",
+ "ironauth-config",
+ "ironauth-env",
+ "ironauth-store",
+ "rustls-native-certs",
+ "serde_json",
+ "tokio",
+ "tokio-rustls",
 ]
 
 [[package]]
