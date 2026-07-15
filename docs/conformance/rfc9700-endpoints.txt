@@ -19,6 +19,12 @@
 /register
 /revoke
 /t/{tenant_id}/e/{environment_id}/.well-known/openid-configuration
+/t/{tenant_id}/e/{environment_id}/account/credentials
+/t/{tenant_id}/e/{environment_id}/account/credentials/remove
+/t/{tenant_id}/e/{environment_id}/account/password
+/t/{tenant_id}/e/{environment_id}/account/sessions
+/t/{tenant_id}/e/{environment_id}/account/sessions/revoke
+/t/{tenant_id}/e/{environment_id}/account/sessions/revoke-others
 /t/{tenant_id}/e/{environment_id}/connect/register
 /t/{tenant_id}/e/{environment_id}/connect/register/{client_id}
 /t/{tenant_id}/e/{environment_id}/device

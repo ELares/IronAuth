@@ -248,7 +248,7 @@ async fn expand_contract_example_chain_runs_all_three_phases_and_contract_remove
 // per real table); splitting it would not make it clearer.
 #[allow(clippy::too_many_lines)]
 #[tokio::test]
-async fn production_chain_is_only_the_thirty_five_real_migrations_and_ships_no_demo_object() {
+async fn production_chain_is_only_the_thirty_six_real_migrations_and_ships_no_demo_object() {
     // TestDatabase::start runs Store::migrate() (the production chain) on a
     // fresh, empty database.
     let db = TestDatabase::start().await;
@@ -265,8 +265,8 @@ async fn production_chain_is_only_the_thirty_five_real_migrations_and_ships_no_d
     );
     assert_eq!(
         report.already_applied(),
-        35,
-        "the production chain is exactly thirty-five migrations (isolation, audit log, management \
+        36,
+        "the production chain is exactly thirty-six migrations (isolation, audit log, management \
          API, OIDC authorization, signing keys, login/consent, authentication context, redirect \
          registration, UserInfo claims, consent scope upsert, resource servers, opaque access \
          tokens, client auth suite, dynamic client registration, pushed authorization requests, \
@@ -274,15 +274,16 @@ async fn production_chain_is_only_the_thirty_five_real_migrations_and_ships_no_d
          indicators, JWT bearer assertion grant, device authorization, session model, RP-initiated \
          logout, session-ended events, back-channel logout, front-channel logout, resource-model \
          APIs, envelope encryption, environment guardrails, tenant lifecycle, BYOK bindings, \
-         snapshot export, custom domains, environment secrets and variables, config promotion)"
+         snapshot export, custom domains, environment secrets and variables, config promotion, \
+         self-service account)"
     );
 
-    // The ledger holds exactly versions 1 through 35.
+    // The ledger holds exactly versions 1 through 36.
     assert_eq!(
         applied_versions(pool).await,
         vec![
             1_i64, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
-            24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35
+            24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36
         ]
     );
     let phase_of = |version: i64| async move {
@@ -396,6 +397,12 @@ async fn production_chain_is_only_the_thirty_five_real_migrations_and_ships_no_d
     // variables) and read the presence of an environment secret. A pure grant, no
     // schema change, so this is an expand too.
     assert_eq!(phase_of(35).await, "expand");
+    // The self-service account migration (issue #61): a column-scoped UPDATE grant
+    // on users.password_hash (so a self-service password change can replace the
+    // verifier) plus one new account_credentials scoped table with its indexes,
+    // isolation policy, nonempty-scope and closed-type CHECKs, and column-scoped
+    // grants. All additive, so this is an expand too.
+    assert_eq!(phase_of(36).await, "expand");
 
     // The demo object never reaches a production database.
     assert!(
@@ -444,6 +451,11 @@ async fn production_chain_is_only_the_thirty_five_real_migrations_and_ships_no_d
     assert!(table_exists(pool, "users").await, "users exists");
     assert!(table_exists(pool, "sessions").await, "sessions exists");
     assert!(table_exists(pool, "consents").await, "consents exists");
+    // The self-service account-credential registry (issue #61) exists.
+    assert!(
+        table_exists(pool, "account_credentials").await,
+        "account_credentials exists"
+    );
     // The authentication-context columns (issue #14) exist: the recorded login
     // methods on sessions and codes, the frozen auth_time on codes, and the
     // client's require_auth_time registration flag.

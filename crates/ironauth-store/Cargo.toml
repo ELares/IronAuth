@@ -325,5 +325,17 @@ name = "environment_secrets_variables"
 path = "tests/environment_secrets_variables.rs"
 required-features = ["testing"]
 
+# Self-service account management (issue #61): a password change verifies through
+# the stored hash, writes a new one, and revokes every OTHER session while keeping
+# the current one; a credential enroll/list/remove round-trips with the friendly
+# name sealed at rest; the last-usable-credential guardrail blocks removing the last
+# primary-login credential without the recovery acknowledgment; a cross-subject
+# credential id is the uniform not-found; and every mutation is audited to the end
+# user. Needs a real database (DATABASE_URL).
+[[test]]
+name = "self_service_account"
+path = "tests/self_service_account.rs"
+required-features = ["testing"]
+
 [lints]
 workspace = true

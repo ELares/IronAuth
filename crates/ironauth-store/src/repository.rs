@@ -63,11 +63,12 @@ use crate::environment::{EnvironmentType, GuardrailSet};
 use crate::error::StoreError;
 use crate::id::{
     AcmeChallengeId, AssertionMappingId, AuditId, AuditTarget, AuthorizationCodeId,
-    BackChannelDeliveryId, ClientId, ClientSessionId, ConsentId, CorrelationId, CustomDomainId,
-    DcrPolicyId, DekId, DeviceCodeId, EncryptedSecretId, EnvironmentId, EnvironmentSecretId,
-    ExternalIssuerId, GrantId, InitialAccessTokenId, IssuedTokenId, KekId, ManagementKeyId,
-    OperatorId, OrganizationId, PushedRequestId, RefreshFamilyId, RefreshTokenId, ResourceServerId,
-    ServiceAccountId, SessionEventId, SessionId, SigningKeyId, TenantId, UserId, VariableId,
+    BackChannelDeliveryId, ClientId, ClientSessionId, ConsentId, CorrelationId, CredentialId,
+    CustomDomainId, DcrPolicyId, DekId, DeviceCodeId, EncryptedSecretId, EnvironmentId,
+    EnvironmentSecretId, ExternalIssuerId, GrantId, InitialAccessTokenId, IssuedTokenId, KekId,
+    ManagementKeyId, OperatorId, OrganizationId, PushedRequestId, RefreshFamilyId, RefreshTokenId,
+    ResourceServerId, ServiceAccountId, SessionEventId, SessionId, SigningKeyId, TenantId, UserId,
+    VariableId,
 };
 use crate::scope::Scope;
 use crate::store::Store;
@@ -228,6 +229,18 @@ impl<'a> ScopedStore<'a> {
     #[must_use]
     pub fn refresh_family_fleet(&self) -> RefreshFamilyFleetRepo<'a> {
         RefreshFamilyFleetRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
+    /// The read-only account-credential repository for this scope (issue #61): list a
+    /// subject's OWN enrolled credentials; enroll and remove live on
+    /// [`ActingStore::account_credentials`]. Every read is subject-bound, so a
+    /// credential of another subject is not reachable.
+    #[must_use]
+    pub fn account_credentials(&self) -> AccountCredentialRepo<'a> {
+        AccountCredentialRepo {
             store: self.store,
             scope: self.scope,
         }
@@ -549,6 +562,18 @@ impl<'a> ActingStore<'a> {
     #[must_use]
     pub fn sessions(&self) -> ActingSessionRepo<'a> {
         ActingSessionRepo {
+            store: self.store,
+            scope: self.scope,
+            acting: self.acting,
+        }
+    }
+
+    /// The mutating account-credential repository for this scope and actor (issue
+    /// #61): enroll and remove a subject's OWN credentials, audited and
+    /// subject-bound. The last-usable-credential guardrail is enforced on removal.
+    #[must_use]
+    pub fn account_credentials(&self) -> ActingAccountCredentialRepo<'a> {
+        ActingAccountCredentialRepo {
             store: self.store,
             scope: self.scope,
             acting: self.acting,
@@ -7673,6 +7698,36 @@ impl UserRepo<'_> {
         let claims = String::from_utf8(plaintext).map_err(|_| StoreError::Encryption)?;
         Ok(Some(claims))
     }
+
+    /// Read a user's stored Argon2id password verifier by their subject (the `usr_`
+    /// id string), within scope. Returns [`None`] when no such user is visible in
+    /// this scope (including a cross-scope subject). The self-service password change
+    /// (issue #61) reads this to verify the CURRENT password before it writes the new
+    /// one; the hash is a one-way verifier, never the plaintext, and is never logged.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn password_hash_for_subject(
+        &self,
+        subject: &UserId,
+    ) -> Result<Option<String>, StoreError> {
+        if subject.scope() != self.scope {
+            return Ok(None);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT password_hash FROM users \
+             WHERE id = $1 AND tenant_id = $2 AND environment_id = $3",
+        )
+        .bind(subject.to_string())
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(row.map(|row| row.get::<String, _>("password_hash")))
+    }
 }
 
 /// The mutating bootstrap user repository (issue #20).
@@ -7824,6 +7879,97 @@ impl ActingUserRepo<'_> {
         )
         .await?;
         Ok(id)
+    }
+
+    /// CHANGE a user's password at the self-service account surface (issue #61):
+    /// write the fresh Argon2id `new_password_hash` onto the user, and in the SAME
+    /// transaction REVOKE every OTHER session of the user (session-fixation defense),
+    /// cascading each to its refresh families through the unified session-ended
+    /// fan-out (issue #35) exactly as an admin revoke does. The session named by
+    /// `keep` (the one the change is being made from) is preserved so the user is not
+    /// signed out of the browser they are actively using; pass [`None`] to revoke
+    /// EVERY session. One `account.password.change` audit row targets the user and is
+    /// attributed to the acting principal; `step_up_detail` records the operator-safe
+    /// step-up policy the sensitive change declared (never attacker-controlled text).
+    ///
+    /// The caller (the account surface) has already verified the CURRENT password
+    /// against the stored verifier and computed `new_password_hash` through the
+    /// entropy seam, so no plaintext password ever reaches the store and the hash is
+    /// never logged.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if `subject` is out of this scope or names no user;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn change_password(
+        &self,
+        env: &Env,
+        subject: &UserId,
+        new_password_hash: &str,
+        keep: Option<&SessionId>,
+        step_up_detail: &str,
+    ) -> Result<UserRevocation, StoreError> {
+        if subject.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let now_micros = epoch_micros(env.clock().now_utc());
+        let subject_text = subject.to_string();
+        // A cross-scope `keep` is treated as absent (revoke everything): only a
+        // same-scope session id can preserve a session.
+        let keep_text = keep
+            .filter(|keep| keep.scope() == scope)
+            .map(ToString::to_string);
+        let emit = SessionEndedEmit::from_acting(env, &self.acting);
+        let mut outcome = UserRevocation::default();
+        let out = &mut outcome;
+        write_audited_detailed(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::AccountPasswordChange,
+                target: subject,
+            },
+            async move |tx| {
+                // Write the new verifier. A subject that names no user flips no row,
+                // which is a NotFound that rolls the whole audited write back (no
+                // password change, no session revocation, no audit row).
+                let updated = sqlx::query(
+                    "UPDATE users SET password_hash = $1 \
+                     WHERE id = $2 AND tenant_id = $3 AND environment_id = $4",
+                )
+                .bind(new_password_hash)
+                .bind(&subject_text)
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .execute(&mut **tx)
+                .await?;
+                if updated.rows_affected() == 0 {
+                    return Err(StoreError::NotFound);
+                }
+                // Every OTHER live session of the user is revoked in this same
+                // transaction. The keep session (the browser making the change) is
+                // preserved. Each drives one session-ended cascade and one fan-out
+                // event, exactly as an admin revoke does.
+                *out = revoke_other_sessions_in_tx(
+                    tx,
+                    scope,
+                    &subject_text,
+                    keep_text.as_deref(),
+                    SessionEndCause::PasswordChanged,
+                    now_micros,
+                    &emit,
+                )
+                .await?;
+                Ok(())
+            },
+            false,
+            Some(step_up_detail),
+        )
+        .await?;
+        Ok(outcome)
     }
 }
 
@@ -8375,6 +8521,137 @@ impl ActingSessionRepo<'_> {
                 Ok(())
             },
             false,
+        )
+        .await?;
+        Ok(outcome)
+    }
+
+    /// REVOKE one of the acting user's OWN sessions at the self-service account
+    /// surface (issue #61). The revoke is SUBJECT-BOUND in SQL: the session is only
+    /// ended when it belongs to `subject`, so a session id of ANOTHER user (even
+    /// within the same tenant) is a uniform no-op and is never revoked (defense in
+    /// depth behind the surface's own ownership check). A revoked session stops
+    /// resolving immediately and cascades through the unified session-ended fan-out
+    /// (issue #35) EXACTLY as an admin revoke does; the mutation is audited as
+    /// `account.session.revoke` targeting the session and attributed to the end user.
+    /// A no-op (foreign or absent session) writes nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if `id` or `subject` is out of this scope;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn self_revoke(
+        &self,
+        env: &Env,
+        subject: &UserId,
+        id: &SessionId,
+    ) -> Result<SessionRevocation, StoreError> {
+        if id.scope() != self.scope || subject.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let now_micros = epoch_micros(env.clock().now_utc());
+        let mut tx = begin_scoped(self.store, scope).await?;
+        // Subject-bound ownership: only the acting user's OWN session is ended. A
+        // session's subject is immutable, so this read-then-act is race free.
+        let owns = sqlx::query(
+            "SELECT 1 FROM sessions \
+             WHERE id = $1 AND tenant_id = $2 AND environment_id = $3 AND subject = $4",
+        )
+        .bind(id.to_string())
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(subject.to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        if owns.is_none() {
+            // A foreign or absent session: a uniform no-op that writes nothing (no
+            // revocation, no audit row).
+            tx.commit().await?;
+            return Ok(SessionRevocation::default());
+        }
+        let outcome = revoke_session_in_tx(
+            &mut tx,
+            scope,
+            id,
+            SessionEndCause::Revoked,
+            now_micros,
+            false,
+            &SessionEndedEmit::from_acting(env, &self.acting),
+        )
+        .await?;
+        insert_audit_row(
+            &mut tx,
+            &AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::AccountSessionRevoke,
+                target: id,
+            },
+            None,
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(outcome)
+    }
+
+    /// REVOKE all of the acting user's OTHER sessions at the self-service account
+    /// surface (issue #61): the "sign out everywhere else" action. Every live session
+    /// of `subject` EXCEPT `keep` (the one making the request) is ended, cascading
+    /// each through the unified session-ended fan-out (issue #35). One
+    /// `account.sessions.revoke_others` audit row targets the user and is attributed
+    /// to the end user; `step_up_detail` records the operator-safe step-up policy the
+    /// sensitive change declared. Pass [`None`] for `keep` to end EVERY session.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if `subject` is out of this scope;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn self_revoke_others(
+        &self,
+        env: &Env,
+        subject: &UserId,
+        keep: Option<&SessionId>,
+        step_up_detail: &str,
+    ) -> Result<UserRevocation, StoreError> {
+        if subject.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let now_micros = epoch_micros(env.clock().now_utc());
+        let subject_text = subject.to_string();
+        let keep_text = keep
+            .filter(|keep| keep.scope() == scope)
+            .map(ToString::to_string);
+        let emit = SessionEndedEmit::from_acting(env, &self.acting);
+        let mut outcome = UserRevocation::default();
+        let out = &mut outcome;
+        write_audited_detailed(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::AccountSessionsRevokeOthers,
+                target: subject,
+            },
+            async move |tx| {
+                *out = revoke_other_sessions_in_tx(
+                    tx,
+                    scope,
+                    &subject_text,
+                    keep_text.as_deref(),
+                    SessionEndCause::Revoked,
+                    now_micros,
+                    &emit,
+                )
+                .await?;
+                Ok(())
+            },
+            false,
+            Some(step_up_detail),
         )
         .await?;
         Ok(outcome)
@@ -9456,6 +9733,11 @@ pub enum SessionEndCause {
     /// tokens die at the transition. Carrying the lineage forward here instead would
     /// be a cross-user privilege escalation.
     ReplacedByOtherSubject,
+    /// Ended because the user CHANGED their password at the self-service account
+    /// surface (issue #61): a password change revokes every OTHER session of the
+    /// user in the same transaction (session-fixation defense), so a stolen session
+    /// cannot outlive the credential it was minted under.
+    PasswordChanged,
 }
 
 impl SessionEndCause {
@@ -9468,6 +9750,7 @@ impl SessionEndCause {
             SessionEndCause::UserRevokedAll => "user_revoked_all",
             SessionEndCause::LoggedOut => "logged_out",
             SessionEndCause::ReplacedByOtherSubject => "replaced_by_other_subject",
+            SessionEndCause::PasswordChanged => "password_changed",
         }
     }
 
@@ -9484,6 +9767,7 @@ impl SessionEndCause {
             "user_revoked_all" => Some(SessionEndCause::UserRevokedAll),
             "logged_out" => Some(SessionEndCause::LoggedOut),
             "replaced_by_other_subject" => Some(SessionEndCause::ReplacedByOtherSubject),
+            "password_changed" => Some(SessionEndCause::PasswordChanged),
             _ => None,
         }
     }
@@ -9587,6 +9871,48 @@ async fn cascade_families_for_subject(
         .await?;
     }
     Ok(())
+}
+
+/// Revoke every LIVE session of `subject` EXCEPT `keep`, inside an OPEN transaction
+/// (issue #61), cascading each through the unified session-ended fan-out (issue #35)
+/// and PRESERVING the `offline_access` families (no hard kill). Shared by the
+/// self-service password change and the "sign out everywhere else" surface, so both
+/// end a user's other sessions exactly the same way. Accumulates the counts and the
+/// revoked ids into `out`.
+async fn revoke_other_sessions_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    scope: Scope,
+    subject_text: &str,
+    keep_text: Option<&str>,
+    cause: SessionEndCause,
+    now_micros: i64,
+    emit: &SessionEndedEmit<'_>,
+) -> Result<UserRevocation, StoreError> {
+    let live = sqlx::query(
+        "SELECT id FROM sessions \
+         WHERE subject = $1 AND tenant_id = $2 AND environment_id = $3 \
+         AND revoked_at IS NULL AND ended_at IS NULL \
+         AND ($4::text IS NULL OR id <> $4)",
+    )
+    .bind(subject_text)
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .bind(keep_text)
+    .fetch_all(&mut **tx)
+    .await?;
+    let mut out = UserRevocation::default();
+    for row in &live {
+        let session_text: String = row.get("id");
+        let session_id = SessionId::parse_in_scope(&session_text, &scope)?;
+        let revocation =
+            revoke_session_in_tx(tx, scope, &session_id, cause, now_micros, false, emit).await?;
+        if revocation.session_flipped {
+            out.sessions_revoked += 1;
+        }
+        out.families_revoked += revocation.families_revoked;
+        out.revoked_session_ids.push(session_text);
+    }
+    Ok(out)
 }
 
 /// Generate a fresh per-(client, session) `sid` value (issue #32): the `sid_`-tagged
@@ -10108,6 +10434,384 @@ fn refresh_family_summary_from_row(row: &PgRow) -> RefreshFamilySummary {
         created_at_unix_micros: row.get("created_us"),
         absolute_expires_at_unix_micros: row.get("abs_us"),
         revoked_at_unix_micros: row.get("revoked_us"),
+    }
+}
+
+// ===========================================================================
+// The self-service account-credential registry (issue #61).
+//
+// A user's enrolled credentials (passkeys, TOTP authenticators, recovery-code
+// sets) as a scoped, subject-bound resource. Every read and every write filters
+// on the subject, so the surface reaches ONLY the authenticated subject's own
+// credentials: a credential id of another subject (or another scope) resolves to
+// the uniform not-found and is never actionable. The friendly name is user PII,
+// sealed under the scope's envelope DEK (issue #48). This issue ships the registry
+// and its authorization contract; the concrete factor material lands with M7.
+// ===========================================================================
+
+/// The closed set of self-service credential factor kinds (issue #61). The M7
+/// factor issues implement the ceremonies against these; this issue owns the
+/// registry and the authorization contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CredentialType {
+    /// A WebAuthn passkey: a PRIMARY login factor.
+    Passkey,
+    /// A TOTP authenticator app: a second factor.
+    Totp,
+    /// A recovery-code set: a backup factor.
+    RecoveryCode,
+}
+
+impl CredentialType {
+    /// The stable wire string (`passkey`, `totp`, `recovery_code`), matching the
+    /// migration's `account_credentials_type_known` CHECK.
+    #[must_use]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            CredentialType::Passkey => "passkey",
+            CredentialType::Totp => "totp",
+            CredentialType::RecoveryCode => "recovery_code",
+        }
+    }
+
+    /// Parse a wire factor kind. Returns [`None`] for any value outside the closed
+    /// set (the caller maps that to a client error, never a stored row).
+    #[must_use]
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "passkey" => Some(CredentialType::Passkey),
+            "totp" => Some(CredentialType::Totp),
+            "recovery_code" => Some(CredentialType::RecoveryCode),
+            _ => None,
+        }
+    }
+
+    /// Whether this factor kind can serve as a PRIMARY login credential (a passkey
+    /// can; a TOTP or recovery-code set is a second/backup factor). The
+    /// last-usable-credential guardrail counts exactly the primary-login factors,
+    /// so a user cannot strand themselves by removing their last way to sign in.
+    #[must_use]
+    pub fn usable_for_login(&self) -> bool {
+        matches!(self, CredentialType::Passkey)
+    }
+}
+
+/// An enrolled credential as the self-service account surface reports it (issue
+/// #61): its id, factor kind, decrypted friendly name, whether it is usable as a
+/// primary login factor, and the created / last-used timestamps the account UI
+/// shows. Every timestamp is microseconds since the Unix epoch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountCredentialSummary {
+    /// The credential identifier (a `crd_` id string).
+    pub id: String,
+    /// The factor kind wire string (`passkey`, `totp`, `recovery_code`).
+    pub credential_type: String,
+    /// The user-authored friendly name (decrypted from the sealed column).
+    pub friendly_name: String,
+    /// Whether this credential is a primary login factor (the guardrail counts it).
+    pub usable_for_login: bool,
+    /// When the credential was enrolled (the pagination key).
+    pub created_at_unix_micros: i64,
+    /// When the factor was last used to authenticate, if recorded (M7).
+    pub last_used_at_unix_micros: Option<i64>,
+}
+
+/// The outcome of a self-service credential removal (issue #61).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CredentialRemoveOutcome {
+    /// The credential was removed.
+    Removed,
+    /// No such credential is visible for this subject in this scope (absent,
+    /// cross-scope, or another subject's): the uniform not-found, never actionable.
+    NotFound,
+    /// The removal was BLOCKED by the last-usable-credential guardrail: it would
+    /// have removed the subject's last primary-login credential and the request did
+    /// not carry the documented recovery acknowledgment, so the user is not silently
+    /// stranded. Nothing was removed and no audit row was written.
+    BlockedLastCredential,
+}
+
+/// The read-only account-credential repository (issue #61): list and inspect a
+/// subject's enrolled credentials. The scope is fixed AND every read is
+/// subject-bound, so a credential of another subject, tenant, or environment is not
+/// reachable.
+pub struct AccountCredentialRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl AccountCredentialRepo<'_> {
+    /// Parse an untrusted credential identifier under this scope. A malformed
+    /// identifier and one minted in another scope both return the uniform not-found.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the identifier is malformed or out of scope.
+    pub fn parse_id(&self, raw: &str) -> Result<CredentialId, StoreError> {
+        Ok(CredentialId::parse_in_scope(raw, &self.scope)?)
+    }
+
+    /// One page of `subject`'s enrolled credentials, ordered by `(created_at, id)`,
+    /// starting strictly after `after`. Filtered on the subject, so it lists ONLY
+    /// that subject's own credentials. The friendly name is decrypted from its sealed
+    /// column under the row's DEK version.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Encryption`] if no platform master key is configured or a sealed
+    /// name cannot be authenticated and decrypted; [`StoreError::Database`] on a
+    /// persistence failure.
+    pub async fn list(
+        &self,
+        subject: &UserId,
+        limit: i64,
+        after: Option<&CursorPosition>,
+    ) -> Result<Vec<AccountCredentialSummary>, StoreError> {
+        if subject.scope() != self.scope {
+            return Ok(Vec::new());
+        }
+        let master = self.store.master().ok_or(StoreError::Encryption)?;
+        let (after_micros, after_id) = split_cursor(after);
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let rows = sqlx::query(
+            "SELECT id, credential_type, friendly_name_sealed, pii_dek_version, \
+             usable_for_login, \
+             (EXTRACT(EPOCH FROM created_at) * 1000000)::bigint AS created_us, \
+             (EXTRACT(EPOCH FROM last_used_at) * 1000000)::bigint AS last_used_us \
+             FROM account_credentials \
+             WHERE tenant_id = $1 AND environment_id = $2 AND subject = $3 \
+             AND ($4::bigint IS NULL OR (created_at, id) > \
+                  (TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval, $5::text)) \
+             ORDER BY created_at, id LIMIT $6",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(subject.to_string())
+        .bind(after_micros)
+        .bind(after_id)
+        .bind(limit.clamp(0, MANAGEMENT_LIST_HARD_CAP + 1))
+        .fetch_all(&mut *tx)
+        .await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let dek_version: i32 = row.get("pii_dek_version");
+            let sealed: Vec<u8> = row.get("friendly_name_sealed");
+            let dek = fetch_dek_by_version(&mut tx, self.scope, master, dek_version).await?;
+            let plaintext = dek.open(
+                &credential_pii_seal_aad(self.scope, dek_version),
+                &Sealed::from_bytes(sealed)?,
+            )?;
+            let friendly_name = String::from_utf8(plaintext).map_err(|_| StoreError::Encryption)?;
+            out.push(AccountCredentialSummary {
+                id: row.get("id"),
+                credential_type: row.get("credential_type"),
+                friendly_name,
+                usable_for_login: row.get("usable_for_login"),
+                created_at_unix_micros: row.get("created_us"),
+                last_used_at_unix_micros: row.get("last_used_us"),
+            });
+        }
+        tx.commit().await?;
+        Ok(out)
+    }
+}
+
+/// The mutating account-credential repository (issue #61): enroll and remove a
+/// subject's own credentials, audited and subject-bound.
+pub struct ActingAccountCredentialRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+    acting: ActingContext,
+}
+
+impl ActingAccountCredentialRepo<'_> {
+    /// Ensure the scope has a live KEK and DEK to seal the friendly name under,
+    /// provisioning each lazily on first use (idempotent). Mirrors the users-PII
+    /// path so a credential name is sealed exactly like the login handle.
+    async fn ensure_scope_keys(&self, env: &Env, master: &MasterKey) -> Result<(), StoreError> {
+        let envelope = ActingEnvelopeRepo {
+            store: self.store,
+            scope: self.scope,
+            acting: self.acting,
+        };
+        match envelope.provision_kek(env, master).await {
+            Ok(_) | Err(StoreError::Conflict) => {}
+            Err(error) => return Err(error),
+        }
+        match envelope.provision_dek(env, master).await {
+            Ok(_) | Err(StoreError::Conflict) => {}
+            Err(error) => return Err(error),
+        }
+        Ok(())
+    }
+
+    /// ENROLL a credential of `credential_type` named `friendly_name` for `subject`
+    /// (issue #61), sealing the name under the scope's DEK (issue #48) and returning
+    /// the fresh id. Writes one `account.credential.enroll` audit row targeting the
+    /// credential; `step_up_detail` records the operator-safe step-up policy the
+    /// sensitive change declared. The credential is bound to `subject`, so a later
+    /// list or removal by that subject reaches it and no other subject ever can.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if `subject` is out of this scope;
+    /// [`StoreError::Encryption`] if no platform master key is configured;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn enroll(
+        &self,
+        env: &Env,
+        subject: &UserId,
+        credential_type: CredentialType,
+        friendly_name: &str,
+        step_up_detail: &str,
+    ) -> Result<CredentialId, StoreError> {
+        if subject.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let master = self.store.master().ok_or(StoreError::Encryption)?;
+        self.ensure_scope_keys(env, master).await?;
+        let id = CredentialId::generate(env, &self.scope);
+        let scope = self.scope;
+        let subject_text = subject.to_string();
+        let usable_for_login = credential_type.usable_for_login();
+        let type_str = credential_type.as_str();
+        write_audited_detailed(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::AccountCredentialEnroll,
+                target: &id,
+            },
+            async move |tx| {
+                let (dek_version, dek) = fetch_active_dek(tx, scope, master).await?;
+                let name_sealed = dek.seal(
+                    env.entropy(),
+                    &credential_pii_seal_aad(scope, dek_version),
+                    friendly_name.as_bytes(),
+                );
+                sqlx::query(
+                    "INSERT INTO account_credentials \
+                     (id, tenant_id, environment_id, subject, credential_type, \
+                      friendly_name_sealed, pii_dek_version, usable_for_login) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+                )
+                .bind(id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(&subject_text)
+                .bind(type_str)
+                .bind(name_sealed.into_bytes())
+                .bind(dek_version)
+                .bind(usable_for_login)
+                .execute(&mut **tx)
+                .await?;
+                Ok(())
+            },
+            false,
+            Some(step_up_detail),
+        )
+        .await?;
+        Ok(id)
+    }
+
+    /// REMOVE `subject`'s credential `id` (issue #61), enforcing the
+    /// last-usable-credential guardrail in the SAME transaction it reads the state
+    /// in (so a concurrent removal cannot slip two "last" credentials past it).
+    ///
+    /// The credential is resolved WITH its subject bound, so another subject's id (or
+    /// a cross-scope id) is the uniform [`CredentialRemoveOutcome::NotFound`], never
+    /// actionable. When the credential is a primary-login factor and it is the
+    /// subject's LAST such factor, the removal is BLOCKED
+    /// ([`CredentialRemoveOutcome::BlockedLastCredential`]) unless `acknowledge_recovery`
+    /// is set (the documented recovery acknowledgment), so a user cannot silently
+    /// strand themselves. A successful removal writes one `account.credential.remove`
+    /// audit row targeting the credential; a blocked or not-found removal writes
+    /// nothing. `step_up_detail` records the operator-safe step-up policy declared.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn remove(
+        &self,
+        env: &Env,
+        subject: &UserId,
+        id: &CredentialId,
+        acknowledge_recovery: bool,
+        step_up_detail: &str,
+    ) -> Result<CredentialRemoveOutcome, StoreError> {
+        if id.scope() != self.scope || subject.scope() != self.scope {
+            return Ok(CredentialRemoveOutcome::NotFound);
+        }
+        let scope = self.scope;
+        let subject_text = subject.to_string();
+        let id_text = id.to_string();
+        let mut tx = begin_scoped(self.store, scope).await?;
+        // Resolve the credential WITH its subject bound: another subject's id finds
+        // no row and is the uniform not-found.
+        let row = sqlx::query(
+            "SELECT usable_for_login FROM account_credentials \
+             WHERE id = $1 AND tenant_id = $2 AND environment_id = $3 AND subject = $4",
+        )
+        .bind(&id_text)
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(&subject_text)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(row) = row else {
+            tx.commit().await?;
+            return Ok(CredentialRemoveOutcome::NotFound);
+        };
+        let usable_for_login: bool = row.get("usable_for_login");
+        // The guardrail: removing the subject's LAST primary-login credential is
+        // blocked unless the recovery acknowledgment is present. Counted inside the
+        // same transaction so a concurrent removal cannot race two "last" credentials
+        // out from under it.
+        if usable_for_login && !acknowledge_recovery {
+            let remaining: i64 = sqlx::query(
+                "SELECT count(*) AS n FROM account_credentials \
+                 WHERE tenant_id = $1 AND environment_id = $2 AND subject = $3 \
+                 AND usable_for_login = true AND id <> $4",
+            )
+            .bind(scope.tenant().to_string())
+            .bind(scope.environment().to_string())
+            .bind(&subject_text)
+            .bind(&id_text)
+            .fetch_one(&mut *tx)
+            .await?
+            .get("n");
+            if remaining == 0 {
+                tx.commit().await?;
+                return Ok(CredentialRemoveOutcome::BlockedLastCredential);
+            }
+        }
+        sqlx::query(
+            "DELETE FROM account_credentials \
+             WHERE id = $1 AND tenant_id = $2 AND environment_id = $3 AND subject = $4",
+        )
+        .bind(&id_text)
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(&subject_text)
+        .execute(&mut *tx)
+        .await?;
+        insert_audit_row(
+            &mut tx,
+            &AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::AccountCredentialRemove,
+                target: id,
+            },
+            Some(step_up_detail),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(CredentialRemoveOutcome::Removed)
     }
 }
 
@@ -13617,6 +14321,10 @@ const USER_PII_SEAL_LABEL: &str = "ironauth.envelope.user-pii.v1";
 /// The AAD label domain-separating the `users.identifier` blind index from every
 /// other keyed derivation.
 const USER_IDENTIFIER_BIDX_LABEL: &str = "ironauth.envelope.user-identifier-bidx.v1";
+/// The AAD label domain-separating a sealed `account_credentials.friendly_name`
+/// (the user-authored credential label, issue #61) from every other envelope
+/// context, so a credential-name seal never authenticates under another column's.
+const CREDENTIAL_PII_SEAL_LABEL: &str = "ironauth.envelope.account-credential-pii.v1";
 /// The purpose label bound into a sealed `users.identifier` (the login handle).
 const USER_IDENTIFIER_PURPOSE: &str = "identifier";
 /// The purpose label bound into a sealed `users.claims` (the standard-claim JSON).
@@ -13673,6 +14381,20 @@ fn user_pii_seal_aad(scope: Scope, purpose: &str, dek_version: i32) -> Aad {
         .text(&scope.tenant().to_string())
         .text(&scope.environment().to_string())
         .text(purpose)
+        .version(i64::from(dek_version))
+        .build()
+}
+
+/// The associated data binding a sealed `account_credentials.friendly_name` (the
+/// user-authored credential label, issue #61) to its scope and the DEK version that
+/// sealed it. Shares the tenant/environment/version replay protection of every
+/// other sealed payload; the distinct label keeps a credential-name seal from ever
+/// authenticating under the generic secret-store or the users-PII context.
+fn credential_pii_seal_aad(scope: Scope, dek_version: i32) -> Aad {
+    Aad::builder()
+        .text(CREDENTIAL_PII_SEAL_LABEL)
+        .text(&scope.tenant().to_string())
+        .text(&scope.environment().to_string())
         .version(i64::from(dek_version))
         .build()
 }
