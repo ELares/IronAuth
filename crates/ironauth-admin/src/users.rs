@@ -212,6 +212,11 @@ pub async fn create_user(
                 claims_json: claims_string.as_deref(),
                 external_id: external_id.as_deref(),
                 state: user_state,
+                // The management create surface (issue #52) sets no foreign
+                // credential; the streaming bulk import path (issue #55) is where an
+                // imported foreign hash enters.
+                foreign_password_hash: None,
+                foreign_password_algo: None,
             },
             created_at_micros,
             Some(write),

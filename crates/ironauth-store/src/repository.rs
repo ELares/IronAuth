@@ -7581,11 +7581,23 @@ pub struct UserRecord {
     /// The login handle the user typed.
     pub identifier: String,
     /// The Argon2id PHC verifier string. One-way; never the plaintext password.
+    /// For a user imported with a foreign hash and not yet logged in, this is the
+    /// unusable sentinel until the first successful foreign login rehashes onto it.
     pub password_hash: String,
     /// The user's lifecycle state (issue #52). The login read path FENCES a user
     /// whose state cannot authenticate (blocked, disabled, `pending_verification`):
     /// the credential is correct but the account is not permitted to sign in.
     pub state: UserState,
+    /// The imported FOREIGN password hash (issue #55) in a canonical
+    /// algorithm-tagged string, or [`None`] when the user has no foreign credential
+    /// (the common case, and always the case after the first foreign login rehashes
+    /// it away). One-way; never the plaintext. The login path verifies against this
+    /// when the native `password_hash` is the unusable sentinel, then rehashes to
+    /// Argon2id and clears it.
+    pub foreign_password_hash: Option<String>,
+    /// The non-secret algorithm tag of `foreign_password_hash`, or [`None`] when
+    /// there is no foreign hash.
+    pub foreign_password_algo: Option<String>,
 }
 
 impl fmt::Debug for UserRecord {
@@ -7746,6 +7758,16 @@ pub struct NewAdminUser<'a> {
     pub external_id: Option<&'a str>,
     /// The initial lifecycle state (must be a creatable state).
     pub state: UserState,
+    /// The imported FOREIGN password hash in a canonical algorithm-tagged string
+    /// (issue #55), or [`None`] for a user with no imported credential. Stored
+    /// AS-IS (a one-way verifier, never a plaintext password) and verified on the
+    /// user's next login, then rehashed to the native Argon2id verifier. When set,
+    /// [`NewAdminUser::foreign_password_algo`] carries its non-secret algorithm tag.
+    pub foreign_password_hash: Option<&'a str>,
+    /// The non-secret algorithm tag of `foreign_password_hash` (for example
+    /// `bcrypt`, `scrypt`, `pbkdf2`, `argon2`, `firebase-scrypt`), or [`None`] when
+    /// there is no foreign hash. Set together with the hash.
+    pub foreign_password_algo: Option<&'a str>,
 }
 
 /// The read-only bootstrap user repository (issue #20).
@@ -7780,7 +7802,8 @@ impl UserRepo<'_> {
         // `deleted_at IS NULL` filter reads it as absent, so a deleted user cannot
         // authenticate exactly as an unknown one cannot.
         let row = sqlx::query(
-            "SELECT id, identifier_sealed, password_hash, pii_dek_version, state FROM users \
+            "SELECT id, identifier_sealed, password_hash, pii_dek_version, state, \
+             foreign_password_hash, foreign_password_algo FROM users \
              WHERE identifier_bidx = $1 AND tenant_id = $2 AND environment_id = $3 \
              AND deleted_at IS NULL",
         )
@@ -7811,6 +7834,8 @@ impl UserRepo<'_> {
             identifier,
             password_hash: row.get("password_hash"),
             state,
+            foreign_password_hash: row.get("foreign_password_hash"),
+            foreign_password_algo: row.get("foreign_password_algo"),
         }))
     }
 
@@ -8267,6 +8292,12 @@ impl ActingUserRepo<'_> {
         let claims_json = spec.claims_json.unwrap_or("{}");
         let external_id = spec.external_id;
         let state = spec.state;
+        // The imported foreign hash (issue #55) is stored AS-IS with its non-secret
+        // algorithm tag. It is credential material, not PII, so it is not sealed
+        // (exactly like the native password_hash). A user with no foreign credential
+        // stores NULL for both.
+        let foreign_password_hash = spec.foreign_password_hash;
+        let foreign_password_algo = spec.foreign_password_algo;
         // created_at and updated_at are bound from the caller's clock read (not the
         // database clock), so the response body built before the write matches the
         // stored row exactly and paging stays deterministic under a manual clock.
@@ -8306,10 +8337,11 @@ impl ActingUserRepo<'_> {
                      (id, tenant_id, environment_id, identifier_bidx, identifier_sealed, \
                       password_hash, claims_sealed, pii_dek_version, state, \
                       external_id_bidx, external_id_sealed, external_id_dek_version, \
-                      created_at, updated_at) \
+                      created_at, updated_at, foreign_password_hash, foreign_password_algo) \
                      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, \
                              TIMESTAMPTZ 'epoch' + ($13::text || ' microseconds')::interval, \
-                             TIMESTAMPTZ 'epoch' + ($13::text || ' microseconds')::interval)",
+                             TIMESTAMPTZ 'epoch' + ($13::text || ' microseconds')::interval, \
+                             $14, $15)",
                 )
                 .bind(id.to_string())
                 .bind(scope.tenant().to_string())
@@ -8324,6 +8356,8 @@ impl ActingUserRepo<'_> {
                 .bind(external_id_sealed)
                 .bind(external_id_dek_version)
                 .bind(now_micros)
+                .bind(foreign_password_hash)
+                .bind(foreign_password_algo)
                 .execute(&mut **tx)
                 .await;
                 match result {
@@ -8917,6 +8951,85 @@ impl ActingUserRepo<'_> {
         )
         .await?;
         Ok(outcome)
+    }
+
+    /// Land the verify-then-rehash upgrade of an imported FOREIGN credential (issue
+    /// #55). The login surface has already VERIFIED the presented password against
+    /// the user's stored foreign hash and computed `new_password_hash` (the native
+    /// Argon2id verifier) through the entropy seam. This writes that verifier onto
+    /// `password_hash` and CLEARS the foreign hash and its algorithm tag, atomically
+    /// per user, and writes one `user.password.upgrade` audit row in the same
+    /// transaction, so the foreign hash is retired transparently on first sign-in.
+    ///
+    /// The UPDATE is guarded on the foreign hash still being present, so two
+    /// concurrent logins for the same user race safely: exactly one wins and
+    /// upgrades, the loser flips zero rows and is a benign no-op (it returns
+    /// `Ok(false)` and writes no audit row, because the winner already upgraded).
+    /// A successful upgrade returns `Ok(true)`.
+    ///
+    /// The caller treats the result as best-effort: the login has already succeeded
+    /// on the foreign verify, so a no-op (a race) or a transient failure leaves the
+    /// foreign hash in place to be upgraded on the next login rather than failing
+    /// the sign-in. No plaintext password ever reaches the store and the hash is
+    /// never logged.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if `subject` is out of this scope or names no user;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn upgrade_foreign_password(
+        &self,
+        env: &Env,
+        subject: &UserId,
+        new_password_hash: &str,
+    ) -> Result<bool, StoreError> {
+        if subject.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let subject_text = subject.to_string();
+        let result = write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::UserPasswordUpgrade,
+                target: subject,
+            },
+            async move |tx| {
+                // Guard on the foreign hash still being present so a concurrent
+                // upgrade (or a user with no foreign credential) flips zero rows.
+                // Zero rows rolls the whole audited write back (no password change,
+                // no audit row) and is reported as the benign no-op below.
+                let updated = sqlx::query(
+                    "UPDATE users \
+                     SET password_hash = $1, foreign_password_hash = NULL, \
+                         foreign_password_algo = NULL \
+                     WHERE id = $2 AND tenant_id = $3 AND environment_id = $4 \
+                     AND deleted_at IS NULL AND foreign_password_hash IS NOT NULL",
+                )
+                .bind(new_password_hash)
+                .bind(&subject_text)
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .execute(&mut **tx)
+                .await?;
+                if updated.rows_affected() == 0 {
+                    return Err(StoreError::NotFound);
+                }
+                Ok(())
+            },
+            false,
+        )
+        .await;
+        match result {
+            Ok(()) => Ok(true),
+            // No row to upgrade: the user has no foreign hash (already upgraded, or
+            // a lost race). A benign no-op, not a fault; the audit row rolled back.
+            Err(StoreError::NotFound) => Ok(false),
+            Err(other) => Err(other),
+        }
     }
 }
 

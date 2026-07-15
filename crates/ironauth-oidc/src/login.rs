@@ -13,6 +13,8 @@
 use axum::extract::{Form, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
+use ironauth_import::ForeignHash;
+use ironauth_store::{CorrelationId, Scope, UserId, UserRecord};
 use serde::Deserialize;
 
 use crate::authn::AuthenticationEvent;
@@ -116,32 +118,50 @@ pub async fn login_post(
             let _ = password::verify_password(password, &user.password_hash);
             failed_login_page(identifier, &resume.return_to, &resume.hints, banner)
         }
-        Ok(Some(user)) if password::verify_password(password, &user.password_hash) => {
-            let actor = interaction::user_actor(&user.id);
-            let subject = user.id.to_string();
-            // The recorded authentication event: a password login (RFC 8176
-            // `pwd`) at the current clock instant. The ID token's auth_time, amr,
-            // and acr all derive from it (issue #14).
-            let event = AuthenticationEvent::password(epoch_micros(state.now()));
-            // Session-fixation defense (issue #32): establish_session rotates away
-            // any session the browser already presented (read from `headers`),
-            // invalidating it in the same transaction as the fresh one.
-            match interaction::establish_session(
-                &state,
-                resume.scope,
-                &subject,
-                &event,
-                actor,
-                &headers,
-            )
-            .await
-            {
-                Ok(cookie) => interaction::redirect_setting_cookie(&resume.return_to, &cookie),
-                Err(_) => interaction::server_error_page(),
+        Ok(Some(user)) => {
+            // Verify the native Argon2id hash first; if the account was imported with
+            // a FOREIGN hash (issue #55) and has not yet logged in, the native hash is
+            // the unusable sentinel, so fall through to the foreign verify.
+            let native_ok = password::verify_password(password, &user.password_hash);
+            let foreign_ok = !native_ok && verify_foreign(&user, password);
+            if native_ok || foreign_ok {
+                // First successful FOREIGN login: transparently rehash the password
+                // to the native Argon2id verifier and retire the foreign hash
+                // (verify-then-rehash), so the second login verifies natively. This
+                // is best-effort: the login has already succeeded, so a rehash
+                // failure leaves the foreign hash in place for the next login rather
+                // than failing the sign-in.
+                if foreign_ok {
+                    rehash_foreign_credential(&state, resume.scope, &user.id, password).await;
+                }
+                let actor = interaction::user_actor(&user.id);
+                let subject = user.id.to_string();
+                // The recorded authentication event: a password login (RFC 8176
+                // `pwd`) at the current clock instant. The ID token's auth_time, amr,
+                // and acr all derive from it (issue #14).
+                let event = AuthenticationEvent::password(epoch_micros(state.now()));
+                // Session-fixation defense (issue #32): establish_session rotates away
+                // any session the browser already presented (read from `headers`),
+                // invalidating it in the same transaction as the fresh one.
+                match interaction::establish_session(
+                    &state,
+                    resume.scope,
+                    &subject,
+                    &event,
+                    actor,
+                    &headers,
+                )
+                .await
+                {
+                    Ok(cookie) => interaction::redirect_setting_cookie(&resume.return_to, &cookie),
+                    Err(_) => interaction::server_error_page(),
+                }
+            } else {
+                // Present but wrong password: generic failure (no wrong-password
+                // oracle), whether the stored verifier is native or foreign.
+                failed_login_page(identifier, &resume.return_to, &resume.hints, banner)
             }
         }
-        // Present but wrong password: generic failure (no wrong-password oracle).
-        Ok(Some(_)) => failed_login_page(identifier, &resume.return_to, &resume.hints, banner),
         // Absent account: spend comparable Argon2id time, then the SAME generic
         // failure (no user-enumeration oracle).
         Ok(None) => {
@@ -150,6 +170,46 @@ pub async fn login_post(
         }
         Err(_) => interaction::server_error_page(),
     }
+}
+
+/// Verify `password` against a user's imported FOREIGN hash (issue #55), if it has
+/// one. Returns `false` when the user carries no foreign hash or the stored value
+/// cannot be parsed (fail closed). Dispatches on the hash scheme (bcrypt, scrypt,
+/// PBKDF2, Argon2, Firebase modified scrypt).
+fn verify_foreign(user: &UserRecord, password: &str) -> bool {
+    let Some(stored) = user.foreign_password_hash.as_deref() else {
+        return false;
+    };
+    match ForeignHash::parse(stored) {
+        Ok(foreign) => foreign.verify(password.as_bytes()),
+        Err(_) => false,
+    }
+}
+
+/// Land the verify-then-rehash upgrade after a successful foreign login (issue #55):
+/// hash `password` with the native Argon2id at current parameters and hand it to the
+/// audited store upgrade, which writes it onto the user and clears the foreign hash
+/// atomically. Best-effort: any failure (a hashing error, a lost race, a transient
+/// persistence fault) is swallowed so the sign-in still succeeds; the foreign hash
+/// simply remains to be upgraded on the next login. The plaintext never leaves this
+/// function and the hash is never logged.
+async fn rehash_foreign_credential(
+    state: &OidcState,
+    scope: Scope,
+    subject: &UserId,
+    password: &str,
+) {
+    let Ok(new_hash) = password::hash_password(state.env(), password) else {
+        return;
+    };
+    let actor = interaction::user_actor(subject);
+    let _ = state
+        .store()
+        .scoped(scope)
+        .acting(actor, CorrelationId::generate(state.env()))
+        .users()
+        .upgrade_foreign_password(state.env(), subject, &new_hash)
+        .await;
 }
 
 /// Re-render the login form with a generic failure message, prefilling the

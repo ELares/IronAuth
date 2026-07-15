@@ -222,6 +222,12 @@ pub enum Action {
     /// `detail` records the target state; a session-ending transition (block,
     /// disable) cascades in the same transaction and fans out to relying parties.
     UserStateChange,
+    /// A user's imported FOREIGN password hash was verified on first login and
+    /// transparently rehashed to the native Argon2id verifier (issue #55): the
+    /// verify-then-rehash upgrade. The foreign hash and its algorithm tag are
+    /// cleared in the same transaction; no credential material is recorded on the
+    /// audit row, only that the user's credential was upgraded, and when.
+    UserPasswordUpgrade,
     /// A user's EXTERNAL ID was linked through the management API (issue #52): a
     /// correlation id from the tenant's own systems was claimed for the user
     /// (unique per scope, so a second claim of the same external id is refused).
@@ -541,6 +547,7 @@ impl Action {
             Action::UserUpdate => "user.update",
             Action::UserDelete => "user.delete",
             Action::UserStateChange => "user.state_change",
+            Action::UserPasswordUpgrade => "user.password.upgrade",
             Action::UserExternalIdLink => "user.external_id.link",
             Action::UserExternalIdUnlink => "user.external_id.unlink",
             Action::UserOffboardingExecute => "user.offboarding.execute",

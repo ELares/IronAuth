@@ -6,6 +6,28 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Foreign password-hash storage for bulk import (issue #55, migration 0039,
+  expand): the persistence half of the streaming import engine (the engine and the
+  algorithm-tagged verify/rehash scheme layer live in the new `ironauth-import`
+  crate).
+  - **Two additive `users` columns.** `foreign_password_hash` (the imported
+    verifier in its canonical algorithm-tagged string, stored AS-IS) and
+    `foreign_password_algo` (the non-secret algorithm tag). A password hash is a
+    one-way verifier, not PII, so both are stored as text exactly like the native
+    `password_hash`; neither is in the PII taxonomy. A user with no imported
+    credential stores NULL for both.
+  - **`NewAdminUser` foreign fields.** `admin_create` now accepts
+    `foreign_password_hash` / `foreign_password_algo`, so the import path creates
+    users through the same audited, isolation-scoped, PII-sealing write path as the
+    management create (issue #52). `UserRecord` (the login read) carries the two
+    columns.
+  - **Verify-then-rehash landing.** `ActingUserRepo::upgrade_foreign_password`
+    writes the fresh native Argon2id verifier onto the user and clears the foreign
+    hash and its tag atomically, guarded on the foreign hash still being present so
+    two concurrent logins race safely (the loser is a benign no-op, no audit row),
+    and audits `user.password.upgrade`. A column-scoped UPDATE grant on exactly the
+    two import columns to the data and control roles (never table-wide, the #31
+    lesson) backs it.
 - JSON Schema identity traits with versioning and migration jobs (issue #53,
   migration 0038, expand): custom user profile fields (traits) beyond the standard
   OIDC claims, validated against a per (tenant, environment) JSON Schema (draft

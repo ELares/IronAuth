@@ -20,6 +20,11 @@ ironauth-env.workspace = true
 ironauth-config.workspace = true
 ironauth-store.workspace = true
 ironauth-jose.workspace = true
+# The foreign password-hash scheme layer (issue #55): the login path verifies an
+# imported bcrypt/scrypt/PBKDF2/Argon2/Firebase hash and, on success, rehashes the
+# password to the native Argon2id verifier (verify-then-rehash). Only the pure
+# `scheme` surface is used here.
+ironauth-import.workspace = true
 # The per-tenant/per-environment quota fairness engine (issue #50). The data
 # plane constructs one enforcer from the [quota] config and spends it on the
 # request path, short-circuiting an over-quota scope with a 429; the engine
