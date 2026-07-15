@@ -12,6 +12,7 @@ table is the authoritative list of artifacts and their versions at HEAD.
 | ironauth-config | 0.1.0 | library | 1.85 |
 | ironauth-env | 0.1.0 | library | 1.85 |
 | ironauth-fetch | 0.1.0 | library | 1.85 |
+| ironauth-import | 0.1.0 | library | 1.85 |
 | ironauth-jose | 0.1.0 | library | 1.85 |
 | ironauth-kms | 0.1.0 | library | 1.85 |
 | ironauth-oidc | 0.1.0 | library | 1.85 |

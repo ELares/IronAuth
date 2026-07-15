@@ -6,6 +6,11 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Foreign password import follow-through (issue #55): the admin user create path
+  passes the new `NewAdminUser` foreign-hash fields as `None` (the management create
+  surface sets no imported credential; the streaming bulk import path in
+  `ironauth-import` is where an imported foreign hash enters).
+
 - Admin user management API (issue #52): complete control-plane user CRUD,
   lifecycle transitions, and external-id correlation under an environment, on the M1
   API discipline (OpenAPI source of truth, cursor pagination, `Idempotency-Key` on

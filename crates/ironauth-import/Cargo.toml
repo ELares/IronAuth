@@ -1,0 +1,86 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+[package]
+name = "ironauth-import"
+version = "0.1.0"
+description = "IronAuth streaming bulk user import with foreign password-hash support: a passwap-style algorithm-tagged verify/rehash hash-scheme layer and a bounded-memory, resumable, per-record-isolated import engine"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# Auto-discovery is off so the database-backed integration test is gated behind
+# `required-features = ["testing"]` and never compiles on the DB-free lanes
+# (clippy, msrv, musl, cargo check), exactly like ironauth-store.
+autotests = false
+
+[dependencies]
+# The determinism seam: the rehash salt is drawn from env.entropy() and the
+# import clock read from env.clock(), never a raw RNG or SystemTime, so the
+# engine stays reproducible under a fixed test env and the invariant lints hold.
+ironauth-env.workspace = true
+# The engine creates every imported user THROUGH the audited, isolation-scoped
+# ActingUserRepo (issue #52), so it depends on the store; the store does NOT
+# depend back on this crate (the hash-scheme layer stays a leaf), keeping the
+# graph acyclic. The pure `scheme` module below has no store dependency and is
+# what the login verify path (ironauth-oidc) consumes.
+ironauth-store.workspace = true
+
+# The algorithm-tagged foreign-hash verify dispatch. Every crate is RustCrypto or
+# equally permissive (MIT OR Apache-2.0), pure Rust (no C, musl-static clean), and
+# builds under MSRV 1.85.
+#
+# argon2 is already the workspace native hasher (issue #20); reusing it verifies an
+# imported Argon2 family hash and produces the rehash target, so no new crate for
+# the native side.
+argon2.workspace = true
+# bcrypt (all four $2a$/$2b$/$2x$/$2y$ variants), the single most common foreign
+# scheme.
+bcrypt = "0.16"
+# scrypt (RFC 7914) PHC-string verify, and the key-derivation half of Firebase's
+# modified scrypt.
+scrypt = "0.11"
+# PBKDF2 (RFC 8018 / PKCS#5 v2.1) PHC-string verify over HMAC-SHA256/512.
+pbkdf2 = { version = "0.12", features = ["simple", "sha2"] }
+# The PHC string parser and the PasswordVerifier trait shared by argon2, scrypt,
+# and pbkdf2. Already in the tree via argon2, so no new crate.
+password-hash = "0.5"
+# Firebase modified scrypt finishes by AES-256-CTR encrypting the account signer
+# key under the scrypt-derived key; aes + ctr supply exactly that primitive.
+aes = "0.8"
+ctr = "0.9"
+# Constant-time comparison for the Firebase hash equality check (no timing oracle).
+subtle = "2"
+# base64 for the Firebase salt / salt-separator / signer-key / hash operands and
+# the canonical foreign-hash storage serialization. Already in the tree.
+base64.workspace = true
+# The line-delimited import record format is parsed one record at a time (bounded
+# memory): serde derives the record shape and serde_json parses each line.
+serde.workspace = true
+serde_json.workspace = true
+
+[features]
+# Default build is lean: no test-support surface.
+default = []
+# Test-support surface: enables the database-backed engine integration test's
+# dependency on the ironauth-store test harness. Adds no dependency beyond what is
+# already present, so it stays MSRV-1.85 and musl clean.
+testing = ["ironauth-store/testing"]
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+# The database-backed engine test drives raw dump-probe queries (a stolen-backup
+# view of the sealed columns) against the same throwaway Postgres the store harness
+# brings up. Runtime query API only, matching ironauth-store.
+sqlx.workspace = true
+
+# The database-backed engine test: streaming bounded-memory import, per-record
+# failure isolation, idempotent re-import, cross-tenant isolation, sealed PII, and
+# the foreign-verify-then-rehash login upgrade. Needs a real database
+# (DATABASE_URL); see scripts/with-test-db.sh.
+[[test]]
+name = "engine"
+path = "tests/engine.rs"
+required-features = ["testing"]
+
+[lints]
+workspace = true

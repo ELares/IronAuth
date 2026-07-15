@@ -248,7 +248,7 @@ async fn expand_contract_example_chain_runs_all_three_phases_and_contract_remove
 // per real table); splitting it would not make it clearer.
 #[allow(clippy::too_many_lines)]
 #[tokio::test]
-async fn production_chain_is_only_the_thirty_seven_real_migrations_and_ships_no_demo_object() {
+async fn production_chain_is_only_the_thirty_eight_real_migrations_and_ships_no_demo_object() {
     // TestDatabase::start runs Store::migrate() (the production chain) on a
     // fresh, empty database.
     let db = TestDatabase::start().await;
@@ -265,8 +265,8 @@ async fn production_chain_is_only_the_thirty_seven_real_migrations_and_ships_no_
     );
     assert_eq!(
         report.already_applied(),
-        37,
-        "the production chain is exactly thirty-seven migrations (isolation, audit log, management \
+        38,
+        "the production chain is exactly thirty-eight migrations (isolation, audit log, management \
          API, OIDC authorization, signing keys, login/consent, authentication context, redirect \
          registration, UserInfo claims, consent scope upsert, resource servers, opaque access \
          tokens, client auth suite, dynamic client registration, pushed authorization requests, \
@@ -275,15 +275,15 @@ async fn production_chain_is_only_the_thirty_seven_real_migrations_and_ships_no_
          logout, session-ended events, back-channel logout, front-channel logout, resource-model \
          APIs, envelope encryption, environment guardrails, tenant lifecycle, BYOK bindings, \
          snapshot export, custom domains, environment secrets and variables, config promotion, \
-         self-service account, admin user lifecycle)"
+         self-service account, admin user lifecycle, foreign password import)"
     );
 
-    // The ledger holds exactly versions 1 through 37.
+    // The ledger holds exactly versions 1 through 38.
     assert_eq!(
         applied_versions(pool).await,
         vec![
             1_i64, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
-            24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37
+            24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38
         ]
     );
     let phase_of = |version: i64| async move {
@@ -410,6 +410,11 @@ async fn production_chain_is_only_the_thirty_seven_real_migrations_and_ships_no_
     // SELECT/INSERT plus a column-scoped UPDATE on users, and control-plane
     // SELECT/INSERT on the envelope key tables). All additive, so it is an expand too.
     assert_eq!(phase_of(37).await, "expand");
+    // The foreign-password-import migration (issue #55): two additive nullable users
+    // columns (foreign_password_hash, foreign_password_algo) plus a column-scoped
+    // UPDATE grant to the data and control roles so the verify-then-rehash login
+    // landing can retire the foreign hash. All additive, so it is an expand too.
+    assert_eq!(phase_of(38).await, "expand");
 
     // The demo object never reaches a production database.
     assert!(
@@ -1177,6 +1182,17 @@ async fn production_chain_is_only_the_thirty_seven_real_migrations_and_ships_no_
         !column_exists(pool, "users", "external_id").await,
         "users must have no plaintext external_id column after 0037"
     );
+
+    // The foreign-password-import columns folded onto users (issue #55): the
+    // algorithm-tagged foreign verifier and its non-secret algorithm tag, both
+    // added by 0038. A password hash is a one-way verifier, not PII, so it is stored
+    // as text exactly like the native password_hash.
+    for column in ["foreign_password_hash", "foreign_password_algo"] {
+        assert!(
+            column_exists(pool, "users", column).await,
+            "users.{column} exists after 0038"
+        );
+    }
 }
 
 #[tokio::test]
