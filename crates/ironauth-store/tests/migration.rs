@@ -344,7 +344,10 @@ async fn production_chain_is_only_the_twenty_seven_real_migrations_and_ships_no_
     // column-scoped grant are all expands.
     assert_eq!(phase_of(26).await, "expand");
     // The resource-model APIs expand (issue #41): one additive organizations ALTER
-    // ADD COLUMN (deleted_at) plus control-plane grants are all expands.
+    // ADD COLUMN (deleted_at) plus control-plane grants, and a REVOKE of the unused
+    // over-broad data-plane grant on organizations (the #31 least-privilege lesson).
+    // The revoke is expand-safe: no pre-#41 binary issued an organization statement
+    // as ironauth_app, so removing the grant depends on and breaks nothing.
     assert_eq!(phase_of(27).await, "expand");
 
     // The demo object never reaches a production database.

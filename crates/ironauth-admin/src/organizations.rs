@@ -9,6 +9,16 @@
 //! enforced on create: the parent environment must exist and be live, and the
 //! typed [`ironauth_store::OrganizationId`] embeds the scope so a foreign id
 //! collapses to the uniform not-found rather than leaking existence.
+//!
+//! Delete is a soft deactivation, idempotent IN EFFECT per RFC 9110: the row is
+//! retained (so the append-only audit log's foreign key to it stays satisfiable),
+//! and a live organization is deactivated and reads as absent thereafter, exactly
+//! as tenants and environments behave. A soft-deleted organization reads as absent
+//! (get is a 404), so the delete's STATUS CODE is not itself idempotent: the first
+//! delete of a live organization is a 204, and a repeat delete of an
+//! already-deactivated organization, like a delete of an absent one, is the uniform
+//! 404. That anti-oracle 404 is the same not-found the get returns, so delete never
+//! discloses whether a not-found id was once live.
 
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
@@ -230,7 +240,7 @@ pub async fn get_organization(
     Ok(json(StatusCode::OK, body))
 }
 
-/// Deactivate an organization (soft delete; idempotent).
+/// Deactivate an organization (soft delete; idempotent in effect).
 #[utoipa::path(
     delete,
     path = "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}",
@@ -243,10 +253,10 @@ pub async fn get_organization(
     ),
     security(("bearer" = [])),
     responses(
-        (status = 204, description = "Deactivated (idempotent)"),
+        (status = 204, description = "Deactivated"),
         (status = 401, description = "Missing or invalid credential", body = ErrorBody),
         (status = 403, description = "Wrong plane or scope", body = ErrorBody),
-        (status = 404, description = "Not found (absent or already deactivated)", body = ErrorBody)
+        (status = 404, description = "Not found (absent, or already deactivated: a repeat delete)", body = ErrorBody)
     )
 )]
 pub async fn delete_organization(

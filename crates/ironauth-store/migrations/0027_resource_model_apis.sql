@@ -30,9 +30,19 @@
 --   - organizations is already registered in scripts/query-audit.sh, so all of
 --     its SQL is confined to the repository module.
 --
--- The existing data-plane grant on organizations (issue #6, for the M10 B2B read
--- path) is left untouched: both roles are subject to the same forced row-level
--- security, so co-tenanting the table across the two planes is safe.
+-- The data-plane grant on organizations is REVOKED here (the #31 least-privilege
+-- lesson this issue cites, applied to the other role). The isolation root (0001)
+-- gave ironauth_app a table-wide SELECT, INSERT, UPDATE, DELETE on organizations
+-- when the level was a schema slot only, but the organization lifecycle is entirely
+-- a MANAGEMENT-plane operation: no data-plane or OIDC path creates, mutates, OR
+-- reads organizations (every organization statement runs through the control-plane
+-- repository as ironauth_control). The broad data-plane grant is therefore a
+-- capability with no caller, and a hazard: it lets the low-privilege role HARD
+-- DELETE an organization row (breaking the soft-delete retention that keeps the
+-- append-only audit_log foreign key satisfiable) and UPDATE any column. Grant what
+-- a caller needs when it needs it: M10's B2B read path (issue #6) will re-grant
+-- exactly SELECT to ironauth_app in its own migration, once a data-plane reader
+-- actually exists.
 
 -- ---------------------------------------------------------------------------
 -- Soft deactivation for organizations, mirroring tenants and environments (0003).
@@ -53,3 +63,12 @@ ALTER TABLE organizations ADD COLUMN deleted_at timestamptz;
 -- organization row can never be removed and its audit history stays intact.
 GRANT SELECT, INSERT ON organizations TO ironauth_control;
 GRANT UPDATE (deleted_at) ON organizations TO ironauth_control;
+
+-- ---------------------------------------------------------------------------
+-- Revoke the unused, over-broad data-plane grant on organizations (see the note
+-- above). The data plane never touches organizations, so this removes a hazard
+-- (a low-privilege hard DELETE or a table-wide UPDATE) without affecting any
+-- running binary. It is expand-safe: the pre-#41 releases treated organizations
+-- as a schema slot only and issued no organization statement as ironauth_app, so
+-- no N-1 binary depends on the grant being present.
+REVOKE SELECT, INSERT, UPDATE, DELETE ON organizations FROM ironauth_app;

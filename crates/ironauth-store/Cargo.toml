@@ -207,5 +207,14 @@ name = "organizations"
 path = "tests/organizations.rs"
 required-features = ["testing"]
 
+# Least-privilege enforcement of the data-plane role on organizations (issue #41):
+# as ironauth_app, every statement on organizations is refused as insufficient
+# privilege (the #31 lesson applied to the other role), while ironauth_control keeps
+# its column-scoped soft delete. Needs a real database (DATABASE_URL).
+[[test]]
+name = "organization_grants"
+path = "tests/organization_grants.rs"
+required-features = ["testing"]
+
 [lints]
 workspace = true

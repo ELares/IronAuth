@@ -2033,7 +2033,7 @@
         "tags": [
           "organizations"
         ],
-        "summary": "Deactivate an organization (soft delete; idempotent).",
+        "summary": "Deactivate an organization (soft delete; idempotent in effect).",
         "operationId": "deleteOrganization",
         "parameters": [
           {
@@ -2066,7 +2066,7 @@
         ],
         "responses": {
           "204": {
-            "description": "Deactivated (idempotent)"
+            "description": "Deactivated"
           },
           "401": {
             "description": "Missing or invalid credential",
@@ -2089,7 +2089,7 @@
             }
           },
           "404": {
-            "description": "Not found (absent or already deactivated)",
+            "description": "Not found (absent, or already deactivated: a repeat delete)",
             "content": {
               "application/json": {
                 "schema": {

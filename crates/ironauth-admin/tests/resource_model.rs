@@ -60,6 +60,42 @@ async fn organization_crud_and_list_round_trip() {
 }
 
 #[tokio::test]
+async fn organization_delete_is_idempotent_in_effect_and_a_repeat_is_404() {
+    // The documented contract: delete is idempotent IN EFFECT (the row is retained,
+    // the org reads as absent), but NOT in status code. The first delete of a live
+    // org is a 204; a repeat delete of an already-deactivated org is the uniform
+    // not-found, the same 404 the get returns, so delete is no existence oracle.
+    let harness = Harness::start(50).await;
+    let (tenant, environment) = harness.create_tenant("Acme", "k-tenant").await;
+    let base = format!("/v1/tenants/{tenant}/environments/{environment}/organizations");
+    let body = serde_json::json!({ "display_name": "org" }).to_string();
+    let (status, _, response) = harness.post(&base, "k-org", &body).await;
+    assert_eq!(status, StatusCode::CREATED, "create org: {response}");
+    let id = serde_json::from_str::<Value>(&response).expect("json")["id"]
+        .as_str()
+        .expect("id")
+        .to_owned();
+
+    // First delete deactivates the live org: 204.
+    let (status, _, _) = harness.delete(&format!("{base}/{id}")).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "first delete deactivates");
+
+    // The org now reads as absent, and a repeat delete is the same uniform 404.
+    let (status, _, _) = harness.get(&format!("{base}/{id}")).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "a deactivated org reads as absent"
+    );
+    let (status, _, _) = harness.delete(&format!("{base}/{id}")).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "a repeat delete of an already-deactivated org is the uniform not-found"
+    );
+}
+
+#[tokio::test]
 async fn organization_list_paginates_with_a_cursor() {
     let harness = Harness::start(2).await;
     let (tenant, environment) = harness.create_tenant("Acme", "k-tenant").await;
