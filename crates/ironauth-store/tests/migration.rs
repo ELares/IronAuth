@@ -248,7 +248,7 @@ async fn expand_contract_example_chain_runs_all_three_phases_and_contract_remove
 // per real table); splitting it would not make it clearer.
 #[allow(clippy::too_many_lines)]
 #[tokio::test]
-async fn production_chain_is_only_the_thirty_eight_real_migrations_and_ships_no_demo_object() {
+async fn production_chain_is_only_the_thirty_nine_real_migrations_and_ships_no_demo_object() {
     // TestDatabase::start runs Store::migrate() (the production chain) on a
     // fresh, empty database.
     let db = TestDatabase::start().await;
@@ -265,8 +265,8 @@ async fn production_chain_is_only_the_thirty_eight_real_migrations_and_ships_no_
     );
     assert_eq!(
         report.already_applied(),
-        38,
-        "the production chain is exactly thirty-eight migrations (isolation, audit log, management \
+        39,
+        "the production chain is exactly thirty-nine migrations (isolation, audit log, management \
          API, OIDC authorization, signing keys, login/consent, authentication context, redirect \
          registration, UserInfo claims, consent scope upsert, resource servers, opaque access \
          tokens, client auth suite, dynamic client registration, pushed authorization requests, \
@@ -275,7 +275,8 @@ async fn production_chain_is_only_the_thirty_eight_real_migrations_and_ships_no_
          logout, session-ended events, back-channel logout, front-channel logout, resource-model \
          APIs, envelope encryption, environment guardrails, tenant lifecycle, BYOK bindings, \
          snapshot export, custom domains, environment secrets and variables, config promotion, \
-         self-service account, admin user lifecycle, foreign password import)"
+         self-service account, admin user lifecycle, identity traits, foreign password \
+         import)"
     );
 
     // The ledger holds exactly versions 1 through 38.
@@ -283,7 +284,7 @@ async fn production_chain_is_only_the_thirty_eight_real_migrations_and_ships_no_
         applied_versions(pool).await,
         vec![
             1_i64, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
-            24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38
+            24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39
         ]
     );
     let phase_of = |version: i64| async move {
@@ -410,11 +411,17 @@ async fn production_chain_is_only_the_thirty_eight_real_migrations_and_ships_no_
     // SELECT/INSERT plus a column-scoped UPDATE on users, and control-plane
     // SELECT/INSERT on the envelope key tables). All additive, so it is an expand too.
     assert_eq!(phase_of(37).await, "expand");
+    // The identity-traits migration (issue #53): two new tenant-scoped tables
+    // (trait_schemas, trait_migration_jobs) with their indexes, isolation policies,
+    // nonempty-scope CHECKs, and column-scoped grants, plus three additive users
+    // columns (traits_sealed, traits_dek_version, traits_schema_version) with a
+    // column-scoped grant. All additive, so it is an expand too.
+    assert_eq!(phase_of(38).await, "expand");
     // The foreign-password-import migration (issue #55): two additive nullable users
     // columns (foreign_password_hash, foreign_password_algo) plus a column-scoped
     // UPDATE grant to the data and control roles so the verify-then-rehash login
     // landing can retire the foreign hash. All additive, so it is an expand too.
-    assert_eq!(phase_of(38).await, "expand");
+    assert_eq!(phase_of(39).await, "expand");
 
     // The demo object never reaches a production database.
     assert!(
@@ -1183,14 +1190,74 @@ async fn production_chain_is_only_the_thirty_eight_real_migrations_and_ships_no_
         "users must have no plaintext external_id column after 0037"
     );
 
+    // The identity-traits tables and the per-user sealed trait columns (issue #53).
+    assert!(
+        table_exists(pool, "trait_schemas").await,
+        "trait_schemas exists after 0038"
+    );
+    for column in [
+        "id",
+        "tenant_id",
+        "environment_id",
+        "version",
+        "schema_json",
+        "status",
+    ] {
+        assert!(
+            column_exists(pool, "trait_schemas", column).await,
+            "trait_schemas.{column} exists after 0038"
+        );
+    }
+    assert!(
+        table_exists(pool, "trait_migration_jobs").await,
+        "trait_migration_jobs exists after 0038"
+    );
+    for column in [
+        "id",
+        "tenant_id",
+        "environment_id",
+        "kind",
+        "from_version",
+        "to_version",
+        "transform_json",
+        "status",
+        "cursor_id",
+        "total_count",
+        "processed_count",
+        "migrated_count",
+        "failure_count",
+        "failures_json",
+    ] {
+        assert!(
+            column_exists(pool, "trait_migration_jobs", column).await,
+            "trait_migration_jobs.{column} exists after 0038"
+        );
+    }
+    // A user's traits are user profile PII, sealed under the scope DEK (issue #48):
+    // the document lands only on the sealed bytea column, never a plaintext one, and
+    // the identity records the schema version it was validated against.
+    for column in [
+        "traits_sealed",
+        "traits_dek_version",
+        "traits_schema_version",
+    ] {
+        assert!(
+            column_exists(pool, "users", column).await,
+            "users.{column} exists after 0038"
+        );
+    }
+    assert!(
+        !column_exists(pool, "users", "traits").await,
+        "users must have no plaintext traits column after 0038"
+    );
     // The foreign-password-import columns folded onto users (issue #55): the
     // algorithm-tagged foreign verifier and its non-secret algorithm tag, both
-    // added by 0038. A password hash is a one-way verifier, not PII, so it is stored
+    // added by 0039. A password hash is a one-way verifier, not PII, so it is stored
     // as text exactly like the native password_hash.
     for column in ["foreign_password_hash", "foreign_password_algo"] {
         assert!(
             column_exists(pool, "users", column).await,
-            "users.{column} exists after 0038"
+            "users.{column} exists after 0039"
         );
     }
 }

@@ -67,11 +67,12 @@ use crate::id::{
     CustomDomainId, DcrPolicyId, DekId, DeviceCodeId, EncryptedSecretId, EnvironmentId,
     EnvironmentSecretId, ExternalIssuerId, GrantId, InitialAccessTokenId, IssuedTokenId, KekId,
     ManagementKeyId, OperatorId, OrganizationId, PushedRequestId, RefreshFamilyId, RefreshTokenId,
-    ResourceServerId, ServiceAccountId, SessionEventId, SessionId, SigningKeyId, TenantId, UserId,
-    VariableId,
+    ResourceServerId, ServiceAccountId, SessionEventId, SessionId, SigningKeyId, TenantId,
+    TraitMigrationJobId, TraitSchemaId, UserId, VariableId,
 };
 use crate::scope::Scope;
 use crate::store::Store;
+use crate::trait_schema::{TraitSchema, TransformOp, ValidationFailure};
 
 /// A store bound to one `(tenant, environment)` scope. Hands out the per-kind
 /// read repositories, and the acting entry point for writes.
@@ -18331,5 +18332,1147 @@ async fn apply_variable_change(
             .await?;
             Ok(())
         }
+    }
+}
+
+// ===========================================================================
+// Identity traits: the versioned schema registry, sealed per-user trait data, and
+// the Postgres-backed migration / dry-run job substrate (issue #53).
+//
+// Every mutation below routes through the same `write_audited` primitive as the
+// rest of the module, so a trait write, a schema-version create/activate, and a
+// migration-job create/advance each commit their audit row in the same transaction
+// as the data change. All SQL against the scoped `trait_schemas`,
+// `trait_migration_jobs`, and `users` tables lives here (the query-audit rule).
+// ===========================================================================
+
+/// The purpose label bound into a sealed `users.traits` document (issue #53): the
+/// custom identity-trait fields. A distinct label keeps a traits seal from ever
+/// authenticating under the login-handle, claim, or external-id context.
+const USER_TRAITS_PURPOSE: &str = "traits";
+
+/// A trait migration/dry-run job kind (issue #53): validate every identity against
+/// a candidate version without mutating (dry-run), or transform and re-validate,
+/// writing the new trait document and version (migrate).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TraitJobKind {
+    /// Validate existing identities against a candidate version, mutating nothing.
+    DryRun,
+    /// Transform (declarative field mapping) and re-validate, writing the result.
+    Migrate,
+}
+
+impl TraitJobKind {
+    /// The stable wire string stored in `trait_migration_jobs.kind`.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TraitJobKind::DryRun => "dry_run",
+            TraitJobKind::Migrate => "migrate",
+        }
+    }
+
+    /// Reconstruct a kind from its wire string, or [`None`] for an unknown value.
+    #[must_use]
+    pub fn from_wire(value: &str) -> Option<Self> {
+        match value {
+            "dry_run" => Some(TraitJobKind::DryRun),
+            "migrate" => Some(TraitJobKind::Migrate),
+            _ => None,
+        }
+    }
+}
+
+/// A trait migration/dry-run job lifecycle status (issue #53).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TraitJobStatus {
+    /// Created, not yet advanced.
+    Pending,
+    /// Advanced at least one batch, more work remains.
+    Running,
+    /// Finished with zero unresolved invalid identities.
+    Completed,
+    /// Finished with one or more unresolved invalid identities (a dry-run that
+    /// found problems, or a migrate that could not transform every identity into a
+    /// valid shape). The failing identities are reported per record.
+    Failed,
+}
+
+impl TraitJobStatus {
+    /// The stable wire string stored in `trait_migration_jobs.status`.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TraitJobStatus::Pending => "pending",
+            TraitJobStatus::Running => "running",
+            TraitJobStatus::Completed => "completed",
+            TraitJobStatus::Failed => "failed",
+        }
+    }
+
+    /// Reconstruct a status from its wire string, or [`None`] for an unknown value.
+    #[must_use]
+    pub fn from_wire(value: &str) -> Option<Self> {
+        match value {
+            "pending" => Some(TraitJobStatus::Pending),
+            "running" => Some(TraitJobStatus::Running),
+            "completed" => Some(TraitJobStatus::Completed),
+            "failed" => Some(TraitJobStatus::Failed),
+            _ => None,
+        }
+    }
+
+    /// Whether this is a terminal status (a re-run of the job is a no-op).
+    #[must_use]
+    pub fn is_terminal(self) -> bool {
+        matches!(self, TraitJobStatus::Completed | TraitJobStatus::Failed)
+    }
+}
+
+/// One immutable trait-schema version as the registry reports it (issue #53).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TraitSchemaVersion {
+    /// The schema-version identifier (a `tsc_` id embedding its scope).
+    pub id: TraitSchemaId,
+    /// The per-scope monotonic version number.
+    pub version: i32,
+    /// The JSON Schema document (draft 2020-12) with inline behavior annotations.
+    pub schema_json: String,
+    /// Whether this version is the scope's active served default.
+    pub active: bool,
+    /// Creation time, microseconds since the Unix epoch.
+    pub created_at_unix_micros: i64,
+}
+
+/// One identity's per-record failure in a migration/dry-run report (issue #53): the
+/// identity subject and its per-field validation failures. Never carries a trait
+/// value, so a failure report carries no PII.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RecordFailure {
+    /// The failing identity's subject (a `usr_` id string).
+    pub subject: String,
+    /// The per-field validation failures, each an RFC 6901 JSON Pointer and reason.
+    pub failures: Vec<ValidationFailure>,
+}
+
+/// A trait migration/dry-run job as the management API reports it (issue #53): its
+/// definition, lifecycle status, progress counters, and per-record failure report.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TraitMigrationJob {
+    /// The job identifier (a `tmj_` id embedding its scope).
+    pub id: TraitMigrationJobId,
+    /// Whether the job validates only (dry-run) or transforms and writes (migrate).
+    pub kind: TraitJobKind,
+    /// The schema version identities are migrated / validated FROM.
+    pub from_version: i32,
+    /// The candidate schema version identities are validated / migrated TO.
+    pub to_version: i32,
+    /// The job's lifecycle status.
+    pub status: TraitJobStatus,
+    /// The number of identities the job set out to process.
+    pub total_count: i64,
+    /// The number of identities processed so far.
+    pub processed_count: i64,
+    /// The number of identities migrated (a migrate job; always zero for a dry-run).
+    pub migrated_count: i64,
+    /// The number of identities that failed validation.
+    pub failure_count: i64,
+    /// The per-record failure report.
+    pub failures: Vec<RecordFailure>,
+}
+
+/// Everything the migration-job create needs, bundled to keep the repository method
+/// within the readable-argument-count lint (issue #53).
+#[derive(Debug, Clone, Copy)]
+pub struct NewTraitMigrationJob<'a> {
+    /// Whether to validate only (dry-run) or transform and write (migrate).
+    pub kind: TraitJobKind,
+    /// The schema version to migrate / validate FROM.
+    pub from_version: i32,
+    /// The candidate schema version to validate / migrate TO.
+    pub to_version: i32,
+    /// The declarative transform program (a JSON array), or [`None`] for the empty
+    /// program (a dry-run, or a migrate that only re-validates).
+    pub transform_json: Option<&'a str>,
+}
+
+/// Build a [`TraitSchemaVersion`] from a selected registry row.
+fn trait_schema_version_from_row(
+    scope: Scope,
+    row: &PgRow,
+) -> Result<TraitSchemaVersion, StoreError> {
+    let id_text: String = row.get("id");
+    let id = TraitSchemaId::parse_in_scope(&id_text, &scope)?;
+    let status: String = row.get("status");
+    Ok(TraitSchemaVersion {
+        id,
+        version: row.get("version"),
+        schema_json: row.get("schema_json"),
+        active: status == "active",
+        created_at_unix_micros: row.get("created_us"),
+    })
+}
+
+/// The column list every trait-schema read selects.
+const TRAIT_SCHEMA_COLUMNS: &str = "id, version, schema_json, status, \
+     (EXTRACT(EPOCH FROM created_at) * 1000000)::bigint AS created_us";
+
+/// The read-only trait-schema registry for a scope (issue #53).
+pub struct TraitSchemaRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl TraitSchemaRepo<'_> {
+    /// The scope's active (served default) schema version, or [`None`] if the scope
+    /// has no active version yet.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn active(&self) -> Result<Option<TraitSchemaVersion>, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(&format!(
+            "SELECT {TRAIT_SCHEMA_COLUMNS} FROM trait_schemas \
+             WHERE tenant_id = $1 AND environment_id = $2 AND status = 'active'"
+        ))
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        row.map(|row| trait_schema_version_from_row(self.scope, &row))
+            .transpose()
+    }
+
+    /// A specific schema version in this scope, or [`None`] if absent.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn get_version(
+        &self,
+        version: i32,
+    ) -> Result<Option<TraitSchemaVersion>, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(&format!(
+            "SELECT {TRAIT_SCHEMA_COLUMNS} FROM trait_schemas \
+             WHERE tenant_id = $1 AND environment_id = $2 AND version = $3"
+        ))
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(version)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        row.map(|row| trait_schema_version_from_row(self.scope, &row))
+            .transpose()
+    }
+
+    /// Every schema version in this scope, ascending by version.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn list_versions(&self) -> Result<Vec<TraitSchemaVersion>, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let rows = sqlx::query(&format!(
+            "SELECT {TRAIT_SCHEMA_COLUMNS} FROM trait_schemas \
+             WHERE tenant_id = $1 AND environment_id = $2 ORDER BY version"
+        ))
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        rows.iter()
+            .map(|row| trait_schema_version_from_row(self.scope, row))
+            .collect()
+    }
+}
+
+/// The mutating trait-schema registry for a scope and actor (issue #53).
+pub struct ActingTraitSchemaRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+    acting: ActingContext,
+}
+
+impl ActingTraitSchemaRepo<'_> {
+    /// Create a new immutable schema version from its JSON text, returning its id and
+    /// version. The schema is proved well formed before anything is written; the new
+    /// version starts as a `candidate` (activation is a separate, cutover-guarded
+    /// step). Writes a `trait_schema.create` audit row in the same transaction.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::SchemaMalformed`] if the schema is not a well-formed JSON Schema
+    /// of the supported vocabulary; [`StoreError::Database`] on a persistence failure.
+    pub async fn create_version(
+        &self,
+        env: &Env,
+        schema_json: &str,
+        created_at_micros: i64,
+    ) -> Result<(TraitSchemaId, i32), StoreError> {
+        // Prove the schema is well formed BEFORE the transaction: a malformed schema
+        // never reaches the registry.
+        TraitSchema::compile(schema_json)?;
+        let scope = self.scope;
+        let id = TraitSchemaId::generate(env, &scope);
+        let schema_owned = schema_json.to_string();
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::TraitSchemaCreate,
+                target: &id,
+            },
+            async move |tx| {
+                // The next per-scope version number, computed under the row lock the
+                // audited transaction holds, so two concurrent creates cannot mint the
+                // same version (the unique index would also refuse it).
+                let next: i32 = sqlx::query(
+                    "SELECT COALESCE(MAX(version), 0) + 1 AS next FROM trait_schemas \
+                     WHERE tenant_id = $1 AND environment_id = $2",
+                )
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .fetch_one(&mut **tx)
+                .await?
+                .get("next");
+                sqlx::query(
+                    "INSERT INTO trait_schemas \
+                     (id, tenant_id, environment_id, version, schema_json, status, created_at) \
+                     VALUES ($1, $2, $3, $4, $5, 'candidate', \
+                             TIMESTAMPTZ 'epoch' + ($6::text || ' microseconds')::interval)",
+                )
+                .bind(id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(next)
+                .bind(&schema_owned)
+                .bind(created_at_micros)
+                .execute(&mut **tx)
+                .await?;
+                Ok(())
+            },
+            false,
+        )
+        .await?;
+        // Read back the version the audited insert minted (the in-transaction
+        // MAX + 1), keyed by the id we just created.
+        let mut tx = begin_scoped(self.store, scope).await?;
+        let version: i32 = sqlx::query(
+            "SELECT version FROM trait_schemas \
+             WHERE id = $1 AND tenant_id = $2 AND environment_id = $3",
+        )
+        .bind(id.to_string())
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .fetch_one(&mut *tx)
+        .await?
+        .get("version");
+        tx.commit().await?;
+        Ok((id, version))
+    }
+
+    /// Activate a candidate version as the scope's served default (the cutover). The
+    /// activation is REFUSED while any existing identity's traits fail the target
+    /// schema (the cutover rule); when clean, the prior active version is demoted to a
+    /// candidate and the target becomes active, in one transaction. Writes a
+    /// `trait_schema.activate` audit row recording the activated version.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the version does not exist in this scope;
+    /// [`StoreError::CutoverBlocked`] if any identity fails the target schema;
+    /// [`StoreError::Encryption`] if no master key is configured or a sealed value
+    /// cannot be opened; [`StoreError::Database`] on a persistence failure.
+    pub async fn activate_version(&self, env: &Env, version: i32) -> Result<(), StoreError> {
+        let master = self.store.master().ok_or(StoreError::Encryption)?;
+        let scope = self.scope;
+        let detail = version.to_string();
+        // The audit target is the scope's environment; a schema-version activation is
+        // a scope-level pointer move, and the activated version is the operator-safe
+        // `detail` on the audit row.
+        let target = scope.environment();
+        write_audited_detailed(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::TraitSchemaActivate,
+                target: &target,
+            },
+            async move |tx| {
+                let schema_json: Option<String> = sqlx::query(
+                    "SELECT schema_json FROM trait_schemas \
+                     WHERE tenant_id = $1 AND environment_id = $2 AND version = $3",
+                )
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(version)
+                .fetch_optional(&mut **tx)
+                .await?
+                .map(|row| row.get("schema_json"));
+                let Some(schema_json) = schema_json else {
+                    return Err(StoreError::NotFound);
+                };
+                let target_schema = TraitSchema::compile(&schema_json)?;
+                // The cutover rule: refuse activation while any identity's traits fail
+                // the target schema (an authoritative live scan).
+                let invalid =
+                    count_identities_failing_schema(tx, scope, master, &target_schema).await?;
+                if invalid > 0 {
+                    return Err(StoreError::CutoverBlocked {
+                        invalid_identities: invalid,
+                    });
+                }
+                // Demote the current active version (if any), then activate the target.
+                // The partial unique index can never hold two active rows because the
+                // demote runs first in this one transaction.
+                sqlx::query(
+                    "UPDATE trait_schemas SET status = 'candidate' \
+                     WHERE tenant_id = $1 AND environment_id = $2 AND status = 'active'",
+                )
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .execute(&mut **tx)
+                .await?;
+                sqlx::query(
+                    "UPDATE trait_schemas SET status = 'active' \
+                     WHERE tenant_id = $1 AND environment_id = $2 AND version = $3",
+                )
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(version)
+                .execute(&mut **tx)
+                .await?;
+                Ok(())
+            },
+            false,
+            Some(detail.as_str()),
+        )
+        .await?;
+        Ok(())
+    }
+}
+
+/// Count the scope's identities whose sealed traits fail `schema`. Opens each
+/// identity's trait document under its recorded DEK version and validates it. Used by
+/// the activation cutover guard.
+async fn count_identities_failing_schema(
+    tx: &mut Transaction<'_, Postgres>,
+    scope: Scope,
+    master: &MasterKey,
+    schema: &TraitSchema,
+) -> Result<i64, StoreError> {
+    let rows = sqlx::query(
+        "SELECT id, traits_sealed, traits_dek_version FROM users \
+         WHERE tenant_id = $1 AND environment_id = $2 \
+         AND deleted_at IS NULL AND traits_sealed IS NOT NULL ORDER BY id",
+    )
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .fetch_all(&mut **tx)
+    .await?;
+    let mut invalid: i64 = 0;
+    for row in &rows {
+        let traits = open_user_traits(tx, scope, master, row).await?;
+        if !schema.validate(&traits).is_empty() {
+            invalid += 1;
+        }
+    }
+    Ok(invalid)
+}
+
+/// Open one identity's sealed trait document from a selected row carrying
+/// `traits_sealed` and `traits_dek_version`.
+async fn open_user_traits(
+    tx: &mut Transaction<'_, Postgres>,
+    scope: Scope,
+    master: &MasterKey,
+    row: &PgRow,
+) -> Result<serde_json::Value, StoreError> {
+    let dek_version: i32 = row.get("traits_dek_version");
+    let sealed: Vec<u8> = row.get("traits_sealed");
+    let dek = fetch_dek_by_version(tx, scope, master, dek_version).await?;
+    let plaintext = dek.open(
+        &user_pii_seal_aad(scope, USER_TRAITS_PURPOSE, dek_version),
+        &Sealed::from_bytes(sealed)?,
+    )?;
+    serde_json::from_slice(&plaintext).map_err(|_| StoreError::Encryption)
+}
+
+/// The read-only trait migration/dry-run job repository for a scope (issue #53).
+pub struct TraitMigrationJobRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl TraitMigrationJobRepo<'_> {
+    /// Fetch one job by id, within scope. A job absent in this scope (including a
+    /// cross-scope id) is the uniform [`StoreError::NotFound`].
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if no such job is visible in this scope;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn get(&self, id: &TraitMigrationJobId) -> Result<TraitMigrationJob, StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT id, kind, from_version, to_version, status, total_count, \
+             processed_count, migrated_count, failure_count, failures_json \
+             FROM trait_migration_jobs \
+             WHERE id = $1 AND tenant_id = $2 AND environment_id = $3",
+        )
+        .bind(id.to_string())
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        let row = row.ok_or(StoreError::NotFound)?;
+        trait_migration_job_from_row(self.scope, &row)
+    }
+}
+
+/// Build a [`TraitMigrationJob`] from a selected row.
+fn trait_migration_job_from_row(
+    scope: Scope,
+    row: &PgRow,
+) -> Result<TraitMigrationJob, StoreError> {
+    let id_text: String = row.get("id");
+    let id = TraitMigrationJobId::parse_in_scope(&id_text, &scope)?;
+    let kind =
+        TraitJobKind::from_wire(&row.get::<String, _>("kind")).ok_or(StoreError::NotFound)?;
+    let status =
+        TraitJobStatus::from_wire(&row.get::<String, _>("status")).ok_or(StoreError::NotFound)?;
+    let failures_json: String = row.get("failures_json");
+    let failures: Vec<RecordFailure> = serde_json::from_str(&failures_json).unwrap_or_default();
+    Ok(TraitMigrationJob {
+        id,
+        kind,
+        from_version: row.get("from_version"),
+        to_version: row.get("to_version"),
+        status,
+        total_count: row.get("total_count"),
+        processed_count: row.get("processed_count"),
+        migrated_count: row.get("migrated_count"),
+        failure_count: row.get("failure_count"),
+        failures,
+    })
+}
+
+/// The mutating trait migration/dry-run job repository for a scope and actor (#53).
+pub struct ActingTraitMigrationJobRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+    acting: ActingContext,
+}
+
+impl ActingTraitMigrationJobRepo<'_> {
+    /// Create a queued job over the scope's identities. The target schema must exist
+    /// and the transform must parse before anything is written; the candidate
+    /// population is counted into `total_count` so progress is observable. Writes a
+    /// `trait_migration_job.create` audit row in the same transaction.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the target version does not exist in this scope;
+    /// [`StoreError::SchemaMalformed`] if the transform program is malformed;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn create(
+        &self,
+        env: &Env,
+        spec: NewTraitMigrationJob<'_>,
+        created_at_micros: i64,
+    ) -> Result<TraitMigrationJobId, StoreError> {
+        let scope = self.scope;
+        // The transform program must parse (a dry-run leaves it empty).
+        let transform_json = spec.transform_json.unwrap_or("[]");
+        crate::trait_schema::parse_transform(transform_json)?;
+        let id = TraitMigrationJobId::generate(env, &scope);
+        let transform_owned = transform_json.to_string();
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::TraitMigrationJobCreate,
+                target: &id,
+            },
+            async move |tx| {
+                // The target schema version must exist in this scope.
+                let exists: bool = sqlx::query(
+                    "SELECT EXISTS ( SELECT 1 FROM trait_schemas \
+                     WHERE tenant_id = $1 AND environment_id = $2 AND version = $3 ) AS present",
+                )
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(spec.to_version)
+                .fetch_one(&mut **tx)
+                .await?
+                .get("present");
+                if !exists {
+                    return Err(StoreError::NotFound);
+                }
+                // Count the candidate population (progress denominator).
+                let total: i64 = match spec.kind {
+                    TraitJobKind::Migrate => sqlx::query(
+                        "SELECT count(*) AS c FROM users \
+                         WHERE tenant_id = $1 AND environment_id = $2 AND deleted_at IS NULL \
+                         AND traits_sealed IS NOT NULL AND traits_schema_version = $3",
+                    )
+                    .bind(scope.tenant().to_string())
+                    .bind(scope.environment().to_string())
+                    .bind(spec.from_version)
+                    .fetch_one(&mut **tx)
+                    .await?
+                    .get("c"),
+                    TraitJobKind::DryRun => sqlx::query(
+                        "SELECT count(*) AS c FROM users \
+                         WHERE tenant_id = $1 AND environment_id = $2 AND deleted_at IS NULL \
+                         AND traits_sealed IS NOT NULL",
+                    )
+                    .bind(scope.tenant().to_string())
+                    .bind(scope.environment().to_string())
+                    .fetch_one(&mut **tx)
+                    .await?
+                    .get("c"),
+                };
+                sqlx::query(
+                    "INSERT INTO trait_migration_jobs \
+                     (id, tenant_id, environment_id, kind, from_version, to_version, \
+                      transform_json, status, total_count, created_at, updated_at) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending', $8, \
+                             TIMESTAMPTZ 'epoch' + ($9::text || ' microseconds')::interval, \
+                             TIMESTAMPTZ 'epoch' + ($9::text || ' microseconds')::interval)",
+                )
+                .bind(id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(spec.kind.as_str())
+                .bind(spec.from_version)
+                .bind(spec.to_version)
+                .bind(&transform_owned)
+                .bind(total)
+                .bind(created_at_micros)
+                .execute(&mut **tx)
+                .await?;
+                Ok(())
+            },
+            false,
+        )
+        .await?;
+        Ok(id)
+    }
+
+    /// Advance a job by ONE bounded batch and return its refreshed state (issue #53).
+    /// Deterministic (identities are processed ascending by id), idempotent (a
+    /// terminal job is a no-op, and a migrated identity is filtered out so it is never
+    /// migrated twice), resumable (the cursor is committed per batch, so a crash
+    /// mid-run continues past it), and scoped (only this tenant/environment's
+    /// identities are ever touched). Writes a `trait_migration_job.advance` audit row.
+    ///
+    /// Call repeatedly until the returned status is terminal; a worker loop does this.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the job is absent in this scope;
+    /// [`StoreError::Encryption`] if no master key is configured or a sealed value
+    /// cannot be opened; [`StoreError::Database`] on a persistence failure.
+    pub async fn advance(
+        &self,
+        env: &Env,
+        job_id: &TraitMigrationJobId,
+        batch_limit: i64,
+    ) -> Result<TraitMigrationJob, StoreError> {
+        let read = TraitMigrationJobRepo {
+            store: self.store,
+            scope: self.scope,
+        };
+        let current = read.get(job_id).await?;
+        // A terminal job is a no-op (idempotent): a re-run migrates nothing.
+        if current.status.is_terminal() {
+            return Ok(current);
+        }
+        let master = self.store.master().ok_or(StoreError::Encryption)?;
+        let scope = self.scope;
+        // Compile the target schema and parse the transform once, outside the batch.
+        let target_version = current.to_version;
+        let target_schema_json: Option<String> = {
+            let mut tx = begin_scoped(self.store, scope).await?;
+            let row = sqlx::query(
+                "SELECT schema_json FROM trait_schemas \
+                 WHERE tenant_id = $1 AND environment_id = $2 AND version = $3",
+            )
+            .bind(scope.tenant().to_string())
+            .bind(scope.environment().to_string())
+            .bind(target_version)
+            .fetch_optional(&mut *tx)
+            .await?;
+            tx.commit().await?;
+            row.map(|row| row.get("schema_json"))
+        };
+        let target_schema = TraitSchema::compile(&target_schema_json.ok_or(StoreError::NotFound)?)?;
+        let ops = load_job_transform(self.store, scope, job_id).await?;
+        let params = AdvanceParams {
+            scope,
+            master,
+            target: &target_schema,
+            ops: &ops,
+            kind: current.kind,
+            from_version: current.from_version,
+            to_version: target_version,
+            batch_limit,
+            now_micros: epoch_micros(env.clock().now_utc()),
+            env,
+            job_id: job_id.to_string(),
+        };
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::TraitMigrationJobAdvance,
+                target: job_id,
+            },
+            async move |tx| run_advance_batch(tx, &params).await,
+            false,
+        )
+        .await?;
+        read.get(job_id).await
+    }
+}
+
+/// Load a job's declarative transform program.
+async fn load_job_transform(
+    store: &Store,
+    scope: Scope,
+    job_id: &TraitMigrationJobId,
+) -> Result<Vec<TransformOp>, StoreError> {
+    let mut tx = begin_scoped(store, scope).await?;
+    let transform_json: String = sqlx::query(
+        "SELECT transform_json FROM trait_migration_jobs \
+         WHERE id = $1 AND tenant_id = $2 AND environment_id = $3",
+    )
+    .bind(job_id.to_string())
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .fetch_one(&mut *tx)
+    .await?
+    .get("transform_json");
+    tx.commit().await?;
+    crate::trait_schema::parse_transform(&transform_json).map_err(StoreError::from)
+}
+
+/// Everything a batch step needs, bundled to keep [`run_advance_batch`] within the
+/// readable-argument-count lint.
+struct AdvanceParams<'a> {
+    scope: Scope,
+    master: &'a MasterKey,
+    target: &'a TraitSchema,
+    ops: &'a [TransformOp],
+    kind: TraitJobKind,
+    from_version: i32,
+    to_version: i32,
+    batch_limit: i64,
+    now_micros: i64,
+    env: &'a Env,
+    job_id: String,
+}
+
+/// The accumulated state a batch reads from and writes back to the job row.
+struct BatchState {
+    cursor: Option<String>,
+    processed: i64,
+    migrated: i64,
+    failure_count: i64,
+    failures: Vec<RecordFailure>,
+}
+
+/// Process one bounded batch of a migration/dry-run job inside the audited
+/// transaction: lock the job row, select the next ascending run of candidate
+/// identities past the cursor, validate (and for a migrate, transform and re-seal)
+/// each, accumulate the per-record failures, and write the advanced job row.
+async fn run_advance_batch(
+    tx: &mut Transaction<'_, Postgres>,
+    p: &AdvanceParams<'_>,
+) -> Result<(), StoreError> {
+    // Lock the job row and read its progress under the lock.
+    let job_row = sqlx::query(
+        "SELECT status, cursor_id, processed_count, migrated_count, failure_count, failures_json \
+         FROM trait_migration_jobs \
+         WHERE id = $1 AND tenant_id = $2 AND environment_id = $3 FOR UPDATE",
+    )
+    .bind(&p.job_id)
+    .bind(p.scope.tenant().to_string())
+    .bind(p.scope.environment().to_string())
+    .fetch_one(&mut **tx)
+    .await?;
+    let status: String = job_row.get("status");
+    // Re-check terminality under the lock (a concurrent advance may have finished it).
+    if matches!(status.as_str(), "completed" | "failed") {
+        return Ok(());
+    }
+    let failures_json: String = job_row.get("failures_json");
+    let mut state = BatchState {
+        cursor: job_row.get("cursor_id"),
+        processed: job_row.get("processed_count"),
+        migrated: job_row.get("migrated_count"),
+        failure_count: job_row.get("failure_count"),
+        failures: serde_json::from_str(&failures_json).unwrap_or_default(),
+    };
+
+    let rows = select_candidate_identities(tx, p, state.cursor.as_deref()).await?;
+    let batch_len = i64::try_from(rows.len()).unwrap_or(i64::MAX);
+    for row in &rows {
+        let subject: String = row.get("id");
+        let traits = open_user_traits(tx, p.scope, p.master, row).await?;
+        let candidate = if matches!(p.kind, TraitJobKind::Migrate) {
+            crate::trait_schema::apply_transform(p.ops, &traits)
+        } else {
+            traits
+        };
+        let record_failures = p.target.validate(&candidate);
+        if record_failures.is_empty() {
+            if matches!(p.kind, TraitJobKind::Migrate) {
+                write_migrated_traits(tx, p, &subject, &candidate).await?;
+                state.migrated += 1;
+            }
+        } else {
+            state.failure_count += 1;
+            state.failures.push(RecordFailure {
+                subject: subject.clone(),
+                failures: record_failures,
+            });
+        }
+        state.processed += 1;
+        state.cursor = Some(subject);
+    }
+
+    // A full batch means there may be more; a short batch means the run is done.
+    let more = p.batch_limit > 0 && batch_len == p.batch_limit;
+    let new_status = if more {
+        "running"
+    } else if state.failure_count == 0 {
+        "completed"
+    } else {
+        "failed"
+    };
+    let failures_out = serde_json::to_string(&state.failures).unwrap_or_else(|_| "[]".to_string());
+    sqlx::query(
+        "UPDATE trait_migration_jobs SET \
+             status = $1, cursor_id = $2, processed_count = $3, migrated_count = $4, \
+             failure_count = $5, failures_json = $6, \
+             updated_at = TIMESTAMPTZ 'epoch' + ($7::text || ' microseconds')::interval \
+         WHERE id = $8 AND tenant_id = $9 AND environment_id = $10",
+    )
+    .bind(new_status)
+    .bind(state.cursor.as_deref())
+    .bind(state.processed)
+    .bind(state.migrated)
+    .bind(state.failure_count)
+    .bind(&failures_out)
+    .bind(p.now_micros)
+    .bind(&p.job_id)
+    .bind(p.scope.tenant().to_string())
+    .bind(p.scope.environment().to_string())
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+/// Select the next ascending run of candidate identities past `cursor`, bounded by
+/// the batch limit. A migrate selects identities still on the source version; a
+/// dry-run selects every identity that has traits.
+async fn select_candidate_identities(
+    tx: &mut Transaction<'_, Postgres>,
+    p: &AdvanceParams<'_>,
+    cursor: Option<&str>,
+) -> Result<Vec<PgRow>, StoreError> {
+    let rows = match p.kind {
+        TraitJobKind::Migrate => {
+            sqlx::query(
+                "SELECT id, traits_sealed, traits_dek_version FROM users \
+                 WHERE tenant_id = $1 AND environment_id = $2 AND deleted_at IS NULL \
+                 AND traits_sealed IS NOT NULL AND traits_schema_version = $3 \
+                 AND ($4::text IS NULL OR id > $4) ORDER BY id LIMIT $5",
+            )
+            .bind(p.scope.tenant().to_string())
+            .bind(p.scope.environment().to_string())
+            .bind(p.from_version)
+            .bind(cursor)
+            .bind(p.batch_limit)
+            .fetch_all(&mut **tx)
+            .await?
+        }
+        TraitJobKind::DryRun => {
+            sqlx::query(
+                "SELECT id, traits_sealed, traits_dek_version FROM users \
+                 WHERE tenant_id = $1 AND environment_id = $2 AND deleted_at IS NULL \
+                 AND traits_sealed IS NOT NULL \
+                 AND ($3::text IS NULL OR id > $3) ORDER BY id LIMIT $4",
+            )
+            .bind(p.scope.tenant().to_string())
+            .bind(p.scope.environment().to_string())
+            .bind(cursor)
+            .bind(p.batch_limit)
+            .fetch_all(&mut **tx)
+            .await?
+        }
+    };
+    Ok(rows)
+}
+
+/// Re-seal a migrated identity's transformed traits under the scope's active DEK and
+/// stamp the target schema version onto the row.
+async fn write_migrated_traits(
+    tx: &mut Transaction<'_, Postgres>,
+    p: &AdvanceParams<'_>,
+    subject: &str,
+    traits: &serde_json::Value,
+) -> Result<(), StoreError> {
+    let (dek_version, dek) = fetch_active_dek(tx, p.scope, p.master).await?;
+    let serialized = serde_json::to_vec(traits).map_err(|_| StoreError::Encryption)?;
+    let sealed = dek.seal(
+        p.env.entropy(),
+        &user_pii_seal_aad(p.scope, USER_TRAITS_PURPOSE, dek_version),
+        &serialized,
+    );
+    sqlx::query(
+        "UPDATE users SET traits_sealed = $1, traits_dek_version = $2, traits_schema_version = $3 \
+         WHERE id = $4 AND tenant_id = $5 AND environment_id = $6",
+    )
+    .bind(sealed.into_bytes())
+    .bind(dek_version)
+    .bind(p.to_version)
+    .bind(subject)
+    .bind(p.scope.tenant().to_string())
+    .bind(p.scope.environment().to_string())
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Scope- and actor-store accessors for the identity-traits repositories (#53).
+// ---------------------------------------------------------------------------
+
+impl<'a> ScopedStore<'a> {
+    /// The read-only trait-schema registry for this scope (issue #53): the active
+    /// served version, a specific version, and the full version list. Registering and
+    /// activating versions lives on [`ActingStore::trait_schemas`].
+    #[must_use]
+    pub fn trait_schemas(&self) -> TraitSchemaRepo<'a> {
+        TraitSchemaRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
+    /// The read-only trait migration/dry-run job repository for this scope (issue
+    /// #53). Creating and advancing jobs lives on [`ActingStore::trait_migration_jobs`].
+    #[must_use]
+    pub fn trait_migration_jobs(&self) -> TraitMigrationJobRepo<'a> {
+        TraitMigrationJobRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+}
+
+impl<'a> ActingStore<'a> {
+    /// The mutating trait-schema registry for this scope and actor (issue #53):
+    /// create an immutable candidate version and activate one (cutover guarded).
+    #[must_use]
+    pub fn trait_schemas(&self) -> ActingTraitSchemaRepo<'a> {
+        ActingTraitSchemaRepo {
+            store: self.store,
+            scope: self.scope,
+            acting: self.acting,
+        }
+    }
+
+    /// The mutating trait migration/dry-run job repository for this scope and actor
+    /// (issue #53): create a job and advance it a batch at a time.
+    #[must_use]
+    pub fn trait_migration_jobs(&self) -> ActingTraitMigrationJobRepo<'a> {
+        ActingTraitMigrationJobRepo {
+            store: self.store,
+            scope: self.scope,
+            acting: self.acting,
+        }
+    }
+}
+
+impl UserRepo<'_> {
+    /// Read one identity's trait document, decrypted, along with the schema version it
+    /// was validated against. Returns [`None`] when the identity has no traits set (or
+    /// is absent / soft-deleted / out of scope).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Encryption`] if no master key is configured or the sealed value
+    /// cannot be opened; [`StoreError::Database`] on a persistence failure.
+    pub async fn traits(
+        &self,
+        id: &UserId,
+    ) -> Result<Option<(i32, serde_json::Value)>, StoreError> {
+        if id.scope() != self.scope {
+            return Ok(None);
+        }
+        let master = self.store.master().ok_or(StoreError::Encryption)?;
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT traits_sealed, traits_dek_version, traits_schema_version FROM users \
+             WHERE id = $1 AND tenant_id = $2 AND environment_id = $3 \
+             AND deleted_at IS NULL AND traits_sealed IS NOT NULL",
+        )
+        .bind(id.to_string())
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(row) = row else {
+            tx.commit().await?;
+            return Ok(None);
+        };
+        let version: i32 = row.get("traits_schema_version");
+        let traits = open_user_traits(&mut tx, self.scope, master, &row).await?;
+        tx.commit().await?;
+        Ok(Some((version, traits)))
+    }
+
+    /// Read one identity's trait document as a self-service (user-facing) surface sees
+    /// it: with every admin-only field stripped per the active schema's annotations
+    /// (issue #53). Returns [`None`] when the identity has no traits. Falls back to the
+    /// full document only if there is no active schema to read annotations from.
+    ///
+    /// # Errors
+    ///
+    /// As [`UserRepo::traits`].
+    pub async fn traits_user_visible(
+        &self,
+        id: &UserId,
+    ) -> Result<Option<serde_json::Value>, StoreError> {
+        let Some((_, traits)) = self.traits(id).await? else {
+            return Ok(None);
+        };
+        let schemas = TraitSchemaRepo {
+            store: self.store,
+            scope: self.scope,
+        };
+        let redacted = match schemas.active().await? {
+            Some(active) => TraitSchema::compile(&active.schema_json)
+                .map(|schema| schema.annotations().redact_for_user(&traits))
+                .unwrap_or(traits),
+            None => traits,
+        };
+        Ok(Some(redacted))
+    }
+}
+
+impl ActingUserRepo<'_> {
+    /// Set (or replace) an identity's traits, validated against the scope's ACTIVE
+    /// schema version and sealed at rest (issue #53). The traits document is validated
+    /// before anything is written; an invalid document is refused with per-field JSON
+    /// Pointer failures and nothing is persisted. On success the sealed document and
+    /// the active schema version are written and a `user.traits.update` audit row is
+    /// recorded in the same transaction. Returns the schema version the traits were
+    /// validated against.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the identity is absent in this scope;
+    /// [`StoreError::NoActiveTraitSchema`] if the scope has no active schema;
+    /// [`StoreError::TraitsInvalid`] if the traits fail the active schema;
+    /// [`StoreError::Encryption`] if no master key is configured;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn set_traits(
+        &self,
+        env: &Env,
+        id: &UserId,
+        traits_json: &str,
+    ) -> Result<i32, StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let master = self.store.master().ok_or(StoreError::Encryption)?;
+        let scope = self.scope;
+        // The active schema is the write-time contract. No active schema is a distinct,
+        // legible error (register and activate a schema first).
+        let read = TraitSchemaRepo {
+            store: self.store,
+            scope,
+        };
+        let active = read
+            .active()
+            .await?
+            .ok_or(StoreError::NoActiveTraitSchema)?;
+        let schema = TraitSchema::compile(&active.schema_json)?;
+        let value: serde_json::Value = serde_json::from_str(traits_json).map_err(|err| {
+            StoreError::TraitsInvalid(vec![ValidationFailure {
+                pointer: String::new(),
+                message: format!("traits are not valid JSON: {err}"),
+            }])
+        })?;
+        let failures = schema.validate(&value);
+        if !failures.is_empty() {
+            return Err(StoreError::TraitsInvalid(failures));
+        }
+        let schema_version = active.version;
+        let serialized = serde_json::to_vec(&value).map_err(|_| StoreError::Encryption)?;
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::UserTraitsUpdate,
+                target: id,
+            },
+            async move |tx| {
+                // The identity must exist and be live; a missing row updates nothing,
+                // which is reported as the uniform not-found.
+                let (dek_version, dek) = fetch_active_dek(tx, scope, master).await?;
+                let sealed = dek.seal(
+                    env.entropy(),
+                    &user_pii_seal_aad(scope, USER_TRAITS_PURPOSE, dek_version),
+                    &serialized,
+                );
+                let affected = sqlx::query(
+                    "UPDATE users SET traits_sealed = $1, traits_dek_version = $2, \
+                         traits_schema_version = $3 \
+                     WHERE id = $4 AND tenant_id = $5 AND environment_id = $6 \
+                     AND deleted_at IS NULL",
+                )
+                .bind(sealed.into_bytes())
+                .bind(dek_version)
+                .bind(schema_version)
+                .bind(id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .execute(&mut **tx)
+                .await?
+                .rows_affected();
+                if affected == 0 {
+                    return Err(StoreError::NotFound);
+                }
+                Ok(())
+            },
+            false,
+        )
+        .await?;
+        Ok(schema_version)
     }
 }

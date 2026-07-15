@@ -61,6 +61,7 @@ mod repository;
 mod scope;
 pub mod snapshot;
 mod store;
+pub mod trait_schema;
 
 /// The reusable cross-tenant IDOR test harness. Present only under the
 /// `testing` feature; every future surface registers its operations here.
@@ -102,7 +103,8 @@ pub use id::{
     PushedRequestKind, RefreshFamilyId, RefreshFamilyKind, RefreshTokenId, RefreshTokenKind,
     ResourceServerId, ResourceServerKind, ScopedId, ScopedKind, ServiceAccountId,
     ServiceAccountKind, ServiceId, ServiceKind, SessionEventId, SessionEventKind, SessionId,
-    SessionKind, SigningKeyId, SigningKeyKind, TenantId, TenantKind, UserId, UserKind, VariableId,
+    SessionKind, SigningKeyId, SigningKeyKind, TenantId, TenantKind, TraitMigrationJobId,
+    TraitMigrationJobKind, TraitSchemaId, TraitSchemaKind, UserId, UserKind, VariableId,
     VariableKind,
 };
 pub use migrate::{Migration, MigrationError, MigrationReport, MigrationRunner, Phase};
@@ -120,8 +122,9 @@ pub use repository::{
     ActingEnvironmentVariableRepo, ActingExternalAssertionIssuerRepo, ActingInitialAccessTokenRepo,
     ActingManagementCredentialRepo, ActingManagementStore, ActingOrganizationRepo,
     ActingPushedRequestRepo, ActingRefreshRepo, ActingResourceServerRepo, ActingServiceAccountRepo,
-    ActingSessionRepo, ActingSigningKeyRepo, ActingStore, ActingTenantRepo, ActingUserRepo,
-    ActiveDeviceFlow, ActiveOpaqueToken, ApprovedDeviceGrant, AssertionSubjectMappingRecord,
+    ActingSessionRepo, ActingSigningKeyRepo, ActingStore, ActingTenantRepo,
+    ActingTraitMigrationJobRepo, ActingTraitSchemaRepo, ActingUserRepo, ActiveDeviceFlow,
+    ActiveOpaqueToken, ApprovedDeviceGrant, AssertionSubjectMappingRecord,
     AssertionSubjectMappingRepo, AuditRecord, AuditRepo, AuthorizationRepo,
     BackChannelDeliveryRepo, ByokBinding, ClientAssertionJtiRepo, ClientAuthDiagnosticReason,
     ClientAuthDiagnosticRecord, ClientAuthDiagnosticsRepo, ClientAuthRecord,
@@ -141,17 +144,19 @@ pub use repository::{
     ManagementStore, NewAdminUser, NewAssertionSubjectMapping, NewClientAuthDiagnostic,
     NewDcrPolicy, NewDeviceCode, NewDynamicClient, NewEnvironment, NewExternalAssertionIssuer,
     NewInitialAccessToken, NewJwtAuthClient, NewOpaqueAccessToken, NewRefreshFamily,
-    NewResourceServer, NewSession, NewSigningKey, OperatorRecord, OperatorRepo, OrganizationRecord,
-    OrganizationRepo, PriorSessionOutcome, PushRequest, PushedRequestRepo, RedeemOutcome,
-    RefreshFamilyFleetFilter, RefreshFamilyFleetRepo, RefreshFamilyOpenOutcome,
-    RefreshFamilySummary, RefreshRedeem, RefreshRedeemOutcome, RefreshRepo, RefreshTokenResolution,
-    ResourceServerRecord, ResourceServerRepo, RotatedRefreshToken, ScopedStore, ServiceAccountRepo,
-    SessionEndCause, SessionEndedEvent, SessionEventOutboxRepo, SessionFleetFilter,
-    SessionFleetRepo, SessionRecord, SessionRepo, SessionRevocation, SessionSummary,
-    SigningKeyMaterial, SigningKeyMaterialKind, SigningKeyRecord, SigningKeyRepo,
-    StoredIdempotentResponse, TenantRecord, TenantRepo, TenantStatus, TokenFormat, TokenKind,
-    TokenStatus, UserAdminRecord, UserListFilter, UserRecord, UserRepo, UserRevocation, UserState,
-    device_code_digest, opaque_access_token_digest, refresh_token_digest, user_code_hash,
+    NewResourceServer, NewSession, NewSigningKey, NewTraitMigrationJob, OperatorRecord,
+    OperatorRepo, OrganizationRecord, OrganizationRepo, PriorSessionOutcome, PushRequest,
+    PushedRequestRepo, RecordFailure, RedeemOutcome, RefreshFamilyFleetFilter,
+    RefreshFamilyFleetRepo, RefreshFamilyOpenOutcome, RefreshFamilySummary, RefreshRedeem,
+    RefreshRedeemOutcome, RefreshRepo, RefreshTokenResolution, ResourceServerRecord,
+    ResourceServerRepo, RotatedRefreshToken, ScopedStore, ServiceAccountRepo, SessionEndCause,
+    SessionEndedEvent, SessionEventOutboxRepo, SessionFleetFilter, SessionFleetRepo, SessionRecord,
+    SessionRepo, SessionRevocation, SessionSummary, SigningKeyMaterial, SigningKeyMaterialKind,
+    SigningKeyRecord, SigningKeyRepo, StoredIdempotentResponse, TenantRecord, TenantRepo,
+    TenantStatus, TokenFormat, TokenKind, TokenStatus, TraitJobKind, TraitJobStatus,
+    TraitMigrationJob, TraitMigrationJobRepo, TraitSchemaRepo, TraitSchemaVersion, UserAdminRecord,
+    UserListFilter, UserRecord, UserRepo, UserRevocation, UserState, device_code_digest,
+    opaque_access_token_digest, refresh_token_digest, user_code_hash,
 };
 pub use scope::Scope;
 pub use snapshot::{
@@ -161,3 +166,7 @@ pub use snapshot::{
     validate_document,
 };
 pub use store::Store;
+pub use trait_schema::{
+    MAX_DEPTH as TRAIT_SCHEMA_MAX_DEPTH, SchemaError, TraitAnnotations, TraitSchema, TransformOp,
+    ValidationFailure, Visibility, apply_transform, parse_transform,
+};
