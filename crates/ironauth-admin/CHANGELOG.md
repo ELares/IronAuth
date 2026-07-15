@@ -26,6 +26,22 @@ range per docs/RELEASING.md.
     /v1/tenants/{tenant_id}/restore` restores a grace tenant in-window (`409` once
     the window has elapsed). The delete no longer crypto-shreds; erasure is deferred
     to the terminal hard-delete stage per issue #46's out-of-scope.
+- Typed environments with guardrails and scoped keys (issue #42). Environment
+  creation is a single call that types the environment and provisions its identity.
+  - **Typed create.** `POST /v1/tenants/{tenant_id}/environments` now takes a required
+    `kind` (`dev`, `staging`, or `prod`) and an optional `custom_domain`; the tenant-create
+    body takes the same for its first environment (defaulting to `dev`, which needs no
+    domain, so a tenant is always creatable in one call). An unknown kind is a `400`; a
+    production environment with no configured custom domain is a `422 guardrail_violation`
+    naming each failed guardrail in a new `failed_guardrails` field on the error body.
+  - **Guardrails on the view.** `EnvironmentView` now exposes `kind`, `guardrail_class`,
+    `custom_domain`, and a `guardrails` object (a new `GuardrailView`) with the derived
+    flags: insecure-redirect allowance, https-only redirects, custom-domain requirement,
+    one-time-view secrets, hosted-page noindex, and the environment banner.
+  - **Day-one signing key.** Creation generates the environment's own `EdDSA` day-one
+    signing key from the entropy seam (`provision::DayOneSigningKey`) and provisions it in
+    the same transaction, so the new environment serves discovery with its own issuer and
+    a disjoint JWKS immediately. The key is the environment's identity, never promoted.
 - The four-level resource model as public APIs (issue #41). Operator, tenant,
   environment, and organization are now each manageable through documented endpoints,
   and every resource type carries a machine-readable promotion classification.

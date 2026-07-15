@@ -510,6 +510,58 @@
       },
       "type": "object"
     },
+    "QuotaConfig": {
+      "additionalProperties": false,
+      "description": "Per-tenant and per-environment quota settings (issue #50).\n\nThe tenant-plane fairness layer. Two nested token-bucket tiers, one keyed by\ntenant and one by (tenant, environment), over three independently enforced\ndimensions (request rate, token issuance, hook execution seconds). An\nenvironment spend also draws from its tenant bucket, so an environment can\nnever exceed its tenant and no tenant can starve another (the buckets are\nper-scope and isolated). Every limit is a setting with a safe default (the\ntunability principle); the full five-layer limiter with the edge and the\nIronCache-backed shared L2 lands in M15 on top of this process-local core.",
+      "properties": {
+        "environment": {
+          "$ref": "#/$defs/ScopeQuotaConfig",
+          "default": {
+            "hook_seconds_burst": 60,
+            "hook_seconds_per_second": 30,
+            "requests_burst": 200,
+            "requests_per_second": 100,
+            "token_issuance_burst": 100,
+            "token_issuance_per_second": 50
+          },
+          "description": "The per-environment tier. Bounds one environment, nested under its\ntenant: an environment spend draws from BOTH the environment bucket and\nthe tenant bucket, so it can never consume beyond its tenant's remaining\nshare."
+        },
+        "idle_bucket_ttl_secs": {
+          "default": 3600,
+          "description": "How long (in seconds) an idle per-tenant or per-environment token bucket is\nretained before the reaper evicts it, bounding the in-memory footprint under\nlegitimate scope churn (an environment deleted, a tenant offboarded). A\nbucket untouched for this long is dropped; it is re-created full on the next\nspend, exactly as a never-seen scope would be, so eviction is behaviorally\ntransparent (a scope idle this long has already refilled to full under any\nnormal rate). The default (3600) is one hour. Set it to 0 to disable the\nreaper (buckets then live for the process lifetime); the key space is still\nbounded by real tenancy, because only a verified, existing scope ever\nallocates a bucket.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "tenant": {
+          "$ref": "#/$defs/ScopeQuotaConfig",
+          "default": {
+            "hook_seconds_burst": 120,
+            "hook_seconds_per_second": 60,
+            "requests_burst": 1000,
+            "requests_per_second": 500,
+            "token_issuance_burst": 200,
+            "token_issuance_per_second": 100
+          },
+          "description": "The per-tenant tier. Bounds the aggregate of all of a tenant's\nenvironments; a single tenant cannot exceed it however many environments\nit runs."
+        },
+        "usage_thresholds_percent": {
+          "default": [
+            80,
+            100
+          ],
+          "description": "The usage percentages (1 to 100) at which a saturation webhook fires per\ndimension, so operators see pressure before the hard limit. The default\n(`[80, 100]`) warns at 80 percent and again at the limit. An empty list\ndisables saturation webhooks. At most `QUOTA_MAX_USAGE_THRESHOLDS`\nentries; each must be between 1 and 100.",
+          "items": {
+            "format": "uint8",
+            "maximum": 255,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
     "RegistrationMode": {
       "description": "The Dynamic Client Registration exposure switch (issue #31): who may register\na client through the public `/connect/register` endpoint. Layered under\n`oidc.registration_enabled` (which mounts the endpoint at all): when the\nendpoint is mounted, this decides whether a request is allowed and how.\n\nThe SAFE default is `token_gated`: a valid initial access token is required,\nso open self-service registration is opt-in, never on by accident. `closed`\nrefuses every public registration (clients are then created only through the\nmanagement API). `open` allows anonymous registration but the resulting client\nstarts QUARANTINED (consent always shown, redirect set restricted) until an\nadmin verifies it.",
       "oneOf": [
@@ -529,6 +581,55 @@
           "type": "string"
         }
       ]
+    },
+    "ScopeQuotaConfig": {
+      "additionalProperties": false,
+      "description": "The limits for one quota tier (issue #50), over the three enforced\ndimensions. Each dimension is a token bucket with a sustained refill rate\n(`*_per_second`) and a burst capacity (`*_burst`); the dimensions enforce\nindependently, so exhausting one does not affect another. A `*_burst` of 0\ndisables that dimension (unlimited), which is how a single-tenant self-hoster\nexpresses no quota.",
+      "properties": {
+        "hook_seconds_burst": {
+          "default": 60,
+          "description": "Burst capacity for the hook-seconds dimension. 0 means unlimited.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "hook_seconds_per_second": {
+          "default": 30,
+          "description": "Sustained hook/webhook execution seconds admitted per wall second (the\nrefill rate for the hook-seconds dimension). Bounds how much outbound\nhook execution time a scope may consume.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "requests_burst": {
+          "default": 200,
+          "description": "Burst capacity for the request-rate dimension: the most requests that can\nbe admitted in an instantaneous spike before the sustained rate governs.\n0 means unlimited (the dimension is not enforced).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "requests_per_second": {
+          "default": 100,
+          "description": "Sustained requests per second (the token bucket refill rate for the\nrequest-rate dimension).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "token_issuance_burst": {
+          "default": 100,
+          "description": "Burst capacity for the token-issuance dimension. 0 means unlimited.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "token_issuance_per_second": {
+          "default": 50,
+          "description": "Sustained token issuance per second (the refill rate for the\ntoken-issuance dimension: access, ID, and refresh tokens minted).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
     },
     "Secret": {
       "description": "A secret value by indirection: the contents of a file ({ file = \"/path\" }), an environment variable ({ env = \"VAR_NAME\" }), or a literal string (discouraged; flagged outside dev mode).",
@@ -735,6 +836,33 @@
         "trusted_hops": 0
       },
       "description": "Trusted-proxy policy. Controls whether forwarding headers are honored;\nthe safe default trusts nothing."
+    },
+    "quota": {
+      "$ref": "#/$defs/QuotaConfig",
+      "default": {
+        "environment": {
+          "hook_seconds_burst": 60,
+          "hook_seconds_per_second": 30,
+          "requests_burst": 200,
+          "requests_per_second": 100,
+          "token_issuance_burst": 100,
+          "token_issuance_per_second": 50
+        },
+        "idle_bucket_ttl_secs": 3600,
+        "tenant": {
+          "hook_seconds_burst": 120,
+          "hook_seconds_per_second": 60,
+          "requests_burst": 1000,
+          "requests_per_second": 500,
+          "token_issuance_burst": 200,
+          "token_issuance_per_second": 100
+        },
+        "usage_thresholds_percent": [
+          80,
+          100
+        ]
+      },
+      "description": "Per-tenant and per-environment quota fairness settings (issue #50). The\noperator-plane noisy-neighbor guard: nested token buckets that keep one\ntenant or environment from starving another. Safe defaults, fully tunable\n(the tunability principle); a burst of 0 for a dimension means unlimited\n(the single-tenant self-hoster posture)."
     },
     "server": {
       "$ref": "#/$defs/ServerConfig",

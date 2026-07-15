@@ -13,6 +13,45 @@ range per docs/RELEASING.md.
   suspended or offboarded tenant. A suspend or delete therefore stops serving on the
   very next request with no process restart, and a resume serves again with no data
   loss. A store error reading the fence fails closed (denies serving).
+- Tenant/environment quota enforcement on the data plane (issue #50). The provider
+  now constructs one `ironauth_quota::QuotaEnforcer` from the `[quota]` config
+  (seeded with the same env clock) and spends it on the request path, turning the
+  previously inert quota engine live.
+  - **Enforcement point (`quota.rs`, `authorize.rs`).** `/authorize` charges the
+    request-rate quota for the `(tenant, environment)` the `client_id` declares,
+    only AFTER the client store lookup confirms the client exists in that scope, so a
+    spend is only ever drawn on a VERIFIED, real scope. A well-formed but
+    unregistered `client_id` (whose declared scope is attacker-chosen and
+    unauthenticated: any random bytes decode to a valid-looking scope) is rejected by
+    the not-found path and NEVER reaches a spend. This restores the engine's "an
+    unknown scope is rejected before it reaches a spend" invariant and closes an
+    unauthenticated unbounded-bucket-allocation memory-exhaustion vector and a
+    spoofed-victim-tenant throttling vector (the fix for the pre-verification spend
+    the re-review flagged). An over-quota spend short-circuits with an RFC 6585 `429`
+    carrying the structured `RateLimit`/`RateLimit-Policy` headers, the legacy
+    `X-RateLimit-*` triplet, `Retry-After`, the `x-ratelimit-block` signal header,
+    and the `__Host-ira-rl-block` cookie for a cookie-gating WAF. A scope under quota
+    passes through untouched.
+  - **Fairness.** The spend draws from the environment bucket and, by nesting, its
+    tenant bucket, and the buckets are per-scope: one tenant flooding its own quota
+    never throttles another tenant. Proven end to end over the live router in
+    `tests/quota.rs` (at-quota 429 with headers, under-quota passes, noisy-vs-quiet
+    fairness, the configured tier governing the limit, and a concurrency storm that
+    never oversells the burst) over REGISTERED clients on the verified-scope path.
+    Three further tests prove the enforcement point is safe: a flood of unregistered
+    `client_id`s allocates zero buckets, a spoofed victim-tenant scope cannot drain
+    the victim's shared bucket, and an idle bucket is reaped after the configured
+    window.
+  - **State wiring (`state.rs`).** `OidcState::with_quota_enforcer` installs the
+    enforcer; with none installed the data plane admits every request (the default,
+    and the self-hoster's unlimited posture), so the existing DB-only tests are
+    unaffected.
+  - Still deferred (precisely): live charging of the token-issuance and hook-seconds
+    dimensions on their request paths (the engine enforces them independently; the
+    same `OidcState` hook applies at the `/token` mint and the hook-execution
+    accounting point), the usage-threshold webhook delivery (no platform eventing
+    surface exists yet to route the produced events to), and the audited
+    management-API surface for adjusting a tenant's quota at runtime. See notes.
 - Session Management 1.0 and Front-Channel Logout 1.0, behind default-off flags for
   certification completeness (issue #39). Both iframe mechanisms are degraded under
   third-party-cookie partitioning (Session Management 1.0 section 5.1), so they ship

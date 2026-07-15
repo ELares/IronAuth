@@ -53,6 +53,7 @@ fn live_router(harness: &Harness) -> (Router, String) {
             KeySet::bootstrap(key, SystemTime::UNIX_EPOCH),
             SigningPolicy::eddsa_default(),
             PairwiseSalt::new(Vec::new()),
+            ironauth_store::GuardrailSet::for_kind(ironauth_store::EnvironmentType::Dev),
         ),
     );
     let discovery = discovery_router(DiscoveryState::new(

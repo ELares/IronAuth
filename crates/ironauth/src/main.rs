@@ -13,7 +13,7 @@ use std::sync::Arc;
 use axum::Router;
 use ironauth_admin::AdminState;
 use ironauth_config::{
-    Config, FeatureRegistry, GLOBAL_TOKEN_REVOCATION_FEATURE, Loaded, OidcConfig,
+    Config, FeatureRegistry, GLOBAL_TOKEN_REVOCATION_FEATURE, Loaded, OidcConfig, QuotaConfig,
 };
 use ironauth_env::Env;
 use ironauth_jose::MasterKey;
@@ -22,6 +22,7 @@ use ironauth_oidc::{
     IssuerRegistry, IssuerState, JwksCacheWindow, OidcState, WorkerSettings, discovery_router,
     issuer_router, oidc_router,
 };
+use ironauth_quota::QuotaEnforcer;
 use ironauth_server::Server;
 use ironauth_store::Store;
 
@@ -126,6 +127,7 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
                 config.database.url.expose().to_owned(),
                 env.clone(),
                 resolve_master_key(&config),
+                config.quota.clone(),
             ))
         } else {
             None
@@ -147,7 +149,7 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
         }
         // Mount the OIDC provider on the PUBLIC plane when enabled. The issuer root
         // is the server's config-derived base URL, so issuers are per environment.
-        if let Some((oidc_config, dsn, oidc_env, master_key)) = oidc_inputs {
+        if let Some((oidc_config, dsn, oidc_env, master_key, quota_config)) = oidc_inputs {
             let issuer_base = server.base_url();
             if let Some(router) = build_oidc_router(
                 &oidc_config,
@@ -156,6 +158,7 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
                 issuer_base,
                 global_revocation_enabled,
                 master_key,
+                &quota_config,
             )
             .await
             {
@@ -263,6 +266,7 @@ async fn build_oidc_router(
     issuer_base: String,
     global_revocation_enabled: bool,
     master_key: Option<Arc<MasterKey>>,
+    quota_config: &QuotaConfig,
 ) -> Option<Router> {
     let store = match Store::connect(data_plane_dsn).await {
         Ok(store) => store,
@@ -313,8 +317,16 @@ async fn build_oidc_router(
     let issuer_state = IssuerState::new(Arc::clone(&registry), env.clone());
     let jwks = issuer_router(issuer_state);
 
+    // The data-plane quota enforcer (issue #50): one shared, in-memory nested
+    // token-bucket engine seeded from the [quota] config and the SAME env clock, so
+    // the tenant-fairness spend on the authorization path refills deterministically.
+    // A dimension with a burst of 0 is unlimited, which is how a self-hoster who
+    // wants no quota expresses it; enforcement then admits every request.
+    let quota_enforcer = Arc::new(QuotaEnforcer::from_config(quota_config, env.clock_arc()));
+
     let state = OidcState::new(store, env, registry, oidc_config, issuer_base)
-        .with_global_token_revocation_enabled(global_revocation_enabled);
+        .with_global_token_revocation_enabled(global_revocation_enabled)
+        .with_quota_enforcer(quota_enforcer);
     if global_revocation_enabled {
         tracing::info!(
             "experimental Global Token Revocation receiver mounted (issue #36); the draft \

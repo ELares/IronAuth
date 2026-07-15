@@ -1,0 +1,16 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+[package]
+name = "ironauth-quota"
+version = "0.1.0"
+description = "Per-tenant and per-environment quota fairness for IronAuth: nested token buckets with fail-closed enforcement"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+ironauth-env.workspace = true
+ironauth-config.workspace = true
+
+[lints]
+workspace = true

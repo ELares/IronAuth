@@ -26,7 +26,8 @@ use ironauth_config::{
 };
 use ironauth_env::Env;
 use ironauth_jose::{JwsAlgorithm, TrustedKey, VerificationPolicy, VerifiedToken, verify};
-use ironauth_store::{Scope, Store, TokenFormat};
+use ironauth_quota::QuotaEnforcer;
+use ironauth_store::{GuardrailSet, Scope, Store, TokenFormat};
 
 use crate::client_keys::ClientKeyResolver;
 use crate::introspection::{IntrospectionSerializer, default_serializer};
@@ -71,6 +72,14 @@ pub struct OidcState {
     // resolves it from the strict config feature ladder (feature enabled AND acked)
     // and sets it here. Default: false (the endpoint is unmounted).
     global_token_revocation_enabled: bool,
+    // The per-tenant/per-environment quota enforcer (issue #50), the data plane's
+    // tenant-fairness layer. Kept OUTSIDE `Inner` and installed by the boot path
+    // (built from the [quota] config, seeded with the SAME env clock), so a spend
+    // refills deterministically under a test's ManualClock. A single enforcer is
+    // shared across every request thread. Default: `None`, which disables
+    // enforcement entirely (every request admitted, nothing charged) so the
+    // many DB-only OIDC tests and a self-hoster who wants no quota are unaffected.
+    quota: Option<Arc<QuotaEnforcer>>,
 }
 
 // The per-environment policy flags each mirror an independent, individually
@@ -322,6 +331,7 @@ impl OidcState {
             revocation_sink: default_sink(),
             introspection_serializer: default_serializer(),
             global_token_revocation_enabled: false,
+            quota: None,
         }
     }
 
@@ -353,6 +363,32 @@ impl OidcState {
     #[must_use]
     pub fn global_token_revocation_enabled(&self) -> bool {
         self.global_token_revocation_enabled
+    }
+
+    /// Install the per-tenant/per-environment quota enforcer (issue #50), turning
+    /// on data-plane tenant fairness. The boot path builds one enforcer from the
+    /// `[quota]` config (seeded with the same env clock) and installs it here; a
+    /// test installs a small-budget enforcer to drive the 429 path. With no
+    /// enforcer installed the data plane admits every request (no enforcement),
+    /// which is the default and the self-hoster's unlimited posture.
+    #[must_use]
+    pub fn with_quota_enforcer(mut self, enforcer: Arc<QuotaEnforcer>) -> Self {
+        self.quota = Some(enforcer);
+        self
+    }
+
+    /// Charge one request against the tenant and environment request-rate quota
+    /// for `scope` (issue #50).
+    ///
+    /// Returns [`Some`] `429 Too Many Requests` response when the scope is over
+    /// quota: the caller MUST return it and spend nothing further (fail-closed at
+    /// the ceiling). Returns [`None`] when the request is admitted (or when no
+    /// enforcer is installed), and the caller proceeds untouched. The spend draws
+    /// from the environment bucket and, by nesting, its tenant bucket, so one
+    /// tenant hitting its limit never consumes another tenant's share.
+    #[must_use]
+    pub(crate) fn enforce_request_quota(&self, scope: &Scope) -> Option<axum::response::Response> {
+        crate::quota::enforce_request(self.quota.as_ref()?, scope)
     }
 
     /// Whether a Global Token Revocation hard-kills the subject's `offline_access`
@@ -941,6 +977,32 @@ impl OidcState {
     /// and policy into the pure, synchronous mint functions.
     pub(crate) async fn issuer_entry(&self, scope: &Scope) -> Option<Arc<IssuerEntry>> {
         self.inner.issuers.entry_for(scope).await
+    }
+
+    /// Resolve the environment's TYPED guardrail set for `scope` (issue #42),
+    /// derived from its kind through the same shared registry the mint reads.
+    ///
+    /// `None` when the environment has no provisioned issuer entry (unprovisioned or
+    /// cross-tenant, which fails closed). The client-registration paths consult this
+    /// to enforce the two-class asymmetry (an `http` loopback redirect is
+    /// registrable in a `dev`/`staging` environment and rejected in `prod`) without
+    /// reading the environments level table the data plane has no grant on.
+    pub(crate) async fn environment_guardrails(&self, scope: &Scope) -> Option<GuardrailSet> {
+        self.issuer_entry(scope)
+            .await
+            .map(|entry| entry.guardrails())
+    }
+
+    /// The environment banner label to show on hosted pages for `scope` (issue #42),
+    /// or `None` for a production environment (which shows no banner and is
+    /// search-indexable). A non-production environment returns its guardrail class
+    /// label (`non-production`), and the hosted pages additionally mark themselves
+    /// `noindex`. `None` also when the environment has no provisioned issuer entry.
+    pub(crate) async fn environment_banner(&self, scope: &Scope) -> Option<&'static str> {
+        let guardrails = self.environment_guardrails(scope).await?;
+        guardrails
+            .show_environment_banner
+            .then(|| guardrails.class.as_str())
     }
 
     /// Whether this environment copies the scope-derived claims into the ID token

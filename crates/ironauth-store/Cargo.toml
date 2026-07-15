@@ -120,6 +120,18 @@ name = "signing_keys"
 path = "tests/signing_keys.rs"
 required-features = ["testing"]
 
+# Environments as first-class typed objects (issue #42): environment CRUD with a
+# typed kind and custom domain through the control plane, the day-one signing key
+# provisioned at creation (each environment's keys are its own identity and are
+# disjoint across sibling environments and tenants), unbounded environment count
+# with no per-environment schema growth (a catalog diff), and the environment /
+# signing-key / management-credential environment-identity classification the
+# snapshot and promotion engines rely on. Needs a real database (DATABASE_URL).
+[[test]]
+name = "environment_guardrails"
+path = "tests/environment_guardrails.rs"
+required-features = ["testing"]
+
 # Resource-server registry persistence and isolation (issue #29): the
 # audience-to-format registry round-trips both formats, is scope-isolated, rejects
 # a duplicate audience per environment, and audits registration. Needs a real

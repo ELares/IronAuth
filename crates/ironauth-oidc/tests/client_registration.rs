@@ -128,6 +128,61 @@ fn jws_header_alg(jws: &str) -> String {
 }
 
 #[tokio::test]
+async fn prod_rejects_an_http_loopback_redirect_dev_accepts_it_via_the_data_plane_guardrail() {
+    // Issue #42 acceptance 1 (the headline security rule), driven through the REAL
+    // DCR path over a STORE-BACKED registry: the environment's typed guardrail is
+    // read from the scope-forced data-plane projection (the environments level table
+    // is unreadable by the data-plane role), so a PROD environment rejects an http
+    // loopback redirect with a guardrail error while a DEV environment accepts it.
+    let loopback = json!({
+        "application_type": "native",
+        "redirect_uris": ["http://127.0.0.1:8080/callback"]
+    });
+    let https = json!({
+        "application_type": "native",
+        "redirect_uris": ["https://app.example/cb"]
+    });
+
+    // PROD: the http loopback is rejected with the named guardrail; https is accepted.
+    let prod =
+        Harness::start_store_backed_kind(dcr_config(), "prod", Some("auth.acme.example")).await;
+    let (status, body) = post_json(&prod, &register_path(&prod), loopback.clone()).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a prod environment rejects an http loopback redirect: {body}"
+    );
+    assert_eq!(body["error"], "invalid_redirect_uri", "{body}");
+    assert!(
+        body["error_description"]
+            .as_str()
+            .is_some_and(|d| d.contains("https_only_redirect_uris")),
+        "the error names the failed guardrail: {body}"
+    );
+    let (status, body) = post_json(&prod, &register_path(&prod), https.clone()).await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "a prod environment accepts an https redirect: {body}"
+    );
+
+    // DEV: the SAME http loopback registers successfully (the relaxed guardrail).
+    let dev = Harness::start_store_backed_kind(dcr_config(), "dev", None).await;
+    let (status, body) = post_json(&dev, &register_path(&dev), loopback).await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "a dev environment accepts an http loopback redirect: {body}"
+    );
+    let (status, body) = post_json(&dev, &register_path(&dev), https).await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "https is accepted in dev too: {body}"
+    );
+}
+
+#[tokio::test]
 async fn omitted_metadata_gets_the_per_spec_defaults() {
     // AC2: client_secret_basic auth, response_types ["code"], application_type web.
     // The omitted id_token_signed_response_alg records the ENVIRONMENT's actual

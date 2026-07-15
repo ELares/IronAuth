@@ -14,18 +14,97 @@ use axum::extract::{Path, Query, State};
 use axum::http::HeaderMap;
 use axum::http::{StatusCode, Uri};
 use axum::response::Response;
-use ironauth_store::{CorrelationId, EnvironmentId, IdempotencyWrite, StoreError, TenantId};
+use ironauth_store::{
+    CorrelationId, EnvironmentId, EnvironmentType, GuardrailReport, GuardrailSet, IdempotencyWrite,
+    NewEnvironment, Scope, StoreError, TenantId,
+};
 
 use crate::auth::Principal;
 use crate::error::{ApiError, ErrorBody};
 use crate::idempotency;
 use crate::input::{parse_json, require_non_empty};
 use crate::pagination::{ListQuery, Pagination};
+use crate::provision::DayOneSigningKey;
 use crate::response::{json, no_content};
 use crate::state::{AdminState, BOOTSTRAP_OPERATOR_DISPLAY_NAME};
 use crate::views::{
     CreateTenantRequest, EnvironmentView, TenantCreated, TenantList, TenantStatusView, TenantView,
 };
+
+/// The validated attributes of a tenant's first environment (issue #42), parsed
+/// from a tenant-create request before any write.
+struct FirstEnvironment {
+    display_name: String,
+    kind: EnvironmentType,
+    custom_domain: Option<String>,
+    guardrails: GuardrailSet,
+}
+
+/// Parse and validate the first environment's attributes from a tenant-create
+/// request (issue #42): its display name (defaulting to `development`), its kind
+/// (defaulting to `dev`, the relaxed non-production kind that needs no custom
+/// domain, so a tenant is always creatable in one call; an explicit unknown kind is
+/// rejected, never coerced), and its custom domain, with the production
+/// custom-domain guardrail enforced before any write.
+fn validated_first_environment(
+    request: &CreateTenantRequest,
+) -> Result<FirstEnvironment, ApiError> {
+    let display_name = request
+        .environment_display_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("development")
+        .to_owned();
+    let kind = match request.environment_kind.as_deref() {
+        None => EnvironmentType::Dev,
+        Some(raw) => {
+            EnvironmentType::parse(raw).map_err(|error| ApiError::BadRequest(error.to_string()))?
+        }
+    };
+    let custom_domain = request
+        .environment_custom_domain
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned);
+    let guardrails = kind.guardrails();
+    let mut report = GuardrailReport::new();
+    report.check(guardrails.check_custom_domain(custom_domain.as_deref()));
+    if !report.is_clean() {
+        return Err(ApiError::GuardrailViolation(report.into_violations()));
+    }
+    Ok(FirstEnvironment {
+        display_name,
+        kind,
+        custom_domain,
+        guardrails,
+    })
+}
+
+/// Validate an optional `home_region` against the operator's configured region set
+/// (issue #46), returning the normalized value. A blank value is treated as omitted
+/// (no region recorded). Validation is against the configured set, so a deployment
+/// with no region set rejects any present `home_region` fail closed. Runs BEFORE any
+/// write.
+fn validated_home_region(
+    state: &AdminState,
+    raw: Option<&str>,
+) -> Result<Option<String>, ApiError> {
+    let home_region = raw
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned);
+    if let Some(region) = home_region.as_deref() {
+        if !state.home_region_is_allowed(region) {
+            return Err(ApiError::BadRequest(format!(
+                "home_region {region:?} is not one of the operator's configured data-residency \
+                 regions"
+            )));
+        }
+    }
+    Ok(home_region)
+}
 
 /// Create a tenant and its first environment.
 #[utoipa::path(
@@ -67,36 +146,20 @@ pub async fn create_tenant(
 
     let request: CreateTenantRequest = parse_json(&body)?;
     let display_name = require_non_empty(&request.display_name, "display_name")?;
-    let environment_display_name = request
-        .environment_display_name
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or("production")
-        .to_owned();
+    let FirstEnvironment {
+        display_name: environment_display_name,
+        kind: environment_kind,
+        custom_domain: environment_custom_domain,
+        guardrails,
+    } = validated_first_environment(&request)?;
 
-    // Residency (issue #46): a present home_region must be one of the operator's
-    // configured regions, validated BEFORE any write. A blank value is treated as
-    // omitted (no region recorded). This validates against the configured set, so a
-    // deployment with no region set rejects any home_region fail closed.
-    let home_region = request
-        .home_region
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_owned);
-    if let Some(region) = home_region.as_deref() {
-        if !state.home_region_is_allowed(region) {
-            return Err(ApiError::BadRequest(format!(
-                "home_region {region:?} is not one of the operator's configured data-residency \
-                 regions"
-            )));
-        }
-    }
+    let home_region = validated_home_region(&state, request.home_region.as_deref())?;
 
     let created_at_micros = state.now_unix_micros();
     let tenant_id = TenantId::generate(state.env());
     let environment_id = EnvironmentId::generate(state.env());
+    let scope = Scope::new(tenant_id, environment_id);
+    let signing_key = DayOneSigningKey::generate(state.env(), &scope);
 
     let created = TenantCreated {
         tenant: TenantView {
@@ -111,6 +174,10 @@ pub async fn create_tenant(
             id: environment_id.to_string(),
             tenant_id: tenant_id.to_string(),
             display_name: environment_display_name.clone(),
+            kind: environment_kind.as_str().to_owned(),
+            guardrail_class: environment_kind.guardrail_class().as_str().to_owned(),
+            custom_domain: environment_custom_domain.clone(),
+            guardrails: guardrails.into(),
             // The tenant's first environment pins no region here; a per-environment
             // region is set through the dedicated environment-create endpoint.
             region: None,
@@ -138,8 +205,14 @@ pub async fn create_tenant(
             created_at_micros,
             BOOTSTRAP_OPERATOR_DISPLAY_NAME,
             &display_name,
-            &environment_display_name,
+            NewEnvironment {
+                display_name: &environment_display_name,
+                kind: environment_kind,
+                custom_domain: environment_custom_domain.as_deref(),
+                region: None,
+            },
             home_region.as_deref(),
+            signing_key.as_new(created_at_micros),
             Some(write),
         )
         .await;

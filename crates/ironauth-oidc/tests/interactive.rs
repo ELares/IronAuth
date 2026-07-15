@@ -71,6 +71,48 @@ fn authorize_query(client_id: &str, prompt: Option<&str>) -> String {
 }
 
 #[tokio::test]
+async fn non_prod_hosted_pages_carry_noindex_and_a_banner_prod_pages_do_not() {
+    // Issue #42 acceptance 6, driven through the REAL hosted-page path over a
+    // STORE-BACKED registry: the login page's environment chrome is resolved from
+    // the environment's typed guardrails (read from the data-plane guardrail
+    // projection). A DEV environment marks the page noindex and shows a banner; a
+    // PROD environment shows neither.
+    use ironauth_config::OidcConfig;
+
+    let dev = Harness::start_store_backed_kind(OidcConfig::default(), "dev", None).await;
+    let return_to = format!("/authorize?client_id={}", dev.client_id());
+    let (status, _headers, body) = dev
+        .get_with_cookie(&format!("/login?return_to={}", enc(&return_to)), None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        body.contains("<meta name=\"robots\" content=\"noindex\">"),
+        "a dev hosted page is marked noindex: {body}"
+    );
+    assert!(
+        body.contains("data-environment-banner="),
+        "a dev hosted page shows an environment banner: {body}"
+    );
+
+    let prod =
+        Harness::start_store_backed_kind(OidcConfig::default(), "prod", Some("auth.acme.example"))
+            .await;
+    let return_to = format!("/authorize?client_id={}", prod.client_id());
+    let (status, _headers, body) = prod
+        .get_with_cookie(&format!("/login?return_to={}", enc(&return_to)), None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        !body.contains("noindex"),
+        "a prod hosted page is indexable: {body}"
+    );
+    assert!(
+        !body.contains("data-environment-banner"),
+        "a prod hosted page shows no environment banner: {body}"
+    );
+}
+
+#[tokio::test]
 async fn a_user_can_register_consent_and_receive_tokens_end_to_end() {
     let harness = Harness::start().await;
     let client_id = harness.client_id().to_string();

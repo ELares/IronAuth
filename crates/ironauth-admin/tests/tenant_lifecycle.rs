@@ -229,7 +229,8 @@ async fn environment_create_records_and_validates_a_region_pin() {
     // A valid per-environment region is stored and returned on the create and on a
     // subsequent read.
     let path = format!("/v1/tenants/{tenant_id}/environments");
-    let body = serde_json::json!({ "display_name": "staging", "region": "us-east" }).to_string();
+    let body = serde_json::json!({ "display_name": "staging", "kind": "dev", "region": "us-east" })
+        .to_string();
     let (status, _, response) = harness.post(&path, "k-env", &body).await;
     assert_eq!(status, StatusCode::CREATED, "create env: {response}");
     let created = json(&response);
@@ -244,7 +245,8 @@ async fn environment_create_records_and_validates_a_region_pin() {
     assert_eq!(json(&response)["region"], "us-east");
 
     // An invalid region is refused, before any write.
-    let bad = serde_json::json!({ "display_name": "prod", "region": "mars-1" }).to_string();
+    let bad = serde_json::json!({ "display_name": "prod", "kind": "dev", "region": "mars-1" })
+        .to_string();
     let (status, _, response) = harness.post(&path, "k-bad", &bad).await;
     assert_eq!(
         status,
@@ -263,7 +265,7 @@ async fn environment_create_is_refused_under_a_suspended_tenant() {
     let path = format!("/v1/tenants/{tenant_id}/environments");
 
     // Under the ACTIVE tenant, a create works.
-    let body = serde_json::json!({ "display_name": "staging" }).to_string();
+    let body = serde_json::json!({ "display_name": "staging", "kind": "dev" }).to_string();
     let (status, _, response) = harness.post(&path, "k-env-active", &body).await;
     assert_eq!(status, StatusCode::CREATED, "active create: {response}");
 

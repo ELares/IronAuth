@@ -860,6 +860,7 @@ dependencies = [
  "ironauth-env",
  "ironauth-jose",
  "ironauth-oidc",
+ "ironauth-quota",
  "ironauth-server",
  "ironauth-store",
  "tokio",
@@ -946,6 +947,7 @@ dependencies = [
  "ironauth-env",
  "ironauth-fetch",
  "ironauth-jose",
+ "ironauth-quota",
  "ironauth-store",
  "metrics",
  "oauth2",
@@ -957,6 +959,14 @@ dependencies = [
  "tower 0.5.3",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "ironauth-quota"
+version = "0.1.0"
+dependencies = [
+ "ironauth-config",
+ "ironauth-env",
 ]
 
 [[package]]

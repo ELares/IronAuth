@@ -16,7 +16,7 @@ use axum::Router;
 use axum::body::Body;
 use axum::http::{HeaderMap, Request, StatusCode, header};
 use http_body_util::BodyExt;
-use ironauth_config::OidcConfig;
+use ironauth_config::{OidcConfig, QuotaConfig};
 use ironauth_env::{Env, ManualClock};
 use ironauth_jose::{
     EmissionOptions, JwsAlgorithm, KeySet, SigningKey, SigningPolicy, TrustedKey,
@@ -27,6 +27,7 @@ use ironauth_oidc::{
     IssuerRegistry, IssuerState, JwksCacheWindow, OidcState, PairwiseSalt, SESSION_COOKIE,
     discovery_router, issuer_router, oidc_router,
 };
+use ironauth_quota::QuotaEnforcer;
 use ironauth_store::test_support::TestDatabase;
 use ironauth_store::{
     AssertionMappingId, ClientId, CorrelationId, ExternalIssuerId, InitialAccessTokenId,
@@ -216,6 +217,9 @@ pub struct Harness {
     // A clone of the OidcState the router was built from, so a test can call the
     // state directly (for example the access-token target resolution, issue #29).
     state: OidcState,
+    // The quota engine installed on the state, retained so a test can inspect the
+    // live bucket count and drive the idle-bucket reaper (issue #50).
+    quota: Option<Arc<QuotaEnforcer>>,
     router: Router,
 }
 
@@ -243,17 +247,29 @@ impl Harness {
     /// Like [`Harness::start`] but with explicit OIDC settings (for the expiry
     /// test, which wants a short code lifetime).
     pub async fn start_with(config: OidcConfig) -> Self {
-        Self::start_inner(config, None).await
+        Self::start_inner(config, None, None).await
     }
 
     /// Like [`Harness::start_with`] but wiring a `private_key_jwt` client-key
     /// resolver (issue #25), so a `jwks_uri` client's keys resolve through the
     /// fetcher. Confidential PKCE is relaxed via the passed config.
     pub async fn start_with_resolver(config: OidcConfig, resolver: Arc<ClientKeyResolver>) -> Self {
-        Self::start_inner(config, Some(resolver)).await
+        Self::start_inner(config, Some(resolver), None).await
     }
 
-    async fn start_inner(config: OidcConfig, resolver: Option<Arc<ClientKeyResolver>>) -> Self {
+    /// Like [`Harness::start_with`] but with the tenant/environment quota engine
+    /// (issue #50) installed on the data plane, built from `quota_config` and the
+    /// harness's deterministic clock. Used to drive the real `/authorize` request
+    /// path into a 429 and to prove tenant fairness end to end.
+    pub async fn start_with_quota(config: OidcConfig, quota_config: QuotaConfig) -> Self {
+        Self::start_inner(config, None, Some(quota_config)).await
+    }
+
+    async fn start_inner(
+        config: OidcConfig,
+        resolver: Option<Arc<ClientKeyResolver>>,
+        quota_config: Option<QuotaConfig>,
+    ) -> Self {
         let (db, env, clock, scope, client_id) = Self::seed_common().await;
 
         // One Ed25519 signing key for the environment, held in a PRE-POPULATED
@@ -273,6 +289,7 @@ impl Harness {
                 KeySet::bootstrap(signing_key, SystemTime::UNIX_EPOCH),
                 SigningPolicy::eddsa_default(),
                 PairwiseSalt::new(Vec::new()),
+                ironauth_store::GuardrailSet::for_kind(ironauth_store::EnvironmentType::Dev),
             ),
         );
         let registry = Arc::new(registry);
@@ -294,6 +311,19 @@ impl Harness {
                 ISSUER_BASE,
             ),
         };
+        // Install the tenant/environment quota engine over the SAME deterministic
+        // clock when the test asked for it (issue #50), so an over-quota scope on the
+        // real request path short-circuits with a 429 and refill is clock-driven.
+        let (state, quota) = match quota_config {
+            Some(quota_config) => {
+                let enforcer = Arc::new(QuotaEnforcer::from_config(&quota_config, env.clock_arc()));
+                (
+                    state.with_quota_enforcer(Arc::clone(&enforcer)),
+                    Some(enforcer),
+                )
+            }
+            None => (state, None),
+        };
         let issuer = state.issuer_for(&scope);
         let router = oidc_router(state.clone());
 
@@ -307,6 +337,7 @@ impl Harness {
             issuer,
             registry,
             state,
+            quota,
             router,
         }
     }
@@ -344,7 +375,12 @@ impl Harness {
         );
         registry.insert(
             scope,
-            IssuerEntry::new(keyset, policy, PairwiseSalt::new(Vec::new())),
+            IssuerEntry::new(
+                keyset,
+                policy,
+                PairwiseSalt::new(Vec::new()),
+                ironauth_store::GuardrailSet::for_kind(ironauth_store::EnvironmentType::Dev),
+            ),
         );
         let registry = Arc::new(registry);
 
@@ -368,6 +404,7 @@ impl Harness {
             issuer,
             registry,
             state,
+            quota: None,
             router,
         }
     }
@@ -411,13 +448,38 @@ impl Harness {
         .await
     }
 
+    /// Like [`Harness::start_store_backed_with`] but seeds the environment with an
+    /// explicit KIND (`dev`, `staging`, or `prod`) and optional custom domain, so a
+    /// test drives the LIVE data-plane guardrail projection (issue #42): the
+    /// store-backed issuer registry loads the environment's typed guardrails from the
+    /// scope-forced view, and the DCR / interaction paths enforce them. Provisions an
+    /// Ed25519 environment key.
+    pub async fn start_store_backed_kind(
+        config: OidcConfig,
+        kind: &str,
+        custom_domain: Option<&str>,
+    ) -> Self {
+        Self::build_store_backed_kind(config, HarnessKey::Ed25519, kind, custom_domain).await
+    }
+
     /// Build a store-backed harness whose environment is provisioned with `key`,
     /// mounting the protocol, per-environment JWKS, and discovery routers over the
     /// one lazy registry (exactly as `main.rs` mounts all three), so a test can
     /// fetch the LIVE discovery document whose per-environment policy is derived from
     /// the loaded key set.
     async fn build_store_backed(config: OidcConfig, key: HarnessKey) -> Self {
-        let (db, env, clock, scope, client_id) = Self::seed_common().await;
+        Self::build_store_backed_kind(config, key, "dev", None).await
+    }
+
+    /// Like [`Harness::build_store_backed`] but seeds the environment with an
+    /// explicit `kind` and optional `custom_domain` (issue #42).
+    async fn build_store_backed_kind(
+        config: OidcConfig,
+        key: HarnessKey,
+        kind: &str,
+        custom_domain: Option<&str>,
+    ) -> Self {
+        let (db, env, clock, scope, client_id) = Self::seed_common_kind(kind, custom_domain).await;
 
         // Build the key with its `sik_` id as the kid and PROVISION the SAME
         // material into the store, so the lazily loaded key rebuilds identically and
@@ -482,6 +544,7 @@ impl Harness {
             issuer,
             registry,
             state,
+            quota: None,
             router,
         }
     }
@@ -532,6 +595,7 @@ impl Harness {
             issuer: self.issuer.clone(),
             registry,
             state,
+            quota: None,
             router,
         }
     }
@@ -541,9 +605,19 @@ impl Harness {
     /// scope, and one OAuth client with the harness redirect URI registered (so the
     /// exact-string redirect match, issue #13, accepts it).
     async fn seed_common() -> (TestDatabase, Env, Arc<ManualClock>, Scope, ClientId) {
+        Self::seed_common_kind("dev", None).await
+    }
+
+    /// Like [`Harness::seed_common`] but seeds the environment with an explicit
+    /// `kind` and optional `custom_domain` (issue #42), so a store-backed harness
+    /// can stand up a PROD environment whose typed guardrails the data plane reads.
+    async fn seed_common_kind(
+        kind: &str,
+        custom_domain: Option<&str>,
+    ) -> (TestDatabase, Env, Arc<ManualClock>, Scope, ClientId) {
         let db = TestDatabase::start().await;
         let (env, clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0x0D1C_5EED);
-        let scope = db.seed_scope(&env).await;
+        let scope = db.seed_scope_with_kind(&env, kind, custom_domain).await;
 
         let client_id = db
             .store()
@@ -583,6 +657,15 @@ impl Harness {
     #[must_use]
     pub fn db(&self) -> &TestDatabase {
         &self.db
+    }
+
+    /// The quota engine installed on the state (issue #50), for tests that assert
+    /// the live bucket count stays bounded or drive the idle-bucket reaper.
+    #[must_use]
+    pub fn quota_enforcer(&self) -> &Arc<QuotaEnforcer> {
+        self.quota
+            .as_ref()
+            .expect("harness was started with a quota engine")
     }
 
     /// The seeded scope.

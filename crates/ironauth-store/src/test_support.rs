@@ -274,6 +274,22 @@ impl TestDatabase {
     ///
     /// Panics if the seed inserts fail.
     pub async fn seed_scope(&self, env: &Env) -> Scope {
+        self.seed_scope_with_kind(env, "dev", None).await
+    }
+
+    /// Like [`TestDatabase::seed_scope`] but with an explicit environment `kind`
+    /// (`dev`, `staging`, or `prod`) and optional `custom_domain`, so a test can
+    /// stand up a PROD environment and exercise the typed guardrails (issue #42).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the seed inserts fail.
+    pub async fn seed_scope_with_kind(
+        &self,
+        env: &Env,
+        kind: &str,
+        custom_domain: Option<&str>,
+    ) -> Scope {
         let operator = OperatorId::generate(env);
         sqlx::query("INSERT INTO operators (id, display_name) VALUES ($1, $2)")
             .bind(operator.to_string())
@@ -291,7 +307,9 @@ impl TestDatabase {
             .await
             .expect("seed tenant");
 
-        let environment = self.seed_environment(env, tenant).await;
+        let environment = self
+            .seed_environment_with_kind(env, tenant, kind, custom_domain)
+            .await;
         Scope::new(tenant, environment)
     }
 
@@ -330,14 +348,37 @@ impl TestDatabase {
     ///
     /// Panics if the seed insert fails.
     pub async fn seed_environment(&self, env: &Env, tenant: TenantId) -> EnvironmentId {
-        let environment = EnvironmentId::generate(env);
-        sqlx::query("INSERT INTO environments (id, tenant_id, display_name) VALUES ($1, $2, $3)")
-            .bind(environment.to_string())
-            .bind(tenant.to_string())
-            .bind("test environment")
-            .execute(&self.owner_pool)
+        self.seed_environment_with_kind(env, tenant, "dev", None)
             .await
-            .expect("seed environment");
+    }
+
+    /// Like [`TestDatabase::seed_environment`] but with an explicit `kind` and
+    /// optional `custom_domain` (issue #42), so the guardrail projection resolves
+    /// the intended typed guardrail set for the seeded environment.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the seed insert fails.
+    pub async fn seed_environment_with_kind(
+        &self,
+        env: &Env,
+        tenant: TenantId,
+        kind: &str,
+        custom_domain: Option<&str>,
+    ) -> EnvironmentId {
+        let environment = EnvironmentId::generate(env);
+        sqlx::query(
+            "INSERT INTO environments (id, tenant_id, display_name, kind, custom_domain) \
+             VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind(environment.to_string())
+        .bind(tenant.to_string())
+        .bind("test environment")
+        .bind(kind)
+        .bind(custom_domain)
+        .execute(&self.owner_pool)
+        .await
+        .expect("seed environment");
         environment
     }
 }

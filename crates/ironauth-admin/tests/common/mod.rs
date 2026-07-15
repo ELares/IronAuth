@@ -360,8 +360,11 @@ impl Harness {
         display_name: &str,
         key: &str,
     ) -> String {
+        // The default helper creates a dev environment (the relaxed kind that
+        // needs no custom domain), so the callers that only care about scoping
+        // stay one line. Guardrail-specific tests use create_environment_typed.
         let path = format!("/v1/tenants/{tenant_id}/environments");
-        let body = serde_json::json!({ "display_name": display_name }).to_string();
+        let body = serde_json::json!({ "display_name": display_name, "kind": "dev" }).to_string();
         let (status, _, response) = self.post(&path, key, &body).await;
         assert_eq!(
             status,
@@ -370,6 +373,26 @@ impl Harness {
         );
         let value: serde_json::Value = serde_json::from_str(&response).expect("json");
         value["id"].as_str().expect("environment id").to_owned()
+    }
+
+    /// Create an environment of an explicit kind (and optional custom domain),
+    /// returning the raw `(status, response body)` so a guardrail test can assert
+    /// on either a success or a structured guardrail failure (issue #42).
+    pub async fn create_environment_typed(
+        &self,
+        tenant_id: &str,
+        display_name: &str,
+        kind: &str,
+        custom_domain: Option<&str>,
+        key: &str,
+    ) -> (StatusCode, String) {
+        let path = format!("/v1/tenants/{tenant_id}/environments");
+        let mut body = serde_json::json!({ "display_name": display_name, "kind": kind });
+        if let Some(domain) = custom_domain {
+            body["custom_domain"] = serde_json::Value::String(domain.to_owned());
+        }
+        let (status, _, response) = self.post(&path, key, &body.to_string()).await;
+        (status, response)
     }
 
     /// Mint a management key under an environment and return its secret token.

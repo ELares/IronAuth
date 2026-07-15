@@ -132,5 +132,15 @@ name = "tenant_lifecycle"
 path = "tests/tenant_lifecycle.rs"
 required-features = ["testing"]
 
+# Environments as first-class typed objects (issue #42): environment creation with
+# a typed kind, the derived guardrail flags on the view (noindex and banner for
+# non-production, https-only and one-time-view for production), the unknown-kind
+# rejection, the production custom-domain guardrail returning a structured error,
+# and unbounded environment creation with no count gate.
+[[test]]
+name = "environments"
+path = "tests/environments.rs"
+required-features = ["testing"]
+
 [lints]
 workspace = true

@@ -94,6 +94,7 @@ mod pages;
 mod par;
 mod password;
 mod pkce;
+mod quota;
 mod register;
 mod registry;
 mod resource;

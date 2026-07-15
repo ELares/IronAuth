@@ -42,17 +42,26 @@ pub struct RegisterForm {
 /// `GET /register`: render the registration form for a valid resume target. The
 /// `display` / `ui_locales` hints carried on the resuming request shape the page
 /// shell, and the `login_hint` prefills the identifier (issue #16).
-pub async fn register_get(Query(query): Query<ResumeQuery>) -> Response {
+pub async fn register_get(
+    State(state): State<OidcState>,
+    Query(query): Query<ResumeQuery>,
+) -> Response {
     match parse_resume(query.return_to.as_deref()) {
-        Some(resume) => pages::secure_html(
-            StatusCode::OK,
-            pages::register_page(
-                resume.hints.login_hint().unwrap_or_default(),
-                &resume.return_to,
-                None,
-                &resume.hints,
-            ),
-        ),
+        Some(resume) => {
+            // The environment-kind chrome (issue #42): non-production marks the page
+            // noindex and shows a banner; prod shows neither.
+            let banner = state.environment_banner(&resume.scope).await;
+            pages::secure_html(
+                StatusCode::OK,
+                pages::register_page(
+                    resume.hints.login_hint().unwrap_or_default(),
+                    &resume.return_to,
+                    None,
+                    &resume.hints,
+                    banner,
+                ),
+            )
+        }
         None => interaction::invalid_link_page(),
     }
 }
@@ -86,12 +95,16 @@ pub async fn register_post(
         .unwrap_or_default();
     let password = form.password.as_deref().unwrap_or_default();
 
+    // The environment-kind chrome (issue #42) for any re-rendered error page.
+    let banner = state.environment_banner(&resume.scope).await;
+
     if identifier.is_empty() {
         return register_error(
             identifier,
             &resume.return_to,
             "An identifier is required.",
             &resume.hints,
+            banner,
         );
     }
     if password.len() < MIN_PASSWORD_LEN {
@@ -100,6 +113,7 @@ pub async fn register_post(
             &resume.return_to,
             "The password must be at least 8 characters.",
             &resume.hints,
+            banner,
         );
     }
 
@@ -146,6 +160,7 @@ pub async fn register_post(
             &resume.return_to,
             "That identifier is already registered.",
             &resume.hints,
+            banner,
         ),
         Err(_) => interaction::server_error_page(),
     }
@@ -157,9 +172,16 @@ fn register_error(
     return_to: &str,
     message: &str,
     hints: &crate::hints::InteractionHints,
+    environment_banner: Option<&str>,
 ) -> Response {
     pages::secure_html(
         StatusCode::OK,
-        pages::register_page(identifier, return_to, Some(message), hints),
+        pages::register_page(
+            identifier,
+            return_to,
+            Some(message),
+            hints,
+            environment_banner,
+        ),
     )
 }

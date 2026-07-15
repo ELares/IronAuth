@@ -37,6 +37,28 @@ range per docs/RELEASING.md.
     `tenant_keks`. The ordinary tenant and environment deletes no longer shred (the
     crypto-shred erasure mechanism is deferred to a later erasure issue per #46's
     out-of-scope). New `Action::TenantRestore`/`TenantPurge` audit variants.
+- Environments as first-class typed objects with guardrails and scoped keys (issue
+  #42, migration 0029, expand). Environments become the load-bearing promotable object
+  under snapshot export (#43) and promotion (#44).
+  - **Typed kind and guardrails.** New `environment` module: `EnvironmentType` (a closed
+    `dev`/`staging`/`prod` set whose `parse` rejects an unknown token rather than coercing
+    it), the two `GuardrailClass`es the three kinds map onto (dev and staging inherit the
+    relaxed non-production set; prod gets the hard production set), and `GuardrailSet`, a
+    typed, purely-derived set that validates a redirect URI (production is https-only per
+    RFC 9700, non-production allows the RFC 8252 http loopback) and a custom domain
+    (production requires one). `GuardrailReport` accumulates every failed guardrail so a
+    caller learns all failures at once.
+  - **Environment columns.** Migration 0029 adds `environments.kind` (with a CHECK pinning
+    the closed set) and `environments.custom_domain`; `EnvironmentRecord` carries both.
+    They are ENVIRONMENT-IDENTITY (issue #41 classification): a snapshot and a promotion
+    never copy them, so promoting dev to prod never carries dev's laxity.
+  - **Day-one scoped key.** Environment creation (`ActingEnvironmentRepo::create` and the
+    first environment in `ActingTenantRepo::create`, now taking a `NewEnvironment` and a
+    `NewSigningKey`) provisions the environment's own signing key in the same transaction,
+    so a fresh environment serves discovery with its own issuer and a disjoint JWKS
+    immediately. Migration 0029 grants the control role `INSERT` on `signing_keys` for
+    exactly this; normal rotation stays a data-plane operation. The signing-key INSERT is
+    factored into a shared `insert_signing_key_row` helper.
 - The four-level resource model as public APIs (issue #41, migration 0027, expand).
   Completes the operator > tenant > environment > organization hierarchy at the store
   layer so the management API can expose all four levels as first-class resources.

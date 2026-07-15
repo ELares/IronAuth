@@ -27,10 +27,41 @@ use ironauth_env::{Env, ManualClock};
 use ironauth_jose::MasterKey;
 use ironauth_store::test_support::TestDatabase;
 use ironauth_store::{
-    ActorRef, CorrelationId, EnvironmentId, EnvironmentServingState, OperatorId, Scope, StoreError,
-    TenantId, TenantStatus,
+    ActorRef, CorrelationId, EnvironmentId, EnvironmentServingState, EnvironmentType,
+    NewEnvironment, NewSigningKey, OperatorId, Scope, SigningKeyId, SigningKeyMaterialKind,
+    StoreError, TenantId, TenantStatus,
 };
 use sqlx::Row;
+
+/// A minted day-one key for a create transaction: its id and arbitrary seed bytes
+/// (the store persists the seed verbatim, so these lifecycle tests need no real
+/// cryptography). Mirrors the helper in the environment-guardrails suite.
+struct DayOneKey {
+    id: SigningKeyId,
+    seed: [u8; 32],
+}
+
+impl DayOneKey {
+    fn generate(env: &Env, scope: &Scope) -> Self {
+        let id = SigningKeyId::generate(env, scope);
+        let mut seed = [0_u8; 32];
+        env.entropy().fill_bytes(&mut seed);
+        Self { id, seed }
+    }
+
+    fn as_new(&self) -> NewSigningKey<'_> {
+        NewSigningKey {
+            id: &self.id,
+            algorithm: "EdDSA",
+            material_kind: SigningKeyMaterialKind::Ed25519Seed,
+            material: &self.seed,
+            publish_at_micros: 0,
+            activate_at_micros: 0,
+            retire_at_micros: None,
+            expire_at_micros: None,
+        }
+    }
+}
 
 /// A test retention window: 30 days, so an in-window restore and a post-window hard
 /// delete are cleanly separated by advancing the manual clock.
@@ -75,6 +106,8 @@ impl Fixture {
     async fn create_tenant(&self, region: Option<&str>) -> Scope {
         let tenant = TenantId::generate(&self.env);
         let environment = EnvironmentId::generate(&self.env);
+        let scope = Scope::new(tenant, environment);
+        let key = DayOneKey::generate(&self.env, &scope);
         self.db
             .control_store()
             .management()
@@ -87,13 +120,19 @@ impl Fixture {
                 1_000_000,
                 "test operator",
                 "test tenant",
-                "production",
+                NewEnvironment {
+                    display_name: "production",
+                    kind: EnvironmentType::Dev,
+                    custom_domain: None,
+                    region: None,
+                },
                 region,
+                key.as_new(),
                 None,
             )
             .await
             .expect("create tenant");
-        Scope::new(tenant, environment)
+        scope
     }
 
     async fn status(&self, tenant: &TenantId) -> Result<TenantStatus, StoreError> {
@@ -173,15 +212,29 @@ impl Fixture {
         region: Option<&str>,
     ) -> (Scope, Result<(), StoreError>) {
         let environment = EnvironmentId::generate(&self.env);
+        let scope = Scope::new(tenant, environment);
+        let key = DayOneKey::generate(&self.env, &scope);
         let result = self
             .db
             .control_store()
             .management()
             .acting(self.actor, CorrelationId::generate(&self.env))
             .environments(tenant)
-            .create(&self.env, &environment, 2_000_000, "staging", region, None)
+            .create(
+                &self.env,
+                &environment,
+                2_000_000,
+                NewEnvironment {
+                    display_name: "staging",
+                    kind: EnvironmentType::Dev,
+                    custom_domain: None,
+                    region,
+                },
+                key.as_new(),
+                None,
+            )
             .await;
-        (Scope::new(tenant, environment), result)
+        (scope, result)
     }
 
     /// Read an environment's recorded region pin through a control-plane read.

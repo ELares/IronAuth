@@ -44,6 +44,7 @@ fn registry_with_one_environment(
             keyset,
             SigningPolicy::eddsa_default(),
             PairwiseSalt::new(vec![0_u8; 32]),
+            ironauth_store::GuardrailSet::for_kind(ironauth_store::EnvironmentType::Dev),
         ),
     );
     (registry, scope, kid.to_owned())
@@ -168,6 +169,7 @@ async fn two_environments_have_disjoint_issuers_and_key_sets() {
                 KeySet::bootstrap(key, SystemTime::UNIX_EPOCH),
                 SigningPolicy::eddsa_default(),
                 PairwiseSalt::new(vec![0_u8; 32]),
+                ironauth_store::GuardrailSet::for_kind(ironauth_store::EnvironmentType::Dev),
             ),
         );
     }
