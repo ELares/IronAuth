@@ -530,23 +530,41 @@ fn logged_out(state: &OidcState) -> Response {
 /// `303` (never a body-preserving `307`/`308`) with `Cache-Control: no-store` and
 /// `Referrer-Policy: no-referrer`, matching the interaction redirects.
 fn logout_redirect(state: &OidcState, location: &str) -> Response {
-    let clear = session::clear_set_cookie(state.session_partitioned_cookie());
-    Response::builder()
+    let mut builder = Response::builder()
         .status(StatusCode::SEE_OTHER)
         .header(header::LOCATION, location)
-        .header(header::SET_COOKIE, clear)
         .header(header::CACHE_CONTROL, "no-store")
-        .header(header::REFERRER_POLICY, "no-referrer")
+        .header(header::REFERRER_POLICY, "no-referrer");
+    for clear in clear_cookies(state) {
+        builder = builder.header(header::SET_COOKIE, clear);
+    }
+    builder
         .body(axum::body::Body::empty())
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
-/// Attach the `Max-Age=0` clear-cookie header to a logout page response, matching the
-/// CHIPS `Partitioned` shape the session was set with so it targets the same jar.
+/// Attach the `Max-Age=0` clear-cookie header(s) to a logout page response, matching the
+/// CHIPS `Partitioned` shape the session was set with so it targets the same jar. When
+/// session management is enabled the OP browser-state cookie (issue #39) is cleared too,
+/// so a logged-out session flips the `check_session_iframe` to `changed`.
 fn set_clear_cookie(state: &OidcState, response: &mut Response) {
-    if let Ok(value) = header::HeaderValue::from_str(&session::clear_set_cookie(
-        state.session_partitioned_cookie(),
-    )) {
-        response.headers_mut().append(header::SET_COOKIE, value);
+    for clear in clear_cookies(state) {
+        if let Ok(value) = header::HeaderValue::from_str(&clear) {
+            response.headers_mut().append(header::SET_COOKIE, value);
+        }
     }
+}
+
+/// The `Set-Cookie` clear header value(s) a terminal logout emits: the session cookie
+/// always, and ONLY when session management is enabled (issue #39) the OP browser-state
+/// cookie, so the iframe answers `changed` for the ended session exactly as intended.
+/// With the flag off nothing beyond the session cookie is cleared.
+fn clear_cookies(state: &OidcState) -> Vec<String> {
+    let mut clears = vec![session::clear_set_cookie(
+        state.session_partitioned_cookie(),
+    )];
+    if state.session_management_enabled() {
+        clears.push(session::clear_op_browser_state_cookie());
+    }
+    clears
 }

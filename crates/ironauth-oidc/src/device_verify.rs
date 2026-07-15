@@ -488,14 +488,17 @@ async fn render_after_login(
     }
 }
 
-/// Attach a `Set-Cookie` header to an already-built response (issue #24), so the
-/// confirmation page rendered right after sign-in also establishes the session cookie
-/// (the prefill-only GET cannot carry it forward through a redirect). A cookie value
-/// that is not a valid header value is dropped rather than panicking (unreachable for a
-/// server-built session cookie; defense in depth).
-fn with_set_cookie(mut response: Response, set_cookie: &str) -> Response {
-    if let Ok(value) = HeaderValue::from_str(set_cookie) {
-        response.headers_mut().insert(header::SET_COOKIE, value);
+/// Attach the session `Set-Cookie` header(s) to an already-built response (issue #24),
+/// so the confirmation page rendered right after sign-in also establishes the session
+/// cookie (the prefill-only GET cannot carry it forward through a redirect). When
+/// session management is enabled the `cookies` carry the OP browser-state cookie as a
+/// second header (issue #39). A value that is not a valid header value is dropped rather
+/// than panicking (unreachable for a server-built cookie; defense in depth).
+fn with_set_cookie(mut response: Response, cookies: &interaction::SessionCookies) -> Response {
+    for value in cookies.header_values() {
+        if let Ok(value) = HeaderValue::from_str(value) {
+            response.headers_mut().append(header::SET_COOKIE, value);
+        }
     }
     response
 }
