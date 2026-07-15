@@ -48,6 +48,12 @@ const SIGNING_MATERIAL_MARKER: &[u8] = b"SIGNING-KEY-PRIVATE-MATERIAL-DO-NOT-EXP
 const PUBLIC_JWKS: &str =
     r#"{"keys":[{"kty":"OKP","crv":"Ed25519","x":"11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo"}]}"#;
 
+/// A JWK Set carrying PRIVATE key material (an RSA private key and an EC private
+/// key) alongside the public halves. `jose`'s trusted-key parse ignores private
+/// members, so the store accepts and persists exactly this; the export MUST project
+/// it to its public half and leak NONE of these distinctive private values.
+const PRIVATE_JWKS: &str = r#"{"keys":[{"kty":"RSA","kid":"r1","n":"PUB-RSA-N","e":"AQAB","d":"LEAK-RSA-D","p":"LEAK-RSA-P","q":"LEAK-RSA-Q","dp":"LEAK-RSA-DP","dq":"LEAK-RSA-DQ","qi":"LEAK-RSA-QI"},{"kty":"EC","kid":"e1","crv":"P-256","x":"PUB-EC-X","y":"PUB-EC-Y","d":"LEAK-EC-D"}]}"#;
+
 /// Wall-clock microseconds drawn from the ENVIRONMENT clock seam (the invariant
 /// lint forbids reaching for the process wall clock directly). The value never
 /// enters the snapshot (the document excludes timestamps), so it is a DCR-policy
@@ -255,6 +261,176 @@ async fn export_is_deterministic_secret_free_and_classification_bound() {
     assert_eq!(
         first_bytes, reserialized,
         "the canonical snapshot must round-trip byte-identically"
+    );
+}
+
+#[tokio::test]
+async fn export_projects_a_private_bearing_client_jwks_to_its_public_half() {
+    // FIX 1 (issue #43): a client whose STORED jwks column carries private key
+    // material must not leak it into the snapshot, and the exported document must
+    // pass its own validator (export and import agree).
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let app = db.store();
+
+    // Seed a private_key_jwt client whose jwks carries RSA and EC private keys. The
+    // store binds the column verbatim (no private-param stripping), exactly as a
+    // registration through the OIDC path would persist it.
+    app.scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .clients()
+        .create_jwt_auth(
+            &env,
+            NewJwtAuthClient {
+                display_name: "svc-private",
+                auth_method: "private_key_jwt",
+                jwks: Some(PRIVATE_JWKS),
+                jwks_uri: None,
+                signing_alg: Some("RS256"),
+            },
+        )
+        .await
+        .expect("create private-bearing jwt-auth client");
+
+    let control = db.control_store();
+    let snapshot = export_snapshot(&control.scoped(scope))
+        .await
+        .expect("export");
+    let bytes = snapshot.to_canonical_bytes().expect("canonical bytes");
+    let text = String::from_utf8(bytes.clone()).expect("utf8");
+
+    // NONE of the distinctive private VALUES appear anywhere in the bytes.
+    for leaked in [
+        "LEAK-RSA-D",
+        "LEAK-RSA-P",
+        "LEAK-RSA-Q",
+        "LEAK-RSA-DP",
+        "LEAK-RSA-DQ",
+        "LEAK-RSA-QI",
+        "LEAK-EC-D",
+    ] {
+        assert!(
+            !text.contains(leaked),
+            "private jwks material {leaked:?} leaked into the snapshot: {text}"
+        );
+    }
+
+    // The public halves survive (the export still carries usable verification keys).
+    for public in ["PUB-RSA-N", "PUB-EC-X", "PUB-EC-Y"] {
+        assert!(
+            text.contains(public),
+            "public jwks member {public:?} was dropped: {text}"
+        );
+    }
+
+    // The exported document PASSES its own validator: round-trip clean. A verbatim
+    // copy of the private-bearing column would have been rejected here (the validator
+    // flags `/jwks/keys/N/d`), so this is the property the fix restores.
+    validate_document(&bytes).expect("the exported snapshot validates (secret-free)");
+}
+
+#[tokio::test]
+async fn canonical_order_is_byte_order_independent_of_db_collation() {
+    // FIX 2 (issue #43): resource_server and dcr_policy order is re-sorted in Rust by
+    // byte / code-point order, so the canonical byte order does not depend on the
+    // Postgres collation the `ORDER BY` runs under. Seed keys whose byte order
+    // differs from a common case-insensitive collation order (uppercase sorts BEFORE
+    // lowercase by byte, but AFTER it under a case-insensitive collation).
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let app = db.store();
+    let control = db.control_store();
+
+    for audience in [
+        "https://api.example/alpha",
+        "https://api.example/Zeta",
+        "https://api.example/Beta",
+    ] {
+        let id = ResourceServerId::generate(&env, &scope);
+        app.scoped(scope)
+            .acting(db.test_actor(&env), CorrelationId::generate(&env))
+            .resource_servers()
+            .register(
+                &env,
+                NewResourceServer {
+                    id: &id,
+                    audience,
+                    token_format: TokenFormat::AtJwt,
+                    access_token_ttl_secs: None,
+                },
+            )
+            .await
+            .expect("register resource server");
+    }
+
+    for name in ["alpha", "Zeta", "Beta"] {
+        let id = DcrPolicyId::generate(&env, &scope);
+        control
+            .scoped(scope)
+            .acting(db.test_actor(&env), CorrelationId::generate(&env))
+            .dcr_policies()
+            .create(
+                &env,
+                &id,
+                now_micros(&env),
+                NewDcrPolicy {
+                    name,
+                    primitives: r#"[{"kind":"require_https"}]"#,
+                },
+                None,
+            )
+            .await
+            .expect("create dcr policy");
+    }
+
+    let snapshot = export_snapshot(&control.scoped(scope))
+        .await
+        .expect("export");
+
+    // The exported order is exactly byte / code-point order, which is what a Rust
+    // `str::cmp` produces and is independent of the DB collation.
+    let audiences: Vec<&str> = snapshot
+        .resources
+        .resource_server
+        .iter()
+        .map(|r| r.audience.as_str())
+        .collect();
+    let mut expected_audiences = audiences.clone();
+    expected_audiences.sort_unstable();
+    assert_eq!(
+        audiences, expected_audiences,
+        "resource servers must be in byte order (collation-independent): {audiences:?}"
+    );
+    // Uppercase 'B'/'Z' (0x42/0x5A) sort BEFORE lowercase 'a' (0x61) by byte, unlike
+    // a case-insensitive collation. Prove the byte-order discriminator concretely.
+    assert_eq!(
+        audiences,
+        [
+            "https://api.example/Beta",
+            "https://api.example/Zeta",
+            "https://api.example/alpha",
+        ],
+        "the canonical order is byte order, not a case-insensitive collation order"
+    );
+
+    let names: Vec<&str> = snapshot
+        .resources
+        .dcr_policy
+        .iter()
+        .map(|p| p.name.as_str())
+        .collect();
+    let mut expected_names = names.clone();
+    expected_names.sort_unstable();
+    assert_eq!(
+        names, expected_names,
+        "dcr policies must be in byte order (collation-independent): {names:?}"
+    );
+    assert_eq!(
+        names,
+        ["Beta", "Zeta", "alpha"],
+        "the canonical policy order is byte order, not a case-insensitive collation order"
     );
 }
 

@@ -135,8 +135,10 @@ pub struct ClientSnapshot {
     pub require_auth_time: bool,
     /// The client's inline JWK Set (PUBLIC verification keys) for
     /// `private_key_jwt`, if registered inline. Public key material, never a
-    /// private key: the export reads only the `jwks` column, which holds a public
-    /// JWK Set, and [`validate_document`] rejects any private JWK parameter.
+    /// private key: the export projects the stored `jwks` column to its public
+    /// members with [`project_jwks_public`], stripping every private JWK parameter
+    /// (so a private-bearing stored column cannot leak), and [`validate_document`]
+    /// rejects any private JWK parameter that somehow remained.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub jwks: Option<String>,
     /// The client's `jwks_uri`, if its verification keys are fetched rather than
@@ -259,6 +261,13 @@ fn write_canonical(value: &serde_json::Value, out: &mut String) {
         serde_json::Value::Null => out.push_str("null"),
         serde_json::Value::Bool(true) => out.push_str("true"),
         serde_json::Value::Bool(false) => out.push_str("false"),
+        // `serde_json`'s `Number::to_string` renders integers exactly and floats via
+        // ryu's shortest round-tripping form. Every number a snapshot carries is
+        // integer-bounded in practice (a resource server's `access_token_ttl_secs` is
+        // an `i64`; a DCR policy's embedded primitive counts are JSON integers), so
+        // the output is canonical for the value space actually used. Even were a
+        // float to appear, the rendering is a pure function of the parsed value, so
+        // determinism (equal snapshots produce equal bytes) holds regardless.
         serde_json::Value::Number(number) => out.push_str(&number.to_string()),
         serde_json::Value::String(text) => write_json_string(text, out),
         serde_json::Value::Array(items) => {
@@ -346,7 +355,7 @@ pub async fn export(scoped: &ScopedStore<'_>) -> Result<Snapshot, StoreError> {
             store_skipped_consent: record.store_skipped_consent,
             require_pushed_authorization_requests: record.require_pushed_authorization_requests,
             require_auth_time: record.require_auth_time,
-            jwks: auth.jwks,
+            jwks: project_jwks_public(auth.jwks),
             jwks_uri: auth.jwks_uri,
             token_endpoint_auth_signing_alg: auth.token_endpoint_auth_signing_alg,
             refresh_rotation: auth.refresh_rotation,
@@ -359,7 +368,7 @@ pub async fn export(scoped: &ScopedStore<'_>) -> Result<Snapshot, StoreError> {
     // independent of insertion time.
     clients.sort_by(|a, b| a.client_id.cmp(&b.client_id));
 
-    let resource_server = scoped
+    let mut resource_server: Vec<ResourceServerSnapshot> = scoped
         .resource_servers()
         .list()
         .await?
@@ -370,6 +379,12 @@ pub async fn export(scoped: &ScopedStore<'_>) -> Result<Snapshot, StoreError> {
             access_token_ttl_secs: record.access_token_ttl_secs,
         })
         .collect();
+    // Re-sort by the stable public natural key in Rust (byte / code-point order),
+    // exactly as the clients are sorted above. The SQL `ORDER BY audience` is
+    // collation-dependent, so relying on it would make the byte order vary across
+    // differently-collated Postgres deployments and break diffability; a Rust
+    // `str::cmp` is collation-independent and reproducible.
+    resource_server.sort_by(|a, b| a.audience.cmp(&b.audience));
 
     let mut dcr_policy = Vec::new();
     for record in scoped.dcr_policies().list_all().await? {
@@ -383,6 +398,10 @@ pub async fn export(scoped: &ScopedStore<'_>) -> Result<Snapshot, StoreError> {
             primitives,
         });
     }
+    // Re-sort by the stable natural key in Rust for the same collation-independence
+    // reason as the resource servers above: the SQL `ORDER BY name` is
+    // collation-dependent and must not decide the canonical byte order.
+    dcr_policy.sort_by(|a, b| a.name.cmp(&b.name));
 
     Ok(Snapshot {
         schema_version: SNAPSHOT_SCHEMA_VERSION.to_string(),
@@ -392,6 +411,62 @@ pub async fn export(scoped: &ScopedStore<'_>) -> Result<Snapshot, StoreError> {
             dcr_policy,
         },
     })
+}
+
+/// Project a stored client JWK Set to its PUBLIC members only, making the export
+/// SECRET-FREE BY CONSTRUCTION (issue #43).
+///
+/// The `jwks` column is trusted-key input the client registered; `jose`'s
+/// `trusted_key_from_jwk` reads only the public members and IGNORES private
+/// parameters, so a JWK carrying private key material (RSA `d`/`p`/`q`/`dp`/`dq`/
+/// `qi`, EC/OKP `d`, symmetric `k`) can be accepted and persisted verbatim. Copying
+/// that column into a snapshot would leak a private signing key into a document that
+/// is meant to be safe to commit, and [`validate_document`] would then reject the
+/// very bytes the export produced. This projection removes exactly the parameters
+/// [`PRIVATE_JWK_PARAMS`] names (the ONE shared definition of "private" the
+/// validator's [`scan_private_params`] also uses), so export and import agree and an
+/// exported snapshot round-trips clean. A symmetric (`kty: "oct"`) JWK is dropped
+/// entirely: it is all-secret, with no public half worth carrying. The surviving
+/// public members (`kty`, `kid`, `use`, `alg`, `n`, `e`, `x`, `y`, `crv`) are kept.
+///
+/// Returns `None` when the stored value is absent or does not parse as JSON: there
+/// is no public key material to project, so none is emitted.
+fn project_jwks_public(jwks: Option<String>) -> Option<String> {
+    let text = jwks?;
+    let mut value: serde_json::Value = serde_json::from_str(&text).ok()?;
+    // Drop symmetric keys outright (all-secret), then strip every private parameter
+    // from what remains.
+    if let Some(keys) = value
+        .get_mut("keys")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        keys.retain(|key| key.get("kty").and_then(serde_json::Value::as_str) != Some("oct"));
+    }
+    strip_private_params(&mut value);
+    serde_json::to_string(&value).ok()
+}
+
+/// Recursively remove every [`PRIVATE_JWK_PARAMS`] member from `value`, mirroring
+/// the traversal [`scan_private_params`] uses to DETECT them, so a projected JWK Set
+/// carries no parameter the validator would reject. Export (strip) and import
+/// (reject) therefore share one definition of "private".
+fn strip_private_params(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for param in PRIVATE_JWK_PARAMS {
+                map.remove(param);
+            }
+            for child in map.values_mut() {
+                strip_private_params(child);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items.iter_mut() {
+                strip_private_params(item);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// One validation failure against the snapshot format, carrying a JSON Pointer
@@ -885,8 +960,8 @@ pub fn classification_coverage_gaps() -> (Vec<ResourceType>, Vec<ResourceType>) 
 #[cfg(test)]
 mod tests {
     use super::{
-        SNAPSHOT_RESOURCE_TYPES, SNAPSHOT_SCHEMA_VERSION, Snapshot, SnapshotResources,
-        classification_coverage_gaps, validate_document,
+        PRIVATE_JWK_PARAMS, SNAPSHOT_RESOURCE_TYPES, SNAPSHOT_SCHEMA_VERSION, Snapshot,
+        SnapshotResources, classification_coverage_gaps, project_jwks_public, validate_document,
     };
     use crate::classification::{ResourceClassification, ResourceType, classify};
 
@@ -1042,6 +1117,93 @@ mod tests {
                 .any(|v| v.path == "/resources/signing_key"),
             "an environment-identity type key must be rejected: {violations:?}"
         );
+    }
+
+    #[test]
+    fn project_jwks_strips_every_private_parameter() {
+        // A JWK Set carrying an RSA private key (d/p/q/dp/dq/qi) and an EC private
+        // key (d) alongside their public halves. The stored `jwks` column can hold
+        // exactly this: `jose`'s trusted-key parse ignores private members, so a
+        // private-bearing set is accepted and persisted verbatim.
+        let private = r#"{"keys":[
+            {"kty":"RSA","kid":"r1","use":"sig","alg":"RS256","n":"PUB-N","e":"AQAB",
+             "d":"RSA-D-SECRET","p":"RSA-P-SECRET","q":"RSA-Q-SECRET",
+             "dp":"RSA-DP-SECRET","dq":"RSA-DQ-SECRET","qi":"RSA-QI-SECRET"},
+            {"kty":"EC","kid":"e1","crv":"P-256","x":"EC-X","y":"EC-Y","d":"EC-D-SECRET"}
+        ]}"#;
+
+        // Prove the LEAK exists on a verbatim copy: the raw column carries the
+        // private material, so copying it into a snapshot would leak it.
+        assert!(private.contains("RSA-D-SECRET") && private.contains("EC-D-SECRET"));
+
+        let projected = project_jwks_public(Some(private.to_string())).expect("projected");
+
+        // None of the private VALUES survive the projection.
+        for secret in [
+            "RSA-D-SECRET",
+            "RSA-P-SECRET",
+            "RSA-Q-SECRET",
+            "RSA-DP-SECRET",
+            "RSA-DQ-SECRET",
+            "RSA-QI-SECRET",
+            "EC-D-SECRET",
+        ] {
+            assert!(
+                !projected.contains(secret),
+                "private material {secret:?} leaked into the projected jwks: {projected}"
+            );
+        }
+
+        // No private PARAMETER key survives either (the shared definition of
+        // "private" the validator scans for).
+        let parsed: serde_json::Value = serde_json::from_str(&projected).expect("valid json");
+        let mut found = Vec::new();
+        super::scan_private_params(&parsed, "", &PRIVATE_JWK_PARAMS, &mut found);
+        assert!(found.is_empty(), "a private parameter survived: {found:?}");
+
+        // The public members are preserved intact.
+        for public in ["PUB-N", "AQAB", "EC-X", "EC-Y", "RS256", "P-256"] {
+            assert!(
+                projected.contains(public),
+                "public member {public:?} was dropped: {projected}"
+            );
+        }
+
+        // The projected set embedded in a client element passes the validator: export
+        // and import agree (round-trip clean), which a verbatim copy did NOT.
+        let doc = format!(
+            r#"{{"schema_version":"{SNAPSHOT_SCHEMA_VERSION}","resources":{{"client":[{{"client_id":"cli_x","display_name":"X","token_endpoint_auth_method":"private_key_jwt","redirect_uris":[],"post_logout_redirect_uris":[],"frontchannel_logout_session_required":false,"consent_mode":"explicit","skip_consent":false,"store_skipped_consent":false,"require_pushed_authorization_requests":false,"require_auth_time":false,"jwks":{projected:?}}}]}}}}"#
+        );
+        validate_document(doc.as_bytes()).expect("projected jwks validates");
+    }
+
+    #[test]
+    fn project_jwks_drops_symmetric_keys_and_preserves_public_sets() {
+        // A symmetric `oct` key is all-secret: the whole element is dropped.
+        let with_oct = r#"{"keys":[
+            {"kty":"oct","kid":"s1","k":"SYMMETRIC-SECRET-K"},
+            {"kty":"OKP","kid":"o1","crv":"Ed25519","x":"OKP-X-PUBLIC"}
+        ]}"#;
+        let projected = project_jwks_public(Some(with_oct.to_string())).expect("projected");
+        assert!(
+            !projected.contains("SYMMETRIC-SECRET-K") && !projected.contains("\"oct\""),
+            "the symmetric key must be dropped entirely: {projected}"
+        );
+        assert!(
+            projected.contains("OKP-X-PUBLIC"),
+            "the public OKP key must survive: {projected}"
+        );
+
+        // A purely-public set survives with all members present.
+        let public = r#"{"keys":[{"kty":"OKP","crv":"Ed25519","x":"11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo"}]}"#;
+        let projected_public = project_jwks_public(Some(public.to_string())).expect("projected");
+        let a: serde_json::Value = serde_json::from_str(public).unwrap();
+        let b: serde_json::Value = serde_json::from_str(&projected_public).unwrap();
+        assert_eq!(a, b, "a purely-public jwks must be preserved intact");
+
+        // Absent or unparseable input yields no key material.
+        assert_eq!(project_jwks_public(None), None);
+        assert_eq!(project_jwks_public(Some("not json".to_string())), None);
     }
 
     #[test]

@@ -65,9 +65,10 @@ async fn operator_exports_a_canonical_secret_free_snapshot() {
     let (status, headers, body) = harness.get(&path).await;
     assert_eq!(status, 200, "export: {body}");
     assert!(
-        headers
-            .get("content-type")
-            .is_some_and(|value| value.to_str().unwrap_or_default().contains("application/json")),
+        headers.get("content-type").is_some_and(|value| value
+            .to_str()
+            .unwrap_or_default()
+            .contains("application/json")),
         "the snapshot is served as JSON"
     );
 
@@ -75,7 +76,11 @@ async fn operator_exports_a_canonical_secret_free_snapshot() {
     // seeded promotable policy.
     let parsed = validate_document(body.as_bytes()).expect("exported snapshot validates");
     assert!(
-        parsed.resources.dcr_policy.iter().any(|p| p.name == "baseline"),
+        parsed
+            .resources
+            .dcr_policy
+            .iter()
+            .any(|p| p.name == "baseline"),
         "the seeded promotable policy must be in the snapshot"
     );
 
@@ -114,7 +119,10 @@ async fn a_management_key_for_another_environment_is_refused() {
 
     // Environment two's key cannot export environment one: loud wrong-scope 403.
     let (status, _, body) = harness.get_as(&path_one, &key_two).await;
-    assert_eq!(status, 403, "cross-environment export must be refused: {body}");
+    assert_eq!(
+        status, 403,
+        "cross-environment export must be refused: {body}"
+    );
 
     // Environment one's OWN key can export it.
     let key_one = harness
@@ -126,5 +134,8 @@ async fn a_management_key_for_another_environment_is_refused() {
         )
         .await;
     let (status, _, body) = harness.get_as(&path_one, &key_one).await;
-    assert_eq!(status, 200, "the environment's own key may export it: {body}");
+    assert_eq!(
+        status, 200,
+        "the environment's own key may export it: {body}"
+    );
 }
