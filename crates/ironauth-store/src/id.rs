@@ -246,6 +246,18 @@ impl ScopedKind for ClientSessionKind {
     const PREFIX: &'static str = "cse";
 }
 
+/// Marker for a session-ended outbox event (`sev_`), the durable row the session
+/// domain enqueues on EVERY terminal session end (issue #35). The transactional-outbox
+/// substrate the back-channel logout worker (#34) and the external webhooks (M11)
+/// drain off one seam. Tenant scoped like every other resource, so a scope can never
+/// drain another tenant's session-ended events; the id doubles as the IDEMPOTENCY KEY a
+/// consumer dedups redelivery on. An INTERNAL tracking row, never a bearer credential.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SessionEventKind;
+impl ScopedKind for SessionEventKind {
+    const PREFIX: &'static str = "sev";
+}
+
 /// Marker for a recorded consent decision (`con_`), the row that means a subject
 /// authorized a client (issue #20). Tenant scoped like every other resource; the
 /// grant's `consent_ref` seam references it.
@@ -550,6 +562,9 @@ pub type SessionId = ScopedId<SessionKind>;
 /// A per-client session identifier (`cse_...`), the tier-two row that carries the
 /// per-(client, session) `sid` claim of the two-tier session model (issue #32).
 pub type ClientSessionId = ScopedId<ClientSessionKind>;
+/// A session-ended outbox event identifier (`sev_...`), the durable row enqueued on
+/// every terminal session end and the idempotency key a consumer dedups on (issue #35).
+pub type SessionEventId = ScopedId<SessionEventKind>;
 /// A recorded-consent identifier (`con_...`), the decision row a grant references
 /// (issue #20).
 pub type ConsentId = ScopedId<ConsentKind>;

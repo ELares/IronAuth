@@ -6,6 +6,41 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- The durable session-ended event fan-out substrate (issue #35, migration 0023, expand).
+  The transactional-outbox seam the back-channel logout worker (#34) and the external
+  webhooks (M11) drain the session-ended signal off, closing the field's most-reported
+  logout gap (missing PROPAGATION) structurally: ONE internal event, EVERY terminal
+  cause, ONE fan-out.
+  - **Transactional outbox.** A `session_ended_events` row is enqueued in the EXACT
+    transaction that flips the session (in `revoke_session_in_tx`, so the single revoke,
+    the bulk revoke, and the replaced-by-other-subject rotation branch are all covered,
+    and in `revoke_all_for_user`, one row per ended session). The event and the
+    revocation commit together or not at all: never emitted for a rolled-back revoke,
+    never lost for a committed one, exactly as the audit row is.
+  - **A rotation is not a session end.** Only a TERMINAL flip enqueues (guarded by the
+    same `RETURNING` on the `revoked_at IS NULL AND ended_at IS NULL` update), so a
+    re-authentication (which re-points a session's lineage onto its successor and never
+    reaches the revoke path) enqueues nothing. A naive consumer never logs a user out on
+    a re-auth. Enqueue is exactly-once by construction and a `UNIQUE (scope, session_id)`
+    makes a second event for one session impossible.
+  - **The drain seam.** `ScopedStore::session_events()` hands out a
+    `SessionEventOutboxRepo`: `claim` atomically leases a batch of undelivered events
+    (stamping `claimed_at`, `FOR UPDATE SKIP LOCKED` so two workers never take the same
+    row and a crashed worker's event reappears once its lease lapses), `pending` peeks
+    the undelivered tail, and `mark_delivered` sets `delivered_at` idempotently.
+    Delivery is at-least-once, so consumers dedup on the event `id` (the `sev_`
+    idempotency key). The typed `SessionEndedEvent` is the STABLE contract a consumer
+    receives (scope, ended session, subject, terminal cause, actor, correlation,
+    instant, monotonic `sequence`); the affected (client, session) pairs are resolved by
+    joining `client_sessions` at delivery, not denormalized here.
+  - **Least privilege.** `session_ended_events` ENABLEs and FORCEs row-level security
+    with the (tenant, environment) isolation policy and the nonempty-scope CHECK, so the
+    outbox is cross-tenant isolated. The data-plane role holds SELECT + INSERT and a
+    COLUMN-SCOPED `UPDATE (claimed_at, delivered_at)` ONLY (never a table-wide UPDATE,
+    the #31 lesson), so a drain can lease and mark but can never rewrite the immutable
+    event body; the control role can enqueue but not drain. Added `SessionEventId`
+    (`sev_`) and `SessionEndCause::from_wire`.
+
 - The authoritative two-tier session model with fleet operations (issue #32, migration
   0022, expand). Closes the M4 slice of tracking issue #206: this model SUPERSEDES the
   #20 bootstrap session.

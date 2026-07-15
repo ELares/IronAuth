@@ -58,8 +58,8 @@ use crate::id::{
     AssertionMappingId, AuditId, AuditTarget, AuthorizationCodeId, ClientId, ClientSessionId,
     ConsentId, CorrelationId, DcrPolicyId, DeviceCodeId, EnvironmentId, ExternalIssuerId, GrantId,
     InitialAccessTokenId, IssuedTokenId, ManagementKeyId, OperatorId, PushedRequestId,
-    RefreshFamilyId, RefreshTokenId, ResourceServerId, ServiceAccountId, SessionId, SigningKeyId,
-    TenantId, UserId,
+    RefreshFamilyId, RefreshTokenId, ResourceServerId, ServiceAccountId, SessionEventId, SessionId,
+    SigningKeyId, TenantId, UserId,
 };
 use crate::scope::Scope;
 use crate::store::Store;
@@ -139,6 +139,20 @@ impl<'a> ScopedStore<'a> {
     #[must_use]
     pub fn client_sessions(&self) -> ClientSessionRepo<'a> {
         ClientSessionRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
+    /// The durable session-ended outbox drain for this scope (issue #35): the seam the
+    /// back-channel logout worker (#34) and the external webhooks (M11) consume the
+    /// session-ended fan-out off. Off the audited path (drain bookkeeping, like the
+    /// device-code poll), even though its claim/mark mutate the two lifecycle columns:
+    /// the durable record of an end is the outbox row and its audit sibling, both
+    /// written when the session flipped, never the drain.
+    #[must_use]
+    pub fn session_events(&self) -> SessionEventOutboxRepo<'a> {
+        SessionEventOutboxRepo {
             store: self.store,
             scope: self.scope,
         }
@@ -7581,6 +7595,7 @@ impl ActingSessionRepo<'_> {
                 SessionEndCause::BulkRevoked,
                 now_micros,
                 hard_kill,
+                &SessionEndedEmit::from_acting(env, &self.acting),
             )
             .await?;
             if outcome.session_flipped {
@@ -7634,6 +7649,9 @@ impl ActingSessionRepo<'_> {
         let subject_text = subject.to_string();
         let mut outcome = UserRevocation::default();
         let out = &mut outcome;
+        // The session-ended fan-out attributes every one of the user's ended sessions to
+        // the SAME actor and request the revoke-all audit row carries (issue #35).
+        let emit = SessionEndedEmit::from_acting(env, &self.acting);
         write_audited(
             AuditedWrite {
                 store: self.store,
@@ -7645,7 +7663,10 @@ impl ActingSessionRepo<'_> {
             },
             async move |tx| {
                 insert_idempotency(tx, idempotency).await?;
-                let sessions = sqlx::query(
+                // RETURNING id hands back EVERY session that actually flipped (an
+                // already-ended one returns no row), so exactly one durable session-ended
+                // event is enqueued per terminal end, below, in this same transaction.
+                let flipped = sqlx::query(
                     "UPDATE sessions \
                      SET revoked_at = \
                              TIMESTAMPTZ 'epoch' + ($1::text || ' microseconds')::interval, \
@@ -7654,15 +7675,29 @@ impl ActingSessionRepo<'_> {
                              TIMESTAMPTZ 'epoch' + ($1::text || ' microseconds')::interval, \
                          end_cause = 'user_revoked_all' \
                      WHERE subject = $2 AND tenant_id = $3 AND environment_id = $4 \
-                     AND revoked_at IS NULL AND ended_at IS NULL",
+                     AND revoked_at IS NULL AND ended_at IS NULL \
+                     RETURNING id",
                 )
                 .bind(now_micros)
                 .bind(&subject_text)
                 .bind(scope.tenant().to_string())
                 .bind(scope.environment().to_string())
-                .execute(&mut **tx)
+                .fetch_all(&mut **tx)
                 .await?;
-                out.sessions_revoked = sessions.rows_affected();
+                out.sessions_revoked = flipped.len() as u64;
+                for row in &flipped {
+                    let session_text: String = row.get("id");
+                    enqueue_session_ended_event(
+                        tx,
+                        &emit,
+                        scope,
+                        &session_text,
+                        &subject_text,
+                        SessionEndCause::UserRevokedAll,
+                        now_micros,
+                    )
+                    .await?;
+                }
                 // The per-client sessions (the sid tier) of every one of the user's
                 // sessions end with them, in this same transaction.
                 sqlx::query(
@@ -7726,7 +7761,16 @@ impl ActingSessionRepo<'_> {
             },
             async move |tx| {
                 insert_idempotency(tx, idempotency).await?;
-                *out = revoke_session_in_tx(tx, scope, id, cause, now_micros, hard_kill).await?;
+                *out = revoke_session_in_tx(
+                    tx,
+                    scope,
+                    id,
+                    cause,
+                    now_micros,
+                    hard_kill,
+                    &SessionEndedEmit::from_acting(env, &self.acting),
+                )
+                .await?;
                 Ok(())
             },
             poison_after_audit,
@@ -7891,6 +7935,7 @@ async fn reconcile_prior_session_at_rotation(
             SessionEndCause::ReplacedByOtherSubject,
             now_micros,
             false,
+            &SessionEndedEmit::from_acting(env, acting),
         )
         .await?;
         // NAME the terminally revoked session in the trail: the rotation's own audit row
@@ -7990,29 +8035,44 @@ async fn revoke_session_in_tx(
     cause: SessionEndCause,
     now_micros: i64,
     hard_kill: bool,
+    emit: &SessionEndedEmit<'_>,
 ) -> Result<SessionRevocation, StoreError> {
     let session_text = id.to_string();
     let cause_str = cause.as_str();
     let mut outcome = SessionRevocation::default();
     // The session itself stops resolving IMMEDIATELY (the read guard rejects a
-    // revoked row regardless of expiry, so this can never silently no-op).
-    let flipped = sqlx::query(
+    // revoked row regardless of expiry, so this can never silently no-op). The
+    // RETURNING clause hands back the ended session's subject ONLY when the row
+    // actually flipped (a foreign, absent, or already-ended session returns no row),
+    // so the session-ended fan-out is driven off the exact same guarded flip: an event
+    // is enqueued for a TERMINAL end and never for a no-op.
+    let flipped_row = sqlx::query(
         "UPDATE sessions \
          SET revoked_at = TIMESTAMPTZ 'epoch' + ($1::text || ' microseconds')::interval, \
              revoke_reason = $5, \
              ended_at = TIMESTAMPTZ 'epoch' + ($1::text || ' microseconds')::interval, \
              end_cause = $5 \
          WHERE id = $2 AND tenant_id = $3 AND environment_id = $4 \
-         AND revoked_at IS NULL AND ended_at IS NULL",
+         AND revoked_at IS NULL AND ended_at IS NULL \
+         RETURNING subject",
     )
     .bind(now_micros)
     .bind(&session_text)
     .bind(scope.tenant().to_string())
     .bind(scope.environment().to_string())
     .bind(cause_str)
-    .execute(&mut **tx)
+    .fetch_optional(&mut **tx)
     .await?;
-    outcome.session_flipped = flipped.rows_affected() > 0;
+    outcome.session_flipped = flipped_row.is_some();
+    // The durable session-ended event (issue #35): enqueued in THIS transaction, so it
+    // commits with the revocation or not at all (never emitted for a rolled-back
+    // revoke, never lost for a committed one). Only on a real terminal flip, so a
+    // rotation (which never reaches this function) and a no-op revoke enqueue nothing.
+    if let Some(row) = flipped_row {
+        let subject: String = row.get("subject");
+        enqueue_session_ended_event(tx, emit, scope, &session_text, &subject, cause, now_micros)
+            .await?;
+    }
     // The per-client sessions (the sid tier) end with their SSO session.
     sqlx::query(
         "UPDATE client_sessions \
@@ -8065,6 +8125,268 @@ async fn revoke_session_in_tx(
         .await?;
     }
     Ok(outcome)
+}
+
+/// The acting context the session-ended fan-out enqueue needs (issue #35): the
+/// clock/entropy seam (for the event id and its instant) and the SAME actor and
+/// correlation the revocation's audit row carries, so a drained event attributes the
+/// end to exactly the principal and request the audit trail does. Bundled so
+/// [`revoke_session_in_tx`] stays inside the readable-argument-count lint.
+struct SessionEndedEmit<'a> {
+    /// The clock/entropy seam: the event id draws from entropy, its instant from the
+    /// clock (never a direct process read), so the fan-out is deterministic under test.
+    env: &'a Env,
+    /// The principal that caused the end (the audit row's actor).
+    actor: ActorRef,
+    /// The request the end belongs to (the audit row's correlation id).
+    correlation: CorrelationId,
+}
+
+impl<'a> SessionEndedEmit<'a> {
+    /// Build the emit context from the acting context of the surrounding audited
+    /// revocation, so the event and the audit row name the same actor and request.
+    fn from_acting(env: &'a Env, acting: &ActingContext) -> Self {
+        Self {
+            env,
+            actor: acting.actor(),
+            correlation: acting.correlation(),
+        }
+    }
+}
+
+/// Enqueue ONE durable session-ended event into the outbox inside the OPEN revocation
+/// transaction (issue #35), so it commits with the session flip or not at all (the
+/// transactional-outbox guarantee: never emitted for a rolled-back revoke, never lost
+/// for a committed one). Called ONLY on a real terminal flip, so a rotation and a
+/// no-op revoke enqueue nothing. The row's `id` is the idempotency key a consumer
+/// dedups redelivery on; `sequence`, `claimed_at`, and `delivered_at` are assigned or
+/// set later by the drain, never here.
+async fn enqueue_session_ended_event(
+    tx: &mut Transaction<'_, Postgres>,
+    emit: &SessionEndedEmit<'_>,
+    scope: Scope,
+    session_text: &str,
+    subject: &str,
+    cause: SessionEndCause,
+    occurred_micros: i64,
+) -> Result<(), StoreError> {
+    let event_id = SessionEventId::generate(emit.env, &scope);
+    let actor = emit.actor;
+    sqlx::query(
+        "INSERT INTO session_ended_events \
+         (id, tenant_id, environment_id, session_id, subject, cause, \
+          actor_kind, actor_id, correlation_id, occurred_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, \
+                 TIMESTAMPTZ 'epoch' + ($10::text || ' microseconds')::interval)",
+    )
+    .bind(event_id.to_string())
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .bind(session_text)
+    .bind(subject)
+    .bind(cause.as_str())
+    .bind(actor.kind_str())
+    .bind(actor.id_string())
+    .bind(emit.correlation.to_string())
+    .bind(occurred_micros)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+/// A drained session-ended event (issue #35): the STABLE typed contract a consumer
+/// receives off the outbox. It names WHAT ended (never any bearer secret): the scope,
+/// the ended SSO session, the user, the terminal cause, the principal that caused it,
+/// the request it belongs to, and the instant it ended, plus the monotonic drain
+/// `sequence`. The affected (client, session) pairs are NOT denormalized here: they
+/// were ended in the same transaction, so a consumer resolves the per-client `sid`s to
+/// target by joining `client_sessions` on `session_id` at delivery time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionEndedEvent {
+    /// The outbox event id (an `sev_` id): the IDEMPOTENCY KEY a consumer dedups on.
+    pub id: String,
+    /// The monotonic drain-order key the database assigned. A consumer draining in
+    /// ascending `sequence` sees ends in the order they happened.
+    pub sequence: i64,
+    /// The SSO session (a `ses_` id) that terminally ended.
+    pub session_id: String,
+    /// The user (a `usr_` id) whose session ended.
+    pub subject: String,
+    /// The terminal end cause. Never a rotation (a rotation is not a session end).
+    pub cause: SessionEndCause,
+    /// The principal that caused the end (the audit envelope's actor).
+    pub actor: ActorRef,
+    /// The request the end belongs to (a `req_` correlation id).
+    pub correlation_id: String,
+    /// When the session ended, in microseconds since the Unix epoch (clock seam).
+    pub occurred_at_unix_micros: i64,
+}
+
+/// The columns every outbox read selects, in one place so the claim and the pending
+/// read return the identical shape. `sequence` is the drain order; the `occurred_us`
+/// projection reconstructs the exact microsecond instant (PostgreSQL 14+ returns a
+/// numeric `EXTRACT(EPOCH ...)`, so this is exact on the supported deployment).
+const SESSION_EVENT_COLUMNS: &str = "id, sequence, session_id, subject, cause, \
+     actor_kind, actor_id, correlation_id, \
+     (EXTRACT(EPOCH FROM occurred_at) * 1000000)::bigint AS occurred_us";
+
+/// Reconstruct a [`SessionEndedEvent`] from a selected outbox row. A row whose stored
+/// cause or actor does not decode is a corrupt or forward-versioned row; it surfaces
+/// as a [`StoreError::Database`] rather than a panic.
+fn session_event_from_row(row: &PgRow) -> Result<SessionEndedEvent, StoreError> {
+    let cause_str: String = row.get("cause");
+    let cause = SessionEndCause::from_wire(&cause_str).ok_or_else(|| {
+        StoreError::Database(sqlx::Error::Decode(
+            format!("session_ended_events row carries an unknown cause: {cause_str}").into(),
+        ))
+    })?;
+    let actor_kind: String = row.get("actor_kind");
+    let actor_id: String = row.get("actor_id");
+    let actor = ActorRef::from_parts(&actor_kind, &actor_id)
+        .map_err(|e| StoreError::Database(sqlx::Error::Decode(Box::new(e))))?;
+    Ok(SessionEndedEvent {
+        id: row.get("id"),
+        sequence: row.get("sequence"),
+        session_id: row.get("session_id"),
+        subject: row.get("subject"),
+        cause,
+        actor,
+        correlation_id: row.get("correlation_id"),
+        occurred_at_unix_micros: row.get("occurred_us"),
+    })
+}
+
+/// The session-ended outbox drain (issue #35): the seam the back-channel logout worker
+/// (#34) and the external webhooks (M11) consume off. It is a plain (unaudited) scoped
+/// repository, like the device-code poll: draining is high-frequency bookkeeping, not
+/// an audited business event, and the durable record of the end is the outbox row and
+/// its audit sibling, both written when the session flipped.
+///
+/// Delivery is AT-LEAST-ONCE. [`claim`](SessionEventOutboxRepo::claim) atomically leases
+/// a batch of undelivered events (stamping `claimed_at`, skipping rows another worker
+/// holds), the consumer acts idempotently, then [`mark_delivered`](SessionEventOutboxRepo::mark_delivered)
+/// sets `delivered_at`. A consumer that crashes after acting but before marking sees the
+/// event again once its lease lapses, so consumers MUST dedup on the event `id`.
+pub struct SessionEventOutboxRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl SessionEventOutboxRepo<'_> {
+    /// Atomically CLAIM up to `limit` undelivered session-ended events in this scope,
+    /// oldest first, stamping each with a visibility lease that expires `lease` from
+    /// now (issue #35). A row another worker holds an unexpired lease on is SKIPPED, so
+    /// two workers never claim the same event concurrently; a crashed worker's row
+    /// reappears once its lease lapses (at-least-once). `SELECT ... FOR UPDATE SKIP
+    /// LOCKED` inside the same statement takes the row locks, so concurrent claimers
+    /// never block on each other.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence fault or an undecodable stored row.
+    pub async fn claim(
+        &self,
+        env: &Env,
+        lease: Duration,
+        limit: i64,
+    ) -> Result<Vec<SessionEndedEvent>, StoreError> {
+        let scope = self.scope;
+        let now_micros = epoch_micros(env.clock().now_utc());
+        let lease_micros = i64::try_from(lease.as_micros()).unwrap_or(i64::MAX);
+        // A row is claimable when it is undelivered AND (never claimed OR its lease has
+        // lapsed). The outer UPDATE stamps a fresh lease start (`claimed_at = now`); the
+        // lease expiry is `claimed_at + lease`, so the reappear condition is
+        // `claimed_at < now - lease`, expressed as `claimed_at`'s microseconds below.
+        let sql = format!(
+            "UPDATE session_ended_events \
+             SET claimed_at = TIMESTAMPTZ 'epoch' + ($1::text || ' microseconds')::interval \
+             WHERE id IN ( \
+                 SELECT id FROM session_ended_events \
+                 WHERE tenant_id = $2 AND environment_id = $3 \
+                 AND delivered_at IS NULL \
+                 AND (claimed_at IS NULL \
+                      OR claimed_at < TIMESTAMPTZ 'epoch' \
+                         + (($1::bigint - $4)::text || ' microseconds')::interval) \
+                 ORDER BY sequence \
+                 LIMIT $5 \
+                 FOR UPDATE SKIP LOCKED \
+             ) \
+             RETURNING {SESSION_EVENT_COLUMNS}"
+        );
+        let mut tx = begin_scoped(self.store, scope).await?;
+        let rows = sqlx::query(&sql)
+            .bind(now_micros)
+            .bind(scope.tenant().to_string())
+            .bind(scope.environment().to_string())
+            .bind(lease_micros)
+            .bind(limit)
+            .fetch_all(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        rows.iter().map(session_event_from_row).collect()
+    }
+
+    /// Read up to `limit` undelivered session-ended events in this scope, oldest first,
+    /// WITHOUT claiming them (issue #35): a read-only peek at the pending tail for
+    /// diagnostics and tests. Draining a real consumer goes through
+    /// [`claim`](SessionEventOutboxRepo::claim) so the lease and skip-locked semantics apply.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence fault or an undecodable stored row.
+    pub async fn pending(&self, limit: i64) -> Result<Vec<SessionEndedEvent>, StoreError> {
+        let scope = self.scope;
+        let sql = format!(
+            "SELECT {SESSION_EVENT_COLUMNS} FROM session_ended_events \
+             WHERE tenant_id = $1 AND environment_id = $2 AND delivered_at IS NULL \
+             ORDER BY sequence LIMIT $3"
+        );
+        let mut tx = begin_scoped(self.store, scope).await?;
+        let rows = sqlx::query(&sql)
+            .bind(scope.tenant().to_string())
+            .bind(scope.environment().to_string())
+            .bind(limit)
+            .fetch_all(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        rows.iter().map(session_event_from_row).collect()
+    }
+
+    /// Mark ONE claimed session-ended event DELIVERED by its `id` (issue #35), so it
+    /// never drains again. Idempotent: it flips `delivered_at` only while it is still
+    /// NULL, so a double mark (or a mark racing a re-claim after a lapsed lease) sets it
+    /// once and reports `false` the second time. A foreign-scope or malformed id is a
+    /// uniform no-op (`false`), never an oracle. A column-scoped UPDATE of
+    /// `delivered_at` alone, the only mutation a consumer is granted (never a
+    /// table-wide UPDATE, the #31 lesson). Returns whether THIS call flipped it.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence fault.
+    pub async fn mark_delivered(&self, env: &Env, id: &str) -> Result<bool, StoreError> {
+        let scope = self.scope;
+        // A malformed or foreign-scope id resolves to a uniform no-op (the anti-oracle
+        // boundary), never a query against another tenant's row.
+        let Ok(event_id) = SessionEventId::parse_in_scope(id, &scope) else {
+            return Ok(false);
+        };
+        let now_micros = epoch_micros(env.clock().now_utc());
+        let mut tx = begin_scoped(self.store, scope).await?;
+        let flipped = sqlx::query(
+            "UPDATE session_ended_events \
+             SET delivered_at = TIMESTAMPTZ 'epoch' + ($1::text || ' microseconds')::interval \
+             WHERE id = $2 AND tenant_id = $3 AND environment_id = $4 \
+             AND delivered_at IS NULL",
+        )
+        .bind(now_micros)
+        .bind(event_id.to_string())
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(flipped.rows_affected() > 0)
+    }
 }
 
 /// The fields a fresh SSO session carries at rotation/creation (issue #32).
@@ -8127,6 +8449,23 @@ impl SessionEndCause {
             SessionEndCause::UserRevokedAll => "user_revoked_all",
             SessionEndCause::LoggedOut => "logged_out",
             SessionEndCause::ReplacedByOtherSubject => "replaced_by_other_subject",
+        }
+    }
+
+    /// Reconstruct an end cause from the wire string stored on a session-ended event
+    /// (issue #35). The inverse of [`SessionEndCause::as_str`]; used only when reading a
+    /// drained outbox row back into a typed [`SessionEndedEvent`]. Returns [`None`] for
+    /// an unknown tag, so a corrupt or forward-versioned row surfaces as a decode error
+    /// rather than a panic.
+    #[must_use]
+    pub fn from_wire(cause: &str) -> Option<Self> {
+        match cause {
+            "revoked" => Some(SessionEndCause::Revoked),
+            "bulk_revoked" => Some(SessionEndCause::BulkRevoked),
+            "user_revoked_all" => Some(SessionEndCause::UserRevokedAll),
+            "logged_out" => Some(SessionEndCause::LoggedOut),
+            "replaced_by_other_subject" => Some(SessionEndCause::ReplacedByOtherSubject),
+            _ => None,
         }
     }
 }
