@@ -246,6 +246,19 @@ impl ScopedKind for ClientSessionKind {
     const PREFIX: &'static str = "cse";
 }
 
+/// Marker for an enrolled account credential (`crd_`), one row in a user's
+/// self-service credential registry (a passkey, a TOTP authenticator, or a
+/// recovery-code set; issue #61). A tenant-scoped resource: the identifier embeds
+/// its `(tenant, environment)`, so a credential id minted in one scope parses as a
+/// uniform not-found under another, and a credential is only ever reachable by the
+/// subject it is bound to. It is an INTERNAL registry row, never a bearer
+/// credential (the factor material and ceremonies are the M7 factor issues).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CredentialKind;
+impl ScopedKind for CredentialKind {
+    const PREFIX: &'static str = "crd";
+}
+
 /// Marker for a session-ended outbox event (`sev_`), the durable row the session
 /// domain enqueues on EVERY terminal session end (issue #35). The transactional-outbox
 /// substrate the back-channel logout worker (#34) and the external webhooks (M11)
@@ -664,6 +677,9 @@ pub type SessionId = ScopedId<SessionKind>;
 /// A per-client session identifier (`cse_...`), the tier-two row that carries the
 /// per-(client, session) `sid` claim of the two-tier session model (issue #32).
 pub type ClientSessionId = ScopedId<ClientSessionKind>;
+/// An account-credential identifier (`crd_...`), one enrolled credential in a
+/// user's self-service credential registry (issue #61).
+pub type CredentialId = ScopedId<CredentialKind>;
 /// A session-ended outbox event identifier (`sev_...`), the durable row enqueued on
 /// every terminal session end and the idempotency key a consumer dedups on (issue #35).
 pub type SessionEventId = ScopedId<SessionEventKind>;

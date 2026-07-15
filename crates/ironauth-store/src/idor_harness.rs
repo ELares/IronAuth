@@ -45,11 +45,11 @@ use ironauth_env::Env;
 
 use crate::audit::ActorRef;
 use crate::id::{
-    CorrelationId, GrantId, IssuedTokenId, ServiceId, SessionId, SigningKeyId, UserId,
+    CorrelationId, CredentialId, GrantId, IssuedTokenId, ServiceId, SessionId, SigningKeyId, UserId,
 };
 use crate::repository::{
-    RedeemOutcome, RefreshFamilyFleetFilter, SessionEndCause, SessionFleetFilter, TokenStatus,
-    UserListFilter, UserState,
+    CredentialRemoveOutcome, RedeemOutcome, RefreshFamilyFleetFilter, SessionEndCause,
+    SessionFleetFilter, TokenStatus, UserListFilter, UserState,
 };
 use crate::scope::Scope;
 use crate::store::Store;
@@ -227,6 +227,15 @@ impl IdorHarness {
         self.register(Box::new(UserAdminUpdateClaimsProbe));
         self.register(Box::new(UserAdminExternalIdLinkProbe));
         self.register(Box::new(UserAdminExternalIdUnlinkProbe));
+        self
+    }
+
+    /// Register the self-service account-credential probes (issue #61): the
+    /// mutating removal of an enrolled credential must refuse a credential id from
+    /// another tenant or environment as the uniform not-found, never a cross-scope
+    /// credential deletion. Run with the data-plane store (`ironauth_app`).
+    pub fn register_account_probes(&mut self) -> &mut Self {
+        self.register(Box::new(AccountCredentialRemoveProbe));
         self
     }
 
@@ -1214,6 +1223,48 @@ impl IsolationProbe for UserAdminExternalIdUnlinkProbe {
             {
                 Ok(()) => ProbeOutcome::Leaked,
                 Err(_) => ProbeOutcome::Denied,
+            }
+        })
+    }
+}
+
+/// Built-in probe for `ActingAccountCredentialRepo::remove` (issue #61): the
+/// self-service credential removal. A credential id minted in another tenant or
+/// environment must be the uniform not-found, never a cross-scope deletion. The id
+/// is parsed under its OWN declared scope (as an attacker would smuggle it), so the
+/// repository's `id.scope() != self.scope` fence is what must reject it; the subject
+/// is a throwaway one in the caller's scope, so only the scope fence can save it.
+struct AccountCredentialRemoveProbe;
+
+impl IsolationProbe for AccountCredentialRemoveProbe {
+    fn name(&self) -> &'static str {
+        "account_credentials.remove"
+    }
+
+    fn probe<'a>(
+        &'a self,
+        store: &'a Store,
+        caller: Scope,
+        foreign_id: &'a str,
+    ) -> BoxProbeFuture<'a> {
+        Box::pin(async move {
+            let env = Env::system();
+            let Ok(id) = CredentialId::parse_declared_scope(foreign_id) else {
+                return ProbeOutcome::Denied;
+            };
+            let subject = UserId::generate(&env, &caller);
+            let actor = ActorRef::service(ServiceId::generate(&env));
+            let correlation = CorrelationId::generate(&env);
+            match store
+                .scoped(caller)
+                .acting(actor, correlation)
+                .account_credentials()
+                .remove(&env, &subject, &id, true, "probe")
+                .await
+            {
+                // Removing a foreign credential would be a cross-tenant deletion.
+                Ok(CredentialRemoveOutcome::Removed) => ProbeOutcome::Leaked,
+                Ok(_) | Err(_) => ProbeOutcome::Denied,
             }
         })
     }

@@ -248,7 +248,7 @@ async fn expand_contract_example_chain_runs_all_three_phases_and_contract_remove
 // per real table); splitting it would not make it clearer.
 #[allow(clippy::too_many_lines)]
 #[tokio::test]
-async fn production_chain_is_only_the_thirty_six_real_migrations_and_ships_no_demo_object() {
+async fn production_chain_is_only_the_thirty_seven_real_migrations_and_ships_no_demo_object() {
     // TestDatabase::start runs Store::migrate() (the production chain) on a
     // fresh, empty database.
     let db = TestDatabase::start().await;
@@ -265,8 +265,8 @@ async fn production_chain_is_only_the_thirty_six_real_migrations_and_ships_no_de
     );
     assert_eq!(
         report.already_applied(),
-        36,
-        "the production chain is exactly thirty-six migrations (isolation, audit log, management \
+        37,
+        "the production chain is exactly thirty-seven migrations (isolation, audit log, management \
          API, OIDC authorization, signing keys, login/consent, authentication context, redirect \
          registration, UserInfo claims, consent scope upsert, resource servers, opaque access \
          tokens, client auth suite, dynamic client registration, pushed authorization requests, \
@@ -275,15 +275,15 @@ async fn production_chain_is_only_the_thirty_six_real_migrations_and_ships_no_de
          logout, session-ended events, back-channel logout, front-channel logout, resource-model \
          APIs, envelope encryption, environment guardrails, tenant lifecycle, BYOK bindings, \
          snapshot export, custom domains, environment secrets and variables, config promotion, \
-         admin user lifecycle)"
+         self-service account, admin user lifecycle)"
     );
 
-    // The ledger holds exactly versions 1 through 36.
+    // The ledger holds exactly versions 1 through 37.
     assert_eq!(
         applied_versions(pool).await,
         vec![
             1_i64, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
-            24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36
+            24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37
         ]
     );
     let phase_of = |version: i64| async move {
@@ -397,13 +397,19 @@ async fn production_chain_is_only_the_thirty_six_real_migrations_and_ships_no_de
     // variables) and read the presence of an environment secret. A pure grant, no
     // schema change, so this is an expand too.
     assert_eq!(phase_of(35).await, "expand");
+    // The self-service account migration (issue #61): a column-scoped UPDATE grant
+    // on users.password_hash (so a self-service password change can replace the
+    // verifier) plus one new account_credentials scoped table with its indexes,
+    // isolation policy, nonempty-scope and closed-type CHECKs, and column-scoped
+    // grants. All additive, so this is an expand too.
+    assert_eq!(phase_of(36).await, "expand");
     // The admin-user-lifecycle migration (issue #52): additive users columns (state,
     // external-id blind index + sealed value + its DEK version, scheduled-offboarding
     // instant, updated_at, deleted_at), a state CHECK, a per-scope partial unique
     // index on the external-id blind index, and a set of grants (control-plane
     // SELECT/INSERT plus a column-scoped UPDATE on users, and control-plane
     // SELECT/INSERT on the envelope key tables). All additive, so it is an expand too.
-    assert_eq!(phase_of(36).await, "expand");
+    assert_eq!(phase_of(37).await, "expand");
 
     // The demo object never reaches a production database.
     assert!(
@@ -452,6 +458,38 @@ async fn production_chain_is_only_the_thirty_six_real_migrations_and_ships_no_de
     assert!(table_exists(pool, "users").await, "users exists");
     assert!(table_exists(pool, "sessions").await, "sessions exists");
     assert!(table_exists(pool, "consents").await, "consents exists");
+    // The self-service account-credential registry (issue #61) exists, with its
+    // per-user credential columns: the subject the credential belongs to, the closed
+    // factor type, the sealed friendly name and its DEK version (user PII never lands
+    // on a plaintext column), the primary-login-usable flag, and the created /
+    // last-used timestamps the account UI shows.
+    assert!(
+        table_exists(pool, "account_credentials").await,
+        "account_credentials exists"
+    );
+    for column in [
+        "id",
+        "tenant_id",
+        "environment_id",
+        "subject",
+        "credential_type",
+        "friendly_name_sealed",
+        "pii_dek_version",
+        "usable_for_login",
+        "created_at",
+        "last_used_at",
+    ] {
+        assert!(
+            column_exists(pool, "account_credentials", column).await,
+            "account_credentials.{column} exists after 0036"
+        );
+    }
+    // A credential's friendly name is user-authored PII, sealed under the scope DEK
+    // (issue #48): the plaintext label never lands on a column.
+    assert!(
+        !column_exists(pool, "account_credentials", "friendly_name").await,
+        "account_credentials must have no plaintext friendly_name column after 0036"
+    );
     // The authentication-context columns (issue #14) exist: the recorded login
     // methods on sessions and codes, the frozen auth_time on codes, and the
     // client's require_auth_time registration flag.
@@ -1114,6 +1152,31 @@ async fn production_chain_is_only_the_thirty_six_real_migrations_and_ships_no_de
             "environment_secrets must have no plaintext secret column ({forbidden})"
         );
     }
+
+    // The admin-user-lifecycle columns folded onto users (issue #52): the lifecycle
+    // state, the external-id blind index + sealed value + its DEK version (the
+    // plaintext external id never lands on a column), the scheduled-offboarding
+    // instant, and the mutation / soft-delete timestamps.
+    for column in [
+        "state",
+        "external_id_bidx",
+        "external_id_sealed",
+        "external_id_dek_version",
+        "scheduled_offboarding_at",
+        "updated_at",
+        "deleted_at",
+    ] {
+        assert!(
+            column_exists(pool, "users", column).await,
+            "users.{column} exists after 0037"
+        );
+    }
+    // The external id is a lookup key, so it follows the blind-index pattern (issue
+    // #48): the plaintext external id never lands on a column.
+    assert!(
+        !column_exists(pool, "users", "external_id").await,
+        "users must have no plaintext external_id column after 0037"
+    );
 }
 
 #[tokio::test]

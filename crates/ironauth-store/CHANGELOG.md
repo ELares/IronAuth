@@ -6,7 +6,7 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
-- Admin user CRUD, lifecycle states, and external IDs (issue #52, migration 0036,
+- Admin user CRUD, lifecycle states, and external IDs (issue #52, migration 0037,
   expand): the foundational M6 promotion of the bootstrap `users` directory into a
   full control-plane managed entity, with no weakening of its isolation or PII
   guarantees.
@@ -50,10 +50,41 @@ range per docs/RELEASING.md.
     surface (`users.get`, `users.list`, `users.by_external_id`, `users.delete`,
     `users.set_state`, `users.update_claims`, `users.external_id.link`,
     `users.external_id.unlink`) so the IDOR harness proves uniform cross-tenant
-    not-found on the mutating and the reading surfaces alike. Migration 0036 grants
+    not-found on the mutating and the reading surfaces alike. Migration 0037 grants
     the control plane SELECT/INSERT + a column-scoped UPDATE on `users` and
     SELECT/INSERT on the envelope key tables (it manages user PII), with a per-scope
     partial unique index on the external-id blind index.
+- Self-service account management: sessions and credentials (issue #61, migration
+  0036, expand). The store layer of the end-user account surface.
+  - **Password change (`ActingUserRepo::change_password`).** Writes a fresh Argon2id
+    verifier (the caller has already verified the current password and hashed the new
+    one through the entropy seam; no plaintext or hash is ever logged) and, in the
+    SAME transaction (session-fixation defense), revokes every OTHER session of the
+    user while KEEPING the one the change is made from, cascading each revoked session
+    through the unified session-ended fan-out (issue #35) exactly as an admin revoke
+    does. One `account.password.change` audit row targets the user; a new column-scoped
+    `GRANT UPDATE (password_hash) ON users` is the only new users privilege (the #31
+    least-privilege lesson). `UserRepo::password_hash_for_subject` reads the stored
+    verifier for the current-password check.
+  - **Self-service session revoke (`ActingSessionRepo::self_revoke` /
+    `self_revoke_others`).** A user revokes ONE of their own sessions (subject-bound in
+    SQL, so another user's session id is a uniform no-op) or all of their OTHER sessions
+    ("sign out everywhere else"), both flowing through the same session-ended fan-out as
+    an admin revoke and audited as `account.session.revoke` /
+    `account.sessions.revoke_others` attributed to the end user.
+  - **Credential registry (new `account_credentials` table + `AccountCredentialRepo` /
+    `ActingAccountCredentialRepo`).** Enroll, list, and remove a subject's OWN
+    credentials (passkeys, TOTP, recovery-code sets), every read and write bound to the
+    subject so a cross-user id is the uniform not-found. The user-authored friendly name
+    is sealed under the scope's envelope DEK (issue #48; a raw column probe yields no
+    plaintext). Removing the last usable (primary-login) credential is BLOCKED unless the
+    documented recovery acknowledgment is present, so a user cannot silently strand
+    themselves. Enroll and remove are audited as `account.credential.enroll` /
+    `account.credential.remove`; the audit `detail` records the declared step-up policy.
+    New `CredentialType`, `AccountCredentialSummary`, `CredentialRemoveOutcome`,
+    `CredentialId`/`CredentialKind`, and the `AccountCredential` classification
+    (`runtime`). The cross-tenant IDOR harness gains an `account_credentials.remove`
+    probe.
 - Server-side config promotion: diff, plan, and apply (issue #44, migration 0035,
   expand). The flagship differentiator, at the store layer.
   - **Engine (`promotion` module, pure and deterministic).** `diff` compares a
