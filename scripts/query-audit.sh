@@ -104,7 +104,13 @@ cd "$(git rev-parse --show-toplevel)"
 # forced row-level security, so their SQL stays in the repository module too. They
 # store only wrapped keys and ciphertext, never a plaintext key or payload; the AEAD
 # primitive lives in ironauth-jose (the one crate allowed a direct ring dependency).
-SCOPED_TABLES='clients|organizations|audit_log|management_credentials|idempotency_keys|grants|authorization_codes|issued_tokens|signing_keys|users|sessions|consents|resource_servers|opaque_access_tokens|client_assertion_jtis|client_auth_diagnostics|pushed_authorization_requests|refresh_families|refresh_tokens|service_accounts|dcr_policies|dcr_initial_access_tokens|dcr_rate_counters|external_assertion_issuers|external_assertion_subject_mappings|external_assertion_jtis|device_codes|client_sessions|session_ended_events|backchannel_logout_deliveries|tenant_keks|tenant_deks|encrypted_secrets'
+# environment_guardrails (#42) is the scope-forced guardrail PROJECTION VIEW the
+# data plane reads to enforce the redirect guardrail (an http loopback is rejected
+# in a prod environment). It is not a base table (it is a definer view over the
+# environments level table whose WHERE clause pins the bound scope), but its SQL is
+# kept in the repository module for the same reason: no other file may name it, so
+# the scoped read stays in one place.
+SCOPED_TABLES='clients|organizations|audit_log|management_credentials|idempotency_keys|grants|authorization_codes|issued_tokens|signing_keys|users|sessions|consents|resource_servers|opaque_access_tokens|client_assertion_jtis|client_auth_diagnostics|pushed_authorization_requests|refresh_families|refresh_tokens|service_accounts|dcr_policies|dcr_initial_access_tokens|dcr_rate_counters|external_assertion_issuers|external_assertion_subject_mappings|external_assertion_jtis|device_codes|client_sessions|session_ended_events|backchannel_logout_deliveries|tenant_keks|tenant_deks|encrypted_secrets|environment_guardrails'
 
 # The one module allowed to name a scoped table in SQL.
 REPO_MODULE='crates/ironauth-store/src/repository.rs'

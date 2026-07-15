@@ -44,17 +44,26 @@ pub struct LoginForm {
 /// `login_hint` carried on the resuming authorization request prefills the
 /// identifier field (escaped into the attribute by the page), and the `display` /
 /// `ui_locales` hints shape the page shell (issue #16).
-pub async fn login_get(Query(query): Query<ResumeQuery>) -> Response {
+pub async fn login_get(
+    State(state): State<OidcState>,
+    Query(query): Query<ResumeQuery>,
+) -> Response {
     match parse_resume(query.return_to.as_deref()) {
-        Some(resume) => pages::secure_html(
-            StatusCode::OK,
-            pages::login_page(
-                resume.hints.login_hint().unwrap_or_default(),
-                &resume.return_to,
-                None,
-                &resume.hints,
-            ),
-        ),
+        Some(resume) => {
+            // The environment-kind chrome (issue #42): a non-production environment
+            // marks the page noindex and shows a visible banner; prod shows neither.
+            let banner = state.environment_banner(&resume.scope).await;
+            pages::secure_html(
+                StatusCode::OK,
+                pages::login_page(
+                    resume.hints.login_hint().unwrap_or_default(),
+                    &resume.return_to,
+                    None,
+                    &resume.hints,
+                    banner,
+                ),
+            )
+        }
         None => interaction::invalid_link_page(),
     }
 }
@@ -87,6 +96,9 @@ pub async fn login_post(
         .map(str::trim)
         .unwrap_or_default();
     let password = form.password.as_deref().unwrap_or_default();
+
+    // The environment-kind chrome (issue #42) for a re-rendered failure page.
+    let banner = state.environment_banner(&resume.scope).await;
 
     let lookup = state
         .store()
@@ -121,12 +133,12 @@ pub async fn login_post(
             }
         }
         // Present but wrong password: generic failure (no wrong-password oracle).
-        Ok(Some(_)) => failed_login_page(identifier, &resume.return_to, &resume.hints),
+        Ok(Some(_)) => failed_login_page(identifier, &resume.return_to, &resume.hints, banner),
         // Absent account: spend comparable Argon2id time, then the SAME generic
         // failure (no user-enumeration oracle).
         Ok(None) => {
             let _ = password::verify_absent(password);
-            failed_login_page(identifier, &resume.return_to, &resume.hints)
+            failed_login_page(identifier, &resume.return_to, &resume.hints, banner)
         }
         Err(_) => interaction::server_error_page(),
     }
@@ -139,6 +151,7 @@ fn failed_login_page(
     identifier: &str,
     return_to: &str,
     hints: &crate::hints::InteractionHints,
+    environment_banner: Option<&str>,
 ) -> Response {
     pages::secure_html(
         StatusCode::OK,
@@ -147,6 +160,7 @@ fn failed_login_page(
             return_to,
             Some("Incorrect identifier or password."),
             hints,
+            environment_banner,
         ),
     )
 }

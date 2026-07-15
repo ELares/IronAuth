@@ -94,9 +94,18 @@ pub async fn consent_get(
         .unwrap_or_default()
         .split_whitespace()
         .collect();
+    // The environment-kind chrome (issue #42): non-production marks the page
+    // noindex and shows a banner; prod shows neither.
+    let banner = state.environment_banner(&resume.scope).await;
     pages::secure_html(
         StatusCode::OK,
-        pages::consent_page(&client_name, &scopes, &resume.return_to, &resume.hints),
+        pages::consent_page(
+            &client_name,
+            &scopes,
+            &resume.return_to,
+            &resume.hints,
+            banner,
+        ),
     )
 }
 

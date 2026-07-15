@@ -289,6 +289,7 @@ impl Harness {
                 KeySet::bootstrap(signing_key, SystemTime::UNIX_EPOCH),
                 SigningPolicy::eddsa_default(),
                 PairwiseSalt::new(Vec::new()),
+                ironauth_store::GuardrailSet::for_kind(ironauth_store::EnvironmentType::Dev),
             ),
         );
         let registry = Arc::new(registry);
@@ -374,7 +375,12 @@ impl Harness {
         );
         registry.insert(
             scope,
-            IssuerEntry::new(keyset, policy, PairwiseSalt::new(Vec::new())),
+            IssuerEntry::new(
+                keyset,
+                policy,
+                PairwiseSalt::new(Vec::new()),
+                ironauth_store::GuardrailSet::for_kind(ironauth_store::EnvironmentType::Dev),
+            ),
         );
         let registry = Arc::new(registry);
 
@@ -442,13 +448,38 @@ impl Harness {
         .await
     }
 
+    /// Like [`Harness::start_store_backed_with`] but seeds the environment with an
+    /// explicit KIND (`dev`, `staging`, or `prod`) and optional custom domain, so a
+    /// test drives the LIVE data-plane guardrail projection (issue #42): the
+    /// store-backed issuer registry loads the environment's typed guardrails from the
+    /// scope-forced view, and the DCR / interaction paths enforce them. Provisions an
+    /// Ed25519 environment key.
+    pub async fn start_store_backed_kind(
+        config: OidcConfig,
+        kind: &str,
+        custom_domain: Option<&str>,
+    ) -> Self {
+        Self::build_store_backed_kind(config, HarnessKey::Ed25519, kind, custom_domain).await
+    }
+
     /// Build a store-backed harness whose environment is provisioned with `key`,
     /// mounting the protocol, per-environment JWKS, and discovery routers over the
     /// one lazy registry (exactly as `main.rs` mounts all three), so a test can
     /// fetch the LIVE discovery document whose per-environment policy is derived from
     /// the loaded key set.
     async fn build_store_backed(config: OidcConfig, key: HarnessKey) -> Self {
-        let (db, env, clock, scope, client_id) = Self::seed_common().await;
+        Self::build_store_backed_kind(config, key, "dev", None).await
+    }
+
+    /// Like [`Harness::build_store_backed`] but seeds the environment with an
+    /// explicit `kind` and optional `custom_domain` (issue #42).
+    async fn build_store_backed_kind(
+        config: OidcConfig,
+        key: HarnessKey,
+        kind: &str,
+        custom_domain: Option<&str>,
+    ) -> Self {
+        let (db, env, clock, scope, client_id) = Self::seed_common_kind(kind, custom_domain).await;
 
         // Build the key with its `sik_` id as the kid and PROVISION the SAME
         // material into the store, so the lazily loaded key rebuilds identically and
@@ -574,9 +605,19 @@ impl Harness {
     /// scope, and one OAuth client with the harness redirect URI registered (so the
     /// exact-string redirect match, issue #13, accepts it).
     async fn seed_common() -> (TestDatabase, Env, Arc<ManualClock>, Scope, ClientId) {
+        Self::seed_common_kind("dev", None).await
+    }
+
+    /// Like [`Harness::seed_common`] but seeds the environment with an explicit
+    /// `kind` and optional `custom_domain` (issue #42), so a store-backed harness
+    /// can stand up a PROD environment whose typed guardrails the data plane reads.
+    async fn seed_common_kind(
+        kind: &str,
+        custom_domain: Option<&str>,
+    ) -> (TestDatabase, Env, Arc<ManualClock>, Scope, ClientId) {
         let db = TestDatabase::start().await;
         let (env, clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0x0D1C_5EED);
-        let scope = db.seed_scope(&env).await;
+        let scope = db.seed_scope_with_kind(&env, kind, custom_domain).await;
 
         let client_id = db
             .store()

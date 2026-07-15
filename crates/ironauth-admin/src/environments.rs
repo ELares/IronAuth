@@ -13,16 +13,30 @@ use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, Uri};
 use axum::response::Response;
-use ironauth_store::{CorrelationId, EnvironmentId, IdempotencyWrite, StoreError};
+use ironauth_store::{
+    CorrelationId, EnvironmentId, EnvironmentType, GuardrailReport, IdempotencyWrite,
+    NewEnvironment, Scope, StoreError,
+};
 
 use crate::auth::Principal;
 use crate::error::{ApiError, ErrorBody};
 use crate::idempotency;
 use crate::input::{parse_json, require_non_empty};
 use crate::pagination::{ListQuery, Pagination};
+use crate::provision::DayOneSigningKey;
 use crate::response::{json, no_content};
 use crate::state::AdminState;
 use crate::views::{CreateEnvironmentRequest, EnvironmentList, EnvironmentView};
+
+/// Normalize an optional custom-domain input: trim surrounding whitespace and
+/// treat an empty (or whitespace-only) value as unconfigured (`None`). This is
+/// the one place the input is canonicalized, so the stored value, the guardrail
+/// check, and the response view all agree.
+fn normalize_custom_domain(raw: Option<&str>) -> Option<String> {
+    raw.map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+}
 
 /// Create an environment under a tenant.
 #[utoipa::path(
@@ -84,13 +98,38 @@ pub async fn create_environment(
 
     let request: CreateEnvironmentRequest = parse_json(&body)?;
     let display_name = require_non_empty(&request.display_name, "display_name")?;
+    // Parse the typed kind: an unknown value is rejected (a plain 400), never
+    // coerced to a default, so a typo can never create a mis-typed environment.
+    let kind = EnvironmentType::parse(&request.kind)
+        .map_err(|error| ApiError::BadRequest(error.to_string()))?;
+    let custom_domain = normalize_custom_domain(request.custom_domain.as_deref());
+
+    // Validate the environment's guardrails BEFORE any write: a production
+    // environment with no configured custom domain fails structurally, listing
+    // each failed guardrail (issue #42). A well-formed request that satisfies the
+    // guardrails proceeds.
+    let guardrails = kind.guardrails();
+    let mut report = GuardrailReport::new();
+    report.check(guardrails.check_custom_domain(custom_domain.as_deref()));
+    if !report.is_clean() {
+        return Err(ApiError::GuardrailViolation(report.into_violations()));
+    }
 
     let created_at_micros = state.now_unix_micros();
     let environment_id = EnvironmentId::generate(state.env());
+    let scope = Scope::new(tenant, environment_id);
+    // The environment's day-one signing key, generated here (the entropy seam) and
+    // provisioned in the same transaction as the environment.
+    let signing_key = DayOneSigningKey::generate(state.env(), &scope);
+
     let view = EnvironmentView {
         id: environment_id.to_string(),
         tenant_id: tenant.to_string(),
         display_name: display_name.clone(),
+        kind: kind.as_str().to_owned(),
+        guardrail_class: kind.guardrail_class().as_str().to_owned(),
+        custom_domain: custom_domain.clone(),
+        guardrails: guardrails.into(),
         created_at_unix_ms: created_at_micros / 1000,
     };
     let body_string = serde_json::to_string(&view).map_err(|_| ApiError::Internal)?;
@@ -111,7 +150,12 @@ pub async fn create_environment(
             state.env(),
             &environment_id,
             created_at_micros,
-            &display_name,
+            NewEnvironment {
+                display_name: &display_name,
+                kind,
+                custom_domain: custom_domain.as_deref(),
+            },
+            signing_key.as_new(created_at_micros),
             Some(write),
         )
         .await;
