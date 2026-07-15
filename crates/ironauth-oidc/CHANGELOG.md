@@ -35,8 +35,14 @@ range per docs/RELEASING.md.
     the experimental ack can never be bypassed from `[oidc]`.
   - **Not yet built** (honest scope): the TRANSMITTER side (emitting Global Token
     Revocation calls to downstream receivers) needs the #35 delivery-worker fan-out, which
-    is not merged; only the RECEIVER ships here. Subject-identifier formats beyond `opaque`
-    (`email`, `iss_sub`, ...) are recognized but not yet mapped to a local subject.
+    is not merged; only the RECEIVER ships here. The terminal session-ended signals are
+    produced on the shared `RevocationEventSink` seam, but the DEFAULT sink is a no-op, so
+    the durable relying-party logout landing arrives only once #35 wires a real sink via
+    `OidcState::with_revocation_sink`. Subject-identifier formats beyond `opaque`
+    (`email`, `iss_sub`, ...) are recognized but not yet mapped to a local subject. The
+    external-interop acceptance criterion (a recorded run against an outside receiver such
+    as Okta or Auth0) is infra-gated and NOT done; nothing here claims verified
+    conformance against another implementation, only the pinned draft revision.
 - The session model on the OIDC surface (issue #32).
   - **`sid` in EVERY flow's ID token (not just the code flow).** The token endpoint
     resolves the per-(client, session) `sid` from the code's authenticating SSO session

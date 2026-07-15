@@ -57,12 +57,27 @@
 //! families and their grants too) in ONE audited transaction, returning the exact set
 //! of sessions it flipped. The endpoint then publishes a TERMINAL
 //! [`SessionLifecycleEvent`] (cause [`SessionSignalCause::UserRevokedAll`], no
-//! successor) per revoked session on the [`RevocationEventSink`](crate::RevocationEventSink)
-//! seam, so the downstream logout fan-out (issue #35) terminates every relying party's
-//! view of the subject. Because the revoke is `WHERE revoked_at IS NULL`, a repeated
-//! call for the same subject flips nothing the second time and publishes no spurious
-//! event: the endpoint is idempotent, always answering `204` for an authenticated,
-//! well-formed request.
+//! successor) per revoked session on the SAME
+//! [`RevocationEventSink`](crate::RevocationEventSink) seam the existing session
+//! lifecycle emit sites already use (it reuses the shared choke point rather than a
+//! private path), so the downstream logout fan-out (issue #35) can terminate every
+//! relying party's view of the subject WITHOUT touching this endpoint.
+//!
+//! Honest ordering, so this is not read as a half-measure: the DEFAULT sink is a no-op
+//! (the [`NoopRevocationSink`](crate::NoopRevocationSink), like every other emit site
+//! today), so this cut PRODUCES the terminal events on the shared seam but does not
+//! itself deliver a logout. The durable, relying-party-facing landing arrives only once
+//! issue #35 wires a real sink through
+//! [`OidcState::with_revocation_sink`](crate::OidcState::with_revocation_sink); building
+//! that durable delivery worker is #35's job and is deliberately NOT duplicated here.
+//!
+//! Because the revoke is `WHERE revoked_at IS NULL`, a repeated call for the same
+//! subject flips nothing the second time and publishes no spurious event: the endpoint
+//! is idempotent, always answering `204` for an authenticated, well-formed request. A
+//! well-formed, in-scope subject that does not exist (or that holds nothing) takes that
+//! same `204` path BY DESIGN, so the endpoint is not a subject-existence oracle (the
+//! same no-oracle reasoning as the cross-tenant `400`): the uniform response reveals
+//! nothing about whether the subject was real or held any live tokens.
 
 use axum::body::Bytes;
 use axum::extract::State;
