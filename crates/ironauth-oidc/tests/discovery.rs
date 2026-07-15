@@ -57,6 +57,7 @@ fn router_and_scope(capabilities: DiscoveryCapabilities) -> (Router, Scope) {
             KeySet::bootstrap(key, SystemTime::UNIX_EPOCH),
             SigningPolicy::eddsa_default(),
             PairwiseSalt::new(Vec::new()),
+            ironauth_store::GuardrailSet::for_kind(ironauth_store::EnvironmentType::Dev),
         ),
     );
     let state = DiscoveryState::new(

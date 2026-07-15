@@ -10,6 +10,7 @@
 
 use std::fmt;
 
+use crate::environment::GuardrailViolation;
 use crate::id::NotInScope;
 use crate::migrate::MigrationError;
 
@@ -47,6 +48,18 @@ pub enum StoreError {
     /// value that could never be a safe redirect target never reaches the
     /// registered set. Carries no tenant data.
     InvalidRedirectUri,
+    /// A config write violated one of the environment's TYPED guardrails (issue
+    /// #42): for example registering an `http` loopback redirect URI in a
+    /// PRODUCTION environment, which the two-class asymmetry forbids (dev and
+    /// staging relax it; prod hard-requires `https`). DELIBERATELY distinct from
+    /// [`InvalidRedirectUri`], which is a shape failure (not a registrable RFC 8252
+    /// target at all): a guardrail violation is a well-formed value the
+    /// environment's KIND rejects, so the caller can name the exact failed
+    /// guardrail. Carries the failed [`GuardrailViolation`] (a stable wire code and
+    /// an operator-safe message, no tenant data).
+    ///
+    /// [`InvalidRedirectUri`]: StoreError::InvalidRedirectUri
+    GuardrailViolation(GuardrailViolation),
     /// A dynamic client registration would exceed the environment's configured
     /// registered-client quota (issue #31). Enforced atomically inside the
     /// registration transaction (under a per-scope advisory lock, so a concurrent
@@ -76,6 +89,9 @@ impl fmt::Display for StoreError {
             StoreError::IdempotencyConflict => f.write_str("idempotency-key conflict"),
             StoreError::Conflict => f.write_str("uniqueness conflict"),
             StoreError::InvalidRedirectUri => f.write_str("invalid redirect uri"),
+            StoreError::GuardrailViolation(violation) => {
+                write!(f, "guardrail violation: {violation}")
+            }
             StoreError::QuotaExceeded => f.write_str("registration quota exceeded"),
             StoreError::Encryption => f.write_str("envelope decryption failed"),
         }
@@ -89,6 +105,7 @@ impl std::error::Error for StoreError {
             | StoreError::IdempotencyConflict
             | StoreError::Conflict
             | StoreError::InvalidRedirectUri
+            | StoreError::GuardrailViolation(_)
             | StoreError::QuotaExceeded
             | StoreError::Encryption => None,
             StoreError::Database(source) => Some(source),

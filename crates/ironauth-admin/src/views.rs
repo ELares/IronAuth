@@ -11,8 +11,8 @@
 use std::fmt;
 
 use ironauth_store::{
-    EnvironmentRecord, ManagementCredentialRecord, OperatorRecord, OrganizationRecord,
-    RefreshFamilySummary, ResourceType, SessionSummary, TenantRecord,
+    EnvironmentRecord, GuardrailSet, ManagementCredentialRecord, OperatorRecord,
+    OrganizationRecord, RefreshFamilySummary, ResourceType, SessionSummary, TenantRecord,
 };
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -52,8 +52,53 @@ pub struct EnvironmentView {
     pub tenant_id: String,
     /// The human-facing display name.
     pub display_name: String,
+    /// The typed environment kind: `dev`, `staging`, or `prod` (issue #42).
+    pub kind: String,
+    /// The guardrail class the kind maps onto: `non-production` or `production`.
+    pub guardrail_class: String,
+    /// The configured custom domain, if any. A production environment always has
+    /// one (the custom-domain guardrail); a non-production environment may omit it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub custom_domain: Option<String>,
+    /// The typed guardrails this environment enforces, derived from its kind.
+    pub guardrails: GuardrailView,
     /// Creation time, milliseconds since the Unix epoch.
     pub created_at_unix_ms: i64,
+}
+
+/// The typed guardrails an environment enforces (issue #42), derived purely from
+/// its kind so the production asymmetry can never drift.
+// The guardrail flags are a flat set of independent booleans by design, mirroring
+// the store's `GuardrailSet`; an enum would hide the per-guardrail table.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct GuardrailView {
+    /// Whether an `http` loopback redirect URI is registrable (true for
+    /// non-production, false for production).
+    pub allow_insecure_redirect_uris: bool,
+    /// Whether every redirect URI must be `https` (true for production only).
+    pub require_https_redirect_uris: bool,
+    /// Whether a configured custom domain is required (true for production only).
+    pub require_custom_domain: bool,
+    /// Whether secret values are one-time-view (true for production only).
+    pub one_time_view_secrets: bool,
+    /// Whether hosted pages carry a `noindex` marker (true for non-production only).
+    pub hosted_pages_noindex: bool,
+    /// Whether a visible environment banner is shown (true for non-production only).
+    pub show_environment_banner: bool,
+}
+
+impl From<GuardrailSet> for GuardrailView {
+    fn from(set: GuardrailSet) -> Self {
+        Self {
+            allow_insecure_redirect_uris: set.allow_insecure_redirect_uris,
+            require_https_redirect_uris: set.require_https_redirect_uris,
+            require_custom_domain: set.require_custom_domain,
+            one_time_view_secrets: set.one_time_view_secrets,
+            hosted_pages_noindex: set.hosted_pages_noindex,
+            show_environment_banner: set.show_environment_banner,
+        }
+    }
 }
 
 impl From<EnvironmentRecord> for EnvironmentView {
@@ -62,6 +107,10 @@ impl From<EnvironmentRecord> for EnvironmentView {
             id: record.id.to_string(),
             tenant_id: record.tenant_id.to_string(),
             display_name: record.display_name,
+            kind: record.kind.as_str().to_owned(),
+            guardrail_class: record.kind.guardrail_class().as_str().to_owned(),
+            custom_domain: record.custom_domain,
+            guardrails: record.kind.guardrails().into(),
             created_at_unix_ms: ms(record.created_at_unix_micros),
         }
     }
@@ -94,9 +143,19 @@ pub struct CreateTenantRequest {
     /// The tenant's display name.
     #[schema(example = "Acme, Inc.")]
     pub display_name: String,
-    /// The first environment's display name. Defaults to `production`.
+    /// The first environment's display name. Defaults to `development`.
     #[serde(default)]
     pub environment_display_name: Option<String>,
+    /// The first environment's kind: `dev`, `staging`, or `prod` (issue #42).
+    /// Defaults to `dev`, the relaxed non-production kind that requires no custom
+    /// domain, so a tenant is always creatable in one call with sane defaults.
+    #[serde(default)]
+    #[schema(example = "dev")]
+    pub environment_kind: Option<String>,
+    /// The first environment's custom domain, if any. Required only when
+    /// `environment_kind` is `prod` (the production custom-domain guardrail).
+    #[serde(default)]
+    pub environment_custom_domain: Option<String>,
 }
 
 /// The result of creating a tenant: the tenant and its first environment.
@@ -114,6 +173,16 @@ pub struct CreateEnvironmentRequest {
     /// The environment's display name.
     #[schema(example = "staging")]
     pub display_name: String,
+    /// The environment kind: `dev`, `staging`, or `prod` (issue #42). Required;
+    /// an unknown value is rejected. The kind fixes the environment's guardrail
+    /// class (dev and staging inherit the relaxed non-production set; prod gets
+    /// the hard production set).
+    #[schema(example = "staging")]
+    pub kind: String,
+    /// The custom domain to configure. Required when `kind` is `prod` (the
+    /// production custom-domain guardrail); optional otherwise.
+    #[serde(default)]
+    pub custom_domain: Option<String>,
 }
 
 /// The body to mint a management API key in a `(tenant, environment)` scope.

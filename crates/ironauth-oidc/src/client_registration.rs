@@ -90,7 +90,7 @@ use ironauth_config::RegistrationMode;
 use ironauth_env::Env;
 use ironauth_jose::JwsAlgorithm;
 use ironauth_store::{
-    Action, ActorRef, CorrelationId, DynamicClientRecord, DynamicClientUpdate,
+    Action, ActorRef, CorrelationId, DynamicClientRecord, DynamicClientUpdate, GuardrailSet,
     InitialAccessTokenId, NewDynamicClient, Scope, ServiceId, StoreError,
     redirect_uri_is_registrable,
 };
@@ -245,7 +245,25 @@ pub async fn register(
         return server_error();
     };
 
-    let validated = match validate_metadata(&state, &metadata, None, &signable, default_alg).await {
+    // The environment's TYPED guardrails (issue #42): a PROD environment rejects an
+    // http loopback redirect that a dev/staging environment accepts. Resolved from
+    // the shared registry (the same cached entry env_signing_capability just loaded),
+    // so the redirect guardrail is enforced on the real DCR path BEFORE the client
+    // is stored.
+    let Some(guardrails) = state.environment_guardrails(&scope).await else {
+        return server_error();
+    };
+
+    let validated = match validate_metadata(
+        &state,
+        &metadata,
+        None,
+        &signable,
+        default_alg,
+        guardrails,
+    )
+    .await
+    {
         Ok(validated) => validated,
         Err(error) => return error.into_response(),
     };
@@ -397,11 +415,25 @@ pub async fn update(
         return server_error();
     };
 
-    let validated =
-        match validate_metadata(&state, &metadata, Some(&record), &signable, default_alg).await {
-            Ok(validated) => validated,
-            Err(error) => return error.into_response(),
-        };
+    // The environment's TYPED guardrails also bind an RFC 7592 UPDATE (issue #42):
+    // a prod client can never be edited to carry an http loopback redirect.
+    let Some(guardrails) = state.environment_guardrails(&scope).await else {
+        return server_error();
+    };
+
+    let validated = match validate_metadata(
+        &state,
+        &metadata,
+        Some(&record),
+        &signable,
+        default_alg,
+        guardrails,
+    )
+    .await
+    {
+        Ok(validated) => validated,
+        Err(error) => return error.into_response(),
+    };
 
     // Rotate the registration access token on every successful update: mint a fresh
     // one, store only its new hash, and hand back the plaintext. The superseded
@@ -877,6 +909,7 @@ async fn validate_metadata(
     existing: Option<&DynamicClientRecord>,
     signable: &[JwsAlgorithm],
     default_alg: JwsAlgorithm,
+    guardrails: GuardrailSet,
 ) -> Result<ValidatedMetadata, RegistrationError> {
     let application_type = match metadata.get("application_type") {
         None => "web".to_owned(),
@@ -896,7 +929,7 @@ async fn validate_metadata(
 
     let auth_method = validate_auth_method(metadata)?;
 
-    let redirect_uris = validate_redirect_uris(metadata, &application_type)?;
+    let redirect_uris = validate_redirect_uris(metadata, &application_type, guardrails)?;
 
     // On an RFC 7592 update, switching to a secret-based method requires a secret
     // the client does not have (an update never mints one), so refuse the
@@ -965,12 +998,18 @@ fn validate_auth_method(
 }
 
 /// Validate `redirect_uris` as RFC 8252 targets under the client's application
-/// type. `redirect_uris` is required (the only supported flow is redirect based),
-/// every entry must be registrable, and for a `web` client every entry must be
-/// https (loopback and private-use schemes are native-only).
+/// type AND the environment's typed guardrails (issue #42). `redirect_uris` is
+/// required (the only supported flow is redirect based), every entry must be
+/// registrable, and for a `web` client every entry must be https (loopback and
+/// private-use schemes are native-only). Layered ON TOP of the application-type
+/// rule, the environment guardrail additionally rejects an http loopback (which a
+/// `native` client would otherwise register) in a PRODUCTION environment: a prod
+/// environment hard-requires https redirect URIs, so it cannot silently carry the
+/// dev laxity a native-app loopback represents.
 fn validate_redirect_uris(
     metadata: &serde_json::Map<String, Value>,
     application_type: &str,
+    guardrails: GuardrailSet,
 ) -> Result<Vec<String>, RegistrationError> {
     let Some(value) = metadata.get("redirect_uris") else {
         return Err(RegistrationError::redirect(
@@ -998,6 +1037,13 @@ fn validate_redirect_uris(
             return Err(RegistrationError::redirect(
                 "a redirect_uri is not a valid target for this application_type",
             ));
+        }
+        // The environment-kind guardrail (issue #42): registrability is established
+        // above, so the only remaining failure is the production https-only rule,
+        // which rejects an http loopback in a prod environment with the named
+        // guardrail. A dev/staging environment relaxes it and accepts the loopback.
+        if let Err(violation) = guardrails.check_redirect_uri(uri) {
+            return Err(RegistrationError::guardrail(&violation));
         }
         uris.push(uri.to_owned());
     }
@@ -1394,6 +1440,11 @@ enum RegistrationError {
     InvalidClientMetadata(String),
     /// A `redirect_uri` is not a valid registrable target.
     InvalidRedirectUri(String),
+    /// A `redirect_uri` is well formed but the environment's KIND rejects it under
+    /// a typed guardrail (issue #42): for example an http loopback in a PROD
+    /// environment. Carries the stable guardrail code and an operator-safe message,
+    /// so the error names the exact failed guardrail.
+    Guardrail(String),
 }
 
 impl RegistrationError {
@@ -1408,6 +1459,15 @@ impl RegistrationError {
     fn redirect(message: &'static str) -> Self {
         RegistrationError::InvalidRedirectUri(message.to_owned())
     }
+
+    /// Build a guardrail error naming the failed guardrail (issue #42).
+    fn guardrail(violation: &ironauth_store::GuardrailViolation) -> Self {
+        RegistrationError::Guardrail(format!(
+            "guardrail {}: {}",
+            violation.code(),
+            violation.message
+        ))
+    }
 }
 
 impl IntoResponse for RegistrationError {
@@ -1416,7 +1476,8 @@ impl IntoResponse for RegistrationError {
             RegistrationError::InvalidClientMetadata(description) => {
                 error_body("invalid_client_metadata", &description)
             }
-            RegistrationError::InvalidRedirectUri(description) => {
+            RegistrationError::InvalidRedirectUri(description)
+            | RegistrationError::Guardrail(description) => {
                 error_body("invalid_redirect_uri", &description)
             }
         }

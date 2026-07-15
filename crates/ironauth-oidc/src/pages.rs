@@ -123,20 +123,48 @@ pub fn secure_html(status: StatusCode, body: String) -> Response {
 /// default). Both are UNTRUSTED-derived, so both are escaped here regardless: the
 /// `lang` value is charset-guarded by [`InteractionHints::lang`] and escaped, and
 /// `display` comes from the closed [`crate::hints::Display`] registry.
-fn document(title: &str, body_html: &str, lang: &str, display: &str) -> String {
+///
+/// `environment_banner` is the typed guardrail chrome (issue #42): `Some(label)` for
+/// a NON-PRODUCTION environment adds a `<meta name="robots" content="noindex">` (so a
+/// dev/staging hosted page is kept out of search indexes) AND a visible environment
+/// banner at the top of the body; `None` (a production environment) adds neither, so
+/// prod pages stay indexable and unbannered. The label is a fixed, server-known
+/// guardrail class token, escaped defensively regardless.
+fn document(
+    title: &str,
+    body_html: &str,
+    lang: &str,
+    display: &str,
+    environment_banner: Option<&str>,
+) -> String {
     let lang = escape_html(lang);
     let display = escape_html(display);
+    let robots = if environment_banner.is_some() {
+        "<meta name=\"robots\" content=\"noindex\">"
+    } else {
+        ""
+    };
+    let banner = match environment_banner {
+        Some(label) => format!(
+            "<p role=\"status\" data-environment-banner=\"{label}\">\
+             Non-production environment ({label}). Not for production use.</p>",
+            label = escape_html(label),
+        ),
+        None => String::new(),
+    };
     format!(
         "<!doctype html><html lang=\"{lang}\"><head><meta charset=\"utf-8\">\
-         <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
-         <title>{title}</title></head><body data-display=\"{display}\">{body_html}</body></html>"
+         <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">{robots}\
+         <title>{title}</title></head>\
+         <body data-display=\"{display}\">{banner}{body_html}</body></html>"
     )
 }
 
 /// The document shell for a server-authored notice page (English, the default
-/// `page` layout): the interaction-hint context does not apply to a fixed notice.
+/// `page` layout): the interaction-hint context does not apply to a fixed notice,
+/// and a notice carries no environment banner.
 fn notice_document(title: &str, body_html: &str) -> String {
-    document(title, body_html, "en", "page")
+    document(title, body_html, "en", "page", None)
 }
 
 /// A hidden `return_to` form field carrying the (escaped) resume target, so the
@@ -168,6 +196,7 @@ pub fn login_page(
     return_to: &str,
     error: Option<&str>,
     hints: &InteractionHints,
+    environment_banner: Option<&str>,
 ) -> String {
     let body = format!(
         "<h1>Sign in</h1>{error}\
@@ -181,7 +210,13 @@ pub fn login_page(
         return_to = return_to_field(return_to),
         identifier = escape_html(identifier),
     );
-    document("Sign in", &body, hints.lang(), hints.display().as_str())
+    document(
+        "Sign in",
+        &body,
+        hints.lang(),
+        hints.display().as_str(),
+        environment_banner,
+    )
 }
 
 /// The minimal registration page: an identifier and password form posting to
@@ -193,6 +228,7 @@ pub fn register_page(
     return_to: &str,
     error: Option<&str>,
     hints: &InteractionHints,
+    environment_banner: Option<&str>,
 ) -> String {
     let body = format!(
         "<h1>Create account</h1>{error}\
@@ -211,6 +247,7 @@ pub fn register_page(
         &body,
         hints.lang(),
         hints.display().as_str(),
+        environment_banner,
     )
 }
 
@@ -224,6 +261,7 @@ pub fn consent_page(
     scopes: &[&str],
     return_to: &str,
     hints: &InteractionHints,
+    environment_banner: Option<&str>,
 ) -> String {
     let scope_items: String = if scopes.is_empty() {
         "<li>(no scopes requested)</li>".to_owned()
@@ -249,6 +287,7 @@ pub fn consent_page(
         &body,
         hints.lang(),
         hints.display().as_str(),
+        environment_banner,
     )
 }
 
@@ -778,9 +817,9 @@ mod tests {
         let hints = InteractionHints::default();
         let hostile = "\"><script>alert(1)</script>";
         for page in [
-            login_page("", hostile, None, &hints),
-            register_page("", hostile, None, &hints),
-            consent_page("Acme", &["openid"], hostile, &hints),
+            login_page("", hostile, None, &hints, None),
+            register_page("", hostile, None, &hints, None),
+            consent_page("Acme", &["openid"], hostile, &hints, None),
         ] {
             assert!(
                 !page.contains("<script>alert(1)"),
@@ -800,6 +839,7 @@ mod tests {
             &["openid", "<img src=x>"],
             "/authorize?x=1",
             &InteractionHints::default(),
+            None,
         );
         assert!(!page.contains("<b>Evil</b>"), "client name escaped");
         assert!(!page.contains("<img src=x>"), "scope escaped");
@@ -818,7 +858,7 @@ mod tests {
             None,
             Some("touch"),
         );
-        let page = login_page("ada@example.test", "/authorize?x=1", None, &hints);
+        let page = login_page("ada@example.test", "/authorize?x=1", None, &hints, None);
         assert!(
             page.contains("<html lang=\"fr-CA\">"),
             "ui_locales lang: {page}"
@@ -833,9 +873,56 @@ mod tests {
             "login_hint prefilled: {page}"
         );
         // The default context renders the English page layout.
-        let plain = register_page("", "/authorize?x=1", None, &InteractionHints::default());
+        let plain = register_page(
+            "",
+            "/authorize?x=1",
+            None,
+            &InteractionHints::default(),
+            None,
+        );
         assert!(plain.contains("<html lang=\"en\">"));
         assert!(plain.contains("data-display=\"page\""));
+    }
+
+    #[test]
+    fn non_production_hosted_pages_carry_noindex_and_a_banner_prod_does_not() {
+        // Issue #42 acceptance 6: a NON-PRODUCTION hosted page marks itself noindex
+        // and shows a visible environment banner; a PRODUCTION page carries neither.
+        let hints = InteractionHints::default();
+        for page in [
+            login_page("", "/authorize?x=1", None, &hints, Some("non-production")),
+            register_page("", "/authorize?x=1", None, &hints, Some("non-production")),
+            consent_page(
+                "Acme",
+                &["openid"],
+                "/authorize?x=1",
+                &hints,
+                Some("non-production"),
+            ),
+        ] {
+            assert!(
+                page.contains("<meta name=\"robots\" content=\"noindex\">"),
+                "a non-production page is marked noindex: {page}"
+            );
+            assert!(
+                page.contains("data-environment-banner=\"non-production\""),
+                "a non-production page shows an environment banner: {page}"
+            );
+        }
+        // A production page: no noindex marker, no banner.
+        for page in [
+            login_page("", "/authorize?x=1", None, &hints, None),
+            consent_page("Acme", &["openid"], "/authorize?x=1", &hints, None),
+        ] {
+            assert!(
+                !page.contains("noindex"),
+                "a production page is indexable: {page}"
+            );
+            assert!(
+                !page.contains("data-environment-banner"),
+                "a production page shows no environment banner: {page}"
+            );
+        }
     }
 
     #[test]
@@ -849,7 +936,7 @@ mod tests {
             None,
             None,
         );
-        let page = login_page("", "/authorize?x=1", None, &hints);
+        let page = login_page("", "/authorize?x=1", None, &hints, None);
         assert!(!page.contains("<script>alert(1)"), "no breakout: {page}");
         assert!(
             page.contains("<html lang=\"en\">"),

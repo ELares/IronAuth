@@ -14,13 +14,17 @@ use axum::extract::{Path, Query, State};
 use axum::http::HeaderMap;
 use axum::http::{StatusCode, Uri};
 use axum::response::Response;
-use ironauth_store::{CorrelationId, EnvironmentId, IdempotencyWrite, StoreError, TenantId};
+use ironauth_store::{
+    CorrelationId, EnvironmentId, EnvironmentType, GuardrailReport, IdempotencyWrite,
+    NewEnvironment, Scope, StoreError, TenantId,
+};
 
 use crate::auth::Principal;
 use crate::error::{ApiError, ErrorBody};
 use crate::idempotency;
 use crate::input::{parse_json, require_non_empty};
 use crate::pagination::{ListQuery, Pagination};
+use crate::provision::DayOneSigningKey;
 use crate::response::{json, no_content};
 use crate::state::{AdminState, BOOTSTRAP_OPERATOR_DISPLAY_NAME};
 use crate::views::{CreateTenantRequest, EnvironmentView, TenantCreated, TenantList, TenantView};
@@ -70,12 +74,38 @@ pub async fn create_tenant(
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .unwrap_or("production")
+        .unwrap_or("development")
         .to_owned();
+    // The first environment's kind defaults to dev (the relaxed non-production
+    // kind requiring no custom domain), so a tenant is always creatable in one
+    // call; an explicit unknown kind is rejected, never coerced.
+    let environment_kind = match request.environment_kind.as_deref() {
+        None => EnvironmentType::Dev,
+        Some(raw) => {
+            EnvironmentType::parse(raw).map_err(|error| ApiError::BadRequest(error.to_string()))?
+        }
+    };
+    let environment_custom_domain = request
+        .environment_custom_domain
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned);
+
+    // The first environment's guardrails are validated before any write, exactly
+    // like a standalone environment creation (issue #42).
+    let guardrails = environment_kind.guardrails();
+    let mut report = GuardrailReport::new();
+    report.check(guardrails.check_custom_domain(environment_custom_domain.as_deref()));
+    if !report.is_clean() {
+        return Err(ApiError::GuardrailViolation(report.into_violations()));
+    }
 
     let created_at_micros = state.now_unix_micros();
     let tenant_id = TenantId::generate(state.env());
     let environment_id = EnvironmentId::generate(state.env());
+    let scope = Scope::new(tenant_id, environment_id);
+    let signing_key = DayOneSigningKey::generate(state.env(), &scope);
 
     let created = TenantCreated {
         tenant: TenantView {
@@ -87,6 +117,10 @@ pub async fn create_tenant(
             id: environment_id.to_string(),
             tenant_id: tenant_id.to_string(),
             display_name: environment_display_name.clone(),
+            kind: environment_kind.as_str().to_owned(),
+            guardrail_class: environment_kind.guardrail_class().as_str().to_owned(),
+            custom_domain: environment_custom_domain.clone(),
+            guardrails: guardrails.into(),
             created_at_unix_ms: created_at_micros / 1000,
         },
     };
@@ -111,7 +145,12 @@ pub async fn create_tenant(
             created_at_micros,
             BOOTSTRAP_OPERATOR_DISPLAY_NAME,
             &display_name,
-            &environment_display_name,
+            NewEnvironment {
+                display_name: &environment_display_name,
+                kind: environment_kind,
+                custom_domain: environment_custom_domain.as_deref(),
+            },
+            signing_key.as_new(created_at_micros),
             Some(write),
         )
         .await;
