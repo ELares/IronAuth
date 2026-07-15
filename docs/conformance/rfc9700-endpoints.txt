@@ -11,6 +11,7 @@
 /authorize
 /consent
 /device_authorization
+/end_session
 /introspect
 /login
 /par
