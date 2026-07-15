@@ -6,6 +6,28 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Canonical secret-free config snapshot export (issue #43, migration 0031, expand).
+  - **New `snapshot` module.** `Snapshot`/`SnapshotResources` plus the per-type
+    secret-free projections (`ClientSnapshot`, `ResourceServerSnapshot`,
+    `DcrPolicySnapshot`) and `SecretRef`. `export` reads the promotable resource
+    types in scope and returns a `Snapshot`; `Snapshot::to_canonical_string`/
+    `to_canonical_bytes` emit a canonical, deterministic form (recursively sorted
+    keys, compact, no volatile fields), so two exports of the same config are
+    byte-identical. `validate_document` validates a full document WITHOUT applying,
+    enumerating every violation with a JSON Pointer path and rejecting raw
+    secret-shaped material and private JWK parameters (the secret-free invariant).
+  - **Classification-bound coverage.** `SNAPSHOT_RESOURCE_TYPES` and
+    `classification_coverage_gaps` are checked by a unit test against
+    `classify() == Promotable`, so a newly promotable type forces snapshot coverage
+    and an environment-identity or runtime type can never appear.
+  - **Repository reads.** New `ResourceServerRepo::list` and
+    `DcrPolicyRepo::list_all` (ordered by their stable natural keys) feed the
+    export.
+  - **Migration 0031.** `GRANT SELECT ON resource_servers TO ironauth_control`, so
+    the management-plane export (the first control-plane reader of the
+    resource-server registry) can read it. A pure grant, no schema change.
+  - Adds a direct `serde` dependency (already in the tree; no new crate).
+
 - Tenant lifecycle state machine, residency attributes, data-plane fence, and the
   offboarding pipeline (issue #46, migration 0029, expand).
   - **Lifecycle status.** `tenants.status` (`active`/`suspended`) plus

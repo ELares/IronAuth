@@ -1009,6 +1009,7 @@ dependencies = [
  "ironauth-env",
  "ironauth-jose",
  "ironauth-kms",
+ "serde",
  "serde_json",
  "sha2",
  "sqlx",

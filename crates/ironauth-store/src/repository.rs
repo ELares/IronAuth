@@ -2739,6 +2739,33 @@ impl DcrPolicyRepo<'_> {
         rows.iter().map(|row| self.row_to_record(row)).collect()
     }
 
+    /// List EVERY policy in this scope, ordered by `name` (issue #43). The name is
+    /// unique per scope, so this is a total, stable order with no volatile
+    /// tiebreaker (unlike the cursor-paginated [`Self::list`], which orders by
+    /// `created_at` for keyset pagination). The canonical snapshot export
+    /// (`crate::snapshot`) reads it to emit the promotable DCR-policy set
+    /// deterministically, independent of insertion time.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn list_all(&self) -> Result<Vec<DcrPolicyRecord>, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let rows = sqlx::query(
+            "SELECT id, name, primitives, \
+             (EXTRACT(EPOCH FROM created_at) * 1000000)::bigint AS created_us \
+             FROM dcr_policies \
+             WHERE tenant_id = $1 AND environment_id = $2 \
+             ORDER BY name",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        rows.iter().map(|row| self.row_to_record(row)).collect()
+    }
+
     fn row_to_record(&self, row: &PgRow) -> Result<DcrPolicyRecord, StoreError> {
         Ok(DcrPolicyRecord {
             id: DcrPolicyId::parse_in_scope(&row.get::<String, _>("id"), &self.scope)?,
@@ -5189,6 +5216,32 @@ impl ResourceServerRepo<'_> {
             None => Ok(None),
             Some(row) => Ok(Some(resource_server_from_row(&row, &self.scope)?)),
         }
+    }
+
+    /// List every resource server registered in this scope, ordered by
+    /// `audience` (issue #43). The audience is unique per environment, so this is
+    /// a total, stable order with no volatile tiebreaker: the canonical snapshot
+    /// export (`crate::snapshot`) reads it to emit the promotable resource-server
+    /// registry deterministically.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure, or if a stored row fails
+    /// to decode (an unknown token format).
+    pub async fn list(&self) -> Result<Vec<ResourceServerRecord>, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let rows = sqlx::query(
+            "SELECT id, audience, token_format, access_token_ttl_secs FROM resource_servers \
+             WHERE tenant_id = $1 AND environment_id = $2 ORDER BY audience",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        rows.iter()
+            .map(|row| resource_server_from_row(row, &self.scope))
+            .collect()
     }
 }
 

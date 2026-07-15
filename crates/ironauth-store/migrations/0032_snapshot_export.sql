@@ -1,0 +1,40 @@
+-- SPDX-License-Identifier: MIT OR Apache-2.0
+--
+-- Canonical secret-free config snapshot export (issue #43).
+--
+-- The snapshot export is a MANAGEMENT-plane read: it produces a canonical,
+-- deterministic, secret-free document of everything an environment classifies
+-- PROMOTABLE (issue #41), so it can be diffed in ordinary code review, committed
+-- to a repository, and later promoted (the flagship substrate). The promotable
+-- set today is exactly three resource types: clients, resource servers, and DCR
+-- policies (crates/ironauth-store/src/classification.rs is the single source of
+-- truth the export iterates).
+--
+-- The export runs through the control-plane repository (ironauth_control), the
+-- same role the rest of the management API uses. The control role can already
+-- SELECT the other two promotable tables:
+--
+--   * clients      -- GRANT SELECT ... TO ironauth_control (0018, DCR management)
+--   * dcr_policies -- GRANT SELECT ... TO ironauth_control (0018, DCR policies)
+--
+-- resource_servers, however, was registered as a DATA-plane-only table (0011
+-- granted SELECT/INSERT to ironauth_app alone), because at the time its only
+-- reader was the token mint. The snapshot export is the FIRST management-plane
+-- reader of the resource-server registry, so this migration grants exactly the
+-- narrow right that new reader needs and nothing more: SELECT to the control
+-- role. This is the #31 least-privilege lesson applied forward -- grant a
+-- capability when a caller for it actually exists, never pre-emptively.
+--
+-- This is a pure GRANT: no schema change, no new table, no new row-level-security
+-- obligation. resource_servers already ENABLEs and FORCEs row-level security
+-- under its (tenant, environment) isolation policy (0011), and the control role
+-- is never a superuser and never the table owner, so FORCE row-level security
+-- applies to it too: the export reads only rows in the (tenant, environment) the
+-- scoped repository binds, exactly like every other control-plane read. The grant
+-- is SELECT ONLY -- the export never writes, and the resource-server WRITE path
+-- stays the data-plane role's alone.
+--
+-- Expand-safe: adding a grant to a role removes no capability from any running
+-- binary, and no N-1 binary depends on the control role LACKING this read.
+
+GRANT SELECT ON resource_servers TO ironauth_control;

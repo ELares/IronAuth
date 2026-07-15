@@ -1022,6 +1022,78 @@
         ]
       }
     },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/config/snapshot": {
+      "get": {
+        "tags": [
+          "config-promotion"
+        ],
+        "summary": "Export the environment's canonical secret-free config snapshot.",
+        "operationId": "exportConfigSnapshot",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The canonical, deterministic, secret-free config snapshot of the environment's promotable resources (clients, resource servers, DCR policies). The document validates against the published JSON Schema at docs/snapshot/snapshot.schema.json; two exports of the same configuration are byte-identical, and no secret or key material appears in it.",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Environment not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/v1/tenants/{tenant_id}/environments/{environment_id}/dcr/initial-access-tokens": {
       "post": {
         "tags": [
@@ -4263,6 +4335,10 @@
     {
       "name": "resource-model",
       "description": "The resource-type classification catalog (promotable, runtime, environment-identity)"
+    },
+    {
+      "name": "config-promotion",
+      "description": "Canonical secret-free config snapshot export: the diffable, committable substrate the config-promotion flagship consumes"
     },
     {
       "name": "keys",
