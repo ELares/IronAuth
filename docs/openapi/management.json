@@ -1665,6 +1665,78 @@
         ]
       }
     },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/export": {
+      "get": {
+        "tags": [
+          "exit"
+        ],
+        "summary": "Export every identity of an environment as newline-delimited import records.",
+        "operationId": "exportIdentities",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The full identity export as newline-delimited JSON (application/x-ndjson): one import record per line, carrying every user's id, login handle, external id, lifecycle state, standard claims, identity traits and schema version, and the password verifier with its algorithm tag and parameters (a native Argon2id PHC string, or the imported foreign hash for a user not yet logged in). This is the exact format the streaming bulk import consumes, so it re-imports into a fresh instance losslessly with logins intact. Documented at docs/exit-guide.md.",
+            "content": {
+              "application/x-ndjson": {}
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Environment not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/v1/tenants/{tenant_id}/environments/{environment_id}/invitations": {
       "get": {
         "tags": [
@@ -2550,6 +2622,92 @@
           },
           "404": {
             "description": "Not found (absent, already revoked, or in another scope)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/migration/verify-credential": {
+      "post": {
+        "tags": [
+          "exit"
+        ],
+        "summary": "Verify a user credential for a successor system's lazy migration.",
+        "operationId": "verifyMigrationCredential",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/VerifyCredentialRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The verification verdict. On success it carries the stable subject and the user's profile (claims and traits), so the successor migrates the full identity. A wrong password, unknown account, or fenced account returns verified=false with no distinguishing oracle. Enabled and credentialed through environment-scoped config; documented at docs/exit-guide.md.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/VerifyCredentialResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid outbound verification token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The endpoint is disabled, or the environment was not found",
             "content": {
               "application/json": {
                 "schema": {
@@ -6361,6 +6519,67 @@
             "description": "Last-mutation time, milliseconds since the Unix epoch."
           }
         }
+      },
+      "VerifyCredentialRequest": {
+        "type": "object",
+        "description": "A successor system's credential-verification request (issue #58): a user's login\nhandle and the candidate password to check. Neither is ever logged; the password\nis compared only against the stored one-way verifier. No `Debug` is derived so a\nstray struct dump cannot spill the password.",
+        "required": [
+          "identifier",
+          "password"
+        ],
+        "properties": {
+          "identifier": {
+            "type": "string",
+            "description": "The login handle to verify."
+          },
+          "password": {
+            "type": "string",
+            "description": "The candidate password (never logged or echoed)."
+          }
+        }
+      },
+      "VerifyCredentialResponse": {
+        "type": "object",
+        "description": "The verdict returned to the successor (issue #58): whether the credential is\nvalid and, on success, the stable subject and the user's exportable profile. No\n`Debug` is derived so the profile (claims and traits are PII) cannot spill.",
+        "required": [
+          "verified"
+        ],
+        "properties": {
+          "profile": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/VerifyProfile",
+                "description": "The user's profile, present only on a successful verification, so the\nsuccessor can seed its own record."
+              }
+            ]
+          },
+          "subject": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The stable pseudonymous subject (the `usr_` id) of the verified user, present\nonly when `verified` is true."
+          },
+          "verified": {
+            "type": "boolean",
+            "description": "Whether the identifier plus password verified against the stored credential\nAND the account is permitted to authenticate. A wrong password, an unknown\naccount, and a fenced account (blocked, disabled, pending verification) all\nreturn `false`, with no oracle distinguishing them."
+          }
+        }
+      },
+      "VerifyProfile": {
+        "type": "object",
+        "description": "The optional profile returned alongside a successful verification (issue #58):\nthe user's standard claims and identity traits, so the successor migrates the\nfull identity, not merely the credential.",
+        "properties": {
+          "claims": {
+            "description": "The user's OIDC standard-claim document, or null when the user has none."
+          },
+          "traits": {
+            "description": "The user's identity-traits document, or null when the user has none."
+          }
+        }
       }
     },
     "securitySchemes": {
@@ -6415,6 +6634,10 @@
     {
       "name": "invitations",
       "description": "Admin user-invitation CRUD: create (provisioning a pending-verification user and a single-use, expiring, hashed-at-rest token), list, get, revoke, and resend"
+    },
+    {
+      "name": "exit",
+      "description": "The exit-friendliness covenant (issue #58): the full identity export (users, traits, states, external ids, and password hashes with their algorithm tags) in the line-delimited import format, plus the outbound lazy-migration credential-verification endpoint a successor system calls to migrate away"
     }
   ]
 }

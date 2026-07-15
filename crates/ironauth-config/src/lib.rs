@@ -423,6 +423,31 @@ pub struct AdminConfig {
     /// refused until it does.
     #[serde(default = "default_offboarding_retention_secs")]
     pub offboarding_retention_secs: u64,
+
+    /// Enable the OUTBOUND lazy-migration credential-verification endpoint (issue
+    /// #58): the mirror of IronAuth's inbound migration hook, so a SUCCESSOR system
+    /// can migrate away from IronAuth exactly as easily as IronAuth migrates off an
+    /// incumbent. When enabled, `POST .../migration/verify-credential` lets a
+    /// successor present a user's identifier plus password during its OWN lazy
+    /// migration and receive a verdict (and, on success, an optional profile), so it
+    /// upgrades users to its native store on their next login without a password
+    /// reset. The SAFE default (`false`) leaves the endpoint returning a uniform
+    /// not-found: the exit-friendliness covenant makes the export SELF-SERVE, but
+    /// exposing a live credential-oracle to a third party is an explicit,
+    /// per-deployment opt-in. This is a promotable per-environment setting in spirit
+    /// (like the OIDC toggles); the process value is the deployment default until
+    /// per-environment overrides ride the M5 promotion pipeline.
+    pub outbound_verification_enabled: bool,
+
+    /// The shared bearer token a successor system presents to the OUTBOUND
+    /// lazy-migration verification endpoint (issue #58), as
+    /// `Authorization: Bearer <token>`. It is a DISTINCT credential from the
+    /// management operator token and any management key: it authorizes ONLY the
+    /// credential-verification endpoint, never any other management surface. Unset
+    /// (the default) leaves the endpoint unauthorized even when
+    /// `outbound_verification_enabled` is true (fail closed: no token, no access).
+    /// Use the `file`/`env` secret indirection, never a literal, outside dev mode.
+    pub outbound_verification_token: Option<Secret>,
 }
 
 /// The default tenant-offboarding retention window: 30 days in seconds (issue #46).
@@ -439,6 +464,8 @@ impl Default for AdminConfig {
             default_page_size: 50,
             allowed_regions: Vec::new(),
             offboarding_retention_secs: default_offboarding_retention_secs(),
+            outbound_verification_enabled: false,
+            outbound_verification_token: None,
         }
     }
 }

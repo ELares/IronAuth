@@ -24,6 +24,13 @@ ironauth-store.workspace = true
 # and canonicalize a policy at create time (one source of truth for the primitive
 # shape, no drift between what the admin stores and what the engine applies).
 ironauth-oidc.workspace = true
+# The full identity export (issue #58) SERIALIZES the same line-delimited record
+# format the streaming bulk import consumes, so export-to-import round-trips by
+# construction; the outbound credential-verification endpoint reuses the same
+# algorithm-tagged foreign-hash verify layer the login path does (native Argon2id
+# and every foreign scheme through one `ForeignHash`). One source of truth for both
+# the record shape and the hash dispatch, no drift between export and import.
+ironauth-import.workspace = true
 
 axum = { workspace = true, features = ["matched-path", "query", "json"] }
 tower = { workspace = true }
@@ -54,6 +61,12 @@ testing = ["ironauth-store/testing"]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 tower = { workspace = true, features = ["util"] }
 http-body-util.workspace = true
+# The exit-export round-trip test (issue #58) drives the real streaming import
+# engine to re-import an export into a fresh scope, and seeds users carrying real
+# native Argon2id and foreign bcrypt hashes so the round-trip covers both a native
+# credential and an imported foreign one. Both crates are already in the tree.
+argon2.workspace = true
+bcrypt = "0.16"
 # Database-FREE test support only: builds a LAZY pool (parses the URL, never
 # connects) so the unit tests and the router/spec contract test can construct an
 # AdminState without a database. No connection is ever opened (auth rejects at the
@@ -165,6 +178,16 @@ required-features = ["testing"]
 [[test]]
 name = "invitations"
 path = "tests/invitations.rs"
+required-features = ["testing"]
+
+# The exit-friendliness covenant (issue #58): the full identity export round-trips
+# into a fresh instance with logins working (including a user on an imported foreign
+# hash), a field-coverage test fails on an unexported user column, the export is
+# permission-gated and audited, the export core streams within a memory ceiling, and
+# the outbound credential-verification endpoint is disabled by default.
+[[test]]
+name = "export"
+path = "tests/export.rs"
 required-features = ["testing"]
 
 [lints]

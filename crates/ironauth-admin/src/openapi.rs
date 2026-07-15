@@ -74,7 +74,13 @@ use crate::views::{
                                        session-ending transitions"),
         (name = "invitations", description = "Admin user-invitation CRUD: create (provisioning a \
                                              pending-verification user and a single-use, expiring, \
-                                             hashed-at-rest token), list, get, revoke, and resend")
+                                             hashed-at-rest token), list, get, revoke, and resend"),
+        (name = "exit", description = "The exit-friendliness covenant (issue #58): the full \
+                                     identity export (users, traits, states, external ids, and \
+                                     password hashes with their algorithm tags) in the \
+                                     line-delimited import format, plus the outbound \
+                                     lazy-migration credential-verification endpoint a successor \
+                                     system calls to migrate away")
     ),
     paths(
         crate::operators::list_operators,
@@ -127,6 +133,8 @@ use crate::views::{
         crate::invitations::get_invitation,
         crate::invitations::revoke_invitation,
         crate::invitations::resend_invitation,
+        crate::export::export_identities,
+        crate::migration::verify_credential,
     ),
     components(schemas(
         ErrorBody,
@@ -182,6 +190,9 @@ use crate::views::{
         CreateInvitationRequest,
         InvitationCreatedView,
         InvitationStateChangeView,
+        crate::migration::VerifyCredentialRequest,
+        crate::migration::VerifyCredentialResponse,
+        crate::migration::VerifyProfile,
     ))
 )]
 struct ApiDoc;

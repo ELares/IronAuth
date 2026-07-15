@@ -7750,6 +7750,61 @@ pub struct UserAdminRecord {
     pub updated_at_unix_micros: i64,
 }
 
+/// A user with EVERYTHING the identity model holds, for the full exit-export
+/// (issue #58): the exit-friendliness covenant made mechanical. Unlike
+/// [`UserAdminRecord`] (which deliberately withholds credential material), this
+/// carries the one-way password verifiers and every sealed PII field OPENED, so a
+/// full export imports into a fresh instance with logins intact. It is produced
+/// ONLY by [`UserRepo::export_page`], reached ONLY through the permission-gated,
+/// audited management export path. Every timestamp is microseconds since the Unix
+/// epoch.
+///
+/// [`fmt::Debug`] is hand written and redacting: the record aggregates the most
+/// sensitive material in the system (password hashes and opened PII), so a struct
+/// dump or a `tracing` field spills only the non-secret id, state, and timestamp.
+#[derive(Clone, PartialEq, Eq)]
+pub struct UserExportRecord {
+    /// The user identifier (a `usr_` id embedding its scope).
+    pub id: UserId,
+    /// The login handle, opened from its sealed column.
+    pub identifier: String,
+    /// The lifecycle state.
+    pub state: UserState,
+    /// The external correlation id, opened, or [`None`] when unlinked.
+    pub external_id: Option<String>,
+    /// The user's OIDC standard-claim document as JSON text, opened from its sealed
+    /// column (the empty object `{}` for a user with no claims).
+    pub claims_json: String,
+    /// The user's identity-traits document as JSON text, opened from its sealed
+    /// column, or [`None`] when the user has no traits set.
+    pub traits_json: Option<String>,
+    /// The trait-schema version the traits were last validated against, or [`None`]
+    /// when there are no traits.
+    pub traits_schema_version: Option<i32>,
+    /// The native Argon2id PHC verifier string, or [`None`] when it is the unusable
+    /// sentinel (a credential-less or foreign-only account). One-way; never the
+    /// plaintext password.
+    pub password_hash: Option<String>,
+    /// The imported FOREIGN password hash (issue #55) in its canonical
+    /// algorithm-tagged string, present for a user imported with a foreign
+    /// credential that has not yet logged in, else [`None`]. One-way.
+    pub foreign_password_hash: Option<String>,
+    /// The non-secret algorithm tag of `foreign_password_hash`, or [`None`].
+    pub foreign_password_algo: Option<String>,
+    /// Creation time (the pagination key).
+    pub created_at_unix_micros: i64,
+}
+
+impl fmt::Debug for UserExportRecord {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("UserExportRecord")
+            .field("id", &self.id)
+            .field("state", &self.state)
+            .field("created_at_unix_micros", &self.created_at_unix_micros)
+            .finish_non_exhaustive()
+    }
+}
+
 /// The management-plane user list filters (issue #52): by lifecycle state, by
 /// external id, and by login handle. The external-id and identifier filters are
 /// resolved through their per-tenant blind indexes (the plaintext is never stored),
@@ -7794,6 +7849,21 @@ pub struct NewAdminUser<'a> {
     /// `bcrypt`, `scrypt`, `pbkdf2`, `argon2`, `firebase-scrypt`), or [`None`] when
     /// there is no foreign hash. Set together with the hash.
     pub foreign_password_algo: Option<&'a str>,
+    /// The user's identity-traits document (issue #53) as JSON text, or [`None`] for
+    /// a user with no traits set (the three trait columns stay NULL). Sealed at rest
+    /// under the scope's active DEK exactly like the claim document. Unlike the
+    /// self-service and admin trait-write paths ([`ActingUserRepo::set_traits`]),
+    /// this seals the document VERBATIM without re-validating it against the scope's
+    /// active trait schema: it is the streaming-import / exit-restore path (issue
+    /// #58), where the traits already validated in the SOURCE instance are restored
+    /// as-is so a round-trip is lossless even into a fresh scope that has not yet
+    /// registered a schema. Set together with [`NewAdminUser::traits_schema_version`].
+    pub traits_json: Option<&'a str>,
+    /// The trait-schema version the imported `traits_json` was last validated against
+    /// in the source instance (issue #58), preserved verbatim so a later migration
+    /// job can select identities still on an older version. [`None`] when there are
+    /// no traits.
+    pub traits_schema_version: Option<i32>,
 }
 
 /// The read-only bootstrap user repository (issue #20).
@@ -8123,6 +8193,62 @@ impl UserRepo<'_> {
         tx.commit().await?;
         Ok(row.map(|row| row.get::<String, _>("password_hash")))
     }
+
+    /// One page of the FULL identity export (issue #58), ordered by `(created_at,
+    /// id)` and starting strictly after `after`, opening every sealed field and
+    /// returning the credential material. This is the read half of the
+    /// exit-friendliness covenant: it drains a scope's live (non-tombstoned) users
+    /// one bounded page at a time, so a 100k-user export streams without ever loading
+    /// the whole set (the caller pages until a short page). It mirrors
+    /// [`UserRepo::list`]'s keyset pagination but returns [`UserExportRecord`], which
+    /// unlike [`UserAdminRecord`] carries the native and foreign password hashes and
+    /// the opened claims and traits, exactly the fields a lossless import needs.
+    ///
+    /// The native `password_hash` is normalized to [`None`] when it is the unusable
+    /// sentinel (a credential-less or foreign-only account), so the caller never
+    /// exports a non-verifier as if it were a credential.
+    ///
+    /// A soft-deleted user (`deleted_at IS NOT NULL`) is a tombstone and is excluded,
+    /// exactly as it is from every other read: a deleted identity is not exported.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Encryption`] if no master key is configured or a sealed value
+    /// cannot be opened; [`StoreError::Database`] on a persistence failure.
+    pub async fn export_page(
+        &self,
+        after: Option<&CursorPosition>,
+        limit: i64,
+    ) -> Result<Vec<UserExportRecord>, StoreError> {
+        let master = self.store.master().ok_or(StoreError::Encryption)?;
+        let (after_micros, after_id) = split_cursor(after);
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let rows = sqlx::query(
+            "SELECT id, identifier_sealed, claims_sealed, pii_dek_version, state, \
+             external_id_sealed, external_id_dek_version, \
+             traits_sealed, traits_dek_version, traits_schema_version, \
+             password_hash, foreign_password_hash, foreign_password_algo, \
+             (EXTRACT(EPOCH FROM created_at) * 1000000)::bigint AS created_us \
+             FROM users \
+             WHERE tenant_id = $1 AND environment_id = $2 AND deleted_at IS NULL \
+             AND ($3::bigint IS NULL OR (created_at, id) > \
+                  (TIMESTAMPTZ 'epoch' + ($3::text || ' microseconds')::interval, $4::text)) \
+             ORDER BY created_at, id LIMIT $5",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(after_micros)
+        .bind(after_id)
+        .bind(limit.clamp(0, MANAGEMENT_LIST_HARD_CAP + 1))
+        .fetch_all(&mut *tx)
+        .await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in &rows {
+            out.push(user_export_record_from_row(&mut tx, self.scope, master, row).await?);
+        }
+        tx.commit().await?;
+        Ok(out)
+    }
 }
 
 /// The mutating bootstrap user repository (issue #20).
@@ -8289,6 +8415,10 @@ impl ActingUserRepo<'_> {
     /// id is already taken in the scope (a 409); [`StoreError::IdempotencyConflict`]
     /// if the idempotency key is already stored; [`StoreError::Encryption`] if no
     /// master key is configured; [`StoreError::Database`] on a persistence failure.
+    // One linear seal-and-insert: the field list (identifier, claims, external id,
+    // and now traits, each sealed then bound) reads top to bottom as the column map,
+    // with no extractable logic, so the length lint is not meaningful here.
+    #[allow(clippy::too_many_lines)]
     pub async fn admin_create(
         &self,
         env: &Env,
@@ -8324,6 +8454,15 @@ impl ActingUserRepo<'_> {
         // stores NULL for both.
         let foreign_password_hash = spec.foreign_password_hash;
         let foreign_password_algo = spec.foreign_password_algo;
+        // The identity-traits document (issue #53) is sealed VERBATIM here, exactly
+        // like the claim document, when the create carries one (the streaming-import /
+        // exit-restore path, issue #58). It is deliberately NOT routed through the
+        // validating trait-write path (`set_traits`), because a lossless round-trip
+        // restores traits that already validated in the SOURCE instance as-is, even
+        // into a fresh scope with no active schema. A create without traits leaves the
+        // three columns NULL. Its recorded schema version is preserved verbatim.
+        let traits_json = spec.traits_json;
+        let traits_schema_version = spec.traits_schema_version;
         // created_at and updated_at are bound from the caller's clock read (not the
         // database clock), so the response body built before the write matches the
         // stored row exactly and paging stays deterministic under a manual clock.
@@ -8358,16 +8497,28 @@ impl ActingUserRepo<'_> {
                     .into_bytes()
                 });
                 let external_id_dek_version = external_id.map(|_| dek_version);
+                // Seal the traits document verbatim under the same active DEK when the
+                // create carries one; a traits-less create leaves all three columns NULL.
+                let traits_sealed = traits_json.map(|value| {
+                    dek.seal(
+                        env.entropy(),
+                        &user_pii_seal_aad(scope, USER_TRAITS_PURPOSE, dek_version),
+                        value.as_bytes(),
+                    )
+                    .into_bytes()
+                });
+                let traits_dek_version = traits_json.map(|_| dek_version);
                 let result = sqlx::query(
                     "INSERT INTO users \
                      (id, tenant_id, environment_id, identifier_bidx, identifier_sealed, \
                       password_hash, claims_sealed, pii_dek_version, state, \
                       external_id_bidx, external_id_sealed, external_id_dek_version, \
-                      created_at, updated_at, foreign_password_hash, foreign_password_algo) \
+                      created_at, updated_at, foreign_password_hash, foreign_password_algo, \
+                      traits_sealed, traits_dek_version, traits_schema_version) \
                      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, \
                              TIMESTAMPTZ 'epoch' + ($13::text || ' microseconds')::interval, \
                              TIMESTAMPTZ 'epoch' + ($13::text || ' microseconds')::interval, \
-                             $14, $15)",
+                             $14, $15, $16, $17, $18)",
                 )
                 .bind(id.to_string())
                 .bind(scope.tenant().to_string())
@@ -8384,6 +8535,9 @@ impl ActingUserRepo<'_> {
                 .bind(now_micros)
                 .bind(foreign_password_hash)
                 .bind(foreign_password_algo)
+                .bind(traits_sealed)
+                .bind(traits_dek_version)
+                .bind(traits_schema_version)
                 .execute(&mut **tx)
                 .await;
                 match result {
@@ -8402,6 +8556,36 @@ impl ActingUserRepo<'_> {
         )
         .await?;
         Ok(id)
+    }
+
+    /// Record that a full identity EXPORT was served for this scope (issue #58),
+    /// writing one `user.export` audit row attributed to the acting principal. The
+    /// exit-friendliness covenant is OBSERVABLE, not obstructed: a bulk read of
+    /// credential material leaves an auditable trail. The row targets the environment
+    /// the export drained and records only the identity `count` in its operator-safe
+    /// `detail`, never any exported value. This is a read, so the audited write's
+    /// mutation is a no-op: the single audit row is the whole point.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn record_export_audit(&self, env: &Env, count: u64) -> Result<(), StoreError> {
+        let environment = self.scope.environment();
+        let detail = format!("exported {count} identities");
+        write_audited_detailed(
+            AuditedWrite {
+                store: self.store,
+                scope: self.scope,
+                acting: &self.acting,
+                env,
+                action: Action::UserExport,
+                target: &environment,
+            },
+            async move |_tx| Ok(()),
+            false,
+            Some(&detail),
+        )
+        .await
     }
 
     /// Update a live user's standard-claim profile through the management API (RFC
@@ -16422,6 +16606,86 @@ async fn user_admin_record_from_row(
         scheduled_offboarding_at_unix_micros: row.get("scheduled_us"),
         created_at_unix_micros: row.get("created_us"),
         updated_at_unix_micros: row.get("updated_us"),
+    })
+}
+
+/// Build a [`UserExportRecord`] from a full-export row inside the caller's scoped
+/// transaction (issue #58): open the sealed identifier, claims, external id, and
+/// traits, and carry the native and foreign password verifiers. Mirrors
+/// [`user_admin_record_from_row`] but reaches every field a lossless import needs.
+/// The native `password_hash` is normalized to [`None`] when it is the unusable
+/// sentinel, so a credential-less account never exports a non-verifier.
+async fn user_export_record_from_row(
+    tx: &mut Transaction<'_, Postgres>,
+    scope: Scope,
+    master: &MasterKey,
+    row: &PgRow,
+) -> Result<UserExportRecord, StoreError> {
+    let id = UserId::parse_in_scope(&row.get::<String, _>("id"), &scope)?;
+    let state =
+        UserState::from_wire(&row.get::<String, _>("state")).ok_or(StoreError::Encryption)?;
+    let pii_dek_version: i32 = row.get("pii_dek_version");
+    let pii_dek = fetch_dek_by_version(tx, scope, master, pii_dek_version).await?;
+    let identifier_bytes = pii_dek.open(
+        &user_pii_seal_aad(scope, USER_IDENTIFIER_PURPOSE, pii_dek_version),
+        &Sealed::from_bytes(row.get::<Vec<u8>, _>("identifier_sealed"))?,
+    )?;
+    let identifier = String::from_utf8(identifier_bytes).map_err(|_| StoreError::Encryption)?;
+    // Claims are sealed under the same row DEK version as the identifier.
+    let claims_bytes = pii_dek.open(
+        &user_pii_seal_aad(scope, USER_CLAIMS_PURPOSE, pii_dek_version),
+        &Sealed::from_bytes(row.get::<Vec<u8>, _>("claims_sealed"))?,
+    )?;
+    let claims_json = String::from_utf8(claims_bytes).map_err(|_| StoreError::Encryption)?;
+    let external_id = match (
+        row.get::<Option<Vec<u8>>, _>("external_id_sealed"),
+        row.get::<Option<i32>, _>("external_id_dek_version"),
+    ) {
+        (Some(sealed), Some(version)) => {
+            let ext_dek = fetch_dek_by_version(tx, scope, master, version).await?;
+            let bytes = ext_dek.open(
+                &user_pii_seal_aad(scope, USER_EXTERNAL_ID_PURPOSE, version),
+                &Sealed::from_bytes(sealed)?,
+            )?;
+            Some(String::from_utf8(bytes).map_err(|_| StoreError::Encryption)?)
+        }
+        _ => None,
+    };
+    // Traits are optional; the three columns are all NULL for a user with none.
+    let (traits_json, traits_schema_version) = match (
+        row.get::<Option<Vec<u8>>, _>("traits_sealed"),
+        row.get::<Option<i32>, _>("traits_dek_version"),
+        row.get::<Option<i32>, _>("traits_schema_version"),
+    ) {
+        (Some(sealed), Some(version), schema_version) => {
+            let traits_dek = fetch_dek_by_version(tx, scope, master, version).await?;
+            let bytes = traits_dek.open(
+                &user_pii_seal_aad(scope, USER_TRAITS_PURPOSE, version),
+                &Sealed::from_bytes(sealed)?,
+            )?;
+            let json = String::from_utf8(bytes).map_err(|_| StoreError::Encryption)?;
+            (Some(json), schema_version)
+        }
+        _ => (None, None),
+    };
+    let native: String = row.get("password_hash");
+    let password_hash = if native == USER_UNUSABLE_PASSWORD_HASH {
+        None
+    } else {
+        Some(native)
+    };
+    Ok(UserExportRecord {
+        id,
+        identifier,
+        state,
+        external_id,
+        claims_json,
+        traits_json,
+        traits_schema_version,
+        password_hash,
+        foreign_password_hash: row.get("foreign_password_hash"),
+        foreign_password_algo: row.get("foreign_password_algo"),
+        created_at_unix_micros: row.get("created_us"),
     })
 }
 

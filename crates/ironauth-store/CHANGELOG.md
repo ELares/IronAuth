@@ -6,6 +6,19 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Exit-friendliness covenant support (issue #58, no migration): the read and write
+  halves of the full identity export. A new `UserRepo::export_page` reads every field
+  the identity model holds one keyset-paginated, bounded page at a time (opening the
+  sealed identifier, claims, external id, and traits, and returning the native and
+  foreign password verifiers), so a 100k-user export streams without loading the
+  whole set; `UserExportRecord` is its redacting read model. `NewAdminUser` gains
+  `traits_json` / `traits_schema_version`, and `admin_create` seals a traits document
+  VERBATIM (like it seals claims, skipping schema re-validation) so the streaming
+  import restores traits losslessly even into a fresh scope with no active schema.
+  `ActingUserRepo::record_export_audit` writes the `user.export` audit row (a new
+  `Action` variant) attributed to the acting principal. Purely additive: the users
+  table already carried every column the export reads, so this needs no migration.
+
 - User invitation persistence (issue #60, migration 0040, expand): the one new
   piece of durable state the admin-initiated invitation flow needs, a tenant-scoped
   `user_invitations` table with RLS forced and the (tenant, environment) isolation

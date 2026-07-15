@@ -46,11 +46,13 @@ mod config;
 mod dcr;
 mod environments;
 mod error;
+mod export;
 mod hash;
 mod idempotency;
 mod input;
 mod invitations;
 mod keys;
+mod migration;
 mod openapi;
 mod operators;
 mod organizations;
@@ -151,6 +153,22 @@ pub fn management_router(state: AdminState) -> Router {
         .route(
             "/v1/tenants/{tenant_id}/environments/{environment_id}/config/snapshot",
             get(config::export_config_snapshot),
+        )
+        // Full identity export (issue #58): the exit-friendliness covenant. A static
+        // suffix, matched before the parameterized keys/organizations routes. Streams
+        // every identity as the line-delimited import format, permission-gated and
+        // audited.
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/export",
+            get(export::export_identities),
+        )
+        // Outbound lazy-migration credential verification (issue #58): the mirror of
+        // the inbound migration hook, so a successor system can migrate away. A static
+        // suffix; disabled by default and gated by an environment-scoped shared token
+        // (never a management key), so it does not take the management Principal.
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/migration/verify-credential",
+            post(migration::verify_credential),
         )
         // Server-side config promotion (issue #44): the write half of the flagship.
         // A dry-run PLAN and a transactional APPLY into the target environment.

@@ -120,6 +120,8 @@ struct PreparedCreate {
     id: Option<UserId>,
     external_id: Option<String>,
     claims_json: Option<String>,
+    traits_json: Option<String>,
+    traits_schema_version: Option<i32>,
     state: UserState,
     foreign_hash: Option<String>,
     foreign_algo: Option<&'static str>,
@@ -177,6 +179,11 @@ async fn create_user(
                 state: prepared.state,
                 foreign_password_hash: prepared.foreign_hash.as_deref(),
                 foreign_password_algo: prepared.foreign_algo,
+                // Traits are restored VERBATIM (issue #58): sealed as-is without
+                // re-validating against the target scope's active schema, so a full
+                // export imports losslessly even into a fresh scope with no schema.
+                traits_json: prepared.traits_json.as_deref(),
+                traits_schema_version: prepared.traits_schema_version,
             },
             created_at,
             None,
@@ -289,11 +296,20 @@ fn prepare_record(record: ImportRecord, scope: Scope) -> Result<PreparedCreate, 
         ),
         Some(_) => return Err("claims must be a JSON object".to_owned()),
     };
+    let traits_json = match record.traits {
+        None => None,
+        Some(ref value) if value.is_object() => Some(
+            serde_json::to_string(value).map_err(|_| "traits are not serializable".to_owned())?,
+        ),
+        Some(_) => return Err("traits must be a JSON object".to_owned()),
+    };
     Ok(PreparedCreate {
         identifier: record.identifier,
         id,
         external_id: record.external_id,
         claims_json,
+        traits_json,
+        traits_schema_version: record.traits_schema_version,
         state,
         foreign_hash,
         foreign_algo,

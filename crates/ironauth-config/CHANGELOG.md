@@ -6,6 +6,14 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- `[admin]` outbound lazy-migration verification settings (issue #58), DISABLED BY
+  DEFAULT. `admin.outbound_verification_enabled` (default false) leaves the outbound
+  credential-verification endpoint a uniform not-found; `admin.outbound_verification_token`
+  (unset by default, via the `file`/`env` secret indirection) is the shared bearer a
+  successor system presents, a credential distinct from the operator token and every
+  management key that authorizes ONLY that endpoint. Exposing a live credential oracle
+  to a third party is an explicit per-deployment opt-in.
+
 - `[byok]`: bring-your-own-key customer-managed encryption settings (issue #49),
   EXPERIMENTAL and DEFAULT-OFF. `byok.enabled` (default false) leaves every BYOK
   path unreachable; `byok.provider` (default `local`) selects the key-management

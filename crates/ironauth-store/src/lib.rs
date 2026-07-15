@@ -157,8 +157,8 @@ pub use repository::{
     SigningKeyRecord, SigningKeyRepo, StoredIdempotentResponse, TenantRecord, TenantRepo,
     TenantStatus, TokenFormat, TokenKind, TokenStatus, TraitJobKind, TraitJobStatus,
     TraitMigrationJob, TraitMigrationJobRepo, TraitSchemaRepo, TraitSchemaVersion, UserAdminRecord,
-    UserListFilter, UserRecord, UserRepo, UserRevocation, UserState, device_code_digest,
-    invitation_token_digest, mint_invitation_token, mint_invitation_token_for,
+    UserExportRecord, UserListFilter, UserRecord, UserRepo, UserRevocation, UserState,
+    device_code_digest, invitation_token_digest, mint_invitation_token, mint_invitation_token_for,
     opaque_access_token_digest, refresh_token_digest, user_code_hash,
 };
 pub use scope::Scope;

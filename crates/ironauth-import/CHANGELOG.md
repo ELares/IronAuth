@@ -6,6 +6,14 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Export side of the record format (issue #58): `ImportRecord` now also derives
+  `Serialize`, and `to_record_line` writes exactly what `parse_record_line` reads, so
+  the full identity export (in `ironauth-admin`) produces the same line-delimited
+  format the import consumes and a round-trip is lossless by construction. The record
+  gains optional `traits` and `traits_schema_version` fields; the engine restores
+  traits VERBATIM through the extended `admin_create`, so an export re-import carries
+  a user's identity traits, not only the credential.
+
 - New crate: streaming bulk user import with foreign password-hash support (issue
   #55). IronAuth's migration on-ramp, published as its own semver-versioned crate
   (the passwap pattern): the hash-scheme layer earns outside review of exactly the

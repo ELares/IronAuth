@@ -63,10 +63,43 @@ impl Harness {
         Self { db, router }
     }
 
+    /// Start a fresh database and router with the OUTBOUND lazy-migration
+    /// credential-verification endpoint enabled and its shared token set (issue
+    /// #58). `token` is the bearer a successor system presents; `None` leaves the
+    /// endpoint enabled but unauthorized (fail-closed testing).
+    pub async fn start_with_outbound_verification(token: Option<&str>) -> Self {
+        let db = TestDatabase::start().await;
+        let config = AdminConfig {
+            bootstrap_operator_token: Some(Secret::Literal(SecretString::new(OPERATOR_TOKEN))),
+            max_page_size: 200,
+            default_page_size: 50,
+            outbound_verification_enabled: true,
+            outbound_verification_token: token
+                .map(|value| Secret::Literal(SecretString::new(value))),
+            ..AdminConfig::default()
+        };
+        let state = AdminState::new(db.control_store().clone(), Env::system(), &config)
+            .expect("admin state builds");
+        let router = management_router(state);
+        Self { db, router }
+    }
+
     /// The control-plane store behind the router, for verifying audit rows.
     #[must_use]
     pub fn control_store(&self) -> &Store {
         self.db.control_store()
+    }
+
+    /// The data-plane store behind the router, for seeding data-plane rows.
+    #[must_use]
+    pub fn store(&self) -> &Store {
+        self.db.store()
+    }
+
+    /// A stable test audit actor, for seeding rows through an acting repository.
+    #[must_use]
+    pub fn test_actor(&self, env: &Env) -> ironauth_store::ActorRef {
+        self.db.test_actor(env)
     }
 
     /// A fresh data-plane scope (tenant + environment), for seeding a data-plane row

@@ -57,6 +57,23 @@
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
+        },
+        "outbound_verification_enabled": {
+          "default": false,
+          "description": "Enable the OUTBOUND lazy-migration credential-verification endpoint (issue\n#58): the mirror of IronAuth's inbound migration hook, so a SUCCESSOR system\ncan migrate away from IronAuth exactly as easily as IronAuth migrates off an\nincumbent. When enabled, `POST .../migration/verify-credential` lets a\nsuccessor present a user's identifier plus password during its OWN lazy\nmigration and receive a verdict (and, on success, an optional profile), so it\nupgrades users to its native store on their next login without a password\nreset. The SAFE default (`false`) leaves the endpoint returning a uniform\nnot-found: the exit-friendliness covenant makes the export SELF-SERVE, but\nexposing a live credential-oracle to a third party is an explicit,\nper-deployment opt-in. This is a promotable per-environment setting in spirit\n(like the OIDC toggles); the process value is the deployment default until\nper-environment overrides ride the M5 promotion pipeline.",
+          "type": "boolean"
+        },
+        "outbound_verification_token": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Secret"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "The shared bearer token a successor system presents to the OUTBOUND\nlazy-migration verification endpoint (issue #58), as\n`Authorization: Bearer <token>`. It is a DISTINCT credential from the\nmanagement operator token and any management key: it authorizes ONLY the\ncredential-verification endpoint, never any other management surface. Unset\n(the default) leaves the endpoint unauthorized even when\n`outbound_verification_enabled` is true (fail closed: no token, no access).\nUse the `file`/`env` secret indirection, never a literal, outside dev mode."
         }
       },
       "type": "object"
@@ -801,7 +818,9 @@
         "control_database_url": null,
         "default_page_size": 50,
         "max_page_size": 200,
-        "offboarding_retention_secs": 2592000
+        "offboarding_retention_secs": 2592000,
+        "outbound_verification_enabled": false,
+        "outbound_verification_token": null
       },
       "description": "Management API settings (issue #11)."
     },

@@ -23,3 +23,16 @@ pub fn json(status: StatusCode, body: String) -> Response {
 pub fn no_content() -> Response {
     StatusCode::NO_CONTENT.into_response()
 }
+
+/// A newline-delimited JSON (`application/x-ndjson`) response with a pre-built
+/// body: one JSON record per line, the format the full identity export (issue #58)
+/// serves and the streaming bulk import consumes. An empty body (no records) is a
+/// valid `200`.
+#[must_use]
+pub fn ndjson(status: StatusCode, body: String) -> Response {
+    Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, "application/x-ndjson")
+        .body(body.into())
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
