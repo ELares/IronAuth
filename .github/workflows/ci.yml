@@ -167,6 +167,8 @@ jobs:
         run: scripts/dash-scan.sh
       - name: discovery scan (no static discovery JSON; generated at serve time)
         run: scripts/discovery-scan.sh
+      - name: rfc9700 scan (every OAuth endpoint bound to a conformance test)
+        run: scripts/rfc9700-scan.sh
       - name: conformance harness static checks (results gate, matrix, digest pins, plan config, downgrade confinement)
         # THIS is the conformance enforcement that is real today. It is always-on,
         # runner-independent, gated by NO repository variable, and required on

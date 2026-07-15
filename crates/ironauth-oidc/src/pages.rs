@@ -15,8 +15,9 @@
 //! - `X-Frame-Options: DENY` alongside `frame-ancestors 'none'`, so a legacy
 //!   browser that ignores the CSP directive still refuses to frame the page
 //!   (clickjacking defense in depth);
-//! - `Referrer-Policy: no-referrer`, so an authorization URL (which can carry
-//!   request parameters) never leaks through the `Referer` header;
+//! - `Referrer-Policy: same-origin` (see [`PAGE_REFERRER_POLICY`]), so an
+//!   authorization URL (which can carry request parameters) never leaks through the
+//!   `Referer` header to any CROSS-ORIGIN destination;
 //! - `X-Content-Type-Options: nosniff` and `Cache-Control: no-store`.
 //!
 //! # Escaping
@@ -46,6 +47,31 @@ use crate::hints::InteractionHints;
 /// `base-uri 'none'` refuses a `<base>` override.
 const CONTENT_SECURITY_POLICY: &str =
     "default-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'";
+
+/// The referrer policy every bootstrap PAGE carries.
+///
+/// `same-origin` sends a `Referer` only to THIS origin and NOTHING at all
+/// cross-origin, so it preserves the exact property the pages need: an authorization
+/// URL (which carries `state`, `nonce`, and the `redirect_uri`) is never disclosed to
+/// a third party.
+///
+/// It is deliberately NOT `no-referrer`. Per the Fetch standard ("append a request
+/// `Origin` header"), a request whose method is neither `GET` nor `HEAD` and whose
+/// mode is not `cors` (exactly a same-origin HTML form POST) has its serialized
+/// origin set to `null` when the document's referrer policy is `no-referrer`. Every
+/// login, registration, consent, and device-approval POST would then arrive with the
+/// opaque `Origin: null`, which the CSRF allowlist
+/// ([`crate::interaction::same_origin_ok`]) cannot distinguish from a hostile
+/// submission: a real browser would be 403-ed on every form. `same-origin` keeps a
+/// real, checkable `Origin` on the same-origin POST while still stripping the
+/// `Referer` from every cross-origin request.
+///
+/// The CODE-CARRYING responses are a different seam and keep `no-referrer`: the
+/// query-mode authorization redirect ([`crate::response`]), the `form_post`
+/// interstitial ([`form_post_response`]), and the interaction redirects
+/// ([`crate::interaction::redirect`]) never host a form that posts back to us, so
+/// nothing there depends on an `Origin`, and the strictest policy is free.
+const PAGE_REFERRER_POLICY: &str = "same-origin";
 
 /// HTML-escape a string for safe interpolation into element text or a
 /// double-quoted attribute value. Escapes the five characters that can break out
@@ -78,7 +104,7 @@ pub fn secure_html(status: StatusCode, body: String) -> Response {
             (header::CONTENT_TYPE, "text/html; charset=utf-8"),
             (header::CONTENT_SECURITY_POLICY, CONTENT_SECURITY_POLICY),
             (header::X_FRAME_OPTIONS, "DENY"),
-            (header::REFERRER_POLICY, "no-referrer"),
+            (header::REFERRER_POLICY, PAGE_REFERRER_POLICY),
             (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
             (header::CACHE_CONTROL, "no-store"),
         ],
@@ -258,7 +284,7 @@ pub fn device_verify_html(status: StatusCode, body: String) -> Response {
             (header::CONTENT_TYPE, "text/html; charset=utf-8"),
             (header::CONTENT_SECURITY_POLICY, DEVICE_VERIFY_CSP),
             (header::X_FRAME_OPTIONS, "DENY"),
-            (header::REFERRER_POLICY, "no-referrer"),
+            (header::REFERRER_POLICY, PAGE_REFERRER_POLICY),
             (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
             (header::CACHE_CONTROL, "no-store"),
         ],
@@ -521,7 +547,37 @@ mod tests {
             "nosniff"
         );
         assert_eq!(headers.get(header::CACHE_CONTROL).unwrap(), "no-store");
-        assert_eq!(headers.get(header::REFERRER_POLICY).unwrap(), "no-referrer");
+        assert_eq!(headers.get(header::REFERRER_POLICY).unwrap(), "same-origin");
+    }
+
+    #[test]
+    fn form_hosting_pages_keep_a_real_origin_while_code_carriers_send_no_referrer() {
+        // A form-hosting PAGE must NOT be no-referrer: under that policy a browser
+        // serializes the origin of the form POST as the opaque `null` (Fetch), and the
+        // CSRF allowlist cannot tell that apart from a hostile submission. `same-origin`
+        // keeps the Referer off every cross-origin request (the property the policy is
+        // there for) while preserving a checkable Origin on the same-origin POST.
+        for page in [
+            secure_html(StatusCode::OK, "<form></form>".to_owned()),
+            device_verify_html(StatusCode::OK, "<form></form>".to_owned()),
+        ] {
+            let policy = page.headers().get(header::REFERRER_POLICY).unwrap();
+            assert_eq!(
+                policy, "same-origin",
+                "a form-hosting page keeps its Origin"
+            );
+            assert_ne!(policy, "no-referrer");
+        }
+
+        // The CODE-CARRYING form_post interstitial hosts a form that posts to the
+        // CLIENT, never back to us, so nothing depends on an Origin: it keeps the
+        // strictest policy.
+        let carrier = form_post_response("https://client.test/cb", &[("code", Some("ac_1"))]);
+        assert_eq!(
+            carrier.headers().get(header::REFERRER_POLICY).unwrap(),
+            "no-referrer",
+            "a code-carrying response stays no-referrer"
+        );
     }
 
     #[test]

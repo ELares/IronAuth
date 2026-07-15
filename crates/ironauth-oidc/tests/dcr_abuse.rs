@@ -421,7 +421,7 @@ async fn quarantine_forces_consent_even_with_skip_consent_until_verified() {
         enc(REDIRECT_URI)
     );
     let (status, headers, body) = h.authorize_with_cookie(&query, &cookie).await;
-    assert_eq!(status, StatusCode::FOUND, "{body}");
+    assert_eq!(status, StatusCode::SEE_OTHER, "{body}");
     assert!(
         location_param(&headers, "code").is_none(),
         "a quarantined client must not skip consent: no code is issued while quarantined"
@@ -437,7 +437,7 @@ async fn quarantine_forces_consent_even_with_skip_consent_until_verified() {
     let subject2 = h.seed_unique_user().await;
     let cookie2 = h.session_cookie(&subject2).await;
     let (status, headers, body) = h.authorize_with_cookie(&query, &cookie2).await;
-    assert_eq!(status, StatusCode::FOUND, "{body}");
+    assert_eq!(status, StatusCode::SEE_OTHER, "{body}");
     assert!(
         location_param(&headers, "code").is_some(),
         "a verified client with skip_consent skips consent and issues a code"
@@ -493,7 +493,7 @@ async fn quarantine_restricts_redirects_to_https_until_verified() {
     let (status, headers, body) = authorize(https, &cookie).await;
     assert_eq!(
         status,
-        StatusCode::FOUND,
+        StatusCode::SEE_OTHER,
         "an https redirect passes the quarantine restriction and reaches consent: {body}"
     );
     assert!(
@@ -527,7 +527,11 @@ async fn quarantine_restricts_redirects_to_https_until_verified() {
     h.grant_consent(&subject3, &client_id).await;
     let cookie3 = h.session_cookie(&subject3).await;
     let (status, headers, body) = authorize(loopback, &cookie3).await;
-    assert_eq!(status, StatusCode::FOUND, "loopback after verify: {body}");
+    assert_eq!(
+        status,
+        StatusCode::SEE_OTHER,
+        "loopback after verify: {body}"
+    );
     assert!(
         location_param(&headers, "code").is_some(),
         "verification lifts the redirect restriction"
@@ -596,7 +600,7 @@ async fn a_quarantined_client_reprompts_consent_even_with_a_prior_recorded_conse
     );
     let cookie = h.session_cookie(&subject).await;
     let (status, headers, body) = h.authorize_with_cookie(&query, &cookie).await;
-    assert_eq!(status, StatusCode::FOUND, "{body}");
+    assert_eq!(status, StatusCode::SEE_OTHER, "{body}");
     assert!(
         location_param(&headers, "code").is_none(),
         "a quarantined client re-prompts consent even with a prior recorded consent"
@@ -610,7 +614,7 @@ async fn a_quarantined_client_reprompts_consent_even_with_a_prior_recorded_conse
     );
     let cookie2 = h.session_cookie(&subject).await;
     let (status, headers, body) = h.authorize_with_cookie(&query, &cookie2).await;
-    assert_eq!(status, StatusCode::FOUND, "{body}");
+    assert_eq!(status, StatusCode::SEE_OTHER, "{body}");
     assert!(
         location_param(&headers, "code").is_some(),
         "after verify, the recorded consent authorizes the request (fast path restored)"

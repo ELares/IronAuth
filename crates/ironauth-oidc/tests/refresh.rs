@@ -513,7 +513,7 @@ async fn offline_access_on_a_web_client_requires_explicit_consent() {
     // Requesting offline_access on top is NOT covered: re-prompt to consent.
     let (status, loc, code) =
         authorize_scope(&harness, &client_id, "openid offline_access", &cookie).await;
-    assert_eq!(status, StatusCode::FOUND);
+    assert_eq!(status, StatusCode::SEE_OTHER);
     assert!(
         code.is_none(),
         "no code is issued without offline_access consent"
@@ -531,7 +531,7 @@ async fn offline_access_on_a_web_client_requires_explicit_consent() {
     let cookie = harness.session_cookie(&consented).await;
     let (status, _loc, code) =
         authorize_scope(&harness, &client_id, "openid offline_access", &cookie).await;
-    assert_eq!(status, StatusCode::FOUND);
+    assert_eq!(status, StatusCode::SEE_OTHER);
     assert!(
         code.is_some(),
         "a covering offline_access consent issues the code"
@@ -556,7 +556,7 @@ async fn a_trusted_first_party_client_skips_offline_access_consent() {
     let cookie = harness.session_cookie(&subject).await;
     let (status, _loc, code) =
         authorize_scope(&harness, &client_id, "openid offline_access", &cookie).await;
-    assert_eq!(status, StatusCode::FOUND);
+    assert_eq!(status, StatusCode::SEE_OTHER);
     assert!(
         code.is_some(),
         "a first-party client is auto-granted, offline_access included"
@@ -578,7 +578,7 @@ async fn consent_mode_explicit_prompts_and_implicit_auto_grants_with_the_store_k
     let subject = harness.seed_unique_user().await;
     let cookie = harness.session_cookie(&subject).await;
     let (status, loc, code) = authorize_scope(&harness, &explicit_id, "openid", &cookie).await;
-    assert_eq!(status, StatusCode::FOUND);
+    assert_eq!(status, StatusCode::SEE_OTHER);
     assert!(code.is_none(), "explicit mode prompts");
     assert!(loc.starts_with("/consent?return_to="), "to consent: {loc}");
 
@@ -594,7 +594,7 @@ async fn consent_mode_explicit_prompts_and_implicit_auto_grants_with_the_store_k
     let cookie = harness.session_cookie(&subject).await;
     let (status, _loc, code) =
         authorize_scope(&harness, &implicit_store_id, "openid", &cookie).await;
-    assert_eq!(status, StatusCode::FOUND);
+    assert_eq!(status, StatusCode::SEE_OTHER);
     assert!(code.is_some(), "implicit mode auto-grants");
     assert!(
         harness
@@ -621,7 +621,7 @@ async fn consent_mode_explicit_prompts_and_implicit_auto_grants_with_the_store_k
     let cookie = harness.session_cookie(&subject).await;
     let (status, _loc, code) =
         authorize_scope(&harness, &implicit_nostore_id, "openid", &cookie).await;
-    assert_eq!(status, StatusCode::FOUND);
+    assert_eq!(status, StatusCode::SEE_OTHER);
     assert!(
         code.is_some(),
         "implicit mode auto-grants even without storing"
@@ -661,13 +661,13 @@ async fn a_remembered_consent_lapses_after_its_ttl() {
 
     // Within the TTL: the remembered consent covers the request, so a code issues.
     let (status, _loc, code) = authorize_scope(&harness, &client_id, "openid", &cookie).await;
-    assert_eq!(status, StatusCode::FOUND);
+    assert_eq!(status, StatusCode::SEE_OTHER);
     assert!(code.is_some(), "a live remembered consent issues the code");
 
     // Past the TTL: the consent has lapsed, so the next authorization re-prompts.
     harness.clock().advance(Duration::from_secs(200));
     let (status, loc, code) = authorize_scope(&harness, &client_id, "openid", &cookie).await;
-    assert_eq!(status, StatusCode::FOUND);
+    assert_eq!(status, StatusCode::SEE_OTHER);
     assert!(code.is_none(), "an expired remembered consent re-prompts");
     assert!(loc.starts_with("/consent?return_to="), "to consent: {loc}");
 }

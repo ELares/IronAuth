@@ -1111,7 +1111,7 @@ impl Harness {
             enc(REDIRECT_URI)
         );
         let (status, headers, body) = self.authorize_with_cookie(&query, &cookie).await;
-        assert_eq!(status, StatusCode::FOUND, "authorize: {body}");
+        assert_eq!(status, StatusCode::SEE_OTHER, "authorize: {body}");
         location_param(&headers, "code").expect("code in redirect")
     }
 
@@ -1376,7 +1376,7 @@ impl Harness {
             enc(REDIRECT_URI)
         );
         let (status, headers, body) = self.authorize_with_cookie(&query, &cookie).await;
-        assert_eq!(status, StatusCode::FOUND, "authorize: {body}");
+        assert_eq!(status, StatusCode::SEE_OTHER, "authorize: {body}");
         location_param(&headers, "code").expect("code in redirect")
     }
 

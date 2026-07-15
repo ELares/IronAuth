@@ -54,7 +54,7 @@ async fn prompt_none_with_no_session_returns_login_required_through_the_response
     let (status, headers, body) = harness
         .authorize(&authorize_query(&client_id, &["prompt=none"]))
         .await;
-    assert_eq!(status, StatusCode::FOUND, "error redirect: {body}");
+    assert_eq!(status, StatusCode::SEE_OTHER, "error redirect: {body}");
     let loc = location(&headers).expect("location");
     assert!(
         loc.starts_with(REDIRECT_URI),
@@ -84,7 +84,7 @@ async fn prompt_none_without_consent_returns_consent_required() {
     let (status, headers, _) = harness
         .authorize_with_cookie(&authorize_query(&client_id, &["prompt=none"]), &cookie)
         .await;
-    assert_eq!(status, StatusCode::FOUND);
+    assert_eq!(status, StatusCode::SEE_OTHER);
     assert_eq!(
         location_param(&headers, "error").as_deref(),
         Some("consent_required"),
@@ -112,7 +112,7 @@ async fn prompt_none_with_a_narrower_recorded_consent_returns_consent_required()
     let (status, headers, body) = harness
         .authorize_with_cookie(&authorize_query(&client_id, &["prompt=none"]), &cookie)
         .await;
-    assert_eq!(status, StatusCode::FOUND, "error redirect: {body}");
+    assert_eq!(status, StatusCode::SEE_OTHER, "error redirect: {body}");
     let loc = location(&headers).expect("location");
     assert!(
         loc.starts_with(REDIRECT_URI),
@@ -140,7 +140,7 @@ async fn prompt_none_with_session_and_consent_issues_the_code() {
     let (status, headers, body) = harness
         .authorize_with_cookie(&authorize_query(&client_id, &["prompt=none"]), &cookie)
         .await;
-    assert_eq!(status, StatusCode::FOUND, "code redirect: {body}");
+    assert_eq!(status, StatusCode::SEE_OTHER, "code redirect: {body}");
     let loc = location(&headers).expect("location");
     assert!(loc.starts_with(REDIRECT_URI), "code to redirect_uri: {loc}");
     assert!(
@@ -161,7 +161,7 @@ async fn prompt_login_re_authenticates_despite_a_valid_session() {
     let (status, headers, _) = harness
         .authorize_with_cookie(&authorize_query(&client_id, &["prompt=login"]), &cookie)
         .await;
-    assert_eq!(status, StatusCode::FOUND);
+    assert_eq!(status, StatusCode::SEE_OTHER);
     let loc = location(&headers).expect("location");
     assert!(
         loc.starts_with("/login?return_to="),
@@ -180,7 +180,7 @@ async fn prompt_consent_re_prompts_even_when_consent_is_recorded() {
     let (status, headers, _) = harness
         .authorize_with_cookie(&authorize_query(&client_id, &["prompt=consent"]), &cookie)
         .await;
-    assert_eq!(status, StatusCode::FOUND);
+    assert_eq!(status, StatusCode::SEE_OTHER);
     let loc = location(&headers).expect("location");
     assert!(
         loc.starts_with("/consent?return_to="),
@@ -206,7 +206,7 @@ async fn prompt_login_round_trip_issues_a_code_and_does_not_loop() {
     let (status, headers, _) = harness
         .authorize_with_cookie(&authorize_query(&client_id, &["prompt=login"]), &cookie)
         .await;
-    assert_eq!(status, StatusCode::FOUND);
+    assert_eq!(status, StatusCode::SEE_OTHER);
     let login_location = location(&headers).expect("login redirect");
     assert!(
         login_location.starts_with("/login?return_to="),
@@ -222,13 +222,13 @@ async fn prompt_login_round_trip_issues_a_code_and_does_not_loop() {
         ("return_to", &return_to),
     ]);
     let (status, headers, body) = harness.post_form("/login", &login_body, None).await;
-    assert_eq!(status, StatusCode::FOUND, "login post: {body}");
+    assert_eq!(status, StatusCode::SEE_OTHER, "login post: {body}");
     let fresh_cookie = set_cookie_pair(&headers).expect("fresh session cookie");
     let resume = location(&headers).expect("resume after login");
 
     // 3. The resumed authorize ISSUES THE CODE (it does not loop back to /login).
     let (status, headers, _) = harness.get_with_cookie(&resume, Some(&fresh_cookie)).await;
-    assert_eq!(status, StatusCode::FOUND);
+    assert_eq!(status, StatusCode::SEE_OTHER);
     let final_location = location(&headers).expect("final redirect");
     assert!(
         final_location.starts_with(REDIRECT_URI) && location_param(&headers, "code").is_some(),
@@ -252,7 +252,7 @@ async fn prompt_consent_round_trip_issues_a_code_and_does_not_loop() {
     let (status, headers, _) = harness
         .authorize_with_cookie(&authorize_query(&client_id, &["prompt=consent"]), &cookie)
         .await;
-    assert_eq!(status, StatusCode::FOUND);
+    assert_eq!(status, StatusCode::SEE_OTHER);
     let consent_location = location(&headers).expect("consent redirect");
     assert!(
         consent_location.starts_with("/consent?return_to="),
@@ -268,12 +268,12 @@ async fn prompt_consent_round_trip_issues_a_code_and_does_not_loop() {
     let (status, headers, body) = harness
         .post_form("/consent", &consent_body, Some(&cookie))
         .await;
-    assert_eq!(status, StatusCode::FOUND, "consent post: {body}");
+    assert_eq!(status, StatusCode::SEE_OTHER, "consent post: {body}");
     let resume = location(&headers).expect("resume after consent");
 
     // 3. The resumed authorize ISSUES THE CODE (no loop back to /consent).
     let (status, headers, _) = harness.get_with_cookie(&resume, Some(&cookie)).await;
-    assert_eq!(status, StatusCode::FOUND);
+    assert_eq!(status, StatusCode::SEE_OTHER);
     assert!(
         location_param(&headers, "code").is_some(),
         "prompt=consent completes after one re-consent, not a loop: {:?}",
@@ -301,7 +301,7 @@ async fn max_age_zero_round_trip_completes_under_an_advancing_clock() {
     let (status, headers, _) = harness
         .authorize_with_cookie(&authorize_query(&client_id, &["max_age=0"]), &cookie)
         .await;
-    assert_eq!(status, StatusCode::FOUND);
+    assert_eq!(status, StatusCode::SEE_OTHER);
     let login_location = location(&headers).expect("login redirect");
     assert!(
         login_location.starts_with("/login?return_to="),
@@ -318,7 +318,7 @@ async fn max_age_zero_round_trip_completes_under_an_advancing_clock() {
         ("return_to", &return_to),
     ]);
     let (status, headers, body) = harness.post_form("/login", &login_body, None).await;
-    assert_eq!(status, StatusCode::FOUND, "login post: {body}");
+    assert_eq!(status, StatusCode::SEE_OTHER, "login post: {body}");
     let fresh_cookie = set_cookie_pair(&headers).expect("fresh session cookie");
     let resume = location(&headers).expect("resume after login");
     // The resume consumed max_age and carries the emit_auth_time marker.
@@ -335,7 +335,7 @@ async fn max_age_zero_round_trip_completes_under_an_advancing_clock() {
     //    ISSUES THE CODE rather than looping back to /login.
     harness.clock().advance(Duration::from_secs(1));
     let (status, headers, _) = harness.get_with_cookie(&resume, Some(&fresh_cookie)).await;
-    assert_eq!(status, StatusCode::FOUND);
+    assert_eq!(status, StatusCode::SEE_OTHER);
     let code = location_param(&headers, "code").expect("code issued, not a loop");
 
     // 4. The ID token still carries auth_time (max_age required it).
@@ -383,7 +383,7 @@ async fn max_age_zero_forces_reauth_but_absent_max_age_does_not() {
     let (status, headers, _) = harness
         .authorize_with_cookie(&authorize_query(&client_id, &["max_age=0"]), &cookie)
         .await;
-    assert_eq!(status, StatusCode::FOUND);
+    assert_eq!(status, StatusCode::SEE_OTHER);
     let loc = location(&headers).expect("location");
     assert!(
         loc.starts_with("/login?return_to="),
@@ -394,7 +394,7 @@ async fn max_age_zero_forces_reauth_but_absent_max_age_does_not() {
     let (status, headers, _) = harness
         .authorize_with_cookie(&authorize_query(&client_id, &[]), &cookie)
         .await;
-    assert_eq!(status, StatusCode::FOUND);
+    assert_eq!(status, StatusCode::SEE_OTHER);
     assert!(
         location_param(&headers, "code").is_some(),
         "an absent max_age never forces re-auth"
@@ -404,7 +404,7 @@ async fn max_age_zero_forces_reauth_but_absent_max_age_does_not() {
     let (status, headers, _) = harness
         .authorize_with_cookie(&authorize_query(&client_id, &["max_age=3600"]), &cookie)
         .await;
-    assert_eq!(status, StatusCode::FOUND);
+    assert_eq!(status, StatusCode::SEE_OTHER);
     assert!(
         location_param(&headers, "code").is_some(),
         "a session younger than max_age is not stale"
@@ -420,7 +420,7 @@ async fn max_age_zero_with_no_session_is_login_required_under_prompt_none() {
     let (status, headers, _) = harness
         .authorize(&authorize_query(&client_id, &["prompt=none", "max_age=0"]))
         .await;
-    assert_eq!(status, StatusCode::FOUND);
+    assert_eq!(status, StatusCode::SEE_OTHER);
     assert_eq!(
         location_param(&headers, "error").as_deref(),
         Some("login_required"),
@@ -442,7 +442,7 @@ async fn login_hint_prefills_the_login_form() {
             &[&format!("login_hint={}", enc(hint))],
         ))
         .await;
-    assert_eq!(status, StatusCode::FOUND);
+    assert_eq!(status, StatusCode::SEE_OTHER);
     let login_location = location(&headers).expect("login redirect");
     assert!(login_location.starts_with("/login?return_to="));
 
@@ -495,7 +495,7 @@ async fn prompt_none_combined_with_login_is_invalid_request() {
             &[&format!("prompt={}", enc("none login"))],
         ))
         .await;
-    assert_eq!(status, StatusCode::FOUND);
+    assert_eq!(status, StatusCode::SEE_OTHER);
     assert_eq!(
         location_param(&headers, "error").as_deref(),
         Some("invalid_request"),
@@ -523,7 +523,7 @@ async fn an_essential_acr_no_method_can_meet_is_unmet_authentication_requirement
             &cookie,
         )
         .await;
-    assert_eq!(status, StatusCode::FOUND);
+    assert_eq!(status, StatusCode::SEE_OTHER);
     assert_eq!(
         location_param(&headers, "error").as_deref(),
         Some("unmet_authentication_requirements"),
@@ -553,7 +553,7 @@ async fn a_voluntary_unsatisfiable_acr_values_still_issues_the_code() {
             &cookie,
         )
         .await;
-    assert_eq!(status, StatusCode::FOUND);
+    assert_eq!(status, StatusCode::SEE_OTHER);
     assert!(
         location_param(&headers, "code").is_some(),
         "a voluntary acr_values never fails closed"
@@ -571,7 +571,7 @@ async fn prompt_create_still_deep_links_to_registration() {
     let (status, headers, _) = harness
         .authorize(&authorize_query(&client_id, &["prompt=create"]))
         .await;
-    assert_eq!(status, StatusCode::FOUND);
+    assert_eq!(status, StatusCode::SEE_OTHER);
     let loc = location(&headers).expect("register redirect");
     assert!(
         loc.starts_with("/register?return_to="),

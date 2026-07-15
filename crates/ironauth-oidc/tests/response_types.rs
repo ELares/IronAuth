@@ -71,7 +71,7 @@ async fn id_token_flow_returns_a_fragment_id_token_with_nonce_and_no_hashes() {
         enc(REDIRECT_URI),
     );
     let (status, headers, body) = harness.authorize_with_cookie(&query, &cookie).await;
-    assert_eq!(status, StatusCode::FOUND, "fragment redirect: {body}");
+    assert_eq!(status, StatusCode::SEE_OTHER, "fragment redirect: {body}");
 
     let location = location(&headers).expect("Location present");
     assert!(
@@ -136,7 +136,7 @@ async fn pure_id_token_emits_scope_and_claims_parameter_claims_into_the_id_token
         enc("openid email profile"),
     );
     let (status, headers, body) = harness.authorize_with_cookie(&query, &cookie).await;
-    assert_eq!(status, StatusCode::FOUND, "fragment redirect: {body}");
+    assert_eq!(status, StatusCode::SEE_OTHER, "fragment redirect: {body}");
 
     let id_token = location_fragment_param(&headers, "id_token").expect("id_token in fragment");
     let claims = verified_claims(&harness, &client_id, &id_token);
@@ -178,7 +178,7 @@ async fn hybrid_code_id_token_carries_a_correct_c_hash_and_a_redeemable_code() {
     let (status, headers, body) = harness.authorize_with_cookie(&query, &cookie).await;
     assert_eq!(
         status,
-        StatusCode::FOUND,
+        StatusCode::SEE_OTHER,
         "hybrid fragment redirect: {body}"
     );
 
@@ -240,7 +240,7 @@ async fn response_type_none_redirects_with_state_and_iss_and_issues_nothing() {
         enc(REDIRECT_URI),
     );
     let (status, headers, body) = harness.authorize_with_cookie(&query, &cookie).await;
-    assert_eq!(status, StatusCode::FOUND, "none redirect: {body}");
+    assert_eq!(status, StatusCode::SEE_OTHER, "none redirect: {body}");
     // Default mode for none is query.
     let location = location(&headers).expect("Location");
     assert!(
@@ -338,7 +338,7 @@ async fn a_legacy_type_disabled_by_default_is_unsupported_response_type() {
         enc(REDIRECT_URI),
     );
     let (status, headers, body) = harness.authorize(&query).await;
-    assert_eq!(status, StatusCode::FOUND, "error redirect: {body}");
+    assert_eq!(status, StatusCode::SEE_OTHER, "error redirect: {body}");
     assert_eq!(
         location_fragment_param(&headers, "error").as_deref(),
         Some("unsupported_response_type"),
@@ -369,7 +369,7 @@ async fn a_token_bearing_response_type_is_always_unsupported() {
             enc(REDIRECT_URI),
         );
         let (status, headers, body) = harness.authorize(&query).await;
-        assert_eq!(status, StatusCode::FOUND, "{response_type}: {body}");
+        assert_eq!(status, StatusCode::SEE_OTHER, "{response_type}: {body}");
         assert_eq!(
             location_param(&headers, "error").as_deref(),
             Some("unsupported_response_type"),
@@ -399,7 +399,7 @@ async fn a_front_channel_type_requires_nonce() {
     let (status, headers, body) = harness
         .authorize_with_cookie(&query, &harness.authenticated_cookie().await)
         .await;
-    assert_eq!(status, StatusCode::FOUND, "error redirect: {body}");
+    assert_eq!(status, StatusCode::SEE_OTHER, "error redirect: {body}");
     assert_eq!(
         location_fragment_param(&headers, "error").as_deref(),
         Some("invalid_request"),
@@ -421,7 +421,7 @@ async fn query_response_mode_is_rejected_for_a_front_channel_type() {
         enc(REDIRECT_URI),
     );
     let (status, headers, body) = harness.authorize(&query).await;
-    assert_eq!(status, StatusCode::FOUND, "error redirect: {body}");
+    assert_eq!(status, StatusCode::SEE_OTHER, "error redirect: {body}");
     assert_eq!(
         location_fragment_param(&headers, "error").as_deref(),
         Some("invalid_request"),
@@ -445,7 +445,7 @@ async fn form_post_is_rejected_when_not_enabled() {
         enc(REDIRECT_URI),
     );
     let (status, headers, body) = harness.authorize(&query).await;
-    assert_eq!(status, StatusCode::FOUND, "error redirect: {body}");
+    assert_eq!(status, StatusCode::SEE_OTHER, "error redirect: {body}");
     assert_eq!(
         location_param(&headers, "error").as_deref(),
         Some("invalid_request"),

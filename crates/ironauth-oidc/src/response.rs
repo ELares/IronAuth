@@ -99,8 +99,8 @@ pub(crate) fn append_fragment(base: &str, params: &[(&str, Option<&str>)]) -> St
 /// list (from [`success_params`] or [`error_params`]), so `iss` and every other
 /// parameter travel identically regardless of mode:
 ///
-/// - `query`: a `302` redirect with the parameters in the query string;
-/// - `fragment`: a `302` redirect with the parameters in the URL fragment (never
+/// - `query`: a `303` redirect with the parameters in the query string;
+/// - `fragment`: a `303` redirect with the parameters in the URL fragment (never
 ///   sent to a server, so a front-channel `id_token` is not logged or
 ///   `Referer`-leaked);
 /// - `form_post`: a `200` auto-submitting HTML form that posts the parameters to
@@ -147,6 +147,10 @@ mod tests {
         let error = error_params("invalid_request", "nonce is required", Some("xyz"), iss);
         assert!(has_iss(&error), "error response must carry iss");
     }
+
+    /// The RFC 9700 credential-bearing redirect status: `303`, never the legacy
+    /// `302` and never a body-preserving `307`/`308`.
+    const REDIRECT_STATUS: axum::http::StatusCode = axum::http::StatusCode::SEE_OTHER;
 
     #[test]
     fn iss_is_emitted_across_query_and_fragment_and_form_post_modes() {
@@ -201,10 +205,11 @@ mod tests {
         let iss = "https://issuer.test/t/a/e/b";
         let params = success_params(Some("ac_secret_code"), None, Some("s"), iss);
 
-        // query and fragment are 302 redirects carrying a Location.
+        // query and fragment are 303 See Other redirects carrying a Location, and
+        // the code-carrying seam sets no-store AND no-referrer (RFC 9700).
         for mode in [ResponseMode::Query, ResponseMode::Fragment] {
             let response = render(mode, "https://client.test/cb", &params);
-            assert_eq!(response.status(), axum::http::StatusCode::FOUND);
+            assert_eq!(response.status(), REDIRECT_STATUS);
             assert!(
                 response.headers().get(header::LOCATION).is_some(),
                 "{mode:?} sets a Location"
@@ -212,6 +217,10 @@ mod tests {
             assert_eq!(
                 response.headers().get(header::CACHE_CONTROL).unwrap(),
                 "no-store"
+            );
+            assert_eq!(
+                response.headers().get(header::REFERRER_POLICY).unwrap(),
+                "no-referrer"
             );
         }
 

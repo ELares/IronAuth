@@ -113,7 +113,7 @@ async fn authorize_public(
 /// resources, asserting a code is issued and returning it.
 async fn authorize_public_code(harness: &Harness, resources: &[&str]) -> String {
     let (status, headers, body) = authorize_public(harness, resources).await;
-    assert_eq!(status, StatusCode::FOUND, "authorize: {body}");
+    assert_eq!(status, StatusCode::SEE_OTHER, "authorize: {body}");
     location_param(&headers, "code").expect("code")
 }
 
@@ -127,7 +127,7 @@ async fn authorize_public_code_with_scope(harness: &Harness, resources: &[&str])
     let mut query = authorize_query(&client, resources);
     query.push_str("&scope=openid");
     let (status, headers, body) = harness.authorize_with_cookie(&query, &cookie).await;
-    assert_eq!(status, StatusCode::FOUND, "authorize: {body}");
+    assert_eq!(status, StatusCode::SEE_OTHER, "authorize: {body}");
     location_param(&headers, "code").expect("code")
 }
 
@@ -207,7 +207,7 @@ async fn multi_resource_authorization_is_narrowed_at_the_token_endpoint() {
 
     // Approve BOTH resources at authorization; redeem for a SINGLE one.
     let (status, headers, body) = authorize_public(&harness, &[RS_A, RS_B]).await;
-    assert_eq!(status, StatusCode::FOUND, "authorize: {body}");
+    assert_eq!(status, StatusCode::SEE_OTHER, "authorize: {body}");
     let code = location_param(&headers, "code").expect("code");
     let (status, _, body) = harness.token(&token_form(&code, &client, &[RS_A])).await;
     assert_eq!(status, StatusCode::OK, "token: {body}");
@@ -294,7 +294,7 @@ async fn a_resource_outside_the_client_allowlist_is_invalid_target() {
     set_policy(&harness, &client_id, Some(vec![RS_A.to_owned()]), false).await;
 
     let (status, headers, body) = authorize_public(&harness, &[RS_B]).await;
-    assert_eq!(status, StatusCode::FOUND, "authorize: {body}");
+    assert_eq!(status, StatusCode::SEE_OTHER, "authorize: {body}");
     assert_eq!(
         location_param(&headers, "error").as_deref(),
         Some("invalid_target"),
@@ -303,7 +303,7 @@ async fn a_resource_outside_the_client_allowlist_is_invalid_target() {
 
     // The allowlisted resource succeeds (a code is issued).
     let (status, headers, _) = authorize_public(&harness, &[RS_A]).await;
-    assert_eq!(status, StatusCode::FOUND);
+    assert_eq!(status, StatusCode::SEE_OTHER);
     assert!(
         location_param(&headers, "code").is_some(),
         "an allowlisted resource is accepted"
@@ -320,7 +320,7 @@ async fn a_malformed_or_fragment_resource_is_invalid_target() {
 
     // Authorization endpoint: a relative reference (no scheme).
     let (status, headers, _) = authorize_public(&harness, &["not-a-uri"]).await;
-    assert_eq!(status, StatusCode::FOUND);
+    assert_eq!(status, StatusCode::SEE_OTHER);
     assert_eq!(
         location_param(&headers, "error").as_deref(),
         Some("invalid_target")
@@ -348,7 +348,7 @@ async fn an_unregistered_resource_is_invalid_target() {
     let harness = Harness::start().await;
     // RS_A is deliberately NOT registered.
     let (status, headers, _) = authorize_public(&harness, &[RS_A]).await;
-    assert_eq!(status, StatusCode::FOUND);
+    assert_eq!(status, StatusCode::SEE_OTHER);
     assert_eq!(
         location_param(&headers, "error").as_deref(),
         Some("invalid_target")
@@ -373,7 +373,7 @@ async fn refresh_downscopes_to_a_subset_but_expansion_is_rejected() {
     let mut query = authorize_query(&client, &[RS_A, RS_B]);
     query.push_str("&scope=openid");
     let (status, headers, body) = harness.authorize_with_cookie(&query, &cookie).await;
-    assert_eq!(status, StatusCode::FOUND, "authorize: {body}");
+    assert_eq!(status, StatusCode::SEE_OTHER, "authorize: {body}");
     let code = location_param(&headers, "code").expect("code");
     let (status, _, body) = harness
         .token(&token_form(&code, &client, &[RS_A, RS_B]))
@@ -437,7 +437,7 @@ async fn opaque_token_audiences_are_reported_via_introspection() {
         enc(RS_B)
     );
     let (status, headers, body) = harness.authorize_with_cookie(&query, &cookie).await;
-    assert_eq!(status, StatusCode::FOUND, "authorize: {body}");
+    assert_eq!(status, StatusCode::SEE_OTHER, "authorize: {body}");
     let code = location_param(&headers, "code").expect("code");
     let token_body = form(&[
         ("grant_type", "authorization_code"),
@@ -478,7 +478,7 @@ async fn opaque_token_audiences_are_reported_via_introspection() {
     harness.grant_consent(&subject, &client).await;
     let cookie = harness.session_cookie(&subject).await;
     let (status, headers, body) = harness.authorize_with_cookie(&single_query, &cookie).await;
-    assert_eq!(status, StatusCode::FOUND, "authorize single: {body}");
+    assert_eq!(status, StatusCode::SEE_OTHER, "authorize single: {body}");
     let code = location_param(&headers, "code").expect("code");
     let token_body = form(&[
         ("grant_type", "authorization_code"),
@@ -513,7 +513,7 @@ async fn a_client_requiring_a_resource_refuses_a_no_resource_request() {
 
     // No resource named: refused with invalid_target.
     let (status, headers, _) = authorize_public(&harness, &[]).await;
-    assert_eq!(status, StatusCode::FOUND);
+    assert_eq!(status, StatusCode::SEE_OTHER);
     assert_eq!(
         location_param(&headers, "error").as_deref(),
         Some("invalid_target"),
@@ -522,7 +522,7 @@ async fn a_client_requiring_a_resource_refuses_a_no_resource_request() {
 
     // A resource named: accepted.
     let (status, headers, _) = authorize_public(&harness, &[RS_A]).await;
-    assert_eq!(status, StatusCode::FOUND);
+    assert_eq!(status, StatusCode::SEE_OTHER);
     assert!(location_param(&headers, "code").is_some());
 }
 
@@ -714,7 +714,7 @@ async fn a_duplicate_resource_dedups_and_a_case_variant_is_invalid_target() {
     // normalized into a match.
     let variant = "https://api.example/A";
     let (status, headers, body) = authorize_public(&harness, &[variant]).await;
-    assert_eq!(status, StatusCode::FOUND, "authorize: {body}");
+    assert_eq!(status, StatusCode::SEE_OTHER, "authorize: {body}");
     assert_eq!(
         location_param(&headers, "error").as_deref(),
         Some("invalid_target"),
@@ -795,7 +795,7 @@ async fn par_validates_resources_at_push_and_round_trips_a_valid_one() {
     let cookie = harness.session_cookie(&subject).await;
     let query = format!("client_id={client}&request_uri={}", enc(&request_uri));
     let (status, headers, body) = harness.authorize_with_cookie(&query, &cookie).await;
-    assert_eq!(status, StatusCode::FOUND, "authorize via PAR: {body}");
+    assert_eq!(status, StatusCode::SEE_OTHER, "authorize via PAR: {body}");
     let code = location_param(&headers, "code").expect("code");
     let (status, _, body) = harness.token(&token_form(&code, &client, &[])).await;
     assert_eq!(status, StatusCode::OK, "token: {body}");

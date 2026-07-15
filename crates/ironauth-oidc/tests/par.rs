@@ -82,7 +82,7 @@ async fn a_pushed_request_uri_works_exactly_once() {
     let (status, headers, body) = harness
         .authorize_with_cookie(&authorize_via_par(&client_id, &request_uri), &cookie)
         .await;
-    assert_eq!(status, StatusCode::FOUND, "authorize via PAR: {body}");
+    assert_eq!(status, StatusCode::SEE_OTHER, "authorize via PAR: {body}");
     assert!(
         location_param(&headers, "code").is_some(),
         "a code is issued for the pushed request"
@@ -179,7 +179,7 @@ async fn a_request_uri_from_client_a_is_rejected_for_client_b_and_not_burned() {
         .await;
     assert_eq!(
         status,
-        StatusCode::FOUND,
+        StatusCode::SEE_OTHER,
         "the bound client can still use the un-burned request_uri: {body}"
     );
     assert!(location_param(&headers, "code").is_some());
@@ -276,7 +276,7 @@ async fn require_par_per_client_rejects_a_plain_request_but_allows_a_pushed_one(
         .await;
     assert_eq!(
         status,
-        StatusCode::FOUND,
+        StatusCode::SEE_OTHER,
         "the pushed request is honored: {body}"
     );
     assert!(location_param(&headers, "code").is_some());
@@ -316,7 +316,7 @@ async fn the_global_require_par_switch_rejects_a_plain_request() {
         .await;
     assert_eq!(
         status,
-        StatusCode::FOUND,
+        StatusCode::SEE_OTHER,
         "the pushed request is honored: {body}"
     );
 }
@@ -467,7 +467,7 @@ async fn drive_par_login_consent(
         .await;
     assert_eq!(
         status,
-        StatusCode::FOUND,
+        StatusCode::SEE_OTHER,
         "PAR authorize redirects to login: {body}"
     );
     let login_location = location(&headers).expect("login redirect");
@@ -490,7 +490,7 @@ async fn drive_par_login_consent(
         ("return_to", &form_return_to),
     ]);
     let (status, headers, body) = harness.post_form("/login", &login_body, None).await;
-    assert_eq!(status, StatusCode::FOUND, "login post: {body}");
+    assert_eq!(status, StatusCode::SEE_OTHER, "login post: {body}");
     let cookie = set_cookie_pair(&headers).expect("session cookie set on login");
     let resume = location(&headers).expect("resume after login");
 
@@ -499,7 +499,7 @@ async fn drive_par_login_consent(
     let (status, headers, body) = harness.get_with_cookie(&resume, Some(&cookie)).await;
     assert_eq!(
         status,
-        StatusCode::FOUND,
+        StatusCode::SEE_OTHER,
         "the resumed PAR request must not be rejected by the require-PAR gate: {body}"
     );
     let consent_location = location(&headers).expect("consent redirect");
@@ -517,7 +517,7 @@ async fn drive_par_login_consent(
     let (status, headers, body) = harness
         .post_form("/consent", &consent_body, Some(&cookie))
         .await;
-    assert_eq!(status, StatusCode::FOUND, "consent post: {body}");
+    assert_eq!(status, StatusCode::SEE_OTHER, "consent post: {body}");
     let resume = location(&headers).expect("resume after consent");
     harness.get_with_cookie(&resume, Some(&cookie)).await
 }
@@ -540,7 +540,11 @@ async fn require_par_per_client_resumes_through_login_and_consent_to_a_code() {
         SEED_PASSWORD,
     )
     .await;
-    assert_eq!(status, StatusCode::FOUND, "the final resume issues: {body}");
+    assert_eq!(
+        status,
+        StatusCode::SEE_OTHER,
+        "the final resume issues: {body}"
+    );
     assert!(
         location(&headers).is_some_and(|l| l.starts_with(REDIRECT_URI)),
         "the code is delivered to the redirect_uri"
@@ -578,7 +582,11 @@ async fn the_global_require_par_switch_resumes_through_login_and_consent_to_a_co
         SEED_PASSWORD,
     )
     .await;
-    assert_eq!(status, StatusCode::FOUND, "the final resume issues: {body}");
+    assert_eq!(
+        status,
+        StatusCode::SEE_OTHER,
+        "the final resume issues: {body}"
+    );
     assert!(
         location_param(&headers, "code").is_some(),
         "a real authorization code is issued through the interaction under the global switch, not a 400"
@@ -682,7 +690,7 @@ async fn pushed_values_win_over_conflicting_inline_params_at_authorize() {
     let (status, headers, body) = harness.authorize_with_cookie(&conflicting, &cookie).await;
     assert_eq!(
         status,
-        StatusCode::FOUND,
+        StatusCode::SEE_OTHER,
         "authorize via PAR issues: {body}"
     );
     let loc = location(&headers).expect("code redirect");
@@ -743,7 +751,7 @@ async fn concurrent_issuances_of_one_request_uri_yield_at_most_one_code() {
     let mut rejected = 0_usize;
     for task in tasks {
         let (status, headers, _body) = task.await.expect("task joins");
-        if status == StatusCode::FOUND && location_param(&headers, "code").is_some() {
+        if status == StatusCode::SEE_OTHER && location_param(&headers, "code").is_some() {
             codes += 1;
         } else {
             rejected += 1;

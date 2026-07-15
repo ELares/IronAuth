@@ -6,6 +6,67 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- RFC 9700 (OAuth 2.0 Security BCP) checklist encoded as CI conformance invariants
+  (issue #38).
+  - **Conformance suite.** A new registered test target `tests/rfc9700.rs` drives the
+    live authorization, token, discovery, and interaction endpoints and asserts each
+    applicable RFC 9700 item: exact `redirect_uri` matching with the scoped RFC 8252
+    loopback exception, no open redirector, S256-only PKCE with downgrade prevention in
+    both directions, no front-channel access token, RFC 9207 `iss` on every
+    authorization response, refresh rotation with reuse family revocation,
+    audience-restricted tokens never delivered in a URL, single-use client- and
+    `redirect_uri`-bound codes, sender-uniform token errors, and no ROPC. Each
+    header/shape item reduces to a shared predicate scored against the live response;
+    an in-binary mutation harness feeds each predicate the regression shape a flipped
+    guard would produce and asserts it is rejected, so no test can pass vacuously. The
+    harness lives only in the test binary and is absent from the release and musl
+    builds. Traceability: `docs/conformance/rfc9700-checklist.md`; rationale:
+    `docs/design/rfc9700-conformance.md`.
+  - **303 for credential-bearing redirects (behavior change).** The authorization and
+    interaction redirects now emit `303 See Other` instead of `302 Found`, so the user
+    agent re-issues the follow-up as a body-less `GET` (a submitted login/consent POST
+    body is never replayed to the redirect target) and a code-carrying redirect is
+    never method-ambiguous; `307`/`308` are forbidden. Emitted from the three existing
+    redirect builders (`error.rs::redirect_response`, `interaction.rs::redirect` and
+    `redirect_setting_cookie`).
+  - **Referrer-Policy on code-carrying redirects.** `Referrer-Policy: no-referrer` now
+    rides the `query`-mode authorization redirect (which carries the code in the
+    `Location` query) from the same single seam, closing the gap where it previously
+    set only `Cache-Control: no-store`; the `form_post` interstitial already had it.
+  - **FIX (security, user-facing): every bootstrap form POST failed in a real browser.**
+    The login, registration, consent, and device-approval pages were served with
+    `Referrer-Policy: no-referrer`. Per the Fetch standard ("append a request `Origin`
+    header"), a non-`GET`/`HEAD`, non-CORS request (exactly a same-origin HTML form
+    POST) from a `no-referrer` document has its serialized origin set to `null`, so a
+    real user agent submitted every one of those forms with `Origin: null`, which the
+    same-origin CSRF allowlist (issue #196) read as a cross-origin mismatch and refused
+    with a `403`. The test suites never saw it because a harness request carries no
+    `Origin` at all and the absent-header path deliberately falls through to allow.
+    Fixed in both layers: the PAGES now carry `Referrer-Policy: same-origin`
+    (`pages::PAGE_REFERRER_POLICY`), which still sends no `Referer` to any cross-origin
+    destination but leaves a real, checkable `Origin` on the same-origin POST, while the
+    code-carrying responses keep `no-referrer`; and `interaction::same_origin_ok` now
+    resolves an opaque `Origin: null` by fetch metadata, accepting it only alongside a
+    user-agent-authored `Sec-Fetch-Site: same-origin` (a forbidden header name that page
+    script cannot forge) and rejecting it when the metadata is absent or says `same-site`
+    or `cross-site`. A genuine foreign `Origin` is still rejected whatever the fetch
+    metadata claims. Pinned by browser-shaped regression tests in the `interactive` and
+    `rfc9700` suites.
+  - **Conformance coverage completed.** The checklist now also asserts CSRF on the
+    credential-bearing interaction POSTs (R16), clickjacking refusal on every
+    interaction page (R17), refusal of a non-registrable or insecure `redirect_uri` at
+    registration (R18), and a server-minted `client_id` a client cannot choose (R19).
+    Codes additionally assert their short lifetime and grant-chain revocation on reuse
+    (R13), and "never in a URL" now asserts both directions: no token is placed in any
+    URL-valued header or echoed into any response header, and a valid access token
+    presented in a query string is refused (R9).
+  - **Freshness lint.** `scripts/rfc9700-scan.sh` (wired into `scripts/gate.sh` and the
+    `invariants` CI job) generates the OAuth endpoint inventory from EVERY router in the
+    crate, diffs it, and binds every mounted endpoint to a covering test, so a future
+    BCP-relevant endpoint cannot ship uncovered while the checklist reads complete. It
+    previously sliced `lib.rs` at `pub fn oidc_router`, which made the discovery and
+    issuer/JWKS routes invisible to it; those four endpoints are now in the inventory
+    and mapped in the checklist.
 - Add `tests/conformance_seed.rs` (issue #37). The OIDF harness's `seed.sh` used
   to compute the cert user's Argon2id hash at run time by pulling a MUTABLE
   `alpine:3.20` tag and installing a package FROM THE NETWORK inside the gate

@@ -372,6 +372,17 @@ name = "device"
 path = "tests/device.rs"
 required-features = ["testing"]
 
+# RFC 9700 (OAuth 2.0 Security BCP) as executable CI conformance invariants (issue
+# #38): one named test per applicable checklist item driving the LIVE endpoints, plus
+# an in-binary mutation harness proving every shared checker predicate rejects the
+# regression shape a flipped guard would produce (non-vacuity). The traceability
+# mapping is docs/conformance/rfc9700-checklist.md and scripts/rfc9700-scan.sh binds
+# every mounted endpoint to a covering test so a future endpoint cannot ship
+# uncovered. Over a real database with a provisioned signing key.
+[[test]]
+name = "rfc9700"
+path = "tests/rfc9700.rs"
+required-features = ["testing"]
 # The OIDF conformance seed credential (issue #37). seed.sh installs a COMMITTED
 # Argon2id hash rather than computing one in a network container, so this proves
 # the committed hash actually verifies the committed cert password through the

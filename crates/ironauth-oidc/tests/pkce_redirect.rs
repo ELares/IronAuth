@@ -53,7 +53,7 @@ async fn code_challenge_method_plain_is_invalid_request_with_iss() {
         enc(REDIRECT_URI),
     );
     let (status, headers, body) = harness.authorize(&query).await;
-    assert_eq!(status, StatusCode::FOUND, "error redirect: {body}");
+    assert_eq!(status, StatusCode::SEE_OTHER, "error redirect: {body}");
     assert_eq!(
         location_param(&headers, "error").as_deref(),
         Some("invalid_request"),
@@ -86,7 +86,7 @@ async fn a_malformed_s256_code_challenge_is_invalid_request_with_iss() {
         enc(REDIRECT_URI),
     );
     let (status, headers, body) = harness.authorize(&query).await;
-    assert_eq!(status, StatusCode::FOUND, "error redirect: {body}");
+    assert_eq!(status, StatusCode::SEE_OTHER, "error redirect: {body}");
     assert_eq!(
         location_param(&headers, "error").as_deref(),
         Some("invalid_request"),
@@ -114,7 +114,7 @@ async fn a_public_client_without_a_code_challenge_is_rejected() {
         enc(REDIRECT_URI),
     );
     let (status, headers, body) = harness.authorize(&query).await;
-    assert_eq!(status, StatusCode::FOUND, "error redirect: {body}");
+    assert_eq!(status, StatusCode::SEE_OTHER, "error redirect: {body}");
     assert_eq!(
         location_param(&headers, "error").as_deref(),
         Some("invalid_request"),
@@ -137,7 +137,7 @@ async fn a_confidential_client_requires_pkce_under_the_default_policy() {
         enc(REDIRECT_URI),
     );
     let (status, headers, body) = harness.authorize(&query).await;
-    assert_eq!(status, StatusCode::FOUND, "error redirect: {body}");
+    assert_eq!(status, StatusCode::SEE_OTHER, "error redirect: {body}");
     assert_eq!(
         location_param(&headers, "error").as_deref(),
         Some("invalid_request"),
@@ -276,7 +276,11 @@ async fn a_loopback_ip_literal_matches_with_a_variable_port() {
         enc(presented),
     );
     let (status, headers, body) = harness.authorize_with_cookie(&query, &cookie).await;
-    assert_eq!(status, StatusCode::FOUND, "loopback variable port: {body}");
+    assert_eq!(
+        status,
+        StatusCode::SEE_OTHER,
+        "loopback variable port: {body}"
+    );
     assert!(
         location(&headers).is_some_and(|l| l.starts_with(presented)),
         "the code is delivered to the presented loopback URI"
@@ -325,7 +329,11 @@ async fn a_native_private_use_scheme_redirect_is_accepted() {
         enc(redirect),
     );
     let (status, headers, body) = harness.authorize_with_cookie(&query, &cookie).await;
-    assert_eq!(status, StatusCode::FOUND, "custom scheme redirect: {body}");
+    assert_eq!(
+        status,
+        StatusCode::SEE_OTHER,
+        "custom scheme redirect: {body}"
+    );
     assert!(
         location(&headers).is_some_and(|l| l.starts_with("com.example.app:/oauth2redirect")),
         "the code is delivered to the custom-scheme URI"
@@ -395,7 +403,7 @@ async fn iss_is_emitted_on_the_success_response() {
         enc(REDIRECT_URI),
     );
     let (status, headers, body) = harness.authorize_with_cookie(&query, &cookie).await;
-    assert_eq!(status, StatusCode::FOUND, "success redirect: {body}");
+    assert_eq!(status, StatusCode::SEE_OTHER, "success redirect: {body}");
     assert!(
         location_param(&headers, "code").is_some(),
         "a code is issued"
@@ -417,7 +425,7 @@ async fn iss_is_emitted_on_the_error_response() {
         enc(REDIRECT_URI),
     );
     let (status, headers, body) = harness.authorize(&query).await;
-    assert_eq!(status, StatusCode::FOUND, "error redirect: {body}");
+    assert_eq!(status, StatusCode::SEE_OTHER, "error redirect: {body}");
     assert_eq!(
         location_param(&headers, "error").as_deref(),
         Some("unsupported_response_type"),
