@@ -98,6 +98,15 @@ name = "idor"
 path = "tests/idor.rs"
 required-features = ["testing"]
 
+# The four-level resource model as public APIs (issue #41): organization CRUD and
+# pagination, cross-tenant and wrong-scope isolation, idempotent creation, the
+# operator-plane read surface, and the resource-type classification catalog. Needs
+# a real database (DATABASE_URL).
+[[test]]
+name = "resource_model"
+path = "tests/resource_model.rs"
+required-features = ["testing"]
+
 # DCR abuse-control management surface (issue #31): authoring a reusable policy
 # (create/list/replay/conflict/invalid-primitive), minting an initial access token
 # carrying a policy-chain snapshot (plaintext once, idempotent replay, unknown policy

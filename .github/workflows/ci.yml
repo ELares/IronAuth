@@ -159,6 +159,8 @@ jobs:
         run: scripts/invariant-lints.sh
       - name: query audit (no scoped-table SQL outside the repository module)
         run: scripts/query-audit.sh
+      - name: classification lint (every resource type is classified; all three classes used)
+        run: scripts/classification-lint.sh
       - name: http audit (no outbound HTTP client outside the fetch dispatcher)
         run: scripts/http-audit.sh
       - name: no M2M metering (no metering/billing/quota hook on the client-credentials path)

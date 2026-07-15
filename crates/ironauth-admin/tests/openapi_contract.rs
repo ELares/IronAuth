@@ -50,20 +50,27 @@ fn operation_ids_are_the_stable_set() {
             "createDcrPolicy",
             "createEnvironment",
             "createManagementKey",
+            "createOrganization",
             "createTenant",
             "deleteEnvironment",
             "deleteManagementKey",
+            "deleteOrganization",
             "deleteTenant",
             "getDcrClient",
             "getEnvironment",
             "getManagementKey",
+            "getOperator",
+            "getOrganization",
             "getRefreshFamily",
             "getSession",
             "getTenant",
             "listDcrPolicies",
             "listEnvironments",
             "listManagementKeys",
+            "listOperators",
+            "listOrganizations",
             "listRefreshFamilies",
+            "listResourceTypes",
             "listSessions",
             "listTenants",
             "revokeSession",
@@ -90,8 +97,10 @@ fn error_schema_and_bearer_scheme_are_present() {
 fn every_list_endpoint_documents_cursor_pagination() {
     let doc = spec();
     for op in [
+        "listOperators",
         "listTenants",
         "listEnvironments",
+        "listOrganizations",
         "listManagementKeys",
         "listDcrPolicies",
         "listSessions",
@@ -118,6 +127,7 @@ fn every_post_documents_the_idempotency_key_header() {
     for op in [
         "createTenant",
         "createEnvironment",
+        "createOrganization",
         "createManagementKey",
         "createDcrPolicy",
         "createDcrInitialAccessToken",
@@ -166,6 +176,10 @@ fn documented_paths_are_the_expected_set() {
             "DELETE /v1/tenants/{tenant_id}",
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}",
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/keys/{key_id}",
+            "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}",
+            "GET /v1/operators",
+            "GET /v1/operators/{operator_id}",
+            "GET /v1/resource-types",
             "GET /v1/tenants",
             "GET /v1/tenants/{tenant_id}",
             "GET /v1/tenants/{tenant_id}/environments",
@@ -174,6 +188,8 @@ fn documented_paths_are_the_expected_set() {
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/dcr/policies",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/keys",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/keys/{key_id}",
+            "GET /v1/tenants/{tenant_id}/environments/{environment_id}/organizations",
+            "GET /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/refresh-families",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/refresh-families/{family_id}",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/sessions",
@@ -184,6 +200,7 @@ fn documented_paths_are_the_expected_set() {
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/dcr/initial-access-tokens",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/dcr/policies",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/keys",
+            "POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/sessions/revoke",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/sessions/{session_id}/revoke",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}/sessions/revoke",
@@ -225,7 +242,7 @@ fn committed_artifact_matches_generated_spec() {
 async fn served_routes_match_documented_routes() {
     let router = db_free_router();
     let documented = documented_method_paths();
-    assert_eq!(documented.len(), 24, "the documented route count is pinned");
+    assert_eq!(documented.len(), 31, "the documented route count is pinned");
 
     // 1. Every documented (method, path) is wired and auth-gated (401, not
     //    404/405). The unauthenticated probe rejects before any DB access.

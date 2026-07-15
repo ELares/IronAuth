@@ -10,6 +10,187 @@
     "version": "0.1.0"
   },
   "paths": {
+    "/v1/operators": {
+      "get": {
+        "tags": [
+          "operators"
+        ],
+        "summary": "List operators (cursor paginated).",
+        "operationId": "listOperators",
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "The desired page size, a positive integer. Clamped to\n`[1, max_page_size]`; defaults to the configured default when absent.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "The opaque cursor from a previous page's `next_cursor`. Absent for the\nfirst page (keyset pagination; there is no offset).",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "A page of operators",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OperatorList"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed cursor",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/operators/{operator_id}": {
+      "get": {
+        "tags": [
+          "operators"
+        ],
+        "summary": "Get one operator.",
+        "operationId": "getOperator",
+        "parameters": [
+          {
+            "name": "operator_id",
+            "in": "path",
+            "description": "The operator identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The operator",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OperatorView"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/resource-types": {
+      "get": {
+        "tags": [
+          "resource-model"
+        ],
+        "summary": "List every resource type and its promotion classification.",
+        "operationId": "listResourceTypes",
+        "responses": {
+          "200": {
+            "description": "The resource-type classification catalog",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ResourceTypesList"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/v1/tenants": {
       "get": {
         "tags": [
@@ -1555,6 +1736,376 @@
         ]
       }
     },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations": {
+      "get": {
+        "tags": [
+          "organizations"
+        ],
+        "summary": "List organizations under an environment (cursor paginated).",
+        "operationId": "listOrganizations",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "The desired page size, a positive integer. Clamped to\n`[1, max_page_size]`; defaults to the configured default when absent.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "The opaque cursor from a previous page's `next_cursor`. Absent for the\nfirst page (keyset pagination; there is no offset).",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "A page of organizations",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrganizationList"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed cursor",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      },
+      "post": {
+        "tags": [
+          "organizations"
+        ],
+        "summary": "Create an organization under an environment.",
+        "operationId": "createOrganization",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Required. Replaying a POST with the same key returns the original response without re-executing.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateOrganizationRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Created",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrganizationView"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Environment not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency-Key reused with a different request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}": {
+      "get": {
+        "tags": [
+          "organizations"
+        ],
+        "summary": "Get one organization.",
+        "operationId": "getOrganization",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "organization_id",
+            "in": "path",
+            "description": "The organization identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The organization",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrganizationView"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      },
+      "delete": {
+        "tags": [
+          "organizations"
+        ],
+        "summary": "Deactivate an organization (soft delete; idempotent).",
+        "operationId": "deleteOrganization",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "organization_id",
+            "in": "path",
+            "description": "The organization identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Deactivated (idempotent)"
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found (absent or already deactivated)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/v1/tenants/{tenant_id}/environments/{environment_id}/refresh-families": {
       "get": {
         "tags": [
@@ -2457,6 +3008,20 @@
           }
         }
       },
+      "CreateOrganizationRequest": {
+        "type": "object",
+        "description": "The body to create an organization in an environment.",
+        "required": [
+          "display_name"
+        ],
+        "properties": {
+          "display_name": {
+            "type": "string",
+            "description": "The organization's display name.",
+            "example": "Globex Corporation"
+          }
+        }
+      },
       "CreateTenantRequest": {
         "type": "object",
         "description": "The body to create a tenant. The first environment is created with it.",
@@ -2746,6 +3311,115 @@
           }
         }
       },
+      "OperatorList": {
+        "type": "object",
+        "description": "A page of operators.",
+        "required": [
+          "items"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/OperatorView"
+            },
+            "description": "The operators on this page, oldest first."
+          },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The opaque cursor for the next page, or null if this is the last page."
+          }
+        }
+      },
+      "OperatorView": {
+        "type": "object",
+        "description": "An operator, as returned by the management API. The operator plane is the root\nof the four-level model; its identifier embeds neither a tenant nor an\nenvironment.",
+        "required": [
+          "id",
+          "display_name",
+          "created_at_unix_ms"
+        ],
+        "properties": {
+          "created_at_unix_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Creation time, milliseconds since the Unix epoch."
+          },
+          "display_name": {
+            "type": "string",
+            "description": "The human-facing display name."
+          },
+          "id": {
+            "type": "string",
+            "description": "The operator identifier (`op_...`)."
+          }
+        }
+      },
+      "OrganizationList": {
+        "type": "object",
+        "description": "A page of organizations.",
+        "required": [
+          "items"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/OrganizationView"
+            },
+            "description": "The organizations on this page, oldest first."
+          },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The opaque cursor for the next page, or null if this is the last page."
+          }
+        }
+      },
+      "OrganizationView": {
+        "type": "object",
+        "description": "An organization, as returned by the management API. Organizations live inside\nenvironments, so the identifier embeds both the tenant and the environment.",
+        "required": [
+          "id",
+          "tenant_id",
+          "environment_id",
+          "display_name",
+          "active",
+          "created_at_unix_ms"
+        ],
+        "properties": {
+          "active": {
+            "type": "boolean",
+            "description": "Whether the organization is active. Always true on a read (a deactivated\norganization reads as not-found); present so the wire shape carries the\nactive-state field the resource model declares."
+          },
+          "created_at_unix_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Creation time, milliseconds since the Unix epoch."
+          },
+          "display_name": {
+            "type": "string",
+            "description": "The human-facing display name."
+          },
+          "environment_id": {
+            "type": "string",
+            "description": "The environment the organization lives in (`env_...`)."
+          },
+          "id": {
+            "type": "string",
+            "description": "The organization identifier (`org_...`, embeds its scope)."
+          },
+          "tenant_id": {
+            "type": "string",
+            "description": "The tenant the organization belongs to (`ten_...`)."
+          }
+        }
+      },
       "RefreshFamilyList": {
         "type": "object",
         "description": "A page of refresh-token families.",
@@ -2828,6 +3502,45 @@
           "subject": {
             "type": "string",
             "description": "The authenticated end-user subject the family's tokens are minted for."
+          }
+        }
+      },
+      "ResourceTypeView": {
+        "type": "object",
+        "description": "One resource type's promotion classification, as served by the resource-model\nmetadata endpoint. This is the machine-readable classification the snapshot\nexport (5.3) and the promotion engine (5.4) consume so they never maintain a\nparallel promotable/runtime list.",
+        "required": [
+          "name",
+          "level",
+          "classification"
+        ],
+        "properties": {
+          "classification": {
+            "type": "string",
+            "description": "The promotion classification: `promotable`, `runtime`, or\n`environment-identity`."
+          },
+          "level": {
+            "type": "string",
+            "description": "The scope level its identifier is defined at (`operator`, `tenant`, or\n`environment`)."
+          },
+          "name": {
+            "type": "string",
+            "description": "The resource type's stable wire name (for example `organization`)."
+          }
+        }
+      },
+      "ResourceTypesList": {
+        "type": "object",
+        "description": "The resource-type classification catalog.",
+        "required": [
+          "items"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ResourceTypeView"
+            },
+            "description": "Every first-class resource type and its classification."
           }
         }
       },
@@ -3083,12 +3796,24 @@
   },
   "tags": [
     {
+      "name": "operators",
+      "description": "Operator plane: the root of the four-level resource model, a read surface above tenants"
+    },
+    {
       "name": "tenants",
       "description": "Tenant CRUD (operator plane)"
     },
     {
       "name": "environments",
       "description": "Environment CRUD under a tenant"
+    },
+    {
+      "name": "organizations",
+      "description": "Organization CRUD under an environment: the minimal per-environment shell (M10 adds membership)"
+    },
+    {
+      "name": "resource-model",
+      "description": "The resource-type classification catalog (promotable, runtime, environment-identity)"
     },
     {
       "name": "keys",

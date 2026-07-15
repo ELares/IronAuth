@@ -58,8 +58,8 @@ use crate::id::{
     AssertionMappingId, AuditId, AuditTarget, AuthorizationCodeId, BackChannelDeliveryId, ClientId,
     ClientSessionId, ConsentId, CorrelationId, DcrPolicyId, DeviceCodeId, EnvironmentId,
     ExternalIssuerId, GrantId, InitialAccessTokenId, IssuedTokenId, ManagementKeyId, OperatorId,
-    PushedRequestId, RefreshFamilyId, RefreshTokenId, ResourceServerId, ServiceAccountId,
-    SessionEventId, SessionId, SigningKeyId, TenantId, UserId,
+    OrganizationId, PushedRequestId, RefreshFamilyId, RefreshTokenId, ResourceServerId,
+    ServiceAccountId, SessionEventId, SessionId, SigningKeyId, TenantId, UserId,
 };
 use crate::scope::Scope;
 use crate::store::Store;
@@ -11159,6 +11159,32 @@ pub struct ManagementCredentialRecord {
     pub created_at_unix_micros: i64,
 }
 
+/// An operator row: the platform deployment root, above every tenant (issue #41).
+/// The operator plane carries no tenant or environment, so its identifier embeds
+/// neither.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OperatorRecord {
+    /// The operator identifier (`op_...`, embeds neither tenant nor environment).
+    pub id: OperatorId,
+    /// The human-facing display name.
+    pub display_name: String,
+    /// Creation time in microseconds since the Unix epoch (the pagination key).
+    pub created_at_unix_micros: i64,
+}
+
+/// An organization row (management plane, issue #41): the minimal M5 shell.
+/// Organizations live inside environments, so the identifier embeds both the
+/// tenant and the environment. M10 extends this shell with membership.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrganizationRecord {
+    /// The organization identifier (`org_...`, embeds its `(tenant, environment)`).
+    pub id: OrganizationId,
+    /// The human-facing display name.
+    pub display_name: String,
+    /// Creation time in microseconds since the Unix epoch (the pagination key).
+    pub created_at_unix_micros: i64,
+}
+
 /// The control-plane entry point: reads and the acting door for writes.
 ///
 /// Reached through [`Store::management`]. Its pool must authenticate as
@@ -11183,12 +11209,32 @@ impl<'a> ManagementStore<'a> {
         }
     }
 
+    /// The read-only operator repository. The operator plane is the root of the
+    /// four-level model (issue #41); it is not tenant-scoped, so it carries no
+    /// scope argument.
+    #[must_use]
+    pub fn operators(&self) -> OperatorRepo<'a> {
+        OperatorRepo { store: self.store }
+    }
+
     /// The read-only environment repository under `tenant`.
     #[must_use]
     pub fn environments(&self, tenant: TenantId) -> EnvironmentRepo<'a> {
         EnvironmentRepo {
             store: self.store,
             tenant,
+        }
+    }
+
+    /// The read-only organization repository for `scope` (issue #41).
+    /// Organizations are environment-scoped, so the repository is constructible
+    /// only from a `(tenant, environment)` scope and binds row-level security to
+    /// it before every statement.
+    #[must_use]
+    pub fn organizations(&self, scope: Scope) -> OrganizationRepo<'a> {
+        OrganizationRepo {
+            store: self.store,
+            scope,
         }
     }
 
@@ -11279,6 +11325,16 @@ impl<'a> ActingManagementStore<'a> {
     #[must_use]
     pub fn credentials(&self, scope: Scope) -> ActingManagementCredentialRepo<'a> {
         ActingManagementCredentialRepo {
+            store: self.store,
+            acting: self.acting,
+            scope,
+        }
+    }
+
+    /// The mutating organization repository for `scope` (issue #41).
+    #[must_use]
+    pub fn organizations(&self, scope: Scope) -> ActingOrganizationRepo<'a> {
+        ActingOrganizationRepo {
             store: self.store,
             acting: self.acting,
             scope,
@@ -11422,6 +11478,161 @@ impl EnvironmentRepo<'_> {
         .fetch_all(self.store.pool())
         .await?;
         rows.iter().map(environment_from_row).collect()
+    }
+}
+
+/// Read-only operators (the operator plane, issue #41).
+///
+/// The operator plane is the root of the four-level model and is not
+/// tenant-scoped: operators carry no row-level security (they are a LEVEL table,
+/// like tenants and environments), and their identifiers embed neither a tenant
+/// nor an environment.
+pub struct OperatorRepo<'a> {
+    store: &'a Store,
+}
+
+impl OperatorRepo<'_> {
+    /// Parse an untrusted operator identifier. A malformed identifier is the
+    /// uniform not-found, exactly like an absent one.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the identifier is malformed.
+    pub fn parse_id(&self, raw: &str) -> Result<OperatorId, StoreError> {
+        OperatorId::parse(raw).map_err(|_| StoreError::NotFound)
+    }
+
+    /// Fetch one operator by id.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if no such operator exists.
+    pub async fn get(&self, id: &OperatorId) -> Result<OperatorRecord, StoreError> {
+        let row = sqlx::query(
+            "SELECT id, display_name, \
+             (EXTRACT(EPOCH FROM created_at) * 1000000)::bigint AS created_us \
+             FROM operators WHERE id = $1",
+        )
+        .bind(id.to_string())
+        .fetch_optional(self.store.pool())
+        .await?
+        .ok_or(StoreError::NotFound)?;
+        operator_from_row(&row)
+    }
+
+    /// One page of operators, ordered by `(created_at, id)`.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn list(
+        &self,
+        limit: i64,
+        after: Option<&CursorPosition>,
+    ) -> Result<Vec<OperatorRecord>, StoreError> {
+        let (after_micros, after_id) = split_cursor(after);
+        let rows = sqlx::query(
+            "SELECT id, display_name, \
+             (EXTRACT(EPOCH FROM created_at) * 1000000)::bigint AS created_us \
+             FROM operators \
+             WHERE ($1::bigint IS NULL OR (created_at, id) > \
+                  (TIMESTAMPTZ 'epoch' + ($1::text || ' microseconds')::interval, $2::text)) \
+             ORDER BY created_at, id LIMIT $3",
+        )
+        .bind(after_micros)
+        .bind(after_id)
+        .bind(limit.clamp(0, MANAGEMENT_LIST_HARD_CAP + 1))
+        .fetch_all(self.store.pool())
+        .await?;
+        rows.iter().map(operator_from_row).collect()
+    }
+}
+
+/// Read-only organizations for one scope (issue #41).
+///
+/// Organizations live inside environments, so this repository is constructible
+/// only from a `(tenant, environment)` scope, binds forced row-level security to
+/// it before every statement, and an organization of ANOTHER scope is the
+/// uniform not-found (the scope filter is the anti-oracle). The typed
+/// [`OrganizationId`] embeds its scope, so a cross-scope id fails to parse in
+/// scope before any query runs.
+pub struct OrganizationRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl OrganizationRepo<'_> {
+    /// Parse an untrusted organization identifier under this scope. A malformed
+    /// identifier and one minted in another scope both return the uniform
+    /// not-found.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if malformed or out of scope.
+    pub fn parse_id(&self, raw: &str) -> Result<OrganizationId, StoreError> {
+        Ok(OrganizationId::parse_in_scope(raw, &self.scope)?)
+    }
+
+    /// Fetch a live organization by id, within scope.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if no such live organization is visible in this
+    /// scope.
+    pub async fn get(&self, id: &OrganizationId) -> Result<OrganizationRecord, StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT id, display_name, \
+             (EXTRACT(EPOCH FROM created_at) * 1000000)::bigint AS created_us \
+             FROM organizations \
+             WHERE id = $1 AND tenant_id = $2 AND environment_id = $3 AND deleted_at IS NULL",
+        )
+        .bind(id.to_string())
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        let row = row.ok_or(StoreError::NotFound)?;
+        organization_from_row(&row, &self.scope)
+    }
+
+    /// One page of live organizations in this scope, ordered by `(created_at,
+    /// id)`.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn list(
+        &self,
+        limit: i64,
+        after: Option<&CursorPosition>,
+    ) -> Result<Vec<OrganizationRecord>, StoreError> {
+        let (after_micros, after_id) = split_cursor(after);
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let rows = sqlx::query(
+            "SELECT id, display_name, \
+             (EXTRACT(EPOCH FROM created_at) * 1000000)::bigint AS created_us \
+             FROM organizations \
+             WHERE tenant_id = $1 AND environment_id = $2 AND deleted_at IS NULL \
+             AND ($3::bigint IS NULL OR (created_at, id) > \
+                  (TIMESTAMPTZ 'epoch' + ($3::text || ' microseconds')::interval, $4::text)) \
+             ORDER BY created_at, id LIMIT $5",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(after_micros)
+        .bind(after_id)
+        .bind(limit.clamp(0, MANAGEMENT_LIST_HARD_CAP + 1))
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        rows.iter()
+            .map(|row| organization_from_row(row, &self.scope))
+            .collect()
     }
 }
 
@@ -12017,6 +12228,121 @@ impl ActingManagementCredentialRepo<'_> {
     }
 }
 
+/// Mutating organizations for one scope (issue #41).
+pub struct ActingOrganizationRepo<'a> {
+    store: &'a Store,
+    acting: ActingContext,
+    scope: Scope,
+}
+
+impl ActingOrganizationRepo<'_> {
+    /// Create an organization in this scope and audit `organization.create` in the
+    /// same transaction, scoped to `(tenant, environment)`.
+    ///
+    /// Containment is enforced structurally on three layers: the typed
+    /// [`OrganizationId`] embeds this scope (a foreign id never reaches here), the
+    /// forced row-level-security WITH CHECK rejects any row whose scope is not the
+    /// bound one, and the `(environment_id, tenant_id)` foreign key rejects a
+    /// nonexistent environment. The caller additionally verifies the parent
+    /// environment is LIVE before calling, so a soft-deleted parent is a clean
+    /// not-found rather than a foreign-key surprise.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the id is not in this scope;
+    /// [`StoreError::IdempotencyConflict`] on a concurrent Idempotency-Key race;
+    /// [`StoreError::Database`] on a persistence failure (including a nonexistent
+    /// environment, which surfaces as the foreign-key violation).
+    pub async fn create(
+        &self,
+        env: &Env,
+        id: &OrganizationId,
+        created_at_micros: i64,
+        display_name: &str,
+        idempotency: Option<IdempotencyWrite<'_>>,
+    ) -> Result<(), StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::OrganizationCreate,
+                target: id,
+            },
+            async move |tx| {
+                sqlx::query(
+                    "INSERT INTO organizations \
+                     (id, tenant_id, environment_id, display_name, created_at) \
+                     VALUES ($1, $2, $3, $4, \
+                             TIMESTAMPTZ 'epoch' + ($5::text || ' microseconds')::interval)",
+                )
+                .bind(id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(display_name)
+                .bind(created_at_micros)
+                .execute(&mut **tx)
+                .await?;
+                insert_idempotency(tx, idempotency).await?;
+                Ok(())
+            },
+            false,
+        )
+        .await
+    }
+
+    /// Deactivate an organization (soft delete) in this scope and audit
+    /// `organization.delete` in the same transaction. The row is retained (only
+    /// the column-scoped `deleted_at` is written), so the audit foreign key to it
+    /// stays satisfiable.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the id is not in this scope, or no live
+    /// organization matched.
+    pub async fn delete(&self, env: &Env, id: &OrganizationId) -> Result<(), StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::OrganizationDelete,
+                target: id,
+            },
+            async move |tx| {
+                let result = sqlx::query(
+                    "UPDATE organizations SET deleted_at = \
+                     TIMESTAMPTZ 'epoch' + ($1::text || ' microseconds')::interval \
+                     WHERE id = $2 AND tenant_id = $3 AND environment_id = $4 \
+                     AND deleted_at IS NULL",
+                )
+                .bind(epoch_micros(env.clock().now_utc()))
+                .bind(id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .execute(&mut **tx)
+                .await?;
+                if result.rows_affected() == 0 {
+                    return Err(StoreError::NotFound);
+                }
+                Ok(())
+            },
+            false,
+        )
+        .await
+    }
+}
+
 /// Insert a pending idempotency row, if the caller supplied one. A primary-key
 /// collision (a concurrent request already stored this key) surfaces as the
 /// distinct [`StoreError::IdempotencyConflict`] so the caller can re-read and
@@ -12082,6 +12408,30 @@ fn environment_from_row(row: &PgRow) -> Result<EnvironmentRecord, StoreError> {
     Ok(EnvironmentRecord {
         id: EnvironmentId::parse(&row.get::<String, _>("id")).map_err(decode)?,
         tenant_id: TenantId::parse(&row.get::<String, _>("tenant_id")).map_err(decode)?,
+        display_name: row.get("display_name"),
+        created_at_unix_micros: row.get("created_us"),
+    })
+}
+
+/// Reconstruct an [`OperatorRecord`] from a row.
+fn operator_from_row(row: &PgRow) -> Result<OperatorRecord, StoreError> {
+    let decode =
+        |e: crate::id::IdParseError| StoreError::Database(sqlx::Error::Decode(Box::new(e)));
+    Ok(OperatorRecord {
+        id: OperatorId::parse(&row.get::<String, _>("id")).map_err(decode)?,
+        display_name: row.get("display_name"),
+        created_at_unix_micros: row.get("created_us"),
+    })
+}
+
+/// Reconstruct an [`OrganizationRecord`] from a row read within scope. The stored
+/// id is parsed back UNDER the scope, so a corrupt cross-scope row fails to decode
+/// rather than being returned.
+fn organization_from_row(row: &PgRow, scope: &Scope) -> Result<OrganizationRecord, StoreError> {
+    let id_text: String = row.get("id");
+    let id = OrganizationId::parse_in_scope(&id_text, scope)?;
+    Ok(OrganizationRecord {
+        id,
         display_name: row.get("display_name"),
         created_at_unix_micros: row.get("created_us"),
     })

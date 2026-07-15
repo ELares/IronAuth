@@ -933,6 +933,80 @@ mod tests {
     }
 
     #[test]
+    fn four_level_ids_embed_the_scope_their_level_defines() {
+        // The resource-model identifier contract (issue #41), per level: an
+        // operator-plane id embeds neither tenant nor environment, a tenant-level
+        // id embeds neither in its bytes (it IS the tenant), an environment-level
+        // id likewise, and an environment-scoped organization id embeds BOTH.
+        let env = test_env();
+
+        // Operator plane: typed, embeds no scope, round-trips.
+        let operator = OperatorId::generate(&env);
+        assert!(operator.to_string().starts_with("op_"));
+        assert_eq!(
+            OperatorId::parse(&operator.to_string()).expect("round-trips"),
+            operator
+        );
+
+        // Organization (environment-scoped): embeds its (tenant, environment).
+        let scope = Scope::new(TenantId::generate(&env), EnvironmentId::generate(&env));
+        let organization = OrganizationId::generate(&env, &scope);
+        assert!(organization.to_string().starts_with("org_"));
+        assert_eq!(
+            organization.scope(),
+            scope,
+            "organization id embeds tenant and environment"
+        );
+    }
+
+    #[test]
+    fn property_organization_ids_round_trip_and_deny_cross_scope() {
+        // A property sweep over the organization level (issue #41): every freshly
+        // minted id round-trips in its own scope, and NONE parses in a foreign
+        // tenant or environment. Malformed and wrong-prefix inputs fail identically
+        // (no oracle), exactly as the client exemplar does.
+        let env = test_env();
+        let tenant_a = TenantId::generate(&env);
+        let tenant_b = TenantId::generate(&env);
+        let env_1 = EnvironmentId::generate(&env);
+        let env_2 = EnvironmentId::generate(&env);
+        let scope_a = Scope::new(tenant_a, env_1);
+        let cross_tenant = Scope::new(tenant_b, env_1);
+        let cross_env = Scope::new(tenant_a, env_2);
+
+        for _ in 0..1_000 {
+            let id = OrganizationId::generate(&env, &scope_a);
+            let text = id.to_string();
+            // Round-trips in its own scope.
+            assert_eq!(
+                OrganizationId::parse_in_scope(&text, &scope_a).expect("in scope"),
+                id
+            );
+            // Denied uniformly in a foreign tenant and a foreign environment.
+            assert_eq!(
+                OrganizationId::parse_in_scope(&text, &cross_tenant),
+                Err(NotInScope)
+            );
+            assert_eq!(
+                OrganizationId::parse_in_scope(&text, &cross_env),
+                Err(NotInScope)
+            );
+        }
+
+        // Malformed and wrong-prefix inputs fail with the same NotInScope.
+        assert_eq!(
+            OrganizationId::parse_in_scope("org_not-base64-!!", &scope_a),
+            Err(NotInScope)
+        );
+        let a_client = ClientId::generate(&env, &scope_a).to_string();
+        assert_eq!(
+            OrganizationId::parse_in_scope(&a_client, &scope_a),
+            Err(NotInScope),
+            "a client id is not an organization id even in the right scope"
+        );
+    }
+
+    #[test]
     fn wrong_prefix_and_bad_length_are_rejected() {
         let env = test_env();
         let id = TenantId::generate(&env);

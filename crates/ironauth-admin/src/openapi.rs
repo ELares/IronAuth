@@ -23,10 +23,12 @@ use crate::error::ErrorBody;
 use crate::views::{
     BulkRevocationView, BulkRevokeSessionsRequest, ClientVerificationView, CreateDcrPolicyRequest,
     CreateEnvironmentRequest, CreateInitialAccessTokenRequest, CreateManagementKeyRequest,
-    CreateTenantRequest, DcrPolicyList, DcrPolicyView, EnvironmentList, EnvironmentView,
-    InitialAccessTokenCreated, ManagementKeyCreated, ManagementKeyList, ManagementKeyView,
-    RefreshFamilyList, RefreshFamilyView, RevokeSessionsRequest, SessionList,
-    SessionRevocationView, SessionView, TenantCreated, TenantList, TenantView, UserRevocationView,
+    CreateOrganizationRequest, CreateTenantRequest, DcrPolicyList, DcrPolicyView, EnvironmentList,
+    EnvironmentView, InitialAccessTokenCreated, ManagementKeyCreated, ManagementKeyList,
+    ManagementKeyView, OperatorList, OperatorView, OrganizationList, OrganizationView,
+    RefreshFamilyList, RefreshFamilyView, ResourceTypeView, ResourceTypesList,
+    RevokeSessionsRequest, SessionList, SessionRevocationView, SessionView, TenantCreated,
+    TenantList, TenantView, UserRevocationView,
 };
 
 /// The management API's OpenAPI document. The handlers listed in `paths(...)`
@@ -46,8 +48,14 @@ use crate::views::{
     ),
     modifiers(&SecurityAddon),
     tags(
+        (name = "operators", description = "Operator plane: the root of the four-level \
+                                           resource model, a read surface above tenants"),
         (name = "tenants", description = "Tenant CRUD (operator plane)"),
         (name = "environments", description = "Environment CRUD under a tenant"),
+        (name = "organizations", description = "Organization CRUD under an environment: the \
+                                               minimal per-environment shell (M10 adds membership)"),
+        (name = "resource-model", description = "The resource-type classification catalog \
+                                                (promotable, runtime, environment-identity)"),
         (name = "keys", description = "Environment-scoped management API keys"),
         (name = "dcr", description = "Dynamic Client Registration abuse controls: \
                                      policies, initial access tokens, client verification"),
@@ -56,6 +64,9 @@ use crate::views::{
                                           everything-for-a-user with a token-family cascade)")
     ),
     paths(
+        crate::operators::list_operators,
+        crate::operators::get_operator,
+        crate::resource_types::list_resource_types,
         crate::tenants::list_tenants,
         crate::tenants::create_tenant,
         crate::tenants::get_tenant,
@@ -64,6 +75,10 @@ use crate::views::{
         crate::environments::create_environment,
         crate::environments::get_environment,
         crate::environments::delete_environment,
+        crate::organizations::list_organizations,
+        crate::organizations::create_organization,
+        crate::organizations::get_organization,
+        crate::organizations::delete_organization,
         crate::keys::list_keys,
         crate::keys::create_key,
         crate::keys::get_key,
@@ -90,6 +105,13 @@ use crate::views::{
         EnvironmentView,
         EnvironmentList,
         CreateEnvironmentRequest,
+        OperatorView,
+        OperatorList,
+        OrganizationView,
+        OrganizationList,
+        CreateOrganizationRequest,
+        ResourceTypeView,
+        ResourceTypesList,
         ManagementKeyView,
         ManagementKeyCreated,
         ManagementKeyList,

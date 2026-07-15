@@ -7,7 +7,9 @@
 use ironauth_env::Env;
 use ironauth_store::idor_harness::IdorHarness;
 use ironauth_store::test_support::TestDatabase;
-use ironauth_store::{ActorRef, CorrelationId, ManagementKeyId, Scope, ServiceId, StoreError};
+use ironauth_store::{
+    ActorRef, CorrelationId, ManagementKeyId, OrganizationId, Scope, ServiceId, StoreError,
+};
 
 /// A stand-in key hash for a planted victim (the probes resolve by id, not hash).
 const VICTIM_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
@@ -28,6 +30,11 @@ async fn management_probes_deny_cross_tenant_and_cross_environment_uniformly() {
     let victim_b = plant_key(control, &env, scope_b).await;
     let victim_a2 = plant_key(control, &env, scope_a2).await;
 
+    // Organizations are the fourth level (issue #41): plant a victim in each
+    // foreign scope so the organization probes have a real cross-scope target.
+    let victim_org_b = plant_org(control, &env, scope_b).await;
+    let victim_org_a2 = plant_org(control, &env, scope_a2).await;
+
     // A well-formed key id in the caller's OWN scope that was never stored.
     let absent_in_a = ManagementKeyId::generate(&env, &scope_a).to_string();
 
@@ -47,7 +54,9 @@ async fn management_probes_deny_cross_tenant_and_cross_environment_uniformly() {
         harness.probe_names(),
         vec![
             "management_credentials.get",
-            "management_credentials.delete"
+            "management_credentials.delete",
+            "organizations.get",
+            "organizations.delete",
         ],
         "every management resolve-by-id operation is registered",
     );
@@ -55,6 +64,8 @@ async fn management_probes_deny_cross_tenant_and_cross_environment_uniformly() {
     let foreign = [
         victim_b.to_string(),
         victim_a2.to_string(),
+        victim_org_b.to_string(),
+        victim_org_a2.to_string(),
         absent_in_a.clone(),
     ];
     let foreign_refs: Vec<&str> = foreign.iter().map(String::as_str).collect();
@@ -80,6 +91,41 @@ async fn management_probes_deny_cross_tenant_and_cross_environment_uniformly() {
             .is_ok(),
         "environment A2's key must survive the delete probe"
     );
+
+    // The victim organizations must likewise survive: the organizations.delete
+    // probe must not have leak-deactivated a foreign-scope row.
+    assert!(
+        control
+            .management()
+            .organizations(scope_b)
+            .get(&victim_org_b)
+            .await
+            .is_ok(),
+        "tenant B's organization must survive the delete probe"
+    );
+    assert!(
+        control
+            .management()
+            .organizations(scope_a2)
+            .get(&victim_org_a2)
+            .await
+            .is_ok(),
+        "environment A2's organization must survive the delete probe"
+    );
+}
+
+/// Plant a live organization in `scope` via the control store.
+async fn plant_org(control: &ironauth_store::Store, env: &Env, scope: Scope) -> OrganizationId {
+    let id = OrganizationId::generate(env, &scope);
+    let actor = ActorRef::service(ServiceId::generate(env));
+    control
+        .management()
+        .acting(actor, CorrelationId::generate(env))
+        .organizations(scope)
+        .create(env, &id, 1_000_000, "victim organization", None)
+        .await
+        .expect("plant victim organization");
+    id
 }
 
 /// Plant a live management key in `scope` via the control store.

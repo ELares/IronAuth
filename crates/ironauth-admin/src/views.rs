@@ -11,8 +11,8 @@
 use std::fmt;
 
 use ironauth_store::{
-    EnvironmentRecord, ManagementCredentialRecord, RefreshFamilySummary, SessionSummary,
-    TenantRecord,
+    EnvironmentRecord, ManagementCredentialRecord, OperatorRecord, OrganizationRecord,
+    RefreshFamilySummary, ResourceType, SessionSummary, TenantRecord,
 };
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -198,6 +198,133 @@ pub struct ManagementKeyList {
     /// The opaque cursor for the next page, or null if this is the last page.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// The four-level resource model as public APIs (issue #41): operators (the
+// operator plane above tenants) and organizations (the minimal per-environment
+// shell), plus the machine-readable promotable/runtime/environment-identity
+// classification of every resource type.
+// ---------------------------------------------------------------------------
+
+/// An operator, as returned by the management API. The operator plane is the root
+/// of the four-level model; its identifier embeds neither a tenant nor an
+/// environment.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct OperatorView {
+    /// The operator identifier (`op_...`).
+    pub id: String,
+    /// The human-facing display name.
+    pub display_name: String,
+    /// Creation time, milliseconds since the Unix epoch.
+    pub created_at_unix_ms: i64,
+}
+
+impl From<OperatorRecord> for OperatorView {
+    fn from(record: OperatorRecord) -> Self {
+        Self {
+            id: record.id.to_string(),
+            display_name: record.display_name,
+            created_at_unix_ms: ms(record.created_at_unix_micros),
+        }
+    }
+}
+
+/// A page of operators.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct OperatorList {
+    /// The operators on this page, oldest first.
+    pub items: Vec<OperatorView>,
+    /// The opaque cursor for the next page, or null if this is the last page.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+/// An organization, as returned by the management API. Organizations live inside
+/// environments, so the identifier embeds both the tenant and the environment.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct OrganizationView {
+    /// The organization identifier (`org_...`, embeds its scope).
+    pub id: String,
+    /// The tenant the organization belongs to (`ten_...`).
+    pub tenant_id: String,
+    /// The environment the organization lives in (`env_...`).
+    pub environment_id: String,
+    /// The human-facing display name.
+    pub display_name: String,
+    /// Whether the organization is active. Always true on a read (a deactivated
+    /// organization reads as not-found); present so the wire shape carries the
+    /// active-state field the resource model declares.
+    pub active: bool,
+    /// Creation time, milliseconds since the Unix epoch.
+    pub created_at_unix_ms: i64,
+}
+
+impl OrganizationView {
+    /// Build a view from a stored record. `active` is always true here: the
+    /// repository only returns live organizations.
+    #[must_use]
+    pub fn from_record(record: OrganizationRecord) -> Self {
+        Self {
+            id: record.id.to_string(),
+            tenant_id: record.id.scope().tenant().to_string(),
+            environment_id: record.id.scope().environment().to_string(),
+            display_name: record.display_name,
+            active: true,
+            created_at_unix_ms: ms(record.created_at_unix_micros),
+        }
+    }
+}
+
+/// The body to create an organization in an environment.
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct CreateOrganizationRequest {
+    /// The organization's display name.
+    #[schema(example = "Globex Corporation")]
+    pub display_name: String,
+}
+
+/// A page of organizations.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct OrganizationList {
+    /// The organizations on this page, oldest first.
+    pub items: Vec<OrganizationView>,
+    /// The opaque cursor for the next page, or null if this is the last page.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+/// One resource type's promotion classification, as served by the resource-model
+/// metadata endpoint. This is the machine-readable classification the snapshot
+/// export (5.3) and the promotion engine (5.4) consume so they never maintain a
+/// parallel promotable/runtime list.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct ResourceTypeView {
+    /// The resource type's stable wire name (for example `organization`).
+    pub name: String,
+    /// The scope level its identifier is defined at (`operator`, `tenant`, or
+    /// `environment`).
+    pub level: String,
+    /// The promotion classification: `promotable`, `runtime`, or
+    /// `environment-identity`.
+    pub classification: String,
+}
+
+impl From<ResourceType> for ResourceTypeView {
+    fn from(resource: ResourceType) -> Self {
+        Self {
+            name: resource.as_str().to_owned(),
+            level: resource.level().as_str().to_owned(),
+            classification: resource.classification().as_str().to_owned(),
+        }
+    }
+}
+
+/// The resource-type classification catalog.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct ResourceTypesList {
+    /// Every first-class resource type and its classification.
+    pub items: Vec<ResourceTypeView>,
 }
 
 // ---------------------------------------------------------------------------

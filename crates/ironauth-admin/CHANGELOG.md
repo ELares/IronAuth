@@ -6,6 +6,29 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- The four-level resource model as public APIs (issue #41). Operator, tenant,
+  environment, and organization are now each manageable through documented endpoints,
+  and every resource type carries a machine-readable promotion classification.
+  - **Organization endpoints.** `POST` and `GET /v1/tenants/{tenant_id}/environments/{environment_id}/organizations`
+    and `GET`/`DELETE .../organizations/{organization_id}`, following the M1 discipline:
+    cursor pagination, `Idempotency-Key` on create, rate-limit headers, and a
+    same-transaction audit row on every mutation. Reachable by the operator or by a
+    management key scoped to exactly that environment (a sibling-environment key is the
+    LOUD wrong-scope 403). Create enforces containment: the parent environment must
+    exist and be live, and a cross-scope `org_` id is the uniform not-found.
+  - **Operator-plane read surface.** `GET /v1/operators` and
+    `GET /v1/operators/{operator_id}`, the root of the resource model exposed for
+    inspection (a single-binary deployment self-bootstraps its one operator; a
+    management key here is the wrong-plane 403).
+  - **Resource-type classification catalog.** `GET /v1/resource-types` serves every
+    resource type with its scope level and its promotable / runtime /
+    environment-identity classification, the machine-readable metadata the snapshot and
+    promotion engines consume. Readable by any valid management credential.
+  - **Contract.** New views (`OperatorView`, `OrganizationView`,
+    `CreateOrganizationRequest`, `ResourceTypeView`, and their list wrappers), seven new
+    operations pinned in the OpenAPI contract test and regenerated into
+    `docs/openapi/management.json`, and organization probes added to the management IDOR
+    harness run.
 - Session and refresh-family FLEET OPERATIONS (issue #32). Sessions and refresh-token
   families are now first-class, searchable, metadata-carrying management resources
   rather than an opaque internal table.

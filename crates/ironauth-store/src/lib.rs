@@ -48,6 +48,7 @@
 //! database is needed only to run the integration tests.
 
 pub mod audit;
+pub mod classification;
 mod error;
 mod id;
 mod migrate;
@@ -67,6 +68,7 @@ pub mod idor_harness;
 pub mod test_support;
 
 pub use audit::{ActingContext, Action, ActorRef};
+pub use classification::{ResourceClassification, ResourceLevel, ResourceType, classify};
 pub use error::StoreError;
 pub use id::{
     AgentId, AgentKind, AssertionMappingId, AssertionMappingKind, AuditId, AuditKind, AuditTarget,
@@ -88,10 +90,10 @@ pub use repository::{
     AccessTokenResolution, ActingAssertionSubjectMappingRepo, ActingAuthorizationRepo,
     ActingClientRepo, ActingConsentRepo, ActingDcrPolicyRepo, ActingDeviceCodeRepo,
     ActingEnvironmentRepo, ActingExternalAssertionIssuerRepo, ActingInitialAccessTokenRepo,
-    ActingManagementCredentialRepo, ActingManagementStore, ActingPushedRequestRepo,
-    ActingRefreshRepo, ActingResourceServerRepo, ActingServiceAccountRepo, ActingSessionRepo,
-    ActingSigningKeyRepo, ActingStore, ActingTenantRepo, ActingUserRepo, ActiveDeviceFlow,
-    ActiveOpaqueToken, ApprovedDeviceGrant, AssertionSubjectMappingRecord,
+    ActingManagementCredentialRepo, ActingManagementStore, ActingOrganizationRepo,
+    ActingPushedRequestRepo, ActingRefreshRepo, ActingResourceServerRepo, ActingServiceAccountRepo,
+    ActingSessionRepo, ActingSigningKeyRepo, ActingStore, ActingTenantRepo, ActingUserRepo,
+    ActiveDeviceFlow, ActiveOpaqueToken, ApprovedDeviceGrant, AssertionSubjectMappingRecord,
     AssertionSubjectMappingRepo, AuditRecord, AuditRepo, AuthorizationRepo,
     BackChannelDeliveryRepo, ClientAssertionJtiRepo, ClientAuthDiagnosticReason,
     ClientAuthDiagnosticRecord, ClientAuthDiagnosticsRepo, ClientAuthRecord,
@@ -108,16 +110,16 @@ pub use repository::{
     ManagementStore, NewAssertionSubjectMapping, NewClientAuthDiagnostic, NewDcrPolicy,
     NewDeviceCode, NewDynamicClient, NewExternalAssertionIssuer, NewInitialAccessToken,
     NewJwtAuthClient, NewOpaqueAccessToken, NewRefreshFamily, NewResourceServer, NewSession,
-    NewSigningKey, PriorSessionOutcome, PushRequest, PushedRequestRepo, RedeemOutcome,
-    RefreshFamilyFleetFilter, RefreshFamilyFleetRepo, RefreshFamilyOpenOutcome,
-    RefreshFamilySummary, RefreshRedeem, RefreshRedeemOutcome, RefreshRepo, RefreshTokenResolution,
-    ResourceServerRecord, ResourceServerRepo, RotatedRefreshToken, ScopedStore, ServiceAccountRepo,
-    SessionEndCause, SessionEndedEvent, SessionEventOutboxRepo, SessionFleetFilter,
-    SessionFleetRepo, SessionRecord, SessionRepo, SessionRevocation, SessionSummary,
-    SigningKeyMaterial, SigningKeyMaterialKind, SigningKeyRecord, SigningKeyRepo,
-    StoredIdempotentResponse, TenantRecord, TenantRepo, TokenFormat, TokenKind, TokenStatus,
-    UserRecord, UserRepo, UserRevocation, device_code_digest, opaque_access_token_digest,
-    refresh_token_digest, user_code_hash,
+    NewSigningKey, OperatorRecord, OperatorRepo, OrganizationRecord, OrganizationRepo,
+    PriorSessionOutcome, PushRequest, PushedRequestRepo, RedeemOutcome, RefreshFamilyFleetFilter,
+    RefreshFamilyFleetRepo, RefreshFamilyOpenOutcome, RefreshFamilySummary, RefreshRedeem,
+    RefreshRedeemOutcome, RefreshRepo, RefreshTokenResolution, ResourceServerRecord,
+    ResourceServerRepo, RotatedRefreshToken, ScopedStore, ServiceAccountRepo, SessionEndCause,
+    SessionEndedEvent, SessionEventOutboxRepo, SessionFleetFilter, SessionFleetRepo, SessionRecord,
+    SessionRepo, SessionRevocation, SessionSummary, SigningKeyMaterial, SigningKeyMaterialKind,
+    SigningKeyRecord, SigningKeyRepo, StoredIdempotentResponse, TenantRecord, TenantRepo,
+    TokenFormat, TokenKind, TokenStatus, UserRecord, UserRepo, UserRevocation, device_code_digest,
+    opaque_access_token_digest, refresh_token_digest, user_code_hash,
 };
 pub use scope::Scope;
 pub use store::Store;

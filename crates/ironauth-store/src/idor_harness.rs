@@ -131,10 +131,15 @@ impl IdorHarness {
         self
     }
 
-    /// Register the management-plane probes (issue #11): the scoped-resource
+    /// Register the management-plane probes (issue #11, #41): the scoped-resource
     /// resolve-by-id operations of the management API. Today that is the
-    /// environment-scoped management-credential repository:
-    /// `management_credentials.get` and `management_credentials.delete`.
+    /// environment-scoped management-credential repository
+    /// (`management_credentials.get`, `management_credentials.delete`) and the
+    /// environment-scoped organization repository (`organizations.get`,
+    /// `organizations.delete`), the two-thirds of the four-level resource model
+    /// that is tenant-and-environment scoped (operators, tenants, and environments
+    /// are LEVEL tables whose isolation is exercised by the management-plane tests
+    /// directly, not through the scope-embedding IDOR harness).
     ///
     /// Run these with a store whose pool authenticates as `ironauth_control`
     /// (the data-plane role has no grant on `management_credentials`); a
@@ -144,6 +149,8 @@ impl IdorHarness {
     pub fn register_management_probes(&mut self) -> &mut Self {
         self.register(Box::new(ManagementCredentialGetProbe));
         self.register(Box::new(ManagementCredentialDeleteProbe));
+        self.register(Box::new(OrganizationGetProbe));
+        self.register(Box::new(OrganizationDeleteProbe));
         self
     }
 
@@ -355,6 +362,76 @@ impl IsolationProbe for ManagementCredentialDeleteProbe {
                 .acting(actor, correlation)
                 .credentials(caller);
             match credentials.delete(&env, &id).await {
+                Ok(()) => ProbeOutcome::Leaked,
+                Err(_) => ProbeOutcome::Denied,
+            }
+        })
+    }
+}
+
+/// Built-in probe for `OrganizationRepo::get` (issue #41). `store` must
+/// authenticate as `ironauth_control`. An organization created in another tenant
+/// or environment must never be readable under the caller's scope.
+struct OrganizationGetProbe;
+
+impl IsolationProbe for OrganizationGetProbe {
+    fn name(&self) -> &'static str {
+        "organizations.get"
+    }
+
+    fn probe<'a>(
+        &'a self,
+        store: &'a Store,
+        caller: Scope,
+        foreign_id: &'a str,
+    ) -> BoxProbeFuture<'a> {
+        Box::pin(async move {
+            let organizations = store.management().organizations(caller);
+            // Parse the untrusted id under the caller's OWN scope; an organization
+            // minted in another scope fails here as a uniform not-found.
+            let Ok(id) = organizations.parse_id(foreign_id) else {
+                return ProbeOutcome::Denied;
+            };
+            match organizations.get(&id).await {
+                Ok(_) => ProbeOutcome::Leaked,
+                Err(_) => ProbeOutcome::Denied,
+            }
+        })
+    }
+}
+
+/// Built-in probe for `ActingOrganizationRepo::delete` (issue #41). `store` must
+/// authenticate as `ironauth_control`. Deactivating another tenant's organization
+/// would be a cross-tenant mutation, so it must be the uniform not-found.
+struct OrganizationDeleteProbe;
+
+impl IsolationProbe for OrganizationDeleteProbe {
+    fn name(&self) -> &'static str {
+        "organizations.delete"
+    }
+
+    fn probe<'a>(
+        &'a self,
+        store: &'a Store,
+        caller: Scope,
+        foreign_id: &'a str,
+    ) -> BoxProbeFuture<'a> {
+        Box::pin(async move {
+            let env = Env::system();
+            let Ok(id) = store
+                .management()
+                .organizations(caller)
+                .parse_id(foreign_id)
+            else {
+                return ProbeOutcome::Denied;
+            };
+            let actor = ActorRef::service(ServiceId::generate(&env));
+            let correlation = CorrelationId::generate(&env);
+            let organizations = store
+                .management()
+                .acting(actor, correlation)
+                .organizations(caller);
+            match organizations.delete(&env, &id).await {
                 Ok(()) => ProbeOutcome::Leaked,
                 Err(_) => ProbeOutcome::Denied,
             }
