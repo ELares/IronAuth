@@ -178,14 +178,27 @@ impl IntoResponse for AuthorizeError {
     }
 }
 
-/// A `302 Found` redirect to `location`. Built by hand so the exact `Location`
-/// string (already percent-encoded) is emitted verbatim.
+/// A `303 See Other` redirect to `location`. Built by hand so the exact
+/// `Location` string (already percent-encoded) is emitted verbatim.
+///
+/// `303` (never `302` and never `307`/`308`) is the RFC 9700 status for a
+/// credential-bearing redirect: an authorization response carries the code (or a
+/// front-channel token) in `location`, and `303` MANDATES that the user agent
+/// re-issue the follow-up as a `GET` with no request body. A body-preserving
+/// `307`/`308` would replay a credential from the request body to the redirect
+/// target, and the legacy `302` leaves the method conversion browser-dependent;
+/// `303` closes both.
+/// `Referrer-Policy: no-referrer` rides EVERY code-carrying response from this one
+/// seam, so the authorization code (which lives in the `Location` query for the
+/// `query` response mode) is never leaked onward through the `Referer` header, and
+/// `Cache-Control: no-store` keeps it out of shared caches.
 #[must_use]
 pub fn redirect_response(location: &str) -> Response {
     Response::builder()
-        .status(StatusCode::FOUND)
+        .status(StatusCode::SEE_OTHER)
         .header(header::LOCATION, location)
         .header(header::CACHE_CONTROL, "no-store")
+        .header(header::REFERRER_POLICY, "no-referrer")
         .body(axum::body::Body::empty())
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }

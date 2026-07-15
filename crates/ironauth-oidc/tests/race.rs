@@ -34,7 +34,7 @@ async fn one_code_redeemed_concurrently_succeeds_exactly_once() {
     );
     let cookie = harness.authenticated_cookie().await;
     let (status, headers, body) = harness.authorize_with_cookie(&query, &cookie).await;
-    assert_eq!(status, StatusCode::FOUND, "authorize: {body}");
+    assert_eq!(status, StatusCode::SEE_OTHER, "authorize: {body}");
     let code = common::location_param(&headers, "code").expect("code");
 
     // The exchange body (identical for every racer).

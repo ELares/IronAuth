@@ -6,6 +6,48 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Wire the OIDF conformance suite into CI as a merge gate (issue #37). New
+  `deploy/conformance/` harness: a docker-compose stack pinned BY DIGEST via a
+  committed `SUITE_VERSION` (the OIDF suite, MongoDB, an nginx TLS terminator
+  fronting the OP as the `op` issuer host, and IronAuth), a
+  certification-representative `ironauth.toml` that turns on the legacy/downgrade
+  OP-profile toggles FOR THE CERT ENVIRONMENT ONLY (the shipped default stays
+  hardened, proven by a config test), a reviewed `profile-matrix.yaml` (the four
+  OP profiles on the merge gate, Implicit/Hybrid nightly, the four logout
+  profiles deferred to #33/#34/#39 as explicitly not-yet-enabled), a strict
+  results gate (`parse_results.py`) that fails on ANY non-PASS (finished-but-
+  failed, unreviewed WARNING, REVIEW, SKIPPED, unfinished, or a vacuously empty
+  run) with standard-library unit tests, and a one-command runner that FAILS
+  CLOSED: it exits 0 only after actually driving at least one plan with every
+  module passing, and exits non-zero on a missing OIDF runner, an empty profile
+  selection, a crashed selector, or an unrenderable plan config. Each plan's
+  runner config is GENERATED from the profile matrix (`gen-plan-config.py`), so
+  the exact-string issuer the suite matches has exactly one definition (#194).
+  The runner is bash 3.2 portable, so the one-command local reproduction works on
+  stock macOS.
+
+  CI gains an always-on static lane (`scripts/conformance-check.sh`, in the
+  invariants job) which is what actually ENFORCES today: it is gated by no
+  repository variable and it runs the results-gate unit tests, validates the
+  matrix, renders every enabled profile's plan config, verifies every image
+  reference anywhere under `deploy/conformance` is pinned by digest, asserts the
+  harness cannot fail open, and re-checks downgrade confinement. The LIVE suite
+  lane always runs but is explicitly ADVISORY and named so it cannot be mistaken
+  for a gate: it has no job-level `if:`, because GitHub reports a skipped job to
+  branch protection as SUCCESS, so a required check gated on a repository
+  variable would turn silently green if that variable were unset or mistyped.
+  While the suite is unprovisioned it prints a `NOT ENFORCING` banner rather than
+  posing as a passing gate. Also a nightly full-matrix workflow with a
+  least-privilege badge-publish job, which now FAILS THE RUN when the matrix does
+  not pass (a failing nightly used to be a green run recorded only in a badge
+  JSON, notifying nobody), and a secret-isolated track-suite-master workflow.
+
+  Provisioning the OIDF runner, resolving the real image digests, validating the
+  generated plan config against the live runner, demonstrating the seeded
+  regression, and only then promoting the live check to required are owner
+  actions; docs/conformance/RUNBOOK.md carries the complete list, and
+  docs/conformance/README.md states plainly what enforces today versus what does
+  not.
 - Compose per-environment issuers, JWKS serving, and signing into the live data
   plane (issue #194). `build_oidc_router` now builds ONE store-backed
   `IssuerRegistry` (keys load lazily and RLS-scoped from the data-plane store on

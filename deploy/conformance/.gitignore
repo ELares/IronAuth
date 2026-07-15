@@ -1,0 +1,15 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+#
+# Generated TLS material for the conformance stack. Private keys and
+# environment-specific certs are NEVER committed; gen-certs.sh regenerates them.
+tls/
+
+# Rendered seed SQL (seed.sh substitutes a generated password hash into it).
+seed.rendered.sql
+
+# Local run outputs (results JSON, suite log exports).
+results/
+
+# Python bytecode from running the results-gate tests locally.
+__pycache__/
+*.pyc

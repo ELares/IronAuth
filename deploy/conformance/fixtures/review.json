@@ -1,0 +1,8 @@
+{
+  "plan_name": "oidcc-basic-certification-test-plan",
+  "plan_id": "example-review",
+  "modules": [
+    {"name": "oidcc-server", "id": "m1", "status": "FINISHED", "result": "PASSED"},
+    {"name": "oidcc-ensure-request-object-with-redirect-uri", "id": "m2", "status": "FINISHED", "result": "REVIEW"}
+  ]
+}

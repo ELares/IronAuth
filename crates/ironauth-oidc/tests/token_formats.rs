@@ -287,7 +287,7 @@ async fn at_jwt_carries_acr_and_auth_time_from_an_authenticated_flow() {
         enc(REDIRECT_URI),
     );
     let (status, headers, body) = harness.authorize_with_cookie(&query, &cookie).await;
-    assert_eq!(status, StatusCode::FOUND, "authorize: {body}");
+    assert_eq!(status, StatusCode::SEE_OTHER, "authorize: {body}");
     let code = location_param(&headers, "code").expect("code in redirect");
 
     let (status, _, body) = harness.token(&token_form(&code, &client)).await;

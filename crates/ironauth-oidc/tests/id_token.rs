@@ -67,7 +67,7 @@ async fn id_token_claims(
         .await;
     assert_eq!(
         status,
-        StatusCode::FOUND,
+        StatusCode::SEE_OTHER,
         "authorize should redirect: {body}"
     );
     let code = location_param(&headers, "code").expect("code in redirect");

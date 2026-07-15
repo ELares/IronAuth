@@ -1,0 +1,9 @@
+{
+  "plan_name": "oidcc-basic-certification-test-plan",
+  "plan_id": "example-passed",
+  "modules": [
+    {"name": "oidcc-server", "id": "m1", "status": "FINISHED", "result": "PASSED"},
+    {"name": "oidcc-response-type-missing", "id": "m2", "status": "FINISHED", "result": "PASSED"},
+    {"name": "oidcc-userinfo-get", "id": "m3", "status": "FINISHED", "result": "PASSED"}
+  ]
+}
