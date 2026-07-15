@@ -987,6 +987,7 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "ironauth-env",
+ "ironauth-jose",
  "serde_json",
  "sha2",
  "sqlx",

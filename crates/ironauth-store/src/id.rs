@@ -303,6 +303,43 @@ impl ScopedKind for ResourceServerKind {
     const PREFIX: &'static str = "rsv";
 }
 
+/// Marker for a per-tenant key-encryption key (`kek_`), the envelope-encryption
+/// KEK that wraps that scope's data-encryption keys (issue #48). A tenant-scoped
+/// resource: the identifier embeds its `(tenant, environment)`, so a KEK row can
+/// never be read across a tenant or environment boundary. The KEK material NEVER
+/// appears in the id (the id is a public handle); the wrapped key bytes live in
+/// the row, sealed under the platform master key. Destroying every KEK version of
+/// a scope crypto-shreds all of its envelope-protected data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct KekKind;
+impl ScopedKind for KekKind {
+    const PREFIX: &'static str = "kek";
+}
+
+/// Marker for a per-tenant data-encryption key (`dek_`), the envelope-encryption
+/// DEK that seals the actual PII and secret payloads (issue #48). A tenant-scoped
+/// resource: the identifier embeds its `(tenant, environment)`. The DEK material
+/// NEVER appears in the id; the wrapped key bytes live in the row, sealed under
+/// the scope's active KEK. New writes use the active DEK version; older versions
+/// stay readable until background re-encryption retires them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct DekKind;
+impl ScopedKind for DekKind {
+    const PREFIX: &'static str = "dek";
+}
+
+/// Marker for an encrypted secret record (`sec_`), a stored secret value sealed
+/// under a scope's DEK (issue #48): the transparent encrypted-column store the
+/// envelope substrate protects (TOTP seeds in M7, connector credentials, and
+/// environment-scoped secret values all land here from their first write). A
+/// tenant-scoped resource: the identifier embeds its `(tenant, environment)`, and
+/// the row holds only ciphertext, never a plaintext column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct EncryptedSecretKind;
+impl ScopedKind for EncryptedSecretKind {
+    const PREFIX: &'static str = "sec";
+}
+
 /// Marker for a service-account principal (`sva_`), the first-class machine
 /// identity every M2M-capable client maps to (issue #23). A tenant-scoped
 /// resource: the identifier embeds its `(tenant, environment)`, so a service
@@ -590,6 +627,15 @@ pub type SigningKeyId = ScopedId<SigningKeyKind>;
 /// access tokens are minted for (issue #29). Its `audience` selects the token
 /// format the mint emits.
 pub type ResourceServerId = ScopedId<ResourceServerKind>;
+/// A key-encryption-key identifier (`kek_...`), the per-tenant envelope KEK that
+/// wraps a scope's data-encryption keys (issue #48).
+pub type KekId = ScopedId<KekKind>;
+/// A data-encryption-key identifier (`dek_...`), the per-tenant envelope DEK that
+/// seals a scope's PII and secret payloads (issue #48).
+pub type DekId = ScopedId<DekKind>;
+/// An encrypted-secret identifier (`sec_...`), a stored secret value sealed under
+/// a scope's DEK (issue #48).
+pub type EncryptedSecretId = ScopedId<EncryptedSecretKind>;
 /// A pushed-authorization-request identifier (`par_...`), the single-use reference
 /// the PAR endpoint returns and `/authorize` consumes (RFC 9126, issue #27). It is
 /// the reference portion of the `urn:ietf:params:oauth:request_uri:<id>` value.

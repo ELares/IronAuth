@@ -37,6 +37,84 @@ range per docs/RELEASING.md.
   - **IDOR coverage.** `register_management_probes` now also registers `organizations.get`
     and `organizations.delete`, so the #6 cross-tenant harness proves a foreign-scope
     organization is a uniform not-found on every new resolve-by-id surface.
+- Per-tenant envelope encryption for PII and secrets (issue #48, migration 0027,
+  expand). The DEK/KEK envelope substrate at the persistence layer: PII and secret
+  values are encrypted at rest under a per-tenant key, and destroying a tenant's
+  KEK crypto-shreds all of that tenant's data (the offboarding property #49
+  extends). The AEAD primitive is the standard `ring::aead` AES-256-GCM scheme in
+  the new `ironauth_jose::envelope` module (the one crate allowed a direct `ring`
+  dependency); this crate owns the key lifecycle, the context binding, and the
+  encrypted columns.
+  - **Three new tenant-scoped tables.** `tenant_keks` (per-(tenant, environment)
+    key-encryption keys, stored wrapped under the platform master key, versioned,
+    with a `destroyed` crypto-shred state), `tenant_deks` (per-(tenant,
+    environment) data-encryption keys, stored wrapped under the active KEK,
+    versioned), and `encrypted_secrets` (the transparent encrypted-secret store:
+    each row holds ONLY ciphertext, never a plaintext column). All three ENABLE +
+    FORCE row-level security, carry the (tenant, environment) isolation policy and
+    the nonempty-scope CHECK, and use COLUMN-SCOPED data-plane UPDATE grants (the
+    #31 lesson), and are registered in `scripts/query-audit.sh`.
+  - **Scoped repositories.** `EnvelopeRepo` (read: `open_secret`,
+    `secret_dek_version`, `active_kek_version`, `active_dek_version`) on
+    `ScopedStore::envelope`, and `ActingEnvelopeRepo` (audited writes:
+    `provision_kek`, `provision_dek`, `rotate_kek`, `rotate_dek`, `destroy_kek`,
+    `put_secret`, `reencrypt_secret`) on `ActingStore::envelope`. Every key and
+    ciphertext is scope-filtered and runs under the row-level-security session
+    variables, so another tenant's key or ciphertext is not expressible.
+  - **Rotation without downtime.** `rotate_kek` re-wraps every DEK under a fresh
+    KEK version in one transaction with NO record-payload rewrite (old ciphertext
+    still reads); `rotate_dek` versions new writes while old versions stay readable,
+    and `reencrypt_secret` performs the observable background re-encryption onto the
+    active DEK version (the plaintext never changes).
+  - **Crypto-shredding.** `destroy_kek` overwrites every KEK version's wrapped
+    bytes with an empty blob and marks it destroyed, so the scope's DEKs can never
+    be unwrapped and all of its ciphertext is permanently unreadable, while the
+    ciphertext rows are retained on disk (shredded, not deleted).
+  - **Fail-closed structured errors.** A new `StoreError::Encryption`, distinct
+    from `NotFound`, so a caller tells "this ciphertext did not authenticate" (a
+    wrong/crypto-shredded key, a tampered blob, or a cross-row/tenant/column replay)
+    apart from "there is no such record". It carries no key material or plaintext.
+  - **CI classification lint.** `scripts/pii-encryption-scan.sh` fails the build
+    when a schema column whose name matches the PII/secret taxonomy is declared
+    without an encryption declaration (a `bytea` sealed column, or an inline
+    `pii-encryption-allow: <reason>` marker), wired into `scripts/gate.sh`.
+  - New audited actions: `envelope.kek.provision`, `envelope.kek.rotate`,
+    `envelope.kek.destroy`, `envelope.dek.provision`, `envelope.dek.rotate`,
+    `encrypted_secret.put`, `encrypted_secret.reencrypt`.
+  - The migration is additive (three new tables), safe for the old binary; the
+    DB-backed guard test now asserts a twenty-seven-migration production chain and
+    the new tables' wrapped-key/ciphertext columns (and the absence of any
+    plaintext-key or plaintext-secret column). New `tests/envelope.rs` proves the
+    round-trip, cross-tenant and cross-context decryption failure, KEK rotation
+    without payload rewrite, DEK rotation with observable re-encryption,
+    crypto-shredding with sibling isolation, and a database-dump-yields-no-plaintext
+    check.
+  - **The bootstrap `users` PII columns now route through the substrate.** Migration
+    0027 additionally converts the two plaintext PII columns the login/consent
+    bootstrap shipped (`users.identifier`, the login handle, and `users.claims`, the
+    standard-claim JSON) into sealed envelope columns, so the acceptance criterion
+    "no plaintext PII in a database dump" holds for the live schema, not only for the
+    substrate. `users.claims` becomes `claims_sealed` (a `bytea` sealed under the
+    scope's active DEK, decrypted transparently by `UserRepo::claims_for_subject`).
+    `users.identifier` becomes a BLIND INDEX (`identifier_bidx`, a deterministic
+    per-tenant HMAC that `UserRepo::by_identifier` queries for the equality lookup)
+    plus a sealed `identifier_sealed` for display/round-trip; `pii_dek_version`
+    records the sealing DEK version. The plaintext `identifier`/`claims` columns are
+    dropped (a full expand-contract folded into 0027, justified in the migration
+    header: `users` is the pre-1.0 M2 bootstrap slice with no cross-release contract).
+    Registration provisions the scope's KEK/DEK lazily and seals in the same audited
+    transaction. The `Store` now carries an optional platform `MasterKey`
+    (`Store::with_master_key`); the PII paths FAIL CLOSED (`StoreError::Encryption`)
+    when no key is wired, never falling back to plaintext.
+  - **The classification lint is no longer blind to these columns.**
+    `scripts/pii-encryption-scan.sh` gains `identifier`/`claims` (and the JSON
+    aggregate case) to its taxonomy and a drop-aware pass: a plaintext PII column is
+    compliant only if it is `bytea`, allow-marked, OR dropped by a later migration, so
+    the expand-contract passes while a NEWLY added undropped plaintext PII column
+    fails. New `tests/user_pii.rs` proves no plaintext handle/claims in a dump, login
+    lookup through the blind index, exact claims round-trip, a duplicate-handle
+    conflict, and cross-tenant non-collision/non-leak of both the blind index and the
+    sealed values.
 - Front-Channel Logout registration (issue #39, migration 0025, expand). The per-client
   opt-in the OIDC `end_session` flow reads when front-channel logout is enabled.
   - **Registered front-channel logout columns.** Two additive `clients` columns:

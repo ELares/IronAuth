@@ -9,6 +9,9 @@
 //! [`Store::scoped`], which demands a [`Scope`] and hands back repositories
 //! that carry it.
 
+use std::sync::Arc;
+
+use ironauth_jose::MasterKey;
 use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
 
@@ -23,6 +26,14 @@ pub struct Store {
     // Private on purpose. Reaching a scoped table requires `scoped(scope)`;
     // there is no accessor that hands out the raw pool to other crates.
     pool: PgPool,
+    // The platform envelope master key (issue #48), when configured. It wraps
+    // per-tenant KEKs and drives the blind-index derivation, so the store can seal
+    // classified PII columns (users.identifier, users.claims) at rest and still look
+    // a user up by identifier. It is `None` only where no encrypted-PII path runs
+    // (a migration-owner or control-plane handle, or a store built before a key is
+    // wired); the PII read/write paths then FAIL CLOSED rather than fall back to
+    // plaintext. Never logged, displayed, or serialized (the key redacts itself).
+    master: Option<Arc<MasterKey>>,
 }
 
 impl Store {
@@ -41,7 +52,7 @@ impl Store {
             .max_connections(16)
             .connect(url)
             .await?;
-        Ok(Self { pool })
+        Ok(Self { pool, master: None })
     }
 
     /// Build a store from a pool the caller already configured (for example a
@@ -50,13 +61,31 @@ impl Store {
     /// not widen access to scoped tables.
     #[must_use]
     pub fn from_pool(pool: PgPool) -> Self {
-        Self { pool }
+        Self { pool, master: None }
+    }
+
+    /// Attach the platform envelope master key (issue #48), enabling the encrypted
+    /// PII paths (sealing and blind-indexing users.identifier / users.claims). A
+    /// handle without a key fails those paths closed, so wire this on every store
+    /// that serves the login, registration, or `UserInfo` surface. Consumes and
+    /// returns `self` so it composes with the constructors
+    /// (`Store::connect(url).await?.with_master_key(key)`).
+    #[must_use]
+    pub fn with_master_key(mut self, master: Arc<MasterKey>) -> Self {
+        self.master = Some(master);
+        self
     }
 
     /// The pool, for the repository layer only. Crate-private so no other crate
     /// can issue an unscoped query against a scoped table.
     pub(crate) fn pool(&self) -> &PgPool {
         &self.pool
+    }
+
+    /// The configured platform master key, for the repository layer only. `None`
+    /// when no key is wired (the encrypted-PII paths then fail closed).
+    pub(crate) fn master(&self) -> Option<&MasterKey> {
+        self.master.as_deref()
     }
 
     /// Apply the full IronAuth migration chain to bring the schema current.

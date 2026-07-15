@@ -28,6 +28,8 @@ scripts/query-audit.sh
 
 echo "==> classification lint (every resource type is classified; all three classes used)"
 scripts/classification-lint.sh
+echo "==> pii encryption (every classified PII/secret column is envelope-encrypted)"
+scripts/pii-encryption-scan.sh
 
 echo "==> http audit (ironauth-fetch is the only outbound HTTP path)"
 scripts/http-audit.sh

@@ -49,17 +49,18 @@ use std::fmt;
 use std::time::{Duration, SystemTime};
 
 use ironauth_env::Env;
+use ironauth_jose::{Aad, BlindIndex, Dek, Kek, MasterKey, Sealed};
 use sqlx::postgres::PgRow;
-use sqlx::{Postgres, Row, Transaction};
+use sqlx::{PgConnection, Postgres, Row, Transaction};
 
 use crate::audit::{ActingContext, Action, ActorRef};
 use crate::error::StoreError;
 use crate::id::{
     AssertionMappingId, AuditId, AuditTarget, AuthorizationCodeId, BackChannelDeliveryId, ClientId,
-    ClientSessionId, ConsentId, CorrelationId, DcrPolicyId, DeviceCodeId, EnvironmentId,
-    ExternalIssuerId, GrantId, InitialAccessTokenId, IssuedTokenId, ManagementKeyId, OperatorId,
-    OrganizationId, PushedRequestId, RefreshFamilyId, RefreshTokenId, ResourceServerId,
-    ServiceAccountId, SessionEventId, SessionId, SigningKeyId, TenantId, UserId,
+    ClientSessionId, ConsentId, CorrelationId, DcrPolicyId, DekId, DeviceCodeId, EncryptedSecretId,
+    EnvironmentId, ExternalIssuerId, GrantId, InitialAccessTokenId, IssuedTokenId, KekId,
+    ManagementKeyId, OperatorId, OrganizationId, PushedRequestId, RefreshFamilyId, RefreshTokenId,
+    ResourceServerId, ServiceAccountId, SessionEventId, SessionId, SigningKeyId, TenantId, UserId,
 };
 use crate::scope::Scope;
 use crate::store::Store;
@@ -385,6 +386,18 @@ impl<'a> ScopedStore<'a> {
         }
     }
 
+    /// The read-only envelope-encryption repository for this scope (issue #48):
+    /// decrypt an encrypted secret value, and inspect the scope's active KEK/DEK
+    /// versions. Decryption needs the platform master key; the mutating lifecycle
+    /// (provision, rotate, crypto-shred, write) lives on [`ActingStore::envelope`].
+    #[must_use]
+    pub fn envelope(&self) -> EnvelopeRepo<'a> {
+        EnvelopeRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
     /// Enter an acting context (who is acting, and under which correlation id).
     /// The returned store hands out the *mutating* repositories, so every write
     /// carries an actor and a correlation id into its audit row.
@@ -470,6 +483,22 @@ impl<'a> ActingStore<'a> {
     #[must_use]
     pub fn signing_keys(&self) -> ActingSigningKeyRepo<'a> {
         ActingSigningKeyRepo {
+            store: self.store,
+            scope: self.scope,
+            acting: self.acting,
+        }
+    }
+
+    /// The mutating envelope-encryption repository for this scope and actor (issue
+    /// #48): provision the scope's KEK and DEK, rotate the KEK (re-wrapping every
+    /// DEK online with no payload rewrite), rotate the DEK (versioning new writes),
+    /// crypto-shred the KEK (making all of the scope's data permanently
+    /// unreadable), write an encrypted secret, and re-encrypt a secret onto the
+    /// active DEK version. Every mutation writes its audit row in the same
+    /// transaction.
+    #[must_use]
+    pub fn envelope(&self) -> ActingEnvelopeRepo<'a> {
+        ActingEnvelopeRepo {
             store: self.store,
             scope: self.scope,
             acting: self.acting,
@@ -7286,33 +7315,50 @@ impl UserRepo<'_> {
     /// against a dummy hash when this is [`None`] so a present and an absent
     /// account take indistinguishable time (user-enumeration hardening).
     ///
+    /// The identifier is sealed at rest, so the equality lookup queries the
+    /// deterministic blind index (a per-tenant keyed HMAC of the handle) rather
+    /// than the plaintext, and the returned record's plaintext handle is recovered
+    /// by decrypting the sealed identifier under the row's DEK version.
+    ///
     /// # Errors
     ///
-    /// [`StoreError::Database`] on a persistence failure.
+    /// [`StoreError::Encryption`] if no platform master key is configured (the PII
+    /// path fails closed rather than fall back to plaintext) or a sealed value
+    /// cannot be authenticated and decrypted; [`StoreError::Database`] on a
+    /// persistence failure.
     pub async fn by_identifier(&self, identifier: &str) -> Result<Option<UserRecord>, StoreError> {
+        let master = self.store.master().ok_or(StoreError::Encryption)?;
+        let bidx = user_identifier_blind_index(master, self.scope, identifier);
         let mut tx = begin_scoped(self.store, self.scope).await?;
         let row = sqlx::query(
-            "SELECT id, identifier, password_hash FROM users \
-             WHERE identifier = $1 AND tenant_id = $2 AND environment_id = $3",
+            "SELECT id, identifier_sealed, password_hash, pii_dek_version FROM users \
+             WHERE identifier_bidx = $1 AND tenant_id = $2 AND environment_id = $3",
         )
-        .bind(identifier)
+        .bind(bidx.into_bytes())
         .bind(self.scope.tenant().to_string())
         .bind(self.scope.environment().to_string())
         .fetch_optional(&mut *tx)
         .await?;
+        let Some(row) = row else {
+            tx.commit().await?;
+            return Ok(None);
+        };
+        let id_text: String = row.get("id");
+        let id = UserId::parse_in_scope(&id_text, &self.scope)?;
+        let dek_version: i32 = row.get("pii_dek_version");
+        let sealed: Vec<u8> = row.get("identifier_sealed");
+        let dek = fetch_dek_by_version(&mut tx, self.scope, master, dek_version).await?;
+        let plaintext = dek.open(
+            &user_pii_seal_aad(self.scope, USER_IDENTIFIER_PURPOSE, dek_version),
+            &Sealed::from_bytes(sealed)?,
+        )?;
         tx.commit().await?;
-        match row {
-            None => Ok(None),
-            Some(row) => {
-                let id_text: String = row.get("id");
-                let id = UserId::parse_in_scope(&id_text, &self.scope)?;
-                Ok(Some(UserRecord {
-                    id,
-                    identifier: row.get("identifier"),
-                    password_hash: row.get("password_hash"),
-                }))
-            }
-        }
+        let identifier = String::from_utf8(plaintext).map_err(|_| StoreError::Encryption)?;
+        Ok(Some(UserRecord {
+            id,
+            identifier,
+            password_hash: row.get("password_hash"),
+        }))
     }
 
     /// Read a user's stored standard-claim document (issue #15) by their subject
@@ -7327,13 +7373,19 @@ impl UserRepo<'_> {
     /// stored or read from here: it is always derived through the shared subject
     /// function.
     ///
+    /// The claim document is sealed at rest, so this decrypts it transparently
+    /// under the row's DEK version before returning the plaintext JSON.
+    ///
     /// # Errors
     ///
-    /// [`StoreError::Database`] on a persistence failure.
+    /// [`StoreError::Encryption`] if no platform master key is configured (the PII
+    /// path fails closed) or the sealed claims cannot be authenticated and
+    /// decrypted; [`StoreError::Database`] on a persistence failure.
     pub async fn claims_for_subject(&self, subject: &str) -> Result<Option<String>, StoreError> {
+        let master = self.store.master().ok_or(StoreError::Encryption)?;
         let mut tx = begin_scoped(self.store, self.scope).await?;
         let row = sqlx::query(
-            "SELECT claims FROM users \
+            "SELECT claims_sealed, pii_dek_version FROM users \
              WHERE id = $1 AND tenant_id = $2 AND environment_id = $3",
         )
         .bind(subject)
@@ -7341,8 +7393,20 @@ impl UserRepo<'_> {
         .bind(self.scope.environment().to_string())
         .fetch_optional(&mut *tx)
         .await?;
+        let Some(row) = row else {
+            tx.commit().await?;
+            return Ok(None);
+        };
+        let dek_version: i32 = row.get("pii_dek_version");
+        let sealed: Vec<u8> = row.get("claims_sealed");
+        let dek = fetch_dek_by_version(&mut tx, self.scope, master, dek_version).await?;
+        let plaintext = dek.open(
+            &user_pii_seal_aad(self.scope, USER_CLAIMS_PURPOSE, dek_version),
+            &Sealed::from_bytes(sealed)?,
+        )?;
         tx.commit().await?;
-        Ok(row.map(|row| row.get::<String, _>("claims")))
+        let claims = String::from_utf8(plaintext).map_err(|_| StoreError::Encryption)?;
+        Ok(Some(claims))
     }
 }
 
@@ -7401,9 +7465,32 @@ impl ActingUserRepo<'_> {
             .await
     }
 
-    /// Shared body of the registration path: insert the user (with its claim
-    /// document) and its audit row in one transaction, mapping a duplicate login
-    /// handle to the caller-facing [`StoreError::Conflict`].
+    /// Ensure the scope has a live KEK and DEK to seal PII under, provisioning each
+    /// lazily on first use. Idempotent: an already-provisioned key is a no-op (the
+    /// provision path's [`StoreError::Conflict`] is swallowed here), so a repeat
+    /// registration never fails on it.
+    async fn ensure_scope_keys(&self, env: &Env, master: &MasterKey) -> Result<(), StoreError> {
+        let envelope = ActingEnvelopeRepo {
+            store: self.store,
+            scope: self.scope,
+            acting: self.acting,
+        };
+        match envelope.provision_kek(env, master).await {
+            Ok(_) | Err(StoreError::Conflict) => {}
+            Err(error) => return Err(error),
+        }
+        match envelope.provision_dek(env, master).await {
+            Ok(_) | Err(StoreError::Conflict) => {}
+            Err(error) => return Err(error),
+        }
+        Ok(())
+    }
+
+    /// Shared body of the registration path: seal the login handle and the claim
+    /// document under the scope's active DEK, insert the user (with its blind index
+    /// for lookup) and its audit row in one transaction, and map a duplicate login
+    /// handle to the caller-facing [`StoreError::Conflict`]. The plaintext handle
+    /// and claims never reach a column.
     async fn register_inner(
         &self,
         env: &Env,
@@ -7411,8 +7498,15 @@ impl ActingUserRepo<'_> {
         password_hash: &str,
         claims_json: &str,
     ) -> Result<UserId, StoreError> {
+        let master = self.store.master().ok_or(StoreError::Encryption)?;
+        // The scope needs a live KEK/DEK before the first PII seal; provision them
+        // lazily (idempotent) outside the register transaction.
+        self.ensure_scope_keys(env, master).await?;
         let id = UserId::generate(env, &self.scope);
         let scope = self.scope;
+        // The blind index is deterministic under the master key alone (no DEK), so
+        // compute it up front; it is what a later `by_identifier` lookup queries.
+        let bidx = user_identifier_blind_index(master, scope, identifier);
         write_audited(
             AuditedWrite {
                 store: self.store,
@@ -7423,25 +7517,40 @@ impl ActingUserRepo<'_> {
                 target: &id,
             },
             async move |tx| {
+                let (dek_version, dek) = fetch_active_dek(tx, scope, master).await?;
+                let identifier_sealed = dek.seal(
+                    env.entropy(),
+                    &user_pii_seal_aad(scope, USER_IDENTIFIER_PURPOSE, dek_version),
+                    identifier.as_bytes(),
+                );
+                let claims_sealed = dek.seal(
+                    env.entropy(),
+                    &user_pii_seal_aad(scope, USER_CLAIMS_PURPOSE, dek_version),
+                    claims_json.as_bytes(),
+                );
                 let result = sqlx::query(
                     "INSERT INTO users \
-                     (id, tenant_id, environment_id, identifier, password_hash, claims) \
-                     VALUES ($1, $2, $3, $4, $5, $6)",
+                     (id, tenant_id, environment_id, identifier_bidx, identifier_sealed, \
+                      password_hash, claims_sealed, pii_dek_version) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
                 )
                 .bind(id.to_string())
                 .bind(scope.tenant().to_string())
                 .bind(scope.environment().to_string())
-                .bind(identifier)
+                .bind(bidx.into_bytes())
+                .bind(identifier_sealed.into_bytes())
                 .bind(password_hash)
-                .bind(claims_json)
+                .bind(claims_sealed.into_bytes())
+                .bind(dek_version)
                 .execute(&mut **tx)
                 .await;
                 match result {
                     Ok(_) => Ok(()),
                     // A duplicate login handle is a caller-facing conflict (the
-                    // handle is taken), not a persistence fault. Erroring here
-                    // rolls the audited write back, so a rejected registration
-                    // leaves neither a user row nor an audit row.
+                    // handle is taken, caught by the blind-index unique
+                    // constraint), not a persistence fault. Erroring here rolls the
+                    // audited write back, so a rejected registration leaves neither
+                    // a user row nor an audit row.
                     Err(error) if is_unique_violation(&error) => Err(StoreError::Conflict),
                     Err(error) => Err(error.into()),
                 }
@@ -12449,4 +12558,863 @@ fn credential_from_row(
         display_name: row.get("display_name"),
         created_at_unix_micros: row.get("created_us"),
     })
+}
+
+// ===========================================================================
+// Per-tenant envelope encryption for PII and secrets (issue #48).
+//
+// The DEK/KEK envelope substrate at the persistence layer. Three tenant-scoped
+// tables (tenant_keks, tenant_deks, encrypted_secrets), isolated exactly like
+// every other data-plane table and reached only through the scoped repository,
+// so a KEK, a DEK, or a ciphertext of another tenant is not expressible. The AEAD
+// primitive itself (a standard ring::aead AES-256-GCM DEK/KEK envelope) lives in
+// ironauth-jose (the one crate allowed a direct ring dependency); this module
+// owns the key lifecycle, the context binding, and the encrypted columns.
+//
+// Key material and nonces are drawn only from the env.entropy() seam (via the
+// ironauth-jose primitive), never an OS RNG. A KEK is stored wrapped under the
+// platform master key; a DEK is stored wrapped under its scope's active KEK; a
+// secret value is stored sealed under the scope's active DEK, with the tenant,
+// environment, purpose, and key version bound as associated data so a ciphertext
+// cannot be replayed across a row, tenant, environment, or column. Destroying a
+// scope's KEK (the crypto-shred) makes every DEK unwrappable and therefore every
+// ciphertext permanently unreadable.
+// ===========================================================================
+
+/// The AAD label domain-separating a KEK wrap from every other envelope context.
+const KEK_WRAP_LABEL: &str = "ironauth.envelope.kek-wrap.v1";
+/// The AAD label domain-separating a DEK wrap from every other envelope context.
+const DEK_WRAP_LABEL: &str = "ironauth.envelope.dek-wrap.v1";
+/// The AAD label domain-separating a secret-payload seal from every other context.
+const SECRET_SEAL_LABEL: &str = "ironauth.envelope.secret.v1";
+/// The AAD label domain-separating a sealed `users` PII payload (the login handle
+/// or the standard-claim document) from every other envelope context.
+const USER_PII_SEAL_LABEL: &str = "ironauth.envelope.user-pii.v1";
+/// The AAD label domain-separating the `users.identifier` blind index from every
+/// other keyed derivation.
+const USER_IDENTIFIER_BIDX_LABEL: &str = "ironauth.envelope.user-identifier-bidx.v1";
+/// The purpose label bound into a sealed `users.identifier` (the login handle).
+const USER_IDENTIFIER_PURPOSE: &str = "identifier";
+/// The purpose label bound into a sealed `users.claims` (the standard-claim JSON).
+const USER_CLAIMS_PURPOSE: &str = "claims";
+
+/// The associated data binding a wrapped KEK to its scope, version, and master
+/// key. A KEK wrapped under one context fails to unwrap under any other, so it
+/// cannot be lifted into another tenant, environment, or master-key generation.
+fn kek_wrap_aad(scope: Scope, version: i32, master_key_id: &str) -> Aad {
+    Aad::builder()
+        .text(KEK_WRAP_LABEL)
+        .text(&scope.tenant().to_string())
+        .text(&scope.environment().to_string())
+        .version(i64::from(version))
+        .text(master_key_id)
+        .build()
+}
+
+/// The associated data binding a wrapped DEK to its scope and version. It does
+/// NOT bind the wrapping KEK version, so a KEK rotation re-wraps a DEK under the
+/// same AAD (only the wrapping key changes); using the wrong KEK still fails
+/// authentication, so the KEK identity needs no separate AAD field.
+fn dek_wrap_aad(scope: Scope, version: i32) -> Aad {
+    Aad::builder()
+        .text(DEK_WRAP_LABEL)
+        .text(&scope.tenant().to_string())
+        .text(&scope.environment().to_string())
+        .version(i64::from(version))
+        .build()
+}
+
+/// The associated data binding a sealed secret payload to its scope, column
+/// (purpose), and the DEK version that sealed it. A ciphertext lifted to another
+/// row, tenant, environment, column, or claimed under another DEK version fails
+/// authenticated decryption.
+fn secret_seal_aad(scope: Scope, purpose: &str, dek_version: i32) -> Aad {
+    Aad::builder()
+        .text(SECRET_SEAL_LABEL)
+        .text(&scope.tenant().to_string())
+        .text(&scope.environment().to_string())
+        .text(purpose)
+        .version(i64::from(dek_version))
+        .build()
+}
+
+/// The associated data binding a sealed `users` PII value to its scope, column
+/// (purpose: the login handle or the claim document), and the DEK version that
+/// sealed it. Shares the row/tenant/environment/column/version replay protection
+/// of every other sealed payload; the distinct label keeps a `users` seal from
+/// ever authenticating under the generic secret-store context.
+fn user_pii_seal_aad(scope: Scope, purpose: &str, dek_version: i32) -> Aad {
+    Aad::builder()
+        .text(USER_PII_SEAL_LABEL)
+        .text(&scope.tenant().to_string())
+        .text(&scope.environment().to_string())
+        .text(purpose)
+        .version(i64::from(dek_version))
+        .build()
+}
+
+/// The blind-index context for a `users.identifier`: the label, the scope, and the
+/// identifier value, length-prefixed. The master key derives a per-tenant HMAC key
+/// over this context, so the same handle in two tenants maps to two different tags
+/// (an index collision cannot leak across tenants) and the tag is never a bare
+/// unsalted hash of the handle.
+fn user_identifier_bidx_aad(scope: Scope, identifier: &str) -> Aad {
+    Aad::builder()
+        .text(USER_IDENTIFIER_BIDX_LABEL)
+        .text(&scope.tenant().to_string())
+        .text(&scope.environment().to_string())
+        .field(identifier.as_bytes())
+        .build()
+}
+
+/// The deterministic blind index for `identifier` in `scope` under `master`, the
+/// value an equality lookup queries against `users.identifier_bidx`.
+fn user_identifier_blind_index(master: &MasterKey, scope: Scope, identifier: &str) -> BlindIndex {
+    master.blind_index(&user_identifier_bidx_aad(scope, identifier))
+}
+
+/// Load and unwrap the scope's active KEK (the highest live version), under the
+/// platform master key. Returns [`StoreError::Encryption`] when there is no live
+/// KEK (never provisioned, or crypto-shredded): a shredded scope's data is then
+/// UNREADABLE, never reported as a missing record.
+async fn fetch_active_kek(
+    conn: &mut PgConnection,
+    scope: Scope,
+    master: &MasterKey,
+) -> Result<(i32, Kek), StoreError> {
+    let row = sqlx::query(
+        "SELECT version, master_key_id, wrapped_kek FROM tenant_keks \
+         WHERE tenant_id = $1 AND environment_id = $2 AND status = 'active' \
+         ORDER BY version DESC LIMIT 1",
+    )
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .fetch_optional(&mut *conn)
+    .await?;
+    let row = row.ok_or(StoreError::Encryption)?;
+    let version: i32 = row.get("version");
+    let master_key_id: String = row.get("master_key_id");
+    let wrapped: Vec<u8> = row.get("wrapped_kek");
+    let kek = master.unwrap_kek(
+        &kek_wrap_aad(scope, version, &master_key_id),
+        &Sealed::from_bytes(wrapped)?,
+    )?;
+    Ok((version, kek))
+}
+
+/// Load and unwrap a specific KEK version under the master key. Used by KEK
+/// rotation to unwrap DEKs that were wrapped under the outgoing KEK.
+async fn fetch_kek_by_version(
+    conn: &mut PgConnection,
+    scope: Scope,
+    master: &MasterKey,
+    version: i32,
+) -> Result<Kek, StoreError> {
+    let row = sqlx::query(
+        "SELECT master_key_id, wrapped_kek FROM tenant_keks \
+         WHERE tenant_id = $1 AND environment_id = $2 AND version = $3",
+    )
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .bind(version)
+    .fetch_optional(&mut *conn)
+    .await?;
+    let row = row.ok_or(StoreError::Encryption)?;
+    let master_key_id: String = row.get("master_key_id");
+    let wrapped: Vec<u8> = row.get("wrapped_kek");
+    let kek = master.unwrap_kek(
+        &kek_wrap_aad(scope, version, &master_key_id),
+        &Sealed::from_bytes(wrapped)?,
+    )?;
+    Ok(kek)
+}
+
+/// Load and unwrap a specific DEK version (via the KEK that wrapped it).
+async fn fetch_dek_by_version(
+    conn: &mut PgConnection,
+    scope: Scope,
+    master: &MasterKey,
+    version: i32,
+) -> Result<Dek, StoreError> {
+    let row = sqlx::query(
+        "SELECT kek_version, wrapped_dek FROM tenant_deks \
+         WHERE tenant_id = $1 AND environment_id = $2 AND version = $3",
+    )
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .bind(version)
+    .fetch_optional(&mut *conn)
+    .await?;
+    let row = row.ok_or(StoreError::Encryption)?;
+    let kek_version: i32 = row.get("kek_version");
+    let wrapped: Vec<u8> = row.get("wrapped_dek");
+    let kek = fetch_kek_by_version(conn, scope, master, kek_version).await?;
+    let dek = kek.unwrap_dek(&dek_wrap_aad(scope, version), &Sealed::from_bytes(wrapped)?)?;
+    Ok(dek)
+}
+
+/// Load and unwrap the scope's active DEK (the highest live version).
+async fn fetch_active_dek(
+    conn: &mut PgConnection,
+    scope: Scope,
+    master: &MasterKey,
+) -> Result<(i32, Dek), StoreError> {
+    let version = active_dek_version(conn, scope)
+        .await?
+        .ok_or(StoreError::Encryption)?;
+    let dek = fetch_dek_by_version(conn, scope, master, version).await?;
+    Ok((version, dek))
+}
+
+/// The scope's highest live KEK version, or `None` if there is no live KEK.
+async fn active_kek_version(
+    conn: &mut PgConnection,
+    scope: Scope,
+) -> Result<Option<i32>, StoreError> {
+    let row = sqlx::query(
+        "SELECT max(version) AS v FROM tenant_keks \
+         WHERE tenant_id = $1 AND environment_id = $2 AND status = 'active'",
+    )
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .fetch_one(&mut *conn)
+    .await?;
+    Ok(row.get::<Option<i32>, _>("v"))
+}
+
+/// The scope's highest live DEK version, or `None` if there is no live DEK.
+async fn active_dek_version(
+    conn: &mut PgConnection,
+    scope: Scope,
+) -> Result<Option<i32>, StoreError> {
+    let row = sqlx::query(
+        "SELECT max(version) AS v FROM tenant_deks \
+         WHERE tenant_id = $1 AND environment_id = $2 AND status = 'active'",
+    )
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .fetch_one(&mut *conn)
+    .await?;
+    Ok(row.get::<Option<i32>, _>("v"))
+}
+
+/// The highest KEK version stored for the scope (any status), or `None`.
+async fn max_kek_version(conn: &mut PgConnection, scope: Scope) -> Result<Option<i32>, StoreError> {
+    let row = sqlx::query(
+        "SELECT max(version) AS v FROM tenant_keks \
+         WHERE tenant_id = $1 AND environment_id = $2",
+    )
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .fetch_one(&mut *conn)
+    .await?;
+    Ok(row.get::<Option<i32>, _>("v"))
+}
+
+/// The highest DEK version stored for the scope (any status), or `None`.
+async fn max_dek_version(conn: &mut PgConnection, scope: Scope) -> Result<Option<i32>, StoreError> {
+    let row = sqlx::query(
+        "SELECT max(version) AS v FROM tenant_deks \
+         WHERE tenant_id = $1 AND environment_id = $2",
+    )
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .fetch_one(&mut *conn)
+    .await?;
+    Ok(row.get::<Option<i32>, _>("v"))
+}
+
+/// The read-only envelope-encryption repository (issue #48): decrypt an encrypted
+/// secret and inspect the scope's active key versions. Every query is scope
+/// filtered and runs under the row-level-security session variables.
+pub struct EnvelopeRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl EnvelopeRepo<'_> {
+    /// Decrypt the secret stored under `purpose`, under the platform master key.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if no secret is stored under `purpose` in this
+    /// scope; [`StoreError::Encryption`] if the ciphertext cannot be
+    /// authenticated and decrypted (a crypto-shredded scope, a tampered blob);
+    /// [`StoreError::Database`] on a persistence failure. The encryption failure
+    /// is deliberately distinct from the missing-record case.
+    pub async fn open_secret(
+        &self,
+        master: &MasterKey,
+        purpose: &str,
+    ) -> Result<Vec<u8>, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT dek_version, ciphertext FROM encrypted_secrets \
+             WHERE tenant_id = $1 AND environment_id = $2 AND purpose = $3",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(purpose)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(row) = row else {
+            tx.commit().await?;
+            return Err(StoreError::NotFound);
+        };
+        let dek_version: i32 = row.get("dek_version");
+        let ciphertext: Vec<u8> = row.get("ciphertext");
+        let dek = fetch_dek_by_version(&mut tx, self.scope, master, dek_version).await?;
+        let plaintext = dek.open(
+            &secret_seal_aad(self.scope, purpose, dek_version),
+            &Sealed::from_bytes(ciphertext)?,
+        )?;
+        tx.commit().await?;
+        Ok(plaintext)
+    }
+
+    /// The DEK version that currently seals the secret under `purpose` (so a test
+    /// or a background worker can observe re-encryption advancing it).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if no secret is stored under `purpose`.
+    pub async fn secret_dek_version(&self, purpose: &str) -> Result<i32, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT dek_version FROM encrypted_secrets \
+             WHERE tenant_id = $1 AND environment_id = $2 AND purpose = $3",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(purpose)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        row.map(|r| r.get::<i32, _>("dek_version"))
+            .ok_or(StoreError::NotFound)
+    }
+
+    /// The scope's active KEK version, or `None` if the scope has no live KEK
+    /// (never provisioned, or crypto-shredded).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn active_kek_version(&self) -> Result<Option<i32>, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let version = active_kek_version(&mut tx, self.scope).await?;
+        tx.commit().await?;
+        Ok(version)
+    }
+
+    /// The scope's active DEK version, or `None` if the scope has no live DEK.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn active_dek_version(&self) -> Result<Option<i32>, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let version = active_dek_version(&mut tx, self.scope).await?;
+        tx.commit().await?;
+        Ok(version)
+    }
+}
+
+/// The mutating envelope-encryption repository (issue #48). Reachable only through
+/// [`ScopedStore::acting`], so every lifecycle mutation carries an actor and a
+/// correlation id and routes through the module's single audited-write primitive.
+pub struct ActingEnvelopeRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+    acting: ActingContext,
+}
+
+impl ActingEnvelopeRepo<'_> {
+    /// Provision the scope's day-one KEK: generate a fresh KEK, wrap it under the
+    /// platform master key, and store version 1. Audited.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Conflict`] if the scope already has a KEK;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn provision_kek(&self, env: &Env, master: &MasterKey) -> Result<KekId, StoreError> {
+        let scope = self.scope;
+        let id = KekId::generate(env, &scope);
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::EnvelopeKekProvision,
+                target: &id,
+            },
+            async move |tx| {
+                if max_kek_version(tx, scope).await?.is_some() {
+                    return Err(StoreError::Conflict);
+                }
+                let kek = Kek::generate(env.entropy());
+                let wrapped =
+                    master.wrap_kek(env.entropy(), &kek_wrap_aad(scope, 1, master.id()), &kek);
+                sqlx::query(
+                    "INSERT INTO tenant_keks \
+                     (id, tenant_id, environment_id, version, master_key_id, wrapped_kek, status) \
+                     VALUES ($1, $2, $3, 1, $4, $5, 'active')",
+                )
+                .bind(id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(master.id())
+                .bind(wrapped.into_bytes())
+                .execute(&mut **tx)
+                .await?;
+                Ok(())
+            },
+            false,
+        )
+        .await?;
+        Ok(id)
+    }
+
+    /// Provision the scope's day-one DEK: generate a fresh DEK, wrap it under the
+    /// scope's active KEK, and store version 1. Audited.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Conflict`] if the scope already has a DEK;
+    /// [`StoreError::Encryption`] if the scope has no live KEK to wrap under;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn provision_dek(&self, env: &Env, master: &MasterKey) -> Result<DekId, StoreError> {
+        let scope = self.scope;
+        let id = DekId::generate(env, &scope);
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::EnvelopeDekProvision,
+                target: &id,
+            },
+            async move |tx| {
+                if max_dek_version(tx, scope).await?.is_some() {
+                    return Err(StoreError::Conflict);
+                }
+                let (kek_version, kek) = fetch_active_kek(tx, scope, master).await?;
+                let dek = Dek::generate(env.entropy());
+                let wrapped = kek.wrap_dek(env.entropy(), &dek_wrap_aad(scope, 1), &dek);
+                sqlx::query(
+                    "INSERT INTO tenant_deks \
+                     (id, tenant_id, environment_id, version, kek_version, wrapped_dek, status) \
+                     VALUES ($1, $2, $3, 1, $4, $5, 'active')",
+                )
+                .bind(id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(kek_version)
+                .bind(wrapped.into_bytes())
+                .execute(&mut **tx)
+                .await?;
+                Ok(())
+            },
+            false,
+        )
+        .await?;
+        Ok(id)
+    }
+
+    /// Rotate the scope's KEK online: generate a fresh KEK version, re-wrap EVERY
+    /// one of the scope's DEKs under it (unwrap under the outgoing KEK, wrap under
+    /// the incoming one), and retire the outgoing KEK. No record payload is
+    /// rewritten, so old ciphertext still reads. Audited, all in one transaction.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Encryption`] if the scope has no live KEK to rotate;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn rotate_kek(&self, env: &Env, master: &MasterKey) -> Result<KekId, StoreError> {
+        let scope = self.scope;
+        let id = KekId::generate(env, &scope);
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::EnvelopeKekRotate,
+                target: &id,
+            },
+            async move |tx| {
+                // Require a live KEK to rotate; the outgoing KEK stays active until
+                // the DEK re-wrap below finishes reading through it.
+                let old_version = active_kek_version(tx, scope)
+                    .await?
+                    .ok_or(StoreError::Encryption)?;
+                let new_version = old_version + 1;
+                let new_kek = Kek::generate(env.entropy());
+                let wrapped_new_kek = master.wrap_kek(
+                    env.entropy(),
+                    &kek_wrap_aad(scope, new_version, master.id()),
+                    &new_kek,
+                );
+                sqlx::query(
+                    "INSERT INTO tenant_keks \
+                     (id, tenant_id, environment_id, version, master_key_id, wrapped_kek, status) \
+                     VALUES ($1, $2, $3, $4, $5, $6, 'active')",
+                )
+                .bind(id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(new_version)
+                .bind(master.id())
+                .bind(wrapped_new_kek.into_bytes())
+                .execute(&mut **tx)
+                .await?;
+
+                // Re-wrap every DEK under the new KEK. The DEK-wrap AAD is
+                // constant across the rotation, so this is a cheap re-seal of the
+                // 32 key bytes, never a record-payload rewrite.
+                let dek_rows = sqlx::query(
+                    "SELECT version FROM tenant_deks \
+                     WHERE tenant_id = $1 AND environment_id = $2 ORDER BY version",
+                )
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .fetch_all(&mut **tx)
+                .await?;
+                for dek_row in &dek_rows {
+                    let dek_version: i32 = dek_row.get("version");
+                    let dek = fetch_dek_by_version(tx, scope, master, dek_version).await?;
+                    let rewrapped =
+                        new_kek.wrap_dek(env.entropy(), &dek_wrap_aad(scope, dek_version), &dek);
+                    sqlx::query(
+                        "UPDATE tenant_deks SET wrapped_dek = $4, kek_version = $5 \
+                         WHERE tenant_id = $1 AND environment_id = $2 AND version = $3",
+                    )
+                    .bind(scope.tenant().to_string())
+                    .bind(scope.environment().to_string())
+                    .bind(dek_version)
+                    .bind(rewrapped.into_bytes())
+                    .bind(new_version)
+                    .execute(&mut **tx)
+                    .await?;
+                }
+
+                // Retire the outgoing KEK: it is no longer the active head and no
+                // DEK references it, but the row is retained (destroyed only by a
+                // crypto-shred).
+                sqlx::query(
+                    "UPDATE tenant_keks SET status = 'retired' \
+                     WHERE tenant_id = $1 AND environment_id = $2 AND version = $3",
+                )
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(old_version)
+                .execute(&mut **tx)
+                .await?;
+                Ok(())
+            },
+            false,
+        )
+        .await?;
+        Ok(id)
+    }
+
+    /// Rotate the scope's DEK: generate a fresh DEK version (wrapped under the
+    /// active KEK) for NEW writes, and retire the outgoing DEK, which stays
+    /// readable so old rows decrypt until background re-encryption advances them.
+    /// Audited.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Encryption`] if the scope has no live KEK/DEK;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn rotate_dek(&self, env: &Env, master: &MasterKey) -> Result<DekId, StoreError> {
+        let scope = self.scope;
+        let id = DekId::generate(env, &scope);
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::EnvelopeDekRotate,
+                target: &id,
+            },
+            async move |tx| {
+                let current = max_dek_version(tx, scope)
+                    .await?
+                    .ok_or(StoreError::Encryption)?;
+                let new_version = current + 1;
+                let (kek_version, kek) = fetch_active_kek(tx, scope, master).await?;
+                let dek = Dek::generate(env.entropy());
+                let wrapped = kek.wrap_dek(env.entropy(), &dek_wrap_aad(scope, new_version), &dek);
+                // Retire the current active DEK (readable, not written to).
+                sqlx::query(
+                    "UPDATE tenant_deks SET status = 'retired' \
+                     WHERE tenant_id = $1 AND environment_id = $2 AND status = 'active'",
+                )
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .execute(&mut **tx)
+                .await?;
+                sqlx::query(
+                    "INSERT INTO tenant_deks \
+                     (id, tenant_id, environment_id, version, kek_version, wrapped_dek, status) \
+                     VALUES ($1, $2, $3, $4, $5, $6, 'active')",
+                )
+                .bind(id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(new_version)
+                .bind(kek_version)
+                .bind(wrapped.into_bytes())
+                .execute(&mut **tx)
+                .await?;
+                Ok(())
+            },
+            false,
+        )
+        .await?;
+        Ok(id)
+    }
+
+    /// Crypto-shred the scope's KEK: overwrite every KEK version's wrapped bytes
+    /// with an empty blob and mark it destroyed. After this the scope's DEKs can
+    /// never be unwrapped, so every one of its ciphertexts is permanently
+    /// unreadable (the offboarding property #49 productizes). Audited.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the scope has no KEK to destroy;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn destroy_kek(&self, env: &Env) -> Result<KekId, StoreError> {
+        let scope = self.scope;
+        // The audit target is the scope's highest KEK version (read out of band).
+        let mut probe = begin_scoped(self.store, scope).await?;
+        let target_row = sqlx::query(
+            "SELECT id FROM tenant_keks \
+             WHERE tenant_id = $1 AND environment_id = $2 ORDER BY version DESC LIMIT 1",
+        )
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .fetch_optional(&mut *probe)
+        .await?;
+        probe.commit().await?;
+        let target_text: String = target_row.ok_or(StoreError::NotFound)?.get("id");
+        let target = KekId::parse_in_scope(&target_text, &scope)?;
+
+        let destroyed_micros = epoch_micros(env.clock().now_utc());
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::EnvelopeKekDestroy,
+                target: &target,
+            },
+            async move |tx| {
+                // Overwrite the wrapped KEK bytes (crypto-shred) and mark every
+                // not-yet-destroyed version destroyed, stamping the instant from
+                // the application clock seam.
+                sqlx::query(
+                    "UPDATE tenant_keks \
+                     SET wrapped_kek = $3, status = 'destroyed', \
+                         destroyed_at = TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval \
+                     WHERE tenant_id = $1 AND environment_id = $2 AND status <> 'destroyed'",
+                )
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(Vec::<u8>::new())
+                .bind(destroyed_micros)
+                .execute(&mut **tx)
+                .await?;
+                Ok(())
+            },
+            false,
+        )
+        .await?;
+        Ok(target)
+    }
+
+    /// Write an encrypted secret under `purpose`: seal `plaintext` under the
+    /// scope's active DEK with the column context bound as associated data, and
+    /// upsert it (one secret per purpose per scope). Audited.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Encryption`] if the scope has no live KEK/DEK to seal under;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn put_secret(
+        &self,
+        env: &Env,
+        master: &MasterKey,
+        purpose: &str,
+        plaintext: &[u8],
+    ) -> Result<EncryptedSecretId, StoreError> {
+        let scope = self.scope;
+        // Reuse an existing row's id (a stable audit target across overwrites),
+        // or mint a fresh one for a first write.
+        let mut probe = begin_scoped(self.store, scope).await?;
+        let existing = sqlx::query(
+            "SELECT id FROM encrypted_secrets \
+             WHERE tenant_id = $1 AND environment_id = $2 AND purpose = $3",
+        )
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(purpose)
+        .fetch_optional(&mut *probe)
+        .await?;
+        probe.commit().await?;
+        let id = match existing {
+            Some(row) => EncryptedSecretId::parse_in_scope(&row.get::<String, _>("id"), &scope)?,
+            None => EncryptedSecretId::generate(env, &scope),
+        };
+        let updated_micros = epoch_micros(env.clock().now_utc());
+        let plaintext = plaintext.to_vec();
+        let purpose_owned = purpose.to_string();
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::EncryptedSecretPut,
+                target: &id,
+            },
+            async move |tx| {
+                let (dek_version, dek) = fetch_active_dek(tx, scope, master).await?;
+                let sealed = dek.seal(
+                    env.entropy(),
+                    &secret_seal_aad(scope, &purpose_owned, dek_version),
+                    &plaintext,
+                );
+                sqlx::query(
+                    "INSERT INTO encrypted_secrets \
+                     (id, tenant_id, environment_id, purpose, dek_version, ciphertext, updated_at) \
+                     VALUES ($1, $2, $3, $4, $5, $6, \
+                             TIMESTAMPTZ 'epoch' + ($7::text || ' microseconds')::interval) \
+                     ON CONFLICT (tenant_id, environment_id, purpose) DO UPDATE \
+                     SET ciphertext = EXCLUDED.ciphertext, dek_version = EXCLUDED.dek_version, \
+                         updated_at = EXCLUDED.updated_at",
+                )
+                .bind(id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(&purpose_owned)
+                .bind(dek_version)
+                .bind(sealed.into_bytes())
+                .bind(updated_micros)
+                .execute(&mut **tx)
+                .await?;
+                Ok(())
+            },
+            false,
+        )
+        .await?;
+        Ok(id)
+    }
+
+    /// Re-encrypt the secret under `purpose` from its current DEK version onto the
+    /// scope's active DEK version (the observable background re-encryption step a
+    /// DEK rotation schedules). The plaintext never changes; only the sealing key
+    /// version does. Returns whether the secret advanced (it is a no-op, and not
+    /// audited, when the secret is already on the active version). Audited when it
+    /// re-encrypts.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if no secret is stored under `purpose`;
+    /// [`StoreError::Encryption`] if the ciphertext cannot be decrypted (a
+    /// crypto-shredded scope); [`StoreError::Database`] on a persistence failure.
+    pub async fn reencrypt_secret(
+        &self,
+        env: &Env,
+        master: &MasterKey,
+        purpose: &str,
+    ) -> Result<bool, StoreError> {
+        let scope = self.scope;
+        // Pre-check: is the secret already on the active DEK version?
+        let mut probe = begin_scoped(self.store, scope).await?;
+        let row = sqlx::query(
+            "SELECT id, dek_version FROM encrypted_secrets \
+             WHERE tenant_id = $1 AND environment_id = $2 AND purpose = $3",
+        )
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(purpose)
+        .fetch_optional(&mut *probe)
+        .await?;
+        let active = active_dek_version(&mut probe, scope).await?;
+        probe.commit().await?;
+        let row = row.ok_or(StoreError::NotFound)?;
+        let id = EncryptedSecretId::parse_in_scope(&row.get::<String, _>("id"), &scope)?;
+        let current: i32 = row.get("dek_version");
+        let active = active.ok_or(StoreError::Encryption)?;
+        if current == active {
+            return Ok(false);
+        }
+
+        let purpose_owned = purpose.to_string();
+        let updated_micros = epoch_micros(env.clock().now_utc());
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::EncryptedSecretReencrypt,
+                target: &id,
+            },
+            async move |tx| {
+                // Re-read within the write transaction so the re-encryption is
+                // consistent even under a concurrent overwrite.
+                let secret_row = sqlx::query(
+                    "SELECT dek_version, ciphertext FROM encrypted_secrets \
+                     WHERE tenant_id = $1 AND environment_id = $2 AND purpose = $3",
+                )
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(&purpose_owned)
+                .fetch_optional(&mut **tx)
+                .await?
+                .ok_or(StoreError::NotFound)?;
+                let old_version: i32 = secret_row.get("dek_version");
+                let ciphertext: Vec<u8> = secret_row.get("ciphertext");
+                let (active_version, active_dek) = fetch_active_dek(tx, scope, master).await?;
+                if old_version == active_version {
+                    return Ok(());
+                }
+                let old_dek = fetch_dek_by_version(tx, scope, master, old_version).await?;
+                let plaintext = old_dek.open(
+                    &secret_seal_aad(scope, &purpose_owned, old_version),
+                    &Sealed::from_bytes(ciphertext)?,
+                )?;
+                let resealed = active_dek.seal(
+                    env.entropy(),
+                    &secret_seal_aad(scope, &purpose_owned, active_version),
+                    &plaintext,
+                );
+                sqlx::query(
+                    "UPDATE encrypted_secrets \
+                     SET ciphertext = $4, dek_version = $5, \
+                         updated_at = TIMESTAMPTZ 'epoch' + ($6::text || ' microseconds')::interval \
+                     WHERE tenant_id = $1 AND environment_id = $2 AND purpose = $3",
+                )
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(&purpose_owned)
+                .bind(resealed.into_bytes())
+                .bind(active_version)
+                .bind(updated_micros)
+                .execute(&mut **tx)
+                .await?;
+                Ok(())
+            },
+            false,
+        )
+        .await?;
+        Ok(true)
+    }
 }

@@ -27,7 +27,10 @@
 //! This harness is the reusable substrate; future crates depend on
 //! `ironauth-store` with `features = ["testing"]` and reuse it.
 
-use ironauth_env::Env;
+use std::sync::Arc;
+
+use ironauth_env::{Env, FixedEntropy};
+use ironauth_jose::MasterKey;
 use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
 
@@ -61,6 +64,12 @@ pub struct TestDatabase {
     /// the SAME database and rebuild its process-level state from nothing: the
     /// rolling-restart simulation (issue #32 AC 1).
     app_url: String,
+    /// The platform envelope master key (issue #48), shared across every data-plane
+    /// handle this database hands out (including a simulated restart), so encrypted
+    /// PII sealed by one handle reads back through another. Deterministic (a fixed
+    /// entropy seed) so a run is reproducible; a fresh database per run means one
+    /// shared key across databases is harmless.
+    master: Arc<MasterKey>,
 }
 
 impl TestDatabase {
@@ -107,10 +116,17 @@ impl TestDatabase {
         // The data-plane handles authenticate as the low-privilege app role, so
         // they are subject to row-level security exactly as production is.
         let app_url = format!("postgres://{APP_ROLE}:{APP_ROLE}@{host}:{port}/{db_name}");
+        // One platform master key for the whole database, so every data-plane
+        // handle seals and opens PII under the same key (issue #48).
+        let master = Arc::new(MasterKey::generate(
+            "master-test",
+            &FixedEntropy::new(0x4841_5348),
+        ));
+
         let app_pool = PgPool::connect(&app_url)
             .await
             .expect("connect as low-privilege app role");
-        let store = Store::from_pool(app_pool.clone());
+        let store = Store::from_pool(app_pool.clone()).with_master_key(master.clone());
 
         // The control-plane handle authenticates as the SEPARATE control role;
         // its pool is distinct from the data-plane pool, mirroring production
@@ -129,7 +145,17 @@ impl TestDatabase {
             store,
             control_store,
             app_url,
+            master,
         }
+    }
+
+    /// The platform envelope master key wired into this database's data-plane
+    /// handles (issue #48). A test that builds its OWN data-plane [`Store`] (a
+    /// second simulated node) must attach THIS key with
+    /// [`Store::with_master_key`] so it seals and opens PII compatibly.
+    #[must_use]
+    pub fn master_key(&self) -> Arc<MasterKey> {
+        self.master.clone()
     }
 
     /// Open a BRAND-NEW data-plane pool against the SAME database and wrap it in a NEW
@@ -147,7 +173,7 @@ impl TestDatabase {
         let pool = PgPool::connect(&self.app_url)
             .await
             .expect("reconnect as low-privilege app role after a simulated restart");
-        Store::from_pool(pool)
+        Store::from_pool(pool).with_master_key(self.master.clone())
     }
 
     /// The store bound to the low-privilege application role. Repository
@@ -176,7 +202,7 @@ impl TestDatabase {
             .connect(&self.app_url)
             .await
             .expect("build a wider data-plane pool for the concurrency storm");
-        Store::from_pool(pool)
+        Store::from_pool(pool).with_master_key(self.master.clone())
     }
 
     /// The store bound to the low-privilege control-plane role (issue #11).

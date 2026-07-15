@@ -434,6 +434,12 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0027_resource_model_apis.sql"),
         },
+        Migration {
+            version: 28,
+            name: "envelope_encryption",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0028_envelope_encryption.sql"),
+        },
     ]
 }
 

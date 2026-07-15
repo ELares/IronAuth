@@ -121,6 +121,7 @@
 mod claims;
 mod cnf;
 mod crypto;
+pub mod envelope;
 mod error;
 mod header;
 mod json;
@@ -139,6 +140,9 @@ pub mod seams;
 
 pub use claims::VerifiedClaims;
 pub use cnf::{CnfError, Confirmation};
+pub use envelope::{
+    Aad, AadBuilder, BlindIndex, Dek, EnvelopeError, KEY_LEN, Kek, MasterKey, NONCE_BYTES, Sealed,
+};
 pub use error::{RejectReason, VerifyError};
 pub use jwks::{Jwk, JwkSet, trusted_keys_from_jwks};
 pub use keystore::EnvironmentKeyStore;
