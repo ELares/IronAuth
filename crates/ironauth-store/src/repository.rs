@@ -2349,8 +2349,10 @@ impl ActingClientRepo<'_> {
                 // Enforce the quota atomically: take a per-scope advisory lock (held
                 // until this transaction commits or rolls back) so a concurrent pair
                 // of registrations serialize, then count and compare inside the same
-                // transaction as the INSERT. Only DCR registration takes this lock,
-                // so it never contends with any other operation.
+                // transaction as the INSERT. This is the ONLY user of the TWO-argument
+                // advisory-lock space keyed on the two scope strings; the
+                // config-promotion apply deliberately uses the single-argument form
+                // (a disjoint lock space), so the two operations never contend.
                 if let Some(max) = max_clients {
                     sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))")
                         .bind(scope.tenant().to_string())
@@ -15959,12 +15961,18 @@ impl ActingStore<'_> {
         // plan enumerated. Holding this lock, the second apply blocks until the first
         // commits, then re-reads the NOW-CHANGED revision and correctly returns
         // `Drift`, changing nothing. `pg_advisory_xact_lock` auto-releases at
-        // commit/rollback; the lock is per TARGET (keyed on the two scope strings,
-        // mirroring the DCR-quota path above), so applies to DIFFERENT environments
-        // still run fully concurrently.
-        sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))")
-            .bind(scope.tenant().to_string())
-            .bind(scope.environment().to_string())
+        // commit/rollback; the lock is per TARGET (keyed on a promotion-namespaced
+        // hash of the two scope strings), so applies to DIFFERENT environments still
+        // run fully concurrently. The single-argument form is used deliberately: it
+        // occupies a lock space DISJOINT from the two-argument DCR-quota lock, so a
+        // config-promotion apply and a DCR registration to the same scope do NOT
+        // needlessly serialize against each other.
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))")
+            .bind(format!(
+                "config-promotion:apply:{}:{}",
+                scope.tenant(),
+                scope.environment()
+            ))
             .execute(&mut *tx)
             .await?;
 
