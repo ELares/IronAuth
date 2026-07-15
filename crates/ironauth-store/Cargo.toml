@@ -241,6 +241,20 @@ name = "user_admin"
 path = "tests/user_admin.rs"
 required-features = ["testing"]
 
+# JSON Schema identity traits with versioning and migration jobs (issue #53): a
+# well-formed schema is accepted and a malformed one rejected; traits validate
+# against the active version at write (invalid refused with JSON Pointer errors,
+# nothing persisted); arrays and nested objects round-trip; trait data is
+# envelope-encrypted (no plaintext in a dump); versioning is immutable and each
+# identity records its version; a dry-run reports invalid identities and blocks the
+# cutover; a migration job migrates N -> N+1 deterministically, idempotently, and
+# resumably; the admin-only visibility split holds; a job is per-scope and audited.
+# Needs a real database (DATABASE_URL).
+[[test]]
+name = "traits"
+path = "tests/traits.rs"
+required-features = ["testing"]
+
 # Compile-fail proofs. Database-free, so it runs on every lane (including MSRV).
 [[test]]
 name = "compile_fail"
