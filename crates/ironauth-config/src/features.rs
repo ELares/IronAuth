@@ -18,6 +18,17 @@ use std::fmt;
 
 use crate::{Config, FeatureToggle};
 
+/// The exact revision of `draft-parecki-oauth-global-token-revocation` this build
+/// implements (issue #36). It doubles as the experimental `ack` version for the
+/// `global-token-revocation` feature: an operator enabling the feature acknowledges
+/// this exact draft revision, and a future draft that changes the wire shape bumps
+/// this string and invalidates the old ack. Surfaced in `docs/CONFIG.md` (the feature
+/// ladder table) so an interop mismatch with another implementer is diagnosable.
+pub const GLOBAL_TOKEN_REVOCATION_DRAFT: &str = "draft-parecki-oauth-global-token-revocation-01";
+
+/// The registry name of the Global Token Revocation experimental feature (issue #36).
+pub const GLOBAL_TOKEN_REVOCATION_FEATURE: &str = "global-token-revocation";
+
 /// How mature a feature is, and therefore what enabling it requires.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Maturity {
@@ -145,6 +156,7 @@ impl FeatureRegistry {
     pub fn builtin() -> Self {
         let mut registry = Self::new();
         registry.register_sample_experimental();
+        registry.register_global_token_revocation();
         registry
     }
 
@@ -187,6 +199,24 @@ impl FeatureRegistry {
              gates no behavior.",
             "0.1.0-exp.1",
             "crates/ironauth-config/CHANGELOG.md",
+        ));
+    }
+
+    /// Registers the Global Token Revocation receiver feature (issue #36), the Okta
+    /// Universal Logout shape of `draft-parecki-oauth-global-token-revocation`. It is
+    /// EXPERIMENTAL: the draft is an individual Internet-Draft (not yet WG-adopted),
+    /// so the wire shape may break between releases and enabling it must acknowledge
+    /// the exact implemented draft revision. Off by default; when enabled AND acked,
+    /// the OIDC provider mounts `POST /global-token-revocation`.
+    pub fn register_global_token_revocation(&mut self) {
+        self.register(Feature::experimental(
+            GLOBAL_TOKEN_REVOCATION_FEATURE,
+            "Global Token Revocation receiver (Okta Universal Logout shape, \
+             draft-parecki-oauth-global-token-revocation): a strongly-authenticated, \
+             subject-scoped revoke-everything endpoint. EXPERIMENTAL: the draft is not \
+             yet WG-adopted and the wire shape may break between releases.",
+            GLOBAL_TOKEN_REVOCATION_DRAFT,
+            "crates/ironauth-oidc/CHANGELOG.md",
         ));
     }
 

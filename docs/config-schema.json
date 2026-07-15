@@ -255,6 +255,11 @@
           "description": "Whether to mount the public OIDC endpoints (`/authorize`, `/token`). Off\nby default so the default boot serves only the skeleton and needs no\ndatabase. When on, the provider connects the data-plane store using\n`database.url`.",
           "type": "boolean"
         },
+        "global_token_revocation_hard_kill": {
+          "default": false,
+          "description": "Whether the Global Token Revocation receiver (issue #36) HARD-KILLS the\nsubject's `offline_access` refresh families too, not only the session-bound\nones. This has effect ONLY when the experimental `global-token-revocation`\nfeature is enabled (the endpoint is otherwise unmounted). The SAFE default\n(`false`) matches the platform-wide revoke-everything semantic: offline\n(consented long-lived) grants survive a revoke unless a hard kill is asked for\n(issue #21/#32), so a routine global revoke does not silently strip a user's\nstanding offline authorizations. Set it to `true` for an account-takeover\nposture, where a global revoke must terminate absolutely everything the subject\nholds, offline grants included, so every already-issued token dies at once.",
+          "type": "boolean"
+        },
         "issue_refresh_tokens": {
           "default": true,
           "description": "Whether the authorization-code grant issues a refresh token (issue #21).\nDefault `true`: a successful code exchange returns a rotating refresh token\nalongside the access token. A refresh token issued WITHOUT the\n`offline_access` scope is session-bound (it is revoked when the end user's\nRP session is logged out); one issued WITH `offline_access` survives RP\nlogout and gets the separate offline lifecycle. Set it to `false` for an\nenvironment that mints access tokens only.",
@@ -614,6 +619,7 @@
         "enable_response_type_id_token": false,
         "enable_response_type_none": false,
         "enabled": false,
+        "global_token_revocation_hard_kill": false,
         "issue_refresh_tokens": true,
         "jwks_cache_max_age_secs": 600,
         "offline_access_requires_consent": true,

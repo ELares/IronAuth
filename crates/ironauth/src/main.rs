@@ -12,7 +12,9 @@ use std::sync::Arc;
 
 use axum::Router;
 use ironauth_admin::AdminState;
-use ironauth_config::{Config, Loaded, OidcConfig};
+use ironauth_config::{
+    Config, FeatureRegistry, GLOBAL_TOKEN_REVOCATION_FEATURE, Loaded, OidcConfig,
+};
 use ironauth_env::Env;
 use ironauth_oidc::{
     DiscoveryCapabilities, DiscoveryState, IssuerRegistry, IssuerState, JwksCacheWindow, OidcState,
@@ -89,6 +91,22 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
             tracing::warn!(%warning, "configuration warning");
         }
 
+        // The strict feature-maturity gate (issue #4): every `[features]` entry must
+        // name a feature this build knows, and an enabled EXPERIMENTAL feature must
+        // acknowledge its exact current version. A violation fails the boot with the
+        // changelog pointer rather than silently changing behavior (for example arming
+        // the experimental global-token-revocation receiver without an ack).
+        let features = FeatureRegistry::builtin();
+        if let Err(error) = features.validate(&config) {
+            tracing::error!(%error, "refusing to boot on a feature-gate violation");
+            return ExitCode::FAILURE;
+        }
+        // The experimental Global Token Revocation receiver (issue #36) mounts only when
+        // its feature is enabled AND acknowledged; the gate is the ladder, never a plain
+        // [oidc] toggle, so the ack can never be bypassed.
+        let global_revocation_enabled =
+            features.is_enabled(&config, GLOBAL_TOKEN_REVOCATION_FEATURE);
+
         let env = Env::system();
 
         // Build the management API router (issue #11) before moving config into
@@ -124,7 +142,14 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
         // is the server's config-derived base URL, so issuers are per environment.
         if let Some((oidc_config, dsn, oidc_env)) = oidc_inputs {
             let issuer_base = server.base_url();
-            if let Some(router) = build_oidc_router(&oidc_config, &dsn, oidc_env, issuer_base).await
+            if let Some(router) = build_oidc_router(
+                &oidc_config,
+                &dsn,
+                oidc_env,
+                issuer_base,
+                global_revocation_enabled,
+            )
+            .await
             {
                 server = server.mount_public(router);
             }
@@ -221,6 +246,7 @@ async fn build_oidc_router(
     data_plane_dsn: &str,
     env: Env,
     issuer_base: String,
+    global_revocation_enabled: bool,
 ) -> Option<Router> {
     let store = match Store::connect(data_plane_dsn).await {
         Ok(store) => store,
@@ -263,7 +289,14 @@ async fn build_oidc_router(
     let issuer_state = IssuerState::new(Arc::clone(&registry), env.clone());
     let jwks = issuer_router(issuer_state);
 
-    let state = OidcState::new(store, env, registry, oidc_config, issuer_base);
+    let state = OidcState::new(store, env, registry, oidc_config, issuer_base)
+        .with_global_token_revocation_enabled(global_revocation_enabled);
+    if global_revocation_enabled {
+        tracing::info!(
+            "experimental Global Token Revocation receiver mounted (issue #36); the draft \
+             is not WG-adopted and the wire shape may change between releases"
+        );
+    }
     tracing::info!(
         "OIDC provider, discovery, and per-environment JWKS mounted on the public plane; \
          per-environment signing keys load lazily from the store on first use"
