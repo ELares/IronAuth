@@ -242,6 +242,19 @@ pub enum Action {
     /// disable. Idempotent: once executed the user is no longer scheduled, so a
     /// re-run of the worker re-processes nothing.
     UserOffboardingExecute,
+    /// A typed login IDENTIFIER was added to a user (issue #54): an email, username,
+    /// or phone, canonicalized once at the seam and blind-indexed for uniqueness. The
+    /// identifier value is never recorded on the audit row (it is sealed and
+    /// blind-indexed on its row); only that the user gained an identifier, and when.
+    UserIdentifierAdd,
+    /// A per-environment identifier UNIQUENESS mode was APPLIED (issue #54): an
+    /// operator switched the environment's mode and the store recomputed every
+    /// identifier row's uniqueness discriminator under the new mode, in one
+    /// scope-fenced transaction, after refusing the change while a
+    /// post-canonicalization collision the new mode would enforce still existed. The
+    /// target is the environment; no identifier value is recorded (they are sealed and
+    /// blind-indexed on their rows).
+    UserIdentifierApplyUniquenessMode,
     /// A user invitation was CREATED through the management API (issue #60): an
     /// admin invited a new identity, provisioning a `pending_verification` user and a
     /// single-use, expiring, unguessable token. The token is never recorded on the
@@ -578,6 +591,8 @@ impl Action {
             Action::UserExternalIdLink => "user.external_id.link",
             Action::UserExternalIdUnlink => "user.external_id.unlink",
             Action::UserOffboardingExecute => "user.offboarding.execute",
+            Action::UserIdentifierAdd => "user.identifier.add",
+            Action::UserIdentifierApplyUniquenessMode => "user.identifier.uniqueness.apply",
             Action::InvitationCreate => "invitation.create",
             Action::InvitationRedeem => "invitation.redeem",
             Action::InvitationRevoke => "invitation.revoke",

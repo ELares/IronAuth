@@ -6,12 +6,12 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
-- Exit-export credential registry (issue #58, review, migration 0041, expand):
+- Exit-export credential registry (issue #58, review, migration 0042, expand):
   `UserExportRecord` now carries the user's enrolled `account_credentials` (a new
   `ExportedCredential` list: factor kind, opened friendly name, last-used instant),
   and `ActingAccountCredentialRepo::enroll_restored` re-enrolls an exported credential
   under a fresh user, preserving the last-used instant, for the exit-import restore.
-  Migration 0041 grants the control plane SELECT + INSERT on the existing
+  Migration 0042 grants the control plane SELECT + INSERT on the existing
   `account_credentials` table (least privilege: no UPDATE / DELETE) so the export
   reads and the import restores the credential registry; it adds no table, column, or
   policy.
@@ -27,7 +27,64 @@ range per docs/RELEASING.md.
   `ActingUserRepo::record_export_audit` writes the `user.export` audit row (a new
   `Action` variant) attributed to the acting principal. Purely additive: the users
   table already carried every column the export reads, so this needs no migration.
-
+- Flexible identifiers on the central canonicalization seam (issue #54, migration
+  0041, expand). Multiple typed login identifiers per user with uniqueness as
+  configuration, built around one canonicalization function so the
+  canonicalization-mismatch CVE class (Authelia CVE-2026-47203 / CVE-2025-24806 /
+  CVE-2026-48794, Zitadel CVE-2025-31124) is designed out by construction.
+  - **The one seam.** New `identifier` module: `canonicalize_identifier(kind, raw)`
+    is the SINGLE entry point that produces a `CanonicalIdentifier` (email, username,
+    or phone). It strips Unicode invisible and control characters by PROPERTY (General
+    Category Cc/Cf/Zl/Zp plus the derived Default_Ignorable set, via the
+    `unicode-properties` crate) rather than a hand-curated list with gaps, applies NFKC
+    (folding fullwidth and other compatibility homoglyphs), strips ALL whitespace
+    (interior included, since a login handle has none), and case-folds per type with
+    full Unicode Default Case Folding (the `caseless` crate, so the German sharp s and
+    the Greek final sigma fold correctly) rather than simple lowercase. Email folds
+    local part and domain; phone normalizes to structural E.164 `+<digits>`. A
+    degenerate all-invisible / whitespace-only input, or an email with no `@` shape,
+    canonicalizes to the EMPTY form (rejected at the write boundary, see below). It is
+    TOTAL (never panics) and IDEMPOTENT, proven by property tests and the
+    `canonicalize_identifier` fuzz target. `CanonicalIdentifier`'s fields are private,
+    so a raw handle cannot reach a comparison without passing the seam;
+    `scripts/canonicalization-seam.sh` backstops it in CI. Documented structural
+    limits (not folded): cross-script confusables (UTS-39 skeleton, out of scope),
+    NFKC over-folding, and phone-extension merge.
+  - **The `user_identifiers` table.** One new tenant-scoped table (RLS forced, the
+    (tenant, environment) isolation policy, closed-type CHECK, column-scoped grants):
+    the canonical form as a per-tenant keyed-HMAC blind index (`canonical_bidx`, for
+    lookup and uniqueness), the raw input AEAD-sealed for display (`raw_sealed`, issue
+    #48; the plaintext never lands on a column), a per-identifier `verified` flag, and
+    a `uniqueness_key` discriminator.
+  - **Uniqueness as configuration, not code.** A partial unique index over the
+    `uniqueness_key`: environment-wide (the default), org-scoped (falling back to the
+    environment scope for a membership-free user until M10), or non-unique. A
+    post-canonicalization collision within the configured scope is refused as the
+    deterministic `StoreError::Conflict`.
+  - **Identifier-first resolution.** `UserIdentifierRepo::resolve` canonicalizes a
+    submitted identifier and returns each matching account with only the
+    authentication methods it actually has (`LoginMethod::Password` / `Passkey`),
+    consumed later by M7/M9. `list_for_user` and the `collisions_for_mode`
+    mode-change validation pass round it out; `ActingUserIdentifierRepo::add` is the
+    audited (`user.identifier.add`) mutation.
+  - **Degenerate identifiers are refused.** `ActingUserIdentifierRepo::add` rejects an
+    empty canonical form (an all-invisible / whitespace-only submission, or a malformed
+    email with no `@` shape) with the new deterministic `StoreError::InvalidIdentifier`
+    before any write, so an all-invisible submission cannot squat the empty slot; a
+    `resolve` of an empty canonical form returns an empty result without querying (never
+    an oracle). New `CanonicalIdentifier::is_empty()` helper.
+  - **Mode tightening actually recomputes keys.** New audited, single-transaction,
+    scope-fenced `ActingUserIdentifierRepo::apply_uniqueness_mode(mode)`
+    (`user.identifier.uniqueness.apply`): it refuses (deterministic `Conflict`) while
+    `collisions_for_mode(mode)` reports any collision the new mode would enforce, then
+    recomputes every row's `uniqueness_key` under the new mode in the same transaction.
+    This closes the gap where a pre-existing NULL-keyed (non-unique) row stayed exempt
+    from the partial unique index after a tightening, allowing a later three-way
+    "unique" collision.
+  - **`collisions_for_mode(OrgScoped)` agrees with `add`.** The org-scoped collision
+    scan now groups by the SAME discriminator `add` uses (including the org key), so a
+    legitimate cross-org duplicate is no longer falsely reported as a blocking
+    collision.
 - User invitation persistence (issue #60, migration 0040, expand): the one new
   piece of durable state the admin-initiated invitation flow needs, a tenant-scoped
   `user_invitations` table with RLS forced and the (tenant, environment) isolation

@@ -19,7 +19,15 @@ range per docs/RELEASING.md.
   successor system presents, a credential distinct from the operator token and every
   management key that authorizes ONLY that endpoint. Exposing a live credential oracle
   to a third party is an explicit per-deployment opt-in.
-
+- `[identifiers]`: flexible-identifier settings (issue #54). `identifiers.uniqueness`
+  selects the per-environment login-identifier uniqueness policy: `environment_wide`
+  (the safe default, one canonical identifier per tenant-environment), `org_scoped`
+  (unique within an org, falling back to the environment scope for a membership-free
+  user once M10 org membership ships), or `non_unique` (multiple accounts may share
+  one identifier; identifier-first login still resolves deterministically). Changing
+  the mode on a populated environment requires a validation pass that reports
+  post-canonicalization collisions before it applies. New public
+  `IdentifiersConfig` and `IdentifierUniqueness` types.
 - `[byok]`: bring-your-own-key customer-managed encryption settings (issue #49),
   EXPERIMENTAL and DEFAULT-OFF. `byok.enabled` (default false) leaves every BYOK
   path unreachable; `byok.provider` (default `local`) selects the key-management

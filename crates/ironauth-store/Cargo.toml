@@ -31,6 +31,24 @@ sqlx.workspace = true
 # non-canonical trailing bits on decode, so a malformed identifier cannot masquerade
 # as a valid one.
 base64.workspace = true
+# Unicode NFKC normalization for the central identifier canonicalization seam
+# (issue #54): the compatibility-fold half of turning a raw login handle into its
+# one canonical form. Already present transitively via sqlx (url -> idna), so this
+# is a direct path edge, not a new crate; MSRV 1.85 and the musl static lane hold.
+unicode-normalization.workspace = true
+# Unicode General_Category lookup for the canonicalization seam (issue #54): step 1
+# strips invisible / control / format / separator characters by PROPERTY (Cc, Cf,
+# Zl, Zp), not a hand-curated code-point list with gaps. Already present transitively
+# via sqlx (-> stringprep), so no new crate enters the graph; MSRV 1.85 and the musl
+# static lane hold.
+unicode-properties.workspace = true
+# Full Unicode Default Case Folding for the canonicalization seam (issue #54): folds
+# the case pairs where simple lowercasing diverges (the German sharp s, the Greek
+# final sigma) so a mixed-case enumeration variant of a login handle canonicalizes to
+# one form. A standard unicode-rs crate (MIT), pure Rust, no build script, depending
+# only on unicode-normalization (already in the tree); MSRV 1.85 and the musl static
+# lane hold, and cargo-deny passes.
+caseless.workspace = true
 # SHA-256 over migration text for the expand-contract runner's checksums (drift
 # and tamper detection). Pure Rust, permissive, already present transitively via
 # sqlx, so no new crate enters the graph; keeps MSRV 1.85 and musl clean.
@@ -371,6 +389,20 @@ required-features = ["testing"]
 [[test]]
 name = "self_service_account"
 path = "tests/self_service_account.rs"
+required-features = ["testing"]
+
+# Flexible identifiers on the central canonicalization seam (issue #54): the
+# canonicalization-mismatch CVE class fails to reproduce (Unicode invisibles,
+# mixed case, and fullwidth homoglyphs resolve identically across resolution and
+# uniqueness), all three uniqueness modes behave (environment-wide default,
+# org-scoped fallback, and non-unique), a post-canonicalization collision is
+# rejected with the deterministic conflict, identifier-first resolution returns
+# only the methods applicable to the resolved account, the mode-change validation
+# pass reports collisions, and the identifier value is sealed and blind-indexed (no
+# plaintext in a dump). Needs a real database (DATABASE_URL).
+[[test]]
+name = "flexible_identifiers"
+path = "tests/flexible_identifiers.rs"
 required-features = ["testing"]
 
 [lints]

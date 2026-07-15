@@ -259,6 +259,19 @@ impl ScopedKind for CredentialKind {
     const PREFIX: &'static str = "crd";
 }
 
+/// Marker for a flexible login identifier (`uid_`), one row in a user's typed
+/// login-identifier set (issue #54): a verified-or-not email, username, or phone a
+/// user can log in with. A tenant-scoped resource: the identifier row id embeds its
+/// `(tenant, environment)`, so a row minted in one scope parses as a uniform
+/// not-found under another. It is an INTERNAL registry row (never a bearer
+/// credential); the sensitive value it points at is the sealed / blind-indexed
+/// canonical identifier, not this id, so its debug form stays legible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct UserIdentifierKind;
+impl ScopedKind for UserIdentifierKind {
+    const PREFIX: &'static str = "uid";
+}
+
 /// Marker for a user invitation (`inv_`), one pending invitation row (issue #60).
 /// A tenant-scoped resource: the identifier embeds its `(tenant, environment)`, so
 /// an invitation id minted in one scope parses as a uniform not-found under
@@ -718,6 +731,9 @@ pub type ClientSessionId = ScopedId<ClientSessionKind>;
 /// An account-credential identifier (`crd_...`), one enrolled credential in a
 /// user's self-service credential registry (issue #61).
 pub type CredentialId = ScopedId<CredentialKind>;
+/// A flexible-login-identifier row id (`uid_...`), one typed login identifier
+/// (email, username, or phone) a user can authenticate with (issue #54).
+pub type UserIdentifierId = ScopedId<UserIdentifierKind>;
 /// A user-invitation identifier (`inv_...`), one pending invitation and the routing
 /// handle embedded in its single-use token (issue #60).
 pub type InvitationId = ScopedId<InvitationKind>;

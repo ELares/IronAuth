@@ -71,6 +71,10 @@ pub struct Config {
     /// OIDC provider settings (issue #12).
     pub oidc: OidcConfig,
 
+    /// Flexible-identifier settings (issue #54): the per-environment uniqueness
+    /// policy for typed login identifiers. Safe default: environment-wide uniqueness.
+    pub identifiers: IdentifiersConfig,
+
     /// Per-tenant and per-environment quota fairness settings (issue #50). The
     /// operator-plane noisy-neighbor guard: nested token buckets that keep one
     /// tenant or environment from starving another. Safe defaults, fully tunable
@@ -306,6 +310,45 @@ pub enum ClientCredentialsAudience {
     ClientId,
     /// The token's `aud` is the per-environment issuer.
     Issuer,
+}
+
+/// The per-environment login-identifier UNIQUENESS mode (issue #54).
+///
+/// Uniqueness is a POLICY, not a fixed schema rule: a greenfield identity model
+/// bakes scoped uniqueness in on day one rather than retrofitting it later (Zitadel
+/// #9535, Auth0's multi-year path to non-unique emails). The safe default
+/// (`environment_wide`) gives one canonical identifier at most one user per
+/// (tenant, environment). `org_scoped` makes an identifier unique only within an
+/// organization (meaningful once M10 org membership ships; a membership-free user
+/// falls back to the environment scope). `non_unique` allows several accounts to
+/// share one identifier (identifier-first login still resolves deterministically:
+/// the M7 factor step disambiguates). Changing the mode on a POPULATED environment
+/// requires a validation pass that reports post-canonicalization collisions before
+/// the change applies. This is a promotable per-environment setting in spirit; the
+/// process value is the deployment default until per-environment overrides ride the
+/// M5 promotion pipeline.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum IdentifierUniqueness {
+    /// A canonical identifier maps to at most one user per (tenant, environment).
+    /// The safe default.
+    #[default]
+    EnvironmentWide,
+    /// A canonical identifier is unique within an organization; users in different
+    /// orgs may share one. Falls back to the environment scope for a user with no
+    /// org membership.
+    OrgScoped,
+    /// Multiple users may share one canonical identifier.
+    NonUnique,
+}
+
+/// Flexible-identifier settings (issue #54): the per-environment uniqueness policy
+/// for typed login identifiers (email, username, phone).
+#[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields, default)]
+pub struct IdentifiersConfig {
+    /// The uniqueness mode for login identifiers. Safe default: environment-wide.
+    pub uniqueness: IdentifierUniqueness,
 }
 
 /// Structured-log output format.

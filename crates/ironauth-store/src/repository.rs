@@ -70,7 +70,11 @@ use crate::id::{
     EnvironmentSecretId, ExternalIssuerId, GrantId, InitialAccessTokenId, InvitationId,
     IssuedTokenId, KekId, ManagementKeyId, OperatorId, OrganizationId, PushedRequestId,
     RefreshFamilyId, RefreshTokenId, ResourceServerId, ServiceAccountId, SessionEventId, SessionId,
-    SigningKeyId, TenantId, TraitMigrationJobId, TraitSchemaId, UserId, VariableId,
+    SigningKeyId, TenantId, TraitMigrationJobId, TraitSchemaId, UserId, UserIdentifierId,
+    VariableId,
+};
+use crate::identifier::{
+    CanonicalIdentifier, IdentifierType, UniquenessMode, canonicalize_identifier,
 };
 use crate::scope::Scope;
 use crate::store::Store;
@@ -160,6 +164,19 @@ impl<'a> ScopedStore<'a> {
     #[must_use]
     pub fn users(&self) -> UserRepo<'a> {
         UserRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
+    /// The read-only flexible-identifier repository for this scope (issue #54):
+    /// identifier-first login resolution (canonicalize a submitted identifier and
+    /// return the applicable authentication methods), a user's identifier list, and
+    /// the mode-change collision validation pass. The mutating add lives on
+    /// [`ActingStore::user_identifiers`].
+    #[must_use]
+    pub fn user_identifiers(&self) -> UserIdentifierRepo<'a> {
+        UserIdentifierRepo {
             store: self.store,
             scope: self.scope,
         }
@@ -566,6 +583,19 @@ impl<'a> ActingStore<'a> {
     #[must_use]
     pub fn users(&self) -> ActingUserRepo<'a> {
         ActingUserRepo {
+            store: self.store,
+            scope: self.scope,
+            acting: self.acting,
+        }
+    }
+
+    /// The mutating flexible-identifier repository for this scope and actor (issue
+    /// #54): add a typed login identifier to a user (canonicalized once at the seam,
+    /// blind-indexed for uniqueness and lookup, raw sealed for display), and
+    /// recompute the uniqueness discriminators on a mode change, each audited.
+    #[must_use]
+    pub fn user_identifiers(&self) -> ActingUserIdentifierRepo<'a> {
+        ActingUserIdentifierRepo {
             store: self.store,
             scope: self.scope,
             acting: self.acting,
@@ -9289,6 +9319,571 @@ impl ActingUserRepo<'_> {
 /// fence rejects it anyway while it is pending verification).
 const USER_UNUSABLE_PASSWORD_HASH: &str = "!";
 
+// ===========================================================================
+// Flexible login identifiers on the central canonicalization seam (issue #54).
+// ===========================================================================
+
+/// An authentication method applicable to a resolved identifier (issue #54). The
+/// identifier-first resolution step returns the set the M7 factor logic and the M9
+/// flows offer for the account behind a submitted identifier; it is derived from the
+/// user's stored credential state, never guessed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoginMethod {
+    /// A password login is available: the user has a usable native Argon2id
+    /// verifier or an unconsumed imported foreign hash (issue #55).
+    Password,
+    /// A passkey (WebAuthn) login is available: the user has at least one enrolled
+    /// credential usable for login (issue #61).
+    Passkey,
+}
+
+impl LoginMethod {
+    /// The stable wire tag for this method.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LoginMethod::Password => "password",
+            LoginMethod::Passkey => "passkey",
+        }
+    }
+}
+
+/// One match from identifier-first resolution (issue #54): the account behind a
+/// submitted, canonicalized identifier and the authentication methods it can use.
+/// Non-unique mode may return SEVERAL of these for one identifier (the M7 factor
+/// step disambiguates); the default and org-scoped modes return at most one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdentifierResolution {
+    /// The identifier row id (`uid_...`).
+    pub identifier_id: UserIdentifierId,
+    /// The owning user (the `usr_` subject tokens are minted for).
+    pub user_id: UserId,
+    /// The identifier kind that matched.
+    pub identifier_type: IdentifierType,
+    /// Whether this identifier is verified.
+    pub verified: bool,
+    /// The authentication methods applicable to the resolved account, in a stable
+    /// order ([`LoginMethod::Password`] before [`LoginMethod::Passkey`]).
+    pub methods: Vec<LoginMethod>,
+}
+
+/// One typed login identifier on a user's identifier list (issue #54), for the
+/// account-management read. The raw value the user typed is decrypted for display;
+/// the canonical form is never returned in plaintext (it lives only as the blind
+/// index).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserIdentifierRecord {
+    /// The identifier row id (`uid_...`).
+    pub id: UserIdentifierId,
+    /// The identifier kind.
+    pub identifier_type: IdentifierType,
+    /// The RAW value the user typed, decrypted for display.
+    pub raw: String,
+    /// Whether this identifier is verified.
+    pub verified: bool,
+}
+
+/// A post-canonicalization collision a uniqueness-mode change would create (issue
+/// #54): the validation pass that must run BEFORE a populated environment switches
+/// mode reports these so an operator sees the conflicts before they would be
+/// enforced. Carries the identifier kind and how many users share the canonical
+/// form, never the plaintext identifier.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdentifierCollision {
+    /// The identifier kind the collision is within.
+    pub identifier_type: IdentifierType,
+    /// How many distinct identifier rows share this canonical form in the scope.
+    pub count: i64,
+}
+
+/// The SQL expression that computes a row's TARGET uniqueness discriminator under
+/// `mode` (issue #54). It is a fixed, code-owned constant per mode (never
+/// attacker-controlled), so interpolating it into a query is safe. Sharing ONE
+/// expression between the collision scan ([`UserIdentifierRepo::collisions_for_mode`])
+/// and the recompute ([`ActingUserIdentifierRepo::apply_uniqueness_mode`]) is what
+/// keeps them consistent: the scan groups by exactly the key the recompute will write,
+/// so a mode that the scan reports collision-free cannot then violate the partial
+/// unique index mid-recompute.
+///
+///   * [`UniquenessMode::EnvironmentWide`]: the constant `'env'` for every row, so the
+///     partial unique index collapses to per-(scope, type, canonical) uniqueness.
+///   * [`UniquenessMode::OrgScoped`]: preserve an app-supplied `org:<id>` key, else the
+///     environment fallback `'env'` (the membership-free reality until M10 org
+///     membership ships; see the M10 caveat in the module docs).
+///   * [`UniquenessMode::NonUnique`]: `NULL`, which the partial unique index excludes,
+///     so duplicates are allowed.
+fn mode_target_key_sql(mode: UniquenessMode) -> &'static str {
+    match mode {
+        UniquenessMode::EnvironmentWide => "'env'",
+        UniquenessMode::OrgScoped => {
+            "CASE WHEN uniqueness_key LIKE 'org:%' THEN uniqueness_key ELSE 'env' END"
+        }
+        UniquenessMode::NonUnique => "NULL",
+    }
+}
+
+/// The extra GROUP BY term for the collision scan under `mode`, or [`None`] when the
+/// target key is a per-mode CONSTANT for every row. Grouping the collision scan by
+/// [`mode_target_key_sql`] directly would embed a bare constant in `GROUP BY` (which
+/// Postgres rejects, and which is a redundant no-op anyway); this returns the extra
+/// term ONLY for the org-scoped mode, whose per-row `CASE` discriminator genuinely
+/// partitions rows (different orgs into different groups). Environment-wide (constant
+/// `'env'`) and non-unique (no scan) return [`None`], so the scan groups by
+/// `(identifier_type, canonical_bidx)` alone, and every same-canonical pair collides.
+fn mode_group_key_sql(mode: UniquenessMode) -> Option<&'static str> {
+    match mode {
+        UniquenessMode::OrgScoped => Some(mode_target_key_sql(mode)),
+        UniquenessMode::EnvironmentWide | UniquenessMode::NonUnique => None,
+    }
+}
+
+/// The read-only flexible-identifier repository (issue #54).
+pub struct UserIdentifierRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl UserIdentifierRepo<'_> {
+    /// Identifier-first login resolution (issue #54): canonicalize `raw` as `kind`
+    /// through the single seam, then return every matching account and its
+    /// applicable authentication methods. The comparison is on the CANONICAL form
+    /// only, so a mixed-case, zero-width-padded, or fullwidth-homoglyph spelling of
+    /// a registered identifier resolves to the same account.
+    ///
+    /// Returns an empty vector when no account in this scope has that identifier
+    /// (the caller, M7/M9, then runs the same uniform-timing dummy path it runs for
+    /// a wrong password, so a present and an absent identifier are indistinguishable).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Encryption`] if no platform master key is configured (the PII
+    /// path fails closed); [`StoreError::Database`] on a persistence failure.
+    pub async fn resolve(
+        &self,
+        kind: IdentifierType,
+        raw: &str,
+    ) -> Result<Vec<IdentifierResolution>, StoreError> {
+        let master = self.store.master().ok_or(StoreError::Encryption)?;
+        // Canonicalize EXACTLY ONCE, at this boundary, before any comparison.
+        let canonical = canonicalize_identifier(kind, raw);
+        // A degenerate (empty) canonical form is never a real identifier: the write
+        // boundary refuses to store one, so nothing legitimately matches it. Return
+        // an empty result WITHOUT querying, so an all-invisible / shapeless submission
+        // is a clean miss and never an oracle for the empty slot.
+        if canonical.is_empty() {
+            return Ok(Vec::new());
+        }
+        let bidx = flexible_identifier_blind_index(master, self.scope, &canonical);
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let rows = sqlx::query(
+            "SELECT id, user_id, verified FROM user_identifiers \
+             WHERE tenant_id = $1 AND environment_id = $2 \
+             AND identifier_type = $3 AND canonical_bidx = $4 \
+             ORDER BY user_id, id",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(kind.as_str())
+        .bind(bidx.into_bytes())
+        .fetch_all(&mut *tx)
+        .await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let id_text: String = row.get("id");
+            let identifier_id = UserIdentifierId::parse_in_scope(&id_text, &self.scope)?;
+            let user_text: String = row.get("user_id");
+            let user_id = UserId::parse_in_scope(&user_text, &self.scope)?;
+            let verified: bool = row.get("verified");
+            let methods = login_methods_for_user(&mut tx, self.scope, &user_text).await?;
+            out.push(IdentifierResolution {
+                identifier_id,
+                user_id,
+                identifier_type: kind,
+                verified,
+                methods,
+            });
+        }
+        tx.commit().await?;
+        Ok(out)
+    }
+
+    /// List a user's typed login identifiers within scope (issue #54), raw values
+    /// decrypted for display, ordered deterministically by `(type, id)`. A user in
+    /// another scope (or with no identifiers) yields an empty vector.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Encryption`] if no master key is configured or a sealed value
+    /// cannot be opened; [`StoreError::Database`] on a persistence failure.
+    pub async fn list_for_user(
+        &self,
+        user_id: &UserId,
+    ) -> Result<Vec<UserIdentifierRecord>, StoreError> {
+        if user_id.scope() != self.scope {
+            return Ok(Vec::new());
+        }
+        let master = self.store.master().ok_or(StoreError::Encryption)?;
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let rows = sqlx::query(
+            "SELECT id, identifier_type, raw_sealed, pii_dek_version, verified \
+             FROM user_identifiers \
+             WHERE tenant_id = $1 AND environment_id = $2 AND user_id = $3 \
+             ORDER BY identifier_type, id",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(user_id.to_string())
+        .fetch_all(&mut *tx)
+        .await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let id_text: String = row.get("id");
+            let id = UserIdentifierId::parse_in_scope(&id_text, &self.scope)?;
+            let kind = IdentifierType::from_wire(&row.get::<String, _>("identifier_type"))
+                .ok_or(StoreError::Encryption)?;
+            let dek_version: i32 = row.get("pii_dek_version");
+            let sealed: Vec<u8> = row.get("raw_sealed");
+            let dek = fetch_dek_by_version(&mut tx, self.scope, master, dek_version).await?;
+            let plaintext = dek.open(
+                &flexible_identifier_seal_aad(self.scope, dek_version),
+                &Sealed::from_bytes(sealed)?,
+            )?;
+            let raw = String::from_utf8(plaintext).map_err(|_| StoreError::Encryption)?;
+            out.push(UserIdentifierRecord {
+                id,
+                identifier_type: kind,
+                raw,
+                verified: row.get("verified"),
+            });
+        }
+        tx.commit().await?;
+        Ok(out)
+    }
+
+    /// The validation pass a uniqueness-mode change requires (issue #54): report the
+    /// post-canonicalization collisions that switching to `mode` would enforce,
+    /// BEFORE it is applied. A mode with a uniqueness scope (environment-wide, and
+    /// org-scoped which falls back to the environment scope until M10 org membership
+    /// ships) collides when two or more identifier rows share one canonical form of
+    /// one kind; [`UniquenessMode::NonUnique`] never collides, so it reports nothing.
+    ///
+    /// Reports the kind and the count per colliding canonical form, never a
+    /// plaintext identifier. An empty vector means the change is safe to apply.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn collisions_for_mode(
+        &self,
+        mode: UniquenessMode,
+    ) -> Result<Vec<IdentifierCollision>, StoreError> {
+        // Non-unique mode enforces no uniqueness, so it never collides.
+        if matches!(mode, UniquenessMode::NonUnique) {
+            return Ok(Vec::new());
+        }
+        // Group by the SAME discriminator the partial unique index (and `add`) would
+        // enforce under `mode`: (type, canonical, target-key). For environment-wide
+        // the target key is a constant, so grouping collapses to (type, canonical) and
+        // any two same-canonical rows collide REGARDLESS of their current org key. For
+        // org-scoped the target key preserves an app-supplied `org:<id>` (else the
+        // environment fallback), so two same-canonical identifiers in DIFFERENT orgs
+        // land in different groups and are NOT a collision, exactly as `add` allows.
+        // This is the fix for the org-ignoring disagreement with `add`.
+        let group_extra = mode_group_key_sql(mode).map_or_else(String::new, |e| format!(", ({e})"));
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let rows = sqlx::query(&format!(
+            "SELECT identifier_type, count(*) AS n FROM user_identifiers \
+             WHERE tenant_id = $1 AND environment_id = $2 \
+             GROUP BY identifier_type, canonical_bidx{group_extra} \
+             HAVING count(*) > 1 \
+             ORDER BY identifier_type"
+        ))
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let Some(kind) = IdentifierType::from_wire(&row.get::<String, _>("identifier_type"))
+            else {
+                continue;
+            };
+            out.push(IdentifierCollision {
+                identifier_type: kind,
+                count: row.get("n"),
+            });
+        }
+        Ok(out)
+    }
+}
+
+/// The specification for adding a typed login identifier to a user (issue #54),
+/// passed to [`ActingUserIdentifierRepo::add`].
+#[derive(Debug, Clone, Copy)]
+pub struct NewUserIdentifier<'a> {
+    /// The owning user (must be in the acting scope).
+    pub user_id: &'a UserId,
+    /// The identifier kind, which drives the canonicalization policy.
+    pub identifier_type: IdentifierType,
+    /// The RAW identifier the user typed. Canonicalized once at the seam; the raw
+    /// value is sealed for display and the canonical form is blind-indexed.
+    pub raw: &'a str,
+    /// The initial verification state (M7 owns the ceremony that flips it later).
+    pub verified: bool,
+    /// The configured per-environment uniqueness mode.
+    pub mode: UniquenessMode,
+    /// The user's owning organization id when org-scoped uniqueness applies (M10);
+    /// [`None`] for the environment-wide scope and for a membership-free user (the
+    /// documented fallback to the environment scope).
+    pub org: Option<&'a str>,
+}
+
+/// The mutating flexible-identifier repository (issue #54).
+pub struct ActingUserIdentifierRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+    acting: ActingContext,
+}
+
+impl ActingUserIdentifierRepo<'_> {
+    /// Add a typed login identifier to a user (issue #54). Canonicalizes the raw
+    /// value through the single seam, seals the RAW value for display, blind-indexes
+    /// the CANONICAL form for lookup and uniqueness, and writes the row plus its
+    /// audit row in one transaction. The row's uniqueness discriminator is
+    /// [`UniquenessMode::uniqueness_key`], so a post-canonicalization collision
+    /// within the configured scope is refused by the partial unique index as the
+    /// deterministic [`StoreError::Conflict`].
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Conflict`] if the canonical identifier already exists in the
+    /// configured uniqueness scope; [`StoreError::NotFound`] if the user is not in
+    /// scope; [`StoreError::Encryption`] if no master key is configured;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn add(
+        &self,
+        env: &Env,
+        spec: NewUserIdentifier<'_>,
+    ) -> Result<UserIdentifierId, StoreError> {
+        let NewUserIdentifier {
+            user_id,
+            identifier_type: kind,
+            raw,
+            verified,
+            mode,
+            org,
+        } = spec;
+        if user_id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let master = self.store.master().ok_or(StoreError::Encryption)?;
+        let scope = self.scope;
+        let id = UserIdentifierId::generate(env, &scope);
+        // Canonicalize EXACTLY ONCE at this boundary; everything downstream keys on
+        // the canonical form.
+        let canonical = canonicalize_identifier(kind, raw);
+        // Refuse a degenerate (empty) canonical form deterministically, BEFORE any
+        // write and independent of any existing row. An all-invisible / whitespace-only
+        // submission, or an email with no usable `@` shape (which canonicalizes to the
+        // empty form), would otherwise squat the "empty" slot and resolve to this
+        // account, or be stored as a username-like fold. This is not an existence
+        // probe, so it is a caller-facing validation error, never the uniform
+        // not-found.
+        if canonical.is_empty() {
+            return Err(StoreError::InvalidIdentifier);
+        }
+        let bidx = flexible_identifier_blind_index(master, scope, &canonical);
+        let uniqueness_key = mode.uniqueness_key(org);
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::UserIdentifierAdd,
+                target: &id,
+            },
+            async move |tx| {
+                let (dek_version, dek) = fetch_active_dek(tx, scope, master).await?;
+                let raw_sealed = dek.seal(
+                    env.entropy(),
+                    &flexible_identifier_seal_aad(scope, dek_version),
+                    raw.as_bytes(),
+                );
+                let result = sqlx::query(
+                    "INSERT INTO user_identifiers \
+                     (id, tenant_id, environment_id, user_id, identifier_type, \
+                      canonical_bidx, raw_sealed, pii_dek_version, verified, uniqueness_key) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+                )
+                .bind(id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(user_id.to_string())
+                .bind(kind.as_str())
+                .bind(bidx.into_bytes())
+                .bind(raw_sealed.into_bytes())
+                .bind(dek_version)
+                .bind(verified)
+                .bind(uniqueness_key)
+                .execute(&mut **tx)
+                .await;
+                match result {
+                    Ok(_) => Ok(()),
+                    // A collision on the partial unique index (the canonical form is
+                    // already taken in the configured uniqueness scope) is a
+                    // caller-facing conflict, never a persistence fault. The audited
+                    // write rolls back, so a rejected add leaves neither row.
+                    Err(error) if is_unique_violation(&error) => Err(StoreError::Conflict),
+                    Err(error) => Err(error.into()),
+                }
+            },
+            false,
+        )
+        .await?;
+        Ok(id)
+    }
+
+    /// Apply a uniqueness-mode change to a populated environment (issue #54): recompute
+    /// every identifier row's `uniqueness_key` under `mode`, in ONE scope-fenced,
+    /// audited transaction, AFTER refusing the change while a post-canonicalization
+    /// collision the new mode would enforce still exists.
+    ///
+    /// This is the step the 0041 migration comment described but the original
+    /// implementation never shipped: without it, switching (for example) from
+    /// non-unique to environment-wide left pre-existing NULL-keyed rows exempt from the
+    /// partial unique index, so a later environment-wide `add` of the same identifier
+    /// SUCCEEDED and produced a "unique" three-way collision. Recomputing the keys in
+    /// the same transaction closes that gap: after a successful apply every row carries
+    /// the discriminator the new mode enforces, so a subsequent duplicate `add` is the
+    /// deterministic [`StoreError::Conflict`].
+    ///
+    /// Fail-closed ordering: the collision scan and the recompute run in the SAME
+    /// transaction and share [`mode_target_key_sql`], so the set of rows checked is
+    /// exactly the set rewritten. If any collision the new mode would enforce exists
+    /// the whole transaction rolls back (no key is rewritten, no audit row is
+    /// committed) and the call returns [`StoreError::Conflict`]; the operator resolves
+    /// the reported collisions (see [`UserIdentifierRepo::collisions_for_mode`]) and
+    /// retries.
+    ///
+    /// The M10 caveat (module docs) applies: the org discriminator is app-supplied with
+    /// no database membership tie, and this recompute PRESERVES an existing `org:<id>`
+    /// key rather than deriving membership, so it does not repair an org key after a
+    /// membership change (a pre-M10 follow-up).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Conflict`] if a collision the new mode would enforce still exists
+    /// (nothing is changed); [`StoreError::Database`] on a persistence failure.
+    pub async fn apply_uniqueness_mode(
+        &self,
+        env: &Env,
+        mode: UniquenessMode,
+    ) -> Result<(), StoreError> {
+        let scope = self.scope;
+        let environment = scope.environment();
+        let target_key = mode_target_key_sql(mode);
+        // The collision scan (skipped for non-unique, which enforces nothing) and the
+        // recompute share one target-key expression and one transaction. The scan's
+        // GROUP BY uses the same conditional term as `collisions_for_mode` so the set
+        // of rows it checks is exactly the set the recompute rewrites.
+        let group_extra = mode_group_key_sql(mode).map_or_else(String::new, |e| format!(", ({e})"));
+        let collision_check = !matches!(mode, UniquenessMode::NonUnique);
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::UserIdentifierApplyUniquenessMode,
+                target: &environment,
+            },
+            async move |tx| {
+                if collision_check {
+                    // Any (type, canonical, target-key) group of two or more rows is a
+                    // collision the new mode would enforce: refuse before rewriting.
+                    let colliding = sqlx::query(&format!(
+                        "SELECT 1 FROM user_identifiers \
+                         WHERE tenant_id = $1 AND environment_id = $2 \
+                         GROUP BY identifier_type, canonical_bidx{group_extra} \
+                         HAVING count(*) > 1 \
+                         LIMIT 1"
+                    ))
+                    .bind(scope.tenant().to_string())
+                    .bind(scope.environment().to_string())
+                    .fetch_optional(&mut **tx)
+                    .await?;
+                    if colliding.is_some() {
+                        return Err(StoreError::Conflict);
+                    }
+                }
+                // Recompute every row's discriminator under the new mode. The UPDATE is
+                // column-scoped to (uniqueness_key, updated_at), within the grant.
+                sqlx::query(&format!(
+                    "UPDATE user_identifiers \
+                     SET uniqueness_key = ({target_key}), updated_at = now() \
+                     WHERE tenant_id = $1 AND environment_id = $2"
+                ))
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .execute(&mut **tx)
+                .await?;
+                Ok(())
+            },
+            false,
+        )
+        .await
+    }
+}
+
+/// The authentication methods available to the user `user_id` in scope, in a stable
+/// order, derived from the user's stored credential state. Runs inside the caller's
+/// open transaction so the read is scope-consistent.
+async fn login_methods_for_user(
+    tx: &mut Transaction<'_, Postgres>,
+    scope: Scope,
+    user_id: &str,
+) -> Result<Vec<LoginMethod>, StoreError> {
+    let mut methods = Vec::new();
+    // A password login is available when the user has a usable native verifier or an
+    // unconsumed imported foreign hash. A soft-deleted user offers nothing.
+    let pw = sqlx::query(
+        "SELECT (password_hash <> $4 OR foreign_password_hash IS NOT NULL) AS has_password \
+         FROM users \
+         WHERE id = $1 AND tenant_id = $2 AND environment_id = $3 AND deleted_at IS NULL",
+    )
+    .bind(user_id)
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .bind(USER_UNUSABLE_PASSWORD_HASH)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some(pw) = pw else {
+        // No live user behind the identifier (a dangling row): no methods.
+        return Ok(methods);
+    };
+    if pw.get::<bool, _>("has_password") {
+        methods.push(LoginMethod::Password);
+    }
+    // A passkey login is available when the user has at least one login-usable
+    // enrolled credential (issue #61).
+    let passkey = sqlx::query(
+        "SELECT 1 FROM account_credentials \
+         WHERE subject = $1 AND tenant_id = $2 AND environment_id = $3 \
+         AND usable_for_login = true LIMIT 1",
+    )
+    .bind(user_id)
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .fetch_optional(&mut **tx)
+    .await?;
+    if passkey.is_some() {
+        methods.push(LoginMethod::Passkey);
+    }
+    Ok(methods)
+}
+
 /// An SSO session read back within scope (issue #20, extended by issue #32).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionRecord {
@@ -16528,6 +17123,14 @@ const INVITATION_IDENTIFIER_SEAL_LABEL: &str = "ironauth.envelope.invitation-ide
 /// index (issue #60) from every other keyed derivation, so the SAME identifier as an
 /// invite target and as a login handle never produces a colliding index tag.
 const INVITATION_IDENTIFIER_BIDX_LABEL: &str = "ironauth.envelope.invitation-identifier-bidx.v1";
+/// The AAD label domain-separating a sealed `user_identifiers.raw_sealed` value (the
+/// raw login identifier a user typed, issue #54) from every other envelope context.
+const FLEXIBLE_IDENTIFIER_SEAL_LABEL: &str = "ironauth.envelope.user-identifier.v1";
+/// The AAD label domain-separating the `user_identifiers.canonical_bidx` blind index
+/// (issue #54) from every other keyed derivation, including the bootstrap login-handle
+/// index, so the same string as a bootstrap handle and as a flexible identifier never
+/// produces a colliding tag.
+const FLEXIBLE_IDENTIFIER_BIDX_LABEL: &str = "ironauth.envelope.user-identifier-bidx.v1";
 
 /// The associated data binding a wrapped KEK to its scope, version, and master
 /// key. A KEK wrapped under one context fails to unwrap under any other, so it
@@ -16670,6 +17273,46 @@ fn invitation_identifier_blind_index(
     identifier: &str,
 ) -> BlindIndex {
     master.blind_index(&invitation_identifier_bidx_aad(scope, identifier))
+}
+
+/// The associated data binding a sealed `user_identifiers.raw_sealed` value (issue
+/// #54) to its scope and the DEK version that sealed it.
+fn flexible_identifier_seal_aad(scope: Scope, dek_version: i32) -> Aad {
+    Aad::builder()
+        .text(FLEXIBLE_IDENTIFIER_SEAL_LABEL)
+        .text(&scope.tenant().to_string())
+        .text(&scope.environment().to_string())
+        .version(i64::from(dek_version))
+        .build()
+}
+
+/// The blind-index context for a `user_identifiers.canonical_bidx` (issue #54): the
+/// label, the scope, the identifier KIND, and the CANONICAL identifier value,
+/// length-prefixed. Binding the kind keeps the same string as an email and as a
+/// username from colliding; the per-tenant HMAC key keeps the same identifier in two
+/// tenants from colliding. The value is always the output of the canonicalization
+/// seam ([`CanonicalIdentifier`]), never a raw handle.
+fn flexible_identifier_bidx_aad(scope: Scope, canonical: &CanonicalIdentifier) -> Aad {
+    Aad::builder()
+        .text(FLEXIBLE_IDENTIFIER_BIDX_LABEL)
+        .text(&scope.tenant().to_string())
+        .text(&scope.environment().to_string())
+        .text(canonical.kind().as_str())
+        .field(canonical.as_str().as_bytes())
+        .build()
+}
+
+/// The deterministic blind index for a canonical identifier in `scope` under
+/// `master`, the value the resolution lookup and the partial unique index query
+/// against `user_identifiers.canonical_bidx`. Takes a [`CanonicalIdentifier`], so a
+/// raw handle cannot reach this index without first passing the canonicalization
+/// seam (issue #54).
+fn flexible_identifier_blind_index(
+    master: &MasterKey,
+    scope: Scope,
+    canonical: &CanonicalIdentifier,
+) -> BlindIndex {
+    master.blind_index(&flexible_identifier_bidx_aad(scope, canonical))
 }
 
 /// Reconstruct a [`UserAdminRecord`] from a management-plane `users` row, opening
