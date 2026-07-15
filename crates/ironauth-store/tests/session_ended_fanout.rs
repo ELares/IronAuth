@@ -20,6 +20,8 @@
 //!   events.
 //! - At-least-once delivery with a claim lease: a claim hides an event, a lapsed lease
 //!   reappears it, and a delivered event never drains again.
+//! - Concurrent-drain safety: two workers claiming the same scope at once lease DISJOINT
+//!   event sets and never block on each other (`FOR UPDATE SKIP LOCKED`).
 //! - Least privilege: the app role can claim and mark delivered, but cannot rewrite the
 //!   immutable event body (no table-wide UPDATE, the #31 lesson).
 
@@ -256,18 +258,22 @@ async fn revoke_all_for_a_user_enqueues_one_ordered_event_per_ended_session() {
             "{session} has an event"
         );
     }
-    // The drain order is the monotonic sequence: strictly ascending, so a consumer
-    // sees ends in a total order.
+    // pending() sorts by the monotonic sequence, so within one drain the returned rows
+    // come back in ascending sequence order. This is a best-effort ordering HINT for the
+    // visible tail, NOT a global total order: these ends were enqueued serially in this
+    // test, so their sequences are strictly ascending, but under concurrent producers a
+    // lower sequence can commit after a higher one, which is why the drain is
+    // at-least-once per row and never advances a sequence high-water-mark.
     let sequences: Vec<i64> = events.iter().map(|event| event.sequence).collect();
     let mut sorted = sequences.clone();
     sorted.sort_unstable();
     assert_eq!(
         sequences, sorted,
-        "pending() returns events in sequence order"
+        "pending() returns events sorted by the sequence hint"
     );
     assert!(
         sequences.windows(2).all(|pair| pair[0] < pair[1]),
-        "the sequence is strictly monotonic"
+        "serially enqueued events carry strictly ascending sequences"
     );
 }
 
@@ -437,6 +443,124 @@ async fn claim_leases_then_marks_delivered_and_a_delivered_event_never_redrains(
     assert!(
         outbox.pending(100).await.expect("pending").is_empty(),
         "a delivered event is no longer pending"
+    );
+}
+
+#[tokio::test]
+async fn two_concurrent_claimers_lease_disjoint_event_sets_via_skip_locked() {
+    // The substrate's concurrent-drain guarantee, pinned against the real Postgres: a
+    // claim runs `FOR UPDATE SKIP LOCKED`, so two workers draining the SAME scope at once
+    // never lease the same event, and the second worker never BLOCKS on the first (it
+    // skips the rows in flight rather than waiting on them). This is the property the
+    // whole at-least-once fan-out rests on: without it, two back-channel logout workers
+    // could double-deliver or serialize into a stall.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let subject = UserId::generate(&env, &scope).to_string();
+
+    // Enqueue four undelivered events, one terminal revoke each.
+    for _ in 0..4 {
+        let session = create_session(&db, &env, scope, &subject, None).await;
+        db.store()
+            .scoped(scope)
+            .acting(db.test_actor(&env), CorrelationId::generate(&env))
+            .sessions()
+            .revoke(&env, &session, SessionEndCause::Revoked, false, None)
+            .await
+            .expect("revoke");
+    }
+    let all_ids: std::collections::HashSet<String> = pending(&db, scope)
+        .await
+        .into_iter()
+        .map(|event| event.id)
+        .collect();
+    assert_eq!(all_ids.len(), 4, "four undelivered events are enqueued");
+
+    let tenant = scope.tenant().to_string();
+    let environment = scope.environment().to_string();
+
+    // Worker A: open a claim transaction and HOLD it open. It leases the first two rows
+    // with the exact claimable SELECT `claim` runs (`FOR UPDATE SKIP LOCKED`), then keeps
+    // the transaction open so its row locks stay held while worker B drains concurrently.
+    // It runs on the raw app pool, a pool distinct from the store's, so B never contends
+    // for A's connection.
+    let mut worker_a = db
+        .app_pool()
+        .begin()
+        .await
+        .expect("begin worker A claim tx");
+    bind_scope(&mut worker_a, &tenant, &environment).await;
+    let a_rows = sqlx::query(
+        "SELECT id FROM session_ended_events \
+         WHERE tenant_id = $1 AND environment_id = $2 \
+         AND delivered_at IS NULL AND claimed_at IS NULL \
+         ORDER BY sequence LIMIT 2 FOR UPDATE SKIP LOCKED",
+    )
+    .bind(&tenant)
+    .bind(&environment)
+    .fetch_all(&mut *worker_a)
+    .await
+    .expect("worker A leases its batch");
+    let a_ids: std::collections::HashSet<String> = a_rows
+        .iter()
+        .map(|row| row.get::<String, _>("id"))
+        .collect();
+    assert_eq!(
+        a_ids.len(),
+        2,
+        "worker A leases two rows and holds their locks"
+    );
+
+    // Worker B: a real `claim` through the store while A still holds its locks. SKIP
+    // LOCKED means B does not block on A and never sees A's rows: it leases only the
+    // remaining two.
+    let b_ids: std::collections::HashSet<String> = db
+        .store()
+        .scoped(scope)
+        .session_events()
+        .claim(&env, Duration::from_secs(60), 100)
+        .await
+        .expect("worker B claims concurrently")
+        .into_iter()
+        .map(|event| event.id)
+        .collect();
+    assert_eq!(
+        b_ids.len(),
+        2,
+        "worker B leases the two rows A did not hold"
+    );
+
+    // The two leases are DISJOINT: no event is delivered to both workers.
+    assert!(
+        a_ids.is_disjoint(&b_ids),
+        "concurrent claimers lease disjoint sets (SKIP LOCKED, no double delivery)"
+    );
+    // Together they cover the whole undelivered set exactly once: nothing was lost, and B
+    // was not blocked into leasing nothing.
+    let union: std::collections::HashSet<String> = a_ids.union(&b_ids).cloned().collect();
+    assert_eq!(
+        union, all_ids,
+        "A and B together cover every undelivered event exactly once"
+    );
+
+    // A rolls back, standing in for a crashed worker: its two rows never got a claimed_at
+    // stamp, so they are claimable again and reappear on the next drain (at-least-once),
+    // while B's freshly leased rows stay hidden under their unexpired lease.
+    worker_a.rollback().await.expect("worker A rolls back");
+    let reappeared: std::collections::HashSet<String> = db
+        .store()
+        .scoped(scope)
+        .session_events()
+        .claim(&env, Duration::from_secs(60), 100)
+        .await
+        .expect("drain after worker A rolls back")
+        .into_iter()
+        .map(|event| event.id)
+        .collect();
+    assert_eq!(
+        reappeared, a_ids,
+        "A's un-committed rows reappear for another worker; B's leased rows stay hidden"
     );
 }
 

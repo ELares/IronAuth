@@ -31,8 +31,11 @@ range per docs/RELEASING.md.
     Delivery is at-least-once, so consumers dedup on the event `id` (the `sev_`
     idempotency key). The typed `SessionEndedEvent` is the STABLE contract a consumer
     receives (scope, ended session, subject, terminal cause, actor, correlation,
-    instant, monotonic `sequence`); the affected (client, session) pairs are resolved by
-    joining `client_sessions` at delivery, not denormalized here.
+    instant, and a monotonic `sequence` that is a best-effort drain ORDERING HINT, not a
+    safe high-water-mark: under concurrent producers a lower sequence can commit after a
+    higher one, so the drain stays at-least-once per row and consumers never skip past a
+    sequence mark); the affected (client, session) pairs are resolved by joining
+    `client_sessions` at delivery, not denormalized here.
   - **Least privilege.** `session_ended_events` ENABLEs and FORCEs row-level security
     with the (tenant, environment) isolation policy and the nonempty-scope CHECK, so the
     outbox is cross-tenant isolated. The data-plane role holds SELECT + INSERT and a

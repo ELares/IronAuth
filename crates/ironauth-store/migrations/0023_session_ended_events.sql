@@ -40,8 +40,14 @@
 --
 -- id is an sev_ scoped identifier (embeds its (tenant, environment)) and is the
 -- IDEMPOTENCY KEY a consumer dedups redelivery on. `sequence` is a monotonic
--- database-assigned ordering key, so a consumer drains in the order sessions ended
--- (a total order globally, and the correct sub-order within one scope). session_id is
+-- database-assigned key that gives the drain a best-effort ORDERING HINT, not a safe
+-- high-water-mark. Under concurrent producers the sequence is assigned when a row is
+-- inserted, which can be BEFORE its transaction commits, so a lower-numbered row can
+-- commit AFTER a higher-numbered one; a consumer that tracked only a sequence
+-- high-water-mark could skip an event that commits after the mark advanced past it.
+-- The drain never relies on that: it is at-least-once per ROW (claim leases the
+-- undelivered rows, mark_delivered retires them), and the sequence only sorts the
+-- currently visible undelivered tail into a sensible drain order. session_id is
 -- the SSO session (ses_) that ended; subject is the user (usr_) whose session it was;
 -- cause is the terminal end cause (revoked, bulk_revoked, user_revoked_all,
 -- logged_out, replaced_by_other_subject), never `rotated` (a rotation is not an end).
@@ -95,8 +101,10 @@ CREATE TABLE session_ended_events (
 
 CREATE INDEX session_ended_events_scope_idx
     ON session_ended_events (tenant_id, environment_id);
--- The drain path: undelivered rows in scope, in sequence order. A partial index keeps
--- the working set to the not-yet-delivered tail rather than the whole history.
+-- The drain path: undelivered rows in scope, sorted by the sequence HINT. A partial
+-- index keeps the working set to the not-yet-delivered tail rather than the whole
+-- history. Delivery is at-least-once per row; the sort is a drain convenience, not a
+-- safe high-water-mark to advance past (see the sequence note above).
 CREATE INDEX session_ended_events_undelivered_idx
     ON session_ended_events (tenant_id, environment_id, sequence)
     WHERE delivered_at IS NULL;

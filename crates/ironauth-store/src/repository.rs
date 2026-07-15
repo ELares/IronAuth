@@ -8205,8 +8205,11 @@ async fn enqueue_session_ended_event(
 pub struct SessionEndedEvent {
     /// The outbox event id (an `sev_` id): the IDEMPOTENCY KEY a consumer dedups on.
     pub id: String,
-    /// The monotonic drain-order key the database assigned. A consumer draining in
-    /// ascending `sequence` sees ends in the order they happened.
+    /// The monotonic drain-order key the database assigned. It is a best-effort
+    /// ordering HINT that sorts the visible undelivered tail, NOT a safe high-water-mark:
+    /// under concurrent producers a lower `sequence` can commit after a higher one, so a
+    /// consumer must not treat a drained `sequence` as a mark to skip past. Delivery is
+    /// at-least-once per row; consumers dedup on `id`.
     pub sequence: i64,
     /// The SSO session (a `ses_` id) that terminally ended.
     pub session_id: String,
