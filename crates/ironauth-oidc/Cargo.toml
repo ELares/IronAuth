@@ -196,6 +196,16 @@ name = "interactive"
 path = "tests/interactive.rs"
 required-features = ["testing"]
 
+# The self-service end-user account API (issue #61): a user lists and revokes their
+# OWN sessions, changes their OWN password, and enrolls/lists/removes their OWN
+# credentials, always bound to the authenticated subject (a cross-user id is the
+# uniform not-found), with the same-origin CSRF check on every state change and the
+# last-usable-credential guardrail. Needs a real database (DATABASE_URL).
+[[test]]
+name = "account"
+path = "tests/account.rs"
+required-features = ["testing"]
+
 # Secret-based client authentication: client_secret_basic and client_secret_post,
 # the registered-method enforcement, and spec-exact invalid_client (issue #20).
 [[test]]

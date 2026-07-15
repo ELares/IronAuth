@@ -67,6 +67,7 @@
 //! router directly with a populated key store, exactly as the management-API tests
 //! build their router.
 
+mod account;
 mod acme;
 mod authn;
 mod authorize;
@@ -247,6 +248,37 @@ pub fn oidc_router(state: OidcState) -> Router {
         .route(
             "/t/{tenant_id}/e/{environment_id}/device",
             get(device_verify::device_get).post(device_verify::device_post),
+        )
+        // The self-service end-user account API (issue #61): an AUTHENTICATED user
+        // manages their OWN account. Scope-routed under the per-environment path so
+        // every read/write runs under the right row-level-security scope, and
+        // authenticated by the user's OWN session cookie (never the management API's
+        // admin credentials). Every endpoint acts ONLY on the authenticated subject's
+        // resources; the state-changing POSTs carry the #196 same-origin CSRF check.
+        // The hosted account pages (M9) consume this API without any private endpoint.
+        .route(
+            "/t/{tenant_id}/e/{environment_id}/account/sessions",
+            get(account::list_sessions),
+        )
+        .route(
+            "/t/{tenant_id}/e/{environment_id}/account/sessions/revoke",
+            post(account::revoke_session),
+        )
+        .route(
+            "/t/{tenant_id}/e/{environment_id}/account/sessions/revoke-others",
+            post(account::revoke_other_sessions),
+        )
+        .route(
+            "/t/{tenant_id}/e/{environment_id}/account/credentials",
+            get(account::list_credentials).post(account::enroll_credential),
+        )
+        .route(
+            "/t/{tenant_id}/e/{environment_id}/account/credentials/remove",
+            post(account::remove_credential),
+        )
+        .route(
+            "/t/{tenant_id}/e/{environment_id}/account/password",
+            post(account::change_password),
         );
 
     // Dynamic Client Registration (issue #30, RFC 7591 + RFC 7592), mounted ONLY

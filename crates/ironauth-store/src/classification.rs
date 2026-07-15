@@ -134,13 +134,16 @@ pub enum ResourceType {
     User,
     /// An authenticated session.
     Session,
+    /// An enrolled self-service account credential (a passkey, TOTP authenticator,
+    /// or recovery-code set; issue #61).
+    AccountCredential,
 }
 
 impl ResourceType {
     /// Every resource type, in a stable order. The classification lint and the
     /// metadata endpoint both iterate this; a variant missing here is caught by
     /// the `all_lists_every_variant` test and by `scripts/classification-lint.sh`.
-    pub const ALL: [ResourceType; 14] = [
+    pub const ALL: [ResourceType; 15] = [
         ResourceType::Operator,
         ResourceType::Tenant,
         ResourceType::Environment,
@@ -155,6 +158,7 @@ impl ResourceType {
         ResourceType::EnvironmentSecret,
         ResourceType::User,
         ResourceType::Session,
+        ResourceType::AccountCredential,
     ];
 
     /// The stable wire name of this resource type (for example `organization`).
@@ -175,6 +179,7 @@ impl ResourceType {
             ResourceType::EnvironmentSecret => "environment_secret",
             ResourceType::User => "user",
             ResourceType::Session => "session",
+            ResourceType::AccountCredential => "account_credential",
         }
     }
 
@@ -196,7 +201,8 @@ impl ResourceType {
             | ResourceType::Variable
             | ResourceType::EnvironmentSecret
             | ResourceType::User
-            | ResourceType::Session => ResourceLevel::Environment,
+            | ResourceType::Session
+            | ResourceType::AccountCredential => ResourceLevel::Environment,
         }
     }
 
@@ -248,7 +254,8 @@ pub fn classify(resource: ResourceType) -> ResourceClassification {
         | ResourceType::Tenant
         | ResourceType::Organization
         | ResourceType::User
-        | ResourceType::Session => Runtime,
+        | ResourceType::Session
+        | ResourceType::AccountCredential => Runtime,
     }
 }
 

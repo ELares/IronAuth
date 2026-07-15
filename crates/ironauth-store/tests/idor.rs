@@ -7,8 +7,9 @@ use ironauth_env::Env;
 use ironauth_store::idor_harness::IdorHarness;
 use ironauth_store::test_support::TestDatabase;
 use ironauth_store::{
-    AuthorizationCodeId, ClientId, CorrelationId, GrantId, IssueCode, NewRefreshFamily, NewSession,
-    RefreshFamilyId, RefreshTokenId, Scope, SessionId, StoreError, UserId, refresh_token_digest,
+    AuthorizationCodeId, ClientId, CorrelationId, CredentialType, GrantId, IssueCode,
+    NewRefreshFamily, NewSession, RefreshFamilyId, RefreshTokenId, Scope, SessionId, StoreError,
+    UserId, refresh_token_digest,
 };
 
 /// A timestamp far past any test's clock, so a planted fixture never expires mid-test.
@@ -186,6 +187,76 @@ async fn session_fleet_surfaces_are_cross_tenant_and_cross_environment_isolated(
             "a foreign session must survive every probe"
         );
     }
+}
+
+#[tokio::test]
+async fn account_credential_surfaces_are_cross_tenant_and_cross_environment_isolated() {
+    // The self-service credential removal (issue #61) must refuse a credential id
+    // minted in another tenant or environment as the uniform not-found, never a
+    // cross-scope deletion.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+
+    let scope_a = db.seed_scope(&env).await;
+    let scope_b = db.seed_scope(&env).await;
+    let env_a2 = db.seed_environment(&env, scope_a.tenant()).await;
+    let scope_a2 = Scope::new(scope_a.tenant(), env_a2);
+
+    // Plant a victim credential in each foreign scope, keeping its owning subject so
+    // the survival check can list it back.
+    let (subject_b, victim_b) = plant_credential(&db, &env, scope_b).await;
+    let (subject_a2, victim_a2) = plant_credential(&db, &env, scope_a2).await;
+
+    let mut harness = IdorHarness::new();
+    harness.register_account_probes();
+    assert_eq!(
+        harness.probe_names(),
+        vec!["account_credentials.remove"],
+        "the account-credential surface is registered with the harness"
+    );
+
+    let foreign = [victim_b.clone(), victim_a2.clone()];
+    let refs: Vec<&str> = foreign.iter().map(String::as_str).collect();
+    let leaks = harness.run(db.store(), scope_a, &refs).await;
+    assert!(leaks.is_empty(), "cross-scope leak detected: {leaks:?}");
+
+    // Neither victim credential was removed: both still list in their own scope.
+    for (scope, subject, id) in [
+        (scope_b, subject_b, victim_b),
+        (scope_a2, subject_a2, victim_a2),
+    ] {
+        let listed = db
+            .store()
+            .scoped(scope)
+            .account_credentials()
+            .list(&subject, 50, None)
+            .await
+            .expect("list");
+        assert!(
+            listed.iter().any(|cred| cred.id == id),
+            "a foreign credential must survive every probe"
+        );
+    }
+}
+
+/// Plant a live account credential in `scope` and return its owning subject and id.
+async fn plant_credential(db: &TestDatabase, env: &Env, scope: Scope) -> (UserId, String) {
+    let subject = UserId::generate(env, &scope);
+    let id = db
+        .store()
+        .scoped(scope)
+        .acting(db.test_actor(env), CorrelationId::generate(env))
+        .account_credentials()
+        .enroll(
+            env,
+            &subject,
+            CredentialType::Passkey,
+            "victim key",
+            "probe",
+        )
+        .await
+        .expect("plant credential");
+    (subject, id.to_string())
 }
 
 /// Plant a live session in `scope` (with a far-future lifetime), for the fleet probes.

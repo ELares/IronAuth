@@ -6,6 +6,34 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Self-service end-user account API (issue #61). An API-first surface an
+  AUTHENTICATED user manages their OWN account with, mounted on the public data plane
+  and scope-routed under `/t/{tenant}/e/{environment}/account/...`, authenticated by
+  the user's OWN session cookie (never the management API's admin credentials). The
+  hosted account pages (M9) consume this API without any private endpoint.
+  - **Sessions.** `GET .../account/sessions` lists the caller's OWN active sessions
+    with device metadata (user agent, a coarse network-locality hint derived from the
+    IP observed at authentication with the host portion zeroed), created / last-seen
+    timestamps, and a current-session marking; `POST .../account/sessions/revoke`
+    revokes ONE own session; `POST .../account/sessions/revoke-others` signs out
+    everywhere else. Every read and write binds to the authenticated subject: a session
+    the caller does not own is the uniform not-found and is never actionable, and a
+    revoke flows through the unified session-ended fan-out exactly as an admin revoke.
+  - **Credentials.** `GET`/`POST .../account/credentials` list and enroll the caller's
+    OWN credentials; `POST .../account/credentials/remove` removes one, subject-bound
+    (a cross-user id is refused) and behind the last-usable-credential guardrail (a 409
+    unless the request carries the documented `acknowledge_recovery`). The endpoints and
+    authorization contract ship now; the concrete factor ceremonies land with M7.
+  - **Password change.** `POST .../account/password` verifies the CURRENT password via
+    the Argon2id path, sets a new verifier at the same OWASP parameters through the
+    entropy seam (never returning or logging the hash), and revokes the caller's OTHER
+    sessions (session-fixation defense).
+  - **Guardrails.** Every state-changing POST carries the same-origin CSRF check
+    (issue #196) BEFORE any mutation; the sensitive operations DECLARE a configurable
+    recent-re-authentication (step-up) requirement recorded in the audit trail and
+    reported to the caller, with the enforcement seam ready to activate once M7's
+    step-up issue lands; an unauthenticated request, and a session cookie presented at
+    the wrong scope, are `401`.
 - ACME certificate-authority DIRECTORY client for custom domains (issue #47,
   EXPLORATORY): `AcmeDirectoryClient` fetches and parses a CA's directory (RFC 8555
   7.1.1) ONLY through the SSRF-hardened `ironauth_fetch::Fetcher`, so a directory or

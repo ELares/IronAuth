@@ -409,6 +409,38 @@ pub enum Action {
     /// row. The operator-safe `detail` records the change counts (create, update,
     /// delete); no promoted value or secret is recorded.
     ConfigPromotionApply,
+    /// An end user CHANGED their OWN password through the self-service account
+    /// surface (issue #61): the current password was verified and a fresh Argon2id
+    /// verifier was written, and (session-fixation defense) every OTHER session of
+    /// the user was revoked in the SAME transaction. The row targets the user and
+    /// is attributed to the end user. No password or hash is ever recorded; the
+    /// `detail` records the step-up policy the sensitive change declared.
+    AccountPasswordChange,
+    /// An end user ENROLLED a credential through the self-service account surface
+    /// (issue #61): a passkey, TOTP authenticator, or recovery-code set was added
+    /// to their own registry. The row targets the credential and is attributed to
+    /// the end user; the `detail` records the step-up policy the sensitive change
+    /// declared. The concrete factor material lands with the M7 factor issues.
+    AccountCredentialEnroll,
+    /// An end user REMOVED one of their OWN credentials through the self-service
+    /// account surface (issue #61). Blocked by the last-usable-credential guardrail
+    /// unless it is not the last, or the request carried the documented recovery
+    /// acknowledgment. The row targets the credential and is attributed to the end
+    /// user; the `detail` records the step-up policy the sensitive change declared.
+    AccountCredentialRemove,
+    /// An end user REVOKED one of their OWN sessions through the self-service
+    /// account surface (issue #61): a single session the user chose to sign out,
+    /// stopping it from resolving immediately and cascading through the unified
+    /// session-ended fan-out exactly as an admin revoke does. The row targets the
+    /// session and is attributed to the end user.
+    AccountSessionRevoke,
+    /// An end user REVOKED all of their OTHER sessions through the self-service
+    /// account surface (issue #61): every session except the one making the request
+    /// (the "sign out everywhere else" action). Each revoked session cascades
+    /// through the unified session-ended fan-out. The row targets the user and is
+    /// attributed to the end user; the `detail` records the step-up policy the
+    /// sensitive change declared.
+    AccountSessionsRevokeOthers,
 }
 
 impl Action {
@@ -500,6 +532,11 @@ impl Action {
             Action::EnvironmentSecretPut => "environment_secret.put",
             Action::EnvironmentSecretDelete => "environment_secret.delete",
             Action::ConfigPromotionApply => "config_promotion.apply",
+            Action::AccountPasswordChange => "account.password.change",
+            Action::AccountCredentialEnroll => "account.credential.enroll",
+            Action::AccountCredentialRemove => "account.credential.remove",
+            Action::AccountSessionRevoke => "account.session.revoke",
+            Action::AccountSessionsRevokeOthers => "account.sessions.revoke_others",
         }
     }
 }
