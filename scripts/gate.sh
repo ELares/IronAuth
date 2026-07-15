@@ -31,6 +31,9 @@ scripts/classification-lint.sh
 echo "==> pii encryption (every classified PII/secret column is envelope-encrypted)"
 scripts/pii-encryption-scan.sh
 
+echo "==> canonicalization seam (every identifier comparison routes through the one seam)"
+scripts/canonicalization-seam.sh
+
 echo "==> http audit (ironauth-fetch is the only outbound HTTP path)"
 scripts/http-audit.sh
 

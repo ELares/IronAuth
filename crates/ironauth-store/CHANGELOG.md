@@ -6,6 +6,38 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Flexible identifiers on the central canonicalization seam (issue #54, migration
+  0041, expand). Multiple typed login identifiers per user with uniqueness as
+  configuration, built around one canonicalization function so the
+  canonicalization-mismatch CVE class (Authelia CVE-2026-47203 / CVE-2025-24806 /
+  CVE-2026-48794, Zitadel CVE-2025-31124) is designed out by construction.
+  - **The one seam.** New `identifier` module: `canonicalize_identifier(kind, raw)`
+    is the SINGLE entry point that produces a `CanonicalIdentifier` (email, username,
+    or phone). It strips Unicode invisible and control characters, applies NFKC
+    (folding fullwidth and other compatibility homoglyphs), trims, and case-folds per
+    type (email folds local part and domain, username Unicode-lowercases, phone
+    normalizes to structural E.164 `+<digits>`). It is TOTAL (never panics) and
+    IDEMPOTENT, proven by property tests and the `canonicalize_identifier` fuzz
+    target. `CanonicalIdentifier`'s fields are private, so a raw handle cannot reach
+    a comparison without passing the seam; `scripts/canonicalization-seam.sh` backstops
+    it in CI.
+  - **The `user_identifiers` table.** One new tenant-scoped table (RLS forced, the
+    (tenant, environment) isolation policy, closed-type CHECK, column-scoped grants):
+    the canonical form as a per-tenant keyed-HMAC blind index (`canonical_bidx`, for
+    lookup and uniqueness), the raw input AEAD-sealed for display (`raw_sealed`, issue
+    #48; the plaintext never lands on a column), a per-identifier `verified` flag, and
+    a `uniqueness_key` discriminator.
+  - **Uniqueness as configuration, not code.** A partial unique index over the
+    `uniqueness_key`: environment-wide (the default), org-scoped (falling back to the
+    environment scope for a membership-free user until M10), or non-unique. A
+    post-canonicalization collision within the configured scope is refused as the
+    deterministic `StoreError::Conflict`.
+  - **Identifier-first resolution.** `UserIdentifierRepo::resolve` canonicalizes a
+    submitted identifier and returns each matching account with only the
+    authentication methods it actually has (`LoginMethod::Password` / `Passkey`),
+    consumed later by M7/M9. `list_for_user` and the `collisions_for_mode`
+    mode-change validation pass round it out; `ActingUserIdentifierRepo::add` is the
+    audited (`user.identifier.add`) mutation.
 - User invitation persistence (issue #60, migration 0040, expand): the one new
   piece of durable state the admin-initiated invitation flow needs, a tenant-scoped
   `user_invitations` table with RLS forced and the (tenant, environment) isolation

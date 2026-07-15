@@ -80,6 +80,15 @@ sqlx = { version = "0.8", default-features = false, features = [
     "postgres",
 ] }
 base64 = "0.22"
+# Unicode NFKC normalization for the central identifier canonicalization seam
+# (crates/ironauth-store, issue #54). NFKC folds the compatibility-confusable class
+# (fullwidth ASCII, ligatures, circled forms) onto ordinary forms so a homoglyph
+# spoof of a login handle canonicalizes to the same value as the real one. Pure
+# Rust, permissive (MIT OR Apache-2.0), and ALREADY in the tree transitively (sqlx
+# -> url -> idna -> idna_adapter -> unicode-normalization), so this adds a direct
+# edge, not a new crate: the dependency graph, licenses, MSRV 1.85, and the musl
+# static lane are unchanged.
+unicode-normalization = "0.1"
 # Argon2id password hashing for the bootstrap login/registration surface
 # (issue #20), at the OWASP default parameters. Pure Rust (RustCrypto), permissive
 # (MIT OR Apache-2.0), no C dependency, so the tree stays musl-static clean and

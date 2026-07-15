@@ -30,3 +30,10 @@ path = "fuzz_targets/redirect_match.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "canonicalize_identifier"
+path = "fuzz_targets/canonicalize_identifier.rs"
+test = false
+doc = false
+bench = false
