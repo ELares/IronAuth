@@ -26,6 +26,7 @@ use ironauth_config::{
 };
 use ironauth_env::Env;
 use ironauth_jose::{JwsAlgorithm, TrustedKey, VerificationPolicy, VerifiedToken, verify};
+use ironauth_quota::QuotaEnforcer;
 use ironauth_store::{GuardrailSet, Scope, Store, TokenFormat};
 
 use crate::client_keys::ClientKeyResolver;
@@ -71,6 +72,14 @@ pub struct OidcState {
     // resolves it from the strict config feature ladder (feature enabled AND acked)
     // and sets it here. Default: false (the endpoint is unmounted).
     global_token_revocation_enabled: bool,
+    // The per-tenant/per-environment quota enforcer (issue #50), the data plane's
+    // tenant-fairness layer. Kept OUTSIDE `Inner` and installed by the boot path
+    // (built from the [quota] config, seeded with the SAME env clock), so a spend
+    // refills deterministically under a test's ManualClock. A single enforcer is
+    // shared across every request thread. Default: `None`, which disables
+    // enforcement entirely (every request admitted, nothing charged) so the
+    // many DB-only OIDC tests and a self-hoster who wants no quota are unaffected.
+    quota: Option<Arc<QuotaEnforcer>>,
 }
 
 // The per-environment policy flags each mirror an independent, individually
@@ -322,6 +331,7 @@ impl OidcState {
             revocation_sink: default_sink(),
             introspection_serializer: default_serializer(),
             global_token_revocation_enabled: false,
+            quota: None,
         }
     }
 
@@ -353,6 +363,32 @@ impl OidcState {
     #[must_use]
     pub fn global_token_revocation_enabled(&self) -> bool {
         self.global_token_revocation_enabled
+    }
+
+    /// Install the per-tenant/per-environment quota enforcer (issue #50), turning
+    /// on data-plane tenant fairness. The boot path builds one enforcer from the
+    /// `[quota]` config (seeded with the same env clock) and installs it here; a
+    /// test installs a small-budget enforcer to drive the 429 path. With no
+    /// enforcer installed the data plane admits every request (no enforcement),
+    /// which is the default and the self-hoster's unlimited posture.
+    #[must_use]
+    pub fn with_quota_enforcer(mut self, enforcer: Arc<QuotaEnforcer>) -> Self {
+        self.quota = Some(enforcer);
+        self
+    }
+
+    /// Charge one request against the tenant and environment request-rate quota
+    /// for `scope` (issue #50).
+    ///
+    /// Returns [`Some`] `429 Too Many Requests` response when the scope is over
+    /// quota: the caller MUST return it and spend nothing further (fail-closed at
+    /// the ceiling). Returns [`None`] when the request is admitted (or when no
+    /// enforcer is installed), and the caller proceeds untouched. The spend draws
+    /// from the environment bucket and, by nesting, its tenant bucket, so one
+    /// tenant hitting its limit never consumes another tenant's share.
+    #[must_use]
+    pub(crate) fn enforce_request_quota(&self, scope: &Scope) -> Option<axum::response::Response> {
+        crate::quota::enforce_request(self.quota.as_ref()?, scope)
     }
 
     /// Whether a Global Token Revocation hard-kills the subject's `offline_access`

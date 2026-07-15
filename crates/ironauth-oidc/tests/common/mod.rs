@@ -16,7 +16,7 @@ use axum::Router;
 use axum::body::Body;
 use axum::http::{HeaderMap, Request, StatusCode, header};
 use http_body_util::BodyExt;
-use ironauth_config::OidcConfig;
+use ironauth_config::{OidcConfig, QuotaConfig};
 use ironauth_env::{Env, ManualClock};
 use ironauth_jose::{
     EmissionOptions, JwsAlgorithm, KeySet, SigningKey, SigningPolicy, TrustedKey,
@@ -27,6 +27,7 @@ use ironauth_oidc::{
     IssuerRegistry, IssuerState, JwksCacheWindow, OidcState, PairwiseSalt, SESSION_COOKIE,
     discovery_router, issuer_router, oidc_router,
 };
+use ironauth_quota::QuotaEnforcer;
 use ironauth_store::test_support::TestDatabase;
 use ironauth_store::{
     AssertionMappingId, ClientId, CorrelationId, ExternalIssuerId, InitialAccessTokenId,
@@ -216,6 +217,9 @@ pub struct Harness {
     // A clone of the OidcState the router was built from, so a test can call the
     // state directly (for example the access-token target resolution, issue #29).
     state: OidcState,
+    // The quota engine installed on the state, retained so a test can inspect the
+    // live bucket count and drive the idle-bucket reaper (issue #50).
+    quota: Option<Arc<QuotaEnforcer>>,
     router: Router,
 }
 
@@ -243,17 +247,29 @@ impl Harness {
     /// Like [`Harness::start`] but with explicit OIDC settings (for the expiry
     /// test, which wants a short code lifetime).
     pub async fn start_with(config: OidcConfig) -> Self {
-        Self::start_inner(config, None).await
+        Self::start_inner(config, None, None).await
     }
 
     /// Like [`Harness::start_with`] but wiring a `private_key_jwt` client-key
     /// resolver (issue #25), so a `jwks_uri` client's keys resolve through the
     /// fetcher. Confidential PKCE is relaxed via the passed config.
     pub async fn start_with_resolver(config: OidcConfig, resolver: Arc<ClientKeyResolver>) -> Self {
-        Self::start_inner(config, Some(resolver)).await
+        Self::start_inner(config, Some(resolver), None).await
     }
 
-    async fn start_inner(config: OidcConfig, resolver: Option<Arc<ClientKeyResolver>>) -> Self {
+    /// Like [`Harness::start_with`] but with the tenant/environment quota engine
+    /// (issue #50) installed on the data plane, built from `quota_config` and the
+    /// harness's deterministic clock. Used to drive the real `/authorize` request
+    /// path into a 429 and to prove tenant fairness end to end.
+    pub async fn start_with_quota(config: OidcConfig, quota_config: QuotaConfig) -> Self {
+        Self::start_inner(config, None, Some(quota_config)).await
+    }
+
+    async fn start_inner(
+        config: OidcConfig,
+        resolver: Option<Arc<ClientKeyResolver>>,
+        quota_config: Option<QuotaConfig>,
+    ) -> Self {
         let (db, env, clock, scope, client_id) = Self::seed_common().await;
 
         // One Ed25519 signing key for the environment, held in a PRE-POPULATED
@@ -295,6 +311,19 @@ impl Harness {
                 ISSUER_BASE,
             ),
         };
+        // Install the tenant/environment quota engine over the SAME deterministic
+        // clock when the test asked for it (issue #50), so an over-quota scope on the
+        // real request path short-circuits with a 429 and refill is clock-driven.
+        let (state, quota) = match quota_config {
+            Some(quota_config) => {
+                let enforcer = Arc::new(QuotaEnforcer::from_config(&quota_config, env.clock_arc()));
+                (
+                    state.with_quota_enforcer(Arc::clone(&enforcer)),
+                    Some(enforcer),
+                )
+            }
+            None => (state, None),
+        };
         let issuer = state.issuer_for(&scope);
         let router = oidc_router(state.clone());
 
@@ -308,6 +337,7 @@ impl Harness {
             issuer,
             registry,
             state,
+            quota,
             router,
         }
     }
@@ -374,6 +404,7 @@ impl Harness {
             issuer,
             registry,
             state,
+            quota: None,
             router,
         }
     }
@@ -513,6 +544,7 @@ impl Harness {
             issuer,
             registry,
             state,
+            quota: None,
             router,
         }
     }
@@ -563,6 +595,7 @@ impl Harness {
             issuer: self.issuer.clone(),
             registry,
             state,
+            quota: None,
             router,
         }
     }
@@ -617,6 +650,15 @@ impl Harness {
     #[must_use]
     pub fn state(&self) -> &OidcState {
         &self.state
+    }
+
+    /// The quota engine installed on the state (issue #50), for tests that assert
+    /// the live bucket count stays bounded or drive the idle-bucket reaper.
+    #[must_use]
+    pub fn quota_enforcer(&self) -> &Arc<QuotaEnforcer> {
+        self.quota
+            .as_ref()
+            .expect("harness was started with a quota engine")
     }
 
     /// The seeded scope.

@@ -6,6 +6,23 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Per-tenant and per-environment quota fairness settings (issue #50), on a new
+  `[quota]` section consumed by the `ironauth-quota` engine.
+  - `[quota.tenant]` and `[quota.environment]`: the two nested tiers, each with a
+    sustained rate and burst capacity per dimension (`requests_per_second` /
+    `requests_burst`, `token_issuance_per_second` / `token_issuance_burst`,
+    `hook_seconds_per_second` / `hook_seconds_burst`). Safe defaults; the
+    per-tenant envelope is larger than the per-environment share. A `*_burst` of
+    0 is the documented unlimited form for a single-tenant self-hoster.
+  - `quota.usage_thresholds_percent` (default `[80, 100]`): the utilization
+    percentages at which a saturation webhook fires per dimension. Validated to
+    be at most `QUOTA_MAX_USAGE_THRESHOLDS` entries, each 1..=100, with no
+    duplicates; an empty list disables saturation webhooks.
+  - `quota.idle_bucket_ttl_secs` (default `3600`): how long an idle per-tenant or
+    per-environment token bucket is retained before the reaper evicts it, bounding
+    the in-memory footprint under legitimate scope churn. `0` disables the reaper
+    (buckets live for the process lifetime); the key space is still bounded by real
+    tenancy, because only a verified, existing scope ever allocates a bucket.
 - Session Management 1.0 and Front-Channel Logout 1.0, behind default-off flags for
   certification completeness (issue #39).
   - `oidc.session_management_enabled` (default `false`): when set, the OP serves the

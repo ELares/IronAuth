@@ -23,6 +23,10 @@ ironauth-admin.workspace = true
 # only, so the musl static lane holds.
 ironauth-oidc.workspace = true
 ironauth-jose.workspace = true
+# The tenant/environment quota engine (issue #50): the boot path builds one
+# enforcer from the [quota] config and hands it to the OIDC data plane. Pure,
+# in-memory token buckets with no persistence or network dependency.
+ironauth-quota.workspace = true
 axum = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "time"] }
 tracing.workspace = true

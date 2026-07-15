@@ -20,6 +20,11 @@ ironauth-env.workspace = true
 ironauth-config.workspace = true
 ironauth-store.workspace = true
 ironauth-jose.workspace = true
+# The per-tenant/per-environment quota fairness engine (issue #50). The data
+# plane constructs one enforcer from the [quota] config and spends it on the
+# request path, short-circuiting an over-quota scope with a 429; the engine
+# itself is a pure, in-memory token-bucket core with no persistence dependency.
+ironauth-quota.workspace = true
 # The SSRF-hardened outbound fetcher: the ONLY path sector_identifier_uri
 # validation reaches the network through. Depending on ironauth-fetch (not an
 # HTTP-client crate) keeps scripts/http-audit.sh satisfied.
@@ -437,6 +442,17 @@ path = "tests/conformance_seed.rs"
 [[test]]
 name = "global_revocation"
 path = "tests/global_revocation.rs"
+required-features = ["testing"]
+
+# Tenant/environment quota enforcement on the REAL /authorize request path (issue
+# #50): a scope at its quota gets a 429 with the RateLimit headers and block signal;
+# under quota passes; one tenant's flood never throttles another (fairness end to
+# end); the configured tiers actually govern (change a tier, behavior changes); and a
+# concurrency storm on the live endpoint never oversells the burst. Needs the store
+# harness for the data-plane store, though the quota check short-circuits before it.
+[[test]]
+name = "quota"
+path = "tests/quota.rs"
 required-features = ["testing"]
 
 [lints]

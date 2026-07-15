@@ -66,10 +66,7 @@ def describe(node):
     first = text.split("\n\n")[0].replace("\n", " ")
     return first
 
-def default_of(node):
-    if "default" not in node:
-        return ""
-    value = node["default"]
+def format_default(value):
     if value is None:
         return "unset"
     if isinstance(value, (dict, list)) and not value:
@@ -78,17 +75,38 @@ def default_of(node):
         return "see fields"
     return f"`{json.dumps(value)}`"
 
+def default_of(node):
+    if "default" not in node:
+        return ""
+    return format_default(node["default"])
+
 rows = []
 
-def walk(prefix, node):
+def walk(prefix, node, parent_default=None):
     node = resolve(node)
     for key in sorted(node.get("properties", {})):
         child = node["properties"][key]
         path = f"{prefix}{key}"
         resolved = resolve(child)
-        rows.append((path, type_name(child), default_of(child), describe(child)))
+        # Prefer the ENCLOSING object default for this field. A nested tier whose
+        # per-field defaults are overridden by the parent Default impl (for
+        # example quota.tenant and quota.environment share one $def, but the real
+        # per-tier defaults live only in the QuotaConfig Default) must show its
+        # ACTUAL composed default, not the shared field-level one. When the parent
+        # carries no default for the key, fall back to the field own default.
+        if isinstance(parent_default, dict) and key in parent_default:
+            default_str = format_default(parent_default[key])
+            child_default = parent_default[key]
+        else:
+            default_str = default_of(child)
+            child_default = resolved.get("default")
+        rows.append((path, type_name(child), default_str, describe(child)))
         if "properties" in resolved:
-            walk(f"{path}.", resolved)
+            walk(
+                f"{path}.",
+                resolved,
+                child_default if isinstance(child_default, dict) else None,
+            )
         extra = resolved.get("additionalProperties")
         if isinstance(extra, dict):
             walk(f"{path}.<name>.", extra)
