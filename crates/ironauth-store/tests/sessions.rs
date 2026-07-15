@@ -470,6 +470,16 @@ async fn revoke_all_for_a_user_ends_every_session_and_cascades_offline_preservin
         .expect("revoke all");
     assert_eq!(outcome.sessions_revoked, 2, "both of the user's sessions");
     assert_eq!(outcome.families_revoked, 1, "only the session-bound family");
+    // The revoked-session ids are returned (issue #36 fan-out source): exactly the two
+    // sessions that flipped, and nobody else's.
+    let mut returned = outcome.revoked_session_ids.clone();
+    returned.sort();
+    let mut expected = vec![s1.to_string(), s2.to_string()];
+    expected.sort();
+    assert_eq!(
+        returned, expected,
+        "revoked_session_ids names exactly the flipped sessions"
+    );
 
     let sessions = db.store().scoped(scope).sessions();
     assert!(sessions.get(&s1, 0, 0).await.expect("read").is_none());

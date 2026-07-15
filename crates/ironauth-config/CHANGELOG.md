@@ -6,6 +6,18 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Global Token Revocation, an EXPERIMENTAL receiver (issue #36).
+  - The `global-token-revocation` feature is registered on the maturity ladder as
+    Experimental: off by default, and enabling it requires an `ack` equal to the exact
+    implemented draft revision (`GLOBAL_TOKEN_REVOCATION_DRAFT`,
+    `draft-parecki-oauth-global-token-revocation-01`). A future draft that changes the
+    wire shape bumps that version and invalidates the old ack. The implemented draft
+    revision is surfaced in `docs/CONFIG.md` (the feature ladder table) so an interop
+    mismatch with another implementer is diagnosable.
+  - `oidc.global_token_revocation_hard_kill`: whether a global revoke ALSO revokes the
+    subject's `offline_access` families (not only the session-bound ones). Off by default
+    (offline grants survive, matching the platform-wide revoke-everything semantic); set
+    it for an account-takeover posture. Effect only when the feature is enabled.
 - Session-model settings (issue #32).
   - `oidc.session_idle_ttl_secs`: the session IDLE timeout, alongside `session_ttl_secs`
     (now documented as the ABSOLUTE hard cap). Validated to be at least 1 second, at most

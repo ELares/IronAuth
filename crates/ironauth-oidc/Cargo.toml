@@ -412,5 +412,16 @@ required-features = ["testing"]
 name = "conformance_seed"
 path = "tests/conformance_seed.rs"
 
+# The experimental Global Token Revocation receiver end to end (issue #36): a
+# strongly-authorized subject-scoped revoke ends every session and refresh family in
+# scope and fans a terminal signal out per session; an unauthenticated or public-client
+# caller is refused; cross-tenant isolation holds; offline families follow the hard-kill
+# flag; the receiver is idempotent; and the endpoint is unmounted unless the feature is
+# enabled. Over a real database with a provisioned signing key.
+[[test]]
+name = "global_revocation"
+path = "tests/global_revocation.rs"
+required-features = ["testing"]
+
 [lints]
 workspace = true

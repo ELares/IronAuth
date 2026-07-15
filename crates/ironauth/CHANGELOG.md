@@ -6,6 +6,13 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- The boot path now runs the strict feature-maturity gate (issue #4/#36): it validates
+  `[features]` against the built-in registry and REFUSES to boot on a violation (an
+  unknown feature, or an enabled experimental feature without an exact-version ack), and
+  it resolves the experimental Global Token Revocation receiver's mount from that ladder
+  (feature enabled AND acked) rather than any plain `[oidc]` toggle, so the ack can never
+  be bypassed. When enabled it mounts `POST /global-token-revocation` and logs the
+  experimental-surface warning.
 - Wire the OIDF conformance suite into CI as a merge gate (issue #37). New
   `deploy/conformance/` harness: a docker-compose stack pinned BY DIGEST via a
   committed `SUITE_VERSION` (the OIDF suite, MongoDB, an nginx TLS terminator

@@ -7725,7 +7725,7 @@ impl ActingSessionRepo<'_> {
             },
             async move |tx| {
                 insert_idempotency(tx, idempotency).await?;
-                let sessions = sqlx::query(
+                let revoked = sqlx::query(
                     "UPDATE sessions \
                      SET revoked_at = \
                              TIMESTAMPTZ 'epoch' + ($1::text || ' microseconds')::interval, \
@@ -7734,15 +7734,20 @@ impl ActingSessionRepo<'_> {
                              TIMESTAMPTZ 'epoch' + ($1::text || ' microseconds')::interval, \
                          end_cause = 'user_revoked_all' \
                      WHERE subject = $2 AND tenant_id = $3 AND environment_id = $4 \
-                     AND revoked_at IS NULL AND ended_at IS NULL",
+                     AND revoked_at IS NULL AND ended_at IS NULL \
+                     RETURNING id",
                 )
                 .bind(now_micros)
                 .bind(&subject_text)
                 .bind(scope.tenant().to_string())
                 .bind(scope.environment().to_string())
-                .execute(&mut **tx)
+                .fetch_all(&mut **tx)
                 .await?;
-                out.sessions_revoked = sessions.rows_affected();
+                out.revoked_session_ids = revoked
+                    .iter()
+                    .map(|row| row.get::<String, _>("id"))
+                    .collect();
+                out.sessions_revoked = out.revoked_session_ids.len() as u64;
                 // The per-client sessions (the sid tier) of every one of the user's
                 // sessions end with them, in this same transaction.
                 sqlx::query(
@@ -8249,12 +8254,22 @@ pub struct SessionRevocation {
 }
 
 /// The outcome of revoking every session of one user (issue #32).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+///
+/// [`revoked_session_ids`](Self::revoked_session_ids) names EXACTLY the sessions this
+/// call flipped live -> revoked (captured with `RETURNING` in the same transaction),
+/// so a caller that must fan a terminal session-ended signal out per session (the
+/// global-token-revocation receiver, issue #36) emits one signal per truly-revoked
+/// session with no list-then-revoke race and no spurious signal for an
+/// already-revoked one.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct UserRevocation {
     /// How many of the user's live sessions were revoked.
     pub sessions_revoked: u64,
     /// How many of the user's refresh families were revoked by the cascade.
     pub families_revoked: u64,
+    /// The ids of the sessions this call actually revoked (`ses_...`), in no
+    /// guaranteed order. Empty when the subject had no live session.
+    pub revoked_session_ids: Vec<String>,
 }
 
 /// Revoke a user's refresh families inside an OPEN transaction (issue #32): the
