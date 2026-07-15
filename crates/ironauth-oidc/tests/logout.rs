@@ -22,14 +22,17 @@ use axum::http::{HeaderMap, Request, StatusCode, header};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use common::{
-    Harness, PKCE_CHALLENGE, PKCE_VERIFIER, REDIRECT_URI, enc, form, json, location, location_param,
+    Harness, PKCE_CHALLENGE, PKCE_VERIFIER, REDIRECT_URI, enc, form, form_field, json, location,
+    location_param,
 };
+use ironauth_config::OidcConfig;
 use ironauth_oidc::SESSION_COOKIE;
 use ironauth_store::{
     AuthorizationCodeId, ClientId, CorrelationId, GrantId, IssueCode, NewRefreshFamily, NewSession,
     RefreshFamilyId, RefreshTokenId, Scope, SessionId, refresh_token_digest,
 };
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::time::Duration;
 
 /// Re-sign `hint`'s claims with the environment's LIVE signing key after DROPPING the
@@ -365,6 +368,335 @@ async fn a_same_origin_confirmation_post_ends_the_session() {
     assert!(
         !session_still_authenticates(&harness, &cookie).await,
         "a confirmed logout ends the session"
+    );
+}
+
+/// Start a harness with Front-Channel Logout 1.0 enabled (issue #39). `enabled: true`
+/// keeps the OIDC provider mounted; the front-channel flag arms the feature.
+async fn frontchannel_harness() -> Harness {
+    Harness::start_with(OidcConfig {
+        enabled: true,
+        frontchannel_logout_enabled: true,
+        ..OidcConfig::default()
+    })
+    .await
+}
+
+#[tokio::test]
+async fn check_session_iframe_is_mounted_and_framable_only_when_enabled() {
+    // Issue #39: with session management OFF (the default) the check_session_iframe is
+    // NOT mounted (a uniform 404). With it enabled the iframe is served with the
+    // deliberate framing carve-out: no X-Frame-Options, and a CSP that does not deny
+    // framing, so an RP can embed it cross-origin.
+    let off = Harness::start().await;
+    let (status, _headers, _body) = off.get_with_cookie("/connect/check_session", None).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "check_session_iframe is unmounted by default"
+    );
+
+    let on = Harness::start_with(OidcConfig {
+        enabled: true,
+        session_management_enabled: true,
+        ..OidcConfig::default()
+    })
+    .await;
+    let (status, headers, body) = on.get_with_cookie("/connect/check_session", None).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "check_session_iframe served: {body}"
+    );
+    assert!(
+        headers.get(header::X_FRAME_OPTIONS).is_none(),
+        "the iframe must be framable: no X-Frame-Options"
+    );
+    let csp = headers
+        .get(header::CONTENT_SECURITY_POLICY)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+    assert!(
+        !csp.contains("frame-ancestors"),
+        "the carve-out must not deny framing: {csp}"
+    );
+    assert!(
+        body.contains("addEventListener") && body.contains("check_session"),
+        "serves the session-management iframe: {body}"
+    );
+}
+
+/// Start a harness with OIDC Session Management 1.0 enabled (issue #39), so the
+/// `check_session_iframe` is mounted, the authorization response carries `session_state`,
+/// and login publishes the `__ironauth_opbs` cookie.
+async fn session_management_harness() -> Harness {
+    Harness::start_with(OidcConfig {
+        enabled: true,
+        session_management_enabled: true,
+        ..OidcConfig::default()
+    })
+    .await
+}
+
+/// The value of the first `Set-Cookie` header that sets `name`, ignoring its attributes.
+fn first_set_cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
+    headers
+        .get_all(header::SET_COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .find_map(|value| {
+            let (cookie_name, cookie_value) = value.split(';').next()?.trim().split_once('=')?;
+            (cookie_name == name).then(|| cookie_value.to_owned())
+        })
+}
+
+/// Replicate EXACTLY what the `check_session_iframe`'s inline script computes for a poll
+/// (see `CHECK_SESSION_SCRIPT` in `pages.rs`): it reads `opbs` from the `__ironauth_opbs`
+/// cookie (the empty string when the cookie is absent or cleared), takes the salt from
+/// the RP's stored `session_state`, and answers `unchanged` iff
+/// `base64url(sha256("client origin opbs salt")) + "." + salt` equals that
+/// `session_state`. This is the ONE comparison the whole mechanism turns on.
+fn iframe_verdict(client_id: &str, origin: &str, opbs: &str, session_state: &str) -> &'static str {
+    let Some((_digest, salt)) = session_state.split_once('.') else {
+        return "error";
+    };
+    let mut hasher = Sha256::new();
+    hasher.update(format!("{client_id} {origin} {opbs} {salt}").as_bytes());
+    let expected = format!("{}.{salt}", URL_SAFE_NO_PAD.encode(hasher.finalize()));
+    if expected == session_state {
+        "unchanged"
+    } else {
+        "changed"
+    }
+}
+
+#[tokio::test]
+async fn session_management_publishes_opbs_so_the_iframe_flips_unchanged_then_changed() {
+    // Issue #39, the correct-but-inert defect: with session management ENABLED, login must
+    // publish the OP browser state to the script-readable __ironauth_opbs cookie the
+    // check_session_iframe reads. Without that cookie the iframe reads nothing and can only
+    // ever answer `changed`, so the OIDC Session Management OP profile cannot pass and an RP
+    // polling check_session re-authenticates forever (spec section 5.1). This proves the
+    // cookie now carries op_browser_state (never the session id), that a stable session
+    // polls `unchanged`, and that logout clears the cookie so the SAME poll flips to
+    // `changed`. Before the fix the `expect` on the __ironauth_opbs cookie FAILS: it is
+    // never set, which is exactly the criterion that could not pass.
+    let harness = session_management_harness().await;
+    let client_id = harness.client_id().to_string();
+    harness
+        .seed_user("sm@example.test", "s3cr3t-passphrase")
+        .await;
+
+    // 1. Unauthenticated authorize -> login, then round-trip the login form.
+    let (_s, headers, _b) = harness.authorize(&authorize_query(&client_id)).await;
+    let login_location = location(&headers).expect("login redirect");
+    let (_s, _h, login_html) = harness.get_with_cookie(&login_location, None).await;
+    let return_to = form_field(&login_html, "return_to").expect("login return_to");
+
+    // 2. POST credentials: the login response establishes the session cookie AND (this is
+    //    the fix) the __ironauth_opbs cookie.
+    let login_body = form(&[
+        ("identifier", "sm@example.test"),
+        ("password", "s3cr3t-passphrase"),
+        ("return_to", &return_to),
+    ]);
+    let (status, login_headers, body) = harness.post_form("/login", &login_body, None).await;
+    assert_eq!(status, StatusCode::SEE_OTHER, "login post: {body}");
+    let session_id =
+        first_set_cookie_value(&login_headers, SESSION_COOKIE).expect("session cookie set");
+    let opbs = first_set_cookie_value(&login_headers, "__ironauth_opbs")
+        .expect("session management must publish the __ironauth_opbs cookie at login");
+
+    // The cookie holds op_browser_state, NOT the session id: a fixed-width one-way digest.
+    assert_ne!(
+        opbs, session_id,
+        "the opbs cookie must not be the session id"
+    );
+    assert!(
+        !opbs.contains(&session_id),
+        "the opbs must not embed the session id: {opbs}"
+    );
+    assert_eq!(opbs.len(), 43, "opbs is a SHA-256 url-safe-no-pad digest");
+
+    // 3. Finish authorize (through consent) to obtain the session_state the authorization
+    //    response returns for this session.
+    let cookie = format!("{SESSION_COOKIE}={session_id}");
+    let resume = location(&login_headers).expect("resume after login");
+    let (_s, headers, _b) = harness.get_with_cookie(&resume, Some(&cookie)).await;
+    let consent_location = location(&headers).expect("consent redirect");
+    let (_s, _h, consent_html) = harness
+        .get_with_cookie(&consent_location, Some(&cookie))
+        .await;
+    let consent_return_to = form_field(&consent_html, "return_to").expect("consent return_to");
+    let consent_body = form(&[("decision", "allow"), ("return_to", &consent_return_to)]);
+    let (_s, headers, _b) = harness
+        .post_form("/consent", &consent_body, Some(&cookie))
+        .await;
+    let resume = location(&headers).expect("resume after consent");
+    let (_s, headers, _b) = harness.get_with_cookie(&resume, Some(&cookie)).await;
+    let session_state =
+        location_param(&headers, "session_state").expect("session_state on the code redirect");
+
+    // The RP origin the iframe posts from is the origin of its redirect_uri.
+    let origin = "https://client.test";
+
+    // 4. While the session is stable the iframe recomputes session_state from the SAME opbs
+    //    the cookie carries and answers UNCHANGED. This is the reply that was structurally
+    //    impossible before the fix (no cookie -> opbs "" -> forever `changed`).
+    assert_eq!(
+        iframe_verdict(&client_id, origin, &opbs, &session_state),
+        "unchanged",
+        "a stable session must poll `unchanged`"
+    );
+    // Sanity: had the cookie stayed unset (the old behavior), the very same poll is `changed`.
+    assert_eq!(
+        iframe_verdict(&client_id, origin, "", &session_state),
+        "changed",
+        "with no opbs cookie the poll can only be `changed` (the inert failure)"
+    );
+
+    // 5. Log out: the terminal path clears the opbs cookie (Max-Age=0), so the browser
+    //    presents no opbs and the SAME poll now answers CHANGED, exactly as intended.
+    let (status, logout_headers, body) = post_end_session(
+        &harness,
+        "",
+        Some(&cookie),
+        Some(SELF_ORIGIN),
+        Some("same-origin"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "logout: {body}");
+    let opbs_cleared = logout_headers
+        .get_all(header::SET_COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .any(|value| value.contains("__ironauth_opbs=") && value.contains("Max-Age=0"));
+    assert!(
+        opbs_cleared,
+        "logout must clear the __ironauth_opbs cookie so the iframe flips to `changed`"
+    );
+}
+
+#[tokio::test]
+async fn session_management_off_by_default_sets_no_opbs_cookie() {
+    // Issue #39: with session management OFF (the default) login sets NO __ironauth_opbs
+    // cookie and the authorization response carries no session_state. The feature is fully
+    // inert-by-config: nothing advertised, nothing mounted, no extra cookie.
+    let harness = Harness::start().await;
+    let client_id = harness.client_id().to_string();
+    harness
+        .seed_user("plain@example.test", "s3cr3t-passphrase")
+        .await;
+
+    let (_s, headers, _b) = harness.authorize(&authorize_query(&client_id)).await;
+    let login_location = location(&headers).expect("login redirect");
+    let (_s, _h, login_html) = harness.get_with_cookie(&login_location, None).await;
+    let return_to = form_field(&login_html, "return_to").expect("login return_to");
+    let login_body = form(&[
+        ("identifier", "plain@example.test"),
+        ("password", "s3cr3t-passphrase"),
+        ("return_to", &return_to),
+    ]);
+    let (status, login_headers, body) = harness.post_form("/login", &login_body, None).await;
+    assert_eq!(status, StatusCode::SEE_OTHER, "login post: {body}");
+    assert!(
+        first_set_cookie_value(&login_headers, SESSION_COOKIE).is_some(),
+        "the session cookie is still set"
+    );
+    assert!(
+        first_set_cookie_value(&login_headers, "__ironauth_opbs").is_none(),
+        "no OP browser-state cookie when session management is off"
+    );
+}
+
+#[tokio::test]
+async fn frontchannel_logout_renders_the_rp_iframe_with_iss_and_own_sid() {
+    // Issue #39: with the feature enabled and the client opted in with
+    // frontchannel_logout_session_required, a confirmed logout renders the
+    // front-channel logout page with a hidden iframe pointing at the RP's registered
+    // frontchannel_logout_uri, carrying iss and the RP's OWN sid.
+    let harness = frontchannel_harness().await;
+    let client_id = harness.client_id().to_string();
+    let (_session_id, cookie) = seeded_session(&harness).await;
+    // Minting an id token creates the per-(client, session) sid the front-channel
+    // iframe will carry.
+    let hint = mint_id_token(&harness, &client_id, &cookie).await;
+    let sid = {
+        let segment = hint.split('.').nth(1).expect("payload");
+        let bytes = URL_SAFE_NO_PAD.decode(segment).expect("b64");
+        let claims: Value = serde_json::from_slice(&bytes).expect("claims");
+        claims["sid"].as_str().expect("sid").to_owned()
+    };
+    harness
+        .register_frontchannel_logout(
+            harness.client_id(),
+            Some("https://rp.test/frontchannel"),
+            true,
+        )
+        .await;
+
+    // A same-origin confirmation POST ends the session and renders the front-channel
+    // page.
+    let (status, headers, body) = post_end_session(
+        &harness,
+        "",
+        Some(&cookie),
+        Some(SELF_ORIGIN),
+        Some("same-origin"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "front-channel logout page: {body}");
+    assert_cookie_cleared(&headers);
+    // Exactly one RP iframe, carrying the registered URI, iss, and the RP's OWN sid.
+    assert!(
+        body.contains("<iframe") && body.contains("https://rp.test/frontchannel"),
+        "renders the RP logout iframe: {body}"
+    );
+    assert!(body.contains("iss="), "the iframe carries iss: {body}");
+    assert!(
+        body.contains(&format!("sid={sid}")),
+        "the iframe carries the RP's OWN sid: {body}"
+    );
+    // The page keeps its anti-clickjacking posture and scopes frame-src to the RP.
+    let csp = headers
+        .get(header::CONTENT_SECURITY_POLICY)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+    assert!(csp.contains("frame-ancestors 'none'"), "csp: {csp}");
+    assert!(csp.contains("frame-src https://rp.test"), "csp: {csp}");
+    assert_eq!(headers.get(header::X_FRAME_OPTIONS).unwrap(), "DENY");
+}
+
+#[tokio::test]
+async fn frontchannel_logout_off_by_default_renders_the_neutral_page() {
+    // Issue #39: with the feature DISABLED (the default) a confirmed logout renders the
+    // plain logged-out page even when a client registered a frontchannel_logout_uri:
+    // the environment flag must also be on. No iframe is emitted.
+    let harness = Harness::start().await;
+    let client_id = harness.client_id().to_string();
+    let (_session_id, cookie) = seeded_session(&harness).await;
+    let _hint = mint_id_token(&harness, &client_id, &cookie).await;
+    harness
+        .register_frontchannel_logout(
+            harness.client_id(),
+            Some("https://rp.test/frontchannel"),
+            true,
+        )
+        .await;
+
+    let (status, headers, body) = post_end_session(
+        &harness,
+        "",
+        Some(&cookie),
+        Some(SELF_ORIGIN),
+        Some("same-origin"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "neutral page: {body}");
+    assert_cookie_cleared(&headers);
+    assert!(
+        !body.contains("<iframe"),
+        "no front-channel iframe when the feature is off: {body}"
     );
 }
 

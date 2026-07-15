@@ -34,6 +34,14 @@ use std::time::Duration;
 /// carries a `Domain`, so the prefix enforces those attributes browser-side.
 pub const SESSION_COOKIE: &str = "__Host-ironauth_session";
 
+/// The OP browser-state cookie name (OIDC Session Management 1.0, issue #39). It
+/// deliberately does NOT carry the `__Host-` prefix and is NOT `HttpOnly`, because
+/// the `check_session_iframe` script must read it via `document.cookie` from inside
+/// an RP-embedded, cross-site (third-party) iframe. Its value is the one-way
+/// `op_browser_state` digest (see [`crate::session_mgmt::op_browser_state`]), never
+/// the session id, so a script-readable, cross-site cookie leaks nothing.
+pub const OP_BROWSER_STATE_COOKIE: &str = "__ironauth_opbs";
+
 /// The internal request header carrying the POLICY-RESOLVED client IP: the input of
 /// the OFF-BY-DEFAULT peer-IP session binding (issue #32). Defined once in the config
 /// crate that both the server (which stamps it) and this crate (which reads it) share,
@@ -100,6 +108,50 @@ pub fn clear_set_cookie(partitioned: bool) -> String {
         same_site(partitioned),
         partitioned_suffix(partitioned),
     )
+}
+
+/// Build the `Set-Cookie` header that publishes the OP browser state to the
+/// `check_session_iframe` (OIDC Session Management 1.0, issue #39).
+///
+/// This cookie is the load-bearing half of session management: the iframe recomputes
+/// `session_state` from `client_id`, its own `origin`, this cookie, and the echoed
+/// salt, and can only ever answer `unchanged` when the value it reads here matches
+/// the `op_browser_state` the authorization response baked into `session_state`.
+/// Without this cookie the iframe reads nothing and answers `changed` forever, so an
+/// RP polling `check_session` re-authenticates in a loop (spec section 5.1).
+///
+/// Its attributes are deliberately the OPPOSITE of the session cookie's on three
+/// axes, and identical on the rest:
+///
+/// - NOT `HttpOnly`: the iframe script reads it with `document.cookie`. This is safe
+///   because the value is the one-way `op_browser_state` digest, never the session id;
+/// - `SameSite=None` (and therefore `Secure`): the iframe is embedded by the RP, so
+///   the cookie is read in a third-party context and must ride the cross-site request;
+/// - NO `__Host-` prefix: `__Host-` is compatible with `SameSite=None`, but the value
+///   is a public digest with none of the session cookie's confidentiality needs, so
+///   the prefix would only add friction without buying secrecy the digest already has.
+///
+/// `Max-Age` matches the session lifetime, so the browser drops it when the session
+/// row would have expired anyway; [`clear_op_browser_state_cookie`] expires it at
+/// logout.
+#[must_use]
+pub fn build_op_browser_state_cookie(op_browser_state: &str, ttl: Duration) -> String {
+    let max_age = i64::try_from(ttl.as_secs()).unwrap_or(i64::MAX);
+    format!(
+        "{OP_BROWSER_STATE_COOKIE}={op_browser_state}; Path=/; Secure; SameSite=None; \
+         Max-Age={max_age}"
+    )
+}
+
+/// Build the `Set-Cookie` header that CLEARS the OP browser-state cookie at logout
+/// (issue #39): the same name and attributes with an empty value and `Max-Age=0`, so
+/// a conformant browser drops it and the `check_session_iframe` flips to `changed` for
+/// the ended session exactly as the spec intends. It names the same
+/// `Path`/`Secure`/`SameSite` attributes as [`build_op_browser_state_cookie`] so it
+/// targets the same jar.
+#[must_use]
+pub fn clear_op_browser_state_cookie() -> String {
+    format!("{OP_BROWSER_STATE_COOKIE}=; Path=/; Secure; SameSite=None; Max-Age=0")
 }
 
 /// Extract the session-cookie value from a `Cookie` header value, if present. The
@@ -213,6 +265,44 @@ mod tests {
             "the session cookie must stay a small opaque id, got {} bytes: {cookie}",
             cookie.len()
         );
+    }
+
+    #[test]
+    fn op_browser_state_cookie_is_script_readable_cross_site_and_unprefixed() {
+        // Issue #39: the OP browser-state cookie is the deliberate OPPOSITE of the
+        // session cookie on three axes, so the check_session_iframe can read it from a
+        // third-party context. Its value is the one-way op_browser_state digest, so a
+        // script-readable, cross-site cookie leaks nothing.
+        let cookie = build_op_browser_state_cookie("opbsdigest", Duration::from_secs(3600));
+        assert!(cookie.starts_with("__ironauth_opbs=opbsdigest; "));
+        for attr in ["Path=/", "Secure", "SameSite=None", "Max-Age=3600"] {
+            assert!(cookie.contains(attr), "missing {attr}: {cookie}");
+        }
+        // NOT HttpOnly: the iframe reads it via document.cookie.
+        assert!(
+            !cookie.contains("HttpOnly"),
+            "the iframe must be able to read it: {cookie}"
+        );
+        // NOT __Host- prefixed, and never scoped to a Domain.
+        assert!(!cookie.contains("__Host-"), "{cookie}");
+        assert!(!cookie.contains("Domain"), "{cookie}");
+        // SameSite=None is load-bearing: a Lax cookie is withheld from the third-party
+        // iframe, so the mechanism would stay inert.
+        assert!(!cookie.contains("SameSite=Lax"), "{cookie}");
+    }
+
+    #[test]
+    fn clear_op_browser_state_cookie_expires_immediately_with_a_matching_shape() {
+        // Logout (issue #39) clears the cookie with Max-Age=0 and an empty value, naming
+        // the SAME Path/Secure/SameSite attributes so it targets the same jar and the
+        // iframe flips to `changed`.
+        let cookie = clear_op_browser_state_cookie();
+        assert!(cookie.starts_with("__ironauth_opbs=; "));
+        for attr in ["Path=/", "Secure", "SameSite=None", "Max-Age=0"] {
+            assert!(cookie.contains(attr), "missing {attr}: {cookie}");
+        }
+        assert!(!cookie.contains("HttpOnly"), "{cookie}");
+        assert!(!cookie.contains("Domain"), "{cookie}");
     }
 
     #[test]

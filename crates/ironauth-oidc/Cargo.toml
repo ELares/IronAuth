@@ -70,6 +70,10 @@ ironauth-jose = { workspace = true }
 ironauth-env = { workspace = true }
 # Base64 for building client_secret_basic Authorization headers in the tests.
 base64.workspace = true
+# SHA-256 lets the session-management test replicate the check_session_iframe's own
+# session_state recomputation (issue #39), so it proves the iframe would answer
+# `unchanged` while the session is stable and `changed` once its opbs cookie is cleared.
+sha2.workspace = true
 # A real third-party Rust OAuth 2.0 client, used to prove client_secret_basic and
 # client_secret_post interoperate through a mainstream library (issue #20
 # acceptance). default-features off drops its bundled reqwest client (the test

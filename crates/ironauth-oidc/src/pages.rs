@@ -551,6 +551,161 @@ pub fn logged_out_page() -> String {
     notice_page("Signed out", "You have been signed out.")
 }
 
+/// The exact inline script the OIDC Session Management 1.0 `check_session_iframe`
+/// runs (issue #39). It listens for `postMessage`, and for each message:
+///
+/// - replies ONLY to the sender's exact `event.origin` (NEVER `*`), so a
+///   session-state answer is never broadcast to an arbitrary frame;
+/// - folds that same `event.origin` into the recomputed `session_state`, so a
+///   wrong-origin poller computes a different value and learns nothing about the real
+///   session;
+/// - reads the OP browser state from the non-HttpOnly `__ironauth_opbs` cookie and
+///   recomputes `session_state` with the salt the RP echoed, replying `unchanged`,
+///   `changed`, or `error` per the spec.
+///
+/// It is a FIXED constant (no server-injected values) so [`check_session_iframe_csp`]
+/// can pin it by SHA-256 hash: no other inline or injected script can ever run in the
+/// iframe. `crypto.subtle` (a secure-context API) does the digest, so no hand-rolled
+/// SHA-256 ships in the page.
+const CHECK_SESSION_SCRIPT: &str = "(function(){\
+var UNCHANGED='unchanged',CHANGED='changed',ERR='error';\
+function b64url(buf){var s=btoa(String.fromCharCode.apply(null,new Uint8Array(buf)));\
+return s.replace(/\\+/g,'-').replace(/\\//g,'_').replace(/=+$/,'');}\
+function opbs(){var m=document.cookie.match(/(?:^|; )__ironauth_opbs=([^;]*)/);\
+return m?decodeURIComponent(m[1]):'';}\
+window.addEventListener('message',function(ev){\
+function reply(r){if(ev.source){ev.source.postMessage(r,ev.origin);}}\
+try{var parts=String(ev.data).split(' ');var clientId=parts[0],ss=parts[1];\
+if(!clientId||!ss){reply(ERR);return;}\
+var salt=ss.split('.')[1];if(!salt){reply(ERR);return;}\
+var msg=clientId+' '+ev.origin+' '+opbs()+' '+salt;\
+crypto.subtle.digest('SHA-256',new TextEncoder().encode(msg)).then(function(d){\
+var expected=b64url(d)+'.'+salt;reply(expected===ss?UNCHANGED:CHANGED);\
+}).catch(function(){reply(ERR);});}catch(e){reply(ERR);}},false);})();";
+
+/// The CSP `script-src` hash source for [`CHECK_SESSION_SCRIPT`]. Computed from the
+/// script constant itself, so policy and script can never drift.
+fn check_session_script_hash() -> String {
+    let digest = Sha256::digest(CHECK_SESSION_SCRIPT.as_bytes());
+    format!("'sha256-{}'", BASE64_STANDARD.encode(digest))
+}
+
+/// The Content-Security-Policy for the `check_session_iframe` (issue #39). It keeps
+/// `default-src 'none'` and permits ONLY the one hash-pinned script. Crucially it does
+/// NOT set `frame-ancestors 'none'`, and the response sets NO `X-Frame-Options`,
+/// because the whole point of this page is that an RP embeds it CROSS-ORIGIN. This is
+/// the ONE deliberate framing carve-out, scoped to this single flagged endpoint; every
+/// other page keeps `frame-ancestors 'none'` and `X-Frame-Options: DENY`.
+fn check_session_iframe_csp() -> String {
+    format!(
+        "default-src 'none'; base-uri 'none'; script-src {hash}",
+        hash = check_session_script_hash(),
+    )
+}
+
+/// The OIDC Session Management 1.0 `check_session_iframe` page body (issue #39): the
+/// fixed session-state script and nothing else. It carries no reflected input.
+#[must_use]
+pub fn check_session_iframe_page() -> String {
+    format!(
+        "<!doctype html><html><head><meta charset=\"utf-8\"><title>check_session</title>\
+             <script>{CHECK_SESSION_SCRIPT}</script></head><body></body></html>"
+    )
+}
+
+/// Build the `check_session_iframe` response (issue #39). It sets the hash-pinned CSP
+/// and, DELIBERATELY, neither `frame-ancestors 'none'` nor `X-Frame-Options`, so a
+/// relying party can embed it cross-origin as the spec requires. `Cache-Control` is a
+/// long public max-age: the iframe is a static, per-deployment artifact. This carve-out
+/// exists ONLY while session management is enabled (the route is otherwise unmounted).
+#[must_use]
+pub fn check_session_iframe_response() -> Response {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+        .header(header::CONTENT_SECURITY_POLICY, check_session_iframe_csp())
+        .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff")
+        .header(header::CACHE_CONTROL, "public, max-age=3600")
+        .body(axum::body::Body::from(check_session_iframe_page()))
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+/// The OIDC Front-Channel Logout 1.0 logout page body (issue #39): one hidden iframe
+/// per participating RP, each pointing at that RP's registered
+/// `frontchannel_logout_uri` (already carrying `iss` and the RP's own `sid` when
+/// required). Each `src` is HTML-attribute-escaped. The page hosts no script and no
+/// reflected free text; the iframe sources are server-assembled from registered,
+/// https-validated URIs.
+#[must_use]
+pub fn frontchannel_logout_page(iframe_urls: &[String]) -> String {
+    let iframes: String = iframe_urls.iter().fold(String::new(), |mut acc, url| {
+        let _ = write!(
+            acc,
+            "<iframe src=\"{}\" style=\"display:none\" sandbox=\"allow-same-origin allow-scripts\">\
+             </iframe>",
+            escape_html(url)
+        );
+        acc
+    });
+    let body = format!("<h1>Signing out</h1><p>You have been signed out.</p>{iframes}");
+    notice_document("Signing out", &body)
+}
+
+/// The `frame-src` CSP source list for the front-channel logout page: EXACTLY the
+/// participating RPs' registered `frontchannel_logout_uri` origins, de-duplicated in
+/// first-seen order. With no participants the source is `'none'`, so the page can frame
+/// nothing.
+fn frontchannel_frame_src(origins: &[String]) -> String {
+    let mut seen: Vec<&str> = Vec::new();
+    for origin in origins {
+        if !seen.contains(&origin.as_str()) {
+            seen.push(origin.as_str());
+        }
+    }
+    if seen.is_empty() {
+        "'none'".to_owned()
+    } else {
+        seen.join(" ")
+    }
+}
+
+/// The Content-Security-Policy for the front-channel logout page (issue #39). Unlike
+/// the `check_session_iframe`, this page KEEPS its own anti-clickjacking posture
+/// (`frame-ancestors 'none'`, plus `X-Frame-Options: DENY` on the response): it must
+/// not itself be framed. Its ONE relaxation is a `frame-src` built from EXACTLY the
+/// participating RPs' registered `frontchannel_logout_uri` origins, so the OP can load
+/// those RP iframes and nothing else.
+fn frontchannel_logout_csp(origins: &[String]) -> String {
+    format!(
+        "default-src 'none'; base-uri 'none'; frame-ancestors 'none'; frame-src {}",
+        frontchannel_frame_src(origins),
+    )
+}
+
+/// Build the front-channel logout page response (issue #39): the hidden RP iframes
+/// with a per-response CSP whose `frame-src` is exactly the participating RP origins.
+/// `iframe_urls` are the full iframe `src` values; `frame_origins` are their origins
+/// (scheme, host, port) for the CSP. The page keeps `frame-ancestors 'none'` and
+/// `X-Frame-Options: DENY` (it must not be framed), sends `Referrer-Policy:
+/// no-referrer` (the RP URIs never leak through `Referer`), and is never cached.
+#[must_use]
+pub fn frontchannel_logout_response(iframe_urls: &[String], frame_origins: &[String]) -> Response {
+    let body = frontchannel_logout_page(iframe_urls);
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+        .header(
+            header::CONTENT_SECURITY_POLICY,
+            frontchannel_logout_csp(frame_origins),
+        )
+        .header(header::X_FRAME_OPTIONS, "DENY")
+        .header(header::REFERRER_POLICY, "no-referrer")
+        .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff")
+        .header(header::CACHE_CONTROL, "no-store")
+        .body(axum::body::Body::from(body))
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -805,5 +960,92 @@ mod tests {
             headers.get(header::LOCATION).is_none(),
             "form_post never sets Location"
         );
+    }
+
+    #[test]
+    fn check_session_iframe_is_framable_and_pins_its_script() {
+        // Issue #39: the check_session_iframe is the ONE page an RP must embed
+        // cross-origin, so it carries NO X-Frame-Options and its CSP has NO
+        // frame-ancestors 'none'. Its inline script is pinned by SHA-256 hash.
+        let response = check_session_iframe_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let headers = response.headers();
+        assert!(
+            headers.get(header::X_FRAME_OPTIONS).is_none(),
+            "the check_session_iframe must be framable: no X-Frame-Options"
+        );
+        let csp = headers
+            .get(header::CONTENT_SECURITY_POLICY)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(
+            !csp.contains("frame-ancestors"),
+            "the iframe carve-out must not deny framing: {csp}"
+        );
+        assert!(
+            csp.contains("script-src 'sha256-"),
+            "the inline script is hash-pinned: {csp}"
+        );
+    }
+
+    #[test]
+    fn check_session_script_replies_to_the_sender_origin_never_wildcard() {
+        // The security-critical postMessage posture (issue #39): the iframe replies
+        // ONLY to ev.origin (never '*') and folds ev.origin into the recomputed value,
+        // so a wrong-origin poller learns nothing.
+        assert!(
+            CHECK_SESSION_SCRIPT.contains("postMessage(r,ev.origin)"),
+            "replies to the exact sender origin"
+        );
+        assert!(
+            !CHECK_SESSION_SCRIPT.contains("postMessage(r,'*')")
+                && !CHECK_SESSION_SCRIPT.contains("\"*\""),
+            "never broadcasts to a wildcard origin"
+        );
+        assert!(
+            CHECK_SESSION_SCRIPT.contains("clientId+' '+ev.origin+' '+opbs()"),
+            "the sender origin is bound into the recomputed session_state"
+        );
+    }
+
+    #[test]
+    fn frontchannel_logout_page_keeps_framing_defense_and_scopes_frame_src() {
+        // Issue #39: the front-channel logout page KEEPS its own anti-clickjacking
+        // posture (it must not be framed) and opens frame-src to EXACTLY the
+        // participating RP origins, so it can load those iframes and nothing else.
+        let iframe_urls = vec![
+            "https://rp-a.test/fc?iss=x&sid=s1".to_owned(),
+            "https://rp-b.test/fc".to_owned(),
+        ];
+        let origins = vec![
+            "https://rp-a.test".to_owned(),
+            "https://rp-b.test".to_owned(),
+        ];
+        let response = frontchannel_logout_response(&iframe_urls, &origins);
+        let headers = response.headers();
+        assert_eq!(
+            headers.get(header::X_FRAME_OPTIONS).unwrap(),
+            "DENY",
+            "the logout page itself must not be framable"
+        );
+        assert_eq!(headers.get(header::REFERRER_POLICY).unwrap(), "no-referrer");
+        let csp = headers
+            .get(header::CONTENT_SECURITY_POLICY)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(csp.contains("frame-ancestors 'none'"), "{csp}");
+        assert!(
+            csp.contains("frame-src https://rp-a.test https://rp-b.test"),
+            "frame-src is exactly the participating origins: {csp}"
+        );
+        // The page embeds one hidden iframe per participant, each src escaped.
+        let body = frontchannel_logout_page(&iframe_urls);
+        assert_eq!(body.matches("<iframe").count(), 2);
+        assert!(body.contains("display:none"), "iframes are hidden");
+        // No participants: frame-src is 'none' (the page frames nothing).
+        let empty = frontchannel_logout_csp(&[]);
+        assert!(empty.contains("frame-src 'none'"), "{empty}");
     }
 }

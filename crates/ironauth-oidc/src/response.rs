@@ -43,12 +43,18 @@ pub(crate) fn success_params<'a>(
     id_token: Option<&'a str>,
     state: Option<&'a str>,
     iss: &'a str,
-) -> [(&'a str, Option<&'a str>); 4] {
+    session_state: Option<&'a str>,
+) -> [(&'a str, Option<&'a str>); 5] {
     [
         ("code", code),
         ("id_token", id_token),
         ("state", state),
         ("iss", Some(iss)),
+        // OIDC Session Management 1.0 section 3 (issue #39): present ONLY when session
+        // management is enabled and the request had a resolvable origin, so a client
+        // can seed its check_session_iframe poll. A None entry is dropped by every
+        // encoder, so a response without it is byte-identical to before the feature.
+        ("session_state", session_state),
     ]
 }
 
@@ -136,16 +142,36 @@ mod tests {
         // Every success shape carries iss: code flow, implicit id_token, hybrid,
         // and none.
         for params in [
-            success_params(Some("ac_123"), None, Some("xyz"), iss),
-            success_params(None, Some("id.jwt"), Some("xyz"), iss),
-            success_params(Some("ac_123"), Some("id.jwt"), None, iss),
-            success_params(None, None, Some("xyz"), iss),
+            success_params(Some("ac_123"), None, Some("xyz"), iss, None),
+            success_params(None, Some("id.jwt"), Some("xyz"), iss, None),
+            success_params(Some("ac_123"), Some("id.jwt"), None, iss, None),
+            success_params(None, None, Some("xyz"), iss, None),
         ] {
             assert!(has_iss(&params), "success response must carry iss");
         }
 
         let error = error_params("invalid_request", "nonce is required", Some("xyz"), iss);
         assert!(has_iss(&error), "error response must carry iss");
+    }
+
+    #[test]
+    fn session_state_rides_the_params_only_when_present() {
+        let iss = "https://issuer.test/t/a/e/b";
+        // Off (None): the parameter is dropped by every encoder, so a query response is
+        // byte-identical to before the feature.
+        let off = success_params(Some("ac_123"), None, Some("xyz"), iss, None);
+        let query = append_query("https://client.test/cb", &off);
+        assert!(
+            !query.contains("session_state="),
+            "session_state absent when None: {query}"
+        );
+        // On: the value is carried in the same list every mode serializes.
+        let on = success_params(Some("ac_123"), None, Some("xyz"), iss, Some("abc.def"));
+        let query = append_query("https://client.test/cb", &on);
+        assert!(
+            query.contains("session_state=abc.def"),
+            "session_state carried when present: {query}"
+        );
     }
 
     /// The RFC 9700 credential-bearing redirect status: `303`, never the legacy
@@ -155,7 +181,7 @@ mod tests {
     #[test]
     fn iss_is_emitted_across_query_and_fragment_and_form_post_modes() {
         let iss = "https://issuer.test/t/a/e/b";
-        let params = success_params(Some("ac_123"), None, Some("xyz"), iss);
+        let params = success_params(Some("ac_123"), None, Some("xyz"), iss, None);
         let encoded_iss = "iss=https%3A%2F%2Fissuer.test%2Ft%2Fa%2Fe%2Fb";
 
         // Query mode: iss is in the query string.
@@ -187,7 +213,7 @@ mod tests {
     fn a_none_valued_parameter_is_dropped_in_query_and_fragment() {
         let iss = "https://issuer.test/t/a/e/b";
         // No code and no state (the implicit id_token flow with no state).
-        let params = success_params(None, Some("id.jwt"), None, iss);
+        let params = success_params(None, Some("id.jwt"), None, iss, None);
         let query = append_query("https://client.test/cb", &params);
         let fragment = append_fragment("https://client.test/cb", &params);
         for encoded in [&query, &fragment] {
@@ -203,7 +229,7 @@ mod tests {
     #[test]
     fn render_query_and_fragment_redirect_and_never_leak_the_code_in_form_post() {
         let iss = "https://issuer.test/t/a/e/b";
-        let params = success_params(Some("ac_secret_code"), None, Some("s"), iss);
+        let params = success_params(Some("ac_secret_code"), None, Some("s"), iss, None);
 
         // query and fragment are 303 See Other redirects carrying a Location, and
         // the code-carrying seam sets no-store AND no-referrer (RFC 9700).

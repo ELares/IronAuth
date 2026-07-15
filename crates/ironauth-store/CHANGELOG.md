@@ -6,6 +6,26 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Front-Channel Logout registration (issue #39, migration 0025, expand). The per-client
+  opt-in the OIDC `end_session` flow reads when front-channel logout is enabled.
+  - **Registered front-channel logout columns.** Two additive `clients` columns:
+    `frontchannel_logout_uri text` (nullable; the endpoint the OP loads in a hidden
+    iframe on logout) and `frontchannel_logout_session_required boolean NOT NULL DEFAULT
+    false` (whether `iss` and the RP's own `sid` are appended). They read into
+    `ClientRecord::{frontchannel_logout_uri, frontchannel_logout_session_required}` and
+    are written by the new audited `ActingClientRepo::register_frontchannel_logout` (an
+    `https`-only URI validated before anything is stored; a
+    `client.frontchannel_logout.register` audit row in the same transaction). The
+    data-plane write is a COLUMN-SCOPED
+    `GRANT UPDATE (frontchannel_logout_uri, frontchannel_logout_session_required)` (the
+    #31 lesson: never a table-wide UPDATE).
+  - **Participant lookup.** `ClientSessionRepo::frontchannel_participants(session_id)`
+    joins `client_sessions` to `clients` and returns, per participating RP, its
+    `frontchannel_logout_uri`, its `session_required` flag, and its OWN `sid`, so the
+    logout page builds a per-RP iframe URL that only ever carries that RP's own `sid`.
+  - The migration is additive (two `ALTER TABLE clients ADD COLUMN` plus a column-scoped
+    grant), safe for the old binary; the DB-backed guard test now asserts a
+    twenty-five-migration production chain and the two new columns.
 - Back-Channel Logout persistence (issue #34, migration 0025, expand). Lets the
   back-channel logout delivery worker resolve participants and drive an at-least-once,
   per-RP delivery queue on top of the #35 session-ended outbox.

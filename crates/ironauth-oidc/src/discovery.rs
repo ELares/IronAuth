@@ -272,6 +272,17 @@ pub struct DiscoveryCapabilities {
     /// never advertises an endpoint the server does not serve. Default-off, gated by
     /// `oidc.registration_enabled`.
     registration_endpoint_enabled: bool,
+    /// Whether OIDC Session Management 1.0 is enabled (issue #39). When `true`, the
+    /// document advertises `check_session_iframe` (`{base}/connect/check_session`);
+    /// when `false` the field is absent, so discovery never advertises an iframe the
+    /// server does not mount. Default-off, gated by `oidc.session_management_enabled`.
+    session_management_enabled: bool,
+    /// Whether OIDC Front-Channel Logout 1.0 is enabled (issue #39). When `true`, the
+    /// document advertises `frontchannel_logout_supported` and
+    /// `frontchannel_logout_session_supported` as `true`; when `false` both are absent
+    /// (per OIDC Front-Channel Logout 1.0 a missing field means unsupported).
+    /// Default-off, gated by `oidc.frontchannel_logout_enabled`.
+    frontchannel_logout_enabled: bool,
 }
 
 impl DiscoveryCapabilities {
@@ -311,6 +322,25 @@ impl DiscoveryCapabilities {
             caps = caps.with_additional_response_mode(ResponseMode::FormPost.as_str());
         }
         caps.with_registration_endpoint(config.registration_enabled)
+            .with_session_management(config.session_management_enabled)
+            .with_frontchannel_logout(config.frontchannel_logout_enabled)
+    }
+
+    /// Declare whether OIDC Session Management 1.0 is enabled (issue #39), so
+    /// discovery advertises `check_session_iframe` only when the iframe is mounted.
+    #[must_use]
+    pub fn with_session_management(mut self, enabled: bool) -> Self {
+        self.session_management_enabled = enabled;
+        self
+    }
+
+    /// Declare whether OIDC Front-Channel Logout 1.0 is enabled (issue #39), so
+    /// discovery advertises `frontchannel_logout_supported`/`_session_supported` only
+    /// when the feature is on.
+    #[must_use]
+    pub fn with_frontchannel_logout(mut self, enabled: bool) -> Self {
+        self.frontchannel_logout_enabled = enabled;
+        self
     }
 
     /// Declare whether the `claims` request parameter is supported (issue #15).
@@ -582,6 +612,31 @@ pub fn discovery_document(
         json!(true),
     );
 
+    // OIDC Session Management 1.0 (issue #39): the check_session_iframe is advertised
+    // ONLY when session management is enabled, and it is a deployment-root endpoint
+    // ({base}/connect/check_session), served with a framing carve-out so an RP can
+    // embed it cross-origin. Absent by default, so discovery never advertises an iframe
+    // the server does not mount.
+    if capabilities.session_management_enabled {
+        document.insert(
+            "check_session_iframe".to_owned(),
+            json!(format!("{base}/connect/check_session")),
+        );
+    }
+
+    // OIDC Front-Channel Logout 1.0 (issue #39): advertised ONLY when the feature is
+    // enabled, and truthfully. `frontchannel_logout_session_supported` is true because
+    // the OP CAN pass `iss` and the RP's own per-(client, session) `sid` to a client
+    // that registered `frontchannel_logout_session_required`. Both fields are absent by
+    // default (a missing field means unsupported), so discovery never claims a logout
+    // mechanism the server does not run.
+    if capabilities.frontchannel_logout_enabled {
+        document.insert("frontchannel_logout_supported".to_owned(), json!(true));
+        document.insert(
+            "frontchannel_logout_session_supported".to_owned(),
+            json!(true),
+        );
+    }
     // OIDC Back-Channel Logout 1.0 (issue #34): the OP builds a signed Logout Token per
     // participating relying party and delivers it out of band to the registered
     // backchannel_logout_uri, so this is advertised TRUTHFULLY as supported. It is
@@ -994,6 +1049,50 @@ mod tests {
             doc(&caps)["registration_endpoint"],
             json!("https://i.test/t/a/e/b/connect/register")
         );
+    }
+
+    #[test]
+    fn session_management_and_frontchannel_are_advertised_only_when_enabled() {
+        // Issue #39: with both flags off (the default) discovery advertises NEITHER
+        // check_session_iframe nor the front-channel logout capabilities, and mounts
+        // nothing; each is advertised truthfully only when its flag is enabled.
+        let policy = SigningPolicy::eddsa_default();
+        let doc = |caps: &DiscoveryCapabilities| {
+            discovery_document(
+                "https://i.test/t/a/e/b",
+                "https://i.test",
+                "https://i.test/t/a/e/b/jwks.json",
+                &policy,
+                caps,
+            )
+        };
+
+        // Default off: all three fields are absent.
+        let off = doc(&DiscoveryCapabilities::from_config(&OidcConfig::default()));
+        assert!(off.get("check_session_iframe").is_none());
+        assert!(off.get("frontchannel_logout_supported").is_none());
+        assert!(off.get("frontchannel_logout_session_supported").is_none());
+
+        // Session management on: check_session_iframe at the deployment root, and still
+        // no front-channel fields.
+        let sm = doc(&DiscoveryCapabilities::from_config(&OidcConfig {
+            session_management_enabled: true,
+            ..OidcConfig::default()
+        }));
+        assert_eq!(
+            sm["check_session_iframe"],
+            json!("https://i.test/connect/check_session")
+        );
+        assert!(sm.get("frontchannel_logout_supported").is_none());
+
+        // Front-channel logout on: both capabilities true, and still no iframe.
+        let fc = doc(&DiscoveryCapabilities::from_config(&OidcConfig {
+            frontchannel_logout_enabled: true,
+            ..OidcConfig::default()
+        }));
+        assert_eq!(fc["frontchannel_logout_supported"], json!(true));
+        assert_eq!(fc["frontchannel_logout_session_supported"], json!(true));
+        assert!(fc.get("check_session_iframe").is_none());
     }
 
     #[test]

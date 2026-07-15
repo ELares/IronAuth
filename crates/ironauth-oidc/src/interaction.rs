@@ -366,7 +366,7 @@ pub async fn establish_session(
     event: &AuthenticationEvent,
     actor: ActorRef,
     headers: &HeaderMap,
-) -> Result<String, StoreError> {
+) -> Result<SessionCookies, StoreError> {
     let now = state.now();
     let session_id = SessionId::generate(state.env(), &scope);
     let idle_micros = epoch_micros(now.checked_add(state.session_idle_ttl()).unwrap_or(now));
@@ -431,11 +431,49 @@ pub async fn establish_session(
             state.revocation_sink().publish_session(&signal);
         }
     }
-    Ok(session::build_set_cookie(
+    let session_cookie = session::build_set_cookie(
         &session_id.to_string(),
         state.session_ttl(),
         state.session_partitioned_cookie(),
-    ))
+    );
+    // OIDC Session Management 1.0 (issue #39): ONLY when session management is enabled,
+    // publish the OP browser state to a script-readable cookie the `check_session_iframe`
+    // can read. It is `op_browser_state(issuer, session_id)`, the EXACT value the
+    // authorization response folds into `session_state` (authorize.rs), so while this
+    // session is stable the iframe recomputes a matching `session_state` and answers
+    // `unchanged`; the moment the session rotates (a fresh id here) or is cleared
+    // (logout) the value changes and the iframe answers `changed`. Without this cookie
+    // the mechanism is inert: the iframe reads nothing and can only ever say `changed`.
+    // With the flag off the cookie is absent and the response is byte-identical to before.
+    let op_browser_state_cookie = state.session_management_enabled().then(|| {
+        let issuer = state.issuer_for(&scope);
+        let opbs = crate::session_mgmt::op_browser_state(&issuer, &session_id.to_string());
+        session::build_op_browser_state_cookie(&opbs, state.session_ttl())
+    });
+    Ok(SessionCookies {
+        session: session_cookie,
+        op_browser_state: op_browser_state_cookie,
+    })
+}
+
+/// The `Set-Cookie` header value(s) that establish a session (issue #20), plus, ONLY
+/// when session management is enabled (issue #39), the script-readable OP browser-state
+/// cookie the `check_session_iframe` reads. With session management off the second is
+/// [`None`] and nothing beyond the session cookie is emitted.
+pub struct SessionCookies {
+    /// The hardened `__Host-ironauth_session` cookie (see [`session::build_set_cookie`]).
+    session: String,
+    /// The `__ironauth_opbs` cookie (see [`session::build_op_browser_state_cookie`]),
+    /// present ONLY when session management is enabled.
+    op_browser_state: Option<String>,
+}
+
+impl SessionCookies {
+    /// Every `Set-Cookie` header value to emit, in order: the session cookie first, then
+    /// the OP browser-state cookie when session management is enabled.
+    pub(crate) fn header_values(&self) -> impl Iterator<Item = &str> {
+        std::iter::once(self.session.as_str()).chain(self.op_browser_state.as_deref())
+    }
 }
 
 /// The prior session id presented on the request, if any, parsed under `scope`
@@ -510,17 +548,21 @@ pub fn redirect(location: &str) -> Response {
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
-/// A `303 See Other` to `location` that also sets a session cookie. `303` (never
+/// A `303 See Other` to `location` that also sets the session cookie(s). `303` (never
 /// `307`/`308`) so the post-login POST is not replayed to `return_to`; see
-/// [`redirect`] for the full rationale.
+/// [`redirect`] for the full rationale. When session management is enabled the
+/// `cookies` carry the OP browser-state cookie as a second `Set-Cookie` (issue #39).
 #[must_use]
-pub fn redirect_setting_cookie(location: &str, set_cookie: &str) -> Response {
-    Response::builder()
+pub fn redirect_setting_cookie(location: &str, cookies: &SessionCookies) -> Response {
+    let mut builder = Response::builder()
         .status(StatusCode::SEE_OTHER)
         .header(header::LOCATION, location)
-        .header(header::SET_COOKIE, set_cookie)
         .header(header::CACHE_CONTROL, "no-store")
-        .header(header::REFERRER_POLICY, "no-referrer")
+        .header(header::REFERRER_POLICY, "no-referrer");
+    for value in cookies.header_values() {
+        builder = builder.header(header::SET_COOKIE, value);
+    }
+    builder
         .body(Body::empty())
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }

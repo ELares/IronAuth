@@ -6,6 +6,19 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Session Management 1.0 and Front-Channel Logout 1.0, behind default-off flags for
+  certification completeness (issue #39).
+  - `oidc.session_management_enabled` (default `false`): when set, the OP serves the
+    `check_session_iframe`, discovery advertises `check_session_iframe`, and every
+    authorization response carries `session_state`. Off by default because these iframe
+    mechanisms are degraded under third-party-cookie partitioning (Session Management
+    1.0 section 5.1); enabling still requires a per-client opt-in.
+  - `oidc.frontchannel_logout_enabled` (default `false`): when set, the `end_session`
+    flow renders a hidden iframe per participating RP that registered a
+    `frontchannel_logout_uri`, passing `iss` and the RP's own `sid` when it registered
+    `frontchannel_logout_session_required`. Best-effort only; it never blocks or
+    reorders the authoritative back-channel logout path. Off by default; enabling still
+    requires the per-client registration.
 - Back-Channel Logout delivery worker settings (issue #34), all on `[oidc]`:
   - `backchannel_logout_enabled` (default `false`): whether the delivery worker runs. Off
     by default (the covenant: no mandatory background infrastructure). Discovery advertises
