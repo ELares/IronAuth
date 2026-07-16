@@ -39,7 +39,8 @@ pub mod scheme;
 
 pub use engine::{ImportContext, ImportReport, RecordError, RecordOutcome, import_stream};
 pub use record::{
-    ImportCredential, ImportRecord, RecordParseError, parse_record_line, to_record_line,
+    ImportCredential, ImportRecord, ImportRecoveryCode, ImportTotp, RecordParseError,
+    parse_record_line, to_record_line,
 };
 pub use run::import_into_run;
 pub use scheme::{ForeignHash, HashError, Scheme};

@@ -118,6 +118,7 @@ mod token;
 mod token_credential;
 mod token_hash;
 mod tokens;
+mod totp;
 mod userinfo;
 mod util;
 mod verification;
@@ -358,6 +359,37 @@ pub fn oidc_router(state: OidcState) -> Router {
         .route(
             "/t/{tenant_id}/e/{environment_id}/webauthn/credentials/remove",
             post(webauthn::remove_credential),
+        )
+        // The TOTP second-factor and recovery-code endpoints (issue #69), self-service
+        // and session-authenticated. Each handler fails closed with a 404 when
+        // `oidc.totp_enabled` is off, so a disabled deployment exposes no surface.
+        .route(
+            "/t/{tenant_id}/e/{environment_id}/account/mfa/totp/enroll",
+            post(totp::enroll_begin),
+        )
+        .route(
+            "/t/{tenant_id}/e/{environment_id}/account/mfa/totp/verify-enrollment",
+            post(totp::enroll_verify),
+        )
+        .route(
+            "/t/{tenant_id}/e/{environment_id}/account/mfa/totp/verify",
+            post(totp::verify),
+        )
+        .route(
+            "/t/{tenant_id}/e/{environment_id}/account/mfa/totp/remove",
+            post(totp::remove),
+        )
+        .route(
+            "/t/{tenant_id}/e/{environment_id}/account/mfa/recovery-codes",
+            post(totp::recovery_regenerate),
+        )
+        .route(
+            "/t/{tenant_id}/e/{environment_id}/account/mfa/recovery-codes/redeem",
+            post(totp::recovery_redeem),
+        )
+        .route(
+            "/t/{tenant_id}/e/{environment_id}/account/mfa/plan",
+            get(totp::plan),
         )
         // The public invitation-accept endpoint (issue #60): the invitee side of the
         // admin-initiated invitation flow. Scope-routed under the per-environment path

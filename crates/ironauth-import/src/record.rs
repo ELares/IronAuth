@@ -15,6 +15,8 @@
 //! credential-less account (it cannot log in until a credential is set); a record
 //! WITH a hash imports it verbatim for the verify-then-rehash login path.
 
+use core::fmt;
+
 use serde::{Deserialize, Serialize};
 
 /// One user to import (issue #55): the (de)serialized shape of a single JSON line.
@@ -83,6 +85,73 @@ pub struct ImportRecord {
     /// generalized field-coverage guard forces to be covered.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credentials: Option<Vec<ImportCredential>>,
+    /// The user's enrolled TOTP authenticators (issue #58/#69): each carries the RFC
+    /// 6238 SEED the export opened (Base32), the parameters, the friendly name, the
+    /// status, and the single-use step, so a re-imported factor verifies against the
+    /// ORIGINAL authenticator (a TOTP seed is a portable shared secret, unlike a
+    /// passkey). Absent when the user has enrolled no authenticator.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub totp: Option<Vec<ImportTotp>>,
+    /// The user's one-time recovery codes (issue #58/#69): each carries the one-way
+    /// Argon2id HASH (verbatim, exactly like a password verifier, so the code stays
+    /// redeemable) and its consumed state. Absent when the user has none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_codes: Option<Vec<ImportRecoveryCode>>,
+}
+
+/// One enrolled TOTP authenticator to restore alongside a user (issue #58/#69): the
+/// (de)serialized shape the full identity export writes for each `totp_credentials`
+/// row. The SEED is the covenant secret (a long-lived shared secret, re-sealed under
+/// the destination DEK at import); the internal `tot_` id, subject, scope, and key
+/// version are re-minted / re-sealed against the destination.
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ImportTotp {
+    /// The RFC 6238 shared secret, Base32-encoded (the form the export emits and a
+    /// fresh instance re-seals). SECRET material, never a plaintext-at-rest column.
+    pub seed_base32: String,
+    /// The RFC 6238 hash token (`SHA1`, `SHA256`, `SHA512`).
+    pub algorithm: String,
+    /// The number of decimal digits (6..=8).
+    pub digits: i32,
+    /// The time-step period in seconds (15..=60).
+    pub period_secs: i32,
+    /// The user-authored friendly name (1 to 200 characters), sealed at rest under
+    /// the destination scope's DEK through the restore path.
+    pub friendly_name: String,
+    /// The enrollment status (`active` or `pending`), reproduced verbatim.
+    pub status: String,
+    /// The last time-step a verification consumed (the single-use spine), preserved
+    /// so a re-imported factor keeps its anti-replay position, or [`None`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_consumed_step: Option<i64>,
+}
+
+impl fmt::Debug for ImportTotp {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // The seed and the friendly name are secret / PII; render only parameters.
+        f.debug_struct("ImportTotp")
+            .field("algorithm", &self.algorithm)
+            .field("digits", &self.digits)
+            .field("period_secs", &self.period_secs)
+            .field("status", &self.status)
+            .finish_non_exhaustive()
+    }
+}
+
+/// One one-time recovery code to restore alongside a user (issue #58/#69): the
+/// (de)serialized shape the export writes for each `recovery_codes` row. The
+/// `code_hash` is a one-way Argon2id verifier (never a plaintext code), carried
+/// verbatim exactly like a password hash, so a still-unconsumed code stays redeemable
+/// after import. The internal `rvc_` id, subject, and scope are re-minted.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ImportRecoveryCode {
+    /// The Argon2id PHC verifier of the code. One-way, never the plaintext code.
+    pub code_hash: String,
+    /// Whether the code was already redeemed in the source instance (single-use state).
+    #[serde(default, skip_serializing_if = "core::ops::Not::not")]
+    pub consumed: bool,
 }
 
 /// One enrolled credential to restore alongside a user (issue #58/#61): the
@@ -242,6 +311,8 @@ mod tests {
                     last_used_at: Some(1_710_000_000_000_000),
                 },
             ]),
+            totp: None,
+            recovery_codes: None,
         };
         let line = to_record_line(&record).expect("serialize");
         let parsed = parse_record_line(&line).expect("parse").expect("some");
@@ -251,6 +322,70 @@ mod tests {
         assert_eq!(credentials[0].friendly_name, "my laptop");
         assert_eq!(credentials[1].credential_type, "totp");
         assert_eq!(credentials[1].last_used_at, Some(1_710_000_000_000_000));
+    }
+
+    #[test]
+    fn totp_and_recovery_codes_round_trip_through_to_record_line_and_back() {
+        // The SECOND FACTOR round-trips (issue #58/#69): the exported seed, parameters,
+        // status, single-use step, and the recovery-code hashes serialize and re-parse
+        // symmetrically, so the emitted bytes carry a factor that re-imports and
+        // verifies, not a metadata echo. This is the byte-level guard the original
+        // false-positive (asserting on an in-memory struct) lacked.
+        let record = ImportRecord {
+            identifier: "erin@b.test".to_owned(),
+            id: None,
+            external_id: None,
+            state: None,
+            claims: None,
+            traits: None,
+            traits_schema_version: None,
+            password_hash: None,
+            credentials: None,
+            totp: Some(vec![ImportTotp {
+                seed_base32: "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ".to_owned(),
+                algorithm: "SHA1".to_owned(),
+                digits: 6,
+                period_secs: 30,
+                friendly_name: "my phone".to_owned(),
+                status: "active".to_owned(),
+                last_consumed_step: Some(100),
+            }]),
+            recovery_codes: Some(vec![
+                ImportRecoveryCode {
+                    code_hash: "$argon2id$v=19$m=19456,t=2,p=1$c2FsdHNhbHQ$aGFzaGhhc2g".to_owned(),
+                    consumed: false,
+                },
+                ImportRecoveryCode {
+                    code_hash: "$argon2id$v=19$m=19456,t=2,p=1$c2FsdHNhbHQ$b3RoZXJoYXNo".to_owned(),
+                    consumed: true,
+                },
+            ]),
+        };
+        let line = to_record_line(&record).expect("serialize");
+        // The EMITTED bytes carry the seed and the hashes (not merely the in-memory
+        // struct): exactly what the export bug silently dropped.
+        assert!(
+            line.contains("GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ"),
+            "the emitted line carries the opened TOTP seed: {line}"
+        );
+        assert!(
+            line.contains("aGFzaGhhc2g"),
+            "the emitted line carries the recovery-code hash: {line}"
+        );
+        let parsed = parse_record_line(&line).expect("parse").expect("some");
+        let totp = parsed.totp.expect("totp preserved");
+        assert_eq!(totp.len(), 1);
+        assert_eq!(totp[0].seed_base32, "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ");
+        assert_eq!(totp[0].algorithm, "SHA1");
+        assert_eq!(totp[0].digits, 6);
+        assert_eq!(totp[0].period_secs, 30);
+        assert_eq!(totp[0].status, "active");
+        assert_eq!(totp[0].last_consumed_step, Some(100));
+        let codes = parsed.recovery_codes.expect("recovery codes preserved");
+        assert_eq!(codes.len(), 2);
+        assert!(codes[0].code_hash.starts_with("$argon2"));
+        assert!(!codes[0].consumed);
+        assert!(codes[1].consumed);
     }
 
     #[test]

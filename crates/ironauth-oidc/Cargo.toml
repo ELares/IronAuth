@@ -236,6 +236,17 @@ name = "account"
 path = "tests/account.rs"
 required-features = ["testing"]
 
+# The TOTP second-factor and recovery-code HTTP surface (issue #69): enrollment
+# activates only after a valid current code, a verified code is single-use (a replay
+# is the uniform invalid-code error), a recovery code is usable in place of the
+# second factor and single-use, regeneration invalidates prior codes, the per-tenant
+# factor order changes the orchestration plan across two configs, and the endpoints
+# fail closed when TOTP is disabled. Needs a real database (DATABASE_URL).
+[[test]]
+name = "totp"
+path = "tests/totp.rs"
+required-features = ["testing"]
+
 # WebAuthn passkey ceremonies end to end (issue #65): the four ceremony endpoints
 # driven through the real router by a software authenticator (a CBOR
 # attestationObject / COSE key, real Ed25519 assertion signatures). A passkey

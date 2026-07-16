@@ -157,7 +157,14 @@ cd "$(git rev-parse --show-toplevel)"
 # with forced row-level security, so its SQL stays in the repository module too. Its
 # high-frequency LAYERED failure counters reuse the generic dcr_rate_counters
 # fixed-window counter (an abuse: key namespace), exactly like device_verify.
-SCOPED_TABLES='clients|organizations|audit_log|management_credentials|idempotency_keys|grants|authorization_codes|issued_tokens|signing_keys|users|sessions|consents|resource_servers|opaque_access_tokens|client_assertion_jtis|client_auth_diagnostics|pushed_authorization_requests|refresh_families|refresh_tokens|service_accounts|dcr_policies|dcr_initial_access_tokens|dcr_rate_counters|external_assertion_issuers|external_assertion_subject_mappings|external_assertion_jtis|device_codes|client_sessions|session_ended_events|backchannel_logout_deliveries|tenant_keks|tenant_deks|encrypted_secrets|environment_states|tenant_byok_bindings|environment_guardrails|custom_domains|acme_challenges|environment_variables|environment_secrets|account_credentials|trait_schemas|trait_migration_jobs|user_invitations|user_identifiers|migration_runs|migration_run_records|webauthn_credentials|webauthn_challenges|abuse_bans'
+#
+# totp_credentials / recovery_codes (#69) are the TOTP second-factor tables: one row
+# per enrolled authenticator (its RFC 6238 SEED sealed under the scope DEK, the
+# parameters, the enrollment status, the single-use last-consumed time-step, and the
+# resync offset) and the per-user one-time recovery codes (each stored as an Argon2id
+# hash, single-use). Both TENANT-SCOPED with forced row-level security, and every
+# read/write additionally subject-bound, so their SQL stays in the repository module too.
+SCOPED_TABLES='clients|organizations|audit_log|management_credentials|idempotency_keys|grants|authorization_codes|issued_tokens|signing_keys|users|sessions|consents|resource_servers|opaque_access_tokens|client_assertion_jtis|client_auth_diagnostics|pushed_authorization_requests|refresh_families|refresh_tokens|service_accounts|dcr_policies|dcr_initial_access_tokens|dcr_rate_counters|external_assertion_issuers|external_assertion_subject_mappings|external_assertion_jtis|device_codes|client_sessions|session_ended_events|backchannel_logout_deliveries|tenant_keks|tenant_deks|encrypted_secrets|environment_states|tenant_byok_bindings|environment_guardrails|custom_domains|acme_challenges|environment_variables|environment_secrets|account_credentials|trait_schemas|trait_migration_jobs|user_invitations|user_identifiers|migration_runs|migration_run_records|webauthn_credentials|webauthn_challenges|abuse_bans|totp_credentials|recovery_codes'
 
 # The one module allowed to name a scoped table in SQL.
 REPO_MODULE='crates/ironauth-store/src/repository.rs'

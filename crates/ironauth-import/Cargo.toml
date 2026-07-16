@@ -24,6 +24,10 @@ ironauth-env.workspace = true
 # graph acyclic. The pure `scheme` module below has no store dependency and is
 # what the login verify path (ironauth-oidc) consumes.
 ironauth-store.workspace = true
+# The Base32 codec (RFC 4648) the exit-import uses to decode an exported TOTP seed
+# back to raw bytes before re-sealing it under the target scope's DEK (issue #58/#69).
+# A pure-Rust leaf crate already in the tree; no new external dependency.
+ironauth-jose.workspace = true
 
 # The algorithm-tagged foreign-hash verify dispatch. Every crate is RustCrypto or
 # equally permissive (MIT OR Apache-2.0), pure Rust (no C, musl-static clean), and

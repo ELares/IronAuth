@@ -530,6 +530,22 @@
           },
           "description": "The INBOUND lazy-migration hook (issue #56): verify a first login against a\nlegacy credential store over the SSRF-hardened outbound fetcher and, on success,\ncreate the user locally with a native Argon2id hash so subsequent logins never\ncall the hook. Disabled by default; the endpoint and its authentication secret\nare environment-scoped config (see [`LazyMigrationConfig`]). This is a promotable\nper-environment setting in spirit; the process value is the deployment default\nuntil per-environment overrides ride the M5 promotion pipeline."
         },
+        "mfa_factor_order": {
+          "default": [
+            "passkey",
+            "totp"
+          ],
+          "description": "The per-tenant factor order (issue #69): which second-factor kinds are\noffered or required first, at both enrollment prompts and login. Entries are\ndrawn from the closed set `passkey`, `totp`, `password`; the order is\nhonored by the factor-orchestration plan. The default prefers a\nphishing-resistant passkey, then TOTP. Duplicates and unknown kinds are a\nboot-time [`ConfigError::Invalid`].",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "mfa_required": {
+          "default": false,
+          "description": "Whether MFA is REQUIRED for a user who has no second factor (issue #69). SCOPE\nTODAY: this drives the ENROLLMENT PROMPT only. When true, the\nfactor-orchestration plan (`/account/mfa/plan`) marks a second-factor\nenrollment as `enrollment_required` for a user who has none, so the hosted flow\nprompts for it after primary authentication. It does NOT today HARD-GATE the\nlogin flow: a full session is still established after the password alone. Hard\nlogin-flow enforcement (challenging the second factor with a partial session\nBEFORE a full session is issued) is the core deliverable of the step-up issue\n(#72) and lands with it, so do not rely on this to BLOCK a login until #72\nships. Off by default (MFA is offered, not forced); a per-tenant override rides\nthe tenant-policy pipeline.",
+          "type": "boolean"
+        },
         "offline_access_requires_consent": {
           "default": true,
           "description": "Whether the `offline_access` scope requires explicit consent for a web\nclient (issue #21, OIDC Core 11). Default `true`: a confidential/web client\nrequesting `offline_access` must obtain explicit consent that covers it,\nUNLESS the trusted first-party carve-out applies (the client's consent mode\nis `implicit` or its `skip_consent` flag is set). Set it to `false` to grant\n`offline_access` without a dedicated consent prompt for every client.",
@@ -685,6 +701,47 @@
           "default": 3600,
           "description": "Session ABSOLUTE hard-cap lifetime in seconds (issue #20, extended by issue\n#32). The opaque `__Host-` session cookie established at login is valid for at\nmost this long however active; a request presenting an expired session\nre-authenticates. The default (3600) is a conservative one hour. Must be at\nleast 1 and at most `OIDC_MAX_SESSION_TTL_SECS`. Pairs with\n`session_idle_ttl_secs` (the idle timeout).",
           "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "totp_digits": {
+          "default": 6,
+          "description": "The number of decimal digits in a TOTP code (issue #69). The\nauthenticator-app default (6) is the widest compatibility; 7 or 8 are\naccepted for apps that honor the `digits=` parameter. Must be in 6..=8.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "totp_drift_steps": {
+          "default": 1,
+          "description": "The one-sided drift tolerance, in time-steps, a TOTP verification accepts\n(issue #69): a code from up to this many steps before or after the current\nstep verifies, absorbing clock skew between the server and the authenticator.\nThe default (1) is plus or minus one 30-second period. Bounded to 0..=2 so a\nmisconfiguration cannot widen the accepted window into a brute-force aid; a\nper-tenant override within that bound rides the tenant-policy pipeline.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "totp_enabled": {
+          "default": true,
+          "description": "Whether the TOTP second-factor endpoints are mounted (issue #69). On by\ndefault: TOTP is the universal second factor. When off, the enroll/verify/\nrecovery endpoints fail closed with a uniform 404, so a deployment that does\nnot want TOTP exposes no surface. Enrollment is always opt-in per user.",
+          "type": "boolean"
+        },
+        "totp_issuer": {
+          "default": null,
+          "description": "The issuer label shown in an authenticator app (the `issuer=` parameter of\nthe `otpauth://` provisioning URI, issue #69). When unset, it is DERIVED at\nenrollment from the serving scope, which is the correct default for a\nsingle-brand deployment. A true per-tenant override rides the tenant-policy\npipeline.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "totp_period_secs": {
+          "default": 30,
+          "description": "The TOTP time-step period in seconds (issue #69). The RFC 6238 default (30)\nis what every authenticator app assumes; changing it requires an app that\nhonors the `period=` parameter. Must be in 15..=60.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "totp_recovery_code_count": {
+          "default": 10,
+          "description": "The number of one-time recovery codes minted at MFA enrollment (issue #69).\nThe default (10) sits in the accepted 8..=16 range. A per-tenant override\nwithin that bound rides the tenant-policy pipeline.",
+          "format": "uint32",
           "minimum": 0,
           "type": "integer"
         },
@@ -1200,6 +1257,11 @@
           "secret": null,
           "timeout_secs": 5
         },
+        "mfa_factor_order": [
+          "passkey",
+          "totp"
+        ],
+        "mfa_required": false,
         "offline_access_requires_consent": true,
         "offline_idle_ttl_secs": 2592000,
         "offline_max_lifetime_secs": 7776000,
@@ -1234,6 +1296,12 @@
         "session_partitioned_cookie": false,
         "session_peer_ip_binding": false,
         "session_ttl_secs": 3600,
+        "totp_digits": 6,
+        "totp_drift_steps": 1,
+        "totp_enabled": true,
+        "totp_issuer": null,
+        "totp_period_secs": 30,
+        "totp_recovery_code_count": 10,
         "userinfo_cors_origins": [],
         "webauthn_challenge_ttl_secs": 300,
         "webauthn_clone_detection_block": false,

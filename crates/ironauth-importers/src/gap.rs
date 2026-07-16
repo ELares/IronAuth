@@ -305,6 +305,8 @@ mod tests {
             traits_schema_version: None,
             password_hash: None,
             credentials: None,
+            totp: None,
+            recovery_codes: None,
         }
     }
 

@@ -72,6 +72,10 @@ http-body-util.workspace = true
 # credential and an imported foreign one. Both crates are already in the tree.
 argon2.workspace = true
 bcrypt = "0.16"
+# The exit-export MFA round-trip test (issue #58/#69) computes an RFC 6238 code from
+# the original seed to prove a re-imported TOTP factor still verifies, and Base32
+# encodes the seed to assert the export line carries it. Already in the tree.
+ironauth-jose.workspace = true
 # Database-FREE test support only: builds a LAZY pool (parses the URL, never
 # connects) so the unit tests and the router/spec contract test can construct an
 # AdminState without a database. No connection is ever opened (auth rejects at the

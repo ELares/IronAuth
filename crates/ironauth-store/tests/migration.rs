@@ -46,6 +46,21 @@ async fn column_exists(pool: &sqlx::PgPool, table: &str, column: &str) -> bool {
     .get("present")
 }
 
+/// The SQL `data_type` of `table.column` (`information_schema.columns`), for
+/// asserting a sealed column is a `bytea` (secret material at rest is ciphertext).
+async fn column_data_type(pool: &sqlx::PgPool, table: &str, column: &str) -> String {
+    sqlx::query(
+        "SELECT data_type FROM information_schema.columns \
+         WHERE table_name = $1 AND column_name = $2",
+    )
+    .bind(table)
+    .bind(column)
+    .fetch_one(pool)
+    .await
+    .expect("data type lookup")
+    .get("data_type")
+}
+
 /// Whether `table` has BOTH `ENABLE` and `FORCE` row-level security on (`pg_class`).
 async fn rls_enabled_and_forced(pool: &sqlx::PgPool, table: &str) -> bool {
     sqlx::query(
@@ -312,7 +327,7 @@ async fn expand_contract_example_chain_runs_all_three_phases_and_contract_remove
 // per real table); splitting it would not make it clearer.
 #[allow(clippy::too_many_lines)]
 #[tokio::test]
-async fn production_chain_is_only_the_forty_five_real_migrations_and_ships_no_demo_object() {
+async fn production_chain_is_only_the_forty_six_real_migrations_and_ships_no_demo_object() {
     // TestDatabase::start runs Store::migrate() (the production chain) on a
     // fresh, empty database.
     let db = TestDatabase::start().await;
@@ -329,8 +344,8 @@ async fn production_chain_is_only_the_forty_five_real_migrations_and_ships_no_de
     );
     assert_eq!(
         report.already_applied(),
-        45,
-        "the production chain is exactly forty-five migrations (isolation, audit log, management \
+        46,
+        "the production chain is exactly forty-six migrations (isolation, audit log, management \
          API, OIDC authorization, signing keys, login/consent, authentication context, redirect \
          registration, UserInfo claims, consent scope upsert, resource servers, opaque access \
          tokens, client auth suite, dynamic client registration, pushed authorization requests, \
@@ -341,15 +356,17 @@ async fn production_chain_is_only_the_forty_five_real_migrations_and_ships_no_de
          snapshot export, custom domains, environment secrets and variables, config promotion, \
          self-service account, admin user lifecycle, identity traits, foreign password \
          import, user invitations, flexible identifiers, exit-export credential grants, \
-         migration state machine, webauthn credentials, credential abuse defenses)"
+         migration state machine, webauthn credentials, totp credentials, credential abuse \
+         defenses)"
     );
 
-    // The ledger holds exactly versions 1 through 45.
+    // The ledger holds exactly versions 1 through 46.
     assert_eq!(
         applied_versions(pool).await,
         vec![
             1_i64, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
-            24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45
+            24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45,
+            46
         ]
     );
     let phase_of = |version: i64| async move {
@@ -514,9 +531,12 @@ async fn production_chain_is_only_the_forty_five_real_migrations_and_ships_no_de
     // The WebAuthn passkey migration (issue #65) is an EXPAND: two new tenant-scoped
     // tables, no rewrite of existing state.
     assert_eq!(phase_of(44).await, "expand");
+    // The TOTP migration (issue #69) is an EXPAND: two new tenant-scoped tables
+    // (totp_credentials, recovery_codes), no rewrite of existing state.
+    assert_eq!(phase_of(45).await, "expand");
     // The credential-abuse-defenses migration (issue #64) is an EXPAND: one new
     // tenant-scoped ban table, no rewrite of existing state.
-    assert_eq!(phase_of(45).await, "expand");
+    assert_eq!(phase_of(46).await, "expand");
 
     // The demo object never reaches a production database.
     assert!(
@@ -1659,10 +1679,111 @@ async fn production_chain_is_only_the_forty_five_real_migrations_and_ships_no_de
         "webauthn_challenges must carry the ceremony-known CHECK constraint"
     );
 
-    // The credential-abuse ban registry (issue #64, migration 0045).
+    // ---- 0045 totp credentials + recovery codes (issue #69) ----
+    assert!(
+        table_exists(pool, "totp_credentials").await,
+        "totp_credentials exists after 0045"
+    );
+    for column in [
+        "id",
+        "tenant_id",
+        "environment_id",
+        "subject",
+        "totp_seed",
+        "friendly_name_sealed",
+        "pii_dek_version",
+        "algorithm",
+        "digits",
+        "period_secs",
+        "status",
+        "last_consumed_step",
+        "last_offset",
+        "created_at",
+        "activated_at",
+        "last_used_at",
+    ] {
+        assert!(
+            column_exists(pool, "totp_credentials", column).await,
+            "totp_credentials.{column} exists after 0045"
+        );
+    }
+    // The RFC 6238 SEED is secret material: it lands ONLY as a sealed `bytea`
+    // ciphertext (issue #48), never a plaintext column, and the pii-encryption-scan
+    // enforces this structurally too. Assert the type is bytea and that no plaintext
+    // seed / secret column ever exists.
+    assert_eq!(
+        column_data_type(pool, "totp_credentials", "totp_seed").await,
+        "bytea",
+        "the TOTP seed must be a sealed bytea, never plaintext"
+    );
+    for forbidden in [
+        "seed",
+        "secret",
+        "totp_secret",
+        "seed_plaintext",
+        "shared_secret",
+    ] {
+        assert!(
+            !column_exists(pool, "totp_credentials", forbidden).await,
+            "totp_credentials must have no plaintext seed column ({forbidden})"
+        );
+    }
+    assert!(
+        table_exists(pool, "recovery_codes").await,
+        "recovery_codes exists after 0045"
+    );
+    for column in [
+        "id",
+        "tenant_id",
+        "environment_id",
+        "subject",
+        "code_hash",
+        "generation",
+        "consumed_at",
+        "created_at",
+    ] {
+        assert!(
+            column_exists(pool, "recovery_codes", column).await,
+            "recovery_codes.{column} exists after 0045"
+        );
+    }
+    // Recovery codes are stored ONLY as a one-way hash, never a plaintext code.
+    for forbidden in ["code", "code_plaintext", "recovery_code", "plaintext"] {
+        assert!(
+            !column_exists(pool, "recovery_codes", forbidden).await,
+            "recovery_codes must have no plaintext code column ({forbidden})"
+        );
+    }
+    // The tenant-scoped-table obligations for both new tables.
+    for table in ["totp_credentials", "recovery_codes"] {
+        assert!(
+            rls_enabled_and_forced(pool, table).await,
+            "{table} must ENABLE and FORCE row-level security"
+        );
+        assert!(
+            policy_exists(pool, table, &format!("{table}_tenant_isolation")).await,
+            "the (tenant, environment) isolation policy must exist on {table}"
+        );
+        assert!(
+            check_constraint_exists(pool, table, &format!("{table}_scope_nonempty")).await,
+            "{table} must carry the scope-nonempty CHECK constraint"
+        );
+    }
+    // The closed status and RFC 6238 hash sets (no HOTP): a corrupt or unknown value
+    // can never be written.
+    assert!(
+        check_constraint_exists(pool, "totp_credentials", "totp_credentials_status_known").await,
+        "totp_credentials must carry the status-known CHECK constraint"
+    );
+    assert!(
+        check_constraint_exists(pool, "totp_credentials", "totp_credentials_algorithm_known").await,
+        "totp_credentials must carry the algorithm-known CHECK constraint (no HOTP)"
+    );
+
+    // The credential-abuse ban registry (issue #64, migration 0046).
     assert!(
         table_exists(pool, "abuse_bans").await,
-        "abuse_bans exists after 0045"
+        "abuse_bans exists after 0046"
     );
     for column in [
         "id",

@@ -191,6 +191,8 @@ fn map_user(index: usize, user: &ScimUser) -> MappedUser {
         // SCIM exports carry no password hash; the user is credential-less by design.
         password_hash: None,
         credentials: None,
+        totp: None,
+        recovery_codes: None,
     };
     MappedUser::mapped(source_key, record, gaps)
 }

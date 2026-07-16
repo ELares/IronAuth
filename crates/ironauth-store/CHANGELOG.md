@@ -6,7 +6,7 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
-- Credential-abuse defenses (issue #64): migration 0045 adds the durable, tenant-scoped
+- Credential-abuse defenses (issue #64): migration 0046 adds the durable, tenant-scoped
   `abuse_bans` registry (forced RLS, the (tenant, environment) isolation policy, the
   nonempty-scope and closed-set CHECKs, and column-scoped grants). The ban subject (an
   identifier, an account, or an IP) is envelope-sealed and keyed by a per-tenant HMAC
@@ -25,6 +25,38 @@ range per docs/RELEASING.md.
   per-identifier counter read/write, the ban check, and now the clear) all surface their
   backend error when the envelope master key is missing, so the caller denies rather than
   admits. No schema change (reuses `dcr_rate_counters`).
+- TOTP review hardening (issue #69, review): the exit export now RE-HOMES the second
+  factor for real. New `ActingTotpCredentialRepo::restore` re-seals an exported seed
+  under the target scope's DEK and reproduces the row (status, single-use step), and
+  `ActingRecoveryCodeRepo::restore_all` inserts the carried recovery-code hashes, so a
+  re-imported active factor VERIFIES against the original authenticator and a
+  re-imported code REDEEMS. The seed seal AAD now binds the `tot_` credential id
+  (LOW-4), so a seed sealed for one row cannot be transplanted into another subject's
+  row and still open. `recovery_codes` gains a keyed `code_bidx` blind index (migration
+  0045 still count 45, still expand) and `RecoveryCodeRepo::candidates_for_code`, so a
+  redemption resolves the ONE candidate and verifies a single Argon2 hash instead of
+  scanning the set (LOW-3; imported NULL-index codes fall back to a bounded scan).
+  Removing a TOTP factor now cascade-deletes the subject's recovery codes in the same
+  transaction (INFO-5). `replace_all` takes `NewRecoveryCode` (normalized code + hash)
+  to derive the index.
+- TOTP authenticators and recovery codes (issue #69, migration 0045, expand): two
+  new tenant-scoped tables with forced row-level security. `totp_credentials` holds
+  one row per enrolled authenticator with the RFC 6238 SEED sealed under the scope
+  DEK (issue #48, the `totp_seed` bytea, never plaintext), the parameters, the
+  enrollment status (pending until a code-verified activation, so an abandoned
+  enrollment leaves no active factor), the single-use `last_consumed_step` (a
+  verification advances it strictly upward, so a replayed time-step is refused), and
+  the resync `last_offset`. `recovery_codes` holds one-time codes stored as Argon2id
+  hashes (issue #62), single-use, with a full regeneration invalidating the prior
+  batch. New repos `TotpCredentialRepo` / `ActingTotpCredentialRepo` (begin_enroll,
+  activate, record_verification, remove, open_material) and `RecoveryCodeRepo` /
+  `ActingRecoveryCodeRepo` (replace_all, redeem, unconsumed, remaining_count); new
+  audit actions `account.totp.*` and `account.recovery_code*` (a TOTP verify audited
+  DISTINCTLY from a recovery redemption); new `tot_` / `rvc_` scoped id kinds. The
+  exit export (issue #58) now carries the OPENED seed (`ExportedTotp`) and the
+  recovery-code hashes (`ExportedRecoveryCode`) on `UserExportRecord`, so the exit
+  covenant carries the second factor.
+
 - `UserRepo::rehash_native_password` (issue #62): lands the transparent upgrade of a
   NATIVE Argon2id credential to the current hashing parameters after a successful login.
   It writes the recomputed verifier onto `password_hash` and audits one

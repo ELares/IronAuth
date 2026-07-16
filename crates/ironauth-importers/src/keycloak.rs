@@ -224,6 +224,8 @@ fn map_user(index: usize, user: &KcUser) -> MappedUser {
         traits_schema_version: None,
         password_hash,
         credentials: None,
+        totp: None,
+        recovery_codes: None,
     };
     MappedUser::mapped(source_key, record, gaps)
 }

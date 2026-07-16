@@ -134,6 +134,7 @@ mod rotation;
 mod sign;
 mod signing_key;
 mod signing_policy;
+pub mod totp;
 mod verify;
 pub mod webauthn;
 
@@ -159,5 +160,9 @@ pub use redact::Redacted;
 pub use rotation::{KeySet, RotationError, RotationParams, includes_downgrade_key};
 pub use signing_key::{SigningKey, SigningKeyError};
 pub use signing_policy::{SigningPolicy, SigningPolicyError};
+pub use totp::{
+    Base32Error, TotpAlgorithm, TotpParams, TotpParamsError, base32_decode, base32_encode, code_at,
+    grouped_secret, provisioning_uri, verify as verify_totp,
+};
 pub use verify::{VerifiedToken, verify};
 pub use webauthn::{WebauthnKey, WebauthnSignatureError, verify_webauthn_signature};

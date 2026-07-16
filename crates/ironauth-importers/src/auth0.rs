@@ -229,6 +229,8 @@ fn map_user(index: usize, user: Auth0User, hashes: &HashMap<String, String>) -> 
         traits_schema_version: None,
         password_hash,
         credentials: None,
+        totp: None,
+        recovery_codes: None,
     };
     MappedUser::mapped(source_key, record, gaps)
 }

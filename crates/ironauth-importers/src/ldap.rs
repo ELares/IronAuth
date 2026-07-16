@@ -114,6 +114,8 @@ fn map_entry((index, entry): (usize, Value)) -> MappedUser {
         traits_schema_version: None,
         password_hash,
         credentials: None,
+        totp: None,
+        recovery_codes: None,
     };
     MappedUser::mapped(source_key, record, gaps)
 }

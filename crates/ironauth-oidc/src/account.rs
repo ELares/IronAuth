@@ -337,6 +337,50 @@ pub async fn list_credentials(
             }));
         }
     }
+    // Fold in the caller's TOTP authenticators (issue #69), each with its status, and
+    // a single recovery-code summary row carrying the remaining count. Subject-bound.
+    // Only when TOTP is enabled for this deployment.
+    if state.totp_enabled() {
+        let totp = state
+            .store()
+            .scoped(account.scope)
+            .totp_credentials()
+            .list(&account.subject)
+            .await;
+        let Ok(totp) = totp else {
+            return server_error();
+        };
+        for factor in &totp {
+            items.push(json!({
+                "id": factor.id,
+                "type": "totp",
+                "friendly_name": factor.friendly_name,
+                "usable_for_login": false,
+                "status": factor.status,
+                "algorithm": factor.algorithm,
+                "digits": factor.digits,
+                "period": factor.period_secs,
+                "created_at": factor.created_at_unix_micros,
+                "last_used_at": factor.last_used_at_unix_micros,
+            }));
+        }
+        let remaining = state
+            .store()
+            .scoped(account.scope)
+            .recovery_codes()
+            .remaining_count(&account.subject)
+            .await;
+        let Ok(remaining) = remaining else {
+            return server_error();
+        };
+        if remaining > 0 {
+            items.push(json!({
+                "type": "recovery_code",
+                "usable_for_login": false,
+                "recovery_codes_remaining": remaining,
+            }));
+        }
+    }
     json_response(StatusCode::OK, json!({ "credentials": items }))
 }
 
@@ -370,6 +414,18 @@ pub async fn enroll_credential(
     let Some(credential_type) = CredentialType::parse(&body.credential_type) else {
         return bad_request("unsupported credential type");
     };
+    // TOTP and recovery codes have dedicated, code-verified enrollment flows (issue
+    // #69): a generic enroll would create a partial, unverified credential, which the
+    // no-partial-factor contract forbids. Route the caller to the dedicated endpoints.
+    if matches!(
+        credential_type,
+        CredentialType::Totp | CredentialType::RecoveryCode
+    ) {
+        return bad_request(
+            "enroll a TOTP authenticator through /account/mfa/totp/enroll; recovery codes are \
+             minted at TOTP enrollment",
+        );
+    }
     let name = body.friendly_name.trim();
     if name.is_empty() || name.len() > 200 {
         return bad_request("friendly_name must be 1 to 200 characters");
