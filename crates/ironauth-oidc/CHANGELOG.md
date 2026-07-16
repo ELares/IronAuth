@@ -6,6 +6,36 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Credential-abuse defenses (issue #64): a new `abuse` module with the counter INTERFACE
+  (`CounterStore` trait + in-process L1 `MemoryCounterStore`, shaped so an optional
+  IronCache L2 slots in behind the same trait later), the risk-based escalation
+  (`escalating_delay`, `RegulationSettings`), and the documented fail-open/closed matrix
+  (per-IP fails OPEN / availability-biased; per-identifier, per-account, and the ban check
+  fail CLOSED / security-biased). `login_post`, `register_post`, and a NEW anti-enumeration
+  recovery surface (`GET`/`POST /recover`) key regulation on the CANONICAL identifier (the
+  #54 seam) and the non-forgeable resolved peer IP (the #31 lesson), per authentication
+  PATH, so failed-password spray throttles ONLY the password path and never the passkey or
+  recovery path (the account-DoS safeguard, Keycloak CVE-2024-1722). Anti-enumeration is
+  uniform across login, registration, and recovery (byte-identical present vs absent), and
+  a new `VerificationSender` seam suppresses a send to an unknown recipient under closed
+  registration while returning the identical acknowledgment (the Logto pattern). Throttled
+  responses carry the standard rate-limit headers (reusing the quota crate's contract).
+- Credential-abuse regulation, review hardening (issue #64): the escalation now actually
+  ESCALATES. `regulate_before` RECORDS every regulated attempt (throttled OR allowed) as
+  part of the decision and computes the delay from the incremented count, so the
+  per-identifier / per-IP `Retry-After` doubles per failure up to `max_delay` and the
+  per-account counter climbs until the opt-in `hard_lockout` threshold is REACHABLE
+  (previously the counter froze at the soft threshold because a throttled attempt was never
+  recorded, pinning `Retry-After` flat at the base delay and making `hard_lockout`
+  unreachable). The passkey ceremony (`authenticate/verify`) is now GOVERNED on its own
+  `AuthPath::Passkey` path: a passkey or `all` ban is enforced and passkey abuse is
+  throttled on its own per-IP counters, while a password-path ban or spray never touches
+  it (path independence preserved). A successful login (and passkey sign-in) RESETS its
+  path's identifier/account/IP failure counters so a legitimate user is not punished after
+  a correct credential. Under `hard_lockout`, the banned-account response now carries the
+  SAME snapshot shape (status, body, `Retry-After`) as an escalation throttle at the cap,
+  so a banned present account is not distinguishable from a throttled identifier by the
+  RESPONSE (only the inherent onset differs; see the `hard_lockout` config note).
 - TOTP review hardening (issue #69, review):
   - Recovery-code regeneration is now behind FRESH AUTHENTICATION (MEDIUM). The
     `recovery-codes` POST requires a current credential proof (the password verified

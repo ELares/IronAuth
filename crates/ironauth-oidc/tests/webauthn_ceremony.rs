@@ -15,6 +15,8 @@
 
 mod common;
 
+use std::time::SystemTime;
+
 use axum::body::Body;
 use axum::http::{HeaderMap, Request, StatusCode, header};
 use base64::Engine as _;
@@ -23,6 +25,9 @@ use ciborium::value::{Integer, Value};
 use common::{Harness, ISSUER_BASE};
 use ironauth_config::OidcConfig;
 use ironauth_jose::webauthn::test_util;
+use ironauth_store::{
+    AbuseBanId, AbuseSubject, ActorRef, AuthPath, CorrelationId, NewBan, ServiceId,
+};
 use serde_json::{Value as Json, json};
 use sha2::{Digest, Sha256};
 
@@ -949,4 +954,186 @@ async fn a_passwordless_user_is_blocked_from_removing_their_last_passkey() {
     let (status, after) = get(&harness, &format!("{base}/credentials"), Some(&cookie)).await;
     assert_eq!(status, StatusCode::OK);
     assert!(after["passkeys"].as_array().unwrap().is_empty());
+}
+
+// --- Passkey-path regulation (issue #64 MEDIUM-2) ---
+
+/// The current clock-seam time in microseconds since the Unix epoch.
+fn now_micros(harness: &Harness) -> i64 {
+    i64::try_from(
+        harness
+            .env()
+            .clock()
+            .now_utc()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("after epoch")
+            .as_micros(),
+    )
+    .expect("fits i64")
+}
+
+/// Place an operator ban on `subject` for `path` through the audited store repository, as
+/// the CLI/admin ban surface would.
+async fn place_ban(harness: &Harness, subject: &AbuseSubject, path: AuthPath) {
+    let env = harness.env();
+    let scope = harness.scope();
+    let id = AbuseBanId::generate(env, &scope);
+    let actor = ActorRef::service(ServiceId::from_seed_bytes([7_u8; 16]));
+    harness
+        .store()
+        .scoped(scope)
+        .acting(actor, CorrelationId::generate(env))
+        .abuse()
+        .ban(
+            env,
+            NewBan {
+                id: &id,
+                subject,
+                auth_path: path,
+                reason: "test ban",
+                expires_at_unix_micros: None,
+            },
+            now_micros(harness),
+        )
+        .await
+        .expect("place ban");
+}
+
+/// Register a synced UV passkey for the seeded `identifier` and return its subject, the
+/// authenticator seed, and the credential id, ready to drive a discoverable sign-in.
+async fn enrolled_passkey(
+    harness: &Harness,
+    identifier: &str,
+    seed: [u8; 32],
+    cred: &'static [u8],
+) -> String {
+    let subject = harness.seed_user(identifier, "correct horse battery").await;
+    let (_id, cookie) = harness.session_with_id(&subject, "pwd", 0).await;
+    let (status, body) = register_flags(harness, &cookie, &seed, cred, REG_SYNCED_UV).await;
+    assert_eq!(status, StatusCode::CREATED, "register: {body}");
+    subject
+}
+
+#[tokio::test]
+async fn a_passkey_ban_blocks_a_passkey_sign_in() {
+    // A passkey-path ban is ENFORCED on the passkey ceremony (issue #64 MEDIUM-2): the
+    // account is governed on its OWN passkey path, so an operator-placed passkey ban refuses
+    // the sign-in with the uniform throttle rather than doing nothing.
+    let harness = Harness::start().await;
+    let seed = [41_u8; 32];
+    let cred = b"passkey-ban-cred";
+    let subject = enrolled_passkey(&harness, "ada@example.test", seed, cred).await;
+
+    // Sanity: without a ban the passkey signs in.
+    let (status, _h, resp) = authenticate_flags(
+        &harness,
+        &seed,
+        cred,
+        Some(subject.as_bytes()),
+        ASSERT_SYNCED_UV,
+        1,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "baseline passkey sign-in: {resp}");
+
+    // Place a passkey-path ban on the account, then a fresh sign-in is refused (429).
+    place_ban(
+        &harness,
+        &AbuseSubject::account(subject.clone()),
+        AuthPath::Passkey,
+    )
+    .await;
+    let (status, _h, _resp) = authenticate_flags(
+        &harness,
+        &seed,
+        cred,
+        Some(subject.as_bytes()),
+        ASSERT_SYNCED_UV,
+        2,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::TOO_MANY_REQUESTS,
+        "a passkey ban must block the passkey sign-in"
+    );
+}
+
+#[tokio::test]
+async fn an_all_ban_blocks_a_passkey_sign_in() {
+    // An `all`-path ban spans every path, so it blocks the passkey ceremony too (issue #64
+    // MEDIUM-2).
+    let harness = Harness::start().await;
+    let seed = [42_u8; 32];
+    let cred = b"passkey-all-ban-cred";
+    let subject = enrolled_passkey(&harness, "bru@example.test", seed, cred).await;
+
+    place_ban(
+        &harness,
+        &AbuseSubject::account(subject.clone()),
+        AuthPath::All,
+    )
+    .await;
+    let (status, _h, _resp) = authenticate_flags(
+        &harness,
+        &seed,
+        cred,
+        Some(subject.as_bytes()),
+        ASSERT_SYNCED_UV,
+        1,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::TOO_MANY_REQUESTS,
+        "an `all` ban must block the passkey sign-in"
+    );
+}
+
+#[tokio::test]
+async fn a_password_path_ban_does_not_block_the_passkey_path() {
+    // Path INDEPENDENCE (issue #64 MEDIUM-2, the account-DoS safeguard): the passkey path is
+    // governed independently of the password path, so a PASSWORD-path ban on the account
+    // (the most severe state a failed-password spray can reach under hard lockout) does NOT
+    // throttle or block the owner's passkey sign-in.
+    let harness = Harness::start().await;
+    let seed = [43_u8; 32];
+    let cred = b"passkey-independence-cred";
+    let subject = enrolled_passkey(&harness, "cyd@example.test", seed, cred).await;
+
+    // A password-path ban is placed on the account (what a spray under hard lockout yields).
+    place_ban(
+        &harness,
+        &AbuseSubject::account(subject.clone()),
+        AuthPath::Password,
+    )
+    .await;
+    // The password path IS banned...
+    let subjects = [AbuseSubject::account(subject.clone())];
+    assert!(
+        harness
+            .store()
+            .scoped(harness.scope())
+            .abuse()
+            .active_ban(&subjects, AuthPath::Password, now_micros(&harness))
+            .await
+            .expect("ban check")
+            .is_some(),
+        "the password path is banned"
+    );
+    // ...but the passkey sign-in still succeeds: the password ban does not govern passkey.
+    let (status, _h, resp) = authenticate_flags(
+        &harness,
+        &seed,
+        cred,
+        Some(subject.as_bytes()),
+        ASSERT_SYNCED_UV,
+        1,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a password-path ban must NOT block the passkey path: {resp}"
+    );
 }

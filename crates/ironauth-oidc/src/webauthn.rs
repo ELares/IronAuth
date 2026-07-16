@@ -30,8 +30,8 @@ use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use ironauth_store::{
-    ConsumedChallenge, CorrelationId, CredentialRemoveOutcome, NewWebauthnCredential, Scope,
-    StoreError, UserId, WebauthnCeremony, WebauthnCredentialId, WebauthnCredentialOutcome,
+    AuthPath, ConsumedChallenge, CorrelationId, CredentialRemoveOutcome, NewWebauthnCredential,
+    Scope, StoreError, UserId, WebauthnCeremony, WebauthnCredentialId, WebauthnCredentialOutcome,
     WebauthnCredentialRecord,
 };
 use ironauth_webauthn::{
@@ -322,6 +322,28 @@ pub async fn authenticate_verify(
         return ceremony_error();
     };
 
+    // Credential-abuse regulation for the PASSKEY path (issue #64 MEDIUM-2), keyed on the
+    // non-forgeable resolved peer IP and governed INDEPENDENTLY of the password path (its
+    // own `AuthPath::Passkey` counters and bans). This RECORDS the attempt and applies any
+    // IP-scoped or `all`-scoped ban plus the per-IP escalation, so a passkey/`all` ban
+    // takes effect and passkey abuse throttles on its OWN counters; a password-failure
+    // spray (a different path) can never throttle or ban the passkey path. No identifier is
+    // presented in a discoverable sign-in, so the account dimension is checked below once
+    // the assertion resolves the credential to its subject.
+    let regulation_ctx = crate::abuse::AttemptContext {
+        path: AuthPath::Passkey,
+        scope,
+        ip: crate::abuse::resolved_client_ip(&headers),
+        identifier: None,
+        account_id: None,
+        client_id: None,
+    };
+    if let crate::abuse::RegulationOutcome::Throttled(snapshot) =
+        state.regulate_before(&regulation_ctx).await
+    {
+        return passkey_throttled(&snapshot);
+    }
+
     let Some(challenge) = consume(
         &state,
         scope,
@@ -355,6 +377,15 @@ pub async fn authenticate_verify(
     else {
         return ceremony_error();
     };
+
+    // Account-scoped passkey/`all` ban check (issue #64 MEDIUM-2): now that the assertion
+    // has resolved the credential to its subject, honor an operator ban placed on THIS
+    // account for the passkey path (or an `all` ban). Independent of the password path: a
+    // `password` ban never matches here, so failed-password spray cannot lock the owner out
+    // of passkey login. Fails closed, matching the password-path ban check.
+    if state.passkey_account_banned(scope, &target.subject).await {
+        return passkey_throttled(&crate::abuse::banned_snapshot(state.regulation()));
+    }
 
     // Defensive userHandle check (WebAuthn L3 7.2): the subject is resolved through
     // the credential id (above), so the userHandle is not trusted for resolution.
@@ -481,6 +512,11 @@ pub async fn authenticate_verify(
     else {
         return ceremony_error();
     };
+
+    // Successful passkey sign-in: relax the passkey-path per-IP throttle so a legitimate
+    // user is not punished after a correct sign-in (issue #64 LOW-6). Keyed on the same
+    // passkey-path context the attempt was recorded on.
+    state.reset_after_success(&regulation_ctx).await;
 
     let mut builder = Response::builder()
         .status(StatusCode::OK)
@@ -774,6 +810,22 @@ fn credential_not_found() -> Response {
 
 fn json_response(status: StatusCode, body: Value) -> Response {
     (status, [(header::CACHE_CONTROL, "no-store")], Json(body)).into_response()
+}
+
+/// The uniform passkey-path throttle response when regulation refuses the ceremony (issue
+/// #64 MEDIUM-2): a `429 Too Many Requests` carrying the standard rate-limit headers and
+/// the same non-enumerating ceremony body every other passkey failure returns, so a
+/// throttled or banned passkey ceremony is not distinguishable from any other failure.
+fn passkey_throttled(snapshot: &ironauth_quota::RateLimitSnapshot) -> Response {
+    let mut response = json_response(
+        StatusCode::TOO_MANY_REQUESTS,
+        json!({
+            "error": "ceremony_failed",
+            "message": "The passkey could not be verified. Please try again.",
+        }),
+    );
+    crate::abuse::stamp_rate_limit_headers(&mut response, snapshot);
+    response
 }
 
 /// The single non-enumerating ceremony error. Every failure (a bad challenge, a

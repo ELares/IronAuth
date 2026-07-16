@@ -542,6 +542,12 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0045_totp_credentials.sql"),
         },
+        Migration {
+            version: 46,
+            name: "credential_abuse_defenses",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0046_credential_abuse_defenses.sql"),
+        },
     ]
 }
 

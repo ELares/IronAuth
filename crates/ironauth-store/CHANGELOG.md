@@ -6,6 +6,25 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Credential-abuse defenses (issue #64): migration 0046 adds the durable, tenant-scoped
+  `abuse_bans` registry (forced RLS, the (tenant, environment) isolation policy, the
+  nonempty-scope and closed-set CHECKs, and column-scoped grants). The ban subject (an
+  identifier, an account, or an IP) is envelope-sealed and keyed by a per-tenant HMAC
+  blind index, never plaintext (#48). `AbuseRepo` (read) offers the request-path ban
+  check, the CLI/admin listing, and the layered per-IP/per-account/per-identifier failure
+  counters (reusing the generic `dcr_rate_counters` fixed-window table with an `abuse:`
+  key namespace, so they survive a restart); `ActingAbuseRepo` (write) places and lifts a
+  ban, each an audited write (`abuse.ban.create` / `abuse.ban.lift`). Bans and counters
+  are keyed per authentication PATH, so a `password` ban never governs the `passkey` or
+  `recovery` path (the account-DoS safeguard, Keycloak CVE-2024-1722). New public types:
+  `AbuseSubject`, `AbuseSubjectKind`, `AuthPath`, `NewBan`, `AbuseBanView`, `AbuseBanId`.
+- `AbuseRepo::clear_failures` (issue #64 review hardening): zeroes a subject's failure
+  counter for one path in place (SELECT/INSERT/UPDATE grants only, no DELETE), so a
+  SUCCESSFUL authentication relaxes that path's throttle without bleeding onto another
+  path; a later failure starts a fresh climb from one. The fail-CLOSED security cells (the
+  per-identifier counter read/write, the ban check, and now the clear) all surface their
+  backend error when the envelope master key is missing, so the caller denies rather than
+  admits. No schema change (reuses `dcr_rate_counters`).
 - TOTP review hardening (issue #69, review): the exit export now RE-HOMES the second
   factor for real. New `ActingTotpCredentialRepo::restore` re-seals an exported seed
   under the target scope's DEK and reproduces the row (status, single-use step), and

@@ -611,6 +611,18 @@ impl ScopedKind for MigrationRunRecordKind {
     const PREFIX: &'static str = "mrr";
 }
 
+/// Marker for a credential-abuse ban (`abn_`), one durable, DB-backed ban row over a
+/// single regulated dimension (an attacker IP, an account, or a canonical identifier)
+/// and a single authentication PATH (issue #64). Tenant scoped; the id is the ban row's
+/// primary key and the CLI/admin handle. The per-path key is the account-DoS defense: a
+/// `password` ban never governs the `passkey` or `recovery` path (Keycloak
+/// CVE-2024-1722). An INTERNAL operational row, never a bearer credential.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct AbuseBanKind;
+impl ScopedKind for AbuseBanKind {
+    const PREFIX: &'static str = "abn";
+}
+
 /// Marker for a human actor (an interactive user). One of the three actor kinds
 /// an audit envelope can name (see [`crate::audit::ActorRef`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -894,6 +906,9 @@ pub type MigrationRunId = ScopedId<MigrationRunKind>;
 /// A migration-run record identifier (`mrr_`), one per-record accounting row of a
 /// migration run (issue #59).
 pub type MigrationRunRecordId = ScopedId<MigrationRunRecordKind>;
+/// A credential-abuse ban identifier (`abn_`), one durable ban row over a regulated
+/// dimension and authentication path (issue #64).
+pub type AbuseBanId = ScopedId<AbuseBanKind>;
 
 impl<K: ScopedKind> ScopedId<K> {
     /// Mint a fresh scoped identifier under `scope`, drawing the unique

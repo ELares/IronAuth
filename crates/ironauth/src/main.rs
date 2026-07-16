@@ -21,11 +21,14 @@ use ironauth_jose::MasterKey;
 use ironauth_oidc::{
     BackChannelLogoutWorker, DiscoveryCapabilities, DiscoveryState, FetchLogoutSender,
     IssuerRegistry, IssuerState, JwksCacheWindow, LazyMigrationHook, OidcState, WorkerSettings,
-    discovery_router, issuer_router, oidc_router,
+    canonical_login_identifier, discovery_router, issuer_router, oidc_router,
 };
 use ironauth_quota::QuotaEnforcer;
 use ironauth_server::Server;
-use ironauth_store::Store;
+use ironauth_store::{
+    AbuseBanId, AbuseSubject, AbuseSubjectKind, ActorRef, AuthPath, CorrelationId, EnvironmentId,
+    NewBan, Scope, ServiceId, Store, TenantId,
+};
 
 /// Semantic version of this build, injected by Cargo.
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -45,6 +48,11 @@ fn main() -> ExitCode {
         // measures the host and recommends parameters. The same probe backs the
         // in-admin tuning helper; both call ironauth_oidc::run_probe.
         Some("hash-probe") => hash_probe(&mut args),
+        // Credential-abuse ban management (issue #64): place, lift, and list durable
+        // bans directly against the data-plane store, each an audited write. The admin
+        // API (crates/ironauth-admin) offers the same operations over HTTP for remote
+        // management; both write through the SAME audited store repository.
+        Some(verb @ ("ban" | "unban" | "bans")) => manage_bans(verb, &mut args),
         Some("--version" | "-V" | "version") => {
             println!("ironauth {VERSION}");
             ExitCode::SUCCESS
@@ -646,6 +654,310 @@ fn parse_config_path(
     Ok(config_path)
 }
 
+/// The parsed flags of a `ban` / `unban` / `bans` invocation (issue #64).
+#[derive(Default)]
+struct BanArgs {
+    config: Option<String>,
+    tenant: Option<String>,
+    environment: Option<String>,
+    kind: Option<String>,
+    subject: Option<String>,
+    path: Option<String>,
+    reason: Option<String>,
+    expires_secs: Option<i64>,
+}
+
+/// Parse the shared flags of the ban subcommands. Supports both `--flag value` and
+/// `--flag=value`.
+fn parse_ban_args(args: &mut impl Iterator<Item = String>) -> Result<BanArgs, String> {
+    let mut parsed = BanArgs::default();
+    while let Some(arg) = args.next() {
+        let (flag, inline) = match arg.split_once('=') {
+            Some((flag, value)) => (flag.to_owned(), Some(value.to_owned())),
+            None => (arg, None),
+        };
+        let mut take = |inline: Option<String>| -> Result<String, String> {
+            match inline {
+                Some(value) => Ok(value),
+                None => args
+                    .next()
+                    .ok_or_else(|| format!("{flag} requires a value")),
+            }
+        };
+        match flag.as_str() {
+            "--config" => parsed.config = Some(take(inline)?),
+            "--tenant" => parsed.tenant = Some(take(inline)?),
+            "--environment" => parsed.environment = Some(take(inline)?),
+            "--kind" => parsed.kind = Some(take(inline)?),
+            "--subject" => parsed.subject = Some(take(inline)?),
+            "--path" => parsed.path = Some(take(inline)?),
+            "--reason" => parsed.reason = Some(take(inline)?),
+            "--expires-secs" => {
+                let value = take(inline)?;
+                let secs = value
+                    .parse::<i64>()
+                    .map_err(|_| "--expires-secs expects a whole number of seconds".to_owned())?;
+                parsed.expires_secs = Some(secs);
+            }
+            other => return Err(format!("unrecognized argument '{other}'")),
+        }
+    }
+    Ok(parsed)
+}
+
+/// Resolve the scope, data-plane DSN, and envelope master key a ban subcommand needs:
+/// parse the tenant/environment ids, load config, and require the master key (a ban
+/// subject is sealed under it).
+fn prepare_ban(parsed: &BanArgs) -> Result<(Scope, String, Arc<MasterKey>), String> {
+    let tenant_raw = parsed.tenant.as_deref().ok_or("--tenant is required")?;
+    let environment_raw = parsed
+        .environment
+        .as_deref()
+        .ok_or("--environment is required")?;
+    let tenant = TenantId::parse(tenant_raw).map_err(|_| "invalid --tenant id".to_owned())?;
+    let environment =
+        EnvironmentId::parse(environment_raw).map_err(|_| "invalid --environment id".to_owned())?;
+    let scope = Scope::new(tenant, environment);
+    let config = match &parsed.config {
+        Some(path) => {
+            Config::load(path)
+                .map_err(|error| format!("cannot load config: {error}"))?
+                .config
+        }
+        None => Config::default(),
+    };
+    let master = resolve_master_key(&config)
+        .ok_or("database.master_key must be set to seal a ban subject")?;
+    let dsn = config.database.url.expose().to_owned();
+    Ok((scope, dsn, master))
+}
+
+/// Run the `ban` / `unban` / `bans` subcommands (issue #64): place, lift, and list durable
+/// credential-abuse bans directly against the data-plane store, each an audited write. The
+/// admin API offers the same operations over HTTP; both write through the SAME repository.
+fn manage_bans(verb: &str, args: &mut impl Iterator<Item = String>) -> ExitCode {
+    let parsed = match parse_ban_args(args) {
+        Ok(parsed) => parsed,
+        Err(message) => {
+            eprintln!("ironauth {verb}: {message}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let (scope, dsn, master) = match prepare_ban(&parsed) {
+        Ok(prepared) => prepared,
+        Err(message) => {
+            eprintln!("ironauth {verb}: {message}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let env = Env::system();
+    let runtime = match tokio::runtime::Runtime::new() {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            eprintln!("ironauth {verb}: cannot start async runtime: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    runtime.block_on(async move {
+        let store = match Store::connect(&dsn).await {
+            Ok(store) => store.with_master_key(master),
+            Err(error) => {
+                eprintln!("ironauth {verb}: cannot connect the data-plane store: {error}");
+                return ExitCode::FAILURE;
+            }
+        };
+        match verb {
+            "bans" => list_bans(&store, scope, &env).await,
+            "ban" => place_ban(&store, scope, &env, &parsed).await,
+            "unban" => lift_ban(&store, scope, &env, &parsed).await,
+            _ => unreachable!("dispatch guarantees the verb"),
+        }
+    })
+}
+
+/// Build the regulated subject for a ban subcommand: an identifier subject is
+/// CANONICALIZED through the same seam the login path keys on (issue #54/#64), so a CLI
+/// ban matches the exact form the request path checks.
+fn ban_subject(parsed: &BanArgs) -> Result<AbuseSubject, String> {
+    let kind_raw = parsed.kind.as_deref().ok_or("--kind is required")?;
+    let subject_raw = parsed.subject.as_deref().ok_or("--subject is required")?;
+    let kind = AbuseSubjectKind::from_wire(kind_raw)
+        .ok_or("--kind must be one of ip | account | identifier")?;
+    let value = match kind {
+        AbuseSubjectKind::Identifier => canonical_login_identifier(subject_raw).as_str().to_owned(),
+        AbuseSubjectKind::Ip | AbuseSubjectKind::Account => subject_raw.to_owned(),
+    };
+    Ok(AbuseSubject { kind, value })
+}
+
+/// Parse the `--path` flag, defaulting to the password path.
+fn ban_path(parsed: &BanArgs) -> Result<AuthPath, String> {
+    match parsed.path.as_deref() {
+        None => Ok(AuthPath::Password),
+        Some(raw) => AuthPath::from_wire(raw).ok_or_else(|| {
+            "--path must be one of password | passkey | recovery | register | all".to_owned()
+        }),
+    }
+}
+
+/// Place a ban (issue #64).
+async fn place_ban(store: &Store, scope: Scope, env: &Env, parsed: &BanArgs) -> ExitCode {
+    let subject = match ban_subject(parsed) {
+        Ok(subject) => subject,
+        Err(message) => {
+            eprintln!("ironauth ban: {message}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let path = match ban_path(parsed) {
+        Ok(path) => path,
+        Err(message) => {
+            eprintln!("ironauth ban: {message}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let reason = parsed.reason.as_deref().unwrap_or("operator ban (CLI)");
+    let now = now_micros(env);
+    let expires = parsed
+        .expires_secs
+        .map(|secs| now.saturating_add(secs.saturating_mul(1_000_000)));
+    let id = AbuseBanId::generate(env, &scope);
+    let actor = ActorRef::service(ServiceId::generate(env));
+    let result = store
+        .scoped(scope)
+        .acting(actor, CorrelationId::generate(env))
+        .abuse()
+        .ban(
+            env,
+            NewBan {
+                id: &id,
+                subject: &subject,
+                auth_path: path,
+                reason,
+                expires_at_unix_micros: expires,
+            },
+            now,
+        )
+        .await;
+    match result {
+        Ok(id) => {
+            println!(
+                "banned {} '{}' on the {} path ({})",
+                subject.kind.as_str(),
+                subject.value,
+                path.as_str(),
+                id
+            );
+            ExitCode::SUCCESS
+        }
+        Err(ironauth_store::StoreError::Conflict) => {
+            println!(
+                "already banned: {} on the {} path",
+                subject.kind.as_str(),
+                path.as_str()
+            );
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("ironauth ban: cannot place ban: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Lift a ban (issue #64).
+async fn lift_ban(store: &Store, scope: Scope, env: &Env, parsed: &BanArgs) -> ExitCode {
+    let subject = match ban_subject(parsed) {
+        Ok(subject) => subject,
+        Err(message) => {
+            eprintln!("ironauth unban: {message}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let path = match ban_path(parsed) {
+        Ok(path) => path,
+        Err(message) => {
+            eprintln!("ironauth unban: {message}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let actor = ActorRef::service(ServiceId::generate(env));
+    match store
+        .scoped(scope)
+        .acting(actor, CorrelationId::generate(env))
+        .abuse()
+        .lift(env, &subject, path)
+        .await
+    {
+        Ok(true) => {
+            println!(
+                "lifted ban on {} '{}' for the {} path",
+                subject.kind.as_str(),
+                subject.value,
+                path.as_str()
+            );
+            ExitCode::SUCCESS
+        }
+        Ok(false) => {
+            println!(
+                "no active ban on {} '{}' for the {} path",
+                subject.kind.as_str(),
+                subject.value,
+                path.as_str()
+            );
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("ironauth unban: cannot lift ban: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// List active bans (issue #64).
+async fn list_bans(store: &Store, scope: Scope, env: &Env) -> ExitCode {
+    match store
+        .scoped(scope)
+        .abuse()
+        .list_active(now_micros(env))
+        .await
+    {
+        Ok(bans) => {
+            if bans.is_empty() {
+                println!("no active bans");
+            }
+            for ban in bans {
+                let expires = ban.expires_at_unix_micros.map_or_else(
+                    || "never".to_owned(),
+                    |micros| (micros / 1_000_000).to_string(),
+                );
+                println!(
+                    "{id}\t{kind}\t{subject}\t{path}\texpires_unix={expires}\treason={reason}",
+                    id = ban.id,
+                    kind = ban.subject_kind.as_str(),
+                    subject = ban.subject,
+                    path = ban.auth_path.as_str(),
+                    reason = ban.reason,
+                );
+            }
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("ironauth bans: cannot list bans: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// The current instant in epoch microseconds, drawn from the determinism seam.
+fn now_micros(env: &Env) -> i64 {
+    let now = env.clock().now_utc();
+    let micros = now
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_micros());
+    i64::try_from(micros).unwrap_or(i64::MAX)
+}
+
 /// Run the `hash-probe` subcommand (issue #62): measure Argon2id on this host and
 /// recommend parameters that meet the target per-hash latency, showing projected
 /// logins/s per core. Reads the target latency from `[password_hashing]` when
@@ -801,6 +1113,16 @@ fn print_help() {
     println!("  ironauth plan <document> ...      Render the server-computed promotion plan");
     println!("  ironauth apply <document> ...     Apply a config document to a target");
     println!("  ironauth drift <document> ...     Report whether a target has drifted");
+    println!("  ironauth ban --config PATH --tenant TID --environment EID \\");
+    println!("               --kind ip|account|identifier --subject VALUE \\");
+    println!("               [--path password|passkey|recovery|register|all] \\");
+    println!("               [--reason TEXT] [--expires-secs N]");
+    println!("                                   Place a durable credential-abuse ban (issue #64)");
+    println!("  ironauth unban --config PATH --tenant TID --environment EID \\");
+    println!("               --kind ... --subject VALUE [--path ...]");
+    println!("                                   Lift a ban");
+    println!("  ironauth bans --config PATH --tenant TID --environment EID");
+    println!("                                   List active bans");
     println!("  ironauth --version               Print the version");
     println!("  ironauth --help                  Print this help");
     println!();

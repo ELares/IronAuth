@@ -96,6 +96,13 @@ name = "rls"
 path = "tests/rls.rs"
 required-features = ["testing"]
 
+# Credential-abuse defenses (issue #64): the durable ban registry (per-dimension,
+# per-path, sealed subject) and the layered failure counters, against a real database.
+[[test]]
+name = "abuse"
+path = "tests/abuse.rs"
+required-features = ["testing"]
+
 # Cross-tenant / cross-environment IDOR harness against every scoped repository
 # operation that exists today. Needs a real database (DATABASE_URL).
 [[test]]

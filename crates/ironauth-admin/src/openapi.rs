@@ -143,6 +143,9 @@ use crate::views::{
         crate::migration_runs::list_migration_runs,
         crate::migration_runs::get_migration_run,
         crate::migration_runs::list_migration_run_violations,
+        crate::bans::create_ban,
+        crate::bans::lift_ban,
+        crate::bans::list_bans,
     ),
     components(schemas(
         ErrorBody,
@@ -211,6 +214,11 @@ use crate::views::{
         crate::migration_runs::MigrationRunDetailView,
         crate::migration_runs::OffendingRecordView,
         crate::migration_runs::MigrationRunViolationList,
+        crate::bans::CreateBanRequest,
+        crate::bans::LiftBanRequest,
+        crate::bans::BanView,
+        crate::bans::BanList,
+        crate::bans::LiftBanView,
     ))
 )]
 struct ApiDoc;

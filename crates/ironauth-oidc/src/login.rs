@@ -115,6 +115,10 @@ fn passkey_nonce(state: &OidcState) -> String {
 
 /// `POST /login`: verify the password and, on success, establish a session and
 /// resume the authorization request.
+// The linear flow (parse, CSRF, lookup, regulate, verify, session, per-arm failure
+// recording) reads best as one function; splitting it would scatter the anti-enumeration
+// invariant across helpers, so the length lint is allowed here (issue #64).
+#[allow(clippy::too_many_lines)]
 pub async fn login_post(
     State(state): State<OidcState>,
     headers: HeaderMap,
@@ -151,6 +155,37 @@ pub async fn login_post(
         .users()
         .by_identifier(identifier)
         .await;
+
+    // Credential-abuse regulation (issue #64), keyed on the CANONICAL identifier (the
+    // #54 seam) and the non-forgeable resolved peer IP (the #31 lesson), on the PASSWORD
+    // path only. The account id is threaded in when the identifier resolved, so a manual
+    // per-account ban applies; the escalation decision itself uses only the
+    // existence-INDEPENDENT identifier + IP dimensions, so a throttle never distinguishes
+    // a present from an absent identifier. Evaluated AFTER the (uniform-cost) lookup so
+    // both present and absent identifiers pay the same work before any throttle. A
+    // throttled attempt spends NO password verification, uniformly for both.
+    let account_id = match &lookup {
+        Ok(Some(user)) => Some(user.id.to_string()),
+        _ => None,
+    };
+    let ctx = crate::abuse::AttemptContext {
+        path: ironauth_store::AuthPath::Password,
+        scope: resume.scope,
+        ip: crate::abuse::resolved_client_ip(&headers),
+        identifier: Some(crate::abuse::canonical_login_identifier(identifier)),
+        account_id,
+        client_id: Some(resume.client_id.to_string()),
+    };
+    if let crate::abuse::RegulationOutcome::Throttled(snapshot) = state.regulate_before(&ctx).await
+    {
+        return throttled_login_page(
+            &snapshot,
+            identifier,
+            &resume.return_to,
+            &resume.hints,
+            banner,
+        );
+    }
 
     match lookup {
         // A user whose lifecycle state cannot authenticate (blocked, disabled, or
@@ -210,12 +245,20 @@ pub async fn login_post(
                 )
                 .await
                 {
-                    Ok(cookie) => interaction::redirect_setting_cookie(&resume.return_to, &cookie),
+                    Ok(cookie) => {
+                        // Successful login: relax this path's identifier/account/IP failure
+                        // counters so a user who typoed past the soft threshold is not
+                        // throttled for the rest of the window (issue #64 LOW-6).
+                        state.reset_after_success(&ctx).await;
+                        interaction::redirect_setting_cookie(&resume.return_to, &cookie)
+                    }
                     Err(_) => interaction::server_error_page(),
                 }
             } else {
                 // Present but wrong password: generic failure (no wrong-password
-                // oracle), whether the stored verifier is native or foreign.
+                // oracle), whether the stored verifier is native or foreign. The failed
+                // attempt was already recorded by `regulate_before` on the layered abuse
+                // counters (issue #64), so no further recording here.
                 failed_login_page(identifier, &resume.return_to, &resume.hints, banner)
             }
         }
@@ -241,6 +284,9 @@ pub async fn login_post(
                     )
                     .await
                     {
+                        // A verified lazy migration is a successful first login: relax this
+                        // path's identifier/IP failure counters (issue #64 LOW-6).
+                        state.reset_after_success(&ctx).await;
                         return response;
                     }
                 }
@@ -253,6 +299,9 @@ pub async fn login_post(
                 Ok(_) => {}
                 Err(rejection) => return rejection.to_response(),
             }
+            // The failed attempt was already recorded by `regulate_before` on the SAME
+            // existence-independent dimensions (identifier + IP) an existing account would,
+            // so an absent identifier is counted and throttled identically (issue #64).
             failed_login_page(identifier, &resume.return_to, &resume.hints, banner)
         }
         Err(_) => interaction::server_error_page(),
@@ -464,6 +513,24 @@ async fn complete_lazy_migration(
         Ok(cookie) => Some(interaction::redirect_setting_cookie(return_to, &cookie)),
         Err(_) => Some(interaction::server_error_page()),
     }
+}
+
+/// The uniform throttle response when credential-abuse regulation refuses the attempt
+/// (issue #64): the SAME generic login page body a wrong password renders (so it stays
+/// non-oracular), but with a `429 Too Many Requests` status and the standard rate-limit
+/// response headers. Identical for a present and an absent identifier, since the throttle
+/// decision keys only on the existence-independent identifier + IP dimensions.
+fn throttled_login_page(
+    snapshot: &ironauth_quota::RateLimitSnapshot,
+    identifier: &str,
+    return_to: &str,
+    hints: &crate::hints::InteractionHints,
+    environment_banner: Option<&str>,
+) -> Response {
+    let mut response = failed_login_page(identifier, return_to, hints, environment_banner);
+    *response.status_mut() = StatusCode::TOO_MANY_REQUESTS;
+    crate::abuse::stamp_rate_limit_headers(&mut response, snapshot);
+    response
 }
 
 /// Re-render the login form with a generic failure message, prefilling the

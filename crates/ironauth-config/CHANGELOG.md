@@ -6,6 +6,20 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- `[oidc.regulation]` settings (issue #64): a new `RegulationConfig` table for
+  credential-abuse regulation and the anti-enumeration posture. The DEFAULT is
+  account-DoS-safe: risk-based escalating `Retry-After` delays (`soft_threshold`,
+  `base_delay_secs`, `max_delay_secs`, `window_secs`) that target the attacker's
+  dimensions, never a hard lockout. `hard_lockout` is an explicit per-tenant OPT-IN
+  (documented weaponization tradeoff) confined to the password path;
+  `registration_closed` switches `/register` to the uniform, send-suppressing Logto
+  posture. Each field is floor/ceiling validated at load. The `hard_lockout` field doc now
+  states BOTH tradeoffs it accepts: the DoS weaponization tradeoff (Keycloak
+  CVE-2024-1722) AND, separately, a login ENUMERATION oracle (a real account auto-bans
+  once its per-account counter crosses the threshold while an unknown identifier never
+  does, so the 429 ONSET is earlier for a present account); that onset difference is
+  inherent, while the avoidable response-shape leak is closed. On the default posture
+  neither applies.
 - `mfa_required` doc honesty (issue #69, review): the `[oidc].mfa_required` field doc
   (and the regenerated `docs/CONFIG.md`) now states that TODAY it drives the
   enrollment PROMPT and the `/account/mfa/plan` surface only; HARD login-flow

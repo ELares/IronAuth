@@ -55,6 +55,7 @@ use ironauth_jose::{Aad, BlindIndex, Dek, Kek, MasterKey, Sealed};
 use sqlx::postgres::PgRow;
 use sqlx::{PgConnection, Postgres, Row, Transaction};
 
+use crate::abuse::{AbuseBanView, AbuseSubject, AbuseSubjectKind, AuthPath, NewBan};
 use crate::audit::{ActingContext, Action, ActorRef};
 use crate::classification::ResourceType;
 use crate::custom_domain::{
@@ -64,7 +65,7 @@ use crate::custom_domain::{
 use crate::environment::{EnvironmentType, GuardrailSet};
 use crate::error::StoreError;
 use crate::id::{
-    AcmeChallengeId, AssertionMappingId, AuditId, AuditTarget, AuthorizationCodeId,
+    AbuseBanId, AcmeChallengeId, AssertionMappingId, AuditId, AuditTarget, AuthorizationCodeId,
     BackChannelDeliveryId, ClientId, ClientSessionId, ConsentId, CorrelationId, CredentialId,
     CustomDomainId, DcrPolicyId, DekId, DeviceCodeId, EncryptedSecretId, EnvironmentId,
     EnvironmentSecretId, ExternalIssuerId, GrantId, InitialAccessTokenId, InvitationId,
@@ -514,6 +515,21 @@ impl<'a> ScopedStore<'a> {
         }
     }
 
+    /// The read-and-counter credential-abuse repository for this scope (issue #64):
+    /// the ban check the request path makes, the CLI/admin ban listing, and the
+    /// layered fixed-window FAILURE counters (per-IP, per-account, per-identifier)
+    /// that drive risk-based escalation. The counters reuse the generic
+    /// `dcr_rate_counters` table with an `abuse:` key namespace and, like the DCR
+    /// limiter, commit their own transaction off the audited-write path. The audited
+    /// ban and unban mutations live on [`ActingStore::abuse`].
+    #[must_use]
+    pub fn abuse(&self) -> AbuseRepo<'a> {
+        AbuseRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
     /// The read-and-bookkeeping device-authorization repository for this scope (issue
     /// #24, RFC 8628). Resolves a presented device code at the token-endpoint poll,
     /// looks up a flow by a submitted user code on the verification page, records a
@@ -654,6 +670,19 @@ impl<'a> ActingStore<'a> {
     #[must_use]
     pub fn invitations(&self) -> ActingInvitationRepo<'a> {
         ActingInvitationRepo {
+            store: self.store,
+            scope: self.scope,
+            acting: self.acting,
+        }
+    }
+
+    /// The mutating credential-abuse ban repository for this scope and actor (issue
+    /// #64): place a durable ban on a regulated dimension and path, and lift one, each
+    /// audited. The request-path ban check, the ban listing, and the failure counters
+    /// are reads on [`ScopedStore::abuse`].
+    #[must_use]
+    pub fn abuse(&self) -> ActingAbuseRepo<'a> {
+        ActingAbuseRepo {
             store: self.store,
             scope: self.scope,
             acting: self.acting,
@@ -3306,6 +3335,454 @@ impl DcrRateLimiterRepo<'_> {
         .get("count");
         tx.commit().await?;
         Ok(i64::from(count) <= limit)
+    }
+}
+
+/// The read-and-counter credential-abuse repository (issue #64): the request-path ban
+/// check, the CLI/admin ban listing, and the layered fixed-window FAILURE counters
+/// (per-IP, per-account, per-identifier) that drive risk-based escalation.
+///
+/// The counters REUSE the generic `dcr_rate_counters` fixed-window table with an
+/// `abuse:` key namespace (the identifier dimension keyed by its per-tenant blind index,
+/// so no plaintext identifier ever lands in the counter table), so they survive a
+/// restart and share the atomic, clock-seam-driven window logic. Like the DCR limiter,
+/// a counter mutation is a cache write, not a business event, so it commits its own
+/// transaction off the audited-write path.
+pub struct AbuseRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl AbuseRepo<'_> {
+    /// The reused `dcr_rate_counters` key for a subject on a path. The identifier
+    /// dimension is keyed by its blind-index hex (never a plaintext identifier); the IP
+    /// and account dimensions carry their non-PII value directly.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Encryption`] if the identifier dimension is keyed but no master key
+    /// is configured (the identity layer FAILS CLOSED).
+    fn counter_key(&self, subject: &AbuseSubject, path: AuthPath) -> Result<String, StoreError> {
+        let keyed = match subject.kind {
+            AbuseSubjectKind::Identifier => {
+                let master = self.store.master().ok_or(StoreError::Encryption)?;
+                let index =
+                    abuse_subject_blind_index(master, self.scope, subject.kind, &subject.value);
+                blind_index_hex(&index)
+            }
+            AbuseSubjectKind::Ip | AbuseSubjectKind::Account => subject.value.clone(),
+        };
+        Ok(abuse_counter_key(path, subject.kind, &keyed))
+    }
+
+    /// Record one FAILED attempt against `subject` on `path` in the current fixed window
+    /// and return the new count. The window is `window_secs` long and both the
+    /// now-instant and the rollover comparison use the clock seam (`now_micros`), so it
+    /// is deterministic under a manual clock. Reuses `dcr_rate_counters`.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Encryption`] if an identifier subject cannot be keyed;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn record_failure(
+        &self,
+        subject: &AbuseSubject,
+        path: AuthPath,
+        window_secs: i64,
+        now_micros: i64,
+    ) -> Result<u64, StoreError> {
+        let key = self.counter_key(subject, path)?;
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let count: i32 = sqlx::query(
+            "INSERT INTO dcr_rate_counters \
+             (tenant_id, environment_id, rate_key, window_start, count) \
+             VALUES ($1, $2, $3, \
+                     TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval, 1) \
+             ON CONFLICT (tenant_id, environment_id, rate_key) DO UPDATE SET \
+                 count = CASE \
+                     WHEN dcr_rate_counters.window_start + ($5::text || ' seconds')::interval \
+                          <= TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval \
+                     THEN 1 ELSE dcr_rate_counters.count + 1 END, \
+                 window_start = CASE \
+                     WHEN dcr_rate_counters.window_start + ($5::text || ' seconds')::interval \
+                          <= TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval \
+                     THEN TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval \
+                     ELSE dcr_rate_counters.window_start END \
+             RETURNING count",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(&key)
+        .bind(now_micros)
+        .bind(window_secs)
+        .fetch_one(&mut *tx)
+        .await?
+        .get("count");
+        tx.commit().await?;
+        Ok(u64::try_from(count).unwrap_or(0))
+    }
+
+    /// Read the CURRENT failure count for `subject` on `path` WITHOUT incrementing it,
+    /// treating a rolled-over window as zero. Used to compute the risk-based escalation
+    /// BEFORE spending a credential verification. Reuses `dcr_rate_counters`.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Encryption`] if an identifier subject cannot be keyed;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn failure_count(
+        &self,
+        subject: &AbuseSubject,
+        path: AuthPath,
+        window_secs: i64,
+        now_micros: i64,
+    ) -> Result<u64, StoreError> {
+        let key = self.counter_key(subject, path)?;
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let count: Option<i32> = sqlx::query(
+            "SELECT count FROM dcr_rate_counters \
+             WHERE tenant_id = $1 AND environment_id = $2 AND rate_key = $3 \
+               AND window_start + ($5::text || ' seconds')::interval \
+                   > TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(&key)
+        .bind(now_micros)
+        .bind(window_secs)
+        .fetch_optional(&mut *tx)
+        .await?
+        .map(|row| row.get("count"));
+        tx.commit().await?;
+        Ok(count.and_then(|c| u64::try_from(c).ok()).unwrap_or(0))
+    }
+
+    /// CLEAR the failure counter for `subject` on `path` (issue #64): a SUCCESSFUL
+    /// authentication relaxes the per-identifier / per-account throttle so a legitimate user
+    /// who typoed past the soft threshold is not throttled for the rest of the window. Only
+    /// this path's counter is zeroed, so the reset never bleeds onto another path. Reuses
+    /// `dcr_rate_counters` and zeroes the count in place (the data-plane role holds
+    /// SELECT/INSERT/UPDATE, not DELETE); a no-op when no counter row exists. A later
+    /// failure starts a fresh climb from one.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Encryption`] if an identifier subject cannot be keyed;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn clear_failures(
+        &self,
+        subject: &AbuseSubject,
+        path: AuthPath,
+    ) -> Result<(), StoreError> {
+        let key = self.counter_key(subject, path)?;
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        sqlx::query(
+            "UPDATE dcr_rate_counters SET count = 0 \
+             WHERE tenant_id = $1 AND environment_id = $2 AND rate_key = $3",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(&key)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// The first ACTIVE ban (unexpired) matching ANY of `subjects` on `path` (or a
+    /// path-spanning [`AuthPath::All`] ban), or [`None`]. A `password`-path check never
+    /// matches a `passkey` or `recovery` ban, so failed-password regulation cannot
+    /// block another path (the account-DoS safeguard, issue #64).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Encryption`] if no master key is configured (the ban check FAILS
+    /// CLOSED); [`StoreError::Database`] on a persistence failure.
+    pub async fn active_ban(
+        &self,
+        subjects: &[AbuseSubject],
+        path: AuthPath,
+        now_micros: i64,
+    ) -> Result<Option<AbuseBanView>, StoreError> {
+        if subjects.is_empty() {
+            return Ok(None);
+        }
+        let master = self.store.master().ok_or(StoreError::Encryption)?;
+        let bidxes: Vec<Vec<u8>> = subjects
+            .iter()
+            .map(|subject| {
+                abuse_subject_blind_index(master, self.scope, subject.kind, &subject.value)
+                    .into_bytes()
+            })
+            .collect();
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT id, subject_kind, subject_sealed, pii_dek_version, auth_path, reason, \
+                    (EXTRACT(EPOCH FROM expires_at) * 1000000)::bigint AS expires_us, \
+                    (EXTRACT(EPOCH FROM created_at) * 1000000)::bigint AS created_us \
+             FROM abuse_bans \
+             WHERE tenant_id = $1 AND environment_id = $2 \
+               AND subject_bidx = ANY($3) \
+               AND auth_path IN ($4, 'all') \
+               AND (expires_at IS NULL \
+                    OR expires_at > TIMESTAMPTZ 'epoch' + ($5::text || ' microseconds')::interval) \
+             ORDER BY created_at ASC LIMIT 1",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(&bidxes)
+        .bind(path.as_str())
+        .bind(now_micros)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let view = match row {
+            Some(row) => Some(abuse_ban_view_from_row(&mut tx, self.scope, master, &row).await?),
+            None => None,
+        };
+        tx.commit().await?;
+        Ok(view)
+    }
+
+    /// List every ACTIVE (unexpired) ban in this scope, subjects opened for a CLI/admin
+    /// view, newest first.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Encryption`] if no master key is configured;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn list_active(&self, now_micros: i64) -> Result<Vec<AbuseBanView>, StoreError> {
+        let master = self.store.master().ok_or(StoreError::Encryption)?;
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let rows = sqlx::query(
+            "SELECT id, subject_kind, subject_sealed, pii_dek_version, auth_path, reason, \
+                    (EXTRACT(EPOCH FROM expires_at) * 1000000)::bigint AS expires_us, \
+                    (EXTRACT(EPOCH FROM created_at) * 1000000)::bigint AS created_us \
+             FROM abuse_bans \
+             WHERE tenant_id = $1 AND environment_id = $2 \
+               AND (expires_at IS NULL \
+                    OR expires_at > TIMESTAMPTZ 'epoch' + ($3::text || ' microseconds')::interval) \
+             ORDER BY created_at DESC",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(now_micros)
+        .fetch_all(&mut *tx)
+        .await?;
+        let mut views = Vec::with_capacity(rows.len());
+        for row in &rows {
+            views.push(abuse_ban_view_from_row(&mut tx, self.scope, master, row).await?);
+        }
+        tx.commit().await?;
+        Ok(views)
+    }
+}
+
+/// Reconstruct an [`AbuseBanView`] from an `abuse_bans` row, opening the sealed subject
+/// under the row's DEK version. Runs inside the caller's open transaction.
+async fn abuse_ban_view_from_row(
+    tx: &mut Transaction<'_, Postgres>,
+    scope: Scope,
+    master: &MasterKey,
+    row: &PgRow,
+) -> Result<AbuseBanView, StoreError> {
+    let id = AbuseBanId::parse_in_scope(&row.get::<String, _>("id"), &scope)?;
+    let subject_kind = AbuseSubjectKind::from_wire(&row.get::<String, _>("subject_kind"))
+        .ok_or(StoreError::Encryption)?;
+    let auth_path =
+        AuthPath::from_wire(&row.get::<String, _>("auth_path")).ok_or(StoreError::Encryption)?;
+    let dek_version: i32 = row.get("pii_dek_version");
+    let subject_sealed: Vec<u8> = row.get("subject_sealed");
+    let dek = fetch_dek_by_version(tx, scope, master, dek_version).await?;
+    let subject_bytes = dek.open(
+        &abuse_subject_seal_aad(scope, dek_version),
+        &Sealed::from_bytes(subject_sealed)?,
+    )?;
+    let subject = String::from_utf8(subject_bytes).map_err(|_| StoreError::Encryption)?;
+    Ok(AbuseBanView {
+        id,
+        subject_kind,
+        subject,
+        auth_path,
+        reason: row.get("reason"),
+        expires_at_unix_micros: row.get::<Option<i64>, _>("expires_us"),
+        created_at_unix_micros: row.get::<Option<i64>, _>("created_us").unwrap_or(0),
+    })
+}
+
+/// The mutating credential-abuse ban repository (issue #64): place a durable ban and
+/// lift one, each written through the single audited-write path.
+pub struct ActingAbuseRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+    acting: ActingContext,
+}
+
+impl ActingAbuseRepo<'_> {
+    /// Ensure the scope has a live KEK and DEK to seal the ban subject under,
+    /// provisioning each lazily on first use (idempotent). Mirrors the invitation path.
+    async fn ensure_scope_keys(&self, env: &Env, master: &MasterKey) -> Result<(), StoreError> {
+        let envelope = ActingEnvelopeRepo {
+            store: self.store,
+            scope: self.scope,
+            acting: self.acting,
+        };
+        match envelope.provision_kek(env, master).await {
+            Ok(_) | Err(StoreError::Conflict) => {}
+            Err(error) => return Err(error),
+        }
+        match envelope.provision_dek(env, master).await {
+            Ok(_) | Err(StoreError::Conflict) => {}
+            Err(error) => return Err(error),
+        }
+        Ok(())
+    }
+
+    /// PLACE a durable ban (issue #64): seal and blind-index the regulated subject under
+    /// the scope's DEK and write it with one `abuse.ban.create` audit row (its
+    /// operator-safe `detail` records the dimension and path, never the sealed subject)
+    /// in the same transaction.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Conflict`] if the same subject is already banned on this path;
+    /// [`StoreError::Encryption`] if no master key is configured;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn ban(
+        &self,
+        env: &Env,
+        spec: NewBan<'_>,
+        created_at_micros: i64,
+    ) -> Result<AbuseBanId, StoreError> {
+        if spec.id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let master = self.store.master().ok_or(StoreError::Encryption)?;
+        self.ensure_scope_keys(env, master).await?;
+        let scope = self.scope;
+        let id = *spec.id;
+        let subject = spec.subject;
+        let bidx = abuse_subject_blind_index(master, scope, subject.kind, &subject.value);
+        let detail = format!(
+            "dimension={} path={}",
+            subject.kind.as_str(),
+            spec.auth_path.as_str()
+        );
+        write_audited_detailed(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::AbuseBanCreate,
+                target: &id,
+            },
+            async move |tx| {
+                let (dek_version, dek) = fetch_active_dek(tx, scope, master).await?;
+                let subject_sealed = dek.seal(
+                    env.entropy(),
+                    &abuse_subject_seal_aad(scope, dek_version),
+                    subject.value.as_bytes(),
+                );
+                let result = sqlx::query(
+                    "INSERT INTO abuse_bans \
+                     (id, tenant_id, environment_id, subject_kind, subject_bidx, \
+                      subject_sealed, pii_dek_version, auth_path, reason, expires_at, created_at) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, \
+                             CASE WHEN $10::bigint IS NULL THEN NULL \
+                                  ELSE TIMESTAMPTZ 'epoch' + ($10::text || ' microseconds')::interval END, \
+                             TIMESTAMPTZ 'epoch' + ($11::text || ' microseconds')::interval)",
+                )
+                .bind(id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(subject.kind.as_str())
+                .bind(bidx.into_bytes())
+                .bind(subject_sealed.into_bytes())
+                .bind(dek_version)
+                .bind(spec.auth_path.as_str())
+                .bind(spec.reason)
+                .bind(spec.expires_at_unix_micros)
+                .bind(created_at_micros)
+                .execute(&mut **tx)
+                .await;
+                match result {
+                    Ok(_) => {}
+                    Err(error) if is_unique_violation(&error) => return Err(StoreError::Conflict),
+                    Err(error) => return Err(error.into()),
+                }
+                Ok(())
+            },
+            false,
+            Some(&detail),
+        )
+        .await?;
+        Ok(id)
+    }
+
+    /// LIFT a ban (issue #64): remove the ban on `subject`+`path` (if any) and write one
+    /// `abuse.ban.lift` audit row in the same transaction. A repeat unban (nothing
+    /// matched) is idempotent and returns `false` with no audit row.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Encryption`] if no master key is configured;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn lift(
+        &self,
+        env: &Env,
+        subject: &AbuseSubject,
+        path: AuthPath,
+    ) -> Result<bool, StoreError> {
+        let master = self.store.master().ok_or(StoreError::Encryption)?;
+        let scope = self.scope;
+        let bidx = abuse_subject_blind_index(master, scope, subject.kind, &subject.value);
+        let bidx_bytes = bidx.into_bytes();
+        // Resolve the ban id first (a scoped read), so the audit row can target it. A
+        // missing ban is an idempotent no-op (no audit row, no error).
+        let mut tx = begin_scoped(self.store, scope).await?;
+        let existing: Option<String> = sqlx::query(
+            "SELECT id FROM abuse_bans \
+             WHERE tenant_id = $1 AND environment_id = $2 AND subject_bidx = $3 AND auth_path = $4",
+        )
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(&bidx_bytes)
+        .bind(path.as_str())
+        .fetch_optional(&mut *tx)
+        .await?
+        .map(|row| row.get("id"));
+        tx.commit().await?;
+        let Some(raw_id) = existing else {
+            return Ok(false);
+        };
+        let id = AbuseBanId::parse_in_scope(&raw_id, &scope)?;
+        let detail = format!("dimension={} path={}", subject.kind.as_str(), path.as_str());
+        write_audited_detailed(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::AbuseBanLift,
+                target: &id,
+            },
+            async move |tx| {
+                sqlx::query(
+                    "DELETE FROM abuse_bans \
+                     WHERE tenant_id = $1 AND environment_id = $2 AND id = $3",
+                )
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(id.to_string())
+                .execute(&mut **tx)
+                .await?;
+                Ok(())
+            },
+            false,
+            Some(&detail),
+        )
+        .await?;
+        Ok(true)
     }
 }
 
@@ -19446,6 +19923,14 @@ const FLEXIBLE_IDENTIFIER_SEAL_LABEL: &str = "ironauth.envelope.user-identifier.
 /// index, so the same string as a bootstrap handle and as a flexible identifier never
 /// produces a colliding tag.
 const FLEXIBLE_IDENTIFIER_BIDX_LABEL: &str = "ironauth.envelope.user-identifier-bidx.v1";
+/// The AAD label domain-separating a sealed `abuse_bans.subject` value (the regulated
+/// dimension value, issue #64) from every other envelope context, so a ban-subject
+/// seal never authenticates under the users-PII, invitation, or secret-store context.
+const ABUSE_SUBJECT_SEAL_LABEL: &str = "ironauth.envelope.abuse-subject.v1";
+/// The AAD label domain-separating the `abuse_bans.subject_bidx` blind index (issue
+/// #64) from every other keyed derivation, so the same string as a ban subject and as
+/// a login handle never produces a colliding tag.
+const ABUSE_SUBJECT_BIDX_LABEL: &str = "ironauth.envelope.abuse-subject-bidx.v1";
 
 /// The associated data binding a wrapped KEK to its scope, version, and master
 /// key. A KEK wrapped under one context fails to unwrap under any other, so it
@@ -19700,6 +20185,65 @@ fn flexible_identifier_blind_index(
     canonical: &CanonicalIdentifier,
 ) -> BlindIndex {
     master.blind_index(&flexible_identifier_bidx_aad(scope, canonical))
+}
+
+/// The associated data binding a sealed `abuse_bans.subject` value (issue #64) to its
+/// scope and the DEK version that sealed it.
+fn abuse_subject_seal_aad(scope: Scope, dek_version: i32) -> Aad {
+    Aad::builder()
+        .text(ABUSE_SUBJECT_SEAL_LABEL)
+        .text(&scope.tenant().to_string())
+        .text(&scope.environment().to_string())
+        .version(i64::from(dek_version))
+        .build()
+}
+
+/// The blind-index context for an `abuse_bans.subject_bidx` (issue #64): the label, the
+/// scope, the regulated dimension KIND, and the subject value, length-prefixed. Binding
+/// the kind keeps the same string as an IP and as an identifier from colliding; the
+/// per-tenant HMAC key keeps the same subject in two tenants from colliding. For an
+/// identifier subject the value is the canonical form (the #54 seam output), so a
+/// case/unicode variant of one identity keys to the same tag.
+fn abuse_subject_bidx_aad(scope: Scope, kind: AbuseSubjectKind, value: &str) -> Aad {
+    Aad::builder()
+        .text(ABUSE_SUBJECT_BIDX_LABEL)
+        .text(&scope.tenant().to_string())
+        .text(&scope.environment().to_string())
+        .text(kind.as_str())
+        .field(value.as_bytes())
+        .build()
+}
+
+/// The deterministic blind index for a regulated subject in `scope` under `master`, the
+/// value the request-path ban lookup and the per-(kind, path) unique constraint query
+/// against `abuse_bans.subject_bidx`.
+fn abuse_subject_blind_index(
+    master: &MasterKey,
+    scope: Scope,
+    kind: AbuseSubjectKind,
+    value: &str,
+) -> BlindIndex {
+    master.blind_index(&abuse_subject_bidx_aad(scope, kind, value))
+}
+
+/// The reused `dcr_rate_counters` key for a layered abuse FAILURE counter (issue #64):
+/// `abuse:<path>:<kind>:<value>`. The identifier dimension is keyed by its per-tenant
+/// blind-index hex (never a plaintext identifier lands in the counter table); the IP
+/// and account dimensions carry their non-PII value directly, exactly as the
+/// device-verification counter keys its source (issue #24).
+fn abuse_counter_key(path: AuthPath, kind: AbuseSubjectKind, keyed_value: &str) -> String {
+    format!("abuse:{}:{}:{}", path.as_str(), kind.as_str(), keyed_value)
+}
+
+/// Lowercase-hex encoding of a blind index, for use inside an `abuse:` counter key.
+fn blind_index_hex(index: &BlindIndex) -> String {
+    let bytes = index.as_bytes();
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
 }
 
 /// Reconstruct a [`UserAdminRecord`] from a management-plane `users` row, opening
