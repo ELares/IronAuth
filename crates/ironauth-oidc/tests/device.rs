@@ -26,7 +26,7 @@ use axum::http::StatusCode;
 use common::{Harness, REDIRECT_URI, enc, form, form_field, json};
 use ironauth_config::{QuotaConfig, ScopeQuotaConfig};
 use ironauth_jose::verify;
-use ironauth_oidc::{Argon2Params, HashingPool};
+use ironauth_oidc::{Argon2Params, HashRejection, HashingPool};
 use ironauth_quota::QuotaEnforcer;
 use ironauth_store::{
     DeviceAttemptOutcome, DevicePollOutcome, DeviceUserCodeLookup, UserState, device_code_digest,
@@ -338,29 +338,33 @@ async fn unknown_user_code_is_non_oracular() {
     assert!(html.contains("not recognized"), "non-oracular: {html}");
 }
 
-/// A quota whose `PasswordHashing` ENVIRONMENT bucket admits exactly ONE hash
-/// (`burst = 1`, no refill) before shedding; the tenant envelope is generous so the
-/// environment bucket is the limiter. Draining that single admission up front makes
-/// every subsequent verify over-share (a retryable 429), the attacker-inducible
-/// hashing-overload condition.
-fn one_hash_quota() -> QuotaConfig {
-    let base = ScopeQuotaConfig {
+/// A quota config that grants the ENVIRONMENT scope exactly ONE `PasswordHashing`
+/// admission token with NO refill, every other dimension and the tenant scope unlimited
+/// (`burst 0 == unlimited`, see ironauth-quota `limit_from`). Config-derived limits do
+/// not refill, so once the test drains that single token the bucket stays empty: every
+/// subsequent hashing admission is deterministically over-share, with no token a slower
+/// or differently ordered request could still catch.
+fn one_shot_hashing_quota() -> QuotaConfig {
+    let unlimited = ScopeQuotaConfig {
         requests_per_second: 0,
         requests_burst: 0,
         token_issuance_per_second: 0,
         token_issuance_burst: 0,
         hook_seconds_per_second: 0,
         hook_seconds_burst: 0,
-        password_hashing_per_second: 0, // no refill: an exact budget.
+        password_hashing_per_second: 0,
+        password_hashing_burst: 0,
+    };
+    let environment = ScopeQuotaConfig {
+        // Exactly one admission token, no refill: a deterministic one-shot budget.
         password_hashing_burst: 1,
+        password_hashing_per_second: 0,
+        ..unlimited.clone()
     };
     QuotaConfig {
-        tenant: ScopeQuotaConfig {
-            password_hashing_burst: 1_000_000,
-            ..base.clone()
-        },
-        environment: base,
-        usage_thresholds_percent: vec![100],
+        tenant: unlimited,
+        environment,
+        usage_thresholds_percent: vec![],
         idle_bucket_ttl_secs: 0,
     }
 }
@@ -387,12 +391,14 @@ async fn device_login_is_uniform_under_hashing_overload() {
         .await;
     harness.set_user_state(&fenced, UserState::Disabled).await;
 
-    // A pool whose per-environment hashing budget admits exactly one hash before
-    // shedding; DRAIN that single admission up front (a direct pool verify), so every
-    // device verify below is over-share and sheds with a retryable 429 (the saturated-
-    // pool condition), deterministically and without depending on worker timing.
+    // Saturate admission DETERMINISTICALLY: the environment gets exactly ONE PasswordHashing
+    // token with no refill (see one_shot_hashing_quota). We drain that single token below,
+    // after which every hashing admission is over-share with no token a later request could
+    // catch, so the outcome cannot depend on machine speed, request ordering, or memory
+    // ordering (the flaky "drain then race the refill" failure mode is impossible: refill is
+    // zero).
     let quota = Arc::new(QuotaEnforcer::from_config(
-        &one_hash_quota(),
+        &one_shot_hashing_quota(),
         harness.env().clock_arc(),
     ));
     let pool = Arc::new(HashingPool::new(
@@ -402,34 +408,40 @@ async fn device_login_is_uniform_under_hashing_overload() {
         64,
         Some(quota),
     ));
-    let _ = pool
-        .verify_absent(&scope, "drain the single admission")
-        .await;
     harness.install_hashing_pool(Arc::clone(&pool));
+
+    // Drain the single admission token; with zero refill the bucket now stays empty.
+    let _ = pool.verify_absent(&scope, "drain the one admission token").await;
+
+    // Assert the saturated precondition explicitly: admission is over-share once drained. If
+    // this ever admitted, the test setup (not the code under test) would be wrong, and we
+    // fail here loudly rather than flake in the uniformity checks below.
+    let precheck = pool.verify_absent(&scope, "precondition").await;
+    assert!(
+        matches!(precheck, Err(HashRejection::Overloaded(_))),
+        "the pool must be saturated (over-share) before the probes: {precheck:?}"
+    );
 
     let path = device_path(&harness);
     // All three sign-in submissions carry an identifier+password (routing to the device
     // login step) plus a throwaway user code. A wrong password on the present user means
     // no session is minted, so every branch resolves through the (now saturated) pool.
-    let present = form(&[
-        ("identifier", "present@example.test"),
-        ("password", "nope"),
-        ("user_code", "AAAA-BBBB"),
-    ]);
-    let fenced_form = form(&[
-        ("identifier", "fenced@example.test"),
-        ("password", "nope"),
-        ("user_code", "AAAA-BBBB"),
-    ]);
-    let absent = form(&[
-        ("identifier", "absent@example.test"),
-        ("password", "nope"),
-        ("user_code", "AAAA-BBBB"),
-    ]);
-
-    let (present_status, _h, present_body) = harness.post_form(&path, &present, None).await;
-    let (fenced_status, _h, fenced_body) = harness.post_form(&path, &fenced_form, None).await;
-    let (absent_status, _h, absent_body) = harness.post_form(&path, &absent, None).await;
+    // The requests run sequentially; because admission is over-share from the first call
+    // (zero-burst override, no token to hand out), the outcome does not depend on how long
+    // the sequence takes or on the order of the three probes.
+    let form_for = |identifier: &str| {
+        form(&[
+            ("identifier", identifier),
+            ("password", "nope"),
+            ("user_code", "AAAA-BBBB"),
+        ])
+    };
+    let present = form_for("present@example.test");
+    let fenced_form = form_for("fenced@example.test");
+    let absent = form_for("absent@example.test");
+    let (present_status, _hp, present_body) = harness.post_form(&path, &present, None).await;
+    let (fenced_status, _hf, fenced_body) = harness.post_form(&path, &fenced_form, None).await;
+    let (absent_status, _ha, absent_body) = harness.post_form(&path, &absent, None).await;
 
     // Every branch sheds with the SAME retryable 429, not a mix of 429 and generic 200.
     assert_eq!(
