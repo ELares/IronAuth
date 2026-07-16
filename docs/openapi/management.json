@@ -5472,6 +5472,82 @@
         ]
       }
     },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/webauthn/mds3/health": {
+      "get": {
+        "tags": [
+          "webauthn"
+        ],
+        "summary": "Report the environment's FIDO MDS3 cache health.",
+        "operationId": "getMds3Health",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The environment's FIDO MDS3 cache health: the cached BLOB sequence number, when it was last verified, its nextUpdate, the entry count, and a fresh/stale/missing verdict against the current clock.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Mds3HealthView"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Environment not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/v1/tenants/{tenant_id}/restore": {
       "post": {
         "tags": [
@@ -6783,6 +6859,56 @@
           "id": {
             "type": "string",
             "description": "The key identifier (`mak_...`, embeds its scope; safe to display)."
+          }
+        }
+      },
+      "Mds3HealthView": {
+        "type": "object",
+        "description": "An environment's FIDO MDS3 cache health (issue #66 PR B).",
+        "required": [
+          "cached",
+          "verdict"
+        ],
+        "properties": {
+          "blob_no": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "The cached BLOB's `no` sequence number, or null when none is cached."
+          },
+          "cached": {
+            "type": "boolean",
+            "description": "Whether a verified MDS3 snapshot has been cached for this environment."
+          },
+          "entry_count": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "How many authenticator entries the cached snapshot holds, or null when none is\ncached.",
+            "minimum": 0
+          },
+          "next_update_unix_micros": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "The cached BLOB's own `nextUpdate`, unix microseconds, or null when none is\ncached."
+          },
+          "verdict": {
+            "type": "string",
+            "description": "The freshness verdict against the current clock: `fresh` when the snapshot is\nstill within its `nextUpdate` window, `stale` when it has lapsed (an operator\nshould trigger a resync), or `missing` when nothing is cached."
+          },
+          "verified_at_unix_micros": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "When the cached BLOB's signature chain was last verified, unix microseconds,\nor null when none is cached."
           }
         }
       },

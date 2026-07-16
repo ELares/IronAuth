@@ -445,6 +445,15 @@ async fn every_identity_column_is_exported_or_a_documented_non_exported_field() 
                 "nickname_sealed", // the user label of a non-portable device key
                 "created_at",      // registration time on this instance
                 "last_used_at",    // live usage state
+                // Attestation verdict (issue #66 PR B): reg-time-immutable facts about
+                // THIS registration on THIS instance (the AAGUID was allow-listed and the
+                // statement chained to the FIDO MDS3 root here). They are derived, not
+                // secret, so they export as plaintext non-PII operational device state,
+                // not portable identity: an imported passkey re-registers and is
+                // re-attested against the target instance's own policy and MDS3 cache.
+                "attestation_type", // none/self/basic: the attestation established
+                "attestation_verified", // whether the model was proven against MDS3
+                "attestation_fmt",  // none/packed: the statement format verified
             ],
         },
         // The totp_credentials registry (issue #69): a user's enrolled TOTP

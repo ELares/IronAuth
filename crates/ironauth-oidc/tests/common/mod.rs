@@ -1388,6 +1388,10 @@ impl Harness {
                     backup_state: synced,
                     discoverable: Some(true),
                     nickname: "test passkey",
+                    // Issue #66 PR B: this seed helper enrolls an unattested passkey.
+                    attestation_type: "none",
+                    attestation_verified: false,
+                    attestation_fmt: "none",
                 },
             )
             .await

@@ -35,22 +35,40 @@
 //! Verification never mutates state, so a timed-out or cancelled ceremony leaves
 //! no partial credential: the store layer persists only after `Ok`.
 //!
-//! Attestation-statement trust (MDS3, AAGUID allowlists) is deliberately OUT OF
-//! SCOPE here (issue #66); ceremonies request `attestation: "none"`.
+//! # Attestation (issue #66 PR B)
+//!
+//! Under a tenant's `direct` attestation mode, [`verify_attestation`] verifies the
+//! attestation statement (`none` and `packed` in v1; any other format fails closed
+//! under `direct`) and the [`mds3`] module verifies the FIDO Metadata Service BLOB
+//! against a compiled-in FIDO root, so a registration can be pinned to an
+//! allow-listed, cryptographically attested authenticator model. These paths stay
+//! pure (no store, no clock, no `ring`): the OIDC handler feeds them the AAGUID
+//! rules, the cached MDS3 roots, and the `env.clock()` instant. The certificate
+//! chain crypto is delegated, as ever, to the one `ring`-backed `ironauth-jose`
+//! primitive.
 
 mod attestation;
 mod authdata;
 mod client_data;
 mod cose;
+mod der;
 mod digest;
 mod encoding;
 mod error;
 mod flags;
+pub mod mds3;
 mod options;
 mod types;
 mod verify;
+mod x509;
 
-pub use attestation::extract_auth_data;
+#[cfg(test)]
+mod testpki;
+
+pub use attestation::{
+    AttestationObject, AttestationOutcome, AttestationType, extract_auth_data,
+    parse_attestation_object, verify_attestation,
+};
 pub use authdata::{AttestedCredential, AuthenticatorData, parse_authenticator_data};
 pub use client_data::{ClientData, TYPE_CREATE, TYPE_GET, validate_client_data};
 pub use cose::parse_cose_key;

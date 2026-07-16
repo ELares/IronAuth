@@ -349,6 +349,32 @@ impl ScopedKind for AttestationConfigKind {
     const PREFIX: &'static str = "atc";
 }
 
+/// Marker for a per-scope verified MDS3 BLOB cache (`mbc_`), the SINGLETON row per
+/// (tenant, environment) (issue #66, PR B): the extracted, trusted FIDO Metadata
+/// Service (MDS3) authenticator entries the 'direct' attestation path evaluates
+/// against, plus the raw-BLOB digest and the `no` sequence number a refresh
+/// supersedes on. A tenant-scoped resource: the id embeds its (tenant, environment).
+/// It is an INTERNAL cache row (never a bearer credential); the payload it points at
+/// is PUBLIC authenticator metadata, so its debug form stays legible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Mds3BlobCacheKind;
+impl ScopedKind for Mds3BlobCacheKind {
+    const PREFIX: &'static str = "mbc";
+}
+
+/// Marker for a per-scope AAGUID allow/deny rule (`aag_`), one row pinning one
+/// authenticator model (its 16-byte AAGUID) to a disposition ('allow' or 'deny')
+/// (issue #66, PR B): the 'direct' attestation path admits or refuses a specific
+/// model against these rules. A tenant-scoped resource: the id embeds its (tenant,
+/// environment). It is an INTERNAL configuration row (never a bearer credential); the
+/// values it points at are a public AAGUID and a disposition, so its debug form stays
+/// legible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct AaguidRuleKind;
+impl ScopedKind for AaguidRuleKind {
+    const PREFIX: &'static str = "aag";
+}
+
 /// Marker for a flexible login identifier (`uid_`), one row in a user's typed
 /// login-identifier set (issue #54): a verified-or-not email, username, or phone a
 /// user can log in with. A tenant-scoped resource: the identifier row id embeds its
@@ -929,6 +955,15 @@ pub type CredentialClassPolicyId = ScopedId<CredentialClassPolicyKind>;
 /// A per-scope attestation-config id (`atc_...`), one row per (tenant, environment)
 /// carrying the attestation conveyance mode (issue #66).
 pub type AttestationConfigId = ScopedId<AttestationConfigKind>;
+
+/// A per-scope MDS3 BLOB cache id (`mbc_...`), the SINGLETON verified FIDO MDS3
+/// metadata cache per (tenant, environment) the attestation path evaluates against
+/// (issue #66, PR B).
+pub type Mds3BlobCacheId = ScopedId<Mds3BlobCacheKind>;
+
+/// A per-scope AAGUID rule id (`aag_...`), one authenticator-model allow/deny rule the
+/// 'direct' attestation path consults (issue #66, PR B).
+pub type AaguidRuleId = ScopedId<AaguidRuleKind>;
 
 /// A flexible-login-identifier row id (`uid_...`), one typed login identifier
 /// (email, username, or phone) a user can authenticate with (issue #54).

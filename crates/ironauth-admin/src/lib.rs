@@ -53,6 +53,7 @@ mod idempotency;
 mod input;
 mod invitations;
 mod keys;
+mod mds3_health;
 mod migration;
 mod migration_runs;
 mod migration_status;
@@ -181,6 +182,13 @@ pub fn management_router(state: AdminState) -> Router {
         .route(
             "/v1/tenants/{tenant_id}/environments/{environment_id}/migration/progress",
             get(migration_status::get_migration_progress),
+        )
+        // The FIDO MDS3 metadata cache health (issue #66 PR B): the cached BLOB
+        // sequence number, verify time, nextUpdate, and a fresh/stale verdict.
+        // Environment-scoped, read-only. Static `webauthn/mds3/health` suffix.
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/webauthn/mds3/health",
+            get(mds3_health::get_mds3_health),
         )
         // The in-admin Argon2id tuning probe (issue #62): a host-measured parameter
         // recommendation, the same probe the CLI wraps. Environment-scoped, read-only.

@@ -54,6 +54,9 @@ fn new_credential<'a>(
         backup_state: true,
         discoverable: Some(true),
         nickname,
+        attestation_type: "none",
+        attestation_verified: false,
+        attestation_fmt: "none",
     }
 }
 

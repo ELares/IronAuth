@@ -6,6 +6,12 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- MDS3 BLOB signature primitive (issue #66 PR B): `verify_jws_signature` verifies a
+  JWS/JWT compact-serialization signature (fixed-width ES256 `r||s` per JWA, plus EdDSA
+  and RS256) for the FIDO MDS3 BLOB. It is the sibling of `verify_webauthn_signature`,
+  which stays ASN.1-DER for WebAuthn ceremony signatures; the MDS3 chain verifier calls
+  it out of band after pinning the `x5c` chain, since the JWS `verify` core deliberately
+  rejects `x5c`. `ring` stays confined to this crate.
 - RFC 6238 TOTP primitive (issue #69), a new public `totp` module. The
   second-factor code is a keyed HMAC over a time-step counter plus RFC 4226
   dynamic truncation, so it lives here for the same structural reason as

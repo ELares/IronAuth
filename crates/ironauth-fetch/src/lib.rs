@@ -141,6 +141,14 @@ pub enum FetchPurpose {
     /// external fetch: a range URL that resolves to an internal or loopback address is
     /// refused exactly like any other blocked destination.
     BreachScreening,
+    /// Fetching the FIDO Metadata Service (MDS3) BLOB for passkey attestation
+    /// verification (issue #66, PR B). The signed metadata BLOB is fetched from the FIDO
+    /// Alliance endpoint (default `https://mds3.fidoalliance.org/`, overridable per
+    /// deployment), verified once, and cached; ONLY the endpoint URL is on the wire (no
+    /// credential or user data), and the endpoint is outbound, so it rides the same
+    /// SSRF-hardened path as every other external fetch: an MDS3 URL that resolves to an
+    /// internal or loopback address is refused exactly like any other blocked destination.
+    Mds3Sync,
 }
 
 impl FetchPurpose {
@@ -157,6 +165,7 @@ impl FetchPurpose {
             FetchPurpose::KmsRequest => "kms_request",
             FetchPurpose::LazyMigration => "lazy_migration",
             FetchPurpose::BreachScreening => "breach_screening",
+            FetchPurpose::Mds3Sync => "mds3_sync",
         }
     }
 }

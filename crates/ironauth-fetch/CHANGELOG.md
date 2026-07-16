@@ -6,6 +6,9 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Add the `FetchPurpose::Mds3Sync` label (issue #66 PR B): the outbound FIDO MDS3 BLOB
+  fetch declares its own purpose so it rides the SSRF-hardened path with a distinct,
+  bounded metric label.
 - Add the `FetchPurpose::BreachScreening` label (issue #63): the online HIBP
   k-anonymity breached-password screening query is an outbound call, so it rides the same
   SSRF-hardened dispatcher as every other fetch. ONLY the 5-character SHA-1 prefix is ever

@@ -505,7 +505,9 @@ mod tests {
 
     #[test]
     fn default_order_is_the_credential_ladder() {
-        assert_eq!(default_acr_order(), vec![PWD, MFA, PHR, PHRH]);
+        // PR B (issue #66) ranks the attested_passkey acr at the TOP (strongest), so
+        // strictest-wins composition of an attested floor with any ranked floor is exact.
+        assert_eq!(default_acr_order(), vec![PWD, MFA, PHR, PHRH, ATTESTED]);
     }
 
     #[test]
@@ -670,22 +672,110 @@ mod tests {
     }
 
     #[test]
-    fn a_dormant_attested_class_floor_fails_closed() {
-        // The `attested_passkey` class maps to an unranked acr while the rung is dormant
-        // (PR A), so NO achievable method satisfies it and it is NOT achievable at all:
-        // the gate fails closed (Remediation::Fail), never mints an under-class token.
+    fn the_attested_class_floor_is_ranked_at_the_top_and_only_an_attested_login_meets_it() {
+        // PR B (issue #66) activates and RANKS the attested rung at the top of the default
+        // order, so the `attested_passkey` class floor is now achievable and EXACT: no
+        // weaker acr satisfies it, and only the attested acr does.
         let order = order();
         let attested_floor = authn::acr_for_class(authn::CredentialClass::AttestedPasskey);
         assert_eq!(attested_floor, ATTESTED);
+        // No below-attested acr satisfies the attested floor (a below-attested session
+        // can never mint an attested token).
         for achieved in [PWD, MFA, PHR, PHRH] {
             assert!(
                 !acr_satisfies(achieved, attested_floor, &order),
-                "{achieved} must not satisfy the dormant attested floor"
+                "{achieved} must not satisfy the attested floor"
             );
         }
-        assert!(
-            !floor_is_achievable(attested_floor, &order),
-            "the attested floor is unachievable while the rung is dormant (fail closed)"
+        // Only an attested login satisfies it, and the floor is achievable (the rung is
+        // active), so the gate steers a passkey ceremony rather than failing outright.
+        assert!(acr_satisfies(ATTESTED, attested_floor, &order));
+        assert!(floor_is_achievable(attested_floor, &order));
+    }
+
+    #[test]
+    fn strictest_wins_is_exact_when_an_attested_floor_composes_with_a_ranked_floor() {
+        // The PR A degrade fix: with the attested acr ranked at the top, folding an
+        // attested class floor with a ranked step-up floor (phrh) keeps the STRONGER
+        // (attested) floor, so strictest-wins is exact (attested dominates phrh), not a
+        // collapse to the ranked floor.
+        let order = order();
+        let attested_floor = authn::acr_for_class(authn::CredentialClass::AttestedPasskey);
+        let mut requirement = AuthnRequirement {
+            min_acr: Some(PHRH.to_owned()),
+            max_auth_age_secs: None,
+        };
+        requirement.merge_stronger(
+            &AuthnRequirement {
+                min_acr: Some(attested_floor.to_owned()),
+                max_auth_age_secs: None,
+            },
+            &order,
+        );
+        assert_eq!(
+            requirement.min_acr.as_deref(),
+            Some(ATTESTED),
+            "the attested floor dominates a ranked phrh floor (exact strictest-wins)"
+        );
+        // And the reverse merge order yields the same dominant floor.
+        let mut reverse = AuthnRequirement {
+            min_acr: Some(attested_floor.to_owned()),
+            max_auth_age_secs: None,
+        };
+        reverse.merge_stronger(
+            &AuthnRequirement {
+                min_acr: Some(PHRH.to_owned()),
+                max_auth_age_secs: None,
+            },
+            &order,
+        );
+        assert_eq!(reverse.min_acr.as_deref(), Some(ATTESTED));
+    }
+
+    #[test]
+    fn an_attested_login_satisfies_an_attested_class_floor_but_a_plain_passkey_does_not() {
+        // The full reconciliation contract, end to end through the enforcement layer:
+        // a tenant policy requiring the attested_passkey class folds to the attested acr
+        // floor; an ATTESTED login satisfies it (its recorded method achieves the attested
+        // acr AND satisfied_class folds to AttestedPasskey, in agreement), while a plain UV
+        // passkey WITHOUT attestation achieves only phr/phrh, folds to Passkey, and does
+        // NOT satisfy the floor. This is the reconciled path: the two enforcement views
+        // (achieved acr and satisfied class) agree in both directions.
+        let order = order();
+        let required = authn::required_class([authn::CredentialClass::AttestedPasskey]);
+        let floor = authn::acr_for_class(required);
+        assert_eq!(floor, ATTESTED);
+
+        // An attested login (its stored attestation fact drove the recorded method).
+        let attested = authn::AuthenticationEvent::attested_passkey(1, false, true);
+        assert!(acr_satisfies(
+            authn::achieved_acr(attested.methods()),
+            floor,
+            &order
+        ));
+        let attested_facts = authn::CredentialFacts {
+            require_user_verification: true,
+            attestation_verified: true,
+        };
+        assert_eq!(
+            authn::satisfied_class(&attested, &attested_facts),
+            authn::CredentialClass::AttestedPasskey
+        );
+
+        // A plain UV passkey without attestation: neither view reaches the attested rung.
+        let plain = authn::AuthenticationEvent::passkey(1, false, true);
+        assert!(!acr_satisfies(
+            authn::achieved_acr(plain.methods()),
+            floor,
+            &order
+        ));
+        let plain_facts = authn::CredentialFacts {
+            require_user_verification: true,
+            attestation_verified: false,
+        };
+        assert_ne!(
+            authn::satisfied_class(&plain, &plain_facts),
+            authn::CredentialClass::AttestedPasskey
         );
     }
 

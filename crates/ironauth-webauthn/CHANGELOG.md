@@ -6,6 +6,15 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Attestation policy and FIDO MDS3 (issue #66 PR B): `verify_attestation` now verifies
+  the attestation statement under a tenant's `direct` mode, supporting `none` and
+  `packed` (WebAuthn L3 section 8.2) and failing closed on any other format; the new
+  `mds3` module verifies the FIDO Metadata Service BLOB (a JWS with an `x5c` chain)
+  against a pinned FIDO root and returns the per-AAGUID attestation roots. An in-tree
+  minimal DER reader (`der`) and X.509 chain verifier (`x509`) anchor both, with every
+  certificate-signature check delegated to `ironauth-jose` so `ring` stays confined.
+  Ships the AAGUID-spoof, chain-to-wrong-root, expired-certificate, and tampered-BLOB
+  adversarial tests over a self-generated Ed25519 test PKI.
 - Related-origin coverage (issue #67): a `client_data` test documents that with the
   serving origin AND a related origin in the allowed set, a ceremony from either
   verifies while an unlisted origin still fails with `OriginMismatch`. No code change:

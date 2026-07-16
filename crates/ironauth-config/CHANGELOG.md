@@ -6,6 +6,10 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- MDS3 endpoint override (issue #66 PR B): `webauthn.mds3_base_url` (optional, validated
+  as an https URL, mirroring `hibp_base_url`) lets a deployment point the FIDO MDS3 sync
+  at an alternate endpoint; the pinned FIDO Alliance root stays compiled in and is never
+  fetched.
 - Guarded SMS-OTP settings note (issue #70, adversarial review LOW-3): the
   `oidc.sms_route_throttle_secs` / `oidc.sms_conversion_window_secs` relationship is now
   safe by construction. A `throttle_secs < conversion_window_secs` ratio was previously a

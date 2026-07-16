@@ -165,4 +165,6 @@ pub use totp::{
     grouped_secret, provisioning_uri, verify as verify_totp,
 };
 pub use verify::{VerifiedToken, verify};
-pub use webauthn::{WebauthnKey, WebauthnSignatureError, verify_webauthn_signature};
+pub use webauthn::{
+    WebauthnKey, WebauthnSignatureError, verify_jws_signature, verify_webauthn_signature,
+};

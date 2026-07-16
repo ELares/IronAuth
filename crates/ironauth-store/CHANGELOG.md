@@ -6,6 +6,16 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Passkey attestation schema (issue #66 PR B): migration 0051 adds `mds3_blob_cache`
+  (the per-scope verified FIDO MDS3 snapshot, RLS forced, singleton per scope) and
+  `aaguid_rules` (per-scope AAGUID allow/deny, RLS forced), and three reg-time-immutable
+  `webauthn_credentials` columns (`attestation_type`, `attestation_verified`,
+  `attestation_fmt`) that are INSERT-only and deliberately omitted from every GRANT
+  UPDATE (the attestation verdict cannot be inflated post-registration). New scoped
+  repositories for the cache and the rules, the three attestation fields on
+  `NewWebauthnCredential`, and `attestation_verified` on the assertion target so a
+  passkey login can record the attested rung. Both new tables registered in
+  `scripts/query-audit.sh` and the migration guard test.
 - Guarded SMS-OTP conversion counter hardening (issue #70, adversarial review LOW-3):
   `record_send` now RE-ARMS the route's low-conversion alarm within a still-open window.
   When the previous `throttled_until` has lapsed but the conversion window has not yet
