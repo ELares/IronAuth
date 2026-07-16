@@ -47,6 +47,7 @@
 //! `query!` macros), so every database-free CI lane stays database-free; a live
 //! database is needed only to run the integration tests.
 
+pub mod abuse;
 pub mod audit;
 pub mod classification;
 pub mod custom_domain;
@@ -74,6 +75,7 @@ pub mod idor_harness;
 #[cfg(feature = "testing")]
 pub mod test_support;
 
+pub use abuse::{AbuseBanView, AbuseSubject, AbuseSubjectKind, AuthPath, NewBan};
 pub use audit::{ActingContext, Action, ActorRef};
 pub use classification::{ResourceClassification, ResourceLevel, ResourceType, classify};
 pub use custom_domain::{
@@ -90,8 +92,8 @@ pub use esv::{
     reference_resolves, resolve_value,
 };
 pub use id::{
-    AcmeChallengeId, AcmeChallengeKind, AgentId, AgentKind, AssertionMappingId,
-    AssertionMappingKind, AuditId, AuditKind, AuditTarget, AuthorizationCodeId,
+    AbuseBanId, AbuseBanKind, AcmeChallengeId, AcmeChallengeKind, AgentId, AgentKind,
+    AssertionMappingId, AssertionMappingKind, AuditId, AuditKind, AuditTarget, AuthorizationCodeId,
     AuthorizationCodeKind, BackChannelDeliveryId, BackChannelDeliveryKind, COMPONENT_BYTES,
     ClientId, ClientKind, ClientSessionId, ClientSessionKind, ConsentId, ConsentKind,
     CorrelationId, CorrelationKind, CredentialId, CredentialKind, CustomDomainId, CustomDomainKind,
@@ -121,10 +123,11 @@ pub use promotion::{
 };
 pub use redirect::{redirect_uri_is_registrable, redirect_uri_matches};
 pub use repository::{
-    AcceptedInvitation, AccessTokenResolution, AccountCredentialRepo, AccountCredentialSummary,
-    ActingAccountCredentialRepo, ActingAssertionSubjectMappingRepo, ActingAuthorizationRepo,
-    ActingClientRepo, ActingConsentRepo, ActingCustomDomainRepo, ActingDcrPolicyRepo,
-    ActingDeviceCodeRepo, ActingEnvelopeRepo, ActingEnvironmentRepo, ActingEnvironmentSecretRepo,
+    AbuseRepo, AcceptedInvitation, AccessTokenResolution, AccountCredentialRepo,
+    AccountCredentialSummary, ActingAbuseRepo, ActingAccountCredentialRepo,
+    ActingAssertionSubjectMappingRepo, ActingAuthorizationRepo, ActingClientRepo,
+    ActingConsentRepo, ActingCustomDomainRepo, ActingDcrPolicyRepo, ActingDeviceCodeRepo,
+    ActingEnvelopeRepo, ActingEnvironmentRepo, ActingEnvironmentSecretRepo,
     ActingEnvironmentVariableRepo, ActingExternalAssertionIssuerRepo, ActingInitialAccessTokenRepo,
     ActingInvitationRepo, ActingManagementCredentialRepo, ActingManagementStore,
     ActingMigrationRunRepo, ActingOrganizationRepo, ActingPushedRequestRepo, ActingRefreshRepo,

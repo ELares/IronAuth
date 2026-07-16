@@ -601,6 +601,18 @@ pub enum Action {
     /// attributed to the end user; the `detail` records the step-up policy the
     /// sensitive change declared.
     AccountSessionsRevokeOthers,
+    /// A credential-abuse BAN was placed on a regulated dimension (issue #64): an
+    /// operator, through the CLI or the admin API, banned an attacker IP, an account,
+    /// or a canonical identifier on ONE authentication path. The row targets the
+    /// `abn_` ban; the `detail` records the banned dimension and path (never the
+    /// plaintext subject, which is sealed on the row). The per-path scope is the
+    /// account-DoS safeguard: a `password` ban never governs the `passkey` or
+    /// `recovery` path (Keycloak CVE-2024-1722).
+    AbuseBanCreate,
+    /// A credential-abuse ban was LIFTED (issue #64): an operator un-banned a
+    /// previously banned dimension and path through the CLI or admin API. The row
+    /// targets the `abn_` ban; the `detail` records the dimension and path.
+    AbuseBanLift,
 }
 
 impl Action {
@@ -732,6 +744,8 @@ impl Action {
             Action::WebauthnBackupEligibilityMismatch => "webauthn.backup_eligibility.mismatch",
             Action::AccountSessionRevoke => "account.session.revoke",
             Action::AccountSessionsRevokeOthers => "account.sessions.revoke_others",
+            Action::AbuseBanCreate => "abuse.ban.create",
+            Action::AbuseBanLift => "abuse.ban.lift",
         }
     }
 }

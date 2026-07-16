@@ -312,7 +312,7 @@ async fn expand_contract_example_chain_runs_all_three_phases_and_contract_remove
 // per real table); splitting it would not make it clearer.
 #[allow(clippy::too_many_lines)]
 #[tokio::test]
-async fn production_chain_is_only_the_forty_four_real_migrations_and_ships_no_demo_object() {
+async fn production_chain_is_only_the_forty_five_real_migrations_and_ships_no_demo_object() {
     // TestDatabase::start runs Store::migrate() (the production chain) on a
     // fresh, empty database.
     let db = TestDatabase::start().await;
@@ -329,8 +329,8 @@ async fn production_chain_is_only_the_forty_four_real_migrations_and_ships_no_de
     );
     assert_eq!(
         report.already_applied(),
-        44,
-        "the production chain is exactly forty-four migrations (isolation, audit log, management \
+        45,
+        "the production chain is exactly forty-five migrations (isolation, audit log, management \
          API, OIDC authorization, signing keys, login/consent, authentication context, redirect \
          registration, UserInfo claims, consent scope upsert, resource servers, opaque access \
          tokens, client auth suite, dynamic client registration, pushed authorization requests, \
@@ -341,15 +341,15 @@ async fn production_chain_is_only_the_forty_four_real_migrations_and_ships_no_de
          snapshot export, custom domains, environment secrets and variables, config promotion, \
          self-service account, admin user lifecycle, identity traits, foreign password \
          import, user invitations, flexible identifiers, exit-export credential grants, \
-         migration state machine, webauthn credentials)"
+         migration state machine, webauthn credentials, credential abuse defenses)"
     );
 
-    // The ledger holds exactly versions 1 through 44.
+    // The ledger holds exactly versions 1 through 45.
     assert_eq!(
         applied_versions(pool).await,
         vec![
             1_i64, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
-            24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44
+            24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45
         ]
     );
     let phase_of = |version: i64| async move {
@@ -514,6 +514,9 @@ async fn production_chain_is_only_the_forty_four_real_migrations_and_ships_no_de
     // The WebAuthn passkey migration (issue #65) is an EXPAND: two new tenant-scoped
     // tables, no rewrite of existing state.
     assert_eq!(phase_of(44).await, "expand");
+    // The credential-abuse-defenses migration (issue #64) is an EXPAND: one new
+    // tenant-scoped ban table, no rewrite of existing state.
+    assert_eq!(phase_of(45).await, "expand");
 
     // The demo object never reaches a production database.
     assert!(
@@ -1655,6 +1658,54 @@ async fn production_chain_is_only_the_forty_four_real_migrations_and_ships_no_de
         .await,
         "webauthn_challenges must carry the ceremony-known CHECK constraint"
     );
+
+    // The credential-abuse ban registry (issue #64, migration 0045).
+    assert!(
+        table_exists(pool, "abuse_bans").await,
+        "abuse_bans exists after 0045"
+    );
+    for column in [
+        "id",
+        "subject_kind",
+        "subject_bidx",
+        "subject_sealed",
+        "pii_dek_version",
+        "auth_path",
+        "reason",
+        "expires_at",
+        "created_at",
+    ] {
+        assert!(
+            column_exists(pool, "abuse_bans", column).await,
+            "abuse_bans.{column} exists after 0045"
+        );
+    }
+    // The regulated subject is PII (an identifier / IP): it is sealed and blind-indexed,
+    // never a plaintext column.
+    for forbidden in ["subject", "identifier", "ip", "email", "account_id"] {
+        assert!(
+            !column_exists(pool, "abuse_bans", forbidden).await,
+            "abuse_bans must have no plaintext subject column ({forbidden})"
+        );
+    }
+    assert!(
+        rls_enabled_and_forced(pool, "abuse_bans").await,
+        "abuse_bans must ENABLE and FORCE row-level security"
+    );
+    assert!(
+        policy_exists(pool, "abuse_bans", "abuse_bans_tenant_isolation").await,
+        "the (tenant, environment) isolation policy must exist on abuse_bans"
+    );
+    for constraint in [
+        "abuse_bans_scope_nonempty",
+        "abuse_bans_subject_kind_known",
+        "abuse_bans_auth_path_known",
+    ] {
+        assert!(
+            check_constraint_exists(pool, "abuse_bans", constraint).await,
+            "abuse_bans must carry the {constraint} CHECK constraint"
+        );
+    }
 }
 
 #[tokio::test]

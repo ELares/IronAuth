@@ -6,6 +6,20 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Credential-abuse defenses (issue #64): a new `abuse` module with the counter INTERFACE
+  (`CounterStore` trait + in-process L1 `MemoryCounterStore`, shaped so an optional
+  IronCache L2 slots in behind the same trait later), the risk-based escalation
+  (`escalating_delay`, `RegulationSettings`), and the documented fail-open/closed matrix
+  (per-IP fails OPEN / availability-biased; per-identifier, per-account, and the ban check
+  fail CLOSED / security-biased). `login_post`, `register_post`, and a NEW anti-enumeration
+  recovery surface (`GET`/`POST /recover`) key regulation on the CANONICAL identifier (the
+  #54 seam) and the non-forgeable resolved peer IP (the #31 lesson), per authentication
+  PATH, so failed-password spray throttles ONLY the password path and never the passkey or
+  recovery path (the account-DoS safeguard, Keycloak CVE-2024-1722). Anti-enumeration is
+  uniform across login, registration, and recovery (byte-identical present vs absent), and
+  a new `VerificationSender` seam suppresses a send to an unknown recipient under closed
+  registration while returning the identical acknowledgment (the Logto pattern). Throttled
+  responses carry the standard rate-limit headers (reusing the quota crate's contract).
 - Argon2id hashing pool with per-tenant fair-share admission (issue #62): password
   hashing, the hottest and most denial-of-service-prone operation, now runs in a
   dedicated worker pool (`HashingPool`) of fixed OS threads kept OFF the async request

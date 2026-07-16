@@ -823,6 +823,282 @@
         ]
       }
     },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/abuse/bans": {
+      "get": {
+        "tags": [
+          "abuse"
+        ],
+        "summary": "List the active credential-abuse bans under an environment.",
+        "operationId": "listBans",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The active bans",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BanList"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Environment not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      },
+      "post": {
+        "tags": [
+          "abuse"
+        ],
+        "summary": "Place a durable credential-abuse ban.",
+        "operationId": "createBan",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateBanRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Ban placed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BanView"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Environment not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The subject is already banned on this path",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/abuse/bans/lift": {
+      "post": {
+        "tags": [
+          "abuse"
+        ],
+        "summary": "Lift a credential-abuse ban.",
+        "operationId": "liftBan",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LiftBanRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Lift processed (idempotent)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LiftBanView"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Environment not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/v1/tenants/{tenant_id}/environments/{environment_id}/clients/{client_id}": {
       "get": {
         "tags": [
@@ -5505,6 +5781,69 @@
           }
         }
       },
+      "BanList": {
+        "type": "object",
+        "description": "A page of bans.",
+        "required": [
+          "bans"
+        ],
+        "properties": {
+          "bans": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/BanView"
+            },
+            "description": "The active bans, newest first."
+          }
+        }
+      },
+      "BanView": {
+        "type": "object",
+        "description": "A single ban, subject opened for the authorized operator.",
+        "required": [
+          "id",
+          "subject_kind",
+          "subject",
+          "auth_path",
+          "reason",
+          "created_at_unix_ms"
+        ],
+        "properties": {
+          "auth_path": {
+            "type": "string",
+            "description": "The authentication path the ban governs."
+          },
+          "created_at_unix_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "When the ban was placed, in Unix milliseconds."
+          },
+          "expires_at_unix_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "The auto-expiry instant in Unix milliseconds, or null for a permanent ban."
+          },
+          "id": {
+            "type": "string",
+            "description": "The `abn_` ban id."
+          },
+          "reason": {
+            "type": "string",
+            "description": "The operator-safe reason."
+          },
+          "subject": {
+            "type": "string",
+            "description": "The opened subject value."
+          },
+          "subject_kind": {
+            "type": "string",
+            "description": "The regulated dimension."
+          }
+        }
+      },
       "BulkRevocationView": {
         "type": "object",
         "description": "The result of a BULK session revocation (issue #32). States the post-condition; see\n[`SessionRevocationView`] for why.",
@@ -5570,6 +5909,44 @@
             ],
             "format": "int64",
             "description": "When the client was verified, milliseconds since the Unix epoch, or null if\nnever verified."
+          }
+        }
+      },
+      "CreateBanRequest": {
+        "type": "object",
+        "description": "The request body to place a ban.",
+        "required": [
+          "subject_kind",
+          "subject",
+          "auth_path"
+        ],
+        "properties": {
+          "auth_path": {
+            "type": "string",
+            "description": "The authentication path the ban governs: `password`, `passkey`, `recovery`,\n`register`, or `all`. A per-path ban is the account-DoS safeguard."
+          },
+          "expires_in_secs": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Seconds until the ban auto-expires (optional; omitted = permanent)."
+          },
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "An operator-safe reason (optional)."
+          },
+          "subject": {
+            "type": "string",
+            "description": "The subject value (an IP, a `usr_` id, or a login identifier; an identifier is\ncanonicalized to match the login path)."
+          },
+          "subject_kind": {
+            "type": "string",
+            "description": "The regulated dimension: `ip`, `account`, or `identifier`."
           }
         }
       },
@@ -6273,6 +6650,42 @@
           "user_id": {
             "type": "string",
             "description": "The `pending_verification` user (`usr_...`) this invitation provisions and\nactivates on accept."
+          }
+        }
+      },
+      "LiftBanRequest": {
+        "type": "object",
+        "description": "The request body to lift a ban.",
+        "required": [
+          "subject_kind",
+          "subject",
+          "auth_path"
+        ],
+        "properties": {
+          "auth_path": {
+            "type": "string",
+            "description": "The authentication path the ban governs."
+          },
+          "subject": {
+            "type": "string",
+            "description": "The subject value (an identifier is canonicalized to match the ban)."
+          },
+          "subject_kind": {
+            "type": "string",
+            "description": "The regulated dimension: `ip`, `account`, or `identifier`."
+          }
+        }
+      },
+      "LiftBanView": {
+        "type": "object",
+        "description": "The result of a lift.",
+        "required": [
+          "lifted"
+        ],
+        "properties": {
+          "lifted": {
+            "type": "boolean",
+            "description": "Whether an active ban was actually removed (false = nothing matched, idempotent)."
           }
         }
       },

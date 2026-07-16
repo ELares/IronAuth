@@ -356,6 +356,37 @@ pub fn register_page(
     )
 }
 
+/// The minimal account-recovery request page (issue #64): a single identifier field
+/// posting to `/recover`. The identifier and `return_to` are escaped. Whatever a user
+/// submits, the response is the SAME uniform acknowledgment (an existing account is never
+/// distinguishable from an unknown one).
+#[must_use]
+pub fn recover_page(
+    identifier: &str,
+    return_to: &str,
+    error: Option<&str>,
+    hints: &InteractionHints,
+    environment_banner: Option<&str>,
+) -> String {
+    let body = format!(
+        "<h1>Recover account</h1>{error}\
+         <form method=\"post\" action=\"/recover\">{return_to}\
+         <p><label>Identifier <input type=\"text\" name=\"identifier\" value=\"{identifier}\" \
+         autocomplete=\"username\" required></label></p>\
+         <p><button type=\"submit\">Send recovery instructions</button></p></form>",
+        error = error_banner(error),
+        return_to = return_to_field(return_to),
+        identifier = escape_html(identifier),
+    );
+    document(
+        "Recover account",
+        &body,
+        hints.lang(),
+        hints.display().as_str(),
+        environment_banner,
+    )
+}
+
 /// The minimal consent page: shows the client's display name and the requested
 /// scopes, with Allow and Deny buttons posting to `/consent`. Every reflected
 /// value (client name, each scope, `return_to`) is escaped. `hints` is the typed

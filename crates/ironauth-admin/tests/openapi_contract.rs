@@ -47,6 +47,7 @@ fn operation_ids_are_the_stable_set() {
         vec![
             "applyConfigPromotion",
             "bulkRevokeSessions",
+            "createBan",
             "createDcrInitialAccessToken",
             "createDcrPolicy",
             "createEnvironment",
@@ -74,7 +75,9 @@ fn operation_ids_are_the_stable_set() {
             "getSession",
             "getTenant",
             "getUser",
+            "liftBan",
             "linkUserExternalId",
+            "listBans",
             "listDcrPolicies",
             "listEnvironments",
             "listInvitations",
@@ -224,6 +227,7 @@ fn documented_paths_are_the_expected_set() {
             "GET /v1/tenants/{tenant_id}",
             "GET /v1/tenants/{tenant_id}/environments",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}",
+            "GET /v1/tenants/{tenant_id}/environments/{environment_id}/abuse/bans",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/clients/{client_id}",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/config/snapshot",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/dcr/policies",
@@ -247,6 +251,8 @@ fn documented_paths_are_the_expected_set() {
             "PATCH /v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}",
             "POST /v1/tenants",
             "POST /v1/tenants/{tenant_id}/environments",
+            "POST /v1/tenants/{tenant_id}/environments/{environment_id}/abuse/bans",
+            "POST /v1/tenants/{tenant_id}/environments/{environment_id}/abuse/bans/lift",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/clients/{client_id}/verify",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/config/promotion/apply",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/config/promotion/plan",
@@ -306,7 +312,7 @@ fn committed_artifact_matches_generated_spec() {
 async fn served_routes_match_documented_routes() {
     let router = db_free_router();
     let documented = documented_method_paths();
-    assert_eq!(documented.len(), 57, "the documented route count is pinned");
+    assert_eq!(documented.len(), 60, "the documented route count is pinned");
 
     // The OUTBOUND lazy-migration endpoint (issue #58) is the one documented route
     // that is NOT gated by the management `Principal` at 401. It is DISABLED BY

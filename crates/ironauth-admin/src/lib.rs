@@ -42,6 +42,7 @@
 //! `ironauth_store::Store::management` and `docs/adr/0005-management-api.md`.
 
 mod auth;
+mod bans;
 mod config;
 mod dcr;
 mod environments;
@@ -320,6 +321,16 @@ pub fn management_router(state: AdminState) -> Router {
         .route(
             "/v1/tenants/{tenant_id}/environments/{environment_id}/refresh-families/{family_id}",
             get(sessions::get_refresh_family),
+        )
+        // Credential-abuse ban management (issue #64). The static `/lift` suffix is
+        // registered before it could be read as a parameterized sibling.
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/abuse/bans/lift",
+            post(bans::lift_ban),
+        )
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/abuse/bans",
+            post(bans::create_ban).get(bans::list_bans),
         )
         .route("/openapi.json", get(serve_openapi))
         .layer(from_fn(ratelimit::rate_limit_headers))

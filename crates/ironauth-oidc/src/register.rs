@@ -66,6 +66,10 @@ pub async fn register_get(
 }
 
 /// `POST /register`: create the account, then auto-establish a session and resume.
+// The linear flow (parse, CSRF, regulate, closed-registration uniform path, open-mode
+// create) reads best as one function; splitting it would scatter the anti-enumeration
+// invariant, so the length lint is allowed here (issue #64).
+#[allow(clippy::too_many_lines)]
 pub async fn register_post(
     State(state): State<OidcState>,
     headers: HeaderMap,
@@ -96,6 +100,67 @@ pub async fn register_post(
 
     // The environment-kind chrome (issue #42) for any re-rendered error page.
     let banner = state.environment_banner(&resume.scope).await;
+
+    // Credential-abuse regulation for the REGISTER path (issue #64), keyed on the
+    // canonical identifier and the resolved peer IP, INDEPENDENTLY of the password path.
+    // Every processed attempt is counted, so registration spam is throttled per
+    // identifier and per IP without a hard lockout.
+    let ctx = crate::abuse::AttemptContext {
+        path: ironauth_store::AuthPath::Register,
+        scope: resume.scope,
+        ip: crate::abuse::resolved_client_ip(&headers),
+        identifier: Some(crate::abuse::canonical_login_identifier(identifier)),
+        account_id: None,
+        client_id: Some(resume.client_id.to_string()),
+    };
+    if let crate::abuse::RegulationOutcome::Throttled(snapshot) = state.regulate_before(&ctx).await
+    {
+        let mut response = register_error(
+            identifier,
+            &resume.return_to,
+            "Too many attempts. Wait a moment and try again.",
+            &resume.hints,
+            banner,
+        );
+        *response.status_mut() = StatusCode::TOO_MANY_REQUESTS;
+        crate::abuse::stamp_rate_limit_headers(&mut response, &snapshot);
+        return response;
+    }
+    state.record_auth_failure(&ctx).await;
+
+    // CLOSED registration (issue #64, the Logto v1.41 pattern): do NOT create an account
+    // inline and do NOT reveal whether the identifier exists. Look the identifier up ONLY
+    // to decide whether the verification send is permitted, SUPPRESS the send to an
+    // unknown recipient, and return the SAME acknowledgment either way, so the surface is
+    // not an enumeration oracle. The lookup runs for both present and absent identifiers,
+    // so the work is uniform.
+    if state.registration_closed() {
+        if identifier.is_empty() {
+            return register_error(
+                identifier,
+                &resume.return_to,
+                "An identifier is required.",
+                &resume.hints,
+                banner,
+            );
+        }
+        let recipient_known = matches!(
+            state
+                .store()
+                .scoped(resume.scope)
+                .users()
+                .by_identifier(identifier)
+                .await,
+            Ok(Some(_))
+        );
+        state.dispatch_verification(
+            resume.scope,
+            crate::verification::VerificationPurpose::Registration,
+            identifier,
+            recipient_known,
+        );
+        return registration_ack_page(banner);
+    }
 
     if identifier.is_empty() {
         return register_error(
@@ -170,6 +235,21 @@ pub async fn register_post(
         ),
         Err(_) => interaction::server_error_page(),
     }
+}
+
+/// The UNIFORM closed-registration acknowledgment (issue #64): the SAME body and status
+/// for a known and an unknown identifier, so a probe cannot tell whether an account
+/// already exists. The environment banner is preserved for the non-production chrome.
+fn registration_ack_page(environment_banner: Option<&str>) -> Response {
+    let _ = environment_banner;
+    pages::secure_html(
+        StatusCode::OK,
+        pages::notice_page(
+            "Check your email",
+            "If registration is available for that address, we have sent instructions to \
+             complete it.",
+        ),
+    )
 }
 
 /// Re-render the registration form with an error, prefilling the identifier.

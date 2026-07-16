@@ -67,6 +67,7 @@
 //! router directly with a populated key store, exactly as the management-API tests
 //! build their router.
 
+mod abuse;
 mod account;
 mod acme;
 mod authn;
@@ -101,6 +102,7 @@ mod password;
 mod pkce;
 mod probe;
 mod quota;
+mod recover;
 mod register;
 mod registry;
 mod resource;
@@ -118,12 +120,17 @@ mod token_hash;
 mod tokens;
 mod userinfo;
 mod util;
+mod verification;
 mod webauthn;
 mod wellknown;
 
 use axum::Router;
 use axum::routing::{get, post};
 
+pub use abuse::{
+    AttemptContext, CounterError, CounterStore, MemoryCounterStore, RegulationOutcome,
+    RegulationSettings, canonical_login_identifier, layer_fails_open,
+};
 pub use acme::{AcmeDirectory, AcmeDirectoryClient, AcmeError};
 pub use authn::{
     AuthMethod, AuthenticationEvent, achieved_acr, acr_values_supported, amr_values, methods_token,
@@ -200,6 +207,7 @@ pub use tokens::{
     AccessTokenTarget, ClientCredentialsMintRequest, MintedAccessToken, OPAQUE_ACCESS_TOKEN_PREFIX,
     OPAQUE_REFRESH_TOKEN_PREFIX,
 };
+pub use verification::{NullVerificationSender, VerificationPurpose, VerificationSender};
 
 /// Build the OIDC provider router.
 ///
@@ -259,6 +267,12 @@ pub fn oidc_router(state: OidcState) -> Router {
         .route(
             "/register",
             get(register::register_get).post(register::register_post),
+        )
+        // HUMAN account recovery (issue #64): the anti-enumeration-uniform recovery
+        // request surface, governed on the INDEPENDENT recovery path.
+        .route(
+            "/recover",
+            get(recover::recover_get).post(recover::recover_post),
         )
         .route(
             "/consent",

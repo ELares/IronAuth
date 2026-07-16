@@ -6,6 +6,13 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Credential-abuse ban management (issue #64): new environment-scoped endpoints
+  `POST`/`GET /v1/tenants/{tenant}/environments/{environment}/abuse/bans` and
+  `POST .../abuse/bans/lift` to place, list, and lift durable credential-abuse bans, the
+  management-plane parity for the CLI ban commands. Each writes through the SAME audited
+  store repository; an identifier subject is canonicalized through the login seam so an
+  admin ban matches the form the request path checks, and a listed subject is opened from
+  its envelope seal. OpenAPI spec and the committed artifact regenerated.
 - In-admin Argon2id tuning probe (issue #62): a new env-scoped, permission-gated
   `POST /v1/tenants/{tenant}/environments/{environment}/password-hashing/probe` runs the
   host-measured `ironauth_oidc::run_probe` (on a blocking thread, never inline on the

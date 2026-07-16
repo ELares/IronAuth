@@ -6,6 +6,18 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Credential-abuse defenses (issue #64): migration 0045 adds the durable, tenant-scoped
+  `abuse_bans` registry (forced RLS, the (tenant, environment) isolation policy, the
+  nonempty-scope and closed-set CHECKs, and column-scoped grants). The ban subject (an
+  identifier, an account, or an IP) is envelope-sealed and keyed by a per-tenant HMAC
+  blind index, never plaintext (#48). `AbuseRepo` (read) offers the request-path ban
+  check, the CLI/admin listing, and the layered per-IP/per-account/per-identifier failure
+  counters (reusing the generic `dcr_rate_counters` fixed-window table with an `abuse:`
+  key namespace, so they survive a restart); `ActingAbuseRepo` (write) places and lifts a
+  ban, each an audited write (`abuse.ban.create` / `abuse.ban.lift`). Bans and counters
+  are keyed per authentication PATH, so a `password` ban never governs the `passkey` or
+  `recovery` path (the account-DoS safeguard, Keycloak CVE-2024-1722). New public types:
+  `AbuseSubject`, `AbuseSubjectKind`, `AuthPath`, `NewBan`, `AbuseBanView`, `AbuseBanId`.
 - `UserRepo::rehash_native_password` (issue #62): lands the transparent upgrade of a
   NATIVE Argon2id credential to the current hashing parameters after a successful login.
   It writes the recomputed verifier onto `password_hash` and audits one

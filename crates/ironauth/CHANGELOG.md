@@ -6,6 +6,12 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- `ban` / `unban` / `bans` subcommands (issue #64): place, lift, and list durable
+  credential-abuse bans directly against the data-plane store, each an audited write. An
+  identifier subject is canonicalized through the login seam so a CLI ban matches the form
+  the request path checks, and a `--path` scopes the ban to one authentication path
+  (default `password`), so a CLI lockout never blocks the passkey or recovery path. The
+  admin API offers the same operations over HTTP; both write through the SAME repository.
 - Wire the Argon2id hashing pool (issue #62): when the OIDC provider is mounted, the boot
   path builds ONE `HashingPool` from `[password_hashing]` (worker count from
   `pool_threads`, or the host core count when 0; the configured Argon2id parameters and

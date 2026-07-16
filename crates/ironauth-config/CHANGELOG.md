@@ -6,6 +6,14 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- `[oidc.regulation]` settings (issue #64): a new `RegulationConfig` table for
+  credential-abuse regulation and the anti-enumeration posture. The DEFAULT is
+  account-DoS-safe: risk-based escalating `Retry-After` delays (`soft_threshold`,
+  `base_delay_secs`, `max_delay_secs`, `window_secs`) that target the attacker's
+  dimensions, never a hard lockout. `hard_lockout` is an explicit per-tenant OPT-IN
+  (documented weaponization tradeoff) confined to the password path;
+  `registration_closed` switches `/register` to the uniform, send-suppressing Logto
+  posture. Each field is floor/ceiling validated at load.
 - `[password_hashing]` settings (issue #62): a new `PasswordHashingConfig` table for the
   Argon2id parameters of NEWLY set passwords and the dedicated hashing worker pool.
   `memory_kib`/`iterations`/`parallelism` default to the OWASP recommendation

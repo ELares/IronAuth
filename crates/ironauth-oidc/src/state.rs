@@ -29,7 +29,12 @@ use ironauth_config::{
 use ironauth_env::Env;
 use ironauth_jose::{JwsAlgorithm, TrustedKey, VerificationPolicy, VerifiedToken, verify};
 use ironauth_quota::QuotaEnforcer;
-use ironauth_store::{GuardrailSet, Scope, Store, TokenFormat};
+use ironauth_store::{
+    AbuseBanId, AbuseSubject, ActorRef, AuthPath, CorrelationId, GuardrailSet, NewBan, Scope,
+    ServiceId, Store, TokenFormat,
+};
+
+use crate::util::epoch_micros;
 
 use crate::client_keys::ClientKeyResolver;
 use crate::introspection::{IntrospectionSerializer, default_serializer};
@@ -151,6 +156,17 @@ pub struct OidcState {
     // off the protocol-I/O threads) with no admission, which keeps the many DB-only
     // OIDC tests and the self-hoster who wants no admission control unaffected.
     hashing_pool: Option<Arc<crate::hashing_pool::HashingPool>>,
+    // The in-process L1 counter store for the fast request-shaping layer (issue #64).
+    // Kept OUTSIDE `Inner` so it is swappable with a cheap builder: the optional
+    // IronCache L2 installs its `CounterStore` impl here later, and a test wires a
+    // failing stub to exercise the fail-open matrix. Default: the in-process
+    // MemoryCounterStore. Shared across every request thread.
+    abuse_counters: Arc<dyn crate::abuse::CounterStore>,
+    // The verification / OTP send seam (issue #64). Kept OUTSIDE `Inner` so the real
+    // transport (issue #68) installs its sender here later without a wire change.
+    // Default: the no-op NullVerificationSender (no transport wired yet), so the
+    // closed-registration acknowledgment is identical whether or not a send goes out.
+    verification_sender: Arc<dyn crate::verification::VerificationSender>,
 }
 
 // The per-environment policy flags each mirror an independent, individually
@@ -303,6 +319,11 @@ struct Inner {
     webauthn_challenge_ttl_secs: u64,
     webauthn_require_user_verification: bool,
     webauthn_clone_detection_block: bool,
+    // Credential-abuse regulation policy (issue #64): the resolved risk-based escalation
+    // and ban policy. Config-derived and immutable. The in-process L1 counter store for
+    // the fast request-shaping layer lives OUTSIDE Inner (like the hashing pool) so it
+    // is swappable for the optional IronCache L2 later.
+    regulation: crate::abuse::RegulationSettings,
 }
 
 impl OidcState {
@@ -411,6 +432,7 @@ impl OidcState {
                 webauthn_challenge_ttl_secs: config.webauthn_challenge_ttl_secs,
                 webauthn_require_user_verification: config.webauthn_require_user_verification,
                 webauthn_clone_detection_block: config.webauthn_clone_detection_block,
+                regulation: crate::abuse::RegulationSettings::from_config(&config.regulation),
             }),
             revocation_sink: default_sink(),
             introspection_serializer: default_serializer(),
@@ -418,6 +440,8 @@ impl OidcState {
             quota: None,
             migration_hook: None,
             hashing_pool: None,
+            abuse_counters: Arc::new(crate::abuse::MemoryCounterStore::new()),
+            verification_sender: Arc::new(crate::verification::NullVerificationSender),
         }
     }
 
@@ -588,6 +612,259 @@ impl OidcState {
         }
         let password = password.to_owned();
         bounded_inline(move || crate::password::verify_absent(&password)).await
+    }
+
+    /// The resolved credential-abuse regulation settings (issue #64).
+    #[must_use]
+    pub(crate) fn regulation(&self) -> &crate::abuse::RegulationSettings {
+        &self.inner.regulation
+    }
+
+    /// Install a custom counter store for the fast request-shaping layer (issue #64),
+    /// replacing the default in-process L1. A test wires a failing stub here to exercise
+    /// the fail-open matrix; the optional IronCache L2 wires its `CounterStore` impl here
+    /// later. Called only before the state is shared across request threads.
+    #[must_use]
+    pub fn with_abuse_counters(mut self, counters: Arc<dyn crate::abuse::CounterStore>) -> Self {
+        self.abuse_counters = counters;
+        self
+    }
+
+    /// Install the verification / OTP sender (issue #64), replacing the default no-op
+    /// [`NullVerificationSender`](crate::verification::NullVerificationSender). The real
+    /// transport (issue #68) wires its sender here; a test wires a recording sender to
+    /// assert the closed-registration suppression.
+    #[must_use]
+    pub fn with_verification_sender(
+        mut self,
+        sender: Arc<dyn crate::verification::VerificationSender>,
+    ) -> Self {
+        self.verification_sender = sender;
+        self
+    }
+
+    /// Whether self-service registration is CLOSED (issue #64): the Logto send-suppression
+    /// posture.
+    #[must_use]
+    pub(crate) fn registration_closed(&self) -> bool {
+        self.inner.regulation.registration_closed
+    }
+
+    /// Dispatch a verification / OTP send through the seam (issue #64), applying the
+    /// closed-registration SUPPRESSION: when `recipient_known` is false the send is
+    /// silently dropped (a suppressed send is an audited-by-tracing event), but the caller
+    /// returns the SAME user-visible acknowledgment either way, so a probe cannot
+    /// distinguish an existing account from an unknown one.
+    pub(crate) fn dispatch_verification(
+        &self,
+        scope: Scope,
+        purpose: crate::verification::VerificationPurpose,
+        recipient: &str,
+        recipient_known: bool,
+    ) {
+        if recipient_known {
+            self.verification_sender.send(scope, purpose, recipient);
+        } else {
+            // Suppressed send (issue #64): no delivery to an unknown recipient. Recorded
+            // on the observability plane (never a body difference), so the acknowledgment
+            // stays identical to a real send.
+            tracing::info!(
+                target: "ironauth.abuse",
+                purpose = purpose.as_str(),
+                tenant = %scope.tenant(),
+                environment = %scope.environment(),
+                "verification send suppressed for an unknown recipient (closed registration)"
+            );
+            metrics::counter!(
+                "ironauth_verification_send_suppressed_total",
+                "purpose" => purpose.as_str(),
+            )
+            .increment(1);
+        }
+    }
+
+    /// Evaluate credential-abuse regulation BEFORE spending a credential verification
+    /// (issue #64): the durable ban check, then the risk-based escalation over the
+    /// existence-INDEPENDENT dimensions (the canonical identifier and the IP), so the
+    /// decision never distinguishes a present from an absent identifier.
+    ///
+    /// The ban check and the identifier layer are SECURITY-biased and FAIL CLOSED (a
+    /// backend error refuses the attempt); the IP layer is AVAILABILITY-biased and FAILS
+    /// OPEN (a future-L2 outage does not block logins). The per-account dimension is
+    /// deliberately NOT consulted here (only for the opt-in hard lockout), so failed
+    /// spray against a victim cannot turn the pre-check into an existence oracle.
+    pub(crate) async fn regulate_before(
+        &self,
+        ctx: &crate::abuse::AttemptContext,
+    ) -> crate::abuse::RegulationOutcome {
+        use crate::abuse::{
+            RegulationOutcome, banned_snapshot, escalating_delay, ip_counter_key, throttle_snapshot,
+        };
+        let now = epoch_micros(self.now());
+        let settings = *self.regulation();
+        let scope = ctx.scope;
+        // 1. Durable ban check (DB), fail CLOSED. Explicit operator bans apply regardless
+        //    of the auto-escalation switch.
+        let subjects = ctx.ban_subjects();
+        if !subjects.is_empty() {
+            match self
+                .store()
+                .scoped(scope)
+                .abuse()
+                .active_ban(&subjects, ctx.path, now)
+                .await
+            {
+                Ok(Some(_)) | Err(_) => {
+                    return RegulationOutcome::Throttled(banned_snapshot(&settings));
+                }
+                Ok(None) => {}
+            }
+        }
+        if !settings.enabled {
+            return RegulationOutcome::Allow;
+        }
+        let window_secs = i64::try_from(settings.window_secs()).unwrap_or(i64::MAX);
+        let mut worst: Option<(u64, std::time::Duration)> = None;
+        // 2a. Per-identifier escalation (DB), fail CLOSED. Existence-independent: the
+        //     counter keys on the canonical identifier whether or not it resolves.
+        if let Some(identifier) = &ctx.identifier {
+            let subject = AbuseSubject::identifier(identifier.as_str().to_owned());
+            match self
+                .store()
+                .scoped(scope)
+                .abuse()
+                .failure_count(&subject, ctx.path, window_secs, now)
+                .await
+            {
+                Ok(count) => {
+                    if let Some(delay) = escalating_delay(&settings, count) {
+                        worst = Some(max_escalation(worst, count, delay));
+                    }
+                }
+                Err(_) => {
+                    return RegulationOutcome::Throttled(banned_snapshot(&settings));
+                }
+            }
+        }
+        // 2b. Per-IP escalation (L1), fail OPEN: a counter-store error is ignored.
+        if let Some(ip) = &ctx.ip {
+            if let Ok(count) =
+                self.abuse_counters
+                    .peek(&ip_counter_key(ctx.path, ip), settings.window_secs(), now)
+            {
+                if let Some(delay) = escalating_delay(&settings, count) {
+                    worst = Some(max_escalation(worst, count, delay));
+                }
+            }
+        }
+        match worst {
+            Some((count, delay)) => {
+                RegulationOutcome::Throttled(throttle_snapshot(&settings, count, delay))
+            }
+            None => RegulationOutcome::Allow,
+        }
+    }
+
+    /// Record one FAILED authentication attempt across the layered counters (issue #64):
+    /// the per-identifier and per-account failure counters (DB, durable), and the
+    /// per-IP, per-client, and per-(tenant, environment) counters (L1, in-process). Under
+    /// the per-tenant hard-lockout OPT-IN, a per-account count over the threshold
+    /// auto-places a PASSWORD-path ban (never passkey or recovery), confined to the
+    /// account so the owner keeps every other path.
+    pub(crate) async fn record_auth_failure(&self, ctx: &crate::abuse::AttemptContext) {
+        let settings = *self.regulation();
+        if !settings.enabled {
+            return;
+        }
+        let now = epoch_micros(self.now());
+        let scope = ctx.scope;
+        let window_secs = i64::try_from(settings.window_secs()).unwrap_or(i64::MAX);
+        // Per-identifier failure (DB, durable). Existence-independent.
+        if let Some(identifier) = &ctx.identifier {
+            let subject = AbuseSubject::identifier(identifier.as_str().to_owned());
+            let _ = self
+                .store()
+                .scoped(scope)
+                .abuse()
+                .record_failure(&subject, ctx.path, window_secs, now)
+                .await;
+        }
+        // Per-account failure (DB, durable), used for the opt-in hard lockout only.
+        if let Some(account) = &ctx.account_id {
+            let subject = AbuseSubject::account(account.clone());
+            let account_count = self
+                .store()
+                .scoped(scope)
+                .abuse()
+                .record_failure(&subject, ctx.path, window_secs, now)
+                .await
+                .unwrap_or(0);
+            if settings.hard_lockout
+                && ctx.path == AuthPath::Password
+                && account_count >= settings.hard_lockout_threshold
+            {
+                self.auto_lockout(scope, account, now, &settings).await;
+            }
+        }
+        // Per-IP, per-client, per-(tenant, environment) failure counters (L1, in-process).
+        if let Some(ip) = &ctx.ip {
+            let _ = self.abuse_counters.incr(
+                &crate::abuse::ip_counter_key(ctx.path, ip),
+                settings.window_secs(),
+                now,
+            );
+        }
+        if let Some(client) = &ctx.client_id {
+            let _ = self.abuse_counters.incr(
+                &crate::abuse::client_counter_key(ctx.path, client),
+                settings.window_secs(),
+                now,
+            );
+        }
+        let _ = self.abuse_counters.incr(
+            &crate::abuse::tenant_counter_key(
+                ctx.path,
+                &scope.tenant().to_string(),
+                &scope.environment().to_string(),
+            ),
+            settings.window_secs(),
+            now,
+        );
+    }
+
+    /// Auto-place a PASSWORD-path hard-lockout ban on `account` (issue #64), best-effort.
+    /// Confined to the password path so the passkey and recovery paths stay open. A
+    /// Conflict (already locked) is fine.
+    async fn auto_lockout(
+        &self,
+        scope: Scope,
+        account: &str,
+        now: i64,
+        settings: &crate::abuse::RegulationSettings,
+    ) {
+        let id = AbuseBanId::generate(self.env(), &scope);
+        let subject = AbuseSubject::account(account.to_owned());
+        let duration_micros =
+            i64::try_from(settings.hard_lockout_duration.as_micros()).unwrap_or(i64::MAX);
+        let expires_at = now.saturating_add(duration_micros);
+        let actor = ActorRef::service(ServiceId::generate(self.env()));
+        let _ = self
+            .store()
+            .scoped(scope)
+            .acting(actor, CorrelationId::generate(self.env()))
+            .abuse()
+            .ban(
+                self.env(),
+                NewBan {
+                    id: &id,
+                    subject: &subject,
+                    auth_path: AuthPath::Password,
+                    reason: "auto hard-lockout: failed-password threshold exceeded",
+                    expires_at_unix_micros: Some(expires_at),
+                },
+                now,
+            )
+            .await;
     }
 
     /// Whether a Global Token Revocation hard-kills the subject's `offline_access`
@@ -1502,6 +1779,22 @@ fn map_token_format(format: ironauth_config::TokenFormat) -> TokenFormat {
     match format {
         ironauth_config::TokenFormat::AtJwt => TokenFormat::AtJwt,
         ironauth_config::TokenFormat::Opaque => TokenFormat::Opaque,
+    }
+}
+
+/// Keep the escalation with the LARGER delay (issue #64): the binding layer is the one
+/// asking the client to wait the longest, so the response reports the limit that bites
+/// first.
+fn max_escalation(
+    current: Option<(u64, std::time::Duration)>,
+    count: u64,
+    delay: std::time::Duration,
+) -> (u64, std::time::Duration) {
+    match current {
+        Some((existing_count, existing_delay)) if existing_delay >= delay => {
+            (existing_count, existing_delay)
+        }
+        _ => (count, delay),
     }
 }
 

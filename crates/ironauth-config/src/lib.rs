@@ -1122,6 +1122,12 @@ pub struct OidcConfig {
     /// until per-environment overrides ride the M5 promotion pipeline.
     pub lazy_migration: LazyMigrationConfig,
 
+    /// Credential-abuse regulation and anti-enumeration posture (issue #64): the
+    /// risk-based escalating throttle, the durable ban policy, and the closed-
+    /// registration switch. The default posture is account-DoS-safe (no hard lockout).
+    /// See [`RegulationConfig`].
+    pub regulation: RegulationConfig,
+
     /// Whether the WebAuthn passkey ceremony endpoints are mounted and the hosted
     /// login page offers conditional-UI passkey sign-in (issue #65). On by default:
     /// passkeys are the headline primary credential for the platform. When on,
@@ -1199,6 +1205,7 @@ impl Default for OidcConfig {
             par_ttl_secs: 60,
             registration_enabled: false,
             registration_mode: RegistrationMode::TokenGated,
+            regulation: RegulationConfig::default(),
             registration_max_clients: 100,
             registration_rate_limit: 20,
             registration_rate_window_secs: 60,
@@ -1308,6 +1315,97 @@ impl Default for LazyMigrationConfig {
             breaker_failure_threshold: 5,
             breaker_window_secs: 30,
             breaker_cooldown_secs: 30,
+        }
+    }
+}
+
+/// The credential-abuse regulation settings (issue #64).
+///
+/// This governs the RISK-BASED, ESCALATING response to failed authentication and the
+/// anti-enumeration posture, both keyed on the CANONICAL identifier (the #54 seam) so a
+/// case/unicode variant of one identity shares regulation state. The DEFAULT posture is
+/// deliberately account-DoS-SAFE (Keycloak CVE-2024-1722): escalation is an increasing
+/// `Retry-After` delay that targets the ATTACKER's dimensions (IP, identifier), NEVER a
+/// hard account lockout, and every path is governed independently, so failed-password
+/// spray against a victim can never lock the legitimate owner out of the passkey or
+/// recovery path.
+///
+/// [`hard_lockout`](Self::hard_lockout) is the explicit per-tenant OPT-IN to a hard
+/// lockout, with the documented weaponization tradeoff: enabling it lets an attacker who
+/// sprays failed passwords at a victim's account temporarily deny that victim the
+/// PASSWORD path. Even then the lockout is confined to the password path (the passkey
+/// and recovery paths stay open), so the victim is never locked out of every path.
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields, default)]
+pub struct RegulationConfig {
+    /// Whether credential-abuse regulation is active. On by default (it is table-stakes
+    /// online-guessing resistance, NIST SP 800-63B-4 3.2.2). When false, the failure
+    /// counters and ban checks are skipped; the anti-enumeration UNIFORMITY of the
+    /// login/register/recovery surfaces does not depend on this switch.
+    pub enabled: bool,
+
+    /// The fixed window, in seconds, over which failed-attempt counts accumulate for
+    /// escalation (issue #64). The default (300) is a conservative five minutes. Must be
+    /// at least 1 and at most `OIDC_MAX_LIFETIME_SECS`.
+    pub window_secs: u64,
+
+    /// The number of failed attempts on a dimension within `window_secs` before
+    /// escalation begins (issue #64). Attempts at or below it are unthrottled; beyond it
+    /// each further failure raises the `Retry-After` delay. The default (5) follows the
+    /// NIST online-guessing guidance. Must be at least 1.
+    pub soft_threshold: u32,
+
+    /// The base escalation delay, in seconds, applied the first time a dimension exceeds
+    /// `soft_threshold` (issue #64). The delay doubles per further failure up to
+    /// `max_delay_secs`. The default (1) is gentle. Must be at least 1.
+    pub base_delay_secs: u64,
+
+    /// The ceiling, in seconds, on the escalating `Retry-After` delay (issue #64). The
+    /// default (60) bounds the throttle so a legitimate user is never delayed
+    /// indefinitely. Must be at least `base_delay_secs`.
+    pub max_delay_secs: u64,
+
+    /// The explicit per-tenant OPT-IN to a HARD account lockout (issue #64). FALSE by
+    /// default: the account-DoS-safe posture. When true, a per-account password-path ban
+    /// is auto-placed once the account dimension exceeds `hard_lockout_threshold`,
+    /// blocking the PASSWORD path for `hard_lockout_duration_secs`. The passkey and
+    /// recovery paths are NEVER locked (they are governed independently), so even under
+    /// hard lockout the owner is not locked out of every path. Enabling this accepts the
+    /// documented weaponization tradeoff.
+    pub hard_lockout: bool,
+
+    /// The account-dimension failure count within `window_secs` that auto-places a
+    /// password-path hard-lockout ban, when `hard_lockout` is true (issue #64). The
+    /// default (20) is well above `soft_threshold` so the escalating delay bites first.
+    /// Must be at least 1.
+    pub hard_lockout_threshold: u32,
+
+    /// How long, in seconds, an auto-placed hard-lockout ban lasts before it expires
+    /// (issue #64). The default (900) is fifteen minutes. Must be at least 1 and at most
+    /// `OIDC_MAX_LIFETIME_SECS`.
+    pub hard_lockout_duration_secs: u64,
+
+    /// Whether self-service registration is CLOSED (issue #64, the Logto v1.41 pattern).
+    /// FALSE by default (open self-service registration, unchanged). When true,
+    /// `POST /register` no longer creates an account inline; it returns a UNIFORM
+    /// acknowledgment for both known and unknown identifiers, and any verification send
+    /// to an unknown recipient is SUPPRESSED, so a probe cannot distinguish an existing
+    /// account from an unknown one at the registration surface.
+    pub registration_closed: bool,
+}
+
+impl Default for RegulationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            window_secs: 300,
+            soft_threshold: 5,
+            base_delay_secs: 1,
+            max_delay_secs: 60,
+            hard_lockout: false,
+            hard_lockout_threshold: 20,
+            hard_lockout_duration_secs: 900,
+            registration_closed: false,
         }
     }
 }
@@ -1803,11 +1901,63 @@ impl Config {
         validate_device_authorization(&self.oidc)?;
         validate_backchannel_logout(&self.oidc)?;
         validate_lazy_migration(&self.oidc)?;
+        validate_regulation(&self.oidc)?;
         validate_webauthn(&self.oidc, &self.server)?;
         validate_quota(&self.quota)?;
         validate_password_hashing(&self.password_hashing)?;
         Ok(())
     }
+}
+
+/// Validate the credential-abuse regulation settings (issue #64), kept out of
+/// [`Config::validate`] so each stays within the readable-length lint.
+fn validate_regulation(oidc: &OidcConfig) -> Result<(), ConfigError> {
+    let regulation = &oidc.regulation;
+    if regulation.window_secs < 1 || regulation.window_secs > OIDC_MAX_LIFETIME_SECS {
+        return Err(ConfigError::Invalid {
+            message: format!(
+                "oidc.regulation.window_secs ({}) must be between 1 and \
+                 {OIDC_MAX_LIFETIME_SECS} seconds",
+                regulation.window_secs
+            ),
+        });
+    }
+    if regulation.soft_threshold < 1 {
+        return Err(ConfigError::Invalid {
+            message: "oidc.regulation.soft_threshold must be at least 1".to_owned(),
+        });
+    }
+    if regulation.base_delay_secs < 1 {
+        return Err(ConfigError::Invalid {
+            message: "oidc.regulation.base_delay_secs must be at least 1 second".to_owned(),
+        });
+    }
+    if regulation.max_delay_secs < regulation.base_delay_secs {
+        return Err(ConfigError::Invalid {
+            message: format!(
+                "oidc.regulation.max_delay_secs ({}) must be at least \
+                 oidc.regulation.base_delay_secs ({})",
+                regulation.max_delay_secs, regulation.base_delay_secs
+            ),
+        });
+    }
+    if regulation.hard_lockout_threshold < 1 {
+        return Err(ConfigError::Invalid {
+            message: "oidc.regulation.hard_lockout_threshold must be at least 1".to_owned(),
+        });
+    }
+    if regulation.hard_lockout_duration_secs < 1
+        || regulation.hard_lockout_duration_secs > OIDC_MAX_LIFETIME_SECS
+    {
+        return Err(ConfigError::Invalid {
+            message: format!(
+                "oidc.regulation.hard_lockout_duration_secs ({}) must be between 1 and \
+                 {OIDC_MAX_LIFETIME_SECS} seconds",
+                regulation.hard_lockout_duration_secs
+            ),
+        });
+    }
+    Ok(())
 }
 
 /// Validate the password-hashing settings (issue #62), kept out of
