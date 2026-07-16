@@ -21,6 +21,12 @@ range per docs/RELEASING.md.
   is a documented M11 seam a deployment installs in its place). SMS OTP stays off by default,
   so the stub is inert until a tenant explicitly enables SMS and configures a country
   allowlist.
+- `ironauth credential-class-policy set|list|remove` CLI (issue #66, PR A): set, list, and
+  remove the declarative per-scope minimum-credential-class ladder row for a subject
+  (`--subject tenant|group|org`, `--subject-ref ID`, `--class any|mfa|passkey|attested_passkey`),
+  each an audited write through the same acting repository the authentication path composes
+  from with strictest-wins. Mirrors the `step-up-policy` CLI pattern; a hosted admin HTTP CRUD
+  can layer on later.
 - Magic-link cross-device UI reachability (issue #68, adversarial review): the served
   magic-link send acknowledgment page now renders a `short_code` entry form, so the
   cross-device fallback (open the link on one device, finish on the originating device that

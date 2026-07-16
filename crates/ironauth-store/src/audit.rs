@@ -648,6 +648,18 @@ pub enum Action {
     /// `step_up_max_age_secs` registration floor was configured through the
     /// management seam. The row targets the `cli_` client.
     ClientStepUpPolicySet,
+    /// A credential-class policy was SET (created or updated) through the management
+    /// seam (issue #66): the minimum credential class required of a login for a
+    /// subject (the tenant, a group, or an org). The row targets the `ccp_` policy;
+    /// the `detail` records the subject and the minimum class.
+    CredentialClassPolicySet,
+    /// A credential-class policy was REMOVED (issue #66): the minimum-class
+    /// requirement for a subject was deleted. The row targets the `ccp_` policy.
+    CredentialClassPolicyRemove,
+    /// The per-scope attestation mode was SET (issue #66): the attestation conveyance
+    /// ('none' or 'direct') the passkey registration path requests. The row targets
+    /// the `atc_` config; the `detail` records the mode.
+    AttestationConfigSet,
     /// An email-OTP code was SENT (issue #68): a fresh numeric code was issued to a
     /// user for a purpose, invalidating any prior active code. The row targets the
     /// `eot_` code; the `detail` records the purpose (never the plaintext code, which
@@ -833,6 +845,9 @@ impl Action {
             Action::ScopeStepUpPolicySet => "step_up.scope_policy.set",
             Action::ScopeStepUpPolicyRemove => "step_up.scope_policy.remove",
             Action::ClientStepUpPolicySet => "client.step_up_policy.set",
+            Action::CredentialClassPolicySet => "credential_class.policy.set",
+            Action::CredentialClassPolicyRemove => "credential_class.policy.remove",
+            Action::AttestationConfigSet => "attestation.config.set",
             Action::EmailOtpSend => "email_otp.send",
             Action::EmailOtpVerify => "email_otp.verify",
             Action::SmsOtpSend => "sms_otp.send",

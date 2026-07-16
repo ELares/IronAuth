@@ -69,16 +69,16 @@ use crate::email_otp::{
 use crate::environment::{EnvironmentType, GuardrailSet};
 use crate::error::StoreError;
 use crate::id::{
-    AbuseBanId, AcmeChallengeId, AssertionMappingId, AuditId, AuditTarget, AuthorizationCodeId,
-    BackChannelDeliveryId, ClientId, ClientSessionId, ConsentId, CorrelationId, CredentialId,
-    CustomDomainId, DcrPolicyId, DekId, DeviceCodeId, EmailOtpCodeId, EncryptedSecretId,
-    EnvironmentId, EnvironmentSecretId, ExternalIssuerId, GrantId, InitialAccessTokenId,
-    InvitationId, IssuedTokenId, KekId, MagicLinkTokenId, ManagementKeyId, MigrationRunId,
-    MigrationRunRecordId, OperatorId, OrganizationId, PushedRequestId, RecoveryCodeId,
-    RefreshFamilyId, RefreshTokenId, ResourceServerId, ScopeStepUpPolicyId, ServiceAccountId,
-    SessionEventId, SessionId, SigningKeyId, SmsOtpCodeId, SmsRouteStatId, TenantId,
-    TotpCredentialId, TraitMigrationJobId, TraitSchemaId, UserId, UserIdentifierId, VariableId,
-    WebauthnChallengeId, WebauthnCredentialId,
+    AbuseBanId, AcmeChallengeId, AssertionMappingId, AttestationConfigId, AuditId, AuditTarget,
+    AuthorizationCodeId, BackChannelDeliveryId, ClientId, ClientSessionId, ConsentId,
+    CorrelationId, CredentialClassPolicyId, CredentialId, CustomDomainId, DcrPolicyId, DekId,
+    DeviceCodeId, EmailOtpCodeId, EncryptedSecretId, EnvironmentId, EnvironmentSecretId,
+    ExternalIssuerId, GrantId, InitialAccessTokenId, InvitationId, IssuedTokenId, KekId,
+    MagicLinkTokenId, ManagementKeyId, MigrationRunId, MigrationRunRecordId, OperatorId,
+    OrganizationId, PushedRequestId, RecoveryCodeId, RefreshFamilyId, RefreshTokenId,
+    ResourceServerId, ScopeStepUpPolicyId, ServiceAccountId, SessionEventId, SessionId,
+    SigningKeyId, SmsOtpCodeId, SmsRouteStatId, TenantId, TotpCredentialId, TraitMigrationJobId,
+    TraitSchemaId, UserId, UserIdentifierId, VariableId, WebauthnChallengeId, WebauthnCredentialId,
 };
 use crate::identifier::{
     CanonicalIdentifier, IdentifierType, UniquenessMode, canonicalize_identifier,
@@ -118,6 +118,30 @@ impl<'a> ScopedStore<'a> {
     #[must_use]
     pub fn scope_step_up_policies(&self) -> ScopeStepUpPolicyRepo<'a> {
         ScopeStepUpPolicyRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
+    /// The read-only credential-class policy repository for this scope (issue #66):
+    /// list the minimum-credential-class rows the authentication and enrollment paths
+    /// compose with strictest-wins. The managing writes live on
+    /// [`ActingStore::credential_class_policies`].
+    #[must_use]
+    pub fn credential_class_policies(&self) -> CredentialClassPolicyRepo<'a> {
+        CredentialClassPolicyRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
+    /// The read-only attestation-config repository for this scope (issue #66): read the
+    /// attestation conveyance mode the passkey registration path requests. The managing
+    /// write lives on [`ActingStore::attestation_config`]. Dormant in PR A (no reader
+    /// gates a registration on it yet).
+    #[must_use]
+    pub fn attestation_config(&self) -> AttestationConfigRepo<'a> {
+        AttestationConfigRepo {
             store: self.store,
             scope: self.scope,
         }
@@ -712,6 +736,29 @@ impl<'a> ActingStore<'a> {
     #[must_use]
     pub fn scope_step_up_policies(&self) -> ActingScopeStepUpPolicyRepo<'a> {
         ActingScopeStepUpPolicyRepo {
+            store: self.store,
+            scope: self.scope,
+            acting: self.acting,
+        }
+    }
+
+    /// The mutating credential-class policy repository for this scope and actor (issue
+    /// #66): set (upsert) or remove a minimum-credential-class row for a subject (the
+    /// tenant, a group, or an org), each audited.
+    #[must_use]
+    pub fn credential_class_policies(&self) -> ActingCredentialClassPolicyRepo<'a> {
+        ActingCredentialClassPolicyRepo {
+            store: self.store,
+            scope: self.scope,
+            acting: self.acting,
+        }
+    }
+
+    /// The mutating attestation-config repository for this scope and actor (issue #66):
+    /// set (upsert) the attestation conveyance mode, audited.
+    #[must_use]
+    pub fn attestation_config(&self) -> ActingAttestationConfigRepo<'a> {
+        ActingAttestationConfigRepo {
             store: self.store,
             scope: self.scope,
             acting: self.acting,
@@ -1925,6 +1972,279 @@ impl ActingScopeStepUpPolicyRepo<'_> {
             false,
         )
         .await
+    }
+}
+
+/// One credential-class policy row (issue #66): the minimum credential class
+/// required of a login for a policy subject, read within scope.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CredentialClassPolicy {
+    /// The `ccp_` policy identifier (embeds its tenant and environment).
+    pub id: CredentialClassPolicyId,
+    /// The policy subject kind: `tenant`, `group`, or `org`.
+    pub subject_kind: String,
+    /// The group / org id the policy names (`None` for the tenant-wide row).
+    pub subject_ref: Option<String>,
+    /// The minimum credential class token (`any`, `mfa`, `passkey`, or
+    /// `attested_passkey`).
+    pub min_class: String,
+}
+
+/// The read-only credential-class policy repository for a scope (issue #66).
+///
+/// Reachable through [`ScopedStore::credential_class_policies`]. The authentication
+/// and enrollment paths read the applicable rows and fold their `min_class` values
+/// with strictest-wins composition into a single required class.
+pub struct CredentialClassPolicyRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl CredentialClassPolicyRepo<'_> {
+    /// Every credential-class policy in this scope, oldest first.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn list(&self) -> Result<Vec<CredentialClassPolicy>, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let rows = sqlx::query(
+            "SELECT id, subject_kind, subject_ref, min_class FROM credential_class_policies \
+             WHERE tenant_id = $1 AND environment_id = $2 ORDER BY created_at, id",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        rows.iter()
+            .map(|row| {
+                let id_text: String = row.get("id");
+                let id = CredentialClassPolicyId::parse_in_scope(&id_text, &self.scope)?;
+                Ok(CredentialClassPolicy {
+                    id,
+                    subject_kind: row.get("subject_kind"),
+                    subject_ref: row.get("subject_ref"),
+                    min_class: row.get("min_class"),
+                })
+            })
+            .collect()
+    }
+}
+
+/// The mutating credential-class policy repository for a scope and actor (issue #66).
+/// Reachable only through [`ScopedStore::acting`], so every mutation carries an actor
+/// and correlation id and routes through the audited-write primitive.
+pub struct ActingCredentialClassPolicyRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+    acting: ActingContext,
+}
+
+impl ActingCredentialClassPolicyRepo<'_> {
+    /// Set (create or update) the minimum credential class for a policy subject,
+    /// auditing `credential_class.policy.set` in the same transaction. `subject_ref`
+    /// is `None` for the tenant-wide row and the group/org id otherwise (the CHECK
+    /// ties the discriminator to its ref). An existing policy for the same subject is
+    /// overwritten (the unique subject key collapses the upsert). Returns the policy id.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure (including a malformed subject
+    /// or an unknown class, which the CHECKs refuse).
+    pub async fn set(
+        &self,
+        env: &Env,
+        subject_kind: &str,
+        subject_ref: Option<&str>,
+        min_class: &str,
+    ) -> Result<CredentialClassPolicyId, StoreError> {
+        let scope = self.scope;
+        let id = CredentialClassPolicyId::generate(env, &scope);
+        let now_micros = epoch_micros(env.clock().now_utc());
+        let detail = format!("subject={subject_kind} min_class={min_class}");
+        write_audited_detailed(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::CredentialClassPolicySet,
+                target: &id,
+            },
+            async move |tx| {
+                sqlx::query(
+                    "INSERT INTO credential_class_policies \
+                     (id, tenant_id, environment_id, subject_kind, subject_ref, min_class, \
+                      created_at, updated_at) \
+                     VALUES ($1, $2, $3, $4, $5, $6, \
+                             TIMESTAMPTZ 'epoch' + ($7::text || ' microseconds')::interval, \
+                             TIMESTAMPTZ 'epoch' + ($7::text || ' microseconds')::interval) \
+                     ON CONFLICT (tenant_id, environment_id, subject_kind, COALESCE(subject_ref, '')) \
+                     DO UPDATE SET min_class = EXCLUDED.min_class, updated_at = EXCLUDED.updated_at",
+                )
+                .bind(id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(subject_kind)
+                .bind(subject_ref)
+                .bind(min_class)
+                .bind(now_micros)
+                .execute(&mut **tx)
+                .await?;
+                Ok(())
+            },
+            false,
+            Some(&detail),
+        )
+        .await?;
+        Ok(id)
+    }
+
+    /// Remove the credential-class policy for a subject, auditing
+    /// `credential_class.policy.remove` in the same transaction. A no-op audit is
+    /// still written when no policy matched (the management action was attempted).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn remove(
+        &self,
+        env: &Env,
+        subject_kind: &str,
+        subject_ref: Option<&str>,
+    ) -> Result<(), StoreError> {
+        let scope = self.scope;
+        let id = CredentialClassPolicyId::generate(env, &scope);
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::CredentialClassPolicyRemove,
+                target: &id,
+            },
+            async move |tx| {
+                sqlx::query(
+                    "DELETE FROM credential_class_policies \
+                     WHERE tenant_id = $1 AND environment_id = $2 AND subject_kind = $3 \
+                       AND COALESCE(subject_ref, '') = COALESCE($4, '')",
+                )
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(subject_kind)
+                .bind(subject_ref)
+                .execute(&mut **tx)
+                .await?;
+                Ok(())
+            },
+            false,
+        )
+        .await
+    }
+}
+
+/// The per-scope attestation configuration (issue #66): the conveyance mode the
+/// passkey registration path requests, read within scope. Dormant in PR A.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttestationConfig {
+    /// The `atc_` config identifier (embeds its tenant and environment).
+    pub id: AttestationConfigId,
+    /// The attestation conveyance mode: `none` (default) or `direct`.
+    pub mode: String,
+}
+
+/// The read-only attestation-config repository for a scope (issue #66).
+pub struct AttestationConfigRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl AttestationConfigRepo<'_> {
+    /// The attestation config for this scope, or `None` when no row exists (the
+    /// implicit default is `mode = 'none'`).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn get(&self) -> Result<Option<AttestationConfig>, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT id, mode FROM attestation_config \
+             WHERE tenant_id = $1 AND environment_id = $2",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        row.map(|row| {
+            let id_text: String = row.get("id");
+            let id = AttestationConfigId::parse_in_scope(&id_text, &self.scope)?;
+            Ok(AttestationConfig {
+                id,
+                mode: row.get("mode"),
+            })
+        })
+        .transpose()
+    }
+}
+
+/// The mutating attestation-config repository for a scope and actor (issue #66).
+pub struct ActingAttestationConfigRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+    acting: ActingContext,
+}
+
+impl ActingAttestationConfigRepo<'_> {
+    /// Set (create or update) the attestation conveyance mode for this scope, auditing
+    /// `attestation.config.set` in the same transaction. The unique (tenant,
+    /// environment) key collapses the upsert. Returns the config id.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure (including an unknown mode,
+    /// which the CHECK refuses).
+    pub async fn set(&self, env: &Env, mode: &str) -> Result<AttestationConfigId, StoreError> {
+        let scope = self.scope;
+        let id = AttestationConfigId::generate(env, &scope);
+        let now_micros = epoch_micros(env.clock().now_utc());
+        let detail = format!("mode={mode}");
+        write_audited_detailed(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::AttestationConfigSet,
+                target: &id,
+            },
+            async move |tx| {
+                sqlx::query(
+                    "INSERT INTO attestation_config \
+                     (id, tenant_id, environment_id, mode, created_at, updated_at) \
+                     VALUES ($1, $2, $3, $4, \
+                             TIMESTAMPTZ 'epoch' + ($5::text || ' microseconds')::interval, \
+                             TIMESTAMPTZ 'epoch' + ($5::text || ' microseconds')::interval) \
+                     ON CONFLICT (tenant_id, environment_id) \
+                     DO UPDATE SET mode = EXCLUDED.mode, updated_at = EXCLUDED.updated_at",
+                )
+                .bind(id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(mode)
+                .bind(now_micros)
+                .execute(&mut **tx)
+                .await?;
+                Ok(())
+            },
+            false,
+            Some(&detail),
+        )
+        .await?;
+        Ok(id)
     }
 }
 

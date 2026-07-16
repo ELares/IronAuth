@@ -562,9 +562,15 @@ fn registry() -> Vec<Migration> {
         },
         Migration {
             version: 49,
+            name: "credential_class_policies",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0049_credential_class_policies.sql"),
+        },
+        Migration {
+            version: 50,
             name: "sms_otp",
             phase: Phase::Expand,
-            sql: include_str!("../migrations/0049_sms_otp.sql"),
+            sql: include_str!("../migrations/0050_sms_otp.sql"),
         },
     ]
 }
