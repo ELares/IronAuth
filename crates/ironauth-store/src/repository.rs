@@ -13555,10 +13555,24 @@ impl ActingWebauthnCredentialRepo<'_> {
         Ok(WebauthnCredentialOutcome::Applied)
     }
 
-    /// REMOVE `subject`'s passkey `id` (issue #65), writing one
-    /// `webauthn.credential.remove` audit row on success. Subject-bound, so another
-    /// subject's id is the uniform [`WebauthnCredentialOutcome::NotFound`] and writes
-    /// nothing.
+    /// REMOVE `subject`'s passkey `id` (issue #65), enforcing the
+    /// last-usable-login-factor guardrail in the SAME transaction it reads the state
+    /// in, and writing one `webauthn.credential.remove` audit row on success.
+    ///
+    /// The passkey is resolved WITH its subject bound, so another subject's id (or a
+    /// cross-scope id) is the uniform [`CredentialRemoveOutcome::NotFound`], never
+    /// actionable. A passkey is a first-class primary-login factor: a passwordless
+    /// account (activated by a passkey invitation, with no password ever provisioned)
+    /// can have a passkey as its ONLY login credential, so removing it would strand the
+    /// user permanently. Mirroring the sibling `account_credentials` path (issue #61),
+    /// the removal is BLOCKED ([`CredentialRemoveOutcome::BlockedLastCredential`]) when
+    /// it would leave the subject with ZERO usable login factors across ALL sources,
+    /// unless `acknowledge_recovery` is set (the documented recovery acknowledgment).
+    /// The remaining factors are counted in the same transaction so a concurrent
+    /// removal cannot race two "last" factors out from under the guard. The three
+    /// sources counted are: a provisioned native password (a real `password_hash`, not
+    /// the unusable sentinel), any `account_credentials` usable for login, and the
+    /// subject's OTHER passkeys (excluding the one being removed).
     ///
     /// # Errors
     ///
@@ -13568,28 +13582,95 @@ impl ActingWebauthnCredentialRepo<'_> {
         env: &Env,
         subject: &UserId,
         id: &WebauthnCredentialId,
-    ) -> Result<WebauthnCredentialOutcome, StoreError> {
+        acknowledge_recovery: bool,
+    ) -> Result<CredentialRemoveOutcome, StoreError> {
         if id.scope() != self.scope || subject.scope() != self.scope {
-            return Ok(WebauthnCredentialOutcome::NotFound);
+            return Ok(CredentialRemoveOutcome::NotFound);
         }
         let scope = self.scope;
         let id_text = id.to_string();
         let subject_text = subject.to_string();
+        let tenant = scope.tenant().to_string();
+        let environment = scope.environment().to_string();
         let mut tx = begin_scoped(self.store, scope).await?;
-        let result = sqlx::query(
+        // Resolve the passkey WITH its subject bound: another subject's id finds no
+        // row and is the uniform not-found, never actionable.
+        let exists = sqlx::query(
+            "SELECT 1 AS one FROM webauthn_credentials \
+             WHERE id = $1 AND tenant_id = $2 AND environment_id = $3 AND subject = $4",
+        )
+        .bind(&id_text)
+        .bind(&tenant)
+        .bind(&environment)
+        .bind(&subject_text)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if exists.is_none() {
+            tx.commit().await?;
+            return Ok(CredentialRemoveOutcome::NotFound);
+        }
+        // The guardrail: block removing the subject's LAST usable login factor across
+        // all sources unless the recovery acknowledgment is present. Counted inside
+        // the same transaction so a concurrent removal cannot slip two "last" factors
+        // past it. A foreign-only hash is deliberately NOT counted as a factor here:
+        // the safe failure direction for a lockout guard is to block (recoverable via
+        // the acknowledgment) rather than to allow a permanent lockout.
+        if !acknowledge_recovery {
+            // (a) A provisioned native password (not the unusable sentinel).
+            let has_password: bool = sqlx::query(
+                "SELECT count(*) AS n FROM users \
+                 WHERE id = $1 AND tenant_id = $2 AND environment_id = $3 \
+                 AND password_hash <> $4",
+            )
+            .bind(&subject_text)
+            .bind(&tenant)
+            .bind(&environment)
+            .bind(USER_UNUSABLE_PASSWORD_HASH)
+            .fetch_one(&mut *tx)
+            .await?
+            .get::<i64, _>("n")
+                > 0;
+            // (b) Any account_credentials usable for login (a passkey is NOT in this
+            //     table, so every such row is an independent factor).
+            let usable_account_credentials: i64 = sqlx::query(
+                "SELECT count(*) AS n FROM account_credentials \
+                 WHERE tenant_id = $1 AND environment_id = $2 AND subject = $3 \
+                 AND usable_for_login = true",
+            )
+            .bind(&tenant)
+            .bind(&environment)
+            .bind(&subject_text)
+            .fetch_one(&mut *tx)
+            .await?
+            .get("n");
+            // (c) The subject's OTHER passkeys (excluding the one being removed).
+            let other_passkeys: i64 = sqlx::query(
+                "SELECT count(*) AS n FROM webauthn_credentials \
+                 WHERE tenant_id = $1 AND environment_id = $2 AND subject = $3 \
+                 AND id <> $4",
+            )
+            .bind(&tenant)
+            .bind(&environment)
+            .bind(&subject_text)
+            .bind(&id_text)
+            .fetch_one(&mut *tx)
+            .await?
+            .get("n");
+            if !has_password && usable_account_credentials == 0 && other_passkeys == 0 {
+                tx.commit().await?;
+                return Ok(CredentialRemoveOutcome::BlockedLastCredential);
+            }
+        }
+        sqlx::query(
             "DELETE FROM webauthn_credentials \
              WHERE id = $1 AND tenant_id = $2 AND environment_id = $3 AND subject = $4",
         )
         .bind(&id_text)
-        .bind(scope.tenant().to_string())
-        .bind(scope.environment().to_string())
+        .bind(&tenant)
+        .bind(&environment)
         .bind(&subject_text)
         .execute(&mut *tx)
         .await?;
-        if result.rows_affected() == 0 {
-            tx.commit().await?;
-            return Ok(WebauthnCredentialOutcome::NotFound);
-        }
         insert_audit_row(
             &mut tx,
             &AuditedWrite {
@@ -13604,7 +13685,7 @@ impl ActingWebauthnCredentialRepo<'_> {
         )
         .await?;
         tx.commit().await?;
-        Ok(WebauthnCredentialOutcome::Applied)
+        Ok(CredentialRemoveOutcome::Removed)
     }
 }
 

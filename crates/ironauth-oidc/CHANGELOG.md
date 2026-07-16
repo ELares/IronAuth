@@ -6,6 +6,15 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Passwordless self-lockout guard on passkey removal (issue #65 review hardening):
+  `webauthn/credentials/remove` no longer unconditionally deletes a passkey. A
+  passwordless account (activated by a passkey invitation, with no password ever
+  provisioned) can have a passkey as its ONLY login factor, so removing the caller's
+  LAST usable login factor is now BLOCKED with a `409 last_credential` unless
+  `acknowledgeRecovery` is set, mirroring the sibling #61 `account_credentials` guard.
+  The remaining factors are counted in the removal transaction across all sources: a
+  provisioned native password, any `account_credentials` usable for login, and the
+  caller's other passkeys.
 - Passkey acr/amr truthfulness and credential management (issue #65 review hardening):
   a sign-in's assurance is now derived from the credential's STORED, registration-time
   backup-eligible flag, never the mutable BE bit of the presented assertion, so a

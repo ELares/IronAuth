@@ -901,3 +901,52 @@ async fn a_mismatched_user_handle_is_refused() {
     .await;
     assert_eq!(status, StatusCode::OK, "the correct userHandle signs in");
 }
+
+#[tokio::test]
+async fn a_passwordless_user_is_blocked_from_removing_their_last_passkey() {
+    // The passwordless self-lockout guard end to end: a passkey-only account (no
+    // password ever provisioned) cannot remove its only login factor, but can with
+    // the recovery acknowledgment. This mirrors the #61 account-credential guardrail.
+    let harness = Harness::start().await;
+    let subject = harness.seed_passwordless_user("lockout@example.test").await;
+    let (_id, cookie) = harness.session_with_id(&subject, "passkey", 0).await;
+    let seed = [81_u8; 32];
+    let cred = b"lockout-credential";
+
+    let (status, reg) = register_flags(&harness, &cookie, &seed, cred, REG_SYNCED_UV).await;
+    assert_eq!(status, StatusCode::CREATED, "register: {reg}");
+    let pky = reg["id"].as_str().unwrap().to_owned();
+    let base = webauthn_base(&harness);
+
+    // Removing the last usable login factor is blocked (409 last_credential).
+    let (status, body) = post(
+        &harness,
+        &format!("{base}/credentials/remove"),
+        Some(&cookie),
+        ISSUER_BASE,
+        &json!({ "credentialId": pky }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "blocked: {body}");
+    assert_eq!(body["error"], "last_credential");
+
+    // The passkey is untouched (a blocked removal deletes nothing).
+    let (status, listed) = get(&harness, &format!("{base}/credentials"), Some(&cookie)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(listed["passkeys"].as_array().unwrap().len(), 1);
+
+    // With the explicit acknowledgment, the removal proceeds.
+    let (status, removed) = post(
+        &harness,
+        &format!("{base}/credentials/remove"),
+        Some(&cookie),
+        ISSUER_BASE,
+        &json!({ "credentialId": pky, "acknowledgeRecovery": true }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "acknowledged removal: {removed}");
+    assert_eq!(removed["removed"], true);
+    let (status, after) = get(&harness, &format!("{base}/credentials"), Some(&cookie)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(after["passkeys"].as_array().unwrap().is_empty());
+}

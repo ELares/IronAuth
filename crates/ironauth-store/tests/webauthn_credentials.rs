@@ -19,8 +19,8 @@
 use ironauth_env::Env;
 use ironauth_store::test_support::TestDatabase;
 use ironauth_store::{
-    Action, CorrelationId, NewWebauthnCredential, Scope, UserId, WEBAUTHN_CHALLENGE_TTL_SECS,
-    WebauthnCeremony, WebauthnChallengeId, WebauthnCredentialId, WebauthnCredentialOutcome,
+    Action, CorrelationId, CredentialRemoveOutcome, NewWebauthnCredential, Scope, UserId,
+    WEBAUTHN_CHALLENGE_TTL_SECS, WebauthnCeremony, WebauthnChallengeId, WebauthnCredentialId,
 };
 use sqlx::Row;
 
@@ -370,19 +370,183 @@ async fn another_subjects_credential_is_the_uniform_not_found_on_remove() {
         .scoped(scope)
         .acting(db.test_actor(&env), CorrelationId::generate(&env))
         .webauthn_credentials()
-        .remove(&env, &other, &id)
+        .remove(&env, &other, &id, false)
         .await
         .expect("remove");
-    assert_eq!(outcome, WebauthnCredentialOutcome::NotFound);
+    assert_eq!(outcome, CredentialRemoveOutcome::NotFound);
 
-    // The owner can, and it is audited.
+    // The owner can (they hold a password, so the passkey is not their last usable
+    // login factor), and it is audited.
     let outcome = db
         .store()
         .scoped(scope)
         .acting(db.test_actor(&env), CorrelationId::generate(&env))
         .webauthn_credentials()
-        .remove(&env, &owner, &id)
+        .remove(&env, &owner, &id, false)
         .await
         .expect("remove");
-    assert_eq!(outcome, WebauthnCredentialOutcome::Applied);
+    assert_eq!(outcome, CredentialRemoveOutcome::Removed);
+}
+
+/// Register a PASSWORDLESS user: the native `password_hash` is the unusable sentinel
+/// (`!`), exactly as a passkey-invitation activation leaves it, so a passkey is the
+/// user's only login factor.
+async fn register_passwordless_user(
+    db: &TestDatabase,
+    env: &Env,
+    scope: Scope,
+    handle: &str,
+) -> UserId {
+    db.store()
+        .scoped(scope)
+        .acting(db.test_actor(env), CorrelationId::generate(env))
+        .users()
+        .register(env, handle, "!")
+        .await
+        .expect("register passwordless user")
+}
+
+#[tokio::test]
+async fn a_passwordless_user_cannot_remove_their_last_passkey_without_acknowledgment() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let subject = register_passwordless_user(&db, &env, scope, "solo@example.test").await;
+    let transports: Vec<String> = vec![];
+
+    let id = db
+        .store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .webauthn_credentials()
+        .register(
+            &env,
+            &subject,
+            &new_credential(b"only", b"cose", &transports, "only key"),
+        )
+        .await
+        .expect("register");
+
+    // Removing the last usable login factor with NO acknowledgment is blocked, and
+    // the credential is untouched (a blocked removal deletes nothing).
+    let blocked = db
+        .store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .webauthn_credentials()
+        .remove(&env, &subject, &id, false)
+        .await
+        .expect("remove");
+    assert_eq!(blocked, CredentialRemoveOutcome::BlockedLastCredential);
+    let still_there = db
+        .store()
+        .scoped(scope)
+        .webauthn_credentials()
+        .list(&subject, 10, None)
+        .await
+        .expect("list");
+    assert_eq!(still_there.len(), 1, "a blocked removal deletes nothing");
+
+    // With the recovery acknowledgment, the removal proceeds.
+    let removed = db
+        .store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .webauthn_credentials()
+        .remove(&env, &subject, &id, true)
+        .await
+        .expect("remove");
+    assert_eq!(removed, CredentialRemoveOutcome::Removed);
+}
+
+#[tokio::test]
+async fn a_passkey_that_is_not_the_last_login_factor_removes_without_acknowledgment() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let transports: Vec<String> = vec![];
+
+    // A passwordless user with TWO passkeys: removing the first (the second remains a
+    // usable factor) is allowed without acknowledgment; removing the now-last one is
+    // then blocked.
+    let subject = register_passwordless_user(&db, &env, scope, "pair@example.test").await;
+    let first = db
+        .store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .webauthn_credentials()
+        .register(
+            &env,
+            &subject,
+            &new_credential(b"first", b"cose", &transports, "first key"),
+        )
+        .await
+        .expect("register first");
+    let second = db
+        .store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .webauthn_credentials()
+        .register(
+            &env,
+            &subject,
+            &new_credential(b"second", b"cose", &transports, "second key"),
+        )
+        .await
+        .expect("register second");
+    let removed = db
+        .store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .webauthn_credentials()
+        .remove(&env, &subject, &first, false)
+        .await
+        .expect("remove first");
+    assert_eq!(
+        removed,
+        CredentialRemoveOutcome::Removed,
+        "not the last factor: removable without acknowledgment"
+    );
+    let blocked = db
+        .store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .webauthn_credentials()
+        .remove(&env, &subject, &second, false)
+        .await
+        .expect("remove second");
+    assert_eq!(
+        blocked,
+        CredentialRemoveOutcome::BlockedLastCredential,
+        "the now-last passkey is protected"
+    );
+
+    // A user who HOLDS a native password can remove a lone passkey freely: the
+    // password is the remaining login factor.
+    let with_pw = register_user(&db, &env, scope, "haspw@example.test").await;
+    let pk = db
+        .store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .webauthn_credentials()
+        .register(
+            &env,
+            &with_pw,
+            &new_credential(b"pwpk", b"cose", &transports, "pw user key"),
+        )
+        .await
+        .expect("register");
+    let removed = db
+        .store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .webauthn_credentials()
+        .remove(&env, &with_pw, &pk, false)
+        .await
+        .expect("remove");
+    assert_eq!(
+        removed,
+        CredentialRemoveOutcome::Removed,
+        "a native password is a remaining login factor"
+    );
 }

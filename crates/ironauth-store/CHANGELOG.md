@@ -6,6 +6,15 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Last-usable-login-factor guard on passkey removal (issue #65 review hardening):
+  `ActingWebauthnCredentialRepo::remove` now takes an `acknowledge_recovery` flag and
+  returns the shared `CredentialRemoveOutcome`. In the removal transaction it counts
+  the subject's remaining usable login factors across all sources (a provisioned
+  native password that is not the unusable sentinel, any `account_credentials` usable
+  for login, and the subject's other passkeys) and returns `BlockedLastCredential`
+  when removing the passkey would leave zero, unless the acknowledgment is set, so a
+  passwordless user cannot strand themselves. No new migration (a count query and a
+  conditional, not schema).
 - Passkey management and security audit actions (issue #65 review hardening): the
   passkey rename now writes a `webauthn.credential.rename` audit row on success (it
   was silent before), and a new `record_backup_eligibility_mismatch` writes a

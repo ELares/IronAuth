@@ -30,8 +30,9 @@ use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use ironauth_store::{
-    ConsumedChallenge, CorrelationId, NewWebauthnCredential, Scope, StoreError, UserId,
-    WebauthnCeremony, WebauthnCredentialId, WebauthnCredentialOutcome, WebauthnCredentialRecord,
+    ConsumedChallenge, CorrelationId, CredentialRemoveOutcome, NewWebauthnCredential, Scope,
+    StoreError, UserId, WebauthnCeremony, WebauthnCredentialId, WebauthnCredentialOutcome,
+    WebauthnCredentialRecord,
 };
 use ironauth_webauthn::{
     AuthenticationResponse, CredentialDescriptor, RegisteredCredential, RegistrationResponse,
@@ -603,12 +604,21 @@ pub struct RemoveCredentialBody {
     /// value is the uniform not-found.
     #[serde(rename = "credentialId")]
     credential_id: String,
+    /// The documented recovery acknowledgment (mirrors the #61 account-credential
+    /// flow): when true, removing the caller's LAST usable login factor is permitted
+    /// (the user accepts they will rely on account recovery). Absent or false blocks
+    /// that removal so a passwordless user cannot silently strand themselves.
+    #[serde(default, rename = "acknowledgeRecovery")]
+    acknowledge_recovery: bool,
 }
 
 /// `POST /t/{tenant}/e/{environment}/webauthn/credentials/remove`: remove one of the
 /// caller's OWN passkeys (issue #65). Same-origin guarded (CSRF), authenticated,
 /// subject-bound at the store layer, and audited on success. Another user's
-/// credential is the uniform not-found and is never removed.
+/// credential is the uniform not-found and is never removed. Removing the caller's
+/// LAST usable login factor (counted across a native password, `account_credentials`,
+/// and other passkeys) is blocked unless `acknowledgeRecovery` is set, so a
+/// passwordless account cannot lock itself out.
 pub async fn remove_credential(
     State(state): State<OidcState>,
     Path((tenant_id, environment_id)): Path<(String, String)>,
@@ -641,14 +651,23 @@ pub async fn remove_credential(
             CorrelationId::generate(state.env()),
         )
         .webauthn_credentials()
-        .remove(state.env(), &subject, &id)
+        .remove(state.env(), &subject, &id, body.acknowledge_recovery)
         .await;
     match outcome {
-        Ok(WebauthnCredentialOutcome::Applied) => json_response(
+        Ok(CredentialRemoveOutcome::Removed) => json_response(
             StatusCode::OK,
             json!({ "id": id.to_string(), "removed": true }),
         ),
-        Ok(WebauthnCredentialOutcome::NotFound) => credential_not_found(),
+        Ok(CredentialRemoveOutcome::NotFound) => credential_not_found(),
+        Ok(CredentialRemoveOutcome::BlockedLastCredential) => json_response(
+            StatusCode::CONFLICT,
+            json!({
+                "error": "last_credential",
+                "error_description": "This is your last credential that can sign you in. \
+                     Removing it would lock you out. Set acknowledgeRecovery to confirm you \
+                     accept relying on account recovery.",
+            }),
+        ),
         Err(_) => ceremony_error(),
     }
 }
