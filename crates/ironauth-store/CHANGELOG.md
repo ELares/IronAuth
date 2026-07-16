@@ -6,6 +6,15 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Admin sudo elevation ledger (issue #73): migration 0052 adds the tenant-scoped,
+  forced-RLS `admin_sudo_elevations` append-only table (the acting principal, the achieved
+  acr, the recorded elevation instant, and the window expiry), an `elv_` scoped id, the
+  `AdminSudoElevationRepo::latest_for_actor` read and `ActingAdminSudoElevationRepo::record`
+  / `record_challenge` audited writes, and the `admin.privilege.elevated` /
+  `admin.privilege.challenged` audit actions. The ledger row IS the audit trail, and it is
+  the only source of the freshness the admin mutation guard reads (never client-asserted).
+  Granted to the control-plane role only. Registered in the migration guard test and
+  `scripts/query-audit.sh`.
 - MDS3 cache rollback protection (issue #66 PR B, adversarial review): the
   `mds3_blob_cache` upsert now enforces the documented monotonic rule with an
   `ON CONFLICT ... WHERE EXCLUDED.blob_no > mds3_blob_cache.blob_no` guard, so a replayed

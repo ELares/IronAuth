@@ -578,6 +578,12 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0051_passkey_attestation.sql"),
         },
+        Migration {
+            version: 52,
+            name: "admin_sudo_elevations",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0052_admin_sudo_elevations.sql"),
+        },
     ]
 }
 

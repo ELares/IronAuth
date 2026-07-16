@@ -69,16 +69,17 @@ use crate::email_otp::{
 use crate::environment::{EnvironmentType, GuardrailSet};
 use crate::error::StoreError;
 use crate::id::{
-    AaguidRuleId, AbuseBanId, AcmeChallengeId, AssertionMappingId, AttestationConfigId, AuditId,
-    AuditTarget, AuthorizationCodeId, BackChannelDeliveryId, ClientId, ClientSessionId, ConsentId,
-    CorrelationId, CredentialClassPolicyId, CredentialId, CustomDomainId, DcrPolicyId, DekId,
-    DeviceCodeId, EmailOtpCodeId, EncryptedSecretId, EnvironmentId, EnvironmentSecretId,
-    ExternalIssuerId, GrantId, InitialAccessTokenId, InvitationId, IssuedTokenId, KekId,
-    MagicLinkTokenId, ManagementKeyId, Mds3BlobCacheId, MigrationRunId, MigrationRunRecordId,
-    OperatorId, OrganizationId, PushedRequestId, RecoveryCodeId, RefreshFamilyId, RefreshTokenId,
-    ResourceServerId, ScopeStepUpPolicyId, ServiceAccountId, SessionEventId, SessionId,
-    SigningKeyId, SmsOtpCodeId, SmsRouteStatId, TenantId, TotpCredentialId, TraitMigrationJobId,
-    TraitSchemaId, UserId, UserIdentifierId, VariableId, WebauthnChallengeId, WebauthnCredentialId,
+    AaguidRuleId, AbuseBanId, AcmeChallengeId, AdminSudoElevationId, AssertionMappingId,
+    AttestationConfigId, AuditId, AuditTarget, AuthorizationCodeId, BackChannelDeliveryId,
+    ClientId, ClientSessionId, ConsentId, CorrelationId, CredentialClassPolicyId, CredentialId,
+    CustomDomainId, DcrPolicyId, DekId, DeviceCodeId, EmailOtpCodeId, EncryptedSecretId,
+    EnvironmentId, EnvironmentSecretId, ExternalIssuerId, GrantId, InitialAccessTokenId,
+    InvitationId, IssuedTokenId, KekId, MagicLinkTokenId, ManagementKeyId, Mds3BlobCacheId,
+    MigrationRunId, MigrationRunRecordId, OperatorId, OrganizationId, PushedRequestId,
+    RecoveryCodeId, RefreshFamilyId, RefreshTokenId, ResourceServerId, ScopeStepUpPolicyId,
+    ServiceAccountId, SessionEventId, SessionId, SigningKeyId, SmsOtpCodeId, SmsRouteStatId,
+    TenantId, TotpCredentialId, TraitMigrationJobId, TraitSchemaId, UserId, UserIdentifierId,
+    VariableId, WebauthnChallengeId, WebauthnCredentialId,
 };
 use crate::identifier::{
     CanonicalIdentifier, IdentifierType, UniquenessMode, canonicalize_identifier,
@@ -118,6 +119,18 @@ impl<'a> ScopedStore<'a> {
     #[must_use]
     pub fn scope_step_up_policies(&self) -> ScopeStepUpPolicyRepo<'a> {
         ScopeStepUpPolicyRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
+    /// The read-only admin sudo elevation repository for this scope (issue #73): read
+    /// the latest recorded re-authentication elevation for an acting principal so the
+    /// mutation guard can evaluate its freshness. The recording writes live on
+    /// [`ActingStore::admin_sudo_elevations`].
+    #[must_use]
+    pub fn admin_sudo_elevations(&self) -> AdminSudoElevationRepo<'a> {
+        AdminSudoElevationRepo {
             store: self.store,
             scope: self.scope,
         }
@@ -758,6 +771,18 @@ impl<'a> ActingStore<'a> {
     #[must_use]
     pub fn scope_step_up_policies(&self) -> ActingScopeStepUpPolicyRepo<'a> {
         ActingScopeStepUpPolicyRepo {
+            store: self.store,
+            scope: self.scope,
+            acting: self.acting,
+        }
+    }
+
+    /// The mutating admin sudo elevation repository for this scope and actor (issue
+    /// #73): record a re-authentication elevation (the ledger row is also the audit
+    /// row). The reads live on [`ScopedStore::admin_sudo_elevations`].
+    #[must_use]
+    pub fn admin_sudo_elevations(&self) -> ActingAdminSudoElevationRepo<'a> {
+        ActingAdminSudoElevationRepo {
             store: self.store,
             scope: self.scope,
             acting: self.acting,
@@ -2013,6 +2038,175 @@ impl ActingScopeStepUpPolicyRepo<'_> {
                 .await?;
                 Ok(())
             },
+            false,
+        )
+        .await
+    }
+}
+
+/// One admin sudo elevation ledger row (issue #73): a recorded re-authentication
+/// event that opens a freshness window for admin mutations, read within scope.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdminSudoElevation {
+    /// The `elv_` elevation identifier (embeds its tenant and environment).
+    pub id: AdminSudoElevationId,
+    /// The achieved authentication context of the recorded re-auth (a server-derived
+    /// acr string, never a client-asserted value).
+    pub acr: String,
+    /// The recorded re-authentication instant, epoch microseconds (the freshness
+    /// source the mutation guard evaluates against the window).
+    pub elevated_at_unix_micros: i64,
+    /// The window expiry, epoch microseconds (`elevated_at + the per-environment
+    /// window`). The elevation is fresh only while `now < expires_at`.
+    pub expires_at_unix_micros: i64,
+}
+
+/// The read-only admin sudo elevation repository for a scope (issue #73).
+///
+/// Reachable through [`ScopedStore::admin_sudo_elevations`]. The mutation guard reads
+/// the LATEST elevation for the acting principal and treats it as fresh only while the
+/// window has not lapsed; an absent or lapsed elevation fails closed (a challenge). The
+/// freshness source is entirely SERVER-SIDE state, so the elevation can never be
+/// client-asserted (the #14/#72 acr honesty discipline).
+pub struct AdminSudoElevationRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl AdminSudoElevationRepo<'_> {
+    /// The most recent elevation recorded for `actor_id` in this scope, or `None`
+    /// when the acting principal has never elevated here.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn latest_for_actor(
+        &self,
+        actor_id: &str,
+    ) -> Result<Option<AdminSudoElevation>, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT id, acr, \
+             (EXTRACT(EPOCH FROM elevated_at) * 1000000)::bigint AS elevated_us, \
+             (EXTRACT(EPOCH FROM expires_at) * 1000000)::bigint AS expires_us \
+             FROM admin_sudo_elevations \
+             WHERE tenant_id = $1 AND environment_id = $2 AND actor_id = $3 \
+             ORDER BY elevated_at DESC, id DESC LIMIT 1",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(actor_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        row.map(|row| {
+            let id_text: String = row.get("id");
+            let id = AdminSudoElevationId::parse_in_scope(&id_text, &self.scope)?;
+            Ok(AdminSudoElevation {
+                id,
+                acr: row.get("acr"),
+                elevated_at_unix_micros: row.get("elevated_us"),
+                expires_at_unix_micros: row.get("expires_us"),
+            })
+        })
+        .transpose()
+    }
+}
+
+/// The mutating admin sudo elevation repository for a scope and actor (issue #73).
+/// Reachable only through [`ScopedStore::acting`], so every recorded elevation carries
+/// its acting principal and correlation id and routes through the audited-write
+/// primitive (the elevation ledger IS the audit trail).
+pub struct ActingAdminSudoElevationRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+    acting: ActingContext,
+}
+
+impl ActingAdminSudoElevationRepo<'_> {
+    /// Record a re-authentication elevation for the acting principal, auditing
+    /// `admin.privilege.elevated` in the same transaction. `elevated_at_unix_micros`
+    /// is the recorded re-auth instant (from the caller's clock seam) and
+    /// `expires_at_unix_micros` is the window expiry; both are server-written, never
+    /// client-supplied. `acr` is the achieved authentication context. Returns the
+    /// elevation id.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn record(
+        &self,
+        env: &Env,
+        acr: &str,
+        elevated_at_unix_micros: i64,
+        expires_at_unix_micros: i64,
+    ) -> Result<AdminSudoElevationId, StoreError> {
+        let scope = self.scope;
+        let id = AdminSudoElevationId::generate(env, &scope);
+        let actor = self.acting.actor();
+        let actor_kind = actor.kind_str();
+        let actor_id = actor.id_string();
+        let detail = format!("acr={acr}; expires_at_us={expires_at_unix_micros}");
+        write_audited_detailed(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::AdminPrivilegeElevated,
+                target: &id,
+            },
+            async move |tx| {
+                sqlx::query(
+                    "INSERT INTO admin_sudo_elevations \
+                     (id, tenant_id, environment_id, actor_kind, actor_id, acr, \
+                      elevated_at, expires_at) \
+                     VALUES ($1, $2, $3, $4, $5, $6, \
+                             TIMESTAMPTZ 'epoch' + ($7::text || ' microseconds')::interval, \
+                             TIMESTAMPTZ 'epoch' + ($8::text || ' microseconds')::interval)",
+                )
+                .bind(id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(actor_kind)
+                .bind(actor_id)
+                .bind(acr)
+                .bind(elevated_at_unix_micros)
+                .bind(expires_at_unix_micros)
+                .execute(&mut **tx)
+                .await?;
+                Ok(())
+            },
+            false,
+            Some(&detail),
+        )
+        .await?;
+        Ok(id)
+    }
+
+    /// Audit a REFUSED admin mutation whose sudo freshness window had lapsed, writing
+    /// `admin.privilege.challenged` in its own transaction (issue #73). No ledger row
+    /// is inserted (the elevation was absent or expired, which is exactly the audited
+    /// fact); the audit target is a synthetic elevation handle so the event stays
+    /// legible without a prior read. The mutation itself is never executed, so a stolen
+    /// credential without a fresh re-auth leaves only this refusal in the trail.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn record_challenge(&self, env: &Env) -> Result<(), StoreError> {
+        let scope = self.scope;
+        let id = AdminSudoElevationId::generate(env, &scope);
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::AdminPrivilegeChallenged,
+                target: &id,
+            },
+            async move |_tx| Ok(()),
             false,
         )
         .await

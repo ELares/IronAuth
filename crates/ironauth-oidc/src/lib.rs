@@ -211,7 +211,7 @@ pub use state::{
     OidcState, PASSWORD_BREACHED_AT_LOGIN_TOTAL, PASSWORD_SCREEN_TOTAL, ResourceTargetError,
     describe_screening_metrics,
 };
-pub use step_up::{canonical_step_up_acr, required_credential_class};
+pub use step_up::{canonical_step_up_acr, privilege_is_fresh, required_credential_class};
 pub use subject::{
     MAX_SUBJECT_LEN, PairwiseSalt, SubjectCache, SubjectConfig, SubjectType, resolve_subject,
     subject_within_cap,
@@ -394,6 +394,20 @@ pub fn oidc_router(state: OidcState) -> Router {
         .route(
             "/t/{tenant_id}/e/{environment_id}/webauthn/credentials/remove",
             post(webauthn::remove_credential),
+        )
+        // The exploratory WebAuthn L3 Signal API surface (issue #73): the
+        // authenticated signal-data endpoint and the hosted passkey-management page
+        // that emits the feature-detected signal JavaScript. Both fail closed with a
+        // 404 when `oidc.webauthn_signal_api_enabled` (or the base webauthn flag) is
+        // off, so the routes stay unconditional for the RFC 9700 endpoint inventory
+        // while the feature is fully inert.
+        .route(
+            "/t/{tenant_id}/e/{environment_id}/webauthn/signal",
+            get(webauthn::signal_data),
+        )
+        .route(
+            "/t/{tenant_id}/e/{environment_id}/webauthn/manage",
+            get(webauthn::signal_manage_page),
         )
         // The TOTP second-factor and recovery-code endpoints (issue #69), self-service
         // and session-authenticated. Each handler fails closed with a 404 when

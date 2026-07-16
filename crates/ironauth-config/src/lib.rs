@@ -525,6 +525,35 @@ pub struct AdminConfig {
     /// uniform not-found. Unset (the default) is fail closed.
     #[serde(default)]
     pub outbound_verification_environment: Option<String>,
+
+    /// Whether admin sudo mode (session privilege separation) is active on the
+    /// management surface (issue #73). OFF by default: it is an exploratory bet, gated
+    /// behind a per-environment flag and a graduation decision. When ON, admin READS are
+    /// unaffected but a MUTATION requires a RECENT re-authentication: the acting
+    /// credential must have a recorded elevation whose freshness window has not lapsed,
+    /// evaluated the same way step-up (issue #72) evaluates a max-auth-age window. A
+    /// mutation without a fresh elevation returns a structured RFC 9470 challenge
+    /// (`insufficient_user_authentication`) and executes nothing. The elevation derives
+    /// only from a SERVER-RECORDED re-auth event, never from a client-supplied header or
+    /// flag, so a stolen credential alone cannot mutate once the window lapses. When OFF,
+    /// the admin surface behaves exactly as before (no freshness gate). Independent of
+    /// every other flag.
+    #[serde(default)]
+    pub sudo_mode_enabled: bool,
+
+    /// The admin sudo re-authentication freshness window, in seconds (issue #73): how
+    /// long a recorded elevation authorizes admin mutations before a fresh
+    /// re-authentication is required. Only consulted when `sudo_mode_enabled` is true.
+    /// The default (600) is ten minutes, the GitHub-sudo-mode convention. A tunable with
+    /// a safe default; a shorter window trades operator friction for a tighter blast
+    /// radius on a stolen credential.
+    #[serde(default = "default_sudo_mode_window_secs")]
+    pub sudo_mode_window_secs: u64,
+}
+
+/// The default admin sudo re-authentication freshness window: ten minutes (issue #73).
+fn default_sudo_mode_window_secs() -> u64 {
+    600
 }
 
 /// The default tenant-offboarding retention window: 30 days in seconds (issue #46).
@@ -545,6 +574,8 @@ impl Default for AdminConfig {
             outbound_verification_token: None,
             outbound_verification_tenant: None,
             outbound_verification_environment: None,
+            sudo_mode_enabled: false,
+            sudo_mode_window_secs: default_sudo_mode_window_secs(),
         }
     }
 }
@@ -1228,6 +1259,39 @@ pub struct OidcConfig {
     /// refused at config load, mirroring the HIBP base-URL rule.
     pub mds3_base_url: Option<String>,
 
+    /// Whether the exploratory WebAuthn Level 3 Signal API surface is active (issue
+    /// #73). OFF by default: it is a forward bet on a browser API that only Chrome 132
+    /// and later ships, gated behind a per-environment flag and a graduation decision.
+    /// When ON, the hosted passkey-management page emits the feature-detected signal
+    /// JavaScript (signalUnknownCredential, signalAllAcceptedCredentials,
+    /// signalCurrentUserDetails) under a nonce-guarded CSP, and the signal-data endpoint
+    /// returns the current accepted-credential id list and user details for the
+    /// authenticated subject. When OFF, no signal JavaScript is emitted (no page change)
+    /// and the signal-data endpoint is a uniform 404, so an unsupported or
+    /// signal-disabled deployment sees no behavior change and no errors. Independent of
+    /// every other flag; a browser that does not support the API feature-detects it away
+    /// regardless.
+    pub webauthn_signal_api_enabled: bool,
+
+    /// Whether conditional-create passkey enrollment is offered after a successful
+    /// password login (issue #73), the silent-upgrade half of the Signal API bet. OFF by
+    /// default and additionally gated by [`OidcConfig::webauthn_signal_api_enabled`] and
+    /// [`OidcConfig::webauthn_enabled`]: even when the signal surface is active, a tenant
+    /// opts INTO the silent upgrade separately (the per-tenant policy on/off). When ON,
+    /// the hosted page attempts a `mediation: 'conditional'` credential creation for a
+    /// user who has no passkey yet, recorded through the STANDARD passkey ceremony
+    /// pipeline (issue #65), and NEVER interrupts or fails the login on a
+    /// conditional-create failure. Honors the frequency cap below.
+    pub webauthn_conditional_create_enabled: bool,
+
+    /// The minimum interval, in seconds, between conditional-create passkey-enrollment
+    /// offers to the same browser (issue #73): the per-tenant frequency cap that keeps
+    /// the silent upgrade from nagging a user who dismissed it. A prior offer within this
+    /// window suppresses the next one. The default (604800) is one week. It is a nag
+    /// cap, not a security control, so it degrades safely to a no-op on a browser that
+    /// does not retain the last-offer marker.
+    pub webauthn_conditional_create_min_interval_secs: u64,
+
     /// Whether the TOTP second-factor endpoints are mounted (issue #69). On by
     /// default: TOTP is the universal second factor. When off, the enroll/verify/
     /// recovery endpoints fail closed with a uniform 404, so a deployment that does
@@ -1430,6 +1494,9 @@ pub struct OidcConfig {
 }
 
 impl Default for OidcConfig {
+    // A flat field-by-field default for a large config struct; it is one assignment per
+    // field with no logic, so the length lint is not meaningful here.
+    #[allow(clippy::too_many_lines)]
     fn default() -> Self {
         Self {
             enabled: false,
@@ -1492,6 +1559,9 @@ impl Default for OidcConfig {
             webauthn_require_user_verification: true,
             webauthn_clone_detection_block: false,
             mds3_base_url: None,
+            webauthn_signal_api_enabled: false,
+            webauthn_conditional_create_enabled: false,
+            webauthn_conditional_create_min_interval_secs: 604_800,
             totp_enabled: true,
             totp_issuer: None,
             totp_period_secs: 30,
@@ -3601,6 +3671,52 @@ impl std::error::Error for ConfigError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The issue #73 flag matrix: both exploratory features are OFF by default and are
+    // independently toggleable per environment, so neither one turns the other on.
+    #[test]
+    fn issue_73_feature_flags_are_off_by_default() {
+        let config = Config::from_toml_str("", "<inline>")
+            .expect("empty config is valid")
+            .config;
+        assert!(
+            !config.oidc.webauthn_signal_api_enabled,
+            "the WebAuthn Signal API is off by default"
+        );
+        assert!(
+            !config.oidc.webauthn_conditional_create_enabled,
+            "conditional-create is off by default"
+        );
+        assert!(
+            !config.admin.sudo_mode_enabled,
+            "admin sudo mode is off by default"
+        );
+        // The supporting tunables keep their documented safe defaults.
+        assert_eq!(
+            config.oidc.webauthn_conditional_create_min_interval_secs,
+            604_800
+        );
+        assert_eq!(config.admin.sudo_mode_window_secs, 600);
+    }
+
+    #[test]
+    fn issue_73_feature_flags_toggle_independently() {
+        // Turning the signal API on does not turn sudo mode on.
+        let signal_only =
+            Config::from_toml_str("[oidc]\nwebauthn_signal_api_enabled = true\n", "<inline>")
+                .expect("valid")
+                .config;
+        assert!(signal_only.oidc.webauthn_signal_api_enabled);
+        assert!(!signal_only.admin.sudo_mode_enabled);
+
+        // Turning sudo mode on does not turn the signal API (or conditional-create) on.
+        let sudo_only = Config::from_toml_str("[admin]\nsudo_mode_enabled = true\n", "<inline>")
+            .expect("valid")
+            .config;
+        assert!(sudo_only.admin.sudo_mode_enabled);
+        assert!(!sudo_only.oidc.webauthn_signal_api_enabled);
+        assert!(!sudo_only.oidc.webauthn_conditional_create_enabled);
+    }
 
     #[test]
     fn empty_input_yields_the_documented_defaults() {

@@ -6,6 +6,26 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Admin session privilege separation (sudo mode), EXPLORATORY and off by default (issue
+  #73). Behind the new per-environment `admin.sudo_mode_enabled` flag, admin READS are
+  unaffected but an environment-scoped MUTATION requires a RECENT re-authentication: the
+  acting credential must have a server-recorded elevation whose freshness window
+  (`admin.sudo_mode_window_secs`, default 10 minutes) has not lapsed, evaluated by the
+  reused step-up `privilege_is_fresh` seam. A mutation without a fresh elevation returns a
+  structured RFC 9470 `insufficient_user_authentication` challenge (a 401 carrying `max_age`
+  in the body and the `WWW-Authenticate` header) and executes nothing. A new
+  `POST .../admin/sudo/elevate` endpoint records a fresh elevation, server-side, from the
+  clock seam and audits it (`admin.privilege.elevated`); a refused mutation audits
+  `admin.privilege.challenged`. The elevation derives ONLY from the recorded event, never
+  from any client-supplied header or flag, so a stolen credential alone cannot mutate once
+  the window lapses (the acceptance-critical guarantee, tested with a forged-header
+  adversarial case). When the flag is off the surface behaves exactly as before and the
+  elevate endpoint is a uniform not-found. The freshness seam is factored so end-user apps
+  can adopt the same mechanism later without rework. Design note: the admin plane
+  authenticates via non-interactive bearer credentials with no second factor, so binding the
+  elevation to a DISTINCT interactive re-auth factor (an operator passkey) is a documented
+  graduation step; the prototype's server-recorded, never-client-asserted elevation is what
+  the guarantee and tests enforce today.
 - OpenAPI contract sync for the MDS3 health route (issue #66 PR B, adversarial review):
   the hardcoded `openapi_contract` assertions now include `getMds3Health` and its
   `GET .../webauthn/mds3/health` path and pin the served-route count at 61, matching the

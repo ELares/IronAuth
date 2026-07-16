@@ -71,6 +71,42 @@ impl Harness {
         }
     }
 
+    /// Start a fresh database and router with admin SUDO MODE enabled (issue #73) and a
+    /// DETERMINISTIC clock, so a test can drive the freshness lifecycle by advancing the
+    /// returned [`ironauth_env::ManualClock`]. `window_secs` is the re-authentication
+    /// freshness window. The router's `AdminState` is built over the returned manual
+    /// clock, so both an elevation's recorded instant and the guard's `now` move only
+    /// when the test advances it. Setup helpers that go through non-environment-scoped
+    /// operator-plane routes (create tenant / environment) are ungated, so they still
+    /// work; the environment-scoped mutation guard is what the test exercises.
+    pub async fn start_with_sudo(
+        window_secs: u64,
+    ) -> (Self, std::sync::Arc<ironauth_env::ManualClock>) {
+        let db = TestDatabase::start().await;
+        // A fixed, non-zero epoch start so recorded instants are plausible timestamps.
+        let start = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        let (env, clock) = Env::deterministic(start, 73);
+        let config = AdminConfig {
+            bootstrap_operator_token: Some(Secret::Literal(SecretString::new(OPERATOR_TOKEN))),
+            max_page_size: 200,
+            default_page_size: 50,
+            sudo_mode_enabled: true,
+            sudo_mode_window_secs: window_secs,
+            ..AdminConfig::default()
+        };
+        let state =
+            AdminState::new(db.control_store().clone(), env, &config).expect("admin state builds");
+        let router = management_router(state);
+        (
+            Self {
+                db,
+                router,
+                outbound_scope: None,
+            },
+            clock,
+        )
+    }
+
     /// Start a fresh database and router with the OUTBOUND lazy-migration
     /// credential-verification endpoint enabled, its shared token set, and BOUND to a
     /// freshly seeded `(tenant, environment)` scope (issue #58). `token` is the bearer

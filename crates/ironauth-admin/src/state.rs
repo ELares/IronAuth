@@ -85,6 +85,12 @@ struct Inner {
     // counts. `None` when no hook is configured, or on a node that does not run the data
     // plane; the endpoint then reports progress with no breaker block.
     migration_hook: Option<Arc<ironauth_oidc::LazyMigrationHook>>,
+    // Admin sudo mode (session privilege separation, issue #73): whether admin
+    // mutations require a recent recorded re-authentication, and the freshness window in
+    // seconds. Off by default; when off the mutation guard is a no-op and the admin
+    // surface behaves exactly as before.
+    sudo_mode_enabled: bool,
+    sudo_mode_window_secs: u64,
 }
 
 impl AdminState {
@@ -167,6 +173,8 @@ impl AdminState {
                     .clone()
                     .filter(|value| !value.trim().is_empty()),
                 migration_hook: None,
+                sudo_mode_enabled: config.sudo_mode_enabled,
+                sudo_mode_window_secs: config.sudo_mode_window_secs,
             }),
         })
     }
@@ -267,6 +275,22 @@ impl AdminState {
     #[must_use]
     pub fn offboarding_retention(&self) -> std::time::Duration {
         std::time::Duration::from_secs(self.inner.offboarding_retention_secs)
+    }
+
+    /// Whether admin sudo mode (session privilege separation, issue #73) is active.
+    /// When false, the admin mutation freshness guard is a no-op and the surface
+    /// behaves exactly as before (the feature is fully inert when off).
+    #[must_use]
+    pub fn sudo_mode_enabled(&self) -> bool {
+        self.inner.sudo_mode_enabled
+    }
+
+    /// The admin sudo re-authentication freshness window, in seconds (issue #73): how
+    /// long a recorded elevation authorizes admin mutations before a fresh
+    /// re-authentication is required.
+    #[must_use]
+    pub fn sudo_mode_window_secs(&self) -> u64 {
+        self.inner.sudo_mode_window_secs
     }
 
     /// The control-plane store.

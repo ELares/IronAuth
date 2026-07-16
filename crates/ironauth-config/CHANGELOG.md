@@ -6,6 +6,14 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Two EXPLORATORY per-environment feature flags for issue #73, both default OFF and
+  independently toggleable: `oidc.webauthn_signal_api_enabled` (the WebAuthn L3 Signal API
+  hosted-page surface) plus its `oidc.webauthn_conditional_create_enabled` policy and
+  `oidc.webauthn_conditional_create_min_interval_secs` frequency cap; and
+  `admin.sudo_mode_enabled` (admin session privilege separation) plus its
+  `admin.sudo_mode_window_secs` re-authentication window (default 600). When off, each
+  feature is fully inert. A config flag-matrix test proves both are off by default and turn
+  on independently.
 - MDS3 endpoint override (issue #66 PR B): `webauthn.mds3_base_url` (optional, validated
   as an https URL, mirroring `hibp_base_url`) lets a deployment point the FIDO MDS3 sync
   at an alternate endpoint; the pinned FIDO Alliance root stays compiled in and is never

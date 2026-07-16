@@ -1099,6 +1099,95 @@
         ]
       }
     },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/admin/sudo/elevate": {
+      "post": {
+        "tags": [
+          "sudo"
+        ],
+        "summary": "`POST .../admin/sudo/elevate`: record a fresh re-authentication elevation for the\nacting credential (issue #73), opening the sudo freshness window so subsequent\nadmin mutations in this environment are authorized until the window lapses.",
+        "description": "The elevation instant is taken from the server clock seam, never the request, and\nthe event is audited (`admin.privilege.elevated`). When sudo mode is off the\nendpoint is a uniform not-found, so the feature is fully inert.",
+        "operationId": "elevateAdminSudo",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Optional. Recording an elevation is naturally safe to repeat (it refreshes the window), so the key is not required.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The acting credential is elevated",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SudoElevationView"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Sudo mode is disabled, or the scope is not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/v1/tenants/{tenant_id}/environments/{environment_id}/clients/{client_id}": {
       "get": {
         "tags": [
@@ -6447,6 +6536,15 @@
             },
             "description": "Present only on a guardrail-violation error (issue #42): the stable code of\nevery guardrail the request failed, so the caller learns each failure at\nonce (for example `[\"custom_domain_required\", \"https_only_redirect_uris\"]`)."
           },
+          "max_age": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Present only on a sudo-mode re-authentication challenge (issue #73): the maximum\nauthentication age, in seconds, the mutation requires. Mirrors the RFC 9470\n`max_age` challenge parameter (also carried in the `WWW-Authenticate` header), so\nthe admin SPA learns how fresh a re-authentication it must obtain before\nretrying.",
+            "minimum": 0
+          },
           "message": {
             "type": "string",
             "description": "A human-readable message. Never carries a secret; for a wrong-scope error\nit names only the scope identifiers the caller already presented.",
@@ -7711,6 +7809,43 @@
           }
         }
       },
+      "SudoElevationView": {
+        "type": "object",
+        "description": "The result of a successful admin sudo elevation (issue #73).",
+        "required": [
+          "elevated",
+          "acr",
+          "elevated_at_unix_micros",
+          "expires_at_unix_micros",
+          "window_secs"
+        ],
+        "properties": {
+          "acr": {
+            "type": "string",
+            "description": "The achieved authentication context recorded for the elevation."
+          },
+          "elevated": {
+            "type": "boolean",
+            "description": "Always `true`: the acting credential is now elevated for the scope."
+          },
+          "elevated_at_unix_micros": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The recorded re-authentication instant, epoch microseconds."
+          },
+          "expires_at_unix_micros": {
+            "type": "integer",
+            "format": "int64",
+            "description": "When the elevation lapses, epoch microseconds (`elevated_at + the window`)."
+          },
+          "window_secs": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The freshness window, in seconds, this elevation authorizes mutations for.",
+            "minimum": 0
+          }
+        }
+      },
       "TenantCreated": {
         "type": "object",
         "description": "The result of creating a tenant: the tenant and its first environment.",
@@ -8098,6 +8233,10 @@
     {
       "name": "migration",
       "description": "Inbound lazy-migration progress (issue #56): how far an environment's lazy migration has come and the node's circuit-breaker state"
+    },
+    {
+      "name": "sudo",
+      "description": "Admin session privilege separation (issue #73): the re-authentication endpoint that records a fresh elevation so admin mutations pass the sudo freshness gate"
     }
   ]
 }

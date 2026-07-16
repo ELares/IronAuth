@@ -42,6 +42,13 @@ pub struct ErrorBody {
     /// once (for example `["custom_domain_required", "https_only_redirect_uris"]`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failed_guardrails: Option<Vec<String>>,
+    /// Present only on a sudo-mode re-authentication challenge (issue #73): the maximum
+    /// authentication age, in seconds, the mutation requires. Mirrors the RFC 9470
+    /// `max_age` challenge parameter (also carried in the `WWW-Authenticate` header), so
+    /// the admin SPA learns how fresh a re-authentication it must obtain before
+    /// retrying.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_age: Option<u64>,
 }
 
 /// A management API error.
@@ -80,6 +87,17 @@ pub enum ApiError {
     /// bad request because the request is well-formed but violates the environment's
     /// enforced guardrail class.
     GuardrailViolation(Vec<GuardrailViolation>),
+    /// Admin sudo mode is on and this mutation needs a RECENT re-authentication that
+    /// the acting credential does not have (issue #73): the recorded elevation is
+    /// absent or its freshness window has lapsed. Renders a 401 RFC 9470
+    /// `insufficient_user_authentication` challenge, carrying the required `max_age`
+    /// both in the JSON body and in the `WWW-Authenticate` header, and executes NOTHING.
+    /// The elevation derives from a server-recorded re-auth event, never from a
+    /// client-supplied header, so a stolen credential alone cannot clear this challenge.
+    ReauthRequired {
+        /// The maximum authentication age, in seconds, the mutation requires.
+        max_age: u64,
+    },
     /// An unexpected internal failure. Renders 500; never leaks detail.
     Internal,
 }
@@ -89,7 +107,9 @@ impl ApiError {
     fn status(&self) -> StatusCode {
         match self {
             ApiError::BadRequest(_) => StatusCode::BAD_REQUEST,
-            ApiError::Unauthorized(_) => StatusCode::UNAUTHORIZED,
+            // A missing credential and the RFC 9470 step-up challenge are both 401 (the
+            // challenge carries its requirement in the WWW-Authenticate header and body).
+            ApiError::Unauthorized(_) | ApiError::ReauthRequired { .. } => StatusCode::UNAUTHORIZED,
             ApiError::WrongScope { .. } => StatusCode::FORBIDDEN,
             ApiError::NotFound => StatusCode::NOT_FOUND,
             ApiError::Conflict(_) => StatusCode::CONFLICT,
@@ -109,6 +129,7 @@ impl ApiError {
                 expected_scope: None,
                 actual_scope: None,
                 failed_guardrails: None,
+                max_age: None,
             },
             ApiError::Unauthorized(message) => ErrorBody {
                 error: "unauthorized".to_owned(),
@@ -116,6 +137,7 @@ impl ApiError {
                 expected_scope: None,
                 actual_scope: None,
                 failed_guardrails: None,
+                max_age: None,
             },
             ApiError::WrongScope {
                 expected,
@@ -127,6 +149,7 @@ impl ApiError {
                 expected_scope: Some(expected.clone()),
                 actual_scope: Some(actual.clone()),
                 failed_guardrails: None,
+                max_age: None,
             },
             ApiError::NotFound => ErrorBody {
                 error: "not_found".to_owned(),
@@ -134,6 +157,7 @@ impl ApiError {
                 expected_scope: None,
                 actual_scope: None,
                 failed_guardrails: None,
+                max_age: None,
             },
             ApiError::Conflict(message) => ErrorBody {
                 error: "conflict".to_owned(),
@@ -141,6 +165,7 @@ impl ApiError {
                 expected_scope: None,
                 actual_scope: None,
                 failed_guardrails: None,
+                max_age: None,
             },
             ApiError::IdempotencyKeyConflict => ErrorBody {
                 error: "idempotency_key_conflict".to_owned(),
@@ -148,6 +173,7 @@ impl ApiError {
                 expected_scope: None,
                 actual_scope: None,
                 failed_guardrails: None,
+                max_age: None,
             },
             ApiError::GuardrailViolation(violations) => ErrorBody {
                 error: "guardrail_violation".to_owned(),
@@ -155,6 +181,15 @@ impl ApiError {
                 expected_scope: None,
                 actual_scope: None,
                 failed_guardrails: Some(violations.iter().map(|v| v.code().to_owned()).collect()),
+                max_age: None,
+            },
+            ApiError::ReauthRequired { max_age } => ErrorBody {
+                error: "insufficient_user_authentication".to_owned(),
+                message: "a fresh re-authentication is required for this operation".to_owned(),
+                expected_scope: None,
+                actual_scope: None,
+                failed_guardrails: None,
+                max_age: Some(*max_age),
             },
             ApiError::Internal => ErrorBody {
                 error: "internal".to_owned(),
@@ -162,6 +197,7 @@ impl ApiError {
                 expected_scope: None,
                 actual_scope: None,
                 failed_guardrails: None,
+                max_age: None,
             },
         }
     }
@@ -197,6 +233,21 @@ impl IntoResponse for ApiError {
                 header::WWW_AUTHENTICATE,
                 header::HeaderValue::from_static("Bearer"),
             );
+        }
+        // RFC 9470: a sudo-mode challenge carries the structured requirement in the
+        // WWW-Authenticate header (the `insufficient_user_authentication` error and the
+        // `max_age` the mutation requires), mirroring the step-up (issue #72) contract.
+        if let ApiError::ReauthRequired { max_age } = self {
+            let challenge = format!(
+                "Bearer error=\"insufficient_user_authentication\", \
+                 error_description=\"a fresh re-authentication is required for this operation\", \
+                 max_age={max_age}"
+            );
+            if let Ok(value) = header::HeaderValue::from_str(&challenge) {
+                response
+                    .headers_mut()
+                    .insert(header::WWW_AUTHENTICATE, value);
+            }
         }
         response
     }

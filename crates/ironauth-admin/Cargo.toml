@@ -155,6 +155,15 @@ name = "dcr"
 path = "tests/dcr.rs"
 required-features = ["testing"]
 
+# Admin session privilege separation (sudo mode, issue #73): the freshness lifecycle
+# (elevate, act, expire, challenge, re-elevate), the stolen-cookie adversarial case (a
+# stale credential cannot mutate and no header forges elevation, while reads work), the
+# inert-when-off posture, and the elevation/expiry audit trail. Needs a real database.
+[[test]]
+name = "sudo"
+path = "tests/sudo.rs"
+required-features = ["testing"]
+
 # Session and refresh-family fleet operations (issue #32): searchable sessions and
 # refresh families, the immediate revoke, the offline-preserving cascade and its
 # hard-kill override, the scope-fenced bulk revoke, and the uniform not-found for every

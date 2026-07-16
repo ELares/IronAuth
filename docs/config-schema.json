@@ -90,6 +90,18 @@
           ],
           "default": null,
           "description": "The shared bearer token a successor system presents to the OUTBOUND\nlazy-migration verification endpoint (issue #58), as\n`Authorization: Bearer <token>`. It is a DISTINCT credential from the\nmanagement operator token and any management key: it authorizes ONLY the\ncredential-verification endpoint, never any other management surface. Unset\n(the default) leaves the endpoint unauthorized even when\n`outbound_verification_enabled` is true (fail closed: no token, no access).\nUse the `file`/`env` secret indirection, never a literal, outside dev mode."
+        },
+        "sudo_mode_enabled": {
+          "default": false,
+          "description": "Whether admin sudo mode (session privilege separation) is active on the\nmanagement surface (issue #73). OFF by default: it is an exploratory bet, gated\nbehind a per-environment flag and a graduation decision. When ON, admin READS are\nunaffected but a MUTATION requires a RECENT re-authentication: the acting\ncredential must have a recorded elevation whose freshness window has not lapsed,\nevaluated the same way step-up (issue #72) evaluates a max-auth-age window. A\nmutation without a fresh elevation returns a structured RFC 9470 challenge\n(`insufficient_user_authentication`) and executes nothing. The elevation derives\nonly from a SERVER-RECORDED re-auth event, never from a client-supplied header or\nflag, so a stolen credential alone cannot mutate once the window lapses. When OFF,\nthe admin surface behaves exactly as before (no freshness gate). Independent of\nevery other flag.",
+          "type": "boolean"
+        },
+        "sudo_mode_window_secs": {
+          "default": 600,
+          "description": "The admin sudo re-authentication freshness window, in seconds (issue #73): how\nlong a recorded elevation authorizes admin mutations before a fresh\nre-authentication is required. Only consulted when `sudo_mode_enabled` is true.\nThe default (600) is ten minutes, the GitHub-sudo-mode convention. A tunable with\na safe default; a shorter window trades operator friction for a tighter blast\nradius on a stolen credential.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
         }
       },
       "type": "object"
@@ -944,6 +956,18 @@
           "description": "The clone-detection policy when a WebAuthn assertion presents a regressing\nsignature counter (issue #65): `true` BLOCKS the sign-in, `false` only WARNS\n(records the security event and flags the credential but allows the login).\nThe default (`false`, warn) avoids locking a user out on a benign counter\ndesync while still surfacing the event; a true per-tenant override rides the\ntenant-policy pipeline.",
           "type": "boolean"
         },
+        "webauthn_conditional_create_enabled": {
+          "default": false,
+          "description": "Whether conditional-create passkey enrollment is offered after a successful\npassword login (issue #73), the silent-upgrade half of the Signal API bet. OFF by\ndefault and additionally gated by [`OidcConfig::webauthn_signal_api_enabled`] and\n[`OidcConfig::webauthn_enabled`]: even when the signal surface is active, a tenant\nopts INTO the silent upgrade separately (the per-tenant policy on/off). When ON,\nthe hosted page attempts a `mediation: 'conditional'` credential creation for a\nuser who has no passkey yet, recorded through the STANDARD passkey ceremony\npipeline (issue #65), and NEVER interrupts or fails the login on a\nconditional-create failure. Honors the frequency cap below.",
+          "type": "boolean"
+        },
+        "webauthn_conditional_create_min_interval_secs": {
+          "default": 604800,
+          "description": "The minimum interval, in seconds, between conditional-create passkey-enrollment\noffers to the same browser (issue #73): the per-tenant frequency cap that keeps\nthe silent upgrade from nagging a user who dismissed it. A prior offer within this\nwindow suppresses the next one. The default (604800) is one week. It is a nag\ncap, not a security control, so it degrades safely to a no-op on a browser that\ndoes not retain the last-offer marker.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
         "webauthn_enabled": {
           "default": true,
           "description": "Whether the WebAuthn passkey ceremony endpoints are mounted and the hosted\nlogin page offers conditional-UI passkey sign-in (issue #65). On by default:\npasskeys are the headline primary credential for the platform. When on,\ndiscovery advertises the ceremony endpoints and the passkey `phr`/`phrh`\nACRs are achievable.",
@@ -969,6 +993,11 @@
             "string",
             "null"
           ]
+        },
+        "webauthn_signal_api_enabled": {
+          "default": false,
+          "description": "Whether the exploratory WebAuthn Level 3 Signal API surface is active (issue\n#73). OFF by default: it is a forward bet on a browser API that only Chrome 132\nand later ships, gated behind a per-environment flag and a graduation decision.\nWhen ON, the hosted passkey-management page emits the feature-detected signal\nJavaScript (signalUnknownCredential, signalAllAcceptedCredentials,\nsignalCurrentUserDetails) under a nonce-guarded CSP, and the signal-data endpoint\nreturns the current accepted-credential id list and user details for the\nauthenticated subject. When OFF, no signal JavaScript is emitted (no page change)\nand the signal-data endpoint is a uniform 404, so an unsupported or\nsignal-disabled deployment sees no behavior change and no errors. Independent of\nevery other flag; a browser that does not support the API feature-detects it away\nregardless.",
+          "type": "boolean"
         }
       },
       "type": "object"
@@ -1484,7 +1513,9 @@
         "outbound_verification_enabled": false,
         "outbound_verification_environment": null,
         "outbound_verification_tenant": null,
-        "outbound_verification_token": null
+        "outbound_verification_token": null,
+        "sudo_mode_enabled": false,
+        "sudo_mode_window_secs": 600
       },
       "description": "Management API settings (issue #11)."
     },
@@ -1644,10 +1675,13 @@
         "userinfo_cors_origins": [],
         "webauthn_challenge_ttl_secs": 300,
         "webauthn_clone_detection_block": false,
+        "webauthn_conditional_create_enabled": false,
+        "webauthn_conditional_create_min_interval_secs": 604800,
         "webauthn_enabled": true,
         "webauthn_related_origins": [],
         "webauthn_require_user_verification": true,
-        "webauthn_rp_id": null
+        "webauthn_rp_id": null,
+        "webauthn_signal_api_enabled": false
       },
       "description": "OIDC provider settings (issue #12)."
     },

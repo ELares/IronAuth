@@ -6,6 +6,23 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- WebAuthn Level 3 Signal API and conditional-create, EXPLORATORY and off by default
+  (issue #73). Behind the new per-environment `oidc.webauthn_signal_api_enabled` flag, the
+  hosted passkey-management page (`GET .../webauthn/manage`) emits ONE nonce-guarded,
+  feature-detected script that reads a new authenticated signal-data endpoint
+  (`GET .../webauthn/signal`) and calls `signalAllAcceptedCredentials` (dropping
+  server-deleted ghost credentials) and `signalCurrentUserDetails`; the login ceremony
+  script additionally calls `signalUnknownCredential` on a failed assertion the server
+  reports as a ghost. Behind the additional `oidc.webauthn_conditional_create_enabled`
+  policy (with a per-tenant frequency cap), a passkey-less user is offered a
+  `mediation: 'conditional'` silent upgrade recorded through the STANDARD #65 registration
+  ceremony, wrapped so a failure never interrupts anything. Every call is feature-detected;
+  an unsupported browser and a flag-off deployment see no behavior change and no errors
+  (the endpoint is a uniform 404 and the page emits no script). The literal Chrome-132
+  browser behavior (the authenticator drop/update) is deferred to the browser-conformance
+  wave, matching the #20/#17 precedent; the server endpoints, the flag-gated page emission,
+  the accepted-credential id list, and the conditional-create policy gating are tested
+  rust-natively. Reuses the freshness seam via a new `step_up::privilege_is_fresh`.
 - Direct-mode attestation end-to-end coverage (issue #66 PR B, adversarial review): a new
   `webauthn_attestation` integration test (real database, software authenticator) exercises
   the registration GLUE the unit tests could not: attestation mode `direct`, the AAGUID-rule

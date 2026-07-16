@@ -35,6 +35,8 @@ use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use ironauth_store::{
     AuthPath, ConsumedChallenge, CorrelationId, CredentialRemoveOutcome, NewWebauthnCredential,
     Scope, StoreError, UserId, WebauthnCeremony, WebauthnCredentialId, WebauthnCredentialOutcome,
@@ -496,15 +498,26 @@ pub async fn authenticate_verify(
         return ceremony_error();
     };
     // A missing credential is indistinguishable on the wire from a bad signature:
-    // both are the generic ceremony error.
-    let Ok(Some(target)) = state
+    // both are the generic ceremony error. When the exploratory WebAuthn L3 Signal API
+    // is enabled (issue #73), a POSITIVELY unknown credential (the store has no record
+    // of the id the authenticator physically presented) ALSO carries an advisory so the
+    // hosted page can call `signalUnknownCredential` and the authenticator drops the
+    // ghost. The HTTP status and base error/message stay identical to every other
+    // ceremony failure (status and timing parity), so this does not become an
+    // enumeration oracle for a scripted prober: it only tells the client that holds the
+    // credential that the RP no longer knows it (an operator opt-in, off by default).
+    let resolved = state
         .store()
         .scoped(scope)
         .webauthn_credentials()
         .find_for_assertion(&raw_id)
-        .await
-    else {
-        return ceremony_error();
+        .await;
+    let target = match resolved {
+        Ok(Some(target)) => target,
+        Ok(None) if state.webauthn_signal_api_enabled() => {
+            return ceremony_error_unknown_credential(&rp.rp_id, &raw_id);
+        }
+        _ => return ceremony_error(),
     };
 
     // Account-scoped passkey/`all` ban check (issue #64 MEDIUM-2): now that the assertion
@@ -732,6 +745,197 @@ pub async fn list_credentials(
     };
     let passkeys: Vec<Value> = records.iter().map(passkey_json).collect();
     json_response(StatusCode::OK, json!({ "passkeys": passkeys }))
+}
+
+/// The cookie carrying the epoch-microsecond instant conditional-create was last
+/// OFFERED to this browser (issue #73). It backs the per-tenant frequency cap: a fresh
+/// offer is suppressed until `min_interval` has passed since the marker. It is a
+/// client-side nag marker, never a security control, so it degrades safely to a fresh
+/// offer if the browser drops it.
+const CONDITIONAL_CREATE_COOKIE: &str = "ia_conditional_create_offered";
+
+/// `GET /t/{tenant}/e/{environment}/webauthn/signal`: the WebAuthn L3 Signal API data
+/// for the AUTHENTICATED caller (issue #73). Returns the rpId, the user handle, the
+/// current accepted-credential id list, and the current user details, so the hosted
+/// page can call `signalAllAcceptedCredentials` (dropping server-deleted ghosts) and
+/// `signalCurrentUserDetails`. A uniform 404 when the signal-api flag (or the base
+/// webauthn flag) is off, so the feature is fully inert.
+pub async fn signal_data(
+    State(state): State<OidcState>,
+    Path((tenant_id, environment_id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Response {
+    if !state.webauthn_enabled() || !state.webauthn_signal_api_enabled() {
+        return not_found();
+    }
+    let Some(rp) = state.webauthn_relying_party() else {
+        return ceremony_error();
+    };
+    let (scope, subject) = match authenticate(&state, &tenant_id, &environment_id, &headers).await {
+        Ok(pair) => pair,
+        Err(response) => return response,
+    };
+    let Ok(descriptors) = state
+        .store()
+        .scoped(scope)
+        .webauthn_credentials()
+        .descriptors(&subject)
+        .await
+    else {
+        return ceremony_error();
+    };
+    let accepted: Vec<String> = descriptors
+        .iter()
+        .map(|d| URL_SAFE_NO_PAD.encode(&d.credential_id))
+        .collect();
+    let (name, display_name) = signal_user_details(&state, scope, &subject).await;
+    json_response(
+        StatusCode::OK,
+        json!({
+            "rpId": rp.rp_id,
+            // The WebAuthn user handle is the raw bytes of the opaque usr_ id, exactly
+            // as the registration ceremony sets it; the signal calls carry it base64url.
+            "userId": URL_SAFE_NO_PAD.encode(subject.to_string().as_bytes()),
+            "acceptedCredentialIds": accepted,
+            "userDetails": { "name": name, "displayName": display_name },
+        }),
+    )
+}
+
+/// `GET /t/{tenant}/e/{environment}/webauthn/manage`: the hosted passkey-management
+/// page (issue #73). Authenticated. When the Signal API is enabled it emits the
+/// nonce-guarded, feature-detected signal script (and, when an offer is due, the
+/// conditional-create silent-upgrade block); when it is off the page carries no signal
+/// JavaScript at all (no page change). Base passkeys must be enabled; otherwise a 404.
+pub async fn signal_manage_page(
+    State(state): State<OidcState>,
+    Path((tenant_id, environment_id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Response {
+    if !state.webauthn_enabled() {
+        return not_found();
+    }
+    let (scope, subject) = match authenticate(&state, &tenant_id, &environment_id, &headers).await {
+        Ok(pair) => pair,
+        Err(response) => return response,
+    };
+    let signal_api = state.webauthn_signal_api_enabled();
+    // Conditional-create is offered only when the per-tenant policy allows it, the user
+    // has no passkey yet, and the per-browser frequency cap has elapsed.
+    let last_offer = read_offer_marker(&headers);
+    let now = epoch_micros(state.env().clock().now_utc());
+    let mut offer_conditional_create = false;
+    if signal_api && state.webauthn_conditional_create_enabled() {
+        let has_passkey = state
+            .store()
+            .scoped(scope)
+            .webauthn_credentials()
+            .has_any(&subject)
+            .await
+            .unwrap_or(true);
+        offer_conditional_create = conditional_create_offer(
+            true,
+            has_passkey,
+            state.webauthn_conditional_create_min_interval_secs(),
+            last_offer,
+            now,
+        );
+    }
+    let nonce = crate::login::passkey_nonce(&state);
+    let scope_path = format!("/t/{}/e/{}", scope.tenant(), scope.environment());
+    let banner = state.environment_banner(&scope).await;
+    let ui = crate::pages::SignalManageUi {
+        nonce: &nonce,
+        scope_path: &scope_path,
+        signal_api,
+        conditional_create: offer_conditional_create,
+    };
+    let body = crate::pages::signal_manage_page(&ui, banner);
+    let mut response = crate::pages::login_html(StatusCode::OK, body, &nonce);
+    // Stamp the frequency-cap marker when an offer was emitted, so the next visit
+    // inside the window suppresses a repeat offer.
+    if offer_conditional_create {
+        if let Ok(value) = header::HeaderValue::from_str(&format!(
+            "{CONDITIONAL_CREATE_COOKIE}={now}; Path=/; HttpOnly; SameSite=Lax"
+        )) {
+            response.headers_mut().append(header::SET_COOKIE, value);
+        }
+    }
+    response
+}
+
+/// The pure conditional-create offer decision (issue #73): offer a silent passkey
+/// upgrade only when the per-tenant policy is on, the user has NO passkey yet, and the
+/// per-browser frequency cap has elapsed since the last offer. A never-offered browser
+/// (`None` marker) is eligible; an offer within `min_interval_secs` is suppressed.
+fn conditional_create_offer(
+    policy_enabled: bool,
+    has_passkey: bool,
+    min_interval_secs: u64,
+    last_offer_micros: Option<i64>,
+    now_micros: i64,
+) -> bool {
+    if !policy_enabled || has_passkey {
+        return false;
+    }
+    match last_offer_micros {
+        None => true,
+        Some(last) => {
+            let elapsed = now_micros.saturating_sub(last);
+            let window = i64::try_from(min_interval_secs)
+                .unwrap_or(i64::MAX)
+                .saturating_mul(1_000_000);
+            elapsed >= window
+        }
+    }
+}
+
+/// Read the conditional-create frequency-cap marker (epoch micros) from the request
+/// cookies (issue #73), or `None` when it is absent or unparseable.
+fn read_offer_marker(headers: &HeaderMap) -> Option<i64> {
+    let cookies = headers.get(header::COOKIE)?.to_str().ok()?;
+    for pair in cookies.split(';') {
+        let pair = pair.trim();
+        if let Some(value) = pair.strip_prefix(CONDITIONAL_CREATE_COOKIE) {
+            if let Some(value) = value.strip_prefix('=') {
+                return value.trim().parse::<i64>().ok();
+            }
+        }
+    }
+    None
+}
+
+/// The current profile name and display name for `subject` (issue #73), read from the
+/// sealed user claims and falling back to the opaque subject id (exactly what the
+/// registration ceremony sets as the WebAuthn user name), so `signalCurrentUserDetails`
+/// always carries a value consistent with what the authenticator stored.
+async fn signal_user_details(
+    state: &OidcState,
+    scope: Scope,
+    subject: &UserId,
+) -> (String, String) {
+    let fallback = subject.to_string();
+    let claims = state
+        .store()
+        .scoped(scope)
+        .users()
+        .claims_for_subject(&fallback)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok());
+    let field = |key: &str| -> Option<String> {
+        claims
+            .as_ref()?
+            .get(key)
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+    };
+    let name = field("preferred_username")
+        .or_else(|| field("name"))
+        .unwrap_or_else(|| fallback.clone());
+    let display_name = field("name").unwrap_or_else(|| name.clone());
+    (name, display_name)
 }
 
 /// The rename-passkey request body: the credential to rename and the new nickname.
@@ -1009,6 +1213,25 @@ fn ceremony_error() -> Response {
     )
 }
 
+/// The ceremony error for a POSITIVELY unknown credential when the WebAuthn L3 Signal
+/// API is enabled (issue #73). The status and the base `error`/`message` are byte
+/// identical to [`ceremony_error`] (so the wire response stays non-enumerating against
+/// a scripted prober), plus an advisory the hosted page reads to call
+/// `signalUnknownCredential({rpId, credentialId})` so the authenticator drops the ghost
+/// credential it just presented.
+fn ceremony_error_unknown_credential(rp_id: &str, raw_id: &[u8]) -> Response {
+    json_response(
+        StatusCode::BAD_REQUEST,
+        json!({
+            "error": "ceremony_failed",
+            "message": "The passkey could not be verified. Please try again.",
+            "unknownCredential": true,
+            "rpId": rp_id,
+            "credentialId": URL_SAFE_NO_PAD.encode(raw_id),
+        }),
+    )
+}
+
 fn forbidden() -> Response {
     json_response(StatusCode::FORBIDDEN, json!({ "error": "forbidden" }))
 }
@@ -1018,4 +1241,61 @@ fn unauthenticated() -> Response {
         StatusCode::UNAUTHORIZED,
         json!({ "error": "unauthenticated" }),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const DAY_SECS: u64 = 86_400;
+    const DAY_MICROS: i64 = 86_400_000_000;
+
+    #[test]
+    fn conditional_create_offer_honors_policy_passkey_and_frequency_cap() {
+        let now = 10 * DAY_MICROS;
+        // Disabled policy never offers.
+        assert!(!conditional_create_offer(false, false, DAY_SECS, None, now));
+        // A user who already has a passkey is never offered (already upgraded).
+        assert!(!conditional_create_offer(true, true, DAY_SECS, None, now));
+        // A never-offered, passkey-less user under an enabled policy is offered.
+        assert!(conditional_create_offer(true, false, DAY_SECS, None, now));
+        // Inside the frequency-cap window, a repeat offer is suppressed.
+        let recent = now - DAY_MICROS / 2;
+        assert!(!conditional_create_offer(
+            true,
+            false,
+            DAY_SECS,
+            Some(recent),
+            now
+        ));
+        // Past the window, an offer is due again.
+        let old = now - 2 * DAY_MICROS;
+        assert!(conditional_create_offer(
+            true,
+            false,
+            DAY_SECS,
+            Some(old),
+            now
+        ));
+    }
+
+    #[test]
+    fn read_offer_marker_parses_the_cookie_or_none() {
+        let mut headers = HeaderMap::new();
+        assert_eq!(read_offer_marker(&headers), None);
+        headers.insert(
+            header::COOKIE,
+            "foo=bar; ia_conditional_create_offered=12345; baz=1"
+                .parse()
+                .unwrap(),
+        );
+        assert_eq!(read_offer_marker(&headers), Some(12345));
+        // A non-numeric value is ignored (safe degrade to no marker).
+        let mut bad = HeaderMap::new();
+        bad.insert(
+            header::COOKIE,
+            "ia_conditional_create_offered=notanumber".parse().unwrap(),
+        );
+        assert_eq!(read_offer_marker(&bad), None);
+    }
 }

@@ -77,6 +77,7 @@ pub async fn login_get(
                 let ui = pages::PasskeyUi {
                     nonce: &nonce,
                     scope_path: &scope_path,
+                    signal_api: state.webauthn_signal_api_enabled(),
                 };
                 // A phishing-resistant step-up (RFC 9470, issue #72) routes here with
                 // `passkey=1` to run the passkey ceremony SPECIFICALLY: render the
@@ -304,8 +305,9 @@ fn throttled_mfa_challenge_page(
 
 /// A per-response CSP script nonce for the login page's conditional-UI script
 /// (issue #65), drawn from the entropy seam and hex-encoded so it is a valid CSP
-/// nonce token.
-fn passkey_nonce(state: &OidcState) -> String {
+/// nonce token. Reused by the WebAuthn Signal API management page (issue #73), which
+/// carries the same nonce-guarded, feature-detected script discipline.
+pub(crate) fn passkey_nonce(state: &OidcState) -> String {
     let mut bytes = [0_u8; 16];
     state.env().entropy().fill_bytes(&mut bytes);
     let mut nonce = String::with_capacity(bytes.len() * 2);
