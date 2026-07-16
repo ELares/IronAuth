@@ -103,6 +103,13 @@ name = "abuse"
 path = "tests/abuse.rs"
 required-features = ["testing"]
 
+# Credential-class policy persistence + attestation config + WebAuthn user-handle
+# immutability (issue #66), against a real database.
+[[test]]
+name = "credential_class_policies"
+path = "tests/credential_class_policies.rs"
+required-features = ["testing"]
+
 # Cross-tenant / cross-environment IDOR harness against every scoped repository
 # operation that exists today. Needs a real database (DATABASE_URL).
 [[test]]

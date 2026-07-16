@@ -20,10 +20,10 @@ use ironauth_config::{
 use ironauth_env::Env;
 use ironauth_jose::MasterKey;
 use ironauth_oidc::{
-    BackChannelLogoutWorker, DiscoveryCapabilities, DiscoveryState, FetchLogoutSender,
-    IssuerRegistry, IssuerState, JwksCacheWindow, LazyMigrationHook, OidcState, WorkerSettings,
-    canonical_login_identifier, canonical_step_up_acr, discovery_router, issuer_router,
-    oidc_router,
+    BackChannelLogoutWorker, CredentialClass, DiscoveryCapabilities, DiscoveryState,
+    FetchLogoutSender, IssuerRegistry, IssuerState, JwksCacheWindow, LazyMigrationHook, OidcState,
+    WorkerSettings, canonical_login_identifier, canonical_step_up_acr, discovery_router,
+    issuer_router, oidc_router,
 };
 use ironauth_quota::QuotaEnforcer;
 use ironauth_server::Server;
@@ -62,6 +62,13 @@ fn main() -> ExitCode {
         // operator surface that makes the declarative policy usable without hand-writing
         // Rust or SQL; a hosted admin HTTP CRUD can layer on later.
         Some("step-up-policy") => manage_step_up_policy(&mut args),
+        // Declarative credential-class policy management (issue #66): set, list, and
+        // remove the per-scope minimum-credential-class ladder row for a subject (the
+        // tenant, a group, or an org), each an audited write through the same Acting
+        // repository the authentication path composes from. This is the operator surface
+        // that makes the declarative policy usable; a hosted admin HTTP CRUD can layer on
+        // later (as #262 did for step-up).
+        Some("credential-class-policy") => manage_credential_class_policy(&mut args),
         Some("--version" | "-V" | "version") => {
             println!("ironauth {VERSION}");
             ExitCode::SUCCESS
@@ -1384,6 +1391,272 @@ async fn remove_step_up_policy(
     }
 }
 
+/// The parsed flags of a `credential-class-policy` invocation (issue #66).
+#[derive(Default)]
+struct CredentialClassPolicyArgs {
+    config: Option<String>,
+    tenant: Option<String>,
+    environment: Option<String>,
+    subject: Option<String>,
+    subject_ref: Option<String>,
+    class: Option<String>,
+}
+
+/// Parse the shared flags of the credential-class-policy subcommands. Supports both
+/// `--flag value` and `--flag=value`.
+fn parse_credential_class_policy_args(
+    args: &mut impl Iterator<Item = String>,
+) -> Result<CredentialClassPolicyArgs, String> {
+    let mut parsed = CredentialClassPolicyArgs::default();
+    while let Some(arg) = args.next() {
+        let (flag, inline) = match arg.split_once('=') {
+            Some((flag, value)) => (flag.to_owned(), Some(value.to_owned())),
+            None => (arg, None),
+        };
+        let mut take = |inline: Option<String>| -> Result<String, String> {
+            match inline {
+                Some(value) => Ok(value),
+                None => args
+                    .next()
+                    .ok_or_else(|| format!("{flag} requires a value")),
+            }
+        };
+        match flag.as_str() {
+            "--config" => parsed.config = Some(take(inline)?),
+            "--tenant" => parsed.tenant = Some(take(inline)?),
+            "--environment" => parsed.environment = Some(take(inline)?),
+            "--subject" => parsed.subject = Some(take(inline)?),
+            "--subject-ref" => parsed.subject_ref = Some(take(inline)?),
+            "--class" => parsed.class = Some(take(inline)?),
+            other => return Err(format!("unrecognized argument '{other}'")),
+        }
+    }
+    Ok(parsed)
+}
+
+/// Resolve the scope and data-plane DSN a credential-class-policy subcommand needs.
+/// Like a step-up policy, a credential-class policy stores no sealed PII column, so
+/// no envelope master key is required.
+fn prepare_credential_class_policy(
+    parsed: &CredentialClassPolicyArgs,
+) -> Result<(Scope, String), String> {
+    let tenant_raw = parsed.tenant.as_deref().ok_or("--tenant is required")?;
+    let environment_raw = parsed
+        .environment
+        .as_deref()
+        .ok_or("--environment is required")?;
+    let tenant = TenantId::parse(tenant_raw).map_err(|_| "invalid --tenant id".to_owned())?;
+    let environment =
+        EnvironmentId::parse(environment_raw).map_err(|_| "invalid --environment id".to_owned())?;
+    let scope = Scope::new(tenant, environment);
+    let config = match &parsed.config {
+        Some(path) => {
+            Config::load(path)
+                .map_err(|error| format!("cannot load config: {error}"))?
+                .config
+        }
+        None => Config::default(),
+    };
+    let dsn = config.database.url.expose().to_owned();
+    Ok((scope, dsn))
+}
+
+/// Resolve the (`subject_kind`, `subject_ref`) pair from the parsed flags, applying the
+/// tenant-default and the kind<->ref presence rule the storage CHECK also enforces.
+fn resolve_policy_subject(
+    parsed: &CredentialClassPolicyArgs,
+) -> Result<(String, Option<String>), String> {
+    let subject = parsed.subject.as_deref().unwrap_or("tenant");
+    if !matches!(subject, "tenant" | "group" | "org") {
+        return Err(format!(
+            "invalid --subject '{subject}' (expected tenant | group | org)"
+        ));
+    }
+    match (subject, parsed.subject_ref.as_deref()) {
+        ("tenant", Some(_)) => {
+            Err("--subject-ref is not allowed for the tenant-wide policy".to_owned())
+        }
+        ("tenant", None) => Ok(("tenant".to_owned(), None)),
+        (kind, Some(reference)) if !reference.is_empty() => {
+            Ok((kind.to_owned(), Some(reference.to_owned())))
+        }
+        (kind, _) => Err(format!("--subject-ref is required for a {kind} policy")),
+    }
+}
+
+/// Run the `credential-class-policy set | list | remove` subcommands (issue #66): set,
+/// list, and remove the declarative per-scope minimum-credential-class ladder row for a
+/// subject, each an audited write through the SAME `Acting` repository the authentication
+/// path composes from with strictest-wins.
+fn manage_credential_class_policy(args: &mut impl Iterator<Item = String>) -> ExitCode {
+    let Some(action) = args.next() else {
+        eprintln!("ironauth credential-class-policy: expected a subcommand (set | list | remove)");
+        return ExitCode::FAILURE;
+    };
+    if !matches!(action.as_str(), "set" | "list" | "remove") {
+        eprintln!(
+            "ironauth credential-class-policy: unknown subcommand '{action}' \
+             (expected set | list | remove)"
+        );
+        return ExitCode::FAILURE;
+    }
+    let parsed = match parse_credential_class_policy_args(args) {
+        Ok(parsed) => parsed,
+        Err(message) => {
+            eprintln!("ironauth credential-class-policy {action}: {message}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let (scope, dsn) = match prepare_credential_class_policy(&parsed) {
+        Ok(prepared) => prepared,
+        Err(message) => {
+            eprintln!("ironauth credential-class-policy {action}: {message}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let env = Env::system();
+    let runtime = match tokio::runtime::Runtime::new() {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            eprintln!(
+                "ironauth credential-class-policy {action}: cannot start async runtime: {error}"
+            );
+            return ExitCode::FAILURE;
+        }
+    };
+    runtime.block_on(async move {
+        let store = match Store::connect(&dsn).await {
+            Ok(store) => store,
+            Err(error) => {
+                eprintln!(
+                    "ironauth credential-class-policy {action}: cannot connect the data-plane \
+                     store: {error}"
+                );
+                return ExitCode::FAILURE;
+            }
+        };
+        match action.as_str() {
+            "set" => set_credential_class_policy(&store, scope, &env, &parsed).await,
+            "list" => list_credential_class_policies(&store, scope).await,
+            "remove" => remove_credential_class_policy(&store, scope, &env, &parsed).await,
+            _ => unreachable!("dispatch guarantees the subcommand"),
+        }
+    })
+}
+
+/// Set (create or update) a minimum-credential-class policy for a subject (issue #66).
+async fn set_credential_class_policy(
+    store: &Store,
+    scope: Scope,
+    env: &Env,
+    parsed: &CredentialClassPolicyArgs,
+) -> ExitCode {
+    let Some(class) = parsed.class.as_deref() else {
+        eprintln!(
+            "ironauth credential-class-policy set: --class is required (any | mfa | passkey | attested_passkey)"
+        );
+        return ExitCode::FAILURE;
+    };
+    if CredentialClass::from_token(class).is_none() {
+        eprintln!(
+            "ironauth credential-class-policy set: invalid --class '{class}' \
+             (expected any | mfa | passkey | attested_passkey)"
+        );
+        return ExitCode::FAILURE;
+    }
+    let (subject_kind, subject_ref) = match resolve_policy_subject(parsed) {
+        Ok(subject) => subject,
+        Err(message) => {
+            eprintln!("ironauth credential-class-policy set: {message}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let actor = ActorRef::service(ServiceId::generate(env));
+    let acting = store
+        .scoped(scope)
+        .acting(actor, CorrelationId::generate(env));
+    match acting
+        .credential_class_policies()
+        .set(env, &subject_kind, subject_ref.as_deref(), class)
+        .await
+    {
+        Ok(id) => {
+            println!(
+                "set credential-class policy (subject={subject_kind}, ref={reference}, \
+                 min_class={class}) {id}",
+                reference = subject_ref.as_deref().unwrap_or("-"),
+            );
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("ironauth credential-class-policy set: cannot set policy: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// List the credential-class policies in a scope (issue #66).
+async fn list_credential_class_policies(store: &Store, scope: Scope) -> ExitCode {
+    match store.scoped(scope).credential_class_policies().list().await {
+        Ok(policies) => {
+            if policies.is_empty() {
+                println!("no credential-class policies");
+            }
+            for policy in policies {
+                println!(
+                    "{id}\tsubject={subject_kind}\tref={reference}\tmin_class={min_class}",
+                    id = policy.id,
+                    subject_kind = policy.subject_kind,
+                    reference = policy.subject_ref.as_deref().unwrap_or("-"),
+                    min_class = policy.min_class,
+                );
+            }
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("ironauth credential-class-policy list: cannot list policies: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Remove a credential-class policy for a subject (issue #66).
+async fn remove_credential_class_policy(
+    store: &Store,
+    scope: Scope,
+    env: &Env,
+    parsed: &CredentialClassPolicyArgs,
+) -> ExitCode {
+    let (subject_kind, subject_ref) = match resolve_policy_subject(parsed) {
+        Ok(subject) => subject,
+        Err(message) => {
+            eprintln!("ironauth credential-class-policy remove: {message}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let actor = ActorRef::service(ServiceId::generate(env));
+    let acting = store
+        .scoped(scope)
+        .acting(actor, CorrelationId::generate(env));
+    match acting
+        .credential_class_policies()
+        .remove(env, &subject_kind, subject_ref.as_deref())
+        .await
+    {
+        Ok(()) => {
+            println!(
+                "removed credential-class policy (subject={subject_kind}, ref={reference})",
+                reference = subject_ref.as_deref().unwrap_or("-"),
+            );
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("ironauth credential-class-policy remove: cannot remove policy: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 /// The current instant in epoch microseconds, drawn from the determinism seam.
 fn now_micros(env: &Env) -> i64 {
     let now = env.clock().now_utc();
@@ -1567,6 +1840,23 @@ fn print_help() {
     println!("  ironauth step-up-policy remove --config PATH --tenant TID --environment EID \\");
     println!("               (--scope SCOPE | --client CLIENT_ID)");
     println!("                                   Remove a per-scope policy / clear a client floor");
+    println!(
+        "  ironauth credential-class-policy set --config PATH --tenant TID --environment EID \\"
+    );
+    println!("               [--subject tenant|group|org] [--subject-ref ID] \\");
+    println!("               --class any|mfa|passkey|attested_passkey");
+    println!(
+        "                                   Set a minimum-credential-class policy (issue #66)"
+    );
+    println!(
+        "  ironauth credential-class-policy list --config PATH --tenant TID --environment EID"
+    );
+    println!("                                   List credential-class policies");
+    println!(
+        "  ironauth credential-class-policy remove --config PATH --tenant TID --environment EID \\"
+    );
+    println!("               [--subject tenant|group|org] [--subject-ref ID]");
+    println!("                                   Remove a credential-class policy");
     println!("  ironauth --version               Print the version");
     println!("  ironauth --help                  Print this help");
     println!();

@@ -6,6 +6,22 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Credential-class policies + attestation config + passkey-only markers (issue #66, PR A):
+  migration 0049 (guard count -> 49) adds two new tenant-scoped tables with forced row-level
+  security. `credential_class_policies` carries the per-scope minimum-credential-class ladder
+  row for a policy subject (a closed `{tenant, group, org}` discriminator, with a CHECK tying
+  the kind to its `subject_ref` presence, and a closed `min_class` set); the tenant row is the
+  only APPLICABLE one in v1, the group/org rows are the inert M10-gated attachment seam.
+  `attestation_config` carries the per-scope attestation mode (`none`/`direct`, dormant in
+  PR A). Both add a `ccp_`/`atc_` scoped id, a scope-nonempty CHECK, the (tenant, environment)
+  isolation policy, and column-scoped grants. The `users` table gains two additive columns:
+  `webauthn_user_handle bytea` (IMMUTABLE once set, guarded at TWO layers -- a BEFORE UPDATE
+  trigger `users_user_handle_immutable` that refuses to change a set handle, AND its
+  deliberate omission from every GRANT UPDATE so the app role cannot name it -- the Kratos
+  #4519 bug class), and `passwordless boolean NOT NULL DEFAULT false` (the passkey-only marker
+  PR C flips, with a column-scoped UPDATE grant). New `CredentialClassPolicy` /
+  `AttestationConfig` read repos and audited `set`/`remove` acting repos; new
+  `credential_class.policy.set|remove` and `attestation.config.set` audit actions.
 - Magic-link short-code attempt-limit hardening (issue #68, adversarial review): migration
   0048 (unshipped, amended in place, still guard count 48) adds `attempt_count` and
   `max_attempts` columns plus an `attempts_nonneg` CHECK to `magic_link_tokens`, and extends

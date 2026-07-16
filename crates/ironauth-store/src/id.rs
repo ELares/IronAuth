@@ -323,6 +323,32 @@ impl ScopedKind for ScopeStepUpPolicyKind {
     const PREFIX: &'static str = "sup";
 }
 
+/// Marker for a credential-class policy (`ccp_`), one row in a tenant's
+/// minimum-credential-class ladder (issue #66): the minimum class (`any` < `mfa` <
+/// `passkey` < `attested_passkey`) required of a login for a policy subject (the
+/// tenant, a group, or an org). A tenant-scoped resource: the id embeds its (tenant,
+/// environment), so a policy minted in one scope parses as a uniform not-found under
+/// another. It is an INTERNAL configuration row (never a bearer credential); the
+/// values it points at are a public class string and a subject discriminator, so its
+/// debug form stays legible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CredentialClassPolicyKind;
+impl ScopedKind for CredentialClassPolicyKind {
+    const PREFIX: &'static str = "ccp";
+}
+
+/// Marker for a per-scope attestation configuration (`atc_`), one row per (tenant,
+/// environment) (issue #66): the attestation conveyance mode ('none' or 'direct')
+/// the passkey registration path requests. A tenant-scoped resource: the id embeds
+/// its (tenant, environment). It is an INTERNAL configuration row (never a bearer
+/// credential); the value it points at is a public mode string, so its debug form
+/// stays legible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct AttestationConfigKind;
+impl ScopedKind for AttestationConfigKind {
+    const PREFIX: &'static str = "atc";
+}
+
 /// Marker for a flexible login identifier (`uid_`), one row in a user's typed
 /// login-identifier set (issue #54): a verified-or-not email, username, or phone a
 /// user can log in with. A tenant-scoped resource: the identifier row id embeds its
@@ -874,6 +900,14 @@ pub type RecoveryCodeId = ScopedId<RecoveryCodeKind>;
 /// set (issue #72): the (acr floor, max auth age) requirement governing an OAuth
 /// scope token.
 pub type ScopeStepUpPolicyId = ScopedId<ScopeStepUpPolicyKind>;
+
+/// A credential-class policy id (`ccp_...`), one row in a tenant's
+/// minimum-credential-class ladder (issue #66).
+pub type CredentialClassPolicyId = ScopedId<CredentialClassPolicyKind>;
+
+/// A per-scope attestation-config id (`atc_...`), one row per (tenant, environment)
+/// carrying the attestation conveyance mode (issue #66).
+pub type AttestationConfigId = ScopedId<AttestationConfigKind>;
 
 /// A flexible-login-identifier row id (`uid_...`), one typed login identifier
 /// (email, username, or phone) a user can authenticate with (issue #54).

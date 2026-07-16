@@ -319,7 +319,74 @@ pub(crate) async fn requirement_for_request(
             Err(_) => policy_read_faulted = true,
         }
     }
+    // The credential-class floor (issue #66): the tenant's minimum-credential-class
+    // ladder folds into the SAME requirement as an acr floor, so the one step-up gate
+    // enforces it and steers an under-class session to the right remediation (a plain
+    // password login that yields `pwd` cannot satisfy a `passkey` class floor, so the
+    // gate routes to the passkey ceremony; an `attested_passkey` floor is unranked
+    // while the rung is dormant, so it fails closed). The token acr still derives from
+    // the SATISFIED class (the frozen event), never from this floor. A read fault here
+    // is surfaced on the same flag so the token/refresh path can fail closed.
+    match credential_class_floor(state, scope).await {
+        Ok(Some(class)) => {
+            requirement.merge_stronger(
+                &AuthnRequirement {
+                    min_acr: Some(authn::acr_for_class(class).to_owned()),
+                    max_auth_age_secs: None,
+                },
+                &order,
+            );
+        }
+        Ok(None) => {}
+        Err(()) => policy_read_faulted = true,
+    }
     (requirement, policy_read_faulted)
+}
+
+/// The required credential class for a scope (issue #66): the strictest-wins
+/// composition of the APPLICABLE credential-class policy rows.
+///
+/// "Applicable" in v1 is the single tenant-level row; the group and org rows are the
+/// inert attachment seam (end-to-end group/org attachment is M10-gated), so they are
+/// read but not folded here. Returns `Ok(None)` when no tenant row exists (the honest
+/// floor, [`authn::CredentialClass::Any`], which constrains nothing), or `Err(())` on
+/// a store fault so the caller can fail closed. A malformed `min_class` token is
+/// ignored (it can only ever under-constrain, never over-claim).
+pub(crate) async fn credential_class_floor(
+    state: &OidcState,
+    scope: Scope,
+) -> Result<Option<authn::CredentialClass>, ()> {
+    let policies = state
+        .store()
+        .scoped(scope)
+        .credential_class_policies()
+        .list()
+        .await
+        .map_err(|_| ())?;
+    let applicable = policies
+        .iter()
+        .filter(|policy| policy.subject_kind == "tenant")
+        .filter_map(|policy| authn::CredentialClass::from_token(&policy.min_class));
+    let required = authn::required_class(applicable);
+    if required == authn::CredentialClass::Any {
+        Ok(None)
+    } else {
+        Ok(Some(required))
+    }
+}
+
+/// The credential class a subject must reach for a scope (issue #66), for the
+/// enrollment-steering surface (the account MFA plan): the required class from
+/// [`credential_class_floor`], defaulting to [`authn::CredentialClass::Any`] when no
+/// policy applies. A store fault degrades to `Any` (best-effort for a read-only plan
+/// hint; the authorize/token gate is where the requirement is actually ENFORCED and
+/// fails closed on a fault).
+pub async fn required_credential_class(state: &OidcState, scope: Scope) -> authn::CredentialClass {
+    credential_class_floor(state, scope)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or(authn::CredentialClass::Any)
 }
 
 /// How the authorization endpoint should remediate an unmet requirement (issue #72).
@@ -574,6 +641,51 @@ mod tests {
                 acr_unmet: false,
                 age_lapsed: true
             }
+        );
+    }
+
+    const ATTESTED: &str = "urn:ironauth:acr:attested_passkey";
+
+    #[test]
+    fn a_credential_class_folds_into_the_requirement_as_an_acr_floor() {
+        // The enforcement wiring (issue #66): a required credential class maps to an acr
+        // floor through the ONE canonical mapping, and that floor drives the SAME step-up
+        // gate. A `passkey` class -> phr floor, which a plain password session (pwd) does
+        // NOT satisfy, so the gate steers instead of silently minting an under-class token.
+        let order = order();
+        let passkey_floor = authn::acr_for_class(authn::CredentialClass::Passkey);
+        assert_eq!(passkey_floor, PHR);
+        assert!(
+            !acr_satisfies(PWD, passkey_floor, &order),
+            "a pwd session must not satisfy a passkey-class floor"
+        );
+        assert!(
+            acr_satisfies(PHR, passkey_floor, &order),
+            "a passkey session satisfies its own class floor"
+        );
+        // An `mfa` class -> mfa floor: a pwd session is steered, a mfa session passes.
+        let mfa_floor = authn::acr_for_class(authn::CredentialClass::Mfa);
+        assert!(!acr_satisfies(PWD, mfa_floor, &order));
+        assert!(acr_satisfies(MFA, mfa_floor, &order));
+    }
+
+    #[test]
+    fn a_dormant_attested_class_floor_fails_closed() {
+        // The `attested_passkey` class maps to an unranked acr while the rung is dormant
+        // (PR A), so NO achievable method satisfies it and it is NOT achievable at all:
+        // the gate fails closed (Remediation::Fail), never mints an under-class token.
+        let order = order();
+        let attested_floor = authn::acr_for_class(authn::CredentialClass::AttestedPasskey);
+        assert_eq!(attested_floor, ATTESTED);
+        for achieved in [PWD, MFA, PHR, PHRH] {
+            assert!(
+                !acr_satisfies(achieved, attested_floor, &order),
+                "{achieved} must not satisfy the dormant attested floor"
+            );
+        }
+        assert!(
+            !floor_is_achievable(attested_floor, &order),
+            "the attested floor is unachievable while the rung is dormant (fail closed)"
         );
     }
 
