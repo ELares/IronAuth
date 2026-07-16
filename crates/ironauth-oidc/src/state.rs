@@ -316,6 +316,11 @@ struct Inner {
     // policy come straight from OidcConfig (already validated at startup).
     webauthn_enabled: bool,
     webauthn_rp_id: Option<String>,
+    // The related origins (issue #67): additional origins permitted to use this
+    // environment's RP ID, canonicalized at construction. Empty for a single-origin
+    // deployment. Served at GET /.well-known/webauthn and folded into the ceremony
+    // allowed-origin set.
+    webauthn_related_origins: Vec<String>,
     webauthn_challenge_ttl_secs: u64,
     webauthn_require_user_verification: bool,
     webauthn_clone_detection_block: bool,
@@ -438,6 +443,16 @@ impl OidcState {
                 global_token_revocation_hard_kill: config.global_token_revocation_hard_kill,
                 webauthn_enabled: config.webauthn_enabled,
                 webauthn_rp_id: config.webauthn_rp_id.clone(),
+                // Canonicalize each related origin (lowercased host, default port
+                // dropped, path stripped) so the served document and the ceremony
+                // allowed-origin comparison use the exact byte form a browser sends
+                // in an Origin header (issue #67). Entries were format-validated at
+                // startup, so any that fail to canonicalize here are simply dropped.
+                webauthn_related_origins: config
+                    .webauthn_related_origins
+                    .iter()
+                    .filter_map(|origin| origin_of(origin))
+                    .collect(),
                 webauthn_challenge_ttl_secs: config.webauthn_challenge_ttl_secs,
                 webauthn_require_user_verification: config.webauthn_require_user_verification,
                 webauthn_clone_detection_block: config.webauthn_clone_detection_block,
@@ -1505,12 +1520,20 @@ impl OidcState {
     }
 
     /// The effective WebAuthn Relying Party ID and allowed origins for a ceremony
-    /// (issue #65): the configured `oidc.webauthn_rp_id` (validated at startup) or,
-    /// when unset, the serving origin's host; the allowed origin is this
-    /// deployment's own origin. `None` when the serving origin cannot be derived
-    /// from `server.public_url`, in which case a ceremony fails closed. WebAuthn
-    /// origins are `scheme://host[:port]` with no path, so the per-environment
-    /// `/t/../e/..` suffix is intentionally absent.
+    /// (issue #65, extended by issue #67): the configured `oidc.webauthn_rp_id`
+    /// (validated at startup) or, when unset, the serving origin's host. The allowed
+    /// origins are this deployment's own origin FOLLOWED BY the configured related
+    /// origins (WebAuthn Level 3 Related Origin Requests), deduplicated with the
+    /// serving origin first. `None` when the serving origin cannot be derived from
+    /// `server.public_url`, in which case a ceremony fails closed. WebAuthn origins
+    /// are `scheme://host[:port]` with no path, so the per-environment `/t/../e/..`
+    /// suffix is intentionally absent.
+    ///
+    /// Broadening the accepted origin set to the related origins is the ONLY change
+    /// issue #67 makes to the ceremony security checks: the RP-ID hash, the
+    /// assertion signature, and the single-use challenge are all unchanged. A
+    /// clientData origin outside this exact set still fails with the non-enumerating
+    /// ceremony error.
     #[must_use]
     pub fn webauthn_relying_party(&self) -> Option<WebauthnRelyingParty> {
         let origin = self.self_origin()?;
@@ -1518,10 +1541,33 @@ impl OidcState {
             Some(configured) => configured.clone(),
             None => host_of(&origin)?,
         };
-        Some(WebauthnRelyingParty {
-            rp_id,
-            origins: vec![origin],
-        })
+        let mut origins = Vec::with_capacity(1 + self.inner.webauthn_related_origins.len());
+        origins.push(origin);
+        for related in &self.inner.webauthn_related_origins {
+            if !origins.contains(related) {
+                origins.push(related.clone());
+            }
+        }
+        Some(WebauthnRelyingParty { rp_id, origins })
+    }
+
+    /// The WebAuthn Related Origin Requests document served at
+    /// `GET /.well-known/webauthn` (issue #67): the JSON `{"origins": [...]}` listing
+    /// every origin permitted to use this environment's RP ID (the serving origin
+    /// plus the configured related origins). `None` when the feature is not in use
+    /// for this deployment (WebAuthn disabled, no related origins configured, or no
+    /// derivable serving origin), which the handler maps to a `404` so an
+    /// unconfigured domain serves no document. Generated from live state at request
+    /// time, so a config change is reflected without a code redeploy.
+    #[must_use]
+    pub fn webauthn_related_origins_document(&self) -> Option<String> {
+        if !self.inner.webauthn_enabled || self.inner.webauthn_related_origins.is_empty() {
+            return None;
+        }
+        let rp = self.webauthn_relying_party()?;
+        // serde_json over a borrowed slice of owned Strings: infallible for a Vec of
+        // strings, so the document is a plain serialization of the origin list.
+        serde_json::to_string(&serde_json::json!({ "origins": rp.origins })).ok()
     }
 
     /// The single-use WebAuthn challenge lifetime in seconds (issue #65).

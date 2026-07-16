@@ -259,6 +259,16 @@ name = "webauthn_ceremony"
 path = "tests/webauthn_ceremony.rs"
 required-features = ["testing"]
 
+# WebAuthn Related Origin Requests (issue #67): the GET /.well-known/webauthn
+# document is served with the right content type and caching and reflects a config
+# change without a restart; a passkey registered on the serving origin asserts from a
+# LISTED related origin end to end, while an UNLISTED origin fails with the
+# non-enumerating ceremony error. Needs a real database (DATABASE_URL).
+[[test]]
+name = "webauthn_related_origins"
+path = "tests/webauthn_related_origins.rs"
+required-features = ["testing"]
+
 # The public invitation-accept endpoint (issue #60): a token-authenticated invitee
 # redeems a single-use, expiring, unguessable token to enroll a credential and
 # activate the pending-verification user; the redeem is atomic and single-use, a

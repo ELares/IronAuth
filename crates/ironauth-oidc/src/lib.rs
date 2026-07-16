@@ -123,6 +123,7 @@ mod userinfo;
 mod util;
 mod verification;
 mod webauthn;
+mod webauthn_wellknown;
 mod wellknown;
 
 use axum::Router;
@@ -320,6 +321,17 @@ pub fn oidc_router(state: OidcState) -> Router {
         .route(
             "/t/{tenant_id}/e/{environment_id}/account/password",
             post(account::change_password),
+        )
+        // WebAuthn Related Origin Requests document (issue #67, WebAuthn Level 3):
+        // GET /.well-known/webauthn serves the {"origins": [...]} list a browser
+        // fetches from the RP ID's own origin to accept a ceremony from a related
+        // origin. Deployment-root (NOT scope-routed): a browser fetches it from the
+        // bare host, and the RP ID + related origins are process-level config. It
+        // 404s when the feature is unconfigured, so a domain not using it discloses
+        // nothing.
+        .route(
+            "/.well-known/webauthn",
+            get(webauthn_wellknown::related_origins),
         )
         // WebAuthn passkey ceremonies (issue #65), scope-routed so the RP ID/origin
         // and the credential reads/writes run under the right per-environment scope.

@@ -6,7 +6,13 @@
 //! authentication, mounted under `/t/{tenant}/e/{environment}/webauthn/...`. The
 //! per-environment RP ID and origin are resolved from the serving origin (or the
 //! configured override, validated at startup), so the ceremony is bound to the
-//! right relying party and environment scope.
+//! right relying party and environment scope. The accepted origin set is the
+//! serving origin PLUS the configured related origins (issue #67, WebAuthn Level 3
+//! Related Origin Requests): an assertion from a listed related origin verifies
+//! against the same RP ID, while an unlisted origin still fails with the
+//! non-enumerating ceremony error. The related-origin allowlist is also the
+//! cross-site CSRF allowlist for these endpoints (a related-origin ceremony is a
+//! legitimately cross-site POST), via [`interaction::related_origin_ok`].
 //!
 //! - `register/options` and `register/verify` enroll a passkey for the
 //!   AUTHENTICATED user (a session cookie is required). `register/options`
@@ -89,15 +95,15 @@ pub async fn register_options(
     if !state.webauthn_enabled() {
         return not_found();
     }
-    if !interaction::same_origin_ok(&headers, state.self_origin().as_deref()) {
+    let Some(rp) = state.webauthn_relying_party() else {
+        return ceremony_error();
+    };
+    if !interaction::related_origin_ok(&headers, &rp.origins) {
         return forbidden();
     }
     let (scope, subject) = match authenticate(&state, &tenant_id, &environment_id, &headers).await {
         Ok(pair) => pair,
         Err(response) => return response,
-    };
-    let Some(rp) = state.webauthn_relying_party() else {
-        return ceremony_error();
     };
 
     // excludeCredentials: every passkey the user already has, so the authenticator
@@ -165,15 +171,15 @@ pub async fn register_verify(
     if !state.webauthn_enabled() {
         return not_found();
     }
-    if !interaction::same_origin_ok(&headers, state.self_origin().as_deref()) {
+    let Some(rp) = state.webauthn_relying_party() else {
+        return ceremony_error();
+    };
+    if !interaction::related_origin_ok(&headers, &rp.origins) {
         return forbidden();
     }
     let (scope, subject) = match authenticate(&state, &tenant_id, &environment_id, &headers).await {
         Ok(pair) => pair,
         Err(response) => return response,
-    };
-    let Some(rp) = state.webauthn_relying_party() else {
-        return ceremony_error();
     };
 
     let Some(challenge) = consume(
@@ -260,14 +266,14 @@ pub async fn authenticate_options(
     if !state.webauthn_enabled() {
         return not_found();
     }
-    if !interaction::same_origin_ok(&headers, state.self_origin().as_deref()) {
+    let Some(rp) = state.webauthn_relying_party() else {
+        return ceremony_error();
+    };
+    if !interaction::related_origin_ok(&headers, &rp.origins) {
         return forbidden();
     }
     let Some(scope) = parse_scope(&tenant_id, &environment_id) else {
         return not_found();
-    };
-    let Some(rp) = state.webauthn_relying_party() else {
-        return ceremony_error();
     };
     let Ok(issued) = state
         .store()
@@ -312,14 +318,14 @@ pub async fn authenticate_verify(
     if !state.webauthn_enabled() {
         return not_found();
     }
-    if !interaction::same_origin_ok(&headers, state.self_origin().as_deref()) {
+    let Some(rp) = state.webauthn_relying_party() else {
+        return ceremony_error();
+    };
+    if !interaction::related_origin_ok(&headers, &rp.origins) {
         return forbidden();
     }
     let Some(scope) = parse_scope(&tenant_id, &environment_id) else {
         return not_found();
-    };
-    let Some(rp) = state.webauthn_relying_party() else {
-        return ceremony_error();
     };
 
     // Credential-abuse regulation for the PASSKEY path (issue #64 MEDIUM-2), keyed on the
