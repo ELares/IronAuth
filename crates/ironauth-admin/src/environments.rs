@@ -323,6 +323,9 @@ pub async fn delete_environment(
         .management()
         .environments(tenant)
         .parse_id(&environment_id)?;
+    // Sudo mutation gate (issue #73): deleting an environment is an environment-scoped
+    // mutation. Gate before the delete write so a challenge leaves nothing removed.
+    crate::sudo::require_fresh_privilege(&state, Scope::new(tenant, environment), actor).await?;
     state
         .store()
         .management()

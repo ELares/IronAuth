@@ -153,6 +153,9 @@ pub async fn create_invitation(
     body: Bytes,
 ) -> Result<Response, ApiError> {
     let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    // Sudo mutation gate (issue #73): creating an invitation provisions a pending user
+    // and mints a token. Gate before the idempotency replay so a challenge writes nothing.
+    crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
 
     let key = idempotency::required_key(&headers)?;
     let fingerprint = idempotency::fingerprint("POST", uri.path(), &body);
@@ -425,6 +428,9 @@ pub async fn revoke_invitation(
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    // Sudo mutation gate (issue #73): revoking an invitation is an environment-scoped
+    // mutation. Gate before the idempotency replay so a challenge writes nothing.
+    crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
 
     let key = idempotency::required_key(&headers)?;
     // This transition carries no request body, so the fingerprint is over the empty
@@ -496,6 +502,10 @@ pub async fn resend_invitation(
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    // Sudo mutation gate (issue #73): resending an invitation invalidates the prior
+    // token and issues a fresh one. Gate before the idempotency replay so a challenge
+    // writes nothing.
+    crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
 
     let key = idempotency::required_key(&headers)?;
     // This transition carries no request body, so the fingerprint is over the empty

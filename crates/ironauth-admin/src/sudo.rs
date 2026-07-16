@@ -76,6 +76,9 @@ pub(crate) async fn require_fresh_privilege(
         .await?;
     // The freshness source is the recorded elevation instant. A missing elevation is
     // `None`, which the reused step-up seam treats as lapsed (fail closed).
+    // Note: freshness recomputes `elevated_at + the CURRENT window_secs` and ignores the
+    // stored `expires_at`, so lowering `admin.sudo_window_secs` shrinks already-live
+    // elevations immediately (the tunability principle: a config change takes effect now).
     let auth_time = elevation.as_ref().map(|row| row.elevated_at_unix_micros);
     let fresh = ironauth_oidc::privilege_is_fresh(
         auth_time,

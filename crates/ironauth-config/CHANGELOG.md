@@ -13,7 +13,13 @@ range per docs/RELEASING.md.
   `admin.sudo_mode_enabled` (admin session privilege separation) plus its
   `admin.sudo_mode_window_secs` re-authentication window (default 600). When off, each
   feature is fully inert. A config flag-matrix test proves both are off by default and turn
-  on independently.
+  on independently. The `admin.sudo_mode_enabled` docstring (and the generated
+  docs/CONFIG.md row) carries the honest guarantee: the enforced property is that the
+  elevation is SERVER-RECORDED and never CLIENT-ASSERTED (a forged header cannot elevate),
+  but because the admin plane uses a single non-interactive bearer with no second factor,
+  sudo mode does NOT yet defeat a fully-stolen admin bearer (which can self-elevate);
+  binding elevation to a distinct interactive re-auth factor is a documented graduation
+  step, and the freshness seam is factored so end-user apps get the full guarantee.
 - MDS3 endpoint override (issue #66 PR B): `webauthn.mds3_base_url` (optional, validated
   as an https URL, mirroring `hibp_base_url`) lets a deployment point the FIDO MDS3 sync
   at an alternate endpoint; the pinned FIDO Alliance root stays compiled in and is never

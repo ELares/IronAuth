@@ -190,6 +190,10 @@ pub async fn apply_config_promotion(
 ) -> Result<Response, ApiError> {
     let actor = principal.require_operator()?;
     let (tenant, scope) = scope_from_path(&state, &tenant_id, &environment_id)?;
+    // Sudo mutation gate: applying a config snapshot is the most powerful
+    // environment-scoped write, so it requires a fresh elevation (issue #73). Placed
+    // before the existence read and the apply, so a challenge leaves nothing written.
+    crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
     state
         .store()
         .management()

@@ -533,10 +533,17 @@ pub struct AdminConfig {
     /// credential must have a recorded elevation whose freshness window has not lapsed,
     /// evaluated the same way step-up (issue #72) evaluates a max-auth-age window. A
     /// mutation without a fresh elevation returns a structured RFC 9470 challenge
-    /// (`insufficient_user_authentication`) and executes nothing. The elevation derives
-    /// only from a SERVER-RECORDED re-auth event, never from a client-supplied header or
-    /// flag, so a stolen credential alone cannot mutate once the window lapses. When OFF,
-    /// the admin surface behaves exactly as before (no freshness gate). Independent of
+    /// (`insufficient_user_authentication`) and executes nothing. The enforced guarantee
+    /// is that the elevation is SERVER-RECORDED and never CLIENT-ASSERTED: it derives only
+    /// from a server-written re-auth event, never from a client-supplied header or flag, so
+    /// a forged header cannot elevate. CAVEAT: because the admin plane authenticates via a
+    /// single non-interactive bearer credential with NO second factor, sudo mode does NOT
+    /// yet defeat a fully-stolen admin bearer, which can call the elevate endpoint itself
+    /// and then mutate. It bounds a header-forgery or replay path, not a stolen bearer.
+    /// Binding elevation to a distinct interactive re-auth factor (an operator passkey) is
+    /// a documented graduation step; the freshness seam is factored so end-user
+    /// application sessions, which have that factor split, get the full guarantee. When
+    /// OFF, the admin surface behaves exactly as before (no freshness gate). Independent of
     /// every other flag.
     #[serde(default)]
     pub sudo_mode_enabled: bool,

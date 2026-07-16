@@ -141,6 +141,9 @@ pub async fn create_dcr_policy(
 ) -> Result<Response, ApiError> {
     let actor = principal.require_operator()?;
     let (tenant, scope) = scope_from_path(&state, &tenant_id, &environment_id)?;
+    // Sudo mutation gate (issue #73): writing a DCR policy is an environment-scoped
+    // mutation. Gate before the idempotency replay so a challenge writes nothing.
+    crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
 
     let key = idempotency::required_key(&headers)?;
     let fingerprint = idempotency::fingerprint("POST", uri.path(), &body);
@@ -308,6 +311,9 @@ pub async fn create_initial_access_token(
 ) -> Result<Response, ApiError> {
     let actor = principal.require_operator()?;
     let (tenant, scope) = scope_from_path(&state, &tenant_id, &environment_id)?;
+    // Sudo mutation gate (issue #73): minting a bearer IAT is an environment-scoped
+    // mutation. Gate before the idempotency replay so a challenge writes nothing.
+    crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
 
     let key = idempotency::required_key(&headers)?;
     let fingerprint = idempotency::fingerprint("POST", uri.path(), &body);
