@@ -6,6 +6,20 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Email OTP + magic-link adversarial-review hardening (issue #68): the `otp/send` and
+  `magic/send` handlers now EQUALIZE their present-vs-absent response WORK, closing a
+  timing enumeration oracle. The present path spends one #62-pool Argon2 hash (on the code /
+  short code); an unknown or suppressed recipient now burns the SAME single dummy Argon2
+  hash through the same pool (mirroring the verify path's `verify_absent`), so a probe can no
+  longer distinguish a real from an unknown recipient by send latency. The cross-device
+  magic-link SHORT CODE (a low-entropy 6-8 digit secret) is now per-link ATTEMPT-LIMITED:
+  a wrong short-code guess increments a per-link counter and the link is invalidated at the
+  budget (reusing `email_otp_max_attempts`), closing a binding-cookie-plus-IP-rotation
+  brute force that the per-IP throttle alone did not stop; the high-entropy same-device token
+  path is unchanged. The send acknowledgment page now renders a minimal `short_code` entry
+  form posting to the consume endpoint, so the cross-device flow is completable through the
+  UI rather than only a raw POST. The `HashingPool` gains a test-only `argon2_ops` counter
+  (a deterministic seam for the send-timing-equalization regression test).
 - Email OTP and scanner-safe magic links (issue #68): two passwordless / recovery /
   address-verification factors on the #64 abuse-defense layer. Email OTP mints a numeric
   6-8 digit code (per-tenant width and 5-10 minute TTL), single-active per (user, purpose)

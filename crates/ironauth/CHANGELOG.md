@@ -6,6 +6,11 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Magic-link cross-device UI reachability (issue #68, adversarial review): the served
+  magic-link send acknowledgment page now renders a `short_code` entry form, so the
+  cross-device fallback (open the link on one device, finish on the originating device that
+  holds the binding cookie) is completable through the browser UI the binary serves, not
+  only via a raw POST.
 - Email OTP and scanner-safe magic links (issue #68): the server binary now installs a
   `LoggingVerificationSender` dev transport behind the #64 verification seam, so the email-
   OTP and magic-link factors deliver end to end without a mail server (the code / link are

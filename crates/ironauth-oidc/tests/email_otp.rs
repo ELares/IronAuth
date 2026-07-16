@@ -19,7 +19,10 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
 use common::Harness;
 use ironauth_config::{OidcConfig, RegulationConfig};
-use ironauth_oidc::{EmailOtpMessage, MagicLinkMessage, SESSION_COOKIE, VerificationSender};
+use ironauth_oidc::{
+    Argon2Params, EmailOtpMessage, HashingPool, MagicLinkMessage, SESSION_COOKIE,
+    VerificationSender,
+};
 use ironauth_store::EmailFactorPurpose;
 use serde_json::{Value, json};
 
@@ -362,6 +365,69 @@ async fn send_is_rate_limited_per_recipient() {
     assert!(
         saw_throttle,
         "send flooding to one recipient must be throttled through the #64 abuse layer"
+    );
+}
+
+#[tokio::test]
+async fn send_spends_an_equal_argon2_hash_for_a_present_and_an_unknown_recipient() {
+    // HIGH-1 anti-enumeration TIMING equalization (issue #68): the send response must not
+    // distinguish a real from an unknown recipient by WORK. The present branch spends one
+    // pool Argon2 hash (hashing the code, the ~78 ms dominant cost); the suppressed branch
+    // must burn the SAME single Argon2 hash. Asserted DETERMINISTICALLY by counting pool
+    // Argon2 operations, never a flaky wall-clock timing measurement.
+    //
+    // Regulation is disabled so both sends take the same non-throttled path (a throttled
+    // send returns a 429 before any hashing, which would confound the count).
+    let (mut harness, sender, recipient) = setup_with(OidcConfig {
+        require_pkce_for_confidential_clients: false,
+        regulation: RegulationConfig {
+            enabled: false,
+            ..RegulationConfig::default()
+        },
+        ..OidcConfig::default()
+    })
+    .await;
+    // A cheap hashing pool so the count is deterministic and fast; admission disabled
+    // (None) so nothing is shed. The recording sender is preserved across the reinstall.
+    let pool = Arc::new(HashingPool::new(
+        harness.env().clone(),
+        Argon2Params::new(8, 1, 1),
+        1,
+        64,
+        None,
+    ));
+    harness.install_hashing_pool(Arc::clone(&pool));
+    harness.install_verification_sender(sender.clone());
+    let base = base(&harness);
+
+    let before_present = pool.argon2_ops();
+    let (status, _) = post_json(
+        &harness,
+        &format!("{base}/otp/send"),
+        &json!({ "identifier": recipient, "purpose": "login" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let present = pool.argon2_ops() - before_present;
+
+    let before_absent = pool.argon2_ops();
+    let (status, _) = post_json(
+        &harness,
+        &format!("{base}/otp/send"),
+        &json!({ "identifier": "nobody@example.test", "purpose": "login" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let absent = pool.argon2_ops() - before_absent;
+
+    assert_eq!(
+        present, 1,
+        "a present-recipient send must spend exactly one pool Argon2 hash"
+    );
+    assert_eq!(
+        present, absent,
+        "a present and an unknown-recipient send must spend the SAME number of pool \
+         Argon2 hashes (no timing enumeration oracle)"
     );
 }
 

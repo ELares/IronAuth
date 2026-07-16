@@ -18,8 +18,11 @@ use std::sync::{Arc, Mutex};
 use axum::body::Body;
 use axum::http::{HeaderMap, Request, StatusCode, header};
 use common::Harness;
-use ironauth_config::OidcConfig;
-use ironauth_oidc::{EmailOtpMessage, MagicLinkMessage, SESSION_COOKIE, VerificationSender};
+use ironauth_config::{OidcConfig, RegulationConfig};
+use ironauth_oidc::{
+    Argon2Params, EmailOtpMessage, HashingPool, MagicLinkMessage, SESSION_COOKIE,
+    VerificationSender,
+};
 use ironauth_store::magic_link_token_digest;
 
 const BINDING_COOKIE: &str = "__Host-ironauth_magic_binding";
@@ -342,6 +345,217 @@ async fn the_token_and_short_code_are_one_way_at_rest() {
     );
     // The stored short-code hash is not the plaintext token or short code.
     assert!(!by_token.short_code_hash.contains(&token));
+}
+
+/// A config with the #64 regulation throttle DISABLED, so a test isolates a per-code
+/// mechanism (the attempt counter, the send hashing count) from the request-rate throttle.
+fn no_regulation() -> OidcConfig {
+    OidcConfig {
+        regulation: RegulationConfig {
+            enabled: false,
+            ..RegulationConfig::default()
+        },
+        ..OidcConfig::default()
+    }
+}
+
+/// A wrong short-code guess of the same digit width, guaranteed to differ from `correct`.
+fn wrong_code(correct: &str) -> String {
+    if correct.chars().all(|c| c == '0') {
+        "1".repeat(correct.len())
+    } else {
+        "0".repeat(correct.len())
+    }
+}
+
+#[tokio::test]
+async fn send_spends_an_equal_argon2_hash_for_a_present_and_an_unknown_recipient() {
+    // HIGH-1 anti-enumeration TIMING equalization (issue #68): the magic/send response must
+    // not distinguish a real from an unknown recipient by WORK. The present branch spends
+    // one pool Argon2 hash (hashing the short code, the ~78 ms dominant cost); the
+    // suppressed branch must burn the SAME single Argon2 hash. Asserted DETERMINISTICALLY
+    // by counting pool Argon2 operations, never a flaky wall-clock timing measurement.
+    let mut harness = Harness::start_store_backed_with(no_regulation()).await;
+    let sender = Arc::new(RecordingSender::default());
+    let pool = Arc::new(HashingPool::new(
+        harness.env().clone(),
+        Argon2Params::new(8, 1, 1),
+        1,
+        64,
+        None,
+    ));
+    harness.install_hashing_pool(Arc::clone(&pool));
+    harness.install_verification_sender(sender.clone());
+    let recipient = "ada@example.test".to_owned();
+    harness
+        .seed_user(&recipient, "correct horse battery staple")
+        .await;
+    let base = base(&harness);
+
+    let before_present = pool.argon2_ops();
+    let (status, ..) = post_form(
+        &harness,
+        &format!("{base}/magic/send"),
+        &format!("identifier={recipient}&purpose=login"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let present = pool.argon2_ops() - before_present;
+
+    let before_absent = pool.argon2_ops();
+    let (status, ..) = post_form(
+        &harness,
+        &format!("{base}/magic/send"),
+        "identifier=nobody@example.test&purpose=login",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let absent = pool.argon2_ops() - before_absent;
+
+    assert_eq!(
+        present, 1,
+        "a present-recipient magic send must spend exactly one pool Argon2 hash"
+    );
+    assert_eq!(
+        present, absent,
+        "a present and an unknown-recipient magic send must spend the SAME number of pool \
+         Argon2 hashes (no timing enumeration oracle)"
+    );
+}
+
+#[tokio::test]
+async fn the_cross_device_short_code_dies_after_the_attempt_budget() {
+    // MEDIUM-2 (issue #68): the low-entropy cross-device short code must be per-code
+    // attempt-limited exactly like the email OTP, so an attacker who holds the victim's
+    // binding cookie cannot IP-rotate a brute force of the 6-digit code. After the budget
+    // of wrong guesses, the link dies and even the CORRECT short code no longer consumes.
+    let (harness, sender, recipient) = setup(no_regulation()).await;
+    let base = base(&harness);
+    let (binding, _token, short_code) = send_link(&harness, &sender, &recipient).await;
+    let wrong = wrong_code(&short_code);
+
+    // The default budget is 5 wrong guesses; spend them all through the cross-device path.
+    for _ in 0..5 {
+        let (status, ..) = post_form(
+            &harness,
+            &format!("{base}/magic/consume"),
+            &format!("short_code={wrong}"),
+            Some(&binding),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    // The link is now dead: even the CORRECT short code no longer consumes or mints.
+    let (status, headers, _body) = post_form(
+        &harness,
+        &format!("{base}/magic/consume"),
+        &format!("short_code={short_code}"),
+        Some(&binding),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a link that spent its short-code attempt budget must not consume even when correct"
+    );
+    assert!(
+        !headers.get_all(header::SET_COOKIE).iter().any(|value| value
+            .to_str()
+            .unwrap_or_default()
+            .starts_with(SESSION_COOKIE)),
+        "a dead link must not establish a session"
+    );
+}
+
+#[tokio::test]
+async fn a_correct_short_code_within_budget_mints_and_the_token_path_is_unbounded() {
+    let (harness, sender, recipient) = setup(no_regulation()).await;
+    let base = base(&harness);
+
+    // Link 1: two wrong short-code guesses (BELOW the budget of 5), then the CORRECT short
+    // code still mints the session (the attempt limit does not fire before the budget).
+    let (binding, _token, short_code) = send_link(&harness, &sender, &recipient).await;
+    let wrong = wrong_code(&short_code);
+    for _ in 0..2 {
+        let (status, ..) = post_form(
+            &harness,
+            &format!("{base}/magic/consume"),
+            &format!("short_code={wrong}"),
+            Some(&binding),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+    let (status, headers, _body) = post_form(
+        &harness,
+        &format!("{base}/magic/consume"),
+        &format!("short_code={short_code}"),
+        Some(&binding),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a correct short code within the attempt budget must still mint the session"
+    );
+    assert!(
+        headers.get_all(header::SET_COOKIE).iter().any(|value| value
+            .to_str()
+            .unwrap_or_default()
+            .starts_with(SESSION_COOKIE)),
+        "a correct short code within budget establishes a session"
+    );
+
+    // Link 2: the high-entropy SAME-DEVICE token path carries NO per-guess attempt limit
+    // (it needs none) and consumes on the first correct presentation.
+    let (binding2, token2, _short2) = send_link(&harness, &sender, &recipient).await;
+    let (status, headers, _body) = post_form(
+        &harness,
+        &format!("{base}/magic/consume"),
+        &format!("token={token2}"),
+        Some(&binding2),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the same-device token path must be unaffected by the short-code attempt limit"
+    );
+    assert!(
+        headers.get_all(header::SET_COOKIE).iter().any(|value| value
+            .to_str()
+            .unwrap_or_default()
+            .starts_with(SESSION_COOKIE)),
+        "the same-device token path establishes a session"
+    );
+}
+
+#[tokio::test]
+async fn the_send_ack_page_renders_a_cross_device_short_code_form() {
+    // MEDIUM-3 (issue #68): the cross-device flow must be human-completable through the UI.
+    // The send acknowledgment page (shown on the originating device, which holds the
+    // binding cookie) renders a `short_code` entry form targeting the consume endpoint.
+    let (harness, _sender, recipient) = setup(OidcConfig::default()).await;
+    let base = base(&harness);
+    let (status, _headers, body) = post_form(
+        &harness,
+        &format!("{base}/magic/send"),
+        &format!("identifier={recipient}&purpose=login"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        body.contains("name=\"short_code\""),
+        "the ack page must render a short_code entry form: {body}"
+    );
+    assert!(
+        body.contains(&format!("action=\"{base}/magic/consume\"")),
+        "the short_code form must POST to the consume endpoint: {body}"
+    );
 }
 
 #[tokio::test]

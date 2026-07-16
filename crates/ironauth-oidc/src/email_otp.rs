@@ -221,6 +221,14 @@ pub async fn send(
         state.deliver_email_otp(&message, true);
     } else {
         // Unknown recipient: SUPPRESS the send (no code stored, no delivery), identical ack.
+        //
+        // Anti-enumeration TIMING equalization (issue #68): the present branch above spends
+        // exactly ONE pool Argon2 hash (hashing the code, ~78 ms), which dominates the
+        // send-response time. A suppressed send must burn the SAME single Argon2 spend
+        // through the SAME #62 pool, or the response time would distinguish a real from an
+        // unknown recipient (the verify path already equalizes this with `verify_absent`).
+        // No DB write happens (that is the present path's far cheaper component).
+        let _ = state.verify_absent(&scope, identifier).await;
         let message = EmailOtpMessage {
             scope,
             purpose,

@@ -4361,6 +4361,12 @@ impl ActingEmailOtpCodeRepo<'_> {
         }
         let scope = self.scope;
         let mut tx = begin_scoped(self.store, scope).await?;
+        // Deliberately a SEPARATE transaction from the resolve+verify that precedes it: a
+        // concurrent burst of guesses can overshoot max_attempts by the in-flight
+        // concurrency, but that concurrency is bounded by the #64 per-IP/per-recipient
+        // throttle. Fusing this counter into the verify would hold a DB transaction open
+        // across the Argon2 code verify, which is worse; the small bounded overshoot is the
+        // accepted tradeoff.
         let row = sqlx::query(
             "UPDATE email_otp_codes SET attempt_count = attempt_count + 1 \
              WHERE tenant_id = $1 AND environment_id = $2 AND id = $3 \
@@ -4578,6 +4584,7 @@ impl ActingMagicLinkRepo<'_> {
         let short_code_hash = spec.short_code_hash.to_owned();
         let binding_digest = spec.binding_digest.to_owned();
         let recipient = spec.recipient_email.to_owned();
+        let max_attempts = spec.max_attempts;
         let expires = spec.expires_at_unix_micros;
         let bidx = email_factor_recipient_blind_index(master, scope, &recipient);
         let detail = format!("purpose={}", purpose.as_str());
@@ -4612,10 +4619,11 @@ impl ActingMagicLinkRepo<'_> {
                     "INSERT INTO magic_link_tokens \
                      (id, tenant_id, environment_id, subject, purpose, token_digest, \
                       short_code_hash, binding_digest, recipient_email_bidx, \
-                      recipient_email_sealed, pii_dek_version, expires_at, created_at) \
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, \
-                             TIMESTAMPTZ 'epoch' + ($12::text || ' microseconds')::interval, \
-                             TIMESTAMPTZ 'epoch' + ($13::text || ' microseconds')::interval)",
+                      recipient_email_sealed, pii_dek_version, attempt_count, max_attempts, \
+                      expires_at, created_at) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 0, $12, \
+                             TIMESTAMPTZ 'epoch' + ($13::text || ' microseconds')::interval, \
+                             TIMESTAMPTZ 'epoch' + ($14::text || ' microseconds')::interval)",
                 )
                 .bind(id.to_string())
                 .bind(scope.tenant().to_string())
@@ -4628,6 +4636,7 @@ impl ActingMagicLinkRepo<'_> {
                 .bind(bidx.into_bytes())
                 .bind(recipient_sealed.into_bytes())
                 .bind(dek_version)
+                .bind(max_attempts)
                 .bind(expires)
                 .bind(created_at_micros)
                 .execute(&mut **tx)
@@ -4722,6 +4731,69 @@ impl ActingMagicLinkRepo<'_> {
             Err(StoreError::NotFound) => Ok(MagicLinkConsumeOutcome::NotFound),
             Err(error) => Err(error),
         }
+    }
+
+    /// Record a WRONG cross-device SHORT-CODE guess against a link (issue #68): increment
+    /// the attempt counter and, once it reaches the budget, DELETE the link so it can never
+    /// consume again (the attempt-limit death). The high-entropy same-device TOKEN path is
+    /// not counted here; only the low-entropy short code is brute-forceable and thus
+    /// attempt-limited, mirroring the email-OTP [`ActingEmailOtpCodeRepo::record_wrong_guess`].
+    /// A high-frequency bookkeeping mutation kept off the audited-write path, exactly like
+    /// the abuse failure counters.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn record_wrong_short_code_guess(
+        &self,
+        id: &MagicLinkTokenId,
+        now_micros: i64,
+    ) -> Result<OtpAttemptOutcome, StoreError> {
+        if id.scope() != self.scope {
+            return Ok(OtpAttemptOutcome::Gone);
+        }
+        let scope = self.scope;
+        let mut tx = begin_scoped(self.store, scope).await?;
+        // Deliberately a SEPARATE transaction from the resolve+verify that precedes it: a
+        // concurrent burst of guesses can overshoot max_attempts by the in-flight
+        // concurrency, but that concurrency is bounded by the #64 per-IP throttle. Fusing
+        // this counter into the verify would hold a DB transaction open across the Argon2
+        // short-code verify, which is worse; the small bounded overshoot is the accepted
+        // tradeoff (identical to email_otp record_wrong_guess).
+        let row = sqlx::query(
+            "UPDATE magic_link_tokens SET attempt_count = attempt_count + 1 \
+             WHERE tenant_id = $1 AND environment_id = $2 AND id = $3 \
+               AND consumed_at IS NULL \
+               AND expires_at > TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval \
+             RETURNING attempt_count, max_attempts",
+        )
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(id.to_string())
+        .bind(now_micros)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(row) = row else {
+            tx.commit().await?;
+            return Ok(OtpAttemptOutcome::Gone);
+        };
+        let attempts: i32 = row.get("attempt_count");
+        let max_attempts: i32 = row.get("max_attempts");
+        if attempts >= max_attempts {
+            sqlx::query(
+                "DELETE FROM magic_link_tokens \
+                 WHERE tenant_id = $1 AND environment_id = $2 AND id = $3",
+            )
+            .bind(scope.tenant().to_string())
+            .bind(scope.environment().to_string())
+            .bind(id.to_string())
+            .execute(&mut *tx)
+            .await?;
+            tx.commit().await?;
+            return Ok(OtpAttemptOutcome::Died);
+        }
+        tx.commit().await?;
+        Ok(OtpAttemptOutcome::Survived)
     }
 }
 

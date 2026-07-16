@@ -28,7 +28,10 @@
 --      printed in the same email, so a broken-link email client still completes login.
 --      binding_digest is the SHA-256 digest of the same-device binding secret set as a
 --      cookie at request time; consumption is bound to the requesting browser (or, when
---      the cookie is absent, to the originating device via the short code). consumed_at
+--      the cookie is absent, to the originating device via the short code). attempt_count
+--      is a per-link wrong cross-device short-code guess counter (the short code is a
+--      low-entropy secret, so it is attempt-limited exactly like the OTP; the 256-bit
+--      token path is not); the link dies once it reaches max_attempts. consumed_at
 --      is set exactly once (single-use); expires_at is the TTL horizon; purpose binds
 --      the link to one flow. The recipient email is sealed and blind-indexed (issue
 --      #48). Scanner-safety is a CONSUMPTION-path property (a GET only renders a
@@ -134,8 +137,9 @@ GRANT UPDATE (attempt_count, consumed_at) ON email_otp_codes TO ironauth_app;
 -- token material stored, matched by equality on consumption. short_code_hash is the
 -- Argon2id PHC (issue #62) of the printed cross-device short code. binding_digest is the
 -- SHA-256 of the same-device binding secret set as a cookie at request time. purpose
--- binds the link to one flow. consumed_at is set exactly once (single-use); expires_at is
--- the TTL horizon.
+-- binds the link to one flow. attempt_count counts wrong cross-device short-code guesses;
+-- the link dies at max_attempts (the token path is unbounded, being high-entropy).
+-- consumed_at is set exactly once (single-use); expires_at is the TTL horizon.
 -- ---------------------------------------------------------------------------
 CREATE TABLE magic_link_tokens (
     id                     text        PRIMARY KEY,
@@ -161,6 +165,13 @@ CREATE TABLE magic_link_tokens (
     recipient_email_sealed bytea       NOT NULL,
     -- The DEK version the recipient email was sealed under (for transparent open).
     pii_dek_version        integer     NOT NULL,
+    -- Wrong cross-device SHORT-CODE guess counter; the link dies once it reaches
+    -- max_attempts. The 6-8 digit short code is a low-entropy secret (unlike the 256-bit
+    -- token), so the cross-device path is attempt-limited exactly like the email OTP.
+    attempt_count          integer     NOT NULL DEFAULT 0,
+    -- The per-link short-code wrong-guess budget (a per-tenant value); the link dies at
+    -- this count. The high-entropy same-device TOKEN path needs no such bound.
+    max_attempts           integer     NOT NULL DEFAULT 5,
     -- The TTL horizon (a per-tenant value).
     expires_at             timestamptz NOT NULL,
     -- NULL until consumed; set exactly once at single-use consumption.
@@ -171,6 +182,9 @@ CREATE TABLE magic_link_tokens (
     -- The closed purpose set: an unknown purpose can never be written.
     CONSTRAINT magic_link_tokens_purpose_known
         CHECK (purpose IN ('login', 'register', 'mfa', 'recovery', 'verify_address')),
+    -- The short-code attempt-budget bounds (mirrors email_otp_codes).
+    CONSTRAINT magic_link_tokens_attempts_nonneg
+        CHECK (attempt_count >= 0 AND max_attempts >= 1),
     FOREIGN KEY (tenant_id) REFERENCES tenants (id),
     FOREIGN KEY (environment_id, tenant_id) REFERENCES environments (id, tenant_id)
 );
@@ -203,8 +217,9 @@ CREATE POLICY magic_link_tokens_tenant_isolation ON magic_link_tokens
     );
 
 -- The data plane issues a link (INSERT, after DELETE-ing any prior active one), renders
--- the confirmation page and resolves the token / binding (SELECT), marks it consumed (a
--- COLUMN-scoped UPDATE to consumed_at alone), and prunes a predecessor (DELETE).
+-- the confirmation page and resolves the token / binding (SELECT), marks it consumed and
+-- counts a wrong cross-device short-code guess (a COLUMN-scoped UPDATE to consumed_at /
+-- attempt_count alone), and prunes a predecessor or an over-attempted link (DELETE).
 -- COLUMN-scoped UPDATE only (the #31 least-privilege lesson).
 GRANT SELECT, INSERT, DELETE ON magic_link_tokens TO ironauth_app;
-GRANT UPDATE (consumed_at) ON magic_link_tokens TO ironauth_app;
+GRANT UPDATE (consumed_at, attempt_count) ON magic_link_tokens TO ironauth_app;

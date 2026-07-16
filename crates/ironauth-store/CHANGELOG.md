@@ -6,6 +6,16 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Magic-link short-code attempt-limit hardening (issue #68, adversarial review): migration
+  0048 (unshipped, amended in place, still guard count 48) adds `attempt_count` and
+  `max_attempts` columns plus an `attempts_nonneg` CHECK to `magic_link_tokens`, and extends
+  its column-scoped UPDATE grant to `attempt_count`, so the low-entropy cross-device SHORT
+  CODE is per-link attempt-limited exactly like the email OTP. New
+  `ActingMagicLinkRepo::record_wrong_short_code_guess` increments the counter and DELETEs the
+  link at the budget (the same shape as `record_wrong_guess`); `NewMagicLink` gains a
+  `max_attempts` field. The wrong-guess counter is intentionally a SEPARATE transaction from
+  resolve+verify (a small throttle-bounded overshoot, rather than holding a DB transaction
+  open across the Argon2 verify), now documented at both increment sites.
 - Email OTP and scanner-safe magic-link persistence (issue #68): migration 0048 adds two
   durable, tenant-scoped tables (forced RLS, the (tenant, environment) isolation policy,
   nonempty-scope and purpose-known CHECKs, single-active partial unique indexes, and

@@ -128,6 +128,9 @@ pub struct NewMagicLink<'a> {
     pub binding_digest: &'a str,
     /// The recipient email; sealed and blind-indexed on write (issue #48).
     pub recipient_email: &'a str,
+    /// The per-link cross-device SHORT-CODE wrong-guess budget; the link dies once its
+    /// `attempt_count` reaches this. The high-entropy same-device token path is unbounded.
+    pub max_attempts: i32,
     /// The TTL horizon in Unix microseconds (the clock seam drives it).
     pub expires_at_unix_micros: i64,
 }

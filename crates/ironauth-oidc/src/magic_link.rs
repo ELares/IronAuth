@@ -65,6 +65,32 @@ pub struct SendBody {
     pub purpose: Option<String>,
 }
 
+/// Handle an unknown / suppressed magic-link recipient (issue #68): burn the anti-
+/// enumeration TIMING-equalizing dummy Argon2 hash and record a suppressed delivery.
+///
+/// The present path spends exactly ONE pool Argon2 hash (hashing the short code, the
+/// ~78 ms dominant cost). An unknown/suppressed recipient must burn the SAME single Argon2
+/// spend through the SAME #62 pool, or the send-response time would distinguish a real from
+/// an unknown recipient. No DB write happens (that is the present path's far cheaper
+/// component); this mirrors the verify path's `verify_absent`.
+async fn suppress_send(
+    state: &OidcState,
+    scope: Scope,
+    identifier: &str,
+    purpose: ironauth_store::EmailFactorPurpose,
+) {
+    let _ = state.verify_absent(&scope, identifier).await;
+    let message = MagicLinkMessage {
+        scope,
+        purpose,
+        recipient: identifier,
+        link: "",
+        short_code: "",
+        ttl_secs: state.magic_link_ttl().as_secs(),
+    };
+    state.deliver_magic_link(&message, false);
+}
+
 /// The GET confirmation-page query (QUERY-token mode only).
 #[derive(Deserialize)]
 pub struct ConfirmQuery {
@@ -103,7 +129,7 @@ pub async fn send(
         return response;
     }
     let Some(purpose) = purpose_or_login(body.purpose.as_deref()) else {
-        return ack_page();
+        return ack_page(scope);
     };
     let identifier = body
         .identifier
@@ -118,14 +144,14 @@ pub async fn send(
         session::build_magic_binding_cookie(&binding_secret, state.magic_link_ttl());
 
     if identifier.is_empty() {
-        return set_cookie(ack_page(), &binding_cookie);
+        return set_cookie(ack_page(scope), &binding_cookie);
     }
 
     // Throttle the SEND per recipient and per tenant before resolving existence (#64).
     let ctx = attempt_context(scope, purpose, identifier, &headers);
     if let crate::abuse::RegulationOutcome::Throttled(snapshot) = state.regulate_before(&ctx).await
     {
-        let mut response = ack_page();
+        let mut response = ack_page(scope);
         *response.status_mut() = StatusCode::TOO_MANY_REQUESTS;
         crate::abuse::stamp_rate_limit_headers(&mut response, &snapshot);
         return set_cookie(response, &binding_cookie);
@@ -151,6 +177,9 @@ pub async fn send(
         let ttl = state.magic_link_ttl();
         let now = epoch_micros(state.now());
         let expires = now.saturating_add(i64::try_from(ttl.as_micros()).unwrap_or(i64::MAX));
+        // The cross-device short code is a low-entropy secret, so it is attempt-limited
+        // exactly like the email OTP; reuse the OTP per-code budget config (issue #68).
+        let max_attempts = i32::try_from(state.email_otp_max_attempts()).unwrap_or(5);
         let spec = NewMagicLink {
             id: &id,
             subject: &user.id,
@@ -159,6 +188,7 @@ pub async fn send(
             short_code_hash: &short_code_hash,
             binding_digest: &magic_link_binding_digest(&binding_secret),
             recipient_email: identifier,
+            max_attempts,
             expires_at_unix_micros: expires,
         };
         let issued = state
@@ -173,7 +203,7 @@ pub async fn send(
             .await;
         if issued.is_err() {
             tracing::error!(target: "ironauth.verification", "magic link issue failed");
-            return set_cookie(ack_page(), &binding_cookie);
+            return set_cookie(ack_page(scope), &binding_cookie);
         }
         let link = confirm_link(&state, scope, &token);
         let message = MagicLinkMessage {
@@ -186,17 +216,9 @@ pub async fn send(
         };
         state.deliver_magic_link(&message, true);
     } else {
-        let message = MagicLinkMessage {
-            scope,
-            purpose,
-            recipient: identifier,
-            link: "",
-            short_code: "",
-            ttl_secs: state.magic_link_ttl().as_secs(),
-        };
-        state.deliver_magic_link(&message, false);
+        suppress_send(&state, scope, identifier, purpose).await;
     }
-    set_cookie(ack_page(), &binding_cookie)
+    set_cookie(ack_page(scope), &binding_cookie)
 }
 
 /// `GET /t/{tenant}/e/{environment}/magic/confirm`: render the SCANNER-SAFE confirmation
@@ -360,6 +382,21 @@ async fn consume_cross_device(
         Err(rejection) => return rejection.to_response(),
     };
     if !matched {
+        // The cross-device short code is low-entropy (6-8 digits), so a wrong guess is
+        // counted per-link and the link dies once the budget is spent (issue #68),
+        // mirroring the email-OTP per-code attempt limit. The high-entropy same-device
+        // token path needs no such bound. This closes the short-code brute-force that the
+        // per-IP throttle alone (IP-rotatable) does not.
+        let _ = state
+            .store()
+            .scoped(scope)
+            .acting(
+                interaction::subject_actor(state, scope, &challenge.subject),
+                CorrelationId::generate(state.env()),
+            )
+            .magic_links()
+            .record_wrong_short_code_guess(&challenge.id, now)
+            .await;
         return invalid_page();
     }
     finish_consume(state, scope, &challenge, ctx, headers, now).await
@@ -515,15 +552,25 @@ fn set_cookie(mut response: Response, cookie: &str) -> Response {
     response
 }
 
+/// The consume-endpoint POST target for `scope` (issue #68).
+fn consume_action(scope: Scope) -> String {
+    format!(
+        "/t/{}/e/{}/magic/consume",
+        scope.tenant(),
+        scope.environment()
+    )
+}
+
 /// The UNIFORM send acknowledgment page (issue #68): identical whether the recipient
-/// exists, is unknown, or the send succeeded.
-fn ack_page() -> Response {
+/// exists, is unknown, or the send succeeded (byte-identical for the same `scope`, so it
+/// is never an existence oracle). It also carries the cross-device SHORT-CODE entry form:
+/// the originating device (which holds the binding cookie) can finish a login started
+/// there when the link is opened elsewhere, so the cross-device flow is human-completable
+/// through the UI rather than only via a raw POST.
+fn ack_page(scope: Scope) -> Response {
     pages::secure_html(
         StatusCode::OK,
-        pages::notice_page(
-            "Check your email",
-            "If an account exists for that address, we have sent a sign-in link and code.",
-        ),
+        pages::magic_ack_page(&consume_action(scope)),
     )
 }
 

@@ -572,6 +572,31 @@ pub fn magic_confirm_page(
     notice_document("Confirm your sign in", &body)
 }
 
+/// The UNIFORM magic-link send acknowledgment page (issue #68): shown on the originating
+/// device after a send, byte-identical whether the recipient exists, is unknown, or the
+/// send succeeded (the anti-enumeration ack). It also carries the minimal cross-device
+/// SHORT-CODE entry form: when the link is opened on another device, the originating device
+/// (which holds the binding cookie) enters the code printed in the same email HERE to
+/// finish signing in, so the cross-device flow is human-completable through the UI. The
+/// form POSTs `short_code` to `consume_action` (same-origin, so it rides the standard CSRF
+/// same-origin gate and the `form-action 'self'` CSP of [`secure_html`]); it carries no
+/// script, so no nonce is needed.
+#[must_use]
+pub fn magic_ack_page(consume_action: &str) -> String {
+    let body = format!(
+        "<h1>Check your email</h1>\
+         <p>If an account exists for that address, we have sent a sign-in link and code.</p>\
+         <p>Opened the link on a different device? Enter the code from the same email here, \
+         on the device where you started signing in, to finish.</p>\
+         <form method=\"post\" action=\"{action}\">\
+         <p><label>Sign-in code <input type=\"text\" name=\"short_code\" inputmode=\"numeric\" \
+         autocomplete=\"one-time-code\" required></label></p>\
+         <p><button type=\"submit\">Finish signing in</button></p></form>",
+        action = escape_html(consume_action),
+    );
+    notice_document("Check your email", &body)
+}
+
 /// The magic-link CROSS-DEVICE fallback page (issue #68): shown when the confirmation POST
 /// arrives WITHOUT the same-device binding cookie (the link was opened on another device).
 /// It directs the user to enter the short code printed in the email on the ORIGINATING

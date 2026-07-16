@@ -1977,6 +1977,8 @@ async fn production_chain_is_only_the_forty_eight_real_migrations_and_ships_no_d
         "recipient_email_bidx",
         "recipient_email_sealed",
         "pii_dek_version",
+        "attempt_count",
+        "max_attempts",
         "expires_at",
         "consumed_at",
         "created_at",
@@ -2023,6 +2025,12 @@ async fn production_chain_is_only_the_forty_eight_real_migrations_and_ships_no_d
         assert!(
             check_constraint_exists(pool, table, &format!("{table}_purpose_known")).await,
             "{table} must carry the purpose-known CHECK constraint"
+        );
+        // Both factors attempt-limit their low-entropy secret (the OTP code; the magic
+        // link's cross-device short code), so both carry the attempt-budget CHECK.
+        assert!(
+            check_constraint_exists(pool, table, &format!("{table}_attempts_nonneg")).await,
+            "{table} must carry the attempts-nonneg CHECK constraint"
         );
     }
 }
