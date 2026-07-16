@@ -19,8 +19,8 @@ use ironauth_env::Env;
 use ironauth_jose::MasterKey;
 use ironauth_oidc::{
     BackChannelLogoutWorker, DiscoveryCapabilities, DiscoveryState, FetchLogoutSender,
-    IssuerRegistry, IssuerState, JwksCacheWindow, OidcState, WorkerSettings, discovery_router,
-    issuer_router, oidc_router,
+    IssuerRegistry, IssuerState, JwksCacheWindow, LazyMigrationHook, OidcState, WorkerSettings,
+    discovery_router, issuer_router, oidc_router,
 };
 use ironauth_quota::QuotaEnforcer;
 use ironauth_server::Server;
@@ -57,6 +57,10 @@ fn main() -> ExitCode {
 }
 
 /// Run the `serve` subcommand.
+// The boot sequence is one linear wiring list (config, telemetry, the migration hook,
+// the management and OIDC routers, the background worker, then run); it reads top to
+// bottom with no extractable unit, so the length lint is not meaningful here.
+#[allow(clippy::too_many_lines)]
 fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
     let config_path = match parse_config_path(args) {
         Ok(path) => path,
@@ -119,11 +123,23 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
 
         let env = Env::system();
 
+        // The inbound lazy-migration hook (issue #56), built once and shared: it arms the
+        // login path (OIDC data plane) to verify an unknown identifier's first login
+        // against a legacy store, and the SAME Arc is handed to the management plane so the
+        // migration-progress endpoint reports this node's circuit-breaker state. Built only
+        // when the OIDC provider is mounted (the login path it guards) AND the hook is
+        // enabled; disabled or misconfigured yields `None` (the login path is unchanged).
+        let migration_hook = if config.oidc.enabled {
+            ironauth_oidc::build_lazy_migration_hook(&config.oidc.lazy_migration, &env)
+        } else {
+            None
+        };
+
         // Build the management API router (issue #11) before moving config into
         // the server. It mounts on the management plane only when a bootstrap
         // operator token is configured; otherwise the server boots exactly as the
         // DB-free skeleton it was, serving only health, readiness, and metrics.
-        let management = build_management_router(&config, &env).await;
+        let management = build_management_router(&config, &env, migration_hook.clone()).await;
 
         // Capture what the OIDC mount (issue #12) needs before config and env
         // move into the server: the OIDC settings, the data-plane DSN, and an env
@@ -166,6 +182,7 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
                 global_revocation_enabled,
                 master_key,
                 &quota_config,
+                migration_hook,
             )
             .await
             {
@@ -204,7 +221,11 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
 /// with the DSN chosen by [`select_control_dsn`] (per the D2 policy). A failure
 /// to connect or an invalid admin config is logged and the server continues to
 /// serve health, readiness, and metrics rather than refusing to boot.
-async fn build_management_router(config: &Config, env: &Env) -> Option<Router> {
+async fn build_management_router(
+    config: &Config,
+    env: &Env,
+    migration_hook: Option<Arc<LazyMigrationHook>>,
+) -> Option<Router> {
     if config.admin.bootstrap_operator_token.is_none() {
         tracing::info!(
             "management API not mounted: admin.bootstrap_operator_token is unset (operator plane \
@@ -236,6 +257,12 @@ async fn build_management_router(config: &Config, env: &Env) -> Option<Router> {
     };
     match AdminState::new(store, env.clone(), &config.admin) {
         Ok(state) => {
+            // Share the lazy-migration hook (issue #56) so the migration-progress endpoint
+            // can report this node's circuit-breaker state alongside the DB progress counts.
+            let state = match migration_hook {
+                Some(hook) => state.with_migration_hook(hook),
+                None => state,
+            };
             tracing::info!("management API mounted on the management plane");
             Some(ironauth_admin::management_router(state))
         }
@@ -275,6 +302,10 @@ async fn build_management_router(config: &Config, env: &Env) -> Option<Router> {
 /// The JWKS/discovery cache window is derived from `oidc.jwks_cache_max_age_secs`
 /// and carried by the registry, so the served `Cache-Control: max-age` reflects the
 /// configured value (AC #4).
+// The mount takes the data-plane inputs, the two experimental/quota installs, and now
+// the optional lazy-migration hook; each is an independent input to the one OidcState
+// build, so bundling them into a struct would not make the wiring clearer.
+#[allow(clippy::too_many_arguments)]
 async fn build_oidc_router(
     oidc_config: &OidcConfig,
     data_plane_dsn: &str,
@@ -283,6 +314,7 @@ async fn build_oidc_router(
     global_revocation_enabled: bool,
     master_key: Option<Arc<MasterKey>>,
     quota_config: &QuotaConfig,
+    migration_hook: Option<Arc<LazyMigrationHook>>,
 ) -> Option<Router> {
     let store = match Store::connect(data_plane_dsn).await {
         Ok(store) => store,
@@ -340,9 +372,14 @@ async fn build_oidc_router(
     // wants no quota expresses it; enforcement then admits every request.
     let quota_enforcer = Arc::new(QuotaEnforcer::from_config(quota_config, env.clock_arc()));
 
-    let state = OidcState::new(store, env, registry, oidc_config, issuer_base)
+    let mut state = OidcState::new(store, env, registry, oidc_config, issuer_base)
         .with_global_token_revocation_enabled(global_revocation_enabled)
         .with_quota_enforcer(quota_enforcer);
+    // Arm the inbound lazy-migration hook on the login path (issue #56) when one is
+    // configured; without it an unknown-identifier login is the uniform failure.
+    if let Some(hook) = migration_hook {
+        state = state.with_migration_hook(hook);
+    }
     if global_revocation_enabled {
         tracing::info!(
             "experimental Global Token Revocation receiver mounted (issue #36); the draft \

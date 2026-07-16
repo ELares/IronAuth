@@ -93,6 +93,7 @@ mod jwks;
 mod jwt_bearer;
 mod login;
 mod logout;
+mod migration;
 mod pages;
 mod par;
 mod password;
@@ -156,6 +157,13 @@ pub use issuer::{
 };
 pub use jwks::{IssuerState, issuer_router};
 pub use logout::LogoutParams;
+pub use migration::{
+    BreakerState, CircuitBreaker, CredentialVerifier, HookError, HookOutcome, HookProfile,
+    HookVerdict, LAZY_MIGRATION_BREAKER_STATE, LAZY_MIGRATION_BREAKER_TRANSITIONS_TOTAL,
+    LAZY_MIGRATION_HOOK_LATENCY_SECONDS, LAZY_MIGRATION_HOOK_TOTAL, LAZY_MIGRATION_MIGRATED_TOTAL,
+    LazyMigrationHook, WebhookVerifier, build_from_config as build_lazy_migration_hook,
+    describe_metrics as describe_lazy_migration_metrics,
+};
 pub use password::{PasswordError, hash_password, verify_absent, verify_password};
 pub use registry::{
     GrantType, PkceMethod, PromptSet, PromptSetError, PromptValue, ResponseMode, ResponseType,

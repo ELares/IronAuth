@@ -79,6 +79,12 @@ struct Inner {
     // closed (matches nothing).
     outbound_verification_tenant: Option<String>,
     outbound_verification_environment: Option<String>,
+    // The inbound lazy-migration hook (issue #56), shared with the OIDC data plane in the
+    // same process when one is configured. Held so the management-plane migration-progress
+    // endpoint can report THIS node's circuit-breaker state alongside the DB progress
+    // counts. `None` when no hook is configured, or on a node that does not run the data
+    // plane; the endpoint then reports progress with no breaker block.
+    migration_hook: Option<Arc<ironauth_oidc::LazyMigrationHook>>,
 }
 
 impl AdminState {
@@ -160,8 +166,35 @@ impl AdminState {
                     .outbound_verification_environment
                     .clone()
                     .filter(|value| !value.trim().is_empty()),
+                migration_hook: None,
             }),
         })
+    }
+
+    /// Share the inbound lazy-migration hook (issue #56) with the management plane, so the
+    /// migration-progress endpoint can report this node's circuit-breaker state. The boot
+    /// path installs the SAME `Arc` it installs on the OIDC data plane; with no hook
+    /// installed the progress endpoint reports the DB counts and no breaker block. Kept a
+    /// builder so the many admin tests need not stand a hook up.
+    #[must_use]
+    pub fn with_migration_hook(mut self, hook: Arc<ironauth_oidc::LazyMigrationHook>) -> Self {
+        // The Arc<Inner> is not yet shared at construction time (the caller holds the sole
+        // reference right after `new`), so this get_mut succeeds; if it ever did not, the
+        // hook is simply not installed rather than panicking.
+        if let Some(inner) = Arc::get_mut(&mut self.inner) {
+            inner.migration_hook = Some(hook);
+        }
+        self
+    }
+
+    /// This node's lazy-migration circuit-breaker state (issue #56), or `None` when no
+    /// hook is installed on this node. Reported by the migration-progress endpoint.
+    #[must_use]
+    pub(crate) fn migration_breaker_state(&self) -> Option<ironauth_oidc::BreakerState> {
+        self.inner
+            .migration_hook
+            .as_ref()
+            .map(|hook| hook.breaker_state())
     }
 
     /// Whether the outbound lazy-migration credential-verification endpoint is

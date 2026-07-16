@@ -6,6 +6,14 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Wire the inbound lazy-migration hook (issue #56): when the OIDC provider is mounted and
+  `[oidc.lazy_migration]` is enabled, the boot path builds ONE `LazyMigrationHook` (a
+  dedicated SSRF-hardened fetcher with the configured per-call timeout, the resolved shared
+  secret, and a circuit breaker on the env clock) and installs the SAME Arc on BOTH the OIDC
+  data plane (arming the login path) and the management plane (so the migration-progress
+  endpoint reports the node's breaker state). A disabled or misconfigured hook (unresolvable
+  secret, TLS setup failure) is logged and simply not armed, leaving the login path
+  unchanged.
 - The management-plane control store is now built with the platform envelope master
   key attached (issue #52), so the admin user-management API can seal, blind-index,
   and open user PII (issue #48) exactly as the data plane does. Without the key those

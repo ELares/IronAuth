@@ -1077,6 +1077,7 @@ dependencies = [
  "ironauth-quota",
  "ironauth-store",
  "metrics",
+ "metrics-exporter-prometheus",
  "oauth2",
  "serde",
  "serde_json",

@@ -53,6 +53,7 @@ mod input;
 mod invitations;
 mod keys;
 mod migration;
+mod migration_status;
 mod openapi;
 mod operators;
 mod organizations;
@@ -169,6 +170,14 @@ pub fn management_router(state: AdminState) -> Router {
         .route(
             "/v1/tenants/{tenant_id}/environments/{environment_id}/migration/verify-credential",
             post(migration::verify_credential),
+        )
+        // Inbound lazy-migration progress (issue #56): the queryable JSON view of how far
+        // an environment's lazy migration has come, plus this node's circuit-breaker
+        // state. Environment-scoped read (operator plane or the environment's own key). A
+        // static suffix, matched before the parameterized keys/organizations routes.
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/migration/progress",
+            get(migration_status::get_migration_progress),
         )
         // Server-side config promotion (issue #44): the write half of the flagship.
         // A dry-run PLAN and a transactional APPLY into the target environment.

@@ -6,6 +6,28 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Inbound lazy-migration hook (issue #56): when the `[oidc.lazy_migration]` config arms
+  it, a login whose canonicalized identifier is UNKNOWN locally verifies the submitted
+  credential against a legacy store through a pluggable `CredentialVerifier` (the only
+  shipped implementation, `WebhookVerifier`, delivers the check over the M1 SSRF-hardened
+  fetcher, HTTPS ONLY, with a configured bearer secret). On a positive verdict the user is
+  created locally with a native Argon2id hash and NO foreign hash (migrated by
+  construction), an optional profile's traits are validated against the active identity
+  schema (#53) before anything is persisted (an invalid profile is refused), the user is
+  audited (`user.create`), a session is established, and the request resumes; the SECOND
+  login is a normal local login that never calls the hook. Every non-success outcome
+  (rejected, timeout, error, blocked, or an open breaker) falls through to the SAME uniform
+  failure a local wrong password produces, spending the same `verify_absent` Argon2id work,
+  so the hook is not a user-enumeration oracle. Resilience: a per-call timeout (the
+  fetcher's deadline), NO retry in the login path, and an in-memory per-node
+  `CircuitBreaker` that opens on an error/timeout rate (a verdict never trips it) and
+  fails unmigrated logins fast while local users are unaffected; its window and cooldown
+  read the env clock seam. Observability: the migrated count, per-outcome hook counter,
+  latency histogram, breaker-state gauge, and breaker-transition counter are exported as
+  metrics (`describe_lazy_migration_metrics`). The contract is implementation-agnostic so
+  the M11 WASM hooks engine can slot a WASM verifier in behind the same trait. A standard
+  #55 bulk import closes the tail of stragglers, after which the hook is disabled per
+  environment (a pure config change).
 - Exported `verify_absent` (issue #58, review): the login path's dummy-Argon2id
   primitive is now public so the management outbound verify-credential endpoint can
   reuse the exact same anti-user-enumeration work, keeping absent and wrong-password

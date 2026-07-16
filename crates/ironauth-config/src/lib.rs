@@ -1105,6 +1105,15 @@ pub struct OidcConfig {
     /// RP cannot wedge the worker or block other RPs. The default (10) is conservative.
     /// Must be at least 1 and at most `OIDC_MAX_LIFETIME_SECS`.
     pub backchannel_logout_request_timeout_secs: u64,
+
+    /// The INBOUND lazy-migration hook (issue #56): verify a first login against a
+    /// legacy credential store over the SSRF-hardened outbound fetcher and, on success,
+    /// create the user locally with a native Argon2id hash so subsequent logins never
+    /// call the hook. Disabled by default; the endpoint and its authentication secret
+    /// are environment-scoped config (see [`LazyMigrationConfig`]). This is a promotable
+    /// per-environment setting in spirit; the process value is the deployment default
+    /// until per-environment overrides ride the M5 promotion pipeline.
+    pub lazy_migration: LazyMigrationConfig,
 }
 
 impl Default for OidcConfig {
@@ -1161,6 +1170,92 @@ impl Default for OidcConfig {
             backchannel_logout_retry_base_secs: 10,
             backchannel_logout_poll_interval_secs: 5,
             backchannel_logout_request_timeout_secs: 10,
+            lazy_migration: LazyMigrationConfig::default(),
+        }
+    }
+}
+
+/// The largest per-call timeout the inbound lazy-migration hook may be configured to,
+/// in seconds (issue #56). The hook rides the login path, so a slow or dead legacy
+/// backend must never stall a login for long: the fetcher aborts a call that exceeds
+/// this, the circuit breaker opens on a sustained error/timeout rate, and unmigrated
+/// logins then fail fast with the uniform error. A value beyond thirty seconds is
+/// almost always a misconfiguration, so config load rejects it.
+pub const OIDC_MAX_LAZY_MIGRATION_TIMEOUT_SECS: u64 = 30;
+
+/// The INBOUND lazy-migration hook settings (issue #56).
+///
+/// When enabled, a login whose canonicalized identifier is UNKNOWN locally verifies the
+/// submitted credential against a legacy store through the `endpoint` webhook (delivered
+/// over the M1 SSRF-hardened outbound fetcher, HTTPS ONLY, authenticated with `secret`).
+/// On a positive verdict the user is created locally with a native Argon2id hash and is
+/// MIGRATED by construction, so their next login verifies natively and never calls the
+/// hook. Every failure verdict (wrong password, unknown to the legacy store, timeout,
+/// breaker open) yields the SAME uniform login failure as a local wrong password, so the
+/// hook's existence is not observable to an attacker.
+///
+/// DISABLED BY DEFAULT (`enabled = false`): pointing the login path at an external
+/// credential oracle is an explicit, per-deployment opt-in. Once the tail of stragglers
+/// is closed by a standard #55 bulk import, the hook is disabled again by flipping
+/// `enabled` back to false (a pure config change).
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields, default)]
+pub struct LazyMigrationConfig {
+    /// Whether the inbound lazy-migration hook is armed. False (the default) leaves the
+    /// login path unchanged: an unknown identifier is the uniform failure, no outbound
+    /// call is made. When true, `endpoint` MUST be set (config load rejects an enabled
+    /// hook with no endpoint) and an unknown-identifier login triggers one hook call.
+    pub enabled: bool,
+
+    /// The legacy-store verification webhook URL (an https URL). Outbound and routed
+    /// through the SSRF-hardened fetcher, so a loopback or otherwise internal endpoint is
+    /// refused exactly like any other blocked destination, and a plaintext `http` target
+    /// is refused. Unset when the hook is disabled; REQUIRED (and https) when enabled.
+    pub endpoint: Option<String>,
+
+    /// The shared bearer secret presented to the verification webhook as
+    /// `Authorization: Bearer <secret>`, so the legacy store can authenticate IronAuth.
+    /// Use the `file`/`env` secret indirection, never a literal, outside dev mode. Unset
+    /// sends no Authorization header (for a legacy store that authenticates another way,
+    /// for example a URL-embedded token); most deployments set it.
+    pub secret: Option<Secret>,
+
+    /// The per-call timeout in seconds for one hook verification (issue #56). The
+    /// SSRF-hardened fetcher aborts a call that exceeds it, so a slow legacy backend
+    /// cannot stall the login path. The default (5) is conservative. Must be at least 1
+    /// and at most `OIDC_MAX_LAZY_MIGRATION_TIMEOUT_SECS`.
+    pub timeout_secs: u64,
+
+    /// The circuit-breaker failure threshold (issue #56): the number of hook errors and
+    /// timeouts within `breaker_window_secs` that trips the breaker OPEN. While open,
+    /// unmigrated logins fail fast with the uniform error (no hook call), local users are
+    /// unaffected, and after `breaker_cooldown_secs` the breaker half-opens to trial one
+    /// call. A verdict (verified or rejected) is a HEALTHY response and never counts
+    /// toward the threshold; only transport errors and timeouts do. The default (5) is
+    /// conservative. Must be at least 1.
+    pub breaker_failure_threshold: u32,
+
+    /// The rolling window in seconds over which `breaker_failure_threshold` errors and
+    /// timeouts are counted (issue #56). The default (30) is conservative. Must be at
+    /// least 1.
+    pub breaker_window_secs: u64,
+
+    /// How long the breaker stays OPEN before it half-opens to trial one call (issue
+    /// #56), in seconds. A half-open success closes it; a half-open failure re-opens it
+    /// for another cooldown. The default (30) is conservative. Must be at least 1.
+    pub breaker_cooldown_secs: u64,
+}
+
+impl Default for LazyMigrationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            endpoint: None,
+            secret: None,
+            timeout_secs: 5,
+            breaker_failure_threshold: 5,
+            breaker_window_secs: 30,
+            breaker_cooldown_secs: 30,
         }
     }
 }
@@ -1422,6 +1517,9 @@ impl Config {
         if let Some(dsn) = &self.admin.control_database_url {
             visit("admin.control_database_url", dsn);
         }
+        if let Some(secret) = &self.oidc.lazy_migration.secret {
+            visit("oidc.lazy_migration.secret", secret);
+        }
     }
 
     /// Post-parse bound and cross-field checks the schema alone cannot express.
@@ -1518,9 +1616,78 @@ impl Config {
         }
         validate_device_authorization(&self.oidc)?;
         validate_backchannel_logout(&self.oidc)?;
+        validate_lazy_migration(&self.oidc)?;
         validate_quota(&self.quota)?;
         Ok(())
     }
+}
+
+/// Validate the inbound lazy-migration hook settings (issue #56), kept out of
+/// [`Config::validate`] so each stays within the readable-length lint.
+///
+/// The breaker and timeout bounds are enforced ALWAYS (they have safe defaults in
+/// range); the endpoint constraint (present and https) is enforced only when the hook
+/// is `enabled`, so a disabled hook with no endpoint is a valid, inert configuration.
+/// Requiring https at config load is defense in depth: the SSRF-hardened fetcher also
+/// refuses a plaintext target at call time, but failing fast at startup is clearer.
+///
+/// # Errors
+///
+/// [`ConfigError::Invalid`] if the hook is enabled without an https endpoint, the
+/// timeout is zero or above [`OIDC_MAX_LAZY_MIGRATION_TIMEOUT_SECS`], or a breaker
+/// bound is zero.
+fn validate_lazy_migration(oidc: &OidcConfig) -> Result<(), ConfigError> {
+    let hook = &oidc.lazy_migration;
+    if hook.enabled {
+        match hook.endpoint.as_deref() {
+            None => {
+                return Err(ConfigError::Invalid {
+                    message: "oidc.lazy_migration.endpoint must be set when \
+                              oidc.lazy_migration.enabled is true"
+                        .to_owned(),
+                });
+            }
+            Some(endpoint) if !endpoint.starts_with("https://") => {
+                return Err(ConfigError::Invalid {
+                    message: "oidc.lazy_migration.endpoint must be an https URL (a plaintext \
+                              http target is refused; the hook rides the SSRF-hardened fetcher)"
+                        .to_owned(),
+                });
+            }
+            Some(_) => {}
+        }
+    }
+    if hook.timeout_secs < 1 {
+        return Err(ConfigError::Invalid {
+            message: "oidc.lazy_migration.timeout_secs must be at least 1 second".to_owned(),
+        });
+    }
+    if hook.timeout_secs > OIDC_MAX_LAZY_MIGRATION_TIMEOUT_SECS {
+        return Err(ConfigError::Invalid {
+            message: format!(
+                "oidc.lazy_migration.timeout_secs ({}) must not exceed \
+                 {OIDC_MAX_LAZY_MIGRATION_TIMEOUT_SECS} seconds",
+                hook.timeout_secs
+            ),
+        });
+    }
+    if hook.breaker_failure_threshold < 1 {
+        return Err(ConfigError::Invalid {
+            message: "oidc.lazy_migration.breaker_failure_threshold must be at least 1".to_owned(),
+        });
+    }
+    if hook.breaker_window_secs < 1 {
+        return Err(ConfigError::Invalid {
+            message: "oidc.lazy_migration.breaker_window_secs must be at least 1 second".to_owned(),
+        });
+    }
+    if hook.breaker_cooldown_secs < 1 {
+        return Err(ConfigError::Invalid {
+            message: "oidc.lazy_migration.breaker_cooldown_secs must be at least 1 second"
+                .to_owned(),
+        });
+    }
+    Ok(())
 }
 
 /// Validate the quota fairness settings (issue #50), kept out of

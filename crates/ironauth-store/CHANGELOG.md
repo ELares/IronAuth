@@ -6,6 +6,12 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- `UserRepo::migration_progress` (issue #56): a scoped, master-key-free count of the
+  environment's lazy-migration progress (total live users and how many still carry an
+  imported foreign password hash, the #55 straggler tail). Returns the new
+  `MigrationProgress` value; the management-plane progress endpoint reads it to report how
+  far a migration has come and when the hook can be disabled. No schema change (a COUNT over
+  `users` with the existing `deleted_at IS NULL` filter).
 - Exit-export credential registry (issue #58, review, migration 0042, expand):
   `UserExportRecord` now carries the user's enrolled `account_credentials` (a new
   `ExportedCredential` list: factor kind, opened friendly name, last-used instant),

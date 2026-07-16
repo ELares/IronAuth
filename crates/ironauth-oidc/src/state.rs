@@ -80,6 +80,14 @@ pub struct OidcState {
     // enforcement entirely (every request admitted, nothing charged) so the
     // many DB-only OIDC tests and a self-hoster who wants no quota are unaffected.
     quota: Option<Arc<QuotaEnforcer>>,
+    // The inbound lazy-migration hook (issue #56). Kept OUTSIDE `Inner` and installed by
+    // the boot path (built from the [oidc.lazy_migration] config with a dedicated
+    // SSRF-hardened fetcher and the same env clock), so its circuit breaker's time
+    // window advances deterministically under a test's ManualClock. Shared across every
+    // request thread. Default: `None`, which leaves the login path unchanged (an unknown
+    // identifier is the uniform failure and no outbound call is made), so the many
+    // DB-only OIDC tests and a deployment with no legacy store are unaffected.
+    migration_hook: Option<Arc<crate::migration::LazyMigrationHook>>,
 }
 
 // The per-environment policy flags each mirror an independent, individually
@@ -332,6 +340,7 @@ impl OidcState {
             introspection_serializer: default_serializer(),
             global_token_revocation_enabled: false,
             quota: None,
+            migration_hook: None,
         }
     }
 
@@ -375,6 +384,26 @@ impl OidcState {
     pub fn with_quota_enforcer(mut self, enforcer: Arc<QuotaEnforcer>) -> Self {
         self.quota = Some(enforcer);
         self
+    }
+
+    /// Install the inbound lazy-migration hook (issue #56), arming the login path to
+    /// verify an unknown identifier's first login against a legacy store. The boot path
+    /// builds one hook from the `[oidc.lazy_migration]` config (a dedicated SSRF-hardened
+    /// fetcher plus a circuit breaker on the same env clock) and installs it here; a test
+    /// installs a hook over a stub verifier. With no hook installed (the default) the
+    /// login path is unchanged: an unknown identifier is the uniform failure and no
+    /// outbound call is made.
+    #[must_use]
+    pub fn with_migration_hook(mut self, hook: Arc<crate::migration::LazyMigrationHook>) -> Self {
+        self.migration_hook = Some(hook);
+        self
+    }
+
+    /// The installed lazy-migration hook, if any (issue #56). The login path consults it
+    /// ONLY when the submitted identifier is unknown locally.
+    #[must_use]
+    pub(crate) fn migration_hook(&self) -> Option<&Arc<crate::migration::LazyMigrationHook>> {
+        self.migration_hook.as_ref()
     }
 
     /// Charge one request against the tenant and environment request-rate quota
