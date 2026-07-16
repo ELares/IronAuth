@@ -15,6 +15,22 @@ range per docs/RELEASING.md.
   the only source of the freshness the admin mutation guard reads (never client-asserted).
   Granted to the control-plane role only. Registered in the migration guard test and
   `scripts/query-audit.sh`.
+- Passkey-only accounts and password conversion (issue #66 PR C): `register_passwordless`
+  creates a first-class passkey-only account (unusable password sentinel, `passwordless =
+  true`, and the stable WebAuthn user handle minted at INSERT to the subject id, the ONLY
+  point it can be set given the grant omission + immutability trigger). `remove_password`
+  converts a password account to passkey-only, reusing the cross-source last-credential
+  guard (blocked unless the subject retains a usable passkey/account-credential) and
+  revoking other sessions; `set_first_password` converts a passkey-only account to
+  password-holding, guarded on the sentinel so it never clobbers an existing password.
+  `is_passwordless` reports the authoritative marker, and `UserRecord::has_usable_password_hash`
+  exposes whether the read-back native hash is a real Argon2id verifier or the unusable
+  sentinel, so the login path can keep a sentinel-hash account's timing uniform with an
+  absent account (issue #66 LOW-2) without duplicating the sentinel literal outside the
+  store. Two new audit actions
+  (`account.password.remove`, `account.password.set`). No new migration: reuses the
+  `passwordless` + `webauthn_user_handle` columns (0049). `webauthn_credentials.subject`
+  immutability (grant omission) is now covered by a test alongside the handle immutability.
 - MDS3 cache rollback protection (issue #66 PR B, adversarial review): the
   `mds3_blob_cache` upsert now enforces the documented monotonic rule with an
   `ON CONFLICT ... WHERE EXCLUDED.blob_no > mds3_blob_cache.blob_no` guard, so a replayed

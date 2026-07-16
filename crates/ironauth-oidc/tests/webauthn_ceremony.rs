@@ -246,6 +246,170 @@ async fn a_passkey_registers_and_signs_in_with_phr_acr() {
     );
 }
 
+// The linear lifecycle (signup options -> verify -> DB assertions -> discoverable login)
+// reads best as one test; splitting it would scatter the single flow it pins.
+#[allow(clippy::too_many_lines)]
+#[tokio::test]
+async fn passkey_only_signup_creates_no_password_row_then_logs_in_with_phr() {
+    // The passkey-only (passwordless) lifecycle end to end (issue #66): signup mints an
+    // account with NO password code path, and login/recovery are password-independent.
+    // No account exists yet, so signup requires no session.
+    let harness = Harness::start().await;
+    let base = webauthn_base(&harness);
+    let scope = harness.scope();
+    let identifier = "passkey-only@example.test";
+
+    // 1. signup/options: mint the subject and a UV-required registration challenge.
+    let (status, opts) = post(
+        &harness,
+        &format!("{base}/signup/options"),
+        None,
+        ISSUER_BASE,
+        &json!({ "identifier": identifier }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "signup options: {opts}");
+    let challenge_id = opts["challengeId"].as_str().unwrap().to_owned();
+    let challenge_b64 = opts["publicKey"]["challenge"].as_str().unwrap().to_owned();
+    // The options advertise UV as REQUIRED for a passkey-only account.
+    assert_eq!(
+        opts["publicKey"]["authenticatorSelection"]["userVerification"], "required",
+        "passkey-only signup forces user verification"
+    );
+
+    // 2. signup/verify: a valid UV registration (UP|UV|BE|BS|AT) creates the account and
+    // establishes the HONEST passkey session that resumes the authorization request.
+    let attestation_object = cbor(&Value::Map(vec![
+        (Value::Text("fmt".into()), Value::Text("none".into())),
+        (Value::Text("attStmt".into()), Value::Map(vec![])),
+        (
+            Value::Text("authData".into()),
+            Value::Bytes(auth_data(0b0101_1101, 0, true)),
+        ),
+    ]));
+    let credential = json!({
+        "id": b64(CRED_ID),
+        "rawId": b64(CRED_ID),
+        "type": "public-key",
+        "response": {
+            "clientDataJSON": b64(&client_data("webauthn.create", &challenge_b64)),
+            "attestationObject": b64(&attestation_object),
+            "transports": ["internal"],
+        },
+        "clientExtensionResults": { "credProps": { "rk": true } },
+    });
+    let return_to = format!("/authorize?client_id={}", harness.client_id());
+    let request = Request::builder()
+        .method("POST")
+        .uri(format!("{base}/signup/verify"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .header("origin", ISSUER_BASE)
+        .body(Body::from(
+            json!({
+                "challengeId": challenge_id,
+                "returnTo": return_to,
+                "identifier": identifier,
+                "credential": credential,
+            })
+            .to_string(),
+        ))
+        .expect("request builds");
+    let (status, headers, response) = harness.send(request).await;
+    assert_eq!(status, StatusCode::OK, "signup verify: {response}");
+    let body: Json = serde_json::from_str(&response).unwrap();
+    // The acr is the HONEST phishing-resistant passkey value, NEVER a fabricated pwd.
+    assert_eq!(body["acr"], "phr", "a passkey-only signup logs in as phr");
+    let amr: Vec<&str> = body["amr"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert!(
+        !amr.contains(&"pwd"),
+        "the amr never claims a password: {amr:?}"
+    );
+    assert_eq!(amr, vec!["swk", "user", "mfa"]);
+    assert!(
+        headers.get_all(header::SET_COOKIE).iter().count() >= 1,
+        "signup establishes the session"
+    );
+
+    // 3. The stored account is passkey-only: NO non-sentinel password hash EVER existed.
+    let user = harness
+        .store()
+        .scoped(scope)
+        .users()
+        .by_identifier(identifier)
+        .await
+        .expect("lookup")
+        .expect("the account was created");
+    let stored = harness
+        .store()
+        .scoped(scope)
+        .users()
+        .password_hash_for_subject(&user.id)
+        .await
+        .expect("hash");
+    assert_eq!(
+        stored.as_deref(),
+        Some("!"),
+        "the passkey-only account holds only the unusable password sentinel"
+    );
+    assert_eq!(
+        harness
+            .store()
+            .scoped(scope)
+            .users()
+            .is_passwordless(&user.id)
+            .await
+            .expect("is_passwordless"),
+        Some(true)
+    );
+
+    // 4. Login (and the recovery-redemption path) are password-independent: the same
+    // discoverable-credential sign-in resolves the passkey-only subject with an honest
+    // phr, never touching a password. This is the login and recovery seam for a
+    // passkey-only account (the full M8 recovery subsystem is out of scope).
+    let (status, opts) = post(
+        &harness,
+        &format!("{base}/authenticate/options"),
+        None,
+        ISSUER_BASE,
+        &json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "authenticate options: {opts}");
+    let challenge_id = opts["challengeId"].as_str().unwrap().to_owned();
+    let challenge_b64 = opts["publicKey"]["challenge"].as_str().unwrap().to_owned();
+    let authenticator_data = auth_data(0b0001_1101, 1, false);
+    let client = client_data("webauthn.get", &challenge_b64);
+    let mut signed = authenticator_data.clone();
+    signed.extend_from_slice(&sha256(&client));
+    let signature = test_util::ed25519_sign(&SEED, &signed);
+    let assertion = json!({
+        "id": b64(CRED_ID),
+        "rawId": b64(CRED_ID),
+        "type": "public-key",
+        "response": {
+            "clientDataJSON": b64(&client),
+            "authenticatorData": b64(&authenticator_data),
+            "signature": b64(&signature),
+            "userHandle": b64(user.id.to_string().as_bytes()),
+        },
+    });
+    let (status, login) = post(
+        &harness,
+        &format!("{base}/authenticate/verify"),
+        None,
+        ISSUER_BASE,
+        &json!({ "challengeId": challenge_id, "credential": assertion }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "passkey-only login: {login}");
+    assert_eq!(login["acr"], "phr", "the passkey-only login is honest phr");
+}
+
 #[tokio::test]
 async fn exclude_credentials_is_populated_after_registration_for_dedupe() {
     let harness = Harness::start().await;

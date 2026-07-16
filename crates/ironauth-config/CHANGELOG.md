@@ -20,6 +20,17 @@ range per docs/RELEASING.md.
   sudo mode does NOT yet defeat a fully-stolen admin bearer (which can self-elevate);
   binding elevation to a distinct interactive re-auth factor is a documented graduation
   step, and the freshness seam is factored so end-user apps get the full guarantee.
+- Password-strength score minimum (issue #66 PR C): `password_policy.min_password_strength_score`
+  (integer 0-4, default 0 = scoring off, validated at most 4) wires through to
+  `PasswordPolicy`. Off by default so an existing deployment sees no regression; a higher
+  value refuses a password that is long enough but easily guessable, scored before the
+  breach screen. The key is deliberately NOT named `min_zxcvbn_score`: the backing
+  estimator is a COARSE in-tree length/charset/pattern floor that is BLIND to dictionary
+  words and l33t substitution (e.g. `summer2024` scores the maximum 4), NOT a
+  zxcvbn-equivalent guard; the mandatory HIBP/offline breach screen is the primary defense
+  that backstops it. The field carries a `schemars(range(max = 4))` bound so the generated
+  schema reports `maximum: 4` (not the `u8` type's 255) matching the runtime validation.
+  Config schema and docs regenerated.
 - MDS3 endpoint override (issue #66 PR B): `webauthn.mds3_base_url` (optional, validated
   as an https URL, mirroring `hibp_base_url`) lets a deployment point the FIDO MDS3 sync
   at an alternate endpoint; the pinned FIDO Alliance root stays compiled in and is never

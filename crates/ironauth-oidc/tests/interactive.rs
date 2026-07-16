@@ -19,8 +19,9 @@ use common::{
     Harness, ISSUER_BASE, PKCE_CHALLENGE, PKCE_VERIFIER, REDIRECT_URI, enc, form, form_field, json,
     location, location_param, set_cookie_pair,
 };
+use ironauth_config::{OidcConfig, RegulationConfig};
 use ironauth_jose::verify;
-use ironauth_oidc::ClientAuthMethod;
+use ironauth_oidc::{Argon2Params, ClientAuthMethod, HashingPool};
 
 /// The `Content-Security-Policy` header value, or a panic if absent.
 fn csp(headers: &axum::http::HeaderMap) -> String {
@@ -373,6 +374,115 @@ async fn a_wrong_password_re_renders_the_login_form_generically() {
     assert!(
         !body.to_lowercase().contains("no such"),
         "no enumeration oracle"
+    );
+}
+
+/// One fresh authorize -> login resume, then one password-form POST, returning the number
+/// of pool Argon2 operations that attempt spent and the response status. Shared by the
+/// passkey-only timing-uniformity test.
+async fn login_attempt_ops(
+    harness: &Harness,
+    client_id: &str,
+    pool: &HashingPool,
+    identifier: &str,
+    password: &str,
+) -> (StatusCode, u64) {
+    let (_s, headers, _b) = harness.authorize(&authorize_query(client_id, None)).await;
+    let return_to = location_param(&headers, "return_to").expect("return_to");
+    let body = form(&[
+        ("identifier", identifier),
+        ("password", password),
+        ("return_to", &return_to),
+    ]);
+    let before = pool.argon2_ops();
+    let (status, _headers, _body) = harness.post_form("/login", &body, None).await;
+    (status, pool.argon2_ops() - before)
+}
+
+#[tokio::test]
+async fn a_passkey_only_account_password_login_is_argon2_timing_uniform_with_an_absent_account() {
+    // Issue #66 LOW-2: a passkey-only account (its native password_hash is the unusable
+    // sentinel) submitted through the PASSWORD login path must not be a login-timing
+    // enumeration oracle. A verify against the sentinel would fail-fast with NO Argon2
+    // work, making a passwordless account distinguishable from an absent one by a fast
+    // response. The fix routes the sentinel case through the SAME dummy Argon2 spend
+    // (verify_absent) an absent account pays. Asserted DETERMINISTICALLY by counting pool
+    // Argon2 operations (the issue #68 seam), never a flaky wall-clock measurement.
+    //
+    // Regulation is disabled so every attempt takes the same non-throttled path (a
+    // throttled attempt returns before any hashing, which would confound the count).
+    let mut harness = Harness::start_store_backed_with(OidcConfig {
+        regulation: RegulationConfig {
+            enabled: false,
+            ..RegulationConfig::default()
+        },
+        ..OidcConfig::default()
+    })
+    .await;
+    // A cheap, deterministic single-thread pool; admission disabled (None) so nothing is
+    // shed and the op count is exact.
+    let pool = std::sync::Arc::new(HashingPool::new(
+        harness.env().clone(),
+        Argon2Params::new(8, 1, 1),
+        1,
+        64,
+        None,
+    ));
+    harness.install_hashing_pool(std::sync::Arc::clone(&pool));
+
+    let client_id = harness.client_id().to_string();
+    harness
+        .seed_passwordless_user("passkey-only@example.test")
+        .await;
+    harness
+        .seed_user("has-password@example.test", "the-real-password")
+        .await;
+
+    // A passkey-only account submitted through the password form: it never verifies, but it
+    // must SPEND the dummy Argon2 hash so it is timing-uniform.
+    let (passkey_status, passkey_ops) = login_attempt_ops(
+        &harness,
+        &client_id,
+        &pool,
+        "passkey-only@example.test",
+        "any-password",
+    )
+    .await;
+    // An absent account: the established anti-enumeration dummy-hash path.
+    let (_absent_status, absent_ops) = login_attempt_ops(
+        &harness,
+        &client_id,
+        &pool,
+        "nobody@example.test",
+        "any-password",
+    )
+    .await;
+    // A real account with a wrong password: a full native verify.
+    let (_wrong_status, wrong_ops) = login_attempt_ops(
+        &harness,
+        &client_id,
+        &pool,
+        "has-password@example.test",
+        "wrong-password",
+    )
+    .await;
+
+    assert_eq!(
+        passkey_status,
+        StatusCode::OK,
+        "a passkey-only password login re-renders the generic failure page"
+    );
+    assert_eq!(
+        passkey_ops, 1,
+        "a passkey-only password-login attempt must spend exactly one dummy Argon2 hash"
+    );
+    assert_eq!(
+        passkey_ops, absent_ops,
+        "the passkey-only sentinel path is Argon2-timing-uniform with an absent account"
+    );
+    assert_eq!(
+        passkey_ops, wrong_ops,
+        "and with a real wrong-password verify, so no fast-path enumeration oracle remains"
     );
 }
 

@@ -716,6 +716,320 @@ pub async fn authenticate_verify(
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
+/// The passwordless-signup `options` request body: the desired login handle.
+#[derive(Debug, Deserialize)]
+pub struct SignupOptionsBody {
+    /// The desired login handle for the new passkey-only account. Advisory here (it
+    /// shapes only the authenticator's display); the `verify` step's identifier is
+    /// authoritative and the unique constraint governs a duplicate.
+    identifier: Option<String>,
+}
+
+/// The passwordless-signup `verify` request body.
+#[derive(Debug, Deserialize)]
+pub struct SignupVerifyBody {
+    /// The challenge handle returned by `signup/options`.
+    #[serde(rename = "challengeId")]
+    challenge_id: String,
+    /// The authorization URL to resume at once the account is created and signed in.
+    #[serde(rename = "returnTo")]
+    return_to: String,
+    /// The AUTHORITATIVE login handle for the new account (created here, at verify, so
+    /// an abandoned ceremony never leaves an orphaned passwordless row).
+    identifier: Option<String>,
+    /// The optional passkey nickname (sealed at rest).
+    #[serde(default)]
+    nickname: Option<String>,
+    /// The `navigator.credentials.create` result.
+    credential: RegistrationResponse,
+}
+
+/// `POST /t/{tenant}/e/{environment}/webauthn/signup/options`: begin a PASSWORDLESS
+/// signup (issue #66). No session is required (the account does not exist yet). Mints a
+/// fresh subject id, binds a UV-REQUIRED registration challenge to it, and returns the
+/// `PublicKeyCredentialCreationOptions`. The account itself is created only at `verify`,
+/// once the passkey is proven, so an abandoned ceremony leaves nothing behind and the
+/// signup path never touches a password screen/hash/policy step.
+pub async fn register_passkey_signup_options(
+    State(state): State<OidcState>,
+    Path((tenant_id, environment_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    Json(body): Json<SignupOptionsBody>,
+) -> Response {
+    if !state.webauthn_enabled() {
+        return not_found();
+    }
+    let Some(rp) = state.webauthn_relying_party() else {
+        return ceremony_error();
+    };
+    if !interaction::related_origin_ok(&headers, &rp.origins) {
+        return forbidden();
+    }
+    let Some(scope) = parse_scope(&tenant_id, &environment_id) else {
+        return not_found();
+    };
+    // Closed registration (issue #64) blocks passkey-only signup exactly as it blocks
+    // password registration: no account can be created. Uniform, reveals no account.
+    if state.registration_closed() {
+        return json_response(
+            StatusCode::FORBIDDEN,
+            json!({ "error": "registration_closed" }),
+        );
+    }
+    let identifier = body
+        .identifier
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or_default();
+    if identifier.is_empty() {
+        return json_response(
+            StatusCode::BAD_REQUEST,
+            json!({ "error": "identifier_required" }),
+        );
+    }
+    // Credential-abuse regulation for the REGISTER path (issue #64), keyed on the
+    // canonical identifier and the resolved peer IP, so passkey-only signup spam throttles
+    // on the SAME counters as password registration. No account existence is probed.
+    let ctx = crate::abuse::AttemptContext {
+        path: AuthPath::Register,
+        scope,
+        ip: crate::abuse::resolved_client_ip(&headers),
+        identifier: Some(crate::abuse::canonical_login_identifier(identifier)),
+        account_id: None,
+        client_id: None,
+    };
+    if let crate::abuse::RegulationOutcome::Throttled(snapshot) = state.regulate_before(&ctx).await
+    {
+        return passkey_throttled(&snapshot);
+    }
+    // Pre-allocate the subject id: it binds the challenge now and creates the account at
+    // verify, and it is the account's stable WebAuthn user handle (minted at INSERT).
+    let subject = UserId::generate(state.env(), &scope);
+    let Ok(issued) = state
+        .store()
+        .scoped(scope)
+        .webauthn_challenges()
+        .issue(
+            state.env(),
+            WebauthnCeremony::Register,
+            Some(&subject),
+            challenge_ttl_secs(&state),
+        )
+        .await
+    else {
+        return ceremony_error();
+    };
+    let user = ironauth_webauthn::CeremonyUser {
+        // The user handle is the opaque usr_ id bytes (what the account will store), never
+        // a plain email.
+        id: subject.to_string().into_bytes(),
+        name: identifier.to_owned(),
+        display_name: identifier.to_owned(),
+    };
+    // UV is REQUIRED for a passkey-only account: the passkey is the sole authenticator, so
+    // presence alone must never suffice. Forced here regardless of the tenant default.
+    let options = registration_options(
+        &relying_party(&rp),
+        &user,
+        &issued.challenge,
+        &[],
+        CEREMONY_TIMEOUT_MS,
+        UserVerification::Required,
+    );
+    json_response(
+        StatusCode::OK,
+        json!({ "challengeId": issued.id, "publicKey": options }),
+    )
+}
+
+/// `POST /t/{tenant}/e/{environment}/webauthn/signup/verify`: complete a PASSWORDLESS
+/// signup (issue #66). Verifies the UV-required registration, CREATES the passkey-only
+/// account (unusable password sentinel + `passwordless = true`, no password code path
+/// ever reached), persists the passkey, and establishes the HONEST passkey session
+/// (`phr`/`phrh`, never a fabricated `pwd`), then resumes the authorization request.
+// A linear ceremony: consume, verify (UV forced), attestation, create account, persist
+// passkey, establish the honest session. The fail-closed early returns are the point.
+#[allow(clippy::too_many_lines)]
+pub async fn register_passkey_signup_verify(
+    State(state): State<OidcState>,
+    Path((tenant_id, environment_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    Json(body): Json<SignupVerifyBody>,
+) -> Response {
+    if !state.webauthn_enabled() {
+        return not_found();
+    }
+    let Some(rp) = state.webauthn_relying_party() else {
+        return ceremony_error();
+    };
+    if !interaction::related_origin_ok(&headers, &rp.origins) {
+        return forbidden();
+    }
+    let Some(scope) = parse_scope(&tenant_id, &environment_id) else {
+        return not_found();
+    };
+    // Re-check closed registration (issue #64) here too, for defense in depth (issue #66
+    // INFO): the ceremony is already indirectly gated because no challenge is issued while
+    // registration is closed, but re-checking on verify means a registration toggled closed
+    // MID-ceremony cannot still complete an account. Uniform with the register path.
+    if state.registration_closed() {
+        return json_response(
+            StatusCode::FORBIDDEN,
+            json!({ "error": "registration_closed" }),
+        );
+    }
+    // The resume target must be a valid authorization request in THIS scope, so the
+    // honest passkey session can resume it; an invalid link is the uniform ceremony error.
+    let Some(resume) =
+        interaction::parse_resume(Some(&body.return_to)).filter(|resume| resume.scope == scope)
+    else {
+        return ceremony_error();
+    };
+    let identifier = body
+        .identifier
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or_default();
+    if identifier.is_empty() {
+        return ceremony_error();
+    }
+
+    let Some(challenge) = consume(
+        &state,
+        scope,
+        &body.challenge_id,
+        WebauthnCeremony::Register,
+    )
+    .await
+    else {
+        return ceremony_error();
+    };
+    // The pre-allocated subject the challenge was issued for. It is server-minted (never
+    // a wire value), so the created account and its handle are bound to it.
+    let Some(subject) = challenge
+        .subject
+        .as_deref()
+        .and_then(|s| UserId::parse_in_scope(s, &scope).ok())
+    else {
+        return ceremony_error();
+    };
+
+    // UV is REQUIRED: a passkey-only account must never be reachable by presence alone.
+    let params = VerificationParams {
+        rp_id: &rp.rp_id,
+        allowed_origins: &rp.origins,
+        expected_challenge: &challenge.challenge,
+        require_user_verification: true,
+    };
+    let registered: RegisteredCredential = match verify_registration(&body.credential, &params) {
+        Ok(credential) => credential,
+        Err(_) => return ceremony_error(),
+    };
+    let Ok(attestation) =
+        evaluate_registration_attestation(&state, scope, &body.credential, &registered).await
+    else {
+        return ceremony_error();
+    };
+
+    // CREATE the passkey-only account now (unusable password sentinel + passwordless), with
+    // the pre-allocated id, so an abandoned ceremony left no orphan. A taken identifier is
+    // the uniform conflict. No password screen/hash/policy is reachable on this path.
+    let actor = interaction::user_actor(&subject);
+    match state
+        .store()
+        .scoped(scope)
+        .acting(actor, CorrelationId::generate(state.env()))
+        .users()
+        .register_passwordless(state.env(), &subject, identifier)
+        .await
+    {
+        Ok(_) => {}
+        Err(StoreError::Conflict) => {
+            return json_response(
+                StatusCode::CONFLICT,
+                json!({ "error": "already_registered" }),
+            );
+        }
+        Err(_) => return ceremony_error(),
+    }
+
+    let nickname = body
+        .nickname
+        .as_deref()
+        .map(str::trim)
+        .filter(|n| !n.is_empty() && n.len() <= 200)
+        .unwrap_or(DEFAULT_NICKNAME);
+    let new_credential = NewWebauthnCredential {
+        credential_id: &registered.credential_id,
+        cose_public_key: &registered.cose_public_key,
+        sign_count: registered.sign_count,
+        aaguid: &registered.aaguid,
+        transports: &registered.transports,
+        backup_eligible: registered.backup_eligible,
+        backup_state: registered.backup_state,
+        discoverable: registered.discoverable,
+        nickname,
+        attestation_type: attestation.attestation_type.as_str(),
+        attestation_verified: attestation.model_verified,
+        attestation_fmt: attestation.fmt,
+    };
+    if state
+        .store()
+        .scoped(scope)
+        .acting(
+            interaction::user_actor(&subject),
+            CorrelationId::generate(state.env()),
+        )
+        .webauthn_credentials()
+        .register(state.env(), &subject, &new_credential)
+        .await
+        .is_err()
+    {
+        return ceremony_error();
+    }
+
+    // The HONEST authentication event: the user just PROVED a UV-required, origin-bound
+    // passkey, so this is a phishing-resistant login (`phr`/`phrh`, or `attested_passkey`
+    // when the model was attested), derived from the STORED registration-time backup
+    // eligibility. UV was enforced above, so `user_verified` is true. There is NO `pwd`
+    // method anywhere on this path: the acr can never fabricate a password factor.
+    let auth_time = epoch_micros(state.now());
+    let event = if attestation.model_verified {
+        AuthenticationEvent::attested_passkey(auth_time, registered.backup_eligible, true)
+    } else {
+        AuthenticationEvent::passkey(auth_time, registered.backup_eligible, true)
+    };
+    let Ok(cookies) = interaction::establish_session(
+        &state,
+        scope,
+        &subject.to_string(),
+        &event,
+        interaction::user_actor(&subject),
+        &headers,
+    )
+    .await
+    else {
+        return ceremony_error();
+    };
+
+    let mut builder = Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::CACHE_CONTROL, "no-store");
+    for value in cookies.header_values() {
+        builder = builder.header(header::SET_COOKIE, value);
+    }
+    let payload = json!({
+        "status": "ok",
+        "redirect": resume.return_to,
+        "acr": crate::authn::achieved_acr(event.methods()),
+        "amr": crate::authn::amr_values(event.methods()),
+    });
+    builder
+        .body(axum::body::Body::from(payload.to_string()))
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
 /// `GET /t/{tenant}/e/{environment}/webauthn/credentials`: list the AUTHENTICATED
 /// caller's OWN registered passkeys (issue #65) with their live metadata: the `pky_`
 /// id, nickname, AAGUID and transports, the immutable registration-time BE and the

@@ -32,6 +32,7 @@
 /t/{tenant_id}/e/{environment_id}/account/mfa/totp/verify
 /t/{tenant_id}/e/{environment_id}/account/mfa/totp/verify-enrollment
 /t/{tenant_id}/e/{environment_id}/account/password
+/t/{tenant_id}/e/{environment_id}/account/password/remove
 /t/{tenant_id}/e/{environment_id}/account/sessions
 /t/{tenant_id}/e/{environment_id}/account/sessions/revoke
 /t/{tenant_id}/e/{environment_id}/account/sessions/revoke-others
@@ -56,5 +57,7 @@
 /t/{tenant_id}/e/{environment_id}/webauthn/register/options
 /t/{tenant_id}/e/{environment_id}/webauthn/register/verify
 /t/{tenant_id}/e/{environment_id}/webauthn/signal
+/t/{tenant_id}/e/{environment_id}/webauthn/signup/options
+/t/{tenant_id}/e/{environment_id}/webauthn/signup/verify
 /token
 /userinfo
