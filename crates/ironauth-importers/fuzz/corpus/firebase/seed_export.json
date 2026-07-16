@@ -1,0 +1,28 @@
+{
+  "users": [
+    {
+      "localId": "uid-frank-0001",
+      "email": "frank@acme.test",
+      "emailVerified": true,
+      "displayName": "Frank Foster",
+      "passwordHash": "lSrfV15cpx95/sZS2W9c9Kp6i/LVgQNDNC/qzrCnh1SAyZvqmZqAjTdn3aoItz+VHjoZilo78198JAdRuid5lQ==",
+      "salt": "42xEC+ixf3L2lw==",
+      "customAttributes": "{\"role\":\"admin\",\"tier\":\"gold\"}",
+      "providerUserInfo": [
+        { "providerId": "password", "email": "frank@acme.test", "displayName": "Frank Foster" }
+      ],
+      "createdAt": "1600000000000",
+      "lastLoginAt": "1610000000000"
+    },
+    {
+      "localId": "uid-grace-0002",
+      "email": "grace@acme.test",
+      "emailVerified": true,
+      "phoneNumber": "+15550002222",
+      "providerUserInfo": [
+        { "providerId": "google.com", "rawId": "110000000000000000011", "email": "grace@gmail.test" },
+        { "providerId": "phone", "rawId": "+15550002222" }
+      ]
+    }
+  ]
+}

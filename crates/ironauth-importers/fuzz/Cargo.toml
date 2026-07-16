@@ -1,0 +1,60 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+#
+# The cargo-fuzz harness for the ironauth-importers vendor export parsers (issue
+# #57). Deliberately NOT a workspace member (the empty [workspace] table below
+# detaches it): its libFuzzer dependency needs a nightly toolchain and must not
+# constrain the stable workspace or enter the cargo-deny graph, mirroring
+# ironauth-jose's fuzz/, ironauth-store's fuzz/, ironauth-fetch's fuzz/, and the
+# sibling Iron projects. One target per export parser proves that arbitrary
+# (malformed) vendor input never panics and is bounded by serde_json's default
+# recursion limit. The same input space has stable, in-CI coverage in each
+# importer module's unit tests and the fixture integration suites.
+[package]
+name = "ironauth-importers-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+ironauth-importers = { path = ".." }
+
+[[bin]]
+name = "keycloak"
+path = "fuzz_targets/keycloak.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "auth0"
+path = "fuzz_targets/auth0.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "firebase"
+path = "fuzz_targets/firebase.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "scim"
+path = "fuzz_targets/scim.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ldap"
+path = "fuzz_targets/ldap.rs"
+test = false
+doc = false
+bench = false

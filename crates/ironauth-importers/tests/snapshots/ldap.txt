@@ -1,0 +1,11 @@
+ldap import gap report
+users: 3 (mapped 3, dropped 0)
+
+[uid=judy,ou=people,dc=acme,dc=test]
+  - objectClass: unmodeled attribute (present in the entry but not consumed by the LDAP importer)
+
+[uid=karl,ou=people,dc=acme,dc=test]
+  - userPassword: {SSHA} credential (LDAP {SSHA} is a weak SHA1/MD5 scheme that IronAuth declines to import; the user must reset their password)
+
+[uid=leo,ou=svc,dc=acme,dc=test]
+  - userPassword: {PBKDF2} credential (LDAP {PBKDF2} is HMAC-SHA1, not a recognized scheme; the user must reset their password)

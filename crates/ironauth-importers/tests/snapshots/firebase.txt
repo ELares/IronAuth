@@ -1,0 +1,10 @@
+firebase import gap report
+users: 2 (mapped 2, dropped 0)
+
+[uid-frank-0001]
+  - createdAt: source activity metadata (not imported; IronAuth records its own lifecycle timestamps)
+  - lastLoginAt: source activity metadata (not imported; IronAuth records its own lifecycle timestamps)
+
+[uid-grace-0002]
+  - passwordHash: no password hash (social or phone-only user) (the user has no password credential to import; they sign in via their provider or reset their password)
+  - providerUserInfo: linked providers: google.com (social/federated linked identities are not represented; only the password login is imported)

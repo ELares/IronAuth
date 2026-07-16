@@ -1,0 +1,25 @@
+[
+  {
+    "dn": "uid=judy,ou=people,dc=acme,dc=test",
+    "uid": "judy",
+    "cn": "Judy Jones",
+    "sn": "Jones",
+    "givenName": "Judy",
+    "mail": "judy@acme.test",
+    "telephoneNumber": "+15550005555",
+    "userPassword": "{PBKDF2-SHA256}29000$bGRhcC1zYWx0LXNlZWQtMQ$AfxlRk0.OBvmsx31lOutaSnUIGNSwcB/Pd8WUf8iPvY",
+    "objectClass": ["inetOrgPerson", "posixAccount"]
+  },
+  {
+    "dn": "uid=karl,ou=people,dc=acme,dc=test",
+    "uid": "karl",
+    "cn": "Karl King",
+    "mail": "karl@acme.test",
+    "userPassword": "{SSHA}W6ph5Mm5Pz8GgiULbPgzG37mj9gc2FsdHNhbHQ="
+  },
+  {
+    "dn": "uid=leo,ou=svc,dc=acme,dc=test",
+    "uid": "leo",
+    "userPassword": "{PBKDF2}12000$c2FsdHZhbA$Y2hlY2tzdW12YWw"
+  }
+]
