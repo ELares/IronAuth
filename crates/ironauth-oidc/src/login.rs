@@ -429,6 +429,11 @@ pub async fn login_post(
                 // per-environment parameter change reaches existing users on next login.
                 upgrade_credential_after_login(&state, resume.scope, &user, password, native_ok)
                     .await;
+                // On-login breached detection (issue #63): when screen_on_login is enabled,
+                // screen the just-verified password and, if it is NOW breached, emit an
+                // audit event so a change can be required. Best-effort: it never blocks or
+                // changes this already-successful sign-in.
+                screen_after_login(&state, resume.scope, &user, password).await;
                 let actor = interaction::user_actor(&user.id);
                 let subject = user.id.to_string();
                 // The recorded authentication event: a password login (RFC 8176
@@ -508,6 +513,30 @@ pub async fn login_post(
             failed_login_page(identifier, &resume.return_to, &resume.hints, banner)
         }
         Err(_) => interaction::server_error_page(),
+    }
+}
+
+/// Screen the just-verified password at login (issue #63), best-effort and gated by
+/// `screen_on_login`. If the password is NOW in the breach corpus (it grew since the
+/// password was set), emit an audit event, a metric plus a structured log naming the
+/// subject, so an operator can require a change; it NEVER blocks the already-successful
+/// sign-in and never changes the login outcome. A not-breached verdict or a provider
+/// outage is a no-op (the forced-change surface lands with the hosted change-password page
+/// and M11 messaging). Only the 5-char SHA-1 prefix ever leaves the process.
+async fn screen_after_login(state: &OidcState, scope: Scope, user: &UserRecord, password: &str) {
+    if !state.screen_on_login() {
+        return;
+    }
+    let normalized = ironauth_screening::normalize_nfkc(password);
+    if let crate::state::ScreenDecision::Breached = state.screen_password(&scope, &normalized).await
+    {
+        metrics::counter!(crate::state::PASSWORD_BREACHED_AT_LOGIN_TOTAL).increment(1);
+        let subject = user.id.to_string();
+        tracing::warn!(
+            subject,
+            "a successful login used a password now found in the breach corpus; a password \
+             change should be required"
+        );
     }
 }
 

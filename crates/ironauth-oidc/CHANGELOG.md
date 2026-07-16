@@ -6,6 +6,20 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Breached-password screening and the NIST SP 800-63B-4 policy on set/change/login (issue
+  #63). The register (set) and account change-password paths now, BEFORE any hash is
+  computed, evaluate the 800-63B-4 policy (length in code points, sole-factor 15 by default;
+  no composition unless a legacy tenant enabled it) and screen the password against the
+  installed `ironauth-screening` provider (online HIBP k-anonymity or offline corpus). A
+  breached password is refused with a non-enumerating message; a provider outage follows the
+  configured fail-open (allow + audit) or fail-closed (refuse) policy. NFKC normalization is
+  applied ONCE at the hashing seam (`OidcState::{hash_password,verify_password,verify_absent}`),
+  so a Unicode password round-trips (set and verify agree; identity on ASCII). On-login
+  breached detection is gated by `screen_on_login`: a successful login whose password is now
+  breached emits an audit event (metric + structured log) without blocking the sign-in. New
+  builders `OidcState::with_password_policy` / `with_breach_provider`; new metrics
+  `ironauth_password_screen_total` and `ironauth_password_breached_at_login_total` with
+  `describe_screening_metrics`. Only the 5-char SHA-1 prefix ever leaves the process.
 - Step-up adversarial-review fixes (RFC 9470, issue #72): the step-up second-factor
   challenge (`/login/mfa`) is now THROTTLED through the #64 abuse regulation on a new
   INDEPENDENT `AuthPath::SecondFactor` path, so an online TOTP/recovery-code guess storm

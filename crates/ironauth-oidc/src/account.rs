@@ -549,6 +549,10 @@ pub struct ChangePasswordBody {
 /// OTHER session of the caller while keeping the one the change is made from. A
 /// sensitive operation: it is audited to the end user and reports the step-up policy.
 /// The password hash is never returned or logged.
+// The linear flow (CSRF, authenticate, verify current, policy, screen, hash, persist)
+// reads best as one function; splitting it would scatter the verify-then-screen-then-hash
+// ordering the security properties depend on, so the length lint is allowed here.
+#[allow(clippy::too_many_lines)]
 pub async fn change_password(
     State(state): State<OidcState>,
     Path((tenant_id, environment_id)): Path<(String, String)>,
@@ -598,6 +602,40 @@ pub async fn change_password(
                 "error_description": "The current password is incorrect.",
             }),
         );
+    }
+    // NFKC-normalize the new password ONCE (issue #63): policy length (code points) and
+    // screening both operate on this form, and the hash is derived from it.
+    let normalized = ironauth_screening::normalize_nfkc(&body.new_password);
+    // 800-63B-4 policy on the NEW password (evaluated as the sole authentication factor:
+    // the stricter 15 code-point floor, no composition unless a legacy tenant enabled it).
+    if let Err(rejection) = state
+        .password_policy()
+        .evaluate(&normalized, ironauth_screening::FactorContext::SoleFactor)
+    {
+        return bad_request(&rejection.message());
+    }
+    // MANDATORY breached-password screening (issue #63) BEFORE the new hash is computed:
+    // only the 5-char SHA-1 prefix leaves the process.
+    match state.screen_password(&account.scope, &normalized).await {
+        crate::state::ScreenDecision::Allowed => {}
+        crate::state::ScreenDecision::Breached => {
+            return json_response(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                json!({
+                    "error": "breached_password",
+                    "error_description": crate::state::BREACHED_PASSWORD_MESSAGE,
+                }),
+            );
+        }
+        crate::state::ScreenDecision::RefusedUnavailable => {
+            return json_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                json!({
+                    "error": "screening_unavailable",
+                    "error_description": crate::state::SCREENING_UNAVAILABLE_MESSAGE,
+                }),
+            );
+        }
     }
     // Hash the new password through the same pool (entropy from the env seam, never a
     // raw RNG). The plaintext never reaches the store; only the one-way verifier does.

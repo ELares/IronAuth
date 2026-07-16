@@ -856,6 +856,97 @@
       },
       "type": "object"
     },
+    "PasswordPolicyConfig": {
+      "additionalProperties": false,
+      "description": "The breached-password screening and NIST SP 800-63B-4 password policy (issue #63).\n\nThe shipped defaults are the modern 800-63B-4 memorized-secret posture: a 15\ncode-point minimum when the password is the SOLE factor (an 8 code-point floor only\nwhen it is one factor of MFA), a 64 code-point maximum, NO composition rules, NO\nforced rotation, Unicode accepted (NFKC-normalized once, length counted in code\npoints), and compromised-list screening MANDATORY (on by default, over the online\nHIBP k-anonymity provider). Legacy compliance regimes are expressed as SETTINGS here\n(enable composition, set a rotation interval, change the lengths); each deviating\nsetting is reported to the admin surface as a documented deviation from 63B-4, so a\ndeviation is a configuration, never a fork.\n\nThis is a promotable per-environment setting in spirit; the process value is the\ndeployment default until per-environment overrides ride the M5 promotion pipeline,\nmirroring the other promotable settings.",
+      "properties": {
+        "hibp_base_url": {
+          "default": null,
+          "description": "An alternate base URL for the online HIBP provider (an https URL, base only, no\n`/range` and no trailing slash), for a deployment that fronts HIBP with its own\ncompatible mirror. Unset (the default) uses the canonical public range API.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "max_length": {
+          "default": 64,
+          "description": "The maximum acceptable length in CODE POINTS. The default (`64`) meets the\n800-63B-4 SHOULD (accept at least 64); a value below 64 is annotated as a\ndeviation. Must be at least `min_length_sole_factor` and `min_length_mfa_factor`,\nand at most `PASSWORD_POLICY_MAX_LENGTH_CEILING` (a very long accepted password is\nan Argon2id input-size denial-of-service vector).",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "min_length_mfa_factor": {
+          "default": 8,
+          "description": "The minimum length in CODE POINTS permitted when the password is ONE factor of a\nmulti-factor authentication. The 800-63B-4 default (`8`). Must be at least 1 and\nat most `max_length`.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "min_length_sole_factor": {
+          "default": 15,
+          "description": "The minimum length in CODE POINTS when the password is the SOLE authentication\nfactor. The 800-63B-4 default (`15`) is a SHALL; a lower value is accepted but is\nannotated to the admin surface as a deviation. Must be at least 1 and at most\n`max_length`.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "offline_corpus_path": {
+          "default": null,
+          "description": "The path to the offline corpus dataset file (a UTF-8 list of SHA-1 hashes, the\nHIBP downloadable format or a plain list), required when `screening_provider` is\n`offline` and `screening_enabled` is true. Unset for the `hibp` provider.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "require_digit": {
+          "default": false,
+          "description": "Require at least one digit (a legacy composition rule). Default `false`; enabling\nit is a documented deviation.",
+          "type": "boolean"
+        },
+        "require_lowercase": {
+          "default": false,
+          "description": "Require at least one lowercase letter (a legacy composition rule). The\n800-63B-4-conform default (`false`) imposes NO composition; enabling this is a\ndocumented deviation.",
+          "type": "boolean"
+        },
+        "require_symbol": {
+          "default": false,
+          "description": "Require at least one symbol (a legacy composition rule). Default `false`; enabling\nit is a documented deviation.",
+          "type": "boolean"
+        },
+        "require_uppercase": {
+          "default": false,
+          "description": "Require at least one uppercase letter (a legacy composition rule). Default\n`false`; enabling it is a documented deviation.",
+          "type": "boolean"
+        },
+        "rotation_max_age_days": {
+          "default": 0,
+          "description": "The forced-rotation interval in days (a legacy policy). The 800-63B-4-conform\ndefault (`0`) DISABLES periodic rotation (63B-4 forbids rotation without evidence\nof compromise); a positive value is a documented deviation. At most\n`PASSWORD_POLICY_MAX_ROTATION_DAYS`.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "screen_on_login": {
+          "default": false,
+          "description": "Screen the presented password at LOGIN too (issue #63), so a password that has\nsince become breached (the corpus grew after it was set) is detected on the user's\nnext sign-in and surfaced (an audit event; a forced change once the hosted\nchange-password surface lands). The safe default (`false`) avoids an outbound\nscreening call on every login; enable it for continuous detection.",
+          "type": "boolean"
+        },
+        "screening_enabled": {
+          "default": true,
+          "description": "Whether compromised-list screening runs on set / change / reset. The 800-63B-4\ndefault (`true`) makes screening MANDATORY; setting it to `false` is a documented\ndeviation (screening is a covenant no-paywall security feature, on by default).",
+          "type": "boolean"
+        },
+        "screening_failure_policy": {
+          "$ref": "#/$defs/ScreeningFailurePolicy",
+          "default": "fail_open",
+          "description": "What to do when the screening provider cannot answer: `fail_open` (allow the\npassword and emit an audit event, the safe availability default) or `fail_closed`\n(refuse the set until screening succeeds)."
+        },
+        "screening_provider": {
+          "$ref": "#/$defs/ScreeningProvider",
+          "default": "hibp",
+          "description": "Which screening provider to use (issue #63): `hibp` (the online k-anonymity range\nAPI, the default) or `offline` (an operator-supplied corpus, fully offline)."
+        }
+      },
+      "type": "object"
+    },
     "ProxyConfig": {
       "additionalProperties": false,
       "description": "Trusted-proxy policy.\n\nForwarding headers (RFC 7239 `Forwarded`, `X-Forwarded-For`,\n`X-Forwarded-Proto`, `X-Forwarded-Host`) and the `Host` header are an\naccount-takeover class when trusted blindly. The default trusts NOTHING:\n`trusted_hops = 0` and `trust_forwarded = false` mean the effective client\nIP is the transport peer and the scheme, host, and issuer derive entirely\nfrom `server.public_url`. Only when the server genuinely runs behind a\nfixed number of trusted reverse proxies should these be raised, and even\nthen scheme and issuer stay config-derived.",
@@ -1077,6 +1168,36 @@
         }
       },
       "type": "object"
+    },
+    "ScreeningFailurePolicy": {
+      "description": "What to do when the screening provider cannot answer (issue #63), consistent with\nthe platform's documented fail-open/closed conventions.",
+      "oneOf": [
+        {
+          "const": "fail_open",
+          "description": "Allow the password (do not block the set) and emit an audit event. The safe\navailability default: a screening-provider outage must not lock every user out of\nsetting a password.",
+          "type": "string"
+        },
+        {
+          "const": "fail_closed",
+          "description": "Refuse the set until screening succeeds. The strict-compliance posture: a password\nis never accepted unscreened.",
+          "type": "string"
+        }
+      ]
+    },
+    "ScreeningProvider": {
+      "description": "Which breached-password screening provider an environment uses (issue #63). A closed\nset matching the first-party `ironauth-screening` providers. Neither is paywalled and\nneither depends on a first-party IronAuth service (the covenant).",
+      "oneOf": [
+        {
+          "const": "hibp",
+          "description": "The online Have I Been Pwned range API over the SSRF-hardened fetcher, using the\nk-anonymity protocol (only a 5-character SHA-1 prefix ever leaves the process).\nThe zero-configuration default; free and public.",
+          "type": "string"
+        },
+        {
+          "const": "offline",
+          "description": "An operator-supplied offline corpus, screened entirely locally with no outbound\naccess (for air-gapped or callout-restricted deployments). Requires\n`password_policy.offline_corpus_path`.",
+          "type": "string"
+        }
+      ]
     },
     "Secret": {
       "description": "A secret value by indirection: the contents of a file ({ file = \"/path\" }), an environment variable ({ env = \"VAR_NAME\" }), or a literal string (discouraged; flagged outside dev mode).",
@@ -1350,6 +1471,26 @@
         "probe_target_latency_ms": 250
       },
       "description": "Password-hashing settings (issue #62): the Argon2id parameters for newly\nset passwords and the dedicated, admission-controlled hashing worker pool.\nArgon2id at the OWASP defaults, off the async request threads, with\nper-tenant fair-share admission reusing the `[quota]` layer so one tenant's\ncredential-stuffing storm degrades only that tenant."
+    },
+    "password_policy": {
+      "$ref": "#/$defs/PasswordPolicyConfig",
+      "default": {
+        "hibp_base_url": null,
+        "max_length": 64,
+        "min_length_mfa_factor": 8,
+        "min_length_sole_factor": 15,
+        "offline_corpus_path": null,
+        "require_digit": false,
+        "require_lowercase": false,
+        "require_symbol": false,
+        "require_uppercase": false,
+        "rotation_max_age_days": 0,
+        "screen_on_login": false,
+        "screening_enabled": true,
+        "screening_failure_policy": "fail_open",
+        "screening_provider": "hibp"
+      },
+      "description": "Breached-password screening and NIST SP 800-63B-4 password policy (issue #63).\nThe shipped defaults are the modern 63B-4 posture (length primacy, no composition,\nno forced rotation, Unicode accepted, screening MANDATORY over the free HIBP\nk-anonymity provider). Legacy compliance regimes are per-tenant SETTINGS here, each\nannotated to the admin surface as a deviation from 63B-4."
     },
     "proxy": {
       "$ref": "#/$defs/ProxyConfig",

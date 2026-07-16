@@ -6,6 +6,15 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Breached-password screening and the NIST SP 800-63B-4 policy are wired at boot from the
+  `[password_policy]` config (issue #63). The boot path resolves the policy (length floors,
+  legacy composition/rotation overrides, fail-open/closed) and installs it on the OIDC data
+  plane, and builds the screening provider: the online HIBP k-anonymity range provider over a
+  fresh SSRF-hardened fetcher, or the offline corpus provider loaded from the operator
+  dataset file. The shipped defaults are the modern 63B-4 posture with screening MANDATORY
+  over the free HIBP provider (fail-open), so a default deployment screens passwords with no
+  configuration. A provider whose input is unavailable (a fetcher-setup failure, an
+  unreadable corpus) logs and leaves the state to apply the fail-open/closed policy.
 - `step-up-policy set | list | remove` subcommands (RFC 9470 step-up, issue #72): set,
   list, and remove the declarative per-scope and per-client step-up authentication policy
   directly against the data-plane store, each an audited write through the SAME repositories

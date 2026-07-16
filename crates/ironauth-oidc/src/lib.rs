@@ -200,7 +200,10 @@ pub use sector::{
     SectorError, check_sector_document, sector_uri_required, validate_sector_identifier,
 };
 pub use session::{PEER_IP_HEADER, SESSION_COOKIE, clear_set_cookie};
-pub use state::{OidcState, ResourceTargetError};
+pub use state::{
+    OidcState, PASSWORD_BREACHED_AT_LOGIN_TOTAL, PASSWORD_SCREEN_TOTAL, ResourceTargetError,
+    describe_screening_metrics,
+};
 pub use step_up::canonical_step_up_acr;
 pub use subject::{
     MAX_SUBJECT_LEN, PairwiseSalt, SubjectCache, SubjectConfig, SubjectType, resolve_subject,

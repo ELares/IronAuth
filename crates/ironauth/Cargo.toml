@@ -27,6 +27,14 @@ ironauth-jose.workspace = true
 # enforcer from the [quota] config and hands it to the OIDC data plane. Pure,
 # in-memory token buckets with no persistence or network dependency.
 ironauth-quota.workspace = true
+# Breached-password screening and the NIST SP 800-63B-4 policy (issue #63): the boot
+# path builds the policy and the screening provider (online HIBP or offline corpus) from
+# the [password_policy] config and installs them on the OIDC data plane.
+ironauth-screening.workspace = true
+# The SSRF-hardened outbound fetcher (issue #10): the boot path builds the shared fetcher
+# the online HIBP screening provider dispatches through. Depending on ironauth-fetch (not
+# an HTTP-client crate) keeps scripts/http-audit.sh satisfied.
+ironauth-fetch.workspace = true
 # The config-as-code CLI (issue #51): the `validate`/`plan`/`apply`/`drift`
 # subcommands dispatch into this crate. It is a THIN client of the management API
 # and owns its own control-plane HTTP client (the outbound-HTTP dependency lives
