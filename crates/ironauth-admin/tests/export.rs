@@ -370,10 +370,22 @@ async fn every_identity_column_is_exported_or_a_documented_non_exported_field() 
                 "foreign_password_algo",   // re-derived from the exported PHC string's tag
                 "created_at",              // set fresh at import
                 "updated_at",              // set fresh at import
+                // The passkey-only marker (issue #66) is DERIVED at import from whether the
+                // record carries a usable password hash ("never had a usable password"
+                // semantic), so it is not carried as a wire field. PR C revisits this when
+                // passkey-only signup / conversion lands.
+                "passwordless",
             ],
             operational: &[
                 "scheduled_offboarding_at", // an operational overlay; exports as active
                 "deleted_at",               // tombstone; deleted users are excluded
+                // The WebAuthn user handle (issue #66) is non-portable device-linkage
+                // state: it is meaningful only for this instance's registered passkeys,
+                // which do not re-home (see the webauthn_credentials coverage, all
+                // OPERATIONAL). A fresh handle is minted when the user re-enrolls passkeys
+                // on the destination, so it is not carried across, exactly like the passkey
+                // credential material it links.
+                "webauthn_user_handle",
             ],
         },
         // The account_credentials registry (issue #61): a user's enrolled MFA / login

@@ -6,7 +6,24 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
-- Email OTP + magic-link adversarial-review hardening (issue #68): the `otp/send` and
+- Credential-class ladder + honest acr feed + strictest-wins enforcement (issue #66, PR A):
+  the covenant-critical spine of the passkey policy engine. A new `CredentialClass` ladder
+  (`Any < Mfa < Passkey < AttestedPasskey`, `Ord`-derived so `max()` is strictest-wins)
+  lives co-located with the acr registry in `authn`, the ONE honesty choke point. A pure
+  `satisfied_class(event, facts)` folds the SATISFIED class ONLY from stored/proven facts
+  (the frozen registration-time backup-eligibility, the actually-asserted user-verification
+  bit, and the dormant stored attestation fact), never a client-supplied wire value;
+  `required_class(policies)` composes applicable policy minimums with strictest-wins; and
+  `acr_for_class` is the single canonical class -> acr mapping the step-up gate and the class
+  enforcer both compare against. The four `attested_passkey` `AuthMethod` rows and the
+  `urn:ironauth:acr:attested_passkey` ACR ship DORMANT (`is_active() == false`), so the rung
+  is unreachable and requiring it fails closed until PR B lands the attestation writer;
+  `AuthenticationEvent::attested_passkey` records it ahead of activation. Enforcement folds
+  the tenant's required class into the existing step-up requirement as an acr floor (so the
+  one gate steers an under-class session to the passkey ceremony / enrollment and never mints
+  a token above the SATISFIED class), with `required_credential_class` exposing the class a
+  subject must reach for the enrollment-plan surface. NO attestation/MDS3 (PR B), NO
+  passkey-only signup or zxcvbn (PR C). the `otp/send` and
   `magic/send` handlers now EQUALIZE their present-vs-absent response WORK, closing a
   timing enumeration oracle. The present path spends one #62-pool Argon2 hash (on the code /
   short code); an unknown or suppressed recipient now burns the SAME single dummy Argon2

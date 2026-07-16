@@ -327,13 +327,13 @@ async fn expand_contract_example_chain_runs_all_three_phases_and_contract_remove
 // per real table); splitting it would not make it clearer.
 #[allow(clippy::too_many_lines)]
 #[tokio::test]
-async fn production_chain_is_only_the_forty_eight_real_migrations_and_ships_no_demo_object() {
+async fn production_chain_is_only_the_forty_nine_real_migrations_and_ships_no_demo_object() {
     // TestDatabase::start runs Store::migrate() (the production chain) on a
     // fresh, empty database.
     let db = TestDatabase::start().await;
     let pool = db.owner_pool();
 
-    // Re-running is idempotent and reports exactly thirty-three tracked migrations.
+    // Re-running is idempotent and reports exactly the tracked migrations.
     let report = MigrationRunner::new(pool)
         .run()
         .await
@@ -344,7 +344,7 @@ async fn production_chain_is_only_the_forty_eight_real_migrations_and_ships_no_d
     );
     assert_eq!(
         report.already_applied(),
-        48,
+        49,
         "the production chain is exactly forty-eight migrations (isolation, audit log, management \
          API, OIDC authorization, signing keys, login/consent, authentication context, redirect \
          registration, UserInfo claims, consent scope upsert, resource servers, opaque access \
@@ -357,16 +357,17 @@ async fn production_chain_is_only_the_forty_eight_real_migrations_and_ships_no_d
          self-service account, admin user lifecycle, identity traits, foreign password \
          import, user invitations, flexible identifiers, exit-export credential grants, \
          migration state machine, webauthn credentials, totp credentials, credential abuse \
-         defenses, step-up policies, email OTP and scanner-safe magic links)"
+         defenses, step-up policies, email OTP and scanner-safe magic links, credential-class \
+         policies)"
     );
 
-    // The ledger holds exactly versions 1 through 48.
+    // The ledger holds exactly versions 1 through 49.
     assert_eq!(
         applied_versions(pool).await,
         vec![
             1_i64, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
             24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45,
-            46, 47, 48
+            46, 47, 48, 49
         ]
     );
     let phase_of = |version: i64| async move {
@@ -545,6 +546,10 @@ async fn production_chain_is_only_the_forty_eight_real_migrations_and_ships_no_d
     // tenant-scoped tables (email_otp_codes, magic_link_tokens), no rewrite of existing
     // state.
     assert_eq!(phase_of(48).await, "expand");
+    // The credential-class-policies migration (issue #66) is an EXPAND: two new
+    // tenant-scoped tables (credential_class_policies, attestation_config) plus additive
+    // users columns and a guard trigger, no rewrite of existing state.
+    assert_eq!(phase_of(49).await, "expand");
 
     // The step-up second-factor abuse path (issue #72): migration 0047 WIDENED the
     // abuse_bans auth_path CHECK (0046 pinned the closed set) to also admit
@@ -2033,6 +2038,104 @@ async fn production_chain_is_only_the_forty_eight_real_migrations_and_ships_no_d
             "{table} must carry the attempts-nonneg CHECK constraint"
         );
     }
+
+    // ---- 0049 credential-class policies + attestation config + user-handle (issue #66) ----
+    assert!(
+        table_exists(pool, "credential_class_policies").await,
+        "credential_class_policies exists after 0049"
+    );
+    for column in [
+        "id",
+        "tenant_id",
+        "environment_id",
+        "subject_kind",
+        "subject_ref",
+        "min_class",
+        "created_at",
+        "updated_at",
+    ] {
+        assert!(
+            column_exists(pool, "credential_class_policies", column).await,
+            "credential_class_policies.{column} exists after 0049"
+        );
+    }
+    assert!(
+        table_exists(pool, "attestation_config").await,
+        "attestation_config exists after 0049"
+    );
+    for column in [
+        "id",
+        "tenant_id",
+        "environment_id",
+        "mode",
+        "created_at",
+        "updated_at",
+    ] {
+        assert!(
+            column_exists(pool, "attestation_config", column).await,
+            "attestation_config.{column} exists after 0049"
+        );
+    }
+    // Neither table carries PII (a class token, a subject discriminator, a mode).
+    // The tenant-scoped-table obligations for both new tables.
+    for table in ["credential_class_policies", "attestation_config"] {
+        assert!(
+            rls_enabled_and_forced(pool, table).await,
+            "{table} must ENABLE and FORCE row-level security"
+        );
+        assert!(
+            policy_exists(pool, table, &format!("{table}_tenant_isolation")).await,
+            "the (tenant, environment) isolation policy must exist on {table}"
+        );
+        assert!(
+            check_constraint_exists(pool, table, &format!("{table}_scope_nonempty")).await,
+            "{table} must carry the scope-nonempty CHECK constraint"
+        );
+    }
+    for constraint in [
+        "credential_class_policies_subject_kind_known",
+        "credential_class_policies_min_class_known",
+        "credential_class_policies_subject_ref_presence",
+    ] {
+        assert!(
+            check_constraint_exists(pool, "credential_class_policies", constraint).await,
+            "credential_class_policies must carry the {constraint} CHECK constraint"
+        );
+    }
+    assert!(
+        check_constraint_exists(pool, "attestation_config", "attestation_config_mode_known").await,
+        "attestation_config must carry the mode-known CHECK constraint"
+    );
+    // The passkey-only account markers on users (issue #66): the immutable WebAuthn
+    // user handle (a bytea) and the passwordless flag.
+    for column in ["webauthn_user_handle", "passwordless"] {
+        assert!(
+            column_exists(pool, "users", column).await,
+            "users.{column} exists after 0049"
+        );
+    }
+    assert_eq!(
+        column_data_type(pool, "users", "webauthn_user_handle").await,
+        "bytea",
+        "the WebAuthn user handle is an opaque bytea"
+    );
+    // The user-handle immutability trigger is the storage-layer half of the guarantee
+    // (the other half is the deliberate omission of the column from every GRANT UPDATE).
+    let trigger_present: bool = sqlx::query(
+        "SELECT EXISTS ( \
+            SELECT 1 FROM pg_catalog.pg_trigger \
+            WHERE tgrelid = 'users'::regclass AND tgname = 'users_user_handle_immutable' \
+              AND NOT tgisinternal \
+         ) AS present",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("trigger lookup")
+    .get("present");
+    assert!(
+        trigger_present,
+        "the users_user_handle_immutable BEFORE UPDATE trigger must exist"
+    );
 }
 
 #[tokio::test]

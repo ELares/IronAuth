@@ -138,8 +138,9 @@ pub use abuse::{
 };
 pub use acme::{AcmeDirectory, AcmeDirectoryClient, AcmeError};
 pub use authn::{
-    AuthMethod, AuthenticationEvent, achieved_acr, acr_values_supported, amr_values, methods_token,
-    parse_methods,
+    AuthMethod, AuthenticationEvent, CredentialClass, CredentialFacts, achieved_acr, acr_for_class,
+    acr_for_mfa, acr_values_supported, amr_values, methods_token, parse_methods, required_class,
+    satisfied_class,
 };
 pub use backchannel::{
     BACKCHANNEL_LOGOUT_EVENT, BackChannelLogoutWorker, DrainStats, FetchLogoutSender,
@@ -206,7 +207,7 @@ pub use state::{
     OidcState, PASSWORD_BREACHED_AT_LOGIN_TOTAL, PASSWORD_SCREEN_TOTAL, ResourceTargetError,
     describe_screening_metrics,
 };
-pub use step_up::canonical_step_up_acr;
+pub use step_up::{canonical_step_up_acr, required_credential_class};
 pub use subject::{
     MAX_SUBJECT_LEN, PairwiseSalt, SubjectCache, SubjectConfig, SubjectType, resolve_subject,
     subject_within_cap,
