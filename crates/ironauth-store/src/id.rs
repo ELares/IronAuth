@@ -636,6 +636,33 @@ impl ScopedKind for AbuseBanKind {
     const PREFIX: &'static str = "abn";
 }
 
+/// Marker for an email-OTP code (`eot_`), one row in the per-user email-OTP set
+/// (issue #68): the Argon2id hash of a single numeric code, single-active per
+/// (subject, purpose), single-use. A tenant-scoped resource: the id embeds its
+/// `(tenant, environment)`, so a row minted in one scope parses as a uniform
+/// not-found under another, and it is only ever reachable by the subject it is bound
+/// to. The value it points at is a one-way hash, never a plaintext code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct EmailOtpCodeKind;
+impl ScopedKind for EmailOtpCodeKind {
+    const PREFIX: &'static str = "eot";
+}
+
+/// Marker for a scanner-safe magic-link token (`mlk_`), one row in the per-user
+/// magic-link set (issue #68): the SHA-256 digest of a high-entropy bearer token,
+/// single-active per (subject, purpose), single-use. A tenant-scoped resource: the id
+/// embeds its `(tenant, environment)` AND doubles as the routing handle in the token
+/// wire form `ira_mlk_<id>~<secret>`, so the scope is recoverable from the token
+/// without a database hit. Because that token is a live bearer credential, the id's
+/// debug form REDACTS its payload (like an invitation id and an issued token's `jti`),
+/// so a magic-link id is never rendered into a log line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct MagicLinkTokenKind;
+impl ScopedKind for MagicLinkTokenKind {
+    const PREFIX: &'static str = "mlk";
+    const REDACT_DEBUG: bool = true;
+}
+
 /// Marker for a human actor (an interactive user). One of the three actor kinds
 /// an audit envelope can name (see [`crate::audit::ActorRef`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -927,6 +954,14 @@ pub type MigrationRunRecordId = ScopedId<MigrationRunRecordKind>;
 /// A credential-abuse ban identifier (`abn_`), one durable ban row over a regulated
 /// dimension and authentication path (issue #64).
 pub type AbuseBanId = ScopedId<AbuseBanKind>;
+/// An email-OTP code identifier (`eot_...`), one row in the per-user email-OTP set
+/// (issue #68). The value it points at is a one-way Argon2id hash, never a plaintext
+/// code.
+pub type EmailOtpCodeId = ScopedId<EmailOtpCodeKind>;
+/// A magic-link token identifier (`mlk_...`), one row in the per-user magic-link set
+/// and the scope-declaring routing handle embedded in the `ira_mlk_<id>~<secret>` wire
+/// token (issue #68). Its debug form redacts the payload (it is part of a bearer token).
+pub type MagicLinkTokenId = ScopedId<MagicLinkTokenKind>;
 
 impl<K: ScopedKind> ScopedId<K> {
     /// Mint a fresh scoped identifier under `scope`, drawing the unique

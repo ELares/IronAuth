@@ -595,5 +595,26 @@ name = "lazy_migration"
 path = "tests/lazy_migration.rs"
 required-features = ["testing"]
 
+# Email OTP end to end (issue #68): a code is single-active per (user, purpose) so
+# reissue invalidates the predecessor, the per-code attempt counter kills a code after
+# N wrong guesses, the code is hashed at rest, a correct code signs in with the honest
+# `otp` amr, send flooding is throttled per recipient, and a send to an unknown
+# recipient is suppressed with an identical acknowledgment. Needs a real database.
+[[test]]
+name = "email_otp"
+path = "tests/email_otp.rs"
+required-features = ["testing"]
+
+# Scanner-safe magic links end to end (issue #68): a GET on the link renders a
+# confirmation page and does NOT consume it (a prefetching scanner cannot consume the
+# link; the human POST still succeeds), the fragment-token option keeps the token out of
+# the server-visible GET path, the same-device binding cookie consumes while its absence
+# falls back to the cross-device short code, and the token/short-code are hashed at rest.
+# Needs a real database (DATABASE_URL).
+[[test]]
+name = "magic_link"
+path = "tests/magic_link.rs"
+required-features = ["testing"]
+
 [lints]
 workspace = true

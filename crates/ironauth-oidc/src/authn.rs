@@ -68,6 +68,13 @@ const ACR_PHRH: &str = "phrh";
 pub enum AuthMethod {
     /// A password (a knowledge factor). The bootstrap login. RFC 8176 `pwd`.
     Password,
+    /// An email one-time proof (issue #68): a numeric email-OTP code OR a scanner-safe
+    /// magic link, both proving control of the registered email address (a possession
+    /// factor). RFC 8176 `otp` (a one-time password). RFC 8176 defines no link-based
+    /// method value, so a magic-link login honestly reports `otp` too: both are a
+    /// single-use out-of-band proof delivered to the address. Used as a PRIMARY
+    /// passwordless factor, so on its own it achieves the single-factor `pwd`-level ACR.
+    EmailOtp,
     /// A TOTP code (a possession factor: an authenticator app holding the shared
     /// seed). RFC 8176 `otp`. Used as a SECOND factor, so combined with a primary it
     /// achieves the multi-factor ACR (issue #69).
@@ -103,8 +110,12 @@ impl AuthMethod {
     /// ACR (the verified and presence-only variants of one passkey class) sit
     /// adjacent; their relative order does not matter to [`achieved_acr`] because
     /// their ACR is identical.
-    const ALL: [AuthMethod; 7] = [
+    const ALL: [AuthMethod; 8] = [
         AuthMethod::Password,
+        // Email OTP / magic link is a single-factor PRIMARY passwordless proof at the
+        // same `pwd`-level ACR as a password (adjacent, relative order immaterial since
+        // the ACR is identical).
+        AuthMethod::EmailOtp,
         // The second-factor methods sit above the single password ACR and below the
         // phishing-resistant passkey ACRs: pwd+otp is multi-factor but not
         // phishing-resistant, so a passkey login still outranks it.
@@ -122,6 +133,7 @@ impl AuthMethod {
     pub fn as_token(self) -> &'static str {
         match self {
             AuthMethod::Password => "pwd",
+            AuthMethod::EmailOtp => "email_otp",
             AuthMethod::Totp => "totp",
             AuthMethod::RecoveryCode => "recovery_code",
             AuthMethod::Passkey => "passkey",
@@ -153,6 +165,9 @@ impl AuthMethod {
         match self {
             // `pwd`: password-based authentication.
             AuthMethod::Password => &["pwd"],
+            // `otp`: a single-use out-of-band proof to the registered email (a numeric
+            // code or a magic link). A single primary factor, so no `mfa` here.
+            AuthMethod::EmailOtp => &["otp"],
             // `otp`: a one-time password (RFC 6238); `mfa`: the second factor plus
             // the primary make multiple factors.
             AuthMethod::Totp => &["otp", "mfa"],
@@ -176,7 +191,7 @@ impl AuthMethod {
     #[must_use]
     pub fn acr(self) -> &'static str {
         match self {
-            AuthMethod::Password => ACR_PWD,
+            AuthMethod::Password | AuthMethod::EmailOtp => ACR_PWD,
             AuthMethod::Totp | AuthMethod::RecoveryCode => ACR_MFA,
             AuthMethod::Passkey | AuthMethod::PasskeyVerified => ACR_PHR,
             AuthMethod::PasskeyHardware | AuthMethod::PasskeyHardwareVerified => ACR_PHRH,
@@ -196,6 +211,7 @@ impl AuthMethod {
         matches!(
             self,
             AuthMethod::Password
+                | AuthMethod::EmailOtp
                 | AuthMethod::Totp
                 | AuthMethod::RecoveryCode
                 | AuthMethod::Passkey
@@ -323,6 +339,16 @@ impl AuthenticationEvent {
     pub fn password(auth_time_unix_micros: i64) -> Self {
         Self {
             methods: vec![AuthMethod::Password],
+            auth_time_unix_micros,
+        }
+    }
+
+    /// An email one-time proof authentication at `auth_time_unix_micros` (issue #68): a
+    /// numeric email-OTP code or a scanner-safe magic link, both `amr` `otp`.
+    #[must_use]
+    pub fn email_otp(auth_time_unix_micros: i64) -> Self {
+        Self {
+            methods: vec![AuthMethod::EmailOtp],
             auth_time_unix_micros,
         }
     }

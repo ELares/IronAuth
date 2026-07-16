@@ -51,6 +51,7 @@ pub mod abuse;
 pub mod audit;
 pub mod classification;
 pub mod custom_domain;
+pub mod email_otp;
 pub mod environment;
 mod error;
 pub mod esv;
@@ -82,6 +83,10 @@ pub use custom_domain::{
     AcmeChallengeRecord, ChallengeOutcome, ChallengeStatus, ChallengeType, CustomDomainError,
     CustomDomainRecord, VerificationStatus, domain_is_registrable, normalize_domain,
 };
+pub use email_otp::{
+    ActiveEmailOtpCode, EmailFactorPurpose, MagicLinkChallenge, MagicLinkConsumeOutcome,
+    NewEmailOtpCode, NewMagicLink, OtpAttemptOutcome,
+};
 pub use environment::{
     EnvironmentType, Guardrail, GuardrailClass, GuardrailReport, GuardrailSet, GuardrailViolation,
     UnknownEnvironmentType,
@@ -97,21 +102,22 @@ pub use id::{
     AuthorizationCodeKind, BackChannelDeliveryId, BackChannelDeliveryKind, COMPONENT_BYTES,
     ClientId, ClientKind, ClientSessionId, ClientSessionKind, ConsentId, ConsentKind,
     CorrelationId, CorrelationKind, CredentialId, CredentialKind, CustomDomainId, CustomDomainKind,
-    DcrPolicyId, DcrPolicyKind, DekId, DekKind, DeviceCodeId, DeviceCodeKind, EncryptedSecretId,
-    EncryptedSecretKind, EnvironmentId, EnvironmentKind, EnvironmentSecretId,
-    EnvironmentSecretKind, ExternalIssuerId, ExternalIssuerKind, GrantId, GrantKind, HumanId,
-    HumanKind, IdParseError, InitialAccessTokenId, InitialAccessTokenKind, InvitationId,
-    InvitationKind, IssuedTokenId, IssuedTokenKind, KekId, KekKind, LevelId, LevelKind,
-    ManagementKeyId, ManagementKeyKind, MigrationRunId, MigrationRunKind, MigrationRunRecordId,
-    MigrationRunRecordKind, NotInScope, OperatorId, OperatorKind, OrganizationId, OrganizationKind,
-    PushedRequestId, PushedRequestKind, RecoveryCodeId, RecoveryCodeKind, RefreshFamilyId,
-    RefreshFamilyKind, RefreshTokenId, RefreshTokenKind, ResourceServerId, ResourceServerKind,
-    ScopeStepUpPolicyId, ScopeStepUpPolicyKind, ScopedId, ScopedKind, ServiceAccountId,
-    ServiceAccountKind, ServiceId, ServiceKind, SessionEventId, SessionEventKind, SessionId,
-    SessionKind, SigningKeyId, SigningKeyKind, TenantId, TenantKind, TotpCredentialId,
-    TotpCredentialKind, TraitMigrationJobId, TraitMigrationJobKind, TraitSchemaId, TraitSchemaKind,
-    UserId, UserIdentifierId, UserIdentifierKind, UserKind, VariableId, VariableKind,
-    WebauthnChallengeId, WebauthnChallengeKind, WebauthnCredentialId, WebauthnCredentialKind,
+    DcrPolicyId, DcrPolicyKind, DekId, DekKind, DeviceCodeId, DeviceCodeKind, EmailOtpCodeId,
+    EmailOtpCodeKind, EncryptedSecretId, EncryptedSecretKind, EnvironmentId, EnvironmentKind,
+    EnvironmentSecretId, EnvironmentSecretKind, ExternalIssuerId, ExternalIssuerKind, GrantId,
+    GrantKind, HumanId, HumanKind, IdParseError, InitialAccessTokenId, InitialAccessTokenKind,
+    InvitationId, InvitationKind, IssuedTokenId, IssuedTokenKind, KekId, KekKind, LevelId,
+    LevelKind, MagicLinkTokenId, MagicLinkTokenKind, ManagementKeyId, ManagementKeyKind,
+    MigrationRunId, MigrationRunKind, MigrationRunRecordId, MigrationRunRecordKind, NotInScope,
+    OperatorId, OperatorKind, OrganizationId, OrganizationKind, PushedRequestId, PushedRequestKind,
+    RecoveryCodeId, RecoveryCodeKind, RefreshFamilyId, RefreshFamilyKind, RefreshTokenId,
+    RefreshTokenKind, ResourceServerId, ResourceServerKind, ScopeStepUpPolicyId,
+    ScopeStepUpPolicyKind, ScopedId, ScopedKind, ServiceAccountId, ServiceAccountKind, ServiceId,
+    ServiceKind, SessionEventId, SessionEventKind, SessionId, SessionKind, SigningKeyId,
+    SigningKeyKind, TenantId, TenantKind, TotpCredentialId, TotpCredentialKind,
+    TraitMigrationJobId, TraitMigrationJobKind, TraitSchemaId, TraitSchemaKind, UserId,
+    UserIdentifierId, UserIdentifierKind, UserKind, VariableId, VariableKind, WebauthnChallengeId,
+    WebauthnChallengeKind, WebauthnCredentialId, WebauthnCredentialKind,
 };
 pub use identifier::{
     CanonicalIdentifier, IdentifierType, UniquenessMode, canonicalize_identifier,
@@ -181,7 +187,8 @@ pub use repository::{
     UserRepo, UserRevocation, UserState, WEBAUTHN_CHALLENGE_TTL_SECS, WebauthnAssertionTarget,
     WebauthnCeremony, WebauthnChallengeRepo, WebauthnCredentialDescriptor,
     WebauthnCredentialOutcome, WebauthnCredentialRecord, WebauthnCredentialRepo,
-    device_code_digest, invitation_token_digest, mint_invitation_token, mint_invitation_token_for,
+    device_code_digest, invitation_token_digest, magic_link_binding_digest,
+    magic_link_token_digest, mint_invitation_token, mint_invitation_token_for,
     opaque_access_token_digest, refresh_token_digest, user_code_hash,
 };
 pub use scope::Scope;

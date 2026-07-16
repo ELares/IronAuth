@@ -62,18 +62,22 @@ use crate::custom_domain::{
     AcmeChallengeRecord, ChallengeOutcome, ChallengeStatus, ChallengeType, CustomDomainRecord,
     VerificationStatus,
 };
+use crate::email_otp::{
+    ActiveEmailOtpCode, EmailFactorPurpose, MagicLinkChallenge, MagicLinkConsumeOutcome,
+    NewEmailOtpCode, NewMagicLink, OtpAttemptOutcome,
+};
 use crate::environment::{EnvironmentType, GuardrailSet};
 use crate::error::StoreError;
 use crate::id::{
     AbuseBanId, AcmeChallengeId, AssertionMappingId, AuditId, AuditTarget, AuthorizationCodeId,
     BackChannelDeliveryId, ClientId, ClientSessionId, ConsentId, CorrelationId, CredentialId,
-    CustomDomainId, DcrPolicyId, DekId, DeviceCodeId, EncryptedSecretId, EnvironmentId,
-    EnvironmentSecretId, ExternalIssuerId, GrantId, InitialAccessTokenId, InvitationId,
-    IssuedTokenId, KekId, ManagementKeyId, MigrationRunId, MigrationRunRecordId, OperatorId,
-    OrganizationId, PushedRequestId, RecoveryCodeId, RefreshFamilyId, RefreshTokenId,
-    ResourceServerId, ScopeStepUpPolicyId, ServiceAccountId, SessionEventId, SessionId,
-    SigningKeyId, TenantId, TotpCredentialId, TraitMigrationJobId, TraitSchemaId, UserId,
-    UserIdentifierId, VariableId, WebauthnChallengeId, WebauthnCredentialId,
+    CustomDomainId, DcrPolicyId, DekId, DeviceCodeId, EmailOtpCodeId, EncryptedSecretId,
+    EnvironmentId, EnvironmentSecretId, ExternalIssuerId, GrantId, InitialAccessTokenId,
+    InvitationId, IssuedTokenId, KekId, MagicLinkTokenId, ManagementKeyId, MigrationRunId,
+    MigrationRunRecordId, OperatorId, OrganizationId, PushedRequestId, RecoveryCodeId,
+    RefreshFamilyId, RefreshTokenId, ResourceServerId, ScopeStepUpPolicyId, ServiceAccountId,
+    SessionEventId, SessionId, SigningKeyId, TenantId, TotpCredentialId, TraitMigrationJobId,
+    TraitSchemaId, UserId, UserIdentifierId, VariableId, WebauthnChallengeId, WebauthnCredentialId,
 };
 use crate::identifier::{
     CanonicalIdentifier, IdentifierType, UniquenessMode, canonicalize_identifier,
@@ -541,6 +545,31 @@ impl<'a> ScopedStore<'a> {
         }
     }
 
+    /// The read-only email-OTP repository for this scope (issue #68): resolve a
+    /// subject's ACTIVE (unconsumed, unexpired) code for a purpose so the caller can
+    /// verify it through the hashing pool. Issuing a code and consuming / expiring it
+    /// are audited mutations on [`ActingStore::email_otp_codes`].
+    #[must_use]
+    pub fn email_otp_codes(&self) -> EmailOtpCodeRepo<'a> {
+        EmailOtpCodeRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
+    /// The read-only scanner-safe magic-link repository for this scope (issue #68):
+    /// resolve an ACTIVE link by its same-device binding digest (the cross-device
+    /// short-code path) so the caller can verify the short code through the hashing
+    /// pool. Issuing a link and consuming it single-use are audited mutations on
+    /// [`ActingStore::magic_links`].
+    #[must_use]
+    pub fn magic_links(&self) -> MagicLinkRepo<'a> {
+        MagicLinkRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
     /// The read-and-bookkeeping device-authorization repository for this scope (issue
     /// #24, RFC 8628). Resolves a presented device code at the token-endpoint poll,
     /// looks up a flow by a submitted user code on the verification page, records a
@@ -706,6 +735,32 @@ impl<'a> ActingStore<'a> {
     #[must_use]
     pub fn abuse(&self) -> ActingAbuseRepo<'a> {
         ActingAbuseRepo {
+            store: self.store,
+            scope: self.scope,
+            acting: self.acting,
+        }
+    }
+
+    /// The mutating email-OTP repository for this scope and actor (issue #68): issue a
+    /// fresh code (invalidating any prior active one), consume it single-use on a
+    /// correct guess, and record / retire it on a wrong guess. Issue and consume are
+    /// audited; the wrong-guess bookkeeping is a counter mutation off the audited path.
+    #[must_use]
+    pub fn email_otp_codes(&self) -> ActingEmailOtpCodeRepo<'a> {
+        ActingEmailOtpCodeRepo {
+            store: self.store,
+            scope: self.scope,
+            acting: self.acting,
+        }
+    }
+
+    /// The mutating scanner-safe magic-link repository for this scope and actor (issue
+    /// #68): issue a fresh link (invalidating any prior active one), and consume it
+    /// single-use either by the token digest (same-device POST) or by the id resolved
+    /// through the cross-device short code. Both issue and consume are audited.
+    #[must_use]
+    pub fn magic_links(&self) -> ActingMagicLinkRepo<'a> {
+        ActingMagicLinkRepo {
             store: self.store,
             scope: self.scope,
             acting: self.acting,
@@ -4048,6 +4103,629 @@ impl ActingAbuseRepo<'_> {
 }
 
 // ===========================================================================
+// Email OTP + scanner-safe magic links (issue #68).
+//
+// Two tenant-scoped, single-use factor stores. The email-OTP code is a low-entropy
+// numeric secret stored as an Argon2id PHC (the same one-way form as a password), so
+// it is loaded by the non-secret (subject, purpose) handle and verified through the
+// hashing pool. The magic-link token is a high-entropy bearer credential stored ONLY
+// as its SHA-256 digest (the #29 digest-only pattern), looked up by that digest. Every
+// consume is a guarded, single-use UPDATE (WHERE consumed_at IS NULL) so a double-use
+// race redeems at most once; the recipient email is sealed and blind-indexed (issue
+// #48), never a plaintext column.
+// ===========================================================================
+
+/// The read-only email-OTP repository (issue #68): resolve a subject's ACTIVE code.
+pub struct EmailOtpCodeRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl EmailOtpCodeRepo<'_> {
+    /// Resolve the subject's single ACTIVE (unconsumed, unexpired) code for `purpose`,
+    /// or [`None`] when there is none. The caller verifies the returned one-way
+    /// `code_hash` through the hashing pool; a missing code is the uniform not-found.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn resolve_active(
+        &self,
+        subject: &UserId,
+        purpose: EmailFactorPurpose,
+        now_micros: i64,
+    ) -> Result<Option<ActiveEmailOtpCode>, StoreError> {
+        let scope = self.scope;
+        let mut tx = begin_scoped(self.store, scope).await?;
+        let row = sqlx::query(
+            "SELECT id, code_hash, attempt_count, max_attempts FROM email_otp_codes \
+             WHERE tenant_id = $1 AND environment_id = $2 AND subject = $3 AND purpose = $4 \
+               AND consumed_at IS NULL \
+               AND expires_at > TIMESTAMPTZ 'epoch' + ($5::text || ' microseconds')::interval",
+        )
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(subject.to_string())
+        .bind(purpose.as_str())
+        .bind(now_micros)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let id = EmailOtpCodeId::parse_in_scope(&row.get::<String, _>("id"), &scope)?;
+        Ok(Some(ActiveEmailOtpCode {
+            id,
+            code_hash: row.get("code_hash"),
+            attempt_count: row.get("attempt_count"),
+            max_attempts: row.get("max_attempts"),
+        }))
+    }
+}
+
+/// The mutating email-OTP repository (issue #68): issue, consume, and retire codes.
+pub struct ActingEmailOtpCodeRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+    acting: ActingContext,
+}
+
+impl ActingEmailOtpCodeRepo<'_> {
+    /// Lazily provision the scope's KEK/DEK so the recipient email can be sealed.
+    async fn ensure_scope_keys(&self, env: &Env, master: &MasterKey) -> Result<(), StoreError> {
+        let envelope = ActingEnvelopeRepo {
+            store: self.store,
+            scope: self.scope,
+            acting: self.acting,
+        };
+        match envelope.provision_kek(env, master).await {
+            Ok(_) | Err(StoreError::Conflict) => {}
+            Err(error) => return Err(error),
+        }
+        match envelope.provision_dek(env, master).await {
+            Ok(_) | Err(StoreError::Conflict) => {}
+            Err(error) => return Err(error),
+        }
+        Ok(())
+    }
+
+    /// ISSUE a fresh email-OTP code (issue #68): invalidate any prior ACTIVE code for
+    /// this (subject, purpose) by deleting it, then insert the new one, sealing and
+    /// blind-indexing the recipient email, with one `email_otp.send` audit row in the
+    /// same transaction. The single-active partial unique index makes reissue replace
+    /// the predecessor, so the old code no longer verifies.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the id is out of scope; [`StoreError::Encryption`]
+    /// if no master key is configured; [`StoreError::Database`] on a persistence failure.
+    pub async fn issue(
+        &self,
+        env: &Env,
+        spec: NewEmailOtpCode<'_>,
+        created_at_micros: i64,
+    ) -> Result<EmailOtpCodeId, StoreError> {
+        if spec.id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let master = self.store.master().ok_or(StoreError::Encryption)?;
+        self.ensure_scope_keys(env, master).await?;
+        let scope = self.scope;
+        let id = *spec.id;
+        let subject = spec.subject.to_string();
+        let purpose = spec.purpose;
+        let code_hash = spec.code_hash.to_owned();
+        let recipient = spec.recipient_email.to_owned();
+        let max_attempts = spec.max_attempts;
+        let expires = spec.expires_at_unix_micros;
+        let bidx = email_factor_recipient_blind_index(master, scope, &recipient);
+        let detail = format!("purpose={}", purpose.as_str());
+        write_audited_detailed(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::EmailOtpSend,
+                target: &id,
+            },
+            async move |tx| {
+                sqlx::query(
+                    "DELETE FROM email_otp_codes \
+                     WHERE tenant_id = $1 AND environment_id = $2 AND subject = $3 \
+                       AND purpose = $4 AND consumed_at IS NULL",
+                )
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(&subject)
+                .bind(purpose.as_str())
+                .execute(&mut **tx)
+                .await?;
+                let (dek_version, dek) = fetch_active_dek(tx, scope, master).await?;
+                let recipient_sealed = dek.seal(
+                    env.entropy(),
+                    &email_factor_recipient_seal_aad(scope, dek_version),
+                    recipient.as_bytes(),
+                );
+                sqlx::query(
+                    "INSERT INTO email_otp_codes \
+                     (id, tenant_id, environment_id, subject, purpose, code_hash, \
+                      recipient_email_bidx, recipient_email_sealed, pii_dek_version, \
+                      attempt_count, max_attempts, expires_at, created_at) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 0, $10, \
+                             TIMESTAMPTZ 'epoch' + ($11::text || ' microseconds')::interval, \
+                             TIMESTAMPTZ 'epoch' + ($12::text || ' microseconds')::interval)",
+                )
+                .bind(id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(&subject)
+                .bind(purpose.as_str())
+                .bind(&code_hash)
+                .bind(bidx.into_bytes())
+                .bind(recipient_sealed.into_bytes())
+                .bind(dek_version)
+                .bind(max_attempts)
+                .bind(expires)
+                .bind(created_at_micros)
+                .execute(&mut **tx)
+                .await?;
+                Ok(())
+            },
+            false,
+            Some(&detail),
+        )
+        .await?;
+        Ok(id)
+    }
+
+    /// CONSUME a code single-use (issue #68) after the caller has verified the presented
+    /// code against the returned hash: a guarded UPDATE sets `consumed_at` WHERE it is
+    /// still NULL and unexpired, so a double-submit race consumes at most once, with one
+    /// `email_otp.verify` audit row. Returns `true` when this call consumed the code,
+    /// `false` when a race already did (no audit row).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn consume(
+        &self,
+        env: &Env,
+        id: &EmailOtpCodeId,
+        now_micros: i64,
+    ) -> Result<bool, StoreError> {
+        if id.scope() != self.scope {
+            return Ok(false);
+        }
+        let scope = self.scope;
+        let id = *id;
+        let detail = "purpose=verify";
+        let result = write_audited_detailed(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::EmailOtpVerify,
+                target: &id,
+            },
+            async move |tx| {
+                let affected = sqlx::query(
+                    "UPDATE email_otp_codes \
+                     SET consumed_at = TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval \
+                     WHERE tenant_id = $1 AND environment_id = $2 AND id = $3 \
+                       AND consumed_at IS NULL \
+                       AND expires_at > TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval",
+                )
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(id.to_string())
+                .bind(now_micros)
+                .execute(&mut **tx)
+                .await?
+                .rows_affected();
+                if affected == 0 {
+                    // A race already consumed / expired it: roll back so no audit row is
+                    // written for a consume that did not happen.
+                    return Err(StoreError::NotFound);
+                }
+                Ok(())
+            },
+            false,
+            Some(detail),
+        )
+        .await;
+        match result {
+            Ok(()) => Ok(true),
+            Err(StoreError::NotFound) => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Record a WRONG guess against a code (issue #68): increment the attempt counter,
+    /// and when it reaches the budget, DELETE the code so it can never verify again (the
+    /// attempt-limit death). A high-frequency bookkeeping mutation kept off the
+    /// audited-write path, exactly like the abuse failure counters.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn record_wrong_guess(
+        &self,
+        id: &EmailOtpCodeId,
+        now_micros: i64,
+    ) -> Result<OtpAttemptOutcome, StoreError> {
+        if id.scope() != self.scope {
+            return Ok(OtpAttemptOutcome::Gone);
+        }
+        let scope = self.scope;
+        let mut tx = begin_scoped(self.store, scope).await?;
+        let row = sqlx::query(
+            "UPDATE email_otp_codes SET attempt_count = attempt_count + 1 \
+             WHERE tenant_id = $1 AND environment_id = $2 AND id = $3 \
+               AND consumed_at IS NULL \
+               AND expires_at > TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval \
+             RETURNING attempt_count, max_attempts",
+        )
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(id.to_string())
+        .bind(now_micros)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(row) = row else {
+            tx.commit().await?;
+            return Ok(OtpAttemptOutcome::Gone);
+        };
+        let attempts: i32 = row.get("attempt_count");
+        let max_attempts: i32 = row.get("max_attempts");
+        if attempts >= max_attempts {
+            sqlx::query(
+                "DELETE FROM email_otp_codes \
+                 WHERE tenant_id = $1 AND environment_id = $2 AND id = $3",
+            )
+            .bind(scope.tenant().to_string())
+            .bind(scope.environment().to_string())
+            .bind(id.to_string())
+            .execute(&mut *tx)
+            .await?;
+            tx.commit().await?;
+            return Ok(OtpAttemptOutcome::Died);
+        }
+        tx.commit().await?;
+        Ok(OtpAttemptOutcome::Survived)
+    }
+}
+
+/// The read-only scanner-safe magic-link repository (issue #68).
+pub struct MagicLinkRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl MagicLinkRepo<'_> {
+    /// Whether an ACTIVE (unconsumed, unexpired) link exists for `token_digest`, for the
+    /// GET confirmation page to render a non-enumerating actionable error when it does
+    /// not. This is a READ only: it NEVER consumes (the scanner-safe invariant).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn token_is_active(
+        &self,
+        token_digest: &str,
+        now_micros: i64,
+    ) -> Result<bool, StoreError> {
+        let scope = self.scope;
+        let mut tx = begin_scoped(self.store, scope).await?;
+        let row = sqlx::query(
+            "SELECT 1 AS present FROM magic_link_tokens \
+             WHERE tenant_id = $1 AND environment_id = $2 AND token_digest = $3 \
+               AND consumed_at IS NULL \
+               AND expires_at > TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval",
+        )
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(token_digest)
+        .bind(now_micros)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(row.is_some())
+    }
+
+    /// Resolve the ACTIVE link for `token_digest` whose same-device `binding_digest`
+    /// matches (the same-device POST path): a READ that returns the id/subject/purpose so
+    /// the caller can act as the subject and consume it. Consumption is a separate guarded
+    /// audited mutation ([`ActingMagicLinkRepo::consume_by_id`]); a scanner's GET never
+    /// reaches either. Returns [`None`] for a forged, expired, consumed, or
+    /// binding-mismatched token (the uniform not-found).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn resolve_by_token(
+        &self,
+        token_digest: &str,
+        binding_digest: &str,
+        now_micros: i64,
+    ) -> Result<Option<MagicLinkChallenge>, StoreError> {
+        let scope = self.scope;
+        let mut tx = begin_scoped(self.store, scope).await?;
+        let row = sqlx::query(
+            "SELECT id, subject, purpose, short_code_hash FROM magic_link_tokens \
+             WHERE tenant_id = $1 AND environment_id = $2 AND token_digest = $3 \
+               AND binding_digest = $4 AND consumed_at IS NULL \
+               AND expires_at > TIMESTAMPTZ 'epoch' + ($5::text || ' microseconds')::interval",
+        )
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(token_digest)
+        .bind(binding_digest)
+        .bind(now_micros)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let id = MagicLinkTokenId::parse_in_scope(&row.get::<String, _>("id"), &scope)?;
+        let purpose = EmailFactorPurpose::from_wire(&row.get::<String, _>("purpose"))
+            .ok_or(StoreError::Encryption)?;
+        Ok(Some(MagicLinkChallenge {
+            id,
+            subject: row.get("subject"),
+            purpose,
+            short_code_hash: row.get("short_code_hash"),
+        }))
+    }
+
+    /// Resolve the ACTIVE link bound to `binding_digest` (the cross-device short-code
+    /// path): the originating device presents its binding cookie plus the short code, so
+    /// the caller can verify the returned one-way `short_code_hash` through the hashing
+    /// pool. A READ only: consumption is a separate audited mutation.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn resolve_by_binding(
+        &self,
+        binding_digest: &str,
+        now_micros: i64,
+    ) -> Result<Option<MagicLinkChallenge>, StoreError> {
+        let scope = self.scope;
+        let mut tx = begin_scoped(self.store, scope).await?;
+        let row = sqlx::query(
+            "SELECT id, subject, purpose, short_code_hash FROM magic_link_tokens \
+             WHERE tenant_id = $1 AND environment_id = $2 AND binding_digest = $3 \
+               AND consumed_at IS NULL \
+               AND expires_at > TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval",
+        )
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(binding_digest)
+        .bind(now_micros)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let id = MagicLinkTokenId::parse_in_scope(&row.get::<String, _>("id"), &scope)?;
+        let purpose = EmailFactorPurpose::from_wire(&row.get::<String, _>("purpose"))
+            .ok_or(StoreError::Encryption)?;
+        Ok(Some(MagicLinkChallenge {
+            id,
+            subject: row.get("subject"),
+            purpose,
+            short_code_hash: row.get("short_code_hash"),
+        }))
+    }
+}
+
+/// The mutating scanner-safe magic-link repository (issue #68): issue and consume.
+pub struct ActingMagicLinkRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+    acting: ActingContext,
+}
+
+impl ActingMagicLinkRepo<'_> {
+    /// Lazily provision the scope's KEK/DEK so the recipient email can be sealed.
+    async fn ensure_scope_keys(&self, env: &Env, master: &MasterKey) -> Result<(), StoreError> {
+        let envelope = ActingEnvelopeRepo {
+            store: self.store,
+            scope: self.scope,
+            acting: self.acting,
+        };
+        match envelope.provision_kek(env, master).await {
+            Ok(_) | Err(StoreError::Conflict) => {}
+            Err(error) => return Err(error),
+        }
+        match envelope.provision_dek(env, master).await {
+            Ok(_) | Err(StoreError::Conflict) => {}
+            Err(error) => return Err(error),
+        }
+        Ok(())
+    }
+
+    /// ISSUE a fresh magic link (issue #68): invalidate any prior ACTIVE link for this
+    /// (subject, purpose) by deleting it, then insert the new one (its one-way token
+    /// digest, short-code hash, and binding digest, plus the sealed / blind-indexed
+    /// recipient email), with one `magic_link.send` audit row in the same transaction.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the id is out of scope; [`StoreError::Encryption`]
+    /// if no master key is configured; [`StoreError::Database`] on a persistence failure.
+    pub async fn issue(
+        &self,
+        env: &Env,
+        spec: NewMagicLink<'_>,
+        created_at_micros: i64,
+    ) -> Result<MagicLinkTokenId, StoreError> {
+        if spec.id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let master = self.store.master().ok_or(StoreError::Encryption)?;
+        self.ensure_scope_keys(env, master).await?;
+        let scope = self.scope;
+        let id = *spec.id;
+        let subject = spec.subject.to_string();
+        let purpose = spec.purpose;
+        let token_digest = spec.token_digest.to_owned();
+        let short_code_hash = spec.short_code_hash.to_owned();
+        let binding_digest = spec.binding_digest.to_owned();
+        let recipient = spec.recipient_email.to_owned();
+        let expires = spec.expires_at_unix_micros;
+        let bidx = email_factor_recipient_blind_index(master, scope, &recipient);
+        let detail = format!("purpose={}", purpose.as_str());
+        write_audited_detailed(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::MagicLinkSend,
+                target: &id,
+            },
+            async move |tx| {
+                sqlx::query(
+                    "DELETE FROM magic_link_tokens \
+                     WHERE tenant_id = $1 AND environment_id = $2 AND subject = $3 \
+                       AND purpose = $4 AND consumed_at IS NULL",
+                )
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(&subject)
+                .bind(purpose.as_str())
+                .execute(&mut **tx)
+                .await?;
+                let (dek_version, dek) = fetch_active_dek(tx, scope, master).await?;
+                let recipient_sealed = dek.seal(
+                    env.entropy(),
+                    &email_factor_recipient_seal_aad(scope, dek_version),
+                    recipient.as_bytes(),
+                );
+                sqlx::query(
+                    "INSERT INTO magic_link_tokens \
+                     (id, tenant_id, environment_id, subject, purpose, token_digest, \
+                      short_code_hash, binding_digest, recipient_email_bidx, \
+                      recipient_email_sealed, pii_dek_version, expires_at, created_at) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, \
+                             TIMESTAMPTZ 'epoch' + ($12::text || ' microseconds')::interval, \
+                             TIMESTAMPTZ 'epoch' + ($13::text || ' microseconds')::interval)",
+                )
+                .bind(id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(&subject)
+                .bind(purpose.as_str())
+                .bind(&token_digest)
+                .bind(&short_code_hash)
+                .bind(&binding_digest)
+                .bind(bidx.into_bytes())
+                .bind(recipient_sealed.into_bytes())
+                .bind(dek_version)
+                .bind(expires)
+                .bind(created_at_micros)
+                .execute(&mut **tx)
+                .await?;
+                Ok(())
+            },
+            false,
+            Some(&detail),
+        )
+        .await?;
+        Ok(id)
+    }
+
+    /// CONSUME a link single-use by its resolved challenge (issue #68), used by BOTH the
+    /// same-device token path and the cross-device short-code path after the caller has
+    /// resolved the active row (and, for the short-code path, verified the printed code
+    /// against `short_code_hash`). A guarded UPDATE flips `consumed_at` WHERE it is still
+    /// NULL and unexpired, so a prefetching scanner (which never POSTs) can never consume
+    /// it and a double-submit race consumes at most once, with one `magic_link.consume`
+    /// audit row on success.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn consume_by_id(
+        &self,
+        env: &Env,
+        challenge: &MagicLinkChallenge,
+        now_micros: i64,
+    ) -> Result<MagicLinkConsumeOutcome, StoreError> {
+        self.consume_by_id_inner(
+            env,
+            challenge.id,
+            challenge.subject.clone(),
+            challenge.purpose,
+            now_micros,
+        )
+        .await
+    }
+
+    /// The shared guarded single-use consume: flip `consumed_at` WHERE still NULL and
+    /// unexpired, audited, returning [`MagicLinkConsumeOutcome::NotFound`] when a race
+    /// already consumed it (no audit row for a consume that did not happen).
+    async fn consume_by_id_inner(
+        &self,
+        env: &Env,
+        id: MagicLinkTokenId,
+        subject: String,
+        purpose: EmailFactorPurpose,
+        now_micros: i64,
+    ) -> Result<MagicLinkConsumeOutcome, StoreError> {
+        if id.scope() != self.scope {
+            return Ok(MagicLinkConsumeOutcome::NotFound);
+        }
+        let scope = self.scope;
+        let detail = format!("purpose={}", purpose.as_str());
+        let result = write_audited_detailed(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::MagicLinkConsume,
+                target: &id,
+            },
+            async move |tx| {
+                let affected = sqlx::query(
+                    "UPDATE magic_link_tokens \
+                     SET consumed_at = TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval \
+                     WHERE tenant_id = $1 AND environment_id = $2 AND id = $3 \
+                       AND consumed_at IS NULL \
+                       AND expires_at > TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval",
+                )
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(id.to_string())
+                .bind(now_micros)
+                .execute(&mut **tx)
+                .await?
+                .rows_affected();
+                if affected == 0 {
+                    return Err(StoreError::NotFound);
+                }
+                Ok(())
+            },
+            false,
+            Some(&detail),
+        )
+        .await;
+        match result {
+            Ok(()) => Ok(MagicLinkConsumeOutcome::Consumed { subject, purpose }),
+            Err(StoreError::NotFound) => Ok(MagicLinkConsumeOutcome::NotFound),
+            Err(error) => Err(error),
+        }
+    }
+}
+
+// ===========================================================================
 // OIDC authorization-code grant (issue #12).
 //
 // The data-plane, tenant-scoped persistence behind the public authorization and
@@ -7369,6 +8047,26 @@ pub fn device_code_digest(token: &str) -> String {
 #[must_use]
 pub fn user_code_hash(normalized_user_code: &str) -> String {
     sha256_hex(normalized_user_code)
+}
+
+/// The one canonical digest for a magic-link bearer token (issue #68): the send path
+/// hashes the whole `ira_mlk_<id>~<secret>` token with this to store it, and
+/// [`ActingMagicLinkRepo::consume_by_token`] hashes the presented token with this to
+/// look it up, so the two can never disagree. The plaintext token never reaches the
+/// database; only this one-way digest does, so a database dump yields nothing
+/// replayable.
+#[must_use]
+pub fn magic_link_token_digest(token: &str) -> String {
+    sha256_hex(token)
+}
+
+/// The one canonical digest for the same-device binding secret of a magic link (issue
+/// #68): the send path hashes the binding secret (set as a cookie at request time) with
+/// this to store it, and the consume path hashes the presented cookie value with this to
+/// match it. The plaintext binding secret never reaches the database.
+#[must_use]
+pub fn magic_link_binding_digest(binding_secret: &str) -> String {
+    sha256_hex(binding_secret)
 }
 
 /// The lowercase hex SHA-256 of a string. Shared by the device-code digest and the
@@ -20169,6 +20867,14 @@ const TOTP_NAME_SEAL_LABEL: &str = "ironauth.envelope.totp-name.v1";
 /// (issue #69) from every other keyed derivation, so a recovery-code index tag never
 /// collides with, or leaks across, another index or another tenant.
 const RECOVERY_CODE_BIDX_LABEL: &str = "ironauth.bidx.recovery-code.v1";
+/// The AAD label domain-separating a sealed recipient email on an `email_otp_codes` or
+/// `magic_link_tokens` row (issue #68) from every other envelope context, so a recipient
+/// address ciphertext never authenticates under another column's context.
+const EMAIL_FACTOR_RECIPIENT_SEAL_LABEL: &str = "ironauth.envelope.email-factor-recipient.v1";
+/// The AAD label domain-separating the recipient-email blind index on an
+/// `email_otp_codes` / `magic_link_tokens` row (issue #68) from every other keyed
+/// derivation, so a recipient-email index tag never collides across columns or tenants.
+const EMAIL_FACTOR_RECIPIENT_BIDX_LABEL: &str = "ironauth.bidx.email-factor-recipient.v1";
 /// The purpose label bound into a sealed `users.identifier` (the login handle).
 const USER_IDENTIFIER_PURPOSE: &str = "identifier";
 /// The purpose label bound into a sealed `users.claims` (the standard-claim JSON).
@@ -20507,6 +21213,39 @@ fn abuse_subject_blind_index(
 /// device-verification counter keys its source (issue #24).
 fn abuse_counter_key(path: AuthPath, kind: AbuseSubjectKind, keyed_value: &str) -> String {
     format!("abuse:{}:{}:{}", path.as_str(), kind.as_str(), keyed_value)
+}
+
+/// The associated data binding a sealed recipient email on an email-factor row (issue
+/// #68) to its scope and the DEK version that sealed it.
+fn email_factor_recipient_seal_aad(scope: Scope, dek_version: i32) -> Aad {
+    Aad::builder()
+        .text(EMAIL_FACTOR_RECIPIENT_SEAL_LABEL)
+        .text(&scope.tenant().to_string())
+        .text(&scope.environment().to_string())
+        .version(i64::from(dek_version))
+        .build()
+}
+
+/// The blind-index context for a recipient email on an email-factor row (issue #68): the
+/// label, the scope, and the address, length-prefixed. The per-tenant HMAC key keeps the
+/// same address in two tenants from colliding.
+fn email_factor_recipient_bidx_aad(scope: Scope, recipient: &str) -> Aad {
+    Aad::builder()
+        .text(EMAIL_FACTOR_RECIPIENT_BIDX_LABEL)
+        .text(&scope.tenant().to_string())
+        .text(&scope.environment().to_string())
+        .field(recipient.as_bytes())
+        .build()
+}
+
+/// The deterministic blind index for a recipient email in `scope` under `master` (issue
+/// #68).
+fn email_factor_recipient_blind_index(
+    master: &MasterKey,
+    scope: Scope,
+    recipient: &str,
+) -> BlindIndex {
+    master.blind_index(&email_factor_recipient_bidx_aad(scope, recipient))
 }
 
 /// Lowercase-hex encoding of a blind index, for use inside an `abuse:` counter key.

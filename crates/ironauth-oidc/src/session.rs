@@ -167,6 +167,37 @@ pub fn session_value_from_cookie_header(header: Option<&str>) -> Option<&str> {
     })
 }
 
+/// The magic-link SAME-DEVICE binding cookie name (issue #68). Like the session cookie
+/// it carries the `__Host-` prefix (so a conformant browser accepts it only when
+/// `Secure`, `Path=/`, and no `Domain`), is `HttpOnly` (script cannot read the binding
+/// secret), and `SameSite=Lax` (so it rides the top-level GET navigation when the user
+/// clicks the emailed link and the same-site consume POST, but not a cross-site request).
+pub const MAGIC_BINDING_COOKIE: &str = "__Host-ironauth_magic_binding";
+
+/// Build the `Set-Cookie` header that binds a magic link to THIS browser at send time
+/// (issue #68): the opaque binding secret whose digest is stored on the link row, so a
+/// consume from the same browser matches and a consume from another device (no cookie)
+/// falls back to the printed short code.
+#[must_use]
+pub fn build_magic_binding_cookie(binding_secret: &str, ttl: Duration) -> String {
+    let max_age = i64::try_from(ttl.as_secs()).unwrap_or(i64::MAX);
+    format!(
+        "{MAGIC_BINDING_COOKIE}={binding_secret}; Path=/; Secure; HttpOnly; SameSite=Lax; \
+         Max-Age={max_age}"
+    )
+}
+
+/// The magic-link binding secret presented on the request, if any (issue #68). A missing
+/// cookie means the link was opened on a different device than the one that requested it.
+#[must_use]
+pub fn magic_binding_from_cookie_header(header: Option<&str>) -> Option<&str> {
+    let header = header?;
+    header.split(';').find_map(|pair| {
+        let (name, value) = pair.trim().split_once('=')?;
+        (name == MAGIC_BINDING_COOKIE).then_some(value)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

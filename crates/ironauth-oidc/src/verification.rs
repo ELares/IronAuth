@@ -10,7 +10,7 @@
 //! acknowledgment is IDENTICAL to a real send (the Logto v1.41 pattern), so a probe
 //! cannot distinguish an existing account from an unknown one.
 
-use ironauth_store::Scope;
+use ironauth_store::{EmailFactorPurpose, Scope};
 
 /// Why a verification message would be sent (issue #64). Bound into the send so a future
 /// transport (#68) can render the right template and a test can assert what was sent.
@@ -20,6 +20,45 @@ pub enum VerificationPurpose {
     Registration,
     /// An account-recovery message (a reset link / OTP).
     Recovery,
+}
+
+/// An email-OTP delivery (issue #68): the numeric code to deliver to `recipient`, with
+/// the flow it authorizes and its lifetime. The concrete transport is a documented seam
+/// (M11 messaging); the code is a live secret, so an implementation MUST NOT log it at a
+/// level that reaches production sinks.
+#[derive(Debug, Clone, Copy)]
+pub struct EmailOtpMessage<'a> {
+    /// The tenant/environment scope.
+    pub scope: Scope,
+    /// The flow the code authorizes.
+    pub purpose: EmailFactorPurpose,
+    /// The recipient email address.
+    pub recipient: &'a str,
+    /// The numeric one-time code (a live secret).
+    pub code: &'a str,
+    /// The code lifetime in seconds (for the message copy).
+    pub ttl_secs: u64,
+}
+
+/// A scanner-safe magic-link delivery (issue #68): the confirmation-page link AND the
+/// cross-device short code, both printed in the same email so a broken-link client still
+/// completes login. Both the link (it carries the single-use token) and the short code
+/// are live secrets.
+#[derive(Debug, Clone, Copy)]
+pub struct MagicLinkMessage<'a> {
+    /// The tenant/environment scope.
+    pub scope: Scope,
+    /// The flow the link authorizes.
+    pub purpose: EmailFactorPurpose,
+    /// The recipient email address.
+    pub recipient: &'a str,
+    /// The full confirmation-page URL the user opens (carries the single-use token).
+    pub link: &'a str,
+    /// The cross-device short code, entered on the originating device when the link is
+    /// opened elsewhere or the email client breaks the link.
+    pub short_code: &'a str,
+    /// The link lifetime in seconds (for the message copy).
+    pub ttl_secs: u64,
 }
 
 impl VerificationPurpose {
@@ -46,6 +85,19 @@ pub trait VerificationSender: Send + Sync + std::fmt::Debug {
     /// Deliver a verification message of `purpose` to `recipient` in `scope`. Called ONLY
     /// for a recipient a send is permitted to (never a suppressed one).
     fn send(&self, scope: Scope, purpose: VerificationPurpose, recipient: &str);
+
+    /// Deliver an email-OTP code (issue #68). Called ONLY for a recipient a send is
+    /// permitted to (never a suppressed one). The default is a no-op, so a deployment
+    /// with no transport wired behaves as before; a real transport (M11) overrides it.
+    fn deliver_email_otp(&self, message: &EmailOtpMessage<'_>) {
+        let _ = message;
+    }
+
+    /// Deliver a scanner-safe magic link and its cross-device short code (issue #68).
+    /// Called ONLY for a permitted recipient. The default is a no-op.
+    fn deliver_magic_link(&self, message: &MagicLinkMessage<'_>) {
+        let _ = message;
+    }
 }
 
 /// The default sender: it performs NO delivery (issue #64). The verification/OTP
@@ -56,6 +108,62 @@ pub struct NullVerificationSender;
 
 impl VerificationSender for NullVerificationSender {
     fn send(&self, _scope: Scope, _purpose: VerificationPurpose, _recipient: &str) {
-        // No transport yet (issue #68). Intentionally does nothing.
+        // No transport yet (issue #64). Intentionally does nothing.
+    }
+}
+
+/// A development / diagnostic transport (issue #68): it records that a delivery HAPPENED
+/// on the observability plane, and emits the live secret (the code, the link, the short
+/// code) ONLY at the `debug` trace level so it is available to a developer running a dev
+/// build but is NOT emitted at the `info` level a production sink typically ingests. The
+/// concrete production email provider (SMTP or an API) is a documented seam (M11
+/// messaging) that replaces this sender; this ships so the OTP / magic-link logic is
+/// exercisable end to end without a mail server.
+#[derive(Debug, Default)]
+pub struct LoggingVerificationSender;
+
+impl VerificationSender for LoggingVerificationSender {
+    fn send(&self, scope: Scope, purpose: VerificationPurpose, _recipient: &str) {
+        tracing::info!(
+            target: "ironauth.verification",
+            purpose = purpose.as_str(),
+            tenant = %scope.tenant(),
+            environment = %scope.environment(),
+            "verification message delivered (dev transport)"
+        );
+    }
+
+    fn deliver_email_otp(&self, message: &EmailOtpMessage<'_>) {
+        tracing::info!(
+            target: "ironauth.verification",
+            purpose = message.purpose.as_str(),
+            tenant = %message.scope.tenant(),
+            environment = %message.scope.environment(),
+            ttl_secs = message.ttl_secs,
+            "email OTP delivered (dev transport)"
+        );
+        // The code is a live secret: only at debug, never at info.
+        tracing::debug!(
+            target: "ironauth.verification",
+            code = message.code,
+            "email OTP code (dev transport, debug only)"
+        );
+    }
+
+    fn deliver_magic_link(&self, message: &MagicLinkMessage<'_>) {
+        tracing::info!(
+            target: "ironauth.verification",
+            purpose = message.purpose.as_str(),
+            tenant = %message.scope.tenant(),
+            environment = %message.scope.environment(),
+            ttl_secs = message.ttl_secs,
+            "magic link delivered (dev transport)"
+        );
+        tracing::debug!(
+            target: "ironauth.verification",
+            link = message.link,
+            short_code = message.short_code,
+            "magic link and short code (dev transport, debug only)"
+        );
     }
 }

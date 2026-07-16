@@ -6,6 +6,12 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Email OTP and scanner-safe magic-link settings (issue #68): new `oidc.email_otp_enabled`,
+  `oidc.email_otp_code_digits` (6..=8), `oidc.email_otp_code_ttl_secs` (the 300..=600
+  five-to-ten-minute band), `oidc.email_otp_max_attempts`, `oidc.magic_link_enabled`,
+  `oidc.magic_link_ttl_secs` (300..=3600), `oidc.magic_link_fragment_mode` (carry the token
+  in the URL fragment, out of server logs and scanner request paths), and
+  `oidc.magic_link_short_code_digits` (6..=8), all validated at startup with safe defaults.
 - `oidc.acr_order` setting (RFC 9470 step-up, issue #72): the DEPLOYMENT-level `acr` order
   (weakest first) the step-up comparison ranks against, so an acr floor is met by the same
   value or a rank at least as strong. Resolved once from config and applied across the

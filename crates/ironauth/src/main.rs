@@ -432,7 +432,16 @@ async fn build_oidc_router(
     let mut state = OidcState::new(store, env, registry, oidc_config, issuer_base)
         .with_global_token_revocation_enabled(global_revocation_enabled)
         .with_quota_enforcer(quota_enforcer)
-        .with_hashing_pool(hashing_pool);
+        .with_hashing_pool(hashing_pool)
+        // The email-OTP / magic-link factors (issue #68) deliver through the verification
+        // seam. Until a real email provider is wired (M11 messaging), ship the dev
+        // transport: it records deliveries on the observability plane and emits the code /
+        // link only at the `debug` trace level, so the OTP and magic-link logic works end
+        // to end without a mail server. A production deployment installs its own
+        // `VerificationSender` here.
+        .with_verification_sender(std::sync::Arc::new(
+            ironauth_oidc::LoggingVerificationSender,
+        ));
     // Arm the inbound lazy-migration hook on the login path (issue #56) when one is
     // configured; without it an unknown-identifier login is the uniform failure.
     if let Some(hook) = migration_hook {

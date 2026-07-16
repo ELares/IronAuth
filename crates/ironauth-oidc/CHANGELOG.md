@@ -6,6 +6,25 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Email OTP and scanner-safe magic links (issue #68): two passwordless / recovery /
+  address-verification factors on the #64 abuse-defense layer. Email OTP mints a numeric
+  6-8 digit code (per-tenant width and 5-10 minute TTL), single-active per (user, purpose)
+  so reissue invalidates the predecessor, hashed through the #62 pool (constant-time verify),
+  with a per-code attempt counter that kills a code after N wrong guesses; send/verify are
+  throttled per recipient and per tenant, and a send to an unknown recipient is suppressed
+  with an identical acknowledgment (the anti-enumeration contract). Magic links are the
+  differentiator: a GET on the link renders a CONFIRMATION PAGE ONLY (a prefetching email
+  scanner can never consume the single-use link), consumption is a POST from that page, the
+  token can ride the URL FRAGMENT (kept out of server logs and scanner request paths via a
+  nonce-guarded page script), and a same-device binding cookie binds consumption to the
+  requesting browser with a cross-device fallback to a short code printed in the same email.
+  Tokens are CSPRNG `ira_mlk_<id>~<secret>` stored digest-only (issue #29), the short code is
+  Argon2id-hashed, consumption is a guarded single-use UPDATE, and a successful sign-in
+  establishes a session with an honest `otp` amr (new `AuthMethod::EmailOtp`). New routes
+  `otp/send`, `otp/verify`, `magic/send`, `magic/confirm`, `magic/consume` (mapped in the
+  RFC 9700 checklist); the `VerificationSender` seam gains `deliver_email_otp` /
+  `deliver_magic_link` with a `LoggingVerificationSender` dev transport (the real email
+  provider is an M11 seam). New `oidc.email_otp_*` / `oidc.magic_link_*` config.
 - Step-up adversarial-review fixes (RFC 9470, issue #72): the step-up second-factor
   challenge (`/login/mfa`) is now THROTTLED through the #64 abuse regulation on a new
   INDEPENDENT `AuthPath::SecondFactor` path, so an online TOTP/recovery-code guess storm

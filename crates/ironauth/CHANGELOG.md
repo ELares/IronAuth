@@ -6,6 +6,11 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Email OTP and scanner-safe magic links (issue #68): the server binary now installs a
+  `LoggingVerificationSender` dev transport behind the #64 verification seam, so the email-
+  OTP and magic-link factors deliver end to end without a mail server (the code / link are
+  emitted only at the `debug` trace level; a real email provider is a documented M11 seam
+  a deployment installs in its place).
 - `step-up-policy set | list | remove` subcommands (RFC 9470 step-up, issue #72): set,
   list, and remove the declarative per-scope and per-client step-up authentication policy
   directly against the data-plane store, each an audited write through the SAME repositories
