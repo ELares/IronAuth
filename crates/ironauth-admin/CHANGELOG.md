@@ -6,6 +6,11 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- OpenAPI contract sync for the MDS3 health route (issue #66 PR B, adversarial review):
+  the hardcoded `openapi_contract` assertions now include `getMds3Health` and its
+  `GET .../webauthn/mds3/health` path and pin the served-route count at 61, matching the
+  regenerated `docs/openapi/management.json` (the route landed in sync but the contract
+  assertions had not been updated, a CI-red gap).
 - FIDO MDS3 cache health + attestation export coverage (issue #66 PR B): a new
   environment-scoped read `GET .../webauthn/mds3/health` surfaces the cached MDS3 BLOB
   sequence number, verify time, `nextUpdate`, entry count, and a fresh/stale/missing

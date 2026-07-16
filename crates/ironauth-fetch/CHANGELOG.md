@@ -6,6 +6,13 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Raise the MDS3 response cap so the feature works (issue #66 PR B, adversarial review):
+  the real FIDO MDS3 BLOB is several megabytes, past the 1 MiB default cap, so a sync would
+  fail closed with `ResponseTooLarge` and leave `direct` attestation inert. A new per-purpose
+  `FetchPurpose::response_cap` floors the `Mds3Sync` body cap at `MDS3_SYNC_MIN_RESPONSE_BYTES`
+  (32 MiB, still bounded) while every other purpose keeps the configured cap; the total-time
+  bound and SSRF hardening are unchanged. A behavior test proves a 2 MiB body is refused under
+  an ordinary purpose but fetched under `Mds3Sync`.
 - Add the `FetchPurpose::Mds3Sync` label (issue #66 PR B): the outbound FIDO MDS3 BLOB
   fetch declares its own purpose so it rides the SSRF-hardened path with a distinct,
   bounded metric label.

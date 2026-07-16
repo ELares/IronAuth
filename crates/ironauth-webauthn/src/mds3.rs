@@ -290,6 +290,9 @@ mod tests {
             not_before: 0,
             not_after,
             aaguid: None,
+            is_ca: true,
+            path_len: None,
+            key_usage: None,
         })
     }
 
@@ -302,6 +305,9 @@ mod tests {
             not_before: 0,
             not_after,
             aaguid: None,
+            is_ca: true,
+            path_len: None,
+            key_usage: None,
         })
     }
 
@@ -314,6 +320,9 @@ mod tests {
             not_before: 0,
             not_after,
             aaguid: None,
+            is_ca: false,
+            path_len: None,
+            key_usage: None,
         })
     }
 
@@ -326,6 +335,9 @@ mod tests {
             not_before: 0,
             not_after: FAR_FUTURE,
             aaguid: None,
+            is_ca: true,
+            path_len: None,
+            key_usage: None,
         });
         format!(
             "{{\"no\":42,\"nextUpdate\":\"2099-01-01\",\"entries\":[\
@@ -370,6 +382,9 @@ mod tests {
             not_before: 0,
             not_after: FAR_FUTURE,
             aaguid: None,
+            is_ca: true,
+            path_len: None,
+            key_usage: None,
         });
         assert_eq!(
             verify_blob(&valid_blob(FAR_FUTURE), &wrong_root, NOW),

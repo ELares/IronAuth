@@ -50,6 +50,12 @@ pub enum X509Error {
     UntrustedRoot,
     /// The chain was empty or exceeded the depth bound.
     BadChain,
+    /// A certificate used to sign another certificate violated a basic path
+    /// constraint: it was not a CA (`basicConstraints` `CA:TRUE` absent), its
+    /// `keyUsage` did not permit `keyCertSign`, or its `pathLenConstraint` was
+    /// exceeded. This is what stops a genuine end-entity leaf from being wielded
+    /// as an intermediate to mint a certificate for a different AAGUID.
+    ConstraintViolation,
 }
 
 impl From<DerError> for X509Error {
@@ -70,6 +76,15 @@ const OID_RSA_ENCRYPTION: &[u64] = &[1, 2, 840, 113_549, 1, 1, 1];
 const OID_FIDO_AAGUID: &[u64] = &[1, 3, 6, 1, 4, 1, 45_724, 1, 1, 4];
 // The common-name attribute type (id-at-commonName).
 const OID_COMMON_NAME: &[u64] = &[2, 5, 4, 3];
+// The basicConstraints extension (id-ce-basicConstraints).
+const OID_BASIC_CONSTRAINTS: &[u64] = &[2, 5, 29, 19];
+// The keyUsage extension (id-ce-keyUsage).
+const OID_KEY_USAGE: &[u64] = &[2, 5, 29, 15];
+
+/// The `keyCertSign` bit of an X.509 `KeyUsage` BIT STRING (bit 5, counting from
+/// the most-significant bit of the first octet), taken over the first two octets
+/// as a big-endian `u16`.
+const KEY_USAGE_KEY_CERT_SIGN: u16 = 1 << (15 - 5);
 
 /// The maximum certificate-chain depth (leaf plus intermediates). A real FIDO
 /// chain is two or three deep; a longer one is refused rather than walked.
@@ -97,6 +112,17 @@ pub struct Certificate<'a> {
     pub signature: Vec<u8>,
     /// The FIDO AAGUID from the id-fido-gen-ce-aaguid extension, if present.
     pub aaguid: Option<[u8; 16]>,
+    /// Whether `basicConstraints` asserts `CA:TRUE`. A certificate that signs
+    /// another certificate MUST be a CA; an end-entity leaf (this is `false`,
+    /// whether `CA:FALSE` or the extension is absent) may never act as an issuer.
+    pub is_ca: bool,
+    /// The `pathLenConstraint` from `basicConstraints`, if present: the maximum
+    /// number of intermediate CA certificates that may appear below this one in a
+    /// valid path.
+    pub path_len: Option<u64>,
+    /// The `keyUsage` bits (first two octets, big-endian), if the extension is
+    /// present. When present on an issuer, `keyCertSign` must be set.
+    pub key_usage: Option<u16>,
 }
 
 impl Certificate<'_> {
@@ -147,13 +173,13 @@ pub fn parse_certificate(der_bytes: &[u8]) -> Result<Certificate<'_>, X509Error>
     // subjectPublicKeyInfo.
     let public_key = parse_spki(tbs.take_tag(tag::SEQUENCE)?)?;
 
-    // Optional [1] issuerUniqueID, [2] subjectUniqueID, [3] extensions. We only want
-    // the AAGUID extension inside [3].
-    let mut aaguid = None;
+    // Optional [1] issuerUniqueID, [2] subjectUniqueID, [3] extensions. We read the
+    // AAGUID, basicConstraints, and keyUsage extensions from inside [3].
+    let mut ext = ParsedExtensions::default();
     while let Some(next) = tbs.peek_tag() {
         let (context_tag, contents) = tbs.take_any()?;
         if context_tag == (tag::CONTEXT_CONSTRUCTED | 3) {
-            aaguid = find_aaguid_extension(contents)?;
+            ext = parse_extensions(contents)?;
         }
         let _ = next;
     }
@@ -167,7 +193,10 @@ pub fn parse_certificate(der_bytes: &[u8]) -> Result<Certificate<'_>, X509Error>
         public_key,
         sig_alg,
         signature,
-        aaguid,
+        aaguid: ext.aaguid,
+        is_ca: ext.is_ca,
+        path_len: ext.path_len,
+        key_usage: ext.key_usage,
     })
 }
 
@@ -271,9 +300,22 @@ fn strip_integer(bytes: &[u8]) -> Vec<u8> {
     bytes[start..].to_vec()
 }
 
-/// Search an X.509 `Extensions` (`SEQUENCE OF Extension`) for the FIDO AAGUID
-/// extension and return its 16-byte value.
-fn find_aaguid_extension(contents: &[u8]) -> Result<Option<[u8; 16]>, X509Error> {
+/// The extension fields a chain check reads out of an X.509 `Extensions` block.
+#[derive(Debug, Default)]
+struct ParsedExtensions {
+    aaguid: Option<[u8; 16]>,
+    is_ca: bool,
+    path_len: Option<u64>,
+    key_usage: Option<u16>,
+}
+
+/// Parse the extensions the chain check needs from an X.509 `Extensions`
+/// (`[3] EXPLICIT SEQUENCE OF Extension`): the FIDO AAGUID, `basicConstraints`
+/// (`CA`, `pathLenConstraint`), and `keyUsage`. Unknown extensions are skipped.
+/// Every length read is guarded, so an attacker-supplied certificate can never
+/// panic this parser.
+fn parse_extensions(contents: &[u8]) -> Result<ParsedExtensions, X509Error> {
+    let mut out = ParsedExtensions::default();
     // [3] EXPLICIT wraps a single SEQUENCE OF Extension.
     let mut wrap = Der::new(contents);
     let mut exts = wrap.take_sequence()?;
@@ -295,10 +337,70 @@ fn find_aaguid_extension(contents: &[u8]) -> Result<Option<[u8; 16]>, X509Error>
             let mut inner = Der::new(ext_value);
             let raw = inner.take_tag(tag::OCTET_STRING)?;
             let bytes: [u8; 16] = raw.try_into().map_err(|_| X509Error::Malformed)?;
-            return Ok(Some(bytes));
+            out.aaguid = Some(bytes);
+        } else if oid == OID_BASIC_CONSTRAINTS {
+            let (is_ca, path_len) = parse_basic_constraints(ext_value)?;
+            out.is_ca = is_ca;
+            out.path_len = path_len;
+        } else if oid == OID_KEY_USAGE {
+            out.key_usage = Some(parse_key_usage(ext_value)?);
         }
     }
-    Ok(None)
+    Ok(out)
+}
+
+/// Parse a `basicConstraints` extnValue: an OCTET STRING wrapping
+/// `SEQUENCE { cA BOOLEAN DEFAULT FALSE, pathLenConstraint INTEGER OPTIONAL }`.
+/// Returns `(is_ca, path_len)`.
+fn parse_basic_constraints(ext_value: &[u8]) -> Result<(bool, Option<u64>), X509Error> {
+    let mut wrap = Der::new(ext_value);
+    let mut bc = wrap.take_sequence()?;
+    let mut is_ca = false;
+    if bc.peek_tag() == Some(tag::BOOLEAN) {
+        let value = bc.take_tag(tag::BOOLEAN)?;
+        // DER BOOLEAN TRUE is 0xFF, FALSE is 0x00; any nonzero octet reads as TRUE.
+        is_ca = value.iter().any(|&b| b != 0);
+    }
+    let mut path_len = None;
+    if bc.peek_tag() == Some(tag::INTEGER) {
+        path_len = Some(parse_unsigned_integer(bc.take_tag(tag::INTEGER)?)?);
+    }
+    Ok((is_ca, path_len))
+}
+
+/// Read a small non-negative DER INTEGER's contents into a `u64`, rejecting a
+/// negative or over-wide value (a `pathLenConstraint` is a small count).
+fn parse_unsigned_integer(bytes: &[u8]) -> Result<u64, X509Error> {
+    let (&first, _) = bytes.split_first().ok_or(X509Error::Malformed)?;
+    if first & 0x80 != 0 {
+        // A set sign bit means a negative integer, which pathLenConstraint is not.
+        return Err(X509Error::Malformed);
+    }
+    // Strip a single leading zero (DER sign padding), then require it to fit a u64.
+    let magnitude = if first == 0 { &bytes[1..] } else { bytes };
+    if magnitude.len() > 8 {
+        return Err(X509Error::Malformed);
+    }
+    let mut value = 0u64;
+    for &b in magnitude {
+        value = (value << 8) | u64::from(b);
+    }
+    Ok(value)
+}
+
+/// Parse a `keyUsage` extnValue: an OCTET STRING wrapping a BIT STRING. Returns
+/// the first two octets as a big-endian `u16` (bit 0 is the most-significant bit
+/// of the first octet), which is where `keyCertSign` (bit 5) lives.
+fn parse_key_usage(ext_value: &[u8]) -> Result<u16, X509Error> {
+    let mut wrap = Der::new(ext_value);
+    let bits = wrap.take_tag(tag::BIT_STRING)?;
+    let (&unused, data) = bits.split_first().ok_or(X509Error::Malformed)?;
+    if unused > 7 {
+        return Err(X509Error::Malformed);
+    }
+    let b0 = data.first().copied().unwrap_or(0);
+    let b1 = data.get(1).copied().unwrap_or(0);
+    Ok((u16::from(b0) << 8) | u16::from(b1))
 }
 
 /// Verify a certificate signature: the parent's public key over the child's raw
@@ -352,11 +454,17 @@ pub fn verify_chain<'a>(
             return Err(X509Error::Expired);
         }
     }
-    // Walk child -> parent within the presented chain.
-    for pair in chain.windows(2) {
+    // Walk child -> parent within the presented chain. Each `parent` is acting as a
+    // CA that issues `child`, so it MUST satisfy the CA path constraints: this is
+    // what stops a genuine end-entity leaf (CA:FALSE / no basicConstraints) from
+    // being wielded as an intermediate to mint a certificate for a different AAGUID.
+    // `intermediate_cas_below` is the number of intermediate CA certificates between
+    // this issuer and the leaf (the enumerate index), for the pathLenConstraint check.
+    for (intermediate_cas_below, pair) in chain.windows(2).enumerate() {
         let child = &pair[0];
         let parent = &pair[1];
         names_link(child, parent)?;
+        require_issuer_constraints(parent, intermediate_cas_below)?;
         verify_cert_signature(child, &parent.public_key)?;
     }
     // The last presented certificate must be signed by a pinned anchor.
@@ -385,6 +493,31 @@ pub fn verify_chain<'a>(
     Err(X509Error::UntrustedRoot)
 }
 
+/// A certificate acting as an issuer must satisfy the X.509 CA path constraints:
+/// it MUST be a CA (`basicConstraints` `CA:TRUE`), its `keyUsage` (when present)
+/// MUST permit `keyCertSign`, and its `pathLenConstraint` (when present) MUST NOT
+/// be exceeded by the number of intermediate CAs below it. Enforcing this on every
+/// presented intermediate is the fix for the leaf-as-CA path-validation defect.
+fn require_issuer_constraints(
+    issuer: &Certificate<'_>,
+    intermediate_cas_below: usize,
+) -> Result<(), X509Error> {
+    if !issuer.is_ca {
+        return Err(X509Error::ConstraintViolation);
+    }
+    if let Some(bits) = issuer.key_usage {
+        if bits & KEY_USAGE_KEY_CERT_SIGN == 0 {
+            return Err(X509Error::ConstraintViolation);
+        }
+    }
+    if let Some(max) = issuer.path_len {
+        if intermediate_cas_below as u64 > max {
+            return Err(X509Error::ConstraintViolation);
+        }
+    }
+    Ok(())
+}
+
 /// A child's issuer name must equal the parent's subject name. Both must carry a
 /// common name (an anonymous DN cannot anchor a chain match here).
 fn names_link(child: &Certificate<'_>, parent: &Certificate<'_>) -> Result<(), X509Error> {
@@ -402,6 +535,12 @@ mod tests {
     const NOW: i64 = 1_700_000_000;
     const FAR: i64 = 4_102_444_800;
 
+    // A `keyUsage` bit set holding only `keyCertSign` (bit 5) and, for the negative
+    // case, only `digitalSignature` (bit 0).
+    const KU_KEY_CERT_SIGN: u16 = 1 << (15 - 5);
+    const KU_DIGITAL_SIGNATURE: u16 = 1 << 15;
+
+    #[allow(clippy::too_many_arguments)]
     fn cert(
         subject: &str,
         issuer: &str,
@@ -409,6 +548,7 @@ mod tests {
         is: [u8; 32],
         not_after: i64,
         aaguid: Option<[u8; 16]>,
+        is_ca: bool,
     ) -> Vec<u8> {
         build_cert(&CertSpec {
             subject_cn: subject,
@@ -418,25 +558,49 @@ mod tests {
             not_before: 0,
             not_after,
             aaguid,
+            is_ca,
+            path_len: None,
+            key_usage: None,
         })
     }
 
     #[test]
     fn parses_fields_and_aaguid_extension() {
-        let der = cert("Leaf", "Root", [3; 32], [1; 32], FAR, Some([7; 16]));
+        let der = cert("Leaf", "Root", [3; 32], [1; 32], FAR, Some([7; 16]), false);
         let parsed = parse_certificate(&der).unwrap();
         assert_eq!(parsed.subject_cn.as_deref(), Some("Leaf"));
         assert_eq!(parsed.issuer_cn.as_deref(), Some("Root"));
         assert_eq!(parsed.aaguid, Some([7; 16]));
+        assert!(!parsed.is_ca, "an end-entity leaf has no CA:TRUE");
         assert!(parsed.is_valid_at(NOW));
         assert!(matches!(parsed.public_key, WebauthnKey::Ed25519 { .. }));
     }
 
     #[test]
+    fn parses_basic_constraints_and_key_usage() {
+        let der = build_cert(&CertSpec {
+            subject_cn: "Int",
+            issuer_cn: "Root",
+            subject_seed: [2; 32],
+            issuer_seed: [1; 32],
+            not_before: 0,
+            not_after: FAR,
+            aaguid: None,
+            is_ca: true,
+            path_len: Some(3),
+            key_usage: Some(KU_KEY_CERT_SIGN),
+        });
+        let parsed = parse_certificate(&der).unwrap();
+        assert!(parsed.is_ca);
+        assert_eq!(parsed.path_len, Some(3));
+        assert_eq!(parsed.key_usage, Some(KU_KEY_CERT_SIGN));
+    }
+
+    #[test]
     fn a_two_hop_chain_verifies_to_the_root() {
-        let root_der = cert("Root", "Root", [1; 32], [1; 32], FAR, None);
-        let int_der = cert("Int", "Root", [2; 32], [1; 32], FAR, None);
-        let leaf_der = cert("Leaf", "Int", [3; 32], [2; 32], FAR, None);
+        let root_der = cert("Root", "Root", [1; 32], [1; 32], FAR, None, true);
+        let int_der = cert("Int", "Root", [2; 32], [1; 32], FAR, None, true);
+        let leaf_der = cert("Leaf", "Int", [3; 32], [2; 32], FAR, None, false);
         let root = parse_certificate(&root_der).unwrap();
         let int = parse_certificate(&int_der).unwrap();
         let leaf = parse_certificate(&leaf_der).unwrap();
@@ -445,9 +609,9 @@ mod tests {
 
     #[test]
     fn a_chain_to_a_wrong_root_is_untrusted() {
-        let int_der = cert("Int", "Root", [2; 32], [1; 32], FAR, None);
-        let leaf_der = cert("Leaf", "Int", [3; 32], [2; 32], FAR, None);
-        let wrong_root_der = cert("Other", "Other", [9; 32], [9; 32], FAR, None);
+        let int_der = cert("Int", "Root", [2; 32], [1; 32], FAR, None, true);
+        let leaf_der = cert("Leaf", "Int", [3; 32], [2; 32], FAR, None, false);
+        let wrong_root_der = cert("Other", "Other", [9; 32], [9; 32], FAR, None, true);
         let leaf = parse_certificate(&leaf_der).unwrap();
         let int = parse_certificate(&int_der).unwrap();
         let wrong = parse_certificate(&wrong_root_der).unwrap();
@@ -459,8 +623,8 @@ mod tests {
 
     #[test]
     fn an_expired_certificate_is_rejected() {
-        let root_der = cert("Root", "Root", [1; 32], [1; 32], 1_000, None);
-        let leaf_der = cert("Leaf", "Root", [3; 32], [1; 32], 1_000, None);
+        let root_der = cert("Root", "Root", [1; 32], [1; 32], 1_000, None, true);
+        let leaf_der = cert("Leaf", "Root", [3; 32], [1; 32], 1_000, None, false);
         let root = parse_certificate(&root_der).unwrap();
         let leaf = parse_certificate(&leaf_der).unwrap();
         assert_eq!(
@@ -473,10 +637,161 @@ mod tests {
     fn a_forged_signature_does_not_verify() {
         // A leaf that CLAIMS to be issued by Root but was actually signed by a
         // different (attacker) key must not verify against the real root.
-        let root_der = cert("Root", "Root", [1; 32], [1; 32], FAR, None);
-        let forged_leaf_der = cert("Leaf", "Root", [3; 32], [8; 32], FAR, None); // signed by [8], not root
+        let root_der = cert("Root", "Root", [1; 32], [1; 32], FAR, None, true);
+        // signed by [8], not root:
+        let forged_leaf_der = cert("Leaf", "Root", [3; 32], [8; 32], FAR, None, false);
         let root = parse_certificate(&root_der).unwrap();
         let leaf = parse_certificate(&forged_leaf_der).unwrap();
         assert!(verify_chain(&[leaf], std::slice::from_ref(&root), NOW).is_err());
+    }
+
+    #[test]
+    fn a_genuine_leaf_used_as_an_intermediate_is_rejected() {
+        // The PROVEN break: a genuine end-entity attestation leaf (issued by the
+        // model root, CA:FALSE) is wielded as an INTERMEDIATE to sign a forged
+        // sub-certificate for a DIFFERENT AAGUID. Before basicConstraints was
+        // enforced, the chain [forged, real_leaf] -> model_root verified, defeating
+        // the AAGUID-spoof defense for anyone holding a key under a shared root.
+        let model_root_der = cert(
+            "Model Root",
+            "Model Root",
+            [1; 32],
+            [1; 32],
+            FAR,
+            None,
+            true,
+        );
+        // A REAL end-entity leaf: CA:FALSE (is_ca = false), legitimately issued by
+        // the model root.
+        let real_leaf_der = cert(
+            "Real Leaf",
+            "Model Root",
+            [2; 32],
+            [1; 32],
+            FAR,
+            None,
+            false,
+        );
+        // The attacker signs a sub-cert (for a different model) with the real leaf's
+        // key, presenting the real leaf as an intermediate.
+        let forged_der = cert(
+            "Forged Sub",
+            "Real Leaf",
+            [3; 32],
+            [2; 32],
+            FAR,
+            Some([0xAA; 16]),
+            false,
+        );
+        let model_root = parse_certificate(&model_root_der).unwrap();
+        let real_leaf = parse_certificate(&real_leaf_der).unwrap();
+        let forged = parse_certificate(&forged_der).unwrap();
+
+        // Sanity: the signatures are all genuine (this is a path-constraint break,
+        // not a forged-signature one) - only the CA constraint stops it.
+        assert!(verify_cert_signature(&forged, &real_leaf.public_key).is_ok());
+
+        assert_eq!(
+            verify_chain(&[forged, real_leaf], std::slice::from_ref(&model_root), NOW).err(),
+            Some(X509Error::ConstraintViolation),
+            "a genuine leaf (CA:FALSE) presented as an intermediate must be rejected"
+        );
+    }
+
+    #[test]
+    fn a_proper_ca_intermediate_still_verifies() {
+        // The valid counterpart to the break: the SAME chain shape, but the middle
+        // cert is a proper CA:TRUE intermediate whose keyUsage permits keyCertSign.
+        // It must still verify (no false-negative on the legitimate path).
+        let root_der = cert(
+            "Model Root",
+            "Model Root",
+            [1; 32],
+            [1; 32],
+            FAR,
+            None,
+            true,
+        );
+        let int_der = build_cert(&CertSpec {
+            subject_cn: "Real Intermediate",
+            issuer_cn: "Model Root",
+            subject_seed: [2; 32],
+            issuer_seed: [1; 32],
+            not_before: 0,
+            not_after: FAR,
+            aaguid: None,
+            is_ca: true,
+            path_len: Some(0),
+            key_usage: Some(KU_KEY_CERT_SIGN),
+        });
+        let leaf_der = cert(
+            "Signer",
+            "Real Intermediate",
+            [3; 32],
+            [2; 32],
+            FAR,
+            None,
+            false,
+        );
+        let root = parse_certificate(&root_der).unwrap();
+        let int = parse_certificate(&int_der).unwrap();
+        let leaf = parse_certificate(&leaf_der).unwrap();
+        assert!(verify_chain(&[leaf, int], std::slice::from_ref(&root), NOW).is_ok());
+    }
+
+    #[test]
+    fn an_issuer_without_key_cert_sign_is_rejected() {
+        // A CA:TRUE intermediate whose keyUsage extension is present but does NOT
+        // assert keyCertSign may not sign certificates.
+        let root_der = cert("Root", "Root", [1; 32], [1; 32], FAR, None, true);
+        let int_der = build_cert(&CertSpec {
+            subject_cn: "Int",
+            issuer_cn: "Root",
+            subject_seed: [2; 32],
+            issuer_seed: [1; 32],
+            not_before: 0,
+            not_after: FAR,
+            aaguid: None,
+            is_ca: true,
+            path_len: None,
+            key_usage: Some(KU_DIGITAL_SIGNATURE), // no keyCertSign
+        });
+        let leaf_der = cert("Leaf", "Int", [3; 32], [2; 32], FAR, None, false);
+        let root = parse_certificate(&root_der).unwrap();
+        let int = parse_certificate(&int_der).unwrap();
+        let leaf = parse_certificate(&leaf_der).unwrap();
+        assert_eq!(
+            verify_chain(&[leaf, int], std::slice::from_ref(&root), NOW).err(),
+            Some(X509Error::ConstraintViolation)
+        );
+    }
+
+    #[test]
+    fn a_path_len_constraint_is_enforced() {
+        // The high intermediate pins pathLenConstraint = 0: no CA may appear below
+        // it, yet a second intermediate does, so the path is refused.
+        let root_der = cert("Root", "Root", [1; 32], [1; 32], FAR, None, true);
+        let high_der = build_cert(&CertSpec {
+            subject_cn: "High Int",
+            issuer_cn: "Root",
+            subject_seed: [2; 32],
+            issuer_seed: [1; 32],
+            not_before: 0,
+            not_after: FAR,
+            aaguid: None,
+            is_ca: true,
+            path_len: Some(0),
+            key_usage: None,
+        });
+        let low_der = cert("Low Int", "High Int", [3; 32], [2; 32], FAR, None, true);
+        let leaf_der = cert("Leaf", "Low Int", [4; 32], [3; 32], FAR, None, false);
+        let root = parse_certificate(&root_der).unwrap();
+        let high = parse_certificate(&high_der).unwrap();
+        let low = parse_certificate(&low_der).unwrap();
+        let leaf = parse_certificate(&leaf_der).unwrap();
+        assert_eq!(
+            verify_chain(&[leaf, low, high], std::slice::from_ref(&root), NOW).err(),
+            Some(X509Error::ConstraintViolation)
+        );
     }
 }

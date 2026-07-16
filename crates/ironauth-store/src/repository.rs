@@ -2434,7 +2434,8 @@ impl ActingMds3BlobCacheRepo<'_> {
                      DO UPDATE SET blob_no = EXCLUDED.blob_no, next_update = EXCLUDED.next_update, \
                        payload_jsonb = EXCLUDED.payload_jsonb, blob_digest = EXCLUDED.blob_digest, \
                        fetched_at = EXCLUDED.fetched_at, verified_at = EXCLUDED.verified_at, \
-                       updated_at = EXCLUDED.updated_at",
+                       updated_at = EXCLUDED.updated_at \
+                     WHERE EXCLUDED.blob_no > mds3_blob_cache.blob_no",
                 )
                 .bind(id.to_string())
                 .bind(scope.tenant().to_string())

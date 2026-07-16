@@ -389,6 +389,9 @@ mod tests {
             not_before: 0,
             not_after: FAR,
             aaguid: None,
+            is_ca: true,
+            path_len: None,
+            key_usage: None,
         })
     }
 
@@ -401,6 +404,9 @@ mod tests {
             not_before: 0,
             not_after: FAR,
             aaguid: cert_aaguid,
+            is_ca: false,
+            path_len: None,
+            key_usage: None,
         })
     }
 
@@ -474,6 +480,9 @@ mod tests {
             not_before: 0,
             not_after: FAR,
             aaguid: None,
+            is_ca: true,
+            path_len: None,
+            key_usage: None,
         });
         assert_eq!(
             verify_attestation(&obj, CDH, &cred_key, &AAGUID, &[wrong_root], NOW),

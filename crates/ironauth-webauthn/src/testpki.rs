@@ -117,6 +117,41 @@ fn aaguid_extension(aaguid: &[u8; 16]) -> Vec<u8> {
     seq(&[oid(&[1, 3, 6, 1, 4, 1, 45724, 1, 1, 4]), ext_value])
 }
 
+/// The `basicConstraints` extension (`id-ce-basicConstraints`, 2.5.29.19),
+/// critical, asserting `cA` = TRUE with an optional `pathLenConstraint`.
+fn basic_constraints_extension(path_len: Option<u64>) -> Vec<u8> {
+    // SEQUENCE { cA BOOLEAN TRUE, pathLenConstraint INTEGER OPTIONAL }.
+    let mut inner = vec![tlv(tag::BOOLEAN, &[0xFF])];
+    if let Some(len) = path_len {
+        inner.push(int(len));
+    }
+    let ext_value = tlv(tag::OCTET_STRING, &seq(&inner));
+    seq(&[
+        oid(&[2, 5, 29, 19]),
+        tlv(tag::BOOLEAN, &[0xFF]), // critical
+        ext_value,
+    ])
+}
+
+/// The `keyUsage` extension (`id-ce-keyUsage`, 2.5.29.15), critical, with the
+/// given bits (bit 0 is the most-significant bit of the first octet). Emitted
+/// with zero unused bits over one or two octets.
+fn key_usage_extension(bits: u16) -> Vec<u8> {
+    let b0 = (bits >> 8) as u8;
+    let b1 = (bits & 0xFF) as u8;
+    let mut body = vec![0x00, b0];
+    if b1 != 0 {
+        body.push(b1);
+    }
+    let bit_string = tlv(tag::BIT_STRING, &body);
+    let ext_value = tlv(tag::OCTET_STRING, &bit_string);
+    seq(&[
+        oid(&[2, 5, 29, 15]),
+        tlv(tag::BOOLEAN, &[0xFF]), // critical
+        ext_value,
+    ])
+}
+
 /// A test certificate specification.
 pub struct CertSpec<'a> {
     /// The subject common name.
@@ -133,6 +168,15 @@ pub struct CertSpec<'a> {
     pub not_after: i64,
     /// An optional FIDO AAGUID extension value.
     pub aaguid: Option<[u8; 16]>,
+    /// Emit a critical `basicConstraints` `CA:TRUE`. Set on a certificate that
+    /// issues another certificate (a root or intermediate); left `false` on an
+    /// end-entity leaf.
+    pub is_ca: bool,
+    /// An optional `pathLenConstraint` (only meaningful alongside `is_ca`).
+    pub path_len: Option<u64>,
+    /// An optional critical `keyUsage` extension (bits big-endian, bit 0 is the
+    /// MSB of the first octet). `keyCertSign` is bit 5 (`0x0400`).
+    pub key_usage: Option<u16>,
 }
 
 /// Build a signed DER certificate from a [`CertSpec`].
@@ -158,10 +202,19 @@ pub fn build_cert(spec: &CertSpec<'_>) -> Vec<u8> {
         // subjectPublicKeyInfo.
         ed25519_spki(&subject_pub),
     ];
+    // [3] EXPLICIT extensions, emitted when any extension is present.
+    let mut extensions: Vec<Vec<u8>> = Vec::new();
+    if spec.is_ca || spec.path_len.is_some() {
+        extensions.push(basic_constraints_extension(spec.path_len));
+    }
+    if let Some(bits) = spec.key_usage {
+        extensions.push(key_usage_extension(bits));
+    }
     if let Some(aaguid) = spec.aaguid {
-        // [3] EXPLICIT extensions.
-        let extensions = seq(&[aaguid_extension(&aaguid)]);
-        tbs_elements.push(tlv(tag::CONTEXT_CONSTRUCTED | 3, &extensions));
+        extensions.push(aaguid_extension(&aaguid));
+    }
+    if !extensions.is_empty() {
+        tbs_elements.push(tlv(tag::CONTEXT_CONSTRUCTED | 3, &seq(&extensions)));
     }
     let tbs = seq(&tbs_elements);
     let signature = test_util::ed25519_sign(&spec.issuer_seed, &tbs);

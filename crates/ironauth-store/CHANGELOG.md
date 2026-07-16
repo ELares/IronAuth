@@ -6,6 +6,13 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- MDS3 cache rollback protection (issue #66 PR B, adversarial review): the
+  `mds3_blob_cache` upsert now enforces the documented monotonic rule with an
+  `ON CONFLICT ... WHERE EXCLUDED.blob_no > mds3_blob_cache.blob_no` guard, so a replayed
+  older-but-validly-signed BLOB is a silent no-op and cannot roll the cache back to
+  re-admit a model a newer BLOB removed (a byte-identical refetch is likewise a no-op).
+  New real-Postgres regression test: seeding `blob_no` = N then replaying N-1 leaves the
+  cache at N, while a genuinely newer N+1 advances it.
 - Passkey attestation schema (issue #66 PR B): migration 0051 adds `mds3_blob_cache`
   (the per-scope verified FIDO MDS3 snapshot, RLS forced, singleton per scope) and
   `aaguid_rules` (per-scope AAGUID allow/deny, RLS forced), and three reg-time-immutable

@@ -6,6 +6,14 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Direct-mode attestation end-to-end coverage (issue #66 PR B, adversarial review): a new
+  `webauthn_attestation` integration test (real database, software authenticator) exercises
+  the registration GLUE the unit tests could not: attestation mode `direct`, the AAGUID-rule
+  disposition lookup, the `mds3_blob_cache` read/parse, the packed-format dispatch, and the
+  row stamping. It proves a valid packed attestation over an allow-listed AAGUID stamps
+  `attestation_verified` + `attestation_type`/`fmt` and that a subsequent login reaches the
+  `attested_passkey` acr, plus the fail-closed negative: a non-allow-listed AAGUID under
+  `direct` is rejected and stamps nothing.
 - Passkey attestation activation (issue #66 PR B): the dormant `attested_passkey`
   credential-class rung is now ACTIVE. Registration under a tenant's `direct` attestation
   mode evaluates the presented AAGUID against the allow/deny rules and validates the
