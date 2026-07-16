@@ -435,6 +435,61 @@ async fn every_identity_column_is_exported_or_a_documented_non_exported_field() 
                 "last_used_at",    // live usage state
             ],
         },
+        // The totp_credentials registry (issue #69): a user's enrolled TOTP
+        // authenticators. Unlike a passkey, a TOTP seed IS a portable shared secret,
+        // exactly the class the exit covenant says to export (like a password hash):
+        // it is sealed at rest and OPENED for the gated, audited export, so it
+        // round-trips into a fresh instance. The seed, the friendly name, the
+        // parameters, the status, and the single-use step are exported; the ids /
+        // scope / key version are re-minted / re-sealed at import; the timestamps and
+        // the resync offset are live operational state.
+        TableCoverage {
+            table: "totp_credentials",
+            exported: &[
+                "totp_seed",            // -> totp[].seed_base32 (opened, the covenant secret)
+                "friendly_name_sealed", // -> totp[].friendly_name (opened)
+                "algorithm",            // -> totp[].algorithm
+                "digits",               // -> totp[].digits
+                "period_secs",          // -> totp[].period_secs
+                "status",               // -> totp[].status
+                "last_consumed_step",   // -> totp[].last_consumed_step (single-use spine)
+            ],
+            derived: &[
+                "id",              // a `tot_` id, re-minted per target scope
+                "tenant_id",       // the target scope
+                "environment_id",  // the target scope
+                "subject",         // re-linked to the imported user's fresh usr_ id
+                "pii_dek_version", // the seed and name re-seal under the target DEK
+            ],
+            operational: &[
+                "last_offset",  // resync drift offset, live device state
+                "created_at",   // enrollment time on this instance
+                "activated_at", // activation time on this instance
+                "last_used_at", // live usage state
+            ],
+        },
+        // The recovery_codes store (issue #69): a user's one-time recovery codes.
+        // Each code_hash is a one-way Argon2id verifier (never a plaintext code),
+        // carried verbatim exactly like a password hash, plus its consumed state, so
+        // the covenant round-trips the recovery-code set. The ids / scope are
+        // re-minted at import; created_at is set fresh.
+        TableCoverage {
+            table: "recovery_codes",
+            exported: &[
+                "code_hash",   // -> recovery_codes[].code_hash (one-way, like a password)
+                "consumed_at", // -> recovery_codes[].consumed (single-use state)
+            ],
+            derived: &[
+                "id",             // a `rvc_` id, re-minted per target scope
+                "tenant_id",      // the target scope
+                "environment_id", // the target scope
+                "subject",        // re-linked to the imported user's fresh usr_ id
+                "generation",     // the batch marker, re-numbered on a fresh import
+            ],
+            operational: &[
+                "created_at", // set fresh at import
+            ],
+        },
     ];
 
     let db = TestDatabase::start().await;

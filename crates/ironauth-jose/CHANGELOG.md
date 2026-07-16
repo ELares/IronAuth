@@ -6,6 +6,20 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- RFC 6238 TOTP primitive (issue #69), a new public `totp` module. The
+  second-factor code is a keyed HMAC over a time-step counter plus RFC 4226
+  dynamic truncation, so it lives here for the same structural reason as
+  `envelope` and `webauthn`: `scripts/jose-audit.sh` lets exactly one crate name
+  `ring::hmac`, and building on the ring HMAC that already signs JOSE HMACs keeps
+  the workspace free of a high-level TOTP crate and a raw `hmac`/`sha1` edge. It
+  exposes `TotpAlgorithm` (SHA1 default, SHA256, SHA512), `TotpParams` (6..=8
+  digits, a 15..=60 second period), `code_at`, `verify` (constant-time over the
+  drift window, returning the matched absolute time-step for single-use and
+  resync), Base32 encode/decode plus `grouped_secret` for manual entry, and
+  `provisioning_uri` for the `otpauth://` QR payload. The primitive is pure (the
+  caller supplies `env.clock().now_utc()`), tested against the RFC 6238 appendix
+  vectors. No HOTP surface: the only counter formed is `unix_time / period`.
+
 - WebAuthn ceremony signature verification (issue #65), a new public `webauthn`
   module. A FIDO2 ceremony signature is not a JWS: the signed message is
   `authenticatorData || SHA-256(clientDataJSON)`, the ECDSA signature is ASN.1

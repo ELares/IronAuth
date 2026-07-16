@@ -6,6 +6,24 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- TOTP authenticators and recovery codes (issue #69, migration 0045, expand): two
+  new tenant-scoped tables with forced row-level security. `totp_credentials` holds
+  one row per enrolled authenticator with the RFC 6238 SEED sealed under the scope
+  DEK (issue #48, the `totp_seed` bytea, never plaintext), the parameters, the
+  enrollment status (pending until a code-verified activation, so an abandoned
+  enrollment leaves no active factor), the single-use `last_consumed_step` (a
+  verification advances it strictly upward, so a replayed time-step is refused), and
+  the resync `last_offset`. `recovery_codes` holds one-time codes stored as Argon2id
+  hashes (issue #62), single-use, with a full regeneration invalidating the prior
+  batch. New repos `TotpCredentialRepo` / `ActingTotpCredentialRepo` (begin_enroll,
+  activate, record_verification, remove, open_material) and `RecoveryCodeRepo` /
+  `ActingRecoveryCodeRepo` (replace_all, redeem, unconsumed, remaining_count); new
+  audit actions `account.totp.*` and `account.recovery_code*` (a TOTP verify audited
+  DISTINCTLY from a recovery redemption); new `tot_` / `rvc_` scoped id kinds. The
+  exit export (issue #58) now carries the OPENED seed (`ExportedTotp`) and the
+  recovery-code hashes (`ExportedRecoveryCode`) on `UserExportRecord`, so the exit
+  covenant carries the second factor.
+
 - `UserRepo::rehash_native_password` (issue #62): lands the transparent upgrade of a
   NATIVE Argon2id credential to the current hashing parameters after a successful login.
   It writes the recomputed verifier onto `password_hash` and audits one

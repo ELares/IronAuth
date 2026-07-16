@@ -6,6 +6,15 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- TOTP second-factor settings on `[oidc]` (issue #69): `totp_enabled` (on by
+  default; the endpoints fail closed with a 404 when off), `totp_issuer` (the
+  authenticator-app label, derived from the serving scope when unset),
+  `totp_period_secs` (15..=60), `totp_digits` (6..=8), `totp_drift_steps` (0..=2,
+  the bounded skew window), `totp_recovery_code_count` (8..=16), plus the factor
+  orchestration knobs `mfa_required` and `mfa_factor_order` (a duplicate-free subset
+  of passkey/totp/password). A new `validate_totp` bounds each at startup, so a
+  misconfiguration is a boot-time error rather than a per-request surprise.
+
 - `[password_hashing]` settings (issue #62): a new `PasswordHashingConfig` table for the
   Argon2id parameters of NEWLY set passwords and the dedicated hashing worker pool.
   `memory_kib`/`iterations`/`parallelism` default to the OWASP recommendation

@@ -285,6 +285,31 @@ impl ScopedKind for WebauthnChallengeKind {
     const PREFIX: &'static str = "wch";
 }
 
+/// Marker for an enrolled TOTP authenticator (`tot_`), one row in the per-user
+/// TOTP registry (issue #69): the RFC 6238 shared secret SEED sealed under the
+/// scope DEK, the parameters, the enrollment status, the single-use last-consumed
+/// time-step, and the resync offset. A tenant-scoped resource: the id embeds its
+/// `(tenant, environment)`, so a credential minted in one scope parses as a uniform
+/// not-found under another, and it is only ever reachable by the subject it is
+/// bound to. The seed it points at is SEALED secret material, never a bearer value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TotpCredentialKind;
+impl ScopedKind for TotpCredentialKind {
+    const PREFIX: &'static str = "tot";
+}
+
+/// Marker for a one-time recovery code (`rvc_`), one row in the per-user
+/// recovery-code set (issue #69): the Argon2id hash of a single code, single-use.
+/// A tenant-scoped resource: the id embeds its `(tenant, environment)`, so a row
+/// minted in one scope parses as a uniform not-found under another, and it is only
+/// ever reachable by the subject it is bound to. The value it points at is a
+/// one-way hash, never a plaintext code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RecoveryCodeKind;
+impl ScopedKind for RecoveryCodeKind {
+    const PREFIX: &'static str = "rvc";
+}
+
 /// Marker for a flexible login identifier (`uid_`), one row in a user's typed
 /// login-identifier set (issue #54): a verified-or-not email, username, or phone a
 /// user can log in with. A tenant-scoped resource: the identifier row id embeds its
@@ -785,6 +810,14 @@ pub type WebauthnCredentialId = ScopedId<WebauthnCredentialKind>;
 
 /// A single-use WebAuthn ceremony challenge handle (`wch_`, issue #65).
 pub type WebauthnChallengeId = ScopedId<WebauthnChallengeKind>;
+/// An enrolled TOTP authenticator id (`tot_...`), one row in the per-user TOTP
+/// registry (issue #69).
+pub type TotpCredentialId = ScopedId<TotpCredentialKind>;
+
+/// A one-time recovery code id (`rvc_...`), one row in the per-user recovery-code
+/// set (issue #69).
+pub type RecoveryCodeId = ScopedId<RecoveryCodeKind>;
+
 /// A flexible-login-identifier row id (`uid_...`), one typed login identifier
 /// (email, username, or phone) a user can authenticate with (issue #54).
 pub type UserIdentifierId = ScopedId<UserIdentifierKind>;

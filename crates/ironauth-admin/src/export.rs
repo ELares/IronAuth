@@ -301,6 +301,8 @@ mod tests {
             foreign_password_hash: None,
             foreign_password_algo: None,
             credentials: Vec::new(),
+            totp: Vec::new(),
+            recovery_codes: Vec::new(),
             created_at_unix_micros: i64::try_from(n).unwrap_or(i64::MAX),
         }
     }

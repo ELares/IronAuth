@@ -6,6 +6,13 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Exit-export coverage for the TOTP second factor (issue #69/#58): the identity
+  export now carries a user's enrolled TOTP authenticators (with the OPENED seed,
+  sealed at rest and opened only for the gated, audited export) and their
+  recovery-code hashes, and the field-coverage guard classifies every column of the
+  new `totp_credentials` and `recovery_codes` tables, so the exit covenant stays
+  honest and the guard stays green.
+
 - In-admin Argon2id tuning probe (issue #62): a new env-scoped, permission-gated
   `POST /v1/tenants/{tenant}/environments/{environment}/password-hashing/probe` runs the
   host-measured `ironauth_oidc::run_probe` (on a blocking thread, never inline on the

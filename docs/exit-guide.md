@@ -62,6 +62,8 @@ optional and omitted when empty.
 | `traits_schema_version` | The trait-schema version the traits last validated against, preserved verbatim. |
 | `password_hash` | The password verifier as an algorithm-tagged string (see below), if the account has a credential. |
 | `credentials` | The account's enrolled MFA / login credential registry (see below), if any: each passkey, TOTP, or recovery-code enrollment. |
+| `totp` | The account's enrolled TOTP authenticators (issue #69), if any, each with its OPENED seed (see below), so the second factor round-trips. |
+| `recovery_codes` | The account's one-time recovery codes (issue #69), if any, each as its one-way hash plus its consumed state. |
 
 Example line (formatting added for readability; a real line is one physical line):
 
@@ -76,6 +78,17 @@ Example line (formatting added for readability; a real line is one physical line
   "credentials": [
     { "credential_type": "passkey", "friendly_name": "my laptop" },
     { "credential_type": "totp", "friendly_name": "authenticator app", "last_used_at": 1710000000000000 }
+  ],
+  "totp": [
+    {
+      "friendly_name": "authenticator app",
+      "seed_base32": "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ",
+      "algorithm": "SHA1", "digits": 6, "period_secs": 30,
+      "status": "active", "last_consumed_step": 56789012
+    }
+  ],
+  "recovery_codes": [
+    { "code_hash": "$argon2id$v=19$...<digest>", "consumed": false }
   ]
 }
 ```
@@ -95,11 +108,22 @@ metadata that the credential registry stores today:
 
 On import each enrollment is re-created under the destination user with a fresh
 credential id, its friendly name re-sealed under the destination environment's key,
-and `usable_for_login` re-derived from the factor kind. Verifiable MFA SECRET
-material (a TOTP seed, a passkey public key) is not a registry column in this
-release; when those factor issues add the columns, the material joins this array
-automatically, because the field-coverage test fails the build the moment a
-credential-registry column is added without export coverage (see below).
+and `usable_for_login` re-derived from the factor kind.
+
+### The TOTP second factor and recovery codes (issue #69)
+
+A TOTP seed is a long-lived shared secret, exactly the class the exit covenant says
+to export (like a password hash): it is sealed at rest under the tenant DEK and
+OPENED only for the gated, audited export. Each object in the `totp` array carries
+the opened `seed_base32` plus the RFC 6238 parameters (`algorithm`, `digits`,
+`period_secs`), the enrollment `status`, and the single-use `last_consumed_step`, so
+a destination instance re-seals the seed and the authenticator keeps working. Each
+`recovery_codes` object carries the one-way Argon2id `code_hash` (never a plaintext
+code, exactly like a password verifier) and whether it was already `consumed`. A
+registered WebAuthn passkey is deliberately NOT portable (see below); a TOTP seed is,
+so it round-trips. The field-coverage test enumerates every column of
+`totp_credentials` and `recovery_codes`, so no second-factor column can silently
+escape export coverage.
 
 ### What is NOT in a record, and why
 
@@ -115,13 +139,13 @@ The export omits fields that are re-created at the destination rather than carri
 - Soft-deleted (offboarded) users are excluded: a tombstone is not exported.
 - The account's enrolled MFA / login credential REGISTRY (passkey, TOTP, and
   recovery-code enrollments) IS exported today, in the `credentials` array above: the
-  factor kind, the friendly name, and the last-used instant round-trip. What is not
-  yet a registry column, and so is not yet exported, is the verifiable MFA SECRET
-  material a factor verifies against (a TOTP seed, a passkey public key); those
-  columns land with the factor issues, and the field-coverage test fails the build
-  the moment a credential-registry (or user) column is added without export coverage,
-  so nothing can silently escape. The field-coverage test enumerates the FULL
-  identity model (`users` and `account_credentials`), not one table.
+  factor kind, the friendly name, and the last-used instant round-trip. The TOTP
+  SEED and the recovery-code hashes ARE exported too (issue #69), in the `totp` and
+  `recovery_codes` arrays above: a TOTP seed is a portable shared secret the covenant
+  carries, sealed at rest and opened for the audited export. The field-coverage test
+  fails the build the moment a credential-registry (or user, or `totp_credentials`,
+  or `recovery_codes`) column is added without export coverage, so nothing can
+  silently escape. The test enumerates the FULL identity model, not one table.
 - A registered WebAuthn passkey (the `webauthn_credentials` table, issue #65) is NOT
   in a record. Unlike a password hash, a passkey is DEVICE-BOUND and not portable
   across IdP instances: the private key never leaves the authenticator, and the

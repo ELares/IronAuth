@@ -6,6 +6,25 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- TOTP second-factor and recovery-code endpoints (issue #69), a new self-service
+  `totp` module mounted under `/t/{tenant}/e/{environment}/account/mfa/...`.
+  `totp/enroll` mints a seed from the entropy seam, seals it (issue #48), and returns
+  the `otpauth://` provisioning URI plus the grouped Base32 secret;
+  `totp/verify-enrollment` activates the factor ONLY after a valid current code and
+  mints the one-time recovery codes shown once; `totp/verify` checks a second-factor
+  code with a bounded drift window, a constant-time compare, and the hard store-level
+  single-use invariant (a replay is the uniform invalid-code response);
+  `recovery-codes/redeem` spends a code (hashed through the #62 pool) in place of the
+  second factor, audited distinctly; `recovery-codes` (POST) regenerates the set; and
+  `mfa/plan` reports the per-tenant factor-orchestration order. A clearly-marked
+  `throttle_seam` is the integration point for the #64 abuse-defense counters (not
+  blocked on #64). The `authn` factor model gains `AuthMethod::Totp` (amr `otp`) and
+  `AuthMethod::RecoveryCode` (amr `kba`, distinct from a live authenticator), a new
+  multi-factor ACR, and `AuthenticationEvent::password_and_totp` /
+  `password_and_recovery_code`. The generic `account_credentials` enroll now rejects
+  `totp` / `recovery_code` (they have dedicated code-verified flows), and the account
+  credential list folds in the TOTP factors and the recovery-code remaining count.
+
 - Argon2id hashing pool with per-tenant fair-share admission (issue #62): password
   hashing, the hottest and most denial-of-service-prone operation, now runs in a
   dedicated worker pool (`HashingPool`) of fixed OS threads kept OFF the async request

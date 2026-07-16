@@ -588,6 +588,29 @@ pub enum Action {
     /// the per-tenant policy applied (warn or block). A zero/zero counter (a synced
     /// passkey with no counter) never emits this event.
     WebauthnCloneDetected,
+    /// An end user BEGAN a TOTP enrollment (issue #69): a pending `tot_` row was
+    /// created with a freshly generated, sealed seed. It cannot satisfy MFA until
+    /// activation. The row targets the credential and is attributed to the end user.
+    TotpEnrollBegin,
+    /// An end user ACTIVATED a TOTP authenticator (issue #69): they proved
+    /// possession with a valid current code, so the pending factor became active
+    /// and its recovery codes were minted. The row targets the `tot_` credential.
+    TotpActivate,
+    /// An end user VERIFIED a TOTP code as a second factor (issue #69). Audited
+    /// DISTINCTLY from a recovery-code redemption so the two second-factor paths are
+    /// never conflated. The row targets the `tot_` credential.
+    TotpVerify,
+    /// An end user REMOVED one of their OWN TOTP authenticators (issue #69). The row
+    /// targets the `tot_` credential and is attributed to the end user.
+    TotpRemove,
+    /// An end user GENERATED (or REGENERATED) their recovery codes (issue #69):
+    /// a fresh batch replaced any prior set, invalidating every outstanding code.
+    /// The row targets the user and is attributed to the end user.
+    RecoveryCodesGenerate,
+    /// An end user REDEEMED a one-time recovery code in place of a second factor
+    /// (issue #69). Audited DISTINCTLY from a TOTP verification. The row targets the
+    /// redeemed `rvc_` code and is attributed to the end user.
+    RecoveryCodeRedeem,
     /// An end user REVOKED one of their OWN sessions through the self-service
     /// account surface (issue #61): a single session the user chose to sign out,
     /// stopping it from resolving immediately and cascading through the unified
@@ -730,6 +753,12 @@ impl Action {
             Action::WebauthnCredentialRemove => "webauthn.credential.remove",
             Action::WebauthnCloneDetected => "webauthn.clone.detected",
             Action::WebauthnBackupEligibilityMismatch => "webauthn.backup_eligibility.mismatch",
+            Action::TotpEnrollBegin => "account.totp.enroll_begin",
+            Action::TotpActivate => "account.totp.activate",
+            Action::TotpVerify => "account.totp.verify",
+            Action::TotpRemove => "account.totp.remove",
+            Action::RecoveryCodesGenerate => "account.recovery_codes.generate",
+            Action::RecoveryCodeRedeem => "account.recovery_code.redeem",
             Action::AccountSessionRevoke => "account.session.revoke",
             Action::AccountSessionsRevokeOthers => "account.sessions.revoke_others",
         }
