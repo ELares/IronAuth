@@ -71,7 +71,7 @@ use crate::id::{
     IssuedTokenId, KekId, ManagementKeyId, MigrationRunId, MigrationRunRecordId, OperatorId,
     OrganizationId, PushedRequestId, RefreshFamilyId, RefreshTokenId, ResourceServerId,
     ServiceAccountId, SessionEventId, SessionId, SigningKeyId, TenantId, TraitMigrationJobId,
-    TraitSchemaId, UserId, UserIdentifierId, VariableId,
+    TraitSchemaId, UserId, UserIdentifierId, VariableId, WebauthnChallengeId, WebauthnCredentialId,
 };
 use crate::identifier::{
     CanonicalIdentifier, IdentifierType, UniquenessMode, canonicalize_identifier,
@@ -273,6 +273,28 @@ impl<'a> ScopedStore<'a> {
     #[must_use]
     pub fn account_credentials(&self) -> AccountCredentialRepo<'a> {
         AccountCredentialRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
+    /// The read repository for registered WebAuthn passkeys in this scope (issue
+    /// #65): list a subject's credentials, resolve a credential by its raw
+    /// credential id for an assertion, and read the descriptors for
+    /// `excludeCredentials`.
+    #[must_use]
+    pub fn webauthn_credentials(&self) -> WebauthnCredentialRepo<'a> {
+        WebauthnCredentialRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
+    /// The single-use WebAuthn ceremony challenge store for this scope (issue #65):
+    /// issue a challenge from the entropy seam and consume it exactly once.
+    #[must_use]
+    pub fn webauthn_challenges(&self) -> WebauthnChallengeRepo<'a> {
+        WebauthnChallengeRepo {
             store: self.store,
             scope: self.scope,
         }
@@ -631,6 +653,18 @@ impl<'a> ActingStore<'a> {
     #[must_use]
     pub fn account_credentials(&self) -> ActingAccountCredentialRepo<'a> {
         ActingAccountCredentialRepo {
+            store: self.store,
+            scope: self.scope,
+            acting: self.acting,
+        }
+    }
+
+    /// The mutating WebAuthn passkey repository for this scope and actor (issue
+    /// #65): register a verified credential, record an assertion (advance the sign
+    /// counter, update backup state, flag a clone), rename, and remove.
+    #[must_use]
+    pub fn webauthn_credentials(&self) -> ActingWebauthnCredentialRepo<'a> {
+        ActingWebauthnCredentialRepo {
             store: self.store,
             scope: self.scope,
             acting: self.acting,
@@ -12836,6 +12870,853 @@ impl ActingAccountCredentialRepo<'_> {
     }
 }
 
+// ===========================================================================
+// WebAuthn passkeys (issue #65)
+// ===========================================================================
+
+/// The default time-to-live of a WebAuthn ceremony challenge, in seconds. A
+/// ceremony that is not completed within this window has its challenge expire, so
+/// a captured challenge cannot be replayed later.
+pub const WEBAUTHN_CHALLENGE_TTL_SECS: i64 = 300;
+
+/// Which WebAuthn ceremony a challenge was issued for (the closed set the
+/// `webauthn_challenges_ceremony_known` CHECK enforces).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WebauthnCeremony {
+    /// A registration (create) ceremony.
+    Register,
+    /// An authentication (get) ceremony.
+    Authenticate,
+}
+
+impl WebauthnCeremony {
+    /// The stable wire string (`register`, `authenticate`).
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            WebauthnCeremony::Register => "register",
+            WebauthnCeremony::Authenticate => "authenticate",
+        }
+    }
+}
+
+/// A freshly issued single-use ceremony challenge: the handle the client echoes
+/// back and the raw challenge bytes to place in the ceremony options.
+#[derive(Debug, Clone)]
+pub struct IssuedChallenge {
+    /// The `wch_` challenge handle.
+    pub id: String,
+    /// The raw random challenge bytes.
+    pub challenge: Vec<u8>,
+}
+
+/// A consumed challenge: the raw challenge bytes to verify against and the subject
+/// a registration challenge was bound to (`None` for a discoverable
+/// authentication).
+#[derive(Debug, Clone)]
+pub struct ConsumedChallenge {
+    /// The raw challenge bytes the ceremony must echo.
+    pub challenge: Vec<u8>,
+    /// The subject a registration challenge was bound to.
+    pub subject: Option<String>,
+}
+
+/// A registered WebAuthn passkey as the credential API and account UI report it
+/// (issue #65). Every timestamp is microseconds since the Unix epoch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WebauthnCredentialRecord {
+    /// The credential identifier (a `pky_` id string).
+    pub id: String,
+    /// The raw WebAuthn credential id.
+    pub credential_id: Vec<u8>,
+    /// The verbatim COSE public key bytes.
+    pub cose_public_key: Vec<u8>,
+    /// The current signature counter.
+    pub sign_count: u32,
+    /// The authenticator model identifier.
+    pub aaguid: Vec<u8>,
+    /// The client-reported transports.
+    pub transports: Vec<String>,
+    /// Backup-eligible (BE): a synced passkey sets it, a device-bound key clears it.
+    pub backup_eligible: bool,
+    /// Backup-state (BS): whether the credential is currently synced.
+    pub backup_state: bool,
+    /// Whether the credential is discoverable (`credProps.rk`), if reported.
+    pub discoverable: Option<bool>,
+    /// Whether a sign-count regression has flagged this credential as a possible
+    /// clone.
+    pub clone_detected: bool,
+    /// The user-authored nickname (decrypted from the sealed column).
+    pub nickname: String,
+    /// When the credential was registered (the pagination key).
+    pub created_at_unix_micros: i64,
+    /// When the passkey was last used to authenticate, if recorded.
+    pub last_used_at_unix_micros: Option<i64>,
+}
+
+/// A credential descriptor for `excludeCredentials` / `allowCredentials`: just the
+/// raw credential id and transports (no sealed field, so no master key needed).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WebauthnCredentialDescriptor {
+    /// The raw WebAuthn credential id.
+    pub credential_id: Vec<u8>,
+    /// The client-reported transports.
+    pub transports: Vec<String>,
+}
+
+/// The stored credential an authentication assertion resolves to (issue #65),
+/// looked up by the raw credential id the discoverable assertion presented.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WebauthnAssertionTarget {
+    /// The `pky_` credential id (for the follow-up assertion record).
+    pub id: String,
+    /// The `usr_` subject the credential is bound to (the discoverable assertion
+    /// resolves the user through this).
+    pub subject: String,
+    /// The verbatim COSE public key bytes to verify the signature against.
+    pub cose_public_key: Vec<u8>,
+    /// The signature counter currently stored, for clone detection.
+    pub sign_count: u32,
+    /// The backup-eligible flag recorded at registration.
+    pub backup_eligible: bool,
+}
+
+/// The outcome of a rename or remove of a WebAuthn credential.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WebauthnCredentialOutcome {
+    /// The mutation was applied.
+    Applied,
+    /// No such credential for this subject in this scope (the uniform not-found).
+    NotFound,
+}
+
+/// The single-use WebAuthn ceremony challenge store for one scope (issue #65).
+pub struct WebauthnChallengeRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl WebauthnChallengeRepo<'_> {
+    /// Parse an untrusted challenge handle under this scope; a malformed or
+    /// cross-scope handle is the uniform not-found.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the handle is malformed or out of scope.
+    pub fn parse_id(&self, raw: &str) -> Result<WebauthnChallengeId, StoreError> {
+        Ok(WebauthnChallengeId::parse_in_scope(raw, &self.scope)?)
+    }
+
+    /// ISSUE a fresh single-use challenge for `ceremony`, drawing the challenge
+    /// bytes from the entropy seam and expiring it after `ttl_secs`. A registration
+    /// challenge is bound to `subject`; an authentication challenge passes `None`.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn issue(
+        &self,
+        env: &Env,
+        ceremony: WebauthnCeremony,
+        subject: Option<&UserId>,
+        ttl_secs: i64,
+    ) -> Result<IssuedChallenge, StoreError> {
+        let id = WebauthnChallengeId::generate(env, &self.scope);
+        let mut challenge = [0_u8; 32];
+        env.entropy().fill_bytes(&mut challenge);
+        let now = epoch_micros(env.clock().now_utc());
+        let expires = now.saturating_add(ttl_secs.saturating_mul(1_000_000));
+        let subject_text = subject.map(ToString::to_string);
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        sqlx::query(
+            "INSERT INTO webauthn_challenges \
+             (id, tenant_id, environment_id, ceremony, subject, challenge, expires_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, \
+                     TIMESTAMPTZ 'epoch' + ($7::text || ' microseconds')::interval)",
+        )
+        .bind(id.to_string())
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(ceremony.as_str())
+        .bind(&subject_text)
+        .bind(&challenge[..])
+        .bind(expires)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(IssuedChallenge {
+            id: id.to_string(),
+            challenge: challenge.to_vec(),
+        })
+    }
+
+    /// CONSUME the challenge `id` for `ceremony` exactly once, returning its
+    /// challenge bytes and bound subject. A challenge that is already consumed,
+    /// expired, of the wrong ceremony, or absent returns `None` (single use): the
+    /// atomic `consumed_at` UPDATE is the enforcement, so two concurrent redeems
+    /// cannot both succeed.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn consume(
+        &self,
+        env: &Env,
+        id: &WebauthnChallengeId,
+        ceremony: WebauthnCeremony,
+    ) -> Result<Option<ConsumedChallenge>, StoreError> {
+        if id.scope() != self.scope {
+            return Ok(None);
+        }
+        let now = epoch_micros(env.clock().now_utc());
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "UPDATE webauthn_challenges \
+             SET consumed_at = TIMESTAMPTZ 'epoch' + ($5::text || ' microseconds')::interval \
+             WHERE id = $1 AND tenant_id = $2 AND environment_id = $3 AND ceremony = $4 \
+             AND consumed_at IS NULL \
+             AND expires_at > TIMESTAMPTZ 'epoch' + ($5::text || ' microseconds')::interval \
+             RETURNING challenge, subject",
+        )
+        .bind(id.to_string())
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(ceremony.as_str())
+        .bind(now)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(row.map(|row| ConsumedChallenge {
+            challenge: row.get("challenge"),
+            subject: row.get("subject"),
+        }))
+    }
+}
+
+/// The read repository for registered WebAuthn passkeys in one scope (issue #65).
+pub struct WebauthnCredentialRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl WebauthnCredentialRepo<'_> {
+    /// Parse an untrusted credential identifier under this scope; a malformed or
+    /// cross-scope id is the uniform not-found.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the identifier is malformed or out of scope.
+    pub fn parse_id(&self, raw: &str) -> Result<WebauthnCredentialId, StoreError> {
+        Ok(WebauthnCredentialId::parse_in_scope(raw, &self.scope)?)
+    }
+
+    /// One page of `subject`'s registered passkeys, ordered by `(created_at, id)`,
+    /// decrypting each nickname. Filtered on the subject, so it lists ONLY that
+    /// subject's own credentials.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Encryption`] if no master key is configured or a sealed
+    /// nickname cannot be decrypted; [`StoreError::Database`] on a persistence
+    /// failure.
+    pub async fn list(
+        &self,
+        subject: &UserId,
+        limit: i64,
+        after: Option<&CursorPosition>,
+    ) -> Result<Vec<WebauthnCredentialRecord>, StoreError> {
+        if subject.scope() != self.scope {
+            return Ok(Vec::new());
+        }
+        let master = self.store.master().ok_or(StoreError::Encryption)?;
+        let (after_micros, after_id) = split_cursor(after);
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let rows = sqlx::query(
+            "SELECT id, credential_id, cose_public_key, sign_count, aaguid, transports, \
+             backup_eligible, backup_state, discoverable, clone_detected, \
+             nickname_sealed, pii_dek_version, \
+             (EXTRACT(EPOCH FROM created_at) * 1000000)::bigint AS created_us, \
+             (EXTRACT(EPOCH FROM last_used_at) * 1000000)::bigint AS last_used_us \
+             FROM webauthn_credentials \
+             WHERE tenant_id = $1 AND environment_id = $2 AND subject = $3 \
+             AND ($4::bigint IS NULL OR (created_at, id) > \
+                  (TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval, $5::text)) \
+             ORDER BY created_at, id LIMIT $6",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(subject.to_string())
+        .bind(after_micros)
+        .bind(after_id)
+        .bind(limit.clamp(0, MANAGEMENT_LIST_HARD_CAP + 1))
+        .fetch_all(&mut *tx)
+        .await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let dek_version: i32 = row.get("pii_dek_version");
+            let sealed: Vec<u8> = row.get("nickname_sealed");
+            let dek = fetch_dek_by_version(&mut tx, self.scope, master, dek_version).await?;
+            let plaintext = dek.open(
+                &webauthn_nickname_seal_aad(self.scope, dek_version),
+                &Sealed::from_bytes(sealed)?,
+            )?;
+            let nickname = String::from_utf8(plaintext).map_err(|_| StoreError::Encryption)?;
+            let sign_count: i64 = row.get("sign_count");
+            let transports: String = row.get("transports");
+            out.push(WebauthnCredentialRecord {
+                id: row.get("id"),
+                credential_id: row.get("credential_id"),
+                cose_public_key: row.get("cose_public_key"),
+                sign_count: u32::try_from(sign_count).unwrap_or(0),
+                aaguid: row.get("aaguid"),
+                transports: split_transports(&transports),
+                backup_eligible: row.get("backup_eligible"),
+                backup_state: row.get("backup_state"),
+                discoverable: row.get("discoverable"),
+                clone_detected: row.get("clone_detected"),
+                nickname,
+                created_at_unix_micros: row.get("created_us"),
+                last_used_at_unix_micros: row.get("last_used_us"),
+            });
+        }
+        tx.commit().await?;
+        Ok(out)
+    }
+
+    /// The `excludeCredentials` descriptors for `subject`: the raw credential id and
+    /// transports of every passkey the subject already has, so a registration
+    /// ceremony can refuse to enroll the same authenticator twice. No nickname is
+    /// decrypted (no master key needed).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn descriptors(
+        &self,
+        subject: &UserId,
+    ) -> Result<Vec<WebauthnCredentialDescriptor>, StoreError> {
+        if subject.scope() != self.scope {
+            return Ok(Vec::new());
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let rows = sqlx::query(
+            "SELECT credential_id, transports FROM webauthn_credentials \
+             WHERE tenant_id = $1 AND environment_id = $2 AND subject = $3 \
+             ORDER BY created_at, id",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(subject.to_string())
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(rows
+            .iter()
+            .map(|row| WebauthnCredentialDescriptor {
+                credential_id: row.get("credential_id"),
+                transports: split_transports(&row.get::<String, _>("transports")),
+            })
+            .collect())
+    }
+
+    /// Resolve the credential a discoverable assertion presented, looked up by its
+    /// raw credential id across the scope (all subjects). Returns `None` if no
+    /// credential with that id exists, which the caller maps to the same
+    /// non-enumerating ceremony error as a bad signature.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn find_for_assertion(
+        &self,
+        credential_id: &[u8],
+    ) -> Result<Option<WebauthnAssertionTarget>, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT id, subject, cose_public_key, sign_count, backup_eligible \
+             FROM webauthn_credentials \
+             WHERE tenant_id = $1 AND environment_id = $2 AND credential_id = $3",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(credential_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(row.map(|row| {
+            let sign_count: i64 = row.get("sign_count");
+            WebauthnAssertionTarget {
+                id: row.get("id"),
+                subject: row.get("subject"),
+                cose_public_key: row.get("cose_public_key"),
+                sign_count: u32::try_from(sign_count).unwrap_or(0),
+                backup_eligible: row.get("backup_eligible"),
+            }
+        }))
+    }
+}
+
+/// The mutating WebAuthn passkey repository for one scope and actor (issue #65).
+pub struct ActingWebauthnCredentialRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+    acting: ActingContext,
+}
+
+impl ActingWebauthnCredentialRepo<'_> {
+    /// Ensure the scope has a live KEK and DEK to seal the nickname under.
+    async fn ensure_scope_keys(&self, env: &Env, master: &MasterKey) -> Result<(), StoreError> {
+        let envelope = ActingEnvelopeRepo {
+            store: self.store,
+            scope: self.scope,
+            acting: self.acting,
+        };
+        match envelope.provision_kek(env, master).await {
+            Ok(_) | Err(StoreError::Conflict) => {}
+            Err(error) => return Err(error),
+        }
+        match envelope.provision_dek(env, master).await {
+            Ok(_) | Err(StoreError::Conflict) => {}
+            Err(error) => return Err(error),
+        }
+        Ok(())
+    }
+
+    /// REGISTER a verified passkey for `subject` (issue #65): seal the nickname,
+    /// insert the credential row, and write one `webauthn.credential.register` audit
+    /// row. The COSE public key, AAGUID, transports, and BE/BS flags are stored as
+    /// captured at the ceremony. A duplicate credential id (the same authenticator
+    /// re-enrolling past the `excludeCredentials` hint) is refused as
+    /// [`StoreError::Conflict`], the database half of the dedupe guarantee.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if `subject` is out of scope; [`StoreError::Conflict`]
+    /// on a duplicate credential id; [`StoreError::Encryption`] if no master key is
+    /// configured; [`StoreError::Database`] on a persistence failure.
+    pub async fn register(
+        &self,
+        env: &Env,
+        subject: &UserId,
+        credential: &NewWebauthnCredential<'_>,
+    ) -> Result<WebauthnCredentialId, StoreError> {
+        if subject.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let master = self.store.master().ok_or(StoreError::Encryption)?;
+        self.ensure_scope_keys(env, master).await?;
+        let id = WebauthnCredentialId::generate(env, &self.scope);
+        let scope = self.scope;
+        let subject_text = subject.to_string();
+        let credential_id = credential.credential_id.to_vec();
+        let cose = credential.cose_public_key.to_vec();
+        let aaguid = credential.aaguid.to_vec();
+        let transports = credential.transports.join(" ");
+        let sign_count = i64::from(credential.sign_count);
+        let backup_eligible = credential.backup_eligible;
+        let backup_state = credential.backup_state;
+        let discoverable = credential.discoverable;
+        let nickname = credential.nickname.to_string();
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::WebauthnCredentialRegister,
+                target: &id,
+            },
+            async move |tx| {
+                let (dek_version, dek) = fetch_active_dek(tx, scope, master).await?;
+                let nickname_sealed = dek.seal(
+                    env.entropy(),
+                    &webauthn_nickname_seal_aad(scope, dek_version),
+                    nickname.as_bytes(),
+                );
+                sqlx::query(
+                    "INSERT INTO webauthn_credentials \
+                     (id, tenant_id, environment_id, subject, credential_id, cose_public_key, \
+                      sign_count, aaguid, transports, backup_eligible, backup_state, \
+                      discoverable, nickname_sealed, pii_dek_version) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
+                )
+                .bind(id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(&subject_text)
+                .bind(&credential_id)
+                .bind(&cose)
+                .bind(sign_count)
+                .bind(&aaguid)
+                .bind(&transports)
+                .bind(backup_eligible)
+                .bind(backup_state)
+                .bind(discoverable)
+                .bind(nickname_sealed.into_bytes())
+                .bind(dek_version)
+                .execute(&mut **tx)
+                .await
+                .map_err(|error| {
+                    if is_unique_violation(&error) {
+                        StoreError::Conflict
+                    } else {
+                        StoreError::Database(error)
+                    }
+                })?;
+                Ok(())
+            },
+            false,
+        )
+        .await?;
+        Ok(id)
+    }
+
+    /// RECORD a verified assertion against credential `id` (issue #65): advance the
+    /// signature counter and update the backup state and last-used time on a normal
+    /// assertion; on a `regressed` counter, do NOT advance the stored counter, set
+    /// the clone-detected flag, and write one `webauthn.clone.detected` audit row
+    /// carrying `policy_detail` (the per-tenant warn/block policy applied). The
+    /// caller decides whether a regression BLOCKS the sign-in; this records the
+    /// event and state either way.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if `id` is out of scope; [`StoreError::Database`] on
+    /// a persistence failure.
+    pub async fn record_assertion(
+        &self,
+        env: &Env,
+        id: &WebauthnCredentialId,
+        presented_sign_count: u32,
+        backup_state: bool,
+        regressed: bool,
+        policy_detail: &str,
+    ) -> Result<(), StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let id_text = id.to_string();
+        let now = epoch_micros(env.clock().now_utc());
+        let mut tx = begin_scoped(self.store, scope).await?;
+        if regressed {
+            sqlx::query(
+                "UPDATE webauthn_credentials \
+                 SET clone_detected = true, backup_state = $4, \
+                     last_used_at = TIMESTAMPTZ 'epoch' + ($5::text || ' microseconds')::interval \
+                 WHERE id = $1 AND tenant_id = $2 AND environment_id = $3",
+            )
+            .bind(&id_text)
+            .bind(scope.tenant().to_string())
+            .bind(scope.environment().to_string())
+            .bind(backup_state)
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
+            insert_audit_row(
+                &mut tx,
+                &AuditedWrite {
+                    store: self.store,
+                    scope,
+                    acting: &self.acting,
+                    env,
+                    action: Action::WebauthnCloneDetected,
+                    target: id,
+                },
+                Some(policy_detail),
+            )
+            .await?;
+        } else {
+            sqlx::query(
+                "UPDATE webauthn_credentials \
+                 SET sign_count = $4, backup_state = $5, \
+                     last_used_at = TIMESTAMPTZ 'epoch' + ($6::text || ' microseconds')::interval \
+                 WHERE id = $1 AND tenant_id = $2 AND environment_id = $3",
+            )
+            .bind(&id_text)
+            .bind(scope.tenant().to_string())
+            .bind(scope.environment().to_string())
+            .bind(i64::from(presented_sign_count))
+            .bind(backup_state)
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// RECORD a backup-eligibility immutability violation (issue #65): a WebAuthn
+    /// assertion presented a BE flag that diverged from credential `id`'s stored,
+    /// registration-time BE. BE is immutable for a credential's life (WebAuthn L3
+    /// 7.2), so a flip is a spec violation and a signal of a cloned or spoofed
+    /// authenticator. This writes ONE `webauthn.backup_eligibility.mismatch` security
+    /// audit row and advances NO credential state (the caller refuses the sign-in).
+    /// The `detail` records the stored and presented BE values (booleans, never
+    /// attacker-controlled free text).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if `id` is out of scope; [`StoreError::Database`] on
+    /// a persistence failure.
+    pub async fn record_backup_eligibility_mismatch(
+        &self,
+        env: &Env,
+        id: &WebauthnCredentialId,
+        stored_backup_eligible: bool,
+        presented_backup_eligible: bool,
+    ) -> Result<(), StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let detail = format!(
+            "backup_eligibility immutability violation: stored={stored_backup_eligible} \
+             presented={presented_backup_eligible}"
+        );
+        let mut tx = begin_scoped(self.store, scope).await?;
+        insert_audit_row(
+            &mut tx,
+            &AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::WebauthnBackupEligibilityMismatch,
+                target: id,
+            },
+            Some(&detail),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// RENAME `subject`'s passkey `id` (issue #65): reseal the nickname under the
+    /// scope's active DEK and write one `webauthn.credential.rename` audit row on
+    /// success. Subject-bound, so another subject's id is the uniform
+    /// [`WebauthnCredentialOutcome::NotFound`] and writes nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Encryption`] if no master key is configured; [`StoreError::Database`]
+    /// on a persistence failure.
+    pub async fn rename(
+        &self,
+        env: &Env,
+        subject: &UserId,
+        id: &WebauthnCredentialId,
+        nickname: &str,
+    ) -> Result<WebauthnCredentialOutcome, StoreError> {
+        if id.scope() != self.scope || subject.scope() != self.scope {
+            return Ok(WebauthnCredentialOutcome::NotFound);
+        }
+        let master = self.store.master().ok_or(StoreError::Encryption)?;
+        let scope = self.scope;
+        let id_text = id.to_string();
+        let subject_text = subject.to_string();
+        let mut tx = begin_scoped(self.store, scope).await?;
+        let (dek_version, dek) = fetch_active_dek(&mut tx, scope, master).await?;
+        let nickname_sealed = dek.seal(
+            env.entropy(),
+            &webauthn_nickname_seal_aad(scope, dek_version),
+            nickname.as_bytes(),
+        );
+        let result = sqlx::query(
+            "UPDATE webauthn_credentials SET nickname_sealed = $5, pii_dek_version = $6 \
+             WHERE id = $1 AND tenant_id = $2 AND environment_id = $3 AND subject = $4",
+        )
+        .bind(&id_text)
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(&subject_text)
+        .bind(nickname_sealed.into_bytes())
+        .bind(dek_version)
+        .execute(&mut *tx)
+        .await?;
+        if result.rows_affected() == 0 {
+            tx.commit().await?;
+            return Ok(WebauthnCredentialOutcome::NotFound);
+        }
+        insert_audit_row(
+            &mut tx,
+            &AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::WebauthnCredentialRename,
+                target: id,
+            },
+            None,
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(WebauthnCredentialOutcome::Applied)
+    }
+
+    /// REMOVE `subject`'s passkey `id` (issue #65), enforcing the
+    /// last-usable-login-factor guardrail in the SAME transaction it reads the state
+    /// in, and writing one `webauthn.credential.remove` audit row on success.
+    ///
+    /// The passkey is resolved WITH its subject bound, so another subject's id (or a
+    /// cross-scope id) is the uniform [`CredentialRemoveOutcome::NotFound`], never
+    /// actionable. A passkey is a first-class primary-login factor: a passwordless
+    /// account (activated by a passkey invitation, with no password ever provisioned)
+    /// can have a passkey as its ONLY login credential, so removing it would strand the
+    /// user permanently. Mirroring the sibling `account_credentials` path (issue #61),
+    /// the removal is BLOCKED ([`CredentialRemoveOutcome::BlockedLastCredential`]) when
+    /// it would leave the subject with ZERO usable login factors across ALL sources,
+    /// unless `acknowledge_recovery` is set (the documented recovery acknowledgment).
+    /// The remaining factors are counted in the same transaction so a concurrent
+    /// removal cannot race two "last" factors out from under the guard. The three
+    /// sources counted are: a provisioned native password (a real `password_hash`, not
+    /// the unusable sentinel), any `account_credentials` usable for login, and the
+    /// subject's OTHER passkeys (excluding the one being removed).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn remove(
+        &self,
+        env: &Env,
+        subject: &UserId,
+        id: &WebauthnCredentialId,
+        acknowledge_recovery: bool,
+    ) -> Result<CredentialRemoveOutcome, StoreError> {
+        if id.scope() != self.scope || subject.scope() != self.scope {
+            return Ok(CredentialRemoveOutcome::NotFound);
+        }
+        let scope = self.scope;
+        let id_text = id.to_string();
+        let subject_text = subject.to_string();
+        let tenant = scope.tenant().to_string();
+        let environment = scope.environment().to_string();
+        let mut tx = begin_scoped(self.store, scope).await?;
+        // Resolve the passkey WITH its subject bound: another subject's id finds no
+        // row and is the uniform not-found, never actionable.
+        let exists = sqlx::query(
+            "SELECT 1 AS one FROM webauthn_credentials \
+             WHERE id = $1 AND tenant_id = $2 AND environment_id = $3 AND subject = $4",
+        )
+        .bind(&id_text)
+        .bind(&tenant)
+        .bind(&environment)
+        .bind(&subject_text)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if exists.is_none() {
+            tx.commit().await?;
+            return Ok(CredentialRemoveOutcome::NotFound);
+        }
+        // The guardrail: block removing the subject's LAST usable login factor across
+        // all sources unless the recovery acknowledgment is present. Counted inside
+        // the same transaction so a concurrent removal cannot slip two "last" factors
+        // past it. A foreign-only hash is deliberately NOT counted as a factor here:
+        // the safe failure direction for a lockout guard is to block (recoverable via
+        // the acknowledgment) rather than to allow a permanent lockout.
+        if !acknowledge_recovery {
+            // (a) A provisioned native password (not the unusable sentinel).
+            let has_password: bool = sqlx::query(
+                "SELECT count(*) AS n FROM users \
+                 WHERE id = $1 AND tenant_id = $2 AND environment_id = $3 \
+                 AND password_hash <> $4",
+            )
+            .bind(&subject_text)
+            .bind(&tenant)
+            .bind(&environment)
+            .bind(USER_UNUSABLE_PASSWORD_HASH)
+            .fetch_one(&mut *tx)
+            .await?
+            .get::<i64, _>("n")
+                > 0;
+            // (b) Any account_credentials usable for login (a passkey is NOT in this
+            //     table, so every such row is an independent factor).
+            let usable_account_credentials: i64 = sqlx::query(
+                "SELECT count(*) AS n FROM account_credentials \
+                 WHERE tenant_id = $1 AND environment_id = $2 AND subject = $3 \
+                 AND usable_for_login = true",
+            )
+            .bind(&tenant)
+            .bind(&environment)
+            .bind(&subject_text)
+            .fetch_one(&mut *tx)
+            .await?
+            .get("n");
+            // (c) The subject's OTHER passkeys (excluding the one being removed).
+            let other_passkeys: i64 = sqlx::query(
+                "SELECT count(*) AS n FROM webauthn_credentials \
+                 WHERE tenant_id = $1 AND environment_id = $2 AND subject = $3 \
+                 AND id <> $4",
+            )
+            .bind(&tenant)
+            .bind(&environment)
+            .bind(&subject_text)
+            .bind(&id_text)
+            .fetch_one(&mut *tx)
+            .await?
+            .get("n");
+            if !has_password && usable_account_credentials == 0 && other_passkeys == 0 {
+                tx.commit().await?;
+                return Ok(CredentialRemoveOutcome::BlockedLastCredential);
+            }
+        }
+        sqlx::query(
+            "DELETE FROM webauthn_credentials \
+             WHERE id = $1 AND tenant_id = $2 AND environment_id = $3 AND subject = $4",
+        )
+        .bind(&id_text)
+        .bind(&tenant)
+        .bind(&environment)
+        .bind(&subject_text)
+        .execute(&mut *tx)
+        .await?;
+        insert_audit_row(
+            &mut tx,
+            &AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::WebauthnCredentialRemove,
+                target: id,
+            },
+            None,
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(CredentialRemoveOutcome::Removed)
+    }
+}
+
+/// The fields to persist for a newly registered WebAuthn passkey (issue #65).
+#[derive(Debug, Clone)]
+pub struct NewWebauthnCredential<'a> {
+    /// The raw WebAuthn credential id the authenticator minted.
+    pub credential_id: &'a [u8],
+    /// The verbatim COSE public key bytes.
+    pub cose_public_key: &'a [u8],
+    /// The initial signature counter.
+    pub sign_count: u32,
+    /// The authenticator model identifier.
+    pub aaguid: &'a [u8],
+    /// The client-reported transports.
+    pub transports: &'a [String],
+    /// Backup-eligible (BE) at registration.
+    pub backup_eligible: bool,
+    /// Backup-state (BS) at registration.
+    pub backup_state: bool,
+    /// The `credProps.rk` result (whether the credential is discoverable).
+    pub discoverable: Option<bool>,
+    /// The user-authored nickname to seal.
+    pub nickname: &'a str,
+}
+
+/// Split a space-separated transports column into its tokens (empty for none).
+fn split_transports(raw: &str) -> Vec<String> {
+    raw.split_whitespace().map(ToString::to_string).collect()
+}
+
 /// A recorded consent decision (issue #196): the `con_` id the grant references
 /// AND the `scope` value the decision was made against.
 ///
@@ -17145,6 +18026,10 @@ const USER_IDENTIFIER_BIDX_LABEL: &str = "ironauth.envelope.user-identifier-bidx
 /// (the user-authored credential label, issue #61) from every other envelope
 /// context, so a credential-name seal never authenticates under another column's.
 const CREDENTIAL_PII_SEAL_LABEL: &str = "ironauth.envelope.account-credential-pii.v1";
+/// The AAD label domain-separating a sealed `webauthn_credentials.nickname` (the
+/// user-authored passkey label, issue #65) from every other envelope context, so a
+/// passkey-nickname seal never authenticates under another column's.
+const WEBAUTHN_NICKNAME_SEAL_LABEL: &str = "ironauth.envelope.webauthn-nickname.v1";
 /// The purpose label bound into a sealed `users.identifier` (the login handle).
 const USER_IDENTIFIER_PURPOSE: &str = "identifier";
 /// The purpose label bound into a sealed `users.claims` (the standard-claim JSON).
@@ -17237,6 +18122,19 @@ fn user_pii_seal_aad(scope: Scope, purpose: &str, dek_version: i32) -> Aad {
 fn credential_pii_seal_aad(scope: Scope, dek_version: i32) -> Aad {
     Aad::builder()
         .text(CREDENTIAL_PII_SEAL_LABEL)
+        .text(&scope.tenant().to_string())
+        .text(&scope.environment().to_string())
+        .version(i64::from(dek_version))
+        .build()
+}
+
+/// The AAD binding a sealed `webauthn_credentials.nickname` (issue #65): the
+/// passkey-nickname label, the scope, and the DEK version, so a nickname
+/// ciphertext cannot be lifted to another row, tenant, environment, column, or
+/// key version.
+fn webauthn_nickname_seal_aad(scope: Scope, dek_version: i32) -> Aad {
+    Aad::builder()
+        .text(WEBAUTHN_NICKNAME_SEAL_LABEL)
         .text(&scope.tenant().to_string())
         .text(&scope.environment().to_string())
         .version(i64::from(dek_version))

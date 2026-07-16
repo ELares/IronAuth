@@ -30,6 +30,15 @@ serde.workspace = true
 # never SystemTime::now, so claim-window logic is testable with a manual clock.
 ironauth-env.workspace = true
 
+[features]
+default = []
+# Test-only WebAuthn software-authenticator crypto helpers (issue #65). Exposes a
+# raw Ed25519 sign and public-key derivation over `ring` so a downstream crate's
+# integration test (ironauth-webauthn) can act as a virtual authenticator and
+# produce genuinely valid assertion signatures. Signing-only; it adds no
+# verification path, and ring stays contained in this crate.
+test-util = []
+
 [dev-dependencies]
 # trybuild drives the compile-fail proofs that the private primitives are
 # unreachable from outside the crate.

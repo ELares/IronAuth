@@ -6,6 +6,61 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Passwordless self-lockout guard on passkey removal (issue #65 review hardening):
+  `webauthn/credentials/remove` no longer unconditionally deletes a passkey. A
+  passwordless account (activated by a passkey invitation, with no password ever
+  provisioned) can have a passkey as its ONLY login factor, so removing the caller's
+  LAST usable login factor is now BLOCKED with a `409 last_credential` unless
+  `acknowledgeRecovery` is set, mirroring the sibling #61 `account_credentials` guard.
+  The remaining factors are counted in the removal transaction across all sources: a
+  provisioned native password, any `account_credentials` usable for login, and the
+  caller's other passkeys.
+- Passkey acr/amr truthfulness and credential management (issue #65 review hardening):
+  a sign-in's assurance is now derived from the credential's STORED, registration-time
+  backup-eligible flag, never the mutable BE bit of the presented assertion, so a
+  synced passkey can no longer claim the device-bound `phrh`. A BE flip between the
+  assertion and the stored value is treated as a spec violation (WebAuthn L3 7.2) and a
+  clone/spoof signal: the sign-in is refused with the non-enumerating ceremony error
+  and a `webauthn.backup_eligibility.mismatch` security event is written, with no
+  partial state advanced. The amr is now honest about user verification: `phr`/`phrh`
+  assert phishing resistance (not user verification), `user` (presence) is kept for
+  every passkey login, and `mfa` is added only when the assertion actually verified the
+  user, so a user-presence-only login never implies a verification factor. A defensive
+  userHandle check rejects an assertion whose userHandle does not match the credential's
+  stored subject. New authenticated, IDOR-safe passkey management endpoints
+  (`GET webauthn/credentials`, `webauthn/credentials/rename`, `webauthn/credentials/remove`)
+  let a user list their own passkeys with live BE/BS, rename, and remove them (subject
+  bound, same-origin/CSRF guarded, audited on mutation); the list is also folded into
+  `GET account/credentials` so every credential appears in one place.
+- WebAuthn passkeys, first-class (issue #65): four scope-routed ceremony endpoints
+  (`webauthn/register/options`, `register/verify`, `authenticate/options`,
+  `authenticate/verify`) implement WebAuthn Level 3 registration and authentication.
+  Registration is authenticated by the caller's session and populates
+  `excludeCredentials` so an authenticator cannot enrol twice; authentication uses
+  discoverable credentials (conditional UI), resolves the user through the
+  credential's stored subject, and on success establishes the same server-side
+  session the password login does. Each ceremony draws a single-use challenge from
+  the store, verifies the response in the pure `ironauth-webauthn` core (challenge,
+  origin, RP ID hash, flags, and for an assertion the signature via the ring-backed
+  jose core), persists only after a successful verification (no partial row on
+  failure), and returns one non-enumerating error for every failure. A UV passkey
+  authentication records an honest `AuthenticationEvent`: the acr/amr registry's
+  dormant passkey rows are now ACTIVE, so a UV synced passkey issues tokens whose
+  `acr` is `phr` (amr `swk`+`user`) and a device-bound one `phrh` (amr `hwk`+`user`),
+  chosen by the backup-eligible flag, flowing through the whole session -> code ->
+  token chain; `parse_methods` gained an achievability guard that drops any recorded
+  method not currently active, so a stale/dormant elevated method can never
+  over-claim. The sign-count clone-detection policy (warn or block) is applied on
+  every assertion, with zero-counter synced passkeys never tripping it. The hosted
+  login page wires conditional UI: the identifier field carries the `webauthn`
+  autocomplete token, a passkey button path also exists, and one nonce-guarded
+  ceremony script is served under a login CSP that opens exactly `script-src
+  'nonce-...'` and `connect-src 'self'`. The RP ID and origin are resolved
+  per-environment from the serving origin (or the configured override, validated at
+  startup). Mounted only when `oidc.webauthn_enabled` (default on). Attestation
+  trust (MDS3, AAGUID allowlists) is out of scope (issue #66); ceremonies request
+  `attestation: "none"`.
+
 - Inbound lazy-migration hook (issue #56): when the `[oidc.lazy_migration]` config arms
   it, a login whose canonicalized identifier is UNKNOWN locally verifies the submitted
   credential against a legacy store through a pluggable `CredentialVerifier` (the only

@@ -1114,6 +1114,46 @@ pub struct OidcConfig {
     /// per-environment setting in spirit; the process value is the deployment default
     /// until per-environment overrides ride the M5 promotion pipeline.
     pub lazy_migration: LazyMigrationConfig,
+
+    /// Whether the WebAuthn passkey ceremony endpoints are mounted and the hosted
+    /// login page offers conditional-UI passkey sign-in (issue #65). On by default:
+    /// passkeys are the headline primary credential for the platform. When on,
+    /// discovery advertises the ceremony endpoints and the passkey `phr`/`phrh`
+    /// ACRs are achievable.
+    pub webauthn_enabled: bool,
+
+    /// The per-environment WebAuthn Relying Party ID (issue #65). WebAuthn scopes a
+    /// credential to this registrable-domain identifier. When unset, it is DERIVED
+    /// from the serving origin's host (`server.public_url`), which is the correct
+    /// default for a single-origin deployment. When set, it is validated at STARTUP
+    /// to be the serving origin's host or a parent (registrable-suffix) domain of
+    /// it; a mismatch is a boot-time [`ConfigError::Invalid`], never a per-ceremony
+    /// runtime surprise. Different deployments (dev/staging/prod) serve different
+    /// origins and so resolve different RP IDs.
+    pub webauthn_rp_id: Option<String>,
+
+    /// The lifetime, in seconds, of a WebAuthn ceremony challenge (issue #65). A
+    /// ceremony not completed within this window has its single-use challenge
+    /// expire. The default (300) is a conservative five minutes. Must be at least 1
+    /// and at most `OIDC_MAX_LIFETIME_SECS`.
+    pub webauthn_challenge_ttl_secs: u64,
+
+    /// Whether a WebAuthn ceremony requires user verification (issue #65). On by
+    /// default. Phishing resistance comes from WebAuthn's origin binding, which every
+    /// ceremony has, so the `phr`/`phrh` ACRs do NOT require user verification; what
+    /// user verification governs is the `amr` (a UV assertion additionally carries
+    /// `mfa`, since the possession of the key plus the verification are two factors,
+    /// while a user-presence-only assertion does not). Turning it off allows
+    /// user-presence-only assertions (not recommended).
+    pub webauthn_require_user_verification: bool,
+
+    /// The clone-detection policy when a WebAuthn assertion presents a regressing
+    /// signature counter (issue #65): `true` BLOCKS the sign-in, `false` only WARNS
+    /// (records the security event and flags the credential but allows the login).
+    /// The default (`false`, warn) avoids locking a user out on a benign counter
+    /// desync while still surfacing the event; a true per-tenant override rides the
+    /// tenant-policy pipeline.
+    pub webauthn_clone_detection_block: bool,
 }
 
 impl Default for OidcConfig {
@@ -1171,6 +1211,11 @@ impl Default for OidcConfig {
             backchannel_logout_poll_interval_secs: 5,
             backchannel_logout_request_timeout_secs: 10,
             lazy_migration: LazyMigrationConfig::default(),
+            webauthn_enabled: true,
+            webauthn_rp_id: None,
+            webauthn_challenge_ttl_secs: 300,
+            webauthn_require_user_verification: true,
+            webauthn_clone_detection_block: false,
         }
     }
 }
@@ -1617,9 +1662,95 @@ impl Config {
         validate_device_authorization(&self.oidc)?;
         validate_backchannel_logout(&self.oidc)?;
         validate_lazy_migration(&self.oidc)?;
+        validate_webauthn(&self.oidc, &self.server)?;
         validate_quota(&self.quota)?;
         Ok(())
     }
+}
+
+/// Validate the WebAuthn passkey settings (issue #65), kept out of
+/// [`Config::validate`] for readability.
+///
+/// The challenge lifetime is bounded like the other credential lifetimes. The RP
+/// ID is validated against the serving origin at STARTUP so a misconfiguration is
+/// a boot-time error, never a per-ceremony runtime surprise: when
+/// `oidc.webauthn_rp_id` is set, `server.public_url` must be set and the RP ID must
+/// be the serving origin's host or a parent (registrable-suffix) domain of it (an
+/// authenticator scopes a credential to a registrable-domain suffix of the origin;
+/// an RP ID that is not such a suffix would make every ceremony fail at runtime).
+///
+/// # Errors
+///
+/// [`ConfigError::Invalid`] if the challenge lifetime is out of range, or the RP ID
+/// is set without a serving origin or is not a suffix of the origin host.
+fn validate_webauthn(oidc: &OidcConfig, server: &ServerConfig) -> Result<(), ConfigError> {
+    check_oidc_lifetime(
+        "oidc.webauthn_challenge_ttl_secs",
+        oidc.webauthn_challenge_ttl_secs,
+    )?;
+    if !oidc.webauthn_enabled {
+        return Ok(());
+    }
+    if let Some(rp_id) = oidc.webauthn_rp_id.as_deref() {
+        if rp_id.is_empty() {
+            return Err(ConfigError::Invalid {
+                message: "oidc.webauthn_rp_id must not be empty when set".to_owned(),
+            });
+        }
+        // A single-label RP ID (no dot, for example a bare TLD like `com`) is never
+        // a valid relying-party identifier: the browser rejects it at ceremony time
+        // against the effective-TLD+1 rule, so accepting it here would defer a boot
+        // misconfiguration to a runtime ceremony failure. `localhost` is the one
+        // single-label exception (the dev origin). A registrable domain must contain
+        // a dot; the browser enforces the full public-suffix rule, this catches the
+        // outright-invalid case cheaply without a public-suffix-list dependency.
+        if rp_id != "localhost" && !rp_id.contains('.') {
+            return Err(ConfigError::Invalid {
+                message: format!(
+                    "oidc.webauthn_rp_id ({rp_id}) is a single-label identifier; it must be a \
+                     registrable domain (containing a dot, for example auth.example.com) or the \
+                     dev value 'localhost'. A bare label like a TLD fails every ceremony in the \
+                     browser"
+                ),
+            });
+        }
+        let Some(public_url) = server.public_url.as_deref() else {
+            return Err(ConfigError::Invalid {
+                message: "oidc.webauthn_rp_id is set but server.public_url is not: the RP ID \
+                          must be validated against the serving origin, so the origin must be \
+                          configured"
+                    .to_owned(),
+            });
+        };
+        let Some(host) = uri_host(public_url) else {
+            return Err(ConfigError::Invalid {
+                message: "server.public_url has no parseable host to validate \
+                          oidc.webauthn_rp_id against"
+                    .to_owned(),
+            });
+        };
+        // The RP ID must be the origin host or a parent domain of it (a
+        // registrable-domain suffix). The browser enforces the effective-TLD+1
+        // rule at ceremony time; this startup check catches an outright mismatch.
+        let is_suffix = host == rp_id || host.ends_with(&format!(".{rp_id}"));
+        if !is_suffix {
+            return Err(ConfigError::Invalid {
+                message: format!(
+                    "oidc.webauthn_rp_id ({rp_id}) must be the serving origin host ({host}) \
+                     or a parent domain of it; an RP ID outside the origin's registrable \
+                     domain fails every ceremony at runtime"
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// The host of an absolute URL, or [`None`] if it does not parse or has no host.
+fn uri_host(url: &str) -> Option<String> {
+    http::Uri::try_from(url)
+        .ok()
+        .and_then(|uri| uri.host().map(str::to_owned))
 }
 
 /// Validate the inbound lazy-migration hook settings (issue #56), kept out of
@@ -2189,6 +2320,56 @@ mod tests {
         let err = Config::from_toml_str("[quota.tenant]\nrps = 5\n", "ironauth.toml")
             .expect_err("unknown quota key");
         assert!(err.to_string().contains("requests_per_second"), "{err}");
+    }
+
+    #[test]
+    fn webauthn_rp_id_is_validated_against_the_serving_origin_at_startup() {
+        // An RP ID that is the origin host is accepted.
+        let ok = "[server]\npublic_url = \"https://auth.example.com\"\n\
+                  [oidc]\nwebauthn_rp_id = \"auth.example.com\"\n";
+        assert!(Config::from_toml_str(ok, "ironauth.toml").is_ok());
+
+        // A parent (registrable-suffix) domain is accepted.
+        let parent = "[server]\npublic_url = \"https://auth.example.com\"\n\
+                      [oidc]\nwebauthn_rp_id = \"example.com\"\n";
+        assert!(Config::from_toml_str(parent, "ironauth.toml").is_ok());
+
+        // An RP ID outside the origin's domain is a STARTUP error.
+        let bad = "[server]\npublic_url = \"https://auth.example.com\"\n\
+                   [oidc]\nwebauthn_rp_id = \"evil.test\"\n";
+        let err = Config::from_toml_str(bad, "ironauth.toml").expect_err("mismatched rp id");
+        assert!(err.to_string().contains("webauthn_rp_id"), "{err}");
+
+        // An RP ID set without a serving origin is a STARTUP error.
+        let no_origin = "[oidc]\nwebauthn_rp_id = \"auth.example.com\"\n";
+        let err =
+            Config::from_toml_str(no_origin, "ironauth.toml").expect_err("rp id without origin");
+        assert!(err.to_string().contains("server.public_url"), "{err}");
+
+        // Unset RP ID (derive from origin) is valid.
+        let derived = "[server]\npublic_url = \"https://auth.example.com\"\n";
+        assert!(Config::from_toml_str(derived, "ironauth.toml").is_ok());
+    }
+
+    #[test]
+    fn a_single_label_public_suffix_rp_id_is_a_startup_error() {
+        // A bare TLD/public suffix (`com`) is a suffix of `auth.example.com`, so the
+        // old ends_with heuristic accepted it; the browser then rejects it at
+        // ceremony time. It must now be a BOOT error.
+        let bare_tld = "[server]\npublic_url = \"https://auth.example.com\"\n\
+                        [oidc]\nwebauthn_rp_id = \"com\"\n";
+        let err = Config::from_toml_str(bare_tld, "ironauth.toml").expect_err("single-label rp id");
+        assert!(err.to_string().contains("single-label"), "{err}");
+
+        // A valid registrable domain still loads.
+        let registrable = "[server]\npublic_url = \"https://auth.example.com\"\n\
+                           [oidc]\nwebauthn_rp_id = \"example.com\"\n";
+        assert!(Config::from_toml_str(registrable, "ironauth.toml").is_ok());
+
+        // `localhost` (the single-label dev exception) still loads.
+        let localhost = "[server]\npublic_url = \"http://localhost:8080\"\n\
+                         [oidc]\nwebauthn_rp_id = \"localhost\"\n";
+        assert!(Config::from_toml_str(localhost, "ironauth.toml").is_ok());
     }
 
     #[test]

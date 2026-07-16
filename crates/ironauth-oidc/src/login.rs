@@ -58,19 +58,60 @@ pub async fn login_get(
             // The environment-kind chrome (issue #42): a non-production environment
             // marks the page noindex and shows a visible banner; prod shows neither.
             let banner = state.environment_banner(&resume.scope).await;
-            pages::secure_html(
-                StatusCode::OK,
-                pages::login_page(
+            // Conditional-UI passkey sign-in (issue #65): when WebAuthn is enabled,
+            // the page carries the autofill token, a passkey button, and the one
+            // nonce-guarded ceremony script served under the login CSP. The ceremony
+            // endpoints are scope-routed, so the script targets this request's scope.
+            if state.webauthn_enabled() {
+                let nonce = passkey_nonce(&state);
+                let scope_path = format!(
+                    "/t/{}/e/{}",
+                    resume.scope.tenant(),
+                    resume.scope.environment()
+                );
+                let ui = pages::PasskeyUi {
+                    nonce: &nonce,
+                    scope_path: &scope_path,
+                };
+                let body = pages::login_page(
                     resume.hints.login_hint().unwrap_or_default(),
                     &resume.return_to,
                     None,
                     &resume.hints,
                     banner,
-                ),
-            )
+                    Some(&ui),
+                );
+                pages::login_html(StatusCode::OK, body, &nonce)
+            } else {
+                pages::secure_html(
+                    StatusCode::OK,
+                    pages::login_page(
+                        resume.hints.login_hint().unwrap_or_default(),
+                        &resume.return_to,
+                        None,
+                        &resume.hints,
+                        banner,
+                        None,
+                    ),
+                )
+            }
         }
         None => interaction::invalid_link_page(),
     }
+}
+
+/// A per-response CSP script nonce for the login page's conditional-UI script
+/// (issue #65), drawn from the entropy seam and hex-encoded so it is a valid CSP
+/// nonce token.
+fn passkey_nonce(state: &OidcState) -> String {
+    let mut bytes = [0_u8; 16];
+    state.env().entropy().fill_bytes(&mut bytes);
+    let mut nonce = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(nonce, "{byte:02x}");
+    }
+    nonce
 }
 
 /// `POST /login`: verify the password and, on success, establish a session and
@@ -360,6 +401,8 @@ fn failed_login_page(
     hints: &crate::hints::InteractionHints,
     environment_banner: Option<&str>,
 ) -> Response {
+    // The error re-render is the strict, script-free page: the passkey path is
+    // offered on the primary GET login page (this is a failed-password re-render).
     pages::secure_html(
         StatusCode::OK,
         pages::login_page(
@@ -368,6 +411,7 @@ fn failed_login_page(
             Some("Incorrect identifier or password."),
             hints,
             environment_banner,
+            None,
         ),
     )
 }

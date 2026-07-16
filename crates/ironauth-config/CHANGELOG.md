@@ -6,6 +6,21 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Reject a single-label WebAuthn RP ID at startup (issue #65 review hardening): a bare
+  label such as a public suffix (`com`) is no longer accepted, since it passed the
+  registrable-suffix check against a host like `auth.example.com` yet the browser
+  rejects it at ceremony time. A registrable RP ID must contain a dot; `localhost`
+  stays the single-label dev exception. It is a boot-time `ConfigError::Invalid`.
+- WebAuthn passkey settings on `[oidc]` (issue #65): `webauthn_enabled` (default on),
+  `webauthn_rp_id` (the per-environment Relying Party ID; when unset it is derived
+  from the serving origin's host), `webauthn_challenge_ttl_secs` (default 300),
+  `webauthn_require_user_verification` (default on), and
+  `webauthn_clone_detection_block` (default off, warn). The RP ID is validated at
+  STARTUP against the serving origin: when set, `server.public_url` must be
+  configured and the RP ID must be the origin host or a parent (registrable-suffix)
+  domain of it, so a misconfiguration is a boot-time `ConfigError::Invalid` rather
+  than a per-ceremony runtime surprise.
+
 - `[oidc.lazy_migration]` inbound lazy-migration hook settings (issue #56): a new nested
   config table arming the login-time verification of an unknown identifier against a legacy
   store. `enabled` (default false) gates it; `endpoint` (an https URL, required and https

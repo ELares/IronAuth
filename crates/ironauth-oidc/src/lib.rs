@@ -116,6 +116,7 @@ mod token_hash;
 mod tokens;
 mod userinfo;
 mod util;
+mod webauthn;
 mod wellknown;
 
 use axum::Router;
@@ -194,6 +195,9 @@ pub use tokens::{
 /// and `POST /token`; the `state` carries the data-plane store, the environment
 /// seam, the per-environment signing keys, the issuer base, and the configured
 /// code and access-token lifetimes.
+// A flat inventory of `.route()` mounts; splitting the endpoint list across helpers
+// would scatter the single mounted surface the RFC 9700 lint reads.
+#[allow(clippy::too_many_lines)]
 pub fn oidc_router(state: OidcState) -> Router {
     let mut router = Router::new()
         .route(
@@ -288,6 +292,45 @@ pub fn oidc_router(state: OidcState) -> Router {
         .route(
             "/t/{tenant_id}/e/{environment_id}/account/password",
             post(account::change_password),
+        )
+        // WebAuthn passkey ceremonies (issue #65), scope-routed so the RP ID/origin
+        // and the credential reads/writes run under the right per-environment scope.
+        // The register endpoints require the caller's session; the authenticate
+        // endpoints ARE the sign-in (discoverable credentials, conditional UI). The
+        // handlers fail closed with a 404 when `oidc.webauthn_enabled` is off, so the
+        // route literals stay unconditional for the RFC 9700 endpoint inventory.
+        .route(
+            "/t/{tenant_id}/e/{environment_id}/webauthn/register/options",
+            post(webauthn::register_options),
+        )
+        .route(
+            "/t/{tenant_id}/e/{environment_id}/webauthn/register/verify",
+            post(webauthn::register_verify),
+        )
+        .route(
+            "/t/{tenant_id}/e/{environment_id}/webauthn/authenticate/options",
+            post(webauthn::authenticate_options),
+        )
+        .route(
+            "/t/{tenant_id}/e/{environment_id}/webauthn/authenticate/verify",
+            post(webauthn::authenticate_verify),
+        )
+        // The authenticated passkey management surface (issue #65): the caller lists,
+        // renames, and removes their OWN passkeys (subject-bound, IDOR-safe, audited
+        // on mutation). The list also appears folded into GET /account/credentials so
+        // a user sees every credential in one place; these give the passkey-specific
+        // detail (live BE/BS) and the nickname/remove mutations.
+        .route(
+            "/t/{tenant_id}/e/{environment_id}/webauthn/credentials",
+            get(webauthn::list_credentials),
+        )
+        .route(
+            "/t/{tenant_id}/e/{environment_id}/webauthn/credentials/rename",
+            post(webauthn::rename_credential),
+        )
+        .route(
+            "/t/{tenant_id}/e/{environment_id}/webauthn/credentials/remove",
+            post(webauthn::remove_credential),
         )
         // The public invitation-accept endpoint (issue #60): the invitee side of the
         // admin-initiated invitation flow. Scope-routed under the per-environment path

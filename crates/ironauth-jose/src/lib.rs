@@ -135,6 +135,7 @@ mod sign;
 mod signing_key;
 mod signing_policy;
 mod verify;
+pub mod webauthn;
 
 pub mod seams;
 
@@ -159,3 +160,4 @@ pub use rotation::{KeySet, RotationError, RotationParams, includes_downgrade_key
 pub use signing_key::{SigningKey, SigningKeyError};
 pub use signing_policy::{SigningPolicy, SigningPolicyError};
 pub use verify::{VerifiedToken, verify};
+pub use webauthn::{WebauthnKey, WebauthnSignatureError, verify_webauthn_signature};

@@ -122,6 +122,19 @@ The export omits fields that are re-created at the destination rather than carri
   the moment a credential-registry (or user) column is added without export coverage,
   so nothing can silently escape. The field-coverage test enumerates the FULL
   identity model (`users` and `account_credentials`), not one table.
+- A registered WebAuthn passkey (the `webauthn_credentials` table, issue #65) is NOT
+  in a record. Unlike a password hash, a passkey is DEVICE-BOUND and not portable
+  across IdP instances: the private key never leaves the authenticator, and the
+  stored COSE public key is scoped to this deployment's Relying Party ID, so an
+  authenticator refuses to sign for a different RP ID. Re-homing the public key to
+  another provider would produce a credential that can never authenticate. A user
+  therefore re-enrolls their passkeys on the destination instance (a fresh ceremony
+  binds a new credential to the new RP ID). The whole passkey credential material is
+  classified as OPERATIONAL device state in the field-coverage test, with only the
+  scope/structural columns marked DERIVED, so the guard still fails the build if the
+  table grows an unclassified column. The portable identity (the user and its
+  password hash) round-trips as before; the non-portable device keys are documented
+  here as the honest exception.
 
 ## Password hash formats
 

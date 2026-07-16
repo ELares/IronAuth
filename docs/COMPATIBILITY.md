@@ -20,3 +20,4 @@ table is the authoritative list of artifacts and their versions at HEAD.
 | ironauth-quota | 0.1.0 | library | 1.85 |
 | ironauth-server | 0.1.0 | library | 1.85 |
 | ironauth-store | 0.1.0 | library | 1.85 |
+| ironauth-webauthn | 0.1.0 | library | 1.85 |

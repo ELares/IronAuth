@@ -1,0 +1,33 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+#
+# The cargo-fuzz harness is a standalone crate, deliberately NOT a workspace
+# member (its own empty [workspace] table below makes it its own root): the
+# libfuzzer-sys dependency needs a nightly toolchain and must not constrain the
+# stable workspace. The equivalent no-panic, bounded guarantee runs on stable in
+# crates/ironauth-webauthn/tests/parse_fuzz.rs, which the normal gate exercises;
+# this crate is for the nightly deep-fuzz CI lane.
+#
+# Run (nightly): cargo +nightly fuzz run ceremony_parse
+[package]
+name = "ironauth-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+rust-version = "1.85"
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+ironauth-webauthn = { path = "../crates/ironauth-webauthn" }
+serde_json = "1"
+
+[[bin]]
+name = "ceremony_parse"
+path = "fuzz_targets/ceremony_parse.rs"
+test = false
+doc = false
+bench = false

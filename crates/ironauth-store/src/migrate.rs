@@ -530,6 +530,12 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0043_migration_runs.sql"),
         },
+        Migration {
+            version: 44,
+            name: "webauthn_credentials",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0044_webauthn_credentials.sql"),
+        },
     ]
 }
 

@@ -259,6 +259,32 @@ impl ScopedKind for CredentialKind {
     const PREFIX: &'static str = "crd";
 }
 
+/// Marker for a registered WebAuthn passkey credential (`pky_`), one row in the
+/// per-user passkey registry (issue #65): the COSE public key, sign counter,
+/// AAGUID, transports, BE/BS flags, and the sealed nickname of one authenticator.
+/// A tenant-scoped resource: the id embeds its `(tenant, environment)`, so a
+/// credential minted in one scope parses as a uniform not-found under another,
+/// and a credential is only ever reachable by the subject it is bound to. The
+/// stored COSE key is PUBLIC key material, never a bearer secret.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct WebauthnCredentialKind;
+impl ScopedKind for WebauthnCredentialKind {
+    const PREFIX: &'static str = "pky";
+}
+
+/// Marker for a single-use WebAuthn ceremony challenge (`wch_`), one row in the
+/// short-lived challenge store (issue #65): the random challenge a registration
+/// or authentication ceremony was issued, consumed exactly once. A tenant-scoped
+/// resource: the id embeds its `(tenant, environment)`, so a handle minted in one
+/// scope parses as a uniform not-found under another. The challenge it carries is
+/// a public nonce (it is sent to the client in the ceremony options), not a
+/// secret.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct WebauthnChallengeKind;
+impl ScopedKind for WebauthnChallengeKind {
+    const PREFIX: &'static str = "wch";
+}
+
 /// Marker for a flexible login identifier (`uid_`), one row in a user's typed
 /// login-identifier set (issue #54): a verified-or-not email, username, or phone a
 /// user can log in with. A tenant-scoped resource: the identifier row id embeds its
@@ -753,6 +779,12 @@ pub type ClientSessionId = ScopedId<ClientSessionKind>;
 /// An account-credential identifier (`crd_...`), one enrolled credential in a
 /// user's self-service credential registry (issue #61).
 pub type CredentialId = ScopedId<CredentialKind>;
+
+/// A registered WebAuthn passkey credential id (`pky_`, issue #65).
+pub type WebauthnCredentialId = ScopedId<WebauthnCredentialKind>;
+
+/// A single-use WebAuthn ceremony challenge handle (`wch_`, issue #65).
+pub type WebauthnChallengeId = ScopedId<WebauthnChallengeKind>;
 /// A flexible-login-identifier row id (`uid_...`), one typed login identifier
 /// (email, username, or phone) a user can authenticate with (issue #54).
 pub type UserIdentifierId = ScopedId<UserIdentifierKind>;
