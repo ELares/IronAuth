@@ -301,8 +301,15 @@ fn password_matches(native: Option<&str>, foreign: Option<&str>, password: &str)
                     .and_then(|stored| ForeignHash::parse(stored).ok())
                     .is_some_and(|hash| hash.verify(bytes))
         }
-        // No account: spend the dummy Argon2id work, always a non-match.
-        None => ironauth_oidc::verify_absent(password),
+        // No account: spend the dummy Argon2id work, always a non-match. This runs the
+        // Argon2 verify INLINE rather than through the admission-controlled pool because
+        // the admin crate does not host the hashing pool, and this #58 outbound
+        // credential-verify migration endpoint is a far lower-risk surface than the two
+        // unauthenticated OIDC endpoints the pool exists to protect: it is
+        // disabled-by-default, token-authenticated, and single-`(tenant, environment)`
+        // scoped, so it is not an unauthenticated cross-tenant DoS lever. Justified
+        // exception to the pool boundary; see scripts/hashing-pool-boundary.sh.
+        None => ironauth_oidc::verify_absent(password), // pool-boundary-allow: #58 migration verify is disabled-by-default, token-authed, single-scope; admin crate hosts no pool.
     }
 }
 

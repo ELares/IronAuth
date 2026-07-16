@@ -328,6 +328,72 @@ async fn a_noisy_tenant_is_shed_without_shedding_an_innocent_tenant() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn one_tenant_flooding_many_environments_does_not_shed_a_different_tenant() {
+    // MEDIUM-1 regression (issue #62 re-review): the queue-layer isolation must be
+    // genuinely PER-TENANT, not merely per-(tenant, environment). A single tenant using
+    // many of its OWN environments must be shed on its OWN aggregate bound and must NEVER
+    // exhaust the global backstop to shed a DIFFERENT, innocent tenant.
+    //
+    // Reproduces the reported attack: with a per-environment depth of 1 and the shipped
+    // global fan-out of 16, tenant A spreading across >=16 environments used to fill 16
+    // distinct (A, environment) keys up to the global backstop, so an innocent tenant B's
+    // single hash was shed with PoolExhausted (the global valve). The per-tenant AGGREGATE
+    // cap now bounds A's total across ALL its environments strictly below the backstop, so
+    // A sheds on itself and B is always admitted. Under the pre-fix code B is shed here.
+    let params = Argon2Params::new(65_536, 2, 1); // slow enough the single worker stays busy.
+    let pool = Arc::new(HashingPool::new(Env::system(), params, 1, 1, None));
+
+    // Tenant A spans 24 of its OWN environments (one tenant, distinct environments).
+    let env = Env::system();
+    let a_tenant = TenantId::generate(&env);
+    let a_scopes: Vec<Scope> = (0..24)
+        .map(|_| Scope::new(a_tenant, EnvironmentId::generate(&env)))
+        .collect();
+
+    // A floods one hash into each of its 24 environments, concurrently.
+    let mut a_handles = Vec::new();
+    for scope in a_scopes {
+        let pool = Arc::clone(&pool);
+        a_handles.push(tokio::spawn(async move { pool.hash(&scope, "pw").await }));
+    }
+    // An innocent, DIFFERENT tenant B submits one hash to its own environment.
+    let b_scope = fresh_scope();
+    let b_result = {
+        let pool = Arc::clone(&pool);
+        tokio::spawn(async move { pool.hash(&b_scope, "pw").await })
+    }
+    .await
+    .expect("b task");
+
+    let mut a_shed = 0;
+    for handle in a_handles {
+        if matches!(
+            handle.await.expect("a task"),
+            Err(HashRejection::PoolExhausted)
+        ) {
+            a_shed += 1;
+        }
+    }
+    // A's flood across many of its environments is shed on ITS OWN aggregate bound: the
+    // per-tenant total across all A's environments caps below the 16-deep global backstop,
+    // so a large fraction of A's 24 submissions are shed while A's total never reaches the
+    // backstop. (The exact shed count depends on worker timing; what matters is A sheds on
+    // itself and cannot exhaust the shared valve.)
+    assert!(
+        a_shed > 0,
+        "tenant A flooding many of its own environments is shed on its OWN aggregate bound"
+    );
+    // THE acceptance core: the innocent, different tenant B is NEVER shed. Under the pre-fix
+    // per-(tenant, environment) bound A filled the global backstop and B got PoolExhausted;
+    // the per-tenant aggregate cap keeps the backstop reachable only by a BROAD multi-tenant
+    // flood, so B's single hash is always admitted and completes.
+    assert!(
+        b_result.is_ok(),
+        "an innocent different tenant B is not shed by A's multi-environment flood: {b_result:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_saturated_pool_sheds_with_a_typed_error_not_an_inline_hash() {
     // The bounded queue load-sheds with a TYPED PoolExhausted (retryable 503), and
     // verification never falls back to an unbounded inline hash. One worker plus a

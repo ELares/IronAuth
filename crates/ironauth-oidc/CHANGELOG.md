@@ -46,9 +46,11 @@ range per docs/RELEASING.md.
     `(tenant, environment)` gets its own sub-queue and the workers dequeue round-robin
     across tenants with waiting work, so one tenant's admitted backlog can no longer
     head-of-line-block another tenant's already-admitted hash. Load-shedding is
-    per-tenant (a tenant exceeding its own bounded depth is shed, never an innocent
+    per-tenant (a tenant exceeding its bounded depth is shed, never an innocent
     tenant), with a generous global memory backstop charged only to the submitting
-    tenant. `[password_hashing].max_queue_depth` is now the PER-TENANT bound.
+    tenant. `[password_hashing].max_queue_depth` is the PER-`(tenant, environment)`
+    sub-queue bound (see the re-review follow-up below for the per-tenant AGGREGATE cap
+    that makes the cross-tenant isolation hold across a tenant's own environments).
   - The no-pool `spawn_blocking` fallback (the self-hoster and test posture) is now
     bounded by a semaphore capped at the host core count, so a flood cannot pin the
     tokio blocking pool (~512 threads). The installed pool remains the production path.
@@ -57,9 +59,37 @@ range per docs/RELEASING.md.
     every axis (and stronger on one), so lowering `[password_hashing]` never downgrades
     an existing stronger hash.
   - The admission-rejection metric exposes the machine-readable rejection REASON today
-    (`over_share`, `per_tenant_queue_full`, `global_backstop_full`, `shutting_down`); a
-    per-tenant breakdown deliberately rides the same bounded-cardinality scrape-hook
-    follow-up as issue #50 rather than an unbounded per-tenant label (cardinality-safe).
+    (`over_share`, `per_tenant_queue_full`, `per_environment_queue_full`,
+    `global_backstop_full`, `shutting_down`); a per-tenant breakdown deliberately rides
+    the same bounded-cardinality scrape-hook follow-up as issue #50 rather than an
+    unbounded per-tenant label (cardinality-safe).
+- Argon2id hashing pool re-review residuals (issue #62, second adversarial review):
+  - The queue-layer load-shed is now genuinely PER-TENANT, closing a per-tenant
+    isolation hole. The prior bound was per-`(tenant, environment)`, so one tenant using
+    16 or more of its OWN environments could fill 16 sub-queues up to the global memory
+    backstop and shed an INNOCENT different tenant with `PoolExhausted`. Each tenant now
+    also carries an AGGREGATE queued-depth cap summed across ALL of its environments,
+    set strictly below the global backstop (`max_queue_depth * 8` versus the backstop's
+    `* 16`), so a tenant spanning any number of its environments sheds on its OWN total
+    (`per_tenant_queue_full`) and can never exhaust the backstop to shed another tenant.
+    The per-`(tenant, environment)` round-robin fairness and the finer per-environment
+    sub-queue bound (`per_environment_queue_full`) are unchanged; only a BROAD
+    multi-tenant flood now reaches the global valve.
+  - The device-flow sign-in step now surfaces a pool rejection UNIFORMLY on all three
+    identifier branches (present, fenced, absent), closing an anti-enumeration oracle
+    under overload: the fenced and absent branches previously swallowed the rejection
+    and returned the generic failure page (200) while a present-and-loginable identifier
+    surfaced the retryable 429/503, so an attacker-inducible hashing overload
+    distinguished user presence and status. All three branches now return the identical
+    retryable rejection, matching the hardened `/login` path.
+  - The pool-boundary lint (`scripts/hashing-pool-boundary.sh`) now scans EVERY crate's
+    production source (not just `ironauth-oidc/src`) and catches the crate-root
+    re-export call form (`ironauth_oidc::{hash_password,verify_password,verify_absent}`),
+    so a cross-crate inline hash cannot slip past the boundary. The existing
+    disabled-by-default, token-authenticated, single-scope `ironauth-admin` migration
+    verify (#58) carries an explicit `pool-boundary-allow` marker with its written
+    justification (the admin crate hosts no pool), matching how the repo's other audit
+    lints allow justified exceptions.
 - Inbound lazy-migration hook (issue #56): when the `[oidc.lazy_migration]` config arms
   it, a login whose canonicalized identifier is UNKNOWN locally verifies the submitted
   credential against a legacy store through a pluggable `CredentialVerifier` (the only

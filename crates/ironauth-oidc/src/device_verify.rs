@@ -251,11 +251,18 @@ async fn device_login(
             // pending verification) is FENCED (issue #52): spend comparable password
             // time THROUGH THE ADMISSION-CONTROLLED POOL (issue #62, never an inline
             // hash on a protocol-I/O thread), then return the SAME generic failure as
-            // a wrong password (no oracle). A pool shed here still just fails generic.
+            // a wrong password (no oracle). A pool shed is SURFACED as the retryable
+            // 429/503 here, exactly as the present-and-loginable branch below does, so
+            // an overload response does not distinguish a fenced identifier from a
+            // present one (no username/status enumeration oracle under load).
             if !user.state.can_authenticate() {
-                let _ = state
+                match state
                     .verify_password(&scope, password, &user.password_hash)
-                    .await;
+                    .await
+                {
+                    Ok(_) => {}
+                    Err(rejection) => return rejection.to_response(),
+                }
                 return failed_login(action, raw_code);
             }
             // The credential check runs on the dedicated hashing pool behind
@@ -294,8 +301,14 @@ async fn device_login(
         }
         Ok(None) => {
             // Spend comparable Argon2id time through the pool (admission-controlled),
-            // then the SAME generic failure.
-            let _ = state.verify_absent(&scope, password).await;
+            // then the SAME generic failure. A pool shed is SURFACED as the retryable
+            // 429/503 (not swallowed into the generic failure), so an absent identifier
+            // is indistinguishable from a present one under overload (no enumeration
+            // oracle), matching the fenced and present-and-loginable branches.
+            match state.verify_absent(&scope, password).await {
+                Ok(_) => {}
+                Err(rejection) => return rejection.to_response(),
+            }
             failed_login(action, raw_code)
         }
         Err(_) => server_error(),
