@@ -44,6 +44,8 @@
 /t/{tenant_id}/e/{environment_id}/magic/consume
 /t/{tenant_id}/e/{environment_id}/magic/send
 /t/{tenant_id}/e/{environment_id}/otp/send
+/t/{tenant_id}/e/{environment_id}/otp/sms/send
+/t/{tenant_id}/e/{environment_id}/otp/sms/verify
 /t/{tenant_id}/e/{environment_id}/otp/verify
 /t/{tenant_id}/e/{environment_id}/webauthn/authenticate/options
 /t/{tenant_id}/e/{environment_id}/webauthn/authenticate/verify
