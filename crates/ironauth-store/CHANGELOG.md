@@ -18,14 +18,26 @@ range per docs/RELEASING.md.
   tallies, its live invariant evaluations, and a paginated view of the records
   violating an invariant; `abandon` is an explicit audited terminal transition. Two new
   tenant-scoped tables (`migration_runs`, `migration_run_records`) with forced RLS, the
-  `(tenant, environment)` isolation policy, closed-set CHECKs, and column-scoped grants;
-  a record's natural subject is envelope-sealed and blind-indexed (issue #48), never
-  plaintext. Every transition is audited via `write_audited` with actor attribution
-  (`migration_run.create` / `.transition` / `.ingest` / `.backfill` / `.complete` /
-  `.abandon`). Applied to two concrete kinds (bulk import #55 via `ironauth-import`,
-  schema migration jobs #53); a tenant move (M5) fits the same model without being
-  wired. New public types: `MigrationRun{,Id,Kind,RecordId,RecordKind}`,
-  `MigrationState`, `MigrationRecordOutcome`, `NewMigrationRun`, `RecordOutcomeInput`,
+  `(tenant, environment)` isolation policy, closed-set CHECKs, and column-scoped grants
+  scoped to the DATA plane: only `ironauth_app` INSERTs and column-UPDATEs these tables
+  (it drives every transition); the CONTROL plane (`ironauth_control`, the operator API)
+  is granted SELECT ALONE, since its endpoints are read-only (the #31 least-privilege
+  lesson). A record's natural subject is envelope-sealed and blind-indexed (issue #48),
+  never plaintext. Each invariant family has an in-place, audited unblock path so a
+  blocked run is triaged without abandoning it: re-ingest (count),
+  `ActingMigrationRunRepo::reconcile_records` (consistency: flip a triaged identity back
+  to consistent under the run-row lock, refused on a terminal run), and `mark_backfill`
+  (sentinel); the next `try_complete` re-evaluates live and completes. Every transition
+  is audited via `write_audited` with actor attribution (`migration_run.create` /
+  `.transition` / `.ingest` / `.backfill` / `.reconcile` / `.complete` / `.abandon`).
+  Applied to two concrete kinds through SHIPPED adapters: bulk import #55 via
+  `ironauth_import::import_into_run`, and schema migration jobs #53 via
+  `ActingMigrationRunRepo::ingest_schema_migration_job` (reconciles a #53 job's
+  per-record failure report into the ledger as failed + inconsistent records with their
+  JSON-Pointer reasons, so consistency gates on the failed identities); a tenant move
+  (M5) fits the same model without being wired. New public types:
+  `MigrationRun{,Id,Kind,RecordId,RecordKind}`, `MigrationState`,
+  `MigrationRecordOutcome`, `NewMigrationRun`, `RecordOutcomeInput`,
   `MigrationRunTallies`, `InvariantKind`, `InvariantEvaluation`, `CompletionOutcome`,
   `OffendingRecord`, and the `migration_runs()` accessors on `ScopedStore` / `ActingStore`.
 - `UserRepo::migration_progress` (issue #56): a scoped, master-key-free count of the

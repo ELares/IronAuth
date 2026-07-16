@@ -98,14 +98,20 @@ CREATE POLICY migration_runs_tenant_isolation ON migration_runs
         AND environment_id = current_setting('ironauth.environment_id', true)
     );
 
--- Both planes create and read runs and drive their transitions. The immutable
+-- Only the DATA plane (`ironauth_app`) drives a run: it creates the run and takes
+-- every lifecycle transition (the migration machinery runs there). The CONTROL plane
+-- (`ironauth_admin`, as `ironauth_control`) is READ-ONLY over these tables: its three
+-- operator endpoints only list runs and read live state, tallies, and violations, so
+-- it is granted SELECT alone and never INSERT or UPDATE (the #31 least-privilege
+-- lesson: a role holds only the privileges its callers exercise). The immutable
 -- definition columns (id, tenant_id, environment_id, kind, created_at) are never
--- updated, so the UPDATE grant is COLUMN-scoped to exactly the mutable lifecycle
--- columns, never a table-wide UPDATE (the #31 lesson).
-GRANT SELECT, INSERT ON migration_runs TO ironauth_app, ironauth_control;
+-- updated, so the data plane's UPDATE grant is COLUMN-scoped to exactly the mutable
+-- lifecycle columns, never a table-wide UPDATE.
+GRANT SELECT ON migration_runs TO ironauth_control;
+GRANT SELECT, INSERT ON migration_runs TO ironauth_app;
 GRANT UPDATE (
         state, source_total, backfill_expected, subject_ref, abandoned_reason, updated_at
-    ) ON migration_runs TO ironauth_app, ironauth_control;
+    ) ON migration_runs TO ironauth_app;
 
 -- ---------------------------------------------------------------------------
 -- 2. The per-record accounting and consistency ledger.
@@ -175,10 +181,14 @@ CREATE POLICY migration_run_records_tenant_isolation ON migration_run_records
         AND environment_id = current_setting('ironauth.environment_id', true)
     );
 
--- Both planes ingest and read records; reconciliation and the backfill pass flip the
--- consistent / backfilled / detail columns. The immutable accounting columns (subject
--- and outcome) are never updated, so the UPDATE grant is COLUMN-scoped to exactly the
--- reconciliation columns, never a table-wide UPDATE (the #31 lesson).
-GRANT SELECT, INSERT ON migration_run_records TO ironauth_app, ironauth_control;
+-- Only the DATA plane (`ironauth_app`) ingests records and flips the consistent /
+-- backfilled / detail columns (reconciliation and the backfill pass run there). The
+-- CONTROL plane only reads them for the paginated operator violation view, so it is
+-- granted SELECT alone and never INSERT or UPDATE (the #31 least-privilege lesson).
+-- The immutable accounting columns (subject and outcome) are never updated, so the
+-- data plane's UPDATE grant is COLUMN-scoped to exactly the reconciliation columns,
+-- never a table-wide UPDATE.
+GRANT SELECT ON migration_run_records TO ironauth_control;
+GRANT SELECT, INSERT ON migration_run_records TO ironauth_app;
 GRANT UPDATE (consistent, backfilled, detail)
-    ON migration_run_records TO ironauth_app, ironauth_control;
+    ON migration_run_records TO ironauth_app;

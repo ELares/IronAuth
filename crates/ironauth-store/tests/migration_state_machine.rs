@@ -339,6 +339,104 @@ async fn consistency_invariant_blocks_and_names_the_offending_records() {
 }
 
 #[tokio::test]
+async fn reconciling_an_inconsistent_record_unblocks_and_completes() {
+    // The consistency invariant's in-place unblock path: a `consistent = false` record
+    // blocks completion, and after the operator RECONCILES it (triaged or repaired), the
+    // NEXT completion attempt re-evaluates the invariant LIVE (never a cached verdict)
+    // and SUCCEEDS. This is the consistency counterpart of re-ingest (count) and
+    // mark_backfill (sentinel).
+    let db = TestDatabase::start().await;
+    let (env, _clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0x5c);
+    let scope = db.seed_scope(&env).await;
+    let store = db.store();
+
+    // Two records, both accounted and backfilled, but ONE is inconsistent.
+    let run = create_run(store, &env, scope, MigrationKind::BulkImport, 2, 2).await;
+    drive_to_running(store, &env, scope, &run).await;
+    ingest(
+        store,
+        &env,
+        scope,
+        &run,
+        &[
+            (
+                "usr_good".to_string(),
+                MigrationRecordOutcome::Imported,
+                true,
+                true,
+            ),
+            (
+                "usr_bad".to_string(),
+                MigrationRecordOutcome::Failed,
+                false,
+                true,
+            ),
+        ],
+    )
+    .await;
+    to_reconciling(store, &env, scope, &run).await;
+
+    // It is blocked by the inconsistent identity.
+    let outcome = try_complete(store, &env, scope, &run).await;
+    let CompletionOutcome::Blocked(violated) = outcome else {
+        panic!("expected blocked, got {outcome:?}");
+    };
+    assert!(
+        violated
+            .iter()
+            .any(|e| e.kind == InvariantKind::Consistency),
+        "consistency must block before reconcile: {violated:?}"
+    );
+
+    // Reconcile the offending record: flip it back to consistent, clearing its reason.
+    store
+        .scoped(scope)
+        .acting(actor(store, &env, scope), CorrelationId::generate(&env))
+        .migration_runs()
+        .reconcile_records(&env, &run, &["usr_bad"])
+        .await
+        .expect("reconcile record");
+
+    // The consistency invariant now re-evaluates satisfied (live, from the flipped row).
+    let evals = store
+        .scoped(scope)
+        .migration_runs()
+        .evaluate(&run)
+        .await
+        .expect("evaluate");
+    assert!(
+        satisfied(&evals, InvariantKind::Consistency),
+        "consistency must be satisfied after reconcile: {evals:?}"
+    );
+    // No records remain on the consistency violation view.
+    let offenders = store
+        .scoped(scope)
+        .migration_runs()
+        .list_violations(&run, InvariantKind::Consistency, 100, None)
+        .await
+        .expect("list violations");
+    assert!(offenders.is_empty(), "no inconsistent records remain");
+
+    // Completion now SUCCEEDS: the missing "unblock + complete" half.
+    assert_eq!(
+        try_complete(store, &env, scope, &run).await,
+        CompletionOutcome::Completed
+    );
+    assert_eq!(
+        store
+            .scoped(scope)
+            .migration_runs()
+            .get(&run)
+            .await
+            .expect("get")
+            .state,
+        MigrationState::Complete
+    );
+    assert_eq!(audit_count(&db, scope, "migration_run.reconcile").await, 1);
+    assert_eq!(audit_count(&db, scope, "migration_run.complete").await, 1);
+}
+
+#[tokio::test]
 async fn a_missing_backfill_sentinel_blocks_and_marking_it_unblocks() {
     let db = TestDatabase::start().await;
     let (env, _clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0x5b);
@@ -683,7 +781,6 @@ async fn a_schema_migration_job_wrapped_in_the_machine_blocks_on_failed_identiti
         .await
         .expect("activate v1");
 
-    let mut ids = Vec::new();
     for handle in ["alice", "bob"] {
         let id = acting()
             .users()
@@ -711,7 +808,6 @@ async fn a_schema_migration_job_wrapped_in_the_machine_blocks_on_failed_identiti
             .set_traits(&env, &id, &json!({"name": handle}).to_string())
             .await
             .expect("set traits");
-        ids.push(id);
     }
 
     // A candidate v2 (rename name -> full_name) with NO transform: every identity fails
@@ -742,40 +838,29 @@ async fn a_schema_migration_job_wrapped_in_the_machine_blocks_on_failed_identiti
         .await
         .expect("advance job");
 
-    // WRAP the schema migration job in a run and RECONCILE its per-record outcomes: a
-    // failed identity is failed + inconsistent; a migrated identity would be imported +
-    // consistent + backfilled (its traits_schema_version now stamps to v2).
+    // WRAP the schema migration job in a run and drive the SHIPPED schema-migration
+    // adapter (`ingest_schema_migration_job`, the counterpart of the import crate's
+    // `import_into_run`): it reconciles the job's per-record failure report into the
+    // ledger as failed + inconsistent records, so the CONSISTENCY invariant refuses to
+    // complete the run while any migrated identity failed re-validation. `source_total`
+    // accounts every failed record; the migrated population is zero here (no transform),
+    // so the count invariant is satisfied and consistency is the sole blocker.
     let failed: HashSet<String> = job.failures.iter().map(|f| f.subject.clone()).collect();
     let run = create_run(
         store,
         &env,
         scope,
         MigrationKind::SchemaMigration,
-        job.total_count,
-        job.migrated_count,
+        job.failure_count,
+        0,
     )
     .await;
     drive_to_running(store, &env, scope, &run).await;
-
-    let mut outcomes = Vec::new();
-    for id in &ids {
-        let subject = id.to_string();
-        let (version, _) = store
-            .scoped(scope)
-            .users()
-            .traits(id)
-            .await
-            .expect("read traits")
-            .expect("has traits");
-        if failed.contains(&subject) {
-            outcomes.push((subject, MigrationRecordOutcome::Failed, false, false));
-        } else if version == v2 {
-            outcomes.push((subject, MigrationRecordOutcome::Imported, true, true));
-        } else {
-            outcomes.push((subject, MigrationRecordOutcome::Skipped, true, false));
-        }
-    }
-    ingest(store, &env, scope, &run, &outcomes).await;
+    acting()
+        .migration_runs()
+        .ingest_schema_migration_job(&env, &run, &job)
+        .await
+        .expect("ingest schema migration job");
     to_reconciling(store, &env, scope, &run).await;
 
     // The wrapped run is BLOCKED by the failed identities.

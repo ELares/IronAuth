@@ -21559,7 +21559,10 @@ pub enum MigrationState {
     /// The underlying job is executing; records are being touched.
     Running,
     /// Execution finished; invariants are being evaluated and offending records
-    /// reconciled.
+    /// reconciled in place: a count shortfall by re-ingest, an inconsistent identity by
+    /// [`ActingMigrationRunRepo::reconcile_records`], and an unmarked record by
+    /// [`ActingMigrationRunRepo::mark_backfill`], each unblocking its invariant for the
+    /// next completion attempt.
     Reconciling,
     /// Terminal success: reached only when every invariant re-evaluated satisfied.
     Complete,
@@ -22386,6 +22389,150 @@ impl ActingMigrationRunRepo<'_> {
         )
         .await?;
         Ok(())
+    }
+
+    /// Reconcile a batch of previously-INCONSISTENT records back to consistent, by
+    /// subject (issue #59): an operator who triaged or repaired an offending identity
+    /// flips it back with this AUDITED, run-row-locked call, clearing the recorded
+    /// reason. This is the consistency invariant's in-place unblock path, the exact
+    /// counterpart of re-ingest for the count invariant and [`mark_backfill`] for the
+    /// sentinel: the next [`try_complete`] re-evaluates the invariant LIVE (never a
+    /// cached verdict), so a fully-reconciled run then completes. A subject with no
+    /// record in this run is silently ignored. Reachable only in a NON-terminal state
+    /// (`defined` / `validating` / `running` / `reconciling`), so a terminal run cannot
+    /// be quietly re-opened. Writes ONE `migration_run.reconcile` audit row for the
+    /// batch.
+    ///
+    /// [`mark_backfill`]: ActingMigrationRunRepo::mark_backfill
+    /// [`try_complete`]: ActingMigrationRunRepo::try_complete
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the run is absent;
+    /// [`StoreError::IllegalMigrationTransition`] if the run is terminal;
+    /// [`StoreError::Encryption`] if no master key is configured; [`StoreError::Database`]
+    /// on a persistence failure.
+    pub async fn reconcile_records(
+        &self,
+        env: &Env,
+        run_id: &MigrationRunId,
+        subjects: &[&str],
+    ) -> Result<(), StoreError> {
+        if run_id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let master = self.store.master().ok_or(StoreError::Encryption)?;
+        let scope = self.scope;
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::MigrationRunReconcile,
+                target: run_id,
+            },
+            async move |tx| {
+                // Lock the run row and refuse a terminal run, so a reconcile cannot
+                // touch the ledger of an already complete or abandoned migration.
+                let state = lock_run_state(tx, scope, &run_id.to_string()).await?;
+                if state.is_terminal() {
+                    return Err(StoreError::IllegalMigrationTransition {
+                        from: state.as_str(),
+                        to: "reconcile",
+                    });
+                }
+                for subject in subjects {
+                    let bidx = migration_record_subject_blind_index(master, scope, subject);
+                    // Flip the identity back to consistent and clear its recorded reason;
+                    // the verdict is never cached, so the next completion attempt re-reads
+                    // this column.
+                    sqlx::query(
+                        "UPDATE migration_run_records SET consistent = true, detail = NULL \
+                         WHERE tenant_id = $1 AND environment_id = $2 AND run_id = $3 \
+                         AND subject_bidx = $4",
+                    )
+                    .bind(scope.tenant().to_string())
+                    .bind(scope.environment().to_string())
+                    .bind(run_id.to_string())
+                    .bind(bidx.into_bytes())
+                    .execute(&mut **tx)
+                    .await?;
+                }
+                Ok(())
+            },
+            false,
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Reconcile a schema-migration job's per-record failure report into a run's ledger
+    /// (issue #59): the SHIPPED schema-migration adapter, the counterpart of
+    /// `ironauth_import::import_into_run` for the streaming bulk import. Each identity
+    /// the #53 job reported as a failure (a failed transform or a failed re-validation)
+    /// is ingested as a `failed` + INCONSISTENT record whose operator-safe `detail` is
+    /// the job's RFC 6901 JSON Pointer reasons (never a trait value, so no PII), so the
+    /// CONSISTENCY invariant then refuses to complete the run while any migrated identity
+    /// stands unresolved. The failed records are marked processed (`backfilled`), so only
+    /// the consistency gate blocks; the operator triages each with [`reconcile_records`]
+    /// (or the job is re-run) before completion.
+    ///
+    /// The caller owns the lifecycle exactly as for the import adapter: advance the #53
+    /// job, create the run (declaring `source_total`), drive it to `running`, call this,
+    /// then transition to `reconciling` and attempt the gated completion.
+    ///
+    /// [`reconcile_records`]: ActingMigrationRunRepo::reconcile_records
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the run is absent;
+    /// [`StoreError::IllegalMigrationTransition`] if the run is terminal;
+    /// [`StoreError::Encryption`] if no master key is configured; [`StoreError::Database`]
+    /// on a persistence failure.
+    pub async fn ingest_schema_migration_job(
+        &self,
+        env: &Env,
+        run_id: &MigrationRunId,
+        job: &TraitMigrationJob,
+    ) -> Result<(), StoreError> {
+        // Summarize each failing record's per-field reasons into one operator-safe
+        // detail string, owned so the borrowed `RecordOutcomeInput`s outlive the map.
+        let translated: Vec<(String, String)> = job
+            .failures
+            .iter()
+            .map(|failure| {
+                let detail = if failure.failures.is_empty() {
+                    "failed re-validation".to_string()
+                } else {
+                    failure
+                        .failures
+                        .iter()
+                        .map(|field| {
+                            let pointer = if field.pointer.is_empty() {
+                                "(root)"
+                            } else {
+                                field.pointer.as_str()
+                            };
+                            format!("{pointer}: {}", field.message)
+                        })
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                };
+                (failure.subject.clone(), detail)
+            })
+            .collect();
+        let inputs: Vec<RecordOutcomeInput<'_>> = translated
+            .iter()
+            .map(|(subject, detail)| RecordOutcomeInput {
+                subject,
+                outcome: MigrationRecordOutcome::Failed,
+                consistent: false,
+                backfilled: true,
+                detail: Some(detail),
+            })
+            .collect();
+        self.ingest_outcomes(env, run_id, &inputs).await
     }
 
     /// Attempt to complete the run: the GATED `reconciling -> complete` transition. The

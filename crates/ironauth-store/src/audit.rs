@@ -321,6 +321,13 @@ pub enum Action {
     /// A migration run's records were marked by a BACKFILL pass (issue #59): the
     /// sentinel the backfill invariant requires set. One audit row per backfill batch.
     MigrationRunBackfill,
+    /// A migration run's records were RECONCILED (issue #59): a previously-inconsistent
+    /// identity that an operator triaged or repaired is flipped back to consistent (and
+    /// its recorded reason cleared), so a fixed identity unblocks the consistency
+    /// invariant exactly as re-ingest unblocks count and a backfill mark unblocks the
+    /// sentinel. One audit row per reconcile batch; the next completion attempt
+    /// re-evaluates the invariant live, never a cached verdict.
+    MigrationRunReconcile,
     /// A migration run COMPLETED (issue #59): the terminal success transition, taken
     /// only after every invariant re-evaluated satisfied. A blocked completion
     /// attempt writes NO row (it is not a transition), so a `migration_run.complete`
@@ -631,6 +638,7 @@ impl Action {
             Action::MigrationRunTransition => "migration_run.transition",
             Action::MigrationRunIngest => "migration_run.ingest",
             Action::MigrationRunBackfill => "migration_run.backfill",
+            Action::MigrationRunReconcile => "migration_run.reconcile",
             Action::MigrationRunComplete => "migration_run.complete",
             Action::MigrationRunAbandon => "migration_run.abandon",
             Action::SessionCreate => "session.create",
