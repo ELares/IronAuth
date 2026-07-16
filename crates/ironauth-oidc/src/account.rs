@@ -667,9 +667,11 @@ pub async fn change_password(
     {
         return bad_request(&rejection.message());
     }
-    // zxcvbn password-quality scoring (issue #66) AFTER the length/composition policy and
+    // Password-strength scoring (issue #66) AFTER the length/composition policy and
     // BEFORE the breach screen and hash, so an easily-guessable password spends no
-    // network/hash work. OFF by default (min_zxcvbn_score = 0).
+    // network/hash work. OFF by default (min_password_strength_score = 0). The in-tree
+    // score is a COARSE floor blind to dictionary words / l33t; the breach screen is the
+    // primary defense.
     if let Err(rejection) = state.password_policy().evaluate_strength(&normalized) {
         return bad_request(&rejection.message());
     }
@@ -738,7 +740,7 @@ pub async fn change_password(
 /// password conversion), reached from [`change_password`] when the account is
 /// passwordless. There is NO current password to verify; instead a FRESH passkey
 /// re-authentication is demanded, then the FULL set-path policy runs (length /
-/// composition, zxcvbn quality, breach screen) BEFORE the Argon2id hash, exactly as the
+/// composition, strength, breach screen) BEFORE the Argon2id hash, exactly as the
 /// register and change surfaces do. On success the account flips to password-holding and
 /// every OTHER session is revoked (session-fixation defense).
 async fn set_first_password_flow(
@@ -751,7 +753,7 @@ async fn set_first_password_flow(
     if !fresh_passkey_reauth(state, account) {
         return reauth_required();
     }
-    // NFKC-normalize ONCE (issue #63): policy length (code points), zxcvbn scoring, and
+    // NFKC-normalize ONCE (issue #63): policy length (code points), strength scoring, and
     // screening all operate on this form, and the hash is derived from it.
     let normalized = ironauth_screening::normalize_nfkc(new_password);
     if let Err(rejection) = state
@@ -760,7 +762,8 @@ async fn set_first_password_flow(
     {
         return bad_request(&rejection.message());
     }
-    // zxcvbn scoring AFTER length/composition and BEFORE the screen/hash (issue #66).
+    // Coarse strength scoring AFTER length/composition and BEFORE the screen/hash (issue
+    // #66); the breach screen is the primary defense.
     if let Err(rejection) = state.password_policy().evaluate_strength(&normalized) {
         return bad_request(&rejection.message());
     }
@@ -834,6 +837,14 @@ async fn set_first_password_flow(
 /// never strand themselves. On success the password becomes the unusable sentinel, the
 /// account is marked passwordless, and every OTHER session is revoked (session-fixation
 /// defense). Same-origin (CSRF) guarded and audited to the end user.
+///
+/// KNOWN RESIDUAL (issue #66 LOW-4, documented not fixed here): the last-credential guard
+/// counts ANY `webauthn_credentials` row, so it does not require the SURVIVING passkey to be
+/// UV-capable. A native passkey-only SIGNUP forces UV-required, but a converted account
+/// whose surviving passkey was registered earlier via `/webauthn/register` WITHOUT UV would
+/// not be guaranteed-UV like a native passkey-only signup. Tightening this (requiring a
+/// surviving UV-capable passkey on password removal) is a policy decision left to a future
+/// option; changing the guard is out of scope for this PR.
 pub async fn remove_password(
     State(state): State<OidcState>,
     Path((tenant_id, environment_id)): Path<(String, String)>,

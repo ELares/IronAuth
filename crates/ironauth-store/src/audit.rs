@@ -561,7 +561,7 @@ pub enum Action {
     /// An end user CONVERTED a passkey-only account to password-holding by SETTING a
     /// first password (issue #66): the sentinel `password_hash` was replaced with a fresh
     /// Argon2id verifier and `passwordless` cleared, gated by fresh passkey
-    /// re-authentication and the full set-path policy (length, zxcvbn, breach screen).
+    /// re-authentication and the full set-path policy (length, strength, breach screen).
     /// The row targets the user and is attributed to the end user; the `detail` records
     /// the step-up policy. No password or hash is ever recorded.
     AccountPasswordSet,

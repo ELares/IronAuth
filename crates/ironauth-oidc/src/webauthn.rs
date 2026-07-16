@@ -855,6 +855,16 @@ pub async fn register_passkey_signup_verify(
     let Some(scope) = parse_scope(&tenant_id, &environment_id) else {
         return not_found();
     };
+    // Re-check closed registration (issue #64) here too, for defense in depth (issue #66
+    // INFO): the ceremony is already indirectly gated because no challenge is issued while
+    // registration is closed, but re-checking on verify means a registration toggled closed
+    // MID-ceremony cannot still complete an account. Uniform with the register path.
+    if state.registration_closed() {
+        return json_response(
+            StatusCode::FORBIDDEN,
+            json!({ "error": "registration_closed" }),
+        );
+    }
     // The resume target must be a valid authorization request in THIS scope, so the
     // honest passkey session can resume it; an invalid link is the uniform ceremony error.
     let Some(resume) =

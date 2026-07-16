@@ -190,7 +190,9 @@ pub async fn register_post(
     // zxcvbn password-quality scoring (issue #66) AFTER the length/composition policy and
     // BEFORE any breach screen or hash: a password that is long enough but easily guessable
     // is refused here, so no outbound screening call or Argon2id hash is spent on it. OFF by
-    // default (min_zxcvbn_score = 0), a pure/deterministic check that needs no env seam.
+    // default (min_password_strength_score = 0), a pure/deterministic check that needs no
+    // env seam. NOTE: this in-tree score is a COARSE floor blind to dictionary words / l33t
+    // substitution; the breach screen below is the primary defense (issue #66).
     if let Err(rejection) = state.password_policy().evaluate_strength(&normalized) {
         return register_error(
             identifier,

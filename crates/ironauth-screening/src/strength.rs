@@ -1,6 +1,24 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! A reduced-strength, in-tree password-quality estimator (issue #66).
+//! A COARSE, in-tree password-strength estimator (issue #66).
+//!
+//! # Coarseness: what this is BLIND to (read this first)
+//!
+//! This is a COARSE length/charset/pattern floor, NOT a zxcvbn-equivalent guard. It is
+//! BLIND to dictionary words and l33t substitution: it has no large word list and no
+//! substitution model, so a word-plus-digits password like `summer2024`, `hello123`,
+//! `test1234`, `company1`, or `P@ssw0rd` scores the MAXIMUM `4` here and would clear ANY
+//! threshold, including a `min_password_strength_score = 4`. Do NOT set the floor
+//! believing it rejects such passwords: it does not.
+//!
+//! The mandatory HIBP/offline breach screen that runs RIGHT AFTER this is the PRIMARY
+//! defense; every one of those example passwords is in the breach corpus and is caught
+//! there. This score is only a complementary length/charset floor layered in front of the
+//! (network/hash-spending) screen. The config key is deliberately named
+//! `min_password_strength_score` (NOT `min_zxcvbn_score`) so the name does not imply full
+//! zxcvbn semantics. The real `zxcvbn` crate can be swapped in behind
+//! [`PasswordPolicy::evaluate_strength`] / [`score`] once its dependency tree passes
+//! cargo-deny (see below).
 //!
 //! # Why in-tree, not zxcvbn
 //!
@@ -29,20 +47,24 @@
 //!   a password is trivially guessed however long it is (`password1234567` is not
 //!   strong).
 //!
-//! It is REDUCED-strength: unlike zxcvbn it has no large dictionary or l33t/substitution
-//! model, so it can OVER-credit a short non-random string (a dictionary word with digits)
-//! relative to zxcvbn. That is why it is a COMPLEMENTARY coarse floor, not the primary
-//! defense: the mandatory HIBP/offline breach screen catches actually-common passwords,
-//! and the compiled-in pattern list catches the top trivially-guessed shapes. The scoring
-//! knob (`min_zxcvbn_score`) defaults OFF, and raising it only ever TIGHTENS admission.
+//! It is COARSE: unlike zxcvbn it has no large dictionary and no l33t/substitution model,
+//! so it OVER-credits a word-plus-digits string (e.g. `summer2024` scores the maximum `4`)
+//! relative to zxcvbn. That is why it is a COMPLEMENTARY floor, not the primary defense:
+//! the mandatory HIBP/offline breach screen catches actually-common passwords, and the
+//! compiled-in pattern list catches the top trivially-guessed shapes. The scoring knob
+//! (`min_password_strength_score`) defaults OFF, and raising it only ever TIGHTENS
+//! admission.
 //!
 //! It is a PURE, deterministic function: no clock read, no RNG, no allocation of an
 //! estimator model, so it needs no `ironauth-env` seam and is cheap enough to run inline
 //! before the (network/hash-spending) breach screen.
 
-/// The estimated password-quality score in `0..=4` (issue #66), the same contract the
-/// `min_zxcvbn_score` policy compares against. Higher is stronger. NFKC normalization is
-/// applied by the caller before this runs (like every other password step).
+/// The estimated password-strength score in `0..=4` (issue #66), the same contract the
+/// `min_password_strength_score` policy compares against. Higher is stronger. COARSE and
+/// BLIND to dictionary words / l33t substitution (a word-plus-digits password scores the
+/// maximum), so the breach screen is the primary defense; see the module docs. NFKC
+/// normalization is applied by the caller before this runs (like every other password
+/// step).
 #[must_use]
 pub fn score(password: &str) -> u8 {
     // A known-weak password or an obvious pattern is score 0 no matter how long it is.
@@ -128,14 +150,12 @@ fn entropy_bits(password: &str) -> f64 {
 }
 
 /// The number of DISTINCT characters in `chars` (order-independent), used to discount a
-/// password that is mostly one repeated character.
+/// password that is mostly one repeated character. Uses a `HashSet` so it is O(n) in the
+/// password length regardless of alphabet size: a `Vec::contains` scan would be O(n^2),
+/// which an operator setting a pathological `max_length` plus a non-zero strength floor
+/// could turn into CPU pressure (issue #66 INFO).
 fn distinct_count(chars: &[char]) -> usize {
-    let mut seen: Vec<char> = Vec::with_capacity(chars.len());
-    for &c in chars {
-        if !seen.contains(&c) {
-            seen.push(c);
-        }
-    }
+    let seen: std::collections::HashSet<char> = chars.iter().copied().collect();
     seen.len()
 }
 
@@ -196,7 +216,7 @@ fn is_sequential(s: &str) -> bool {
 /// the public breach top-lists). This is NOT the breach screen (that is the HIBP /
 /// offline corpus with millions of entries); it is only the pattern floor the strength
 /// estimator forces to score 0, so a trivially guessable password never clears a
-/// `min_zxcvbn_score` floor on length alone.
+/// `min_password_strength_score` floor on length alone.
 const COMMON_PASSWORDS: &[&str] = &[
     "password",
     "passw0rd",
@@ -269,15 +289,15 @@ mod tests {
             "a long mixed password is strong"
         );
         // A very short (but non-pattern) mixed string is below the top: the Shannon
-        // bound credits few characters modestly. NOTE (reduced-strength fallback): unlike
-        // zxcvbn this estimator has no large dictionary, so it credits entropy from
-        // length/charset and can OVER-credit a short non-random string relative to
-        // zxcvbn; the HIBP/offline breach screen and the compiled-in common-pattern floor
-        // are the primary defenses, with this score as a coarse complementary floor.
+        // bound credits few characters modestly. NOTE (coarse fallback): unlike zxcvbn
+        // this estimator has no large dictionary, so it credits entropy from
+        // length/charset and can OVER-credit a non-random string relative to zxcvbn; the
+        // HIBP/offline breach screen and the compiled-in common-pattern floor are the
+        // primary defenses, with this score as a coarse complementary floor.
         assert!(score("k7Q") < 4, "a 3-char string is not top-of-ladder");
         // Adding length and variety never LOWERS the score (monotone in the safe
-        // direction), so raising the `min_zxcvbn_score` floor is a strictly tightening
-        // knob.
+        // direction), so raising the `min_password_strength_score` floor is a strictly
+        // tightening knob.
         assert!(score("k7mQ9pLx2R8v") >= score("k7mQ"));
     }
 
@@ -286,5 +306,34 @@ mod tests {
         // Fourteen 'a's is credited as one character's worth, so it stays weak even at
         // length fourteen (also caught by the single-run pattern).
         assert_eq!(score(&"a".repeat(14)), 0);
+    }
+
+    #[test]
+    fn the_dictionary_l33t_blind_spot_is_documented_by_test() {
+        // HONESTY (issue #66 MEDIUM): this estimator is BLIND to dictionary words and
+        // l33t substitution. A word-plus-digits or leetspeak password scores the MAXIMUM
+        // 4 here and would clear EVERY threshold, including min_password_strength_score=4.
+        // This test pins that blind spot so the limitation is never mistaken for a
+        // zxcvbn-grade guard: the mandatory HIBP/offline breach screen (which every one of
+        // these is caught by) is the PRIMARY defense, not this score. If a real dictionary
+        // model is ever swapped in behind `score`, this test flips and must be revisited.
+        for weak in ["summer2024", "hello123", "test1234", "company1", "P@ssw0rd"] {
+            assert_eq!(
+                score(weak),
+                4,
+                "coarse estimator is blind to dictionary/l33t and over-credits {weak:?}; \
+                 the breach screen is the primary defense"
+            );
+        }
+    }
+
+    #[test]
+    fn distinct_count_is_linear_and_correct_on_a_large_input() {
+        // The O(n) HashSet path (issue #66 INFO) returns the same distinct count a scan
+        // would, even for a pathologically long input, without O(n^2) blowup.
+        let chars: Vec<char> = "abcabcabc".chars().collect();
+        assert_eq!(distinct_count(&chars), 3);
+        let many: Vec<char> = "a".repeat(100_000).chars().collect();
+        assert_eq!(distinct_count(&many), 1);
     }
 }

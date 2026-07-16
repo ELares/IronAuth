@@ -1880,12 +1880,21 @@ pub struct PasswordPolicyConfig {
     /// deviation (screening is a covenant no-paywall security feature, on by default).
     pub screening_enabled: bool,
 
-    /// The minimum zxcvbn password-quality score (0-4) required on the password set /
-    /// change path (issue #66), scored AFTER the length/composition policy and BEFORE
-    /// the breach screen. The default (`0`) turns scoring OFF so an existing deployment
-    /// sees no regression; a higher value (a common choice is `3`) refuses a password
-    /// that is technically long enough but easily guessable. Must be at most `4`.
-    pub min_zxcvbn_score: u8,
+    /// The minimum in-tree password-strength score (0-4) required on the password set /
+    /// change path (issue #66), scored AFTER the length/composition policy and BEFORE the
+    /// breach screen; `0` (the default) turns scoring OFF. COARSENESS (read before raising
+    /// this): this is a COARSE length/charset/pattern floor that is BLIND to dictionary
+    /// words and l33t substitution (e.g. `summer2024` scores the MAXIMUM 4 and clears every
+    /// threshold, including `4`), NOT a zxcvbn-equivalent guard, so the mandatory
+    /// HIBP/offline breach screen is the PRIMARY defense that backstops it. Must be at most
+    /// `4`.
+    ///
+    /// The default (`0`) means an existing deployment sees no regression; a higher value
+    /// only ever TIGHTENS admission. The real `zxcvbn` crate can be swapped in behind the
+    /// same seam once its dependency tree passes cargo-deny (today a
+    /// `time`/RUSTSEC-vs-MSRV-1.85 conflict blocks it).
+    #[schemars(range(max = 4))]
+    pub min_password_strength_score: u8,
 
     /// Which screening provider to use (issue #63): `hibp` (the online k-anonymity range
     /// API, the default) or `offline` (an operator-supplied corpus, fully offline).
@@ -1931,7 +1940,7 @@ impl Default for PasswordPolicyConfig {
             require_symbol: false,
             rotation_max_age_days: 0,
             screening_enabled: true,
-            min_zxcvbn_score: 0,
+            min_password_strength_score: 0,
             screening_provider: ScreeningProvider::Hibp,
             screening_failure_policy: ScreeningFailurePolicy::FailOpen,
             screen_on_login: false,
@@ -2833,12 +2842,12 @@ fn validate_password_policy(policy: &PasswordPolicyConfig) -> Result<(), ConfigE
             ),
         });
     }
-    if policy.min_zxcvbn_score > 4 {
+    if policy.min_password_strength_score > 4 {
         return Err(ConfigError::Invalid {
             message: format!(
-                "password_policy.min_zxcvbn_score ({}) must be between 0 and 4 \
-                 (0 disables zxcvbn scoring)",
-                policy.min_zxcvbn_score
+                "password_policy.min_password_strength_score ({}) must be between 0 and 4 \
+                 (0 disables strength scoring)",
+                policy.min_password_strength_score
             ),
         });
     }

@@ -398,11 +398,10 @@ pub async fn login_post(
         Ok(Some(user)) if !user.state.can_authenticate() => {
             // Spend the verification through the admission-controlled pool (issue
             // #62), off the async threads; an over-share tenant or a saturated pool
-            // is the retryable 429/503, never an inline hash on this thread.
-            match state
-                .verify_password(&resume.scope, password, &user.password_hash)
-                .await
-            {
+            // is the retryable 429/503, never an inline hash on this thread. A
+            // sentinel-hash (passkey-only) account routes through the same dummy
+            // Argon2 spend (issue #66 LOW-2) so it stays timing-uniform here too.
+            match spend_native_verify(&state, &resume.scope, password, &user).await {
                 Ok(_) => {}
                 Err(rejection) => return rejection.to_response(),
             }
@@ -412,10 +411,11 @@ pub async fn login_post(
             // Verify the native Argon2id hash first; if the account was imported with
             // a FOREIGN hash (issue #55) and has not yet logged in, the native hash is
             // the unusable sentinel, so fall through to the foreign verify. The native
-            // verification runs on the admission-controlled hashing pool (issue #62).
-            let native_ok = match state
-                .verify_password(&resume.scope, password, &user.password_hash)
-                .await
+            // verification runs on the admission-controlled hashing pool (issue #62). A
+            // sentinel-hash account (passkey-only, credential-less, or not-yet-migrated
+            // foreign) is routed to keep its timing uniform with an absent account (issue
+            // #66 LOW-2), never the fast-fail PHC-parse that would leak its existence.
+            let native_ok = match spend_native_verify(&state, &resume.scope, password, &user).await
             {
                 Ok(ok) => ok,
                 Err(rejection) => return rejection.to_response(),
@@ -572,6 +572,43 @@ async fn upgrade_credential_after_login(
         }
     } else {
         rehash_foreign_credential(state, scope, &user.id, password).await;
+    }
+}
+
+/// Spend the native-hash password verification for a resolved account in a way that is
+/// timing-uniform across every account shape, returning whether the native Argon2id hash
+/// verified.
+///
+/// When the account's native `password_hash` is the unusable sentinel (a passkey-only or
+/// credential-less account, issue #66), `verify_password` on the sentinel fails-fast with
+/// NO Argon2 work, which would let a login probe distinguish an existing passwordless
+/// account by its fast response (a login-timing enumeration oracle, issue #66 LOW-2). This
+/// routes the sentinel case through the SAME dummy Argon2 spend as the absent-account path
+/// (`verify_absent`), so a passkey-only account's password-login attempt costs comparable
+/// time to an absent account and a real wrong-password verify. The login OUTCOME is
+/// unchanged: the sentinel never verifies, so this always returns `false` for it.
+///
+/// A sentinel account that DOES carry a foreign hash (a not-yet-migrated import, issue #55)
+/// is left to the foreign verify the caller runs next, which already spends the work, so no
+/// extra dummy hash is charged in that case.
+async fn spend_native_verify(
+    state: &OidcState,
+    scope: &Scope,
+    password: &str,
+    user: &UserRecord,
+) -> Result<bool, crate::hashing_pool::HashRejection> {
+    if user.has_usable_password_hash() {
+        state
+            .verify_password(scope, password, &user.password_hash)
+            .await
+    } else if user.foreign_password_hash.is_none() {
+        // Passkey-only / credential-less account: spend the dummy Argon2 (the absent-account
+        // path) so the attempt is timing-uniform; the sentinel never verifies (always false).
+        state.verify_absent(scope, password).await.map(|_| false)
+    } else {
+        // Foreign-only account not yet migrated: the caller's foreign verify below spends the
+        // work, so no dummy is needed here. The sentinel native hash never verifies.
+        Ok(false)
     }
 }
 

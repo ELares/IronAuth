@@ -14,7 +14,11 @@ range per docs/RELEASING.md.
   guard (blocked unless the subject retains a usable passkey/account-credential) and
   revoking other sessions; `set_first_password` converts a passkey-only account to
   password-holding, guarded on the sentinel so it never clobbers an existing password.
-  `is_passwordless` reports the authoritative marker. Two new audit actions
+  `is_passwordless` reports the authoritative marker, and `UserRecord::has_usable_password_hash`
+  exposes whether the read-back native hash is a real Argon2id verifier or the unusable
+  sentinel, so the login path can keep a sentinel-hash account's timing uniform with an
+  absent account (issue #66 LOW-2) without duplicating the sentinel literal outside the
+  store. Two new audit actions
   (`account.password.remove`, `account.password.set`). No new migration: reuses the
   `passwordless` + `webauthn_user_handle` columns (0049). `webauthn_credentials.subject`
   immutability (grant omission) is now covered by a test alongside the handle immutability.

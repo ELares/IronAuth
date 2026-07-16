@@ -6,23 +6,32 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
-- Passkey-only accounts, bidirectional conversion, and zxcvbn scoring (issue #66 PR C,
-  CLOSES #66). A first-class passwordless account state: the new scope-routed
+- Passkey-only accounts, bidirectional conversion, and password-strength scoring (issue
+  #66 PR C, CLOSES #66). A first-class passwordless account state: the new scope-routed
   `webauthn/signup/options` + `webauthn/signup/verify` endpoints create an account with
   the unusable password sentinel and `passwordless = true` (no session required, no
   password screen/hash/policy reachable), run a UV-REQUIRED passkey registration, and
   establish the HONEST passkey session (`phr`/`phrh`/`attested_passkey`, never a
   fabricated `pwd`) that resumes the authorization request. The account is created only
-  when the passkey is verified, so an abandoned ceremony leaves no orphan. A password
+  when the passkey is verified, so an abandoned ceremony leaves no orphan;
+  `webauthn/signup/verify` now re-checks `registration_closed()` too, so a registration
+  toggled closed MID-ceremony cannot still complete (adversarial review INFO). A password
   attempt against a passwordless account fails uniformly (the sentinel never verifies), so
-  a passwordless account is never offered the password form. Bidirectional conversion:
-  `POST /account/password/remove` removes the password (password -> passkey-only), gated
-  by a FRESH passkey re-authentication and the cross-source last-credential guard; the
-  change-password endpoint gains a passwordless branch (passkey-only -> password) that
-  skips the current-password check, demands a FRESH passkey re-auth, and runs the full
-  set-path policy. zxcvbn-style quality scoring (`min_zxcvbn_score`, default 0 = off) is
-  wired into the register, account change-password, and invitation-accept set/change hooks,
-  scored after the length/composition policy and before the breach screen.
+  a passwordless account is never offered the password form; that password-login attempt
+  now spends the SAME dummy Argon2 hash an absent account pays (adversarial review LOW-2),
+  closing a login-timing enumeration oracle where the sentinel's fast PHC-parse failure
+  distinguished an existing passwordless account by its quick response. Bidirectional
+  conversion: `POST /account/password/remove` removes the password (password ->
+  passkey-only), gated by a FRESH passkey re-authentication and the cross-source
+  last-credential guard (a documented residual: that guard counts any passkey and does not
+  require the surviving one to be UV-capable, a future policy option); the change-password
+  endpoint gains a passwordless branch (passkey-only -> password) that skips the
+  current-password check, demands a FRESH passkey re-auth, and runs the full set-path
+  policy. Coarse password-strength scoring (`min_password_strength_score`, default 0 = off)
+  is wired into the register, account change-password, and invitation-accept set/change
+  hooks, scored after the length/composition policy and before the breach screen; it is a
+  length/charset/pattern floor BLIND to dictionary words and l33t substitution, so the
+  breach screen remains the primary defense (see the `ironauth-screening` changelog).
   `webauthn_attestation` integration test (real database, software authenticator) exercises
   the registration GLUE the unit tests could not: attestation mode `direct`, the AAGUID-rule
   disposition lookup, the `mds3_blob_cache` read/parse, the packed-format dispatch, and the
@@ -107,7 +116,7 @@ range per docs/RELEASING.md.
   one gate steers an under-class session to the passkey ceremony / enrollment and never mints
   a token above the SATISFIED class), with `required_credential_class` exposing the class a
   subject must reach for the enrollment-plan surface. NO attestation/MDS3 (PR B), NO
-  passkey-only signup or zxcvbn (PR C).
+  passkey-only signup or password-strength scoring (PR C).
 - Email OTP + magic-link adversarial-review hardening (issue #68): the `otp/send` and
   `magic/send` handlers now EQUALIZE their present-vs-absent response WORK, closing a
   timing enumeration oracle. The present path spends one #62-pool Argon2 hash (on the code /

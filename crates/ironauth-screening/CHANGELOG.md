@@ -6,20 +6,29 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
-- Password-quality scoring (issue #66 PR C): `PasswordPolicy` gains a `min_zxcvbn_score`
-  (0-4, default 0 = off) and `evaluate_strength`, a separate step scored AFTER the
-  length/composition policy and BEFORE the breach screen, with a new non-enumerating
-  `PolicyRejection::TooWeak`. zxcvbn GATE DECISION: the `zxcvbn` crate (v3, MIT) was
+- Password-strength scoring (issue #66 PR C): `PasswordPolicy` gains a
+  `min_password_strength_score` (0-4, default 0 = off) accessor and `evaluate_strength`, a
+  separate step scored AFTER the length/composition policy and BEFORE the breach screen,
+  with a new non-enumerating `PolicyRejection::TooWeak`. HONESTY (adversarial review
+  MEDIUM): the scorer is named for what it is, NOT `min_zxcvbn_score`. The in-tree
+  estimator (`strength.rs`) is a COARSE length/charset/pattern floor that is BLIND to
+  dictionary words and l33t substitution: `summer2024`, `hello123`, `test1234`, `company1`,
+  and `P@ssw0rd` all score the MAXIMUM 4 and clear every threshold including 4. It is NOT a
+  zxcvbn-equivalent guard; the mandatory HIBP/offline breach screen (which every one of
+  those is caught by) is the PRIMARY defense, with this score as a complementary floor. The
+  module doc, the config field/schema, and docs/CONFIG.md all state this plainly, and a
+  unit test pins the blind spot. zxcvbn GATE DECISION: the `zxcvbn` crate (v3, MIT) was
   proposed but FAILS the supply-chain gate under this repo's MSRV 1.85 floor. It
   transitively pulls `time`, and there is NO `time` version that satisfies both the
   advisories-as-errors gate (RUSTSEC-2026-0009 is fixed only in `time >= 0.3.47`) and MSRV
   1.85 (every `time >= 0.3.47` requires rustc 1.88). Per the gate protocol the crate is
-  NOT forced; the documented in-tree fallback ships instead: a reduced-strength estimator
-  (`strength.rs`, Shannon-entropy-over-charset-and-length plus a compiled-in
-  common-password / keyboard / sequence pattern floor) exposing the SAME 0-4 score
-  contract behind `evaluate_strength`, so zxcvbn can be swapped back in later behind one
-  function the day its tree passes the gate. Pure and deterministic (no clock, no RNG), so
-  no env seam.
+  NOT forced; the in-tree fallback ships instead (Shannon-entropy-over-charset-and-length
+  plus a compiled-in common-password / keyboard / sequence pattern floor) exposing the SAME
+  0-4 score contract behind `evaluate_strength`, so zxcvbn can be swapped back in later
+  behind one function the day its tree passes the gate. Pure and deterministic (no clock,
+  no RNG), so no env seam. `strength::distinct_count` now uses a `HashSet` (O(n), was an
+  O(n^2) `Vec::contains` scan) so a pathological `max_length` cannot become CPU pressure
+  (adversarial review INFO).
 - Documented the `FactorContext::MfaFactor` residual (issue #63 review): the 8-code-point
   MFA floor is currently INERT because every shipped credential-set path evaluates as
   `SoleFactor` (15, always 63B-4-compliant); it is wired as a policy input and activates when

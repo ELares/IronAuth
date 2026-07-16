@@ -10728,6 +10728,19 @@ pub struct UserRecord {
     pub foreign_password_algo: Option<String>,
 }
 
+impl UserRecord {
+    /// Whether the stored native `password_hash` is a USABLE Argon2id verifier rather than
+    /// the unusable sentinel (issue #66). A passkey-only / credential-less / not-yet-migrated
+    /// foreign account carries the sentinel; the password login path uses this to keep the
+    /// timing of a sentinel-hash account uniform with an absent account (a sentinel would
+    /// otherwise fail-fast with no Argon2 work, a login-timing enumeration oracle), instead
+    /// of duplicating the sentinel literal outside the store.
+    #[must_use]
+    pub fn has_usable_password_hash(&self) -> bool {
+        self.password_hash != USER_UNUSABLE_PASSWORD_HASH
+    }
+}
+
 impl fmt::Debug for UserRecord {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("UserRecord")
@@ -12640,7 +12653,7 @@ impl ActingUserRepo<'_> {
     /// can never clobber an existing password (a concurrent set, or a caller that
     /// mis-routed a password account here, flips zero rows and is the benign
     /// [`FirstPasswordOutcome::Ineligible`]). The caller runs the full set-path policy
-    /// (length, zxcvbn, breach screen) and the FRESH passkey re-authentication gate
+    /// (length, strength, breach screen) and the FRESH passkey re-authentication gate
     /// BEFORE calling this, exactly as the register/change surfaces do; the plaintext
     /// never reaches the store and the hash is never logged.
     ///

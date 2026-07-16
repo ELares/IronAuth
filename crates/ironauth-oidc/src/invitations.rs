@@ -130,10 +130,12 @@ pub async fn accept_invitation(
         {
             return password_rejected(&rejection.message());
         }
-        // zxcvbn password-quality scoring (issue #66) AFTER the length/composition policy
+        // Password-strength scoring (issue #66) AFTER the length/composition policy
         // and BEFORE the breach screen and hash, exactly as the register/change paths do:
         // an easily-guessable invitation password is refused before any network/hash work.
-        // OFF by default (min_zxcvbn_score = 0); reachable only after a valid token resolves.
+        // OFF by default (min_password_strength_score = 0); reachable only after a valid
+        // token resolves. The in-tree score is a COARSE floor blind to dictionary words /
+        // l33t; the breach screen is the primary defense.
         if let Err(rejection) = state.password_policy().evaluate_strength(&normalized) {
             return password_rejected(&rejection.message());
         }
