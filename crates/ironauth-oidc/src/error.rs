@@ -254,6 +254,23 @@ pub enum TokenError {
     /// An unexpected server-side condition (for example no signing key for the
     /// target environment). Renders 500.
     ServerError,
+    /// The refresh or authorization-code grant would mint an access token whose
+    /// scope carries a step-up authentication requirement (an `acr` floor and/or a
+    /// max auth age) that the frozen authentication does NOT satisfy (RFC 9470,
+    /// issue #72). A refresh whose auth-age window has LAPSED, or a grant whose
+    /// recorded `acr` is below the required floor, fails HERE rather than silently
+    /// minting an under-qualified token; the client must re-authorize with the
+    /// carried `acr_values` / `max_age` to run the step-up. Renders 400 with
+    /// `error="insufficient_user_authentication"` (the RFC 9470 challenge error) plus
+    /// the `acr_values` and `max_age` the client needs to construct the retry.
+    InsufficientUserAuthentication {
+        /// The `acr` floor the client must request on the retry authorization, if a
+        /// floor applied.
+        acr_values: Option<String>,
+        /// The maximum authentication age (seconds) the client must request, if an
+        /// age bound applied.
+        max_age: Option<u64>,
+    },
 }
 
 impl TokenError {
@@ -271,6 +288,7 @@ impl TokenError {
             TokenError::AccessDenied => "access_denied",
             TokenError::ExpiredToken => "expired_token",
             TokenError::ServerError => "server_error",
+            TokenError::InsufficientUserAuthentication { .. } => "insufficient_user_authentication",
         }
     }
 
@@ -306,17 +324,37 @@ impl TokenError {
             TokenError::AccessDenied => "the authorization request was denied",
             TokenError::ExpiredToken => "the device code has expired; start a new device flow",
             TokenError::ServerError => "the request could not be processed",
+            TokenError::InsufficientUserAuthentication { .. } => {
+                "the authentication does not meet the required authentication context; \
+                 re-authorize with the indicated acr_values and max_age"
+            }
         }
     }
 }
 
 impl IntoResponse for TokenError {
     fn into_response(self) -> Response {
-        let body = serde_json::json!({
+        let mut object = serde_json::json!({
             "error": self.code(),
             "error_description": self.description(),
-        })
-        .to_string();
+        });
+        // RFC 9470: the step-up error carries the acr_values / max_age the client
+        // needs to construct the retry authorization request.
+        if let TokenError::InsufficientUserAuthentication {
+            acr_values,
+            max_age,
+        } = &self
+        {
+            if let Some(map) = object.as_object_mut() {
+                if let Some(acr) = acr_values {
+                    map.insert("acr_values".to_owned(), serde_json::json!(acr));
+                }
+                if let Some(age) = max_age {
+                    map.insert("max_age".to_owned(), serde_json::json!(age));
+                }
+            }
+        }
+        let body = object.to_string();
         let mut response = (
             self.status(),
             [

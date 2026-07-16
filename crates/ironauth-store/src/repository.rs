@@ -71,9 +71,9 @@ use crate::id::{
     EnvironmentSecretId, ExternalIssuerId, GrantId, InitialAccessTokenId, InvitationId,
     IssuedTokenId, KekId, ManagementKeyId, MigrationRunId, MigrationRunRecordId, OperatorId,
     OrganizationId, PushedRequestId, RecoveryCodeId, RefreshFamilyId, RefreshTokenId,
-    ResourceServerId, ServiceAccountId, SessionEventId, SessionId, SigningKeyId, TenantId,
-    TotpCredentialId, TraitMigrationJobId, TraitSchemaId, UserId, UserIdentifierId, VariableId,
-    WebauthnChallengeId, WebauthnCredentialId,
+    ResourceServerId, ScopeStepUpPolicyId, ServiceAccountId, SessionEventId, SessionId,
+    SigningKeyId, TenantId, TotpCredentialId, TraitMigrationJobId, TraitSchemaId, UserId,
+    UserIdentifierId, VariableId, WebauthnChallengeId, WebauthnCredentialId,
 };
 use crate::identifier::{
     CanonicalIdentifier, IdentifierType, UniquenessMode, canonicalize_identifier,
@@ -101,6 +101,17 @@ impl<'a> ScopedStore<'a> {
     #[must_use]
     pub fn clients(&self) -> ClientRepo<'a> {
         ClientRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
+    /// The read-only per-scope step-up policy repository for this scope (RFC 9470,
+    /// issue #72): list the tenant's per-scope authentication requirements. The
+    /// managing writes live on [`ActingStore::scope_step_up_policies`].
+    #[must_use]
+    pub fn scope_step_up_policies(&self) -> ScopeStepUpPolicyRepo<'a> {
+        ScopeStepUpPolicyRepo {
             store: self.store,
             scope: self.scope,
         }
@@ -651,6 +662,18 @@ impl<'a> ActingStore<'a> {
         }
     }
 
+    /// The mutating per-scope step-up policy repository for this scope and actor
+    /// (RFC 9470, issue #72): set (upsert) or remove a per-scope authentication
+    /// requirement, audited.
+    #[must_use]
+    pub fn scope_step_up_policies(&self) -> ActingScopeStepUpPolicyRepo<'a> {
+        ActingScopeStepUpPolicyRepo {
+            store: self.store,
+            scope: self.scope,
+            acting: self.acting,
+        }
+    }
+
     /// The mutating flexible-identifier repository for this scope and actor (issue
     /// #54): add a typed login identifier to a user (canonicalized once at the seam,
     /// blind-indexed for uniqueness and lookup, raw sealed for display), and
@@ -1015,6 +1038,16 @@ pub struct ClientRecord {
     /// shown) and RESTRICTS its effective redirect-URI set to the https subset,
     /// until an admin verifies it. Defaults to false for every non-DCR client.
     pub quarantined: bool,
+    /// The per-client step-up `acr` floor (RFC 9470, issue #72): the minimum
+    /// authentication context class EVERY authorization from this client must
+    /// achieve, folded together with the request `acr_values` and any per-scope
+    /// policy (the strongest floor wins). [`None`] means the client sets no floor.
+    pub step_up_acr: Option<String>,
+    /// The per-client step-up maximum authentication age in seconds (issue #72):
+    /// EVERY authorization from this client must have authenticated within this
+    /// window, folded with the request `max_age` and any per-scope policy (the
+    /// smallest window wins). [`None`] means the client sets no age bound.
+    pub step_up_max_age_secs: Option<i64>,
 }
 
 /// One relying party that participates in a front-channel logout for a given SSO
@@ -1340,7 +1373,8 @@ impl ClientRepo<'_> {
              frontchannel_logout_uri, frontchannel_logout_session_required, \
              consent_mode, skip_consent, \
              store_skipped_consent, \
-             require_pushed_authorization_requests, quarantined FROM clients \
+             require_pushed_authorization_requests, quarantined, \
+             step_up_acr, step_up_max_age_secs FROM clients \
              WHERE id = $1 AND tenant_id = $2 AND environment_id = $3",
         )
         .bind(id.to_string())
@@ -1366,7 +1400,8 @@ impl ClientRepo<'_> {
              frontchannel_logout_uri, frontchannel_logout_session_required, \
              consent_mode, skip_consent, \
              store_skipped_consent, \
-             require_pushed_authorization_requests, quarantined FROM clients \
+             require_pushed_authorization_requests, quarantined, \
+             step_up_acr, step_up_max_age_secs FROM clients \
              WHERE tenant_id = $1 AND environment_id = $2 ORDER BY created_at, id",
         )
         .bind(self.scope.tenant().to_string())
@@ -1632,7 +1667,178 @@ impl ClientRepo<'_> {
             store_skipped_consent: row.get("store_skipped_consent"),
             require_pushed_authorization_requests: row.get("require_pushed_authorization_requests"),
             quarantined: row.get("quarantined"),
+            step_up_acr: row.get("step_up_acr"),
+            step_up_max_age_secs: row
+                .get::<Option<i32>, _>("step_up_max_age_secs")
+                .map(i64::from),
         })
+    }
+}
+
+/// One per-scope step-up policy (RFC 9470, issue #72): the authentication
+/// requirement governing an OAuth scope token, read within scope.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScopeStepUpPolicy {
+    /// The `sup_` policy identifier (embeds its tenant and environment).
+    pub id: ScopeStepUpPolicyId,
+    /// The OAuth scope token this policy governs (a single scope value).
+    pub scope_token: String,
+    /// The `acr` floor the authentication must achieve for this scope, if any.
+    pub min_acr: Option<String>,
+    /// The maximum authentication age in seconds for this scope, if any.
+    pub max_auth_age_secs: Option<i64>,
+}
+
+/// The read-only per-scope step-up policy repository for a scope (issue #72).
+///
+/// Reachable through [`ScopedStore::scope_step_up_policies`]. The evaluation path
+/// (authorization, token, refresh) reads the whole policy set for a scope and folds
+/// the policies for the requested OAuth scopes into a single requirement.
+pub struct ScopeStepUpPolicyRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl ScopeStepUpPolicyRepo<'_> {
+    /// Every per-scope step-up policy in this scope, oldest first.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn list(&self) -> Result<Vec<ScopeStepUpPolicy>, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let rows = sqlx::query(
+            "SELECT id, scope, min_acr, max_auth_age_secs FROM scope_step_up_policies \
+             WHERE tenant_id = $1 AND environment_id = $2 ORDER BY created_at, id",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        rows.iter()
+            .map(|row| {
+                let id_text: String = row.get("id");
+                let id = ScopeStepUpPolicyId::parse_in_scope(&id_text, &self.scope)?;
+                Ok(ScopeStepUpPolicy {
+                    id,
+                    scope_token: row.get("scope"),
+                    min_acr: row.get("min_acr"),
+                    max_auth_age_secs: row
+                        .get::<Option<i32>, _>("max_auth_age_secs")
+                        .map(i64::from),
+                })
+            })
+            .collect()
+    }
+}
+
+/// The mutating per-scope step-up policy repository for a scope and actor (issue
+/// #72). Reachable only through [`ScopedStore::acting`], so every mutation carries
+/// an actor and correlation id and routes through the audited-write primitive.
+pub struct ActingScopeStepUpPolicyRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+    acting: ActingContext,
+}
+
+impl ActingScopeStepUpPolicyRepo<'_> {
+    /// Set (create or update) the step-up policy for an OAuth scope token, auditing
+    /// `step_up.scope_policy.set` in the same transaction. At least one of `min_acr`
+    /// / `max_auth_age_secs` must be set (the CHECK enforces it). An existing policy
+    /// for the same scope is overwritten (the unique scope key collapses the upsert).
+    /// Returns the policy id.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure (including a requirement
+    /// with neither dimension set, which the CHECK refuses).
+    pub async fn set(
+        &self,
+        env: &Env,
+        scope_token: &str,
+        min_acr: Option<&str>,
+        max_auth_age_secs: Option<i64>,
+    ) -> Result<ScopeStepUpPolicyId, StoreError> {
+        let scope = self.scope;
+        let id = ScopeStepUpPolicyId::generate(env, &scope);
+        let now_micros = epoch_micros(env.clock().now_utc());
+        let max_age = max_auth_age_secs.map(|secs| i32::try_from(secs).unwrap_or(i32::MAX));
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::ScopeStepUpPolicySet,
+                target: &id,
+            },
+            async move |tx| {
+                sqlx::query(
+                    "INSERT INTO scope_step_up_policies \
+                     (id, tenant_id, environment_id, scope, min_acr, max_auth_age_secs, \
+                      created_at, updated_at) \
+                     VALUES ($1, $2, $3, $4, $5, $6, \
+                             TIMESTAMPTZ 'epoch' + ($7::text || ' microseconds')::interval, \
+                             TIMESTAMPTZ 'epoch' + ($7::text || ' microseconds')::interval) \
+                     ON CONFLICT (tenant_id, environment_id, scope) DO UPDATE \
+                     SET min_acr = EXCLUDED.min_acr, \
+                         max_auth_age_secs = EXCLUDED.max_auth_age_secs, \
+                         updated_at = EXCLUDED.updated_at",
+                )
+                .bind(id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(scope_token)
+                .bind(min_acr)
+                .bind(max_age)
+                .bind(now_micros)
+                .execute(&mut **tx)
+                .await?;
+                Ok(())
+            },
+            false,
+        )
+        .await?;
+        Ok(id)
+    }
+
+    /// Remove the step-up policy for an OAuth scope token, auditing
+    /// `step_up.scope_policy.remove` in the same transaction. A no-op audit is still
+    /// written when no policy matched (the management action was attempted).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn remove(&self, env: &Env, scope_token: &str) -> Result<(), StoreError> {
+        let scope = self.scope;
+        // The audit target is the scope-derived policy handle; a synthetic id keeps
+        // the target legible without a prior read.
+        let id = ScopeStepUpPolicyId::generate(env, &scope);
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::ScopeStepUpPolicyRemove,
+                target: &id,
+            },
+            async move |tx| {
+                sqlx::query(
+                    "DELETE FROM scope_step_up_policies \
+                     WHERE tenant_id = $1 AND environment_id = $2 AND scope = $3",
+                )
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(scope_token)
+                .execute(&mut **tx)
+                .await?;
+                Ok(())
+            },
+            false,
+        )
+        .await
     }
 }
 
@@ -2355,6 +2561,61 @@ impl ActingClientRepo<'_> {
                 )
                 .bind(allowed_json.as_deref())
                 .bind(policy)
+                .bind(id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .execute(&mut **tx)
+                .await?;
+                if result.rows_affected() == 0 {
+                    return Err(StoreError::NotFound);
+                }
+                Ok(())
+            },
+            false,
+        )
+        .await
+    }
+
+    /// Set (or clear) a client's step-up floor (RFC 9470, issue #72): the per-client
+    /// `step_up_acr` and `step_up_max_age_secs` registration requirement folded into
+    /// every authorization the client makes. Writes a `client.step_up_policy.set`
+    /// audit row in the same transaction. A [`None`] clears that dimension. Only the
+    /// two step-up columns are touched, under the migration's column-scoped `UPDATE`
+    /// grant.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the id is out of scope or no client matches;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn set_step_up_policy(
+        &self,
+        env: &Env,
+        id: &ClientId,
+        min_acr: Option<&str>,
+        max_auth_age_secs: Option<i64>,
+    ) -> Result<(), StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let max_age = max_auth_age_secs.map(|secs| i32::try_from(secs).unwrap_or(i32::MAX));
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::ClientStepUpPolicySet,
+                target: id,
+            },
+            async move |tx| {
+                let result = sqlx::query(
+                    "UPDATE clients \
+                     SET step_up_acr = $1, step_up_max_age_secs = $2 \
+                     WHERE id = $3 AND tenant_id = $4 AND environment_id = $5",
+                )
+                .bind(min_acr)
+                .bind(max_age)
                 .bind(id.to_string())
                 .bind(scope.tenant().to_string())
                 .bind(scope.environment().to_string())
@@ -7151,6 +7412,11 @@ pub struct RefreshTokenResolution {
     /// The recorded authentication method tokens the refreshed access token's
     /// `acr`/`amr` derive from.
     pub auth_methods: String,
+    /// The recorded `auth_time` frozen onto the family at issuance (epoch
+    /// microseconds), the value a step-up max-age window is re-evaluated against on
+    /// refresh (RFC 9470, issue #72). [`None`] when the code carried no `auth_time`;
+    /// a max-age policy evaluated against `None` fails closed (no silent extend).
+    pub auth_time_unix_micros: Option<i64>,
     /// Whether this is an `offline_access` family (survives RP logout) or a
     /// session-bound one.
     pub offline: bool,
@@ -7201,6 +7467,11 @@ pub struct NewRefreshFamily<'a> {
     pub scope: Option<&'a str>,
     /// The recorded authentication method tokens frozen onto the family.
     pub auth_methods: &'a str,
+    /// The recorded `auth_time` frozen onto the family (epoch microseconds), so a
+    /// refresh can re-evaluate a step-up max-age window without a new authentication
+    /// (RFC 9470, issue #72). [`None`] when the code carried no `auth_time`; a
+    /// max-age policy evaluated against `None` on refresh fails closed.
+    pub auth_time_unix_micros: Option<i64>,
     /// Whether this is an `offline_access` family (survives RP logout).
     pub offline: bool,
     /// When the family was created, in epoch microseconds (clock seam).
@@ -7341,7 +7612,8 @@ impl RefreshRepo<'_> {
              (EXTRACT(EPOCH FROM rt.issued_at) * 1000000)::bigint AS issued_us, \
              (EXTRACT(EPOCH FROM rt.idle_expires_at) * 1000000)::bigint AS idle_us, \
              f.grant_id AS grant_id, f.subject AS subject, f.client_id AS client_id, \
-             f.scope AS scope, f.auth_methods AS auth_methods, f.offline AS offline, \
+             f.scope AS scope, f.auth_methods AS auth_methods, \
+             f.auth_time AS auth_time, f.offline AS offline, \
              g.granted_resources AS granted_resources, \
              (EXTRACT(EPOCH FROM f.absolute_expires_at) * 1000000)::bigint AS abs_us, \
              (f.revoked_at IS NULL) AS family_live, (g.revoked_at IS NULL) AS grant_live \
@@ -7514,8 +7786,8 @@ impl ActingRefreshRepo<'_> {
         let inserted = sqlx::query(
             "INSERT INTO refresh_families \
              (id, tenant_id, environment_id, grant_id, subject, client_id, scope, \
-              auth_methods, session_ref, offline, created_at, absolute_expires_at) \
-             SELECT $1, $2, $3, $4, $5, $6, $7, $8, g.session_ref, $9, \
+              auth_methods, auth_time, session_ref, offline, created_at, absolute_expires_at) \
+             SELECT $1, $2, $3, $4, $5, $6, $7, $8, $13, g.session_ref, $9, \
                     TIMESTAMPTZ 'epoch' + ($10::text || ' microseconds')::interval, \
                     TIMESTAMPTZ 'epoch' + ($11::text || ' microseconds')::interval \
              FROM grants g \
@@ -7541,6 +7813,7 @@ impl ActingRefreshRepo<'_> {
         .bind(family.created_at_unix_micros)
         .bind(family.absolute_expires_at_unix_micros)
         .bind(now_micros)
+        .bind(family.auth_time_unix_micros)
         .execute(&mut *tx)
         .await?
         .rows_affected();
@@ -8163,6 +8436,7 @@ fn refresh_resolution_from_row(
             row.get::<Option<String>, _>("granted_resources").as_deref(),
         ),
         auth_methods: row.get("auth_methods"),
+        auth_time_unix_micros: row.get("auth_time"),
         offline: row.get("offline"),
         issued_at_unix_micros: row.get("issued_us"),
         idle_expires_at_unix_micros: row.get("idle_us"),

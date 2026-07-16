@@ -6,6 +6,19 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Step-up authentication policy (RFC 9470, issue #72): migration 0047 adds the durable,
+  tenant-scoped `scope_step_up_policies` table (forced RLS, the (tenant, environment)
+  isolation policy, the nonempty-scope CHECKs, a unique-per-scope index, and grants) that
+  maps an OAuth scope token to an (acr floor, max auth age) requirement, plus the additive
+  per-client `clients.step_up_acr`/`step_up_max_age_secs` floor columns (with a column-scoped
+  UPDATE grant) and a nullable `refresh_families.auth_time` so a refresh can re-evaluate the
+  max-age window without a new authentication. `ScopeStepUpPolicyRepo` (read) lists a scope's
+  policies; `ActingScopeStepUpPolicyRepo` (write) upserts and removes a policy, and
+  `ActingClientRepo::set_step_up_policy` sets the per-client floor, each an audited write
+  (`step_up.scope_policy.set` / `step_up.scope_policy.remove` / `client.step_up_policy.set`).
+  `ClientRecord` and `NewRefreshFamily`/`RefreshTokenResolution` gain the step-up fields. New
+  public types: `ScopeStepUpPolicy`, `ScopeStepUpPolicyRepo`, `ActingScopeStepUpPolicyRepo`,
+  `ScopeStepUpPolicyId`, `ScopeStepUpPolicyKind`.
 - Credential-abuse defenses (issue #64): migration 0046 adds the durable, tenant-scoped
   `abuse_bans` registry (forced RLS, the (tenant, environment) isolation policy, the
   nonempty-scope and closed-set CHECKs, and column-scoped grants). The ban subject (an

@@ -19,11 +19,12 @@ use ironauth_store::{
 };
 use serde::Deserialize;
 
-use crate::authn::AuthenticationEvent;
+use crate::authn::{AuthMethod, AuthenticationEvent};
 use crate::interaction::{self, parse_resume};
 use crate::migration::{HookOutcome, HookProfile, LazyMigrationHook};
 use crate::pages;
 use crate::state::OidcState;
+use crate::totp::{self, SecondFactorOutcome};
 use crate::util::epoch_micros;
 
 /// The `return_to` carried on the `GET /login` query.
@@ -96,6 +97,149 @@ pub async fn login_get(
             }
         }
         None => interaction::invalid_link_page(),
+    }
+}
+
+/// The `return_to` and optional enroll flag carried on the `GET /login/mfa` query
+/// (RFC 9470 step-up challenge, issue #72).
+#[derive(Deserialize)]
+pub struct MfaChallengeQuery {
+    /// The authorization URL to resume at after the second factor is proven.
+    pub return_to: Option<String>,
+    /// When present (`1`), the subject has no qualifying factor: show the
+    /// enrollment prompt instead of the code form.
+    pub enroll: Option<String>,
+}
+
+/// The posted step-up challenge form (issue #72).
+#[derive(Deserialize)]
+pub struct MfaChallengeForm {
+    /// The TOTP or recovery code (never logged or echoed).
+    pub code: Option<String>,
+    /// The authorization URL to resume at.
+    pub return_to: Option<String>,
+}
+
+/// `GET /login/mfa`: render the step-up second-factor challenge for a valid resume
+/// target (RFC 9470, issue #72). Requires an existing session (the primary
+/// authentication already happened); with none it bounces to login. When `enroll`
+/// is set the page surfaces the factor-enrollment prompt.
+pub async fn mfa_challenge_get(
+    State(state): State<OidcState>,
+    headers: HeaderMap,
+    Query(query): Query<MfaChallengeQuery>,
+) -> Response {
+    let Some(resume) = parse_resume(query.return_to.as_deref()) else {
+        return interaction::invalid_link_page();
+    };
+    // The step-up runs against the CURRENT (primary) session; with none the user
+    // must sign in first, which re-establishes it and resumes the same request.
+    if interaction::resolve_session(&state, resume.scope, &headers)
+        .await
+        .is_none()
+    {
+        return interaction::login_redirect(&resume.return_to);
+    }
+    let banner = state.environment_banner(&resume.scope).await;
+    let enroll_url = query
+        .enroll
+        .as_deref()
+        .filter(|value| *value == "1")
+        .map(|_| {
+            format!(
+                "/t/{}/e/{}/account/mfa/totp/enroll",
+                resume.scope.tenant(),
+                resume.scope.environment()
+            )
+        });
+    pages::secure_html(
+        StatusCode::OK,
+        pages::mfa_challenge_page(
+            &resume.return_to,
+            None,
+            enroll_url.as_deref(),
+            &resume.hints,
+            banner,
+        ),
+    )
+}
+
+/// `POST /login/mfa`: verify the presented second factor and, on success, UPGRADE
+/// the session to record the combined authentication (RFC 9470, issue #72). The
+/// upgraded session carries a FRESH `auth_time` (the instant the step-up completed)
+/// and the honest `acr`/`amr` of the combined factors, so the resumed authorization
+/// issues tokens reflecting what ACTUALLY happened, never a stale or asserted value.
+#[allow(clippy::too_many_lines)]
+pub async fn mfa_challenge_post(
+    State(state): State<OidcState>,
+    headers: HeaderMap,
+    Form(form): Form<MfaChallengeForm>,
+) -> Response {
+    let Some(resume) = parse_resume(form.return_to.as_deref()) else {
+        return interaction::invalid_link_page();
+    };
+    // CSRF defense-in-depth (issue #196) BEFORE any credential work, exactly as the
+    // login POST does.
+    if !interaction::same_origin_ok(&headers, state.self_origin().as_deref()) {
+        return interaction::forbidden_page();
+    }
+    let banner = state.environment_banner(&resume.scope).await;
+    // The step-up runs against the CURRENT (primary) session; with none the user
+    // must sign in first.
+    let Some(session) = interaction::resolve_session(&state, resume.scope, &headers).await else {
+        return interaction::login_redirect(&resume.return_to);
+    };
+    let Ok(subject) = UserId::parse_in_scope(&session.subject, &resume.scope) else {
+        return interaction::server_error_page();
+    };
+    let code = form.code.as_deref().map(str::trim).unwrap_or_default();
+    let rerender = |message: &str| {
+        pages::secure_html(
+            StatusCode::OK,
+            pages::mfa_challenge_page(
+                &resume.return_to,
+                Some(message),
+                None,
+                &resume.hints,
+                banner,
+            ),
+        )
+    };
+    if code.is_empty() {
+        return rerender("Enter a code to continue.");
+    }
+    let new_method = match totp::verify_second_factor(&state, resume.scope, &subject, code).await {
+        SecondFactorOutcome::Totp => AuthMethod::Totp,
+        SecondFactorOutcome::Recovery => AuthMethod::RecoveryCode,
+        SecondFactorOutcome::Invalid => return rerender("Incorrect or expired code."),
+        // A retryable server condition (the hashing pool was unavailable) or a store
+        // fault: a neutral error, never a wrong-code signal.
+        SecondFactorOutcome::Unavailable | SecondFactorOutcome::Error => {
+            return interaction::server_error_page();
+        }
+    };
+    // Combine the factors already proven in this session (the primary login) with
+    // the one just verified, and record the event at the CURRENT clock instant so
+    // auth_time is fresh (issue #14 honesty). establish_session rotates the session
+    // (session-fixation defense) and writes the elevated auth_methods + auth_time.
+    let mut methods = crate::authn::parse_methods(&session.auth_methods);
+    if !methods.contains(&new_method) {
+        methods.push(new_method);
+    }
+    let event = AuthenticationEvent::from_methods(&methods, epoch_micros(state.now()));
+    let actor = interaction::user_actor(&subject);
+    match interaction::establish_session(
+        &state,
+        resume.scope,
+        &session.subject,
+        &event,
+        actor,
+        &headers,
+    )
+    .await
+    {
+        Ok(cookie) => interaction::redirect_setting_cookie(&resume.return_to, &cookie),
+        Err(_) => interaction::server_error_page(),
     }
 }
 

@@ -6,6 +6,30 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Step-up authentication end to end (RFC 9470, issue #72): a new `step_up` module models
+  the declarative authentication requirement (an acr floor plus a max auth age) and its
+  evaluation against a recorded authentication, comparing acr by the tenant's configured
+  order (`oidc.acr_order`, defaulting to the credential ladder pwd < mfa < phr < phrh).
+  The requirement is assembled from three sources (the request `acr_values`/`max_age`, the
+  per-client floor `clients.step_up_acr`/`step_up_max_age_secs`, and the per-scope
+  `scope_step_up_policies` table) and evaluated at THREE points: at authorization, at token
+  issuance, and on refresh. When the current session does not satisfy the requirement the
+  authorize endpoint RUNS the required authentication (the hosted `/login/mfa` second-factor
+  challenge for a multi-factor floor with an enrolled TOTP, or a full re-login), then issues
+  tokens with a FRESH `acr` + `auth_time` reflecting what actually happened (never a stale or
+  asserted value); a user with no qualifying factor is routed to an enrollment prompt where
+  tenant policy allows, or fails with `unmet_authentication_requirements`. The token endpoint
+  re-evaluates the policy against the frozen authentication (code) or the refresh family, and
+  a refresh whose auth-age window has LAPSED fails with the new
+  `TokenError::InsufficientUserAuthentication` (RFC 9470 `insufficient_user_authentication`
+  carrying `acr_values`/`max_age`) rather than silently minting an under-qualified token. A
+  request `acr_values` stays VOLUNTARY (an unachievable value is best-effort, never an error)
+  while an ESSENTIAL `acr` from the `claims` parameter and the tenant policy are binding.
+  `/login/mfa` reuses the credential-bearing interaction seam (same-origin CSRF gate, 303,
+  page hardening) and upgrades the session on a verified TOTP or recovery code. The challenge
+  contract for resource servers is documented in `docs/design/step-up-authentication.md`, with
+  a minimal sample resource server (`examples/step_up_resource_server.rs`) and an integration
+  suite that drives the full round trip (challenge, re-authorization, real step-up, acceptance).
 - Credential-abuse defenses (issue #64): a new `abuse` module with the counter INTERFACE
   (`CounterStore` trait + in-process L1 `MemoryCounterStore`, shaped so an optional
   IronCache L2 slots in behind the same trait later), the risk-based escalation

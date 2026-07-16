@@ -609,6 +609,10 @@ async fn issue_device_refresh(
                 client_id: &grant.client_id,
                 scope: grant.requested_scope.as_deref(),
                 auth_methods: &grant.auth_methods,
+                // The device-authorization grant records no frozen auth_time (issue
+                // #72): a refresh whose scope carries a max-age step-up policy has no
+                // proven freshness and fails closed, which is the honest behavior.
+                auth_time_unix_micros: None,
                 offline,
                 created_at_unix_micros: created,
                 idle_expires_at_unix_micros: idle_expires,

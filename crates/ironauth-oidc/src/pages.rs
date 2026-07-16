@@ -427,6 +427,52 @@ pub fn consent_page(
     )
 }
 
+/// The minimal step-up challenge page (RFC 9470, issue #72): a single field for a
+/// TOTP or recovery code, posting to `/login/mfa`, shown when an authorization
+/// request requires an authentication context (an `acr` floor) the current session
+/// has not achieved. `error` shows a generic failure message; every reflected value
+/// (`return_to`, the optional `enroll_url`) is escaped.
+///
+/// When `enroll_url` is `Some`, the subject has no qualifying second factor and
+/// tenant policy allows enrollment: the page surfaces an enrollment prompt linking
+/// to the factor-enrollment surface instead of the code form.
+#[must_use]
+pub fn mfa_challenge_page(
+    return_to: &str,
+    error: Option<&str>,
+    enroll_url: Option<&str>,
+    hints: &InteractionHints,
+    environment_banner: Option<&str>,
+) -> String {
+    let body = match enroll_url {
+        Some(url) => format!(
+            "<h1>Additional verification required</h1>{error}\
+             <p>This application requires a stronger sign-in than your current one. \
+             You do not have a second factor set up yet.</p>\
+             <p><a href=\"{url}\">Set up a second factor</a>, then return to continue.</p>",
+            error = error_banner(error),
+            url = escape_html(url),
+        ),
+        None => format!(
+            "<h1>Additional verification required</h1>{error}\
+             <p>Enter a code from your authenticator app, or a recovery code, to continue.</p>\
+             <form method=\"post\" action=\"/login/mfa\">{return_to}\
+             <p><label>Code <input type=\"text\" name=\"code\" inputmode=\"numeric\" \
+             autocomplete=\"one-time-code\" autofocus required></label></p>\
+             <p><button type=\"submit\">Verify</button></p></form>",
+            error = error_banner(error),
+            return_to = return_to_field(return_to),
+        ),
+    };
+    document(
+        "Additional verification required",
+        &body,
+        hints.lang(),
+        hints.display().as_str(),
+        environment_banner,
+    )
+}
+
 /// A minimal server-authored notice page (for example after a denied consent).
 /// `message` is server text; it is escaped defensively regardless.
 #[must_use]

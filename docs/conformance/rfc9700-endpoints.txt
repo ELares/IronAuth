@@ -15,6 +15,7 @@
 /end_session
 /introspect
 /login
+/login/mfa
 /par
 /recover
 /register

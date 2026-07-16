@@ -636,6 +636,18 @@ pub enum Action {
     /// previously banned dimension and path through the CLI or admin API. The row
     /// targets the `abn_` ban; the `detail` records the dimension and path.
     AbuseBanLift,
+    /// A per-scope step-up policy was SET (created or updated) through the
+    /// management seam (RFC 9470, issue #72): the (acr floor, max auth age)
+    /// requirement governing an OAuth scope token. The row targets the `sup_`
+    /// policy.
+    ScopeStepUpPolicySet,
+    /// A per-scope step-up policy was REMOVED (issue #72): the requirement governing
+    /// an OAuth scope token was deleted. The row targets the `sup_` policy.
+    ScopeStepUpPolicyRemove,
+    /// A per-CLIENT step-up floor was SET (issue #72): the client's `step_up_acr` /
+    /// `step_up_max_age_secs` registration floor was configured through the
+    /// management seam. The row targets the `cli_` client.
+    ClientStepUpPolicySet,
 }
 
 impl Action {
@@ -775,6 +787,9 @@ impl Action {
             Action::AccountSessionsRevokeOthers => "account.sessions.revoke_others",
             Action::AbuseBanCreate => "abuse.ban.create",
             Action::AbuseBanLift => "abuse.ban.lift",
+            Action::ScopeStepUpPolicySet => "step_up.scope_policy.set",
+            Action::ScopeStepUpPolicyRemove => "step_up.scope_policy.remove",
+            Action::ClientStepUpPolicySet => "client.step_up_policy.set",
         }
     }
 }

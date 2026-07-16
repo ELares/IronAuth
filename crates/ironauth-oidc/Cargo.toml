@@ -81,6 +81,10 @@ testing = ["ironauth-store/testing"]
 # net + io-util let the #25 client-assertion test stand up an in-process loopback
 # HTTP server that serves a client JWK Set through the fetcher's injected dialer.
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-util"] }
+# The http1 feature (examples/tests only, via dev-dep feature unification) lets the
+# RFC 9470 sample resource server example (issue #72) stand up an axum::serve server;
+# the published library never enables it.
+axum = { workspace = true, features = ["http1"] }
 tower = { workspace = true, features = ["util"] }
 http-body-util.workspace = true
 # Verify tokens end to end through the one hardened verify path.
@@ -245,6 +249,16 @@ required-features = ["testing"]
 [[test]]
 name = "totp"
 path = "tests/totp.rs"
+required-features = ["testing"]
+
+# RFC 9470 step-up authentication end to end (issue #72): a per-scope acr floor runs
+# the TOTP second factor and issues a fresh acr/auth_time, a missing factor routes to
+# enrollment, the per-scope policy is enforced at authorization, at token issuance,
+# and on refresh (a lapsed auth-age window triggers step-up), and a session already at
+# the floor proceeds. Needs a real database (DATABASE_URL).
+[[test]]
+name = "step_up"
+path = "tests/step_up.rs"
 required-features = ["testing"]
 
 # WebAuthn passkey ceremonies end to end (issue #65): the four ceremony endpoints

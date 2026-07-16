@@ -6,6 +6,11 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- `oidc.acr_order` setting (RFC 9470 step-up, issue #72): the per-tenant `acr` order
+  (weakest first) the step-up comparison ranks against, so an acr floor is met by the same
+  value or a rank at least as strong. Defaults to the credential-ladder order
+  (`urn:ironauth:acr:pwd`, `urn:ironauth:acr:mfa`, `phr`, `phrh`); an empty list falls back
+  to that default; duplicate entries are a boot-time `ConfigError::Invalid`.
 - `[oidc.regulation]` settings (issue #64): a new `RegulationConfig` table for
   credential-abuse regulation and the anti-enumeration posture. The DEFAULT is
   account-DoS-safe: risk-based escalating `Retry-After` delays (`soft_threshold`,

@@ -361,6 +361,19 @@
           "minimum": 0,
           "type": "integer"
         },
+        "acr_order": {
+          "default": [
+            "urn:ironauth:acr:pwd",
+            "urn:ironauth:acr:mfa",
+            "phr",
+            "phrh"
+          ],
+          "description": "The per-tenant `acr` order for step-up comparison (RFC 9470, issue #72),\nweakest first. A step-up requirement's `acr` floor is satisfied when the\nachieved `acr` is the same value or ranks at least as strong under this\norder. The default is the credential-ladder order the provider advertises\n(`urn:ironauth:acr:pwd`, `urn:ironauth:acr:mfa`, `phr`, `phrh`); a tenant\nthat trusts its factors differently (for example ranking a verified TOTP\nabove a synced passkey) reorders them here. An empty list falls back to the\ndefault ladder. Duplicate entries are a boot-time [`ConfigError::Invalid`].",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
         "authorization_code_ttl_secs": {
           "default": 60,
           "description": "Authorization-code lifetime in seconds. A code is single-use and\nshort-lived; the default (60) follows the OAuth 2.1 guidance that codes\nlive about a minute. Must be at least 1 and at most\n`OIDC_MAX_LIFETIME_SECS`.",
@@ -1222,6 +1235,12 @@
       "$ref": "#/$defs/OidcConfig",
       "default": {
         "access_token_ttl_secs": 300,
+        "acr_order": [
+          "urn:ironauth:acr:pwd",
+          "urn:ironauth:acr:mfa",
+          "phr",
+          "phrh"
+        ],
         "authorization_code_ttl_secs": 60,
         "backchannel_logout_enabled": false,
         "backchannel_logout_max_attempts": 5,

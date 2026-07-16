@@ -45,6 +45,8 @@ const RESUME_PREFIX: &str = "/authorize?";
 const LOGIN_PATH: &str = "/login";
 const REGISTER_PATH: &str = "/register";
 const CONSENT_PATH: &str = "/consent";
+/// The step-up second-factor challenge page (RFC 9470, issue #72).
+const MFA_CHALLENGE_PATH: &str = "/login/mfa";
 
 /// A validated resume target: the local authorization URL to send the user back
 /// to, and the client, scope, and interaction hints recovered from it.
@@ -518,6 +520,23 @@ pub fn register_redirect(return_to: &str) -> Response {
 #[must_use]
 pub fn consent_redirect(return_to: &str) -> Response {
     redirect(&interaction_url(CONSENT_PATH, return_to))
+}
+
+/// A `303` redirect to the step-up second-factor challenge page carrying
+/// `return_to` (RFC 9470, issue #72). When `enroll` is true the subject has no
+/// qualifying factor and the page surfaces the enrollment prompt instead of the
+/// code form.
+#[must_use]
+pub fn mfa_challenge_redirect(return_to: &str, enroll: bool) -> Response {
+    let location = if enroll {
+        append_query(
+            MFA_CHALLENGE_PATH,
+            &[("return_to", Some(return_to)), ("enroll", Some("1"))],
+        )
+    } else {
+        interaction_url(MFA_CHALLENGE_PATH, return_to)
+    };
+    redirect(&location)
 }
 
 /// Build an interaction URL (`/login?return_to=...`), percent-encoding the target.

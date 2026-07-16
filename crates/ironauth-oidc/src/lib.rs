@@ -113,6 +113,7 @@ mod sector;
 mod session;
 mod session_mgmt;
 mod state;
+mod step_up;
 mod subject;
 mod token;
 mod token_credential;
@@ -265,6 +266,14 @@ pub fn oidc_router(state: OidcState) -> Router {
         // HUMAN account registration; the DCR CLIENT registration below is a
         // distinct concept mounted at a distinct `/connect/register` path.
         .route("/login", get(login::login_get).post(login::login_post))
+        // The RFC 9470 step-up second-factor challenge (issue #72): shown when an
+        // authorization request needs an authentication context the current session
+        // has not achieved. Verifies a TOTP or recovery code and upgrades the session
+        // with a fresh acr and auth_time.
+        .route(
+            "/login/mfa",
+            get(login::mfa_challenge_get).post(login::mfa_challenge_post),
+        )
         .route(
             "/register",
             get(register::register_get).post(register::register_post),

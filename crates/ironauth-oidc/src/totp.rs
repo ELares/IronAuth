@@ -377,6 +377,163 @@ pub async fn verify(
     }
 }
 
+/// The recorded second factor a step-up challenge proved (issue #72), or why it
+/// could not. Distinguishes a TOTP verification from a recovery-code redemption so
+/// the recorded [`AuthenticationEvent`](crate::authn::AuthenticationEvent) stays
+/// honest (they map to different `amr`), and reports an unavailable hashing pool
+/// distinctly so the caller can surface a retryable failure rather than a wrong
+/// code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SecondFactorOutcome {
+    /// A valid, single-use TOTP code was verified (amr `otp`+`mfa`).
+    Totp,
+    /// A valid one-time recovery code was redeemed in place of the second factor
+    /// (amr `kba`+`mfa`).
+    Recovery,
+    /// No TOTP or recovery code matched (a uniform failure; never an oracle for
+    /// which codes exist).
+    Invalid,
+    /// The hashing pool needed to verify a recovery code was unavailable: a
+    /// retryable server condition, never a wrong-code signal.
+    Unavailable,
+    /// A store fault while verifying.
+    Error,
+}
+
+/// Verify a presented second-factor `code` for `subject` in `scope` as a step-up
+/// challenge (RFC 9470, issue #72): try the subject's active TOTP first (with
+/// single-use enforcement and drift resync), then fall back to a one-time recovery
+/// code. This is the shared primitive the hosted step-up challenge (login/mfa)
+/// drives; it records the same audited, single-use verification the self-service
+/// account surface does, so a stepped-up second factor is proven exactly once.
+///
+/// The credential-abuse throttle seam (issue #64) gates the attempt through the
+/// same [`throttle_seam`] the account TOTP surface uses (a shared integration point
+/// for the M7 abuse counters); a genuine verification is additionally bounded by the
+/// constant-time compare and the hard store-level single-use invariant.
+pub(crate) async fn verify_second_factor(
+    state: &OidcState,
+    scope: Scope,
+    subject: &UserId,
+    code: &str,
+) -> SecondFactorOutcome {
+    // TOTP first: open the active seed material, verify the code, and enforce
+    // single-use at the store (a replay within the drift window is refused).
+    let credentials = state.store().scoped(scope).totp_credentials();
+    match credentials.open_active_material(subject).await {
+        Ok(Some(material)) => {
+            let Some(params) = params_from_material(&material) else {
+                return SecondFactorOutcome::Error;
+            };
+            let now = now_unix_secs(state);
+            if let Some(step) = verify_totp(
+                &material.seed,
+                params,
+                now,
+                u64::from(state.totp_drift_steps()),
+                code.trim(),
+            ) {
+                let matched_step = i64::try_from(step).unwrap_or(i64::MAX);
+                let now_step = i64::try_from(params.timestep(now)).unwrap_or(0);
+                let offset = i32::try_from(matched_step - now_step).unwrap_or(0);
+                let actor = interaction::user_actor(subject);
+                let recorded = state
+                    .store()
+                    .scoped(scope)
+                    .acting(actor, CorrelationId::generate(state.env()))
+                    .totp_credentials()
+                    .record_verification(state.env(), subject, &material.id, matched_step, offset)
+                    .await;
+                return match recorded {
+                    Ok(TotpVerifyOutcome::Verified) => SecondFactorOutcome::Totp,
+                    // A replayed (or earlier in-window) TOTP code is a uniform failure,
+                    // not an oracle: a replay is never retried as a recovery code.
+                    Ok(TotpVerifyOutcome::Replay | TotpVerifyOutcome::NotFound) => {
+                        SecondFactorOutcome::Invalid
+                    }
+                    Err(_) => SecondFactorOutcome::Error,
+                };
+            }
+            // The TOTP did not match: fall through to a recovery-code attempt.
+        }
+        Ok(None) => {}
+        Err(_) => return SecondFactorOutcome::Error,
+    }
+
+    // Recovery code: narrow candidates by the presented code's blind index, then
+    // verify through the admission-controlled hashing pool and redeem single-use.
+    let presented = normalize_recovery_code(code);
+    let Ok(candidates) = state
+        .store()
+        .scoped(scope)
+        .recovery_codes()
+        .candidates_for_code(subject, &presented)
+        .await
+    else {
+        return SecondFactorOutcome::Error;
+    };
+    let mut matched = None;
+    for candidate in &candidates {
+        match state
+            .verify_password(&scope, &presented, &candidate.code_hash)
+            .await
+        {
+            Ok(true) => {
+                matched = Some(candidate.id);
+                break;
+            }
+            Ok(false) => {}
+            Err(HashRejection::Unavailable) => return SecondFactorOutcome::Unavailable,
+            Err(_) => return SecondFactorOutcome::Error,
+        }
+    }
+    let Some(id) = matched else {
+        return SecondFactorOutcome::Invalid;
+    };
+    let actor = interaction::user_actor(subject);
+    match state
+        .store()
+        .scoped(scope)
+        .acting(actor, CorrelationId::generate(state.env()))
+        .recovery_codes()
+        .redeem(state.env(), subject, &id)
+        .await
+    {
+        Ok(RecoveryRedeemOutcome::Redeemed) => SecondFactorOutcome::Recovery,
+        // A concurrent redemption won: treat as a uniform invalid (single-use held).
+        Ok(RecoveryRedeemOutcome::NotFound) => SecondFactorOutcome::Invalid,
+        Err(_) => SecondFactorOutcome::Error,
+    }
+}
+
+/// Whether `subject` has an ACTIVE TOTP authenticator enrolled in `scope` (issue
+/// #72), the signal the step-up gate uses to decide between challenging a second
+/// factor and prompting enrollment.
+pub(crate) async fn has_active_totp(state: &OidcState, scope: Scope, subject: &UserId) -> bool {
+    state
+        .store()
+        .scoped(scope)
+        .totp_credentials()
+        .open_active_material(subject)
+        .await
+        .is_ok_and(|material| material.is_some())
+}
+
+/// Whether `subject` has a registered passkey in `scope` (issue #72): a
+/// phishing-resistant factor that reaches the `phr`/`phrh` ACRs.
+pub(crate) async fn has_passkey(state: &OidcState, scope: Scope, subject: &UserId) -> bool {
+    if !state.webauthn_enabled() {
+        return false;
+    }
+    state
+        .store()
+        .scoped(scope)
+        .webauthn_credentials()
+        .descriptors(subject)
+        .await
+        .is_ok_and(|descriptors| !descriptors.is_empty())
+}
+
 /// The remove request body: the TOTP factor to remove.
 #[derive(Debug, Deserialize)]
 pub struct RemoveBody {
