@@ -6,6 +6,12 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Add the `FetchPurpose::BreachScreening` label (issue #63): the online HIBP
+  k-anonymity breached-password screening query is an outbound call, so it rides the same
+  SSRF-hardened dispatcher as every other fetch. ONLY the 5-character SHA-1 prefix is ever
+  placed on the wire (never the password or its full hash); a range URL that resolves to a
+  loopback or otherwise internal address is refused exactly like any other blocked
+  destination. The new purpose only adds a bounded metric label (`breach_screening`).
 - Add the `FetchPurpose::LazyMigration` label (issue #56): the inbound
   lazy-migration hook verifies a first login against a legacy credential store,
   which is an outbound call, so it rides the same SSRF-hardened dispatcher as every

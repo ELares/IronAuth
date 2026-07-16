@@ -6,6 +6,23 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Clarified the `screening_failure_policy` documentation (issue #63 review): the default
+  `fail_open` is availability-biased and lets a known-breached password through during a
+  provider outage (audited/detectable); hard enforcement uses `fail_closed` or the offline
+  corpus provider. Documentation only; no schema or behavior change.
+- `[password_policy]` section and the `ScreeningProvider` / `ScreeningFailurePolicy` enums
+  (breached-password screening and NIST SP 800-63B-4, issue #63). The shipped defaults are
+  the modern 63B-4 posture: `min_length_sole_factor = 15` (SHALL), `min_length_mfa_factor =
+  8`, `max_length = 64` (SHOULD), no composition (`require_lowercase`/`uppercase`/`digit`/
+  `symbol` all false), `rotation_max_age_days = 0` (no forced rotation), and
+  `screening_enabled = true` (MANDATORY) over the online `hibp` provider with
+  `screening_failure_policy = fail_open`. Legacy compliance regimes enable composition,
+  rotation, or different lengths as settings; validation rejects an unusable policy (a
+  minimum above the maximum, a zero length, a rotation beyond ten years, a non-https
+  `hibp_base_url`, or the `offline` provider with no `offline_corpus_path`). Lengths are
+  counted in code points. Constants: `PASSWORD_POLICY_NIST_MIN_LENGTH_SOLE_FACTOR`,
+  `PASSWORD_POLICY_NIST_MIN_LENGTH_MFA_FACTOR`, `PASSWORD_POLICY_NIST_MIN_MAX_LENGTH`,
+  `PASSWORD_POLICY_MAX_LENGTH_CEILING`, `PASSWORD_POLICY_MAX_ROTATION_DAYS`.
 - `oidc.acr_order` setting (RFC 9470 step-up, issue #72): the DEPLOYMENT-level `acr` order
   (weakest first) the step-up comparison ranks against, so an acr floor is met by the same
   value or a rank at least as strong. Resolved once from config and applied across the

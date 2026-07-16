@@ -39,6 +39,11 @@ ironauth-quota.workspace = true
 # validation reaches the network through. Depending on ironauth-fetch (not an
 # HTTP-client crate) keeps scripts/http-audit.sh satisfied.
 ironauth-fetch.workspace = true
+# Breached-password screening and the NIST SP 800-63B-4 policy (issue #63): the
+# k-anonymity screening providers, the Screener, and the PasswordPolicy evaluator plus
+# NFKC normalization the set/change/reset and login paths call. The HIBP provider's only
+# outbound path is ironauth-fetch, so http-audit stays satisfied.
+ironauth-screening.workspace = true
 
 # Argon2id verification/hashing for the bootstrap login and registration surface
 # (issue #20), at OWASP defaults. Salt bytes come from the ironauth-env entropy
@@ -238,6 +243,16 @@ required-features = ["testing"]
 [[test]]
 name = "account"
 path = "tests/account.rs"
+required-features = ["testing"]
+
+# Breached-password screening and 800-63B-4 policy on the set/change surfaces (issue #63):
+# a known-breached password is refused on register and change through an injected STUB
+# provider (never the real HIBP API), the fail-open/closed provider-failure policy behaves
+# per config, and a Unicode password round-trips (NFKC applied once, set/verify consistent).
+# Needs a real database (DATABASE_URL).
+[[test]]
+name = "breached_password"
+path = "tests/breached_password.rs"
 required-features = ["testing"]
 
 # The TOTP second-factor and recovery-code HTTP surface (issue #69): enrollment

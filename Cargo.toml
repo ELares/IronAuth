@@ -24,6 +24,7 @@ members = [
     "crates/ironauth-admin",
     "crates/ironauth-oidc",
     "crates/ironauth-quota",
+    "crates/ironauth-screening",
     "crates/ironauth-apply",
     "crates/ironauth-import",
     "crates/ironauth-importers",
@@ -48,6 +49,7 @@ ironauth-kms = { path = "crates/ironauth-kms", version = "0.1.0" }
 ironauth-admin = { path = "crates/ironauth-admin", version = "0.1.0" }
 ironauth-oidc = { path = "crates/ironauth-oidc", version = "0.1.0" }
 ironauth-quota = { path = "crates/ironauth-quota", version = "0.1.0" }
+ironauth-screening = { path = "crates/ironauth-screening", version = "0.1.0" }
 ironauth-apply = { path = "crates/ironauth-apply", version = "0.1.0" }
 ironauth-import = { path = "crates/ironauth-import", version = "0.1.0" }
 ironauth-importers = { path = "crates/ironauth-importers", version = "0.1.0" }
@@ -139,6 +141,14 @@ ring = "0.17"
 # (no asm/C feature), permissive (MIT OR Apache-2.0), already in the tree via
 # sqlx, so this adds a direct edge but no new crate; MSRV 1.85 and musl clean.
 sha2 = "0.10"
+# SHA-1 for the HIBP k-anonymity breached-password screening (crates/ironauth-screening,
+# issue #63). HIBP's range API keys on the SHA-1 of the password; this is NOT a
+# password hash (Argon2id owns that, issue #62), only the range lookup key, computed
+# LOCALLY so only the 5-char hex prefix ever leaves the process. Pure Rust
+# (RustCrypto), permissive (MIT OR Apache-2.0), no C dependency, so the tree stays
+# musl-static clean and MSRV 1.85 holds. Shares the RustCrypto `digest` traits already
+# in the tree via sha2, so this adds a direct edge, not a new trait graph.
+sha1 = "0.10"
 # CBOR decoding for the WebAuthn ceremony layer (crates/ironauth-webauthn, issue
 # #65): the registration attestationObject and the COSE credential public key are
 # CBOR. ciborium is the standard Rust CBOR implementation, pure Rust with no build

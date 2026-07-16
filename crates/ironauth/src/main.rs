@@ -14,7 +14,8 @@ use axum::Router;
 use ironauth_admin::AdminState;
 use ironauth_config::{
     Config, FeatureRegistry, GLOBAL_TOKEN_REVOCATION_FEATURE, Loaded, OidcConfig,
-    PasswordHashingConfig, QuotaConfig,
+    PasswordHashingConfig, PasswordPolicyConfig, QuotaConfig, ScreeningFailurePolicy,
+    ScreeningProvider,
 };
 use ironauth_env::Env;
 use ironauth_jose::MasterKey;
@@ -173,6 +174,7 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
                 resolve_master_key(&config),
                 config.quota.clone(),
                 config.password_hashing.clone(),
+                config.password_policy.clone(),
             ))
         } else {
             None
@@ -194,8 +196,15 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
         }
         // Mount the OIDC provider on the PUBLIC plane when enabled. The issuer root
         // is the server's config-derived base URL, so issuers are per environment.
-        if let Some((oidc_config, dsn, oidc_env, master_key, quota_config, hashing_config)) =
-            oidc_inputs
+        if let Some((
+            oidc_config,
+            dsn,
+            oidc_env,
+            master_key,
+            quota_config,
+            hashing_config,
+            policy_config,
+        )) = oidc_inputs
         {
             let issuer_base = server.base_url();
             if let Some(router) = build_oidc_router(
@@ -207,6 +216,7 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
                 master_key,
                 &quota_config,
                 &hashing_config,
+                &policy_config,
                 migration_hook,
             )
             .await
@@ -340,6 +350,7 @@ async fn build_oidc_router(
     master_key: Option<Arc<MasterKey>>,
     quota_config: &QuotaConfig,
     hashing_config: &PasswordHashingConfig,
+    policy_config: &PasswordPolicyConfig,
     migration_hook: Option<Arc<LazyMigrationHook>>,
 ) -> Option<Router> {
     let store = match Store::connect(data_plane_dsn).await {
@@ -429,10 +440,23 @@ async fn build_oidc_router(
         "Argon2id hashing pool started with per-tenant fair-share admission (issue #62)"
     );
 
+    // Breached-password screening and the NIST SP 800-63B-4 policy (issue #63): the
+    // shipped defaults are the modern 63B-4 posture (15/8/64 length, no composition, no
+    // rotation, screening MANDATORY over the free HIBP k-anonymity provider). The policy
+    // (length floors, legacy overrides, fail-open/closed) always installs; the provider
+    // installs only when screening is enabled and its input is available.
+    let (password_policy, screening_failure, screen_on_login) =
+        build_password_policy(policy_config);
+    ironauth_oidc::describe_screening_metrics();
+
     let mut state = OidcState::new(store, env, registry, oidc_config, issuer_base)
         .with_global_token_revocation_enabled(global_revocation_enabled)
         .with_quota_enforcer(quota_enforcer)
-        .with_hashing_pool(hashing_pool);
+        .with_hashing_pool(hashing_pool)
+        .with_password_policy(password_policy, screening_failure, screen_on_login);
+    if let Some(provider) = build_breach_provider(policy_config) {
+        state = state.with_breach_provider(provider);
+    }
     // Arm the inbound lazy-migration hook on the login path (issue #56) when one is
     // configured; without it an unknown-identifier login is the uniform failure.
     if let Some(hook) = migration_hook {
@@ -449,6 +473,100 @@ async fn build_oidc_router(
          per-environment signing keys load lazily from the store on first use"
     );
     Some(oidc_router(state).merge(discovery).merge(jwks))
+}
+
+/// Resolve the top-level `[password_policy]` config into the runtime 800-63B-4 policy
+/// value, the provider-failure policy, and the on-login-screen flag (issue #63). The
+/// lengths and any legacy composition/rotation overrides map straight across; the shipped
+/// defaults are the modern 63B-4 posture.
+fn build_password_policy(
+    cfg: &PasswordPolicyConfig,
+) -> (
+    ironauth_screening::PasswordPolicy,
+    ironauth_screening::FailurePolicy,
+    bool,
+) {
+    let policy = ironauth_screening::PasswordPolicy::new(
+        cfg.min_length_sole_factor,
+        cfg.min_length_mfa_factor,
+        cfg.max_length,
+        cfg.require_lowercase,
+        cfg.require_uppercase,
+        cfg.require_digit,
+        cfg.require_symbol,
+        cfg.rotation_max_age_days,
+        cfg.screening_enabled,
+    );
+    let failure = match cfg.screening_failure_policy {
+        ScreeningFailurePolicy::FailOpen => ironauth_screening::FailurePolicy::FailOpen,
+        ScreeningFailurePolicy::FailClosed => ironauth_screening::FailurePolicy::FailClosed,
+    };
+    (policy, failure, cfg.screen_on_login)
+}
+
+/// Build the breached-password screening provider from config (issue #63): the online HIBP
+/// range provider over a fresh SSRF-hardened fetcher, or the offline corpus provider loaded
+/// from the operator dataset. `None` when screening is disabled. A provider whose input is
+/// unavailable (a fetcher-setup failure, an unreadable corpus) logs and yields `None`, so
+/// the state then treats screening as provider-unavailable and applies the fail-open/closed
+/// policy rather than silently no-opping the mandatory default.
+fn build_breach_provider(
+    cfg: &PasswordPolicyConfig,
+) -> Option<Arc<dyn ironauth_screening::BreachRangeProvider>> {
+    if !cfg.screening_enabled {
+        return None;
+    }
+    match cfg.screening_provider {
+        ScreeningProvider::Hibp => {
+            let fetcher = match ironauth_fetch::Fetcher::new(ironauth_fetch::FetchLimits::default())
+            {
+                Ok(fetcher) => Arc::new(fetcher),
+                Err(error) => {
+                    tracing::error!(
+                        %error,
+                        "breached-password screening: HIBP fetcher setup failed; the \
+                         provider is unavailable and the fail-open/closed policy applies"
+                    );
+                    return None;
+                }
+            };
+            let provider = match &cfg.hibp_base_url {
+                Some(base) => {
+                    ironauth_screening::HibpRangeProvider::with_base_url(fetcher, base.clone())
+                }
+                None => ironauth_screening::HibpRangeProvider::new(fetcher),
+            };
+            tracing::info!(
+                "breached-password screening enabled over the online HIBP k-anonymity range \
+                 API (issue #63); only a 5-char SHA-1 prefix leaves the process"
+            );
+            Some(Arc::new(provider) as Arc<dyn ironauth_screening::BreachRangeProvider>)
+        }
+        ScreeningProvider::Offline => {
+            // Config load guarantees the path is set when the offline provider is enabled.
+            let path = cfg.offline_corpus_path.as_deref()?;
+            match std::fs::read_to_string(path) {
+                Ok(text) => {
+                    let provider = ironauth_screening::OfflineCorpusProvider::from_text(&text);
+                    tracing::info!(
+                        entries = provider.len(),
+                        path,
+                        "breached-password screening enabled over the offline corpus (issue #63)"
+                    );
+                    Some(Arc::new(provider) as Arc<dyn ironauth_screening::BreachRangeProvider>)
+                }
+                Err(error) => {
+                    tracing::error!(
+                        %error,
+                        path,
+                        "breached-password screening: offline corpus unreadable; the provider \
+                         is unavailable and the fail-open/closed policy applies"
+                    );
+                    None
+                }
+            }
+        }
+    }
 }
 
 /// What the Back-Channel Logout delivery worker (issue #34) needs to start, captured
