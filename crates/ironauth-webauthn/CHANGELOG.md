@@ -6,6 +6,11 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- RSA modulus floor at registration (issue #65 review hardening): an RS256 COSE key
+  whose modulus is outside 2048..=8192 bits is now rejected when the credential is
+  parsed. `ring` rejects such a key at verify time, so a sub-2048-bit key would have
+  registered but been permanently unusable (a dead-credential foot-gun); it is now
+  refused up front.
 - Initial release (issue #65): the WebAuthn Level 3 ceremony core. Builds the
   registration and authentication option documents (discoverable credentials and
   the `credProps` extension requested by default, `excludeCredentials` populated

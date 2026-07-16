@@ -700,7 +700,7 @@
         },
         "webauthn_require_user_verification": {
           "default": true,
-          "description": "Whether a WebAuthn ceremony requires user verification (issue #65). On by\ndefault: a UV assertion is what makes a passkey login phishing-resistant and\nmaps to the `phr`/`phrh` ACRs. Turning it off allows user-presence-only\nassertions (not recommended).",
+          "description": "Whether a WebAuthn ceremony requires user verification (issue #65). On by\ndefault. Phishing resistance comes from WebAuthn's origin binding, which every\nceremony has, so the `phr`/`phrh` ACRs do NOT require user verification; what\nuser verification governs is the `amr` (a UV assertion additionally carries\n`mfa`, since the possession of the key plus the verification are two factors,\nwhile a user-presence-only assertion does not). Turning it off allows\nuser-presence-only assertions (not recommended).",
           "type": "boolean"
         },
         "webauthn_rp_id": {

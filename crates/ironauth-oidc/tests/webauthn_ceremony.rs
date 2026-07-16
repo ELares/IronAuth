@@ -16,11 +16,12 @@
 mod common;
 
 use axum::body::Body;
-use axum::http::{Request, StatusCode, header};
+use axum::http::{HeaderMap, Request, StatusCode, header};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use ciborium::value::{Integer, Value};
 use common::{Harness, ISSUER_BASE};
+use ironauth_config::OidcConfig;
 use ironauth_jose::webauthn::test_util;
 use serde_json::{Value as Json, json};
 use sha2::{Digest, Sha256};
@@ -223,7 +224,8 @@ async fn a_passkey_registers_and_signs_in_with_phr_acr() {
     let (status, headers, response) = harness.send(request).await;
     assert_eq!(status, StatusCode::OK, "authenticate verify: {response}");
     let body: Json = serde_json::from_str(&response).unwrap();
-    // The honest ACR of a UV synced passkey is phr, with swk+user amr.
+    // The honest ACR of a UV synced passkey is phr; the amr is swk+user (presence)
+    // plus mfa, since user verification was performed on this assertion.
     assert_eq!(body["acr"], "phr");
     let amr: Vec<&str> = body["amr"]
         .as_array()
@@ -231,7 +233,7 @@ async fn a_passkey_registers_and_signs_in_with_phr_acr() {
         .iter()
         .map(|v| v.as_str().unwrap())
         .collect();
-    assert_eq!(amr, vec!["swk", "user"]);
+    assert_eq!(amr, vec!["swk", "user", "mfa"]);
     // A session cookie was set.
     assert!(
         headers.get_all(header::SET_COOKIE).iter().count() >= 1,
@@ -323,4 +325,579 @@ async fn a_wrong_origin_ceremony_is_refused_without_enumerating() {
     )
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+// --- Authenticator-data flag divergence and the credential-management surface. ---
+//
+// These exercise the acr/amr truthfulness fixes (the assurance is pinned to the
+// STORED backup-eligible flag, a BE flip is refused and audited, and the amr
+// reflects whether user verification actually happened) and the authenticated,
+// IDOR-safe passkey list/rename/remove surface, all through the real router.
+
+// Authenticator-data flag bytes (bit0 UP, bit2 UV, bit3 BE, bit4 BS, bit6 AT).
+const REG_SYNCED_UV: u8 = 0b0101_1101; // UP|UV|BE|BS|AT (a synced passkey)
+const REG_DEVICE_UV: u8 = 0b0100_0101; // UP|UV|AT       (a device-bound passkey)
+const ASSERT_SYNCED_UV: u8 = 0b0001_1101; // UP|UV|BE|BS
+const ASSERT_DEVICE_UV: u8 = 0b0000_0101; // UP|UV
+const ASSERT_SYNCED_UP_ONLY: u8 = 0b0001_1001; // UP|BE|BS (no UV: user presence only)
+
+/// A COSE Ed25519 public-key document for an explicit seed.
+fn cose_key_from(seed: &[u8; 32]) -> Vec<u8> {
+    let public_key = test_util::ed25519_public_key_from_seed(seed);
+    cbor(&Value::Map(vec![
+        (
+            Value::Integer(Integer::from(1)),
+            Value::Integer(Integer::from(1)),
+        ),
+        (
+            Value::Integer(Integer::from(3)),
+            Value::Integer(Integer::from(-8)),
+        ),
+        (
+            Value::Integer(Integer::from(-1)),
+            Value::Integer(Integer::from(6)),
+        ),
+        (Value::Integer(Integer::from(-2)), Value::Bytes(public_key)),
+    ]))
+}
+
+/// Authenticator data for an explicit credential/seed and flag byte.
+fn auth_data_for(
+    cred_id: &[u8],
+    seed: &[u8; 32],
+    flags: u8,
+    sign_count: u32,
+    attested: bool,
+) -> Vec<u8> {
+    let mut data = Vec::new();
+    data.extend_from_slice(&sha256(RP_ID.as_bytes()));
+    data.push(flags);
+    data.extend_from_slice(&sign_count.to_be_bytes());
+    if attested {
+        data.extend_from_slice(&[0xCD; 16]);
+        data.extend_from_slice(&u16::try_from(cred_id.len()).unwrap().to_be_bytes());
+        data.extend_from_slice(cred_id);
+        data.extend_from_slice(&cose_key_from(seed));
+    }
+    data
+}
+
+/// Register a passkey with explicit credential material and registration flags.
+async fn register_flags(
+    harness: &Harness,
+    cookie: &str,
+    seed: &[u8; 32],
+    cred_id: &[u8],
+    reg_flags: u8,
+) -> (StatusCode, Json) {
+    let base = webauthn_base(harness);
+    let (status, opts) = post(
+        harness,
+        &format!("{base}/register/options"),
+        Some(cookie),
+        ISSUER_BASE,
+        &json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "register options: {opts}");
+    let challenge_id = opts["challengeId"].as_str().unwrap().to_owned();
+    let challenge_b64 = opts["publicKey"]["challenge"].as_str().unwrap().to_owned();
+    let attestation_object = cbor(&Value::Map(vec![
+        (Value::Text("fmt".into()), Value::Text("none".into())),
+        (Value::Text("attStmt".into()), Value::Map(vec![])),
+        (
+            Value::Text("authData".into()),
+            Value::Bytes(auth_data_for(cred_id, seed, reg_flags, 0, true)),
+        ),
+    ]));
+    let credential = json!({
+        "id": b64(cred_id), "rawId": b64(cred_id), "type": "public-key",
+        "response": {
+            "clientDataJSON": b64(&client_data("webauthn.create", &challenge_b64)),
+            "attestationObject": b64(&attestation_object),
+            "transports": ["internal"],
+        },
+        "clientExtensionResults": { "credProps": { "rk": true } },
+    });
+    post(
+        harness,
+        &format!("{base}/register/verify"),
+        Some(cookie),
+        ISSUER_BASE,
+        &json!({ "challengeId": challenge_id, "credential": credential }),
+    )
+    .await
+}
+
+/// Drive an assertion with explicit flags. `user_handle` overrides the userHandle
+/// sent (`None` sends none). Returns the raw status, headers, and body string.
+async fn authenticate_flags(
+    harness: &Harness,
+    seed: &[u8; 32],
+    cred_id: &[u8],
+    user_handle: Option<&[u8]>,
+    flags: u8,
+    sign_count: u32,
+) -> (StatusCode, HeaderMap, String) {
+    let base = webauthn_base(harness);
+    let (status, opts) = post(
+        harness,
+        &format!("{base}/authenticate/options"),
+        None,
+        ISSUER_BASE,
+        &json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "authenticate options: {opts}");
+    let challenge_id = opts["challengeId"].as_str().unwrap().to_owned();
+    let challenge_b64 = opts["publicKey"]["challenge"].as_str().unwrap().to_owned();
+    let authenticator_data = auth_data_for(cred_id, seed, flags, sign_count, false);
+    let client = client_data("webauthn.get", &challenge_b64);
+    let mut signed = authenticator_data.clone();
+    signed.extend_from_slice(&sha256(&client));
+    let signature = test_util::ed25519_sign(seed, &signed);
+    let mut response = json!({
+        "clientDataJSON": b64(&client),
+        "authenticatorData": b64(&authenticator_data),
+        "signature": b64(&signature),
+    });
+    if let Some(handle) = user_handle {
+        response["userHandle"] = Json::String(b64(handle));
+    }
+    let credential = json!({
+        "id": b64(cred_id), "rawId": b64(cred_id), "type": "public-key",
+        "response": response,
+    });
+    let request = Request::builder()
+        .method("POST")
+        .uri(format!("{base}/authenticate/verify"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .header("origin", ISSUER_BASE)
+        .body(Body::from(
+            json!({ "challengeId": challenge_id, "credential": credential }).to_string(),
+        ))
+        .expect("request builds");
+    harness.send(request).await
+}
+
+/// A GET with an optional session cookie.
+async fn get(harness: &Harness, path: &str, cookie: Option<&str>) -> (StatusCode, Json) {
+    let mut builder = Request::builder().method("GET").uri(path);
+    if let Some(cookie) = cookie {
+        builder = builder.header(header::COOKIE, cookie);
+    }
+    let (status, _headers, response) = harness
+        .send(builder.body(Body::empty()).expect("request builds"))
+        .await;
+    let parsed = if response.is_empty() {
+        Json::Null
+    } else {
+        serde_json::from_str(&response).unwrap_or(Json::Null)
+    };
+    (status, parsed)
+}
+
+#[tokio::test]
+async fn a_backup_eligibility_flip_is_refused_and_audited_and_never_upgrades_acr() {
+    // The security HIGH: a synced passkey (stored BE=1, honest acr phr) must not be
+    // able to claim the device-bound phrh by presenting a cleared BE bit. The flip is
+    // a spec violation (WebAuthn L3 7.2: BE is immutable), so it is refused and
+    // audited, and the assurance is always pinned to the STORED BE.
+    let harness = Harness::start().await;
+    let subject = harness
+        .seed_user("dora@example.test", "correct horse")
+        .await;
+    let (_id, cookie) = harness.session_with_id(&subject, "pwd", 0).await;
+    let seed = [21_u8; 32];
+    let cred = b"be-flip-credential";
+
+    let (status, body) = register_flags(&harness, &cookie, &seed, cred, REG_SYNCED_UV).await;
+    assert_eq!(status, StatusCode::CREATED, "register: {body}");
+    assert_eq!(body["backup_eligible"], true, "registered synced (BE=1)");
+
+    // Assert with the BE bit CLEARED (claiming device-bound). Refused, no session.
+    let (status, headers, resp) = authenticate_flags(
+        &harness,
+        &seed,
+        cred,
+        Some(subject.as_bytes()),
+        ASSERT_DEVICE_UV,
+        1,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a BE flip must be refused with the non-enumerating error: {resp}"
+    );
+    assert_eq!(
+        headers.get_all(header::SET_COOKIE).iter().count(),
+        0,
+        "a refused BE flip establishes no session"
+    );
+    assert_eq!(
+        harness
+            .count_audit_action("webauthn.backup_eligibility.mismatch")
+            .await,
+        1,
+        "the BE-flip security event is audited"
+    );
+
+    // A matching (unflipped) assertion still signs in, and the acr is the STORED
+    // synced value phr, never the device-bound phrh.
+    let (status, _headers, resp) = authenticate_flags(
+        &harness,
+        &seed,
+        cred,
+        Some(subject.as_bytes()),
+        ASSERT_SYNCED_UV,
+        2,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "honest assertion signs in: {resp}");
+    let body: Json = serde_json::from_str(&resp).unwrap();
+    assert_eq!(
+        body["acr"], "phr",
+        "the acr is pinned to the stored synced BE"
+    );
+}
+
+#[tokio::test]
+async fn a_device_bound_passkey_signs_in_with_phrh() {
+    // The other half of the distinction: a genuinely device-bound passkey (stored
+    // BE=0) earns phrh, from the STORED registration-time BE.
+    let harness = Harness::start().await;
+    let subject = harness
+        .seed_user("evan@example.test", "battery staple")
+        .await;
+    let (_id, cookie) = harness.session_with_id(&subject, "pwd", 0).await;
+    let seed = [31_u8; 32];
+    let cred = b"device-bound-credential";
+
+    let (status, body) = register_flags(&harness, &cookie, &seed, cred, REG_DEVICE_UV).await;
+    assert_eq!(status, StatusCode::CREATED, "register: {body}");
+    assert_eq!(
+        body["backup_eligible"], false,
+        "registered device-bound (BE=0)"
+    );
+
+    let (status, _headers, resp) = authenticate_flags(
+        &harness,
+        &seed,
+        cred,
+        Some(subject.as_bytes()),
+        ASSERT_DEVICE_UV,
+        1,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "sign in: {resp}");
+    let body: Json = serde_json::from_str(&resp).unwrap();
+    assert_eq!(body["acr"], "phrh", "a device-bound passkey earns phrh");
+    let amr: Vec<&str> = body["amr"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert_eq!(amr, vec!["hwk", "user", "mfa"], "UV device-bound amr");
+}
+
+#[tokio::test]
+async fn a_presence_only_passkey_amr_omits_the_verification_factor() {
+    // With user verification NOT required, a user-presence-only assertion (UV=0)
+    // still signs in and stays phishing-resistant (phr), but its amr must NOT claim a
+    // verification factor: `user` (presence) stays, `mfa` is absent.
+    let harness = Harness::start_with(OidcConfig {
+        require_pkce_for_confidential_clients: false,
+        webauthn_require_user_verification: false,
+        ..OidcConfig::default()
+    })
+    .await;
+    let subject = harness.seed_user("faye@example.test", "hunter two").await;
+    let (_id, cookie) = harness.session_with_id(&subject, "pwd", 0).await;
+    let seed = [41_u8; 32];
+    let cred = b"presence-only-credential";
+
+    let (status, body) = register_flags(&harness, &cookie, &seed, cred, REG_SYNCED_UV).await;
+    assert_eq!(status, StatusCode::CREATED, "register: {body}");
+
+    let (status, _headers, resp) = authenticate_flags(
+        &harness,
+        &seed,
+        cred,
+        Some(subject.as_bytes()),
+        ASSERT_SYNCED_UP_ONLY,
+        1,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "presence-only sign in: {resp}");
+    let body: Json = serde_json::from_str(&resp).unwrap();
+    assert_eq!(body["acr"], "phr", "phishing-resistant even without UV");
+    let amr: Vec<&str> = body["amr"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert_eq!(
+        amr,
+        vec!["swk", "user"],
+        "presence kept, no verification factor"
+    );
+    assert!(
+        !amr.contains(&"mfa"),
+        "UP-only must not imply a verification factor"
+    );
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn a_user_lists_renames_and_removes_only_their_own_passkey() {
+    // The credential-management surface (acceptance criterion 3), IDOR-safe.
+    let harness = Harness::start().await;
+    let alice = harness.seed_user("alice@example.test", "alice pass").await;
+    let (_a, alice_cookie) = harness.session_with_id(&alice, "pwd", 0).await;
+    let bob = harness.seed_user("bobby@example.test", "bob pass").await;
+    let (_b, bob_cookie) = harness.session_with_id(&bob, "pwd", 0).await;
+
+    // Alice and Bob each register a passkey (distinct credential material).
+    let (status, alice_reg) = register_flags(
+        &harness,
+        &alice_cookie,
+        &[51_u8; 32],
+        b"alice-cred",
+        REG_SYNCED_UV,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "alice register: {alice_reg}");
+    let alice_pky = alice_reg["id"].as_str().unwrap().to_owned();
+    let (status, bob_reg) = register_flags(
+        &harness,
+        &bob_cookie,
+        &[52_u8; 32],
+        b"bob-cred",
+        REG_DEVICE_UV,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "bob register: {bob_reg}");
+    let bob_pky = bob_reg["id"].as_str().unwrap().to_owned();
+
+    let base = webauthn_base(&harness);
+
+    // Alice lists her OWN passkeys with live BE/BS; Bob's is never present.
+    let (status, listed) = get(
+        &harness,
+        &format!("{base}/credentials"),
+        Some(&alice_cookie),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "list: {listed}");
+    let passkeys = listed["passkeys"].as_array().unwrap();
+    assert_eq!(passkeys.len(), 1, "alice sees exactly her own passkey");
+    assert_eq!(passkeys[0]["id"], alice_pky);
+    assert_eq!(passkeys[0]["backup_eligible"], true, "live BE readable");
+    assert_eq!(passkeys[0]["backup_state"], true, "live BS readable");
+    assert!(
+        !passkeys.iter().any(|p| p["id"] == bob_pky.as_str()),
+        "alice never sees bob's passkey"
+    );
+
+    // The unified /account/credentials view also shows the passkey.
+    let account = format!(
+        "/t/{}/e/{}/account/credentials",
+        harness.scope().tenant(),
+        harness.scope().environment()
+    );
+    let (status, creds) = get(&harness, &account, Some(&alice_cookie)).await;
+    assert_eq!(status, StatusCode::OK, "account credentials: {creds}");
+    assert!(
+        creds["credentials"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["id"] == alice_pky.as_str() && c["type"] == "passkey"),
+        "the passkey appears in the unified account credential list"
+    );
+
+    // Alice renames her OWN passkey.
+    let (status, renamed) = post(
+        &harness,
+        &format!("{base}/credentials/rename"),
+        Some(&alice_cookie),
+        ISSUER_BASE,
+        &json!({ "credentialId": alice_pky, "nickname": "Alice work laptop" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "rename: {renamed}");
+    assert_eq!(renamed["nickname"], "Alice work laptop");
+
+    // Alice CANNOT rename or remove Bob's passkey: the uniform not-found.
+    let (status, _b) = post(
+        &harness,
+        &format!("{base}/credentials/rename"),
+        Some(&alice_cookie),
+        ISSUER_BASE,
+        &json!({ "credentialId": bob_pky, "nickname": "pwned" }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "cannot rename another user's passkey"
+    );
+    let (status, _b) = post(
+        &harness,
+        &format!("{base}/credentials/remove"),
+        Some(&alice_cookie),
+        ISSUER_BASE,
+        &json!({ "credentialId": bob_pky }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "cannot remove another user's passkey"
+    );
+
+    // Bob's passkey is untouched (still listable by Bob).
+    let (status, bob_list) = get(&harness, &format!("{base}/credentials"), Some(&bob_cookie)).await;
+    assert_eq!(status, StatusCode::OK, "bob list: {bob_list}");
+    assert_eq!(bob_list["passkeys"].as_array().unwrap().len(), 1);
+
+    // Alice removes her OWN passkey; it is gone.
+    let (status, removed) = post(
+        &harness,
+        &format!("{base}/credentials/remove"),
+        Some(&alice_cookie),
+        ISSUER_BASE,
+        &json!({ "credentialId": alice_pky }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "remove: {removed}");
+    let (status, after) = get(
+        &harness,
+        &format!("{base}/credentials"),
+        Some(&alice_cookie),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        after["passkeys"].as_array().unwrap().is_empty(),
+        "alice's passkey is gone after removal"
+    );
+    assert_eq!(
+        harness
+            .count_audit_action("webauthn.credential.rename")
+            .await,
+        1,
+        "the rename is audited"
+    );
+    assert_eq!(
+        harness
+            .count_audit_action("webauthn.credential.remove")
+            .await,
+        1,
+        "the remove is audited"
+    );
+}
+
+#[tokio::test]
+async fn a_regressing_sign_count_with_block_policy_denies_the_signin() {
+    // Clone-detection BLOCK path (only the warn path was integration-tested before):
+    // a regressing counter under block policy returns 403 and establishes no session.
+    let harness = Harness::start_with(OidcConfig {
+        require_pkce_for_confidential_clients: false,
+        webauthn_clone_detection_block: true,
+        ..OidcConfig::default()
+    })
+    .await;
+    let subject = harness.seed_user("gwen@example.test", "sign count").await;
+    let (_id, cookie) = harness.session_with_id(&subject, "pwd", 0).await;
+    let seed = [61_u8; 32];
+    let cred = b"clone-detect-credential";
+
+    let (status, _body) = register_flags(&harness, &cookie, &seed, cred, REG_SYNCED_UV).await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // Advance the counter to 5.
+    let (status, headers, resp) = authenticate_flags(
+        &harness,
+        &seed,
+        cred,
+        Some(subject.as_bytes()),
+        ASSERT_SYNCED_UV,
+        5,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "first assertion: {resp}");
+    assert!(headers.get_all(header::SET_COOKIE).iter().count() >= 1);
+
+    // A REGRESSING counter (3 < 5) under block policy is denied with no session.
+    let (status, headers, resp) = authenticate_flags(
+        &harness,
+        &seed,
+        cred,
+        Some(subject.as_bytes()),
+        ASSERT_SYNCED_UV,
+        3,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a clone under block policy is denied: {resp}"
+    );
+    assert_eq!(
+        headers.get_all(header::SET_COOKIE).iter().count(),
+        0,
+        "a blocked clone establishes no session"
+    );
+    assert_eq!(
+        harness.count_audit_action("webauthn.clone.detected").await,
+        1,
+        "the clone-detection event is audited"
+    );
+}
+
+#[tokio::test]
+async fn a_mismatched_user_handle_is_refused() {
+    // Defensive userHandle check (WebAuthn L3 7.2): a userHandle that does not match
+    // the credential's stored subject is refused, even though resolution is by
+    // credential id.
+    let harness = Harness::start().await;
+    let subject = harness.seed_user("hank@example.test", "user handle").await;
+    let (_id, cookie) = harness.session_with_id(&subject, "pwd", 0).await;
+    let seed = [71_u8; 32];
+    let cred = b"user-handle-credential";
+
+    let (status, _body) = register_flags(&harness, &cookie, &seed, cred, REG_SYNCED_UV).await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // A crafted userHandle (not the stored subject) is refused.
+    let (status, _headers, resp) = authenticate_flags(
+        &harness,
+        &seed,
+        cred,
+        Some(b"usr_someone-else"),
+        ASSERT_SYNCED_UV,
+        1,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a mismatched userHandle is refused: {resp}"
+    );
+
+    // The matching userHandle still works.
+    let (status, _headers, _resp) = authenticate_flags(
+        &harness,
+        &seed,
+        cred,
+        Some(subject.as_bytes()),
+        ASSERT_SYNCED_UV,
+        2,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "the correct userHandle signs in");
 }

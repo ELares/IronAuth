@@ -6,6 +6,12 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Passkey management and security audit actions (issue #65 review hardening): the
+  passkey rename now writes a `webauthn.credential.rename` audit row on success (it
+  was silent before), and a new `record_backup_eligibility_mismatch` writes a
+  `webauthn.backup_eligibility.mismatch` security audit row when an assertion presents
+  a backup-eligible flag that diverges from the credential's immutable, stored value,
+  advancing no credential state. No new migration (audit actions are free-text).
 - WebAuthn passkey persistence (issue #65, migration 0044, expand): two new
   tenant-scoped tables with forced row-level security, the `(tenant, environment)`
   isolation policy, nonempty-scope CHECKs, and column-scoped least-privilege grants.

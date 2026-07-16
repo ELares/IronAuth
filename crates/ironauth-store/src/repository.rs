@@ -13446,9 +13446,56 @@ impl ActingWebauthnCredentialRepo<'_> {
         Ok(())
     }
 
+    /// RECORD a backup-eligibility immutability violation (issue #65): a WebAuthn
+    /// assertion presented a BE flag that diverged from credential `id`'s stored,
+    /// registration-time BE. BE is immutable for a credential's life (WebAuthn L3
+    /// 7.2), so a flip is a spec violation and a signal of a cloned or spoofed
+    /// authenticator. This writes ONE `webauthn.backup_eligibility.mismatch` security
+    /// audit row and advances NO credential state (the caller refuses the sign-in).
+    /// The `detail` records the stored and presented BE values (booleans, never
+    /// attacker-controlled free text).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if `id` is out of scope; [`StoreError::Database`] on
+    /// a persistence failure.
+    pub async fn record_backup_eligibility_mismatch(
+        &self,
+        env: &Env,
+        id: &WebauthnCredentialId,
+        stored_backup_eligible: bool,
+        presented_backup_eligible: bool,
+    ) -> Result<(), StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let detail = format!(
+            "backup_eligibility immutability violation: stored={stored_backup_eligible} \
+             presented={presented_backup_eligible}"
+        );
+        let mut tx = begin_scoped(self.store, scope).await?;
+        insert_audit_row(
+            &mut tx,
+            &AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::WebauthnBackupEligibilityMismatch,
+                target: id,
+            },
+            Some(&detail),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     /// RENAME `subject`'s passkey `id` (issue #65): reseal the nickname under the
-    /// scope's active DEK. Subject-bound, so another subject's id is the uniform
-    /// [`WebauthnCredentialOutcome::NotFound`].
+    /// scope's active DEK and write one `webauthn.credential.rename` audit row on
+    /// success. Subject-bound, so another subject's id is the uniform
+    /// [`WebauthnCredentialOutcome::NotFound`] and writes nothing.
     ///
     /// # Errors
     ///
@@ -13487,12 +13534,25 @@ impl ActingWebauthnCredentialRepo<'_> {
         .bind(dek_version)
         .execute(&mut *tx)
         .await?;
-        tx.commit().await?;
         if result.rows_affected() == 0 {
-            Ok(WebauthnCredentialOutcome::NotFound)
-        } else {
-            Ok(WebauthnCredentialOutcome::Applied)
+            tx.commit().await?;
+            return Ok(WebauthnCredentialOutcome::NotFound);
         }
+        insert_audit_row(
+            &mut tx,
+            &AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::WebauthnCredentialRename,
+                target: id,
+            },
+            None,
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(WebauthnCredentialOutcome::Applied)
     }
 
     /// REMOVE `subject`'s passkey `id` (issue #65), writing one

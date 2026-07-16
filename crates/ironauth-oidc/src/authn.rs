@@ -37,10 +37,16 @@ use std::fmt;
 /// registered values instead, which are bare tokens by that specification.
 const ACR_PWD: &str = "urn:ironauth:acr:pwd";
 /// The OpenID Connect EAP ACR value for a phishing-resistant authenticator
-/// (a synced passkey). Dormant until M7 ships passkeys.
+/// (a synced passkey). Per OpenID Connect EAP ACR Values 1.0 `phr` means
+/// PHISHING-RESISTANT (origin-bound, which every WebAuthn ceremony is); it does
+/// NOT by itself assert user verification, so a phishing-resistant passkey login
+/// earns `phr` whether or not user verification was performed. Dormant until M7
+/// ships passkeys.
 const ACR_PHR: &str = "phr";
 /// The OpenID Connect EAP ACR value for a phishing-resistant, hardware-protected
-/// authenticator (a hardware-bound passkey). Dormant until M7 ships passkeys.
+/// authenticator (a device-bound passkey). Like `phr` this asserts phishing
+/// resistance (and hardware protection), NOT user verification. Dormant until M7
+/// ships passkeys.
 const ACR_PHRH: &str = "phrh";
 
 /// One authentication method the provider can record at login: one row of the
@@ -54,22 +60,38 @@ const ACR_PHRH: &str = "phrh";
 pub enum AuthMethod {
     /// A password (a knowledge factor). The bootstrap login. RFC 8176 `pwd`.
     Password,
-    /// A synced passkey (a phishing-resistant possession factor). Dormant until
-    /// M7; achieves the EAP ACR `phr`.
+    /// A synced passkey used WITHOUT user verification (user presence only): a
+    /// phishing-resistant possession factor. Achieves the EAP ACR `phr` (phishing
+    /// resistance does not require user verification) with amr `swk`+`user`, but
+    /// contributes NO verification factor.
     Passkey,
-    /// A hardware-bound passkey (phishing-resistant, hardware-protected).
-    /// Dormant until M7; achieves the EAP ACR `phrh`.
+    /// A synced passkey used WITH user verification (a PIN or biometric was
+    /// checked). Achieves `phr` with amr `swk`+`user`+`mfa`: the possession of the
+    /// key plus the verification the authenticator performed are two factors, so
+    /// `mfa` is honest here and absent from the presence-only [`AuthMethod::Passkey`].
+    PasskeyVerified,
+    /// A device-bound passkey used WITHOUT user verification (phishing-resistant,
+    /// hardware-protected, user presence only). Achieves `phrh` with amr
+    /// `hwk`+`user` and no verification factor.
     PasskeyHardware,
+    /// A device-bound passkey used WITH user verification. Achieves `phrh` with amr
+    /// `hwk`+`user`+`mfa`.
+    PasskeyHardwareVerified,
 }
 
 impl AuthMethod {
     /// Every method in the registry, in ascending order of the ACR it achieves.
     /// The order is load-bearing: [`achieved_acr`] reflects the STRONGEST method
-    /// of an event, so a later entry outranks an earlier one.
-    const ALL: [AuthMethod; 3] = [
+    /// of an event, so a later entry outranks an earlier one. Methods sharing an
+    /// ACR (the verified and presence-only variants of one passkey class) sit
+    /// adjacent; their relative order does not matter to [`achieved_acr`] because
+    /// their ACR is identical.
+    const ALL: [AuthMethod; 5] = [
         AuthMethod::Password,
         AuthMethod::Passkey,
+        AuthMethod::PasskeyVerified,
         AuthMethod::PasskeyHardware,
+        AuthMethod::PasskeyHardwareVerified,
     ];
 
     /// The stable persistence token for this method (the value recorded in the
@@ -79,7 +101,9 @@ impl AuthMethod {
         match self {
             AuthMethod::Password => "pwd",
             AuthMethod::Passkey => "passkey",
+            AuthMethod::PasskeyVerified => "passkey_uv",
             AuthMethod::PasskeyHardware => "passkey_hw",
+            AuthMethod::PasskeyHardwareVerified => "passkey_hw_uv",
         }
     }
 
@@ -93,33 +117,45 @@ impl AuthMethod {
     }
 
     /// The RFC 8176 `amr` token(s) this method contributes, in a stable order.
+    ///
+    /// `user` (RFC 8176) is a user-PRESENCE test, which every WebAuthn ceremony
+    /// performs, so it appears for every passkey method. It does NOT assert user
+    /// verification. When the authenticator VERIFIED the user (a PIN or biometric),
+    /// the verified variant additionally contributes `mfa` (possession of the key
+    /// plus the verification are multiple factors); the presence-only variant does
+    /// not, so the amr never implies a verification factor that did not happen.
     #[must_use]
     pub fn amr(self) -> &'static [&'static str] {
         match self {
             // `pwd`: password-based authentication.
             AuthMethod::Password => &["pwd"],
-            // `swk`: a software-secured key (a synced passkey); `user`: a user
-            // presence / verification test was performed.
+            // `swk`: a software-secured key (a synced passkey); `user`: presence.
             AuthMethod::Passkey => &["swk", "user"],
-            // `hwk`: a hardware-secured key (a hardware-bound passkey).
+            // `mfa`: possession of the key + the user verification performed.
+            AuthMethod::PasskeyVerified => &["swk", "user", "mfa"],
+            // `hwk`: a hardware-secured key (a device-bound passkey); `user`: presence.
             AuthMethod::PasskeyHardware => &["hwk", "user"],
+            AuthMethod::PasskeyHardwareVerified => &["hwk", "user", "mfa"],
         }
     }
 
     /// The authentication context class (`acr`) this method achieves on its own.
+    /// The verified and presence-only variants of one passkey class share an ACR:
+    /// `phr`/`phrh` assert phishing resistance (and hardware protection), NOT user
+    /// verification, so user verification changes the amr, never the acr.
     #[must_use]
     pub fn acr(self) -> &'static str {
         match self {
             AuthMethod::Password => ACR_PWD,
-            AuthMethod::Passkey => ACR_PHR,
-            AuthMethod::PasskeyHardware => ACR_PHRH,
+            AuthMethod::Passkey | AuthMethod::PasskeyVerified => ACR_PHR,
+            AuthMethod::PasskeyHardware | AuthMethod::PasskeyHardwareVerified => ACR_PHRH,
         }
     }
 
     /// Whether a login path can produce this method today. M7 (issue #65)
-    /// activates the passkey methods: a UV passkey ceremony records
-    /// [`AuthMethod::Passkey`] (a synced, backup-eligible authenticator) or
-    /// [`AuthMethod::PasskeyHardware`] (a device-bound one), so their EAP ACRs
+    /// activates the passkey methods: a passkey ceremony records one of the four
+    /// passkey variants by its STORED backup-eligibility (synced vs device-bound)
+    /// and the assertion's user-verification result, so their EAP ACRs
     /// (`phr`/`phrh`) are now achievable and advertised in
     /// [`acr_values_supported`]. A future dormant method added ahead of its login
     /// path returns `false` here until its writer lands, so the achievability
@@ -128,7 +164,11 @@ impl AuthMethod {
     pub fn is_active(self) -> bool {
         matches!(
             self,
-            AuthMethod::Password | AuthMethod::Passkey | AuthMethod::PasskeyHardware
+            AuthMethod::Password
+                | AuthMethod::Passkey
+                | AuthMethod::PasskeyVerified
+                | AuthMethod::PasskeyHardware
+                | AuthMethod::PasskeyHardwareVerified
         )
     }
 }
@@ -246,19 +286,29 @@ impl AuthenticationEvent {
         }
     }
 
-    /// A user-verified passkey authentication at `auth_time_unix_micros` (issue
-    /// #65). The `backup_eligible` flag chooses the honest ACR: a backup-eligible
-    /// (synced) authenticator records [`AuthMethod::Passkey`] (EAP `phr`, amr
-    /// `swk`+`user`); a device-bound one records [`AuthMethod::PasskeyHardware`]
-    /// (EAP `phrh`, amr `hwk`+`user`). The BE flag is the WebAuthn signal for
-    /// whether the credential can leave the device, so it is exactly what
-    /// distinguishes a hardware-protected authenticator from a synced one.
+    /// A passkey authentication at `auth_time_unix_micros` (issue #65).
+    ///
+    /// `backup_eligible` MUST be the credential's REGISTRATION-time, stored BE
+    /// value, never the mutable BE bit of the presented assertion: WebAuthn L3
+    /// requires BE to be immutable across a credential's life, and deriving the
+    /// assurance from the assertion's flag would let a synced authenticator claim
+    /// the device-bound `phrh`. It chooses the honest ACR: a backup-eligible
+    /// (synced) authenticator earns EAP `phr` (amr `swk`+`user`); a device-bound
+    /// one earns EAP `phrh` (amr `hwk`+`user`).
+    ///
+    /// `user_verified` is the assertion's user-verification result. When true the
+    /// amr additionally carries `mfa` (the possession of the key plus the
+    /// verification the authenticator performed); when false (a user-presence-only
+    /// login, reachable only when `webauthn_require_user_verification` is off) the
+    /// amr carries no verification factor. Either way the acr stays `phr`/`phrh`,
+    /// which assert phishing resistance, not user verification.
     #[must_use]
-    pub fn passkey(auth_time_unix_micros: i64, backup_eligible: bool) -> Self {
-        let method = if backup_eligible {
-            AuthMethod::Passkey
-        } else {
-            AuthMethod::PasskeyHardware
+    pub fn passkey(auth_time_unix_micros: i64, backup_eligible: bool, user_verified: bool) -> Self {
+        let method = match (backup_eligible, user_verified) {
+            (true, true) => AuthMethod::PasskeyVerified,
+            (true, false) => AuthMethod::Passkey,
+            (false, true) => AuthMethod::PasskeyHardwareVerified,
+            (false, false) => AuthMethod::PasskeyHardware,
         };
         Self {
             methods: vec![method],
@@ -369,17 +419,45 @@ mod tests {
 
     #[test]
     fn a_uv_passkey_login_maps_to_phr_or_phrh_by_backup_eligibility() {
-        // A synced (backup-eligible) passkey -> phr with swk+user amr.
-        let synced = AuthenticationEvent::passkey(1_700_000_000_000_000, true);
+        // A user-verified synced (backup-eligible) passkey -> phr with swk+user+mfa
+        // amr (the mfa reflects the verification the authenticator performed).
+        let synced = AuthenticationEvent::passkey(1_700_000_000_000_000, true, true);
+        assert_eq!(synced.methods(), &[AuthMethod::PasskeyVerified]);
+        assert_eq!(achieved_acr(synced.methods()), ACR_PHR);
+        assert_eq!(amr_values(synced.methods()), vec!["swk", "user", "mfa"]);
+        assert_eq!(synced.methods_token(), "passkey_uv");
+        // A user-verified device-bound passkey -> phrh with hwk+user+mfa amr.
+        let device_bound = AuthenticationEvent::passkey(1_700_000_000_000_000, false, true);
+        assert_eq!(
+            device_bound.methods(),
+            &[AuthMethod::PasskeyHardwareVerified]
+        );
+        assert_eq!(achieved_acr(device_bound.methods()), ACR_PHRH);
+        assert_eq!(
+            amr_values(device_bound.methods()),
+            vec!["hwk", "user", "mfa"]
+        );
+        assert_eq!(device_bound.methods_token(), "passkey_hw_uv");
+    }
+
+    #[test]
+    fn a_presence_only_passkey_login_never_claims_a_verification_factor() {
+        // With user verification NOT performed (user presence only, reachable only
+        // when webauthn_require_user_verification is off), the amr keeps `user`
+        // (presence, per RFC 8176) but carries NO `mfa` (no verification happened).
+        // The acr stays phishing-resistant either way: phr/phrh assert phishing
+        // resistance, not user verification.
+        let synced = AuthenticationEvent::passkey(1_700_000_000_000_000, true, false);
         assert_eq!(synced.methods(), &[AuthMethod::Passkey]);
         assert_eq!(achieved_acr(synced.methods()), ACR_PHR);
         assert_eq!(amr_values(synced.methods()), vec!["swk", "user"]);
+        assert!(!amr_values(synced.methods()).contains(&"mfa"));
         assert_eq!(synced.methods_token(), "passkey");
-        // A device-bound passkey -> phrh with hwk+user amr.
-        let device_bound = AuthenticationEvent::passkey(1_700_000_000_000_000, false);
+        let device_bound = AuthenticationEvent::passkey(1_700_000_000_000_000, false, false);
         assert_eq!(device_bound.methods(), &[AuthMethod::PasskeyHardware]);
         assert_eq!(achieved_acr(device_bound.methods()), ACR_PHRH);
         assert_eq!(amr_values(device_bound.methods()), vec!["hwk", "user"]);
+        assert!(!amr_values(device_bound.methods()).contains(&"mfa"));
         assert_eq!(device_bound.methods_token(), "passkey_hw");
     }
 
@@ -389,10 +467,19 @@ mod tests {
         // M7, so their tokens survive parse and derive the passkey ACR.
         assert_eq!(parse_methods("passkey"), vec![AuthMethod::Passkey]);
         assert_eq!(
+            parse_methods("passkey_uv"),
+            vec![AuthMethod::PasskeyVerified]
+        );
+        assert_eq!(
             parse_methods("passkey_hw"),
             vec![AuthMethod::PasskeyHardware]
         );
-        assert_eq!(achieved_acr(&parse_methods("passkey")), ACR_PHR);
+        assert_eq!(
+            parse_methods("passkey_hw_uv"),
+            vec![AuthMethod::PasskeyHardwareVerified]
+        );
+        assert_eq!(achieved_acr(&parse_methods("passkey_uv")), ACR_PHR);
+        assert_eq!(achieved_acr(&parse_methods("passkey_hw_uv")), ACR_PHRH);
     }
 
     #[test]

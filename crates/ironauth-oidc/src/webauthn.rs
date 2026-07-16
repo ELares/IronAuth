@@ -31,7 +31,7 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use ironauth_store::{
     ConsumedChallenge, CorrelationId, NewWebauthnCredential, Scope, StoreError, UserId,
-    WebauthnCeremony, WebauthnCredentialId,
+    WebauthnCeremony, WebauthnCredentialId, WebauthnCredentialOutcome, WebauthnCredentialRecord,
 };
 use ironauth_webauthn::{
     AuthenticationResponse, CredentialDescriptor, RegisteredCredential, RegistrationResponse,
@@ -355,6 +355,19 @@ pub async fn authenticate_verify(
         return ceremony_error();
     };
 
+    // Defensive userHandle check (WebAuthn L3 7.2): the subject is resolved through
+    // the credential id (above), so the userHandle is not trusted for resolution.
+    // But if the response carries one, it MUST match the credential's stored
+    // subject; a mismatch is a malformed or crafted assertion and is refused.
+    if let Some(handle_b64) = body.credential.response.user_handle.as_deref() {
+        let Some(handle) = ironauth_webauthn::b64_decode(handle_b64) else {
+            return ceremony_error();
+        };
+        if handle != target.subject.as_bytes() {
+            return ceremony_error();
+        }
+    }
+
     let params = VerificationParams {
         rp_id: &rp.rp_id,
         allowed_origins: &rp.origins,
@@ -379,17 +392,43 @@ pub async fn authenticate_verify(
     let Ok(credential_id) = WebauthnCredentialId::parse_in_scope(&target.id, &scope) else {
         return ceremony_error();
     };
+    // The assertion resolves the subject through the credential; parse it back to a
+    // typed id for the acting principal and the session.
+    let Ok(subject) = UserId::parse_in_scope(&target.subject, &scope) else {
+        return ceremony_error();
+    };
+
+    // Backup-eligibility immutability (WebAuthn L3 7.2): BE is fixed for a
+    // credential's life. The assurance (phr vs phrh) is derived from the STORED,
+    // registration-time BE, never from this assertion's mutable flag. A DIVERGENCE
+    // between the presented BE and the stored BE is a spec violation and a signal of
+    // a cloned or spoofed authenticator: reject the sign-in with the non-enumerating
+    // ceremony error and write a security/audit event. No partial state is advanced.
+    if outcome.backup_eligible != target.backup_eligible {
+        let _ = state
+            .store()
+            .scoped(scope)
+            .acting(
+                interaction::user_actor(&subject),
+                CorrelationId::generate(state.env()),
+            )
+            .webauthn_credentials()
+            .record_backup_eligibility_mismatch(
+                state.env(),
+                &credential_id,
+                target.backup_eligible,
+                outcome.backup_eligible,
+            )
+            .await;
+        return ceremony_error();
+    }
+
     let policy_detail = if block {
         "clone detection: sign-count regression, policy=block"
     } else if regressed {
         "clone detection: sign-count regression, policy=warn"
     } else {
         "assertion recorded"
-    };
-    // The assertion resolves the subject through the credential; parse it back to a
-    // typed id for the acting principal and the session.
-    let Ok(subject) = UserId::parse_in_scope(&target.subject, &scope) else {
-        return ceremony_error();
     };
     let record = state
         .store()
@@ -419,9 +458,16 @@ pub async fn authenticate_verify(
         );
     }
 
-    // A UV passkey authentication: record the honest event so the phr/phrh ACR and
-    // the amr flow through the whole token chain.
-    let event = AuthenticationEvent::passkey(epoch_micros(state.now()), outcome.backup_eligible);
+    // Record the honest event so the phr/phrh ACR and the amr flow through the whole
+    // token chain. The assurance is derived from the STORED, registration-time BE
+    // (trustworthy, immutable), NOT the assertion's mutable flag; the amr reflects
+    // whether this assertion actually verified the user (`user_verified`), so a
+    // presence-only login never claims a verification factor it did not perform.
+    let event = AuthenticationEvent::passkey(
+        epoch_micros(state.now()),
+        target.backup_eligible,
+        outcome.user_verified,
+    );
     let Ok(cookies) = interaction::establish_session(
         &state,
         scope,
@@ -450,6 +496,161 @@ pub async fn authenticate_verify(
     builder
         .body(axum::body::Body::from(payload.to_string()))
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+/// `GET /t/{tenant}/e/{environment}/webauthn/credentials`: list the AUTHENTICATED
+/// caller's OWN registered passkeys (issue #65) with their live metadata: the `pky_`
+/// id, nickname, AAGUID and transports, the immutable registration-time BE and the
+/// live BS (updated on every assertion), discoverability (rk), the clone-detected
+/// flag, and the created/last-used timestamps. Filtered on the authenticated
+/// subject, so another user's passkeys are never listed (the #61 IDOR discipline).
+pub async fn list_credentials(
+    State(state): State<OidcState>,
+    Path((tenant_id, environment_id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Response {
+    if !state.webauthn_enabled() {
+        return not_found();
+    }
+    let (scope, subject) = match authenticate(&state, &tenant_id, &environment_id, &headers).await {
+        Ok(pair) => pair,
+        Err(response) => return response,
+    };
+    let Ok(records) = state
+        .store()
+        .scoped(scope)
+        .webauthn_credentials()
+        .list(&subject, i64::from(u8::MAX), None)
+        .await
+    else {
+        return ceremony_error();
+    };
+    let passkeys: Vec<Value> = records.iter().map(passkey_json).collect();
+    json_response(StatusCode::OK, json!({ "passkeys": passkeys }))
+}
+
+/// The rename-passkey request body: the credential to rename and the new nickname.
+#[derive(Debug, Deserialize)]
+pub struct RenameCredentialBody {
+    /// The `pky_` credential id. Must be one of the caller's OWN passkeys; any other
+    /// value (another user's, an absent one, a cross-scope one) is the uniform
+    /// not-found.
+    #[serde(rename = "credentialId")]
+    credential_id: String,
+    /// The new user-authored nickname (sealed at rest).
+    nickname: String,
+}
+
+/// `POST /t/{tenant}/e/{environment}/webauthn/credentials/rename`: change the
+/// nickname of one of the caller's OWN passkeys (issue #65). Same-origin guarded
+/// (CSRF), authenticated by the caller's session, subject-bound at the store layer,
+/// and audited on success. Another user's credential is the uniform not-found.
+pub async fn rename_credential(
+    State(state): State<OidcState>,
+    Path((tenant_id, environment_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    Json(body): Json<RenameCredentialBody>,
+) -> Response {
+    if !state.webauthn_enabled() {
+        return not_found();
+    }
+    if !interaction::same_origin_ok(&headers, state.self_origin().as_deref()) {
+        return forbidden();
+    }
+    let (scope, subject) = match authenticate(&state, &tenant_id, &environment_id, &headers).await {
+        Ok(pair) => pair,
+        Err(response) => return response,
+    };
+    let nickname = body.nickname.trim();
+    if nickname.is_empty() || nickname.len() > 200 {
+        return json_response(
+            StatusCode::BAD_REQUEST,
+            json!({ "error": "invalid_nickname" }),
+        );
+    }
+    let Ok(id) = state
+        .store()
+        .scoped(scope)
+        .webauthn_credentials()
+        .parse_id(&body.credential_id)
+    else {
+        return credential_not_found();
+    };
+    let outcome = state
+        .store()
+        .scoped(scope)
+        .acting(
+            interaction::user_actor(&subject),
+            CorrelationId::generate(state.env()),
+        )
+        .webauthn_credentials()
+        .rename(state.env(), &subject, &id, nickname)
+        .await;
+    match outcome {
+        Ok(WebauthnCredentialOutcome::Applied) => json_response(
+            StatusCode::OK,
+            json!({ "id": id.to_string(), "nickname": nickname }),
+        ),
+        Ok(WebauthnCredentialOutcome::NotFound) => credential_not_found(),
+        Err(_) => ceremony_error(),
+    }
+}
+
+/// The remove-passkey request body: the credential to remove.
+#[derive(Debug, Deserialize)]
+pub struct RemoveCredentialBody {
+    /// The `pky_` credential id. Must be one of the caller's OWN passkeys; any other
+    /// value is the uniform not-found.
+    #[serde(rename = "credentialId")]
+    credential_id: String,
+}
+
+/// `POST /t/{tenant}/e/{environment}/webauthn/credentials/remove`: remove one of the
+/// caller's OWN passkeys (issue #65). Same-origin guarded (CSRF), authenticated,
+/// subject-bound at the store layer, and audited on success. Another user's
+/// credential is the uniform not-found and is never removed.
+pub async fn remove_credential(
+    State(state): State<OidcState>,
+    Path((tenant_id, environment_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    Json(body): Json<RemoveCredentialBody>,
+) -> Response {
+    if !state.webauthn_enabled() {
+        return not_found();
+    }
+    if !interaction::same_origin_ok(&headers, state.self_origin().as_deref()) {
+        return forbidden();
+    }
+    let (scope, subject) = match authenticate(&state, &tenant_id, &environment_id, &headers).await {
+        Ok(pair) => pair,
+        Err(response) => return response,
+    };
+    let Ok(id) = state
+        .store()
+        .scoped(scope)
+        .webauthn_credentials()
+        .parse_id(&body.credential_id)
+    else {
+        return credential_not_found();
+    };
+    let outcome = state
+        .store()
+        .scoped(scope)
+        .acting(
+            interaction::user_actor(&subject),
+            CorrelationId::generate(state.env()),
+        )
+        .webauthn_credentials()
+        .remove(state.env(), &subject, &id)
+        .await;
+    match outcome {
+        Ok(WebauthnCredentialOutcome::Applied) => json_response(
+            StatusCode::OK,
+            json!({ "id": id.to_string(), "removed": true }),
+        ),
+        Ok(WebauthnCredentialOutcome::NotFound) => credential_not_found(),
+        Err(_) => ceremony_error(),
+    }
 }
 
 // --- helpers ---
@@ -524,6 +725,32 @@ fn hex(bytes: &[u8]) -> String {
         let _ = write!(out, "{byte:02x}");
     }
     out
+}
+
+/// The JSON projection of one registered passkey for the credential API (issue #65):
+/// its `pky_` id, nickname, AAGUID and transports, the immutable registration-time
+/// BE and the live BS, discoverability (rk), the clone-detected flag, and the
+/// created/last-used timestamps. No secret is exposed (never the COSE key).
+fn passkey_json(record: &WebauthnCredentialRecord) -> Value {
+    json!({
+        "id": record.id,
+        "nickname": record.nickname,
+        "aaguid": hex(&record.aaguid),
+        "transports": record.transports,
+        "backup_eligible": record.backup_eligible,
+        "backup_state": record.backup_state,
+        "discoverable": record.discoverable,
+        "clone_detected": record.clone_detected,
+        "created_at": record.created_at_unix_micros,
+        "last_used_at": record.last_used_at_unix_micros,
+    })
+}
+
+/// The uniform not-found for a credential the caller does not own (another user's,
+/// an absent one, or a cross-scope id): byte-identical to a genuinely absent
+/// resource, so it is never an existence oracle.
+fn credential_not_found() -> Response {
+    json_response(StatusCode::NOT_FOUND, json!({ "error": "not_found" }))
 }
 
 fn json_response(status: StatusCode, body: Value) -> Response {

@@ -6,6 +6,23 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Passkey acr/amr truthfulness and credential management (issue #65 review hardening):
+  a sign-in's assurance is now derived from the credential's STORED, registration-time
+  backup-eligible flag, never the mutable BE bit of the presented assertion, so a
+  synced passkey can no longer claim the device-bound `phrh`. A BE flip between the
+  assertion and the stored value is treated as a spec violation (WebAuthn L3 7.2) and a
+  clone/spoof signal: the sign-in is refused with the non-enumerating ceremony error
+  and a `webauthn.backup_eligibility.mismatch` security event is written, with no
+  partial state advanced. The amr is now honest about user verification: `phr`/`phrh`
+  assert phishing resistance (not user verification), `user` (presence) is kept for
+  every passkey login, and `mfa` is added only when the assertion actually verified the
+  user, so a user-presence-only login never implies a verification factor. A defensive
+  userHandle check rejects an assertion whose userHandle does not match the credential's
+  stored subject. New authenticated, IDOR-safe passkey management endpoints
+  (`GET webauthn/credentials`, `webauthn/credentials/rename`, `webauthn/credentials/remove`)
+  let a user list their own passkeys with live BE/BS, rename, and remove them (subject
+  bound, same-origin/CSRF guarded, audited on mutation); the list is also folded into
+  `GET account/credentials` so every credential appears in one place.
 - WebAuthn passkeys, first-class (issue #65): four scope-routed ceremony endpoints
   (`webauthn/register/options`, `register/verify`, `authenticate/options`,
   `authenticate/verify`) implement WebAuthn Level 3 registration and authentication.

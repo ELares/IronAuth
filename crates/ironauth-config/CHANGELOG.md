@@ -6,6 +6,11 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Reject a single-label WebAuthn RP ID at startup (issue #65 review hardening): a bare
+  label such as a public suffix (`com`) is no longer accepted, since it passed the
+  registrable-suffix check against a host like `auth.example.com` yet the browser
+  rejects it at ceremony time. A registrable RP ID must contain a dot; `localhost`
+  stays the single-label dev exception. It is a boot-time `ConfigError::Invalid`.
 - WebAuthn passkey settings on `[oidc]` (issue #65): `webauthn_enabled` (default on),
   `webauthn_rp_id` (the per-environment Relying Party ID; when unset it is derived
   from the serving origin's host), `webauthn_challenge_ttl_secs` (default 300),

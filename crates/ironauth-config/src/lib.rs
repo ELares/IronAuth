@@ -1139,9 +1139,12 @@ pub struct OidcConfig {
     pub webauthn_challenge_ttl_secs: u64,
 
     /// Whether a WebAuthn ceremony requires user verification (issue #65). On by
-    /// default: a UV assertion is what makes a passkey login phishing-resistant and
-    /// maps to the `phr`/`phrh` ACRs. Turning it off allows user-presence-only
-    /// assertions (not recommended).
+    /// default. Phishing resistance comes from WebAuthn's origin binding, which every
+    /// ceremony has, so the `phr`/`phrh` ACRs do NOT require user verification; what
+    /// user verification governs is the `amr` (a UV assertion additionally carries
+    /// `mfa`, since the possession of the key plus the verification are two factors,
+    /// while a user-presence-only assertion does not). Turning it off allows
+    /// user-presence-only assertions (not recommended).
     pub webauthn_require_user_verification: bool,
 
     /// The clone-detection policy when a WebAuthn assertion presents a regressing
@@ -1692,6 +1695,23 @@ fn validate_webauthn(oidc: &OidcConfig, server: &ServerConfig) -> Result<(), Con
         if rp_id.is_empty() {
             return Err(ConfigError::Invalid {
                 message: "oidc.webauthn_rp_id must not be empty when set".to_owned(),
+            });
+        }
+        // A single-label RP ID (no dot, for example a bare TLD like `com`) is never
+        // a valid relying-party identifier: the browser rejects it at ceremony time
+        // against the effective-TLD+1 rule, so accepting it here would defer a boot
+        // misconfiguration to a runtime ceremony failure. `localhost` is the one
+        // single-label exception (the dev origin). A registrable domain must contain
+        // a dot; the browser enforces the full public-suffix rule, this catches the
+        // outright-invalid case cheaply without a public-suffix-list dependency.
+        if rp_id != "localhost" && !rp_id.contains('.') {
+            return Err(ConfigError::Invalid {
+                message: format!(
+                    "oidc.webauthn_rp_id ({rp_id}) is a single-label identifier; it must be a \
+                     registrable domain (containing a dot, for example auth.example.com) or the \
+                     dev value 'localhost'. A bare label like a TLD fails every ceremony in the \
+                     browser"
+                ),
             });
         }
         let Some(public_url) = server.public_url.as_deref() else {
@@ -2329,6 +2349,27 @@ mod tests {
         // Unset RP ID (derive from origin) is valid.
         let derived = "[server]\npublic_url = \"https://auth.example.com\"\n";
         assert!(Config::from_toml_str(derived, "ironauth.toml").is_ok());
+    }
+
+    #[test]
+    fn a_single_label_public_suffix_rp_id_is_a_startup_error() {
+        // A bare TLD/public suffix (`com`) is a suffix of `auth.example.com`, so the
+        // old ends_with heuristic accepted it; the browser then rejects it at
+        // ceremony time. It must now be a BOOT error.
+        let bare_tld = "[server]\npublic_url = \"https://auth.example.com\"\n\
+                        [oidc]\nwebauthn_rp_id = \"com\"\n";
+        let err = Config::from_toml_str(bare_tld, "ironauth.toml").expect_err("single-label rp id");
+        assert!(err.to_string().contains("single-label"), "{err}");
+
+        // A valid registrable domain still loads.
+        let registrable = "[server]\npublic_url = \"https://auth.example.com\"\n\
+                           [oidc]\nwebauthn_rp_id = \"example.com\"\n";
+        assert!(Config::from_toml_str(registrable, "ironauth.toml").is_ok());
+
+        // `localhost` (the single-label dev exception) still loads.
+        let localhost = "[server]\npublic_url = \"http://localhost:8080\"\n\
+                         [oidc]\nwebauthn_rp_id = \"localhost\"\n";
+        assert!(Config::from_toml_str(localhost, "ironauth.toml").is_ok());
     }
 
     #[test]

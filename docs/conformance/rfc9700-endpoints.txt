@@ -32,6 +32,9 @@
 /t/{tenant_id}/e/{environment_id}/jwks.json
 /t/{tenant_id}/e/{environment_id}/webauthn/authenticate/options
 /t/{tenant_id}/e/{environment_id}/webauthn/authenticate/verify
+/t/{tenant_id}/e/{environment_id}/webauthn/credentials
+/t/{tenant_id}/e/{environment_id}/webauthn/credentials/remove
+/t/{tenant_id}/e/{environment_id}/webauthn/credentials/rename
 /t/{tenant_id}/e/{environment_id}/webauthn/register/options
 /t/{tenant_id}/e/{environment_id}/webauthn/register/verify
 /token

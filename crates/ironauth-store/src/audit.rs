@@ -568,9 +568,20 @@ pub enum Action {
     /// AAGUID, transports, and BE/BS flags). The row targets the `pky_` credential
     /// and is attributed to the end user.
     WebauthnCredentialRegister,
+    /// An end user RENAMED one of their OWN WebAuthn passkeys (issue #65): the
+    /// user-authored nickname was resealed. The row targets the `pky_` credential
+    /// and is attributed to the end user.
+    WebauthnCredentialRename,
     /// An end user REMOVED one of their OWN WebAuthn passkeys (issue #65). The row
     /// targets the `pky_` credential and is attributed to the end user.
     WebauthnCredentialRemove,
+    /// A WebAuthn assertion presented a backup-eligibility (BE) flag that DIVERGED
+    /// from the credential's registration-time, stored BE (issue #65). BE is
+    /// immutable across a credential's life (WebAuthn L3 7.2), so a flip is a spec
+    /// violation and a signal of a cloned or spoofed authenticator: the sign-in is
+    /// refused and this security event is written. The row targets the `pky_`
+    /// credential; the `detail` records the stored and presented BE values.
+    WebauthnBackupEligibilityMismatch,
     /// A WebAuthn assertion presented a REGRESSING signature counter (issue #65):
     /// the credential's stored counter did not advance, a possible cloned
     /// authenticator. The row targets the `pky_` credential; the `detail` records
@@ -715,8 +726,10 @@ impl Action {
             Action::AccountCredentialEnroll => "account.credential.enroll",
             Action::AccountCredentialRemove => "account.credential.remove",
             Action::WebauthnCredentialRegister => "webauthn.credential.register",
+            Action::WebauthnCredentialRename => "webauthn.credential.rename",
             Action::WebauthnCredentialRemove => "webauthn.credential.remove",
             Action::WebauthnCloneDetected => "webauthn.clone.detected",
+            Action::WebauthnBackupEligibilityMismatch => "webauthn.backup_eligibility.mismatch",
             Action::AccountSessionRevoke => "account.session.revoke",
             Action::AccountSessionsRevokeOthers => "account.sessions.revoke_others",
         }

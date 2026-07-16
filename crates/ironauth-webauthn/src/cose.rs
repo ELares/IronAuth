@@ -42,6 +42,28 @@ const CRV_ED25519: i128 = 6;
 const P256_COORD_LEN: usize = 32;
 /// The byte length of an Ed25519 public key.
 const ED25519_KEY_LEN: usize = 32;
+/// The minimum RSA modulus size (bits) `ring` will verify: a smaller key
+/// registers but can never be used, so it is refused at registration.
+const RSA_MIN_MODULUS_BITS: u32 = 2048;
+/// The maximum RSA modulus size (bits) `ring` will verify.
+const RSA_MAX_MODULUS_BITS: u32 = 8192;
+
+/// The significant bit length of a big-endian RSA modulus: leading zero bytes are
+/// ignored, then the position of the most significant set bit gives the exact bit
+/// count. An all-zero (or empty) modulus is zero bits.
+fn rsa_modulus_bits(modulus: &[u8]) -> u32 {
+    let first = modulus.iter().position(|&byte| byte != 0);
+    match first {
+        None => 0,
+        Some(index) => {
+            let significant = &modulus[index..];
+            let top = u32::from(significant[0]);
+            let top_bits = 32 - top.leading_zeros();
+            let lower_bytes = u32::try_from(significant.len() - 1).unwrap_or(u32::MAX);
+            lower_bytes.saturating_mul(8).saturating_add(top_bits)
+        }
+    }
+}
 
 /// Parse a `COSE_Key` CBOR document into a [`WebauthnKey`].
 ///
@@ -89,6 +111,13 @@ pub fn parse_cose_key(cose_bytes: &[u8]) -> Result<WebauthnKey, CeremonyError> {
             let n = get_bytes(map, LABEL_RSA_N).ok_or(CeremonyError::UnsupportedOrMalformedKey)?;
             let e = get_bytes(map, LABEL_RSA_E).ok_or(CeremonyError::UnsupportedOrMalformedKey)?;
             if n.is_empty() || e.is_empty() {
+                return Err(CeremonyError::UnsupportedOrMalformedKey);
+            }
+            // Reject a modulus outside 2048..=8192 bits at REGISTRATION. ring rejects
+            // it at verify time, so a sub-2048 (or >8192) key would register but be
+            // permanently unusable, a dead-credential foot-gun: refuse it up front.
+            let bits = rsa_modulus_bits(&n);
+            if !(RSA_MIN_MODULUS_BITS..=RSA_MAX_MODULUS_BITS).contains(&bits) {
                 return Err(CeremonyError::UnsupportedOrMalformedKey);
             }
             Ok(WebauthnKey::Rs256 { n, e })
@@ -189,8 +218,17 @@ mod tests {
         );
     }
 
+    /// A genuine 2048-bit modulus: 256 bytes with the most significant bit set (a
+    /// real RSA modulus is odd and has its top bit set), so it is exactly 2048 bits.
+    fn modulus_2048() -> Vec<u8> {
+        let mut n = vec![9_u8; 256];
+        n[0] = 0x80;
+        n
+    }
+
     #[test]
     fn parses_a_valid_rs256_key() {
+        let n = modulus_2048();
         let value = Value::Map(vec![
             (
                 Value::Integer(Integer::from(1)),
@@ -200,10 +238,7 @@ mod tests {
                 Value::Integer(Integer::from(3)),
                 Value::Integer(Integer::from(-257)),
             ),
-            (
-                Value::Integer(Integer::from(-1)),
-                Value::Bytes(vec![9_u8; 256]),
-            ),
+            (Value::Integer(Integer::from(-1)), Value::Bytes(n.clone())),
             (
                 Value::Integer(Integer::from(-2)),
                 Value::Bytes(vec![1, 0, 1]),
@@ -213,10 +248,48 @@ mod tests {
         assert_eq!(
             key,
             WebauthnKey::Rs256 {
-                n: vec![9_u8; 256],
+                n,
                 e: vec![1, 0, 1]
             }
         );
+    }
+
+    #[test]
+    fn rejects_sub_2048_bit_rsa_modulus() {
+        // A 1024-bit modulus (128 bytes, top bit set) registers cleanly but ring
+        // rejects it at verify, a dead-credential foot-gun; refuse it up front.
+        let mut short = vec![9_u8; 128];
+        short[0] = 0x80;
+        let value = Value::Map(vec![
+            (
+                Value::Integer(Integer::from(1)),
+                Value::Integer(Integer::from(3)),
+            ),
+            (
+                Value::Integer(Integer::from(3)),
+                Value::Integer(Integer::from(-257)),
+            ),
+            (Value::Integer(Integer::from(-1)), Value::Bytes(short)),
+            (
+                Value::Integer(Integer::from(-2)),
+                Value::Bytes(vec![1, 0, 1]),
+            ),
+        ]);
+        assert_eq!(
+            parse_cose_key(&encode(&value)),
+            Err(CeremonyError::UnsupportedOrMalformedKey)
+        );
+    }
+
+    #[test]
+    fn rsa_modulus_bits_counts_significant_bits() {
+        assert_eq!(rsa_modulus_bits(&[]), 0);
+        assert_eq!(rsa_modulus_bits(&[0, 0]), 0);
+        assert_eq!(rsa_modulus_bits(&[0x01]), 1);
+        assert_eq!(rsa_modulus_bits(&[0x80]), 8);
+        // Leading zero bytes are ignored (a big-endian encoding may carry them).
+        assert_eq!(rsa_modulus_bits(&[0x00, 0x80]), 8);
+        assert_eq!(rsa_modulus_bits(&modulus_2048()), 2048);
     }
 
     #[test]
