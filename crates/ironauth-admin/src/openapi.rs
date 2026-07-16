@@ -139,6 +139,9 @@ use crate::views::{
         crate::export::export_identities,
         crate::migration::verify_credential,
         crate::migration_status::get_migration_progress,
+        crate::migration_runs::list_migration_runs,
+        crate::migration_runs::get_migration_run,
+        crate::migration_runs::list_migration_run_violations,
     ),
     components(schemas(
         ErrorBody,
@@ -198,6 +201,13 @@ use crate::views::{
         crate::migration::VerifyCredentialResponse,
         crate::migration::VerifyProfile,
         crate::migration_status::MigrationProgressView,
+        crate::migration_runs::MigrationRunSummaryView,
+        crate::migration_runs::MigrationRunList,
+        crate::migration_runs::MigrationRunCountsView,
+        crate::migration_runs::InvariantView,
+        crate::migration_runs::MigrationRunDetailView,
+        crate::migration_runs::OffendingRecordView,
+        crate::migration_runs::MigrationRunViolationList,
     ))
 )]
 struct ApiDoc;

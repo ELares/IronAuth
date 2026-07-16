@@ -6,6 +6,14 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Migration state-machine wrap (issue #59, exploratory): `import_into_run` drives
+  `import_stream` and ingests every per-record outcome (`Created` / `Skipped` /
+  `Failed`) into an `ironauth-store` migration run's accounting ledger, so a bulk import
+  is wrapped in the invariant-checked state machine. The run's COUNT invariant then
+  measures the ingested accounting against the caller's declared `source_total`, so an
+  import that does not reconcile with its source cannot be declared complete, and the
+  per-record failures stay visible in the operator view. Purely additive (a new `run`
+  module); no change to the streaming engine or the record format.
 - Credential-registry round-trip (issue #58, review): `ImportRecord` gains an optional
   `credentials` list (a new `ImportCredential`: factor kind, friendly name, optional
   last-used instant), so the full identity export carries every passkey / TOTP /

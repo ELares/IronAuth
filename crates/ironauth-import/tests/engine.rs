@@ -13,9 +13,12 @@
 use argon2::password_hash::{PasswordHash, PasswordVerifier};
 use ironauth_env::Env;
 use ironauth_import::scheme::{ForeignHash, firebase_stored};
-use ironauth_import::{ImportContext, RecordOutcome, import_stream};
+use ironauth_import::{ImportContext, RecordOutcome, import_into_run, import_stream};
 use ironauth_store::test_support::TestDatabase;
-use ironauth_store::{CorrelationId, Scope, UserId, UserListFilter, UserRecord, UserState};
+use ironauth_store::{
+    CompletionOutcome, CorrelationId, MigrationKind, MigrationState, NewMigrationRun, Scope,
+    UserId, UserListFilter, UserRecord, UserState,
+};
 use sqlx::Row;
 
 /// A cheap bcrypt (cost 4) foreign hash for `password`.
@@ -423,5 +426,158 @@ async fn imported_states_and_claims_round_trip() {
     assert!(
         stored.contains("email_verified"),
         "claims round-trip: {stored}"
+    );
+}
+
+/// Wrapping a bulk import in the migration state machine (issue #59): the import runs
+/// into a run, every record is accounted, and when the declared source total matches
+/// the machine COMPLETES. An off-by-one source total instead BLOCKS on the count
+/// invariant, so an import that does not reconcile with its source cannot declare
+/// victory.
+#[allow(clippy::too_many_lines)]
+#[tokio::test]
+async fn a_bulk_import_wrapped_in_the_migration_machine_gates_on_the_count_invariant() {
+    let db = TestDatabase::start().await;
+    let (env, _clock) = Env::deterministic(std::time::SystemTime::UNIX_EPOCH, 0x59);
+    let scope = db.seed_scope(&env).await;
+    let store = db.store();
+
+    // Three well-formed source lines and one unparseable line: four processed records
+    // (three created, one failed), all accounted.
+    let lines = vec![
+        record_line("alice@example.test", &argon2_hash("pw-a")),
+        record_line("bob@example.test", &argon2_hash("pw-b")),
+        record_line("carol@example.test", &argon2_hash("pw-c")),
+        "{ this is not valid json".to_string(),
+    ];
+    let source_total = i64::try_from(lines.len()).expect("source total fits");
+
+    // Create a run declaring the source total, drive it to running, and import into it.
+    let run = store
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .migration_runs()
+        .create(
+            &env,
+            NewMigrationRun {
+                kind: MigrationKind::BulkImport,
+                source_total,
+                backfill_expected: 0,
+                subject_ref: Some("import:2026-07-15"),
+            },
+            1_000_000,
+        )
+        .await
+        .expect("create run");
+    for state in [MigrationState::Validating, MigrationState::Running] {
+        store
+            .scoped(scope)
+            .acting(db.test_actor(&env), CorrelationId::generate(&env))
+            .migration_runs()
+            .transition(&env, &run, state)
+            .await
+            .expect("transition");
+    }
+
+    let context = ctx(&db, &env, scope);
+    let report = import_into_run(&context, &run, lines)
+        .await
+        .expect("import into run");
+    assert_eq!(report.processed, 4);
+    assert_eq!(report.succeeded, 3);
+    assert_eq!(report.failed, 1);
+
+    // The tallies re-derive live: 3 imported + 1 failed == 4 accounted == source_total.
+    let tallies = store
+        .scoped(scope)
+        .migration_runs()
+        .tallies(&run)
+        .await
+        .expect("tallies");
+    assert_eq!(tallies.imported, 3);
+    assert_eq!(tallies.failed, 1);
+    assert_eq!(tallies.accounted, source_total);
+
+    // With the source total matching, the wrapped import COMPLETES.
+    store
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .migration_runs()
+        .transition(&env, &run, MigrationState::Reconciling)
+        .await
+        .expect("-> reconciling");
+    let outcome = store
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .migration_runs()
+        .try_complete(&env, &run)
+        .await
+        .expect("try_complete");
+    assert_eq!(outcome, CompletionOutcome::Completed);
+
+    // A SECOND run over the same source but with an inflated source total (an injected
+    // off-by-one) is BLOCKED by the count invariant: it cannot complete.
+    let run2 = store
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .migration_runs()
+        .create(
+            &env,
+            NewMigrationRun {
+                kind: MigrationKind::BulkImport,
+                source_total: source_total + 1,
+                backfill_expected: 0,
+                subject_ref: None,
+            },
+            1_000_000,
+        )
+        .await
+        .expect("create run2");
+    for state in [MigrationState::Validating, MigrationState::Running] {
+        store
+            .scoped(scope)
+            .acting(db.test_actor(&env), CorrelationId::generate(&env))
+            .migration_runs()
+            .transition(&env, &run2, state)
+            .await
+            .expect("transition");
+    }
+    // Re-import the SAME lines (idempotent: created become skipped), still four accounted.
+    let lines2 = vec![
+        record_line("alice@example.test", &argon2_hash("pw-a")),
+        record_line("bob@example.test", &argon2_hash("pw-b")),
+        record_line("carol@example.test", &argon2_hash("pw-c")),
+        "{ this is not valid json".to_string(),
+    ];
+    import_into_run(&ctx(&db, &env, scope), &run2, lines2)
+        .await
+        .expect("import into run2");
+    store
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .migration_runs()
+        .transition(&env, &run2, MigrationState::Reconciling)
+        .await
+        .expect("-> reconciling");
+    let blocked = store
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .migration_runs()
+        .try_complete(&env, &run2)
+        .await
+        .expect("try_complete");
+    assert!(
+        matches!(blocked, CompletionOutcome::Blocked(_)),
+        "an inflated source total must block completion: {blocked:?}"
+    );
+    assert_eq!(
+        store
+            .scoped(scope)
+            .migration_runs()
+            .get(&run2)
+            .await
+            .expect("get")
+            .state,
+        MigrationState::Reconciling
     );
 }

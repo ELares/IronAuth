@@ -124,6 +124,19 @@ pub enum StoreError {
     ///
     /// [`NotFound`]: StoreError::NotFound
     NoActiveTraitSchema,
+    /// A migration-run state transition was refused because it is not a legal edge of
+    /// the state machine (issue #59): for example advancing a `complete` or
+    /// `abandoned` run, or skipping a state. Carries the current and attempted state
+    /// wire strings so the caller can report the illegal edge. No mutation happens
+    /// when it fires. Distinct from the invariant-gated completion refusal, which is
+    /// a legitimate NON-error outcome the caller inspects (see
+    /// [`crate::CompletionOutcome`]).
+    IllegalMigrationTransition {
+        /// The run's current state (wire string).
+        from: &'static str,
+        /// The refused target state (wire string).
+        to: &'static str,
+    },
 }
 
 impl fmt::Display for StoreError {
@@ -152,6 +165,9 @@ impl fmt::Display for StoreError {
                 "activation blocked: {invalid_identities} identities fail the target schema"
             ),
             StoreError::NoActiveTraitSchema => f.write_str("no active trait schema"),
+            StoreError::IllegalMigrationTransition { from, to } => {
+                write!(f, "illegal migration-run transition from {from} to {to}")
+            }
         }
     }
 }
@@ -171,7 +187,8 @@ impl std::error::Error for StoreError {
             | StoreError::InvalidIdentifier
             | StoreError::TraitsInvalid(_)
             | StoreError::CutoverBlocked { .. }
-            | StoreError::NoActiveTraitSchema => None,
+            | StoreError::NoActiveTraitSchema
+            | StoreError::IllegalMigrationTransition { .. } => None,
             StoreError::Database(source) => Some(source),
             StoreError::Migration(source) => Some(source),
             StoreError::SchemaMalformed(source) => Some(source),

@@ -538,6 +538,28 @@ impl ScopedKind for TraitMigrationJobKind {
     const PREFIX: &'static str = "tmj";
 }
 
+/// Marker for a wrapped migration RUN (`mgr_`), one long-running data migration
+/// (a streaming bulk import, a schema migration job, or, by design, a tenant move)
+/// wrapped in the invariant-checked state machine (issue #59). Tenant scoped, so a
+/// run in one scope can never touch another tenant's records; the id is the run
+/// row's primary key and the audit target of every state transition. An INTERNAL
+/// tracking row, never a bearer credential.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct MigrationRunKind;
+impl ScopedKind for MigrationRunKind {
+    const PREFIX: &'static str = "mgr";
+}
+
+/// Marker for one per-record accounting row of a migration run (`mrr_`, issue #59):
+/// one source record the run touched, its accounting bucket, consistency flag, and
+/// backfill sentinel. Tenant scoped; the id is the record row's primary key. An
+/// INTERNAL tracking row, never a bearer credential.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct MigrationRunRecordKind;
+impl ScopedKind for MigrationRunRecordKind {
+    const PREFIX: &'static str = "mrr";
+}
+
 /// Marker for a human actor (an interactive user). One of the three actor kinds
 /// an audit envelope can name (see [`crate::audit::ActorRef`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -801,6 +823,12 @@ pub type TraitSchemaId = ScopedId<TraitSchemaKind>;
 /// A trait migration/dry-run job identifier (`tmj_`), one queued job over a scope's
 /// identities against a candidate schema version (issue #53).
 pub type TraitMigrationJobId = ScopedId<TraitMigrationJobKind>;
+/// A wrapped migration-run identifier (`mgr_`), one long-running data migration
+/// wrapped in the invariant-checked state machine (issue #59).
+pub type MigrationRunId = ScopedId<MigrationRunKind>;
+/// A migration-run record identifier (`mrr_`), one per-record accounting row of a
+/// migration run (issue #59).
+pub type MigrationRunRecordId = ScopedId<MigrationRunRecordKind>;
 
 impl<K: ScopedKind> ScopedId<K> {
     /// Mint a fresh scoped identifier under `scope`, drawing the unique
