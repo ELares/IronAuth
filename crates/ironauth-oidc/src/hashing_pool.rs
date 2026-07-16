@@ -44,7 +44,7 @@
 //! deterministic test drives the timing. The salt still comes from the entropy seam.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 
@@ -383,6 +383,11 @@ struct Shared {
     global_max_depth: usize,
     /// Current number of workers executing a job (for the utilization gauge).
     active: AtomicI64,
+    /// Total real Argon2 operations executed (hash + verify + verify-absent; NOT the
+    /// diagnostics op). A monotonic test seam (issue #68) for asserting that two code
+    /// paths spend the SAME number of pool Argon2 operations, e.g. that a present and an
+    /// unknown-recipient send are timing-equalized. Not a production metric.
+    argon2_ops: AtomicU64,
 }
 
 impl Shared {
@@ -474,6 +479,7 @@ impl HashingPool {
             per_tenant_max_depth,
             global_max_depth,
             active: AtomicI64::new(0),
+            argon2_ops: AtomicU64::new(0),
         });
         let clock = env.clock_arc();
         let mut workers = Vec::with_capacity(threads);
@@ -621,6 +627,16 @@ impl HashingPool {
         &self.env
     }
 
+    /// The total number of real Argon2 operations (hash / verify / verify-absent) this pool
+    /// has executed since it started. A monotonic test seam (issue #68): a test reads this
+    /// before and after two request flows and asserts they spent the SAME number of pool
+    /// hashes, proving e.g. that a present and an unknown-recipient send are Argon2-equal
+    /// (the anti-enumeration timing property) without a flaky wall-clock measurement.
+    #[must_use]
+    pub fn argon2_ops(&self) -> u64 {
+        self.shared.argon2_ops.load(Ordering::Acquire)
+    }
+
     /// Run a diagnostics job and report the executing thread's context. Used by
     /// the acceptance check that hashing runs off the tokio runtime threads.
     ///
@@ -679,14 +695,16 @@ fn worker_loop(shared: &Shared, env: &Env, clock: &dyn ironauth_env::Clock) {
         };
         shared.active.fetch_add(1, Ordering::AcqRel);
         record_active(shared.active.load(Ordering::Acquire));
-        run_op(op, env, clock);
+        run_op(op, env, clock, &shared.argon2_ops);
         shared.active.fetch_sub(1, Ordering::AcqRel);
         record_active(shared.active.load(Ordering::Acquire));
     }
 }
 
-/// Execute one job on the worker thread, recording its latency.
-fn run_op(op: Op, env: &Env, clock: &dyn ironauth_env::Clock) {
+/// Execute one job on the worker thread, recording its latency. `argon2_ops` counts every
+/// real Argon2 operation (hash / verify / verify-absent, never the diagnostics op) for the
+/// test seam that asserts two paths spend an equal number of pool hashes (issue #68).
+fn run_op(op: Op, env: &Env, clock: &dyn ironauth_env::Clock, argon2_ops: &AtomicU64) {
     match op {
         Op::Hash {
             password,
@@ -695,6 +713,7 @@ fn run_op(op: Op, env: &Env, clock: &dyn ironauth_env::Clock) {
         } => {
             let start = clock.monotonic();
             let result = password::hash_password_with(env, &password, params);
+            argon2_ops.fetch_add(1, Ordering::AcqRel);
             record_duration("hash", clock, start);
             let _ = reply.send(result.map_err(|_| ()));
         }
@@ -705,12 +724,14 @@ fn run_op(op: Op, env: &Env, clock: &dyn ironauth_env::Clock) {
         } => {
             let start = clock.monotonic();
             let verdict = password::verify_password(&password, &stored);
+            argon2_ops.fetch_add(1, Ordering::AcqRel);
             record_duration("verify", clock, start);
             let _ = reply.send(verdict);
         }
         Op::VerifyAbsent { password, reply } => {
             let start = clock.monotonic();
             let verdict = password::verify_absent(&password);
+            argon2_ops.fetch_add(1, Ordering::AcqRel);
             record_duration("verify", clock, start);
             let _ = reply.send(verdict);
         }

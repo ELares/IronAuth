@@ -886,6 +886,19 @@ impl Harness {
         self.state = state;
     }
 
+    /// Install a verification / OTP sender (issue #68) on the state and rebuild the
+    /// protocol router, so a test can capture the delivered email-OTP code and magic-link
+    /// token/short-code from a recording sender. Only the protocol router is rebuilt (the
+    /// email-factor endpoints live there).
+    pub fn install_verification_sender(
+        &mut self,
+        sender: Arc<dyn ironauth_oidc::VerificationSender>,
+    ) {
+        let state = self.state.clone().with_verification_sender(sender);
+        self.router = oidc_router(state.clone());
+        self.state = state;
+    }
+
     /// The environment's public verifying key, for building a verification policy
     /// under a non-EdDSA algorithm (for example the ES256 environment, issue #29).
     #[must_use]

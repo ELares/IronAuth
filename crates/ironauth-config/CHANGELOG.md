@@ -6,6 +6,16 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- `oidc.email_otp_max_attempts` scope note (issue #68, adversarial review): the per-code
+  wrong-guess budget now ALSO bounds the cross-device magic-link short code (a low-entropy
+  6-8 digit secret that flows through the same brute-force surface), so one setting governs
+  both attempt limits. No new key; the existing setting's reach is widened.
+- Email OTP and scanner-safe magic-link settings (issue #68): new `oidc.email_otp_enabled`,
+  `oidc.email_otp_code_digits` (6..=8), `oidc.email_otp_code_ttl_secs` (the 300..=600
+  five-to-ten-minute band), `oidc.email_otp_max_attempts`, `oidc.magic_link_enabled`,
+  `oidc.magic_link_ttl_secs` (300..=3600), `oidc.magic_link_fragment_mode` (carry the token
+  in the URL fragment, out of server logs and scanner request paths), and
+  `oidc.magic_link_short_code_digits` (6..=8), all validated at startup with safe defaults.
 - Clarified the `screening_failure_policy` documentation (issue #63 review): the default
   `fail_open` is availability-biased and lets a known-breached password through during a
   provider outage (audited/detectable); hard enforcement uses `fail_closed` or the offline

@@ -83,6 +83,7 @@ mod dcr_policy;
 mod device;
 mod device_verify;
 mod discovery;
+mod email_otp;
 mod error;
 mod global_revocation;
 mod hashing_pool;
@@ -95,6 +96,7 @@ mod jwks;
 mod jwt_bearer;
 mod login;
 mod logout;
+mod magic_link;
 mod migration;
 mod pages;
 mod par;
@@ -214,7 +216,10 @@ pub use tokens::{
     AccessTokenTarget, ClientCredentialsMintRequest, MintedAccessToken, OPAQUE_ACCESS_TOKEN_PREFIX,
     OPAQUE_REFRESH_TOKEN_PREFIX,
 };
-pub use verification::{NullVerificationSender, VerificationPurpose, VerificationSender};
+pub use verification::{
+    EmailOtpMessage, LoggingVerificationSender, MagicLinkMessage, NullVerificationSender,
+    VerificationPurpose, VerificationSender,
+};
 
 /// Build the OIDC provider router.
 ///
@@ -426,6 +431,34 @@ pub fn oidc_router(state: OidcState) -> Router {
         .route(
             "/t/{tenant_id}/e/{environment_id}/invitations/accept",
             post(invitations::accept_invitation),
+        )
+        // Email OTP + scanner-safe magic links (issue #68), scope-routed under the
+        // per-environment path so the send/verify/consume run under the right
+        // row-level-security scope. Each handler fails closed with a 404 when its
+        // factor is disabled. `otp/send` and `magic/send` are JSON send surfaces
+        // (abuse-throttled, anti-enumeration uniform); `otp/verify` is the JSON code
+        // verify that establishes a session; `magic/confirm` is the SCANNER-SAFE GET
+        // that renders a confirmation page only (never consumes); `magic/consume` is the
+        // POST from that page that consumes the single-use link and establishes a session.
+        .route(
+            "/t/{tenant_id}/e/{environment_id}/otp/send",
+            post(email_otp::send),
+        )
+        .route(
+            "/t/{tenant_id}/e/{environment_id}/otp/verify",
+            post(email_otp::verify),
+        )
+        .route(
+            "/t/{tenant_id}/e/{environment_id}/magic/send",
+            post(magic_link::send),
+        )
+        .route(
+            "/t/{tenant_id}/e/{environment_id}/magic/confirm",
+            get(magic_link::confirm_get),
+        )
+        .route(
+            "/t/{tenant_id}/e/{environment_id}/magic/consume",
+            post(magic_link::consume_post),
         );
 
     // Dynamic Client Registration (issue #30, RFC 7591 + RFC 7592), mounted ONLY

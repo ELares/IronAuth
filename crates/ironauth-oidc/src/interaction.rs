@@ -655,6 +655,20 @@ pub fn redirect_setting_cookie(location: &str, cookies: &SessionCookies) -> Resp
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
+/// Attach every session `Set-Cookie` header to an already-built response (issue #68),
+/// so a non-redirect login result (a JSON verify result or a hosted success page) can
+/// establish the session on the browser exactly as [`redirect_setting_cookie`] does.
+#[must_use]
+pub fn attach_session_cookies(mut response: Response, cookies: &SessionCookies) -> Response {
+    let headers = response.headers_mut();
+    for value in cookies.header_values() {
+        if let Ok(value) = header::HeaderValue::from_str(value) {
+            headers.append(header::SET_COOKIE, value);
+        }
+    }
+    response
+}
+
 /// The page shown when an interaction is reached without a usable resume target
 /// (a missing, malformed, or non-local `return_to`). A hardened HTML page, never a
 /// redirect (the value is untrusted).

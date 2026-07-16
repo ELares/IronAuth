@@ -527,6 +527,89 @@ pub fn mfa_challenge_page(
     )
 }
 
+/// The nonce-guarded inline script for the fragment-token magic-link confirmation page
+/// (issue #68). It reads the single-use token from `location.hash` (which the browser
+/// NEVER sends to the server, so the token stays out of access logs and scanner request
+/// paths) and copies it into the hidden field the confirmation POST carries. It performs
+/// NO automatic submission: consumption still requires the user's POST, so a prefetching
+/// scanner cannot consume the link even if it ran the script.
+const MAGIC_FRAGMENT_SCRIPT: &str = "(function(){var h=location.hash;if(h&&h.length>1){var f=document.getElementById('mlk_token');if(f){f.value=decodeURIComponent(h.slice(1));}}})();";
+
+/// The scanner-safe magic-link CONFIRMATION page (issue #68): a GET renders THIS page,
+/// which only offers a POST button; consumption happens on the POST, so an email security
+/// scanner that prefetches the link (GET/HEAD/bot) never consumes it. `consume_action` is
+/// the POST route. In QUERY mode `token` is the server-visible token placed in a hidden
+/// field; in FRAGMENT mode `token` is [`None`] and the nonce-guarded script fills the
+/// hidden field from `location.hash`, so the server never sees the token in the GET.
+#[must_use]
+pub fn magic_confirm_page(
+    consume_action: &str,
+    token: Option<&str>,
+    fragment_mode: bool,
+    nonce: &str,
+) -> String {
+    let hidden_value = token.unwrap_or("");
+    let script = if fragment_mode {
+        format!(
+            "<script nonce=\"{nonce}\">{script}</script>",
+            nonce = escape_html(nonce),
+            script = MAGIC_FRAGMENT_SCRIPT,
+        )
+    } else {
+        String::new()
+    };
+    let body = format!(
+        "<h1>Confirm your sign in</h1>\
+         <p>Select the button below to finish signing in.</p>\
+         <form method=\"post\" action=\"{action}\">\
+         <input type=\"hidden\" id=\"mlk_token\" name=\"token\" value=\"{token}\">\
+         <p><button type=\"submit\">Confirm sign in</button></p></form>\
+         <p>Opened this link on a different device? Enter the code from the same email \
+         on the device where you started signing in.</p>{script}",
+        action = escape_html(consume_action),
+        token = escape_html(hidden_value),
+    );
+    notice_document("Confirm your sign in", &body)
+}
+
+/// The UNIFORM magic-link send acknowledgment page (issue #68): shown on the originating
+/// device after a send, byte-identical whether the recipient exists, is unknown, or the
+/// send succeeded (the anti-enumeration ack). It also carries the minimal cross-device
+/// SHORT-CODE entry form: when the link is opened on another device, the originating device
+/// (which holds the binding cookie) enters the code printed in the same email HERE to
+/// finish signing in, so the cross-device flow is human-completable through the UI. The
+/// form POSTs `short_code` to `consume_action` (same-origin, so it rides the standard CSRF
+/// same-origin gate and the `form-action 'self'` CSP of [`secure_html`]); it carries no
+/// script, so no nonce is needed.
+#[must_use]
+pub fn magic_ack_page(consume_action: &str) -> String {
+    let body = format!(
+        "<h1>Check your email</h1>\
+         <p>If an account exists for that address, we have sent a sign-in link and code.</p>\
+         <p>Opened the link on a different device? Enter the code from the same email here, \
+         on the device where you started signing in, to finish.</p>\
+         <form method=\"post\" action=\"{action}\">\
+         <p><label>Sign-in code <input type=\"text\" name=\"short_code\" inputmode=\"numeric\" \
+         autocomplete=\"one-time-code\" required></label></p>\
+         <p><button type=\"submit\">Finish signing in</button></p></form>",
+        action = escape_html(consume_action),
+    );
+    notice_document("Check your email", &body)
+}
+
+/// The magic-link CROSS-DEVICE fallback page (issue #68): shown when the confirmation POST
+/// arrives WITHOUT the same-device binding cookie (the link was opened on another device).
+/// It directs the user to enter the short code printed in the email on the ORIGINATING
+/// device (which holds the binding cookie), never consuming anything here.
+#[must_use]
+pub fn magic_cross_device_page() -> String {
+    let body = "<h1>Finish on your other device</h1>\
+         <p>This sign-in link was opened on a different device from the one where you \
+         started. To finish, enter the short code from the same email on the device where \
+         you began signing in.</p>";
+    notice_document("Finish on your other device", body)
+}
+
 /// A minimal server-authored notice page (for example after a denied consent).
 /// `message` is server text; it is escaped defensively regardless.
 #[must_use]

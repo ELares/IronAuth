@@ -327,7 +327,7 @@ async fn expand_contract_example_chain_runs_all_three_phases_and_contract_remove
 // per real table); splitting it would not make it clearer.
 #[allow(clippy::too_many_lines)]
 #[tokio::test]
-async fn production_chain_is_only_the_forty_seven_real_migrations_and_ships_no_demo_object() {
+async fn production_chain_is_only_the_forty_eight_real_migrations_and_ships_no_demo_object() {
     // TestDatabase::start runs Store::migrate() (the production chain) on a
     // fresh, empty database.
     let db = TestDatabase::start().await;
@@ -344,8 +344,8 @@ async fn production_chain_is_only_the_forty_seven_real_migrations_and_ships_no_d
     );
     assert_eq!(
         report.already_applied(),
-        47,
-        "the production chain is exactly forty-seven migrations (isolation, audit log, management \
+        48,
+        "the production chain is exactly forty-eight migrations (isolation, audit log, management \
          API, OIDC authorization, signing keys, login/consent, authentication context, redirect \
          registration, UserInfo claims, consent scope upsert, resource servers, opaque access \
          tokens, client auth suite, dynamic client registration, pushed authorization requests, \
@@ -357,16 +357,16 @@ async fn production_chain_is_only_the_forty_seven_real_migrations_and_ships_no_d
          self-service account, admin user lifecycle, identity traits, foreign password \
          import, user invitations, flexible identifiers, exit-export credential grants, \
          migration state machine, webauthn credentials, totp credentials, credential abuse \
-         defenses, step-up policies)"
+         defenses, step-up policies, email OTP and scanner-safe magic links)"
     );
 
-    // The ledger holds exactly versions 1 through 47.
+    // The ledger holds exactly versions 1 through 48.
     assert_eq!(
         applied_versions(pool).await,
         vec![
             1_i64, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
             24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45,
-            46, 47
+            46, 47, 48
         ]
     );
     let phase_of = |version: i64| async move {
@@ -541,6 +541,10 @@ async fn production_chain_is_only_the_forty_seven_real_migrations_and_ships_no_d
     // per-scope policy table plus additive clients and refresh_families columns, no
     // rewrite of existing state.
     assert_eq!(phase_of(47).await, "expand");
+    // The email-OTP + magic-links migration (issue #68) is an EXPAND: two new
+    // tenant-scoped tables (email_otp_codes, magic_link_tokens), no rewrite of existing
+    // state.
+    assert_eq!(phase_of(48).await, "expand");
 
     // The step-up second-factor abuse path (issue #72): migration 0047 WIDENED the
     // abuse_bans auth_path CHECK (0046 pinned the closed set) to also admit
@@ -1910,6 +1914,125 @@ async fn production_chain_is_only_the_forty_seven_real_migrations_and_ships_no_d
         column_exists(pool, "refresh_families", "auth_time").await,
         "refresh_families.auth_time exists after 0047"
     );
+
+    // ---- 0048 email OTP + scanner-safe magic links (issue #68) ----
+    assert!(
+        table_exists(pool, "email_otp_codes").await,
+        "email_otp_codes exists after 0048"
+    );
+    for column in [
+        "id",
+        "tenant_id",
+        "environment_id",
+        "subject",
+        "purpose",
+        "code_hash",
+        "recipient_email_bidx",
+        "recipient_email_sealed",
+        "pii_dek_version",
+        "attempt_count",
+        "max_attempts",
+        "expires_at",
+        "consumed_at",
+        "created_at",
+    ] {
+        assert!(
+            column_exists(pool, "email_otp_codes", column).await,
+            "email_otp_codes.{column} exists after 0048"
+        );
+    }
+    // A 6-8 digit code is a low-entropy secret: it lands ONLY as a one-way Argon2id hash,
+    // never a plaintext column, and the recipient email is sealed (bytea), never plaintext.
+    assert_eq!(
+        column_data_type(pool, "email_otp_codes", "recipient_email_sealed").await,
+        "bytea",
+        "the recipient email must be a sealed bytea, never plaintext"
+    );
+    for forbidden in [
+        "code",
+        "code_plaintext",
+        "otp",
+        "plaintext",
+        "email",
+        "recipient_email",
+    ] {
+        assert!(
+            !column_exists(pool, "email_otp_codes", forbidden).await,
+            "email_otp_codes must have no plaintext code / email column ({forbidden})"
+        );
+    }
+    assert!(
+        table_exists(pool, "magic_link_tokens").await,
+        "magic_link_tokens exists after 0048"
+    );
+    for column in [
+        "id",
+        "tenant_id",
+        "environment_id",
+        "subject",
+        "purpose",
+        "token_digest",
+        "short_code_hash",
+        "binding_digest",
+        "recipient_email_bidx",
+        "recipient_email_sealed",
+        "pii_dek_version",
+        "attempt_count",
+        "max_attempts",
+        "expires_at",
+        "consumed_at",
+        "created_at",
+    ] {
+        assert!(
+            column_exists(pool, "magic_link_tokens", column).await,
+            "magic_link_tokens.{column} exists after 0048"
+        );
+    }
+    // The magic-link token is stored ONLY as its SHA-256 digest and the short code as an
+    // Argon2id hash, never a plaintext bearer value; the recipient email is sealed.
+    assert_eq!(
+        column_data_type(pool, "magic_link_tokens", "recipient_email_sealed").await,
+        "bytea",
+        "the recipient email must be a sealed bytea, never plaintext"
+    );
+    for forbidden in [
+        "token",
+        "secret",
+        "short_code",
+        "plaintext",
+        "email",
+        "recipient_email",
+    ] {
+        assert!(
+            !column_exists(pool, "magic_link_tokens", forbidden).await,
+            "magic_link_tokens must have no plaintext token / code / email column ({forbidden})"
+        );
+    }
+    // The tenant-scoped-table obligations for both new tables.
+    for table in ["email_otp_codes", "magic_link_tokens"] {
+        assert!(
+            rls_enabled_and_forced(pool, table).await,
+            "{table} must ENABLE and FORCE row-level security"
+        );
+        assert!(
+            policy_exists(pool, table, &format!("{table}_tenant_isolation")).await,
+            "the (tenant, environment) isolation policy must exist on {table}"
+        );
+        assert!(
+            check_constraint_exists(pool, table, &format!("{table}_scope_nonempty")).await,
+            "{table} must carry the scope-nonempty CHECK constraint"
+        );
+        assert!(
+            check_constraint_exists(pool, table, &format!("{table}_purpose_known")).await,
+            "{table} must carry the purpose-known CHECK constraint"
+        );
+        // Both factors attempt-limit their low-entropy secret (the OTP code; the magic
+        // link's cross-device short code), so both carry the attempt-budget CHECK.
+        assert!(
+            check_constraint_exists(pool, table, &format!("{table}_attempts_nonneg")).await,
+            "{table} must carry the attempts-nonneg CHECK constraint"
+        );
+    }
 }
 
 #[tokio::test]

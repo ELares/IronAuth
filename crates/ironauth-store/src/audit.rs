@@ -648,6 +648,25 @@ pub enum Action {
     /// `step_up_max_age_secs` registration floor was configured through the
     /// management seam. The row targets the `cli_` client.
     ClientStepUpPolicySet,
+    /// An email-OTP code was SENT (issue #68): a fresh numeric code was issued to a
+    /// user for a purpose, invalidating any prior active code. The row targets the
+    /// `eot_` code; the `detail` records the purpose (never the plaintext code, which
+    /// is hashed on the row). A send suppressed for anti-enumeration writes no row.
+    EmailOtpSend,
+    /// An email-OTP code was VERIFIED (issue #68): a user presented the correct code
+    /// and it was consumed single-use. The row targets the `eot_` code; the `detail`
+    /// records the purpose.
+    EmailOtpVerify,
+    /// A scanner-safe magic link was SENT (issue #68): a fresh single-use link token
+    /// and its cross-device short code were issued to a user for a purpose,
+    /// invalidating any prior active link. The row targets the `mlk_` token; the
+    /// `detail` records the purpose (never the token or code, both one-way on the row).
+    MagicLinkSend,
+    /// A scanner-safe magic link was CONSUMED (issue #68): a user completed the POST
+    /// confirmation (or the cross-device short code) and the link was consumed
+    /// single-use, establishing a session. A prefetching scanner's GET never reaches
+    /// this. The row targets the `mlk_` token; the `detail` records the purpose.
+    MagicLinkConsume,
 }
 
 impl Action {
@@ -790,6 +809,10 @@ impl Action {
             Action::ScopeStepUpPolicySet => "step_up.scope_policy.set",
             Action::ScopeStepUpPolicyRemove => "step_up.scope_policy.remove",
             Action::ClientStepUpPolicySet => "client.step_up_policy.set",
+            Action::EmailOtpSend => "email_otp.send",
+            Action::EmailOtpVerify => "email_otp.verify",
+            Action::MagicLinkSend => "magic_link.send",
+            Action::MagicLinkConsume => "magic_link.consume",
         }
     }
 }

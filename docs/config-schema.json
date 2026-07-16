@@ -483,6 +483,32 @@
           "minimum": 0,
           "type": "integer"
         },
+        "email_otp_code_digits": {
+          "default": 6,
+          "description": "The number of decimal digits in an email-OTP code (issue #68). NIST SP 800-63B\nout-of-band authenticators require at least a 6-digit code; 7 or 8 add entropy.\nMust be in 6..=8.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "email_otp_code_ttl_secs": {
+          "default": 600,
+          "description": "The email-OTP code time-to-live, in seconds (issue #68). NIST recommends a short\nwindow; a per-tenant value inside the 5-10 minute band. The default (600) is ten\nminutes. Must be in `OIDC_EMAIL_OTP_MIN_TTL_SECS..=OIDC_EMAIL_OTP_MAX_TTL_SECS`\n(300..=600), so a misconfiguration cannot widen the window into a brute-force aid.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "email_otp_enabled": {
+          "default": true,
+          "description": "Whether the email-OTP factor endpoints are mounted (issue #68). On by default:\nemail OTP is the recovery-of-last-resort factor every product ships. When off,\nthe send/verify endpoints fail closed with a uniform 404, so a deployment that\ndoes not want email OTP exposes no surface. The actual email transport is a\ndocumented seam (M11 messaging); the default sender performs no delivery.",
+          "type": "boolean"
+        },
+        "email_otp_max_attempts": {
+          "default": 5,
+          "description": "The per-code wrong-guess budget (issue #68): a code dies after this many wrong\nattempts, so an online brute force against a single low-entropy code is bounded.\nThe default (5) matches the device user-code budget. Must be at least 1.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
         "enable_response_mode_form_post": {
           "default": false,
           "description": "Enable the `response_mode=form_post` encoding for this environment (issue\n#17, OAuth 2.0 Form Post Response Mode 1.0). The safe default (`false`)\nleaves it DISABLED: the authorization endpoint returns results only by\n`query` (and, when a front-channel response type is enabled, `fragment`).\nWhen `true`, a client may request `response_mode=form_post` and the endpoint\nreturns an auto-submitting HTML form that POSTs the authorization-response\nparameters to the `redirect_uri`, and discovery advertises `form_post`.\nIntended for certification runs. This is a promotable per-environment\nsetting: it appears in config snapshots and rides the M5 promotion pipeline;\nthe process value is the deployment default until per-environment overrides\nland.",
@@ -542,6 +568,30 @@
             "timeout_secs": 5
           },
           "description": "The INBOUND lazy-migration hook (issue #56): verify a first login against a\nlegacy credential store over the SSRF-hardened outbound fetcher and, on success,\ncreate the user locally with a native Argon2id hash so subsequent logins never\ncall the hook. Disabled by default; the endpoint and its authentication secret\nare environment-scoped config (see [`LazyMigrationConfig`]). This is a promotable\nper-environment setting in spirit; the process value is the deployment default\nuntil per-environment overrides ride the M5 promotion pipeline."
+        },
+        "magic_link_enabled": {
+          "default": true,
+          "description": "Whether the scanner-safe magic-link factor endpoints are mounted (issue #68). On\nby default. When off, the confirm/consume endpoints fail closed with a uniform\n404. The link is consumed only by a POST from the confirmation page, so an email\nsecurity scanner that prefetches the link never consumes it.",
+          "type": "boolean"
+        },
+        "magic_link_fragment_mode": {
+          "default": false,
+          "description": "Whether the magic-link token rides the URL FRAGMENT rather than the query string\n(issue #68), per deployment. When true the confirmation page reads the token from\n`location.hash` and submits it, so the token never appears in a server access log\nor a scanner's request path. Off by default (the token rides the query string,\nstill scanner-safe because only a POST consumes it).",
+          "type": "boolean"
+        },
+        "magic_link_short_code_digits": {
+          "default": 8,
+          "description": "The number of decimal digits in the cross-device magic-link short code (issue\n#68): the code printed in the email alongside the link, entered on the originating\ndevice when the link is opened on another device (or the email client breaks the\nlink). Must be in 6..=8. The default (8) gives a little more entropy than the code\nOTP because it is not rate-limited by a per-code attempt counter on entry.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "magic_link_ttl_secs": {
+          "default": 600,
+          "description": "The magic-link time-to-live, in seconds (issue #68). The default (600) is ten\nminutes. Must be in `OIDC_EMAIL_OTP_MIN_TTL_SECS..=OIDC_MAGIC_LINK_MAX_TTL_SECS`\n(300..=3600): a link may live a little longer than a typed code because it is\nhigh-entropy and single-use, but is still short-lived.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
         },
         "mfa_factor_order": {
           "default": [
@@ -1387,6 +1437,10 @@
         "device_user_code_max_attempts": 5,
         "device_verification_rate_limit": 10,
         "device_verification_rate_window_secs": 60,
+        "email_otp_code_digits": 6,
+        "email_otp_code_ttl_secs": 600,
+        "email_otp_enabled": true,
+        "email_otp_max_attempts": 5,
         "enable_response_mode_form_post": false,
         "enable_response_type_code_id_token": false,
         "enable_response_type_id_token": false,
@@ -1405,6 +1459,10 @@
           "secret": null,
           "timeout_secs": 5
         },
+        "magic_link_enabled": true,
+        "magic_link_fragment_mode": false,
+        "magic_link_short_code_digits": 8,
+        "magic_link_ttl_secs": 600,
         "mfa_factor_order": [
           "passkey",
           "totp"

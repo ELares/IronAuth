@@ -6,6 +6,29 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Magic-link short-code attempt-limit hardening (issue #68, adversarial review): migration
+  0048 (unshipped, amended in place, still guard count 48) adds `attempt_count` and
+  `max_attempts` columns plus an `attempts_nonneg` CHECK to `magic_link_tokens`, and extends
+  its column-scoped UPDATE grant to `attempt_count`, so the low-entropy cross-device SHORT
+  CODE is per-link attempt-limited exactly like the email OTP. New
+  `ActingMagicLinkRepo::record_wrong_short_code_guess` increments the counter and DELETEs the
+  link at the budget (the same shape as `record_wrong_guess`); `NewMagicLink` gains a
+  `max_attempts` field. The wrong-guess counter is intentionally a SEPARATE transaction from
+  resolve+verify (a small throttle-bounded overshoot, rather than holding a DB transaction
+  open across the Argon2 verify), now documented at both increment sites.
+- Email OTP and scanner-safe magic-link persistence (issue #68): migration 0048 adds two
+  durable, tenant-scoped tables (forced RLS, the (tenant, environment) isolation policy,
+  nonempty-scope and purpose-known CHECKs, single-active partial unique indexes, and
+  column-scoped grants). `email_otp_codes` holds one active numeric code per (user, purpose)
+  as an Argon2id hash (never plaintext); `magic_link_tokens` holds one active single-use
+  link per (user, purpose) as a SHA-256 token digest plus an Argon2id short-code hash and a
+  same-device binding digest. Both seal the recipient email under the scope DEK and blind-
+  index it (issue #48), never a plaintext email column. New `EmailOtpCodeRepo` /
+  `MagicLinkRepo` reads and `ActingEmailOtpCodeRepo` / `ActingMagicLinkRepo` audited
+  mutations (issue, guarded single-use consume, attempt-counter bookkeeping), new
+  `EmailOtpCodeId` (`eot_`) and `MagicLinkTokenId` (`mlk_`, redacted debug) ids, the
+  `email_otp` value-type module, four new `Action` variants, and the
+  `magic_link_token_digest` / `magic_link_binding_digest` helpers.
 - Step-up abuse-path + fault-injection support (RFC 9470, issue #72): a new
   `AuthPath::SecondFactor` variant (wire tag `second_factor`) makes the step-up
   second-factor challenge a first-class, INDEPENDENTLY throttled authentication path;

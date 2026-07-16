@@ -556,6 +556,18 @@ impl Default for AdminConfig {
 /// long-lived code). The safe defaults are far below this ceiling.
 pub const OIDC_MAX_LIFETIME_SECS: u64 = 86_400;
 
+/// The FLOOR of the email-OTP / magic-link TTL band, in seconds (issue #68): five
+/// minutes. NIST SP 800-63B recommends a short out-of-band code lifetime; a shorter
+/// window than this frustrates a legitimate user retrieving the code from their inbox.
+pub const OIDC_EMAIL_OTP_MIN_TTL_SECS: u64 = 300;
+/// The CEILING of the email-OTP TTL band, in seconds (issue #68): ten minutes. A typed
+/// low-entropy code must not linger; a per-tenant value sits inside 300..=600.
+pub const OIDC_EMAIL_OTP_MAX_TTL_SECS: u64 = 600;
+/// The CEILING of the magic-link TTL band, in seconds (issue #68): one hour. A
+/// high-entropy single-use link may live a little longer than a typed code, but is still
+/// short-lived; a per-tenant value sits inside 300..=3600.
+pub const OIDC_MAGIC_LINK_MAX_TTL_SECS: u64 = 3_600;
+
 /// The largest a session lifetime may be configured to, in seconds. A session is
 /// longer lived than a code or an access token (a user stays logged in across
 /// requests), but a session beyond thirty days is almost always a misconfiguration,
@@ -1267,6 +1279,55 @@ pub struct OidcConfig {
     /// per-(tenant, environment) resolution is a future enhancement, consistent with
     /// how the other per-environment config is handled.
     pub acr_order: Vec<String>,
+
+    /// Whether the email-OTP factor endpoints are mounted (issue #68). On by default:
+    /// email OTP is the recovery-of-last-resort factor every product ships. When off,
+    /// the send/verify endpoints fail closed with a uniform 404, so a deployment that
+    /// does not want email OTP exposes no surface. The actual email transport is a
+    /// documented seam (M11 messaging); the default sender performs no delivery.
+    pub email_otp_enabled: bool,
+
+    /// The number of decimal digits in an email-OTP code (issue #68). NIST SP 800-63B
+    /// out-of-band authenticators require at least a 6-digit code; 7 or 8 add entropy.
+    /// Must be in 6..=8.
+    pub email_otp_code_digits: u32,
+
+    /// The email-OTP code time-to-live, in seconds (issue #68). NIST recommends a short
+    /// window; a per-tenant value inside the 5-10 minute band. The default (600) is ten
+    /// minutes. Must be in `OIDC_EMAIL_OTP_MIN_TTL_SECS..=OIDC_EMAIL_OTP_MAX_TTL_SECS`
+    /// (300..=600), so a misconfiguration cannot widen the window into a brute-force aid.
+    pub email_otp_code_ttl_secs: u64,
+
+    /// The per-code wrong-guess budget (issue #68): a code dies after this many wrong
+    /// attempts, so an online brute force against a single low-entropy code is bounded.
+    /// The default (5) matches the device user-code budget. Must be at least 1.
+    pub email_otp_max_attempts: u32,
+
+    /// Whether the scanner-safe magic-link factor endpoints are mounted (issue #68). On
+    /// by default. When off, the confirm/consume endpoints fail closed with a uniform
+    /// 404. The link is consumed only by a POST from the confirmation page, so an email
+    /// security scanner that prefetches the link never consumes it.
+    pub magic_link_enabled: bool,
+
+    /// The magic-link time-to-live, in seconds (issue #68). The default (600) is ten
+    /// minutes. Must be in `OIDC_EMAIL_OTP_MIN_TTL_SECS..=OIDC_MAGIC_LINK_MAX_TTL_SECS`
+    /// (300..=3600): a link may live a little longer than a typed code because it is
+    /// high-entropy and single-use, but is still short-lived.
+    pub magic_link_ttl_secs: u64,
+
+    /// Whether the magic-link token rides the URL FRAGMENT rather than the query string
+    /// (issue #68), per deployment. When true the confirmation page reads the token from
+    /// `location.hash` and submits it, so the token never appears in a server access log
+    /// or a scanner's request path. Off by default (the token rides the query string,
+    /// still scanner-safe because only a POST consumes it).
+    pub magic_link_fragment_mode: bool,
+
+    /// The number of decimal digits in the cross-device magic-link short code (issue
+    /// #68): the code printed in the email alongside the link, entered on the originating
+    /// device when the link is opened on another device (or the email client breaks the
+    /// link). Must be in 6..=8. The default (8) gives a little more entropy than the code
+    /// OTP because it is not rate-limited by a per-code attempt counter on entry.
+    pub magic_link_short_code_digits: u32,
 }
 
 impl Default for OidcConfig {
@@ -1345,6 +1406,14 @@ impl Default for OidcConfig {
                 "phr".to_owned(),
                 "phrh".to_owned(),
             ],
+            email_otp_enabled: true,
+            email_otp_code_digits: 6,
+            email_otp_code_ttl_secs: 600,
+            email_otp_max_attempts: 5,
+            magic_link_enabled: true,
+            magic_link_ttl_secs: 600,
+            magic_link_fragment_mode: false,
+            magic_link_short_code_digits: 8,
         }
     }
 }
@@ -2251,6 +2320,7 @@ impl Config {
         validate_regulation(&self.oidc)?;
         validate_webauthn(&self.oidc, &self.server)?;
         validate_totp(&self.oidc)?;
+        validate_email_otp(&self.oidc)?;
         validate_quota(&self.quota)?;
         validate_password_hashing(&self.password_hashing)?;
         validate_password_policy(&self.password_policy)?;
@@ -2377,6 +2447,61 @@ fn validate_totp(oidc: &OidcConfig) -> Result<(), ConfigError> {
                 ),
             });
         }
+    }
+    Ok(())
+}
+
+/// Validate the email-OTP and scanner-safe magic-link settings (issue #68), kept out of
+/// [`Config::validate`] so each stays within the readable-length lint. Every bound has a
+/// safe default in range, so an empty configuration is valid.
+///
+/// # Errors
+///
+/// [`ConfigError::Invalid`] if any parameter is outside its documented range.
+fn validate_email_otp(oidc: &OidcConfig) -> Result<(), ConfigError> {
+    if !(6..=8).contains(&oidc.email_otp_code_digits) {
+        return Err(ConfigError::Invalid {
+            message: format!(
+                "oidc.email_otp_code_digits ({}) must be in 6..=8",
+                oidc.email_otp_code_digits
+            ),
+        });
+    }
+    if !(OIDC_EMAIL_OTP_MIN_TTL_SECS..=OIDC_EMAIL_OTP_MAX_TTL_SECS)
+        .contains(&oidc.email_otp_code_ttl_secs)
+    {
+        return Err(ConfigError::Invalid {
+            message: format!(
+                "oidc.email_otp_code_ttl_secs ({}) must be in \
+                 {OIDC_EMAIL_OTP_MIN_TTL_SECS}..={OIDC_EMAIL_OTP_MAX_TTL_SECS} (the 5-10 \
+                 minute band)",
+                oidc.email_otp_code_ttl_secs
+            ),
+        });
+    }
+    if oidc.email_otp_max_attempts < 1 {
+        return Err(ConfigError::Invalid {
+            message: "oidc.email_otp_max_attempts must be at least 1".to_owned(),
+        });
+    }
+    if !(6..=8).contains(&oidc.magic_link_short_code_digits) {
+        return Err(ConfigError::Invalid {
+            message: format!(
+                "oidc.magic_link_short_code_digits ({}) must be in 6..=8",
+                oidc.magic_link_short_code_digits
+            ),
+        });
+    }
+    if !(OIDC_EMAIL_OTP_MIN_TTL_SECS..=OIDC_MAGIC_LINK_MAX_TTL_SECS)
+        .contains(&oidc.magic_link_ttl_secs)
+    {
+        return Err(ConfigError::Invalid {
+            message: format!(
+                "oidc.magic_link_ttl_secs ({}) must be in \
+                 {OIDC_EMAIL_OTP_MIN_TTL_SECS}..={OIDC_MAGIC_LINK_MAX_TTL_SECS}",
+                oidc.magic_link_ttl_secs
+            ),
+        });
     }
     Ok(())
 }

@@ -427,6 +427,15 @@ struct Inner {
     mfa_required: bool,
     mfa_factor_order: Vec<String>,
     acr_order: Vec<String>,
+    // Email OTP + scanner-safe magic links (issue #68). All validated at startup.
+    email_otp_enabled: bool,
+    email_otp_code_digits: u32,
+    email_otp_code_ttl_secs: u64,
+    email_otp_max_attempts: u32,
+    magic_link_enabled: bool,
+    magic_link_ttl_secs: u64,
+    magic_link_fragment_mode: bool,
+    magic_link_short_code_digits: u32,
 }
 
 impl OidcState {
@@ -555,6 +564,14 @@ impl OidcState {
                 mfa_required: config.mfa_required,
                 mfa_factor_order: config.mfa_factor_order.clone(),
                 acr_order: config.acr_order.clone(),
+                email_otp_enabled: config.email_otp_enabled,
+                email_otp_code_digits: config.email_otp_code_digits,
+                email_otp_code_ttl_secs: config.email_otp_code_ttl_secs,
+                email_otp_max_attempts: config.email_otp_max_attempts,
+                magic_link_enabled: config.magic_link_enabled,
+                magic_link_ttl_secs: config.magic_link_ttl_secs,
+                magic_link_fragment_mode: config.magic_link_fragment_mode,
+                magic_link_short_code_digits: config.magic_link_short_code_digits,
             }),
             revocation_sink: default_sink(),
             introspection_serializer: default_serializer(),
@@ -1809,6 +1826,108 @@ impl OidcState {
     #[must_use]
     pub fn totp_enabled(&self) -> bool {
         self.inner.totp_enabled
+    }
+
+    /// Whether the email-OTP factor endpoints are mounted (issue #68). When off, the
+    /// send/verify endpoints fail closed with a uniform 404.
+    #[must_use]
+    pub fn email_otp_enabled(&self) -> bool {
+        self.inner.email_otp_enabled
+    }
+
+    /// The number of decimal digits in an email-OTP code (issue #68). In 6..=8.
+    #[must_use]
+    pub fn email_otp_code_digits(&self) -> u32 {
+        self.inner.email_otp_code_digits
+    }
+
+    /// The email-OTP code lifetime (issue #68).
+    #[must_use]
+    pub fn email_otp_code_ttl(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.inner.email_otp_code_ttl_secs)
+    }
+
+    /// The per-code wrong-guess budget (issue #68): a code dies after this many wrong
+    /// attempts. At least 1.
+    #[must_use]
+    pub fn email_otp_max_attempts(&self) -> u32 {
+        self.inner.email_otp_max_attempts
+    }
+
+    /// Whether the scanner-safe magic-link endpoints are mounted (issue #68). When off,
+    /// the confirm/consume endpoints fail closed with a uniform 404.
+    #[must_use]
+    pub fn magic_link_enabled(&self) -> bool {
+        self.inner.magic_link_enabled
+    }
+
+    /// The magic-link lifetime (issue #68).
+    #[must_use]
+    pub fn magic_link_ttl(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.inner.magic_link_ttl_secs)
+    }
+
+    /// Whether the magic-link token rides the URL FRAGMENT rather than the query string
+    /// (issue #68), per deployment. When true the confirmation page reads the token from
+    /// `location.hash`, so it never appears in a server access log or scanner request path.
+    #[must_use]
+    pub fn magic_link_fragment_mode(&self) -> bool {
+        self.inner.magic_link_fragment_mode
+    }
+
+    /// The number of decimal digits in the cross-device magic-link short code (issue
+    /// #68). In 6..=8.
+    #[must_use]
+    pub fn magic_link_short_code_digits(&self) -> u32 {
+        self.inner.magic_link_short_code_digits
+    }
+
+    /// Deliver an email-OTP code through the verification seam (issue #68), applying the
+    /// closed-registration SUPPRESSION: when `recipient_known` is false the delivery is
+    /// silently dropped (recorded only on the observability plane), so the user-visible
+    /// acknowledgment is identical whether or not the recipient exists (the #64
+    /// anti-enumeration contract).
+    pub(crate) fn deliver_email_otp(
+        &self,
+        message: &crate::verification::EmailOtpMessage<'_>,
+        recipient_known: bool,
+    ) {
+        if recipient_known {
+            self.verification_sender.deliver_email_otp(message);
+        } else {
+            Self::record_suppressed_send(message.scope, "email_otp");
+        }
+    }
+
+    /// Deliver a scanner-safe magic link through the verification seam (issue #68), with
+    /// the same closed-registration suppression as [`Self::deliver_email_otp`].
+    pub(crate) fn deliver_magic_link(
+        &self,
+        message: &crate::verification::MagicLinkMessage<'_>,
+        recipient_known: bool,
+    ) {
+        if recipient_known {
+            self.verification_sender.deliver_magic_link(message);
+        } else {
+            Self::record_suppressed_send(message.scope, "magic_link");
+        }
+    }
+
+    /// Record a suppressed send on the observability plane only (issue #68), never a
+    /// body difference, so the acknowledgment stays identical to a real send.
+    fn record_suppressed_send(scope: Scope, factor: &'static str) {
+        tracing::info!(
+            target: "ironauth.abuse",
+            factor,
+            tenant = %scope.tenant(),
+            environment = %scope.environment(),
+            "email-factor send suppressed for an unknown recipient (closed registration)"
+        );
+        metrics::counter!(
+            "ironauth_verification_send_suppressed_total",
+            "purpose" => factor,
+        )
+        .increment(1);
     }
 
     /// The issuer label for a TOTP provisioning URI (issue #69): the configured
