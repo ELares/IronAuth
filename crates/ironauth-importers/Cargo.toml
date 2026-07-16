@@ -1,0 +1,94 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+[package]
+name = "ironauth-importers"
+version = "0.1.0"
+description = "IronAuth first-party migration front-ends: parse documented vendor export formats (Keycloak realm export, Auth0 bulk export, Firebase auth:export) and a generic SCIM/LDAP escape hatch, and emit the ironauth-import bulk-import record format so every source inherits the streaming job's resumability, DoS bounds, and per-record error reporting; every unmapped field is reported per record and a validation-only pass produces the full gap report before anything is committed"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# Auto-discovery is off so the database-backed end-to-end login tests are gated
+# behind `required-features = ["testing"]` and never compile on the DB-free lanes
+# (clippy, msrv, musl, cargo check), exactly like ironauth-import and
+# ironauth-store. The DB-free mapping / gap-report / snapshot tests are listed
+# explicitly below and run on every lane.
+autotests = false
+
+[dependencies]
+# The #55 record format and hash-scheme layer this crate is a front-end over: the
+# importers PRODUCE ImportRecords (to_record_line) that the streaming engine
+# consumes, and re-encode vendor-native hashes into the canonical algorithm-tagged
+# strings ForeignHash::parse accepts (including firebase_stored for Firebase's
+# modified scrypt). No new crypto crate: the scheme layer already verifies every
+# scheme these importers emit.
+ironauth-import.workspace = true
+# serde derives the vendor export shapes; serde_json parses each document (its
+# default 128-level recursion limit bounds nesting, so a malformed vendor document
+# is rejected rather than overflowing the stack). deny_unknown_fields is NOT used:
+# a catch-all `extra` map captures every field the importer does not consume so it
+# is reported as a gap, never silently dropped.
+serde.workspace = true
+serde_json.workspace = true
+# Re-encode vendor-native base64 hash operands (Keycloak secretData, Firebase
+# passwordHash/salt, LDAP {SSHA}/{PBKDF2} operands) into the PHC "B64" (standard
+# alphabet, no padding) the scheme layer's PasswordHash parser expects.
+base64.workspace = true
+
+[features]
+# Default build is lean: no test-support surface.
+default = []
+# Test-support surface: enables the database-backed end-to-end login tests'
+# dependency on the ironauth-store test harness. Adds no dependency beyond what the
+# dev-dependencies already pull, so it stays MSRV-1.85 and musl clean.
+testing = ["ironauth-store/testing"]
+
+[dev-dependencies]
+# The end-to-end login tests drive the real #55 engine against a throwaway
+# Postgres (the ironauth-store harness), proving credential intactness and the
+# verify-then-rehash to Argon2id per source.
+ironauth-store = { workspace = true, features = ["testing"] }
+ironauth-env.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+# The fixture builders compute REAL hashes for a known password so the login tests
+# exercise genuine verification, and the KATs re-encode them the way each vendor
+# export carries them. Same crates and versions the scheme layer verifies with.
+argon2.workspace = true
+bcrypt = "0.16"
+scrypt = "0.11"
+pbkdf2 = { version = "0.12", features = ["simple", "sha2"] }
+password-hash = "0.5"
+
+# The DB-free suites run on every lane: vendor mapping, the gap-report model, the
+# committed real-shape fixtures, and the gap-report snapshots.
+[[test]]
+name = "keycloak"
+path = "tests/keycloak.rs"
+
+[[test]]
+name = "auth0"
+path = "tests/auth0.rs"
+
+[[test]]
+name = "firebase"
+path = "tests/firebase.rs"
+
+[[test]]
+name = "scim_ldap"
+path = "tests/scim_ldap.rs"
+
+[[test]]
+name = "gap_snapshots"
+path = "tests/gap_snapshots.rs"
+
+# The database-backed end-to-end login tests: seed a user through each importer and
+# the #55 engine, verify the original password against the imported foreign hash,
+# and rehash to native Argon2id. Needs a real database (DATABASE_URL); see
+# scripts/with-test-db.sh.
+[[test]]
+name = "login"
+path = "tests/login.rs"
+required-features = ["testing"]
+
+[lints]
+workspace = true

@@ -1,0 +1,13 @@
+keycloak import gap report
+users: 3 (mapped 2, dropped 1)
+
+[9f1c0e14-1111-4a2b-8c33-000000000001]
+  - credentials[1]: otp factor (non-password factor secret material cannot be carried by a bulk export; the user re-enrolls it)
+  - realmRoles: 2 realm role(s) (IronAuth has no representable realm-role target)
+  - clientRoles: client roles for 1 client(s) (IronAuth has no representable client-role target)
+  - groups: 2 group membership(s) (IronAuth has no representable group target)
+  - requiredActions: UPDATE_PASSWORD (required actions are not represented; set them after import if needed)
+  - federatedIdentities: 1 linked identity provider(s) (linked social/identity-provider accounts are not represented)
+  - createdTimestamp: source creation timestamp (not preserved; the imported user's created_at is the import time)
+
+[9f1c0e14-1111-4a2b-8c33-000000000003] DROPPED: keycloak user has no username (the login handle is required)

@@ -1,0 +1,56 @@
+{
+  "realm": "acme",
+  "users": [
+    {
+      "id": "9f1c0e14-1111-4a2b-8c33-000000000001",
+      "username": "alice",
+      "email": "alice@acme.test",
+      "emailVerified": true,
+      "firstName": "Alice",
+      "lastName": "Anderson",
+      "enabled": true,
+      "createdTimestamp": 1600000000000,
+      "attributes": {
+        "department": ["engineering"],
+        "employee_id": ["E-1001"]
+      },
+      "credentials": [
+        {
+          "type": "password",
+          "secretData": "{\"value\":\"WUbeODuKkVfbINCh3aSsJU0Uptv3h9eYkSXBfYGlsmY=\",\"salt\":\"a2Mtc2FsdC1zZWVkLTAx\"}",
+          "credentialData": "{\"hashIterations\":27500,\"algorithm\":\"pbkdf2-sha256\"}"
+        },
+        {
+          "type": "otp",
+          "secretData": "{\"value\":\"Zm9vYmFy\"}",
+          "credentialData": "{\"subType\":\"totp\"}"
+        }
+      ],
+      "realmRoles": ["offline_access", "default-roles-acme"],
+      "clientRoles": {
+        "account": ["view-profile", "manage-account"]
+      },
+      "groups": ["/engineering", "/all-staff"],
+      "requiredActions": ["UPDATE_PASSWORD"],
+      "federatedIdentities": [
+        {
+          "identityProvider": "google",
+          "userId": "108200000000000000001",
+          "userName": "alice@gmail.test"
+        }
+      ]
+    },
+    {
+      "id": "9f1c0e14-1111-4a2b-8c33-000000000002",
+      "username": "bob",
+      "email": "bob@acme.test",
+      "emailVerified": false,
+      "enabled": false
+    },
+    {
+      "id": "9f1c0e14-1111-4a2b-8c33-000000000003",
+      "email": "orphan@acme.test",
+      "enabled": true
+    }
+  ]
+}
