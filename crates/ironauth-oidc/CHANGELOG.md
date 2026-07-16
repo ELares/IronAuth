@@ -6,6 +6,25 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- WebAuthn Related Origin Requests (issue #67, WebAuthn Level 3): a new
+  `GET /.well-known/webauthn` endpoint serving the `{"origins": [...]}` document, and
+  related-origin acceptance in the passkey ceremony. The document is generated from
+  live per-environment config at request time (never a baked static asset), served as
+  `application/json` with the shared well-known cache discipline (an explicit
+  `Cache-Control` plus a strong `ETag` and `304` on a matching `If-None-Match`), and a
+  uniform `404` when the feature is unconfigured (WebAuthn disabled or no related
+  origins). `OidcState::webauthn_relying_party` now returns the serving origin plus the
+  configured related origins as the accepted origin set, and a new
+  `webauthn_related_origins_document` renders the well-known body. This BROADENS ONLY
+  the accepted origin set: the RP-ID-hash, the assertion signature, and the single-use
+  challenge checks are unchanged, so an assertion from a listed related origin verifies
+  end to end while an unlisted origin still fails with the uniform non-enumerating
+  ceremony error. A related-origin ceremony is a legitimately cross-site POST, so the
+  four ceremony endpoints now guard with the new `interaction::related_origin_ok`
+  (accept a request whose browser-set, script-unforgeable `Origin` is in the operator
+  allowlist; fail closed on a missing or opaque origin) instead of the strict
+  same-origin check; the passkey management endpoints stay strictly same-origin. RP ID
+  continuity is documented in `docs/design/PASSKEY-RP-ID-MIGRATION.md`.
 - Credential-abuse defenses (issue #64): a new `abuse` module with the counter INTERFACE
   (`CounterStore` trait + in-process L1 `MemoryCounterStore`, shaped so an optional
   IronCache L2 slots in behind the same trait later), the risk-based escalation

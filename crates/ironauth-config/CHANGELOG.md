@@ -6,6 +6,21 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- `oidc.webauthn_related_origins` (issue #67, WebAuthn Level 3 Related Origin
+  Requests): a per-environment list of additional https origins permitted to use this
+  environment's RP ID, including origins on a different registrable domain (a
+  multi-brand or ccTLD estate). The serving origin is always permitted implicitly;
+  this list adds the others, published at `GET /.well-known/webauthn`. Each entry is
+  validated at STARTUP to be a well-formed https origin (`scheme://host[:port]`, no
+  path); a malformed entry is a boot error. The distinct registrable-label count of
+  the estate (serving origin plus related origins) is checked against the browser
+  budget of five: EXCEEDING it is a boot error (browsers silently ignore origins past
+  it), and sitting AT it emits the new `Warning::WebauthnRelatedOriginLabelBudget`.
+  Unlike the RP ID, a related origin need not be a registrable-suffix of the RP ID
+  (that cross-domain reach is the point); the authorization is this explicit list. The
+  existing `oidc.webauthn_rp_id` continuity rule (the RP ID must be a
+  registrable-suffix of the serving origin) is unchanged and documents the RP ID
+  migration mechanics in `docs/design/PASSKEY-RP-ID-MIGRATION.md`. Empty by default.
 - `[oidc.regulation]` settings (issue #64): a new `RegulationConfig` table for
   credential-abuse regulation and the anti-enumeration posture. The DEFAULT is
   account-DoS-safe: risk-based escalating `Retry-After` delays (`soft_threshold`,

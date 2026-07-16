@@ -216,6 +216,51 @@ pub fn same_origin_ok(headers: &HeaderMap, expected_origin: Option<&str>) -> boo
     true
 }
 
+/// The origin/CSRF guard for a WebAuthn ceremony that may legitimately be invoked
+/// from a configured RELATED origin (issue #67, WebAuthn Level 3 Related Origin
+/// Requests).
+///
+/// A WebAuthn assertion from a related origin is a genuinely CROSS-SITE POST (the
+/// related origin is a different registrable domain), which [`same_origin_ok`]
+/// rejects outright on its `Sec-Fetch-Site: cross-site` signal. This guard instead
+/// accepts a request whose browser-set `Origin` canonically matches one of the
+/// operator-configured `allowed_origins` (the serving origin plus the related
+/// origins the well-known document lists). The `Origin` header is set by the user
+/// agent and is UNFORGEABLE by page script, so membership in that explicit,
+/// operator-controlled allowlist IS the CSRF authorization: an origin absent from
+/// the list is rejected exactly as a cross-site submission is, and no wider set of
+/// origins is ever admitted than the deployment declared.
+///
+/// A missing or opaque (`null`) `Origin` carries no allowlist evidence and falls
+/// back to the strict serving-origin [`same_origin_ok`] check (fail closed without a
+/// positive same-origin fetch-metadata signal). A real related-origin request always
+/// carries a real `Origin`, so this fallback loses no legitimate cross-origin
+/// traffic. With an empty related-origins estate `allowed_origins` is just the
+/// serving origin, and this reduces to the same same-origin decision as before.
+#[must_use]
+pub fn related_origin_ok(headers: &HeaderMap, allowed_origins: &[String]) -> bool {
+    if let Some(origin) = headers
+        .get(header::ORIGIN)
+        .and_then(|value| value.to_str().ok())
+    {
+        let trimmed = origin.trim();
+        if !trimmed.eq_ignore_ascii_case(OPAQUE_ORIGIN) {
+            // Canonicalize both sides (lowercased host, default port dropped) before
+            // the byte comparison, exactly as same_origin_ok does, so a case or
+            // default-port difference never falsely rejects a listed origin.
+            let origin_canon = crate::state::origin_of(trimmed);
+            let origin_cmp = origin_canon.as_deref().unwrap_or(trimmed);
+            return allowed_origins.iter().any(|allowed| {
+                let allowed_canon = crate::state::origin_of(allowed);
+                allowed_canon.as_deref().unwrap_or(allowed) == origin_cmp
+            });
+        }
+    }
+    // No Origin header, or the opaque `null` origin: no allowlist evidence, so defer
+    // to the strict same-origin check against the serving origin (fail closed).
+    same_origin_ok(headers, allowed_origins.first().map(String::as_str))
+}
+
 /// An authenticated bootstrap session: the session id, the subject it names, and
 /// the recorded authentication event (its time and methods), which the ID token's
 /// `auth_time`, `amr`, and `acr` derive from (issue #14).
@@ -676,6 +721,81 @@ mod tests {
         // rejected.
         assert!(same_origin_ok(&cross_origin, None));
         assert!(!same_origin_ok(&cross_site, None));
+    }
+
+    #[test]
+    fn related_origin_ok_admits_a_listed_related_origin_and_rejects_the_rest() {
+        use axum::http::HeaderValue;
+
+        let serving = "https://issuer.test".to_owned();
+        let related = "https://example.de".to_owned();
+        let allowed = vec![serving.clone(), related.clone()];
+
+        // The serving origin (same-origin) is accepted.
+        let mut same = HeaderMap::new();
+        same.insert(
+            header::ORIGIN,
+            HeaderValue::from_static("https://issuer.test"),
+        );
+        same.insert(SEC_FETCH_SITE, HeaderValue::from_static("same-origin"));
+        assert!(related_origin_ok(&same, &allowed));
+
+        // A LISTED related origin, even reported cross-site by fetch metadata (it is a
+        // different registrable domain), is accepted: membership in the operator
+        // allowlist is the authorization. same_origin_ok would reject this.
+        let mut related_hdrs = HeaderMap::new();
+        related_hdrs.insert(
+            header::ORIGIN,
+            HeaderValue::from_static("https://example.de"),
+        );
+        related_hdrs.insert(SEC_FETCH_SITE, HeaderValue::from_static("cross-site"));
+        assert!(related_origin_ok(&related_hdrs, &allowed));
+        // And same_origin_ok against the serving origin rejects it, proving the guard
+        // genuinely widens the accepted set rather than the base check already allowing it.
+        assert!(!same_origin_ok(&related_hdrs, Some(&serving)));
+
+        // An UNLISTED origin is rejected even though it is not flagged cross-site.
+        let mut evil = HeaderMap::new();
+        evil.insert(
+            header::ORIGIN,
+            HeaderValue::from_static("https://evil.test"),
+        );
+        assert!(!related_origin_ok(&evil, &allowed));
+
+        // Canonicalization: a default https port and uppercase host still match a listed
+        // origin (a browser lowercases the host and drops :443).
+        let mut ported = HeaderMap::new();
+        ported.insert(
+            header::ORIGIN,
+            HeaderValue::from_static("https://EXAMPLE.de:443"),
+        );
+        assert!(related_origin_ok(&ported, &allowed));
+    }
+
+    #[test]
+    fn related_origin_ok_falls_back_to_same_origin_for_a_missing_or_opaque_origin() {
+        use axum::http::HeaderValue;
+
+        let allowed = vec![
+            "https://issuer.test".to_owned(),
+            "https://example.de".to_owned(),
+        ];
+
+        // No headers: defers to the serving origin's same-origin decision (allowed,
+        // SameSite cookie is the backstop) exactly as same_origin_ok does.
+        assert!(related_origin_ok(&HeaderMap::new(), &allowed));
+
+        // An opaque `null` Origin with a positive same-origin fetch-metadata signal is
+        // rescued; without it, it fails closed (no allowlist evidence).
+        let mut opaque_ok = HeaderMap::new();
+        opaque_ok.insert(header::ORIGIN, HeaderValue::from_static("null"));
+        opaque_ok.insert(SEC_FETCH_SITE, HeaderValue::from_static("same-origin"));
+        assert!(related_origin_ok(&opaque_ok, &allowed));
+
+        let mut opaque_cross = HeaderMap::new();
+        opaque_cross.insert(header::ORIGIN, HeaderValue::from_static("null"));
+        opaque_cross.insert(SEC_FETCH_SITE, HeaderValue::from_static("cross-site"));
+        assert!(!related_origin_ok(&opaque_cross, &allowed));
     }
 
     /// A header map built from `(name, value)` pairs, for the CSRF matrix below.

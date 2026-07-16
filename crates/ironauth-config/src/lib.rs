@@ -24,7 +24,7 @@ mod dsn;
 mod features;
 mod secret;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 
@@ -1145,6 +1145,27 @@ pub struct OidcConfig {
     /// origins and so resolve different RP IDs.
     pub webauthn_rp_id: Option<String>,
 
+    /// The additional origins permitted to run a WebAuthn ceremony for this
+    /// environment's RP ID (issue #67, WebAuthn Level 3 Related Origin Requests).
+    /// The serving origin is ALWAYS permitted implicitly; this list adds the OTHER
+    /// origins, including ones on a different registrable domain (a multi-brand or
+    /// ccTLD estate: `example.com`, `example.de`, `brand2.com`), which the standard
+    /// registrable-suffix rule would reject. The platform publishes these at
+    /// `GET /.well-known/webauthn` as `{"origins": [...]}` so a browser that
+    /// supports related origin requests (Chrome 128+, Safari 18+) accepts an
+    /// assertion from a listed origin against the RP ID. Each entry must be a
+    /// well-formed https origin (`scheme://host[:port]`, no path), validated at
+    /// STARTUP; a malformed entry is a boot-time [`ConfigError::Invalid`]. Browsers
+    /// cap the document at about five distinct registrable labels, so a list whose
+    /// distinct-label count EXCEEDS that budget is a boot error (some origins would
+    /// be silently ignored by the browser) and a list that sits AT the budget emits
+    /// a [`Warning`]. Unlike the RP ID, a related origin need NOT be a
+    /// registrable-suffix of the RP ID (that cross-domain reach is the whole point);
+    /// the authorization is this explicit, operator-controlled list served from the
+    /// RP ID's own domain. Empty by default (single-origin deployments serve no
+    /// related-origins document and 404 the well-known path).
+    pub webauthn_related_origins: Vec<String>,
+
     /// The lifetime, in seconds, of a WebAuthn ceremony challenge (issue #65). A
     /// ceremony not completed within this window has its single-use challenge
     /// expire. The default (300) is a conservative five minutes. Must be at least 1
@@ -1284,6 +1305,7 @@ impl Default for OidcConfig {
             lazy_migration: LazyMigrationConfig::default(),
             webauthn_enabled: true,
             webauthn_rp_id: None,
+            webauthn_related_origins: Vec::new(),
             webauthn_challenge_ttl_secs: 300,
             webauthn_require_user_verification: true,
             webauthn_clone_detection_block: false,
@@ -1787,6 +1809,16 @@ pub enum Warning {
         /// `database.password`).
         key: String,
     },
+    /// The WebAuthn related-origins estate sits AT the browser label budget
+    /// (issue #67): the document is still fully honored, but there is no headroom
+    /// for another registrable domain before browsers begin ignoring origins.
+    WebauthnRelatedOriginLabelBudget {
+        /// The distinct registrable-label count of the estate (serving origin plus
+        /// related origins).
+        count: usize,
+        /// The browser label budget the count has reached.
+        budget: usize,
+    },
 }
 
 impl fmt::Display for Warning {
@@ -1797,6 +1829,13 @@ impl fmt::Display for Warning {
                 "secret '{key}' is a literal value in the config file; \
                  use {{ file = \"/path\" }} or {{ env = \"VAR\" }} instead \
                  (or set dev_mode = true in development)"
+            ),
+            Warning::WebauthnRelatedOriginLabelBudget { count, budget } => write!(
+                f,
+                "oidc.webauthn_related_origins (with the serving origin) spans {count} distinct \
+                 registrable labels, the browser related-origin budget of {budget}; there is no \
+                 headroom for another registrable domain before browsers begin ignoring origins \
+                 in the /.well-known/webauthn document"
             ),
         }
     }
@@ -1862,6 +1901,18 @@ impl Config {
                 });
             }
         });
+        // The related-origins estate sitting exactly at the browser label budget is
+        // a warn (still fully honored, but no headroom); exceeding it is a hard error
+        // in validate_webauthn_related_origins (issue #67).
+        if self.oidc.webauthn_enabled && !self.oidc.webauthn_related_origins.is_empty() {
+            let count = webauthn_related_origin_labels(&self.oidc, &self.server).len();
+            if count == WEBAUTHN_RELATED_ORIGIN_LABEL_BUDGET {
+                warnings.push(Warning::WebauthnRelatedOriginLabelBudget {
+                    count,
+                    budget: WEBAUTHN_RELATED_ORIGIN_LABEL_BUDGET,
+                });
+            }
+        }
         warnings
     }
 
@@ -2244,7 +2295,108 @@ fn validate_webauthn(oidc: &OidcConfig, server: &ServerConfig) -> Result<(), Con
             });
         }
     }
+    validate_webauthn_related_origins(oidc, server)?;
     Ok(())
+}
+
+/// The browser related-origin label budget (issue #67): current implementations
+/// (Chrome, Safari) accept a `/.well-known/webauthn` document that spans at most
+/// this many DISTINCT registrable labels, silently ignoring origins beyond it. A
+/// configured estate that exceeds this is a boot error (some origins would never
+/// work); one that sits exactly at it emits a [`Warning`].
+pub(crate) const WEBAUTHN_RELATED_ORIGIN_LABEL_BUDGET: usize = 5;
+
+/// Validate the WebAuthn related origins (issue #67, WebAuthn Level 3 Related Origin
+/// Requests). Each entry must be a well-formed https origin, and the estate (the
+/// serving origin plus the related origins) must not exceed the browser label
+/// budget, since a browser silently ignores origins past that budget.
+///
+/// # Errors
+///
+/// [`ConfigError::Invalid`] if a related origin is not a well-formed https origin,
+/// or the distinct registrable-label count exceeds
+/// [`WEBAUTHN_RELATED_ORIGIN_LABEL_BUDGET`].
+fn validate_webauthn_related_origins(
+    oidc: &OidcConfig,
+    server: &ServerConfig,
+) -> Result<(), ConfigError> {
+    if oidc.webauthn_related_origins.is_empty() {
+        return Ok(());
+    }
+    for origin in &oidc.webauthn_related_origins {
+        if !is_well_formed_https_origin(origin) {
+            return Err(ConfigError::Invalid {
+                message: format!(
+                    "oidc.webauthn_related_origins entry ({origin}) is not a well-formed https \
+                     origin; a related origin must be an absolute https origin of the form \
+                     scheme://host[:port] with no path, query, or fragment"
+                ),
+            });
+        }
+    }
+    let count = webauthn_related_origin_labels(oidc, server).len();
+    if count > WEBAUTHN_RELATED_ORIGIN_LABEL_BUDGET {
+        return Err(ConfigError::Invalid {
+            message: format!(
+                "oidc.webauthn_related_origins (with the serving origin) spans {count} distinct \
+                 registrable labels, exceeding the browser related-origin budget of \
+                 {WEBAUTHN_RELATED_ORIGIN_LABEL_BUDGET}; browsers silently ignore origins past \
+                 that budget, so reduce the estate to at most {WEBAUTHN_RELATED_ORIGIN_LABEL_BUDGET} \
+                 registrable domains"
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// The set of distinct registrable labels the well-known document would span: the
+/// serving origin's label (when a `server.public_url` is configured) plus each
+/// related origin's. Used for the browser label-budget check (issue #67).
+fn webauthn_related_origin_labels(oidc: &OidcConfig, server: &ServerConfig) -> BTreeSet<String> {
+    let mut labels = BTreeSet::new();
+    if let Some(host) = server.public_url.as_deref().and_then(uri_host) {
+        labels.insert(registrable_label(&host));
+    }
+    for origin in &oidc.webauthn_related_origins {
+        if let Some(host) = uri_host(origin) {
+            labels.insert(registrable_label(&host));
+        }
+    }
+    labels
+}
+
+/// An approximate registrable label (effective-TLD-plus-one) of a host: the last
+/// two dot-separated labels, or the whole host when it has fewer. Without a
+/// public-suffix-list dependency this over-counts a few multi-part suffixes (for
+/// example `co.uk`), which only makes the budget check MORE conservative (it can
+/// warn or error a shade early, never accept an over-budget estate as under), so it
+/// is a safe approximation for the browser label cap (issue #67).
+fn registrable_label(host: &str) -> String {
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    let labels: Vec<&str> = host.split('.').filter(|label| !label.is_empty()).collect();
+    if labels.len() <= 2 {
+        return host;
+    }
+    labels[labels.len() - 2..].join(".")
+}
+
+/// Whether `origin` is a well-formed absolute https origin: `scheme://host[:port]`
+/// with the https scheme, a non-empty host, no userinfo, and no path, query, or
+/// fragment (issue #67). An origin is stricter than an endpoint URL: it carries no
+/// path. Purely syntactic; it never resolves DNS or touches the network.
+fn is_well_formed_https_origin(origin: &str) -> bool {
+    if origin.contains(|c: char| c.is_whitespace() || c.is_control()) || origin.contains('#') {
+        return false;
+    }
+    http::Uri::try_from(origin).is_ok_and(|uri| {
+        uri.scheme_str() == Some("https")
+            && uri.host().is_some_and(|host| !host.is_empty())
+            && uri
+                .authority()
+                .is_some_and(|authority| !authority.as_str().contains('@'))
+            && matches!(uri.path(), "" | "/")
+            && uri.query().is_none()
+    })
 }
 
 /// The host of an absolute URL, or [`None`] if it does not parse or has no host.
@@ -2930,6 +3082,130 @@ mod tests {
         let localhost = "[server]\npublic_url = \"http://localhost:8080\"\n\
                          [oidc]\nwebauthn_rp_id = \"localhost\"\n";
         assert!(Config::from_toml_str(localhost, "ironauth.toml").is_ok());
+    }
+
+    #[test]
+    fn webauthn_related_origins_validate_as_https_origins() {
+        // A well-formed cross-registrable-domain related origin loads (the multi-brand
+        // estate the related-origin document is for).
+        let ok = "[server]\npublic_url = \"https://auth.example.com\"\n\
+                  [oidc]\nwebauthn_rp_id = \"example.com\"\n\
+                  webauthn_related_origins = [\"https://example.de\", \"https://brand2.com\"]\n";
+        let loaded = Config::from_toml_str(ok, "ironauth.toml").expect("valid related origins");
+        assert_eq!(
+            loaded.config.oidc.webauthn_related_origins,
+            vec![
+                "https://example.de".to_owned(),
+                "https://brand2.com".to_owned()
+            ]
+        );
+
+        // A non-https origin is a boot error.
+        let http = "[server]\npublic_url = \"https://auth.example.com\"\n\
+                    [oidc]\nwebauthn_related_origins = [\"http://example.de\"]\n";
+        let err = Config::from_toml_str(http, "ironauth.toml").expect_err("http origin");
+        assert!(
+            err.to_string().contains("well-formed https origin"),
+            "{err}"
+        );
+
+        // An origin carrying a path is not an origin; boot error.
+        let path = "[server]\npublic_url = \"https://auth.example.com\"\n\
+                    [oidc]\nwebauthn_related_origins = [\"https://example.de/login\"]\n";
+        let err = Config::from_toml_str(path, "ironauth.toml").expect_err("origin with path");
+        assert!(
+            err.to_string().contains("well-formed https origin"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn webauthn_related_origins_enforce_the_browser_label_budget() {
+        // Six distinct registrable domains (the serving one plus five related) exceed
+        // the browser budget of five: a boot error, since browsers ignore the overflow.
+        let over = "[server]\npublic_url = \"https://auth.example.com\"\n\
+                    [oidc]\nwebauthn_related_origins = [\
+                    \"https://a.test\", \"https://b.test\", \"https://c.test\", \
+                    \"https://d.test\", \"https://e.test\"]\n";
+        let err = Config::from_toml_str(over, "ironauth.toml").expect_err("over budget");
+        assert!(err.to_string().contains("label"), "{err}");
+
+        // Exactly at the budget (serving + four related = five labels) loads but warns.
+        let at = "[server]\npublic_url = \"https://auth.example.com\"\n\
+                  [oidc]\nwebauthn_related_origins = [\
+                  \"https://a.test\", \"https://b.test\", \"https://c.test\", \"https://d.test\"]\n";
+        let loaded = Config::from_toml_str(at, "ironauth.toml").expect("at budget loads");
+        assert!(
+            loaded.warnings.iter().any(|w| matches!(
+                w,
+                Warning::WebauthnRelatedOriginLabelBudget {
+                    count: 5,
+                    budget: 5
+                }
+            )),
+            "a warning fires at the budget ceiling: {:?}",
+            loaded.warnings
+        );
+
+        // Multiple origins that share ONE registrable domain count as one label, so a
+        // large same-domain estate stays under budget.
+        let same_domain = "[server]\npublic_url = \"https://auth.example.com\"\n\
+                           [oidc]\nwebauthn_related_origins = [\
+                           \"https://app.example.com\", \"https://id.example.com\", \
+                           \"https://shop.example.com\"]\n";
+        let loaded =
+            Config::from_toml_str(same_domain, "ironauth.toml").expect("same registrable domain");
+        assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
+    }
+
+    #[test]
+    fn rp_id_migration_guide_exists_and_its_config_example_matches_the_schema() {
+        // The published RP ID migration guide (issue #67) must exist and its TOML
+        // example must parse against the SHIPPED config schema (deny_unknown_fields),
+        // so a documented `oidc.webauthn_rp_id` / `oidc.webauthn_related_origins`
+        // snippet cannot drift from the real keys.
+        let guide = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../docs/design/PASSKEY-RP-ID-MIGRATION.md"
+        );
+        let text = std::fs::read_to_string(guide).expect("the migration guide is published");
+        assert!(
+            text.contains("oidc.webauthn_related_origins") && text.contains("oidc.webauthn_rp_id"),
+            "the guide documents both RP ID knobs"
+        );
+        // Extract the fenced ```toml example and prove it is valid config.
+        let toml = text
+            .split_once("```toml")
+            .and_then(|(_, rest)| rest.split_once("```"))
+            .map(|(block, _)| block.trim())
+            .expect("the guide carries a toml example");
+        Config::from_toml_str(toml, "PASSKEY-RP-ID-MIGRATION.md")
+            .expect("the documented example matches the shipped schema");
+    }
+
+    #[test]
+    fn webauthn_rp_id_continuity_holds_across_a_custom_serving_host() {
+        // RP-ID continuity (issue #67): the RP ID is set to the tenant's registrable
+        // domain, INDEPENDENT of the exact serving hostname, so passkeys registered
+        // against `example.com` survive a move to `auth.example.com`. The RP ID must
+        // still be a registrable suffix of the serving origin (WebAuthn validity), and
+        // the config loads with related origins on other registrable domains too.
+        let continuity = "[server]\npublic_url = \"https://auth.example.com\"\n\
+                          [oidc]\nwebauthn_rp_id = \"example.com\"\n\
+                          webauthn_related_origins = [\"https://example.de\"]\n";
+        let loaded = Config::from_toml_str(continuity, "ironauth.toml").expect("continuity loads");
+        assert_eq!(
+            loaded.config.oidc.webauthn_rp_id.as_deref(),
+            Some("example.com")
+        );
+
+        // An RP ID that is NOT a suffix of the serving origin is still a boot error
+        // (the base #65 rule is unchanged; continuity does not weaken it).
+        let bad = "[server]\npublic_url = \"https://auth.example.com\"\n\
+                   [oidc]\nwebauthn_rp_id = \"other.example\"\n\
+                   webauthn_related_origins = [\"https://example.de\"]\n";
+        let err = Config::from_toml_str(bad, "ironauth.toml").expect_err("rp id not a suffix");
+        assert!(err.to_string().contains("webauthn_rp_id"), "{err}");
     }
 
     #[test]
