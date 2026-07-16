@@ -1037,6 +1037,21 @@ impl Harness {
             .to_string()
     }
 
+    /// Register a PASSWORDLESS bootstrap user (the native `password_hash` is the
+    /// unusable sentinel, exactly as a passkey-invitation activation leaves it, so a
+    /// passkey is the user's only login factor) and return its subject.
+    pub async fn seed_passwordless_user(&self, identifier: &str) -> String {
+        let (actor, corr) = self.seeding_actor();
+        self.store()
+            .scoped(self.scope)
+            .acting(actor, corr)
+            .users()
+            .register(&self.env, identifier, "!")
+            .await
+            .expect("register passwordless user")
+            .to_string()
+    }
+
     /// Register a bootstrap user with a standard-claim document (issue #15) and
     /// return its subject. `claims_json` is the OIDC standard-claim object as JSON
     /// text (for example `{"email":"a@b.test","email_verified":true}`), which

@@ -143,7 +143,14 @@ cd "$(git rev-parse --show-toplevel)"
 # only, no plaintext PII column). TENANT-SCOPED with forced row-level security, and
 # every read/write additionally subject-bound, so its SQL stays in the repository
 # module too.
-SCOPED_TABLES='clients|organizations|audit_log|management_credentials|idempotency_keys|grants|authorization_codes|issued_tokens|signing_keys|users|sessions|consents|resource_servers|opaque_access_tokens|client_assertion_jtis|client_auth_diagnostics|pushed_authorization_requests|refresh_families|refresh_tokens|service_accounts|dcr_policies|dcr_initial_access_tokens|dcr_rate_counters|external_assertion_issuers|external_assertion_subject_mappings|external_assertion_jtis|device_codes|client_sessions|session_ended_events|backchannel_logout_deliveries|tenant_keks|tenant_deks|encrypted_secrets|environment_states|tenant_byok_bindings|environment_guardrails|custom_domains|acme_challenges|environment_variables|environment_secrets|account_credentials|trait_schemas|trait_migration_jobs|user_invitations|user_identifiers|migration_runs|migration_run_records'
+#
+# webauthn_credentials / webauthn_challenges (#65) are the passkey factor tables:
+# one row per registered passkey (its COSE public key, sign counter, AAGUID,
+# transports, BE/BS flags, and sealed nickname) and the short-lived single-use
+# ceremony challenge store. Both TENANT-SCOPED with forced row-level security, and
+# the credential reads/writes additionally subject-bound, so their SQL stays in the
+# repository module too.
+SCOPED_TABLES='clients|organizations|audit_log|management_credentials|idempotency_keys|grants|authorization_codes|issued_tokens|signing_keys|users|sessions|consents|resource_servers|opaque_access_tokens|client_assertion_jtis|client_auth_diagnostics|pushed_authorization_requests|refresh_families|refresh_tokens|service_accounts|dcr_policies|dcr_initial_access_tokens|dcr_rate_counters|external_assertion_issuers|external_assertion_subject_mappings|external_assertion_jtis|device_codes|client_sessions|session_ended_events|backchannel_logout_deliveries|tenant_keks|tenant_deks|encrypted_secrets|environment_states|tenant_byok_bindings|environment_guardrails|custom_domains|acme_challenges|environment_variables|environment_secrets|account_credentials|trait_schemas|trait_migration_jobs|user_invitations|user_identifiers|migration_runs|migration_run_records|webauthn_credentials|webauthn_challenges'
 
 # The one module allowed to name a scoped table in SQL.
 REPO_MODULE='crates/ironauth-store/src/repository.rs'

@@ -15,6 +15,16 @@ range per docs/RELEASING.md.
   CLI. The probe is a read-only measurement, so it carries only an optional
   Idempotency-Key; an optional JSON body overrides the target latency and memory budget.
   The OpenAPI spec and the committed `docs/openapi/management.json` gain the endpoint.
+- Export field-coverage extended for WebAuthn passkeys (issue #65): the exit-covenant
+  field-coverage guard now classifies the new `webauthn_credentials` table. A
+  registered passkey is DEVICE-BOUND and not portable across IdP instances (the
+  private key never leaves the authenticator and the stored COSE public key is scoped
+  to this deployment's RP ID), so the credential material is classified OPERATIONAL
+  device state (the scope/structural columns DERIVED) and documented as the honest
+  exception in docs/exit-guide.md; the guard still fails the build if the table grows
+  an unclassified column. The export record format is unchanged (the portable
+  identity, the user and its password hash, round-trips as before).
+
 - Migration state-machine operator view (issue #59, exploratory): three env-scoped,
   permission-gated read endpoints over the invariant-checked migration state machine.
   `GET .../migration-runs` lists a scope's runs (cursor paginated);

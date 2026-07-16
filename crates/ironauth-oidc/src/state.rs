@@ -295,6 +295,14 @@ struct Inner {
     // only when the endpoint is mounted; the safe default (false) preserves offline
     // grants (issue #21/#32).
     global_token_revocation_hard_kill: bool,
+    // WebAuthn passkeys (issue #65). The RP ID override is None when derived from
+    // the serving origin host; the challenge TTL, UV requirement, and clone-detection
+    // policy come straight from OidcConfig (already validated at startup).
+    webauthn_enabled: bool,
+    webauthn_rp_id: Option<String>,
+    webauthn_challenge_ttl_secs: u64,
+    webauthn_require_user_verification: bool,
+    webauthn_clone_detection_block: bool,
 }
 
 impl OidcState {
@@ -398,6 +406,11 @@ impl OidcState {
                     config.device_verification_rate_window_secs,
                 ),
                 global_token_revocation_hard_kill: config.global_token_revocation_hard_kill,
+                webauthn_enabled: config.webauthn_enabled,
+                webauthn_rp_id: config.webauthn_rp_id.clone(),
+                webauthn_challenge_ttl_secs: config.webauthn_challenge_ttl_secs,
+                webauthn_require_user_verification: config.webauthn_require_user_verification,
+                webauthn_clone_detection_block: config.webauthn_clone_detection_block,
             }),
             revocation_sink: default_sink(),
             introspection_serializer: default_serializer(),
@@ -1144,6 +1157,52 @@ impl OidcState {
         origin_of(&self.inner.issuer_base)
     }
 
+    /// Whether the WebAuthn passkey ceremony endpoints are mounted and the hosted
+    /// login page offers conditional-UI passkey sign-in (issue #65).
+    #[must_use]
+    pub fn webauthn_enabled(&self) -> bool {
+        self.inner.webauthn_enabled
+    }
+
+    /// The effective WebAuthn Relying Party ID and allowed origins for a ceremony
+    /// (issue #65): the configured `oidc.webauthn_rp_id` (validated at startup) or,
+    /// when unset, the serving origin's host; the allowed origin is this
+    /// deployment's own origin. `None` when the serving origin cannot be derived
+    /// from `server.public_url`, in which case a ceremony fails closed. WebAuthn
+    /// origins are `scheme://host[:port]` with no path, so the per-environment
+    /// `/t/../e/..` suffix is intentionally absent.
+    #[must_use]
+    pub fn webauthn_relying_party(&self) -> Option<WebauthnRelyingParty> {
+        let origin = self.self_origin()?;
+        let rp_id = match &self.inner.webauthn_rp_id {
+            Some(configured) => configured.clone(),
+            None => host_of(&origin)?,
+        };
+        Some(WebauthnRelyingParty {
+            rp_id,
+            origins: vec![origin],
+        })
+    }
+
+    /// The single-use WebAuthn challenge lifetime in seconds (issue #65).
+    #[must_use]
+    pub fn webauthn_challenge_ttl_secs(&self) -> u64 {
+        self.inner.webauthn_challenge_ttl_secs
+    }
+
+    /// Whether a WebAuthn ceremony requires user verification (issue #65).
+    #[must_use]
+    pub fn webauthn_require_user_verification(&self) -> bool {
+        self.inner.webauthn_require_user_verification
+    }
+
+    /// Whether a sign-count regression BLOCKS the sign-in (`true`) or only WARNS
+    /// and records the event (`false`) (issue #65).
+    #[must_use]
+    pub fn webauthn_clone_detection_block(&self) -> bool {
+        self.inner.webauthn_clone_detection_block
+    }
+
     /// The shared per-environment issuer registry: the ONE holder of every
     /// environment's signing keys, algorithm policy, and salt. The JWKS/discovery
     /// serving reads the SAME `Arc`, so a signed `kid` cannot diverge from the
@@ -1382,6 +1441,29 @@ impl std::fmt::Debug for OidcState {
 /// still differs after it. Used to derive this deployment's own origin from
 /// `issuer_base` for the CSRF Origin allowlist, and to canonicalize the incoming
 /// `Origin` before the comparison.
+/// The effective WebAuthn relying party for a ceremony (issue #65): the RP ID the
+/// authenticator scopes the credential to, and the origin(s) a ceremony may be
+/// invoked from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WebauthnRelyingParty {
+    /// The relying party id (the origin host or a configured parent domain).
+    pub rp_id: String,
+    /// The origins allowed for this environment (`scheme://host[:port]`).
+    pub origins: Vec<String>,
+}
+
+/// The host of an absolute URL, dropping the scheme and any port (issue #65). Used
+/// to derive the default WebAuthn RP ID from the serving origin.
+pub(crate) fn host_of(url: &str) -> Option<String> {
+    let origin = origin_of(url)?;
+    let authority = origin.split_once("://")?.1;
+    let host = match authority.rsplit_once(':') {
+        Some((h, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => h,
+        _ => authority,
+    };
+    Some(host.to_owned())
+}
+
 pub(crate) fn origin_of(url: &str) -> Option<String> {
     let (scheme, rest) = url.split_once("://")?;
     if scheme.is_empty() {

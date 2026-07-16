@@ -273,6 +273,12 @@ pub async fn revoke_other_sessions(
 /// enrolled credentials (passkeys, TOTP, recovery-code sets) with their metadata.
 /// Filtered on the authenticated subject, so another user's credentials are never
 /// listed.
+///
+/// Ceremony-registered WebAuthn passkeys (issue #65) live in their own table, so
+/// they are folded in here too: a user sees ALL their credentials in one place, and
+/// each passkey carries the fields policy and messaging need (the immutable
+/// registration-time backup-eligible flag and the LIVE backup-state, plus
+/// discoverability and the clone-detected flag). Both reads are subject-bound.
 pub async fn list_credentials(
     State(state): State<OidcState>,
     Path((tenant_id, environment_id)): Path<(String, String)>,
@@ -291,7 +297,7 @@ pub async fn list_credentials(
     let Ok(credentials) = listed else {
         return server_error();
     };
-    let items: Vec<Value> = credentials
+    let mut items: Vec<Value> = credentials
         .iter()
         .map(|credential| {
             json!({
@@ -304,6 +310,33 @@ pub async fn list_credentials(
             })
         })
         .collect();
+    // Fold in the caller's ceremony-registered passkeys (issue #65), each with its
+    // live BE/BS. Subject-bound. Only when WebAuthn is enabled for this deployment.
+    if state.webauthn_enabled() {
+        let passkeys = state
+            .store()
+            .scoped(account.scope)
+            .webauthn_credentials()
+            .list(&account.subject, i64::from(u8::MAX), None)
+            .await;
+        let Ok(passkeys) = passkeys else {
+            return server_error();
+        };
+        for passkey in &passkeys {
+            items.push(json!({
+                "id": passkey.id,
+                "type": "passkey",
+                "friendly_name": passkey.nickname,
+                "usable_for_login": true,
+                "backup_eligible": passkey.backup_eligible,
+                "backup_state": passkey.backup_state,
+                "discoverable": passkey.discoverable,
+                "clone_detected": passkey.clone_detected,
+                "created_at": passkey.created_at_unix_micros,
+                "last_used_at": passkey.last_used_at_unix_micros,
+            }));
+        }
+    }
     json_response(StatusCode::OK, json!({ "credentials": items }))
 }
 

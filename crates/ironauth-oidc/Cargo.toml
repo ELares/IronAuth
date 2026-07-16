@@ -20,6 +20,11 @@ ironauth-env.workspace = true
 ironauth-config.workspace = true
 ironauth-store.workspace = true
 ironauth-jose.workspace = true
+# The WebAuthn Level 3 ceremony core (issue #65): builds the registration and
+# authentication option documents and verifies the ceremony responses. The signature
+# check inside it is delegated to the ring-backed ironauth-jose core, so this crate
+# adds no ring dependency.
+ironauth-webauthn.workspace = true
 # The foreign password-hash scheme layer (issue #55): the login path verifies an
 # imported bcrypt/scrypt/PBKDF2/Argon2/Firebase hash and, on success, rehashes the
 # password to the native Argon2id verifier (verify-then-rehash). Only the pure
@@ -79,7 +84,11 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-
 tower = { workspace = true, features = ["util"] }
 http-body-util.workspace = true
 # Verify tokens end to end through the one hardened verify path.
-ironauth-jose = { workspace = true }
+ironauth-jose = { workspace = true, features = ["test-util"] }
+# The WebAuthn HTTP ceremony test acts as a virtual authenticator: it builds the
+# CBOR attestationObject / COSE key (ciborium) and signs assertions (jose test-util
+# Ed25519), then drives the ceremony endpoints end to end through the router.
+ciborium.workspace = true
 # Database-free unit tests build an Env and a deterministic entropy source.
 ironauth-env = { workspace = true }
 # Base64 for building client_secret_basic Authorization headers in the tests.
@@ -217,6 +226,18 @@ required-features = ["testing"]
 [[test]]
 name = "account"
 path = "tests/account.rs"
+required-features = ["testing"]
+
+# WebAuthn passkey ceremonies end to end (issue #65): the four ceremony endpoints
+# driven through the real router by a software authenticator (a CBOR
+# attestationObject / COSE key, real Ed25519 assertion signatures). A passkey
+# registers for the authenticated user, a discoverable-credential sign-in resolves
+# the user and issues a session whose acr is phr, excludeCredentials is populated so
+# the same authenticator cannot register twice (database dedupe), and a wrong-origin
+# ceremony is refused. Needs a real database (DATABASE_URL).
+[[test]]
+name = "webauthn_ceremony"
+path = "tests/webauthn_ceremony.rs"
 required-features = ["testing"]
 
 # The public invitation-accept endpoint (issue #60): a token-authenticated invitee

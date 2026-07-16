@@ -14,6 +14,47 @@ range per docs/RELEASING.md.
   and a concurrent `change_password` is never clobbered. A win returns `Ok(true)`, a
   no-op `Ok(false)`; best-effort like the foreign `upgrade_foreign_password`. No schema
   change (existing `users` table and `UserPasswordUpgrade` audit action).
+- Last-usable-login-factor guard on passkey removal (issue #65 review hardening):
+  `ActingWebauthnCredentialRepo::remove` now takes an `acknowledge_recovery` flag and
+  returns the shared `CredentialRemoveOutcome`. In the removal transaction it counts
+  the subject's remaining usable login factors across all sources (a provisioned
+  native password that is not the unusable sentinel, any `account_credentials` usable
+  for login, and the subject's other passkeys) and returns `BlockedLastCredential`
+  when removing the passkey would leave zero, unless the acknowledgment is set, so a
+  passwordless user cannot strand themselves. No new migration (a count query and a
+  conditional, not schema).
+- Passkey management and security audit actions (issue #65 review hardening): the
+  passkey rename now writes a `webauthn.credential.rename` audit row on success (it
+  was silent before), and a new `record_backup_eligibility_mismatch` writes a
+  `webauthn.backup_eligibility.mismatch` security audit row when an assertion presents
+  a backup-eligible flag that diverges from the credential's immutable, stored value,
+  advancing no credential state. No new migration (audit actions are free-text).
+- WebAuthn passkey persistence (issue #65, migration 0044, expand): two new
+  tenant-scoped tables with forced row-level security, the `(tenant, environment)`
+  isolation policy, nonempty-scope CHECKs, and column-scoped least-privilege grants.
+  `webauthn_credentials` is the per-user registry of registered passkeys: the raw
+  credential id (UNIQUE within a scope, the database half of the excludeCredentials
+  dedupe), the verbatim COSE PUBLIC key (public material, a plaintext `bytea`, never
+  sealed), the signature counter, AAGUID, transports, the backup-eligible (BE) and
+  backup-state (BS) flags, the credProps `rk` result, a clone-detected flag, and the
+  user-authored nickname sealed under the scope's envelope DEK (issue #48, a new
+  `webauthn-nickname` seal label). `webauthn_challenges` is the single-use ceremony
+  challenge store: the challenge is a public nonce minted from the entropy seam and
+  consumed exactly once by an atomic `consumed_at` UPDATE (a used, expired, or
+  wrong-ceremony challenge is refused). New public types
+  `WebauthnCredentialId`/`WebauthnChallengeId` (`pky_`/`wch_` scoped ids),
+  `WebauthnCredentialRepo` (list, `excludeCredentials` descriptors, resolve by raw
+  credential id for a discoverable assertion), `ActingWebauthnCredentialRepo`
+  (register with the nickname sealed and a duplicate credential id refused as a
+  `Conflict`; record an assertion, advancing the sign counter and updating the backup
+  state, and on a regression flagging the clone and writing a
+  `webauthn.clone.detected` audit row; rename; remove), `WebauthnChallengeRepo`
+  (issue and single-use consume), and the `NewWebauthnCredential` /
+  `WebauthnCredentialRecord` / `WebauthnAssertionTarget` / `ConsumedChallenge` value
+  types. Three new audited `Action` variants (`webauthn.credential.register`,
+  `webauthn.credential.remove`, `webauthn.clone.detected`). Every timestamp comes
+  from the clock seam and every challenge from the entropy seam.
+
 - Migrations as an invariant-checked state machine (issue #59, exploratory, migration
   0043, expand): a wrapped long-running migration walks an explicit, audited state
   machine (`defined -> validating -> running -> reconciling -> complete | abandoned`)

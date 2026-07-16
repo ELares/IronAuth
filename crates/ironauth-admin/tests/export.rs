@@ -342,6 +342,7 @@ struct TableCoverage {
 /// NOTE: the #54 `user_identifiers` table is not on this branch, so it is not
 /// covered here; it joins the guard when it merges.
 #[tokio::test]
+#[allow(clippy::too_many_lines)] // one linear per-table coverage model plus the live-column sweep
 async fn every_identity_column_is_exported_or_a_documented_non_exported_field() {
     let model: &[TableCoverage] = &[
         // The users table: the core identity row.
@@ -396,6 +397,43 @@ async fn every_identity_column_is_exported_or_a_documented_non_exported_field() 
                 "created_at",       // set fresh at import (re-enrollment time)
             ],
             operational: &[],
+        },
+        // The webauthn_credentials registry (issue #65): a user's registered
+        // passkeys. Unlike a password hash, a WebAuthn credential is device-bound
+        // and NOT portable across IdP instances: the private key never leaves the
+        // authenticator, and the stored COSE public key is scoped to this
+        // deployment's RP ID, so it cannot be re-homed to another provider (an
+        // authenticator refuses to sign for a different RP ID; the user re-enrolls
+        // passkeys on the new instance). The whole credential-material set is
+        // therefore OPERATIONAL device state, not portable identity; only the
+        // scope/structural columns are derived. The covenant is honored: the
+        // portable identity (the user, the password hash) round-trips; the
+        // non-portable device keys are documented as such here and in
+        // docs/exit-guide.md.
+        TableCoverage {
+            table: "webauthn_credentials",
+            exported: &[],
+            derived: &[
+                "id",              // a `pky_` id, re-minted per target scope
+                "tenant_id",       // the target scope
+                "environment_id",  // the target scope
+                "subject",         // would re-link to the imported user's fresh usr_ id
+                "pii_dek_version", // the nickname would re-seal under the target DEK
+            ],
+            operational: &[
+                "credential_id",   // device-bound authenticator credential id
+                "cose_public_key", // RP-ID-scoped public key; not re-homable
+                "sign_count",      // per-authenticator clone-detection counter
+                "aaguid",          // authenticator model id
+                "transports",      // last-observed client transports
+                "backup_eligible", // BE flag, a property of the authenticator
+                "backup_state",    // BS flag, live device state
+                "discoverable",    // credProps.rk, a property of the credential
+                "clone_detected",  // a security overlay on the live credential
+                "nickname_sealed", // the user label of a non-portable device key
+                "created_at",      // registration time on this instance
+                "last_used_at",    // live usage state
+            ],
         },
     ];
 

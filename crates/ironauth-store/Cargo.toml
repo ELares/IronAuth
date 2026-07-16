@@ -397,6 +397,17 @@ name = "self_service_account"
 path = "tests/self_service_account.rs"
 required-features = ["testing"]
 
+# WebAuthn passkey persistence (issue #65): a verified registration round-trips
+# with the COSE public key stored verbatim and the nickname sealed; the same
+# credential id cannot be registered twice (the database dedupe); an assertion
+# advances the sign counter, and a regression flags a clone with an audit row; a
+# challenge is single-use; a cross-subject credential is the uniform not-found.
+# Needs a real database (DATABASE_URL).
+[[test]]
+name = "webauthn_credentials"
+path = "tests/webauthn_credentials.rs"
+required-features = ["testing"]
+
 # Flexible identifiers on the central canonicalization seam (issue #54): the
 # canonicalization-mismatch CVE class fails to reproduce (Unicode invisibles,
 # mixed case, and fullwidth homoglyphs resolve identically across resolution and

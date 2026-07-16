@@ -6,6 +6,20 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- WebAuthn ceremony signature verification (issue #65), a new public `webauthn`
+  module. A FIDO2 ceremony signature is not a JWS: the signed message is
+  `authenticatorData || SHA-256(clientDataJSON)`, the ECDSA signature is ASN.1
+  DER (not the fixed `r||s` a JWS carries), and the public key is a COSE key. So
+  the JWS `verify` path cannot be reused. This module lives here for the same
+  structural reason as `envelope`: `scripts/jose-audit.sh` lets exactly one crate
+  name `ring::signature`. It exposes `WebauthnKey` (the ES256 / EdDSA / RS256
+  public-key material, never secret) and `verify_webauthn_signature`, which uses
+  ring's `ECDSA_P256_SHA256_ASN1` (DER), `ED25519`, and `RSA_PKCS1_2048_8192_SHA256`
+  verifiers. `ironauth-webauthn` owns all CBOR/COSE/authenticator-data parsing and
+  hands already-parsed key material plus the signed message here for the one
+  cryptographic check. Failures collapse to the opaque `WebauthnSignatureError`,
+  keeping the no-oracle stance of the rest of the crate.
+
 - Envelope-encryption AEAD primitive (issue #48), a new `envelope` module. The
   DEK/KEK envelope scheme for per-tenant PII and secret encryption at rest lives
   here because the workspace lets exactly one crate name `ring` directly
