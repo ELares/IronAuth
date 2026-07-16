@@ -1626,16 +1626,17 @@ impl Config {
 /// [`Config::validate`] so each stays within the readable-length lint.
 ///
 /// The breaker and timeout bounds are enforced ALWAYS (they have safe defaults in
-/// range); the endpoint constraint (present and https) is enforced only when the hook
-/// is `enabled`, so a disabled hook with no endpoint is a valid, inert configuration.
-/// Requiring https at config load is defense in depth: the SSRF-hardened fetcher also
-/// refuses a plaintext target at call time, but failing fast at startup is clearer.
+/// range); the endpoint constraint (present and a well-formed absolute https URL) is
+/// enforced only when the hook is `enabled`, so a disabled hook with no endpoint is a
+/// valid, inert configuration. Validating the URL at config load is defense in depth: the
+/// SSRF-hardened fetcher also refuses a plaintext target at call time, but a malformed
+/// endpoint that would silently fail every login is caught at startup instead.
 ///
 /// # Errors
 ///
-/// [`ConfigError::Invalid`] if the hook is enabled without an https endpoint, the
-/// timeout is zero or above [`OIDC_MAX_LAZY_MIGRATION_TIMEOUT_SECS`], or a breaker
-/// bound is zero.
+/// [`ConfigError::Invalid`] if the hook is enabled without a well-formed absolute https
+/// endpoint, the timeout is zero or above [`OIDC_MAX_LAZY_MIGRATION_TIMEOUT_SECS`], or a
+/// breaker bound is zero.
 fn validate_lazy_migration(oidc: &OidcConfig) -> Result<(), ConfigError> {
     let hook = &oidc.lazy_migration;
     if hook.enabled {
@@ -1647,10 +1648,14 @@ fn validate_lazy_migration(oidc: &OidcConfig) -> Result<(), ConfigError> {
                         .to_owned(),
                 });
             }
-            Some(endpoint) if !endpoint.starts_with("https://") => {
+            Some(endpoint) if !is_well_formed_https_endpoint(endpoint) => {
+                // A malformed-but-https endpoint (`https://`, an embedded space, an
+                // unterminated `[` host) must fail at LOAD, not silently fail every
+                // unknown-identifier login at runtime and trip the breaker (criterion 6).
                 return Err(ConfigError::Invalid {
-                    message: "oidc.lazy_migration.endpoint must be an https URL (a plaintext \
-                              http target is refused; the hook rides the SSRF-hardened fetcher)"
+                    message: "oidc.lazy_migration.endpoint must be a well-formed absolute \
+                              https URL with a host (a plaintext http target or a malformed \
+                              URL is refused; the hook rides the SSRF-hardened fetcher)"
                         .to_owned(),
                 });
             }
@@ -1688,6 +1693,29 @@ fn validate_lazy_migration(oidc: &OidcConfig) -> Result<(), ConfigError> {
         });
     }
     Ok(())
+}
+
+/// Whether `endpoint` is a well-formed absolute https URL with a non-empty host and no
+/// userinfo: the syntactic gate the lazy-migration endpoint must pass at config LOAD.
+///
+/// Parsing catches the structurally broken cases the old `starts_with("https://")` check
+/// let through (`https://` with no host, `https://exa mple.test/verify` with an embedded
+/// space, `https://[not-an-ip/verify` with an unterminated IPv6 literal), so a malformed
+/// endpoint is a clear load error rather than a silent per-login failure at runtime. This
+/// is purely syntactic: it never resolves DNS or touches the network (the SSRF-hardened
+/// fetcher still applies its address policy at call time).
+fn is_well_formed_https_endpoint(endpoint: &str) -> bool {
+    // Whitespace and control characters are never valid in a URL; reject them up front so
+    // an embedded space cannot slip through a lenient parse.
+    if endpoint.contains(|c: char| c.is_whitespace() || c.is_control()) {
+        return false;
+    }
+    http::Uri::try_from(endpoint).is_ok_and(|uri| {
+        uri.scheme_str() == Some("https")
+            && uri.host().is_some_and(|host| !host.is_empty())
+            // Userinfo (`user:pass@host`) would smuggle a credential into the URL; refuse it.
+            && uri.authority().is_some_and(|authority| !authority.as_str().contains('@'))
+    })
 }
 
 /// Validate the quota fairness settings (issue #50), kept out of
@@ -2780,6 +2808,34 @@ mod tests {
         // Guards the expect() in DatabaseConfig::default.
         let config = DatabaseConfig::default();
         assert_eq!(config.url.scheme(), "postgres");
+    }
+
+    #[test]
+    fn lazy_migration_rejects_a_malformed_https_endpoint_at_load() {
+        // A well-formed absolute https endpoint loads cleanly.
+        let ok = "[oidc.lazy_migration]\nenabled = true\n\
+                  endpoint = \"https://legacy.example.test/verify\"\n";
+        Config::from_toml_str(ok, "<inline>").expect("a well-formed https endpoint loads");
+
+        // Every malformed endpoint is a LOAD error (criterion 6), not a silent per-login
+        // failure at runtime that also trips the breaker. The old `starts_with("https://")`
+        // check let the first three through.
+        for bad in [
+            "https://",                          // no host
+            "https://exa mple.test/verify",      // embedded space
+            "https://[not-an-ip/verify",         // unterminated IPv6 literal
+            "http://legacy.example.test/verify", // plaintext (still refused)
+            "ftp://legacy.example.test/verify",  // wrong scheme
+            "https://user:pass@legacy.test/v",   // userinfo smuggled into the URL
+        ] {
+            let input = format!("[oidc.lazy_migration]\nenabled = true\nendpoint = \"{bad}\"\n");
+            let err = Config::from_toml_str(&input, "<inline>")
+                .expect_err(&format!("{bad} must be a load error"));
+            assert!(
+                err.to_string().contains("well-formed absolute"),
+                "{bad}: unexpected error {err}"
+            );
+        }
     }
 
     #[test]

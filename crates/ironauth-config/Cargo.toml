@@ -12,6 +12,9 @@ repository.workspace = true
 serde.workspace = true
 toml.workspace = true
 schemars.workspace = true
+# Only for syntactic URL validation of the lazy-migration endpoint at config load
+# (a malformed https URL must be a LOAD error, not a silent per-login failure).
+http.workspace = true
 
 [dev-dependencies]
 # Only the schema-printing example and the schema-shape tests need JSON

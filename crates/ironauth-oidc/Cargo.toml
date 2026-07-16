@@ -61,6 +61,10 @@ tracing.workspace = true
 # recorder). Meters authorization-code reuse and redeem faults so a dropped
 # revoke or a burst of reuse is visible in aggregate, not just per-request logs.
 metrics.workspace = true
+# `tokio::time::timeout` bounds the lazy-migration verifier in the orchestrator (issue #56),
+# so a verifier that does not self-bound (a future non-webhook impl) cannot stall the login
+# path. Only the `time` feature is needed in the library; the server provides the runtime.
+tokio = { workspace = true, features = ["time"] }
 
 [features]
 default = []

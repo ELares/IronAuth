@@ -11,9 +11,11 @@
 use std::future::Future;
 use std::net::IpAddr;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
+
+use tokio::sync::{Notify, Semaphore};
 
 use ironauth_env::{Clock, ManualClock};
 use ironauth_fetch::{FetchLimits, Fetcher, RecordingDialer, StaticResolver};
@@ -98,6 +100,9 @@ fn hook_with_stub(
         Arc::clone(&verifier) as Arc<dyn CredentialVerifier>,
         breaker,
         Arc::clone(&clock) as Arc<dyn Clock>,
+        // A generous orchestrator timeout: these tests exercise verdict handling and the
+        // breaker, not the timeout bound (that is `the_orchestrator_timeout_bounds...`).
+        Duration::from_secs(3600),
     );
     (hook, verifier, clock)
 }
@@ -105,14 +110,13 @@ fn hook_with_stub(
 #[tokio::test]
 async fn a_verified_credential_returns_the_profile() {
     let profile = HookProfile {
-        claims: Some(serde_json::json!({"email": "u@example.test"})),
-        traits: None,
+        traits: Some(serde_json::json!({"email": "u@example.test"})),
     };
     let (hook, verifier, _clock) = hook_with_stub(Stub::Verified(Some(profile)), 3, 30, 30);
     match hook.attempt("u@example.test", "pw").await {
         HookOutcome::Verified(Some(profile)) => {
             assert_eq!(
-                profile.claims.expect("claims")["email"],
+                profile.traits.expect("traits")["email"],
                 serde_json::json!("u@example.test")
             );
         }
@@ -275,4 +279,181 @@ async fn migration_metrics_are_present_in_the_exposition() {
     ] {
         assert!(text.contains(name), "metric {name} missing from:\n{text}");
     }
+}
+
+/// A verifier whose calls can be made to FAIL (to trip the breaker) or to BLOCK until the
+/// test releases them (to hold a half-open trial in flight, or to be bounded by the
+/// orchestrator timeout). It counts every entry, so a test can assert exactly how many
+/// outbound calls a burst produced.
+struct GatingVerifier {
+    calls: AtomicUsize,
+    /// 0 = fail immediately with a timeout error; 1 = block on `gate` until released.
+    mode: AtomicU8,
+    /// Signaled once a BLOCK-mode call has entered and taken the trial (so the test knows
+    /// the single probe is in flight before it inspects the losers).
+    entered: Notify,
+    /// A BLOCK-mode call waits here; it never proceeds unless the test adds a permit.
+    gate: Semaphore,
+}
+
+impl GatingVerifier {
+    fn new() -> Self {
+        Self {
+            calls: AtomicUsize::new(0),
+            mode: AtomicU8::new(0),
+            entered: Notify::new(),
+            gate: Semaphore::new(0),
+        }
+    }
+
+    fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+
+    fn set_block(&self) {
+        self.mode.store(1, Ordering::SeqCst);
+    }
+}
+
+impl CredentialVerifier for GatingVerifier {
+    fn verify<'a>(
+        &'a self,
+        _identifier: &'a str,
+        _credential: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<HookVerdict, HookError>> + Send + 'a>> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let mode = self.mode.load(Ordering::SeqCst);
+        Box::pin(async move {
+            if mode == 0 {
+                return Err(HookError::Timeout);
+            }
+            // Block-mode: announce we hold the trial, then wait to be released (which the
+            // burst test never does; it aborts us) or to be cancelled by the orchestrator
+            // timeout.
+            self.entered.notify_one();
+            let _permit = self.gate.acquire().await.expect("semaphore open");
+            Ok(HookVerdict::Verified(None))
+        })
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_half_open_burst_fires_exactly_one_outbound_trial() {
+    // The half-open probe is admitted ONCE, not once per concurrent login. Trip the breaker
+    // (threshold 1), let the cooldown elapse, then fire a burst of 16 concurrent attempts
+    // while the single trial is held in flight: exactly ONE reaches the backend; the other
+    // 15 fail fast without an outbound call.
+    let verifier = Arc::new(GatingVerifier::new());
+    let clock = Arc::new(ManualClock::new(SystemTime::UNIX_EPOCH));
+    let breaker = CircuitBreaker::new(
+        Arc::clone(&clock) as Arc<dyn Clock>,
+        1,
+        Duration::from_secs(30),
+        Duration::from_secs(30),
+    );
+    let hook = Arc::new(LazyMigrationHook::new(
+        Arc::clone(&verifier) as Arc<dyn CredentialVerifier>,
+        breaker,
+        Arc::clone(&clock) as Arc<dyn Clock>,
+        // A large orchestrator timeout so it never fires here (this test is about the
+        // breaker's one-trial gate, not the timeout).
+        Duration::from_secs(3600),
+    ));
+
+    // 1. A single failure opens the breaker (fail mode).
+    assert!(matches!(
+        hook.attempt("u@example.test", "pw").await,
+        HookOutcome::Unavailable
+    ));
+    assert_eq!(hook.breaker_state(), BreakerState::Open);
+    assert_eq!(
+        verifier.calls(),
+        1,
+        "one outbound so far (the failing call)"
+    );
+
+    // 2. Cooldown elapses; the next attempt would half-open. Switch to block mode so the
+    //    single trial stays in flight while the burst races the breaker.
+    clock.advance(Duration::from_secs(30));
+    verifier.set_block();
+
+    // 3. Fire 16 concurrent attempts. Exactly one wins the trial and blocks; the rest see a
+    //    trial in progress and fail fast.
+    let n = 16;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut handles = Vec::new();
+    for _ in 0..n {
+        let hook = Arc::clone(&hook);
+        let tx = tx.clone();
+        handles.push(tokio::spawn(async move {
+            let outcome = hook.attempt("u@example.test", "pw").await;
+            // Only the fast-failers report; the single winner blocks and never sends.
+            if matches!(outcome, HookOutcome::Unavailable) {
+                let _ = tx.send(());
+            }
+        }));
+    }
+    drop(tx);
+
+    // Wait until the winner is inside the backend holding the trial.
+    verifier.entered.notified().await;
+
+    // Exactly n-1 attempts fast-fail without an outbound call.
+    for _ in 0..(n - 1) {
+        rx.recv().await.expect("a fast-failed attempt");
+    }
+    assert_eq!(
+        verifier.calls(),
+        2,
+        "exactly ONE outbound trial under the burst (plus the earlier failing call)"
+    );
+    assert_eq!(hook.breaker_state(), BreakerState::HalfOpen);
+
+    // The winner is parked on the gate forever; abort it (and any stragglers).
+    for handle in handles {
+        handle.abort();
+    }
+}
+
+#[tokio::test]
+async fn the_orchestrator_timeout_bounds_a_verifier_that_does_not_self_bound() {
+    // The shipped WebhookVerifier self-bounds via the fetcher, but the CredentialVerifier
+    // trait admits a future impl (an M11 WASM verifier) that does not. The orchestrator
+    // wraps the call in the configured timeout, so such a verifier cannot stall the login:
+    // a block-forever verify is bounded and counted as a failure toward the breaker.
+    let verifier = Arc::new(GatingVerifier::new());
+    verifier.set_block();
+    let clock = Arc::new(ManualClock::new(SystemTime::UNIX_EPOCH));
+    let breaker = CircuitBreaker::new(
+        Arc::clone(&clock) as Arc<dyn Clock>,
+        1,
+        Duration::from_secs(30),
+        Duration::from_secs(30),
+    );
+    let hook = LazyMigrationHook::new(
+        Arc::clone(&verifier) as Arc<dyn CredentialVerifier>,
+        breaker,
+        Arc::clone(&clock) as Arc<dyn Clock>,
+        // A short real-time orchestrator bound; the verifier would otherwise block forever.
+        Duration::from_millis(100),
+    );
+
+    // Bound the whole attempt with a generous 5s tokio timeout: if the orchestrator did NOT
+    // enforce its own 100ms timeout, the block-forever verifier would hang and this outer
+    // timeout would fire (an `Err`), failing the test. That it resolves proves the
+    // orchestrator bounded the non-self-bounding verifier well within the outer bound.
+    let outcome = tokio::time::timeout(Duration::from_secs(5), hook.attempt("u@example.test", "pw"))
+        .await
+        .expect("the orchestrator bounds the verifier; the attempt must not hang");
+
+    assert!(
+        matches!(outcome, HookOutcome::Unavailable),
+        "a non-self-bounding verifier is bounded to the uniform failure"
+    );
+    assert_eq!(verifier.calls(), 1, "the verifier was entered exactly once");
+    assert_eq!(
+        hook.breaker_state(),
+        BreakerState::Open,
+        "an orchestrator timeout counts as a failure toward the breaker"
+    );
 }

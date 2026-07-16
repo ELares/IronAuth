@@ -66,6 +66,7 @@ fn operation_ids_are_the_stable_set() {
             "getEnvironment",
             "getInvitation",
             "getManagementKey",
+            "getMigrationProgress",
             "getOperator",
             "getOrganization",
             "getRefreshFamily",

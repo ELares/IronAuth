@@ -263,17 +263,17 @@ async fn complete_lazy_migration(
         return None;
     };
 
-    // Resolve and VALIDATE the optional profile BEFORE persisting anything. The claim
-    // document is stored verbatim (standard OIDC claims, not schema governed); the traits
-    // document is validated against the environment's active identity schema (issue #53),
-    // and an INVALID traits document refuses the whole migration (nothing is persisted).
-    let mut claims_json: Option<String> = None;
+    // Resolve and VALIDATE the optional profile BEFORE persisting anything. The migration
+    // profile's ONLY identity channel is the traits document, validated against the
+    // environment's active identity schema (issue #53); an INVALID traits document refuses
+    // the whole migration (nothing is persisted). There is deliberately NO verbatim-claims
+    // channel: a hostile or compromised legacy store must not be able to inject an
+    // attacker-controlled email/email_verified/groups claim that an RP would trust. The
+    // created user's released claims come from the normal claim path, exactly like any
+    // other user; the hook never writes `claims_json`.
     let mut traits_json: Option<String> = None;
     let mut traits_schema_version: Option<i32> = None;
     if let Some(profile) = &profile {
-        if let Some(claims) = profile.claims.as_ref().filter(|value| value.is_object()) {
-            claims_json = serde_json::to_string(claims).ok();
-        }
         if let Some(traits) = &profile.traits {
             match state.store().scoped(scope).trait_schemas().active().await {
                 // An active schema is the validation contract: an invalid profile is
@@ -304,7 +304,9 @@ async fn complete_lazy_migration(
         id: Some(&id),
         identifier,
         password_hash: Some(&new_hash),
-        claims_json: claims_json.as_deref(),
+        // No verbatim claims from the hook: a migrated user's claims come from the normal
+        // path, so a legacy store cannot inject an RP-trusted claim (see the traits note).
+        claims_json: None,
         external_id: None,
         // A migrated user is live and can authenticate immediately.
         state: UserState::Active,

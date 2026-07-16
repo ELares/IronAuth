@@ -1030,6 +1030,25 @@ impl Harness {
             .to_string()
     }
 
+    /// Create and ACTIVATE a trait schema (issue #53) for the harness scope, so a test can
+    /// drive the login path's profile validation against a live active schema. Activation
+    /// is clean when no seeded identity's traits violate the target (the cutover rule), so
+    /// seed users AFTER this, or seed traits that satisfy it.
+    pub async fn seed_active_trait_schema(&self, schema_json: &str) {
+        let (actor, corr) = self.seeding_actor();
+        let acting = self.store().scoped(self.scope).acting(actor, corr);
+        let (_, version) = acting
+            .trait_schemas()
+            .create_version(&self.env, schema_json, 0)
+            .await
+            .expect("create trait schema");
+        acting
+            .trait_schemas()
+            .activate_version(&self.env, version)
+            .await
+            .expect("activate trait schema");
+    }
+
     /// Seed a fresh user with a unique identifier (drawn from the deterministic
     /// entropy stream, which advances per call) and return its subject.
     pub async fn seed_unique_user(&self) -> String {

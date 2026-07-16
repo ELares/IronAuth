@@ -36,8 +36,11 @@
 //! login for long. Three mechanisms bound the blast radius, all configurable with safe
 //! defaults ([`ironauth_config::LazyMigrationConfig`]):
 //!
-//! - **Per-call timeout.** The fetcher aborts a call that exceeds
-//!   `timeout_secs`; there is no retry in the login path (one call, then a verdict).
+//! - **Per-call timeout.** The fetcher aborts a call that exceeds `timeout_secs`, and the
+//!   orchestrator ([`LazyMigrationHook::attempt`]) ALSO wraps the verifier in the same
+//!   bound, so a verifier that does not self-bound (a future non-webhook impl) still cannot
+//!   stall the login; there is no retry in the login path (one call, then a verdict). An
+//!   elapsed timeout counts as a failure toward the breaker.
 //! - **Circuit breaker.** [`CircuitBreaker`] opens when `breaker_failure_threshold`
 //!   ERRORS or TIMEOUTS occur within `breaker_window_secs`. A verdict (verified OR
 //!   rejected) is a HEALTHY response and never trips the breaker; only transport errors
@@ -54,6 +57,25 @@
 //!   uses for blocked destinations.
 //!
 //! Nothing in this module ever logs the identifier, the credential, or a profile.
+//!
+//! # Accepted timing residual (migration-window only)
+//!
+//! While the hook is armed, an unknown-local identifier takes the outbound-call path
+//! (a network round trip) that an already-local wrong-password login does not, so an
+//! attacker who can measure response time can distinguish an identifier that is ALREADY
+//! migrated/local (fast) from one that is still unknown-local (slow, hits the hook). This
+//! is an ACCEPTED, characterized residual, not a defect:
+//!
+//! - It reveals migration STATUS only, never credentials and never whether the identifier
+//!   exists in the legacy store: a hook `Rejected` and a hook `Unavailable` both fall
+//!   through to the same uniform failure the local wrong-password path produces, spending
+//!   the same `verify_absent` work, so no verdict content leaks.
+//! - It is bounded to the migration window: once the tail is drained and the hook is
+//!   disabled per environment, the extra path is gone.
+//! - It matches how Auth0 custom-database and Cognito `UserMigration` lazy migration
+//!   behave; fully hiding a synchronous network call would require padding EVERY failed
+//!   login to the hook timeout, a large latency tax on every user for a status-only
+//!   signal. We deliberately do NOT add response-time padding.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -108,21 +130,22 @@ pub fn describe_metrics() {
 }
 
 /// The optional profile a verifier returns alongside a positive verdict: the user's
-/// standard OIDC claims and identity-traits documents, so the migration seeds the full
-/// identity, not merely the credential. Deliberately carries no `Debug`: claims and
-/// traits are PII.
+/// identity-traits document, so the migration seeds the identity, not merely the
+/// credential. Deliberately carries no `Debug`: traits are PII.
 ///
-/// The traits document is VALIDATED against the environment's active identity schema
-/// (issue #53) by the login path before anything is persisted; an invalid profile is
-/// refused and nothing is written. Additional login identifiers a legacy store might
-/// return are out of scope for this issue: the submitted login handle becomes the
-/// user's canonical identifier, and the flexible-identifier (#54) fan-out from a
-/// migration profile is left to a later change.
+/// The traits document is the ONLY channel a legacy store seeds identity through, and it
+/// is VALIDATED against the environment's active identity schema (issue #53) by the login
+/// path before anything is persisted; an invalid profile is refused and nothing is
+/// written. There is deliberately NO verbatim-claims channel: issue #56's profile spec is
+/// "traits, identifiers ... validated against the active identity schema", so a hostile or
+/// compromised legacy store cannot inject an attacker-controlled `email`/`email_verified`
+/// or `groups`/`roles` claim that an RP would trust. The created user's released claims
+/// come from the normal claim path, exactly like any other user. Additional login
+/// identifiers a legacy store might return are out of scope for this issue: the submitted
+/// login handle becomes the user's canonical identifier, and the flexible-identifier (#54)
+/// fan-out from a migration profile is left to a later change.
 #[derive(Clone, Default)]
 pub struct HookProfile {
-    /// The user's OIDC standard-claim document, or `None` when the legacy store returns
-    /// none. Persisted verbatim as the new user's claim document.
-    pub claims: Option<serde_json::Value>,
     /// The user's identity-traits document, or `None`. Validated against the active
     /// trait schema before the user is created; an invalid document refuses the whole
     /// migration.
@@ -203,11 +226,12 @@ struct WebhookVerdict {
     profile: Option<WebhookProfile>,
 }
 
-/// The profile half of a webhook verdict body.
+/// The profile half of a webhook verdict body. A legacy store MAY send extra fields
+/// (including a `claims` object): they are IGNORED, not persisted. The only channel that
+/// seeds identity is the schema-validated `traits` document, so a hostile store cannot
+/// inject an attacker-controlled claim that flows to an RP.
 #[derive(Deserialize)]
 struct WebhookProfile {
-    #[serde(default)]
-    claims: Option<serde_json::Value>,
     #[serde(default)]
     traits: Option<serde_json::Value>,
 }
@@ -307,7 +331,6 @@ impl CredentialVerifier for WebhookVerifier {
             };
             if verdict.verified {
                 let profile = verdict.profile.map(|profile| HookProfile {
-                    claims: profile.claims,
                     traits: profile.traits,
                 });
                 Ok(HookVerdict::Verified(profile))
@@ -359,6 +382,11 @@ struct BreakerInner {
     failures: Vec<Instant>,
     /// When the breaker last opened (for the cooldown), on the monotonic clock.
     opened_at: Option<Instant>,
+    /// Whether a HALF-OPEN trial call is currently outstanding. While it is, the breaker
+    /// admits NO further calls: exactly one probe is in flight at a time, so a burst of
+    /// concurrent logins after the cooldown does not stampede a still-dead backend. Reset
+    /// on every transition out of half-open (success closes, failure re-opens).
+    trial_in_progress: bool,
 }
 
 /// An in-memory, per-node circuit breaker for the lazy-migration hook (issue #56).
@@ -406,13 +434,19 @@ impl CircuitBreaker {
                 state: BreakerState::Closed,
                 failures: Vec::new(),
                 opened_at: None,
+                trial_in_progress: false,
             }),
         }
     }
 
     /// Whether a call may proceed to the verifier. When the breaker is OPEN and the
-    /// cooldown has elapsed, this transitions it to HALF-OPEN and permits the trial call;
-    /// while still cooling down it returns `false` (the caller fails fast, uniform).
+    /// cooldown has elapsed, this transitions it to HALF-OPEN and admits ONE trial call;
+    /// while still cooling down it returns `false` (the caller fails fast, uniform). In
+    /// HALF-OPEN it admits exactly one outstanding trial at a time: a further caller while
+    /// that trial is in flight fails fast (as if still open), so a concurrent burst after
+    /// the cooldown produces a single probe, not a stampede against a possibly-dead
+    /// backend. The trial resolves through [`record_success`](Self::record_success) (close)
+    /// or [`record_failure`](Self::record_failure) (re-open).
     ///
     /// # Panics
     ///
@@ -423,13 +457,25 @@ impl CircuitBreaker {
         let now = self.clock.monotonic();
         let mut inner = self.inner.lock().expect("breaker lock poisoned");
         match inner.state {
-            BreakerState::Closed | BreakerState::HalfOpen => true,
+            BreakerState::Closed => true,
+            BreakerState::HalfOpen => {
+                // A trial is already outstanding: admit no second concurrent probe.
+                if inner.trial_in_progress {
+                    false
+                } else {
+                    inner.trial_in_progress = true;
+                    true
+                }
+            }
             BreakerState::Open => {
                 let elapsed = inner
                     .opened_at
                     .map(|opened| now.saturating_duration_since(opened));
                 if elapsed.is_some_and(|elapsed| elapsed >= self.cooldown) {
                     Self::transition(&mut inner, BreakerState::HalfOpen);
+                    // This caller takes the single trial slot; concurrent callers that now
+                    // see HalfOpen with a trial in progress fail fast until it resolves.
+                    inner.trial_in_progress = true;
                     true
                 } else {
                     false
@@ -447,6 +493,8 @@ impl CircuitBreaker {
     pub fn record_success(&self) {
         let mut inner = self.inner.lock().expect("breaker lock poisoned");
         inner.failures.clear();
+        // The trial (if any) resolved; free the slot regardless of the prior state.
+        inner.trial_in_progress = false;
         if inner.state != BreakerState::Closed {
             inner.opened_at = None;
             Self::transition(&mut inner, BreakerState::Closed);
@@ -471,6 +519,8 @@ impl CircuitBreaker {
         match inner.state {
             BreakerState::HalfOpen => {
                 inner.opened_at = Some(now);
+                // The trial failed and resolved; free the slot and cool down again.
+                inner.trial_in_progress = false;
                 Self::transition(&mut inner, BreakerState::Open);
             }
             BreakerState::Closed => {
@@ -533,6 +583,12 @@ pub struct LazyMigrationHook {
     verifier: Arc<dyn CredentialVerifier>,
     breaker: CircuitBreaker,
     clock: Arc<dyn Clock>,
+    /// The per-call wall-clock bound the orchestrator enforces around the verifier, so a
+    /// verifier that does not self-bound its work cannot stall the login path. The shipped
+    /// [`WebhookVerifier`] already self-bounds via the fetcher deadline; this is
+    /// defense-in-depth for an alternative [`CredentialVerifier`] (for example the M11 WASM
+    /// engine). A timeout is a FAILURE toward the breaker, exactly like a transport error.
+    timeout: Duration,
 }
 
 impl std::fmt::Debug for LazyMigrationHook {
@@ -544,18 +600,22 @@ impl std::fmt::Debug for LazyMigrationHook {
 }
 
 impl LazyMigrationHook {
-    /// Assemble a hook from a verifier, a breaker, and the clock seam (for the latency
-    /// measurement).
+    /// Assemble a hook from a verifier, a breaker, the clock seam (for the latency
+    /// measurement), and the per-call `timeout` the orchestrator enforces around the
+    /// verifier (defense-in-depth for a verifier that does not self-bound). `timeout` is
+    /// clamped to at least one second.
     #[must_use]
     pub fn new(
         verifier: Arc<dyn CredentialVerifier>,
         breaker: CircuitBreaker,
         clock: Arc<dyn Clock>,
+        timeout: Duration,
     ) -> Self {
         Self {
             verifier,
             breaker,
             clock,
+            timeout: timeout.max(Duration::from_secs(1)),
         }
     }
 
@@ -572,7 +632,20 @@ impl LazyMigrationHook {
             return HookOutcome::Unavailable;
         }
         let start = self.clock.monotonic();
-        let result = self.verifier.verify(identifier, credential).await;
+        // Bound the verifier with the configured per-call timeout. The shipped
+        // WebhookVerifier already self-bounds via the fetcher deadline, so this never fires
+        // in production; it is defense-in-depth for an alternative verifier (an M11 WASM
+        // impl) that does not self-bound, so it cannot stall the login path. A tokio I/O
+        // timeout is the sanctioned bounded-wait here (the invariant-lint bans only raw
+        // SystemTime/Instant, not tokio::time). An elapsed timeout is a FAILURE toward the
+        // breaker, exactly like the fetcher's own timeout.
+        let result =
+            match tokio::time::timeout(self.timeout, self.verifier.verify(identifier, credential))
+                .await
+            {
+                Ok(result) => result,
+                Err(_elapsed) => Err(HookError::Timeout),
+            };
         let elapsed = self.clock.monotonic().saturating_duration_since(start);
         metrics::histogram!(LAZY_MIGRATION_HOOK_LATENCY_SECONDS).record(elapsed.as_secs_f64());
         match result {
@@ -655,8 +728,9 @@ pub fn build_from_config(
         },
         None => None,
     };
+    let timeout = Duration::from_secs(config.timeout_secs.max(1));
     let limits = FetchLimits {
-        total_timeout: Duration::from_secs(config.timeout_secs.max(1)),
+        total_timeout: timeout,
         ..FetchLimits::default()
     };
     let fetcher = match Fetcher::new(limits) {
@@ -680,6 +754,7 @@ pub fn build_from_config(
         verifier,
         breaker,
         env.clock_arc(),
+        timeout,
     )))
 }
 
@@ -764,6 +839,57 @@ mod tests {
         assert_eq!(b.state(), BreakerState::HalfOpen);
         b.record_success();
         assert_eq!(b.state(), BreakerState::Closed, "a trial success closes it");
+    }
+
+    #[test]
+    fn half_open_admits_only_one_trial_at_a_time() {
+        // After the cooldown, the FIRST caller takes the single trial slot; every further
+        // caller while that trial is outstanding fails fast (as if still open), so a burst
+        // of concurrent logins produces ONE probe, not a stampede at a possibly-dead
+        // backend. Sequential calls model the burst deterministically: each is a caller
+        // that observes the breaker before the trial resolves.
+        let clock = Arc::new(ManualClock::new(SystemTime::UNIX_EPOCH));
+        let b = breaker(Arc::clone(&clock), 1, 30, 30);
+        b.record_failure();
+        assert_eq!(b.state(), BreakerState::Open);
+        clock.advance(Duration::from_secs(30));
+
+        assert!(b.allow(), "the first caller after cooldown gets the trial");
+        assert_eq!(b.state(), BreakerState::HalfOpen);
+        // A burst of 15 further callers while the trial is still in flight all fail fast.
+        for _ in 0..15 {
+            assert!(
+                !b.allow(),
+                "a concurrent caller must NOT get a second trial while one is outstanding"
+            );
+        }
+        assert_eq!(
+            b.state(),
+            BreakerState::HalfOpen,
+            "still trialing the one probe"
+        );
+
+        // Once the single trial resolves with a success, normal flow resumes.
+        b.record_success();
+        assert_eq!(b.state(), BreakerState::Closed);
+        assert!(b.allow(), "a closed breaker admits calls again");
+    }
+
+    #[test]
+    fn half_open_readmits_a_trial_after_a_failed_one_re_cools_down() {
+        // A failed trial re-opens and re-cools; only after the NEXT cooldown does a single
+        // fresh trial become available again (never a burst).
+        let clock = Arc::new(ManualClock::new(SystemTime::UNIX_EPOCH));
+        let b = breaker(Arc::clone(&clock), 1, 30, 30);
+        b.record_failure();
+        clock.advance(Duration::from_secs(30));
+        assert!(b.allow(), "first trial");
+        assert!(!b.allow(), "no second concurrent trial");
+        b.record_failure();
+        assert_eq!(b.state(), BreakerState::Open);
+        clock.advance(Duration::from_secs(30));
+        assert!(b.allow(), "a fresh single trial after the next cooldown");
+        assert!(!b.allow(), "still only one at a time");
     }
 
     #[test]

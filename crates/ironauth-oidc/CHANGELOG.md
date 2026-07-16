@@ -28,6 +28,28 @@ range per docs/RELEASING.md.
   the M11 WASM hooks engine can slot a WASM verifier in behind the same trait. A standard
   #55 bulk import closes the tail of stragglers, after which the hook is disabled per
   environment (a pure config change).
+- Lazy-migration hook hardening (issue #56, adversarial review):
+  - The migration profile no longer carries a verbatim `claims` channel. A hostile or
+    compromised legacy store could previously return an attacker-controlled
+    `email`/`email_verified` or `groups`/`roles` claim that was persisted verbatim and
+    released to RPs (identity spoof / privilege amplification). Issue #56 authorizes only
+    the schema-validated TRAITS channel; the created user's claims now come from the normal
+    path exactly like any other user. `HookProfile`/`WebhookProfile` drop the `claims`
+    field (a webhook that sends one has it ignored), and the login path never writes it.
+  - The circuit breaker admits exactly ONE half-open trial at a time. Previously, after the
+    cooldown a burst of concurrent logins all saw the half-open state and fired outbound at
+    a possibly-still-dead backend; a trial-in-progress flag now fast-fails the others until
+    the single probe resolves.
+  - `LazyMigrationHook::attempt` now wraps the verifier in the configured timeout, so a
+    verifier that does not self-bound (a future non-webhook impl) cannot stall the login
+    path; an elapsed timeout counts as a failure toward the breaker. The shipped
+    `WebhookVerifier` already self-bounds via the fetcher, so production behavior is
+    unchanged. `LazyMigrationHook::new` takes the per-call timeout.
+  - Documented the ACCEPTED timing residual: while the hook is armed, an unknown-local
+    identifier takes an outbound-call path that an already-local login does not, so timing
+    reveals migration STATUS (never credentials, never legacy existence). It is bounded to
+    the migration window and matches Auth0/Cognito lazy migration; we deliberately do not
+    pad response time. Failure responses remain uniform in status and body shape.
 - Exported `verify_absent` (issue #58, review): the login path's dummy-Argon2id
   primitive is now public so the management outbound verify-credential endpoint can
   reuse the exact same anti-user-enumeration work, keeping absent and wrong-password
