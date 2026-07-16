@@ -14,11 +14,14 @@ use axum::extract::{Form, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
 use ironauth_import::ForeignHash;
-use ironauth_store::{CorrelationId, Scope, UserId, UserRecord};
+use ironauth_store::{
+    CorrelationId, NewAdminUser, Scope, TraitSchema, UserId, UserRecord, UserState,
+};
 use serde::Deserialize;
 
 use crate::authn::AuthenticationEvent;
 use crate::interaction::{self, parse_resume};
+use crate::migration::{HookOutcome, HookProfile, LazyMigrationHook};
 use crate::pages;
 use crate::password;
 use crate::state::OidcState;
@@ -162,9 +165,34 @@ pub async fn login_post(
                 failed_login_page(identifier, &resume.return_to, &resume.hints, banner)
             }
         }
-        // Absent account: spend comparable Argon2id time, then the SAME generic
-        // failure (no user-enumeration oracle).
+        // Absent account: the lazy-migration hook (issue #56) gets FIRST refusal when
+        // one is configured, verifying this unknown identifier against a legacy store and
+        // (on success) creating the user locally with a native Argon2id hash so the NEXT
+        // login is a normal local login that never calls the hook. Every non-success
+        // outcome (rejected, timeout, error, breaker open, an invalid profile, a create
+        // conflict) falls through to the SAME uniform failure a local wrong password
+        // produces, including the comparable Argon2id time spend, so the hook's existence
+        // is not observable to an attacker.
         Ok(None) => {
+            if let Some(hook) = state.migration_hook() {
+                if let HookOutcome::Verified(profile) = hook.attempt(identifier, password).await {
+                    if let Some(response) = complete_lazy_migration(
+                        &state,
+                        resume.scope,
+                        identifier,
+                        password,
+                        &resume.return_to,
+                        &headers,
+                        profile,
+                    )
+                    .await
+                    {
+                        return response;
+                    }
+                }
+            }
+            // No hook, a non-success verdict, or a refused/failed create: spend comparable
+            // Argon2id time, then the SAME generic failure (no user-enumeration oracle).
             let _ = password::verify_absent(password);
             failed_login_page(identifier, &resume.return_to, &resume.hints, banner)
         }
@@ -210,6 +238,117 @@ async fn rehash_foreign_credential(
         .users()
         .upgrade_foreign_password(state.env(), subject, &new_hash)
         .await;
+}
+
+/// Land a verified lazy-migration first login (issue #56): validate the returned
+/// profile, create the user locally with a NATIVE Argon2id hash (and no foreign hash,
+/// so they are migrated by construction), audit the create, and establish the session,
+/// returning the same redirect a local success does. Returns `None` when nothing could
+/// be persisted (an invalid profile, a lost create race, or a persistence fault), in
+/// which case the caller falls through to the uniform failure and NOTHING is persisted.
+///
+/// The plaintext password is hashed here through the shared native hash path (the
+/// entropy seam) and never leaves this function; it is never logged.
+async fn complete_lazy_migration(
+    state: &OidcState,
+    scope: Scope,
+    identifier: &str,
+    password: &str,
+    return_to: &str,
+    headers: &HeaderMap,
+    profile: Option<HookProfile>,
+) -> Option<Response> {
+    // Hash the in-flight password to the native Argon2id verifier (the migration target).
+    let Ok(new_hash) = password::hash_password(state.env(), password) else {
+        return None;
+    };
+
+    // Resolve and VALIDATE the optional profile BEFORE persisting anything. The migration
+    // profile's ONLY identity channel is the traits document, validated against the
+    // environment's active identity schema (issue #53); an INVALID traits document refuses
+    // the whole migration (nothing is persisted). There is deliberately NO verbatim-claims
+    // channel: a hostile or compromised legacy store must not be able to inject an
+    // attacker-controlled email/email_verified/groups claim that an RP would trust. The
+    // created user's released claims come from the normal claim path, exactly like any
+    // other user; the hook never writes `claims_json`.
+    let mut traits_json: Option<String> = None;
+    let mut traits_schema_version: Option<i32> = None;
+    if let Some(profile) = &profile {
+        if let Some(traits) = &profile.traits {
+            match state.store().scoped(scope).trait_schemas().active().await {
+                // An active schema is the validation contract: an invalid profile is
+                // refused and nothing is persisted.
+                Ok(Some(active)) => {
+                    let schema = TraitSchema::compile(&active.schema_json).ok()?;
+                    if !schema.validate(traits).is_empty() {
+                        return None;
+                    }
+                    traits_json = serde_json::to_string(traits).ok();
+                    traits_schema_version = Some(active.version);
+                }
+                // No active schema to validate against: drop the traits rather than
+                // persist an unvalidated document. The user still migrates.
+                Ok(None) => {}
+                // Fail closed on a store fault rather than persist unvalidated traits.
+                Err(_) => return None,
+            }
+        }
+    }
+
+    // Mint the id up front so the create's audit actor is the user acting on themselves,
+    // matching the interactive login's session actor.
+    let id = UserId::generate(state.env(), &scope);
+    let actor = interaction::user_actor(&id);
+    let created_at_micros = epoch_micros(state.now());
+    let spec = NewAdminUser {
+        id: Some(&id),
+        identifier,
+        password_hash: Some(&new_hash),
+        // No verbatim claims from the hook: a migrated user's claims come from the normal
+        // path, so a legacy store cannot inject an RP-trusted claim (see the traits note).
+        claims_json: None,
+        external_id: None,
+        // A migrated user is live and can authenticate immediately.
+        state: UserState::Active,
+        // No foreign hash: the user is migrated by construction (native hash only), so
+        // the next login is a normal local login and never calls the hook.
+        foreign_password_hash: None,
+        foreign_password_algo: None,
+        traits_json: traits_json.as_deref(),
+        traits_schema_version,
+    };
+    let create = state
+        .store()
+        .scoped(scope)
+        .acting(actor, CorrelationId::generate(state.env()))
+        .users()
+        .admin_create(state.env(), spec, created_at_micros, None)
+        .await;
+    // A conflict means a concurrent login already migrated this identifier; a fault is a
+    // transient failure. Either way, fall through to the uniform failure: the user's retry
+    // finds them locally and logs in natively.
+    let Ok(user_id) = create else {
+        return None;
+    };
+    LazyMigrationHook::record_migrated();
+
+    // Establish the session exactly as a known-user success does (session-fixation
+    // defense included, via establish_session).
+    let event = AuthenticationEvent::password(epoch_micros(state.now()));
+    let subject = user_id.to_string();
+    match interaction::establish_session(
+        state,
+        scope,
+        &subject,
+        &event,
+        interaction::user_actor(&user_id),
+        headers,
+    )
+    .await
+    {
+        Ok(cookie) => Some(interaction::redirect_setting_cookie(return_to, &cookie)),
+        Err(_) => Some(interaction::server_error_page()),
+    }
 }
 
 /// Re-render the login form with a generic failure message, prefilling the

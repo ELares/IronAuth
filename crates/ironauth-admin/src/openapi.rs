@@ -80,7 +80,10 @@ use crate::views::{
                                      password hashes with their algorithm tags) in the \
                                      line-delimited import format, plus the outbound \
                                      lazy-migration credential-verification endpoint a successor \
-                                     system calls to migrate away")
+                                     system calls to migrate away"),
+        (name = "migration", description = "Inbound lazy-migration progress (issue #56): how \
+                                          far an environment's lazy migration has come and the \
+                                          node's circuit-breaker state")
     ),
     paths(
         crate::operators::list_operators,
@@ -135,6 +138,7 @@ use crate::views::{
         crate::invitations::resend_invitation,
         crate::export::export_identities,
         crate::migration::verify_credential,
+        crate::migration_status::get_migration_progress,
     ),
     components(schemas(
         ErrorBody,
@@ -193,6 +197,7 @@ use crate::views::{
         crate::migration::VerifyCredentialRequest,
         crate::migration::VerifyCredentialResponse,
         crate::migration::VerifyProfile,
+        crate::migration_status::MigrationProgressView,
     ))
 )]
 struct ApiDoc;

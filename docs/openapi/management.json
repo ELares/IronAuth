@@ -2638,6 +2638,82 @@
         ]
       }
     },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/migration/progress": {
+      "get": {
+        "tags": [
+          "migration"
+        ],
+        "summary": "Report the environment's lazy-migration progress.",
+        "operationId": "getMigrationProgress",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The environment's lazy-migration progress: the total user count, how many are on the native Argon2id verifier (migrated), how many still carry an imported foreign hash (the straggler tail a #55 bulk import closes out), and this node's circuit-breaker state. The migrated count, hook latency, error/timeout rates, and breaker state are also exported as Prometheus metrics.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MigrationProgressView"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Environment not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/v1/tenants/{tenant_id}/environments/{environment_id}/migration/verify-credential": {
       "post": {
         "tags": [
@@ -5844,6 +5920,39 @@
           }
         }
       },
+      "MigrationProgressView": {
+        "type": "object",
+        "description": "An environment's lazy-migration progress (issue #56).",
+        "required": [
+          "total_users",
+          "migrated_users",
+          "foreign_hash_remaining"
+        ],
+        "properties": {
+          "breaker_state": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "This node's lazy-migration circuit-breaker state (`closed`, `open`, or\n`half_open`), or null when no hook is installed on the node serving this request."
+          },
+          "foreign_hash_remaining": {
+            "type": "integer",
+            "format": "int64",
+            "description": "How many users still carry an imported foreign password hash (the #55 import tail\nawaiting a first-login rehash). A standard #55 bulk import closes this out, after\nwhich the hook can be disabled for the environment."
+          },
+          "migrated_users": {
+            "type": "integer",
+            "format": "int64",
+            "description": "How many users are on the native Argon2id verifier (migrated): the total minus the\nforeign-hash stragglers."
+          },
+          "total_users": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The total number of live users in the environment."
+          }
+        }
+      },
       "OperatorList": {
         "type": "object",
         "description": "A page of operators.",
@@ -6638,6 +6747,10 @@
     {
       "name": "exit",
       "description": "The exit-friendliness covenant (issue #58): the full identity export (users, traits, states, external ids, and password hashes with their algorithm tags) in the line-delimited import format, plus the outbound lazy-migration credential-verification endpoint a successor system calls to migrate away"
+    },
+    {
+      "name": "migration",
+      "description": "Inbound lazy-migration progress (issue #56): how far an environment's lazy migration has come and the node's circuit-breaker state"
     }
   ]
 }

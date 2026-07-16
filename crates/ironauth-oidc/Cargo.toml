@@ -61,6 +61,10 @@ tracing.workspace = true
 # recorder). Meters authorization-code reuse and redeem faults so a dropped
 # revoke or a burst of reuse is visible in aggregate, not just per-request logs.
 metrics.workspace = true
+# `tokio::time::timeout` bounds the lazy-migration verifier in the orchestrator (issue #56),
+# so a verifier that does not self-bound (a future non-webhook impl) cannot stall the login
+# path. Only the `time` feature is needed in the library; the server provides the runtime.
+tokio = { workspace = true, features = ["time"] }
 
 [features]
 default = []
@@ -104,6 +108,10 @@ ironauth-fetch = { workspace = true, features = ["test-harness"] }
 # tracing output of a full device flow to a buffer and asserts the device_code and
 # user_code never appear in it.
 tracing-subscriber = { workspace = true, features = ["fmt", "std"] }
+# The lazy-migration metrics-presence test (issue #56) installs a Prometheus recorder,
+# drives the hook, and asserts the migrated counter, breaker gauge, and latency
+# histogram appear in the rendered exposition text.
+metrics-exporter-prometheus = { workspace = true }
 
 # Structural exclusion of forbidden flows: the grant-type, response-type, and
 # PKCE-method registries cannot express ROPC, authorization-endpoint access
@@ -492,6 +500,25 @@ required-features = ["testing"]
 [[test]]
 name = "quota"
 path = "tests/quota.rs"
+required-features = ["testing"]
+
+# The inbound lazy-migration hook against a STUB verifier (issue #56), DB-FREE: the
+# circuit-breaker orchestration (success, wrong-password, timeout, open-breaker,
+# half-open recovery), the SSRF-only + plaintext-refused webhook posture through the
+# hardened fetcher, and the metrics-presence render. Runs on every lane.
+[[test]]
+name = "lazy_migration_hook"
+path = "tests/lazy_migration_hook.rs"
+
+# The inbound lazy-migration hook end to end on the LOGIN path (issue #56): an unknown
+# identifier's first login verifies via the stub legacy verifier, creates the user with
+# a native Argon2id hash, and the SECOND login never calls the hook; a wrong-password
+# verdict is the uniform failure and persists nothing; a hook-backed failure is
+# indistinguishable from a local wrong password; and the breaker fails unmigrated logins
+# fast while local users are unaffected. Over a real database with a provisioned key.
+[[test]]
+name = "lazy_migration"
+path = "tests/lazy_migration.rs"
 required-features = ["testing"]
 
 [lints]

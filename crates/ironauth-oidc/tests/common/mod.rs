@@ -459,7 +459,7 @@ impl Harness {
         kind: &str,
         custom_domain: Option<&str>,
     ) -> Self {
-        Self::build_store_backed_kind(config, HarnessKey::Ed25519, kind, custom_domain).await
+        Self::build_store_backed_kind(config, HarnessKey::Ed25519, kind, custom_domain, None).await
     }
 
     /// Build a store-backed harness whose environment is provisioned with `key`,
@@ -468,16 +468,28 @@ impl Harness {
     /// fetch the LIVE discovery document whose per-environment policy is derived from
     /// the loaded key set.
     async fn build_store_backed(config: OidcConfig, key: HarnessKey) -> Self {
-        Self::build_store_backed_kind(config, key, "dev", None).await
+        Self::build_store_backed_kind(config, key, "dev", None, None).await
+    }
+
+    /// Like [`Harness::start_store_backed_with`] but installs an inbound lazy-migration
+    /// hook (issue #56) on the login path, so a test can drive an unknown-identifier
+    /// first login against a stub legacy verifier. Provisions an Ed25519 environment key.
+    pub async fn start_store_backed_with_migration_hook(
+        config: OidcConfig,
+        hook: Arc<ironauth_oidc::LazyMigrationHook>,
+    ) -> Self {
+        Self::build_store_backed_kind(config, HarnessKey::Ed25519, "dev", None, Some(hook)).await
     }
 
     /// Like [`Harness::build_store_backed`] but seeds the environment with an
-    /// explicit `kind` and optional `custom_domain` (issue #42).
+    /// explicit `kind` and optional `custom_domain` (issue #42), and optionally installs
+    /// a lazy-migration hook on the login path (issue #56).
     async fn build_store_backed_kind(
         config: OidcConfig,
         key: HarnessKey,
         kind: &str,
         custom_domain: Option<&str>,
+        migration_hook: Option<Arc<ironauth_oidc::LazyMigrationHook>>,
     ) -> Self {
         let (db, env, clock, scope, client_id) = Self::seed_common_kind(kind, custom_domain).await;
 
@@ -522,13 +534,16 @@ impl Harness {
             DiscoveryCapabilities::from_config(&config),
             Arc::clone(&registry),
         );
-        let state = OidcState::new(
+        let mut state = OidcState::new(
             db.store().clone(),
             env.clone(),
             Arc::clone(&registry),
             &config,
             ISSUER_BASE,
         );
+        if let Some(hook) = migration_hook {
+            state = state.with_migration_hook(hook);
+        }
         let issuer = state.issuer_for(&scope);
         let router = oidc_router(state.clone())
             .merge(issuer_router(issuer_state))
@@ -1013,6 +1028,25 @@ impl Harness {
             .await
             .expect("register user with claims")
             .to_string()
+    }
+
+    /// Create and ACTIVATE a trait schema (issue #53) for the harness scope, so a test can
+    /// drive the login path's profile validation against a live active schema. Activation
+    /// is clean when no seeded identity's traits violate the target (the cutover rule), so
+    /// seed users AFTER this, or seed traits that satisfy it.
+    pub async fn seed_active_trait_schema(&self, schema_json: &str) {
+        let (actor, corr) = self.seeding_actor();
+        let acting = self.store().scoped(self.scope).acting(actor, corr);
+        let (_, version) = acting
+            .trait_schemas()
+            .create_version(&self.env, schema_json, 0)
+            .await
+            .expect("create trait schema");
+        acting
+            .trait_schemas()
+            .activate_version(&self.env, version)
+            .await
+            .expect("activate trait schema");
     }
 
     /// Seed a fresh user with a unique identifier (drawn from the deterministic

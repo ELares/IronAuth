@@ -6,6 +6,22 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- `[oidc.lazy_migration]` inbound lazy-migration hook settings (issue #56): a new nested
+  config table arming the login-time verification of an unknown identifier against a legacy
+  store. `enabled` (default false) gates it; `endpoint` (an https URL, required and https
+  when enabled, validated at config load) is the verification webhook; `secret` is the
+  shared bearer, through the existing Secret indirection and covered by the literal-secret
+  lint; `timeout_secs` (default 5, bounded by `OIDC_MAX_LAZY_MIGRATION_TIMEOUT_SECS = 30`)
+  is the per-call timeout; and `breaker_failure_threshold` / `breaker_window_secs` /
+  `breaker_cooldown_secs` (defaults 5 / 30 / 30) tune the circuit breaker. Config over a new
+  DB table, promotable per environment in spirit like the other OIDC toggles.
+- Lazy-migration endpoint validation tightened (issue #56, adversarial review): the
+  `endpoint` is now parsed as a well-formed absolute https URL with a non-empty host and no
+  userinfo at config LOAD, instead of the prior bare `starts_with("https://")` check. A
+  malformed-but-https endpoint (`https://` with no host, an embedded space, an unterminated
+  `[` host, or smuggled `user:pass@`) is now a clear load error rather than silently failing
+  every unknown-identifier login and tripping the breaker at runtime (criterion 6). Adds a
+  dependency on the `http` crate purely for this syntactic URL parse.
 - `[admin]` outbound verification SCOPE binding (issue #58, review):
   `admin.outbound_verification_tenant` and `admin.outbound_verification_environment`
   (both unset by default) pin the outbound credential-verification endpoint to exactly

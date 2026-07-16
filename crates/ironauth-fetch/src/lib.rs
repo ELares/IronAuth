@@ -128,6 +128,12 @@ pub enum FetchPurpose {
     /// other external fetch: a KMS URL that resolves to an internal or loopback
     /// address is refused exactly like any other blocked destination.
     KmsRequest,
+    /// Verifying a first login against a legacy credential store through the inbound
+    /// lazy-migration hook (issue #56). The endpoint is operator-configured,
+    /// environment-scoped, and outbound, so it rides the same SSRF-hardened path as
+    /// every other external fetch: a verification URL that resolves to an internal or
+    /// loopback address is refused, and a plaintext `http` target is refused.
+    LazyMigration,
 }
 
 impl FetchPurpose {
@@ -142,6 +148,7 @@ impl FetchPurpose {
             FetchPurpose::Logo => "logo",
             FetchPurpose::AcmeDirectory => "acme_directory",
             FetchPurpose::KmsRequest => "kms_request",
+            FetchPurpose::LazyMigration => "lazy_migration",
         }
     }
 }

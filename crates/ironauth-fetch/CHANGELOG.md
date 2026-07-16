@@ -6,6 +6,13 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Add the `FetchPurpose::LazyMigration` label (issue #56): the inbound
+  lazy-migration hook verifies a first login against a legacy credential store,
+  which is an outbound call, so it rides the same SSRF-hardened dispatcher as every
+  other fetch. A verification endpoint that resolves to a loopback or otherwise
+  internal address is refused, and a plaintext `http` target is refused, exactly like
+  any other blocked destination; the new purpose only adds a bounded metric label,
+  never a policy exception.
 - Add the `FetchPurpose::KmsRequest` label (issue #49): an external
   customer-managed KMS/HSM call for BYOK key wrap/unwrap is outbound, so it rides
   the same SSRF-hardened dispatcher as every other fetch. A KMS endpoint that

@@ -275,6 +275,66 @@
       },
       "type": "object"
     },
+    "LazyMigrationConfig": {
+      "additionalProperties": false,
+      "description": "The INBOUND lazy-migration hook settings (issue #56).\n\nWhen enabled, a login whose canonicalized identifier is UNKNOWN locally verifies the\nsubmitted credential against a legacy store through the `endpoint` webhook (delivered\nover the M1 SSRF-hardened outbound fetcher, HTTPS ONLY, authenticated with `secret`).\nOn a positive verdict the user is created locally with a native Argon2id hash and is\nMIGRATED by construction, so their next login verifies natively and never calls the\nhook. Every failure verdict (wrong password, unknown to the legacy store, timeout,\nbreaker open) yields the SAME uniform login failure as a local wrong password, so the\nhook's existence is not observable to an attacker.\n\nDISABLED BY DEFAULT (`enabled = false`): pointing the login path at an external\ncredential oracle is an explicit, per-deployment opt-in. Once the tail of stragglers\nis closed by a standard #55 bulk import, the hook is disabled again by flipping\n`enabled` back to false (a pure config change).",
+      "properties": {
+        "breaker_cooldown_secs": {
+          "default": 30,
+          "description": "How long the breaker stays OPEN before it half-opens to trial one call (issue\n#56), in seconds. A half-open success closes it; a half-open failure re-opens it\nfor another cooldown. The default (30) is conservative. Must be at least 1.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "breaker_failure_threshold": {
+          "default": 5,
+          "description": "The circuit-breaker failure threshold (issue #56): the number of hook errors and\ntimeouts within `breaker_window_secs` that trips the breaker OPEN. While open,\nunmigrated logins fail fast with the uniform error (no hook call), local users are\nunaffected, and after `breaker_cooldown_secs` the breaker half-opens to trial one\ncall. A verdict (verified or rejected) is a HEALTHY response and never counts\ntoward the threshold; only transport errors and timeouts do. The default (5) is\nconservative. Must be at least 1.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "breaker_window_secs": {
+          "default": 30,
+          "description": "The rolling window in seconds over which `breaker_failure_threshold` errors and\ntimeouts are counted (issue #56). The default (30) is conservative. Must be at\nleast 1.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "enabled": {
+          "default": false,
+          "description": "Whether the inbound lazy-migration hook is armed. False (the default) leaves the\nlogin path unchanged: an unknown identifier is the uniform failure, no outbound\ncall is made. When true, `endpoint` MUST be set (config load rejects an enabled\nhook with no endpoint) and an unknown-identifier login triggers one hook call.",
+          "type": "boolean"
+        },
+        "endpoint": {
+          "default": null,
+          "description": "The legacy-store verification webhook URL (an https URL). Outbound and routed\nthrough the SSRF-hardened fetcher, so a loopback or otherwise internal endpoint is\nrefused exactly like any other blocked destination, and a plaintext `http` target\nis refused. Unset when the hook is disabled; REQUIRED (and https) when enabled.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "secret": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Secret"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "The shared bearer secret presented to the verification webhook as\n`Authorization: Bearer <secret>`, so the legacy store can authenticate IronAuth.\nUse the `file`/`env` secret indirection, never a literal, outside dev mode. Unset\nsends no Authorization header (for a legacy store that authenticates another way,\nfor example a URL-embedded token); most deployments set it."
+        },
+        "timeout_secs": {
+          "default": 5,
+          "description": "The per-call timeout in seconds for one hook verification (issue #56). The\nSSRF-hardened fetcher aborts a call that exceeds it, so a slow legacy backend\ncannot stall the login path. The default (5) is conservative. Must be at least 1\nand at most `OIDC_MAX_LAZY_MIGRATION_TIMEOUT_SECS`.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
     "LogFormat": {
       "description": "Structured-log output format.",
       "oneOf": [
@@ -456,6 +516,19 @@
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
+        },
+        "lazy_migration": {
+          "$ref": "#/$defs/LazyMigrationConfig",
+          "default": {
+            "breaker_cooldown_secs": 30,
+            "breaker_failure_threshold": 5,
+            "breaker_window_secs": 30,
+            "enabled": false,
+            "endpoint": null,
+            "secret": null,
+            "timeout_secs": 5
+          },
+          "description": "The INBOUND lazy-migration hook (issue #56): verify a first login against a\nlegacy credential store over the SSRF-hardened outbound fetcher and, on success,\ncreate the user locally with a native Argon2id hash so subsequent logins never\ncall the hook. Disabled by default; the endpoint and its authentication secret\nare environment-scoped config (see [`LazyMigrationConfig`]). This is a promotable\nper-environment setting in spirit; the process value is the deployment default\nuntil per-environment overrides ride the M5 promotion pipeline."
         },
         "offline_access_requires_consent": {
           "default": true,
@@ -942,6 +1015,15 @@
         "global_token_revocation_hard_kill": false,
         "issue_refresh_tokens": true,
         "jwks_cache_max_age_secs": 600,
+        "lazy_migration": {
+          "breaker_cooldown_secs": 30,
+          "breaker_failure_threshold": 5,
+          "breaker_window_secs": 30,
+          "enabled": false,
+          "endpoint": null,
+          "secret": null,
+          "timeout_secs": 5
+        },
         "offline_access_requires_consent": true,
         "offline_idle_ttl_secs": 2592000,
         "offline_max_lifetime_secs": 7776000,

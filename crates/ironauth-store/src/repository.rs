@@ -7936,6 +7936,18 @@ pub struct NewAdminUser<'a> {
     pub traits_schema_version: Option<i32>,
 }
 
+/// A scope's lazy-migration progress (issue #56): the counts an operator watches to
+/// decide when the migration tail has flattened and the hook can be disabled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MigrationProgress {
+    /// The total number of live (non-tombstoned) users in the scope.
+    pub total_users: i64,
+    /// How many of those still carry an imported foreign password hash (the #55 import
+    /// tail awaiting a first-login rehash). The migrated count is
+    /// `total_users - foreign_hash_remaining`.
+    pub foreign_hash_remaining: i64,
+}
+
 /// The read-only bootstrap user repository (issue #20).
 pub struct UserRepo<'a> {
     store: &'a Store,
@@ -8003,6 +8015,36 @@ impl UserRepo<'_> {
             foreign_password_hash: row.get("foreign_password_hash"),
             foreign_password_algo: row.get("foreign_password_algo"),
         }))
+    }
+
+    /// Count the scope's lazy-migration progress (issue #56): the total number of live
+    /// users, and how many still carry an imported FOREIGN password hash (the #55 import
+    /// tail awaiting a first-login rehash). A user with no foreign hash is on the native
+    /// Argon2id verifier and is MIGRATED; `foreign_hash_remaining` is the straggler tail a
+    /// standard #55 bulk import closes out, after which the hook can be disabled for the
+    /// environment. Reads only counts, so it needs no platform master key and decrypts no
+    /// PII, and it excludes the soft-delete tombstone (`deleted_at IS NULL`).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn migration_progress(&self) -> Result<MigrationProgress, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT count(*) AS total, \
+                    count(*) FILTER (WHERE foreign_password_hash IS NOT NULL) AS foreign_remaining \
+             FROM users \
+             WHERE tenant_id = $1 AND environment_id = $2 AND deleted_at IS NULL",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .fetch_one(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(MigrationProgress {
+            total_users: row.get("total"),
+            foreign_hash_remaining: row.get("foreign_remaining"),
+        })
     }
 
     /// Resolve the lifecycle state of a LIVE user by its subject (the `usr_` id

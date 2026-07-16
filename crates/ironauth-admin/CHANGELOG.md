@@ -6,6 +6,15 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Lazy-migration progress endpoint (issue #56):
+  `GET /v1/tenants/{tenant}/environments/{environment}/migration/progress` reports how far
+  an environment's inbound lazy migration has come (total users, how many are on the native
+  Argon2id verifier, and the foreign-hash straggler tail a #55 bulk import closes out) and,
+  when this node runs the data plane with a hook installed, the node's circuit-breaker state.
+  Environment-scoped read (operator plane or the environment's own management key), reads
+  only counts (decrypts no PII), and is documented in the OpenAPI contract. `AdminState`
+  gains an optional shared `LazyMigrationHook` (installed by the boot path, the SAME Arc the
+  OIDC data plane holds) so the breaker state is visible cross-plane in-process.
 - Exit-export hardening (issue #58, review): the export now carries the enrolled MFA
   / login credential REGISTRY (`account_credentials`), not merely the password: each
   passkey / TOTP / recovery-code enrollment (factor kind, opened friendly name,

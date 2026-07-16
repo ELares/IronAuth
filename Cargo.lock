@@ -988,6 +988,7 @@ dependencies = [
 name = "ironauth-config"
 version = "0.1.0"
 dependencies = [
+ "http",
  "schemars",
  "serde",
  "serde_json",
@@ -1095,6 +1096,7 @@ dependencies = [
  "ironauth-quota",
  "ironauth-store",
  "metrics",
+ "metrics-exporter-prometheus",
  "oauth2",
  "serde",
  "serde_json",
