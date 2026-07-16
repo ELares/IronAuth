@@ -6,6 +6,15 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Guarded SMS OTP factor semantics hardening (issue #70, adversarial review): the SMS
+  verify surface the server exposes now honors the no-silent-downgrade invariant on EVERY
+  purpose. `POST .../otp/sms/verify` establishes a primary session only for `login`,
+  `recovery`, and self-service `register` (each gated by the tenant downgrade opt-in on a
+  passkey / TOTP-protected account); `mfa` and `verify_address` now return a possession
+  proof (`{"verified":true,"purpose":...}`) with NO session cookie instead of a full
+  authenticated `sms` session, closing a purpose-confusion factor-downgrade to account
+  takeover. The SMS send surface stays uniform present-vs-absent even under hashing-pool
+  back-pressure. No configuration or wiring change for the binary.
 - Guarded SMS OTP (issue #70): the server binary now installs a `LoggingSmsSender` dev stub
   behind the SMS provider seam, so the guarded SMS-OTP factor delivers end to end without an
   SMS gateway (the code is emitted only at the `debug` trace level; a real provider adapter

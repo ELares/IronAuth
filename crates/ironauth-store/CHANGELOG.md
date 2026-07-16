@@ -6,6 +6,16 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Guarded SMS-OTP conversion counter hardening (issue #70, adversarial review LOW-3):
+  `record_send` now RE-ARMS the route's low-conversion alarm within a still-open window.
+  When the previous `throttled_until` has lapsed but the conversion window has not yet
+  rolled, both `throttled_until` and `alarm_active` are cleared, so a route that is STILL
+  pumping RE-THROTTLES on the very next send. Without this, a deployment configured with
+  `sms_route_throttle_secs < sms_conversion_window_secs` would deliver again the instant the
+  throttle lapsed while the latched alarm blocked `auto_throttle_route` (which fires only on
+  `alarm_active = false`) from ever re-firing until the window rolled: the route pumped
+  freely in between. Re-arming makes the ratio safe by construction (no migration; the
+  fix is in the existing single-statement upsert). Regression-tested on real Postgres.
 - Guarded SMS-OTP persistence (issue #70): migration 0049 adds four durable, tenant-scoped
   tables (all with forced RLS, the (tenant, environment) isolation policy, the nonempty-scope
   CHECK, and a query-audit registration). `sms_otp_codes` mirrors `email_otp_codes` but seals

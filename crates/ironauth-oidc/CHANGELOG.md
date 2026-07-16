@@ -6,6 +6,29 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Guarded SMS OTP adversarial-review hardening (issue #70): the no-silent-downgrade
+  invariant now holds for EVERY purpose, not only `login` / `recovery`. Previously every
+  successful verify (any purpose) fell through to a full PRIMARY session, so `mfa`,
+  `verify_address`, and `register` each minted an authenticated `sms` session on a
+  passkey / TOTP-protected account while SKIPPING the strong-factor check (a SIM-swap
+  factor-downgrade to account takeover). Now only `login`, `recovery`, and self-service
+  `register` are session-establishing and each passes the `has_stronger_factor` gate
+  (blocked for a protected account unless the tenant opted into the documented downgrade
+  path); `register` is a no-op gate for a genuinely new account but blocks an EXISTING
+  protected one. `mfa` and `verify_address` are now NON-session-establishing possession
+  proofs (`{"verified":true,"purpose":...}`, no `__Host-ironauth_session` cookie, never
+  `authenticated:true` or an `amr`): SMS-as-a-second-factor session elevation is the
+  step-up flow (issue #72), and minting a primary session from an `mfa` OTP alone would
+  claim a first factor that was never proven. The downgrade BLOCK no longer short-circuits
+  faster than a real attempt (it runs the same resolve + Argon2 + single durable write, so
+  a blocked strong-factor account is timing-uniform with a wrong guess and not a
+  factor-possession oracle). The SEND path now falls through to the UNIFORM ack on a
+  hashing-pool rejection instead of surfacing a distinct 429/503, closing a
+  present-vs-absent enumeration oracle under pool back-pressure. The pumping alarm compares
+  the RAW conversion ratio against the threshold rather than a rounded integer percent, so
+  the effective threshold is exact (a 29.5 percent route no longer rounds up to a healthy
+  30). The route bucket is per-COUNTRY (a documented known limitation; carrier-bucket
+  granularity is a follow-up).
 - Guarded SMS OTP with pumping defense (issue #70): new `otp/sms/send` and `otp/sms/verify`
   handlers reuse the #68 email-OTP core (rejection-sampled numeric code, #62-pool Argon2
   hashing, single-active-per-(subject, purpose), single-use consume, per-code attempt death,

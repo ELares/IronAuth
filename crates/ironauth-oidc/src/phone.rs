@@ -128,6 +128,12 @@ impl E164 {
 
     /// The route bucket this number is accounted to (issue #70): its country calling
     /// code. The velocity caps and the conversion auto-throttle are keyed on this.
+    ///
+    /// KNOWN LIMITATION (adversarial review): the bucket is per-COUNTRY, not per-carrier,
+    /// so an attacker can pump enough to auto-throttle a WHOLE country's SMS for a tenant,
+    /// and conversion can be gamed at country granularity (mixing pumped and healthy
+    /// carriers under one calling code). Finer carrier-bucket granularity is a documented
+    /// follow-up (a separate issue tracks it).
     #[must_use]
     pub fn route_key(&self) -> &str {
         &self.country_code

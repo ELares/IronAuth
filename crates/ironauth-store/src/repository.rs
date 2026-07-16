@@ -4974,6 +4974,16 @@ impl ActingSmsOtpRepo<'_> {
     /// permanently penalized. An off-audited-path counter (the pumping-defense signal),
     /// exactly like the abuse counters.
     ///
+    /// It ALSO RE-ARMS the alarm within a still-open window: when the previous
+    /// `throttled_until` has lapsed (`throttled_until <= now_micros`) but the window has
+    /// not yet rolled, both `throttled_until` and `alarm_active` are cleared. Without this,
+    /// a deployment configured with `throttle_secs < conversion_window_secs` would deliver
+    /// again the instant the throttle lapsed while `alarm_active` stayed latched, so
+    /// [`auto_throttle_route`](Self::auto_throttle_route) (which only fires on
+    /// `alarm_active = false`) could never re-throttle a route that is STILL pumping until
+    /// the window rolled. Re-arming makes a still-unhealthy route RE-THROTTLE on the very
+    /// next send, so the ratio is safe by construction (adversarial review LOW-3).
+    ///
     /// # Errors
     ///
     /// [`StoreError::Database`] on a persistence failure.
@@ -5008,12 +5018,24 @@ impl ActingSmsOtpRepo<'_> {
                    <= TIMESTAMPTZ 'epoch' + ($6::text || ' microseconds')::interval \
                  THEN TIMESTAMPTZ 'epoch' + ($5::text || ' microseconds')::interval \
                  ELSE sms_route_stats.window_started_at END, \
-               throttled_until = CASE WHEN sms_route_stats.window_started_at \
+               throttled_until = CASE \
+                 WHEN sms_route_stats.window_started_at \
                    <= TIMESTAMPTZ 'epoch' + ($6::text || ' microseconds')::interval \
-                 THEN NULL ELSE sms_route_stats.throttled_until END, \
-               alarm_active = CASE WHEN sms_route_stats.window_started_at \
+                 THEN NULL \
+                 WHEN sms_route_stats.throttled_until IS NOT NULL \
+                   AND sms_route_stats.throttled_until \
+                     <= TIMESTAMPTZ 'epoch' + ($5::text || ' microseconds')::interval \
+                 THEN NULL \
+                 ELSE sms_route_stats.throttled_until END, \
+               alarm_active = CASE \
+                 WHEN sms_route_stats.window_started_at \
                    <= TIMESTAMPTZ 'epoch' + ($6::text || ' microseconds')::interval \
-                 THEN false ELSE sms_route_stats.alarm_active END, \
+                 THEN false \
+                 WHEN sms_route_stats.throttled_until IS NOT NULL \
+                   AND sms_route_stats.throttled_until \
+                     <= TIMESTAMPTZ 'epoch' + ($5::text || ' microseconds')::interval \
+                 THEN false \
+                 ELSE sms_route_stats.alarm_active END, \
                updated_at = TIMESTAMPTZ 'epoch' + ($5::text || ' microseconds')::interval \
              RETURNING id, route_key, send_count, verify_count, \
                (EXTRACT(EPOCH FROM throttled_until) * 1000000)::bigint AS throttled_us, \

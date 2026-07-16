@@ -126,6 +126,67 @@ fn delivered_to(sender: &RecordingSms, recipient: &str) -> bool {
         .any(|(to, _, _)| to == recipient)
 }
 
+/// Whether the response sets the primary `__Host-ironauth_session` cookie.
+fn sets_session_cookie(headers: &axum::http::HeaderMap) -> bool {
+    headers.get_all(header::SET_COOKIE).iter().any(|value| {
+        value
+            .to_str()
+            .unwrap_or_default()
+            .starts_with(SESSION_COOKIE)
+    })
+}
+
+/// Advance past the tiny velocity windows, send an SMS-OTP code for `purpose`, then verify
+/// the DELIVERED code for that same `purpose`. Returns the verify response so a test can
+/// assert whether it established a primary session.
+async fn send_then_verify_purpose(
+    harness: &Harness,
+    sender: &RecordingSms,
+    base: &str,
+    phone: &str,
+    purpose: &str,
+) -> (StatusCode, axum::http::HeaderMap, Value) {
+    harness.clock().advance(Duration::from_secs(2));
+    let (status, _) = post_json(
+        harness,
+        &format!("{base}/otp/sms/send"),
+        &json!({ "identifier": phone, "purpose": purpose }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "the send is acked for {purpose}");
+    let code = last_code(sender, phone);
+    verify_full(
+        harness,
+        &format!("{base}/otp/sms/verify"),
+        &json!({ "identifier": phone, "purpose": purpose, "code": code }),
+    )
+    .await
+}
+
+/// A harness with SMS enabled (downgrade `allow_downgrade`) for country `1`, the #64
+/// regulation OFF (so cross-purpose verify attempts do not throttle one another and this
+/// isolates the factor-downgrade semantics), a recording sender, and a seeded US-mobile
+/// user PROTECTED by an active TOTP factor.
+async fn protected_account(allow_downgrade: bool) -> (Harness, Arc<RecordingSms>, String) {
+    let mut harness = Harness::start_store_backed_with(OidcConfig {
+        regulation: RegulationConfig {
+            enabled: false,
+            ..RegulationConfig::default()
+        },
+        ..sms_config()
+    })
+    .await;
+    let sender = Arc::new(RecordingSms::default());
+    harness.install_sms_sender(sender.clone());
+    harness.enable_sms(allow_downgrade, &["1"]).await;
+    let phone = "+14155550100".to_owned();
+    let subject = harness
+        .seed_user(&phone, "correct horse battery staple")
+        .await;
+    harness.seed_active_totp(&subject).await;
+    (harness, sender, phone)
+}
+
 /// A harness with SMS enabled for country `1`, a recording sender, and a seeded user
 /// whose identifier is a US mobile number.
 async fn setup() -> (Harness, Arc<RecordingSms>, String) {
@@ -648,5 +709,370 @@ async fn a_send_when_the_factor_is_globally_disabled_is_not_found() {
         status,
         StatusCode::NOT_FOUND,
         "SMS is off by default at the deployment level"
+    );
+}
+
+#[tokio::test]
+async fn no_purpose_mints_a_primary_session_for_a_totp_protected_account() {
+    // Adversarial review HIGH-1: the no-silent-downgrade invariant must hold for EVERY
+    // purpose, not only `login` / `recovery`. On a TOTP-protected account WITHOUT the
+    // downgrade opt-in, NO purpose may mint a primary session: `login` / `recovery` /
+    // `register` are blocked, and `mfa` / `verify_address` are non-session-establishing
+    // possession proofs. The pre-fix code fell through EVERY purpose to a full primary
+    // session, so `mfa` / `verify_address` / `register` each took over the account.
+    let (harness, sender, phone) = protected_account(false).await;
+    let base = base(&harness);
+
+    for purpose in ["login", "recovery", "register", "mfa", "verify_address"] {
+        let (_status, headers, body) =
+            send_then_verify_purpose(&harness, &sender, &base, &phone, purpose).await;
+        assert!(
+            !sets_session_cookie(&headers),
+            "purpose {purpose} must not set the primary session cookie on a protected \
+             account without the downgrade opt-in: {body:?}"
+        );
+        assert_ne!(
+            body["authenticated"],
+            json!(true),
+            "purpose {purpose} must not return an authenticated primary session on a \
+             protected account without the downgrade opt-in: {body:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_downgrade_opt_in_restores_login_and_recovery_but_verify_address_is_never_a_session() {
+    // HIGH-1 complement: WITH the explicit downgrade opt-in, `login` and `recovery` mint a
+    // session again (the documented downgrade path), but `verify_address` is a possession
+    // proof that NEVER mints a session, regardless of the opt-in.
+    let (harness, sender, phone) = protected_account(true).await;
+    let base = base(&harness);
+
+    for purpose in ["login", "recovery"] {
+        let (status, headers, body) =
+            send_then_verify_purpose(&harness, &sender, &base, &phone, purpose).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the opt-in permits the {purpose} downgrade: {body:?}"
+        );
+        assert_eq!(body["amr"], json!(["sms"]), "amr honestly reports sms");
+        assert_eq!(body["authenticated"], json!(true));
+        assert!(
+            sets_session_cookie(&headers),
+            "{purpose} mints a session under the downgrade opt-in"
+        );
+    }
+
+    let (status, headers, body) =
+        send_then_verify_purpose(&harness, &sender, &base, &phone, "verify_address").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["verified"],
+        json!(true),
+        "verify_address proves control"
+    );
+    assert_ne!(
+        body["authenticated"],
+        json!(true),
+        "verify_address never claims an authenticated login: {body:?}"
+    );
+    assert!(
+        !sets_session_cookie(&headers),
+        "verify_address never mints a session even under the downgrade opt-in: {body:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_blocked_downgrade_consumes_the_proven_code_and_is_not_a_fast_path() {
+    // Adversarial review LOW: the downgrade BLOCK must not short-circuit faster than a real
+    // verify attempt (a factor-possession timing oracle). The fixed block runs the SAME
+    // resolve + Argon2 compare + single durable write a real attempt runs; the observable,
+    // non-flaky proof is that a blocked verify with the CORRECT code CONSUMES it (the old
+    // early-return skipped resolve/consume entirely). We also confirm no session leaks.
+    let (harness, sender, phone) = protected_account(false).await;
+    let base = base(&harness);
+    let subject = harness
+        .store()
+        .scoped(harness.scope())
+        .users()
+        .by_identifier(&phone)
+        .await
+        .expect("lookup")
+        .expect("user")
+        .id;
+
+    post_json(
+        &harness,
+        &format!("{base}/otp/sms/send"),
+        &json!({ "identifier": phone, "purpose": "login" }),
+    )
+    .await;
+    let code = last_code(&sender, &phone);
+    let (status, headers, _) = verify_full(
+        &harness,
+        &format!("{base}/otp/sms/verify"),
+        &json!({ "identifier": phone, "purpose": "login", "code": code }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "the downgrade is blocked");
+    assert!(
+        !sets_session_cookie(&headers),
+        "no session leaks on a blocked downgrade"
+    );
+
+    // The proven code was consumed by the block path (equal work, no timing shortcut): it
+    // no longer resolves and a replay is still refused.
+    let active = harness
+        .store()
+        .scoped(harness.scope())
+        .sms_otp()
+        .resolve_active(&subject, EmailFactorPurpose::Login, 0)
+        .await
+        .expect("resolve");
+    assert!(
+        active.is_none(),
+        "a blocked downgrade consumes the proven code (it ran the full resolve + consume, \
+         not a fast short-circuit)"
+    );
+    let (replay, _, _) = verify_full(
+        &harness,
+        &format!("{base}/otp/sms/verify"),
+        &json!({ "identifier": phone, "purpose": "login", "code": code }),
+    )
+    .await;
+    assert_eq!(
+        replay,
+        StatusCode::UNAUTHORIZED,
+        "the consumed code cannot be replayed"
+    );
+}
+
+#[tokio::test]
+async fn a_send_is_uniform_present_vs_absent_even_under_hashing_pool_back_pressure() {
+    // Adversarial review MEDIUM-2: under a shedding per-tenant Argon2 pool, the KNOWN path
+    // must NOT surface a distinct rejection while the unknown path returns the uniform ack
+    // (a present-vs-absent enumeration oracle). We install a pool that deterministically
+    // faults every hash (an invalid parameter triple maps to a pool rejection), standing in
+    // for any pool shed, and assert BOTH a real allowlisted recipient and an unknown one
+    // return the identical uniform 200 ack (never a distinct 429/503/500 for the real one).
+    let mut harness = Harness::start_store_backed_with(sms_config()).await;
+    // An invalid Argon2 triple (memory below 8*parallelism) faults every real hash to a
+    // typed pool rejection; `verify_absent` verifies a FIXED dummy hash independent of these
+    // params, so the absent path still returns its uniform ack.
+    let pool = Arc::new(HashingPool::new(
+        harness.env().clone(),
+        Argon2Params::new(0, 0, 0),
+        1,
+        64,
+        None,
+    ));
+    harness.install_hashing_pool(pool);
+    let sender = Arc::new(RecordingSms::default());
+    harness.install_sms_sender(sender.clone());
+    harness.enable_sms(false, &["1"]).await;
+    let known = "+14155550100".to_owned();
+    harness.seed_user(&known, "pw pw pw pw pw pw").await;
+    let unknown = "+14155550111".to_owned(); // allowlisted country, no account
+    let base = base(&harness);
+
+    let (known_status, known_body) = post_json(
+        &harness,
+        &format!("{base}/otp/sms/send"),
+        &json!({ "identifier": known, "purpose": "login" }),
+    )
+    .await;
+    harness.clock().advance(Duration::from_secs(2));
+    let (unknown_status, unknown_body) = post_json(
+        &harness,
+        &format!("{base}/otp/sms/send"),
+        &json!({ "identifier": unknown, "purpose": "login" }),
+    )
+    .await;
+
+    assert_eq!(
+        known_status,
+        StatusCode::OK,
+        "a real recipient must return the uniform ack under pool back-pressure, not a \
+         distinct rejection: {known_body:?}"
+    );
+    assert_eq!(known_status, unknown_status);
+    assert_eq!(
+        known_body, unknown_body,
+        "present and absent sends are byte-identical even when the hashing pool sheds"
+    );
+    // The pool faulted, so neither send actually delivered a code.
+    assert!(!delivered_to(&sender, &known));
+    assert!(!delivered_to(&sender, &unknown));
+}
+
+#[tokio::test]
+async fn a_code_past_its_ttl_is_refused_even_when_correct() {
+    // Adversarial review coverage gap: an explicit TTL-EXPIRY verify. A correct code
+    // presented after the code TTL (default 300s) must be refused.
+    let (harness, sender, phone) = setup().await;
+    let base = base(&harness);
+    post_json(
+        &harness,
+        &format!("{base}/otp/sms/send"),
+        &json!({ "identifier": phone, "purpose": "login" }),
+    )
+    .await;
+    let code = last_code(&sender, &phone);
+    // Advance past the SMS OTP code TTL on the manual clock.
+    harness.clock().advance(Duration::from_secs(301));
+    let (status, _, _) = verify_full(
+        &harness,
+        &format!("{base}/otp/sms/verify"),
+        &json!({ "identifier": phone, "purpose": "login", "code": code }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "a correct code past its TTL must not verify"
+    );
+}
+
+#[tokio::test]
+async fn a_throttled_route_resumes_after_the_conversion_window_rolls() {
+    // Adversarial review coverage gap: a throttle-LIFT / resume test. After the throttle
+    // horizon lapses AND the conversion window rolls (counters reset -> a now-healthy
+    // route), sends resume.
+    let mut harness = Harness::start_store_backed_with(sms_config()).await;
+    let pool = Arc::new(HashingPool::new(
+        harness.env().clone(),
+        Argon2Params::new(8, 1, 1),
+        1,
+        64,
+        None,
+    ));
+    harness.install_hashing_pool(pool);
+    let sender = Arc::new(RecordingSms::default());
+    harness.install_sms_sender(sender.clone());
+    harness.enable_sms(false, &["1"]).await;
+    let base = base(&harness);
+
+    // Pump the country-1 route to a throttle (>= the 5-sample floor at 0 percent).
+    for n in 0..6 {
+        let phone = format!("+141555510{n:02}");
+        harness.seed_user(&phone, "pw pw pw pw pw pw").await;
+        harness.clock().advance(Duration::from_secs(2));
+        let (status, _) = post_json(
+            &harness,
+            &format!("{base}/otp/sms/send"),
+            &json!({ "identifier": phone, "purpose": "login" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+    // The route is throttled: a fresh send does not deliver.
+    let blocked = "+14155557000".to_owned();
+    harness.seed_user(&blocked, "pw pw pw pw pw pw").await;
+    harness.clock().advance(Duration::from_secs(2));
+    post_json(
+        &harness,
+        &format!("{base}/otp/sms/send"),
+        &json!({ "identifier": blocked, "purpose": "login" }),
+    )
+    .await;
+    assert!(!delivered_to(&sender, &blocked), "the route is throttled");
+
+    // Advance past BOTH the throttle horizon and the conversion window (both 3600s on the
+    // defaults): the counters reset, the route is healthy, and sending resumes.
+    harness.clock().advance(Duration::from_secs(3700));
+    let resumed = "+14155557001".to_owned();
+    harness.seed_user(&resumed, "pw pw pw pw pw pw").await;
+    post_json(
+        &harness,
+        &format!("{base}/otp/sms/send"),
+        &json!({ "identifier": resumed, "purpose": "login" }),
+    )
+    .await;
+    assert!(
+        delivered_to(&sender, &resumed),
+        "after the window rolls the throttle lifts and sending resumes"
+    );
+}
+
+#[tokio::test]
+async fn a_still_pumping_route_re_throttles_after_the_throttle_lapses_within_the_window() {
+    // Adversarial review LOW-3: with `throttle_secs < conversion_window_secs`, a route that
+    // is STILL pumping when its throttle lapses must RE-THROTTLE on the next send rather
+    // than pumping freely until the window rolls. The re-arm (clearing the latched alarm
+    // when the throttle lapses) is the fix; without it `auto_throttle_route` (WHERE
+    // alarm_active = false) can never re-fire and the route pumps freely.
+    let mut harness = Harness::start_store_backed_with(OidcConfig {
+        sms_route_throttle_secs: 5,
+        sms_conversion_window_secs: 3600,
+        ..sms_config()
+    })
+    .await;
+    let pool = Arc::new(HashingPool::new(
+        harness.env().clone(),
+        Argon2Params::new(8, 1, 1),
+        1,
+        64,
+        None,
+    ));
+    harness.install_hashing_pool(pool);
+    let sender = Arc::new(RecordingSms::default());
+    harness.install_sms_sender(sender.clone());
+    harness.enable_sms(false, &["1"]).await;
+    let base = base(&harness);
+
+    // Pump the route to a throttle.
+    for n in 0..6 {
+        let phone = format!("+141555511{n:02}");
+        harness.seed_user(&phone, "pw pw pw pw pw pw").await;
+        harness.clock().advance(Duration::from_secs(2));
+        post_json(
+            &harness,
+            &format!("{base}/otp/sms/send"),
+            &json!({ "identifier": phone, "purpose": "login" }),
+        )
+        .await;
+    }
+    let blocked = "+14155558000".to_owned();
+    harness.seed_user(&blocked, "pw pw pw pw pw pw").await;
+    harness.clock().advance(Duration::from_secs(2));
+    post_json(
+        &harness,
+        &format!("{base}/otp/sms/send"),
+        &json!({ "identifier": blocked, "purpose": "login" }),
+    )
+    .await;
+    assert!(!delivered_to(&sender, &blocked), "the route is throttled");
+
+    // Advance PAST the 5s throttle but well within the 3600s window (the misconfig ratio).
+    harness.clock().advance(Duration::from_secs(10));
+    // The first post-lapse send gets through (throttle lapsed) and re-arms + re-throttles
+    // the still-pumping route.
+    let relapse = "+14155558001".to_owned();
+    harness.seed_user(&relapse, "pw pw pw pw pw pw").await;
+    post_json(
+        &harness,
+        &format!("{base}/otp/sms/send"),
+        &json!({ "identifier": relapse, "purpose": "login" }),
+    )
+    .await;
+    assert!(
+        delivered_to(&sender, &relapse),
+        "the send at the throttle-lapse instant gets through"
+    );
+    // The still-pumping route re-throttled by construction: the NEXT send is refused, not
+    // pumping freely. Without the re-arm this send would deliver.
+    let refused = "+14155558002".to_owned();
+    harness.seed_user(&refused, "pw pw pw pw pw pw").await;
+    harness.clock().advance(Duration::from_secs(2));
+    post_json(
+        &harness,
+        &format!("{base}/otp/sms/send"),
+        &json!({ "identifier": refused, "purpose": "login" }),
+    )
+    .await;
+    assert!(
+        !delivered_to(&sender, &refused),
+        "a still-pumping route re-throttles on the next send after the throttle lapses"
     );
 }

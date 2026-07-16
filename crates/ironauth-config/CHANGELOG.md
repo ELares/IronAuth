@@ -6,6 +6,13 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Guarded SMS-OTP settings note (issue #70, adversarial review LOW-3): the
+  `oidc.sms_route_throttle_secs` / `oidc.sms_conversion_window_secs` relationship is now
+  safe by construction. A `throttle_secs < conversion_window_secs` ratio was previously a
+  footgun (a still-pumping route could deliver freely once its throttle lapsed but before
+  the window rolled); the persistence layer now RE-ARMS the route alarm on throttle lapse
+  so the route re-throttles on its next send, so no additional validation constraint is
+  imposed on the ratio (the settings and their bounds are unchanged).
 - Guarded SMS-OTP settings (issue #70): new `oidc.sms_otp_enabled` (default FALSE, the
   off-by-default deployment kill switch; its doc surfaces the NIST SP 800-63B-4
   restricted-authenticator caveat), `oidc.sms_otp_code_digits` (6..=8),

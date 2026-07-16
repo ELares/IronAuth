@@ -27,9 +27,21 @@
 //!    verify is counted per route; a route whose conversion drops below the configured
 //!    threshold over a sufficient sample auto-throttles WITHOUT operator intervention
 //!    (audit + ops emitted), while healthy routes keep sending.
-//! 6. **No silent downgrade.** SMS can never complete a login/recovery for an account
-//!    protected by a passkey or an active TOTP unless the tenant explicitly opted into
-//!    the documented downgrade path.
+//! 6. **No silent downgrade, on ANY purpose.** No SMS verify may mint a PRIMARY login
+//!    session for an account already protected by a passkey or an active TOTP unless the
+//!    tenant explicitly opted into the documented downgrade path, REGARDLESS of the
+//!    purpose it claims. Only `login`, `recovery`, and self-service `register` are
+//!    session-establishing (and each passes through the downgrade gate); `mfa` and
+//!    `verify_address` are possession PROOFS that never set the session cookie (SMS as a
+//!    second factor is the step-up flow, issue #72, not this factor), so they can never be
+//!    a factor-downgrade / account-takeover vector.
+//!
+//! # Route bucket granularity (known limitation)
+//!
+//! The pumping-defense route bucket is per-COUNTRY (the E.164 calling code; see
+//! [`crate::phone::E164::route_key`]), so an attacker can auto-throttle a whole country's
+//! SMS for a tenant, and conversion is gamed at country granularity. Finer carrier-bucket
+//! granularity is a documented follow-up.
 
 use axum::Json;
 use axum::extract::{Path, State};
@@ -210,7 +222,21 @@ pub async fn send(
     let code = generate_numeric_code(&state, digits);
     let code_hash = match state.hash_password(&scope, &code).await {
         Ok(hash) => hash,
-        Err(rejection) => return rejection.to_response(),
+        // A hashing-pool rejection on the KNOWN path must NOT surface a distinct
+        // status (issue #70 adversarial review, MEDIUM-2). Under a saturated per-tenant
+        // Argon2 pool a real, allowlisted recipient would otherwise return a distinct
+        // 429/503 while an unknown / non-allowlisted recipient (whose `verify_absent`
+        // error is already swallowed above) returns the uniform 200 ack: a
+        // present-vs-absent enumeration oracle under load. So a shed here falls through
+        // to the SAME uniform ack, recorded on the observability plane / metric only.
+        Err(_rejection) => {
+            tracing::error!(
+                target: "ironauth.verification",
+                "SMS OTP hashing rejected under pool back-pressure; uniform ack (no oracle)"
+            );
+            metrics::counter!("ironauth_sms_send_hash_rejected_total").increment(1);
+            return ack();
+        }
     };
     let ttl = state.sms_otp_code_ttl();
     let expires = now.saturating_add(i64::try_from(ttl.as_micros()).unwrap_or(i64::MAX));
@@ -333,35 +359,33 @@ pub async fn verify(
         return invalid_code();
     };
 
-    // The no-silent-downgrade invariant (issue #70): an account protected by a passkey or
-    // an active TOTP cannot complete a PRIMARY (login) or RECOVERY authentication by SMS
-    // unless the tenant explicitly opted into the downgrade path. Enforced BEFORE the
-    // code is compared, with a dummy spend, so a blocked downgrade is timing-uniform with
-    // a wrong code (never an oracle for which accounts hold a strong factor). SMS as an
-    // additive second factor (`mfa`) or an address proof is not a downgrade, so those
-    // purposes are unaffected.
-    if matches!(
-        purpose,
-        EmailFactorPurpose::Login | EmailFactorPurpose::Recovery
-    ) && !config.allow_factor_downgrade
-    {
+    // The no-silent-downgrade invariant (issue #70), enforced for EVERY session-
+    // establishing purpose. SMS is a RESTRICTED authenticator (NIST SP 800-63B-4): it may
+    // never mint a PRIMARY login session for an account already protected by a stronger
+    // factor (a passkey or an active TOTP) unless the tenant EXPLICITLY opted into the
+    // documented downgrade path. Only `login`, `recovery`, and self-service `register`
+    // are session-establishing; `mfa` and `verify_address` prove control of the phone
+    // number WITHOUT signing anyone in (see `establishes_session` / `proof_response`), so
+    // they carry no downgrade risk. A genuinely new `register` account holds no stronger
+    // factor, so the gate is a no-op for it, while an EXISTING protected account is
+    // blocked on `register` exactly like a login.
+    //
+    // The gate is decided BEFORE the code is judged, but it does NOT short-circuit: a
+    // blocked account runs the SAME resolve + Argon2 compare + single durable write a
+    // wrong guess performs (the code is consumed on a correct guess, or a wrong guess is
+    // recorded), so a blocked strong-factor account is timing-uniform with a wrong code on
+    // a weak-factor account and never a factor-possession timing oracle (adversarial
+    // review LOW: the old block returned early after only `verify_absent`, faster than a
+    // real attempt).
+    let establishes_session = establishes_session(purpose);
+    let blocked_downgrade = if establishes_session && !config.allow_factor_downgrade {
         match has_stronger_factor(&state, scope, &user.id).await {
-            Ok(true) => {
-                let _ = state.verify_absent(&scope, code).await;
-                tracing::info!(
-                    target: "ironauth.abuse",
-                    tenant = %scope.tenant(),
-                    environment = %scope.environment(),
-                    purpose = purpose.as_str(),
-                    "SMS factor-downgrade refused: account holds a stronger factor and no \
-                     downgrade path is configured"
-                );
-                return invalid_code();
-            }
-            Ok(false) => {}
+            Ok(blocked) => blocked,
             Err(()) => return server_error(),
         }
-    }
+    } else {
+        false
+    };
 
     let active = match state
         .store()
@@ -396,8 +420,9 @@ pub async fn verify(
         return invalid_code();
     }
 
-    // Correct code: consume it single-use, then account the successful verify to the
-    // route (the conversion numerator) and establish the session.
+    // Correct code: consume it single-use. A blocked downgrade consumes it too, so the
+    // block path spends the SAME durable write a wrong guess does and stays timing-uniform
+    // (and the proven-but-refused code is burned rather than left replayable).
     let consumed = state
         .store()
         .scoped(scope)
@@ -413,6 +438,25 @@ pub async fn verify(
         Ok(false) => return invalid_code(),
         Err(_) => return server_error(),
     }
+
+    // A stronger-factor account without the downgrade opt-in: the code proved phone
+    // control, but SMS must not mint a primary session over the stronger factor. Refuse
+    // uniformly (the work above already equalized the timing). Not counted as a route
+    // conversion (it did not complete an authentication).
+    if blocked_downgrade {
+        tracing::info!(
+            target: "ironauth.abuse",
+            tenant = %scope.tenant(),
+            environment = %scope.environment(),
+            purpose = purpose.as_str(),
+            "SMS factor-downgrade refused: account holds a stronger factor and no \
+             downgrade path is configured"
+        );
+        return invalid_code();
+    }
+
+    // A genuine successful verify (a session sign-in OR a possession proof): account it to
+    // the route as a conversion (a real human received and entered the code).
     let _ = state
         .store()
         .scoped(scope)
@@ -424,7 +468,43 @@ pub async fn verify(
         .record_verify(&route_key)
         .await;
 
-    establish_and_respond(&state, scope, &user.id, &ctx, &headers).await
+    if establishes_session {
+        // `login` / `recovery` / `register`: SMS IS the primary authenticator for these
+        // flows, so mint a session with the honest `sms` amr.
+        establish_and_respond(&state, scope, &user.id, &ctx, &headers).await
+    } else {
+        // `mfa` / `verify_address`: a possession proof only. The abuse throttle relaxes on
+        // a proven possession just as a successful sign-in does.
+        state.reset_after_success(&ctx).await;
+        proof_response(purpose)
+    }
+}
+
+/// Whether a successful verify for `purpose` establishes a PRIMARY login session
+/// (issue #70). `login`, `recovery`, and self-service `register` mint a session with the
+/// honest `sms` amr (the SMS code IS the primary authenticator for these flows) and so
+/// pass through the no-silent-downgrade gate. `mfa` and `verify_address` are possession
+/// PROOFS that never mint a primary session: SMS-as-a-second-factor session elevation is
+/// the step-up flow (issue #72), and address verification proves control of the number
+/// without signing anyone in. Minting a primary `sms` session from an `mfa` OTP alone
+/// would silently claim a first factor that was never proven, so those purposes are never
+/// session-establishing here.
+fn establishes_session(purpose: EmailFactorPurpose) -> bool {
+    matches!(
+        purpose,
+        EmailFactorPurpose::Login | EmailFactorPurpose::Recovery | EmailFactorPurpose::Register
+    )
+}
+
+/// The NON-session-establishing success result for an `mfa` or `verify_address` verify
+/// (issue #70): a possession proof that the presenter controls the phone number, with NO
+/// session cookie and NO authenticated-login claim. It never carries `authenticated: true`
+/// or an `amr`, so it cannot be mistaken for (or promoted into) a primary session.
+fn proof_response(purpose: EmailFactorPurpose) -> Response {
+    json_response(
+        StatusCode::OK,
+        json!({ "verified": true, "purpose": purpose.as_str() }),
+    )
 }
 
 /// Whether `subject` holds a stronger factor than SMS (a passkey or an active TOTP),

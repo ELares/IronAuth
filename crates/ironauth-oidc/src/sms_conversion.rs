@@ -59,11 +59,14 @@ pub fn conversion_percent(sends: i64, verifies: i64) -> Option<u32> {
 }
 
 /// The route-health verdict (issue #70): [`RouteHealth::InsufficientData`] below
-/// `min_samples` sends; otherwise [`RouteHealth::Pumping`] when the conversion percent is
+/// `min_samples` sends; otherwise [`RouteHealth::Pumping`] when the conversion rate is
 /// STRICTLY below `alarm_threshold_percent`, else [`RouteHealth::Healthy`].
 ///
-/// The comparison is strict-below so a route sitting exactly at the threshold is treated
-/// as healthy (the threshold is the floor of acceptable conversion).
+/// The comparison is on the RAW conversion rate against the threshold, NOT a rounded
+/// integer percent (adversarial review INFO): a route at 29.5 percent must read as pumping
+/// against a 30 percent threshold, not round up to a healthy 30 percent, so the effective
+/// threshold is exact. It is strict-below, so a route sitting exactly at the threshold is
+/// treated as healthy (the threshold is the floor of acceptable conversion).
 #[must_use]
 pub fn route_health(
     sends: i64,
@@ -74,8 +77,10 @@ pub fn route_health(
     if sends < i64::from(min_samples) {
         return RouteHealth::InsufficientData;
     }
-    match conversion_percent(sends, verifies) {
-        Some(pct) if pct < alarm_threshold_percent => RouteHealth::Pumping,
+    // Above the sample floor `sends > 0`, so the rate is always `Some`; the `None` arm is
+    // unreachable and collapses to Healthy (never a false pumping alarm).
+    match conversion_rate(sends, verifies) {
+        Some(rate) if rate < f64::from(alarm_threshold_percent) / 100.0 => RouteHealth::Pumping,
         _ => RouteHealth::Healthy,
     }
 }
@@ -135,5 +140,16 @@ mod tests {
         assert_eq!(route_health(30, 9, 20, 30), RouteHealth::Healthy);
         // One below the floor tips into pumping.
         assert_eq!(route_health(100, 29, 20, 30), RouteHealth::Pumping);
+    }
+
+    #[test]
+    fn a_fractional_percent_below_the_threshold_is_pumping_without_rounding() {
+        // Adversarial review INFO: 200 sends, 59 verifies == 29.5 percent. The RAW rate
+        // (0.295) is strictly below the 30 percent threshold, so the route is PUMPING. A
+        // rounded integer percent would round 29.5 up to 30 and mis-read it as healthy,
+        // silently widening the effective threshold; the raw-ratio comparison is exact.
+        assert_eq!(route_health(200, 59, 20, 30), RouteHealth::Pumping);
+        // The complementary just-above case (60 verifies == exactly 30 percent) is healthy.
+        assert_eq!(route_health(200, 60, 20, 30), RouteHealth::Healthy);
     }
 }
