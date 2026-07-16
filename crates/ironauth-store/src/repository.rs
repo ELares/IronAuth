@@ -3408,6 +3408,38 @@ impl AbuseRepo<'_> {
         Ok(count.and_then(|c| u64::try_from(c).ok()).unwrap_or(0))
     }
 
+    /// CLEAR the failure counter for `subject` on `path` (issue #64): a SUCCESSFUL
+    /// authentication relaxes the per-identifier / per-account throttle so a legitimate user
+    /// who typoed past the soft threshold is not throttled for the rest of the window. Only
+    /// this path's counter is zeroed, so the reset never bleeds onto another path. Reuses
+    /// `dcr_rate_counters` and zeroes the count in place (the data-plane role holds
+    /// SELECT/INSERT/UPDATE, not DELETE); a no-op when no counter row exists. A later
+    /// failure starts a fresh climb from one.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Encryption`] if an identifier subject cannot be keyed;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn clear_failures(
+        &self,
+        subject: &AbuseSubject,
+        path: AuthPath,
+    ) -> Result<(), StoreError> {
+        let key = self.counter_key(subject, path)?;
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        sqlx::query(
+            "UPDATE dcr_rate_counters SET count = 0 \
+             WHERE tenant_id = $1 AND environment_id = $2 AND rate_key = $3",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(&key)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     /// The first ACTIVE ban (unexpired) matching ANY of `subjects` on `path` (or a
     /// path-spanning [`AuthPath::All`] ban), or [`None`]. A `password`-path check never
     /// matches a `passkey` or `recovery` ban, so failed-password regulation cannot

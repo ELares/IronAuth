@@ -126,7 +126,9 @@ pub async fn register_post(
         crate::abuse::stamp_rate_limit_headers(&mut response, &snapshot);
         return response;
     }
-    state.record_auth_failure(&ctx).await;
+    // `regulate_before` already RECORDED this attempt on the register-path counters (every
+    // processed attempt is counted, throttled or allowed), so registration spam climbs the
+    // per-identifier and per-IP throttle without a hard lockout (issue #64).
 
     // CLOSED registration (issue #64, the Logto v1.41 pattern): do NOT create an account
     // inline and do NOT reveal whether the identifier exists. Look the identifier up ONLY

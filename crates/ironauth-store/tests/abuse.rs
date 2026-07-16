@@ -247,3 +247,147 @@ async fn failure_counters_survive_a_restart() {
         .expect("count");
     assert_eq!(recovery, 0, "the recovery path counter is independent");
 }
+
+#[tokio::test]
+async fn a_ban_survives_a_restart() {
+    // A durable ban is authoritative in Postgres, so a fresh Store over the same database
+    // (a simulated node restart) still sees it active (issue #64 INFO-8).
+    let db = TestDatabase::start().await;
+    let (env, _clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0x68);
+    let scope = db.seed_scope(&env).await;
+    let subject = AbuseSubject::account("usr_persisted");
+
+    place_ban(db.store(), &env, scope, &subject, AuthPath::Password, None).await;
+
+    // Drop the original Store and re-open over the same database.
+    let restarted = db.restart_app_store().await;
+    let subjects = [subject];
+    assert!(
+        restarted
+            .scoped(scope)
+            .abuse()
+            .active_ban(&subjects, AuthPath::Password, now_micros(&env))
+            .await
+            .expect("ban check")
+            .is_some(),
+        "the ban must survive a restart (it is authoritative in Postgres)"
+    );
+}
+
+#[tokio::test]
+async fn clearing_a_failure_counter_relaxes_only_that_path() {
+    // A successful auth CLEARS the failure counter for its path (issue #64 LOW-6), and the
+    // clear is per-PATH: it never bleeds onto another path's counter.
+    let db = TestDatabase::start().await;
+    let (env, _clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0x69);
+    let scope = db.seed_scope(&env).await;
+    let subject = AbuseSubject::identifier("fumbler@example.test");
+    let window = 300;
+    let now = now_micros(&env);
+
+    for _ in 0..4 {
+        db.store()
+            .scoped(scope)
+            .abuse()
+            .record_failure(&subject, AuthPath::Password, window, now)
+            .await
+            .expect("record password failure");
+    }
+    db.store()
+        .scoped(scope)
+        .abuse()
+        .record_failure(&subject, AuthPath::Recovery, window, now)
+        .await
+        .expect("record recovery failure");
+
+    // Clear the PASSWORD path only.
+    db.store()
+        .scoped(scope)
+        .abuse()
+        .clear_failures(&subject, AuthPath::Password)
+        .await
+        .expect("clear password counter");
+
+    assert_eq!(
+        db.store()
+            .scoped(scope)
+            .abuse()
+            .failure_count(&subject, AuthPath::Password, window, now)
+            .await
+            .expect("count"),
+        0,
+        "the password counter is cleared"
+    );
+    assert_eq!(
+        db.store()
+            .scoped(scope)
+            .abuse()
+            .failure_count(&subject, AuthPath::Recovery, window, now)
+            .await
+            .expect("count"),
+        1,
+        "the recovery counter is untouched by clearing the password path"
+    );
+}
+
+#[tokio::test]
+async fn the_fail_closed_security_cells_deny_when_the_master_key_is_missing() {
+    // The security (fail-CLOSED) abuse cells surface their backend failure when the envelope
+    // master key is missing (issue #64 MEDIUM-5): the per-identifier failure counter (read
+    // and write), the ban check, and the counter clear all ERROR rather than silently
+    // admitting, so the caller (`OidcState::regulate_before`) denies the attempt. This
+    // simulates the "missing master key" backend failure for each fail-closed cell.
+    let db = TestDatabase::start().await;
+    let (env, _clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0x6a);
+    let scope = db.seed_scope(&env).await;
+
+    // A store over the SAME database but with NO master key wired: the identifier-keyed and
+    // ban paths fail closed.
+    let no_master = Store::from_pool(db.app_pool().clone());
+    let subject = AbuseSubject::identifier("victim@example.test");
+    let window = 300;
+    let now = now_micros(&env);
+
+    // The per-identifier failure counter INCREMENT fails closed (an identifier subject
+    // cannot be blind-indexed without the master key).
+    assert!(
+        no_master
+            .scoped(scope)
+            .abuse()
+            .record_failure(&subject, AuthPath::Password, window, now)
+            .await
+            .is_err(),
+        "the per-identifier counter increment must fail closed without a master key"
+    );
+    // The per-identifier failure counter READ fails closed.
+    assert!(
+        no_master
+            .scoped(scope)
+            .abuse()
+            .failure_count(&subject, AuthPath::Password, window, now)
+            .await
+            .is_err(),
+        "the per-identifier counter read must fail closed without a master key"
+    );
+    // The durable ban check fails closed (the subjects are blind-indexed for the lookup).
+    let subjects = [subject.clone()];
+    assert!(
+        no_master
+            .scoped(scope)
+            .abuse()
+            .active_ban(&subjects, AuthPath::Password, now)
+            .await
+            .is_err(),
+        "the ban check must fail closed without a master key"
+    );
+    // The counter clear (on a successful auth) fails closed too.
+    assert!(
+        no_master
+            .scoped(scope)
+            .abuse()
+            .clear_failures(&subject, AuthPath::Password)
+            .await
+            .is_err(),
+        "the per-identifier counter clear must fail closed without a master key"
+    );
+}

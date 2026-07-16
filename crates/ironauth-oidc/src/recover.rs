@@ -97,7 +97,9 @@ pub async fn recover_post(
         crate::abuse::stamp_rate_limit_headers(&mut response, &snapshot);
         return response;
     }
-    state.record_auth_failure(&ctx).await;
+    // `regulate_before` already RECORDED this attempt on the recovery-path counters (every
+    // processed attempt is counted, throttled or allowed), so recovery-request spam climbs
+    // the per-identifier and per-IP throttle without a hard lockout (issue #64).
 
     // Look the identifier up ONLY to decide whether the recovery send is permitted; the
     // lookup runs for both present and absent identifiers, so the work is uniform. A send

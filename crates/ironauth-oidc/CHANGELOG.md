@@ -20,6 +20,22 @@ range per docs/RELEASING.md.
   a new `VerificationSender` seam suppresses a send to an unknown recipient under closed
   registration while returning the identical acknowledgment (the Logto pattern). Throttled
   responses carry the standard rate-limit headers (reusing the quota crate's contract).
+- Credential-abuse regulation, review hardening (issue #64): the escalation now actually
+  ESCALATES. `regulate_before` RECORDS every regulated attempt (throttled OR allowed) as
+  part of the decision and computes the delay from the incremented count, so the
+  per-identifier / per-IP `Retry-After` doubles per failure up to `max_delay` and the
+  per-account counter climbs until the opt-in `hard_lockout` threshold is REACHABLE
+  (previously the counter froze at the soft threshold because a throttled attempt was never
+  recorded, pinning `Retry-After` flat at the base delay and making `hard_lockout`
+  unreachable). The passkey ceremony (`authenticate/verify`) is now GOVERNED on its own
+  `AuthPath::Passkey` path: a passkey or `all` ban is enforced and passkey abuse is
+  throttled on its own per-IP counters, while a password-path ban or spray never touches
+  it (path independence preserved). A successful login (and passkey sign-in) RESETS its
+  path's identifier/account/IP failure counters so a legitimate user is not punished after
+  a correct credential. Under `hard_lockout`, the banned-account response now carries the
+  SAME snapshot shape (status, body, `Retry-After`) as an escalation throttle at the cap,
+  so a banned present account is not distinguishable from a throttled identifier by the
+  RESPONSE (only the inherent onset differs; see the `hard_lockout` config note).
 - Argon2id hashing pool with per-tenant fair-share admission (issue #62): password
   hashing, the hottest and most denial-of-service-prone operation, now runs in a
   dedicated worker pool (`HashingPool`) of fixed OS threads kept OFF the async request

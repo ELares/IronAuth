@@ -30,14 +30,24 @@
 //! | per-client request counter     | L1 in-process (future L2)      | availability | FAIL OPEN (allow)  |
 //! | per-(tenant,env) request meter | L1 in-process (future L2)      | availability | FAIL OPEN (allow)  |
 //! | per-identifier failure counter | DB (`dcr_rate_counters` reuse) | security     | FAIL CLOSED (deny) |
-//! | per-account failure counter    | DB (`dcr_rate_counters` reuse) | security     | FAIL CLOSED (deny) |
+//! | per-account failure counter    | DB (`dcr_rate_counters` reuse) | availability | FAIL OPEN (record)  |
 //! | ban check                      | DB (`abuse_bans`)              | security     | FAIL CLOSED (deny) |
 //!
 //! The rationale: the in-process layer only shapes coarse request rate, so failing it
-//! open costs a little rate protection but preserves availability; the DB layer is the
-//! source of truth already on the request path (the identifier lookup itself hits the
-//! same DB), so failing it closed matches the rest of the system and denies an attacker
-//! any bypass. Each cell has a test that injects the corresponding backend failure.
+//! open costs a little rate protection but preserves availability; the per-identifier
+//! counter and the ban check ARE request-path deny gates (a throttle or a ban refuses the
+//! attempt) and are the source of truth already on the request path (the identifier lookup
+//! itself hits the same DB), so failing them closed matches the rest of the system and
+//! denies an attacker any bypass. The per-account counter is DIFFERENT: it is NOT a
+//! request-path deny gate. It only drives the opt-in hard-lockout auto-ban, records
+//! fail-OPEN (a backend error on its increment is swallowed, never a deny), and is
+//! deliberately omitted from the pre-verify [`OidcState::regulate_before`] decision, so
+//! failed-password spray against a victim can never turn the pre-check into an existence
+//! oracle. Each cell has a test that injects the corresponding backend failure.
+//!
+//! The per-client and per-(tenant, environment) request counters are also RECORDED here
+//! (L1, fail open) but are not yet a throttle input; tenant-plane fairness consumes them in
+//! M5. They increment on every regulated attempt so the future layers have the history.
 //!
 //! # Account-DoS safety (per-path independence)
 //!
@@ -46,6 +56,21 @@
 //! so it can never lock the legitimate owner out of the passkey ([#65]) or recovery
 //! path (Keycloak CVE-2024-1722). Hard lockout is an explicit per-tenant opt-in and even
 //! then is confined to the password path.
+//!
+//! # Anti-enumeration uniformity is a DEFAULT-posture property
+//!
+//! On the DEFAULT posture (`hard_lockout = false`) the pre-verify decision keys ONLY on
+//! the existence-INDEPENDENT dimensions (the canonical identifier and the IP), so a
+//! throttle never distinguishes a present from an absent identifier: the uniformity claim
+//! holds. Enabling `hard_lockout` is an explicit opt-in that BREAKS that property: it adds
+//! a login ENUMERATION oracle DISTINCT from the DoS-weaponization tradeoff. A real account
+//! auto-bans once its per-account counter crosses the threshold, so the 429 ONSET (which
+//! attempt first refuses on the full-wait banned shape) comes earlier for a present
+//! account than for an absent identifier, and that timing/onset difference is INHERENT to
+//! hard lockout and cannot be closed. What IS closed (issue #64) is the avoidable
+//! RESPONSE-SHAPE leak: a banned present account and a throttled identifier carry the SAME
+//! snapshot shape (status, body, and `Retry-After` semantics), so only the onset differs.
+//! Both residuals are documented on the `hard_lockout` config field and in `docs/CONFIG.md`.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -86,6 +111,17 @@ pub trait CounterStore: Send + Sync + std::fmt::Debug {
     ///
     /// [`CounterError::Unavailable`] when the backend cannot be reached (a future L2).
     fn peek(&self, key: &str, window_secs: u64, now_micros: i64) -> Result<u64, CounterError>;
+
+    /// Clear the counter for `key` (issue #64): a SUCCESSFUL authentication relaxes the
+    /// per-IP throttle so a legitimate user who typoed past the soft threshold is not
+    /// punished for the rest of the window once they enter the correct credential. The
+    /// caller treats it as best-effort (a clear failure just leaves the windowed counter
+    /// to roll over on its own).
+    ///
+    /// # Errors
+    ///
+    /// [`CounterError::Unavailable`] when the backend cannot be reached (a future L2).
+    fn clear(&self, key: &str) -> Result<(), CounterError>;
 }
 
 /// One fixed window: when it started (epoch microseconds) and its running count.
@@ -143,6 +179,14 @@ impl CounterStore for MemoryCounterStore {
 
     fn peek(&self, key: &str, window_secs: u64, now_micros: i64) -> Result<u64, CounterError> {
         Ok(self.count(key, window_secs, now_micros, false))
+    }
+
+    fn clear(&self, key: &str) -> Result<(), CounterError> {
+        self.windows
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(key);
+        Ok(())
     }
 }
 
@@ -208,10 +252,18 @@ pub fn escalating_delay(settings: &RegulationSettings, count: u64) -> Option<Dur
         return None;
     }
     let over = count - settings.soft_threshold; // >= 1
-    // base * 2^(over-1), saturating, capped at max_delay.
+    // base * 2^(over-1), SATURATING, capped at max_delay. `checked_shl` only guards the
+    // shift against the type width; the shifted VALUE can still overflow and wrap (for
+    // base_delay >= 2 a large shift wrapped to 0, making the cap non-monotone). Use a
+    // saturating multiply so the delay is monotonically non-decreasing and clamps at
+    // `max_delay` for any base/shift, never wrapping to 0 (issue #64 LOW-7).
     let base = settings.base_delay.as_secs().max(1);
-    let shift = u32::try_from(over - 1).unwrap_or(u32::MAX);
-    let scaled = base.checked_shl(shift).unwrap_or(u64::MAX);
+    let shift = over - 1;
+    let scaled = if shift >= 64 {
+        u64::MAX
+    } else {
+        base.saturating_mul(1_u64 << shift)
+    };
     let capped = scaled.min(settings.max_delay.as_secs());
     Some(Duration::from_secs(capped))
 }
@@ -257,15 +309,23 @@ pub fn tenant_counter_key(path: AuthPath, tenant: &str, environment: &str) -> St
 }
 
 /// The rate-limit snapshot for a ban or a fail-CLOSED security-layer error (issue #64):
-/// a uniform throttle asking the client to wait the regulation window, carrying the same
-/// header shape as an escalation throttle.
+/// a uniform throttle carrying the SAME shape an escalation throttle carries once it has
+/// saturated at the cap. It is byte-identical to
+/// [`throttle_snapshot`]`(settings, count, max_delay)` for any `count` past the soft
+/// threshold: `limit = soft_threshold`, `remaining = 0`, `reset = window`, and
+/// `Retry-After = max_delay`. That identity is load-bearing for anti-enumeration (issue
+/// #64 MEDIUM-3): under `hard_lockout`, a banned PRESENT account and a throttled identifier
+/// must return the same response, so a present account is not distinguished by the
+/// response shape (only the inherent onset differs). `Retry-After` is `max_delay`, NOT the
+/// full ban duration, so it deliberately understates the true wait exactly as the
+/// escalation throttle does; the client that retries early simply gets another 429.
 #[must_use]
 pub fn banned_snapshot(settings: &RegulationSettings) -> RateLimitSnapshot {
     RateLimitSnapshot {
         limit: Some(settings.soft_threshold),
         remaining: Some(0),
         reset_secs: settings.window.as_secs(),
-        retry_after_secs: Some(settings.window.as_secs()),
+        retry_after_secs: Some(settings.max_delay.as_secs()),
     }
 }
 
@@ -440,6 +500,83 @@ mod tests {
     }
 
     #[test]
+    fn escalation_is_monotone_and_capped_for_a_larger_base_delay() {
+        // Regression for the non-monotone cap (issue #64 LOW-7): with base_delay >= 2 the
+        // old `checked_shl` wrapped the shifted value on overflow (base=2, shift=63 -> 0s),
+        // so the delay was NOT monotone and could drop to 0. It must be monotonically
+        // non-decreasing and clamp at max_delay for every shift, never wrapping.
+        let mut settings = settings();
+        settings.base_delay = Duration::from_secs(2);
+        settings.max_delay = Duration::from_secs(60);
+        let mut previous = Duration::ZERO;
+        for over in 1..=200_u64 {
+            let delay = escalating_delay(&settings, settings.soft_threshold + over)
+                .expect("over the soft threshold escalates");
+            assert!(
+                delay >= previous,
+                "the escalating delay must be monotonically non-decreasing (over={over})"
+            );
+            assert!(
+                delay <= settings.max_delay,
+                "the escalating delay must never exceed max_delay (over={over})"
+            );
+            assert!(
+                delay > Duration::ZERO,
+                "the escalating delay must never wrap to zero (over={over})"
+            );
+            previous = delay;
+        }
+        // Far past the threshold it is pinned at the cap, never wrapped.
+        assert_eq!(
+            escalating_delay(&settings, settings.soft_threshold + 1_000).unwrap(),
+            settings.max_delay
+        );
+    }
+
+    #[test]
+    fn a_ban_snapshot_is_byte_identical_to_a_capped_escalation_throttle() {
+        // Anti-enumeration uniformity (issue #64 MEDIUM-3): a banned present account and a
+        // throttled identifier must be indistinguishable by the response. The ban snapshot
+        // is exactly a throttle snapshot at the cap for any count past the soft threshold.
+        let settings = settings();
+        let banned = banned_snapshot(&settings);
+        for count in [
+            settings.soft_threshold + 8,
+            settings.hard_lockout_threshold,
+            settings.hard_lockout_threshold + 50,
+        ] {
+            let throttle = throttle_snapshot(&settings, count, settings.max_delay);
+            assert_eq!(
+                banned, throttle,
+                "the ban snapshot must match a capped escalation throttle (count={count})"
+            );
+            assert_eq!(
+                banned.headers(),
+                throttle.headers(),
+                "the headers must match too"
+            );
+        }
+    }
+
+    #[test]
+    fn a_cleared_memory_counter_relaxes_the_throttle() {
+        // A successful auth clears the per-IP counter so a legitimate user is not punished
+        // after a correct login (issue #64 LOW-6).
+        let store = MemoryCounterStore::new();
+        let key = ip_counter_key(AuthPath::Password, "203.0.113.9");
+        for _ in 0..7 {
+            store.incr(&key, 300, 0).unwrap();
+        }
+        assert_eq!(store.peek(&key, 300, 0).unwrap(), 7);
+        store.clear(&key).unwrap();
+        assert_eq!(
+            store.peek(&key, 300, 0).unwrap(),
+            0,
+            "clearing the counter relaxes the throttle"
+        );
+    }
+
+    #[test]
     fn disabled_regulation_never_escalates() {
         let mut settings = settings();
         settings.enabled = false;
@@ -474,6 +611,9 @@ mod tests {
             Err(CounterError::Unavailable)
         }
         fn peek(&self, _key: &str, _window: u64, _now: i64) -> Result<u64, CounterError> {
+            Err(CounterError::Unavailable)
+        }
+        fn clear(&self, _key: &str) -> Result<(), CounterError> {
             Err(CounterError::Unavailable)
         }
     }

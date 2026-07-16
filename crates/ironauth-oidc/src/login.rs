@@ -203,7 +203,6 @@ pub async fn login_post(
                 Ok(_) => {}
                 Err(rejection) => return rejection.to_response(),
             }
-            state.record_auth_failure(&ctx).await;
             failed_login_page(identifier, &resume.return_to, &resume.hints, banner)
         }
         Ok(Some(user)) => {
@@ -246,14 +245,20 @@ pub async fn login_post(
                 )
                 .await
                 {
-                    Ok(cookie) => interaction::redirect_setting_cookie(&resume.return_to, &cookie),
+                    Ok(cookie) => {
+                        // Successful login: relax this path's identifier/account/IP failure
+                        // counters so a user who typoed past the soft threshold is not
+                        // throttled for the rest of the window (issue #64 LOW-6).
+                        state.reset_after_success(&ctx).await;
+                        interaction::redirect_setting_cookie(&resume.return_to, &cookie)
+                    }
                     Err(_) => interaction::server_error_page(),
                 }
             } else {
                 // Present but wrong password: generic failure (no wrong-password
                 // oracle), whether the stored verifier is native or foreign. The failed
-                // attempt is recorded against the layered abuse counters (issue #64).
-                state.record_auth_failure(&ctx).await;
+                // attempt was already recorded by `regulate_before` on the layered abuse
+                // counters (issue #64), so no further recording here.
                 failed_login_page(identifier, &resume.return_to, &resume.hints, banner)
             }
         }
@@ -279,6 +284,9 @@ pub async fn login_post(
                     )
                     .await
                     {
+                        // A verified lazy migration is a successful first login: relax this
+                        // path's identifier/IP failure counters (issue #64 LOW-6).
+                        state.reset_after_success(&ctx).await;
                         return response;
                     }
                 }
@@ -291,10 +299,9 @@ pub async fn login_post(
                 Ok(_) => {}
                 Err(rejection) => return rejection.to_response(),
             }
-            // Record the failed attempt against the layered abuse counters (issue #64) on
-            // the SAME existence-independent dimensions (identifier + IP) an existing
-            // account would, so an absent identifier is counted and throttled identically.
-            state.record_auth_failure(&ctx).await;
+            // The failed attempt was already recorded by `regulate_before` on the SAME
+            // existence-independent dimensions (identifier + IP) an existing account would,
+            // so an absent identifier is counted and throttled identically (issue #64).
             failed_login_page(identifier, &resume.return_to, &resume.hints, banner)
         }
         Err(_) => interaction::server_error_page(),

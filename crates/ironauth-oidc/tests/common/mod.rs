@@ -789,6 +789,24 @@ impl Harness {
         self.router.clone()
     }
 
+    /// A protocol router over an OIDC state whose data-plane store carries NO master key,
+    /// so the SECURITY (fail-CLOSED) abuse cells (the per-identifier failure counter and
+    /// the durable ban check, both keyed through the envelope master key) surface their
+    /// backend failure. Used to prove the pre-verify regulation DENIES (throttles) rather
+    /// than ADMITS when its security layer errors (issue #64 MEDIUM-5). The registry, env,
+    /// and clock are shared with this harness, so a `return_to` minted here resolves.
+    pub fn router_without_master_key(&self) -> Router {
+        let store = ironauth_store::Store::from_pool(self.db.app_pool().clone());
+        let state = OidcState::new(
+            store,
+            self.env.clone(),
+            Arc::clone(&self.registry),
+            &OidcConfig::default(),
+            ISSUER_BASE,
+        );
+        oidc_router(state)
+    }
+
     /// Install a dedicated Argon2id hashing pool (issue #62) on the state and
     /// rebuild the protocol router, so the public hashing surfaces (login,
     /// register, account, device-flow verify, invitation accept) route through the

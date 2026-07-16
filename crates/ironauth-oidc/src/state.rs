@@ -683,28 +683,41 @@ impl OidcState {
         }
     }
 
-    /// Evaluate credential-abuse regulation BEFORE spending a credential verification
-    /// (issue #64): the durable ban check, then the risk-based escalation over the
-    /// existence-INDEPENDENT dimensions (the canonical identifier and the IP), so the
-    /// decision never distinguishes a present from an absent identifier.
+    /// Evaluate AND RECORD one credential-abuse regulation attempt BEFORE spending a
+    /// credential verification (issue #64). The durable ban check runs first, then this
+    /// RECORDS the attempt on every regulated dimension (so the counter CLIMBS on every
+    /// attempt, throttled OR allowed) and computes the risk-based escalation from the
+    /// now-incremented count over the existence-INDEPENDENT dimensions (the canonical
+    /// identifier and the IP), so on the DEFAULT posture the decision never distinguishes a
+    /// present from an absent identifier.
+    ///
+    /// Recording as part of the decision is what makes the escalation actually escalate
+    /// (issue #64 HIGH-1): a throttled attempt still increments, so the per-identifier /
+    /// per-IP delay keeps DOUBLING up to `max_delay` and the per-account counter keeps
+    /// climbing until the opt-in `hard_lockout` threshold is REACHED (previously the
+    /// counter froze at the soft threshold because a throttled attempt was never recorded).
     ///
     /// The ban check and the identifier layer are SECURITY-biased and FAIL CLOSED (a
     /// backend error refuses the attempt); the IP layer is AVAILABILITY-biased and FAILS
     /// OPEN (a future-L2 outage does not block logins). The per-account dimension is
-    /// deliberately NOT consulted here (only for the opt-in hard lockout), so failed
-    /// spray against a victim cannot turn the pre-check into an existence oracle.
+    /// recorded fail-OPEN and is deliberately NOT a throttle input here (only the opt-in
+    /// hard lockout consumes it), so failed spray against a victim cannot turn the
+    /// pre-check into an existence oracle on the default path.
     pub(crate) async fn regulate_before(
         &self,
         ctx: &crate::abuse::AttemptContext,
     ) -> crate::abuse::RegulationOutcome {
         use crate::abuse::{
-            RegulationOutcome, banned_snapshot, escalating_delay, ip_counter_key, throttle_snapshot,
+            RegulationOutcome, banned_snapshot, client_counter_key, escalating_delay,
+            ip_counter_key, tenant_counter_key, throttle_snapshot,
         };
         let now = epoch_micros(self.now());
         let settings = *self.regulation();
         let scope = ctx.scope;
-        // 1. Durable ban check (DB), fail CLOSED. Explicit operator bans apply regardless
-        //    of the auto-escalation switch.
+        // 1. Durable ban check (DB), fail CLOSED. Explicit operator bans (and an
+        //    auto-placed hard-lockout ban) apply regardless of the auto-escalation switch.
+        //    Keyed only on the subjects present, so it stays existence-independent on the
+        //    default path.
         let subjects = ctx.ban_subjects();
         if !subjects.is_empty() {
             match self
@@ -725,7 +738,8 @@ impl OidcState {
         }
         let window_secs = i64::try_from(settings.window_secs()).unwrap_or(i64::MAX);
         let mut worst: Option<(u64, std::time::Duration)> = None;
-        // 2a. Per-identifier escalation (DB), fail CLOSED. Existence-independent: the
+        // 2a. Per-identifier (DB), fail CLOSED. RECORD the attempt (increment) and compute
+        //     the escalation from the now-climbing count. Existence-independent: the
         //     counter keys on the canonical identifier whether or not it resolves.
         if let Some(identifier) = &ctx.identifier {
             let subject = AbuseSubject::identifier(identifier.as_str().to_owned());
@@ -733,7 +747,7 @@ impl OidcState {
                 .store()
                 .scoped(scope)
                 .abuse()
-                .failure_count(&subject, ctx.path, window_secs, now)
+                .record_failure(&subject, ctx.path, window_secs, now)
                 .await
             {
                 Ok(count) => {
@@ -746,50 +760,43 @@ impl OidcState {
                 }
             }
         }
-        // 2b. Per-IP escalation (L1), fail OPEN: a counter-store error is ignored.
+        // 2b. Per-IP (L1), fail OPEN: RECORD the attempt and escalate from the new count; a
+        //     counter-store error is ignored (availability-biased).
         if let Some(ip) = &ctx.ip {
             if let Ok(count) =
                 self.abuse_counters
-                    .peek(&ip_counter_key(ctx.path, ip), settings.window_secs(), now)
+                    .incr(&ip_counter_key(ctx.path, ip), settings.window_secs(), now)
             {
                 if let Some(delay) = escalating_delay(&settings, count) {
                     worst = Some(max_escalation(worst, count, delay));
                 }
             }
         }
-        match worst {
-            Some((count, delay)) => {
-                RegulationOutcome::Throttled(throttle_snapshot(&settings, count, delay))
-            }
-            None => RegulationOutcome::Allow,
+        // 2c. Per-client and per-(tenant, environment) request counters (L1): recorded for
+        //     the future edge/tenant-fairness layers (M5/M15), never a throttle input here.
+        if let Some(client) = &ctx.client_id {
+            let _ = self.abuse_counters.incr(
+                &client_counter_key(ctx.path, client),
+                settings.window_secs(),
+                now,
+            );
         }
-    }
-
-    /// Record one FAILED authentication attempt across the layered counters (issue #64):
-    /// the per-identifier and per-account failure counters (DB, durable), and the
-    /// per-IP, per-client, and per-(tenant, environment) counters (L1, in-process). Under
-    /// the per-tenant hard-lockout OPT-IN, a per-account count over the threshold
-    /// auto-places a PASSWORD-path ban (never passkey or recovery), confined to the
-    /// account so the owner keeps every other path.
-    pub(crate) async fn record_auth_failure(&self, ctx: &crate::abuse::AttemptContext) {
-        let settings = *self.regulation();
-        if !settings.enabled {
-            return;
-        }
-        let now = epoch_micros(self.now());
-        let scope = ctx.scope;
-        let window_secs = i64::try_from(settings.window_secs()).unwrap_or(i64::MAX);
-        // Per-identifier failure (DB, durable). Existence-independent.
-        if let Some(identifier) = &ctx.identifier {
-            let subject = AbuseSubject::identifier(identifier.as_str().to_owned());
-            let _ = self
-                .store()
-                .scoped(scope)
-                .abuse()
-                .record_failure(&subject, ctx.path, window_secs, now)
-                .await;
-        }
-        // Per-account failure (DB, durable), used for the opt-in hard lockout only.
+        let _ = self.abuse_counters.incr(
+            &tenant_counter_key(
+                ctx.path,
+                &scope.tenant().to_string(),
+                &scope.environment().to_string(),
+            ),
+            settings.window_secs(),
+            now,
+        );
+        // 2d. Per-account (DB) for the opt-in hard lockout ONLY, fail OPEN (records, never a
+        //     request-path deny gate). Climbs every attempt so the threshold is REACHABLE;
+        //     on crossing it (password path only) an auto hard-lockout ban is placed,
+        //     confined to the account and the password path so the owner keeps the
+        //     passkey/recovery paths. The response uses the UNIFORM banned shape so the
+        //     just-banned present account is not distinguishable from a throttled
+        //     identifier by the response (only the onset differs; issue #64 MEDIUM-3).
         if let Some(account) = &ctx.account_id {
             let subject = AbuseSubject::account(account.clone());
             let account_count = self
@@ -804,32 +811,71 @@ impl OidcState {
                 && account_count >= settings.hard_lockout_threshold
             {
                 self.auto_lockout(scope, account, now, &settings).await;
+                return RegulationOutcome::Throttled(banned_snapshot(&settings));
             }
         }
-        // Per-IP, per-client, per-(tenant, environment) failure counters (L1, in-process).
+        // 3. Throttle if the identifier or IP dimension is over the soft threshold.
+        match worst {
+            Some((count, delay)) => {
+                RegulationOutcome::Throttled(throttle_snapshot(&settings, count, delay))
+            }
+            None => RegulationOutcome::Allow,
+        }
+    }
+
+    /// Relax the per-identifier, per-account, and per-IP failure counters for `ctx`'s path
+    /// after a SUCCESSFUL authentication (issue #64 LOW-6), so a legitimate user who typoed
+    /// past the soft threshold is not throttled for the rest of the window once they enter
+    /// the correct credential. Best-effort and per-PATH, so it never touches another path's
+    /// state; a reset failure just leaves the (windowed) counter to roll over on its own.
+    pub(crate) async fn reset_after_success(&self, ctx: &crate::abuse::AttemptContext) {
+        let settings = *self.regulation();
+        if !settings.enabled {
+            return;
+        }
+        let scope = ctx.scope;
+        if let Some(identifier) = &ctx.identifier {
+            let subject = AbuseSubject::identifier(identifier.as_str().to_owned());
+            let _ = self
+                .store()
+                .scoped(scope)
+                .abuse()
+                .clear_failures(&subject, ctx.path)
+                .await;
+        }
+        if let Some(account) = &ctx.account_id {
+            let subject = AbuseSubject::account(account.clone());
+            let _ = self
+                .store()
+                .scoped(scope)
+                .abuse()
+                .clear_failures(&subject, ctx.path)
+                .await;
+        }
         if let Some(ip) = &ctx.ip {
-            let _ = self.abuse_counters.incr(
-                &crate::abuse::ip_counter_key(ctx.path, ip),
-                settings.window_secs(),
-                now,
-            );
+            let _ = self
+                .abuse_counters
+                .clear(&crate::abuse::ip_counter_key(ctx.path, ip));
         }
-        if let Some(client) = &ctx.client_id {
-            let _ = self.abuse_counters.incr(
-                &crate::abuse::client_counter_key(ctx.path, client),
-                settings.window_secs(),
-                now,
-            );
-        }
-        let _ = self.abuse_counters.incr(
-            &crate::abuse::tenant_counter_key(
-                ctx.path,
-                &scope.tenant().to_string(),
-                &scope.environment().to_string(),
-            ),
-            settings.window_secs(),
-            now,
-        );
+    }
+
+    /// Whether the passkey path is BANNED for `account` (issue #64 MEDIUM-2): a passkey- or
+    /// `all`-path ban placed by an operator (or the auto-lockout, though that is password
+    /// only) on the resolved account. Governs the passkey ceremony INDEPENDENTLY of the
+    /// password path (a `password` ban never matches here), so failed-password spray can
+    /// never lock the owner out of passkey login. FAILS CLOSED: a backend error is treated
+    /// as banned, matching the password-path ban check.
+    pub(crate) async fn passkey_account_banned(&self, scope: Scope, account: &str) -> bool {
+        let now = epoch_micros(self.now());
+        let subjects = [AbuseSubject::account(account.to_owned())];
+        matches!(
+            self.store()
+                .scoped(scope)
+                .abuse()
+                .active_ban(&subjects, AuthPath::Passkey, now)
+                .await,
+            Ok(Some(_)) | Err(_)
+        )
     }
 
     /// Auto-place a PASSWORD-path hard-lockout ban on `account` (issue #64), best-effort.

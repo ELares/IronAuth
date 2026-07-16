@@ -1370,8 +1370,20 @@ pub struct RegulationConfig {
     /// is auto-placed once the account dimension exceeds `hard_lockout_threshold`,
     /// blocking the PASSWORD path for `hard_lockout_duration_secs`. The passkey and
     /// recovery paths are NEVER locked (they are governed independently), so even under
-    /// hard lockout the owner is not locked out of every path. Enabling this accepts the
-    /// documented weaponization tradeoff.
+    /// hard lockout the owner is not locked out of every path.
+    ///
+    /// Enabling this accepts TWO distinct documented tradeoffs. First, the denial-of-service
+    /// WEAPONIZATION tradeoff (Keycloak CVE-2024-1722): an attacker who sprays failed
+    /// passwords at a victim's account can hard-lock the victim's password path. Second,
+    /// and SEPARATELY, a login ENUMERATION oracle: because a real account auto-bans once
+    /// its per-account counter crosses the threshold while an unknown identifier never
+    /// does, the 429 onset comes earlier for a present account, so an attacker can
+    /// distinguish existing from unknown accounts by the ONSET (timing) of the throttle.
+    /// That onset difference is INHERENT to hard lockout and cannot be removed; only the
+    /// avoidable RESPONSE-SHAPE leak is closed (a banned present account and a throttled
+    /// identifier return the same status, body, and `Retry-After` header shape). On the
+    /// DEFAULT posture (`hard_lockout` false) neither tradeoff applies and the login,
+    /// registration, and recovery surfaces stay fully anti-enumeration uniform.
     pub hard_lockout: bool,
 
     /// The account-dimension failure count within `window_secs` that auto-places a

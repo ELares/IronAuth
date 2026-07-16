@@ -18,6 +18,13 @@ range per docs/RELEASING.md.
   are keyed per authentication PATH, so a `password` ban never governs the `passkey` or
   `recovery` path (the account-DoS safeguard, Keycloak CVE-2024-1722). New public types:
   `AbuseSubject`, `AbuseSubjectKind`, `AuthPath`, `NewBan`, `AbuseBanView`, `AbuseBanId`.
+- `AbuseRepo::clear_failures` (issue #64 review hardening): zeroes a subject's failure
+  counter for one path in place (SELECT/INSERT/UPDATE grants only, no DELETE), so a
+  SUCCESSFUL authentication relaxes that path's throttle without bleeding onto another
+  path; a later failure starts a fresh climb from one. The fail-CLOSED security cells (the
+  per-identifier counter read/write, the ban check, and now the clear) all surface their
+  backend error when the envelope master key is missing, so the caller denies rather than
+  admits. No schema change (reuses `dcr_rate_counters`).
 - `UserRepo::rehash_native_password` (issue #62): lands the transparent upgrade of a
   NATIVE Argon2id credential to the current hashing parameters after a successful login.
   It writes the recomputed verifier onto `password_hash` and audits one
