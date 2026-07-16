@@ -30,15 +30,16 @@
 //! - `plan` reports the per-tenant factor-orchestration plan (which factor is
 //!   offered or required first), the flow step the hosted login consumes.
 //!
-//! # The abuse-defense seam (issue #64)
+//! # The abuse-defense seam (issue #64/#72)
 //!
 //! TOTP verification and recovery-code redemption are the brute-forceable
-//! surfaces. The M7 abuse-defense counters (issue #64) are being built in parallel
-//! and are not merged yet, so [`throttle_seam`] is the CLEARLY MARKED integration
-//! point where those counters will gate a verification. It does the correct thing
-//! today (the verification runs and is bounded by the constant-time compare and the
-//! store single-use invariant) and is where the #64 merge wires the per-tenant,
-//! per-subject rate gate. This issue does NOT block on #64.
+//! surfaces. [`throttle_seam`] routes every attempt through the #64 abuse regulation
+//! on the INDEPENDENT [`ironauth_store::AuthPath::SecondFactor`] path (issue #72): it
+//! records the attempt and returns a uniform 429 once the per-subject failure budget is
+//! exhausted, BEFORE any seed is opened or any code compared, and it never touches the
+//! password or passkey path. The RFC 9470 step-up challenge (`/login/mfa`) runs the same
+//! regulation on the same path before calling [`verify_second_factor`], so the whole
+//! second-factor surface is throttled through the one #64 counter set.
 
 use axum::Json;
 use axum::extract::{Path, State};
@@ -101,19 +102,38 @@ async fn authenticate(
     })
 }
 
-/// The abuse-defense throttle seam (issue #64, built in parallel).
+/// Throttle a second-factor verification through the #64 abuse regulation (issue
+/// #72, closing the seam issue #69 left).
 ///
-/// This is the CLEARLY MARKED integration point where the M7 per-tenant,
-/// per-subject abuse-defense counters (issue #64) will gate a TOTP verification or
-/// a recovery-code redemption. Until #64 merges this is a no-op that always admits
-/// (returns [`None`]): the verification still runs correctly and is bounded by the
-/// constant-time compare and the hard store-level single-use invariant. When #64
-/// lands, this returns `Some(response)` (a uniform 429) once the per-subject failure
-/// budget is exhausted, BEFORE any seed is opened or any code compared.
-fn throttle_seam(_state: &OidcState, _scope: Scope, _subject: &UserId) -> Option<Response> {
-    // #64 integration point: consume a per-(tenant, subject) verification-attempt
-    // token here and return a 429 when the budget is exhausted.
-    None
+/// TOTP verification and recovery-code redemption are the brute-forceable
+/// second-factor surfaces. This routes an attempt through the SAME per-subject,
+/// fail-CLOSED regulation the password path uses, on the INDEPENDENT
+/// [`ironauth_store::AuthPath::SecondFactor`]: it RECORDS the attempt and, once the
+/// per-subject failure budget is exhausted, returns `Some(response)` (a uniform 429
+/// carrying the standard rate-limit headers) BEFORE any seed is opened or any code is
+/// compared, so an online guess storm is escalated (and can auto-place a
+/// `second_factor` ban). It NEVER touches the password or passkey path, so a
+/// second-factor storm cannot lock the owner out of primary login. Returns `None` to
+/// admit (the verification runs, additionally bounded by the constant-time compare and
+/// the hard store-level single-use invariant).
+async fn throttle_seam(
+    state: &OidcState,
+    scope: Scope,
+    subject: &UserId,
+    headers: &HeaderMap,
+) -> Option<Response> {
+    let ctx = crate::abuse::second_factor_attempt_context(scope, subject, headers);
+    match state.regulate_before(&ctx).await {
+        crate::abuse::RegulationOutcome::Throttled(snapshot) => {
+            let mut response = json_response(
+                StatusCode::TOO_MANY_REQUESTS,
+                json!({ "error": "too_many_requests" }),
+            );
+            crate::abuse::stamp_rate_limit_headers(&mut response, &snapshot);
+            Some(response)
+        }
+        crate::abuse::RegulationOutcome::Allow => None,
+    }
 }
 
 /// The current wall-clock time in whole seconds since the Unix epoch, from the
@@ -321,8 +341,8 @@ pub async fn verify(
         Ok(account) => account,
         Err(response) => return response,
     };
-    // The abuse-defense throttle seam (issue #64) gates the attempt here.
-    if let Some(response) = throttle_seam(&state, account.scope, &account.subject) {
+    // The abuse-defense throttle seam (issue #64/#72) gates the attempt here.
+    if let Some(response) = throttle_seam(&state, account.scope, &account.subject, &headers).await {
         return response;
     }
     let credentials = state.store().scoped(account.scope).totp_credentials();
@@ -407,10 +427,12 @@ pub(crate) enum SecondFactorOutcome {
 /// drives; it records the same audited, single-use verification the self-service
 /// account surface does, so a stepped-up second factor is proven exactly once.
 ///
-/// The credential-abuse throttle seam (issue #64) gates the attempt through the
-/// same [`throttle_seam`] the account TOTP surface uses (a shared integration point
-/// for the M7 abuse counters); a genuine verification is additionally bounded by the
-/// constant-time compare and the hard store-level single-use invariant.
+/// This primitive does NOT itself throttle: its CALLER (the hosted `/login/mfa` step-up
+/// challenge, issue #72) runs the #64 abuse regulation on the INDEPENDENT
+/// [`ironauth_store::AuthPath::SecondFactor`] path BEFORE calling this, so an online
+/// guess storm is escalated (and can auto-place a ban) before any seed is opened. A
+/// genuine verification here is additionally bounded by the constant-time compare and the
+/// hard store-level single-use invariant.
 pub(crate) async fn verify_second_factor(
     state: &OidcState,
     scope: Scope,
@@ -610,7 +632,7 @@ pub async fn recovery_redeem(
         Ok(account) => account,
         Err(response) => return response,
     };
-    if let Some(response) = throttle_seam(&state, account.scope, &account.subject) {
+    if let Some(response) = throttle_seam(&state, account.scope, &account.subject, &headers).await {
         return response;
     }
     let presented = normalize_recovery_code(&body.code);

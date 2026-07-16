@@ -232,6 +232,60 @@ pub fn login_page(
     )
 }
 
+/// The passkey-ONLY sign-in page (RFC 9470 step-up, issue #72): the surface a
+/// `phr`/`phrh` step-up routes a passkey holder to. Unlike the primary login page it
+/// offers NO password form: a password re-login yields the `pwd` acr, which can NEVER
+/// satisfy a phishing-resistant floor, so offering it would loop forever. It shows only
+/// the passkey button and the nonce-guarded ceremony script, and that script NAVIGATES to
+/// `return_to` (the resuming authorization request) on a verified sign-in rather than
+/// reloading, so completing the passkey ceremony (which yields `phr`, satisfying the
+/// floor) TERMINATES the flow. Every reflected value is escaped; `return_to` is a
+/// server-validated local authorization URL, JSON-encoded for the script.
+#[must_use]
+pub fn passkey_signin_page(
+    return_to: &str,
+    error: Option<&str>,
+    hints: &InteractionHints,
+    environment_banner: Option<&str>,
+    ui: &PasskeyUi<'_>,
+) -> String {
+    let body = format!(
+        "<h1>Passkey required</h1>{error}\
+         <p>This application requires a passkey, a phishing-resistant sign-in. \
+         Use your passkey to continue.</p>{passkey}",
+        error = error_banner(error),
+        passkey = passkey_step_up_block(ui, return_to),
+    );
+    document(
+        "Passkey required",
+        &body,
+        hints.lang(),
+        hints.display().as_str(),
+        environment_banner,
+    )
+}
+
+/// The passkey button and ceremony script for the step-up passkey page (issue #72).
+/// Identical to [`passkey_block`] except that on a verified sign-in it NAVIGATES to the
+/// resuming authorization request (`return_to`) instead of reloading the passkey page, so
+/// the step-up flow proceeds to a now-satisfied authorization and terminates rather than
+/// dead-ending on the passkey page. `return_to` is a server-validated local URL,
+/// JSON-encoded and `</`-escaped so it cannot break out of the `<script>` element.
+fn passkey_step_up_block(ui: &PasskeyUi<'_>, return_to: &str) -> String {
+    let target = serde_json::to_string(return_to)
+        .unwrap_or_else(|_| "\"/\"".to_owned())
+        .replace("</", "<\\/");
+    let script = PASSKEY_SCRIPT.replace("__BASE__", ui.scope_path).replace(
+        "window.location.reload();",
+        &format!("window.location.assign({target});"),
+    );
+    format!(
+        "<p><button type=\"button\" id=\"passkey-btn\">Sign in with a passkey</button></p>\
+         <script nonce=\"{nonce}\">{script}</script>",
+        nonce = escape_html(ui.nonce),
+    )
+}
+
 /// The conditional-UI wiring for the hosted login page (issue #65): the per-response
 /// script nonce and the scope path the ceremony endpoints are mounted under.
 #[derive(Debug, Clone, Copy)]

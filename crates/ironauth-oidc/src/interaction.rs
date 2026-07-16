@@ -516,6 +516,19 @@ pub fn register_redirect(return_to: &str) -> Response {
     redirect(&interaction_url(REGISTER_PATH, return_to))
 }
 
+/// A `303` redirect to the PASSKEY-ONLY sign-in (RFC 9470 step-up, issue #72),
+/// carrying `return_to` and the `passkey=1` marker. The login page renders the
+/// passkey ceremony with NO password form for this marker, so a `phr`/`phrh` step-up
+/// cannot be answered by a password re-login (which would loop forever): the only way
+/// forward is the passkey ceremony, which yields `phr` and terminates the flow.
+#[must_use]
+pub fn passkey_reauth_redirect(return_to: &str) -> Response {
+    redirect(&append_query(
+        LOGIN_PATH,
+        &[("return_to", Some(return_to)), ("passkey", Some("1"))],
+    ))
+}
+
 /// A `303` redirect to the consent page carrying `return_to`.
 #[must_use]
 pub fn consent_redirect(return_to: &str) -> Response {

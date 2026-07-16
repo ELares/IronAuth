@@ -32,6 +32,11 @@ use crate::util::epoch_micros;
 pub struct ResumeQuery {
     /// The authorization URL to resume at after a successful sign-in.
     pub return_to: Option<String>,
+    /// When present (`1`), a step-up routed the subject here to run the PASSKEY ceremony
+    /// specifically for a phishing-resistant (`phr`/`phrh`) floor (RFC 9470, issue #72):
+    /// the page renders the passkey ceremony with NO password form (a password re-login
+    /// yields `pwd` and could never satisfy the floor, so offering it would loop).
+    pub passkey: Option<String>,
 }
 
 /// The posted login form.
@@ -73,14 +78,22 @@ pub async fn login_get(
                     nonce: &nonce,
                     scope_path: &scope_path,
                 };
-                let body = pages::login_page(
-                    resume.hints.login_hint().unwrap_or_default(),
-                    &resume.return_to,
-                    None,
-                    &resume.hints,
-                    banner,
-                    Some(&ui),
-                );
+                // A phishing-resistant step-up (RFC 9470, issue #72) routes here with
+                // `passkey=1` to run the passkey ceremony SPECIFICALLY: render the
+                // passkey-only page (no password form), so a `phr`/`phrh` floor cannot be
+                // answered by a `pwd` re-login that would loop.
+                let body = if query.passkey.as_deref() == Some("1") {
+                    pages::passkey_signin_page(&resume.return_to, None, &resume.hints, banner, &ui)
+                } else {
+                    pages::login_page(
+                        resume.hints.login_hint().unwrap_or_default(),
+                        &resume.return_to,
+                        None,
+                        &resume.hints,
+                        banner,
+                        Some(&ui),
+                    )
+                };
                 pages::login_html(StatusCode::OK, body, &nonce)
             } else {
                 pages::secure_html(
@@ -208,6 +221,18 @@ pub async fn mfa_challenge_post(
     if code.is_empty() {
         return rerender("Enter a code to continue.");
     }
+    // Credential-abuse regulation (issue #64) on the INDEPENDENT second-factor path
+    // (issue #72), keyed on the authenticated subject and the non-forgeable resolved
+    // peer IP, BEFORE any code is verified: an online TOTP/recovery-code guess storm is
+    // escalated to a uniform 429 (and can auto-place a SecondFactor ban) exactly as the
+    // password path is, so the step-up challenge is no longer an unbounded guess oracle.
+    // A throttled attempt spends NO verification. Path-independent: a second-factor storm
+    // never throttles the password or passkey path.
+    let ctx = crate::abuse::second_factor_attempt_context(resume.scope, &subject, &headers);
+    if let crate::abuse::RegulationOutcome::Throttled(snapshot) = state.regulate_before(&ctx).await
+    {
+        return throttled_mfa_challenge_page(&snapshot, &resume.return_to, &resume.hints, banner);
+    }
     let new_method = match totp::verify_second_factor(&state, resume.scope, &subject, code).await {
         SecondFactorOutcome::Totp => AuthMethod::Totp,
         SecondFactorOutcome::Recovery => AuthMethod::RecoveryCode,
@@ -238,9 +263,43 @@ pub async fn mfa_challenge_post(
     )
     .await
     {
-        Ok(cookie) => interaction::redirect_setting_cookie(&resume.return_to, &cookie),
+        Ok(cookie) => {
+            // A proven second factor relaxes THIS path's failure counters (issue #64
+            // LOW-6), so a user who fat-fingered a code before entering the right one is
+            // not throttled for the rest of the window. Best-effort and per-PATH, so it
+            // never touches the password or passkey path.
+            state.reset_after_success(&ctx).await;
+            interaction::redirect_setting_cookie(&resume.return_to, &cookie)
+        }
         Err(_) => interaction::server_error_page(),
     }
+}
+
+/// The uniform throttle response when credential-abuse regulation refuses a step-up
+/// second-factor attempt (RFC 9470, issue #72): the SAME generic challenge page body a
+/// wrong code renders, but with a `429 Too Many Requests` status and the standard
+/// rate-limit response headers, so an online guess storm against the second factor is
+/// slowed exactly as the password path is. Keyed on the `SecondFactor` path, so it never
+/// throttles the password or passkey path.
+fn throttled_mfa_challenge_page(
+    snapshot: &ironauth_quota::RateLimitSnapshot,
+    return_to: &str,
+    hints: &crate::hints::InteractionHints,
+    environment_banner: Option<&str>,
+) -> Response {
+    let mut response = pages::secure_html(
+        StatusCode::OK,
+        pages::mfa_challenge_page(
+            return_to,
+            Some("Too many attempts. Wait a moment and try again."),
+            None,
+            hints,
+            environment_banner,
+        ),
+    );
+    *response.status_mut() = StatusCode::TOO_MANY_REQUESTS;
+    crate::abuse::stamp_rate_limit_headers(&mut response, snapshot);
+    response
 }
 
 /// A per-response CSP script nonce for the login page's conditional-UI script

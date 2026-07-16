@@ -239,6 +239,33 @@ impl TestDatabase {
         &self.owner_pool
     }
 
+    /// Execute a raw statement as the OWNER role, for test setup and fault injection
+    /// (issue #72): a test can `DROP` a table so a subsequent data-plane read FAULTS,
+    /// proving a fail-closed path (for example that a step-up policy read fault at token
+    /// issuance denies rather than silently issuing). Owner-only; never a data-plane
+    /// surface.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the statement cannot be executed.
+    pub async fn execute_owner_sql(&self, sql: &str) {
+        sqlx::query(sql)
+            .execute(&self.owner_pool)
+            .await
+            .expect("execute owner SQL");
+    }
+
+    /// The low-privilege data-plane connection URL (`ironauth_app` role) for THIS
+    /// throwaway database. A test that drives the `ironauth` binary as a subprocess (the
+    /// CLI integration tests, issue #72) writes this into a config file so the CLI
+    /// connects to the same database, as the same low-privilege role production uses, and
+    /// its audited write is subject to forced row-level security exactly as it would be
+    /// in production.
+    #[must_use]
+    pub fn app_url(&self) -> &str {
+        &self.app_url
+    }
+
     /// A throwaway human actor for tests that need to perform a write. Writes
     /// require an acting context; tests that only need *an* actor (not a
     /// specific one) can use this rather than minting their own.

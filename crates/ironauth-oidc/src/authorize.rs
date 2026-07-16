@@ -1349,7 +1349,10 @@ async fn evaluate_step_up(
     // Assemble the requirement from the request, the client floor, and the per-scope
     // policy, then fold in any ESSENTIAL acr from the `claims` parameter (the
     // strongest listed value is the floor).
-    let mut requirement = step_up::requirement_for_request(
+    // Authorize is the PRIMARY gate and re-runs on every request, so a transient
+    // policy-read fault is best-effort here (ignored); the token/refresh path fails
+    // closed on it (issue #72 INFO).
+    let (mut requirement, _policy_read_faulted) = step_up::requirement_for_request(
         state,
         scope,
         client,
@@ -1412,6 +1415,10 @@ async fn evaluate_step_up(
                 AuthzErrorCode::LoginRequired,
                 "re-authentication is required but prompt=none forbids interaction",
             ),
+            step_up::Remediation::PasskeyReauth => StepUpOutcome::Fail(
+                AuthzErrorCode::LoginRequired,
+                "a passkey ceremony is required but prompt=none forbids interaction",
+            ),
             step_up::Remediation::SecondFactor => StepUpOutcome::Fail(
                 AuthzErrorCode::InteractionRequired,
                 "a second-factor step-up is required but prompt=none forbids interaction",
@@ -1424,6 +1431,14 @@ async fn evaluate_step_up(
         // resumed request does not loop, exactly like the max_age gate.
         step_up::Remediation::FullReauth => StepUpOutcome::Interaction(
             interaction::login_redirect(&login_resume_url(params, hints, prompt, pushed)),
+        ),
+        // A phishing-resistant floor (phr/phrh), or an mfa floor the subject can only
+        // reach with a passkey: run the passkey ceremony SPECIFICALLY, never the generic
+        // login (a password re-login yields pwd and would loop). Completing the passkey
+        // ceremony yields phr, which satisfies the floor, so the resumed request proceeds
+        // and the flow TERMINATES.
+        step_up::Remediation::PasskeyReauth => StepUpOutcome::Interaction(
+            interaction::passkey_reauth_redirect(&login_resume_url(params, hints, prompt, pushed)),
         ),
         // A second-factor challenge against the LIVE session: resume the request
         // verbatim (the acr is elevated by the challenge, so it does not loop).

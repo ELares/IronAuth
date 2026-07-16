@@ -124,7 +124,7 @@ fn parse_subject_kind(raw: &str) -> Result<AbuseSubjectKind, ApiError> {
 fn parse_auth_path(raw: &str) -> Result<AuthPath, ApiError> {
     AuthPath::from_wire(raw).ok_or_else(|| {
         ApiError::BadRequest(
-            "auth_path must be password, passkey, recovery, register, or all".into(),
+            "auth_path must be password, passkey, recovery, register, second_factor, or all".into(),
         )
     })
 }

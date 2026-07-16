@@ -898,11 +898,22 @@ async fn enforce_step_up_policy(
     let Ok(id) = ClientId::parse_in_scope(client_id, &scope) else {
         return None;
     };
-    let Ok(client) = state.store().scoped(scope).clients().get(&id).await else {
-        return None;
+    // FAIL CLOSED (issue #72 INFO): a transient store fault while assembling the
+    // requirement must NOT be read as "no requirement", or a step-up policy added AFTER
+    // the code or refresh family was issued could be silently skipped on a store blip and
+    // an under-evaluated token minted. A genuinely absent client carries no policy (no
+    // requirement); any other store fault denies with a server error. Authorize stays the
+    // primary gate.
+    let client = match state.store().scoped(scope).clients().get(&id).await {
+        Ok(client) => client,
+        Err(StoreError::NotFound) => return None,
+        Err(_) => return Some(TokenError::ServerError),
     };
-    let requirement =
+    let (requirement, policy_read_faulted) =
         step_up::requirement_for_request(state, scope, &client, oauth_scope, None, None).await;
+    if policy_read_faulted {
+        return Some(TokenError::ServerError);
+    }
     if requirement.is_empty() {
         return None;
     }

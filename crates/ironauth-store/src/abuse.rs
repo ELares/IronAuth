@@ -102,9 +102,9 @@ impl AbuseSubject {
 /// Per-path scoping is the account-DoS safeguard (Keycloak CVE-2024-1722): failed
 /// password spray raises only the [`AuthPath::Password`] counters and can place only a
 /// [`AuthPath::Password`] ban, so it can never lock the legitimate owner out of the
-/// [`AuthPath::Passkey`] or [`AuthPath::Recovery`] path. [`AuthPath::All`] is the
-/// explicit, operator-chosen path-spanning ban (the rare "this IP is purely hostile"
-/// case), never reached by automatic regulation.
+/// [`AuthPath::Passkey`], [`AuthPath::Recovery`], or [`AuthPath::SecondFactor`] path.
+/// [`AuthPath::All`] is the explicit, operator-chosen path-spanning ban (the rare "this
+/// IP is purely hostile" case), never reached by automatic regulation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AuthPath {
     /// The password login path (`/login`, device-verify sign-in, `/register`-adjacent
@@ -117,6 +117,12 @@ pub enum AuthPath {
     Recovery,
     /// The self-service registration path.
     Register,
+    /// The second-factor / MFA verification path (issue #72): the RFC 9470 step-up
+    /// challenge (`/login/mfa`) and the self-service TOTP / recovery-code verify
+    /// surface (issue #69). Governed INDEPENDENTLY of every other path, so a
+    /// second-factor guess storm throttles ONLY the second-factor challenge and can
+    /// never lock the owner out of the password or passkey login path.
+    SecondFactor,
     /// Every path (an explicit, operator-chosen path-spanning ban only).
     All,
 }
@@ -130,6 +136,7 @@ impl AuthPath {
             AuthPath::Passkey => "passkey",
             AuthPath::Recovery => "recovery",
             AuthPath::Register => "register",
+            AuthPath::SecondFactor => "second_factor",
             AuthPath::All => "all",
         }
     }
@@ -143,6 +150,7 @@ impl AuthPath {
             "passkey" => Some(AuthPath::Passkey),
             "recovery" => Some(AuthPath::Recovery),
             "register" => Some(AuthPath::Register),
+            "second_factor" => Some(AuthPath::SecondFactor),
             "all" => Some(AuthPath::All),
             _ => None,
         }

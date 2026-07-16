@@ -41,6 +41,25 @@ tracing.workspace = true
 # Forwarded to the server crate: OTLP trace export off by default so the
 # default build and the musl static lane stay lean and protoc-free.
 otlp = ["ironauth-server/otlp"]
+# Enables the ironauth-store real-database harness for the DB-backed CLI integration
+# test (issue #72). Test-only; adds no production surface.
+testing = ["ironauth-store/testing"]
+
+[dev-dependencies]
+# The step-up-policy CLI integration test (issue #72) stands up a throwaway database
+# (the store test-support harness), seeds a scope, drives the compiled `ironauth`
+# binary as a subprocess against it, and reads the written policy back through the same
+# audited repository the enforcement path reads.
+ironauth-store = { workspace = true, features = ["testing"] }
+ironauth-env = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+
+# The step-up-policy CLI integration test needs the store test-support harness; it is
+# gated on the `testing` feature so the default build stays lean, exactly as the
+# ironauth-oidc DB suites are.
+[[test]]
+name = "step_up_policy_cli"
+required-features = ["testing"]
 
 [lints]
 workspace = true

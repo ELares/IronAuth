@@ -6,6 +6,23 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Step-up adversarial-review fixes (RFC 9470, issue #72): the step-up second-factor
+  challenge (`/login/mfa`) is now THROTTLED through the #64 abuse regulation on a new
+  INDEPENDENT `AuthPath::SecondFactor` path, so an online TOTP/recovery-code guess storm
+  is escalated to a uniform 429 (and can auto-place a ban) before any code is compared,
+  while never locking the owner out of the password or passkey path; the #69 self-service
+  TOTP verify / recovery-code redeem surface routes through the SAME path, closing the seam
+  that left them unthrottled. A phishing-resistant (`phr`/`phrh`) floor no longer routes to
+  a generic re-login (which looped forever on a password re-login) or a TOTP-enrollment
+  dead-end: a passkey holder is routed to a passkey-only ceremony page
+  (`/login?...&passkey=1`, no password form, new `passkey_signin_page`) that terminates on a
+  verified passkey, and a subject with no passkey fails closed with
+  `unmet_authentication_requirements` (new `Remediation::PasskeyReauth`). The per-scope
+  policy read at token issuance/refresh now FAILS CLOSED on a store fault (never silently
+  issues an under-evaluated token); authorization stays the primary gate. `oidc.acr_order`
+  is documented as a DEPLOYMENT-level order (not per-tenant). New `canonical_step_up_acr`
+  helper canonicalizes a short acr alias for the CLI. The sample RS and the runnable example
+  now emit and evaluate `max_age` (not only `acr`).
 - Step-up authentication end to end (RFC 9470, issue #72): a new `step_up` module models
   the declarative authentication requirement (an acr floor plus a max auth age) and its
   evaluation against a recorded authentication, comparing acr by the tenant's configured

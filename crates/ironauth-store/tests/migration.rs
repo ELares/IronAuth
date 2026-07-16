@@ -542,6 +542,25 @@ async fn production_chain_is_only_the_forty_seven_real_migrations_and_ships_no_d
     // rewrite of existing state.
     assert_eq!(phase_of(47).await, "expand");
 
+    // The step-up second-factor abuse path (issue #72): migration 0047 WIDENED the
+    // abuse_bans auth_path CHECK (0046 pinned the closed set) to also admit
+    // 'second_factor', so the RFC 9470 step-up challenge is a first-class throttled
+    // path that can carry a ban independently of password/passkey. The widened CHECK
+    // definition names the new value.
+    let auth_path_check: String = sqlx::query(
+        "SELECT pg_get_constraintdef(oid) AS def FROM pg_catalog.pg_constraint \
+         WHERE conrelid = 'abuse_bans'::regclass AND conname = 'abuse_bans_auth_path_known'",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("auth_path check constraint lookup")
+    .get("def");
+    assert!(
+        auth_path_check.contains("second_factor"),
+        "the abuse_bans auth_path CHECK must admit the step-up second-factor path, got: \
+         {auth_path_check}"
+    );
+
     // The demo object never reaches a production database.
     assert!(
         !table_exists(pool, "migration_demo").await,

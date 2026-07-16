@@ -22,9 +22,11 @@
 //!
 //! # ACR ordering
 //!
-//! `acr` values are compared by their position in the TENANT'S configured order
+//! `acr` values are compared by their position in the DEPLOYMENT-configured order
 //! (weakest first), which defaults to the credential-ladder order the registry
-//! advertises (`pwd` < `mfa` < `phr` < `phrh`, see [`crate::authn`]). A floor is
+//! advertises (`pwd` < `mfa` < `phr` < `phrh`, see [`crate::authn`]). The order is
+//! resolved once from `oidc.acr_order` (per-(tenant, environment) resolution is a
+//! future enhancement). A floor is
 //! satisfied when the achieved `acr` is the SAME value or ranks at least as strong.
 //! An `acr` absent from the order can only be satisfied by an exact match, so an
 //! unknown floor never silently passes.
@@ -32,13 +34,32 @@
 use crate::authn;
 
 /// The default `acr` order (weakest to strongest): the credential-ladder order the
-/// registry advertises. A tenant may override it through `oidc.acr_order`.
+/// registry advertises. A deployment may override it through `oidc.acr_order`.
 #[must_use]
 pub fn default_acr_order() -> Vec<String> {
     authn::acr_values_supported()
         .into_iter()
         .map(str::to_owned)
         .collect()
+}
+
+/// Canonicalize an operator-supplied `acr` alias to the value the enforcement path
+/// compares against (issue #72). A short alias (`pwd`, `mfa`, `phr`, `phrh`) maps to the
+/// server's canonical `acr` for that level (for example `mfa` -> `urn:ironauth:acr:mfa`),
+/// so a policy set through the CLI with `--acr mfa` is stored in the same form the
+/// achieved `acr` carries and actually gates. Any value that is already a full canonical
+/// `acr`, or an unrecognized custom value, passes through verbatim (an unranked custom
+/// floor still only ever matches exactly, per [`acr_satisfies`]).
+#[must_use]
+pub fn canonical_step_up_acr(alias: &str) -> String {
+    for acr in authn::acr_values_supported() {
+        // An exact canonical value passes through; a bare level alias matches the last
+        // `:`-delimited segment of the canonical acr (so `mfa` maps to `...:mfa`).
+        if acr == alias || acr.rsplit(':').next() == Some(alias) {
+            return acr.to_owned();
+        }
+    }
+    alias.to_owned()
 }
 
 /// The rank of an `acr` in `order` (weakest is 0), or [`None`] when the value is
@@ -226,6 +247,13 @@ use crate::state::OidcState;
 /// per-client floor, and the per-scope tenant policy for each requested OAuth scope.
 /// The strongest constraint of each dimension wins (the highest `acr` floor and the
 /// smallest age window), so a request must satisfy every source at once.
+///
+/// Returns the assembled requirement AND a `policy_read_faulted` flag: `true` when the
+/// per-scope policy read hit a store fault, so the requirement may be INCOMPLETE (a
+/// governing policy could exist but was not seen). The authorization endpoint (the
+/// primary gate) treats a fault as best-effort and ignores it; the token/refresh path
+/// FAILS CLOSED on it (issue #72 INFO), so a store blip can never silently skip a policy
+/// added after the code or family was issued.
 pub(crate) async fn requirement_for_request(
     state: &OidcState,
     scope: Scope,
@@ -233,7 +261,7 @@ pub(crate) async fn requirement_for_request(
     requested_scope: Option<&str>,
     acr_values: Option<&str>,
     max_age_secs: Option<u64>,
-) -> AuthnRequirement {
+) -> (AuthnRequirement, bool) {
     let order = state.acr_order();
     // The request `acr_values` is a VOLUNTARY preference (OIDC Core 3.1.2.1): an
     // UNACHIEVABLE requested value (no method can ever reach it) is best-effort and
@@ -261,50 +289,63 @@ pub(crate) async fn requirement_for_request(
         },
         &order,
     );
-    // The per-scope tenant policy for each requested OAuth scope token.
+    // The per-scope tenant policy for each requested OAuth scope token. A store fault
+    // here is SURFACED (not swallowed) so the token/refresh path can fail closed.
+    let mut policy_read_faulted = false;
     if let Some(requested) = requested_scope {
-        if let Ok(policies) = state
+        match state
             .store()
             .scoped(scope)
             .scope_step_up_policies()
             .list()
             .await
         {
-            let requested_tokens: Vec<&str> = requested.split_whitespace().collect();
-            for policy in &policies {
-                if requested_tokens.contains(&policy.scope_token.as_str()) {
-                    requirement.merge_stronger(
-                        &AuthnRequirement {
-                            min_acr: policy.min_acr.clone(),
-                            max_auth_age_secs: policy
-                                .max_auth_age_secs
-                                .and_then(|secs| u64::try_from(secs).ok()),
-                        },
-                        &order,
-                    );
+            Ok(policies) => {
+                let requested_tokens: Vec<&str> = requested.split_whitespace().collect();
+                for policy in &policies {
+                    if requested_tokens.contains(&policy.scope_token.as_str()) {
+                        requirement.merge_stronger(
+                            &AuthnRequirement {
+                                min_acr: policy.min_acr.clone(),
+                                max_auth_age_secs: policy
+                                    .max_auth_age_secs
+                                    .and_then(|secs| u64::try_from(secs).ok()),
+                            },
+                            &order,
+                        );
+                    }
                 }
             }
+            Err(_) => policy_read_faulted = true,
         }
     }
-    requirement
+    (requirement, policy_read_faulted)
 }
 
 /// How the authorization endpoint should remediate an unmet requirement (issue #72).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Remediation {
-    /// Run a FULL re-authentication (redirect to login). Chosen when the age window
-    /// lapsed (the whole session is stale) or when reaching the floor needs a factor
-    /// the login page provides (a passkey).
+    /// Run a FULL re-authentication (redirect to the generic login). Chosen only when
+    /// the age window lapsed (the whole session is stale but the achieved `acr` still
+    /// meets the floor, so a plain re-login refreshes `auth_time` and terminates).
     FullReauth,
     /// Challenge a SECOND FACTOR against the current session (redirect to the
     /// step-up challenge). Chosen when the floor is at the multi-factor level and the
     /// subject has an enrolled TOTP authenticator.
     SecondFactor,
+    /// Run the PASSKEY ceremony SPECIFICALLY (redirect to the passkey-only sign-in),
+    /// not the generic login. Chosen when reaching the floor requires a phishing-resistant
+    /// factor (a `phr`/`phrh` floor), or an `mfa`-level floor the subject can only reach
+    /// with a passkey. A generic re-login would loop forever (a password yields `pwd`,
+    /// which never satisfies these floors); the passkey ceremony yields `phr`, which
+    /// does, so the flow TERMINATES deterministically.
+    PasskeyReauth,
     /// The subject has no qualifying factor but tenant policy allows enrollment:
     /// surface the enrollment prompt on the challenge page.
     Enroll,
     /// The requirement can never be satisfied (no method reaches the floor, or the
-    /// subject cannot and enrollment is not allowed): fail per RFC 9470.
+    /// subject cannot reach it and no enrollable factor could): fail per RFC 9470 with a
+    /// clear, non-looping error, never an under-qualified token.
     Fail,
 }
 
@@ -339,32 +380,45 @@ pub(crate) async fn decide_remediation(
         floor.is_none_or(|floor| acr_satisfies(authn::acr_for_mfa(), floor, &order));
 
     if acr_unmet {
-        let can_reach = if floor_is_mfa_level {
-            has_totp || has_passkey
-        } else {
-            has_passkey
-        };
-        if !can_reach {
-            // No qualifying factor. Surface enrollment where a factor can be enrolled
-            // (the tenant offers TOTP or passkeys); otherwise it can never be met.
+        if floor_is_mfa_level {
+            // An mfa-level floor is reachable by a TOTP second factor OR a UV passkey.
+            // A TOTP the subject already holds is a second-factor challenge against the
+            // LIVE session (no password re-entry). Otherwise a passkey holder runs the
+            // passkey ceremony SPECIFICALLY (a UV passkey reaches, and exceeds, the mfa
+            // floor, so it terminates); a generic re-login is NOT used here because a
+            // password yields `pwd` and would loop.
+            if has_totp {
+                return Remediation::SecondFactor;
+            }
+            if has_passkey {
+                return Remediation::PasskeyReauth;
+            }
+            // No qualifying factor: enroll one where the tenant offers a factor that can
+            // reach the floor (TOTP or a passkey both reach mfa); otherwise it can never
+            // be met.
             return if state.totp_enabled() || state.webauthn_enabled() {
                 Remediation::Enroll
             } else {
                 Remediation::Fail
             };
         }
-        // The subject CAN reach the floor. A multi-factor floor met by a TOTP the
-        // subject already holds is a second-factor challenge against the live session
-        // (no need to re-enter the password); anything else routes through a full
-        // re-login (the login page runs the passkey ceremony).
-        if floor_is_mfa_level && has_totp {
-            return Remediation::SecondFactor;
+        // A phr/phrh floor: ONLY a phishing-resistant UV passkey can reach it. A password
+        // re-login yields `pwd` and a TOTP yields `mfa`, so NEITHER a generic /login nor a
+        // TOTP enrollment can EVER satisfy it -- routing there loops forever (the bug this
+        // fixes), and the TOTP `Enroll` prompt is itself a dead-end (enrolling TOTP can
+        // never reach phr). A passkey holder is routed to the passkey ceremony SPECIFICALLY
+        // (completing it yields `phr`, so it TERMINATES). A subject with NO passkey FAILS
+        // CLOSED with a clear, non-looping "a passkey is required" error, never a TOTP
+        // dead-end and never an under-qualified token.
+        if has_passkey {
+            return Remediation::PasskeyReauth;
         }
-        return Remediation::FullReauth;
+        return Remediation::Fail;
     }
 
     // Only the age window lapsed (the acr is met but the authentication is stale):
-    // a full re-authentication refreshes auth_time honestly.
+    // a full re-authentication refreshes auth_time honestly and terminates (the acr
+    // already satisfies the floor, so a plain re-login is enough).
     let _ = age_lapsed;
     Remediation::FullReauth
 }

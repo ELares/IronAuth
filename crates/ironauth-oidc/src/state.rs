@@ -1603,8 +1603,10 @@ impl OidcState {
         &self.inner.mfa_factor_order
     }
 
-    /// The per-tenant `acr` order for step-up comparison (RFC 9470, issue #72),
-    /// weakest first. Falls back to the default credential-ladder order when the
+    /// The DEPLOYMENT-level `acr` order for step-up comparison (RFC 9470, issue #72),
+    /// weakest first. Resolved once from `OidcConfig` at construction and applied across
+    /// the deployment (NOT per (tenant, environment) today; per-tenant resolution is a
+    /// future enhancement). Falls back to the default credential-ladder order when the
     /// configured list is empty, so a comparison always has a ranking to use.
     #[must_use]
     pub fn acr_order(&self) -> Vec<String> {

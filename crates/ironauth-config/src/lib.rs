@@ -1225,14 +1225,17 @@ pub struct OidcConfig {
     /// boot-time [`ConfigError::Invalid`].
     pub mfa_factor_order: Vec<String>,
 
-    /// The per-tenant `acr` order for step-up comparison (RFC 9470, issue #72),
+    /// The DEPLOYMENT-level `acr` order for step-up comparison (RFC 9470, issue #72),
     /// weakest first. A step-up requirement's `acr` floor is satisfied when the
     /// achieved `acr` is the same value or ranks at least as strong under this
     /// order. The default is the credential-ladder order the provider advertises
-    /// (`urn:ironauth:acr:pwd`, `urn:ironauth:acr:mfa`, `phr`, `phrh`); a tenant
+    /// (`urn:ironauth:acr:pwd`, `urn:ironauth:acr:mfa`, `phr`, `phrh`); a deployment
     /// that trusts its factors differently (for example ranking a verified TOTP
     /// above a synced passkey) reorders them here. An empty list falls back to the
     /// default ladder. Duplicate entries are a boot-time [`ConfigError::Invalid`].
+    /// This is resolved ONCE from configuration and applied across the deployment;
+    /// per-(tenant, environment) resolution is a future enhancement, consistent with
+    /// how the other per-environment config is handled.
     pub acr_order: Vec<String>,
 }
 

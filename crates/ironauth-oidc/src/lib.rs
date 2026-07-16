@@ -200,6 +200,7 @@ pub use sector::{
 };
 pub use session::{PEER_IP_HEADER, SESSION_COOKIE, clear_set_cookie};
 pub use state::{OidcState, ResourceTargetError};
+pub use step_up::canonical_step_up_acr;
 pub use subject::{
     MAX_SUBJECT_LEN, PairwiseSalt, SubjectCache, SubjectConfig, SubjectType, resolve_subject,
     subject_within_cap,

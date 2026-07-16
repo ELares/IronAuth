@@ -6,6 +6,13 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Step-up abuse-path + fault-injection support (RFC 9470, issue #72): a new
+  `AuthPath::SecondFactor` variant (wire tag `second_factor`) makes the step-up
+  second-factor challenge a first-class, INDEPENDENTLY throttled authentication path;
+  migration 0047 widens the `abuse_bans` `auth_path` CHECK to admit it (still an EXPAND).
+  The `test_support` harness gains `TestDatabase::app_url` (the data-plane DSN, for driving
+  the `ironauth` binary as a subprocess) and `execute_owner_sql` (raw owner-role SQL, for
+  fault injection such as dropping a table to prove a fail-closed read).
 - Step-up authentication policy (RFC 9470, issue #72): migration 0047 adds the durable,
   tenant-scoped `scope_step_up_policies` table (forced RLS, the (tenant, environment)
   isolation policy, the nonempty-scope CHECKs, a unique-per-scope index, and grants) that

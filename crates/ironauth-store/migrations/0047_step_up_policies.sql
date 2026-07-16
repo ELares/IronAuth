@@ -116,3 +116,18 @@ GRANT UPDATE (step_up_acr, step_up_max_age_secs) ON clients TO ironauth_app;
 -- ---------------------------------------------------------------------------
 ALTER TABLE refresh_families
     ADD COLUMN auth_time bigint;
+
+-- ---------------------------------------------------------------------------
+-- Widen the abuse-ban auth_path enumeration for the step-up second factor (issue
+-- #72). The RFC 9470 step-up challenge (/login/mfa) and the self-service TOTP /
+-- recovery-code verify surface (issue #69) are a NEW throttled authentication path,
+-- AuthPath::SecondFactor, governed INDEPENDENTLY of the password and passkey paths
+-- (the same per-path account-DoS safeguard, Keycloak CVE-2024-1722): a second-factor
+-- guess storm may auto-place or an operator may set a 'second_factor' ban WITHOUT ever
+-- touching the owner's password or passkey path. Migration 0046 pinned the closed path
+-- set; this REPLACES that CHECK with one that also admits 'second_factor'. Widening a
+-- CHECK to accept a new value is additive (no existing row can violate it and no reader
+-- of an existing path breaks), so this stays an EXPAND.
+ALTER TABLE abuse_bans DROP CONSTRAINT abuse_bans_auth_path_known;
+ALTER TABLE abuse_bans ADD CONSTRAINT abuse_bans_auth_path_known
+    CHECK (auth_path IN ('password', 'passkey', 'recovery', 'register', 'second_factor', 'all'));

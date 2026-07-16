@@ -1214,6 +1214,47 @@ impl Harness {
             .expect("set scope step-up policy");
     }
 
+    /// Seed a registered passkey credential for `subject` (issue #72), so the step-up
+    /// factor probe (`has_passkey`) sees a phishing-resistant factor without driving the
+    /// full WebAuthn ceremony. The credential material is a throwaway placeholder: the
+    /// probe only checks that a credential row EXISTS, so a synthetic descriptor is
+    /// sufficient for the remediation-routing tests. `synced` selects a synced (BE=1,
+    /// phr) versus device-bound (BE=0, phrh) passkey.
+    pub async fn seed_passkey(&self, subject: &str, synced: bool) {
+        let (actor, corr) = self.seeding_actor();
+        let id = self
+            .store()
+            .scoped(self.scope)
+            .users()
+            .parse_id(subject)
+            .expect("parse subject id");
+        let mut credential_id = [0_u8; 16];
+        self.env.entropy().fill_bytes(&mut credential_id);
+        self.store()
+            .scoped(self.scope)
+            .acting(actor, corr)
+            .webauthn_credentials()
+            .register(
+                &self.env,
+                &id,
+                &ironauth_store::NewWebauthnCredential {
+                    credential_id: &credential_id,
+                    // A minimal COSE placeholder: the remediation probe never verifies an
+                    // assertion, only that a credential is enrolled.
+                    cose_public_key: &[0xA0],
+                    sign_count: 0,
+                    aaguid: &[0_u8; 16],
+                    transports: &[],
+                    backup_eligible: synced,
+                    backup_state: synced,
+                    discoverable: Some(true),
+                    nickname: "test passkey",
+                },
+            )
+            .await
+            .expect("seed passkey credential");
+    }
+
     /// Set a per-client step-up floor (issue #72): `step_up_acr` /
     /// `step_up_max_age_secs` applied to every authorization the client makes.
     pub async fn set_client_step_up(
