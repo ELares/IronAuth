@@ -680,6 +680,36 @@
             "type": "string"
           },
           "type": "array"
+        },
+        "webauthn_challenge_ttl_secs": {
+          "default": 300,
+          "description": "The lifetime, in seconds, of a WebAuthn ceremony challenge (issue #65). A\nceremony not completed within this window has its single-use challenge\nexpire. The default (300) is a conservative five minutes. Must be at least 1\nand at most `OIDC_MAX_LIFETIME_SECS`.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "webauthn_clone_detection_block": {
+          "default": false,
+          "description": "The clone-detection policy when a WebAuthn assertion presents a regressing\nsignature counter (issue #65): `true` BLOCKS the sign-in, `false` only WARNS\n(records the security event and flags the credential but allows the login).\nThe default (`false`, warn) avoids locking a user out on a benign counter\ndesync while still surfacing the event; a true per-tenant override rides the\ntenant-policy pipeline.",
+          "type": "boolean"
+        },
+        "webauthn_enabled": {
+          "default": true,
+          "description": "Whether the WebAuthn passkey ceremony endpoints are mounted and the hosted\nlogin page offers conditional-UI passkey sign-in (issue #65). On by default:\npasskeys are the headline primary credential for the platform. When on,\ndiscovery advertises the ceremony endpoints and the passkey `phr`/`phrh`\nACRs are achievable.",
+          "type": "boolean"
+        },
+        "webauthn_require_user_verification": {
+          "default": true,
+          "description": "Whether a WebAuthn ceremony requires user verification (issue #65). On by\ndefault: a UV assertion is what makes a passkey login phishing-resistant and\nmaps to the `phr`/`phrh` ACRs. Turning it off allows user-presence-only\nassertions (not recommended).",
+          "type": "boolean"
+        },
+        "webauthn_rp_id": {
+          "default": null,
+          "description": "The per-environment WebAuthn Relying Party ID (issue #65). WebAuthn scopes a\ncredential to this registrable-domain identifier. When unset, it is DERIVED\nfrom the serving origin's host (`server.public_url`), which is the correct\ndefault for a single-origin deployment. When set, it is validated at STARTUP\nto be the serving origin's host or a parent (registrable-suffix) domain of\nit; a mismatch is a boot-time [`ConfigError::Invalid`], never a per-ceremony\nruntime surprise. Different deployments (dev/staging/prod) serve different\norigins and so resolve different RP IDs.",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "type": "object"
@@ -1047,7 +1077,12 @@
         "session_partitioned_cookie": false,
         "session_peer_ip_binding": false,
         "session_ttl_secs": 3600,
-        "userinfo_cors_origins": []
+        "userinfo_cors_origins": [],
+        "webauthn_challenge_ttl_secs": 300,
+        "webauthn_clone_detection_block": false,
+        "webauthn_enabled": true,
+        "webauthn_require_user_verification": true,
+        "webauthn_rp_id": null
       },
       "description": "OIDC provider settings (issue #12)."
     },

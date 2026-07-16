@@ -1,0 +1,41 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+[package]
+name = "ironauth-webauthn"
+version = "0.1.0"
+description = "IronAuth WebAuthn Level 3 ceremony core: registration and authentication option builders plus the parsing and verification of ceremony responses (CBOR attestation object, COSE public key, authenticator data flags incl BE/BS/UV, clientDataJSON, single-use challenge, origin and RP ID, sign-count clone detection), with the one cryptographic signature check delegated to the ring-backed ironauth-jose core"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# The one crate allowed to name ring: the WebAuthn assertion signature check is a
+# ring primitive (ECDSA-P256-DER / Ed25519 / RSA-PKCS1) and lives in ironauth-jose
+# behind jose-audit.sh. This crate parses COSE key material into a
+# `jose::WebauthnKey` and delegates the cryptographic verification.
+ironauth-jose.workspace = true
+# CBOR decoding for the attestationObject and the COSE credential public key.
+ciborium.workspace = true
+# JSON parsing of clientDataJSON and the ceremony response envelope, and JSON
+# serialization of the option documents sent to the browser.
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+# base64url (URL_SAFE_NO_PAD) decoding of the ceremony response fields and
+# encoding of the option-document byte fields (challenge, credential ids).
+base64.workspace = true
+# SHA-256 for the RP ID hash comparison and the clientDataJSON hash that forms
+# the WebAuthn signed message. Pure Rust, already in the tree.
+sha2.workspace = true
+
+[dev-dependencies]
+# The integration test acts as a virtual authenticator and needs to produce
+# genuinely valid Ed25519 assertion signatures. jose's test-util feature exposes a
+# raw Ed25519 sign over ring (the one crate allowed ring), so the signing stays
+# contained and this crate never names ring itself.
+ironauth-jose = { workspace = true, features = ["test-util"] }
+ciborium.workspace = true
+serde_json.workspace = true
+base64.workspace = true
+
+[lints]
+workspace = true

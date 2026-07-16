@@ -306,13 +306,13 @@ async fn expand_contract_example_chain_runs_all_three_phases_and_contract_remove
     );
 }
 
-/// The PRODUCTION chain (`MigrationRunner::new`) contains exactly the forty-three
+/// The PRODUCTION chain (`MigrationRunner::new`) contains exactly the forty-four
 /// real migrations and leaves no throwaway demo object in a real database.
 // A long but linear ledger-and-table assertion sweep (one line per migration and
 // per real table); splitting it would not make it clearer.
 #[allow(clippy::too_many_lines)]
 #[tokio::test]
-async fn production_chain_is_only_the_forty_three_real_migrations_and_ships_no_demo_object() {
+async fn production_chain_is_only_the_forty_four_real_migrations_and_ships_no_demo_object() {
     // TestDatabase::start runs Store::migrate() (the production chain) on a
     // fresh, empty database.
     let db = TestDatabase::start().await;
@@ -329,8 +329,8 @@ async fn production_chain_is_only_the_forty_three_real_migrations_and_ships_no_d
     );
     assert_eq!(
         report.already_applied(),
-        43,
-        "the production chain is exactly forty-three migrations (isolation, audit log, management \
+        44,
+        "the production chain is exactly forty-four migrations (isolation, audit log, management \
          API, OIDC authorization, signing keys, login/consent, authentication context, redirect \
          registration, UserInfo claims, consent scope upsert, resource servers, opaque access \
          tokens, client auth suite, dynamic client registration, pushed authorization requests, \
@@ -341,15 +341,15 @@ async fn production_chain_is_only_the_forty_three_real_migrations_and_ships_no_d
          snapshot export, custom domains, environment secrets and variables, config promotion, \
          self-service account, admin user lifecycle, identity traits, foreign password \
          import, user invitations, flexible identifiers, exit-export credential grants, \
-         migration state machine)"
+         migration state machine, webauthn credentials)"
     );
 
-    // The ledger holds exactly versions 1 through 43.
+    // The ledger holds exactly versions 1 through 44.
     assert_eq!(
         applied_versions(pool).await,
         vec![
             1_i64, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
-            24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43
+            24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44
         ]
     );
     let phase_of = |version: i64| async move {
@@ -511,6 +511,9 @@ async fn production_chain_is_only_the_forty_three_real_migrations_and_ships_no_d
     // column-scoped grants. The record subject is sealed and blind-indexed (no plaintext
     // PII column). All additive, so it is an expand too.
     assert_eq!(phase_of(43).await, "expand");
+    // The WebAuthn passkey migration (issue #65) is an EXPAND: two new tenant-scoped
+    // tables, no rewrite of existing state.
+    assert_eq!(phase_of(44).await, "expand");
 
     // The demo object never reaches a production database.
     assert!(
@@ -1569,6 +1572,88 @@ async fn production_chain_is_only_the_forty_three_real_migrations_and_ships_no_d
         )
         .await,
         "migration_run_records must carry the outcome-known CHECK constraint"
+    );
+
+    // ---- 0044 webauthn credentials + challenges (issue #65) ----
+    assert!(
+        table_exists(pool, "webauthn_credentials").await,
+        "webauthn_credentials exists after 0044"
+    );
+    for column in [
+        "id",
+        "tenant_id",
+        "environment_id",
+        "subject",
+        "credential_id",
+        "cose_public_key",
+        "sign_count",
+        "aaguid",
+        "transports",
+        "backup_eligible",
+        "backup_state",
+        "discoverable",
+        "clone_detected",
+        "nickname_sealed",
+        "pii_dek_version",
+        "created_at",
+        "last_used_at",
+    ] {
+        assert!(
+            column_exists(pool, "webauthn_credentials", column).await,
+            "webauthn_credentials.{column} exists after 0044"
+        );
+    }
+    // The user-authored nickname is user PII, stored ONLY as the sealed value
+    // (issue #48): no plaintext nickname / friendly-name column ever lands.
+    for forbidden in ["nickname", "friendly_name", "label"] {
+        assert!(
+            !column_exists(pool, "webauthn_credentials", forbidden).await,
+            "webauthn_credentials must have no plaintext nickname column ({forbidden})"
+        );
+    }
+    assert!(
+        table_exists(pool, "webauthn_challenges").await,
+        "webauthn_challenges exists after 0044"
+    );
+    for column in [
+        "id",
+        "tenant_id",
+        "environment_id",
+        "ceremony",
+        "subject",
+        "challenge",
+        "consumed_at",
+        "expires_at",
+        "created_at",
+    ] {
+        assert!(
+            column_exists(pool, "webauthn_challenges", column).await,
+            "webauthn_challenges.{column} exists after 0044"
+        );
+    }
+    // The tenant-scoped-table obligations for both new tables.
+    for table in ["webauthn_credentials", "webauthn_challenges"] {
+        assert!(
+            rls_enabled_and_forced(pool, table).await,
+            "{table} must ENABLE and FORCE row-level security"
+        );
+        assert!(
+            policy_exists(pool, table, &format!("{table}_tenant_isolation")).await,
+            "the (tenant, environment) isolation policy must exist on {table}"
+        );
+        assert!(
+            check_constraint_exists(pool, table, &format!("{table}_scope_nonempty")).await,
+            "{table} must carry the scope-nonempty CHECK constraint"
+        );
+    }
+    assert!(
+        check_constraint_exists(
+            pool,
+            "webauthn_challenges",
+            "webauthn_challenges_ceremony_known"
+        )
+        .await,
+        "webauthn_challenges must carry the ceremony-known CHECK constraint"
     );
 }
 

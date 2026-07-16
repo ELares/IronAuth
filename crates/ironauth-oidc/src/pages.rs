@@ -197,18 +197,31 @@ pub fn login_page(
     error: Option<&str>,
     hints: &InteractionHints,
     environment_banner: Option<&str>,
+    passkey: Option<&PasskeyUi<'_>>,
 ) -> String {
+    // Conditional UI (issue #65): when the passkey ceremony is available, the
+    // identifier field carries the `webauthn` autocomplete token so a browser with
+    // a discoverable passkey offers autofill sign-in WITHOUT a dedicated button, and
+    // a button path also exists. The autofill and button are driven by the
+    // nonce-guarded script below (served under the login CSP that permits exactly
+    // this nonce and a same-origin fetch).
+    let username_autocomplete = if passkey.is_some() {
+        "username webauthn"
+    } else {
+        "username"
+    };
     let body = format!(
         "<h1>Sign in</h1>{error}\
          <form method=\"post\" action=\"/login\">{return_to}\
          <p><label>Identifier <input type=\"text\" name=\"identifier\" value=\"{identifier}\" \
-         autocomplete=\"username\" required></label></p>\
+         autocomplete=\"{username_autocomplete}\" required></label></p>\
          <p><label>Password <input type=\"password\" name=\"password\" \
          autocomplete=\"current-password\" required></label></p>\
-         <p><button type=\"submit\">Sign in</button></p></form>",
+         <p><button type=\"submit\">Sign in</button></p></form>{passkey}",
         error = error_banner(error),
         return_to = return_to_field(return_to),
         identifier = escape_html(identifier),
+        passkey = passkey.map(passkey_block).unwrap_or_default(),
     );
     document(
         "Sign in",
@@ -217,6 +230,98 @@ pub fn login_page(
         hints.display().as_str(),
         environment_banner,
     )
+}
+
+/// The conditional-UI wiring for the hosted login page (issue #65): the per-response
+/// script nonce and the scope path the ceremony endpoints are mounted under.
+#[derive(Debug, Clone, Copy)]
+pub struct PasskeyUi<'a> {
+    /// The per-response CSP script nonce (also set in the login CSP).
+    pub nonce: &'a str,
+    /// The `/t/{tenant}/e/{environment}` prefix the webauthn endpoints live under.
+    pub scope_path: &'a str,
+}
+
+/// The passkey button and the conditional-UI / button-path script for the login
+/// page (issue #65). The script drives `navigator.credentials.get` with conditional
+/// mediation (autofill) on load and modal mediation on the button click, posting the
+/// assertion to the scope's `authenticate/verify` endpoint.
+fn passkey_block(ui: &PasskeyUi<'_>) -> String {
+    // The scope path is server-known (a validated Scope), so it is safe to embed.
+    let script = PASSKEY_SCRIPT.replace("__BASE__", ui.scope_path);
+    format!(
+        "<p><button type=\"button\" id=\"passkey-btn\">Sign in with a passkey</button></p>\
+         <script nonce=\"{nonce}\">{script}</script>",
+        nonce = escape_html(ui.nonce),
+    )
+}
+
+/// The conditional-UI / button sign-in script. `__BASE__` is replaced with the
+/// per-environment scope path. It never interpolates untrusted input, converts the
+/// base64url ceremony fields to and from `ArrayBuffer`, and reloads on a verified
+/// sign-in so the resumed authorization request proceeds.
+const PASSKEY_SCRIPT: &str = r#"(async () => {
+  const base = "__BASE__/webauthn";
+  const dec = (s) => { s = s.replace(/-/g,'+').replace(/_/g,'/'); const p = s.length%4?4-s.length%4:0; s += '='.repeat(p); const b = atob(s); const u = new Uint8Array(b.length); for (let i=0;i<b.length;i++) u[i]=b.charCodeAt(i); return u.buffer; };
+  const enc = (buf) => { const u = new Uint8Array(buf); let s=''; for (const c of u) s+=String.fromCharCode(c); return btoa(s).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,''); };
+  async function signIn(mediation) {
+    let optResp;
+    try { optResp = await fetch(base+"/authenticate/options", {method:"POST", headers:{"content-type":"application/json"}, body:"{}", credentials:"same-origin"}); } catch(e){ return; }
+    if (!optResp.ok) return;
+    const data = await optResp.json();
+    const pk = data.publicKey;
+    pk.challenge = dec(pk.challenge);
+    (pk.allowCredentials||[]).forEach((c)=>{ c.id = dec(c.id); });
+    let assertion;
+    try { assertion = await navigator.credentials.get({publicKey: pk, mediation}); } catch(e){ return; }
+    if (!assertion) return;
+    const credential = { id: assertion.id, rawId: enc(assertion.rawId), type: assertion.type, response: {
+      clientDataJSON: enc(assertion.response.clientDataJSON),
+      authenticatorData: enc(assertion.response.authenticatorData),
+      signature: enc(assertion.response.signature),
+      userHandle: assertion.response.userHandle ? enc(assertion.response.userHandle) : null } };
+    let vResp;
+    try { vResp = await fetch(base+"/authenticate/verify", {method:"POST", headers:{"content-type":"application/json"}, credentials:"same-origin", body: JSON.stringify({challengeId: data.challengeId, credential})}); } catch(e){ return; }
+    if (vResp.ok) window.location.reload();
+  }
+  const btn = document.getElementById("passkey-btn");
+  if (btn) btn.addEventListener("click", ()=>signIn("optional"));
+  if (window.PublicKeyCredential && PublicKeyCredential.isConditionalMediationAvailable) {
+    try { if (await PublicKeyCredential.isConditionalMediationAvailable()) signIn("conditional"); } catch(e){}
+  }
+})();"#;
+
+/// The Content-Security-Policy for the hosted login page WITH conditional UI (issue
+/// #65). It keeps the strict discipline of [`CONTENT_SECURITY_POLICY`] and opens
+/// exactly two sources: `script-src 'nonce-{nonce}'` permits ONLY the one
+/// server-authored ceremony script (no other inline or external script can run), and
+/// `connect-src 'self'` permits the same-origin `fetch` to the ceremony endpoints.
+#[must_use]
+pub fn login_csp(nonce: &str) -> String {
+    format!(
+        "default-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; \
+         script-src 'nonce-{nonce}'; connect-src 'self'"
+    )
+}
+
+/// Build a hosted-login HTML response carrying the conditional-UI login CSP whose
+/// `script-src` nonce matches the page's one ceremony script (issue #65). Every other
+/// header matches [`secure_html`].
+#[must_use]
+pub fn login_html(status: StatusCode, body: String, nonce: &str) -> Response {
+    (
+        status,
+        [
+            (header::CONTENT_TYPE, "text/html; charset=utf-8".to_owned()),
+            (header::CONTENT_SECURITY_POLICY, login_csp(nonce)),
+            (header::X_FRAME_OPTIONS, "DENY".to_owned()),
+            (header::REFERRER_POLICY, PAGE_REFERRER_POLICY.to_owned()),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff".to_owned()),
+            (header::CACHE_CONTROL, "no-store".to_owned()),
+        ],
+        body,
+    )
+        .into_response()
 }
 
 /// The minimal registration page: an identifier and password form posting to
@@ -817,7 +922,7 @@ mod tests {
         let hints = InteractionHints::default();
         let hostile = "\"><script>alert(1)</script>";
         for page in [
-            login_page("", hostile, None, &hints, None),
+            login_page("", hostile, None, &hints, None, None),
             register_page("", hostile, None, &hints, None),
             consent_page("Acme", &["openid"], hostile, &hints, None),
         ] {
@@ -858,7 +963,14 @@ mod tests {
             None,
             Some("touch"),
         );
-        let page = login_page("ada@example.test", "/authorize?x=1", None, &hints, None);
+        let page = login_page(
+            "ada@example.test",
+            "/authorize?x=1",
+            None,
+            &hints,
+            None,
+            None,
+        );
         assert!(
             page.contains("<html lang=\"fr-CA\">"),
             "ui_locales lang: {page}"
@@ -890,7 +1002,14 @@ mod tests {
         // and shows a visible environment banner; a PRODUCTION page carries neither.
         let hints = InteractionHints::default();
         for page in [
-            login_page("", "/authorize?x=1", None, &hints, Some("non-production")),
+            login_page(
+                "",
+                "/authorize?x=1",
+                None,
+                &hints,
+                Some("non-production"),
+                None,
+            ),
             register_page("", "/authorize?x=1", None, &hints, Some("non-production")),
             consent_page(
                 "Acme",
@@ -911,7 +1030,7 @@ mod tests {
         }
         // A production page: no noindex marker, no banner.
         for page in [
-            login_page("", "/authorize?x=1", None, &hints, None),
+            login_page("", "/authorize?x=1", None, &hints, None, None),
             consent_page("Acme", &["openid"], "/authorize?x=1", &hints, None),
         ] {
             assert!(
@@ -936,7 +1055,7 @@ mod tests {
             None,
             None,
         );
-        let page = login_page("", "/authorize?x=1", None, &hints, None);
+        let page = login_page("", "/authorize?x=1", None, &hints, None, None);
         assert!(!page.contains("<script>alert(1)"), "no breakout: {page}");
         assert!(
             page.contains("<html lang=\"en\">"),

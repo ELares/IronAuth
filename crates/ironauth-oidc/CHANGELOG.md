@@ -6,6 +6,35 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- WebAuthn passkeys, first-class (issue #65): four scope-routed ceremony endpoints
+  (`webauthn/register/options`, `register/verify`, `authenticate/options`,
+  `authenticate/verify`) implement WebAuthn Level 3 registration and authentication.
+  Registration is authenticated by the caller's session and populates
+  `excludeCredentials` so an authenticator cannot enrol twice; authentication uses
+  discoverable credentials (conditional UI), resolves the user through the
+  credential's stored subject, and on success establishes the same server-side
+  session the password login does. Each ceremony draws a single-use challenge from
+  the store, verifies the response in the pure `ironauth-webauthn` core (challenge,
+  origin, RP ID hash, flags, and for an assertion the signature via the ring-backed
+  jose core), persists only after a successful verification (no partial row on
+  failure), and returns one non-enumerating error for every failure. A UV passkey
+  authentication records an honest `AuthenticationEvent`: the acr/amr registry's
+  dormant passkey rows are now ACTIVE, so a UV synced passkey issues tokens whose
+  `acr` is `phr` (amr `swk`+`user`) and a device-bound one `phrh` (amr `hwk`+`user`),
+  chosen by the backup-eligible flag, flowing through the whole session -> code ->
+  token chain; `parse_methods` gained an achievability guard that drops any recorded
+  method not currently active, so a stale/dormant elevated method can never
+  over-claim. The sign-count clone-detection policy (warn or block) is applied on
+  every assertion, with zero-counter synced passkeys never tripping it. The hosted
+  login page wires conditional UI: the identifier field carries the `webauthn`
+  autocomplete token, a passkey button path also exists, and one nonce-guarded
+  ceremony script is served under a login CSP that opens exactly `script-src
+  'nonce-...'` and `connect-src 'self'`. The RP ID and origin are resolved
+  per-environment from the serving origin (or the configured override, validated at
+  startup). Mounted only when `oidc.webauthn_enabled` (default on). Attestation
+  trust (MDS3, AAGUID allowlists) is out of scope (issue #66); ceremonies request
+  `attestation: "none"`.
+
 - Inbound lazy-migration hook (issue #56): when the `[oidc.lazy_migration]` config arms
   it, a login whose canonicalized identifier is UNKNOWN locally verifies the submitted
   credential against a legacy store through a pluggable `CredentialVerifier` (the only

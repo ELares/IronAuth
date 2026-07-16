@@ -19,6 +19,7 @@ members = [
     "crates/ironauth-store",
     "crates/ironauth-fetch",
     "crates/ironauth-jose",
+    "crates/ironauth-webauthn",
     "crates/ironauth-kms",
     "crates/ironauth-admin",
     "crates/ironauth-oidc",
@@ -42,6 +43,7 @@ ironauth-server = { path = "crates/ironauth-server", version = "0.1.0" }
 ironauth-store = { path = "crates/ironauth-store", version = "0.1.0" }
 ironauth-fetch = { path = "crates/ironauth-fetch", version = "0.1.0" }
 ironauth-jose = { path = "crates/ironauth-jose", version = "0.1.0" }
+ironauth-webauthn = { path = "crates/ironauth-webauthn", version = "0.1.0" }
 ironauth-kms = { path = "crates/ironauth-kms", version = "0.1.0" }
 ironauth-admin = { path = "crates/ironauth-admin", version = "0.1.0" }
 ironauth-oidc = { path = "crates/ironauth-oidc", version = "0.1.0" }
@@ -137,6 +139,17 @@ ring = "0.17"
 # (no asm/C feature), permissive (MIT OR Apache-2.0), already in the tree via
 # sqlx, so this adds a direct edge but no new crate; MSRV 1.85 and musl clean.
 sha2 = "0.10"
+# CBOR decoding for the WebAuthn ceremony layer (crates/ironauth-webauthn, issue
+# #65): the registration attestationObject and the COSE credential public key are
+# CBOR. ciborium is the standard Rust CBOR implementation, pure Rust with no build
+# script and no C dependency (musl static clean), and its whole tree is permissive
+# and on the deny.toml allowlist (ciborium/ciborium-io/ciborium-ll are Apache-2.0,
+# half is MIT OR Apache-2.0). MSRV 1.58, well below the workspace 1.85 floor. Only
+# the decode path is used: a bounded walk of a `ciborium::value::Value` tree, never
+# a signature or key primitive (those stay in ironauth-jose on ring). The
+# alternative, webauthn-rs, is rejected: webauthn-rs-core is MPL-2.0, which is NOT
+# on the cargo-deny license allowlist and would fail `cargo deny check`.
+ciborium = "0.2"
 trybuild = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 toml = "0.9"

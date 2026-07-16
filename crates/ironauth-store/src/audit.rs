@@ -563,6 +563,20 @@ pub enum Action {
     /// acknowledgment. The row targets the credential and is attributed to the end
     /// user; the `detail` records the step-up policy the sensitive change declared.
     AccountCredentialRemove,
+    /// An end user REGISTERED a WebAuthn passkey (issue #65): a verified
+    /// registration ceremony persisted a new credential (its COSE public key,
+    /// AAGUID, transports, and BE/BS flags). The row targets the `pky_` credential
+    /// and is attributed to the end user.
+    WebauthnCredentialRegister,
+    /// An end user REMOVED one of their OWN WebAuthn passkeys (issue #65). The row
+    /// targets the `pky_` credential and is attributed to the end user.
+    WebauthnCredentialRemove,
+    /// A WebAuthn assertion presented a REGRESSING signature counter (issue #65):
+    /// the credential's stored counter did not advance, a possible cloned
+    /// authenticator. The row targets the `pky_` credential; the `detail` records
+    /// the per-tenant policy applied (warn or block). A zero/zero counter (a synced
+    /// passkey with no counter) never emits this event.
+    WebauthnCloneDetected,
     /// An end user REVOKED one of their OWN sessions through the self-service
     /// account surface (issue #61): a single session the user chose to sign out,
     /// stopping it from resolving immediately and cascading through the unified
@@ -700,6 +714,9 @@ impl Action {
             Action::AccountPasswordChange => "account.password.change",
             Action::AccountCredentialEnroll => "account.credential.enroll",
             Action::AccountCredentialRemove => "account.credential.remove",
+            Action::WebauthnCredentialRegister => "webauthn.credential.register",
+            Action::WebauthnCredentialRemove => "webauthn.credential.remove",
+            Action::WebauthnCloneDetected => "webauthn.clone.detected",
             Action::AccountSessionRevoke => "account.session.revoke",
             Action::AccountSessionsRevokeOthers => "account.sessions.revoke_others",
         }
