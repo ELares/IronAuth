@@ -6,6 +6,36 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Exit-export hardening (issue #58, review): the export now carries the enrolled MFA
+  / login credential REGISTRY (`account_credentials`), not merely the password: each
+  passkey / TOTP / recovery-code enrollment (factor kind, opened friendly name,
+  last-used instant) rides the record and re-imports losslessly. The field-coverage
+  guard now enumerates the FULL identity model (`users` AND `account_credentials`),
+  so a new column on either table, including the M7 credential-secret columns, fails
+  the build until it is exported or explicitly justified. The outbound
+  verify-credential endpoint is now (a) not a user-enumeration timing oracle: an
+  absent or fenced account spends the same Argon2id work as a wrong password through
+  one shared verify entry; (b) SCOPE-BOUND to one configured `(tenant, environment)`,
+  so a request to any other scope, even with the correct token, is a uniform 404 and
+  never a cross-tenant oracle; and (c) evaluated enablement-first, so a disabled
+  endpoint is a uniform 404 even to an unauthenticated probe (indistinguishable from
+  an absent route). The audited export count now equals the lines actually emitted.
+- Exit-friendliness covenant (issue #58): the full identity export and the outbound
+  lazy-migration hook. `GET .../export` streams every identity of an environment as
+  the same newline-delimited record format the streaming bulk import consumes
+  (`application/x-ndjson`, one user per line), carrying login handle, external id,
+  lifecycle state, claims, traits and schema version, and the password verifier with
+  its algorithm tag and full parameters (native Argon2id, or an imported foreign
+  hash), so an export re-imports into a fresh instance losslessly with logins intact.
+  It is permission-gated (operator or the environment's own key), audited
+  (`user.export`), and streams one bounded page at a time. `POST
+  .../migration/verify-credential` is the mirror outbound hook: a successor system
+  presents an identifier plus password and receives a verdict and optional profile,
+  verifying native and foreign credentials through the same dispatch as login,
+  DISABLED BY DEFAULT and gated by an environment-scoped shared token (`admin`
+  config). A field-coverage test fails the build on a user column the export does not
+  cover; the exit guide is `docs/exit-guide.md`.
+
 - User invitation management API (issue #60): the admin side of the invitation
   flow, on the M1 API discipline (OpenAPI source of truth, cursor pagination,
   `Idempotency-Key` on POST, audit-on-mutation, uniform cross-tenant not-found).

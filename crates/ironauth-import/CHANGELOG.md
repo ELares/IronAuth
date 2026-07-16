@@ -6,6 +6,22 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Credential-registry round-trip (issue #58, review): `ImportRecord` gains an optional
+  `credentials` list (a new `ImportCredential`: factor kind, friendly name, optional
+  last-used instant), so the full identity export carries every passkey / TOTP /
+  recovery-code enrollment and the engine restores each one under the imported user
+  (validated to the closed credential-type set and the 1-to-200-character name bound,
+  per-record failure isolation preserved; a re-imported duplicate skips without
+  re-enrolling). The record shape is additive, so the M7 credential-secret material
+  rides the same list.
+- Export side of the record format (issue #58): `ImportRecord` now also derives
+  `Serialize`, and `to_record_line` writes exactly what `parse_record_line` reads, so
+  the full identity export (in `ironauth-admin`) produces the same line-delimited
+  format the import consumes and a round-trip is lossless by construction. The record
+  gains optional `traits` and `traits_schema_version` fields; the engine restores
+  traits VERBATIM through the extended `admin_create`, so an export re-import carries
+  a user's identity traits, not only the credential.
+
 - New crate: streaming bulk user import with foreign password-hash support (issue
   #55). IronAuth's migration on-ramp, published as its own semver-versioned crate
   (the passwap pattern): the hash-scheme layer earns outside review of exactly the

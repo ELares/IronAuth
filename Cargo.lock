@@ -943,12 +943,15 @@ dependencies = [
 name = "ironauth-admin"
 version = "0.1.0"
 dependencies = [
+ "argon2",
  "axum 0.8.9",
  "base64",
+ "bcrypt",
  "http",
  "http-body-util",
  "ironauth-config",
  "ironauth-env",
+ "ironauth-import",
  "ironauth-oidc",
  "ironauth-store",
  "serde",

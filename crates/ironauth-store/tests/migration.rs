@@ -306,13 +306,13 @@ async fn expand_contract_example_chain_runs_all_three_phases_and_contract_remove
     );
 }
 
-/// The PRODUCTION chain (`MigrationRunner::new`) contains exactly the thirty-one
+/// The PRODUCTION chain (`MigrationRunner::new`) contains exactly the forty-two
 /// real migrations and leaves no throwaway demo object in a real database.
 // A long but linear ledger-and-table assertion sweep (one line per migration and
 // per real table); splitting it would not make it clearer.
 #[allow(clippy::too_many_lines)]
 #[tokio::test]
-async fn production_chain_is_only_the_forty_one_real_migrations_and_ships_no_demo_object() {
+async fn production_chain_is_only_the_forty_two_real_migrations_and_ships_no_demo_object() {
     // TestDatabase::start runs Store::migrate() (the production chain) on a
     // fresh, empty database.
     let db = TestDatabase::start().await;
@@ -329,8 +329,8 @@ async fn production_chain_is_only_the_forty_one_real_migrations_and_ships_no_dem
     );
     assert_eq!(
         report.already_applied(),
-        41,
-        "the production chain is exactly forty-one migrations (isolation, audit log, management \
+        42,
+        "the production chain is exactly forty-two migrations (isolation, audit log, management \
          API, OIDC authorization, signing keys, login/consent, authentication context, redirect \
          registration, UserInfo claims, consent scope upsert, resource servers, opaque access \
          tokens, client auth suite, dynamic client registration, pushed authorization requests, \
@@ -340,15 +340,15 @@ async fn production_chain_is_only_the_forty_one_real_migrations_and_ships_no_dem
          APIs, envelope encryption, environment guardrails, tenant lifecycle, BYOK bindings, \
          snapshot export, custom domains, environment secrets and variables, config promotion, \
          self-service account, admin user lifecycle, identity traits, foreign password \
-         import, user invitations, flexible identifiers)"
+         import, user invitations, flexible identifiers, exit-export credential grants)"
     );
 
-    // The ledger holds exactly versions 1 through 41.
+    // The ledger holds exactly versions 1 through 42.
     assert_eq!(
         applied_versions(pool).await,
         vec![
             1_i64, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
-            24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41
+            24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42
         ]
     );
     let phase_of = |version: i64| async move {
@@ -498,6 +498,12 @@ async fn production_chain_is_only_the_forty_one_real_migrations_and_ships_no_dem
     // and column-scoped grants. The identifier value is sealed and blind-indexed (no
     // plaintext PII column). All additive, so it is an expand too.
     assert_eq!(phase_of(41).await, "expand");
+    // The exit-export credential-grant migration (issue #58): a purely additive pair
+    // of control-plane privileges (SELECT + INSERT) on the existing
+    // account_credentials table so the full export reads the credential registry and
+    // the mirror import restores it. No table, column, policy, or backfill, so it is
+    // an expand.
+    assert_eq!(phase_of(42).await, "expand");
 
     // The demo object never reaches a production database.
     assert!(

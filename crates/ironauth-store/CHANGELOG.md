@@ -6,6 +6,27 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Exit-export credential registry (issue #58, review, migration 0042, expand):
+  `UserExportRecord` now carries the user's enrolled `account_credentials` (a new
+  `ExportedCredential` list: factor kind, opened friendly name, last-used instant),
+  and `ActingAccountCredentialRepo::enroll_restored` re-enrolls an exported credential
+  under a fresh user, preserving the last-used instant, for the exit-import restore.
+  Migration 0042 grants the control plane SELECT + INSERT on the existing
+  `account_credentials` table (least privilege: no UPDATE / DELETE) so the export
+  reads and the import restores the credential registry; it adds no table, column, or
+  policy.
+- Exit-friendliness covenant support (issue #58, no migration): the read and write
+  halves of the full identity export. A new `UserRepo::export_page` reads every field
+  the identity model holds one keyset-paginated, bounded page at a time (opening the
+  sealed identifier, claims, external id, and traits, and returning the native and
+  foreign password verifiers), so a 100k-user export streams without loading the
+  whole set; `UserExportRecord` is its redacting read model. `NewAdminUser` gains
+  `traits_json` / `traits_schema_version`, and `admin_create` seals a traits document
+  VERBATIM (like it seals claims, skipping schema re-validation) so the streaming
+  import restores traits losslessly even into a fresh scope with no active schema.
+  `ActingUserRepo::record_export_audit` writes the `user.export` audit row (a new
+  `Action` variant) attributed to the acting principal. Purely additive: the users
+  table already carried every column the export reads, so this needs no migration.
 - Flexible identifiers on the central canonicalization seam (issue #54, migration
   0041, expand). Multiple typed login identifiers per user with uniqueness as
   configuration, built around one canonicalization function so the

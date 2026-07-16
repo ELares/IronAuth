@@ -117,6 +117,8 @@ async fn create_user(db: &TestDatabase, env: &Env, scope: Scope, identifier: &st
                 state: UserState::Active,
                 foreign_password_hash: None,
                 foreign_password_algo: None,
+                traits_json: None,
+                traits_schema_version: None,
             },
             NOW_MICROS,
             None,

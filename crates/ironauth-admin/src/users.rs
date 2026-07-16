@@ -217,6 +217,8 @@ pub async fn create_user(
                 // imported foreign hash enters.
                 foreign_password_hash: None,
                 foreign_password_algo: None,
+                traits_json: None,
+                traits_schema_version: None,
             },
             created_at_micros,
             Some(write),

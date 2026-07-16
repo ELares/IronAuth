@@ -279,6 +279,14 @@ pub enum Action {
     /// are never recorded on the audit row; only that the user's traits changed, by
     /// whom, and when.
     UserTraitsUpdate,
+    /// A full identity EXPORT was served through the management API (issue #58): the
+    /// exit-friendliness covenant made observable. Every export is a permission-gated
+    /// admin action attributed to its actor, so a bulk read of sensitive credential
+    /// material (password hashes, foreign hashes, sealed PII) leaves an auditable
+    /// trail. The exported values are never recorded on the audit row; the
+    /// operator-safe `detail` records only how many identities were exported, targeted
+    /// at the environment the export drained.
+    UserExport,
     /// A new identity trait-schema VERSION was created in a (tenant, environment)
     /// registry (issue #53): an immutable candidate JSON Schema (draft 2020-12) the
     /// scope's future trait writes may validate against once it is activated.
@@ -590,6 +598,7 @@ impl Action {
             Action::InvitationRevoke => "invitation.revoke",
             Action::InvitationResend => "invitation.resend",
             Action::UserTraitsUpdate => "user.traits.update",
+            Action::UserExport => "user.export",
             Action::TraitSchemaCreate => "trait_schema.create",
             Action::TraitSchemaActivate => "trait_schema.activate",
             Action::TraitMigrationJobCreate => "trait_migration_job.create",

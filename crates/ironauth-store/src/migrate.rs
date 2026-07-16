@@ -518,6 +518,12 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0041_flexible_identifiers.sql"),
         },
+        Migration {
+            version: 42,
+            name: "exit_export_credentials",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0042_exit_export_credentials.sql"),
+        },
     ]
 }
 

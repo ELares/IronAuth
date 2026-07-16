@@ -57,6 +57,8 @@ async fn register_passwordless_user(
                 state: UserState::Active,
                 foreign_password_hash: None,
                 foreign_password_algo: None,
+                traits_json: None,
+                traits_schema_version: None,
             },
             0,
             None,

@@ -6,6 +6,10 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Exported `verify_absent` (issue #58, review): the login path's dummy-Argon2id
+  primitive is now public so the management outbound verify-credential endpoint can
+  reuse the exact same anti-user-enumeration work, keeping absent and wrong-password
+  timing indistinguishable through one shared primitive.
 - Public invitation-accept endpoint (issue #60):
   `POST /t/{tenant}/e/{environment}/invitations/accept` on the public data plane
   (never the management port), scope-routed so the redeem runs under the right RLS
