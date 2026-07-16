@@ -6,6 +6,36 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Guarded SMS-OTP conversion counter hardening (issue #70, adversarial review LOW-3):
+  `record_send` now RE-ARMS the route's low-conversion alarm within a still-open window.
+  When the previous `throttled_until` has lapsed but the conversion window has not yet
+  rolled, both `throttled_until` and `alarm_active` are cleared, so a route that is STILL
+  pumping RE-THROTTLES on the very next send. Without this, a deployment configured with
+  `sms_route_throttle_secs < sms_conversion_window_secs` would deliver again the instant the
+  throttle lapsed while the latched alarm blocked `auto_throttle_route` (which fires only on
+  `alarm_active = false`) from ever re-firing until the window rolled: the route pumped
+  freely in between. Re-arming makes the ratio safe by construction (no migration; the
+  fix is in the existing single-statement upsert). Regression-tested on real Postgres.
+- Guarded SMS-OTP persistence (issue #70): migration 0050 adds four durable, tenant-scoped
+  tables (all with forced RLS, the (tenant, environment) isolation policy, the nonempty-scope
+  CHECK, and a query-audit registration). `sms_otp_codes` mirrors `email_otp_codes` but seals
+  and blind-indexes the recipient PHONE under the scope DEK (issue #48), never a plaintext
+  column, with the code stored only as a one-way Argon2id hash; `sms_config` holds the
+  per-tenant enablement (`enabled` DEFAULT false) and the factor-downgrade opt-in
+  (`allow_factor_downgrade` DEFAULT false), so SMS is off and non-downgrading by default
+  everywhere; `sms_country_allowlist` is the per-(tenant, environment, country) ALLOWLIST
+  (never a blocklist); `sms_route_stats` holds the per-route send-to-verify conversion
+  counters and the auto-throttle / alarm state that drives the pumping defense. New store
+  types (`NewSmsOtpCode`, `ActiveSmsOtpCode`, `SmsTenantConfig`, `SmsRouteStat`), scoped ids
+  (`sot_`, `srt_`), a read repo (`SmsOtpRepo`: resolve active code, config, allowlist, route
+  stats) and an acting repo (`ActingSmsOtpRepo`: issue / consume / record-wrong-guess,
+  set-config, add / remove allowlist country, record-send, record-verify, and the audited
+  `auto_throttle_route` that writes both the throttle and the conversion-alarm audit rows in
+  one transaction). New audit actions `sms_otp.send`, `sms_otp.verify`, `sms_route.throttled`,
+  `sms_route.conversion_alarm`, `sms_config.update`. Cheap existence probes
+  `TotpCredentialRepo::has_active` and `WebauthnCredentialRepo::has_any` back the OIDC
+  no-silent-downgrade invariant. The migration guard test asserts the new count (50), phase,
+  ledger range, and every new table / column / RLS / policy / CHECK.
 - Credential-class policies + attestation config + passkey-only markers (issue #66, PR A):
   migration 0049 (guard count -> 49) adds two new tenant-scoped tables with forced row-level
   security. `credential_class_policies` carries the per-scope minimum-credential-class ladder

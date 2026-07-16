@@ -631,5 +631,15 @@ name = "magic_link"
 path = "tests/magic_link.rs"
 required-features = ["testing"]
 
+# Guarded SMS OTP end to end (issue #70): off by default, country allowlist enforcement,
+# velocity caps with cooldowns, the pumping simulation that trips the conversion alarm and
+# auto-throttles the affected route while a healthy route keeps sending, the
+# no-silent-downgrade invariant, and the single-use / TTL-bound / hashed / attempt-limited
+# code contract with `amr` sms. Needs a real database (DATABASE_URL).
+[[test]]
+name = "sms_otp"
+path = "tests/sms_otp.rs"
+required-features = ["testing"]
+
 [lints]
 workspace = true

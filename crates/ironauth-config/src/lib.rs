@@ -568,6 +568,15 @@ pub const OIDC_EMAIL_OTP_MAX_TTL_SECS: u64 = 600;
 /// short-lived; a per-tenant value sits inside 300..=3600.
 pub const OIDC_MAGIC_LINK_MAX_TTL_SECS: u64 = 3_600;
 
+/// The FLOOR of the SMS-OTP TTL band, in seconds (issue #70): two minutes. An SMS
+/// arrives quickly, so a short window is both usable and tighter than the email band;
+/// a shorter lifetime than this risks expiring before a slow carrier delivers the text.
+pub const OIDC_SMS_OTP_MIN_TTL_SECS: u64 = 120;
+/// The CEILING of the SMS-OTP TTL band, in seconds (issue #70): ten minutes. SMS is a
+/// restricted authenticator (NIST SP 800-63B-4), so its low-entropy code must not
+/// linger; a per-tenant value sits inside 120..=600.
+pub const OIDC_SMS_OTP_MAX_TTL_SECS: u64 = 600;
+
 /// The largest a session lifetime may be configured to, in seconds. A session is
 /// longer lived than a code or an access token (a user stays logged in across
 /// requests), but a session beyond thirty days is almost always a misconfiguration,
@@ -1328,6 +1337,87 @@ pub struct OidcConfig {
     /// link). Must be in 6..=8. The default (8) gives a little more entropy than the code
     /// OTP because it is not rate-limited by a per-code attempt counter on entry.
     pub magic_link_short_code_digits: u32,
+
+    /// Whether the guarded SMS-OTP factor endpoints are mounted at all (issue #70). OFF
+    /// by default: SMS is the WEAKEST factor IronAuth ships. NIST SP 800-63B-4 classifies
+    /// PSTN out-of-band as a RESTRICTED authenticator (SIM swap, SS7 interception, and
+    /// industrial SMS-pumping fraud), so it must be a deliberate choice to expose it at
+    /// all. This flag is a deployment-level kill switch; even when it is on, SMS OTP stays
+    /// unusable in every tenant until that tenant EXPLICITLY enables it AND configures a
+    /// country allowlist (there is no allow-all shortcut). See docs/CONFIG.md for the
+    /// restricted-authenticator disclosure obligations.
+    pub sms_otp_enabled: bool,
+
+    /// The number of decimal digits in an SMS-OTP code (issue #70). Must be in 6..=8,
+    /// exactly like the email OTP. The default is 6.
+    pub sms_otp_code_digits: u32,
+
+    /// The SMS-OTP code time-to-live, in seconds (issue #70). Must be in
+    /// `OIDC_SMS_OTP_MIN_TTL_SECS..=OIDC_SMS_OTP_MAX_TTL_SECS` (120..=600). The default
+    /// (300) is five minutes: SMS arrives fast, so the window is tighter than email.
+    pub sms_otp_code_ttl_secs: u64,
+
+    /// The per-code wrong-guess budget for an SMS-OTP code (issue #70): the code dies
+    /// after this many wrong attempts. Must be at least 1. The default is 5.
+    pub sms_otp_max_attempts: u32,
+
+    /// The per-DESTINATION-NUMBER send cap inside `sms_per_number_window_secs` (issue
+    /// #70): a hard velocity cap so a single number can never be pumped. Must be at least
+    /// 1. The default (3) allows a code plus a couple of resends.
+    pub sms_per_number_send_cap: u32,
+
+    /// The fixed window for the per-number send cap, in seconds (issue #70). Must be at
+    /// least 1. The default (3600) is one hour.
+    pub sms_per_number_window_secs: u64,
+
+    /// The cooldown between two sends to the SAME number, in seconds (issue #70): a
+    /// second send inside the cooldown is refused even if the window cap is not yet spent,
+    /// which blunts rapid resend abuse. Must be at least 1. The default is 60.
+    pub sms_send_cooldown_secs: u64,
+
+    /// The per-(tenant, environment) send cap inside `sms_per_tenant_window_secs` (issue
+    /// #70): a tenant-wide velocity ceiling so a compromised account cannot spend the
+    /// tenant's whole SMS budget. Must be at least 1. The default is 1000.
+    pub sms_per_tenant_send_cap: u32,
+
+    /// The fixed window for the per-tenant send cap, in seconds (issue #70). Must be at
+    /// least 1. The default (3600) is one hour.
+    pub sms_per_tenant_window_secs: u64,
+
+    /// The per-ROUTE (country/carrier bucket) send cap inside `sms_per_route_window_secs`
+    /// (issue #70): a per-route velocity ceiling, the coarse companion to the conversion
+    /// auto-throttle. Must be at least 1. The default is 500.
+    pub sms_per_route_send_cap: u32,
+
+    /// The fixed window for the per-route send cap, in seconds (issue #70). Must be at
+    /// least 1. The default (3600) is one hour.
+    pub sms_per_route_window_secs: u64,
+
+    /// Whether pre-send phone scoring is applied (issue #70): the number-type checks
+    /// (blocking known virtual / premium ranges from the number itself) and structural
+    /// sanity that refuse an obviously abusive destination BEFORE any send. On by default.
+    pub sms_phone_scoring_enabled: bool,
+
+    /// The rolling window over which send-to-verify conversion is measured per route,
+    /// in seconds (issue #70). Must be at least 1. The default (3600) is one hour.
+    pub sms_conversion_window_secs: u64,
+
+    /// The minimum number of sends on a route before its conversion rate is trusted
+    /// enough to auto-throttle (issue #70): below this sample size a low rate is noise,
+    /// not a signal. Must be at least 1. The default is 20.
+    pub sms_conversion_min_samples: u32,
+
+    /// The send-to-verify conversion percentage BELOW which a route's pumping alarm fires
+    /// and the route auto-throttles (issue #70): the Twilio Fraud Guard insight is that
+    /// healthy routes convert at 60-85 percent and under ~30 percent signals pumping. Must
+    /// be in 1..=100. The default is 30.
+    pub sms_conversion_alarm_threshold_percent: u32,
+
+    /// How long an auto-throttled route stays throttled, in seconds (issue #70): a route
+    /// that trips the conversion alarm is refused for this long WITHOUT operator
+    /// intervention, while healthy routes keep sending. Must be at least 1. The default
+    /// (3600) is one hour.
+    pub sms_route_throttle_secs: u64,
 }
 
 impl Default for OidcConfig {
@@ -1414,6 +1504,23 @@ impl Default for OidcConfig {
             magic_link_ttl_secs: 600,
             magic_link_fragment_mode: false,
             magic_link_short_code_digits: 8,
+            // SMS OTP is OFF by default in every deployment and tenant (issue #70).
+            sms_otp_enabled: false,
+            sms_otp_code_digits: 6,
+            sms_otp_code_ttl_secs: 300,
+            sms_otp_max_attempts: 5,
+            sms_per_number_send_cap: 3,
+            sms_per_number_window_secs: 3600,
+            sms_send_cooldown_secs: 60,
+            sms_per_tenant_send_cap: 1000,
+            sms_per_tenant_window_secs: 3600,
+            sms_per_route_send_cap: 500,
+            sms_per_route_window_secs: 3600,
+            sms_phone_scoring_enabled: true,
+            sms_conversion_window_secs: 3600,
+            sms_conversion_min_samples: 20,
+            sms_conversion_alarm_threshold_percent: 30,
+            sms_route_throttle_secs: 3600,
         }
     }
 }
@@ -2321,6 +2428,7 @@ impl Config {
         validate_webauthn(&self.oidc, &self.server)?;
         validate_totp(&self.oidc)?;
         validate_email_otp(&self.oidc)?;
+        validate_sms_otp(&self.oidc)?;
         validate_quota(&self.quota)?;
         validate_password_hashing(&self.password_hashing)?;
         validate_password_policy(&self.password_policy)?;
@@ -2502,6 +2610,84 @@ fn validate_email_otp(oidc: &OidcConfig) -> Result<(), ConfigError> {
                 oidc.magic_link_ttl_secs
             ),
         });
+    }
+    Ok(())
+}
+
+/// Validate the guarded SMS-OTP settings (issue #70), kept out of [`Config::validate`]
+/// so each stays within the readable-length lint. Every bound has a safe default in
+/// range, so an empty configuration is valid (and leaves SMS OFF).
+///
+/// # Errors
+///
+/// [`ConfigError::Invalid`] if any parameter is outside its documented range.
+fn validate_sms_otp(oidc: &OidcConfig) -> Result<(), ConfigError> {
+    let invalid = |message: String| Err(ConfigError::Invalid { message });
+    if !(6..=8).contains(&oidc.sms_otp_code_digits) {
+        return invalid(format!(
+            "oidc.sms_otp_code_digits ({}) must be in 6..=8",
+            oidc.sms_otp_code_digits
+        ));
+    }
+    if !(OIDC_SMS_OTP_MIN_TTL_SECS..=OIDC_SMS_OTP_MAX_TTL_SECS)
+        .contains(&oidc.sms_otp_code_ttl_secs)
+    {
+        return invalid(format!(
+            "oidc.sms_otp_code_ttl_secs ({}) must be in \
+             {OIDC_SMS_OTP_MIN_TTL_SECS}..={OIDC_SMS_OTP_MAX_TTL_SECS}",
+            oidc.sms_otp_code_ttl_secs
+        ));
+    }
+    if oidc.sms_otp_max_attempts < 1 {
+        return invalid("oidc.sms_otp_max_attempts must be at least 1".to_owned());
+    }
+    // Every velocity cap, window, and cooldown must be a positive quantity: a zero cap
+    // or window would make the counter meaningless (a zero window rolls every call).
+    for (name, value) in [
+        (
+            "oidc.sms_per_number_send_cap",
+            u64::from(oidc.sms_per_number_send_cap),
+        ),
+        (
+            "oidc.sms_per_number_window_secs",
+            oidc.sms_per_number_window_secs,
+        ),
+        ("oidc.sms_send_cooldown_secs", oidc.sms_send_cooldown_secs),
+        (
+            "oidc.sms_per_tenant_send_cap",
+            u64::from(oidc.sms_per_tenant_send_cap),
+        ),
+        (
+            "oidc.sms_per_tenant_window_secs",
+            oidc.sms_per_tenant_window_secs,
+        ),
+        (
+            "oidc.sms_per_route_send_cap",
+            u64::from(oidc.sms_per_route_send_cap),
+        ),
+        (
+            "oidc.sms_per_route_window_secs",
+            oidc.sms_per_route_window_secs,
+        ),
+        (
+            "oidc.sms_conversion_window_secs",
+            oidc.sms_conversion_window_secs,
+        ),
+        (
+            "oidc.sms_conversion_min_samples",
+            u64::from(oidc.sms_conversion_min_samples),
+        ),
+        ("oidc.sms_route_throttle_secs", oidc.sms_route_throttle_secs),
+    ] {
+        if value < 1 {
+            return invalid(format!("{name} must be at least 1"));
+        }
+    }
+    if !(1..=100).contains(&oidc.sms_conversion_alarm_threshold_percent) {
+        return invalid(format!(
+            "oidc.sms_conversion_alarm_threshold_percent ({}) must be in 1..=100",
+            oidc.sms_conversion_alarm_threshold_percent
+        ));
     }
     Ok(())
 }

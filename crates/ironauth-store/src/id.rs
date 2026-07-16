@@ -689,6 +689,27 @@ impl ScopedKind for MagicLinkTokenKind {
     const REDACT_DEBUG: bool = true;
 }
 
+/// Marker for an SMS-OTP code (`sot_`), one row in the per-user SMS-OTP set (issue
+/// #70): the Argon2id hash of a single numeric code, single-active per (subject,
+/// purpose), single-use. A tenant-scoped resource: the id embeds its `(tenant,
+/// environment)`, so a row minted in one scope parses as a uniform not-found under
+/// another, and it is only ever reachable by the subject it is bound to. The value
+/// it points at is a one-way hash, never a plaintext code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SmsOtpCodeKind;
+impl ScopedKind for SmsOtpCodeKind {
+    const PREFIX: &'static str = "sot";
+}
+
+/// Marker for an SMS route-stats row (`srt_`), one per (tenant, environment, route)
+/// send-to-verify conversion counter and auto-throttle state (issue #70). An
+/// INTERNAL operational row, never a bearer credential.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SmsRouteStatKind;
+impl ScopedKind for SmsRouteStatKind {
+    const PREFIX: &'static str = "srt";
+}
+
 /// Marker for a human actor (an interactive user). One of the three actor kinds
 /// an audit envelope can name (see [`crate::audit::ActorRef`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -996,6 +1017,14 @@ pub type EmailOtpCodeId = ScopedId<EmailOtpCodeKind>;
 /// and the scope-declaring routing handle embedded in the `ira_mlk_<id>~<secret>` wire
 /// token (issue #68). Its debug form redacts the payload (it is part of a bearer token).
 pub type MagicLinkTokenId = ScopedId<MagicLinkTokenKind>;
+/// An SMS-OTP code identifier (`sot_...`), one row in the per-user SMS-OTP set
+/// (issue #70). Semantically identical to an [`EmailOtpCodeId`]: the value it points
+/// at is a one-way Argon2id hash, never a plaintext code.
+pub type SmsOtpCodeId = ScopedId<SmsOtpCodeKind>;
+/// An SMS route-stats identifier (`srt_...`), one row per (tenant, environment,
+/// route) send-to-verify conversion counter (issue #70). An INTERNAL operational
+/// row, never a bearer credential.
+pub type SmsRouteStatId = ScopedId<SmsRouteStatKind>;
 
 impl<K: ScopedKind> ScopedId<K> {
     /// Mint a fresh scoped identifier under `scope`, drawing the unique

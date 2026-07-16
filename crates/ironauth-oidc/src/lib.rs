@@ -101,6 +101,7 @@ mod migration;
 mod pages;
 mod par;
 mod password;
+mod phone;
 mod pkce;
 mod probe;
 mod quota;
@@ -114,6 +115,8 @@ mod scope_claims;
 mod sector;
 mod session;
 mod session_mgmt;
+mod sms_conversion;
+mod sms_otp;
 mod state;
 mod step_up;
 mod subject;
@@ -218,8 +221,8 @@ pub use tokens::{
     OPAQUE_REFRESH_TOKEN_PREFIX,
 };
 pub use verification::{
-    EmailOtpMessage, LoggingVerificationSender, MagicLinkMessage, NullVerificationSender,
-    VerificationPurpose, VerificationSender,
+    EmailOtpMessage, LoggingSmsSender, LoggingVerificationSender, MagicLinkMessage, NullSmsSender,
+    NullVerificationSender, SmsOtpMessage, SmsSender, VerificationPurpose, VerificationSender,
 };
 
 /// Build the OIDC provider router.
@@ -460,6 +463,21 @@ pub fn oidc_router(state: OidcState) -> Router {
         .route(
             "/t/{tenant_id}/e/{environment_id}/magic/consume",
             post(magic_link::consume_post),
+        )
+        // Guarded SMS OTP (issue #70), scope-routed under the per-environment path so the
+        // send/verify run under the right row-level-security scope. Both handlers fail
+        // closed with a uniform 404 when the deployment kill switch is off, and every
+        // guard refusal (a non-allowlisted country, a scored-out number, an
+        // auto-throttled route) returns a UNIFORM acknowledgment, so no branch is an
+        // enumeration oracle. SMS stays unusable in a tenant until that tenant explicitly
+        // enables it AND configures a country allowlist.
+        .route(
+            "/t/{tenant_id}/e/{environment_id}/otp/sms/send",
+            post(sms_otp::send),
+        )
+        .route(
+            "/t/{tenant_id}/e/{environment_id}/otp/sms/verify",
+            post(sms_otp::verify),
         );
 
     // Dynamic Client Registration (issue #30, RFC 7591 + RFC 7592), mounted ONLY

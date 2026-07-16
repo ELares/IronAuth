@@ -767,6 +767,114 @@
           "minimum": 0,
           "type": "integer"
         },
+        "sms_conversion_alarm_threshold_percent": {
+          "default": 30,
+          "description": "The send-to-verify conversion percentage BELOW which a route's pumping alarm fires\nand the route auto-throttles (issue #70): the Twilio Fraud Guard insight is that\nhealthy routes convert at 60-85 percent and under ~30 percent signals pumping. Must\nbe in 1..=100. The default is 30.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "sms_conversion_min_samples": {
+          "default": 20,
+          "description": "The minimum number of sends on a route before its conversion rate is trusted\nenough to auto-throttle (issue #70): below this sample size a low rate is noise,\nnot a signal. Must be at least 1. The default is 20.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "sms_conversion_window_secs": {
+          "default": 3600,
+          "description": "The rolling window over which send-to-verify conversion is measured per route,\nin seconds (issue #70). Must be at least 1. The default (3600) is one hour.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "sms_otp_code_digits": {
+          "default": 6,
+          "description": "The number of decimal digits in an SMS-OTP code (issue #70). Must be in 6..=8,\nexactly like the email OTP. The default is 6.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "sms_otp_code_ttl_secs": {
+          "default": 300,
+          "description": "The SMS-OTP code time-to-live, in seconds (issue #70). Must be in\n`OIDC_SMS_OTP_MIN_TTL_SECS..=OIDC_SMS_OTP_MAX_TTL_SECS` (120..=600). The default\n(300) is five minutes: SMS arrives fast, so the window is tighter than email.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "sms_otp_enabled": {
+          "default": false,
+          "description": "Whether the guarded SMS-OTP factor endpoints are mounted at all (issue #70). OFF\nby default: SMS is the WEAKEST factor IronAuth ships. NIST SP 800-63B-4 classifies\nPSTN out-of-band as a RESTRICTED authenticator (SIM swap, SS7 interception, and\nindustrial SMS-pumping fraud), so it must be a deliberate choice to expose it at\nall. This flag is a deployment-level kill switch; even when it is on, SMS OTP stays\nunusable in every tenant until that tenant EXPLICITLY enables it AND configures a\ncountry allowlist (there is no allow-all shortcut). See docs/CONFIG.md for the\nrestricted-authenticator disclosure obligations.",
+          "type": "boolean"
+        },
+        "sms_otp_max_attempts": {
+          "default": 5,
+          "description": "The per-code wrong-guess budget for an SMS-OTP code (issue #70): the code dies\nafter this many wrong attempts. Must be at least 1. The default is 5.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "sms_per_number_send_cap": {
+          "default": 3,
+          "description": "The per-DESTINATION-NUMBER send cap inside `sms_per_number_window_secs` (issue\n#70): a hard velocity cap so a single number can never be pumped. Must be at least\n1. The default (3) allows a code plus a couple of resends.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "sms_per_number_window_secs": {
+          "default": 3600,
+          "description": "The fixed window for the per-number send cap, in seconds (issue #70). Must be at\nleast 1. The default (3600) is one hour.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "sms_per_route_send_cap": {
+          "default": 500,
+          "description": "The per-ROUTE (country/carrier bucket) send cap inside `sms_per_route_window_secs`\n(issue #70): a per-route velocity ceiling, the coarse companion to the conversion\nauto-throttle. Must be at least 1. The default is 500.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "sms_per_route_window_secs": {
+          "default": 3600,
+          "description": "The fixed window for the per-route send cap, in seconds (issue #70). Must be at\nleast 1. The default (3600) is one hour.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "sms_per_tenant_send_cap": {
+          "default": 1000,
+          "description": "The per-(tenant, environment) send cap inside `sms_per_tenant_window_secs` (issue\n#70): a tenant-wide velocity ceiling so a compromised account cannot spend the\ntenant's whole SMS budget. Must be at least 1. The default is 1000.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "sms_per_tenant_window_secs": {
+          "default": 3600,
+          "description": "The fixed window for the per-tenant send cap, in seconds (issue #70). Must be at\nleast 1. The default (3600) is one hour.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "sms_phone_scoring_enabled": {
+          "default": true,
+          "description": "Whether pre-send phone scoring is applied (issue #70): the number-type checks\n(blocking known virtual / premium ranges from the number itself) and structural\nsanity that refuse an obviously abusive destination BEFORE any send. On by default.",
+          "type": "boolean"
+        },
+        "sms_route_throttle_secs": {
+          "default": 3600,
+          "description": "How long an auto-throttled route stays throttled, in seconds (issue #70): a route\nthat trips the conversion alarm is refused for this long WITHOUT operator\nintervention, while healthy routes keep sending. Must be at least 1. The default\n(3600) is one hour.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "sms_send_cooldown_secs": {
+          "default": 60,
+          "description": "The cooldown between two sends to the SAME number, in seconds (issue #70): a\nsecond send inside the cooldown is refused even if the window cap is not yet spent,\nwhich blunts rapid resend abuse. Must be at least 1. The default is 60.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
         "totp_digits": {
           "default": 6,
           "description": "The number of decimal digits in a TOTP code (issue #69). The\nauthenticator-app default (6) is the widest compatibility; 7 or 8 are\naccepted for apps that honor the `digits=` parameter. Must be in 6..=8.",
@@ -1502,6 +1610,22 @@
         "session_partitioned_cookie": false,
         "session_peer_ip_binding": false,
         "session_ttl_secs": 3600,
+        "sms_conversion_alarm_threshold_percent": 30,
+        "sms_conversion_min_samples": 20,
+        "sms_conversion_window_secs": 3600,
+        "sms_otp_code_digits": 6,
+        "sms_otp_code_ttl_secs": 300,
+        "sms_otp_enabled": false,
+        "sms_otp_max_attempts": 5,
+        "sms_per_number_send_cap": 3,
+        "sms_per_number_window_secs": 3600,
+        "sms_per_route_send_cap": 500,
+        "sms_per_route_window_secs": 3600,
+        "sms_per_tenant_send_cap": 1000,
+        "sms_per_tenant_window_secs": 3600,
+        "sms_phone_scoring_enabled": true,
+        "sms_route_throttle_secs": 3600,
+        "sms_send_cooldown_secs": 60,
         "totp_digits": 6,
         "totp_drift_steps": 1,
         "totp_enabled": true,

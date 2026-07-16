@@ -899,6 +899,66 @@ impl Harness {
         self.state = state;
     }
 
+    /// Install an SMS sender (issue #70) on the state and rebuild the protocol router,
+    /// so a test can capture the delivered SMS-OTP code from a recording stub.
+    pub fn install_sms_sender(&mut self, sender: Arc<dyn ironauth_oidc::SmsSender>) {
+        let state = self.state.clone().with_sms_sender(sender);
+        self.router = oidc_router(state.clone());
+        self.state = state;
+    }
+
+    /// Enable the guarded SMS-OTP factor for the harness scope (issue #70): the explicit
+    /// per-tenant enablement, the factor-downgrade opt-in, and the country allowlist. This
+    /// is the deliberate per-tenant action the off-by-default posture requires.
+    pub async fn enable_sms(&self, allow_downgrade: bool, countries: &[&str]) {
+        let (actor, corr) = self.seeding_actor();
+        let acting = self.store().scoped(self.scope).acting(actor, corr);
+        acting
+            .sms_otp()
+            .set_config(&self.env, true, allow_downgrade, 0)
+            .await
+            .expect("enable sms config");
+        for country in countries {
+            acting
+                .sms_otp()
+                .add_allowlist_country(&self.env, country)
+                .await
+                .expect("add allowlist country");
+        }
+    }
+
+    /// Enroll an ACTIVE TOTP credential for `subject` (issue #70), so a test can drive the
+    /// no-silent-downgrade invariant against an account already protected by a stronger
+    /// factor.
+    pub async fn seed_active_totp(&self, subject: &str) {
+        use ironauth_store::NewTotpEnrollment;
+        let subject_id = self
+            .store()
+            .scoped(self.scope)
+            .users()
+            .parse_id(subject)
+            .expect("parse subject");
+        let (actor, corr) = self.seeding_actor();
+        let acting = self.store().scoped(self.scope).acting(actor, corr);
+        let enrollment = NewTotpEnrollment {
+            seed: &[0x0A; 20],
+            friendly_name: "test totp",
+            algorithm: "SHA1",
+            digits: 6,
+            period_secs: 30,
+        };
+        let id = acting
+            .totp_credentials()
+            .begin_enroll(&self.env, &subject_id, &enrollment)
+            .await
+            .expect("begin totp enroll");
+        acting
+            .totp_credentials()
+            .activate(&self.env, &subject_id, &id, 0)
+            .await
+            .expect("activate totp");
+    }
+
     /// The environment's public verifying key, for building a verification policy
     /// under a non-EdDSA algorithm (for example the ES256 environment, issue #29).
     #[must_use]

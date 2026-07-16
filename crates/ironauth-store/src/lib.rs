@@ -62,6 +62,7 @@ pub mod promotion;
 mod redirect;
 mod repository;
 mod scope;
+pub mod sms_otp;
 pub mod snapshot;
 mod store;
 pub mod trait_schema;
@@ -115,10 +116,11 @@ pub use id::{
     RefreshFamilyKind, RefreshTokenId, RefreshTokenKind, ResourceServerId, ResourceServerKind,
     ScopeStepUpPolicyId, ScopeStepUpPolicyKind, ScopedId, ScopedKind, ServiceAccountId,
     ServiceAccountKind, ServiceId, ServiceKind, SessionEventId, SessionEventKind, SessionId,
-    SessionKind, SigningKeyId, SigningKeyKind, TenantId, TenantKind, TotpCredentialId,
-    TotpCredentialKind, TraitMigrationJobId, TraitMigrationJobKind, TraitSchemaId, TraitSchemaKind,
-    UserId, UserIdentifierId, UserIdentifierKind, UserKind, VariableId, VariableKind,
-    WebauthnChallengeId, WebauthnChallengeKind, WebauthnCredentialId, WebauthnCredentialKind,
+    SessionKind, SigningKeyId, SigningKeyKind, SmsOtpCodeId, SmsOtpCodeKind, SmsRouteStatId,
+    SmsRouteStatKind, TenantId, TenantKind, TotpCredentialId, TotpCredentialKind,
+    TraitMigrationJobId, TraitMigrationJobKind, TraitSchemaId, TraitSchemaKind, UserId,
+    UserIdentifierId, UserIdentifierKind, UserKind, VariableId, VariableKind, WebauthnChallengeId,
+    WebauthnChallengeKind, WebauthnCredentialId, WebauthnCredentialKind,
 };
 pub use identifier::{
     CanonicalIdentifier, IdentifierType, UniquenessMode, canonicalize_identifier,
@@ -141,15 +143,15 @@ pub use repository::{
     ActingManagementStore, ActingMigrationRunRepo, ActingOrganizationRepo, ActingPushedRequestRepo,
     ActingRecoveryCodeRepo, ActingRefreshRepo, ActingResourceServerRepo,
     ActingScopeStepUpPolicyRepo, ActingServiceAccountRepo, ActingSessionRepo, ActingSigningKeyRepo,
-    ActingStore, ActingTenantRepo, ActingTotpCredentialRepo, ActingTraitMigrationJobRepo,
-    ActingTraitSchemaRepo, ActingUserIdentifierRepo, ActingUserRepo, ActingWebauthnCredentialRepo,
-    ActiveDeviceFlow, ActiveOpaqueToken, ApprovedDeviceGrant, AssertionSubjectMappingRecord,
-    AssertionSubjectMappingRepo, AttestationConfig, AttestationConfigRepo, AuditRecord, AuditRepo,
-    AuthorizationRepo, BackChannelDeliveryRepo, ByokBinding, ClientAssertionJtiRepo,
-    ClientAuthDiagnosticReason, ClientAuthDiagnosticRecord, ClientAuthDiagnosticsRepo,
-    ClientAuthRecord, ClientCredentialsAccess, ClientRecord, ClientRepo, ClientResourcePolicy,
-    ClientSessionRepo, CodeBindings, CompletionOutcome, ConsentRepo, ConsumePushedRequest,
-    ConsumedChallenge, ConsumedInitialAccessToken, CredentialClassPolicy,
+    ActingSmsOtpRepo, ActingStore, ActingTenantRepo, ActingTotpCredentialRepo,
+    ActingTraitMigrationJobRepo, ActingTraitSchemaRepo, ActingUserIdentifierRepo, ActingUserRepo,
+    ActingWebauthnCredentialRepo, ActiveDeviceFlow, ActiveOpaqueToken, ApprovedDeviceGrant,
+    AssertionSubjectMappingRecord, AssertionSubjectMappingRepo, AttestationConfig,
+    AttestationConfigRepo, AuditRecord, AuditRepo, AuthorizationRepo, BackChannelDeliveryRepo,
+    ByokBinding, ClientAssertionJtiRepo, ClientAuthDiagnosticReason, ClientAuthDiagnosticRecord,
+    ClientAuthDiagnosticsRepo, ClientAuthRecord, ClientCredentialsAccess, ClientRecord, ClientRepo,
+    ClientResourcePolicy, ClientSessionRepo, CodeBindings, CompletionOutcome, ConsentRepo,
+    ConsumePushedRequest, ConsumedChallenge, ConsumedInitialAccessToken, CredentialClassPolicy,
     CredentialClassPolicyRepo, CredentialRemoveOutcome, CredentialType, CursorPosition,
     CustomDomainRepo, DcrPolicyRecord, DcrPolicyRepo, DcrRateLimiterRepo, DeviceApproval,
     DeviceApproveOutcome, DeviceAttemptOutcome, DeviceClientProfile, DeviceCodeRepo,
@@ -181,19 +183,20 @@ pub use repository::{
     ScopeStepUpPolicyRepo, ScopedStore, ServiceAccountRepo, SessionEndCause, SessionEndedEvent,
     SessionEventOutboxRepo, SessionFleetFilter, SessionFleetRepo, SessionRecord, SessionRepo,
     SessionRevocation, SessionSummary, SigningKeyMaterial, SigningKeyMaterialKind,
-    SigningKeyRecord, SigningKeyRepo, StoredIdempotentResponse, TenantRecord, TenantRepo,
-    TenantStatus, TokenFormat, TokenKind, TokenStatus, TotpActivateOutcome, TotpCredentialRepo,
-    TotpCredentialSummary, TotpMaterial, TotpVerifyOutcome, TraitJobKind, TraitJobStatus,
-    TraitMigrationJob, TraitMigrationJobRepo, TraitSchemaRepo, TraitSchemaVersion, UserAdminRecord,
-    UserExportRecord, UserIdentifierRecord, UserIdentifierRepo, UserListFilter, UserRecord,
-    UserRepo, UserRevocation, UserState, WEBAUTHN_CHALLENGE_TTL_SECS, WebauthnAssertionTarget,
-    WebauthnCeremony, WebauthnChallengeRepo, WebauthnCredentialDescriptor,
+    SigningKeyRecord, SigningKeyRepo, SmsOtpRepo, StoredIdempotentResponse, TenantRecord,
+    TenantRepo, TenantStatus, TokenFormat, TokenKind, TokenStatus, TotpActivateOutcome,
+    TotpCredentialRepo, TotpCredentialSummary, TotpMaterial, TotpVerifyOutcome, TraitJobKind,
+    TraitJobStatus, TraitMigrationJob, TraitMigrationJobRepo, TraitSchemaRepo, TraitSchemaVersion,
+    UserAdminRecord, UserExportRecord, UserIdentifierRecord, UserIdentifierRepo, UserListFilter,
+    UserRecord, UserRepo, UserRevocation, UserState, WEBAUTHN_CHALLENGE_TTL_SECS,
+    WebauthnAssertionTarget, WebauthnCeremony, WebauthnChallengeRepo, WebauthnCredentialDescriptor,
     WebauthnCredentialOutcome, WebauthnCredentialRecord, WebauthnCredentialRepo,
     device_code_digest, invitation_token_digest, magic_link_binding_digest,
     magic_link_token_digest, mint_invitation_token, mint_invitation_token_for,
     opaque_access_token_digest, refresh_token_digest, user_code_hash,
 };
 pub use scope::Scope;
+pub use sms_otp::{ActiveSmsOtpCode, NewSmsOtpCode, SmsRouteStat, SmsTenantConfig};
 pub use snapshot::{
     CLIENT_SECRET_REFERENCE, ClientSnapshot, DcrPolicySnapshot, ResourceServerSnapshot,
     SNAPSHOT_RESOURCE_TYPES, SNAPSHOT_SCHEMA_VERSION, SecretRef, Snapshot, SnapshotResources,

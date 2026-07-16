@@ -86,6 +86,15 @@ pub enum AuthMethod {
     /// single-use out-of-band proof delivered to the address. Used as a PRIMARY
     /// passwordless factor, so on its own it achieves the single-factor `pwd`-level ACR.
     EmailOtp,
+    /// An SMS one-time proof (issue #70): a numeric code delivered to a registered
+    /// phone number over PSTN. RFC 8176 `sms` (a confirmation by text message to a
+    /// registered number). It is the WEAKEST factor IronAuth ships (NIST SP 800-63B-4
+    /// classifies PSTN out-of-band as a RESTRICTED authenticator), so the amr reports
+    /// `sms` HONESTLY and DISTINCTLY from `otp`: an SMS login is never conflated with a
+    /// stronger app-based one-time password, which is what lets the no-silent-downgrade
+    /// invariant be enforced at all. On its own it achieves the single-factor
+    /// `pwd`-level ACR.
+    Sms,
     /// A TOTP code (a possession factor: an authenticator app holding the shared
     /// seed). RFC 8176 `otp`. Used as a SECOND factor, so combined with a primary it
     /// achieves the multi-factor ACR (issue #69).
@@ -136,12 +145,19 @@ impl AuthMethod {
     /// ACR (the verified and presence-only variants of one passkey class) sit
     /// adjacent; their relative order does not matter to [`achieved_acr`] because
     /// their ACR is identical.
-    const ALL: [AuthMethod; 12] = [
+    const ALL: [AuthMethod; 13] = [
         AuthMethod::Password,
         // Email OTP / magic link is a single-factor PRIMARY passwordless proof at the
         // same `pwd`-level ACR as a password (adjacent, relative order immaterial since
         // the ACR is identical).
         AuthMethod::EmailOtp,
+        // SMS OTP (issue #70) is also a single-factor PRIMARY passwordless proof at the
+        // `pwd`-level ACR (adjacent, relative order immaterial since the ACR is
+        // identical). It is the WEAKEST such factor, but the ACR reflects the number of
+        // factors, not their strength; its restricted-authenticator posture is enforced
+        // by the off-by-default guard layer and the no-silent-downgrade invariant, not by
+        // the ACR ladder.
+        AuthMethod::Sms,
         // The second-factor methods sit above the single password ACR and below the
         // phishing-resistant passkey ACRs: pwd+otp is multi-factor but not
         // phishing-resistant, so a passkey login still outranks it.
@@ -168,6 +184,7 @@ impl AuthMethod {
         match self {
             AuthMethod::Password => "pwd",
             AuthMethod::EmailOtp => "email_otp",
+            AuthMethod::Sms => "sms",
             AuthMethod::Totp => "totp",
             AuthMethod::RecoveryCode => "recovery_code",
             AuthMethod::Passkey => "passkey",
@@ -206,6 +223,10 @@ impl AuthMethod {
             // `otp`: a single-use out-of-band proof to the registered email (a numeric
             // code or a magic link). A single primary factor, so no `mfa` here.
             AuthMethod::EmailOtp => &["otp"],
+            // `sms`: a confirmation by text message to a registered number (RFC 8176).
+            // Named DISTINCTLY from `otp` so an SMS login never masquerades as a
+            // stronger app-based OTP. A single primary factor, so no `mfa` here.
+            AuthMethod::Sms => &["sms"],
             // `otp`: a one-time password (RFC 6238); `mfa`: the second factor plus
             // the primary make multiple factors.
             AuthMethod::Totp => &["otp", "mfa"],
@@ -237,7 +258,7 @@ impl AuthMethod {
     #[must_use]
     pub fn acr(self) -> &'static str {
         match self {
-            AuthMethod::Password | AuthMethod::EmailOtp => ACR_PWD,
+            AuthMethod::Password | AuthMethod::EmailOtp | AuthMethod::Sms => ACR_PWD,
             AuthMethod::Totp | AuthMethod::RecoveryCode => ACR_MFA,
             AuthMethod::Passkey | AuthMethod::PasskeyVerified => ACR_PHR,
             AuthMethod::PasskeyHardware | AuthMethod::PasskeyHardwareVerified => ACR_PHRH,
@@ -270,6 +291,7 @@ impl AuthMethod {
             self,
             AuthMethod::Password
                 | AuthMethod::EmailOtp
+                | AuthMethod::Sms
                 | AuthMethod::Totp
                 | AuthMethod::RecoveryCode
                 | AuthMethod::Passkey
@@ -583,6 +605,17 @@ impl AuthenticationEvent {
         }
     }
 
+    /// An SMS one-time proof authentication at `auth_time_unix_micros` (issue #70): a
+    /// numeric code delivered over PSTN, `amr` `sms` (honestly named, distinct from the
+    /// email/app `otp`).
+    #[must_use]
+    pub fn sms(auth_time_unix_micros: i64) -> Self {
+        Self {
+            methods: vec![AuthMethod::Sms],
+            auth_time_unix_micros,
+        }
+    }
+
     /// A passkey authentication at `auth_time_unix_micros` (issue #65).
     ///
     /// `backup_eligible` MUST be the credential's REGISTRATION-time, stored BE
@@ -735,6 +768,24 @@ mod tests {
         assert_eq!(methods, vec![AuthMethod::Password]);
         assert_eq!(amr_values(&methods), vec!["pwd"]);
         assert_eq!(achieved_acr(&methods), ACR_PWD);
+    }
+
+    #[test]
+    fn sms_maps_to_the_sms_amr_and_the_password_acr() {
+        // Issue #70: SMS reports `sms` HONESTLY (RFC 8176), DISTINCT from the email/app
+        // `otp`, and as a single primary factor achieves the `pwd`-level ACR.
+        let event = AuthenticationEvent::sms(1_700_000_000_000_000);
+        assert_eq!(event.methods(), &[AuthMethod::Sms]);
+        assert_eq!(amr_values(event.methods()), vec!["sms"]);
+        assert_ne!(
+            amr_values(event.methods()),
+            vec!["otp"],
+            "sms is never conflated with otp"
+        );
+        assert_eq!(achieved_acr(event.methods()), ACR_PWD);
+        // The token round-trips and the method is active.
+        assert_eq!(AuthMethod::from_token("sms"), Some(AuthMethod::Sms));
+        assert!(AuthMethod::Sms.is_active());
     }
 
     #[test]

@@ -232,6 +232,11 @@ pub struct OidcState {
     // Default: the no-op NullVerificationSender (no transport wired yet), so the
     // closed-registration acknowledgment is identical whether or not a send goes out.
     verification_sender: Arc<dyn crate::verification::VerificationSender>,
+    // The SMS delivery seam (issue #70). Kept OUTSIDE `Inner` so the real provider
+    // adapter (M11 messaging) installs its sender here later without a wire change.
+    // Default: the no-op NullSmsSender (no transport wired yet), so the guarded
+    // acknowledgment is identical whether or not a text goes out.
+    sms_sender: Arc<dyn crate::verification::SmsSender>,
     // The resolved NIST SP 800-63B-4 password policy (issue #63): length floors, the
     // composition/rotation legacy overrides, and whether screening is enabled. Kept
     // OUTSIDE `Inner` and installed by the boot path from the top-level `[password_policy]`
@@ -436,6 +441,24 @@ struct Inner {
     magic_link_ttl_secs: u64,
     magic_link_fragment_mode: bool,
     magic_link_short_code_digits: u32,
+    // Guarded SMS OTP (issue #70). All validated at startup. Off by default at every
+    // layer: the deployment kill switch plus the per-tenant DB enablement + allowlist.
+    sms_otp_enabled: bool,
+    sms_otp_code_digits: u32,
+    sms_otp_code_ttl_secs: u64,
+    sms_otp_max_attempts: u32,
+    sms_per_number_send_cap: u32,
+    sms_per_number_window_secs: u64,
+    sms_send_cooldown_secs: u64,
+    sms_per_tenant_send_cap: u32,
+    sms_per_tenant_window_secs: u64,
+    sms_per_route_send_cap: u32,
+    sms_per_route_window_secs: u64,
+    sms_phone_scoring_enabled: bool,
+    sms_conversion_window_secs: u64,
+    sms_conversion_min_samples: u32,
+    sms_conversion_alarm_threshold_percent: u32,
+    sms_route_throttle_secs: u64,
 }
 
 impl OidcState {
@@ -477,6 +500,9 @@ impl OidcState {
         Self::build(store, env, issuers, config, issuer_base, Some(resolver))
     }
 
+    // One flat field-by-field construction of the immutable Inner; splitting it would
+    // not make the wiring clearer.
+    #[allow(clippy::too_many_lines)]
     fn build(
         store: Store,
         env: Env,
@@ -572,6 +598,23 @@ impl OidcState {
                 magic_link_ttl_secs: config.magic_link_ttl_secs,
                 magic_link_fragment_mode: config.magic_link_fragment_mode,
                 magic_link_short_code_digits: config.magic_link_short_code_digits,
+                sms_otp_enabled: config.sms_otp_enabled,
+                sms_otp_code_digits: config.sms_otp_code_digits,
+                sms_otp_code_ttl_secs: config.sms_otp_code_ttl_secs,
+                sms_otp_max_attempts: config.sms_otp_max_attempts,
+                sms_per_number_send_cap: config.sms_per_number_send_cap,
+                sms_per_number_window_secs: config.sms_per_number_window_secs,
+                sms_send_cooldown_secs: config.sms_send_cooldown_secs,
+                sms_per_tenant_send_cap: config.sms_per_tenant_send_cap,
+                sms_per_tenant_window_secs: config.sms_per_tenant_window_secs,
+                sms_per_route_send_cap: config.sms_per_route_send_cap,
+                sms_per_route_window_secs: config.sms_per_route_window_secs,
+                sms_phone_scoring_enabled: config.sms_phone_scoring_enabled,
+                sms_conversion_window_secs: config.sms_conversion_window_secs,
+                sms_conversion_min_samples: config.sms_conversion_min_samples,
+                sms_conversion_alarm_threshold_percent: config
+                    .sms_conversion_alarm_threshold_percent,
+                sms_route_throttle_secs: config.sms_route_throttle_secs,
             }),
             revocation_sink: default_sink(),
             introspection_serializer: default_serializer(),
@@ -581,6 +624,7 @@ impl OidcState {
             hashing_pool: None,
             abuse_counters: Arc::new(crate::abuse::MemoryCounterStore::new()),
             verification_sender: Arc::new(crate::verification::NullVerificationSender),
+            sms_sender: Arc::new(crate::verification::NullSmsSender),
             password_policy: ironauth_screening::PasswordPolicy::default(),
             screening_failure: ironauth_screening::FailurePolicy::FailOpen,
             screen_on_login: false,
@@ -791,6 +835,16 @@ impl OidcState {
         sender: Arc<dyn crate::verification::VerificationSender>,
     ) -> Self {
         self.verification_sender = sender;
+        self
+    }
+
+    /// Install the SMS sender (issue #70), replacing the default no-op
+    /// [`NullSmsSender`](crate::verification::NullSmsSender). The real provider adapter
+    /// (M11 messaging) wires its sender here; a test wires a recording stub to assert
+    /// what was (and was not) delivered.
+    #[must_use]
+    pub fn with_sms_sender(mut self, sender: Arc<dyn crate::verification::SmsSender>) -> Self {
+        self.sms_sender = sender;
         self
     }
 
@@ -1880,6 +1934,126 @@ impl OidcState {
     #[must_use]
     pub fn magic_link_short_code_digits(&self) -> u32 {
         self.inner.magic_link_short_code_digits
+    }
+
+    /// Whether the guarded SMS-OTP endpoints are mounted at all (issue #70). OFF by
+    /// default; even when on, SMS stays unusable in a tenant until that tenant enables
+    /// it AND configures a country allowlist.
+    #[must_use]
+    pub fn sms_otp_enabled(&self) -> bool {
+        self.inner.sms_otp_enabled
+    }
+
+    /// The number of decimal digits in an SMS-OTP code (issue #70). In 6..=8.
+    #[must_use]
+    pub fn sms_otp_code_digits(&self) -> u32 {
+        self.inner.sms_otp_code_digits
+    }
+
+    /// The SMS-OTP code lifetime (issue #70).
+    #[must_use]
+    pub fn sms_otp_code_ttl(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.inner.sms_otp_code_ttl_secs)
+    }
+
+    /// The per-code wrong-guess budget for an SMS-OTP code (issue #70). At least 1.
+    #[must_use]
+    pub fn sms_otp_max_attempts(&self) -> u32 {
+        self.inner.sms_otp_max_attempts
+    }
+
+    /// Whether pre-send phone scoring is applied (issue #70).
+    #[must_use]
+    pub fn sms_phone_scoring_enabled(&self) -> bool {
+        self.inner.sms_phone_scoring_enabled
+    }
+
+    /// The rolling send-to-verify conversion window (issue #70).
+    #[must_use]
+    pub fn sms_conversion_window(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.inner.sms_conversion_window_secs)
+    }
+
+    /// The minimum route sample before conversion is trusted to auto-throttle (issue
+    /// #70).
+    #[must_use]
+    pub fn sms_conversion_min_samples(&self) -> u32 {
+        self.inner.sms_conversion_min_samples
+    }
+
+    /// The send-to-verify conversion percentage below which a route auto-throttles
+    /// (issue #70). In 1..=100.
+    #[must_use]
+    pub fn sms_conversion_alarm_threshold_percent(&self) -> u32 {
+        self.inner.sms_conversion_alarm_threshold_percent
+    }
+
+    /// How long an auto-throttled route stays throttled (issue #70).
+    #[must_use]
+    pub fn sms_route_throttle(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.inner.sms_route_throttle_secs)
+    }
+
+    /// Increment the SMS velocity counters and report whether ANY per-number, per-tenant,
+    /// or per-route send cap (or the per-number cooldown) is now EXCEEDED (issue #70).
+    /// Layered on the #64 in-process fixed-window counters. `number_key` is a per-process
+    /// counter key derived from the canonical destination (it never leaves the process
+    /// and is never logged). This is a request-shaping (availability-biased) layer: a
+    /// counter-store error fails OPEN, exactly like the #64 fast layer.
+    #[must_use]
+    pub(crate) fn sms_velocity_exceeded(
+        &self,
+        scope: Scope,
+        route_key: &str,
+        number_key: &str,
+        now_micros: i64,
+    ) -> bool {
+        let counters = &self.abuse_counters;
+        let tenant = scope.tenant().to_string();
+        let environment = scope.environment().to_string();
+        let over = |key: &str, window: u64, cap: u64| -> bool {
+            counters
+                .incr(key, window, now_micros)
+                .is_ok_and(|count| count > cap)
+        };
+        let per_number = over(
+            &format!("sms:number:{tenant}:{environment}:{number_key}"),
+            self.inner.sms_per_number_window_secs,
+            u64::from(self.inner.sms_per_number_send_cap),
+        );
+        let cooldown = over(
+            &format!("sms:cooldown:{tenant}:{environment}:{number_key}"),
+            self.inner.sms_send_cooldown_secs,
+            1,
+        );
+        let per_tenant = over(
+            &format!("sms:tenant:{tenant}:{environment}"),
+            self.inner.sms_per_tenant_window_secs,
+            u64::from(self.inner.sms_per_tenant_send_cap),
+        );
+        let per_route = over(
+            &format!("sms:route:{tenant}:{environment}:{route_key}"),
+            self.inner.sms_per_route_window_secs,
+            u64::from(self.inner.sms_per_route_send_cap),
+        );
+        per_number || cooldown || per_tenant || per_route
+    }
+
+    /// Deliver an SMS-OTP code through the SMS seam (issue #70), applying the same
+    /// anti-enumeration SUPPRESSION as [`Self::deliver_email_otp`]: when `permitted` is
+    /// false (an unknown recipient, a refused destination, or a suppressed branch) the
+    /// delivery is silently dropped, recorded only on the observability plane, so the
+    /// acknowledgment is identical to a real send.
+    pub(crate) fn deliver_sms_otp(
+        &self,
+        message: &crate::verification::SmsOtpMessage<'_>,
+        permitted: bool,
+    ) {
+        if permitted {
+            self.sms_sender.send(message);
+        } else {
+            Self::record_suppressed_send(message.scope, "sms_otp");
+        }
     }
 
     /// Deliver an email-OTP code through the verification seam (issue #68), applying the
