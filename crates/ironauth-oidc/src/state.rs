@@ -338,6 +338,7 @@ struct Inner {
     totp_recovery_code_count: u32,
     mfa_required: bool,
     mfa_factor_order: Vec<String>,
+    acr_order: Vec<String>,
 }
 
 impl OidcState {
@@ -465,6 +466,7 @@ impl OidcState {
                 totp_recovery_code_count: config.totp_recovery_code_count,
                 mfa_required: config.mfa_required,
                 mfa_factor_order: config.mfa_factor_order.clone(),
+                acr_order: config.acr_order.clone(),
             }),
             revocation_sink: default_sink(),
             introspection_serializer: default_serializer(),
@@ -1645,6 +1647,20 @@ impl OidcState {
     #[must_use]
     pub fn mfa_factor_order(&self) -> &[String] {
         &self.inner.mfa_factor_order
+    }
+
+    /// The DEPLOYMENT-level `acr` order for step-up comparison (RFC 9470, issue #72),
+    /// weakest first. Resolved once from `OidcConfig` at construction and applied across
+    /// the deployment (NOT per (tenant, environment) today; per-tenant resolution is a
+    /// future enhancement). Falls back to the default credential-ladder order when the
+    /// configured list is empty, so a comparison always has a ranking to use.
+    #[must_use]
+    pub fn acr_order(&self) -> Vec<String> {
+        if self.inner.acr_order.is_empty() {
+            crate::step_up::default_acr_order()
+        } else {
+            self.inner.acr_order.clone()
+        }
     }
 
     /// The shared per-environment issuer registry: the ONE holder of every

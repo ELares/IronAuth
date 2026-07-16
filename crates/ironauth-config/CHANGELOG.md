@@ -6,6 +6,13 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- `oidc.acr_order` setting (RFC 9470 step-up, issue #72): the DEPLOYMENT-level `acr` order
+  (weakest first) the step-up comparison ranks against, so an acr floor is met by the same
+  value or a rank at least as strong. Resolved once from config and applied across the
+  deployment (per-(tenant, environment) resolution is a future enhancement). Defaults to the
+  credential-ladder order
+  (`urn:ironauth:acr:pwd`, `urn:ironauth:acr:mfa`, `phr`, `phrh`); an empty list falls back
+  to that default; duplicate entries are a boot-time `ConfigError::Invalid`.
 - `oidc.webauthn_related_origins` (issue #67, WebAuthn Level 3 Related Origin
   Requests): a per-environment list of additional https origins permitted to use this
   environment's RP ID, including origins on a different registrable domain (a

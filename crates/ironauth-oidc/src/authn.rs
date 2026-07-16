@@ -206,6 +206,14 @@ impl AuthMethod {
     }
 }
 
+/// The multi-factor authentication context class (`acr`) a second factor achieves
+/// (issue #72). Exposed so the step-up gate can rank a request's requirement against
+/// the multi-factor level without re-deriving the URN.
+#[must_use]
+pub fn acr_for_mfa() -> &'static str {
+    ACR_MFA
+}
+
 /// Parse a space-separated `auth_methods` token string into the recorded
 /// methods, dropping unknown tokens.
 ///
@@ -369,6 +377,33 @@ impl AuthenticationEvent {
     pub fn password_and_recovery_code(auth_time_unix_micros: i64) -> Self {
         Self {
             methods: vec![AuthMethod::Password, AuthMethod::RecoveryCode],
+            auth_time_unix_micros,
+        }
+    }
+
+    /// An authentication event from an explicit set of recorded methods at
+    /// `auth_time_unix_micros` (issue #72), used by a step-up that COMBINES a prior
+    /// factor already proven in the session with a fresh one just verified (for
+    /// example a password login stepped up with a live TOTP: `[Password, Totp]`).
+    ///
+    /// The methods are de-duplicated preserving first-seen order, and only active
+    /// methods are kept, so the derived `amr`/`acr` can never over-claim; an empty
+    /// input falls back to a bare password event (the honest floor). `auth_time`
+    /// MUST be the instant the step-up COMPLETED, so a stepped-up token carries a
+    /// fresh `auth_time` reflecting the authentication that actually occurred.
+    #[must_use]
+    pub fn from_methods(methods: &[AuthMethod], auth_time_unix_micros: i64) -> Self {
+        let mut kept: Vec<AuthMethod> = Vec::new();
+        for &method in methods {
+            if method.is_active() && !kept.contains(&method) {
+                kept.push(method);
+            }
+        }
+        if kept.is_empty() {
+            kept.push(AuthMethod::Password);
+        }
+        Self {
+            methods: kept,
             auth_time_unix_micros,
         }
     }

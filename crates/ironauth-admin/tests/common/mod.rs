@@ -286,6 +286,7 @@ impl Harness {
                     client_id,
                     scope: Some("openid"),
                     auth_methods: "pwd",
+                    auth_time_unix_micros: None,
                     offline,
                     created_at_unix_micros: 0,
                     idle_expires_at_unix_micros: FAR_FUTURE_MICROS,

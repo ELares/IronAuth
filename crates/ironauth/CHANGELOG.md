@@ -6,6 +6,13 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- `step-up-policy set | list | remove` subcommands (RFC 9470 step-up, issue #72): set,
+  list, and remove the declarative per-scope and per-client step-up authentication policy
+  directly against the data-plane store, each an audited write through the SAME repositories
+  the enforcement path reads, so an operator can enable a policy without hand-writing Rust or
+  SQL. A short `--acr` alias (`pwd`/`mfa`/`phr`/`phrh`) is canonicalized to the value the
+  enforcement path compares against. Closes the "declarative policy has no production
+  reachability" gap; a hosted admin HTTP CRUD can layer on later.
 - `ban` / `unban` / `bans` subcommands (issue #64): place, lift, and list durable
   credential-abuse bans directly against the data-plane store, each an audited write. An
   identifier subject is canonicalized through the login seam so a CLI ban matches the form

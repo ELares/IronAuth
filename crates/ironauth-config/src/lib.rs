@@ -1247,6 +1247,19 @@ pub struct OidcConfig {
     /// phishing-resistant passkey, then TOTP. Duplicates and unknown kinds are a
     /// boot-time [`ConfigError::Invalid`].
     pub mfa_factor_order: Vec<String>,
+
+    /// The DEPLOYMENT-level `acr` order for step-up comparison (RFC 9470, issue #72),
+    /// weakest first. A step-up requirement's `acr` floor is satisfied when the
+    /// achieved `acr` is the same value or ranks at least as strong under this
+    /// order. The default is the credential-ladder order the provider advertises
+    /// (`urn:ironauth:acr:pwd`, `urn:ironauth:acr:mfa`, `phr`, `phrh`); a deployment
+    /// that trusts its factors differently (for example ranking a verified TOTP
+    /// above a synced passkey) reorders them here. An empty list falls back to the
+    /// default ladder. Duplicate entries are a boot-time [`ConfigError::Invalid`].
+    /// This is resolved ONCE from configuration and applied across the deployment;
+    /// per-(tenant, environment) resolution is a future enhancement, consistent with
+    /// how the other per-environment config is handled.
+    pub acr_order: Vec<String>,
 }
 
 impl Default for OidcConfig {
@@ -1319,6 +1332,12 @@ impl Default for OidcConfig {
             totp_recovery_code_count: 10,
             mfa_required: false,
             mfa_factor_order: vec!["passkey".to_owned(), "totp".to_owned()],
+            acr_order: vec![
+                "urn:ironauth:acr:pwd".to_owned(),
+                "urn:ironauth:acr:mfa".to_owned(),
+                "phr".to_owned(),
+                "phrh".to_owned(),
+            ],
         }
     }
 }
@@ -2157,6 +2176,19 @@ fn validate_totp(oidc: &OidcConfig) -> Result<(), ConfigError> {
                 message: format!(
                     "oidc.mfa_factor_order lists '{factor}' more than once; each factor appears \
                      at most once"
+                ),
+            });
+        }
+    }
+    // The step-up acr order (issue #72) must not repeat a value: a duplicate would
+    // make the rank comparison ambiguous. An empty list is allowed (it falls back to
+    // the default credential-ladder order at read time).
+    let mut seen_acr = std::collections::BTreeSet::new();
+    for acr in &oidc.acr_order {
+        if !seen_acr.insert(acr.clone()) {
+            return Err(ConfigError::Invalid {
+                message: format!(
+                    "oidc.acr_order lists '{acr}' more than once; each acr appears at most once"
                 ),
             });
         }

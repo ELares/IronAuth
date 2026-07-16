@@ -327,7 +327,7 @@ async fn expand_contract_example_chain_runs_all_three_phases_and_contract_remove
 // per real table); splitting it would not make it clearer.
 #[allow(clippy::too_many_lines)]
 #[tokio::test]
-async fn production_chain_is_only_the_forty_six_real_migrations_and_ships_no_demo_object() {
+async fn production_chain_is_only_the_forty_seven_real_migrations_and_ships_no_demo_object() {
     // TestDatabase::start runs Store::migrate() (the production chain) on a
     // fresh, empty database.
     let db = TestDatabase::start().await;
@@ -344,8 +344,8 @@ async fn production_chain_is_only_the_forty_six_real_migrations_and_ships_no_dem
     );
     assert_eq!(
         report.already_applied(),
-        46,
-        "the production chain is exactly forty-six migrations (isolation, audit log, management \
+        47,
+        "the production chain is exactly forty-seven migrations (isolation, audit log, management \
          API, OIDC authorization, signing keys, login/consent, authentication context, redirect \
          registration, UserInfo claims, consent scope upsert, resource servers, opaque access \
          tokens, client auth suite, dynamic client registration, pushed authorization requests, \
@@ -357,16 +357,16 @@ async fn production_chain_is_only_the_forty_six_real_migrations_and_ships_no_dem
          self-service account, admin user lifecycle, identity traits, foreign password \
          import, user invitations, flexible identifiers, exit-export credential grants, \
          migration state machine, webauthn credentials, totp credentials, credential abuse \
-         defenses)"
+         defenses, step-up policies)"
     );
 
-    // The ledger holds exactly versions 1 through 46.
+    // The ledger holds exactly versions 1 through 47.
     assert_eq!(
         applied_versions(pool).await,
         vec![
             1_i64, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
             24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45,
-            46
+            46, 47
         ]
     );
     let phase_of = |version: i64| async move {
@@ -537,6 +537,29 @@ async fn production_chain_is_only_the_forty_six_real_migrations_and_ships_no_dem
     // The credential-abuse-defenses migration (issue #64) is an EXPAND: one new
     // tenant-scoped ban table, no rewrite of existing state.
     assert_eq!(phase_of(46).await, "expand");
+    // The step-up policies migration (issue #72) is an EXPAND: one new tenant-scoped
+    // per-scope policy table plus additive clients and refresh_families columns, no
+    // rewrite of existing state.
+    assert_eq!(phase_of(47).await, "expand");
+
+    // The step-up second-factor abuse path (issue #72): migration 0047 WIDENED the
+    // abuse_bans auth_path CHECK (0046 pinned the closed set) to also admit
+    // 'second_factor', so the RFC 9470 step-up challenge is a first-class throttled
+    // path that can carry a ban independently of password/passkey. The widened CHECK
+    // definition names the new value.
+    let auth_path_check: String = sqlx::query(
+        "SELECT pg_get_constraintdef(oid) AS def FROM pg_catalog.pg_constraint \
+         WHERE conrelid = 'abuse_bans'::regclass AND conname = 'abuse_bans_auth_path_known'",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("auth_path check constraint lookup")
+    .get("def");
+    assert!(
+        auth_path_check.contains("second_factor"),
+        "the abuse_bans auth_path CHECK must admit the step-up second-factor path, got: \
+         {auth_path_check}"
+    );
 
     // The demo object never reaches a production database.
     assert!(
@@ -1827,6 +1850,66 @@ async fn production_chain_is_only_the_forty_six_real_migrations_and_ships_no_dem
             "abuse_bans must carry the {constraint} CHECK constraint"
         );
     }
+
+    // ---- 0047 step-up policies (issue #72) ----
+    assert!(
+        table_exists(pool, "scope_step_up_policies").await,
+        "scope_step_up_policies exists after 0047"
+    );
+    for column in [
+        "id",
+        "tenant_id",
+        "environment_id",
+        "scope",
+        "min_acr",
+        "max_auth_age_secs",
+        "created_at",
+        "updated_at",
+    ] {
+        assert!(
+            column_exists(pool, "scope_step_up_policies", column).await,
+            "scope_step_up_policies.{column} exists after 0047"
+        );
+    }
+    // The tenant-scoped-table obligations (migrate.rs checklist): forced row-level
+    // security, the (tenant, environment) isolation policy, and the nonempty-scope
+    // CHECK.
+    assert!(
+        rls_enabled_and_forced(pool, "scope_step_up_policies").await,
+        "scope_step_up_policies must ENABLE and FORCE row-level security"
+    );
+    assert!(
+        policy_exists(
+            pool,
+            "scope_step_up_policies",
+            "scope_step_up_policies_tenant_isolation"
+        )
+        .await,
+        "the (tenant, environment) isolation policy must exist on scope_step_up_policies"
+    );
+    for constraint in [
+        "scope_step_up_policies_scope_nonempty",
+        "scope_step_up_policies_scope_token_nonempty",
+        "scope_step_up_policies_requirement_present",
+    ] {
+        assert!(
+            check_constraint_exists(pool, "scope_step_up_policies", constraint).await,
+            "scope_step_up_policies must carry the {constraint} CHECK constraint"
+        );
+    }
+    // The additive per-client step-up floor columns (issue #72).
+    for column in ["step_up_acr", "step_up_max_age_secs"] {
+        assert!(
+            column_exists(pool, "clients", column).await,
+            "clients.{column} exists after 0047"
+        );
+    }
+    // The frozen auth_time on the refresh family, so a refresh can re-evaluate the
+    // max-age window without a new authentication (issue #72).
+    assert!(
+        column_exists(pool, "refresh_families", "auth_time").await,
+        "refresh_families.auth_time exists after 0047"
+    );
 }
 
 #[tokio::test]

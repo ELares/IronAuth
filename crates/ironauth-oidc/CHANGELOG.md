@@ -6,6 +6,47 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Step-up adversarial-review fixes (RFC 9470, issue #72): the step-up second-factor
+  challenge (`/login/mfa`) is now THROTTLED through the #64 abuse regulation on a new
+  INDEPENDENT `AuthPath::SecondFactor` path, so an online TOTP/recovery-code guess storm
+  is escalated to a uniform 429 (and can auto-place a ban) before any code is compared,
+  while never locking the owner out of the password or passkey path; the #69 self-service
+  TOTP verify / recovery-code redeem surface routes through the SAME path, closing the seam
+  that left them unthrottled. A phishing-resistant (`phr`/`phrh`) floor no longer routes to
+  a generic re-login (which looped forever on a password re-login) or a TOTP-enrollment
+  dead-end: a passkey holder is routed to a passkey-only ceremony page
+  (`/login?...&passkey=1`, no password form, new `passkey_signin_page`) that terminates on a
+  verified passkey, and a subject with no passkey fails closed with
+  `unmet_authentication_requirements` (new `Remediation::PasskeyReauth`). The per-scope
+  policy read at token issuance/refresh now FAILS CLOSED on a store fault (never silently
+  issues an under-evaluated token); authorization stays the primary gate. `oidc.acr_order`
+  is documented as a DEPLOYMENT-level order (not per-tenant). New `canonical_step_up_acr`
+  helper canonicalizes a short acr alias for the CLI. The sample RS and the runnable example
+  now emit and evaluate `max_age` (not only `acr`).
+- Step-up authentication end to end (RFC 9470, issue #72): a new `step_up` module models
+  the declarative authentication requirement (an acr floor plus a max auth age) and its
+  evaluation against a recorded authentication, comparing acr by the tenant's configured
+  order (`oidc.acr_order`, defaulting to the credential ladder pwd < mfa < phr < phrh).
+  The requirement is assembled from three sources (the request `acr_values`/`max_age`, the
+  per-client floor `clients.step_up_acr`/`step_up_max_age_secs`, and the per-scope
+  `scope_step_up_policies` table) and evaluated at THREE points: at authorization, at token
+  issuance, and on refresh. When the current session does not satisfy the requirement the
+  authorize endpoint RUNS the required authentication (the hosted `/login/mfa` second-factor
+  challenge for a multi-factor floor with an enrolled TOTP, or a full re-login), then issues
+  tokens with a FRESH `acr` + `auth_time` reflecting what actually happened (never a stale or
+  asserted value); a user with no qualifying factor is routed to an enrollment prompt where
+  tenant policy allows, or fails with `unmet_authentication_requirements`. The token endpoint
+  re-evaluates the policy against the frozen authentication (code) or the refresh family, and
+  a refresh whose auth-age window has LAPSED fails with the new
+  `TokenError::InsufficientUserAuthentication` (RFC 9470 `insufficient_user_authentication`
+  carrying `acr_values`/`max_age`) rather than silently minting an under-qualified token. A
+  request `acr_values` stays VOLUNTARY (an unachievable value is best-effort, never an error)
+  while an ESSENTIAL `acr` from the `claims` parameter and the tenant policy are binding.
+  `/login/mfa` reuses the credential-bearing interaction seam (same-origin CSRF gate, 303,
+  page hardening) and upgrades the session on a verified TOTP or recovery code. The challenge
+  contract for resource servers is documented in `docs/design/step-up-authentication.md`, with
+  a minimal sample resource server (`examples/step_up_resource_server.rs`) and an integration
+  suite that drives the full round trip (challenge, re-authorization, real step-up, acceptance).
 - WebAuthn Related Origin Requests (issue #67, WebAuthn Level 3): a new
   `GET /.well-known/webauthn` endpoint serving the `{"origins": [...]}` document, and
   related-origin acceptance in the passkey ceremony. The document is generated from

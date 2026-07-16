@@ -30,7 +30,7 @@ use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
 use ironauth_store::{
     AuthorizationCodeId, ClientId, ClientRecord, ConsumePushedRequest, CorrelationId, GrantId,
-    GrantedConsent, IssueCode, PushedRequestId, Scope, SessionId, StoreError,
+    GrantedConsent, IssueCode, PushedRequestId, Scope, SessionId, StoreError, UserId,
     redirect_uri_is_registrable, redirect_uri_matches,
 };
 use serde::{Deserialize, Serialize};
@@ -49,6 +49,7 @@ use crate::response;
 use crate::scope_claims::{assemble_claims, parse_scope_set};
 use crate::session_mgmt;
 use crate::state::{OidcState, ResourceTargetError};
+use crate::step_up;
 use crate::token_hash;
 use crate::tokens::{self, MintRequest};
 use crate::util::{append_query, client_service_actor, epoch_micros};
@@ -578,21 +579,35 @@ async fn issue_code(
         } => (session, consent_ref),
     };
 
-    // 6b. Essential acr binding and the unmet-authentication surface (OIDC Core
-    //     5.5.1.1, issue #16). A voluntary `acr_values` preference is best-effort:
-    //     the achieved acr always reflects the real authentication event (issue #14),
-    //     never a copied-through request, and an unsatisfiable `acr_values` is not an
-    //     error. An ESSENTIAL acr in the `claims` parameter is binding: if NONE of
-    //     its pinned values is achievable by any method the server offers, no
-    //     authentication can ever satisfy it, so it is
-    //     `unmet_authentication_requirements`; if it is achievable in principle but
-    //     not by THIS session (a step-up, unreachable under the single-method
-    //     bootstrap, owned by M7), it fails closed via `access_denied` as issue #15
-    //     established. Either is delivered by the negotiated mode.
-    if let Some((code, description)) = acr_requirement_error(&claims_request, &session.auth_methods)
+    // 6b. Step-up authentication (RFC 9470, issue #72). Assemble the effective
+    //     authentication requirement from the request `acr_values`/`max_age`, the
+    //     per-client floor, the per-scope tenant policy, and any ESSENTIAL `acr` in
+    //     the `claims` parameter (OIDC Core 5.5.1.1). If the CURRENT session does not
+    //     satisfy it, RUN the required authentication (a second-factor challenge or a
+    //     full re-login) rather than silently reusing the session or issuing an
+    //     under-qualified token; when the requirement can NEVER be met, fail per RFC
+    //     9470 with `unmet_authentication_requirements`. The achieved `acr` always
+    //     reflects the real authentication event (issue #14), never a copied-through
+    //     request value, so a stepped-up token is honest.
+    let step_up_age_bound = match evaluate_step_up(
+        state,
+        scope,
+        &client,
+        effective_scope.as_deref(),
+        &params,
+        max_age_secs,
+        &claims_request,
+        &session,
+        prompt,
+        &hints,
+        pushed,
+    )
+    .await
     {
-        return Err(redirect_error(code, description));
-    }
+        StepUpOutcome::Satisfied { age_bound } => age_bound,
+        StepUpOutcome::Interaction(response) => return Ok(response),
+        StepUpOutcome::Fail(code, description) => return Err(redirect_error(code, description)),
+    };
 
     // 7. Freeze the authentication context. auth_time is emitted in the ID token
     //    when the request asked for max_age (present, including max_age=0) OR the
@@ -603,8 +618,14 @@ async fn issue_code(
     //    recorded instant, so it is frozen only when it is due. The recorded methods
     //    are always frozen so amr/acr can be derived. acr_values is honored as a
     //    preference only: the achieved acr comes from the event, never the request.
-    let auth_time_required =
-        max_age_secs.is_some() || client.require_auth_time || params.emit_auth_time.is_some();
+    let auth_time_required = max_age_secs.is_some()
+        || client.require_auth_time
+        || params.emit_auth_time.is_some()
+        // A step-up max-age policy (per-client or per-scope, issue #72) also requires
+        // freezing auth_time so the refresh path can re-evaluate the window against
+        // it; without this a max-age policy would fail closed at the token endpoint
+        // even for a session that was fresh at authorization.
+        || step_up_age_bound;
     let auth_time_micros = auth_time_required.then_some(session.auth_time_unix_micros);
 
     let session_ref = session.session_id.to_string();
@@ -1284,33 +1305,156 @@ fn parse_claims_request(
 /// closed via `access_denied`, preserving issue #15's fail-closed posture. A
 /// voluntary or absent acr request is always satisfied (the achieved acr is reported
 /// honestly, issue #14), so a preference-only `acr_values` never errors here.
-fn acr_requirement_error(
+/// The outcome of the step-up evaluation (RFC 9470, issue #72).
+enum StepUpOutcome {
+    /// The current session satisfies the requirement; issue the code. `age_bound` is
+    /// true when a max-age step-up requirement applied, so the code MUST freeze
+    /// `auth_time` (the refresh path re-evaluates the window against it).
+    Satisfied {
+        /// Whether a max-age requirement applied (forces freezing `auth_time`).
+        age_bound: bool,
+    },
+    /// A local interaction is needed (a second-factor challenge or a full re-login).
+    Interaction(Response),
+    /// The requirement cannot be met; fail with this authorization error, delivered
+    /// through the negotiated response mode.
+    Fail(AuthzErrorCode, &'static str),
+}
+
+/// Evaluate step-up authentication for a validated, authenticated request (RFC
+/// 9470, issue #72).
+///
+/// Assembles the effective requirement (request `acr_values`/`max_age`, the
+/// per-client floor, the per-scope tenant policy, and any essential `acr` from the
+/// `claims` parameter), compares it against the CURRENT session's achieved `acr`
+/// and recorded `auth_time` (both derived from the real authentication event, issue
+/// #14), and either reports the request ready, redirects to run the required
+/// authentication, or fails per spec. Under `prompt=none` an interaction need
+/// becomes the matching negotiated-mode error rather than a page.
+#[allow(clippy::too_many_arguments)]
+async fn evaluate_step_up(
+    state: &OidcState,
+    scope: Scope,
+    client: &ClientRecord,
+    effective_scope: Option<&str>,
+    params: &AuthorizeParams,
+    max_age_secs: Option<u64>,
     claims_request: &ClaimsRequest,
-    auth_methods: &str,
-) -> Option<(AuthzErrorCode, &'static str)> {
-    let required = claims_request.essential_acr_values();
-    if required.is_empty() {
-        // No binding acr requirement: a voluntary/absent acr is best-effort.
-        return None;
+    session: &interaction::AuthenticatedSession,
+    prompt: PromptSet,
+    hints: &InteractionHints,
+    pushed: Option<&PushedContext>,
+) -> StepUpOutcome {
+    let order = state.acr_order();
+    // Assemble the requirement from the request, the client floor, and the per-scope
+    // policy, then fold in any ESSENTIAL acr from the `claims` parameter (the
+    // strongest listed value is the floor).
+    // Authorize is the PRIMARY gate and re-runs on every request, so a transient
+    // policy-read fault is best-effort here (ignored); the token/refresh path fails
+    // closed on it (issue #72 INFO).
+    let (mut requirement, _policy_read_faulted) = step_up::requirement_for_request(
+        state,
+        scope,
+        client,
+        effective_scope,
+        params.acr_values.as_deref(),
+        max_age_secs,
+    )
+    .await;
+    let essential = claims_request.essential_acr_values();
+    if !essential.is_empty() {
+        let essential_join = essential.join(" ");
+        requirement.merge_stronger(
+            &step_up::requirement_from_acr_values(Some(&essential_join), None, &order),
+            &order,
+        );
     }
-    let supported = authn::acr_values_supported();
-    let achievable = required
-        .iter()
-        .any(|value| supported.contains(&value.as_str()));
-    if !achievable {
-        return Some((
+    let age_bound = requirement.max_auth_age_secs.is_some();
+    if requirement.is_empty() {
+        return StepUpOutcome::Satisfied { age_bound };
+    }
+
+    let achieved = authn::achieved_acr(&authn::parse_methods(&session.auth_methods));
+    let now_micros = epoch_micros(state.now());
+    let satisfaction = step_up::evaluate(
+        &requirement,
+        achieved,
+        Some(session.auth_time_unix_micros),
+        now_micros,
+        &order,
+    );
+    let step_up::Satisfaction::NeedsStepUp {
+        acr_unmet,
+        age_lapsed,
+    } = satisfaction
+    else {
+        return StepUpOutcome::Satisfied { age_bound };
+    };
+
+    // The subject the factor probe binds to. A session subject that will not parse
+    // in scope cannot be probed, so the requirement can never be met here.
+    let Ok(subject) = UserId::parse_in_scope(&session.subject, &scope) else {
+        return StepUpOutcome::Fail(
             AuthzErrorCode::UnmetAuthenticationRequirements,
-            "no available authentication method can satisfy the requested acr",
-        ));
+            "the requested authentication context cannot be satisfied",
+        );
+    };
+    let remediation =
+        step_up::decide_remediation(state, scope, &subject, &requirement, acr_unmet, age_lapsed)
+            .await;
+
+    // Under prompt=none NO UI is rendered: an interaction need becomes the matching
+    // negotiated-mode error (OIDC Core 3.1.2.6, RFC 9470).
+    if prompt.contains(PromptValue::None) {
+        return match remediation {
+            step_up::Remediation::Fail | step_up::Remediation::Enroll => StepUpOutcome::Fail(
+                AuthzErrorCode::UnmetAuthenticationRequirements,
+                "the requested authentication context cannot be satisfied without interaction",
+            ),
+            step_up::Remediation::FullReauth => StepUpOutcome::Fail(
+                AuthzErrorCode::LoginRequired,
+                "re-authentication is required but prompt=none forbids interaction",
+            ),
+            step_up::Remediation::PasskeyReauth => StepUpOutcome::Fail(
+                AuthzErrorCode::LoginRequired,
+                "a passkey ceremony is required but prompt=none forbids interaction",
+            ),
+            step_up::Remediation::SecondFactor => StepUpOutcome::Fail(
+                AuthzErrorCode::InteractionRequired,
+                "a second-factor step-up is required but prompt=none forbids interaction",
+            ),
+        };
     }
-    let achieved = authn::achieved_acr(&authn::parse_methods(auth_methods));
-    if required.iter().any(|value| value.as_str() == achieved) {
-        None
-    } else {
-        Some((
-            AuthzErrorCode::AccessDenied,
-            "the requested authentication context (essential acr) cannot be satisfied",
-        ))
+
+    match remediation {
+        // A full re-login: consume the request's re-auth forcing tokens so the
+        // resumed request does not loop, exactly like the max_age gate.
+        step_up::Remediation::FullReauth => StepUpOutcome::Interaction(
+            interaction::login_redirect(&login_resume_url(params, hints, prompt, pushed)),
+        ),
+        // A phishing-resistant floor (phr/phrh), or an mfa floor the subject can only
+        // reach with a passkey: run the passkey ceremony SPECIFICALLY, never the generic
+        // login (a password re-login yields pwd and would loop). Completing the passkey
+        // ceremony yields phr, which satisfies the floor, so the resumed request proceeds
+        // and the flow TERMINATES.
+        step_up::Remediation::PasskeyReauth => StepUpOutcome::Interaction(
+            interaction::passkey_reauth_redirect(&login_resume_url(params, hints, prompt, pushed)),
+        ),
+        // A second-factor challenge against the LIVE session: resume the request
+        // verbatim (the acr is elevated by the challenge, so it does not loop).
+        step_up::Remediation::SecondFactor => StepUpOutcome::Interaction(
+            interaction::mfa_challenge_redirect(&preserve_resume_url(params, hints, pushed), false),
+        ),
+        // No qualifying factor, but enrollment is allowed: the challenge page
+        // surfaces the enrollment prompt.
+        step_up::Remediation::Enroll => StepUpOutcome::Interaction(
+            interaction::mfa_challenge_redirect(&preserve_resume_url(params, hints, pushed), true),
+        ),
+        // The requirement can never be met: RFC 9470 unmet_authentication_requirements.
+        step_up::Remediation::Fail => StepUpOutcome::Fail(
+            AuthzErrorCode::UnmetAuthenticationRequirements,
+            "no available authentication method can satisfy the requested authentication context",
+        ),
     }
 }
 
@@ -2147,33 +2291,46 @@ mod tests {
     }
 
     #[test]
-    fn acr_requirement_error_is_unmet_only_when_no_method_can_satisfy() {
+    fn essential_acr_folds_into_the_step_up_requirement() {
+        // The essential acr from the `claims` parameter (issue #16) now folds into
+        // the step-up requirement (issue #72), evaluated by the step_up primitives.
         use crate::claims_request::ClaimsRequest;
+        use crate::step_up;
 
-        // A voluntary acr_values-style request has no essential binding, so it never
-        // errors (the achieved acr is reported honestly instead).
-        let voluntary =
-            ClaimsRequest::parse(r#"{"id_token":{"acr":{"values":["urn:example:high"]}}}"#)
-                .expect("parse");
-        assert!(acr_requirement_error(&voluntary, "pwd").is_none());
+        let order = step_up::default_acr_order();
 
-        // An essential acr pinned to a level NO method can achieve is
-        // unmet_authentication_requirements.
+        // An essential acr pinned to a level NO method can achieve is unsatisfiable:
+        // the floor is not achievable, so the gate fails unmet_authentication_requirements.
         let unmet = ClaimsRequest::parse(
             r#"{"id_token":{"acr":{"essential":true,"values":["urn:example:high"]}}}"#,
         )
         .expect("parse");
-        assert_eq!(
-            acr_requirement_error(&unmet, "pwd").map(|(code, _)| code),
-            Some(AuthzErrorCode::UnmetAuthenticationRequirements),
+        let unmet_req = step_up::requirement_from_acr_values(
+            Some(&unmet.essential_acr_values().join(" ")),
+            None,
+            &order,
         );
+        let floor = unmet_req.min_acr.as_deref().expect("a floor");
+        assert!(!step_up::floor_is_achievable(floor, &order));
 
         // An essential acr pinned to the achievable-and-achieved level is satisfied.
         let met = ClaimsRequest::parse(
             r#"{"id_token":{"acr":{"essential":true,"values":["urn:ironauth:acr:pwd"]}}}"#,
         )
         .expect("parse");
-        assert!(acr_requirement_error(&met, "pwd").is_none());
+        let met_req = step_up::requirement_from_acr_values(
+            Some(&met.essential_acr_values().join(" ")),
+            None,
+            &order,
+        );
+        assert!(step_up::floor_is_achievable(
+            met_req.min_acr.as_deref().expect("a floor"),
+            &order
+        ));
+        assert_eq!(
+            step_up::evaluate(&met_req, "urn:ironauth:acr:pwd", Some(0), 0, &order),
+            step_up::Satisfaction::Satisfied,
+        );
     }
 
     #[test]

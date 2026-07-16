@@ -19,11 +19,12 @@ use ironauth_store::{
 };
 use serde::Deserialize;
 
-use crate::authn::AuthenticationEvent;
+use crate::authn::{AuthMethod, AuthenticationEvent};
 use crate::interaction::{self, parse_resume};
 use crate::migration::{HookOutcome, HookProfile, LazyMigrationHook};
 use crate::pages;
 use crate::state::OidcState;
+use crate::totp::{self, SecondFactorOutcome};
 use crate::util::epoch_micros;
 
 /// The `return_to` carried on the `GET /login` query.
@@ -31,6 +32,11 @@ use crate::util::epoch_micros;
 pub struct ResumeQuery {
     /// The authorization URL to resume at after a successful sign-in.
     pub return_to: Option<String>,
+    /// When present (`1`), a step-up routed the subject here to run the PASSKEY ceremony
+    /// specifically for a phishing-resistant (`phr`/`phrh`) floor (RFC 9470, issue #72):
+    /// the page renders the passkey ceremony with NO password form (a password re-login
+    /// yields `pwd` and could never satisfy the floor, so offering it would loop).
+    pub passkey: Option<String>,
 }
 
 /// The posted login form.
@@ -72,14 +78,22 @@ pub async fn login_get(
                     nonce: &nonce,
                     scope_path: &scope_path,
                 };
-                let body = pages::login_page(
-                    resume.hints.login_hint().unwrap_or_default(),
-                    &resume.return_to,
-                    None,
-                    &resume.hints,
-                    banner,
-                    Some(&ui),
-                );
+                // A phishing-resistant step-up (RFC 9470, issue #72) routes here with
+                // `passkey=1` to run the passkey ceremony SPECIFICALLY: render the
+                // passkey-only page (no password form), so a `phr`/`phrh` floor cannot be
+                // answered by a `pwd` re-login that would loop.
+                let body = if query.passkey.as_deref() == Some("1") {
+                    pages::passkey_signin_page(&resume.return_to, None, &resume.hints, banner, &ui)
+                } else {
+                    pages::login_page(
+                        resume.hints.login_hint().unwrap_or_default(),
+                        &resume.return_to,
+                        None,
+                        &resume.hints,
+                        banner,
+                        Some(&ui),
+                    )
+                };
                 pages::login_html(StatusCode::OK, body, &nonce)
             } else {
                 pages::secure_html(
@@ -97,6 +111,195 @@ pub async fn login_get(
         }
         None => interaction::invalid_link_page(),
     }
+}
+
+/// The `return_to` and optional enroll flag carried on the `GET /login/mfa` query
+/// (RFC 9470 step-up challenge, issue #72).
+#[derive(Deserialize)]
+pub struct MfaChallengeQuery {
+    /// The authorization URL to resume at after the second factor is proven.
+    pub return_to: Option<String>,
+    /// When present (`1`), the subject has no qualifying factor: show the
+    /// enrollment prompt instead of the code form.
+    pub enroll: Option<String>,
+}
+
+/// The posted step-up challenge form (issue #72).
+#[derive(Deserialize)]
+pub struct MfaChallengeForm {
+    /// The TOTP or recovery code (never logged or echoed).
+    pub code: Option<String>,
+    /// The authorization URL to resume at.
+    pub return_to: Option<String>,
+}
+
+/// `GET /login/mfa`: render the step-up second-factor challenge for a valid resume
+/// target (RFC 9470, issue #72). Requires an existing session (the primary
+/// authentication already happened); with none it bounces to login. When `enroll`
+/// is set the page surfaces the factor-enrollment prompt.
+pub async fn mfa_challenge_get(
+    State(state): State<OidcState>,
+    headers: HeaderMap,
+    Query(query): Query<MfaChallengeQuery>,
+) -> Response {
+    let Some(resume) = parse_resume(query.return_to.as_deref()) else {
+        return interaction::invalid_link_page();
+    };
+    // The step-up runs against the CURRENT (primary) session; with none the user
+    // must sign in first, which re-establishes it and resumes the same request.
+    if interaction::resolve_session(&state, resume.scope, &headers)
+        .await
+        .is_none()
+    {
+        return interaction::login_redirect(&resume.return_to);
+    }
+    let banner = state.environment_banner(&resume.scope).await;
+    let enroll_url = query
+        .enroll
+        .as_deref()
+        .filter(|value| *value == "1")
+        .map(|_| {
+            format!(
+                "/t/{}/e/{}/account/mfa/totp/enroll",
+                resume.scope.tenant(),
+                resume.scope.environment()
+            )
+        });
+    pages::secure_html(
+        StatusCode::OK,
+        pages::mfa_challenge_page(
+            &resume.return_to,
+            None,
+            enroll_url.as_deref(),
+            &resume.hints,
+            banner,
+        ),
+    )
+}
+
+/// `POST /login/mfa`: verify the presented second factor and, on success, UPGRADE
+/// the session to record the combined authentication (RFC 9470, issue #72). The
+/// upgraded session carries a FRESH `auth_time` (the instant the step-up completed)
+/// and the honest `acr`/`amr` of the combined factors, so the resumed authorization
+/// issues tokens reflecting what ACTUALLY happened, never a stale or asserted value.
+#[allow(clippy::too_many_lines)]
+pub async fn mfa_challenge_post(
+    State(state): State<OidcState>,
+    headers: HeaderMap,
+    Form(form): Form<MfaChallengeForm>,
+) -> Response {
+    let Some(resume) = parse_resume(form.return_to.as_deref()) else {
+        return interaction::invalid_link_page();
+    };
+    // CSRF defense-in-depth (issue #196) BEFORE any credential work, exactly as the
+    // login POST does.
+    if !interaction::same_origin_ok(&headers, state.self_origin().as_deref()) {
+        return interaction::forbidden_page();
+    }
+    let banner = state.environment_banner(&resume.scope).await;
+    // The step-up runs against the CURRENT (primary) session; with none the user
+    // must sign in first.
+    let Some(session) = interaction::resolve_session(&state, resume.scope, &headers).await else {
+        return interaction::login_redirect(&resume.return_to);
+    };
+    let Ok(subject) = UserId::parse_in_scope(&session.subject, &resume.scope) else {
+        return interaction::server_error_page();
+    };
+    let code = form.code.as_deref().map(str::trim).unwrap_or_default();
+    let rerender = |message: &str| {
+        pages::secure_html(
+            StatusCode::OK,
+            pages::mfa_challenge_page(
+                &resume.return_to,
+                Some(message),
+                None,
+                &resume.hints,
+                banner,
+            ),
+        )
+    };
+    if code.is_empty() {
+        return rerender("Enter a code to continue.");
+    }
+    // Credential-abuse regulation (issue #64) on the INDEPENDENT second-factor path
+    // (issue #72), keyed on the authenticated subject and the non-forgeable resolved
+    // peer IP, BEFORE any code is verified: an online TOTP/recovery-code guess storm is
+    // escalated to a uniform 429 (and can auto-place a SecondFactor ban) exactly as the
+    // password path is, so the step-up challenge is no longer an unbounded guess oracle.
+    // A throttled attempt spends NO verification. Path-independent: a second-factor storm
+    // never throttles the password or passkey path.
+    let ctx = crate::abuse::second_factor_attempt_context(resume.scope, &subject, &headers);
+    if let crate::abuse::RegulationOutcome::Throttled(snapshot) = state.regulate_before(&ctx).await
+    {
+        return throttled_mfa_challenge_page(&snapshot, &resume.return_to, &resume.hints, banner);
+    }
+    let new_method = match totp::verify_second_factor(&state, resume.scope, &subject, code).await {
+        SecondFactorOutcome::Totp => AuthMethod::Totp,
+        SecondFactorOutcome::Recovery => AuthMethod::RecoveryCode,
+        SecondFactorOutcome::Invalid => return rerender("Incorrect or expired code."),
+        // A retryable server condition (the hashing pool was unavailable) or a store
+        // fault: a neutral error, never a wrong-code signal.
+        SecondFactorOutcome::Unavailable | SecondFactorOutcome::Error => {
+            return interaction::server_error_page();
+        }
+    };
+    // Combine the factors already proven in this session (the primary login) with
+    // the one just verified, and record the event at the CURRENT clock instant so
+    // auth_time is fresh (issue #14 honesty). establish_session rotates the session
+    // (session-fixation defense) and writes the elevated auth_methods + auth_time.
+    let mut methods = crate::authn::parse_methods(&session.auth_methods);
+    if !methods.contains(&new_method) {
+        methods.push(new_method);
+    }
+    let event = AuthenticationEvent::from_methods(&methods, epoch_micros(state.now()));
+    let actor = interaction::user_actor(&subject);
+    match interaction::establish_session(
+        &state,
+        resume.scope,
+        &session.subject,
+        &event,
+        actor,
+        &headers,
+    )
+    .await
+    {
+        Ok(cookie) => {
+            // A proven second factor relaxes THIS path's failure counters (issue #64
+            // LOW-6), so a user who fat-fingered a code before entering the right one is
+            // not throttled for the rest of the window. Best-effort and per-PATH, so it
+            // never touches the password or passkey path.
+            state.reset_after_success(&ctx).await;
+            interaction::redirect_setting_cookie(&resume.return_to, &cookie)
+        }
+        Err(_) => interaction::server_error_page(),
+    }
+}
+
+/// The uniform throttle response when credential-abuse regulation refuses a step-up
+/// second-factor attempt (RFC 9470, issue #72): the SAME generic challenge page body a
+/// wrong code renders, but with a `429 Too Many Requests` status and the standard
+/// rate-limit response headers, so an online guess storm against the second factor is
+/// slowed exactly as the password path is. Keyed on the `SecondFactor` path, so it never
+/// throttles the password or passkey path.
+fn throttled_mfa_challenge_page(
+    snapshot: &ironauth_quota::RateLimitSnapshot,
+    return_to: &str,
+    hints: &crate::hints::InteractionHints,
+    environment_banner: Option<&str>,
+) -> Response {
+    let mut response = pages::secure_html(
+        StatusCode::OK,
+        pages::mfa_challenge_page(
+            return_to,
+            Some("Too many attempts. Wait a moment and try again."),
+            None,
+            hints,
+            environment_banner,
+        ),
+    );
+    *response.status_mut() = StatusCode::TOO_MANY_REQUESTS;
+    crate::abuse::stamp_rate_limit_headers(&mut response, snapshot);
+    response
 }
 
 /// A per-response CSP script nonce for the login page's conditional-UI script

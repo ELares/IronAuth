@@ -63,6 +63,7 @@ use ironauth_store::{
 };
 use serde::Deserialize;
 
+use crate::authn;
 use crate::claims_request::ClaimsRequest;
 use crate::client_auth::{
     self, AuthenticatedClient, ClientAuthError, ClientAuthInputs, ClientAuthMethod,
@@ -73,6 +74,7 @@ use crate::registry::GrantType;
 use crate::resource;
 use crate::scope_claims::{assemble_claims, parse_scope_set};
 use crate::state::{OidcState, ResourceTargetError};
+use crate::step_up;
 use crate::tokens::{self, AccessTokenTarget, IssuedTokens, MintRequest, MintedAccessToken};
 use crate::util::{client_service_actor, epoch_micros};
 
@@ -214,6 +216,10 @@ async fn exchange(
 
 /// The `authorization_code` grant (issue #12): redeem a single-use code for the ID
 /// and access tokens, and (issue #21) open a refresh-token family alongside them.
+// The linear redeem flow (load, authenticate, re-check bindings, resolve target,
+// step-up re-evaluation, mint-before-consume, atomic redeem) reads best as one
+// function; splitting it would scatter the sign-before-consume discipline.
+#[allow(clippy::too_many_lines)]
 async fn authorization_code_grant(
     state: &OidcState,
     headers: &HeaderMap,
@@ -277,6 +283,26 @@ async fn authorization_code_grant(
     //     defaults to the full approved set, or to the per-client no-resource policy
     //     when none was approved. A violation is a uniform `invalid_target`.
     let target = resolve_code_exchange_target(state, scope, &bindings, resources).await?;
+
+    // 5f. Step-up policy re-evaluation at token issuance (RFC 9470, issue #72). The
+    //     per-client and per-scope authentication requirements are re-checked against
+    //     the authentication FROZEN onto the code (its recorded methods and
+    //     auth_time). This is defense in depth over the authorization-endpoint check:
+    //     a policy that tightened after the code was issued, or any path that reached
+    //     issuance under-qualified, fails HERE with the RFC 9470 step-up error rather
+    //     than minting an under-qualified token.
+    if let Some(error) = enforce_step_up_policy(
+        state,
+        scope,
+        &bindings.client_id,
+        bindings.oauth_scope.as_deref(),
+        &bindings.auth_methods,
+        bindings.auth_time_unix_micros,
+    )
+    .await
+    {
+        return Err(error);
+    }
 
     // 6. Mint (sign) the tokens BEFORE the consume, so a missing key or a signing
     //    failure fails closed without burning the code. The ID token stays lean by
@@ -848,6 +874,69 @@ pub(crate) fn map_store_error(error: StoreError) -> TokenError {
 /// logout that already cascaded cannot be outlived by a family opened just after
 /// it. That is a hard failure, not a fail-soft, because a session-bound token that
 /// escaped its logout is the exact invariant this milestone protects.
+/// Re-evaluate the per-client and per-scope step-up authentication policy at token
+/// issuance and on refresh (RFC 9470, issue #72), against the authentication FROZEN
+/// on the code or the refresh family (its recorded methods and `auth_time`).
+///
+/// Returns [`Some`] with the RFC 9470 step-up error (carrying the `acr_values` and
+/// `max_age` the client must request on the retry) when the frozen authentication
+/// does not satisfy the requirement, and [`None`] when it does or no requirement
+/// applies. A missing `auth_time` against a max-age policy fails closed (the
+/// [`step_up::evaluate`] rule), so a refresh can never silently extend a lapsed
+/// window. A client that no longer resolves, or a store fault while assembling the
+/// requirement, is treated as "no requirement" so this check never turns a
+/// transient read fault into a spurious step-up (the authorization-endpoint check
+/// is the primary gate).
+async fn enforce_step_up_policy(
+    state: &OidcState,
+    scope: Scope,
+    client_id: &str,
+    oauth_scope: Option<&str>,
+    auth_methods: &str,
+    auth_time_unix_micros: Option<i64>,
+) -> Option<TokenError> {
+    let Ok(id) = ClientId::parse_in_scope(client_id, &scope) else {
+        return None;
+    };
+    // FAIL CLOSED (issue #72 INFO): a transient store fault while assembling the
+    // requirement must NOT be read as "no requirement", or a step-up policy added AFTER
+    // the code or refresh family was issued could be silently skipped on a store blip and
+    // an under-evaluated token minted. A genuinely absent client carries no policy (no
+    // requirement); any other store fault denies with a server error. Authorize stays the
+    // primary gate.
+    let client = match state.store().scoped(scope).clients().get(&id).await {
+        Ok(client) => client,
+        Err(StoreError::NotFound) => return None,
+        Err(_) => return Some(TokenError::ServerError),
+    };
+    let (requirement, policy_read_faulted) =
+        step_up::requirement_for_request(state, scope, &client, oauth_scope, None, None).await;
+    if policy_read_faulted {
+        return Some(TokenError::ServerError);
+    }
+    if requirement.is_empty() {
+        return None;
+    }
+    let order = state.acr_order();
+    let achieved = authn::achieved_acr(&authn::parse_methods(auth_methods));
+    let now_micros = epoch_micros(state.now());
+    match step_up::evaluate(
+        &requirement,
+        achieved,
+        auth_time_unix_micros,
+        now_micros,
+        &order,
+    ) {
+        step_up::Satisfaction::Satisfied => None,
+        step_up::Satisfaction::NeedsStepUp { .. } => {
+            Some(TokenError::InsufficientUserAuthentication {
+                acr_values: requirement.min_acr,
+                max_age: requirement.max_auth_age_secs,
+            })
+        }
+    }
+}
+
 async fn issue_refresh_for_code(
     state: &OidcState,
     scope: Scope,
@@ -887,6 +976,10 @@ async fn issue_refresh_for_code(
                 client_id: &bindings.client_id,
                 scope: bindings.oauth_scope.as_deref(),
                 auth_methods: &bindings.auth_methods,
+                // Freeze the code's recorded auth_time onto the family so a refresh
+                // can re-evaluate a step-up max-age window without a new
+                // authentication (RFC 9470, issue #72).
+                auth_time_unix_micros: bindings.auth_time_unix_micros,
                 offline,
                 created_at_unix_micros: created,
                 idle_expires_at_unix_micros: idle_expires,
@@ -951,6 +1044,10 @@ async fn ensure_subject_can_authenticate(
 /// permits refreshing the originally granted scope). The single-use, rotation, and
 /// reuse decision is the store's atomic [`ActingRefreshRepo::redeem`]; this handler
 /// only pre-mints the access token and the successor, then maps the outcome.
+// The linear refresh flow (resolve, authenticate, lifecycle re-check, rotation
+// decision, resource downscope, step-up re-evaluation, mint, atomic redeem) reads
+// best as one function.
+#[allow(clippy::too_many_lines)]
 async fn refresh_token_grant(
     state: &OidcState,
     headers: &HeaderMap,
@@ -1014,6 +1111,27 @@ async fn refresh_token_grant(
     //     authorization but can NEVER expand beyond them; omitting `resource` keeps
     //     the full approved set. A violation is a uniform `invalid_target`.
     let target = resolve_refresh_target(state, scope, &client_id, &resolution, resources).await?;
+
+    // 5d. Step-up policy re-evaluation on refresh (RFC 9470, issue #72). A refresh
+    //     that would mint an access token for a scope whose auth-age window has
+    //     LAPSED (or whose recorded acr is below the required floor) triggers the
+    //     step-up requirement rather than silently succeeding with a stale
+    //     acr/auth_time. The requirement is evaluated against the authentication
+    //     FROZEN onto the family (its recorded methods and auth_time); a family that
+    //     carried no auth_time fails closed against a max-age policy (no silent
+    //     extend). The client must re-authorize with the carried acr_values/max_age.
+    if let Some(error) = enforce_step_up_policy(
+        state,
+        scope,
+        &resolution.client_id,
+        resolution.scope.as_deref(),
+        &resolution.auth_methods,
+        resolution.auth_time_unix_micros,
+    )
+    .await
+    {
+        return Err(error);
+    }
 
     // 6. Mint the refreshed access token. No ID token is re-minted: no new
     //    authentication happened, so the ID token stays with the code exchange.

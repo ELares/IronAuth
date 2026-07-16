@@ -1216,6 +1216,83 @@ impl Harness {
             .expect("configure client policy");
     }
 
+    /// Set a per-scope step-up policy (RFC 9470, issue #72): the `(acr floor, max
+    /// auth age)` requirement governing an OAuth `scope_token`.
+    pub async fn set_scope_step_up_policy(
+        &self,
+        scope_token: &str,
+        min_acr: Option<&str>,
+        max_auth_age_secs: Option<i64>,
+    ) {
+        let (actor, corr) = self.seeding_actor();
+        self.store()
+            .scoped(self.scope)
+            .acting(actor, corr)
+            .scope_step_up_policies()
+            .set(&self.env, scope_token, min_acr, max_auth_age_secs)
+            .await
+            .expect("set scope step-up policy");
+    }
+
+    /// Seed a registered passkey credential for `subject` (issue #72), so the step-up
+    /// factor probe (`has_passkey`) sees a phishing-resistant factor without driving the
+    /// full WebAuthn ceremony. The credential material is a throwaway placeholder: the
+    /// probe only checks that a credential row EXISTS, so a synthetic descriptor is
+    /// sufficient for the remediation-routing tests. `synced` selects a synced (BE=1,
+    /// phr) versus device-bound (BE=0, phrh) passkey.
+    pub async fn seed_passkey(&self, subject: &str, synced: bool) {
+        let (actor, corr) = self.seeding_actor();
+        let id = self
+            .store()
+            .scoped(self.scope)
+            .users()
+            .parse_id(subject)
+            .expect("parse subject id");
+        let mut credential_id = [0_u8; 16];
+        self.env.entropy().fill_bytes(&mut credential_id);
+        self.store()
+            .scoped(self.scope)
+            .acting(actor, corr)
+            .webauthn_credentials()
+            .register(
+                &self.env,
+                &id,
+                &ironauth_store::NewWebauthnCredential {
+                    credential_id: &credential_id,
+                    // A minimal COSE placeholder: the remediation probe never verifies an
+                    // assertion, only that a credential is enrolled.
+                    cose_public_key: &[0xA0],
+                    sign_count: 0,
+                    aaguid: &[0_u8; 16],
+                    transports: &[],
+                    backup_eligible: synced,
+                    backup_state: synced,
+                    discoverable: Some(true),
+                    nickname: "test passkey",
+                },
+            )
+            .await
+            .expect("seed passkey credential");
+    }
+
+    /// Set a per-client step-up floor (issue #72): `step_up_acr` /
+    /// `step_up_max_age_secs` applied to every authorization the client makes.
+    pub async fn set_client_step_up(
+        &self,
+        client_id: &ClientId,
+        min_acr: Option<&str>,
+        max_auth_age_secs: Option<i64>,
+    ) {
+        let (actor, corr) = self.seeding_actor();
+        self.store()
+            .scoped(self.scope)
+            .acting(actor, corr)
+            .clients()
+            .set_step_up_policy(&self.env, client_id, min_acr, max_auth_age_secs)
+            .await
+            .expect("set client step-up policy");
+    }
+
     /// Count the audit rows in the harness scope whose action equals `action` (issue
     /// #21): used to prove the typed reuse event is emitted EXACTLY once per incident.
     pub async fn count_audit_action(&self, action: &str) -> usize {

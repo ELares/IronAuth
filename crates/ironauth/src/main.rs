@@ -21,13 +21,14 @@ use ironauth_jose::MasterKey;
 use ironauth_oidc::{
     BackChannelLogoutWorker, DiscoveryCapabilities, DiscoveryState, FetchLogoutSender,
     IssuerRegistry, IssuerState, JwksCacheWindow, LazyMigrationHook, OidcState, WorkerSettings,
-    canonical_login_identifier, discovery_router, issuer_router, oidc_router,
+    canonical_login_identifier, canonical_step_up_acr, discovery_router, issuer_router,
+    oidc_router,
 };
 use ironauth_quota::QuotaEnforcer;
 use ironauth_server::Server;
 use ironauth_store::{
-    AbuseBanId, AbuseSubject, AbuseSubjectKind, ActorRef, AuthPath, CorrelationId, EnvironmentId,
-    NewBan, Scope, ServiceId, Store, TenantId,
+    AbuseBanId, AbuseSubject, AbuseSubjectKind, ActorRef, AuthPath, ClientId, CorrelationId,
+    EnvironmentId, NewBan, Scope, ServiceId, Store, TenantId,
 };
 
 /// Semantic version of this build, injected by Cargo.
@@ -53,6 +54,13 @@ fn main() -> ExitCode {
         // API (crates/ironauth-admin) offers the same operations over HTTP for remote
         // management; both write through the SAME audited store repository.
         Some(verb @ ("ban" | "unban" | "bans")) => manage_bans(verb, &mut args),
+        // Declarative step-up authentication policy management (RFC 9470, issue #72):
+        // set, list, and remove the per-scope and per-client (acr floor, max auth age)
+        // requirement directly against the data-plane store, each an audited write
+        // through the same Acting* repositories the enforcement path reads. This is the
+        // operator surface that makes the declarative policy usable without hand-writing
+        // Rust or SQL; a hosted admin HTTP CRUD can layer on later.
+        Some("step-up-policy") => manage_step_up_policy(&mut args),
         Some("--version" | "-V" | "version") => {
             println!("ironauth {VERSION}");
             ExitCode::SUCCESS
@@ -795,7 +803,8 @@ fn ban_path(parsed: &BanArgs) -> Result<AuthPath, String> {
     match parsed.path.as_deref() {
         None => Ok(AuthPath::Password),
         Some(raw) => AuthPath::from_wire(raw).ok_or_else(|| {
-            "--path must be one of password | passkey | recovery | register | all".to_owned()
+            "--path must be one of password | passkey | recovery | register | second_factor | all"
+                .to_owned()
         }),
     }
 }
@@ -944,6 +953,305 @@ async fn list_bans(store: &Store, scope: Scope, env: &Env) -> ExitCode {
         }
         Err(error) => {
             eprintln!("ironauth bans: cannot list bans: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// The parsed flags of a `step-up-policy` invocation (RFC 9470 step-up, issue #72).
+#[derive(Default)]
+struct StepUpPolicyArgs {
+    config: Option<String>,
+    tenant: Option<String>,
+    environment: Option<String>,
+    scope_token: Option<String>,
+    client: Option<String>,
+    acr: Option<String>,
+    max_age: Option<i64>,
+}
+
+/// Parse the shared flags of the step-up-policy subcommands. Supports both
+/// `--flag value` and `--flag=value`.
+fn parse_step_up_policy_args(
+    args: &mut impl Iterator<Item = String>,
+) -> Result<StepUpPolicyArgs, String> {
+    let mut parsed = StepUpPolicyArgs::default();
+    while let Some(arg) = args.next() {
+        let (flag, inline) = match arg.split_once('=') {
+            Some((flag, value)) => (flag.to_owned(), Some(value.to_owned())),
+            None => (arg, None),
+        };
+        let mut take = |inline: Option<String>| -> Result<String, String> {
+            match inline {
+                Some(value) => Ok(value),
+                None => args
+                    .next()
+                    .ok_or_else(|| format!("{flag} requires a value")),
+            }
+        };
+        match flag.as_str() {
+            "--config" => parsed.config = Some(take(inline)?),
+            "--tenant" => parsed.tenant = Some(take(inline)?),
+            "--environment" => parsed.environment = Some(take(inline)?),
+            "--scope" => parsed.scope_token = Some(take(inline)?),
+            "--client" => parsed.client = Some(take(inline)?),
+            "--acr" => parsed.acr = Some(take(inline)?),
+            "--max-age" => {
+                let value = take(inline)?;
+                let secs = value
+                    .parse::<i64>()
+                    .map_err(|_| "--max-age expects a whole number of seconds".to_owned())?;
+                parsed.max_age = Some(secs);
+            }
+            other => return Err(format!("unrecognized argument '{other}'")),
+        }
+    }
+    Ok(parsed)
+}
+
+/// Resolve the scope and data-plane DSN a step-up-policy subcommand needs. Unlike a ban,
+/// a step-up policy stores no sealed PII column, so no envelope master key is required.
+fn prepare_step_up_policy(parsed: &StepUpPolicyArgs) -> Result<(Scope, String), String> {
+    let tenant_raw = parsed.tenant.as_deref().ok_or("--tenant is required")?;
+    let environment_raw = parsed
+        .environment
+        .as_deref()
+        .ok_or("--environment is required")?;
+    let tenant = TenantId::parse(tenant_raw).map_err(|_| "invalid --tenant id".to_owned())?;
+    let environment =
+        EnvironmentId::parse(environment_raw).map_err(|_| "invalid --environment id".to_owned())?;
+    let scope = Scope::new(tenant, environment);
+    let config = match &parsed.config {
+        Some(path) => {
+            Config::load(path)
+                .map_err(|error| format!("cannot load config: {error}"))?
+                .config
+        }
+        None => Config::default(),
+    };
+    let dsn = config.database.url.expose().to_owned();
+    Ok((scope, dsn))
+}
+
+/// Run the `step-up-policy set | list | remove` subcommands (RFC 9470, issue #72): set,
+/// list, and remove the declarative per-scope and per-client step-up authentication
+/// policy directly against the data-plane store, each an audited write through the SAME
+/// `Acting*` repositories the enforcement path reads. This is the lightest operator
+/// surface that makes the declarative policy actually usable.
+fn manage_step_up_policy(args: &mut impl Iterator<Item = String>) -> ExitCode {
+    let Some(action) = args.next() else {
+        eprintln!("ironauth step-up-policy: expected a subcommand (set | list | remove)");
+        return ExitCode::FAILURE;
+    };
+    if !matches!(action.as_str(), "set" | "list" | "remove") {
+        eprintln!(
+            "ironauth step-up-policy: unknown subcommand '{action}' (expected set | list | remove)"
+        );
+        return ExitCode::FAILURE;
+    }
+    let parsed = match parse_step_up_policy_args(args) {
+        Ok(parsed) => parsed,
+        Err(message) => {
+            eprintln!("ironauth step-up-policy {action}: {message}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let (scope, dsn) = match prepare_step_up_policy(&parsed) {
+        Ok(prepared) => prepared,
+        Err(message) => {
+            eprintln!("ironauth step-up-policy {action}: {message}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let env = Env::system();
+    let runtime = match tokio::runtime::Runtime::new() {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            eprintln!("ironauth step-up-policy {action}: cannot start async runtime: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    runtime.block_on(async move {
+        let store = match Store::connect(&dsn).await {
+            Ok(store) => store,
+            Err(error) => {
+                eprintln!(
+                    "ironauth step-up-policy {action}: cannot connect the data-plane store: {error}"
+                );
+                return ExitCode::FAILURE;
+            }
+        };
+        match action.as_str() {
+            "set" => set_step_up_policy(&store, scope, &env, &parsed).await,
+            "list" => list_step_up_policies(&store, scope).await,
+            "remove" => remove_step_up_policy(&store, scope, &env, &parsed).await,
+            _ => unreachable!("dispatch guarantees the subcommand"),
+        }
+    })
+}
+
+/// A human display of an optional value, or `-` when absent.
+fn or_dash(value: Option<String>) -> String {
+    value.unwrap_or_else(|| "-".to_owned())
+}
+
+/// Set (create or update) a per-scope or per-client step-up policy (issue #72). Exactly
+/// one of `--scope` / `--client` selects the target; at least one of `--acr` /
+/// `--max-age` must constrain something.
+async fn set_step_up_policy(
+    store: &Store,
+    scope: Scope,
+    env: &Env,
+    parsed: &StepUpPolicyArgs,
+) -> ExitCode {
+    // A short acr alias (mfa/pwd/phr/phrh) is canonicalized to the value the enforcement
+    // path compares against, so `--acr mfa` actually gates.
+    let acr = parsed.acr.as_deref().map(canonical_step_up_acr);
+    let acr_ref = acr.as_deref();
+    let max_age = parsed.max_age;
+    if acr_ref.is_none() && max_age.is_none() {
+        eprintln!("ironauth step-up-policy set: at least one of --acr / --max-age is required");
+        return ExitCode::FAILURE;
+    }
+    let actor = ActorRef::service(ServiceId::generate(env));
+    let acting = store
+        .scoped(scope)
+        .acting(actor, CorrelationId::generate(env));
+    match (&parsed.scope_token, &parsed.client) {
+        (Some(scope_token), None) => {
+            match acting
+                .scope_step_up_policies()
+                .set(env, scope_token, acr_ref, max_age)
+                .await
+            {
+                Ok(id) => {
+                    println!(
+                        "set per-scope step-up policy for '{scope_token}' \
+                         (acr={acr}, max_age={age}) {id}",
+                        acr = acr_ref.unwrap_or("-"),
+                        age = or_dash(max_age.map(|s| s.to_string())),
+                    );
+                    ExitCode::SUCCESS
+                }
+                Err(error) => {
+                    eprintln!("ironauth step-up-policy set: cannot set scope policy: {error}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        (None, Some(client_raw)) => {
+            let Ok(client_id) = ClientId::parse_in_scope(client_raw, &scope) else {
+                eprintln!("ironauth step-up-policy set: invalid --client id");
+                return ExitCode::FAILURE;
+            };
+            match acting
+                .clients()
+                .set_step_up_policy(env, &client_id, acr_ref, max_age)
+                .await
+            {
+                Ok(()) => {
+                    println!(
+                        "set per-client step-up floor for '{client_raw}' \
+                         (acr={acr}, max_age={age})",
+                        acr = acr_ref.unwrap_or("-"),
+                        age = or_dash(max_age.map(|s| s.to_string())),
+                    );
+                    ExitCode::SUCCESS
+                }
+                Err(error) => {
+                    eprintln!("ironauth step-up-policy set: cannot set client floor: {error}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        (Some(_), Some(_)) => {
+            eprintln!("ironauth step-up-policy set: specify exactly one of --scope / --client");
+            ExitCode::FAILURE
+        }
+        (None, None) => {
+            eprintln!("ironauth step-up-policy set: one of --scope / --client is required");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// List the per-scope step-up policies in a scope (issue #72). Per-client floors live on
+/// the client registration row (managed with `set --client` / `remove --client`), so they
+/// are not enumerated here.
+async fn list_step_up_policies(store: &Store, scope: Scope) -> ExitCode {
+    match store.scoped(scope).scope_step_up_policies().list().await {
+        Ok(policies) => {
+            if policies.is_empty() {
+                println!("no per-scope step-up policies");
+            }
+            for policy in policies {
+                println!(
+                    "{id}\tscope={scope_token}\tacr={acr}\tmax_age={age}",
+                    id = policy.id,
+                    scope_token = policy.scope_token,
+                    acr = policy.min_acr.as_deref().unwrap_or("-"),
+                    age = or_dash(policy.max_auth_age_secs.map(|s| s.to_string())),
+                );
+            }
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("ironauth step-up-policy list: cannot list policies: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Remove a per-scope policy, or clear a per-client floor (issue #72). Exactly one of
+/// `--scope` / `--client` selects the target.
+async fn remove_step_up_policy(
+    store: &Store,
+    scope: Scope,
+    env: &Env,
+    parsed: &StepUpPolicyArgs,
+) -> ExitCode {
+    let actor = ActorRef::service(ServiceId::generate(env));
+    let acting = store
+        .scoped(scope)
+        .acting(actor, CorrelationId::generate(env));
+    match (&parsed.scope_token, &parsed.client) {
+        (Some(scope_token), None) => match acting
+            .scope_step_up_policies()
+            .remove(env, scope_token)
+            .await
+        {
+            Ok(()) => {
+                println!("removed per-scope step-up policy for '{scope_token}'");
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("ironauth step-up-policy remove: cannot remove scope policy: {error}");
+                ExitCode::FAILURE
+            }
+        },
+        (None, Some(client_raw)) => {
+            let Ok(client_id) = ClientId::parse_in_scope(client_raw, &scope) else {
+                eprintln!("ironauth step-up-policy remove: invalid --client id");
+                return ExitCode::FAILURE;
+            };
+            // Clearing a per-client floor sets both step-up columns to NULL.
+            match acting
+                .clients()
+                .set_step_up_policy(env, &client_id, None, None)
+                .await
+            {
+                Ok(()) => {
+                    println!("cleared per-client step-up floor for '{client_raw}'");
+                    ExitCode::SUCCESS
+                }
+                Err(error) => {
+                    eprintln!("ironauth step-up-policy remove: cannot clear client floor: {error}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        _ => {
+            eprintln!("ironauth step-up-policy remove: specify exactly one of --scope / --client");
             ExitCode::FAILURE
         }
     }
@@ -1115,7 +1423,7 @@ fn print_help() {
     println!("  ironauth drift <document> ...     Report whether a target has drifted");
     println!("  ironauth ban --config PATH --tenant TID --environment EID \\");
     println!("               --kind ip|account|identifier --subject VALUE \\");
-    println!("               [--path password|passkey|recovery|register|all] \\");
+    println!("               [--path password|passkey|recovery|register|second_factor|all] \\");
     println!("               [--reason TEXT] [--expires-secs N]");
     println!("                                   Place a durable credential-abuse ban (issue #64)");
     println!("  ironauth unban --config PATH --tenant TID --environment EID \\");
@@ -1123,6 +1431,15 @@ fn print_help() {
     println!("                                   Lift a ban");
     println!("  ironauth bans --config PATH --tenant TID --environment EID");
     println!("                                   List active bans");
+    println!("  ironauth step-up-policy set --config PATH --tenant TID --environment EID \\");
+    println!("               (--scope SCOPE | --client CLIENT_ID) \\");
+    println!("               [--acr pwd|mfa|phr|phrh] [--max-age SECONDS]");
+    println!("                                   Set a step-up policy (RFC 9470, issue #72)");
+    println!("  ironauth step-up-policy list --config PATH --tenant TID --environment EID");
+    println!("                                   List per-scope step-up policies");
+    println!("  ironauth step-up-policy remove --config PATH --tenant TID --environment EID \\");
+    println!("               (--scope SCOPE | --client CLIENT_ID)");
+    println!("                                   Remove a per-scope policy / clear a client floor");
     println!("  ironauth --version               Print the version");
     println!("  ironauth --help                  Print this help");
     println!();

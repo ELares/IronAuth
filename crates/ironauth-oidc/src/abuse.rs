@@ -404,6 +404,36 @@ pub struct AttemptContext {
     pub client_id: Option<String>,
 }
 
+/// The regulation context for a step-up / second-factor verification attempt (RFC 9470,
+/// issue #72; the #69 TOTP surface too). The second factor runs against an ALREADY
+/// AUTHENTICATED session, so the subject is known and there is NO user-enumeration
+/// concern: both the (fail-CLOSED, escalation-driving) identifier dimension AND the
+/// account dimension key on the subject id, so a wrong-code storm against this subject's
+/// second factor ESCALATES to a uniform 429 (and can auto-place a ban) BEFORE any seed is
+/// opened or any code is compared. The IP is the non-forgeable resolved peer (the #31
+/// lesson). The path is always [`AuthPath::SecondFactor`], governed INDEPENDENTLY of every
+/// other path, so a second-factor guess storm can never lock the owner out of the password
+/// or passkey login path (the Keycloak CVE-2024-1722 account-DoS safeguard).
+#[must_use]
+pub fn second_factor_attempt_context(
+    scope: ironauth_store::Scope,
+    subject: &ironauth_store::UserId,
+    headers: &axum::http::HeaderMap,
+) -> AttemptContext {
+    let subject_str = subject.to_string();
+    AttemptContext {
+        path: AuthPath::SecondFactor,
+        scope,
+        ip: resolved_client_ip(headers),
+        // No login handle is submitted at a step-up (the subject is recovered from the
+        // session), so the escalation-driving identifier dimension keys on the subject id
+        // itself; there is no present-vs-absent oracle to protect here.
+        identifier: Some(canonical_login_identifier(&subject_str)),
+        account_id: Some(subject_str),
+        client_id: None,
+    }
+}
+
 impl AttemptContext {
     /// The ban subjects to check for this attempt: the IP, the account, and the
     /// identifier dimensions that are present.
