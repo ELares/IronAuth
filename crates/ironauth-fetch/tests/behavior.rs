@@ -83,6 +83,31 @@ async fn an_oversized_body_aborts_at_the_size_cap() {
 }
 
 #[tokio::test]
+async fn the_mds3_sync_purpose_raises_the_response_cap_for_the_real_blob() {
+    // The real FIDO MDS3 BLOB is several megabytes, past the 1 MiB default. A
+    // fetch under the default purpose is refused, but the Mds3Sync purpose raises
+    // the cap (still bounded), so the same body fetches. This keeps the feature
+    // from being inert while preserving the memory bound.
+    const TWO_MIB: usize = 2 << 20;
+    let server = common::start(Behavior::Sized(TWO_MIB)).await;
+    let (fetcher, _dialer) = fetcher_for(server.addr, FetchLimits::default());
+
+    // Under an ordinary purpose the default 1 MiB cap refuses the 2 MiB body.
+    let default_purpose = FetchRequest::get(FetchPurpose::JwksUri, "http://issuer.example/big")
+        .allow_plaintext_http();
+    assert!(matches!(
+        fetcher.fetch(default_purpose).await,
+        Err(FetchError::ResponseTooLarge { .. })
+    ));
+
+    // The MDS3 sync purpose raises the cap, so the same 2 MiB body is accepted.
+    let mds3 = FetchRequest::get(FetchPurpose::Mds3Sync, "http://issuer.example/big")
+        .allow_plaintext_http();
+    let response = fetcher.fetch(mds3).await.expect("the mds3 body fetches");
+    assert_eq!(response.body().len(), TWO_MIB);
+}
+
+#[tokio::test]
 async fn a_hanging_response_aborts_at_the_time_cap() {
     let server = common::start(Behavior::Hang).await;
     let limits = FetchLimits {

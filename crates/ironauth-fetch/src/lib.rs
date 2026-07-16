@@ -92,6 +92,14 @@ pub use resolve::{Dial, RecordingDialer, Resolve, SequenceResolver, StaticResolv
 /// hostile origin cannot exhaust memory.
 pub const DEFAULT_MAX_RESPONSE_BYTES: u64 = 1 << 20;
 
+/// The minimum response-body cap for an MDS3 BLOB fetch: thirty-two mebibytes.
+/// The real FIDO Metadata Service BLOB is several megabytes (and grows as models
+/// are added), well past the 1 MiB default, so the default would fail the fetch
+/// closed and leave `direct` attestation inert. This raises the cap for that one
+/// purpose to a still-BOUNDED value (a hostile MDS3 endpoint cannot exhaust
+/// memory, and the total-time bound and SSRF hardening are unchanged).
+pub const MDS3_SYNC_MIN_RESPONSE_BYTES: u64 = 32 << 20;
+
 /// The default total request deadline.
 pub const DEFAULT_TOTAL_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -141,6 +149,14 @@ pub enum FetchPurpose {
     /// external fetch: a range URL that resolves to an internal or loopback address is
     /// refused exactly like any other blocked destination.
     BreachScreening,
+    /// Fetching the FIDO Metadata Service (MDS3) BLOB for passkey attestation
+    /// verification (issue #66, PR B). The signed metadata BLOB is fetched from the FIDO
+    /// Alliance endpoint (default `https://mds3.fidoalliance.org/`, overridable per
+    /// deployment), verified once, and cached; ONLY the endpoint URL is on the wire (no
+    /// credential or user data), and the endpoint is outbound, so it rides the same
+    /// SSRF-hardened path as every other external fetch: an MDS3 URL that resolves to an
+    /// internal or loopback address is refused exactly like any other blocked destination.
+    Mds3Sync,
 }
 
 impl FetchPurpose {
@@ -157,6 +173,24 @@ impl FetchPurpose {
             FetchPurpose::KmsRequest => "kms_request",
             FetchPurpose::LazyMigration => "lazy_migration",
             FetchPurpose::BreachScreening => "breach_screening",
+            FetchPurpose::Mds3Sync => "mds3_sync",
+        }
+    }
+
+    /// The effective response-body cap for this purpose, given the configured
+    /// default. Most purposes use the configured cap unchanged; [`Mds3Sync`] is
+    /// floored at [`MDS3_SYNC_MIN_RESPONSE_BYTES`] because the real MDS3 BLOB is
+    /// larger than the 1 MiB default, so a fetch under the default would fail
+    /// closed. A larger configured cap still wins (this only ever raises it).
+    ///
+    /// [`Mds3Sync`]: FetchPurpose::Mds3Sync
+    #[must_use]
+    pub const fn response_cap(self, configured: u64) -> u64 {
+        match self {
+            FetchPurpose::Mds3Sync if configured < MDS3_SYNC_MIN_RESPONSE_BYTES => {
+                MDS3_SYNC_MIN_RESPONSE_BYTES
+            }
+            _ => configured,
         }
     }
 }
@@ -359,12 +393,18 @@ impl Fetcher {
             }
         };
 
+        // The response-body cap is raised for purposes whose legitimate payload
+        // exceeds the configured default (the FIDO MDS3 BLOB); the time bound and
+        // SSRF hardening are untouched.
+        let mut limits = self.limits;
+        limits.max_response_bytes = purpose.response_cap(self.limits.max_response_bytes);
+
         let dispatch = Dispatch {
             target: &target,
             method: request.method,
             headers,
             body: request.body,
-            limits: self.limits,
+            limits,
             tls: &self.tls,
             resolver: self.resolver.as_ref(),
             dialer: self.dialer.as_ref(),
@@ -375,7 +415,11 @@ impl Fetcher {
                 observe::record_outcome(purpose, Outcome::Ok);
                 Ok(response)
             }
-            Err(failure) => Err(self.map_failure(purpose, failure)),
+            Err(failure) => Err(Self::map_failure(
+                purpose,
+                limits.max_response_bytes,
+                failure,
+            )),
         }
     }
 
@@ -398,7 +442,13 @@ impl Fetcher {
     }
 
     /// Meter a failed dispatch and translate it to the caller-facing error.
-    fn map_failure(&self, purpose: FetchPurpose, failure: DispatchFailure) -> FetchError {
+    /// `effective_limit` is the response cap actually applied to this fetch (which
+    /// may be raised above the configured default for some purposes).
+    fn map_failure(
+        purpose: FetchPurpose,
+        effective_limit: u64,
+        failure: DispatchFailure,
+    ) -> FetchError {
         match failure {
             DispatchFailure::Blocked(reason) => {
                 observe::record_block(purpose, reason);
@@ -411,7 +461,7 @@ impl Fetcher {
             DispatchFailure::TooLarge => {
                 observe::record_outcome(purpose, Outcome::TooLarge);
                 FetchError::ResponseTooLarge {
-                    limit: self.limits.max_response_bytes,
+                    limit: effective_limit,
                 }
             }
             DispatchFailure::Timeout => {

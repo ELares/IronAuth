@@ -6,6 +6,18 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- OpenAPI contract sync for the MDS3 health route (issue #66 PR B, adversarial review):
+  the hardcoded `openapi_contract` assertions now include `getMds3Health` and its
+  `GET .../webauthn/mds3/health` path and pin the served-route count at 61, matching the
+  regenerated `docs/openapi/management.json` (the route landed in sync but the contract
+  assertions had not been updated, a CI-red gap).
+- FIDO MDS3 cache health + attestation export coverage (issue #66 PR B): a new
+  environment-scoped read `GET .../webauthn/mds3/health` surfaces the cached MDS3 BLOB
+  sequence number, verify time, `nextUpdate`, entry count, and a fresh/stale/missing
+  verdict against the `env.clock()` instant (revocation is deferred for v1, so this is
+  the operator's freshness signal). The three new reg-time-immutable
+  `webauthn_credentials` attestation columns are documented as non-portable operational
+  device state in the #58 export field-coverage.
 - Credential-abuse ban management (issue #64): new environment-scoped endpoints
   `POST`/`GET /v1/tenants/{tenant}/environments/{environment}/abuse/bans` and
   `POST .../abuse/bans/lift` to place, list, and lift durable credential-abuse bans, the

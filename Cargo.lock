@@ -1153,6 +1153,7 @@ dependencies = [
  "serde_json",
  "serde_urlencoded",
  "sha2",
+ "sqlx",
  "tokio",
  "tower 0.5.3",
  "tracing",

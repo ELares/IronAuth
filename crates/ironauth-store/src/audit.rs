@@ -660,6 +660,18 @@ pub enum Action {
     /// ('none' or 'direct') the passkey registration path requests. The row targets
     /// the `atc_` config; the `detail` records the mode.
     AttestationConfigSet,
+    /// The per-scope MDS3 BLOB cache was REFRESHED (issue #66, PR B): a newer, re-verified
+    /// FIDO MDS3 metadata BLOB was fetched and cached (or a byte-identical refetch touched
+    /// the row). The row targets the `mbc_` cache; the `detail` records the BLOB `no`.
+    Mds3BlobCacheRefresh,
+    /// An AAGUID allow/deny rule was SET (created or updated) through the management seam
+    /// (issue #66, PR B): a specific authenticator model was pinned to a disposition
+    /// ('allow' or 'deny'). The row targets the `aag_` rule; the `detail` records the
+    /// disposition.
+    AaguidRuleSet,
+    /// An AAGUID allow/deny rule was REMOVED (issue #66, PR B): the disposition for a
+    /// pinned authenticator model was deleted. The row targets the `aag_` rule.
+    AaguidRuleRemove,
     /// An email-OTP code was SENT (issue #68): a fresh numeric code was issued to a
     /// user for a purpose, invalidating any prior active code. The row targets the
     /// `eot_` code; the `detail` records the purpose (never the plaintext code, which
@@ -848,6 +860,9 @@ impl Action {
             Action::CredentialClassPolicySet => "credential_class.policy.set",
             Action::CredentialClassPolicyRemove => "credential_class.policy.remove",
             Action::AttestationConfigSet => "attestation.config.set",
+            Action::Mds3BlobCacheRefresh => "mds3.blob_cache.refresh",
+            Action::AaguidRuleSet => "aaguid.rule.set",
+            Action::AaguidRuleRemove => "aaguid.rule.remove",
             Action::EmailOtpSend => "email_otp.send",
             Action::EmailOtpVerify => "email_otp.verify",
             Action::SmsOtpSend => "sms_otp.send",

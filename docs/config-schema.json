@@ -593,6 +593,14 @@
           "minimum": 0,
           "type": "integer"
         },
+        "mds3_base_url": {
+          "default": null,
+          "description": "The base URL of the FIDO Metadata Service (MDS3) BLOB endpoint the passkey\nattestation path fetches the signed authenticator-metadata BLOB from (issue #66,\nPR B). When unset (`None`), the built-in default the webauthn/mds3 module carries\n(`https://mds3.fidoalliance.org/`) is used; a deployment behind an outbound proxy\nor an air-gapped mirror overrides it here. The fetch rides the SSRF-hardened\noutbound path, so the value MUST be an `https` URL: a plaintext `http` override is\nrefused at config load, mirroring the HIBP base-URL rule.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "mfa_factor_order": {
           "default": [
             "passkey",
@@ -1571,6 +1579,7 @@
         "magic_link_fragment_mode": false,
         "magic_link_short_code_digits": 8,
         "magic_link_ttl_secs": 600,
+        "mds3_base_url": null,
         "mfa_factor_order": [
           "passkey",
           "totp"

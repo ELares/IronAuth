@@ -6,6 +6,25 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- X.509 path-constraint enforcement (issue #66 PR B, adversarial review): the `x509`
+  chain verifier now parses `basicConstraints` and `keyUsage` and enforces them on every
+  certificate that signs another: an issuer MUST be a CA (`CA:TRUE`), a present `keyUsage`
+  MUST permit `keyCertSign`, and a present `pathLenConstraint` MUST NOT be exceeded. This
+  closes a path-validation defect where a genuine end-entity attestation leaf (CA:FALSE)
+  could be wielded as an intermediate to sign a forged sub-certificate for a different
+  AAGUID and still chain to the pinned root, defeating the AAGUID-spoof defense for anyone
+  holding a key under a shared vendor root. The parser stays panic-safe (every length read
+  guarded). New regression tests: the exact leaf-as-CA break is now rejected, a proper
+  CA:TRUE intermediate still verifies, and the keyUsage and pathLen constraints are exercised.
+- Attestation policy and FIDO MDS3 (issue #66 PR B): `verify_attestation` now verifies
+  the attestation statement under a tenant's `direct` mode, supporting `none` and
+  `packed` (WebAuthn L3 section 8.2) and failing closed on any other format; the new
+  `mds3` module verifies the FIDO Metadata Service BLOB (a JWS with an `x5c` chain)
+  against a pinned FIDO root and returns the per-AAGUID attestation roots. An in-tree
+  minimal DER reader (`der`) and X.509 chain verifier (`x509`) anchor both, with every
+  certificate-signature check delegated to `ironauth-jose` so `ring` stays confined.
+  Ships the AAGUID-spoof, chain-to-wrong-root, expired-certificate, and tampered-BLOB
+  adversarial tests over a self-generated Ed25519 test PKI.
 - Related-origin coverage (issue #67): a `client_data` test documents that with the
   serving origin AND a related origin in the allowed set, a ceremony from either
   verifies while an unlisted origin still fails with `OriginMismatch`. No code change:

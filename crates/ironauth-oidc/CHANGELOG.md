@@ -6,6 +6,28 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Direct-mode attestation end-to-end coverage (issue #66 PR B, adversarial review): a new
+  `webauthn_attestation` integration test (real database, software authenticator) exercises
+  the registration GLUE the unit tests could not: attestation mode `direct`, the AAGUID-rule
+  disposition lookup, the `mds3_blob_cache` read/parse, the packed-format dispatch, and the
+  row stamping. It proves a valid packed attestation over an allow-listed AAGUID stamps
+  `attestation_verified` + `attestation_type`/`fmt` and that a subsequent login reaches the
+  `attested_passkey` acr, plus the fail-closed negative: a non-allow-listed AAGUID under
+  `direct` is rejected and stamps nothing.
+- Passkey attestation activation (issue #66 PR B): the dormant `attested_passkey`
+  credential-class rung is now ACTIVE. Registration under a tenant's `direct` attestation
+  mode evaluates the presented AAGUID against the allow/deny rules and validates the
+  packed attestation against the scope's verified FIDO MDS3 cache, stamping a
+  reg-time-immutable `attestation_verified` verdict onto the credential; a passkey login
+  reads that stored verdict to record the attested method through ONE recording path, so
+  an attested login earns the `attested_passkey` acr end to end while a plain passkey
+  never can. The disjoint attested representation is reconciled: `satisfied_class` now
+  includes the attested variants and agrees with the achieved acr, and a login-path
+  covenant self-check (`satisfied_class` + `CredentialFacts` fed from the stored row)
+  makes those helpers load-bearing. `ACR_ATTESTED` is ranked at the top of the default
+  step-up order so strictest-wins composition is exact. Adds the `mds3_sync`
+  verify-and-cache job (fetch through the SSRF-hardened client, verify against the pinned
+  FIDO root, cache the verified entries).
 - Guarded SMS OTP adversarial-review hardening (issue #70): the no-silent-downgrade
   invariant now holds for EVERY purpose, not only `login` / `recovery`. Previously every
   successful verify (any purpose) fell through to a full PRIMARY session, so `mfa`,

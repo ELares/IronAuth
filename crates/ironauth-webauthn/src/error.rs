@@ -49,6 +49,20 @@ pub enum CeremonyError {
     CredentialNotFound,
     /// The assertion signature did not verify against the stored public key.
     BadSignature,
+    /// The attestation statement used a format IronAuth does not verify under
+    /// attestation mode `direct` (only `none` and `packed` are supported in v1);
+    /// under `direct` an unsupported format is a clean fail-closed reject, never a
+    /// silent downgrade to unattested (issue #66).
+    UnsupportedAttestationFormat,
+    /// The packed attestation signature did not verify over
+    /// `authData || SHA-256(clientDataJSON)`.
+    AttestationSignatureInvalid,
+    /// The packed attestation certificate chain did not terminate at a trusted
+    /// FIDO MDS3 attestation root (untrusted, expired, or name-broken).
+    AttestationChainInvalid,
+    /// The AAGUID in the attestation certificate did not match the AAGUID in the
+    /// authenticator data (an AAGUID spoof).
+    AttestationAaguidMismatch,
 }
 
 impl CeremonyError {
@@ -72,6 +86,10 @@ impl CeremonyError {
             CeremonyError::AttestedCredentialDataMissing => "attested_credential_data_missing",
             CeremonyError::CredentialNotFound => "credential_not_found",
             CeremonyError::BadSignature => "bad_signature",
+            CeremonyError::UnsupportedAttestationFormat => "unsupported_attestation_format",
+            CeremonyError::AttestationSignatureInvalid => "attestation_signature_invalid",
+            CeremonyError::AttestationChainInvalid => "attestation_chain_invalid",
+            CeremonyError::AttestationAaguidMismatch => "attestation_aaguid_mismatch",
         }
     }
 }

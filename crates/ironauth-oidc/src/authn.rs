@@ -287,6 +287,13 @@ impl AuthMethod {
     /// is unranked and fails closed). PR B flips these to `true` when the writer exists.
     #[must_use]
     pub fn is_active(self) -> bool {
+        // PR B (issue #66) activates the four ATTESTED passkey rows: the attestation
+        // writer now lands a STORED attestation-verified fact at registration and the
+        // login path records an attested method only when that fact is set, so their
+        // `attested_passkey` ACR is achievable, advertised by [`acr_values_supported`],
+        // and ranked at the TOP of the default order. Every method is now active; the
+        // `is_active` gate is retained so a FUTURE dormant method added ahead of its
+        // writer still fails closed in [`parse_methods`].
         matches!(
             self,
             AuthMethod::Password
@@ -298,6 +305,10 @@ impl AuthMethod {
                 | AuthMethod::PasskeyVerified
                 | AuthMethod::PasskeyHardware
                 | AuthMethod::PasskeyHardwareVerified
+                | AuthMethod::AttestedPasskey
+                | AuthMethod::AttestedPasskeyVerified
+                | AuthMethod::AttestedPasskeyHardware
+                | AuthMethod::AttestedPasskeyHardwareVerified
         )
     }
 }
@@ -389,10 +400,13 @@ pub struct CredentialFacts {
     /// `Passkey` class (the `webauthn_require_user_verification` setting). When set, a
     /// presence-only passkey does NOT reach the passkey rung.
     pub require_user_verification: bool,
-    /// The STORED attestation-verified fact for the passkey used (issue #66 PR B).
-    /// PR A has NO writer for this, so it is always `false`, which is exactly why the
-    /// `AttestedPasskey` rung is unreachable/dormant: [`satisfied_class`] can only
-    /// return `AttestedPasskey` when this is `true`.
+    /// The STORED attestation-verified fact for the passkey used (issue #66 PR B): the
+    /// `webauthn_credentials.attestation_verified` column, stamped at registration when
+    /// the presented AAGUID was admitted by tenant policy AND its attestation statement
+    /// chained to the pinned FIDO MDS3 root. It is a reg-time-IMMUTABLE fact (never a
+    /// wire value, INSERT-only in the schema). [`satisfied_class`] requires it (together
+    /// with a recorded attested method) to reach `AttestedPasskey`, so the strongest rung
+    /// is gated on a stored, cryptographically established truth.
     pub attestation_verified: bool,
 }
 
@@ -413,6 +427,13 @@ pub struct CredentialFacts {
 #[must_use]
 pub fn satisfied_class(event: &AuthenticationEvent, facts: &CredentialFacts) -> CredentialClass {
     let methods = event.methods();
+    // Every passkey method reaches the passkey rung, INCLUDING the four attested rows
+    // (issue #66 PR B). PR A omitted the attested variants here, which left the
+    // representation DISJOINT: [`AuthenticationEvent::attested_passkey`] records an
+    // attested method that was invisible to this check, so an attested login folded to
+    // `Any` while its [`achieved_acr`] was already `attested_passkey`. Including them
+    // here makes the SATISFIED class and the acr-floor enforcement agree, because both
+    // now read the SAME recorded methods.
     let has_passkey = methods.iter().any(|method| {
         matches!(
             method,
@@ -420,6 +441,10 @@ pub fn satisfied_class(event: &AuthenticationEvent, facts: &CredentialFacts) -> 
                 | AuthMethod::PasskeyVerified
                 | AuthMethod::PasskeyHardware
                 | AuthMethod::PasskeyHardwareVerified
+                | AuthMethod::AttestedPasskey
+                | AuthMethod::AttestedPasskeyVerified
+                | AuthMethod::AttestedPasskeyHardware
+                | AuthMethod::AttestedPasskeyHardwareVerified
         )
     });
     // A passkey that PROVED user verification, when the tenant requires it. When the
@@ -429,15 +454,37 @@ pub fn satisfied_class(event: &AuthenticationEvent, facts: &CredentialFacts) -> 
     let user_verified = methods.iter().any(|method| {
         matches!(
             method,
-            AuthMethod::PasskeyVerified | AuthMethod::PasskeyHardwareVerified
+            AuthMethod::PasskeyVerified
+                | AuthMethod::PasskeyHardwareVerified
+                | AuthMethod::AttestedPasskeyVerified
+                | AuthMethod::AttestedPasskeyHardwareVerified
+        )
+    });
+    // Whether the RECORDED event carries an attested method. This is the SAME signal
+    // [`achieved_acr`] reads to emit `attested_passkey`, so the two never diverge: the
+    // attested rung is method-driven, never fact-driven alone (a plain passkey login
+    // can never reach it even if a stale attestation fact were passed). The STORED
+    // `attestation_verified` fact is additionally REQUIRED (defence in depth): the login
+    // path records an attested method ONLY when that stored column is set, so the method
+    // and the fact are two views of one registration-time truth and always agree.
+    let has_attested_method = methods.iter().any(|method| {
+        matches!(
+            method,
+            AuthMethod::AttestedPasskey
+                | AuthMethod::AttestedPasskeyVerified
+                | AuthMethod::AttestedPasskeyHardware
+                | AuthMethod::AttestedPasskeyHardwareVerified
         )
     });
     let passkey_class_reached = has_passkey && (!facts.require_user_verification || user_verified);
     if passkey_class_reached {
-        // The AttestedPasskey rung requires the STORED attestation-verified fact, which
-        // has no writer in PR A, so this branch is unreachable until PR B: the rung is
-        // dormant by construction, not by a runtime flag.
-        if facts.attestation_verified {
+        // The AttestedPasskey rung requires BOTH an attested recorded method AND the
+        // stored attestation-verified fact. Because the login path derives the attested
+        // method FROM that stored fact, the two agree; requiring both keeps the class
+        // from ever over-claiming (a plain passkey with a spurious fact stays `Passkey`,
+        // matching its `phr`/`phrh` acr), and keeps the class from over-claiming an
+        // attested method whose stored fact was cleared.
+        if has_attested_method && facts.attestation_verified {
             return CredentialClass::AttestedPasskey;
         }
         return CredentialClass::Passkey;
@@ -469,9 +516,11 @@ pub fn required_class(policies: impl IntoIterator<Item = CredentialClass>) -> Cr
 /// - `Mfa` -> the multi-factor ACR,
 /// - `Passkey` -> the phishing-resistant `phr` floor (a synced passkey satisfies it;
 ///   a device-bound `phrh` outranks it under the default order),
-/// - `AttestedPasskey` -> the `attested_passkey` ACR, which is UNRANKED in the
-///   default order until PR B activates the attested methods, so requiring it fails
-///   closed (an unranked floor is met only by an exact match, per the step-up gate).
+/// - `AttestedPasskey` -> the `attested_passkey` ACR, RANKED at the TOP of the default
+///   order now that PR B activates the attested methods (it appears last in
+///   [`acr_values_supported`], so it is the strongest rung and strictest-wins is exact:
+///   an attested floor dominates every `phr`/`phrh` floor, and only an attested login
+///   satisfies it).
 #[must_use]
 pub fn acr_for_class(class: CredentialClass) -> &'static str {
     match class {
@@ -798,7 +847,8 @@ mod tests {
             assert_eq!(methods_token(&[method]), token);
             // parse_methods additionally drops INACTIVE methods (the achievability
             // guard), so only an ACTIVE method survives a parse as itself. A dormant
-            // method parses to the honest password floor, never itself.
+            // method parses to the honest password floor, never itself. Every method is
+            // active in PR B (the attested rows were activated), so every token survives.
             if method.is_active() {
                 assert_eq!(parse_methods(token), vec![method]);
             } else {
@@ -809,6 +859,8 @@ mod tests {
                 );
             }
         }
+        // Sanity: no method is dormant in PR B.
+        assert!(AuthMethod::ALL.into_iter().all(AuthMethod::is_active));
     }
 
     #[test]
@@ -849,12 +901,14 @@ mod tests {
     #[test]
     fn acr_values_supported_advertises_the_active_methods_including_passkeys() {
         // M7 activated the passkey methods (issue #65) and the TOTP / recovery-code
-        // second factors (issue #69), so their ACRs are advertised alongside the
-        // password ACR, in registry (strength) order. TOTP and recovery code share
-        // the multi-factor ACR, so it appears once.
+        // second factors (issue #69), and PR B (issue #66) activated the attested rung,
+        // so their ACRs are advertised alongside the password ACR, in registry (strength)
+        // order. TOTP and recovery code share the multi-factor ACR, so it appears once.
+        // The attested ACR is LAST (strongest), which is what ranks it at the top of the
+        // default step-up order.
         assert_eq!(
             acr_values_supported(),
-            vec![ACR_PWD, ACR_MFA, ACR_PHR, ACR_PHRH]
+            vec![ACR_PWD, ACR_MFA, ACR_PHR, ACR_PHRH, ACR_ATTESTED]
         );
     }
 
@@ -1087,50 +1141,58 @@ mod tests {
     }
 
     #[test]
-    fn the_attested_rung_is_dormant_and_unreachable_in_pr_a() {
-        // No stored attestation-verified fact exists in PR A, so satisfied_class can
-        // NEVER return AttestedPasskey regardless of the passkey used.
-        let facts = CredentialFacts::default();
-        for event in [
-            AuthenticationEvent::passkey(TIME, true, true),
-            AuthenticationEvent::passkey(TIME, false, true),
-            AuthenticationEvent::attested_passkey(TIME, false, true),
-        ] {
-            assert_ne!(
-                satisfied_class(&event, &facts),
-                CredentialClass::AttestedPasskey
-            );
-        }
-        // An attested_passkey event's methods are DORMANT, so parse_methods drops them
-        // and the derived acr is the honest password floor, never ACR_ATTESTED.
-        let attested = AuthenticationEvent::attested_passkey(TIME, false, true);
-        assert_eq!(
-            parse_methods(&attested.methods_token()),
-            vec![AuthMethod::Password]
-        );
-        assert_eq!(
-            achieved_acr(&parse_methods(&attested.methods_token())),
-            ACR_PWD
-        );
-        // The attested ACR is never advertised while the rung is dormant.
-        assert!(!acr_values_supported().contains(&ACR_ATTESTED));
-    }
-
-    #[test]
-    fn only_a_stored_attestation_fact_reaches_the_attested_rung() {
-        // The mechanism check: were the attestation writer to set the fact (PR B), a UV
-        // passkey would reach AttestedPasskey. This proves the rung is gated on a
-        // STORED fact, not a client value, and that PR B activates it by supplying it.
+    fn the_attested_rung_is_active_and_reconciled_with_the_acr_in_pr_b() {
+        // PR B activates the attested rung. An attested login records an attested method
+        // (its token now survives parse_methods) and, with the stored attestation fact,
+        // folds to AttestedPasskey. Crucially the SATISFIED class and the ACHIEVED acr
+        // AGREE: both read the same recorded attested method.
         let attested_fact = CredentialFacts {
             require_user_verification: true,
             attestation_verified: true,
         };
+        let attested = AuthenticationEvent::attested_passkey(TIME, false, true);
         assert_eq!(
-            satisfied_class(
-                &AuthenticationEvent::passkey(TIME, false, true),
-                &attested_fact
-            ),
+            satisfied_class(&attested, &attested_fact),
             CredentialClass::AttestedPasskey
+        );
+        assert_eq!(achieved_acr(attested.methods()), ACR_ATTESTED);
+        // The attested token now round-trips (the rung is active), unlike PR A.
+        assert_eq!(
+            parse_methods(&attested.methods_token()),
+            vec![AuthMethod::AttestedPasskeyHardwareVerified]
+        );
+        assert_eq!(
+            achieved_acr(&parse_methods(&attested.methods_token())),
+            ACR_ATTESTED
+        );
+        // The attested ACR is now advertised (the rung is active).
+        assert!(acr_values_supported().contains(&ACR_ATTESTED));
+    }
+
+    #[test]
+    fn a_plain_passkey_never_reaches_the_attested_rung_even_with_a_stored_fact() {
+        // The disjoint-representation fix: the attested rung is METHOD-driven, so a PLAIN
+        // passkey login can never fold to AttestedPasskey even if a (spurious) stored
+        // attestation fact is passed. This keeps satisfied_class in lockstep with the
+        // achieved acr (a plain passkey achieves phr/phrh, never attested_passkey), so
+        // the two enforcement views can never diverge.
+        let spurious_fact = CredentialFacts {
+            require_user_verification: true,
+            attestation_verified: true,
+        };
+        let plain = AuthenticationEvent::passkey(TIME, false, true);
+        assert_eq!(
+            satisfied_class(&plain, &spurious_fact),
+            CredentialClass::Passkey,
+            "a plain passkey stays Passkey even with a stored fact (method-driven rung)"
+        );
+        assert_eq!(achieved_acr(plain.methods()), ACR_PHRH);
+        // Conversely, an attested method WITHOUT the stored fact also stays below the
+        // attested rung (the fact is a required co-condition), never over-claiming.
+        let attested = AuthenticationEvent::attested_passkey(TIME, false, true);
+        assert_eq!(
+            satisfied_class(&attested, &CredentialFacts::default()),
+            CredentialClass::Passkey
         );
     }
 
@@ -1170,13 +1232,14 @@ mod tests {
                 "a frozen Any session cannot claim {higher}"
             );
         }
-        // Even a persisted token STUFFED with higher-class method tokens (a tampered
-        // session row) cannot inflate the acr: an inactive/dormant token is dropped, and
-        // a token the frozen event never recorded is not present to begin with. Here we
-        // prove the dormant-drop: the attested tokens are stripped, leaving pwd.
-        let stuffed = format!("{persisted} attested_passkey_uv attested_passkey_hw_uv");
-        assert_eq!(parse_methods(&stuffed), vec![AuthMethod::Password]);
-        assert_eq!(achieved_acr(&parse_methods(&stuffed)), ACR_PWD);
+        // The persisted token is derived from the FROZEN event, never from a request or a
+        // client value: a password login records exactly `pwd`, so the higher-class
+        // tokens are simply not present to derive. (Now that PR B activated the attested
+        // rung, parse_methods no longer strips those tokens; the anti-inflation guarantee
+        // is that a below-class session's frozen event never CONTAINS them, and the
+        // achievability guard still fails closed for any FUTURE dormant method.)
+        assert_eq!(persisted, "pwd");
+        assert!(!persisted.contains("passkey"));
     }
 
     #[test]

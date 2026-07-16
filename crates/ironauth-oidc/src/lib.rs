@@ -97,6 +97,7 @@ mod jwt_bearer;
 mod login;
 mod logout;
 mod magic_link;
+pub mod mds3_sync;
 mod migration;
 mod pages;
 mod par;

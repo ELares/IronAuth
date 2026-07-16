@@ -154,6 +154,74 @@ async fn attestation_config_upserts_and_reads_back() {
 }
 
 #[tokio::test]
+async fn mds3_blob_cache_upsert_is_monotonic_and_never_rolls_back() {
+    // The FIDO MDS3 processing rule (and the 0051 migration header) is that the
+    // cache only advances: a refresh supersedes a STRICTLY HIGHER `no` sequence
+    // number, so a replayed older-but-validly-signed BLOB cannot roll the cache
+    // back and re-admit a model that a newer BLOB removed.
+    let env = Env::system();
+    let db = TestDatabase::start().await;
+    let scope = db.seed_scope(&env).await;
+    let store = db.store();
+
+    let acting = || {
+        store
+            .scoped(scope)
+            .acting(db.test_actor(&env), CorrelationId::generate(&env))
+    };
+    let payload = |no: i64| serde_json::json!({ "no": no, "entries": [] });
+
+    // Seed the cache at blob_no = 5.
+    acting()
+        .mds3_blob_cache()
+        .upsert(&env, 5, 1, &payload(5), b"digest-5", 1, 1)
+        .await
+        .expect("seed blob_no 5");
+
+    // Replay an OLDER blob_no = 3 (validly signed, just stale): the write is a
+    // silent no-op, NOT an error, and the cache stays at 5.
+    acting()
+        .mds3_blob_cache()
+        .upsert(&env, 3, 2, &payload(3), b"digest-3", 2, 2)
+        .await
+        .expect("replaying an older blob_no is not an error");
+    let cached = store
+        .scoped(scope)
+        .mds3_blob_cache()
+        .get()
+        .await
+        .expect("get")
+        .expect("a row exists");
+    assert_eq!(
+        cached.blob_no, 5,
+        "an older blob_no must not roll the cache back"
+    );
+    assert_eq!(
+        cached.blob_digest, b"digest-5",
+        "the superseding blob's payload survives the replay"
+    );
+
+    // A genuinely NEWER blob_no = 6 advances the cache.
+    acting()
+        .mds3_blob_cache()
+        .upsert(&env, 6, 3, &payload(6), b"digest-6", 3, 3)
+        .await
+        .expect("newer blob_no 6");
+    let cached = store
+        .scoped(scope)
+        .mds3_blob_cache()
+        .get()
+        .await
+        .expect("get")
+        .expect("a row exists");
+    assert_eq!(
+        cached.blob_no, 6,
+        "a strictly newer blob_no advances the cache"
+    );
+    assert_eq!(cached.blob_digest, b"digest-6");
+}
+
+#[tokio::test]
 async fn webauthn_user_handle_is_immutable_at_the_storage_layer() {
     let env = Env::system();
     let db = TestDatabase::start().await;

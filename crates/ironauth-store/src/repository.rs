@@ -69,13 +69,13 @@ use crate::email_otp::{
 use crate::environment::{EnvironmentType, GuardrailSet};
 use crate::error::StoreError;
 use crate::id::{
-    AbuseBanId, AcmeChallengeId, AssertionMappingId, AttestationConfigId, AuditId, AuditTarget,
-    AuthorizationCodeId, BackChannelDeliveryId, ClientId, ClientSessionId, ConsentId,
+    AaguidRuleId, AbuseBanId, AcmeChallengeId, AssertionMappingId, AttestationConfigId, AuditId,
+    AuditTarget, AuthorizationCodeId, BackChannelDeliveryId, ClientId, ClientSessionId, ConsentId,
     CorrelationId, CredentialClassPolicyId, CredentialId, CustomDomainId, DcrPolicyId, DekId,
     DeviceCodeId, EmailOtpCodeId, EncryptedSecretId, EnvironmentId, EnvironmentSecretId,
     ExternalIssuerId, GrantId, InitialAccessTokenId, InvitationId, IssuedTokenId, KekId,
-    MagicLinkTokenId, ManagementKeyId, MigrationRunId, MigrationRunRecordId, OperatorId,
-    OrganizationId, PushedRequestId, RecoveryCodeId, RefreshFamilyId, RefreshTokenId,
+    MagicLinkTokenId, ManagementKeyId, Mds3BlobCacheId, MigrationRunId, MigrationRunRecordId,
+    OperatorId, OrganizationId, PushedRequestId, RecoveryCodeId, RefreshFamilyId, RefreshTokenId,
     ResourceServerId, ScopeStepUpPolicyId, ServiceAccountId, SessionEventId, SessionId,
     SigningKeyId, SmsOtpCodeId, SmsRouteStatId, TenantId, TotpCredentialId, TraitMigrationJobId,
     TraitSchemaId, UserId, UserIdentifierId, VariableId, WebauthnChallengeId, WebauthnCredentialId,
@@ -142,6 +142,28 @@ impl<'a> ScopedStore<'a> {
     #[must_use]
     pub fn attestation_config(&self) -> AttestationConfigRepo<'a> {
         AttestationConfigRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
+    /// The read-only MDS3 BLOB cache repository for this scope (issue #66, PR B): read
+    /// the singleton verified FIDO MDS3 metadata snapshot the 'direct' attestation path
+    /// evaluates against. The refreshing write lives on [`ActingStore::mds3_blob_cache`].
+    #[must_use]
+    pub fn mds3_blob_cache(&self) -> Mds3BlobCacheRepo<'a> {
+        Mds3BlobCacheRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
+    /// The read-only AAGUID allow/deny rule repository for this scope (issue #66, PR B):
+    /// list the per-authenticator-model dispositions the 'direct' attestation path
+    /// consults. The managing writes live on [`ActingStore::aaguid_rules`].
+    #[must_use]
+    pub fn aaguid_rules(&self) -> AaguidRuleRepo<'a> {
+        AaguidRuleRepo {
             store: self.store,
             scope: self.scope,
         }
@@ -759,6 +781,28 @@ impl<'a> ActingStore<'a> {
     #[must_use]
     pub fn attestation_config(&self) -> ActingAttestationConfigRepo<'a> {
         ActingAttestationConfigRepo {
+            store: self.store,
+            scope: self.scope,
+            acting: self.acting,
+        }
+    }
+
+    /// The mutating MDS3 BLOB cache repository for this scope and actor (issue #66, PR B):
+    /// refresh (upsert) the verified FIDO MDS3 metadata snapshot, audited.
+    #[must_use]
+    pub fn mds3_blob_cache(&self) -> ActingMds3BlobCacheRepo<'a> {
+        ActingMds3BlobCacheRepo {
+            store: self.store,
+            scope: self.scope,
+            acting: self.acting,
+        }
+    }
+
+    /// The mutating AAGUID allow/deny rule repository for this scope and actor (issue #66,
+    /// PR B): set (upsert) or remove a per-authenticator-model disposition, each audited.
+    #[must_use]
+    pub fn aaguid_rules(&self) -> ActingAaguidRuleRepo<'a> {
+        ActingAaguidRuleRepo {
             store: self.store,
             scope: self.scope,
             acting: self.acting,
@@ -2245,6 +2289,351 @@ impl ActingAttestationConfigRepo<'_> {
         )
         .await?;
         Ok(id)
+    }
+}
+
+/// The per-scope verified MDS3 BLOB cache (issue #66, PR B): the SINGLETON snapshot of
+/// the trusted FIDO Metadata Service authenticator entries the 'direct' attestation path
+/// evaluates a registration against, read within scope.
+///
+/// The timestamp fields are UNIX MICROSECONDS (the store's uniform time representation:
+/// the sqlx build carries no `time` feature, so every timestamptz is bound and read as
+/// integer microseconds, never a `time::OffsetDateTime`). `payload_jsonb` is the decoded
+/// entry document (read back from the JSONB column via a `::text` projection, parsed once
+/// here, so the store stays agnostic to a sqlx JSON feature).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Mds3BlobCache {
+    /// The `mbc_` cache identifier (embeds its tenant and environment).
+    pub id: Mds3BlobCacheId,
+    /// The MDS3 `no` monotonic sequence number of the cached BLOB.
+    pub blob_no: i64,
+    /// The cached BLOB's own `nextUpdate`, unix microseconds.
+    pub next_update_unix_micros: i64,
+    /// The extracted, VERIFIED authenticator entries the registration evaluates against.
+    pub payload_jsonb: serde_json::Value,
+    /// The sha-256 of the raw signed BLOB, for byte-identical-refetch change detection.
+    pub blob_digest: Vec<u8>,
+    /// When the BLOB was fetched, unix microseconds.
+    pub fetched_at_unix_micros: i64,
+    /// When the BLOB's signature chain was last re-verified, unix microseconds.
+    pub verified_at_unix_micros: i64,
+}
+
+/// The read-only MDS3 BLOB cache repository for a scope (issue #66, PR B).
+pub struct Mds3BlobCacheRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl Mds3BlobCacheRepo<'_> {
+    /// The verified MDS3 BLOB cache for this scope, or `None` when no BLOB has been
+    /// cached yet (the attestation path then has no trusted snapshot to evaluate against
+    /// and refuses 'direct' attestation fail-closed, or triggers a refresh).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Encryption`] if the stored payload cannot be parsed back (an
+    /// internal invariant violation, since it passed a `::jsonb` cast on write);
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn get(&self) -> Result<Option<Mds3BlobCache>, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT id, blob_no, \
+             (EXTRACT(EPOCH FROM next_update) * 1000000)::bigint AS next_update_us, \
+             payload_jsonb::text AS payload_text, blob_digest, \
+             (EXTRACT(EPOCH FROM fetched_at) * 1000000)::bigint AS fetched_us, \
+             (EXTRACT(EPOCH FROM verified_at) * 1000000)::bigint AS verified_us \
+             FROM mds3_blob_cache \
+             WHERE tenant_id = $1 AND environment_id = $2",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        row.map(|row| {
+            let id_text: String = row.get("id");
+            let id = Mds3BlobCacheId::parse_in_scope(&id_text, &self.scope)?;
+            let payload_text: String = row.get("payload_text");
+            // The payload passed a ::jsonb cast on write, so a parse failure here is an
+            // internal invariant violation, not attacker-influenced input.
+            let payload_jsonb: serde_json::Value =
+                serde_json::from_str(&payload_text).map_err(|_| StoreError::Encryption)?;
+            Ok(Mds3BlobCache {
+                id,
+                blob_no: row.get("blob_no"),
+                next_update_unix_micros: row.get("next_update_us"),
+                payload_jsonb,
+                blob_digest: row.get("blob_digest"),
+                fetched_at_unix_micros: row.get("fetched_us"),
+                verified_at_unix_micros: row.get("verified_us"),
+            })
+        })
+        .transpose()
+    }
+}
+
+/// The mutating MDS3 BLOB cache repository for a scope and actor (issue #66, PR B).
+pub struct ActingMds3BlobCacheRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+    acting: ActingContext,
+}
+
+impl ActingMds3BlobCacheRepo<'_> {
+    /// Refresh (create or update) the verified MDS3 BLOB snapshot for this scope, auditing
+    /// `mds3.blob_cache.refresh` in the same transaction. The unique (tenant, environment)
+    /// key collapses the upsert onto the singleton row. All timestamp arguments are unix
+    /// microseconds (the store's uniform time representation). `blob_digest` is the sha-256
+    /// of the raw signed BLOB, for byte-identical-refetch change detection.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Encryption`] if the payload cannot be serialized (never in practice);
+    /// [`StoreError::Database`] on a persistence failure.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn upsert(
+        &self,
+        env: &Env,
+        blob_no: i64,
+        next_update_unix_micros: i64,
+        payload_jsonb: &serde_json::Value,
+        blob_digest: &[u8],
+        fetched_at_unix_micros: i64,
+        verified_at_unix_micros: i64,
+    ) -> Result<(), StoreError> {
+        let scope = self.scope;
+        let id = Mds3BlobCacheId::generate(env, &scope);
+        let now_micros = epoch_micros(env.clock().now_utc());
+        // A serde_json::Value always serializes; the map mirrors the set_traits precedent.
+        let payload_text =
+            serde_json::to_string(payload_jsonb).map_err(|_| StoreError::Encryption)?;
+        let blob_digest = blob_digest.to_vec();
+        let detail = format!("blob_no={blob_no}");
+        write_audited_detailed(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::Mds3BlobCacheRefresh,
+                target: &id,
+            },
+            async move |tx| {
+                sqlx::query(
+                    "INSERT INTO mds3_blob_cache \
+                     (id, tenant_id, environment_id, blob_no, next_update, payload_jsonb, \
+                      blob_digest, fetched_at, verified_at, updated_at) \
+                     VALUES ($1, $2, $3, $4, \
+                             TIMESTAMPTZ 'epoch' + ($5::text || ' microseconds')::interval, \
+                             $6::jsonb, $7, \
+                             TIMESTAMPTZ 'epoch' + ($8::text || ' microseconds')::interval, \
+                             TIMESTAMPTZ 'epoch' + ($9::text || ' microseconds')::interval, \
+                             TIMESTAMPTZ 'epoch' + ($10::text || ' microseconds')::interval) \
+                     ON CONFLICT (tenant_id, environment_id) \
+                     DO UPDATE SET blob_no = EXCLUDED.blob_no, next_update = EXCLUDED.next_update, \
+                       payload_jsonb = EXCLUDED.payload_jsonb, blob_digest = EXCLUDED.blob_digest, \
+                       fetched_at = EXCLUDED.fetched_at, verified_at = EXCLUDED.verified_at, \
+                       updated_at = EXCLUDED.updated_at \
+                     WHERE EXCLUDED.blob_no > mds3_blob_cache.blob_no",
+                )
+                .bind(id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(blob_no)
+                .bind(next_update_unix_micros)
+                .bind(payload_text)
+                .bind(&blob_digest)
+                .bind(fetched_at_unix_micros)
+                .bind(verified_at_unix_micros)
+                .bind(now_micros)
+                .execute(&mut **tx)
+                .await?;
+                Ok(())
+            },
+            false,
+            Some(&detail),
+        )
+        .await
+    }
+}
+
+/// One AAGUID allow/deny rule (issue #66, PR B): a pinned authenticator model and the
+/// disposition the 'direct' attestation path applies to it, read within scope.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AaguidRule {
+    /// The `aag_` rule identifier (embeds its tenant and environment).
+    pub id: AaguidRuleId,
+    /// The 16-byte authenticator model identifier the rule pins.
+    pub aaguid: Vec<u8>,
+    /// The disposition applied to the model: `allow` or `deny`.
+    pub disposition: String,
+}
+
+/// The read-only AAGUID allow/deny rule repository for a scope (issue #66, PR B).
+///
+/// Reachable through [`ScopedStore::aaguid_rules`]. Under 'direct' attestation the
+/// registration path consults [`AaguidRuleRepo::disposition_for`] to admit or refuse a
+/// specific authenticator model.
+pub struct AaguidRuleRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl AaguidRuleRepo<'_> {
+    /// Every AAGUID rule in this scope, oldest first.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn list(&self) -> Result<Vec<AaguidRule>, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let rows = sqlx::query(
+            "SELECT id, aaguid, disposition FROM aaguid_rules \
+             WHERE tenant_id = $1 AND environment_id = $2 ORDER BY created_at, id",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        rows.iter()
+            .map(|row| {
+                let id_text: String = row.get("id");
+                let id = AaguidRuleId::parse_in_scope(&id_text, &self.scope)?;
+                Ok(AaguidRule {
+                    id,
+                    aaguid: row.get("aaguid"),
+                    disposition: row.get("disposition"),
+                })
+            })
+            .collect()
+    }
+
+    /// The disposition (`allow` or `deny`) pinned for one authenticator model in this
+    /// scope, or `None` when no rule names it (the attestation path then applies its
+    /// default policy). A convenience over [`AaguidRuleRepo::list`] for the hot
+    /// per-registration lookup.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn disposition_for(&self, aaguid: &[u8]) -> Result<Option<String>, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT disposition FROM aaguid_rules \
+             WHERE tenant_id = $1 AND environment_id = $2 AND aaguid = $3",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(aaguid)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(row.map(|row| row.get("disposition")))
+    }
+}
+
+/// The mutating AAGUID allow/deny rule repository for a scope and actor (issue #66, PR B).
+/// Reachable only through [`ScopedStore::acting`], so every mutation carries an actor and
+/// correlation id and routes through the audited-write primitive.
+pub struct ActingAaguidRuleRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+    acting: ActingContext,
+}
+
+impl ActingAaguidRuleRepo<'_> {
+    /// Set (create or update) the disposition for an authenticator model, auditing
+    /// `aaguid.rule.set` in the same transaction. An existing rule for the same AAGUID is
+    /// overwritten (the unique (scope, aaguid) key collapses the upsert). Returns the rule id.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure (including an unknown disposition,
+    /// which the CHECK refuses).
+    pub async fn set(
+        &self,
+        env: &Env,
+        aaguid: &[u8],
+        disposition: &str,
+    ) -> Result<AaguidRuleId, StoreError> {
+        let scope = self.scope;
+        let id = AaguidRuleId::generate(env, &scope);
+        let now_micros = epoch_micros(env.clock().now_utc());
+        let aaguid = aaguid.to_vec();
+        let detail = format!("disposition={disposition}");
+        write_audited_detailed(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::AaguidRuleSet,
+                target: &id,
+            },
+            async move |tx| {
+                sqlx::query(
+                    "INSERT INTO aaguid_rules \
+                     (id, tenant_id, environment_id, aaguid, disposition, created_at, updated_at) \
+                     VALUES ($1, $2, $3, $4, $5, \
+                             TIMESTAMPTZ 'epoch' + ($6::text || ' microseconds')::interval, \
+                             TIMESTAMPTZ 'epoch' + ($6::text || ' microseconds')::interval) \
+                     ON CONFLICT (tenant_id, environment_id, aaguid) \
+                     DO UPDATE SET disposition = EXCLUDED.disposition, updated_at = EXCLUDED.updated_at",
+                )
+                .bind(id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(&aaguid)
+                .bind(disposition)
+                .bind(now_micros)
+                .execute(&mut **tx)
+                .await?;
+                Ok(())
+            },
+            false,
+            Some(&detail),
+        )
+        .await?;
+        Ok(id)
+    }
+
+    /// Remove the rule for an authenticator model, auditing `aaguid.rule.remove` in the
+    /// same transaction. A no-op audit is still written when no rule matched (the
+    /// management action was attempted).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn remove(&self, env: &Env, aaguid: &[u8]) -> Result<(), StoreError> {
+        let scope = self.scope;
+        let id = AaguidRuleId::generate(env, &scope);
+        let aaguid = aaguid.to_vec();
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::AaguidRuleRemove,
+                target: &id,
+            },
+            async move |tx| {
+                sqlx::query(
+                    "DELETE FROM aaguid_rules \
+                     WHERE tenant_id = $1 AND environment_id = $2 AND aaguid = $3",
+                )
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(&aaguid)
+                .execute(&mut **tx)
+                .await?;
+                Ok(())
+            },
+            false,
+        )
+        .await
     }
 }
 
@@ -15776,6 +16165,9 @@ pub struct WebauthnAssertionTarget {
     pub sign_count: u32,
     /// The backup-eligible flag recorded at registration.
     pub backup_eligible: bool,
+    /// Whether the credential's attestation was verified at registration (issue #66,
+    /// PR B). The login path reads this to record an attested-passkey sign-in event.
+    pub attestation_verified: bool,
 }
 
 /// The outcome of a rename or remove of a WebAuthn credential.
@@ -16056,7 +16448,8 @@ impl WebauthnCredentialRepo<'_> {
     ) -> Result<Option<WebauthnAssertionTarget>, StoreError> {
         let mut tx = begin_scoped(self.store, self.scope).await?;
         let row = sqlx::query(
-            "SELECT id, subject, cose_public_key, sign_count, backup_eligible \
+            "SELECT id, subject, cose_public_key, sign_count, backup_eligible, \
+             attestation_verified \
              FROM webauthn_credentials \
              WHERE tenant_id = $1 AND environment_id = $2 AND credential_id = $3",
         )
@@ -16074,6 +16467,7 @@ impl WebauthnCredentialRepo<'_> {
                 cose_public_key: row.get("cose_public_key"),
                 sign_count: u32::try_from(sign_count).unwrap_or(0),
                 backup_eligible: row.get("backup_eligible"),
+                attestation_verified: row.get("attestation_verified"),
             }
         }))
     }
@@ -16140,6 +16534,11 @@ impl ActingWebauthnCredentialRepo<'_> {
         let backup_state = credential.backup_state;
         let discoverable = credential.discoverable;
         let nickname = credential.nickname.to_string();
+        // The reg-time IMMUTABLE attestation facts (issue #66, PR B): INSERT-only, exactly
+        // like backup_eligible, so a later assertion can never rewrite them.
+        let attestation_type = credential.attestation_type.to_string();
+        let attestation_verified = credential.attestation_verified;
+        let attestation_fmt = credential.attestation_fmt.to_string();
         write_audited(
             AuditedWrite {
                 store: self.store,
@@ -16160,8 +16559,10 @@ impl ActingWebauthnCredentialRepo<'_> {
                     "INSERT INTO webauthn_credentials \
                      (id, tenant_id, environment_id, subject, credential_id, cose_public_key, \
                       sign_count, aaguid, transports, backup_eligible, backup_state, \
-                      discoverable, nickname_sealed, pii_dek_version) \
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
+                      discoverable, nickname_sealed, pii_dek_version, \
+                      attestation_type, attestation_verified, attestation_fmt) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, \
+                             $15, $16, $17)",
                 )
                 .bind(id.to_string())
                 .bind(scope.tenant().to_string())
@@ -16177,6 +16578,9 @@ impl ActingWebauthnCredentialRepo<'_> {
                 .bind(discoverable)
                 .bind(nickname_sealed.into_bytes())
                 .bind(dek_version)
+                .bind(&attestation_type)
+                .bind(attestation_verified)
+                .bind(&attestation_fmt)
                 .execute(&mut **tx)
                 .await
                 .map_err(|error| {
@@ -16533,6 +16937,16 @@ pub struct NewWebauthnCredential<'a> {
     pub discoverable: Option<bool>,
     /// The user-authored nickname to seal.
     pub nickname: &'a str,
+    /// The attestation trust-path type verified at registration (issue #66, PR B):
+    /// one of `none`, `self`, `basic`, `attca`, `anonca`. A reg-time IMMUTABLE fact
+    /// (INSERT-only, exactly like `backup_eligible`); never mutated by a later assertion.
+    pub attestation_type: &'a str,
+    /// Whether the attestation statement was validated against the MDS3 snapshot
+    /// (issue #66, PR B). A reg-time IMMUTABLE fact.
+    pub attestation_verified: bool,
+    /// The attestation statement format captured at registration (issue #66, PR B):
+    /// one of `none`, `packed`. A reg-time IMMUTABLE fact.
+    pub attestation_fmt: &'a str,
 }
 
 /// Split a space-separated transports column into its tokens (empty for none).

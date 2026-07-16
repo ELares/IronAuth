@@ -156,6 +156,69 @@ fn verify_asymmetric(
         .map_err(|_| WebauthnSignatureError)
 }
 
+/// Verify a JWS/JWT compact-serialization signature over `signing_input` (the
+/// ASCII `base64url(header) || "." || base64url(payload)`) with `signature`
+/// (the raw, already-base64url-decoded signature bytes) under `key` (issue #66).
+///
+/// This is the SIBLING of [`verify_webauthn_signature`] for the FIDO Metadata
+/// Service BLOB, which is a JWS, NOT a WebAuthn ceremony signature. The ONLY
+/// difference is the ECDSA encoding: a JWS ES256 signature is the fixed-width
+/// `r || s` (64 bytes) of JWA (RFC 7518 section 3.4), where a WebAuthn ECDSA
+/// signature is ASN.1 DER. `EdDSA` and RSA PKCS1-v1_5 are byte-identical between
+/// the two forms, so those arms mirror [`verify_webauthn_signature`] exactly.
+///
+/// It lives here (not in the JWS [`crate::verify`] core) on purpose: [`crate::verify`]
+/// deliberately REJECTS the `x5c` header the MDS3 BLOB carries (in-token key
+/// material is fail-closed there), so the MDS3 chain verifier parses and pins the
+/// x5c chain to the compiled-in FIDO root out of band and then calls this one
+/// narrow primitive for the leaf-key signature check. Like its sibling it carries
+/// no oracle: every failure collapses to [`WebauthnSignatureError`].
+///
+/// # Errors
+///
+/// Returns [`WebauthnSignatureError`] if the key material is malformed or the
+/// signature does not verify.
+pub fn verify_jws_signature(
+    key: &WebauthnKey,
+    signing_input: &[u8],
+    signature: &[u8],
+) -> Result<(), WebauthnSignatureError> {
+    match key {
+        WebauthnKey::Es256 { x, y } => {
+            if x.len() != P256_COORD_LEN || y.len() != P256_COORD_LEN {
+                return Err(WebauthnSignatureError);
+            }
+            let mut point = Vec::with_capacity(1 + 2 * P256_COORD_LEN);
+            point.push(0x04);
+            point.extend_from_slice(x);
+            point.extend_from_slice(y);
+            // The JWA fixed-width `r || s` verifier, NOT the ASN.1-DER one.
+            verify_asymmetric(
+                &signature::ECDSA_P256_SHA256_FIXED,
+                &point,
+                signing_input,
+                signature,
+            )
+        }
+        WebauthnKey::Ed25519 { public_key } => {
+            if public_key.len() != ED25519_KEY_LEN {
+                return Err(WebauthnSignatureError);
+            }
+            verify_asymmetric(&signature::ED25519, public_key, signing_input, signature)
+        }
+        WebauthnKey::Rs256 { n, e } => {
+            let components = RsaPublicKeyComponents { n, e };
+            components
+                .verify(
+                    &signature::RSA_PKCS1_2048_8192_SHA256,
+                    signing_input,
+                    signature,
+                )
+                .map_err(|_| WebauthnSignatureError)
+        }
+    }
+}
+
 /// Test-only WebAuthn software-authenticator crypto helpers.
 ///
 /// Compiled only under the `test-util` feature. A downstream integration test
@@ -231,5 +294,44 @@ mod tests {
             WebauthnSignatureError.to_string(),
             "webauthn signature verification failed"
         );
+    }
+
+    #[cfg(feature = "test-util")]
+    #[test]
+    fn jws_ed25519_signature_verifies_and_rejects_tampering() {
+        // The MDS3 BLOB JWS primitive: an EdDSA signature is byte-identical between the
+        // JWS and WebAuthn forms, so a genuine Ed25519 signature over the signing input
+        // verifies and any tamper of the input or signature is rejected.
+        let seed = [7_u8; 32];
+        let public_key = super::test_util::ed25519_public_key_from_seed(&seed);
+        let key = WebauthnKey::Ed25519 { public_key };
+        let signing_input = b"eyJhbGciOiJFZERTQSJ9.eyJubyI6MX0";
+        let sig = super::test_util::ed25519_sign(&seed, signing_input);
+        assert!(verify_jws_signature(&key, signing_input, &sig).is_ok());
+        // A flipped signature byte fails.
+        let mut bad_sig = sig.clone();
+        bad_sig[0] ^= 0x01;
+        assert!(verify_jws_signature(&key, signing_input, &bad_sig).is_err());
+        // A tampered signing input fails.
+        assert!(verify_jws_signature(&key, b"eyJhbGciOiJFZERTQSJ9.TAMPERED", &sig).is_err());
+    }
+
+    #[test]
+    fn jws_es256_uses_fixed_width_not_der() {
+        // A DER-encoded (WebAuthn-form) signature must NOT verify through the JWS path,
+        // which expects the fixed-width r||s: this proves the two primitives use distinct
+        // ECDSA encodings and cannot be confused.
+        let key = WebauthnKey::Es256 {
+            x: vec![0_u8; 32],
+            y: vec![0_u8; 32],
+        };
+        // A 64-byte all-zero "fixed" signature never verifies against a bogus key.
+        assert!(verify_jws_signature(&key, b"msg", &[0_u8; 64]).is_err());
+        // A wrong coordinate length is rejected up front.
+        let short = WebauthnKey::Es256 {
+            x: vec![0_u8; 31],
+            y: vec![0_u8; 32],
+        };
+        assert!(verify_jws_signature(&short, b"msg", &[0_u8; 64]).is_err());
     }
 }

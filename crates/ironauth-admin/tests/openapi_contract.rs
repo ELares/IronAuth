@@ -67,6 +67,7 @@ fn operation_ids_are_the_stable_set() {
             "getEnvironment",
             "getInvitation",
             "getManagementKey",
+            "getMds3Health",
             "getMigrationProgress",
             "getMigrationRun",
             "getOperator",
@@ -248,6 +249,7 @@ fn documented_paths_are_the_expected_set() {
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/sessions/{session_id}",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/users",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}",
+            "GET /v1/tenants/{tenant_id}/environments/{environment_id}/webauthn/mds3/health",
             "PATCH /v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}",
             "POST /v1/tenants",
             "POST /v1/tenants/{tenant_id}/environments",
@@ -312,7 +314,7 @@ fn committed_artifact_matches_generated_spec() {
 async fn served_routes_match_documented_routes() {
     let router = db_free_router();
     let documented = documented_method_paths();
-    assert_eq!(documented.len(), 60, "the documented route count is pinned");
+    assert_eq!(documented.len(), 61, "the documented route count is pinned");
 
     // The OUTBOUND lazy-migration endpoint (issue #58) is the one documented route
     // that is NOT gated by the management `Principal` at 401. It is DISABLED BY

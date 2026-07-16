@@ -208,6 +208,19 @@ pub async fn register_verify(
         Err(_) => return ceremony_error(),
     };
 
+    // Attestation policy (issue #66 PR B): under the tenant's `direct` attestation
+    // mode, evaluate the presented AAGUID against the allow/deny rules and validate
+    // the attestation statement against the verified FIDO MDS3 cache. A non-allowlisted
+    // AAGUID (or an unsupported format, a spoofed AAGUID, or a chain that does not reach
+    // a trusted root) is a clean fail-closed REJECT, never a silent downgrade. The
+    // returned verdict is stamped onto the credential row as a reg-time-immutable fact;
+    // a login later reads it to record the attested rung.
+    let Ok(attestation) =
+        evaluate_registration_attestation(&state, scope, &body.credential, &registered).await
+    else {
+        return ceremony_error();
+    };
+
     let nickname = body
         .nickname
         .as_deref()
@@ -224,6 +237,9 @@ pub async fn register_verify(
         backup_state: registered.backup_state,
         discoverable: registered.discoverable,
         nickname,
+        attestation_type: attestation.attestation_type.as_str(),
+        attestation_verified: attestation.model_verified,
+        attestation_fmt: attestation.fmt,
     };
     let actor = interaction::user_actor(&subject);
     match state
@@ -254,6 +270,113 @@ pub async fn register_verify(
         ),
         Err(_) => ceremony_error(),
     }
+}
+
+/// Evaluate the tenant attestation policy for a registration (issue #66 PR B).
+///
+/// Returns the [`AttestationOutcome`] to stamp onto the credential row. In the
+/// default `none` mode the credential records an unattested verdict and always
+/// succeeds. Under `direct` mode this ENFORCES the policy: the AAGUID must be
+/// explicitly allow-listed (a denied or unlisted AAGUID is `Err(())`, a fail-closed
+/// reject), and the attestation statement is verified against the scope's verified
+/// FIDO MDS3 cache; an unsupported format, a spoofed AAGUID, a bad signature, or a
+/// chain that does not reach a trusted MDS3 root is `Err(())`. `model_verified` is
+/// `true` only for a basic attestation whose chain terminated at a trusted root, so
+/// the attested credential class is never claimed on an unproven authenticator.
+async fn evaluate_registration_attestation(
+    state: &OidcState,
+    scope: Scope,
+    credential: &RegistrationResponse,
+    registered: &RegisteredCredential,
+) -> Result<ironauth_webauthn::AttestationOutcome, ()> {
+    use ironauth_webauthn::AttestationType;
+
+    let mode = state
+        .store()
+        .scoped(scope)
+        .attestation_config()
+        .get()
+        .await
+        .map_err(|_| ())?
+        .map_or_else(|| "none".to_owned(), |config| config.mode);
+
+    if mode != "direct" {
+        // No attestation requested: record the unattested verdict, always succeed.
+        return Ok(ironauth_webauthn::AttestationOutcome {
+            attestation_type: AttestationType::None,
+            fmt: "none",
+            model_verified: false,
+        });
+    }
+
+    // Under `direct`, the AAGUID must be explicitly allow-listed.
+    let disposition = state
+        .store()
+        .scoped(scope)
+        .aaguid_rules()
+        .disposition_for(&registered.aaguid)
+        .await
+        .map_err(|_| ())?;
+    if disposition.as_deref() != Some("allow") {
+        return Err(());
+    }
+
+    let attestation_bytes =
+        ironauth_webauthn::b64_decode(&credential.response.attestation_object).ok_or(())?;
+    let attestation =
+        ironauth_webauthn::parse_attestation_object(&attestation_bytes).map_err(|_| ())?;
+    let client_data_bytes =
+        ironauth_webauthn::b64_decode(&credential.response.client_data_json).ok_or(())?;
+    let client_data_hash = {
+        use sha2::{Digest, Sha256};
+        Sha256::digest(&client_data_bytes)
+    };
+    let credential_key =
+        ironauth_webauthn::parse_cose_key(&registered.cose_public_key).map_err(|_| ())?;
+
+    // The trusted attestation roots for this AAGUID come from the VERIFIED MDS3 cache
+    // (an empty set when no snapshot covers the model, so basic attestation fails
+    // closed while self/none attestation still record an honest unverified verdict).
+    let trust_anchors = mds3_trust_anchors_for(state, scope, &registered.aaguid).await?;
+    let now_unix = epoch_micros(state.now()) / 1_000_000;
+
+    ironauth_webauthn::verify_attestation(
+        &attestation,
+        &client_data_hash,
+        &credential_key,
+        &registered.aaguid,
+        &trust_anchors,
+        now_unix,
+    )
+    .map_err(|_| ())
+}
+
+/// The trusted attestation root certificates (raw DER) for an AAGUID, read from the
+/// scope's verified MDS3 BLOB cache. An empty vector when no cache snapshot exists or
+/// no entry covers the AAGUID, which makes a basic attestation fail closed.
+async fn mds3_trust_anchors_for(
+    state: &OidcState,
+    scope: Scope,
+    aaguid: &[u8; 16],
+) -> Result<Vec<Vec<u8>>, ()> {
+    let Some(cache) = state
+        .store()
+        .scoped(scope)
+        .mds3_blob_cache()
+        .get()
+        .await
+        .map_err(|_| ())?
+    else {
+        return Ok(Vec::new());
+    };
+    let payload: ironauth_webauthn::mds3::Mds3Payload =
+        serde_json::from_value(cache.payload_jsonb).map_err(|_| ())?;
+    Ok(payload
+        .entries
+        .into_iter()
+        .find(|entry| &entry.aaguid == aaguid)
+        .map(|entry| entry.attestation_root_certs)
+        .unwrap_or_default())
 }
 
 /// `POST /t/{tenant}/e/{environment}/webauthn/authenticate/options`: begin a
@@ -501,11 +624,50 @@ pub async fn authenticate_verify(
     // (trustworthy, immutable), NOT the assertion's mutable flag; the amr reflects
     // whether this assertion actually verified the user (`user_verified`), so a
     // presence-only login never claims a verification factor it did not perform.
-    let event = AuthenticationEvent::passkey(
-        epoch_micros(state.now()),
-        target.backup_eligible,
-        outcome.user_verified,
-    );
+    //
+    // The attested rung (issue #66 PR B) is recorded through ONE path: when the
+    // credential's STORED, registration-time `attestation_verified` fact is set (the
+    // AAGUID was allow-listed and its attestation chained to the pinned FIDO MDS3
+    // root), the login records the ATTESTED method, which derives the
+    // `attested_passkey` acr; otherwise it records the plain passkey method. This is
+    // the single source that keeps `satisfied_class` and the achieved acr in
+    // agreement: both read the recorded method, and the method is derived from the one
+    // stored fact, so an attested login satisfies an attested-class floor end to end
+    // while a plain passkey never can.
+    let auth_time = epoch_micros(state.now());
+    let event = if target.attestation_verified {
+        AuthenticationEvent::attested_passkey(
+            auth_time,
+            target.backup_eligible,
+            outcome.user_verified,
+        )
+    } else {
+        AuthenticationEvent::passkey(auth_time, target.backup_eligible, outcome.user_verified)
+    };
+
+    // Covenant self-check (issue #66 PR B): the credential class this login SATISFIES,
+    // folded from the STORED facts (the tenant user-verification requirement and the
+    // credential's reg-time `attestation_verified` column), must be BACKED by the acr
+    // the event achieves. This is the runtime half of the reconciliation between the
+    // two enforcement views: `satisfied_class` (fed from stored facts) and the achieved
+    // acr (from the recorded method) are computed from independent inputs and must
+    // agree, so an attested login both folds to the attested class AND achieves the
+    // attested acr, while a plain passkey does neither. A divergence would be an
+    // internal bug; fail closed rather than mint a token whose acr the satisfied class
+    // does not back.
+    let facts = crate::authn::CredentialFacts {
+        require_user_verification: state.webauthn_require_user_verification(),
+        attestation_verified: target.attestation_verified,
+    };
+    let satisfied = crate::authn::satisfied_class(&event, &facts);
+    let order = state.acr_order();
+    if !crate::step_up::acr_satisfies(
+        crate::authn::achieved_acr(event.methods()),
+        crate::authn::acr_for_class(satisfied),
+        &order,
+    ) {
+        return ceremony_error();
+    }
     let Ok(cookies) = interaction::establish_session(
         &state,
         scope,

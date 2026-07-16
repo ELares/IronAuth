@@ -1219,6 +1219,15 @@ pub struct OidcConfig {
     /// tenant-policy pipeline.
     pub webauthn_clone_detection_block: bool,
 
+    /// The base URL of the FIDO Metadata Service (MDS3) BLOB endpoint the passkey
+    /// attestation path fetches the signed authenticator-metadata BLOB from (issue #66,
+    /// PR B). When unset (`None`), the built-in default the webauthn/mds3 module carries
+    /// (`https://mds3.fidoalliance.org/`) is used; a deployment behind an outbound proxy
+    /// or an air-gapped mirror overrides it here. The fetch rides the SSRF-hardened
+    /// outbound path, so the value MUST be an `https` URL: a plaintext `http` override is
+    /// refused at config load, mirroring the HIBP base-URL rule.
+    pub mds3_base_url: Option<String>,
+
     /// Whether the TOTP second-factor endpoints are mounted (issue #69). On by
     /// default: TOTP is the universal second factor. When off, the enroll/verify/
     /// recovery endpoints fail closed with a uniform 404, so a deployment that does
@@ -1482,6 +1491,7 @@ impl Default for OidcConfig {
             webauthn_challenge_ttl_secs: 300,
             webauthn_require_user_verification: true,
             webauthn_clone_detection_block: false,
+            mds3_base_url: None,
             totp_enabled: true,
             totp_issuer: None,
             totp_period_secs: 30,
@@ -2866,6 +2876,17 @@ fn validate_webauthn(oidc: &OidcConfig, server: &ServerConfig) -> Result<(), Con
         "oidc.webauthn_challenge_ttl_secs",
         oidc.webauthn_challenge_ttl_secs,
     )?;
+    // The MDS3 BLOB endpoint override (issue #66, PR B) rides the SSRF-hardened outbound
+    // fetch path, so a plaintext override is refused at load, mirroring the HIBP base-URL
+    // rule. Validated regardless of webauthn_enabled so a misconfiguration is caught even
+    // when the surface is off.
+    if let Some(base) = &oidc.mds3_base_url {
+        if !base.starts_with("https://") {
+            return Err(ConfigError::Invalid {
+                message: format!("oidc.mds3_base_url ({base}) must be an https URL"),
+            });
+        }
+    }
     if !oidc.webauthn_enabled {
         return Ok(());
     }
@@ -4649,6 +4670,17 @@ mod tests {
         let err = Config::from_toml_str(bad, "ironauth.toml").expect_err("plaintext base");
         assert!(err.to_string().contains("https"), "{err}");
         let ok = "[password_policy]\nhibp_base_url = \"https://mirror.example.test\"\n";
+        Config::from_toml_str(ok, "<inline>").expect("https base loads");
+    }
+
+    #[test]
+    fn mds3_base_url_must_be_https() {
+        // The MDS3 BLOB endpoint override rides the SSRF-hardened outbound path, so a
+        // plaintext override is refused at load, exactly like the HIBP base URL.
+        let bad = "[oidc]\nmds3_base_url = \"http://mds3.internal\"\n";
+        let err = Config::from_toml_str(bad, "ironauth.toml").expect_err("plaintext base");
+        assert!(err.to_string().contains("https"), "{err}");
+        let ok = "[oidc]\nmds3_base_url = \"https://mds3.example.test/\"\n";
         Config::from_toml_str(ok, "<inline>").expect("https base loads");
     }
 

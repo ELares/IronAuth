@@ -321,13 +321,13 @@ async fn expand_contract_example_chain_runs_all_three_phases_and_contract_remove
     );
 }
 
-/// The PRODUCTION chain (`MigrationRunner::new`) contains exactly the fifty
+/// The PRODUCTION chain (`MigrationRunner::new`) contains exactly the fifty-one
 /// real migrations and leaves no throwaway demo object in a real database.
 // A long but linear ledger-and-table assertion sweep (one line per migration and
 // per real table); splitting it would not make it clearer.
 #[allow(clippy::too_many_lines)]
 #[tokio::test]
-async fn production_chain_is_only_the_fifty_real_migrations_and_ships_no_demo_object() {
+async fn production_chain_is_only_the_fifty_one_real_migrations_and_ships_no_demo_object() {
     // TestDatabase::start runs Store::migrate() (the production chain) on a
     // fresh, empty database.
     let db = TestDatabase::start().await;
@@ -344,8 +344,8 @@ async fn production_chain_is_only_the_fifty_real_migrations_and_ships_no_demo_ob
     );
     assert_eq!(
         report.already_applied(),
-        50,
-        "the production chain is exactly fifty migrations (isolation, audit log, management \
+        51,
+        "the production chain is exactly fifty-one migrations (isolation, audit log, management \
          API, OIDC authorization, signing keys, login/consent, authentication context, redirect \
          registration, UserInfo claims, consent scope upsert, resource servers, opaque access \
          tokens, client auth suite, dynamic client registration, pushed authorization requests, \
@@ -358,16 +358,16 @@ async fn production_chain_is_only_the_fifty_real_migrations_and_ships_no_demo_ob
          import, user invitations, flexible identifiers, exit-export credential grants, \
          migration state machine, webauthn credentials, totp credentials, credential abuse \
          defenses, step-up policies, email OTP and scanner-safe magic links, credential-class \
-         policies, guarded SMS OTP)"
+         policies, guarded SMS OTP, passkey attestation)"
     );
 
-    // The ledger holds exactly versions 1 through 50.
+    // The ledger holds exactly versions 1 through 51.
     assert_eq!(
         applied_versions(pool).await,
         vec![
             1_i64, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
             24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45,
-            46, 47, 48, 49, 50
+            46, 47, 48, 49, 50, 51
         ]
     );
     let phase_of = |version: i64| async move {
@@ -554,6 +554,10 @@ async fn production_chain_is_only_the_fifty_real_migrations_and_ships_no_demo_ob
     // tables (sms_otp_codes, sms_config, sms_country_allowlist, sms_route_stats), no
     // rewrite of existing state.
     assert_eq!(phase_of(50).await, "expand");
+    // The passkey-attestation migration (issue #66, PR B) is an EXPAND: two new
+    // tenant-scoped tables (mds3_blob_cache, aaguid_rules) plus additive
+    // webauthn_credentials attestation columns, no rewrite of existing state.
+    assert_eq!(phase_of(51).await, "expand");
 
     // The step-up second-factor abuse path (issue #72): migration 0047 WIDENED the
     // abuse_bans auth_path CHECK (0046 pinned the closed set) to also admit
@@ -2273,6 +2277,93 @@ async fn production_chain_is_only_the_fifty_real_migrations_and_ships_no_demo_ob
         assert!(
             check_constraint_exists(pool, table, &format!("{table}_scope_nonempty")).await,
             "{table} must carry the scope-nonempty CHECK constraint"
+        );
+    }
+
+    // ---- 0051 passkey attestation (issue #66, PR B) ----
+    // The per-scope verified MDS3 BLOB cache: the extracted, trusted authenticator
+    // entries the attestation path evaluates against, plus the raw-BLOB digest for
+    // byte-identical-refetch change detection. No PII (public authenticator metadata).
+    assert!(
+        table_exists(pool, "mds3_blob_cache").await,
+        "mds3_blob_cache exists after 0051"
+    );
+    for column in [
+        "id",
+        "tenant_id",
+        "environment_id",
+        "blob_no",
+        "next_update",
+        "payload_jsonb",
+        "blob_digest",
+        "fetched_at",
+        "verified_at",
+        "created_at",
+        "updated_at",
+    ] {
+        assert!(
+            column_exists(pool, "mds3_blob_cache", column).await,
+            "mds3_blob_cache.{column} exists after 0051"
+        );
+    }
+    // The per-scope AAGUID allow / deny list: one disposition per pinned model.
+    assert!(
+        table_exists(pool, "aaguid_rules").await,
+        "aaguid_rules exists after 0051"
+    );
+    for column in [
+        "id",
+        "tenant_id",
+        "environment_id",
+        "aaguid",
+        "disposition",
+        "created_at",
+        "updated_at",
+    ] {
+        assert!(
+            column_exists(pool, "aaguid_rules", column).await,
+            "aaguid_rules.{column} exists after 0051"
+        );
+    }
+    // The tenant-scoped-table obligations for both new tables.
+    for table in ["mds3_blob_cache", "aaguid_rules"] {
+        assert!(
+            rls_enabled_and_forced(pool, table).await,
+            "{table} must ENABLE and FORCE row-level security"
+        );
+        assert!(
+            policy_exists(pool, table, &format!("{table}_tenant_isolation")).await,
+            "the (tenant, environment) isolation policy must exist on {table}"
+        );
+        assert!(
+            check_constraint_exists(pool, table, &format!("{table}_scope_nonempty")).await,
+            "{table} must carry the scope-nonempty CHECK constraint"
+        );
+    }
+    // The AAGUID rule disposition is a closed set.
+    assert!(
+        check_constraint_exists(pool, "aaguid_rules", "aaguid_rules_disposition_known").await,
+        "aaguid_rules must carry the disposition-known CHECK constraint"
+    );
+    // The reg-time attestation facts on the passkey credential row: captured once at
+    // registration, immutable thereafter (INSERT-only, absent from every GRANT UPDATE).
+    for column in [
+        "attestation_type",
+        "attestation_verified",
+        "attestation_fmt",
+    ] {
+        assert!(
+            column_exists(pool, "webauthn_credentials", column).await,
+            "webauthn_credentials.{column} exists after 0051"
+        );
+    }
+    for constraint in [
+        "webauthn_credentials_attestation_type_known",
+        "webauthn_credentials_attestation_fmt_known",
+    ] {
+        assert!(
+            check_constraint_exists(pool, "webauthn_credentials", constraint).await,
+            "webauthn_credentials must carry the {constraint} CHECK constraint"
         );
     }
 }
