@@ -2638,6 +2638,321 @@
         ]
       }
     },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/migration-runs": {
+      "get": {
+        "tags": [
+          "migration"
+        ],
+        "summary": "List a scope's migration runs (cursor paginated).",
+        "operationId": "listMigrationRuns",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "The desired page size, a positive integer. Clamped to\n`[1, max_page_size]`; defaults to the configured default when absent.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "The opaque cursor from a previous page's `next_cursor`. Absent for the\nfirst page (keyset pagination; there is no offset).",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "A page of the environment's migration runs",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MigrationRunList"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed cursor",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Environment not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/migration-runs/{run_id}": {
+      "get": {
+        "tags": [
+          "migration"
+        ],
+        "summary": "Read one migration run: its state, per-state counts, and LIVE invariant evaluations.",
+        "operationId": "getMigrationRun",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "run_id",
+            "in": "path",
+            "description": "The migration-run identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The run's current state, per-state record counts, and the live invariant evaluations (re-derived from the database on every call), with the blocking invariants surfaced. A run cannot complete while any invariant is unsatisfied.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MigrationRunDetailView"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Run or environment not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/migration-runs/{run_id}/violations": {
+      "get": {
+        "tags": [
+          "migration"
+        ],
+        "summary": "Page the specific records violating one of a run's invariants (cursor paginated).",
+        "operationId": "listMigrationRunViolations",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "run_id",
+            "in": "path",
+            "description": "The migration-run identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "The desired page size, a positive integer.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "The opaque cursor from a previous page's `next_cursor`.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "invariant",
+            "in": "query",
+            "description": "Which invariant's offending records to enumerate: `count`, `consistency`, or\n`backfill_sentinel`. Defaults to `consistency`. The count invariant is a scalar\ndiscrepancy with no enumerable rows, so it returns an empty page.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "A page of the records violating the selected invariant, each naming the offending identity (opened) and its reason",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MigrationRunViolationList"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed cursor or unknown invariant",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Run or environment not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/v1/tenants/{tenant_id}/environments/{environment_id}/migration/progress": {
       "get": {
         "tags": [
@@ -5661,6 +5976,35 @@
           }
         }
       },
+      "InvariantView": {
+        "type": "object",
+        "description": "One invariant's live evaluation (issue #59).",
+        "required": [
+          "invariant",
+          "satisfied",
+          "current_value",
+          "offending_count"
+        ],
+        "properties": {
+          "current_value": {
+            "type": "string",
+            "description": "An operator-safe description of the invariant's current values (no PII)."
+          },
+          "invariant": {
+            "type": "string",
+            "description": "The invariant family (`count`, `consistency`, or `backfill_sentinel`)."
+          },
+          "offending_count": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The number of records currently violating this invariant."
+          },
+          "satisfied": {
+            "type": "boolean",
+            "description": "Whether the invariant is currently satisfied."
+          }
+        }
+      },
       "InvitationCreatedView": {
         "type": "object",
         "description": "The result of creating (or resending) an invitation (issue #60): the durable\ninvitation, PLUS the raw single-use token returned exactly ONCE for out-of-band\ndelivery. The token is NEVER readable again and is never persisted (only its\ndigest is stored), so an idempotent replay of the POST returns the invitation\nWITHOUT the token.",
@@ -5950,6 +6294,253 @@
             "type": "integer",
             "format": "int64",
             "description": "The total number of live users in the environment."
+          }
+        }
+      },
+      "MigrationRunCountsView": {
+        "type": "object",
+        "description": "The per-state record counts of a run (issue #59), re-derived live.",
+        "required": [
+          "imported",
+          "failed",
+          "skipped",
+          "inconsistent",
+          "unmarked_backfill",
+          "accounted"
+        ],
+        "properties": {
+          "accounted": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The total accounted records (the sum of the three buckets)."
+          },
+          "failed": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Records in the `failed` bucket."
+          },
+          "imported": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Records in the `imported` bucket."
+          },
+          "inconsistent": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Records flagged inconsistent."
+          },
+          "skipped": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Records in the `skipped` bucket."
+          },
+          "unmarked_backfill": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Records not yet backfill-marked."
+          }
+        }
+      },
+      "MigrationRunDetailView": {
+        "type": "object",
+        "description": "One run's full operator view (issue #59): its state, per-state counts, and the LIVE\ninvariant evaluations, with the blocking invariants surfaced.",
+        "required": [
+          "id",
+          "kind",
+          "state",
+          "source_total",
+          "backfill_expected",
+          "counts",
+          "invariants",
+          "blocking"
+        ],
+        "properties": {
+          "abandoned_reason": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The operator-safe abandonment reason, when abandoned."
+          },
+          "backfill_expected": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The number of records a backfill must mark."
+          },
+          "blocking": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The names of the invariants currently BLOCKING completion (empty when the run\ncould complete)."
+          },
+          "counts": {
+            "$ref": "#/components/schemas/MigrationRunCountsView",
+            "description": "The per-state record counts."
+          },
+          "id": {
+            "type": "string",
+            "description": "The run identifier."
+          },
+          "invariants": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/InvariantView"
+            },
+            "description": "Every invariant's live evaluation."
+          },
+          "kind": {
+            "type": "string",
+            "description": "The wrapped-workload kind."
+          },
+          "source_total": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The declared ground-truth source record count."
+          },
+          "state": {
+            "type": "string",
+            "description": "The current lifecycle state."
+          },
+          "subject_ref": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The non-PII link back to the wrapped job, when set."
+          }
+        }
+      },
+      "MigrationRunList": {
+        "type": "object",
+        "description": "A page of migration runs (issue #59).",
+        "required": [
+          "items"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/MigrationRunSummaryView"
+            },
+            "description": "The runs on this page."
+          },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The opaque cursor for the next page, or null on the last page."
+          }
+        }
+      },
+      "MigrationRunSummaryView": {
+        "type": "object",
+        "description": "One run in the paginated list view (issue #59).",
+        "required": [
+          "id",
+          "kind",
+          "state",
+          "source_total",
+          "backfill_expected"
+        ],
+        "properties": {
+          "backfill_expected": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The number of records a backfill must mark."
+          },
+          "id": {
+            "type": "string",
+            "description": "The run identifier (an `mgr_` id)."
+          },
+          "kind": {
+            "type": "string",
+            "description": "The wrapped-workload kind (`bulk_import` or `schema_migration`)."
+          },
+          "source_total": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The declared ground-truth source record count."
+          },
+          "state": {
+            "type": "string",
+            "description": "The current lifecycle state."
+          },
+          "subject_ref": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The non-PII link back to the wrapped job, when set."
+          }
+        }
+      },
+      "MigrationRunViolationList": {
+        "type": "object",
+        "description": "A page of the records violating one invariant (issue #59).",
+        "required": [
+          "invariant",
+          "items"
+        ],
+        "properties": {
+          "invariant": {
+            "type": "string",
+            "description": "The invariant these records violate."
+          },
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/OffendingRecordView"
+            },
+            "description": "The offending records on this page."
+          },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The opaque cursor for the next page, or null on the last page."
+          }
+        }
+      },
+      "OffendingRecordView": {
+        "type": "object",
+        "description": "One record violating an invariant (issue #59).",
+        "required": [
+          "id",
+          "subject",
+          "outcome",
+          "consistent",
+          "backfilled"
+        ],
+        "properties": {
+          "backfilled": {
+            "type": "boolean",
+            "description": "Whether a backfill has marked this record."
+          },
+          "consistent": {
+            "type": "boolean",
+            "description": "Whether the identity is in a consistent state."
+          },
+          "detail": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "An operator-safe reason, when recorded."
+          },
+          "id": {
+            "type": "string",
+            "description": "The record identifier (an `mrr_` id)."
+          },
+          "outcome": {
+            "type": "string",
+            "description": "The accounting bucket."
+          },
+          "subject": {
+            "type": "string",
+            "description": "The record's natural subject, opened from its sealed value."
           }
         }
       },

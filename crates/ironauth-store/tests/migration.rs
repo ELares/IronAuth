@@ -306,13 +306,13 @@ async fn expand_contract_example_chain_runs_all_three_phases_and_contract_remove
     );
 }
 
-/// The PRODUCTION chain (`MigrationRunner::new`) contains exactly the forty-two
+/// The PRODUCTION chain (`MigrationRunner::new`) contains exactly the forty-three
 /// real migrations and leaves no throwaway demo object in a real database.
 // A long but linear ledger-and-table assertion sweep (one line per migration and
 // per real table); splitting it would not make it clearer.
 #[allow(clippy::too_many_lines)]
 #[tokio::test]
-async fn production_chain_is_only_the_forty_two_real_migrations_and_ships_no_demo_object() {
+async fn production_chain_is_only_the_forty_three_real_migrations_and_ships_no_demo_object() {
     // TestDatabase::start runs Store::migrate() (the production chain) on a
     // fresh, empty database.
     let db = TestDatabase::start().await;
@@ -329,8 +329,8 @@ async fn production_chain_is_only_the_forty_two_real_migrations_and_ships_no_dem
     );
     assert_eq!(
         report.already_applied(),
-        42,
-        "the production chain is exactly forty-two migrations (isolation, audit log, management \
+        43,
+        "the production chain is exactly forty-three migrations (isolation, audit log, management \
          API, OIDC authorization, signing keys, login/consent, authentication context, redirect \
          registration, UserInfo claims, consent scope upsert, resource servers, opaque access \
          tokens, client auth suite, dynamic client registration, pushed authorization requests, \
@@ -340,15 +340,16 @@ async fn production_chain_is_only_the_forty_two_real_migrations_and_ships_no_dem
          APIs, envelope encryption, environment guardrails, tenant lifecycle, BYOK bindings, \
          snapshot export, custom domains, environment secrets and variables, config promotion, \
          self-service account, admin user lifecycle, identity traits, foreign password \
-         import, user invitations, flexible identifiers, exit-export credential grants)"
+         import, user invitations, flexible identifiers, exit-export credential grants, \
+         migration state machine)"
     );
 
-    // The ledger holds exactly versions 1 through 42.
+    // The ledger holds exactly versions 1 through 43.
     assert_eq!(
         applied_versions(pool).await,
         vec![
             1_i64, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
-            24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42
+            24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43
         ]
     );
     let phase_of = |version: i64| async move {
@@ -504,6 +505,12 @@ async fn production_chain_is_only_the_forty_two_real_migrations_and_ships_no_dem
     // the mirror import restores it. No table, column, policy, or backfill, so it is
     // an expand.
     assert_eq!(phase_of(42).await, "expand");
+    // The migration state-machine migration (issue #59): two new tenant-scoped tables
+    // (migration_runs, migration_run_records) with their indexes, isolation policies,
+    // nonempty-scope / closed-kind / closed-state / closed-outcome CHECKs, and
+    // column-scoped grants. The record subject is sealed and blind-indexed (no plaintext
+    // PII column). All additive, so it is an expand too.
+    assert_eq!(phase_of(43).await, "expand");
 
     // The demo object never reaches a production database.
     assert!(
@@ -1472,6 +1479,96 @@ async fn production_chain_is_only_the_forty_two_real_migrations_and_ships_no_dem
     assert!(
         partial_unique_index_exists(pool, "user_identifiers", "user_identifiers_uniqueness").await,
         "the partial UNIQUE index user_identifiers_uniqueness must exist"
+    );
+
+    // The migration state-machine tables (issue #59): the run row carrying the named
+    // lifecycle state and the count/backfill thresholds, and the per-record accounting
+    // ledger the invariants re-evaluate against.
+    assert!(
+        table_exists(pool, "migration_runs").await,
+        "migration_runs exists after 0043"
+    );
+    for column in [
+        "id",
+        "tenant_id",
+        "environment_id",
+        "kind",
+        "state",
+        "source_total",
+        "backfill_expected",
+        "subject_ref",
+        "abandoned_reason",
+        "created_at",
+        "updated_at",
+    ] {
+        assert!(
+            column_exists(pool, "migration_runs", column).await,
+            "migration_runs.{column} exists after 0043"
+        );
+    }
+    assert!(
+        table_exists(pool, "migration_run_records").await,
+        "migration_run_records exists after 0043"
+    );
+    for column in [
+        "id",
+        "tenant_id",
+        "environment_id",
+        "run_id",
+        "subject_bidx",
+        "subject_sealed",
+        "subject_dek_version",
+        "outcome",
+        "consistent",
+        "backfilled",
+        "detail",
+        "created_at",
+    ] {
+        assert!(
+            column_exists(pool, "migration_run_records", column).await,
+            "migration_run_records.{column} exists after 0043"
+        );
+    }
+    // A record's natural subject is user PII, stored ONLY as the sealed value and the
+    // blind index (issue #48): no plaintext subject / identifier / email column ever
+    // lands in the schema.
+    for forbidden in ["subject", "identifier", "email", "key", "subject_plain"] {
+        assert!(
+            !column_exists(pool, "migration_run_records", forbidden).await,
+            "migration_run_records must have no plaintext subject column ({forbidden})"
+        );
+    }
+    // The tenant-scoped-table obligations for both new tables (migrate.rs checklist),
+    // asserted structurally against pg_catalog: forced row-level security, the
+    // (tenant, environment) isolation policy, and the nonempty-scope / closed-set CHECKs.
+    for table in ["migration_runs", "migration_run_records"] {
+        assert!(
+            rls_enabled_and_forced(pool, table).await,
+            "{table} must ENABLE and FORCE row-level security"
+        );
+        assert!(
+            policy_exists(pool, table, &format!("{table}_tenant_isolation")).await,
+            "the (tenant, environment) isolation policy must exist on {table}"
+        );
+        assert!(
+            check_constraint_exists(pool, table, &format!("{table}_scope_nonempty")).await,
+            "{table} must carry the scope-nonempty CHECK constraint"
+        );
+    }
+    for constraint in ["migration_runs_kind_known", "migration_runs_state_known"] {
+        assert!(
+            check_constraint_exists(pool, "migration_runs", constraint).await,
+            "migration_runs must carry the {constraint} CHECK constraint"
+        );
+    }
+    assert!(
+        check_constraint_exists(
+            pool,
+            "migration_run_records",
+            "migration_run_records_outcome_known"
+        )
+        .await,
+        "migration_run_records must carry the outcome-known CHECK constraint"
     );
 }
 

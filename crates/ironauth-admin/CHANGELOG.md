@@ -6,6 +6,19 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Migration state-machine operator view (issue #59, exploratory): three env-scoped,
+  permission-gated read endpoints over the invariant-checked migration state machine.
+  `GET .../migration-runs` lists a scope's runs (cursor paginated);
+  `GET .../migration-runs/{run_id}` reports one run's current state, its per-state
+  record counts, and its LIVE invariant evaluations (re-derived from the database on
+  every call, with the blocking invariants surfaced) so an operator can see exactly why
+  a run cannot complete; `GET .../migration-runs/{run_id}/violations?invariant=...`
+  pages the specific records violating an invariant, each naming the offending identity
+  and its reason. Environment-scoped reads (operator plane or the environment's own
+  management key), documented in the OpenAPI contract. New views:
+  `MigrationRunSummaryView`, `MigrationRunList`, `MigrationRunCountsView`,
+  `InvariantView`, `MigrationRunDetailView`, `OffendingRecordView`,
+  `MigrationRunViolationList`.
 - Lazy-migration progress endpoint (issue #56):
   `GET /v1/tenants/{tenant}/environments/{environment}/migration/progress` reports how far
   an environment's inbound lazy migration has come (total users, how many are on the native

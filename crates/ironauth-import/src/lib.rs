@@ -34,10 +34,12 @@
 
 pub mod engine;
 pub mod record;
+pub mod run;
 pub mod scheme;
 
 pub use engine::{ImportContext, ImportReport, RecordError, RecordOutcome, import_stream};
 pub use record::{
     ImportCredential, ImportRecord, RecordParseError, parse_record_line, to_record_line,
 };
+pub use run::import_into_run;
 pub use scheme::{ForeignHash, HashError, Scheme};

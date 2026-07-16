@@ -53,6 +53,7 @@ mod input;
 mod invitations;
 mod keys;
 mod migration;
+mod migration_runs;
 mod migration_status;
 mod openapi;
 mod operators;
@@ -178,6 +179,22 @@ pub fn management_router(state: AdminState) -> Router {
         .route(
             "/v1/tenants/{tenant_id}/environments/{environment_id}/migration/progress",
             get(migration_status::get_migration_progress),
+        )
+        // The migration state-machine operator view (issue #59): list a scope's runs,
+        // read one run's state with its per-state counts and LIVE invariant evaluations,
+        // and page the records violating an invariant. Environment-scoped reads. Static
+        // `migration-runs` suffix, matched before the parameterized keys/organizations routes.
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/migration-runs",
+            get(migration_runs::list_migration_runs),
+        )
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/migration-runs/{run_id}",
+            get(migration_runs::get_migration_run),
+        )
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/migration-runs/{run_id}/violations",
+            get(migration_runs::list_migration_run_violations),
         )
         // Server-side config promotion (issue #44): the write half of the flagship.
         // A dry-run PLAN and a transactional APPLY into the target environment.

@@ -68,10 +68,10 @@ use crate::id::{
     BackChannelDeliveryId, ClientId, ClientSessionId, ConsentId, CorrelationId, CredentialId,
     CustomDomainId, DcrPolicyId, DekId, DeviceCodeId, EncryptedSecretId, EnvironmentId,
     EnvironmentSecretId, ExternalIssuerId, GrantId, InitialAccessTokenId, InvitationId,
-    IssuedTokenId, KekId, ManagementKeyId, OperatorId, OrganizationId, PushedRequestId,
-    RefreshFamilyId, RefreshTokenId, ResourceServerId, ServiceAccountId, SessionEventId, SessionId,
-    SigningKeyId, TenantId, TraitMigrationJobId, TraitSchemaId, UserId, UserIdentifierId,
-    VariableId,
+    IssuedTokenId, KekId, ManagementKeyId, MigrationRunId, MigrationRunRecordId, OperatorId,
+    OrganizationId, PushedRequestId, RefreshFamilyId, RefreshTokenId, ResourceServerId,
+    ServiceAccountId, SessionEventId, SessionId, SigningKeyId, TenantId, TraitMigrationJobId,
+    TraitSchemaId, UserId, UserIdentifierId, VariableId,
 };
 use crate::identifier::{
     CanonicalIdentifier, IdentifierType, UniquenessMode, canonicalize_identifier,
@@ -21447,5 +21447,1166 @@ impl ActingUserRepo<'_> {
         )
         .await?;
         Ok(schema_version)
+    }
+}
+
+// ===========================================================================
+// Migrations as an invariant-checked state machine (issue #59, exploratory).
+//
+// A long-running data migration (a streaming bulk import, a schema migration job,
+// and, by design, a tenant move) is wrapped in an explicit state machine whose
+// `complete` state is GATED: it is reachable only when every invariant re-evaluates
+// satisfied. The state is a POINTER persisted on `migration_runs`; no verdict is ever
+// cached, so every completion attempt and every operator read RE-EVALUATES the
+// invariants with live SQL over `migration_run_records`, and the machine survives a
+// process restart intact (re-opening the store and re-evaluating reproduces the exact
+// verdict). Every transition routes through `write_audited`, so it is attributable.
+//
+// All SQL against the scoped `migration_runs` and `migration_run_records` tables lives
+// here (the query-audit rule). A record's natural subject can be end-user PII, so it is
+// stored only as a blind index and a sealed value (issue #48), never plaintext.
+// ===========================================================================
+
+/// The associated-data label sealing a `migration_run_records.subject_sealed` value
+/// (issue #59). A distinct label keeps a migration-record-subject seal from ever
+/// authenticating under any other sealed-payload context.
+const MIGRATION_RECORD_SUBJECT_SEAL_LABEL: &str = "ironauth.envelope.migration-record-subject.v1";
+
+/// The associated-data label deriving a `migration_run_records.subject_bidx` (issue
+/// #59): a keyed per-tenant HMAC tag, never a bare hash, so the same subject in two
+/// tenants maps to two different tags.
+const MIGRATION_RECORD_SUBJECT_BIDX_LABEL: &str =
+    "ironauth.envelope.migration-record-subject-bidx.v1";
+
+/// The associated data binding a sealed migration-record subject to its scope and the
+/// DEK version that sealed it.
+fn migration_record_subject_seal_aad(scope: Scope, dek_version: i32) -> Aad {
+    Aad::builder()
+        .text(MIGRATION_RECORD_SUBJECT_SEAL_LABEL)
+        .text(&scope.tenant().to_string())
+        .text(&scope.environment().to_string())
+        .version(i64::from(dek_version))
+        .build()
+}
+
+/// The blind-index context for a migration-record subject: the label, the scope, and
+/// the subject value, length-prefixed.
+fn migration_record_subject_bidx_aad(scope: Scope, subject: &str) -> Aad {
+    Aad::builder()
+        .text(MIGRATION_RECORD_SUBJECT_BIDX_LABEL)
+        .text(&scope.tenant().to_string())
+        .text(&scope.environment().to_string())
+        .field(subject.as_bytes())
+        .build()
+}
+
+/// The deterministic blind index for a migration-record `subject` in `scope` under
+/// `master`, the value the per-run dedup index and a backfill mark query against.
+fn migration_record_subject_blind_index(
+    master: &MasterKey,
+    scope: Scope,
+    subject: &str,
+) -> BlindIndex {
+    master.blind_index(&migration_record_subject_bidx_aad(scope, subject))
+}
+
+/// The wrapped-workload type of a migration run (issue #59). A tenant move (M5) fits
+/// the same model and is a documented future value, deliberately not in the closed set
+/// until it is wired.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MigrationKind {
+    /// A streaming bulk import (issue #55).
+    BulkImport,
+    /// A schema migration job (issue #53).
+    SchemaMigration,
+}
+
+impl MigrationKind {
+    /// The stable wire string stored in `migration_runs.kind`.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MigrationKind::BulkImport => "bulk_import",
+            MigrationKind::SchemaMigration => "schema_migration",
+        }
+    }
+
+    /// Reconstruct a kind from its wire string, or [`None`] for an unknown value.
+    #[must_use]
+    pub fn from_wire(value: &str) -> Option<Self> {
+        match value {
+            "bulk_import" => Some(MigrationKind::BulkImport),
+            "schema_migration" => Some(MigrationKind::SchemaMigration),
+            _ => None,
+        }
+    }
+}
+
+/// A named state of the migration state machine (issue #59).
+///
+/// The legal edges are: `defined -> validating -> running -> reconciling`, the
+/// `reconciling -> running` back edge (more work discovered), the GATED
+/// `reconciling -> complete` (only when every invariant re-evaluates satisfied, taken
+/// by [`ActingMigrationRunRepo::try_complete`]), and `<any non-terminal> -> abandoned`
+/// (the explicit audited giving-up, taken by [`ActingMigrationRunRepo::abandon`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MigrationState {
+    /// The run is defined: its source total and backfill expectation are recorded, but
+    /// nothing has executed.
+    Defined,
+    /// The underlying job's pre-flight validation is in progress.
+    Validating,
+    /// The underlying job is executing; records are being touched.
+    Running,
+    /// Execution finished; invariants are being evaluated and offending records
+    /// reconciled.
+    Reconciling,
+    /// Terminal success: reached only when every invariant re-evaluated satisfied.
+    Complete,
+    /// Terminal abandonment: an explicit, audited giving-up so a stuck half-applied
+    /// migration cannot be silently forgotten.
+    Abandoned,
+}
+
+impl MigrationState {
+    /// The stable wire string stored in `migration_runs.state`.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MigrationState::Defined => "defined",
+            MigrationState::Validating => "validating",
+            MigrationState::Running => "running",
+            MigrationState::Reconciling => "reconciling",
+            MigrationState::Complete => "complete",
+            MigrationState::Abandoned => "abandoned",
+        }
+    }
+
+    /// Reconstruct a state from its wire string, or [`None`] for an unknown value.
+    #[must_use]
+    pub fn from_wire(value: &str) -> Option<Self> {
+        match value {
+            "defined" => Some(MigrationState::Defined),
+            "validating" => Some(MigrationState::Validating),
+            "running" => Some(MigrationState::Running),
+            "reconciling" => Some(MigrationState::Reconciling),
+            "complete" => Some(MigrationState::Complete),
+            "abandoned" => Some(MigrationState::Abandoned),
+            _ => None,
+        }
+    }
+
+    /// Whether this is a terminal state (no further transition is legal).
+    #[must_use]
+    pub fn is_terminal(self) -> bool {
+        matches!(self, MigrationState::Complete | MigrationState::Abandoned)
+    }
+
+    /// Whether `to` is a legal NON-gated transition from `self`, the edges
+    /// [`ActingMigrationRunRepo::transition`] drives. The gated `-> complete` and the
+    /// `-> abandoned` edges are deliberately NOT here: they have their own methods so
+    /// completion is always invariant-checked and abandonment is always reason-audited.
+    #[must_use]
+    pub fn can_transition_to(self, to: MigrationState) -> bool {
+        match self {
+            MigrationState::Defined => matches!(to, MigrationState::Validating),
+            MigrationState::Running => matches!(to, MigrationState::Reconciling),
+            // Validating advances to running; reconciling takes the `-> running` BACK
+            // edge (more work discovered). The `reconciling -> complete` edge is
+            // deliberately gated elsewhere (try_complete), never here.
+            MigrationState::Validating | MigrationState::Reconciling => {
+                matches!(to, MigrationState::Running)
+            }
+            MigrationState::Complete | MigrationState::Abandoned => false,
+        }
+    }
+}
+
+/// The accounting bucket of one processed source record (issue #59). Every touched
+/// record lands in exactly one bucket, so their sum is the count invariant's accounted
+/// total.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MigrationRecordOutcome {
+    /// The record was imported / migrated successfully.
+    Imported,
+    /// The record failed (a parse error, a failed transform, a failed re-validation).
+    Failed,
+    /// The record was explicitly skipped (an idempotent duplicate).
+    Skipped,
+}
+
+impl MigrationRecordOutcome {
+    /// The stable wire string stored in `migration_run_records.outcome`.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MigrationRecordOutcome::Imported => "imported",
+            MigrationRecordOutcome::Failed => "failed",
+            MigrationRecordOutcome::Skipped => "skipped",
+        }
+    }
+
+    /// Reconstruct an outcome from its wire string, or [`None`] for an unknown value.
+    #[must_use]
+    pub fn from_wire(value: &str) -> Option<Self> {
+        match value {
+            "imported" => Some(MigrationRecordOutcome::Imported),
+            "failed" => Some(MigrationRecordOutcome::Failed),
+            "skipped" => Some(MigrationRecordOutcome::Skipped),
+            _ => None,
+        }
+    }
+}
+
+/// One per-record outcome to ingest into a run (issue #59). The subject is the record's
+/// natural key (a `usr_` id, or a bulk-import record key); it is blind-indexed and
+/// sealed on write, never stored plaintext.
+#[derive(Debug, Clone, Copy)]
+pub struct RecordOutcomeInput<'a> {
+    /// The record's natural subject.
+    pub subject: &'a str,
+    /// The accounting bucket.
+    pub outcome: MigrationRecordOutcome,
+    /// Whether the identity is in a consistent state.
+    pub consistent: bool,
+    /// Whether a backfill has marked this record (the sentinel).
+    pub backfilled: bool,
+    /// An operator-safe reason (no PII), or [`None`].
+    pub detail: Option<&'a str>,
+}
+
+/// Everything the run-create needs, bundled to keep the repository method within the
+/// readable-argument-count lint (issue #59).
+#[derive(Debug, Clone, Copy)]
+pub struct NewMigrationRun<'a> {
+    /// The wrapped-workload type.
+    pub kind: MigrationKind,
+    /// The ground-truth source record count the count invariant measures against.
+    pub source_total: i64,
+    /// The number of records the sentinel invariant requires backfill-marked.
+    pub backfill_expected: i64,
+    /// A non-PII link back to the wrapped job (a `tmj_` id or an import label).
+    pub subject_ref: Option<&'a str>,
+}
+
+/// A migration run as the operator view reports it (issue #59).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MigrationRun {
+    /// The run identifier (an `mgr_` id embedding its scope).
+    pub id: MigrationRunId,
+    /// The wrapped-workload type.
+    pub kind: MigrationKind,
+    /// The current lifecycle state.
+    pub state: MigrationState,
+    /// The ground-truth source record count.
+    pub source_total: i64,
+    /// The number of records a backfill must mark.
+    pub backfill_expected: i64,
+    /// The non-PII link back to the wrapped job.
+    pub subject_ref: Option<String>,
+    /// The operator-safe abandonment reason, when abandoned.
+    pub abandoned_reason: Option<String>,
+    /// Creation time, microseconds since the Unix epoch.
+    pub created_at_unix_micros: i64,
+}
+
+/// The per-state record tallies of a run (issue #59): the operator view's per-state
+/// counts, all re-derived live from `migration_run_records`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct MigrationRunTallies {
+    /// Records in the `imported` bucket.
+    pub imported: i64,
+    /// Records in the `failed` bucket.
+    pub failed: i64,
+    /// Records in the `skipped` bucket.
+    pub skipped: i64,
+    /// Records flagged inconsistent.
+    pub inconsistent: i64,
+    /// Records not yet backfill-marked.
+    pub unmarked_backfill: i64,
+    /// The total number of accounted records (the sum of the three buckets).
+    pub accounted: i64,
+}
+
+/// The invariant family an evaluation reports on (issue #59).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InvariantKind {
+    /// Source record count == imported + failed + skipped, no unaccounted remainder.
+    Count,
+    /// Zero identities in an inconsistent state at completion.
+    Consistency,
+    /// Every record touched by a backfill is marked; any unmarked record blocks.
+    BackfillSentinel,
+}
+
+impl InvariantKind {
+    /// The stable wire string the operator view reports.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            InvariantKind::Count => "count",
+            InvariantKind::Consistency => "consistency",
+            InvariantKind::BackfillSentinel => "backfill_sentinel",
+        }
+    }
+}
+
+/// One invariant's LIVE evaluation (issue #59): whether it is satisfied, an
+/// operator-safe description of its current values, and how many records violate it.
+/// Re-derived from the database at check time, never a cached verdict.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InvariantEvaluation {
+    /// The invariant family.
+    pub kind: InvariantKind,
+    /// Whether the invariant is currently satisfied.
+    pub satisfied: bool,
+    /// An operator-safe description of the invariant's current values (no PII).
+    pub current_value: String,
+    /// The number of records currently violating this invariant.
+    pub offending_count: i64,
+}
+
+/// The outcome of a completion attempt (issue #59): a legitimate NON-error result the
+/// caller inspects. Blocking is not an error; it is the state machine doing its job.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CompletionOutcome {
+    /// The run transitioned to `complete`; every invariant re-evaluated satisfied.
+    Completed,
+    /// Completion was refused; the carried invariants are the ones currently violated.
+    /// The run stays in `reconciling` and no completion audit row is written.
+    Blocked(Vec<InvariantEvaluation>),
+}
+
+/// One record violating an invariant, as the paginated operator violation view reports
+/// it (issue #59). The subject is opened for the authorized operator; the detail is
+/// operator-safe (no PII).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OffendingRecord {
+    /// The record identifier (an `mrr_` id embedding its scope).
+    pub id: MigrationRunRecordId,
+    /// The record's natural subject, opened from its sealed value.
+    pub subject: String,
+    /// The accounting bucket.
+    pub outcome: MigrationRecordOutcome,
+    /// Whether the identity is in a consistent state.
+    pub consistent: bool,
+    /// Whether a backfill has marked this record.
+    pub backfilled: bool,
+    /// An operator-safe reason, when recorded.
+    pub detail: Option<String>,
+    /// Creation time, microseconds since the Unix epoch.
+    pub created_at_unix_micros: i64,
+}
+
+/// Build a [`MigrationRun`] from a selected row.
+fn migration_run_from_row(scope: Scope, row: &PgRow) -> Result<MigrationRun, StoreError> {
+    let id = MigrationRunId::parse_in_scope(&row.get::<String, _>("id"), &scope)?;
+    let kind =
+        MigrationKind::from_wire(&row.get::<String, _>("kind")).ok_or(StoreError::NotFound)?;
+    let state =
+        MigrationState::from_wire(&row.get::<String, _>("state")).ok_or(StoreError::NotFound)?;
+    Ok(MigrationRun {
+        id,
+        kind,
+        state,
+        source_total: row.get("source_total"),
+        backfill_expected: row.get("backfill_expected"),
+        subject_ref: row.get("subject_ref"),
+        abandoned_reason: row.get("abandoned_reason"),
+        created_at_unix_micros: row.get("created_us"),
+    })
+}
+
+/// The column list every run read selects.
+const MIGRATION_RUN_COLUMNS: &str = "id, kind, state, source_total, backfill_expected, \
+     subject_ref, abandoned_reason, \
+     (EXTRACT(EPOCH FROM created_at) * 1000000)::bigint AS created_us";
+
+/// The raw per-run tallies query, run inside the caller's scoped transaction. Returns
+/// (accounted, imported, failed, skipped, inconsistent, unmarked, marked).
+async fn run_record_counts(
+    tx: &mut Transaction<'_, Postgres>,
+    scope: Scope,
+    run_id: &str,
+) -> Result<(i64, i64, i64, i64, i64, i64, i64), StoreError> {
+    let row = sqlx::query(
+        "SELECT \
+            count(*) AS accounted, \
+            count(*) FILTER (WHERE outcome = 'imported') AS imported, \
+            count(*) FILTER (WHERE outcome = 'failed') AS failed, \
+            count(*) FILTER (WHERE outcome = 'skipped') AS skipped, \
+            count(*) FILTER (WHERE consistent = false) AS inconsistent, \
+            count(*) FILTER (WHERE backfilled = false) AS unmarked, \
+            count(*) FILTER (WHERE backfilled = true) AS marked \
+         FROM migration_run_records \
+         WHERE tenant_id = $1 AND environment_id = $2 AND run_id = $3",
+    )
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .bind(run_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    Ok((
+        row.get("accounted"),
+        row.get("imported"),
+        row.get("failed"),
+        row.get("skipped"),
+        row.get("inconsistent"),
+        row.get("unmarked"),
+        row.get("marked"),
+    ))
+}
+
+/// Evaluate all three invariant families LIVE, inside the caller's scoped transaction,
+/// against the run's records and the run's declared thresholds. This is the single
+/// evaluator both the read-only operator view and the gated completion path call, so a
+/// completion verdict and an operator's view can never diverge.
+async fn evaluate_invariants_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    scope: Scope,
+    run_id: &str,
+    source_total: i64,
+    backfill_expected: i64,
+) -> Result<Vec<InvariantEvaluation>, StoreError> {
+    let (accounted, imported, failed, skipped, inconsistent, unmarked, marked) =
+        run_record_counts(tx, scope, run_id).await?;
+
+    let remainder = source_total - accounted;
+    let count = InvariantEvaluation {
+        kind: InvariantKind::Count,
+        satisfied: remainder == 0,
+        current_value: format!(
+            "source_total={source_total} imported={imported} failed={failed} \
+             skipped={skipped} accounted={accounted} remainder={remainder}"
+        ),
+        offending_count: remainder.abs(),
+    };
+
+    let consistency = InvariantEvaluation {
+        kind: InvariantKind::Consistency,
+        satisfied: inconsistent == 0,
+        current_value: format!("inconsistent={inconsistent} accounted={accounted}"),
+        offending_count: inconsistent,
+    };
+
+    let shortfall = (backfill_expected - marked).max(0);
+    let sentinel = InvariantEvaluation {
+        kind: InvariantKind::BackfillSentinel,
+        satisfied: unmarked == 0 && marked >= backfill_expected,
+        current_value: format!("marked={marked} expected={backfill_expected} unmarked={unmarked}"),
+        offending_count: unmarked + shortfall,
+    };
+
+    Ok(vec![count, consistency, sentinel])
+}
+
+/// The read-only migration-run repository for a scope (issue #59).
+pub struct MigrationRunRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl MigrationRunRepo<'_> {
+    /// Fetch one run by id, within scope. A run absent in this scope (including a
+    /// cross-scope id) is the uniform [`StoreError::NotFound`].
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if no such run is visible; [`StoreError::Database`] on a
+    /// persistence failure.
+    pub async fn get(&self, id: &MigrationRunId) -> Result<MigrationRun, StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(&format!(
+            "SELECT {MIGRATION_RUN_COLUMNS} FROM migration_runs \
+             WHERE id = $1 AND tenant_id = $2 AND environment_id = $3"
+        ))
+        .bind(id.to_string())
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        let row = row.ok_or(StoreError::NotFound)?;
+        migration_run_from_row(self.scope, &row)
+    }
+
+    /// A page of runs in this scope, newest-stable-first, keyset-paginated by
+    /// `(created_at, id)`.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn list(
+        &self,
+        limit: i64,
+        after: Option<&CursorPosition>,
+    ) -> Result<Vec<MigrationRun>, StoreError> {
+        let (after_micros, after_id) = split_cursor(after);
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let rows = sqlx::query(&format!(
+            "SELECT {MIGRATION_RUN_COLUMNS} FROM migration_runs \
+             WHERE tenant_id = $1 AND environment_id = $2 \
+             AND ($3::bigint IS NULL OR (created_at, id) > \
+                  (TIMESTAMPTZ 'epoch' + ($3::text || ' microseconds')::interval, $4::text)) \
+             ORDER BY created_at, id LIMIT $5"
+        ))
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(after_micros)
+        .bind(after_id)
+        .bind(limit.clamp(1, MANAGEMENT_LIST_HARD_CAP + 1))
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        rows.iter()
+            .map(|row| migration_run_from_row(self.scope, row))
+            .collect()
+    }
+
+    /// The run's live per-state record tallies (issue #59): re-derived from
+    /// `migration_run_records` on every call, never cached.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the run is absent; [`StoreError::Database`] on a
+    /// persistence failure.
+    pub async fn tallies(&self, id: &MigrationRunId) -> Result<MigrationRunTallies, StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        // Prove the run exists in scope before reporting tallies for it.
+        let exists: bool = sqlx::query(
+            "SELECT EXISTS ( SELECT 1 FROM migration_runs \
+             WHERE id = $1 AND tenant_id = $2 AND environment_id = $3 ) AS present",
+        )
+        .bind(id.to_string())
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .fetch_one(&mut *tx)
+        .await?
+        .get("present");
+        if !exists {
+            return Err(StoreError::NotFound);
+        }
+        let (accounted, imported, failed, skipped, inconsistent, unmarked, _marked) =
+            run_record_counts(&mut tx, self.scope, &id.to_string()).await?;
+        tx.commit().await?;
+        Ok(MigrationRunTallies {
+            imported,
+            failed,
+            skipped,
+            inconsistent,
+            unmarked_backfill: unmarked,
+            accounted,
+        })
+    }
+
+    /// Evaluate all three invariant families for the run, LIVE from the database (issue
+    /// #59). This is the exact evaluation the gated completion path runs; calling it
+    /// never mutates anything, so an operator can read the current verdict at will.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the run is absent; [`StoreError::Database`] on a
+    /// persistence failure.
+    pub async fn evaluate(
+        &self,
+        id: &MigrationRunId,
+    ) -> Result<Vec<InvariantEvaluation>, StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let run = sqlx::query(
+            "SELECT source_total, backfill_expected FROM migration_runs \
+             WHERE id = $1 AND tenant_id = $2 AND environment_id = $3",
+        )
+        .bind(id.to_string())
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or(StoreError::NotFound)?;
+        let source_total: i64 = run.get("source_total");
+        let backfill_expected: i64 = run.get("backfill_expected");
+        let evals = evaluate_invariants_in_tx(
+            &mut tx,
+            self.scope,
+            &id.to_string(),
+            source_total,
+            backfill_expected,
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(evals)
+    }
+
+    /// A page of the records currently VIOLATING `invariant`, opened and keyset-
+    /// paginated by `(created_at, id)` (issue #59). The count invariant's discrepancy is
+    /// an aggregate with no enumerable offending rows, so it returns an empty page; the
+    /// consistency and sentinel invariants return their inconsistent / unmarked records.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the run is absent; [`StoreError::Encryption`] if no
+    /// master key is configured or a sealed subject cannot be opened;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn list_violations(
+        &self,
+        id: &MigrationRunId,
+        invariant: InvariantKind,
+        limit: i64,
+        after: Option<&CursorPosition>,
+    ) -> Result<Vec<OffendingRecord>, StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        // The count invariant is a scalar discrepancy with no enumerable rows.
+        if matches!(invariant, InvariantKind::Count) {
+            return Ok(Vec::new());
+        }
+        let master = self.store.master().ok_or(StoreError::Encryption)?;
+        let predicate = match invariant {
+            InvariantKind::Consistency => "consistent = false",
+            InvariantKind::BackfillSentinel => "backfilled = false",
+            InvariantKind::Count => unreachable!("count returns early above"),
+        };
+        let (after_micros, after_id) = split_cursor(after);
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let rows = sqlx::query(&format!(
+            "SELECT id, subject_sealed, subject_dek_version, outcome, consistent, backfilled, \
+             detail, (EXTRACT(EPOCH FROM created_at) * 1000000)::bigint AS created_us \
+             FROM migration_run_records \
+             WHERE tenant_id = $1 AND environment_id = $2 AND run_id = $3 AND {predicate} \
+             AND ($4::bigint IS NULL OR (created_at, id) > \
+                  (TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval, $5::text)) \
+             ORDER BY created_at, id LIMIT $6"
+        ))
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(id.to_string())
+        .bind(after_micros)
+        .bind(after_id)
+        .bind(limit.clamp(1, MANAGEMENT_LIST_HARD_CAP + 1))
+        .fetch_all(&mut *tx)
+        .await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in &rows {
+            out.push(offending_record_from_row(&mut tx, self.scope, master, row).await?);
+        }
+        tx.commit().await?;
+        Ok(out)
+    }
+}
+
+/// Open one offending record from a selected row, decrypting its sealed subject.
+async fn offending_record_from_row(
+    tx: &mut Transaction<'_, Postgres>,
+    scope: Scope,
+    master: &MasterKey,
+    row: &PgRow,
+) -> Result<OffendingRecord, StoreError> {
+    let id = MigrationRunRecordId::parse_in_scope(&row.get::<String, _>("id"), &scope)?;
+    let outcome = MigrationRecordOutcome::from_wire(&row.get::<String, _>("outcome"))
+        .ok_or(StoreError::NotFound)?;
+    let dek_version: i32 = row.get("subject_dek_version");
+    let sealed: Vec<u8> = row.get("subject_sealed");
+    let dek = fetch_dek_by_version(tx, scope, master, dek_version).await?;
+    let subject_bytes = dek.open(
+        &migration_record_subject_seal_aad(scope, dek_version),
+        &Sealed::from_bytes(sealed)?,
+    )?;
+    let subject = String::from_utf8(subject_bytes).map_err(|_| StoreError::Encryption)?;
+    Ok(OffendingRecord {
+        id,
+        subject,
+        outcome,
+        consistent: row.get("consistent"),
+        backfilled: row.get("backfilled"),
+        detail: row.get("detail"),
+        created_at_unix_micros: row.get("created_us"),
+    })
+}
+
+/// The mutating migration-run repository for a scope and actor (issue #59).
+pub struct ActingMigrationRunRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+    acting: ActingContext,
+}
+
+impl ActingMigrationRunRepo<'_> {
+    /// Define a new run in the `defined` state. Writes a `migration_run.create` audit
+    /// row in the same transaction.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn create(
+        &self,
+        env: &Env,
+        spec: NewMigrationRun<'_>,
+        created_at_micros: i64,
+    ) -> Result<MigrationRunId, StoreError> {
+        let scope = self.scope;
+        let id = MigrationRunId::generate(env, &scope);
+        let subject_ref = spec.subject_ref.map(str::to_string);
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::MigrationRunCreate,
+                target: &id,
+            },
+            async move |tx| {
+                sqlx::query(
+                    "INSERT INTO migration_runs \
+                     (id, tenant_id, environment_id, kind, state, source_total, \
+                      backfill_expected, subject_ref, created_at, updated_at) \
+                     VALUES ($1, $2, $3, $4, 'defined', $5, $6, $7, \
+                             TIMESTAMPTZ 'epoch' + ($8::text || ' microseconds')::interval, \
+                             TIMESTAMPTZ 'epoch' + ($8::text || ' microseconds')::interval)",
+                )
+                .bind(id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(spec.kind.as_str())
+                .bind(spec.source_total)
+                .bind(spec.backfill_expected)
+                .bind(subject_ref)
+                .bind(created_at_micros)
+                .execute(&mut **tx)
+                .await?;
+                Ok(())
+            },
+            false,
+        )
+        .await?;
+        Ok(id)
+    }
+
+    /// Drive a NON-gated lifecycle transition (`defined -> validating -> running ->
+    /// reconciling`, or the `reconciling -> running` back edge). Writes a
+    /// `migration_run.transition` audit row recording the target state.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the run is absent;
+    /// [`StoreError::IllegalMigrationTransition`] if the edge is not legal (use
+    /// [`ActingMigrationRunRepo::try_complete`] for `-> complete` and
+    /// [`ActingMigrationRunRepo::abandon`] for `-> abandoned`);
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn transition(
+        &self,
+        env: &Env,
+        run_id: &MigrationRunId,
+        to: MigrationState,
+    ) -> Result<(), StoreError> {
+        if run_id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let now_micros = epoch_micros(env.clock().now_utc());
+        let detail = to.as_str();
+        write_audited_detailed(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::MigrationRunTransition,
+                target: run_id,
+            },
+            async move |tx| {
+                let current = lock_run_state(tx, scope, &run_id.to_string()).await?;
+                if !current.can_transition_to(to) {
+                    return Err(StoreError::IllegalMigrationTransition {
+                        from: current.as_str(),
+                        to: to.as_str(),
+                    });
+                }
+                sqlx::query(
+                    "UPDATE migration_runs SET state = $1, \
+                     updated_at = TIMESTAMPTZ 'epoch' + ($2::text || ' microseconds')::interval \
+                     WHERE id = $3 AND tenant_id = $4 AND environment_id = $5",
+                )
+                .bind(to.as_str())
+                .bind(now_micros)
+                .bind(run_id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .execute(&mut **tx)
+                .await?;
+                Ok(())
+            },
+            false,
+            Some(detail),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Ingest a batch of per-record outcomes into a run (issue #59). Each subject is
+    /// blind-indexed and sealed (never plaintext); a subject already accounted in this
+    /// run is skipped (idempotent, so a resumed ingest never double-counts). Writes ONE
+    /// `migration_run.ingest` audit row for the batch (record inserts are data, not
+    /// individually attributable transitions).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the run is absent;
+    /// [`StoreError::IllegalMigrationTransition`] if the run is terminal;
+    /// [`StoreError::Encryption`] if no master key is configured; [`StoreError::Database`]
+    /// on a persistence failure.
+    pub async fn ingest_outcomes(
+        &self,
+        env: &Env,
+        run_id: &MigrationRunId,
+        outcomes: &[RecordOutcomeInput<'_>],
+    ) -> Result<(), StoreError> {
+        if run_id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let master = self.store.master().ok_or(StoreError::Encryption)?;
+        let scope = self.scope;
+        // The scope needs a live KEK/DEK before the first subject seal; provision them
+        // lazily (idempotent) outside the ingest transaction.
+        self.ensure_scope_keys(env, master).await?;
+        let now_micros = epoch_micros(env.clock().now_utc());
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::MigrationRunIngest,
+                target: run_id,
+            },
+            async move |tx| {
+                let state = lock_run_state(tx, scope, &run_id.to_string()).await?;
+                if state.is_terminal() {
+                    return Err(StoreError::IllegalMigrationTransition {
+                        from: state.as_str(),
+                        to: "ingest",
+                    });
+                }
+                let (dek_version, dek) = fetch_active_dek(tx, scope, master).await?;
+                for outcome in outcomes {
+                    let record_id = MigrationRunRecordId::generate(env, &scope);
+                    let bidx =
+                        migration_record_subject_blind_index(master, scope, outcome.subject);
+                    let sealed = dek.seal(
+                        env.entropy(),
+                        &migration_record_subject_seal_aad(scope, dek_version),
+                        outcome.subject.as_bytes(),
+                    );
+                    sqlx::query(
+                        "INSERT INTO migration_run_records \
+                         (id, tenant_id, environment_id, run_id, subject_bidx, subject_sealed, \
+                          subject_dek_version, outcome, consistent, backfilled, detail, created_at) \
+                         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, \
+                                 TIMESTAMPTZ 'epoch' + ($12::text || ' microseconds')::interval) \
+                         ON CONFLICT (tenant_id, environment_id, run_id, subject_bidx) DO NOTHING",
+                    )
+                    .bind(record_id.to_string())
+                    .bind(scope.tenant().to_string())
+                    .bind(scope.environment().to_string())
+                    .bind(run_id.to_string())
+                    .bind(bidx.into_bytes())
+                    .bind(sealed.into_bytes())
+                    .bind(dek_version)
+                    .bind(outcome.outcome.as_str())
+                    .bind(outcome.consistent)
+                    .bind(outcome.backfilled)
+                    .bind(outcome.detail)
+                    .bind(now_micros)
+                    .execute(&mut **tx)
+                    .await?;
+                }
+                Ok(())
+            },
+            false,
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Mark a batch of records backfill-touched (the sentinel), by subject. A subject
+    /// with no record in this run is silently ignored. Writes ONE
+    /// `migration_run.backfill` audit row for the batch.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the run is absent; [`StoreError::Encryption`] if no
+    /// master key is configured; [`StoreError::Database`] on a persistence failure.
+    pub async fn mark_backfill(
+        &self,
+        env: &Env,
+        run_id: &MigrationRunId,
+        subjects: &[&str],
+    ) -> Result<(), StoreError> {
+        if run_id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let master = self.store.master().ok_or(StoreError::Encryption)?;
+        let scope = self.scope;
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::MigrationRunBackfill,
+                target: run_id,
+            },
+            async move |tx| {
+                for subject in subjects {
+                    let bidx = migration_record_subject_blind_index(master, scope, subject);
+                    sqlx::query(
+                        "UPDATE migration_run_records SET backfilled = true \
+                         WHERE tenant_id = $1 AND environment_id = $2 AND run_id = $3 \
+                         AND subject_bidx = $4",
+                    )
+                    .bind(scope.tenant().to_string())
+                    .bind(scope.environment().to_string())
+                    .bind(run_id.to_string())
+                    .bind(bidx.into_bytes())
+                    .execute(&mut **tx)
+                    .await?;
+                }
+                Ok(())
+            },
+            false,
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Attempt to complete the run: the GATED `reconciling -> complete` transition. The
+    /// invariants are RE-EVALUATED live under the run's row lock; the transition is
+    /// taken (and a `migration_run.complete` audit row written) ONLY when every one is
+    /// satisfied. Otherwise the run stays in `reconciling`, nothing is written, and the
+    /// violated invariants are returned. Idempotent: a run already `complete` returns
+    /// [`CompletionOutcome::Completed`].
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the run is absent;
+    /// [`StoreError::IllegalMigrationTransition`] if the run is not in `reconciling`
+    /// (nor already `complete`); [`StoreError::Database`] on a persistence failure.
+    pub async fn try_complete(
+        &self,
+        env: &Env,
+        run_id: &MigrationRunId,
+    ) -> Result<CompletionOutcome, StoreError> {
+        if run_id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let now_micros = epoch_micros(env.clock().now_utc());
+        // A custom inlined audited transaction: the completion audit row is written
+        // ONLY on the satisfied path, so a blocked attempt leaves no trail and no
+        // mutation. The run row is locked FOR UPDATE, then the invariants are
+        // re-evaluated in the SAME transaction, so a concurrent ingest cannot race a
+        // violation past the gate.
+        let mut tx = begin_scoped(self.store, scope).await?;
+        let run = sqlx::query(
+            "SELECT state, source_total, backfill_expected FROM migration_runs \
+             WHERE id = $1 AND tenant_id = $2 AND environment_id = $3 FOR UPDATE",
+        )
+        .bind(run_id.to_string())
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or(StoreError::NotFound)?;
+        let state = MigrationState::from_wire(&run.get::<String, _>("state"))
+            .ok_or(StoreError::NotFound)?;
+        // Idempotent: an already-complete run needs no re-evaluation.
+        if matches!(state, MigrationState::Complete) {
+            tx.commit().await?;
+            return Ok(CompletionOutcome::Completed);
+        }
+        if !matches!(state, MigrationState::Reconciling) {
+            return Err(StoreError::IllegalMigrationTransition {
+                from: state.as_str(),
+                to: "complete",
+            });
+        }
+        let source_total: i64 = run.get("source_total");
+        let backfill_expected: i64 = run.get("backfill_expected");
+        let evals = evaluate_invariants_in_tx(
+            &mut tx,
+            scope,
+            &run_id.to_string(),
+            source_total,
+            backfill_expected,
+        )
+        .await?;
+        let violated: Vec<InvariantEvaluation> =
+            evals.into_iter().filter(|e| !e.satisfied).collect();
+        if !violated.is_empty() {
+            // No mutation, no audit row: dropping the transaction rolls it back.
+            return Ok(CompletionOutcome::Blocked(violated));
+        }
+        sqlx::query(
+            "UPDATE migration_runs SET state = 'complete', \
+             updated_at = TIMESTAMPTZ 'epoch' + ($1::text || ' microseconds')::interval \
+             WHERE id = $2 AND tenant_id = $3 AND environment_id = $4",
+        )
+        .bind(now_micros)
+        .bind(run_id.to_string())
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .execute(&mut *tx)
+        .await?;
+        insert_audit_row(
+            &mut tx,
+            &AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::MigrationRunComplete,
+                target: run_id,
+            },
+            None,
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(CompletionOutcome::Completed)
+    }
+
+    /// Explicitly ABANDON the run (issue #59): the terminal `-> abandoned` transition,
+    /// legal from any non-terminal state, recording an operator-safe reason. Writes a
+    /// `migration_run.abandon` audit row carrying the reason as its detail, so a stuck
+    /// half-applied migration is never silently forgotten.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the run is absent;
+    /// [`StoreError::IllegalMigrationTransition`] if the run is already terminal;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn abandon(
+        &self,
+        env: &Env,
+        run_id: &MigrationRunId,
+        reason: &str,
+    ) -> Result<(), StoreError> {
+        if run_id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let now_micros = epoch_micros(env.clock().now_utc());
+        let reason_owned = reason.to_string();
+        write_audited_detailed(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::MigrationRunAbandon,
+                target: run_id,
+            },
+            async move |tx| {
+                let state = lock_run_state(tx, scope, &run_id.to_string()).await?;
+                if state.is_terminal() {
+                    return Err(StoreError::IllegalMigrationTransition {
+                        from: state.as_str(),
+                        to: "abandoned",
+                    });
+                }
+                sqlx::query(
+                    "UPDATE migration_runs SET state = 'abandoned', abandoned_reason = $1, \
+                     updated_at = TIMESTAMPTZ 'epoch' + ($2::text || ' microseconds')::interval \
+                     WHERE id = $3 AND tenant_id = $4 AND environment_id = $5",
+                )
+                .bind(&reason_owned)
+                .bind(now_micros)
+                .bind(run_id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .execute(&mut **tx)
+                .await?;
+                Ok(())
+            },
+            false,
+            Some(reason),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Provision the scope's KEK/DEK before the first subject seal (idempotent). Mirrors
+    /// the user-registration lazy provisioning; a scope that already has keys tolerates
+    /// the [`StoreError::Conflict`] a concurrent provision returns.
+    async fn ensure_scope_keys(&self, env: &Env, master: &MasterKey) -> Result<(), StoreError> {
+        let envelope = ActingEnvelopeRepo {
+            store: self.store,
+            scope: self.scope,
+            acting: self.acting,
+        };
+        match envelope.provision_kek(env, master).await {
+            Ok(_) | Err(StoreError::Conflict) => {}
+            Err(error) => return Err(error),
+        }
+        match envelope.provision_dek(env, master).await {
+            Ok(_) | Err(StoreError::Conflict) => {}
+            Err(error) => return Err(error),
+        }
+        Ok(())
+    }
+}
+
+/// Lock a run's row and read its current state (used by the transition methods so the
+/// legality check and the update are atomic under the row lock).
+async fn lock_run_state(
+    tx: &mut Transaction<'_, Postgres>,
+    scope: Scope,
+    run_id: &str,
+) -> Result<MigrationState, StoreError> {
+    let row = sqlx::query(
+        "SELECT state FROM migration_runs \
+         WHERE id = $1 AND tenant_id = $2 AND environment_id = $3 FOR UPDATE",
+    )
+    .bind(run_id)
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .fetch_optional(&mut **tx)
+    .await?
+    .ok_or(StoreError::NotFound)?;
+    MigrationState::from_wire(&row.get::<String, _>("state")).ok_or(StoreError::NotFound)
+}
+
+impl<'a> ScopedStore<'a> {
+    /// The read-only migration-run repository for this scope (issue #59): read a run,
+    /// list runs, its live per-state tallies, its live invariant evaluations, and a
+    /// paginated view of the records violating an invariant.
+    #[must_use]
+    pub fn migration_runs(&self) -> MigrationRunRepo<'a> {
+        MigrationRunRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+}
+
+impl<'a> ActingStore<'a> {
+    /// The mutating migration-run repository for this scope and actor (issue #59):
+    /// define a run, drive its transitions, ingest per-record outcomes, mark backfills,
+    /// attempt the invariant-gated completion, and abandon a stuck run.
+    #[must_use]
+    pub fn migration_runs(&self) -> ActingMigrationRunRepo<'a> {
+        ActingMigrationRunRepo {
+            store: self.store,
+            scope: self.scope,
+            acting: self.acting,
+        }
     }
 }

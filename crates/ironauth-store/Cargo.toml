@@ -284,6 +284,12 @@ name = "traits"
 path = "tests/traits.rs"
 required-features = ["testing"]
 
+# Migrations as an invariant-checked state machine (issue #59). Needs a real database.
+[[test]]
+name = "migration_state_machine"
+path = "tests/migration_state_machine.rs"
+required-features = ["testing"]
+
 # Compile-fail proofs. Database-free, so it runs on every lane (including MSRV).
 [[test]]
 name = "compile_fail"

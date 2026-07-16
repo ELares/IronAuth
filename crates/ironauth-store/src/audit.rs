@@ -306,6 +306,30 @@ pub enum Action {
     /// failed job is a no-op (idempotent), so a crash mid-migration resumes without
     /// double-migrating.
     TraitMigrationJobAdvance,
+    /// A wrapped migration RUN was defined (issue #59): a long-running data
+    /// migration (a streaming bulk import, a schema migration job) enrolled into the
+    /// invariant-checked state machine in its initial `defined` state.
+    MigrationRunCreate,
+    /// A wrapped migration run TRANSITIONED between lifecycle states (issue #59):
+    /// defined -> validating -> running -> reconciling. Every transition is audited
+    /// with actor attribution; the target state is the operator-safe `detail`.
+    MigrationRunTransition,
+    /// A batch of per-record OUTCOMES was ingested into a migration run (issue #59):
+    /// the imported / failed / skipped accounting and consistency the invariants
+    /// later re-evaluate. One audit row per ingest batch, not per record.
+    MigrationRunIngest,
+    /// A migration run's records were marked by a BACKFILL pass (issue #59): the
+    /// sentinel the backfill invariant requires set. One audit row per backfill batch.
+    MigrationRunBackfill,
+    /// A migration run COMPLETED (issue #59): the terminal success transition, taken
+    /// only after every invariant re-evaluated satisfied. A blocked completion
+    /// attempt writes NO row (it is not a transition), so a `migration_run.complete`
+    /// row in the trail always means the invariants were clean.
+    MigrationRunComplete,
+    /// A migration run was explicitly ABANDONED (issue #59): the terminal giving-up
+    /// transition, so a stuck half-applied migration cannot be silently forgotten.
+    /// The operator-safe reason is the audit row's `detail`.
+    MigrationRunAbandon,
     /// A bootstrap session was established at login or registration (issue #20).
     SessionCreate,
     /// An SSO session identifier was ROTATED at a privilege transition (issue #32):
@@ -603,6 +627,12 @@ impl Action {
             Action::TraitSchemaActivate => "trait_schema.activate",
             Action::TraitMigrationJobCreate => "trait_migration_job.create",
             Action::TraitMigrationJobAdvance => "trait_migration_job.advance",
+            Action::MigrationRunCreate => "migration_run.create",
+            Action::MigrationRunTransition => "migration_run.transition",
+            Action::MigrationRunIngest => "migration_run.ingest",
+            Action::MigrationRunBackfill => "migration_run.backfill",
+            Action::MigrationRunComplete => "migration_run.complete",
+            Action::MigrationRunAbandon => "migration_run.abandon",
             Action::SessionCreate => "session.create",
             Action::SessionRotate => "session.rotate",
             Action::SessionRevoke => "session.revoke",

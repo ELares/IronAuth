@@ -67,6 +67,7 @@ fn operation_ids_are_the_stable_set() {
             "getInvitation",
             "getManagementKey",
             "getMigrationProgress",
+            "getMigrationRun",
             "getOperator",
             "getOrganization",
             "getRefreshFamily",
@@ -78,6 +79,8 @@ fn operation_ids_are_the_stable_set() {
             "listEnvironments",
             "listInvitations",
             "listManagementKeys",
+            "listMigrationRunViolations",
+            "listMigrationRuns",
             "listOperators",
             "listOrganizations",
             "listRefreshFamilies",
@@ -129,6 +132,8 @@ fn every_list_endpoint_documents_cursor_pagination() {
         "listRefreshFamilies",
         "listUsers",
         "listInvitations",
+        "listMigrationRuns",
+        "listMigrationRunViolations",
     ] {
         let params = find_operation(&doc, op)["parameters"]
             .as_array()
@@ -226,6 +231,9 @@ fn documented_paths_are_the_expected_set() {
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/invitations/{invitation_id}",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/keys",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/keys/{key_id}",
+            "GET /v1/tenants/{tenant_id}/environments/{environment_id}/migration-runs",
+            "GET /v1/tenants/{tenant_id}/environments/{environment_id}/migration-runs/{run_id}",
+            "GET /v1/tenants/{tenant_id}/environments/{environment_id}/migration-runs/{run_id}/violations",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/migration/progress",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/organizations",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}",
@@ -296,7 +304,7 @@ fn committed_artifact_matches_generated_spec() {
 async fn served_routes_match_documented_routes() {
     let router = db_free_router();
     let documented = documented_method_paths();
-    assert_eq!(documented.len(), 53, "the documented route count is pinned");
+    assert_eq!(documented.len(), 56, "the documented route count is pinned");
 
     // The OUTBOUND lazy-migration endpoint (issue #58) is the one documented route
     // that is NOT gated by the management `Principal` at 401. It is DISABLED BY

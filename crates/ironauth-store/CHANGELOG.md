@@ -6,6 +6,28 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Migrations as an invariant-checked state machine (issue #59, exploratory, migration
+  0043, expand): a wrapped long-running migration walks an explicit, audited state
+  machine (`defined -> validating -> running -> reconciling -> complete | abandoned`)
+  whose `complete` state is GATED. `ActingMigrationRunRepo::try_complete` re-evaluates
+  three invariant families LIVE from the database on every attempt (never a cached
+  verdict) and refuses the transition while any is violated: the COUNT invariant
+  (`source_total == imported + failed + skipped`, no unaccounted remainder), the
+  CONSISTENCY invariant (zero inconsistent identities), and the BACKFILL SENTINEL (every
+  touched record marked). `MigrationRunRepo` exposes the run, its live per-state
+  tallies, its live invariant evaluations, and a paginated view of the records
+  violating an invariant; `abandon` is an explicit audited terminal transition. Two new
+  tenant-scoped tables (`migration_runs`, `migration_run_records`) with forced RLS, the
+  `(tenant, environment)` isolation policy, closed-set CHECKs, and column-scoped grants;
+  a record's natural subject is envelope-sealed and blind-indexed (issue #48), never
+  plaintext. Every transition is audited via `write_audited` with actor attribution
+  (`migration_run.create` / `.transition` / `.ingest` / `.backfill` / `.complete` /
+  `.abandon`). Applied to two concrete kinds (bulk import #55 via `ironauth-import`,
+  schema migration jobs #53); a tenant move (M5) fits the same model without being
+  wired. New public types: `MigrationRun{,Id,Kind,RecordId,RecordKind}`,
+  `MigrationState`, `MigrationRecordOutcome`, `NewMigrationRun`, `RecordOutcomeInput`,
+  `MigrationRunTallies`, `InvariantKind`, `InvariantEvaluation`, `CompletionOutcome`,
+  `OffendingRecord`, and the `migration_runs()` accessors on `ScopedStore` / `ActingStore`.
 - `UserRepo::migration_progress` (issue #56): a scoped, master-key-free count of the
   environment's lazy-migration progress (total live users and how many still carry an
   imported foreign password hash, the #55 straggler tail). Returns the new
