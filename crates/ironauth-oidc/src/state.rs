@@ -303,6 +303,15 @@ struct Inner {
     webauthn_challenge_ttl_secs: u64,
     webauthn_require_user_verification: bool,
     webauthn_clone_detection_block: bool,
+    // TOTP second factor and recovery codes (issue #69). All validated at startup.
+    totp_enabled: bool,
+    totp_issuer: Option<String>,
+    totp_period_secs: u64,
+    totp_digits: u32,
+    totp_drift_steps: u32,
+    totp_recovery_code_count: u32,
+    mfa_required: bool,
+    mfa_factor_order: Vec<String>,
 }
 
 impl OidcState {
@@ -411,6 +420,14 @@ impl OidcState {
                 webauthn_challenge_ttl_secs: config.webauthn_challenge_ttl_secs,
                 webauthn_require_user_verification: config.webauthn_require_user_verification,
                 webauthn_clone_detection_block: config.webauthn_clone_detection_block,
+                totp_enabled: config.totp_enabled,
+                totp_issuer: config.totp_issuer.clone(),
+                totp_period_secs: config.totp_period_secs,
+                totp_digits: config.totp_digits,
+                totp_drift_steps: config.totp_drift_steps,
+                totp_recovery_code_count: config.totp_recovery_code_count,
+                mfa_required: config.mfa_required,
+                mfa_factor_order: config.mfa_factor_order.clone(),
             }),
             revocation_sink: default_sink(),
             introspection_serializer: default_serializer(),
@@ -1201,6 +1218,64 @@ impl OidcState {
     #[must_use]
     pub fn webauthn_clone_detection_block(&self) -> bool {
         self.inner.webauthn_clone_detection_block
+    }
+
+    /// Whether the TOTP second-factor endpoints are mounted (issue #69). When off,
+    /// the enroll/verify/recovery endpoints fail closed with a uniform 404.
+    #[must_use]
+    pub fn totp_enabled(&self) -> bool {
+        self.inner.totp_enabled
+    }
+
+    /// The issuer label for a TOTP provisioning URI (issue #69): the configured
+    /// `oidc.totp_issuer`, or the serving origin host when unset, or the fallback
+    /// `IronAuth`. This is the human-facing label an authenticator app shows.
+    #[must_use]
+    pub fn totp_issuer(&self) -> String {
+        if let Some(issuer) = &self.inner.totp_issuer {
+            return issuer.clone();
+        }
+        self.self_origin()
+            .and_then(|origin| host_of(&origin))
+            .unwrap_or_else(|| "IronAuth".to_owned())
+    }
+
+    /// The RFC 6238 parameters a new TOTP enrollment is provisioned with (issue
+    /// #69): the configured algorithm (SHA1, the authenticator-app default), digit
+    /// count, and period. Validated at startup, so this cannot fail.
+    #[must_use]
+    pub fn totp_params(&self) -> ironauth_jose::TotpParams {
+        ironauth_jose::TotpParams::new(
+            ironauth_jose::TotpAlgorithm::Sha1,
+            self.inner.totp_digits,
+            self.inner.totp_period_secs,
+        )
+        .unwrap_or_else(|_| ironauth_jose::TotpParams::authenticator_default())
+    }
+
+    /// The one-sided TOTP drift tolerance in time-steps (issue #69).
+    #[must_use]
+    pub fn totp_drift_steps(&self) -> u32 {
+        self.inner.totp_drift_steps
+    }
+
+    /// The number of one-time recovery codes minted at MFA enrollment (issue #69).
+    #[must_use]
+    pub fn totp_recovery_code_count(&self) -> u32 {
+        self.inner.totp_recovery_code_count
+    }
+
+    /// Whether MFA enrollment is required after primary authentication (issue #69).
+    #[must_use]
+    pub fn mfa_required(&self) -> bool {
+        self.inner.mfa_required
+    }
+
+    /// The per-tenant factor order (issue #69): the second-factor kinds offered or
+    /// required first, honored by the factor-orchestration plan.
+    #[must_use]
+    pub fn mfa_factor_order(&self) -> &[String] {
+        &self.inner.mfa_factor_order
     }
 
     /// The shared per-environment issuer registry: the ONE holder of every

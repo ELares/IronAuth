@@ -69,9 +69,10 @@ use crate::id::{
     CustomDomainId, DcrPolicyId, DekId, DeviceCodeId, EncryptedSecretId, EnvironmentId,
     EnvironmentSecretId, ExternalIssuerId, GrantId, InitialAccessTokenId, InvitationId,
     IssuedTokenId, KekId, ManagementKeyId, MigrationRunId, MigrationRunRecordId, OperatorId,
-    OrganizationId, PushedRequestId, RefreshFamilyId, RefreshTokenId, ResourceServerId,
-    ServiceAccountId, SessionEventId, SessionId, SigningKeyId, TenantId, TraitMigrationJobId,
-    TraitSchemaId, UserId, UserIdentifierId, VariableId, WebauthnChallengeId, WebauthnCredentialId,
+    OrganizationId, PushedRequestId, RecoveryCodeId, RefreshFamilyId, RefreshTokenId,
+    ResourceServerId, ServiceAccountId, SessionEventId, SessionId, SigningKeyId, TenantId,
+    TotpCredentialId, TraitMigrationJobId, TraitSchemaId, UserId, UserIdentifierId, VariableId,
+    WebauthnChallengeId, WebauthnCredentialId,
 };
 use crate::identifier::{
     CanonicalIdentifier, IdentifierType, UniquenessMode, canonicalize_identifier,
@@ -295,6 +296,29 @@ impl<'a> ScopedStore<'a> {
     #[must_use]
     pub fn webauthn_challenges(&self) -> WebauthnChallengeRepo<'a> {
         WebauthnChallengeRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
+    /// The read repository for a subject's TOTP authenticators in this scope (issue
+    /// #69): list a subject's factors and open the seed material for a verification
+    /// or an activation. Every read is subject-bound; enroll, activate, verify, and
+    /// remove live on [`ActingStore::totp_credentials`].
+    #[must_use]
+    pub fn totp_credentials(&self) -> TotpCredentialRepo<'a> {
+        TotpCredentialRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
+    /// The read repository for a subject's recovery codes in this scope (issue #69):
+    /// the remaining-count and the unconsumed set for a redemption. Subject-bound;
+    /// generate and redeem live on [`ActingStore::recovery_codes`].
+    #[must_use]
+    pub fn recovery_codes(&self) -> RecoveryCodeRepo<'a> {
+        RecoveryCodeRepo {
             store: self.store,
             scope: self.scope,
         }
@@ -665,6 +689,31 @@ impl<'a> ActingStore<'a> {
     #[must_use]
     pub fn webauthn_credentials(&self) -> ActingWebauthnCredentialRepo<'a> {
         ActingWebauthnCredentialRepo {
+            store: self.store,
+            scope: self.scope,
+            acting: self.acting,
+        }
+    }
+
+    /// The mutating TOTP repository for this scope and actor (issue #69): begin an
+    /// enrollment (a pending row), activate it after a code-verified proof, record a
+    /// single-use second-factor verification, and remove a factor. Every write is
+    /// subject-bound and audited.
+    #[must_use]
+    pub fn totp_credentials(&self) -> ActingTotpCredentialRepo<'a> {
+        ActingTotpCredentialRepo {
+            store: self.store,
+            scope: self.scope,
+            acting: self.acting,
+        }
+    }
+
+    /// The mutating recovery-code repository for this scope and actor (issue #69):
+    /// regenerate the whole set (invalidating prior codes) and redeem one code in
+    /// place of a second factor. Every write is subject-bound and audited.
+    #[must_use]
+    pub fn recovery_codes(&self) -> ActingRecoveryCodeRepo<'a> {
+        ActingRecoveryCodeRepo {
             store: self.store,
             scope: self.scope,
             acting: self.acting,
@@ -7863,6 +7912,13 @@ pub struct UserExportRecord {
     /// material columns (a TOTP seed, a passkey public key), they ride this same list
     /// as additional fields on [`ExportedCredential`], a purely additive change.
     pub credentials: Vec<ExportedCredential>,
+    /// The user's enrolled TOTP authenticators (issue #58/#69), each with its OPENED
+    /// seed, so the exit covenant carries the second factor. Empty when the user has
+    /// no TOTP factor.
+    pub totp: Vec<ExportedTotp>,
+    /// The user's one-time recovery codes (issue #58/#69), each carried as its
+    /// one-way hash and consumed state. Empty when the user has none.
+    pub recovery_codes: Vec<ExportedRecoveryCode>,
     /// Creation time (the pagination key).
     pub created_at_unix_micros: i64,
 }
@@ -7895,6 +7951,68 @@ impl fmt::Debug for ExportedCredential {
         // non-secret factor kind, exactly like the redacting UserExportRecord Debug.
         f.debug_struct("ExportedCredential")
             .field("credential_type", &self.credential_type)
+            .finish_non_exhaustive()
+    }
+}
+
+/// An enrolled TOTP authenticator, opened for the full identity export (issue
+/// #58/#69). It carries the RFC 6238 SEED (opened from its sealed column and
+/// Base32-encoded) plus the parameters and the single-use / resync state, so the
+/// covenant carries the second factor exactly like a password verifier: sealed at
+/// rest, opened only for the gated and audited export. The internal `tot_` id, the
+/// owning subject, the scope, and the sealing key version are re-minted / re-sealed
+/// at import, so they are not carried.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ExportedTotp {
+    /// The user-authored friendly name, opened from its sealed column.
+    pub friendly_name: String,
+    /// The RFC 6238 shared secret, opened from its sealed column and Base32-encoded
+    /// (the form a fresh instance re-seals). SECRET material.
+    pub seed_base32: String,
+    /// The RFC 6238 hash token (`SHA1`, `SHA256`, `SHA512`).
+    pub algorithm: String,
+    /// The number of decimal digits.
+    pub digits: i32,
+    /// The time-step period in seconds.
+    pub period_secs: i32,
+    /// The enrollment status (`pending` or `active`).
+    pub status: String,
+    /// The last time-step a verification consumed (the single-use spine), or [`None`].
+    pub last_consumed_step: Option<i64>,
+}
+
+impl fmt::Debug for ExportedTotp {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // The seed and the friendly name are secret / PII; a struct dump spills only
+        // the non-secret parameters and status.
+        f.debug_struct("ExportedTotp")
+            .field("algorithm", &self.algorithm)
+            .field("digits", &self.digits)
+            .field("period_secs", &self.period_secs)
+            .field("status", &self.status)
+            .finish_non_exhaustive()
+    }
+}
+
+/// A one-time recovery code, opened for the full identity export (issue #58/#69). It
+/// carries the Argon2id HASH (one-way, exactly like a password verifier: never a
+/// plaintext code) plus whether it has been consumed, so the covenant carries the
+/// recovery-code state losslessly. The internal `rvc_` id, subject, and scope are
+/// re-minted at import and not carried.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ExportedRecoveryCode {
+    /// The Argon2id PHC verifier of the code. One-way, never the plaintext code.
+    pub code_hash: String,
+    /// Whether the code has already been redeemed (single-use spent).
+    pub consumed: bool,
+}
+
+impl fmt::Debug for ExportedRecoveryCode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // The hash is one-way but is still credential material; render only the
+        // non-secret consumed flag.
+        f.debug_struct("ExportedRecoveryCode")
+            .field("consumed", &self.consumed)
             .finish_non_exhaustive()
     }
 }
@@ -13796,6 +13914,1186 @@ fn split_transports(raw: &str) -> Vec<String> {
     raw.split_whitespace().map(ToString::to_string).collect()
 }
 
+// ===========================================================================
+// TOTP authenticators and recovery codes (issue #69).
+// ===========================================================================
+
+/// The fields to persist for a TOTP authenticator RESTORED by the exit-import
+/// (issue #58/#69): the OPENED seed the export carried, the parameters, the friendly
+/// name, and the single-use / status state, re-sealed under the TARGET scope's DEK
+/// so a re-imported factor verifies against the original authenticator. Unlike a
+/// [`NewTotpEnrollment`] (which mints a fresh pending row), a restore reproduces the
+/// source row's status (`active` or `pending`) and its last-consumed step.
+pub struct RestoredTotp<'a> {
+    /// The RFC 6238 shared secret (raw bytes), opened from the export and re-sealed.
+    pub seed: &'a [u8],
+    /// The user-authored friendly name to re-seal.
+    pub friendly_name: &'a str,
+    /// The RFC 6238 hash token (`SHA1`, `SHA256`, `SHA512`).
+    pub algorithm: &'a str,
+    /// The number of decimal digits (6..=8).
+    pub digits: i32,
+    /// The time-step period in seconds (15..=60).
+    pub period_secs: i32,
+    /// The enrollment status to reproduce (`active` or `pending`).
+    pub status: &'a str,
+    /// The last consumed time-step (the single-use spine), or [`None`].
+    pub last_consumed_step: Option<i64>,
+}
+
+impl std::fmt::Debug for RestoredTotp<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The seed and the friendly name are secret / PII; render only parameters.
+        f.debug_struct("RestoredTotp")
+            .field("seed", &"<redacted>")
+            .field("friendly_name", &"<redacted>")
+            .field("algorithm", &self.algorithm)
+            .field("digits", &self.digits)
+            .field("period_secs", &self.period_secs)
+            .field("status", &self.status)
+            .field("last_consumed_step", &self.last_consumed_step)
+            .finish()
+    }
+}
+
+/// The fields to persist for a newly begun TOTP enrollment (issue #69). The seed
+/// is raw secret bytes the repository seals under the scope DEK; it is never stored
+/// or logged in the clear.
+#[derive(Clone)]
+pub struct NewTotpEnrollment<'a> {
+    /// The RFC 6238 shared secret to seal.
+    pub seed: &'a [u8],
+    /// The user-authored friendly name to seal.
+    pub friendly_name: &'a str,
+    /// The RFC 6238 hash token (`SHA1`, `SHA256`, `SHA512`).
+    pub algorithm: &'a str,
+    /// The number of decimal digits in a code (6..=8).
+    pub digits: i32,
+    /// The time-step period in seconds (15..=60).
+    pub period_secs: i32,
+}
+
+impl std::fmt::Debug for NewTotpEnrollment<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The seed and the friendly name are secret / PII; render only the
+        // non-sensitive parameters so a struct dump never spills the seed.
+        f.debug_struct("NewTotpEnrollment")
+            .field("seed", &"<redacted>")
+            .field("friendly_name", &"<redacted>")
+            .field("algorithm", &self.algorithm)
+            .field("digits", &self.digits)
+            .field("period_secs", &self.period_secs)
+            .finish()
+    }
+}
+
+/// A projection of one enrolled TOTP authenticator for the account UI and the
+/// self-service list (issue #69). Carries no seed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TotpCredentialSummary {
+    /// The `tot_` credential id.
+    pub id: String,
+    /// The opened, user-authored friendly name.
+    pub friendly_name: String,
+    /// The enrollment status (`pending` or `active`).
+    pub status: String,
+    /// The RFC 6238 hash token.
+    pub algorithm: String,
+    /// The number of decimal digits.
+    pub digits: i32,
+    /// The time-step period in seconds.
+    pub period_secs: i32,
+    /// When the row was created, in microseconds since the Unix epoch.
+    pub created_at_unix_micros: i64,
+    /// When the factor was activated, or [`None`] while pending.
+    pub activated_at_unix_micros: Option<i64>,
+    /// When the factor was last used to authenticate, or [`None`].
+    pub last_used_at_unix_micros: Option<i64>,
+}
+
+/// The opened TOTP material a verification needs (issue #69): the seed plus the
+/// parameters and the single-use anti-replay state. The caller (in `ironauth-oidc`)
+/// computes the candidate codes with `ironauth_jose::verify_totp` and, on a match,
+/// advances the single-use step through [`ActingTotpCredentialRepo::record_verification`].
+///
+/// The seed is secret material; the redacting `Debug` keeps a struct dump from
+/// spilling it.
+#[derive(Clone)]
+pub struct TotpMaterial {
+    /// The `tot_` credential id.
+    pub id: TotpCredentialId,
+    /// The opened RFC 6238 shared secret.
+    pub seed: Vec<u8>,
+    /// The RFC 6238 hash token.
+    pub algorithm: String,
+    /// The number of decimal digits.
+    pub digits: i32,
+    /// The time-step period in seconds.
+    pub period_secs: i32,
+    /// The enrollment status (`pending` or `active`).
+    pub status: String,
+    /// The last time-step a verification consumed, or [`None`] before first use.
+    pub last_consumed_step: Option<i64>,
+}
+
+impl std::fmt::Debug for TotpMaterial {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TotpMaterial")
+            .field("id", &self.id)
+            .field("seed", &"<redacted>")
+            .field("algorithm", &self.algorithm)
+            .field("digits", &self.digits)
+            .field("period_secs", &self.period_secs)
+            .field("status", &self.status)
+            .field("last_consumed_step", &self.last_consumed_step)
+            .finish()
+    }
+}
+
+/// The outcome of activating a pending TOTP enrollment (issue #69).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TotpActivateOutcome {
+    /// The pending factor became active.
+    Activated,
+    /// No pending factor with that id is owned by the subject.
+    NotFound,
+    /// The subject already has an active TOTP authenticator (remove it first).
+    AlreadyActive,
+}
+
+/// The outcome of recording a TOTP verification (issue #69). The single-use
+/// invariant is a hard store-level guard: a `(credential, time-step)` at or below
+/// the last consumed step is [`TotpVerifyOutcome::Replay`], never accepted twice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TotpVerifyOutcome {
+    /// The verification advanced the single-use step; the code is spent.
+    Verified,
+    /// The presented step was at or below the last consumed step (a replay).
+    Replay,
+    /// No active factor with that id is owned by the subject.
+    NotFound,
+}
+
+/// One unconsumed recovery code for redemption (issue #69): its id and the Argon2id
+/// hash the caller verifies the presented code against through the hashing pool.
+#[derive(Clone)]
+pub struct RecoveryCodeCandidate {
+    /// The `rvc_` code id.
+    pub id: RecoveryCodeId,
+    /// The Argon2id PHC verifier of the code.
+    pub code_hash: String,
+}
+
+impl std::fmt::Debug for RecoveryCodeCandidate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The hash is one-way but is still credential material; render only the id.
+        f.debug_struct("RecoveryCodeCandidate")
+            .field("id", &self.id)
+            .field("code_hash", &"<redacted>")
+            .finish()
+    }
+}
+
+/// One freshly generated recovery code to persist (issue #69): the normalized
+/// plaintext (used ONLY to derive the keyed blind index, never stored) and the
+/// Argon2id verifier the caller minted through the hashing pool (stored one-way). The
+/// blind index lets a later redemption resolve this row directly and verify a single
+/// hash instead of scanning the whole set.
+#[derive(Clone, Copy)]
+pub struct NewRecoveryCode<'a> {
+    /// The normalized (hyphen/space-free) recovery code, used to derive the blind
+    /// index. NEVER persisted: only its HMAC tag and its one-way hash are stored.
+    pub normalized_code: &'a str,
+    /// The Argon2id PHC verifier of the code (minted through the #62 pool).
+    pub code_hash: &'a str,
+}
+
+impl std::fmt::Debug for NewRecoveryCode<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Both fields are code-derived secret material; render neither.
+        f.debug_struct("NewRecoveryCode")
+            .field("normalized_code", &"<redacted>")
+            .field("code_hash", &"<redacted>")
+            .finish()
+    }
+}
+
+/// One recovery code RESTORED by the exit-import (issue #58/#69): the one-way Argon2id
+/// hash carried verbatim from the export (the plaintext never leaves the source
+/// instance, so the blind index cannot be recomputed and is left NULL) and whether it
+/// was already consumed in the source instance.
+#[derive(Debug, Clone)]
+pub struct RestoredRecoveryCode {
+    /// The Argon2id PHC verifier carried verbatim from the export.
+    pub code_hash: String,
+    /// Whether the code was already redeemed in the source instance.
+    pub consumed: bool,
+}
+
+/// The outcome of redeeming a one-time recovery code (issue #69).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecoveryRedeemOutcome {
+    /// The code was marked consumed (single-use spent).
+    Redeemed,
+    /// No unconsumed code with that id is owned by the subject.
+    NotFound,
+}
+
+/// The read repository for a subject's TOTP authenticators in one scope (issue #69).
+pub struct TotpCredentialRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl TotpCredentialRepo<'_> {
+    /// Parse an untrusted credential identifier under this scope; a malformed or
+    /// cross-scope id is the uniform not-found.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the identifier is malformed or out of scope.
+    pub fn parse_id(&self, raw: &str) -> Result<TotpCredentialId, StoreError> {
+        Ok(TotpCredentialId::parse_in_scope(raw, &self.scope)?)
+    }
+
+    /// List `subject`'s TOTP authenticators (pending and active), opening each
+    /// friendly name. Subject-bound, so only that subject's own rows are listed.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Encryption`] if no master key is configured or a sealed name
+    /// cannot be opened; [`StoreError::Database`] on a persistence failure.
+    pub async fn list(&self, subject: &UserId) -> Result<Vec<TotpCredentialSummary>, StoreError> {
+        if subject.scope() != self.scope {
+            return Ok(Vec::new());
+        }
+        let master = self.store.master().ok_or(StoreError::Encryption)?;
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let rows = sqlx::query(
+            "SELECT id, friendly_name_sealed, pii_dek_version, status, algorithm, digits, \
+             period_secs, \
+             (EXTRACT(EPOCH FROM created_at) * 1000000)::bigint AS created_us, \
+             (EXTRACT(EPOCH FROM activated_at) * 1000000)::bigint AS activated_us, \
+             (EXTRACT(EPOCH FROM last_used_at) * 1000000)::bigint AS last_used_us \
+             FROM totp_credentials \
+             WHERE tenant_id = $1 AND environment_id = $2 AND subject = $3 \
+             ORDER BY created_at, id",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(subject.to_string())
+        .fetch_all(&mut *tx)
+        .await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let dek_version: i32 = row.get("pii_dek_version");
+            let sealed: Vec<u8> = row.get("friendly_name_sealed");
+            let dek = fetch_dek_by_version(&mut tx, self.scope, master, dek_version).await?;
+            let plaintext = dek.open(
+                &totp_name_seal_aad(self.scope, dek_version),
+                &Sealed::from_bytes(sealed)?,
+            )?;
+            let friendly_name = String::from_utf8(plaintext).map_err(|_| StoreError::Encryption)?;
+            out.push(TotpCredentialSummary {
+                id: row.get("id"),
+                friendly_name,
+                status: row.get("status"),
+                algorithm: row.get("algorithm"),
+                digits: row.get("digits"),
+                period_secs: row.get("period_secs"),
+                created_at_unix_micros: row.get("created_us"),
+                activated_at_unix_micros: row.get("activated_us"),
+                last_used_at_unix_micros: row.get("last_used_us"),
+            });
+        }
+        tx.commit().await?;
+        Ok(out)
+    }
+
+    /// Open the material of a specific TOTP row owned by `subject` (any status), for
+    /// activating a pending enrollment. A cross-subject or absent id is [`None`].
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Encryption`] if the seed cannot be opened; [`StoreError::Database`]
+    /// on a persistence failure.
+    pub async fn open_material(
+        &self,
+        subject: &UserId,
+        id: &TotpCredentialId,
+    ) -> Result<Option<TotpMaterial>, StoreError> {
+        if subject.scope() != self.scope || id.scope() != self.scope {
+            return Ok(None);
+        }
+        self.open_material_where(subject, Some(id)).await
+    }
+
+    /// Open the material of `subject`'s single ACTIVE TOTP authenticator, for a
+    /// second-factor verification at login. [`None`] if the subject has no active
+    /// factor.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Encryption`] if the seed cannot be opened; [`StoreError::Database`]
+    /// on a persistence failure.
+    pub async fn open_active_material(
+        &self,
+        subject: &UserId,
+    ) -> Result<Option<TotpMaterial>, StoreError> {
+        if subject.scope() != self.scope {
+            return Ok(None);
+        }
+        self.open_material_where(subject, None).await
+    }
+
+    /// The shared open path: when `id` is `Some`, resolve that specific row
+    /// (any status); when `None`, resolve the subject's single active row.
+    async fn open_material_where(
+        &self,
+        subject: &UserId,
+        id: Option<&TotpCredentialId>,
+    ) -> Result<Option<TotpMaterial>, StoreError> {
+        let master = self.store.master().ok_or(StoreError::Encryption)?;
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = if let Some(id) = id {
+            sqlx::query(
+                "SELECT id, totp_seed, pii_dek_version, algorithm, digits, period_secs, status, \
+                 last_consumed_step FROM totp_credentials \
+                 WHERE id = $1 AND tenant_id = $2 AND environment_id = $3 AND subject = $4",
+            )
+            .bind(id.to_string())
+            .bind(self.scope.tenant().to_string())
+            .bind(self.scope.environment().to_string())
+            .bind(subject.to_string())
+            .fetch_optional(&mut *tx)
+            .await?
+        } else {
+            sqlx::query(
+                "SELECT id, totp_seed, pii_dek_version, algorithm, digits, period_secs, status, \
+                 last_consumed_step FROM totp_credentials \
+                 WHERE tenant_id = $1 AND environment_id = $2 AND subject = $3 AND status = 'active'",
+            )
+            .bind(self.scope.tenant().to_string())
+            .bind(self.scope.environment().to_string())
+            .bind(subject.to_string())
+            .fetch_optional(&mut *tx)
+            .await?
+        };
+        let Some(row) = row else {
+            tx.commit().await?;
+            return Ok(None);
+        };
+        let dek_version: i32 = row.get("pii_dek_version");
+        let sealed: Vec<u8> = row.get("totp_seed");
+        let id_text: String = row.get("id");
+        let dek = fetch_dek_by_version(&mut tx, self.scope, master, dek_version).await?;
+        // The seed AAD binds the credential id, so a seed sealed under one row cannot
+        // open under another (issue #69, defense in depth for a long-lived secret).
+        let seed = dek.open(
+            &totp_seed_seal_aad(self.scope, &id_text, dek_version),
+            &Sealed::from_bytes(sealed)?,
+        )?;
+        let material = TotpMaterial {
+            id: TotpCredentialId::parse_in_scope(&id_text, &self.scope)?,
+            seed,
+            algorithm: row.get("algorithm"),
+            digits: row.get("digits"),
+            period_secs: row.get("period_secs"),
+            status: row.get("status"),
+            last_consumed_step: row.get("last_consumed_step"),
+        };
+        tx.commit().await?;
+        Ok(Some(material))
+    }
+}
+
+/// The mutating TOTP repository for one scope and actor (issue #69).
+pub struct ActingTotpCredentialRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+    acting: ActingContext,
+}
+
+impl ActingTotpCredentialRepo<'_> {
+    /// Ensure the scope has a live KEK and DEK to seal the seed and name under.
+    async fn ensure_scope_keys(&self, env: &Env, master: &MasterKey) -> Result<(), StoreError> {
+        let envelope = ActingEnvelopeRepo {
+            store: self.store,
+            scope: self.scope,
+            acting: self.acting,
+        };
+        match envelope.provision_kek(env, master).await {
+            Ok(_) | Err(StoreError::Conflict) => {}
+            Err(error) => return Err(error),
+        }
+        match envelope.provision_dek(env, master).await {
+            Ok(_) | Err(StoreError::Conflict) => {}
+            Err(error) => return Err(error),
+        }
+        Ok(())
+    }
+
+    /// BEGIN a TOTP enrollment for `subject` (issue #69): seal a fresh seed and the
+    /// friendly name, INSERT a PENDING row, and write one `account.totp.enroll_begin`
+    /// audit row. Any prior PENDING row for the subject is cleared first, so an
+    /// abandoned begin never accumulates and a fresh QR always replaces a stale one.
+    /// The pending row cannot satisfy MFA until [`activate`](Self::activate).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if `subject` is out of scope; [`StoreError::Encryption`]
+    /// if no master key is configured; [`StoreError::Database`] on a persistence failure.
+    pub async fn begin_enroll(
+        &self,
+        env: &Env,
+        subject: &UserId,
+        enrollment: &NewTotpEnrollment<'_>,
+    ) -> Result<TotpCredentialId, StoreError> {
+        if subject.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let master = self.store.master().ok_or(StoreError::Encryption)?;
+        self.ensure_scope_keys(env, master).await?;
+        let id = TotpCredentialId::generate(env, &self.scope);
+        let scope = self.scope;
+        let subject_text = subject.to_string();
+        let seed = enrollment.seed.to_vec();
+        let friendly_name = enrollment.friendly_name.to_string();
+        let algorithm = enrollment.algorithm.to_string();
+        let digits = enrollment.digits;
+        let period_secs = enrollment.period_secs;
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::TotpEnrollBegin,
+                target: &id,
+            },
+            async move |tx| {
+                // Clear any stale pending enrollment so a fresh begin is authoritative.
+                sqlx::query(
+                    "DELETE FROM totp_credentials \
+                     WHERE tenant_id = $1 AND environment_id = $2 AND subject = $3 \
+                     AND status = 'pending'",
+                )
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(&subject_text)
+                .execute(&mut **tx)
+                .await?;
+                let (dek_version, dek) = fetch_active_dek(tx, scope, master).await?;
+                let seed_sealed = dek.seal(
+                    env.entropy(),
+                    &totp_seed_seal_aad(scope, &id.to_string(), dek_version),
+                    &seed,
+                );
+                let name_sealed = dek.seal(
+                    env.entropy(),
+                    &totp_name_seal_aad(scope, dek_version),
+                    friendly_name.as_bytes(),
+                );
+                sqlx::query(
+                    "INSERT INTO totp_credentials \
+                     (id, tenant_id, environment_id, subject, totp_seed, friendly_name_sealed, \
+                      pii_dek_version, algorithm, digits, period_secs, status) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'pending')",
+                )
+                .bind(id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(&subject_text)
+                .bind(seed_sealed.into_bytes())
+                .bind(name_sealed.into_bytes())
+                .bind(dek_version)
+                .bind(&algorithm)
+                .bind(digits)
+                .bind(period_secs)
+                .execute(&mut **tx)
+                .await?;
+                Ok(())
+            },
+            false,
+        )
+        .await?;
+        Ok(id)
+    }
+
+    /// ACTIVATE a pending enrollment `id` for `subject` (issue #69): the caller has
+    /// already verified a current code, so flip the row to `active`, seed the
+    /// single-use step with the matched time-step, stamp `activated_at`, and write
+    /// one `account.totp.activate` audit row. A cross-subject or absent pending id is
+    /// [`TotpActivateOutcome::NotFound`]; a subject that already has an active factor
+    /// is [`TotpActivateOutcome::AlreadyActive`] (the partial unique index).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn activate(
+        &self,
+        env: &Env,
+        subject: &UserId,
+        id: &TotpCredentialId,
+        matched_step: i64,
+    ) -> Result<TotpActivateOutcome, StoreError> {
+        if id.scope() != self.scope || subject.scope() != self.scope {
+            return Ok(TotpActivateOutcome::NotFound);
+        }
+        let scope = self.scope;
+        let id_text = id.to_string();
+        let subject_text = subject.to_string();
+        let now = epoch_micros(env.clock().now_utc());
+        let mut tx = begin_scoped(self.store, scope).await?;
+        let result = sqlx::query(
+            "UPDATE totp_credentials \
+             SET status = 'active', last_consumed_step = $5, activated_at = \
+                 TIMESTAMPTZ 'epoch' + ($6::text || ' microseconds')::interval \
+             WHERE id = $1 AND tenant_id = $2 AND environment_id = $3 AND subject = $4 \
+             AND status = 'pending'",
+        )
+        .bind(&id_text)
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(&subject_text)
+        .bind(matched_step)
+        .bind(now)
+        .execute(&mut *tx)
+        .await;
+        let result = match result {
+            Ok(result) => result,
+            Err(error) if is_unique_violation(&error) => {
+                // The partial unique index over active rows rejected a second active
+                // factor: the subject already has one.
+                tx.commit().await?;
+                return Ok(TotpActivateOutcome::AlreadyActive);
+            }
+            Err(error) => return Err(StoreError::Database(error)),
+        };
+        if result.rows_affected() == 0 {
+            tx.commit().await?;
+            return Ok(TotpActivateOutcome::NotFound);
+        }
+        insert_audit_row(
+            &mut tx,
+            &AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::TotpActivate,
+                target: id,
+            },
+            None,
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(TotpActivateOutcome::Activated)
+    }
+
+    /// RECORD a verified second-factor use of active factor `id` for `subject`
+    /// (issue #69), enforcing single-use at the store: the `matched_step` MUST be
+    /// strictly greater than the last consumed step, so a replay of the same (or an
+    /// earlier in-window) code updates zero rows and is [`TotpVerifyOutcome::Replay`].
+    /// On success it advances the step, records the resync `offset`, stamps
+    /// `last_used_at`, and writes one `account.totp.verify` audit row (audited
+    /// DISTINCTLY from a recovery-code redemption).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn record_verification(
+        &self,
+        env: &Env,
+        subject: &UserId,
+        id: &TotpCredentialId,
+        matched_step: i64,
+        offset: i32,
+    ) -> Result<TotpVerifyOutcome, StoreError> {
+        if id.scope() != self.scope || subject.scope() != self.scope {
+            return Ok(TotpVerifyOutcome::NotFound);
+        }
+        let scope = self.scope;
+        let id_text = id.to_string();
+        let subject_text = subject.to_string();
+        let now = epoch_micros(env.clock().now_utc());
+        let mut tx = begin_scoped(self.store, scope).await?;
+        // The single-use spine: advance ONLY when the matched step is strictly newer
+        // than the last consumed one. A replay within the drift window leaves
+        // last_consumed_step >= matched_step, so this updates nothing.
+        let result = sqlx::query(
+            "UPDATE totp_credentials \
+             SET last_consumed_step = $5, last_offset = $6, last_used_at = \
+                 TIMESTAMPTZ 'epoch' + ($7::text || ' microseconds')::interval \
+             WHERE id = $1 AND tenant_id = $2 AND environment_id = $3 AND subject = $4 \
+             AND status = 'active' \
+             AND (last_consumed_step IS NULL OR last_consumed_step < $5)",
+        )
+        .bind(&id_text)
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(&subject_text)
+        .bind(matched_step)
+        .bind(offset)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+        if result.rows_affected() == 0 {
+            // Distinguish a replay (the active row exists) from an absent factor.
+            let exists = sqlx::query(
+                "SELECT 1 AS one FROM totp_credentials \
+                 WHERE id = $1 AND tenant_id = $2 AND environment_id = $3 AND subject = $4 \
+                 AND status = 'active'",
+            )
+            .bind(&id_text)
+            .bind(scope.tenant().to_string())
+            .bind(scope.environment().to_string())
+            .bind(&subject_text)
+            .fetch_optional(&mut *tx)
+            .await?;
+            tx.commit().await?;
+            return Ok(if exists.is_some() {
+                TotpVerifyOutcome::Replay
+            } else {
+                TotpVerifyOutcome::NotFound
+            });
+        }
+        insert_audit_row(
+            &mut tx,
+            &AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::TotpVerify,
+                target: id,
+            },
+            None,
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(TotpVerifyOutcome::Verified)
+    }
+
+    /// REMOVE `subject`'s TOTP authenticator `id` (issue #69) and write one
+    /// `account.totp.remove` audit row. Subject-bound, so another subject's id is the
+    /// uniform not-found. No last-factor guardrail: TOTP is a SECOND factor, not a
+    /// primary login credential, so removing it never strands the account (the primary
+    /// factor and recovery codes remain).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn remove(
+        &self,
+        env: &Env,
+        subject: &UserId,
+        id: &TotpCredentialId,
+    ) -> Result<CredentialRemoveOutcome, StoreError> {
+        if id.scope() != self.scope || subject.scope() != self.scope {
+            return Ok(CredentialRemoveOutcome::NotFound);
+        }
+        let scope = self.scope;
+        let id_text = id.to_string();
+        let subject_text = subject.to_string();
+        let mut tx = begin_scoped(self.store, scope).await?;
+        let result = sqlx::query(
+            "DELETE FROM totp_credentials \
+             WHERE id = $1 AND tenant_id = $2 AND environment_id = $3 AND subject = $4",
+        )
+        .bind(&id_text)
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(&subject_text)
+        .execute(&mut *tx)
+        .await?;
+        if result.rows_affected() == 0 {
+            tx.commit().await?;
+            return Ok(CredentialRemoveOutcome::NotFound);
+        }
+        // Cascade-delete the subject's recovery codes in the SAME transaction (issue
+        // #69): the recovery codes exist to back the authenticator, so once the factor
+        // is gone a leaked recovery code must not remain redeemable. This commits with
+        // the factor removal (both or neither), so a removal never leaves orphaned
+        // codes.
+        sqlx::query(
+            "DELETE FROM recovery_codes \
+             WHERE tenant_id = $1 AND environment_id = $2 AND subject = $3",
+        )
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(&subject_text)
+        .execute(&mut *tx)
+        .await?;
+        insert_audit_row(
+            &mut tx,
+            &AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::TotpRemove,
+                target: id,
+            },
+            None,
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(CredentialRemoveOutcome::Removed)
+    }
+
+    /// RESTORE a TOTP authenticator from the exit-import (issue #58/#69): re-seal the
+    /// exported seed and friendly name under the TARGET scope's active DEK, INSERT the
+    /// row reproducing the source status and single-use step, and write one
+    /// `account.totp.enroll_begin` audit row. A re-imported ACTIVE factor verifies
+    /// against the original authenticator (the seed round-trips exactly) and enforces
+    /// single-use from the restored step, so the covenant re-homes the second factor,
+    /// not merely its metadata.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if `subject` is out of scope; [`StoreError::Encryption`]
+    /// if no master key is configured; [`StoreError::Database`] on a persistence
+    /// failure (including a duplicate active factor, the partial unique index).
+    pub async fn restore(
+        &self,
+        env: &Env,
+        subject: &UserId,
+        restored: &RestoredTotp<'_>,
+    ) -> Result<TotpCredentialId, StoreError> {
+        if subject.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let master = self.store.master().ok_or(StoreError::Encryption)?;
+        self.ensure_scope_keys(env, master).await?;
+        let id = TotpCredentialId::generate(env, &self.scope);
+        let scope = self.scope;
+        let subject_text = subject.to_string();
+        let seed = restored.seed.to_vec();
+        let friendly_name = restored.friendly_name.to_string();
+        let algorithm = restored.algorithm.to_string();
+        let digits = restored.digits;
+        let period_secs = restored.period_secs;
+        let status = restored.status.to_string();
+        let last_consumed_step = restored.last_consumed_step;
+        // The activation instant comes from the env clock seam (never a raw SQL now()),
+        // so a restore is deterministic under a fixed test clock. NULL while pending.
+        let activated_at = (status == "active").then(|| epoch_micros(env.clock().now_utc()));
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::TotpEnrollBegin,
+                target: &id,
+            },
+            async move |tx| {
+                let (dek_version, dek) = fetch_active_dek(tx, scope, master).await?;
+                let seed_sealed = dek.seal(
+                    env.entropy(),
+                    &totp_seed_seal_aad(scope, &id.to_string(), dek_version),
+                    &seed,
+                );
+                let name_sealed = dek.seal(
+                    env.entropy(),
+                    &totp_name_seal_aad(scope, dek_version),
+                    friendly_name.as_bytes(),
+                );
+                sqlx::query(
+                    "INSERT INTO totp_credentials \
+                     (id, tenant_id, environment_id, subject, totp_seed, friendly_name_sealed, \
+                      pii_dek_version, algorithm, digits, period_secs, status, \
+                      last_consumed_step, activated_at) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, \
+                      CASE WHEN $13::bigint IS NULL THEN NULL \
+                           ELSE TIMESTAMPTZ 'epoch' + ($13::text || ' microseconds')::interval END)",
+                )
+                .bind(id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(&subject_text)
+                .bind(seed_sealed.into_bytes())
+                .bind(name_sealed.into_bytes())
+                .bind(dek_version)
+                .bind(&algorithm)
+                .bind(digits)
+                .bind(period_secs)
+                .bind(&status)
+                .bind(last_consumed_step)
+                .bind(activated_at)
+                .execute(&mut **tx)
+                .await?;
+                Ok(())
+            },
+            false,
+        )
+        .await?;
+        Ok(id)
+    }
+}
+
+/// The read repository for a subject's recovery codes in one scope (issue #69).
+pub struct RecoveryCodeRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl RecoveryCodeRepo<'_> {
+    /// The number of `subject`'s UNCONSUMED recovery codes (the count the account UI
+    /// shows). Subject-bound.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn remaining_count(&self, subject: &UserId) -> Result<i64, StoreError> {
+        if subject.scope() != self.scope {
+            return Ok(0);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let count: i64 = sqlx::query(
+            "SELECT count(*) AS n FROM recovery_codes \
+             WHERE tenant_id = $1 AND environment_id = $2 AND subject = $3 \
+             AND consumed_at IS NULL",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(subject.to_string())
+        .fetch_one(&mut *tx)
+        .await?
+        .get("n");
+        tx.commit().await?;
+        Ok(count)
+    }
+
+    /// `subject`'s UNCONSUMED recovery codes (id and hash), for a redemption attempt.
+    /// The caller verifies the presented code against each hash through the hashing
+    /// pool and, on a match, redeems that id. Subject-bound.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn unconsumed(
+        &self,
+        subject: &UserId,
+    ) -> Result<Vec<RecoveryCodeCandidate>, StoreError> {
+        if subject.scope() != self.scope {
+            return Ok(Vec::new());
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let rows = sqlx::query(
+            "SELECT id, code_hash FROM recovery_codes \
+             WHERE tenant_id = $1 AND environment_id = $2 AND subject = $3 \
+             AND consumed_at IS NULL ORDER BY created_at, id",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(subject.to_string())
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let id_text: String = row.get("id");
+            out.push(RecoveryCodeCandidate {
+                id: RecoveryCodeId::parse_in_scope(&id_text, &self.scope)?,
+                code_hash: row.get("code_hash"),
+            });
+        }
+        Ok(out)
+    }
+
+    /// The unconsumed recovery-code candidates a redemption of `presented_code` must
+    /// verify against (issue #69), NARROWED by the per-code blind index so a wrong
+    /// code costs no Argon2 verification and a right code costs exactly ONE. The query
+    /// resolves the single row whose `code_bidx` matches the presented code's keyed
+    /// tag, PLUS any RESTORED codes (whose index is NULL because an export carries only
+    /// the one-way hash), so an imported code still redeems while a natively generated
+    /// code never triggers a full-set scan. The caller verifies the presented code
+    /// against each returned hash through the hashing pool.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Encryption`] if no master key is configured;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn candidates_for_code(
+        &self,
+        subject: &UserId,
+        presented_code: &str,
+    ) -> Result<Vec<RecoveryCodeCandidate>, StoreError> {
+        if subject.scope() != self.scope {
+            return Ok(Vec::new());
+        }
+        let master = self.store.master().ok_or(StoreError::Encryption)?;
+        let subject_text = subject.to_string();
+        let bidx = recovery_code_blind_index(master, self.scope, &subject_text, presented_code)
+            .into_bytes();
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        // The one bidx-matched row for this exact code, plus any imported (NULL-index)
+        // codes: the matched row makes a right code a single hash; the NULL rows keep a
+        // re-imported code redeemable. A wrong code matches no bidx row, so only the
+        // (usually empty) imported set is verified.
+        let rows = sqlx::query(
+            "SELECT id, code_hash FROM recovery_codes \
+             WHERE tenant_id = $1 AND environment_id = $2 AND subject = $3 \
+             AND consumed_at IS NULL AND (code_bidx = $4 OR code_bidx IS NULL) \
+             ORDER BY created_at, id",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(&subject_text)
+        .bind(bidx)
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let id_text: String = row.get("id");
+            out.push(RecoveryCodeCandidate {
+                id: RecoveryCodeId::parse_in_scope(&id_text, &self.scope)?,
+                code_hash: row.get("code_hash"),
+            });
+        }
+        Ok(out)
+    }
+}
+
+/// The mutating recovery-code repository for one scope and actor (issue #69).
+pub struct ActingRecoveryCodeRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+    acting: ActingContext,
+}
+
+impl ActingRecoveryCodeRepo<'_> {
+    /// REPLACE `subject`'s entire recovery-code set with a fresh batch (issue #69):
+    /// in one transaction, DELETE every prior code (so regeneration invalidates all
+    /// outstanding codes) and INSERT the new batch at the next generation, writing one
+    /// `account.recovery_codes.generate` audit row. Each code carries its Argon2id
+    /// hash (minted through the pool, stored one-way) and its normalized plaintext,
+    /// which is used ONLY to derive the keyed blind index for O(1) redemption lookup
+    /// and is never persisted. Returns the new generation number.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if `subject` is out of scope; [`StoreError::Encryption`]
+    /// if no master key is configured; [`StoreError::Database`] on a persistence failure.
+    pub async fn replace_all(
+        &self,
+        env: &Env,
+        subject: &UserId,
+        codes: &[NewRecoveryCode<'_>],
+    ) -> Result<i32, StoreError> {
+        if subject.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let master = self.store.master().ok_or(StoreError::Encryption)?;
+        let scope = self.scope;
+        let subject_text = subject.to_string();
+        let tenant = scope.tenant().to_string();
+        let environment = scope.environment().to_string();
+        // A manual scoped transaction (rather than the write_audited closure) so the
+        // computed generation is returned directly without a captured cell. The
+        // DELETE, the INSERTs, and the audit row all commit together or roll back
+        // together, so a regeneration is atomic.
+        let mut tx = begin_scoped(self.store, scope).await?;
+        // The next generation is one past the highest prior batch (whether or not any
+        // survive), so a regeneration is always monotonically newer.
+        let next_generation: i32 = sqlx::query(
+            "SELECT COALESCE(max(generation), 0) + 1 AS g FROM recovery_codes \
+             WHERE tenant_id = $1 AND environment_id = $2 AND subject = $3",
+        )
+        .bind(&tenant)
+        .bind(&environment)
+        .bind(&subject_text)
+        .fetch_one(&mut *tx)
+        .await?
+        .get("g");
+        // Invalidate every prior code (consumed or not).
+        sqlx::query(
+            "DELETE FROM recovery_codes \
+             WHERE tenant_id = $1 AND environment_id = $2 AND subject = $3",
+        )
+        .bind(&tenant)
+        .bind(&environment)
+        .bind(&subject_text)
+        .execute(&mut *tx)
+        .await?;
+        for code in codes {
+            let id = RecoveryCodeId::generate(env, &scope);
+            // The keyed blind index over the normalized code lets a redemption resolve
+            // this one row and verify a single hash (issue #69). Deterministic under
+            // the per-tenant HMAC key; never a bare hash of the code.
+            let bidx =
+                recovery_code_blind_index(master, scope, &subject_text, code.normalized_code)
+                    .into_bytes();
+            sqlx::query(
+                "INSERT INTO recovery_codes \
+                 (id, tenant_id, environment_id, subject, code_hash, code_bidx, generation) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7)",
+            )
+            .bind(id.to_string())
+            .bind(&tenant)
+            .bind(&environment)
+            .bind(&subject_text)
+            .bind(code.code_hash)
+            .bind(bidx)
+            .bind(next_generation)
+            .execute(&mut *tx)
+            .await?;
+        }
+        insert_audit_row(
+            &mut tx,
+            &AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::RecoveryCodesGenerate,
+                target: subject,
+            },
+            None,
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(next_generation)
+    }
+
+    /// RESTORE `subject`'s recovery codes from the exit-import (issue #58/#69): INSERT
+    /// each carried Argon2id hash (verbatim, one-way) with its consumed state, at a
+    /// fresh generation, writing one `account.recovery_codes.generate` audit row. The
+    /// `code_bidx` is left NULL because an export carries only the hash, never the
+    /// plaintext, so the index cannot be recomputed; redemption falls back to scanning
+    /// these NULL-index rows (bounded by the per-user code count). A re-imported,
+    /// still-unconsumed code redeems exactly like a natively generated one.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if `subject` is out of scope; [`StoreError::Database`]
+    /// on a persistence failure.
+    pub async fn restore_all(
+        &self,
+        env: &Env,
+        subject: &UserId,
+        codes: &[RestoredRecoveryCode],
+    ) -> Result<(), StoreError> {
+        if subject.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        if codes.is_empty() {
+            return Ok(());
+        }
+        let scope = self.scope;
+        let subject_text = subject.to_string();
+        let tenant = scope.tenant().to_string();
+        let environment = scope.environment().to_string();
+        let now = epoch_micros(env.clock().now_utc());
+        let mut tx = begin_scoped(self.store, scope).await?;
+        let next_generation: i32 = sqlx::query(
+            "SELECT COALESCE(max(generation), 0) + 1 AS g FROM recovery_codes \
+             WHERE tenant_id = $1 AND environment_id = $2 AND subject = $3",
+        )
+        .bind(&tenant)
+        .bind(&environment)
+        .bind(&subject_text)
+        .fetch_one(&mut *tx)
+        .await?
+        .get("g");
+        for code in codes {
+            let id = RecoveryCodeId::generate(env, &scope);
+            sqlx::query(
+                "INSERT INTO recovery_codes \
+                 (id, tenant_id, environment_id, subject, code_hash, generation, consumed_at) \
+                 VALUES ($1, $2, $3, $4, $5, $6, \
+                  CASE WHEN $7 THEN TIMESTAMPTZ 'epoch' + ($8::text || ' microseconds')::interval \
+                       ELSE NULL END)",
+            )
+            .bind(id.to_string())
+            .bind(&tenant)
+            .bind(&environment)
+            .bind(&subject_text)
+            .bind(&code.code_hash)
+            .bind(next_generation)
+            .bind(code.consumed)
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
+        }
+        insert_audit_row(
+            &mut tx,
+            &AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::RecoveryCodesGenerate,
+                target: subject,
+            },
+            None,
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// REDEEM one of `subject`'s recovery codes (issue #69): mark `id` consumed if it
+    /// is unconsumed and owned by the subject, writing one
+    /// `account.recovery_code.redeem` audit row. The atomic guarded UPDATE is the
+    /// single-use spine: a code already consumed (or another subject's) updates zero
+    /// rows and is [`RecoveryRedeemOutcome::NotFound`].
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn redeem(
+        &self,
+        env: &Env,
+        subject: &UserId,
+        id: &RecoveryCodeId,
+    ) -> Result<RecoveryRedeemOutcome, StoreError> {
+        if id.scope() != self.scope || subject.scope() != self.scope {
+            return Ok(RecoveryRedeemOutcome::NotFound);
+        }
+        let scope = self.scope;
+        let id_text = id.to_string();
+        let subject_text = subject.to_string();
+        let now = epoch_micros(env.clock().now_utc());
+        let mut tx = begin_scoped(self.store, scope).await?;
+        let result = sqlx::query(
+            "UPDATE recovery_codes \
+             SET consumed_at = TIMESTAMPTZ 'epoch' + ($5::text || ' microseconds')::interval \
+             WHERE id = $1 AND tenant_id = $2 AND environment_id = $3 AND subject = $4 \
+             AND consumed_at IS NULL",
+        )
+        .bind(&id_text)
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(&subject_text)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+        if result.rows_affected() == 0 {
+            tx.commit().await?;
+            return Ok(RecoveryRedeemOutcome::NotFound);
+        }
+        insert_audit_row(
+            &mut tx,
+            &AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::RecoveryCodeRedeem,
+                target: id,
+            },
+            None,
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(RecoveryRedeemOutcome::Redeemed)
+    }
+}
+
 /// A recorded consent decision (issue #196): the `con_` id the grant references
 /// AND the `scope` value the decision was made against.
 ///
@@ -18109,6 +19407,17 @@ const CREDENTIAL_PII_SEAL_LABEL: &str = "ironauth.envelope.account-credential-pi
 /// user-authored passkey label, issue #65) from every other envelope context, so a
 /// passkey-nickname seal never authenticates under another column's.
 const WEBAUTHN_NICKNAME_SEAL_LABEL: &str = "ironauth.envelope.webauthn-nickname.v1";
+/// The AAD label domain-separating a sealed `totp_credentials.totp_seed` (the RFC
+/// 6238 shared secret, issue #69) from every other envelope context, so a seed
+/// ciphertext never authenticates under another column's context.
+const TOTP_SEED_SEAL_LABEL: &str = "ironauth.envelope.totp-seed.v1";
+/// The AAD label domain-separating a sealed `totp_credentials.friendly_name`
+/// (issue #69) from every other envelope context, including the seed in the same row.
+const TOTP_NAME_SEAL_LABEL: &str = "ironauth.envelope.totp-name.v1";
+/// The AAD label domain-separating the `recovery_codes.code_bidx` keyed blind index
+/// (issue #69) from every other keyed derivation, so a recovery-code index tag never
+/// collides with, or leaks across, another index or another tenant.
+const RECOVERY_CODE_BIDX_LABEL: &str = "ironauth.bidx.recovery-code.v1";
 /// The purpose label bound into a sealed `users.identifier` (the login handle).
 const USER_IDENTIFIER_PURPOSE: &str = "identifier";
 /// The purpose label bound into a sealed `users.claims` (the standard-claim JSON).
@@ -18218,6 +19527,65 @@ fn webauthn_nickname_seal_aad(scope: Scope, dek_version: i32) -> Aad {
         .text(&scope.environment().to_string())
         .version(i64::from(dek_version))
         .build()
+}
+
+/// The AAD binding a sealed `totp_credentials.totp_seed` (issue #69): the seed
+/// label, the scope, the `tot_` credential id (the ROW/subject binding), and the DEK
+/// version, so a seed ciphertext cannot be lifted to another row, subject, tenant,
+/// environment, column, or key version. Binding the credential id means a seed sealed
+/// for one authenticator row cannot be transplanted into another subject's row by a
+/// privileged same-scope DB write and still open: the AAD would not match. The seed
+/// is the class of long-lived shared secret the envelope substrate exists for, so it
+/// gets the strongest per-row binding.
+fn totp_seed_seal_aad(scope: Scope, credential_id: &str, dek_version: i32) -> Aad {
+    Aad::builder()
+        .text(TOTP_SEED_SEAL_LABEL)
+        .text(&scope.tenant().to_string())
+        .text(&scope.environment().to_string())
+        .field(credential_id.as_bytes())
+        .version(i64::from(dek_version))
+        .build()
+}
+
+/// The AAD binding a sealed `totp_credentials.friendly_name` (issue #69): the name
+/// label, the scope, and the DEK version. A distinct label from the seed keeps the
+/// two sealed columns of one row from ever cross-authenticating.
+fn totp_name_seal_aad(scope: Scope, dek_version: i32) -> Aad {
+    Aad::builder()
+        .text(TOTP_NAME_SEAL_LABEL)
+        .text(&scope.tenant().to_string())
+        .text(&scope.environment().to_string())
+        .version(i64::from(dek_version))
+        .build()
+}
+
+/// The blind-index context for a `recovery_codes.code_bidx` (issue #69): the label,
+/// the scope, the subject, and the normalized recovery code, length-prefixed. The
+/// per-tenant HMAC key means the SAME code in two tenants (or two subjects) maps to
+/// two different tags, so the index can never link a code across tenants or subjects
+/// and is never a bare unsalted hash of the code. Redemption resolves the ONE
+/// candidate row by this tag, so a wrong code costs no Argon2 verification and a right
+/// code costs exactly one.
+fn recovery_code_bidx_aad(scope: Scope, subject: &str, normalized_code: &str) -> Aad {
+    Aad::builder()
+        .text(RECOVERY_CODE_BIDX_LABEL)
+        .text(&scope.tenant().to_string())
+        .text(&scope.environment().to_string())
+        .field(subject.as_bytes())
+        .field(normalized_code.as_bytes())
+        .build()
+}
+
+/// The deterministic blind index for a normalized recovery `code` belonging to
+/// `subject` in `scope` under `master`, the value a redemption queries against
+/// `recovery_codes.code_bidx` to resolve the single candidate row (issue #69).
+fn recovery_code_blind_index(
+    master: &MasterKey,
+    scope: Scope,
+    subject: &str,
+    normalized_code: &str,
+) -> BlindIndex {
+    master.blind_index(&recovery_code_bidx_aad(scope, subject, normalized_code))
 }
 
 /// The blind-index context for a `users.identifier`: the label, the scope, and the
@@ -18448,6 +19816,10 @@ async fn user_export_record_from_row(
     // transaction, so the export carries every passkey / TOTP / recovery-code
     // enrollment, not merely the password.
     let credentials = user_exported_credentials_from_tx(tx, scope, master, &id.to_string()).await?;
+    // The second-factor state (issue #58/#69): opened in the SAME scoped transaction,
+    // so the export carries the TOTP seed and the recovery-code hashes.
+    let totp = user_exported_totp_from_tx(tx, scope, master, &id.to_string()).await?;
+    let recovery_codes = user_exported_recovery_codes_from_tx(tx, scope, &id.to_string()).await?;
     Ok(UserExportRecord {
         id,
         identifier,
@@ -18460,8 +19832,84 @@ async fn user_export_record_from_row(
         foreign_password_hash: row.get("foreign_password_hash"),
         foreign_password_algo: row.get("foreign_password_algo"),
         credentials,
+        totp,
+        recovery_codes,
         created_at_unix_micros: row.get("created_us"),
     })
+}
+
+/// Read a user's enrolled TOTP authenticators (issue #58/#69) inside the caller's
+/// scoped export transaction, OPENING each sealed seed and friendly name. The seed
+/// is Base32-encoded for the export wire form. Bounded by the per-user factor count.
+async fn user_exported_totp_from_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    scope: Scope,
+    master: &MasterKey,
+    subject: &str,
+) -> Result<Vec<ExportedTotp>, StoreError> {
+    let rows = sqlx::query(
+        "SELECT id, totp_seed, friendly_name_sealed, pii_dek_version, algorithm, digits, \
+         period_secs, status, last_consumed_step FROM totp_credentials \
+         WHERE tenant_id = $1 AND environment_id = $2 AND subject = $3 \
+         ORDER BY created_at, id",
+    )
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .bind(subject)
+    .fetch_all(&mut **tx)
+    .await?;
+    let mut out = Vec::with_capacity(rows.len());
+    for row in &rows {
+        let dek_version: i32 = row.get("pii_dek_version");
+        let id_text: String = row.get("id");
+        let dek = fetch_dek_by_version(tx, scope, master, dek_version).await?;
+        let seed = dek.open(
+            &totp_seed_seal_aad(scope, &id_text, dek_version),
+            &Sealed::from_bytes(row.get::<Vec<u8>, _>("totp_seed"))?,
+        )?;
+        let name_bytes = dek.open(
+            &totp_name_seal_aad(scope, dek_version),
+            &Sealed::from_bytes(row.get::<Vec<u8>, _>("friendly_name_sealed"))?,
+        )?;
+        let friendly_name = String::from_utf8(name_bytes).map_err(|_| StoreError::Encryption)?;
+        out.push(ExportedTotp {
+            friendly_name,
+            seed_base32: ironauth_jose::base32_encode(&seed),
+            algorithm: row.get("algorithm"),
+            digits: row.get("digits"),
+            period_secs: row.get("period_secs"),
+            status: row.get("status"),
+            last_consumed_step: row.get("last_consumed_step"),
+        });
+    }
+    Ok(out)
+}
+
+/// Read a user's recovery codes (issue #58/#69) inside the caller's scoped export
+/// transaction. The `code_hash` is a one-way verifier (never a plaintext code), so
+/// it is carried verbatim exactly like a password hash; no key material is opened.
+async fn user_exported_recovery_codes_from_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    scope: Scope,
+    subject: &str,
+) -> Result<Vec<ExportedRecoveryCode>, StoreError> {
+    let rows = sqlx::query(
+        "SELECT code_hash, (consumed_at IS NOT NULL) AS consumed FROM recovery_codes \
+         WHERE tenant_id = $1 AND environment_id = $2 AND subject = $3 \
+         ORDER BY created_at, id",
+    )
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .bind(subject)
+    .fetch_all(&mut **tx)
+    .await?;
+    Ok(rows
+        .iter()
+        .map(|row| ExportedRecoveryCode {
+            code_hash: row.get("code_hash"),
+            consumed: row.get("consumed"),
+        })
+        .collect())
 }
 
 /// Read a user's enrolled `account_credentials` (issue #58) inside the caller's

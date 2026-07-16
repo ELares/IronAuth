@@ -36,6 +36,14 @@ use std::fmt;
 /// assurance level the bootstrap has not earned. The passkey rows use the EAP
 /// registered values instead, which are bare tokens by that specification.
 const ACR_PWD: &str = "urn:ironauth:acr:pwd";
+/// The IronAuth ACR for a multi-factor authentication: a primary knowledge or
+/// possession factor combined with a verified second factor (a TOTP code or a
+/// one-time recovery code, issue #69). A namespaced URN rather than a bare level:
+/// it asserts that a second factor was checked, which is exactly what a relying
+/// party asking for step-up wants to know, without claiming an ISO/IEC 29115
+/// assurance level. It sits above the single-factor password ACR and below the
+/// phishing-resistant passkey ACRs (TOTP is a shared secret, not origin-bound).
+const ACR_MFA: &str = "urn:ironauth:acr:mfa";
 /// The OpenID Connect EAP ACR value for a phishing-resistant authenticator
 /// (a synced passkey). Per OpenID Connect EAP ACR Values 1.0 `phr` means
 /// PHISHING-RESISTANT (origin-bound, which every WebAuthn ceremony is); it does
@@ -60,6 +68,15 @@ const ACR_PHRH: &str = "phrh";
 pub enum AuthMethod {
     /// A password (a knowledge factor). The bootstrap login. RFC 8176 `pwd`.
     Password,
+    /// A TOTP code (a possession factor: an authenticator app holding the shared
+    /// seed). RFC 8176 `otp`. Used as a SECOND factor, so combined with a primary it
+    /// achieves the multi-factor ACR (issue #69).
+    Totp,
+    /// A one-time recovery code redeemed IN PLACE OF the second factor (issue #69):
+    /// a pre-shared knowledge secret. RFC 8176 `kba` (knowledge-based
+    /// authentication), which is honest and DISTINCT from `otp` so a recovery-code
+    /// login never masquerades as a live authenticator.
+    RecoveryCode,
     /// A synced passkey used WITHOUT user verification (user presence only): a
     /// phishing-resistant possession factor. Achieves the EAP ACR `phr` (phishing
     /// resistance does not require user verification) with amr `swk`+`user`, but
@@ -86,8 +103,13 @@ impl AuthMethod {
     /// ACR (the verified and presence-only variants of one passkey class) sit
     /// adjacent; their relative order does not matter to [`achieved_acr`] because
     /// their ACR is identical.
-    const ALL: [AuthMethod; 5] = [
+    const ALL: [AuthMethod; 7] = [
         AuthMethod::Password,
+        // The second-factor methods sit above the single password ACR and below the
+        // phishing-resistant passkey ACRs: pwd+otp is multi-factor but not
+        // phishing-resistant, so a passkey login still outranks it.
+        AuthMethod::Totp,
+        AuthMethod::RecoveryCode,
         AuthMethod::Passkey,
         AuthMethod::PasskeyVerified,
         AuthMethod::PasskeyHardware,
@@ -100,6 +122,8 @@ impl AuthMethod {
     pub fn as_token(self) -> &'static str {
         match self {
             AuthMethod::Password => "pwd",
+            AuthMethod::Totp => "totp",
+            AuthMethod::RecoveryCode => "recovery_code",
             AuthMethod::Passkey => "passkey",
             AuthMethod::PasskeyVerified => "passkey_uv",
             AuthMethod::PasskeyHardware => "passkey_hw",
@@ -129,6 +153,12 @@ impl AuthMethod {
         match self {
             // `pwd`: password-based authentication.
             AuthMethod::Password => &["pwd"],
+            // `otp`: a one-time password (RFC 6238); `mfa`: the second factor plus
+            // the primary make multiple factors.
+            AuthMethod::Totp => &["otp", "mfa"],
+            // `kba`: knowledge-based authentication (the pre-shared recovery code);
+            // `mfa`: it stands in for the second factor beyond the primary.
+            AuthMethod::RecoveryCode => &["kba", "mfa"],
             // `swk`: a software-secured key (a synced passkey); `user`: presence.
             AuthMethod::Passkey => &["swk", "user"],
             // `mfa`: possession of the key + the user verification performed.
@@ -147,6 +177,7 @@ impl AuthMethod {
     pub fn acr(self) -> &'static str {
         match self {
             AuthMethod::Password => ACR_PWD,
+            AuthMethod::Totp | AuthMethod::RecoveryCode => ACR_MFA,
             AuthMethod::Passkey | AuthMethod::PasskeyVerified => ACR_PHR,
             AuthMethod::PasskeyHardware | AuthMethod::PasskeyHardwareVerified => ACR_PHRH,
         }
@@ -165,6 +196,8 @@ impl AuthMethod {
         matches!(
             self,
             AuthMethod::Password
+                | AuthMethod::Totp
+                | AuthMethod::RecoveryCode
                 | AuthMethod::Passkey
                 | AuthMethod::PasskeyVerified
                 | AuthMethod::PasskeyHardware
@@ -316,6 +349,30 @@ impl AuthenticationEvent {
         }
     }
 
+    /// A password-plus-TOTP multi-factor authentication at `auth_time_unix_micros`
+    /// (issue #69): the user proved a knowledge factor (the password) AND a
+    /// possession factor (a current TOTP code), so the event records both methods
+    /// and derives the honest multi-factor ACR with amr `pwd`+`otp`+`mfa`.
+    #[must_use]
+    pub fn password_and_totp(auth_time_unix_micros: i64) -> Self {
+        Self {
+            methods: vec![AuthMethod::Password, AuthMethod::Totp],
+            auth_time_unix_micros,
+        }
+    }
+
+    /// A password-plus-recovery-code multi-factor authentication at
+    /// `auth_time_unix_micros` (issue #69): a one-time recovery code stood in for the
+    /// second factor. Recorded DISTINCTLY from TOTP (amr `pwd`+`kba`+`mfa`), so a
+    /// recovery-code login is never conflated with a live authenticator.
+    #[must_use]
+    pub fn password_and_recovery_code(auth_time_unix_micros: i64) -> Self {
+        Self {
+            methods: vec![AuthMethod::Password, AuthMethod::RecoveryCode],
+            auth_time_unix_micros,
+        }
+    }
+
     /// The recorded methods.
     #[must_use]
     pub fn methods(&self) -> &[AuthMethod] {
@@ -405,9 +462,41 @@ mod tests {
 
     #[test]
     fn acr_values_supported_advertises_the_active_methods_including_passkeys() {
-        // M7 (issue #65) activated the passkey methods, so their EAP ACRs are now
-        // advertised alongside the password ACR, in registry (strength) order.
-        assert_eq!(acr_values_supported(), vec![ACR_PWD, ACR_PHR, ACR_PHRH]);
+        // M7 activated the passkey methods (issue #65) and the TOTP / recovery-code
+        // second factors (issue #69), so their ACRs are advertised alongside the
+        // password ACR, in registry (strength) order. TOTP and recovery code share
+        // the multi-factor ACR, so it appears once.
+        assert_eq!(
+            acr_values_supported(),
+            vec![ACR_PWD, ACR_MFA, ACR_PHR, ACR_PHRH]
+        );
+    }
+
+    #[test]
+    fn totp_is_a_second_factor_with_honest_amr_and_the_mfa_acr() {
+        // A password-plus-TOTP event records both methods, derives the multi-factor
+        // ACR, and carries pwd+otp+mfa amr (issue #69).
+        let event = AuthenticationEvent::password_and_totp(1_700_000_000_000_000);
+        assert_eq!(event.methods(), &[AuthMethod::Password, AuthMethod::Totp]);
+        assert_eq!(achieved_acr(event.methods()), ACR_MFA);
+        assert_eq!(amr_values(event.methods()), vec!["pwd", "otp", "mfa"]);
+        assert_eq!(event.methods_token(), "pwd totp");
+        assert_eq!(parse_methods("pwd totp"), event.methods());
+    }
+
+    #[test]
+    fn recovery_code_is_distinct_from_totp_in_amr() {
+        // A recovery-code login is knowledge-based (kba), NEVER otp, so it can never
+        // masquerade as a live authenticator, while still achieving the mfa ACR.
+        let event = AuthenticationEvent::password_and_recovery_code(1_700_000_000_000_000);
+        assert_eq!(
+            event.methods(),
+            &[AuthMethod::Password, AuthMethod::RecoveryCode]
+        );
+        assert_eq!(achieved_acr(event.methods()), ACR_MFA);
+        assert_eq!(amr_values(event.methods()), vec!["pwd", "kba", "mfa"]);
+        assert!(!amr_values(event.methods()).contains(&"otp"));
+        assert_eq!(event.methods_token(), "pwd recovery_code");
     }
 
     #[test]

@@ -6,6 +6,21 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- `mfa_required` doc honesty (issue #69, review): the `[oidc].mfa_required` field doc
+  (and the regenerated `docs/CONFIG.md`) now states that TODAY it drives the
+  enrollment PROMPT and the `/account/mfa/plan` surface only; HARD login-flow
+  enforcement (challenging the second factor before a full session) lands with the
+  step-up issue (#72). `validate_totp` gains unit coverage for every bound (digits,
+  period, drift, recovery count, and unknown/duplicate `mfa_factor_order`).
+- TOTP second-factor settings on `[oidc]` (issue #69): `totp_enabled` (on by
+  default; the endpoints fail closed with a 404 when off), `totp_issuer` (the
+  authenticator-app label, derived from the serving scope when unset),
+  `totp_period_secs` (15..=60), `totp_digits` (6..=8), `totp_drift_steps` (0..=2,
+  the bounded skew window), `totp_recovery_code_count` (8..=16), plus the factor
+  orchestration knobs `mfa_required` and `mfa_factor_order` (a duplicate-free subset
+  of passkey/totp/password). A new `validate_totp` bounds each at startup, so a
+  misconfiguration is a boot-time error rather than a per-request surprise.
+
 - `[password_hashing]` settings (issue #62): a new `PasswordHashingConfig` table for the
   Argon2id parameters of NEWLY set passwords and the dedicated hashing worker pool.
   `memory_kib`/`iterations`/`parallelism` default to the OWASP recommendation

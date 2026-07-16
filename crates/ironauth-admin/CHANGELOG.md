@@ -6,6 +6,17 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Exit-export of the TOTP second factor now round-trips for REAL (issue #69/#58,
+  review, HIGH). The prior mapping opened the seed under the DEK and then DROPPED it
+  before serialization (`export_record_to_import` read only `account_credentials`), so
+  a re-import yielded a metadata echo: the factor did not verify. `export_record_to_import`
+  now emits the user's `totp` (opened seed, parameters, status, single-use step) and
+  `recovery_codes` (one-way hashes) into the import record, and the tests assert on the
+  EMITTED bytes plus a full API round-trip: a user with an active TOTP factor exports,
+  imports into a fresh scope, and afterward a code from the ORIGINAL seed verifies
+  against the re-imported factor and an original recovery code redeems once. The
+  field-coverage guard classifies the new `recovery_codes.code_bidx` column.
+
 - In-admin Argon2id tuning probe (issue #62): a new env-scoped, permission-gated
   `POST /v1/tenants/{tenant}/environments/{environment}/password-hashing/probe` runs the
   host-measured `ironauth_oidc::run_probe` (on a blocking thread, never inline on the

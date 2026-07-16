@@ -408,6 +408,18 @@ name = "webauthn_credentials"
 path = "tests/webauthn_credentials.rs"
 required-features = ["testing"]
 
+# TOTP and recovery-code persistence (issue #69): the seed is sealed at rest and
+# opens back under the tenant DEK; an abandoned enrollment stays pending; single-use
+# is a hard store invariant (a replayed time-step is refused) with drift resync;
+# recovery codes are hashed, single-use, and regeneration invalidates prior codes;
+# TOTP verify and recovery redeem are audited distinctly; a cross-subject factor is
+# the uniform not-found; and the exit export carries the opened seed. Needs a real
+# database (DATABASE_URL).
+[[test]]
+name = "totp_credentials"
+path = "tests/totp_credentials.rs"
+required-features = ["testing"]
+
 # Flexible identifiers on the central canonicalization seam (issue #54): the
 # canonicalization-mismatch CVE class fails to reproduce (Unicode invisibles,
 # mixed case, and fullwidth homoglyphs resolve identically across resolution and
