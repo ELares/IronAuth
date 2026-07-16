@@ -667,6 +667,30 @@ pub enum Action {
     /// single-use, establishing a session. A prefetching scanner's GET never reaches
     /// this. The row targets the `mlk_` token; the `detail` records the purpose.
     MagicLinkConsume,
+    /// An SMS-OTP code was SENT (issue #70): a fresh numeric code was issued to a
+    /// user for a purpose, invalidating any prior active code. The row targets the
+    /// `sot_` code; the `detail` records the purpose (never the plaintext code, which
+    /// is hashed on the row). A send suppressed / refused for anti-enumeration writes
+    /// no row.
+    SmsOtpSend,
+    /// An SMS-OTP code was VERIFIED (issue #70): a user presented the correct code
+    /// and it was consumed single-use. The row targets the `sot_` code; the `detail`
+    /// records the purpose.
+    SmsOtpVerify,
+    /// An SMS route was AUTO-THROTTLED by the pumping defense (issue #70): the
+    /// send-to-verify conversion on the route dropped below the configured threshold
+    /// over a sufficient sample, so the route was throttled WITHOUT operator
+    /// intervention. The row targets the route; the `detail` records the route and
+    /// the observed conversion.
+    SmsRouteThrottled,
+    /// An SMS route's low-conversion ALARM fired (issue #70): the send-to-verify
+    /// conversion crossed below the configured threshold. The row targets the route;
+    /// the `detail` records the route and the observed conversion.
+    SmsConversionAlarm,
+    /// The per (tenant, environment) SMS configuration was CHANGED (issue #70):
+    /// SMS OTP was enabled/disabled, the factor-downgrade path was set, or the
+    /// country allowlist was edited. The row records what changed in `detail`.
+    SmsConfigUpdate,
 }
 
 impl Action {
@@ -811,6 +835,11 @@ impl Action {
             Action::ClientStepUpPolicySet => "client.step_up_policy.set",
             Action::EmailOtpSend => "email_otp.send",
             Action::EmailOtpVerify => "email_otp.verify",
+            Action::SmsOtpSend => "sms_otp.send",
+            Action::SmsOtpVerify => "sms_otp.verify",
+            Action::SmsRouteThrottled => "sms_route.throttled",
+            Action::SmsConversionAlarm => "sms_route.conversion_alarm",
+            Action::SmsConfigUpdate => "sms_config.update",
             Action::MagicLinkSend => "magic_link.send",
             Action::MagicLinkConsume => "magic_link.consume",
         }

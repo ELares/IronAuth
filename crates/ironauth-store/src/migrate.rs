@@ -560,6 +560,12 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0048_email_otp_magic_links.sql"),
         },
+        Migration {
+            version: 49,
+            name: "sms_otp",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0049_sms_otp.sql"),
+        },
     ]
 }
 

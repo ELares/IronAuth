@@ -6,6 +6,19 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Guarded SMS-OTP settings (issue #70): new `oidc.sms_otp_enabled` (default FALSE, the
+  off-by-default deployment kill switch; its doc surfaces the NIST SP 800-63B-4
+  restricted-authenticator caveat), `oidc.sms_otp_code_digits` (6..=8),
+  `oidc.sms_otp_code_ttl_secs` (the 120..=600 band), `oidc.sms_otp_max_attempts`, the
+  velocity caps `oidc.sms_per_number_send_cap` / `oidc.sms_per_number_window_secs` /
+  `oidc.sms_send_cooldown_secs` / `oidc.sms_per_tenant_send_cap` /
+  `oidc.sms_per_tenant_window_secs` / `oidc.sms_per_route_send_cap` /
+  `oidc.sms_per_route_window_secs`, `oidc.sms_phone_scoring_enabled`, and the pumping-defense
+  knobs `oidc.sms_conversion_window_secs` / `oidc.sms_conversion_min_samples` /
+  `oidc.sms_conversion_alarm_threshold_percent` (1..=100) / `oidc.sms_route_throttle_secs`,
+  all validated at startup with safe defaults (an empty configuration is valid and leaves
+  SMS OFF). Per-tenant enablement and the country allowlist are per-tenant DB state, not
+  static config, so there is no allow-all shortcut.
 - `oidc.email_otp_max_attempts` scope note (issue #68, adversarial review): the per-code
   wrong-guess budget now ALSO bounds the cross-device magic-link short code (a low-entropy
   6-8 digit secret that flows through the same brute-force surface), so one setting governs

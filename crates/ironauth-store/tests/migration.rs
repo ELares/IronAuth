@@ -327,7 +327,7 @@ async fn expand_contract_example_chain_runs_all_three_phases_and_contract_remove
 // per real table); splitting it would not make it clearer.
 #[allow(clippy::too_many_lines)]
 #[tokio::test]
-async fn production_chain_is_only_the_forty_eight_real_migrations_and_ships_no_demo_object() {
+async fn production_chain_is_only_the_forty_nine_real_migrations_and_ships_no_demo_object() {
     // TestDatabase::start runs Store::migrate() (the production chain) on a
     // fresh, empty database.
     let db = TestDatabase::start().await;
@@ -344,8 +344,8 @@ async fn production_chain_is_only_the_forty_eight_real_migrations_and_ships_no_d
     );
     assert_eq!(
         report.already_applied(),
-        48,
-        "the production chain is exactly forty-eight migrations (isolation, audit log, management \
+        49,
+        "the production chain is exactly forty-nine migrations (isolation, audit log, management \
          API, OIDC authorization, signing keys, login/consent, authentication context, redirect \
          registration, UserInfo claims, consent scope upsert, resource servers, opaque access \
          tokens, client auth suite, dynamic client registration, pushed authorization requests, \
@@ -357,16 +357,16 @@ async fn production_chain_is_only_the_forty_eight_real_migrations_and_ships_no_d
          self-service account, admin user lifecycle, identity traits, foreign password \
          import, user invitations, flexible identifiers, exit-export credential grants, \
          migration state machine, webauthn credentials, totp credentials, credential abuse \
-         defenses, step-up policies, email OTP and scanner-safe magic links)"
+         defenses, step-up policies, email OTP and scanner-safe magic links, guarded SMS OTP)"
     );
 
-    // The ledger holds exactly versions 1 through 48.
+    // The ledger holds exactly versions 1 through 49.
     assert_eq!(
         applied_versions(pool).await,
         vec![
             1_i64, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
             24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45,
-            46, 47, 48
+            46, 47, 48, 49
         ]
     );
     let phase_of = |version: i64| async move {
@@ -545,6 +545,10 @@ async fn production_chain_is_only_the_forty_eight_real_migrations_and_ships_no_d
     // tenant-scoped tables (email_otp_codes, magic_link_tokens), no rewrite of existing
     // state.
     assert_eq!(phase_of(48).await, "expand");
+    // The guarded SMS-OTP migration (issue #70) is an EXPAND: four new tenant-scoped
+    // tables (sms_otp_codes, sms_config, sms_country_allowlist, sms_route_stats), no
+    // rewrite of existing state.
+    assert_eq!(phase_of(49).await, "expand");
 
     // The step-up second-factor abuse path (issue #72): migration 0047 WIDENED the
     // abuse_bans auth_path CHECK (0046 pinned the closed set) to also admit
@@ -2031,6 +2035,141 @@ async fn production_chain_is_only_the_forty_eight_real_migrations_and_ships_no_d
         assert!(
             check_constraint_exists(pool, table, &format!("{table}_attempts_nonneg")).await,
             "{table} must carry the attempts-nonneg CHECK constraint"
+        );
+    }
+
+    // ---- 0049 guarded SMS OTP (issue #70) ----
+    // The SMS-OTP code store mirrors email_otp_codes; the recipient is a sealed +
+    // blind-indexed PHONE, never plaintext, and the code is a one-way Argon2id hash.
+    assert!(
+        table_exists(pool, "sms_otp_codes").await,
+        "sms_otp_codes exists after 0049"
+    );
+    for column in [
+        "id",
+        "tenant_id",
+        "environment_id",
+        "subject",
+        "purpose",
+        "code_hash",
+        "recipient_phone_bidx",
+        "recipient_phone_sealed",
+        "pii_dek_version",
+        "attempt_count",
+        "max_attempts",
+        "expires_at",
+        "consumed_at",
+        "created_at",
+    ] {
+        assert!(
+            column_exists(pool, "sms_otp_codes", column).await,
+            "sms_otp_codes.{column} exists after 0049"
+        );
+    }
+    assert_eq!(
+        column_data_type(pool, "sms_otp_codes", "recipient_phone_sealed").await,
+        "bytea",
+        "the recipient phone must be a sealed bytea, never plaintext"
+    );
+    for forbidden in [
+        "code",
+        "otp",
+        "plaintext",
+        "phone",
+        "phone_number",
+        "recipient_phone",
+    ] {
+        assert!(
+            !column_exists(pool, "sms_otp_codes", forbidden).await,
+            "sms_otp_codes must have no plaintext code / phone column ({forbidden})"
+        );
+    }
+    assert!(
+        rls_enabled_and_forced(pool, "sms_otp_codes").await,
+        "sms_otp_codes must ENABLE and FORCE row-level security"
+    );
+    assert!(
+        policy_exists(pool, "sms_otp_codes", "sms_otp_codes_tenant_isolation").await,
+        "the (tenant, environment) isolation policy must exist on sms_otp_codes"
+    );
+    for constraint in [
+        "sms_otp_codes_scope_nonempty",
+        "sms_otp_codes_purpose_known",
+        "sms_otp_codes_attempts_nonneg",
+    ] {
+        assert!(
+            check_constraint_exists(pool, "sms_otp_codes", constraint).await,
+            "sms_otp_codes must carry the {constraint} CHECK constraint"
+        );
+    }
+
+    // The per-tenant SMS enablement: off by default (enabled DEFAULT false) and the
+    // factor-downgrade opt-in (default false). Both are the safe defaults that keep SMS
+    // off and non-downgrading everywhere.
+    assert!(
+        table_exists(pool, "sms_config").await,
+        "sms_config exists after 0049"
+    );
+    for column in [
+        "tenant_id",
+        "environment_id",
+        "enabled",
+        "allow_factor_downgrade",
+        "updated_at",
+    ] {
+        assert!(
+            column_exists(pool, "sms_config", column).await,
+            "sms_config.{column} exists after 0049"
+        );
+    }
+    // The country ALLOWLIST (never a blocklist): a per (tenant, environment, country)
+    // membership row.
+    assert!(
+        table_exists(pool, "sms_country_allowlist").await,
+        "sms_country_allowlist exists after 0049"
+    );
+    for column in ["tenant_id", "environment_id", "country_code", "created_at"] {
+        assert!(
+            column_exists(pool, "sms_country_allowlist", column).await,
+            "sms_country_allowlist.{column} exists after 0049"
+        );
+    }
+    // The per-route send-to-verify conversion counters + auto-throttle state.
+    assert!(
+        table_exists(pool, "sms_route_stats").await,
+        "sms_route_stats exists after 0049"
+    );
+    for column in [
+        "id",
+        "tenant_id",
+        "environment_id",
+        "route_key",
+        "send_count",
+        "verify_count",
+        "window_started_at",
+        "throttled_until",
+        "alarm_active",
+        "created_at",
+        "updated_at",
+    ] {
+        assert!(
+            column_exists(pool, "sms_route_stats", column).await,
+            "sms_route_stats.{column} exists after 0049"
+        );
+    }
+    // The tenant-scoped-table obligations for every new SMS table.
+    for table in ["sms_config", "sms_country_allowlist", "sms_route_stats"] {
+        assert!(
+            rls_enabled_and_forced(pool, table).await,
+            "{table} must ENABLE and FORCE row-level security"
+        );
+        assert!(
+            policy_exists(pool, table, &format!("{table}_tenant_isolation")).await,
+            "the (tenant, environment) isolation policy must exist on {table}"
+        );
+        assert!(
+            check_constraint_exists(pool, table, &format!("{table}_scope_nonempty")).await,
+            "{table} must carry the scope-nonempty CHECK constraint"
         );
     }
 }

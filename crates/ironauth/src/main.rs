@@ -462,7 +462,14 @@ async fn build_oidc_router(
         // `VerificationSender` here.
         .with_verification_sender(std::sync::Arc::new(
             ironauth_oidc::LoggingVerificationSender,
-        ));
+        ))
+        // The guarded SMS-OTP factor (issue #70) delivers through a SEPARATE provider
+        // seam. Until a real SMS provider (Twilio Verify, Vonage, SNS) is wired (M11
+        // messaging), ship the dev stub: it records deliveries and emits the code only at
+        // the `debug` trace level, so the guarded SMS logic works end to end without an
+        // SMS gateway. A production deployment installs its own `SmsSender` here. SMS OTP
+        // is off by default, so this stub is inert until a tenant explicitly enables SMS.
+        .with_sms_sender(std::sync::Arc::new(ironauth_oidc::LoggingSmsSender));
     if let Some(provider) = build_breach_provider(policy_config) {
         state = state.with_breach_provider(provider);
     }

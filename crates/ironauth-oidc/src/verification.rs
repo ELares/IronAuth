@@ -61,6 +61,26 @@ pub struct MagicLinkMessage<'a> {
     pub ttl_secs: u64,
 }
 
+/// An SMS-OTP delivery (issue #70): the numeric code to text to `recipient`, with the
+/// flow it authorizes and its lifetime. The concrete transport is a documented seam
+/// (M11 messaging: Twilio Verify, Vonage, SNS); the code is a live secret, so an
+/// implementation MUST NOT log it at a level that reaches production sinks.
+#[derive(Debug, Clone, Copy)]
+pub struct SmsOtpMessage<'a> {
+    /// The tenant/environment scope.
+    pub scope: Scope,
+    /// The flow the code authorizes.
+    pub purpose: EmailFactorPurpose,
+    /// The recipient phone number (canonical E.164).
+    pub recipient: &'a str,
+    /// The route bucket the send is accounted to (the country calling code).
+    pub route_key: &'a str,
+    /// The numeric one-time code (a live secret).
+    pub code: &'a str,
+    /// The code lifetime in seconds (for the message copy).
+    pub ttl_secs: u64,
+}
+
 impl VerificationPurpose {
     /// The stable wire tag, for tracing and a future template selection.
     #[must_use]
@@ -69,6 +89,60 @@ impl VerificationPurpose {
             VerificationPurpose::Registration => "registration",
             VerificationPurpose::Recovery => "recovery",
         }
+    }
+}
+
+/// The SMS delivery seam (issue #70): the provider boundary the guarded SMS-OTP factor
+/// delivers through. The concrete transport (Twilio Verify, Vonage, SNS) is M11 and out
+/// of scope here; this issue ships and tests against a local STUB, exactly like the
+/// email [`VerificationSender`] shipped [`NullVerificationSender`] /
+/// [`LoggingVerificationSender`]. An implementation MUST perform an actual delivery ONLY
+/// when [`send`](Self::send) is called; the caller decides whether to call it, applying
+/// the country-allowlist, velocity-cap, phone-scoring, and pumping-defense guards first,
+/// so a refused / suppressed destination never reaches a provider.
+pub trait SmsSender: Send + Sync + std::fmt::Debug {
+    /// Deliver an SMS-OTP code (issue #70). Called ONLY for a destination the guard
+    /// layer has permitted (never a refused / throttled / suppressed one).
+    fn send(&self, message: &SmsOtpMessage<'_>);
+}
+
+/// The default SMS sender: it performs NO delivery (issue #70). The real SMS transport
+/// is M11 messaging; until it is wired, a permitted send is a no-op, so the user-visible
+/// acknowledgment is identical whether or not a text actually goes out.
+#[derive(Debug, Default)]
+pub struct NullSmsSender;
+
+impl SmsSender for NullSmsSender {
+    fn send(&self, _message: &SmsOtpMessage<'_>) {
+        // No transport yet (issue #70). Intentionally does nothing.
+    }
+}
+
+/// A development / diagnostic SMS transport (issue #70): it records that a delivery
+/// HAPPENED on the observability plane and emits the live code ONLY at the `debug` trace
+/// level (never `info`), mirroring [`LoggingVerificationSender`]. The concrete provider
+/// adapters (M11) replace this stub; it ships so the guarded SMS-OTP logic is
+/// exercisable end to end without an SMS gateway.
+#[derive(Debug, Default)]
+pub struct LoggingSmsSender;
+
+impl SmsSender for LoggingSmsSender {
+    fn send(&self, message: &SmsOtpMessage<'_>) {
+        tracing::info!(
+            target: "ironauth.verification",
+            purpose = message.purpose.as_str(),
+            tenant = %message.scope.tenant(),
+            environment = %message.scope.environment(),
+            route = message.route_key,
+            ttl_secs = message.ttl_secs,
+            "SMS OTP delivered (dev transport)"
+        );
+        // The code is a live secret: only at debug, never at info.
+        tracing::debug!(
+            target: "ironauth.verification",
+            code = message.code,
+            "SMS OTP code (dev transport, debug only)"
+        );
     }
 }
 

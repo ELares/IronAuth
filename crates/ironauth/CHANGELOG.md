@@ -6,6 +6,12 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Guarded SMS OTP (issue #70): the server binary now installs a `LoggingSmsSender` dev stub
+  behind the SMS provider seam, so the guarded SMS-OTP factor delivers end to end without an
+  SMS gateway (the code is emitted only at the `debug` trace level; a real provider adapter
+  is a documented M11 seam a deployment installs in its place). SMS OTP stays off by default,
+  so the stub is inert until a tenant explicitly enables SMS and configures a country
+  allowlist.
 - Magic-link cross-device UI reachability (issue #68, adversarial review): the served
   magic-link send acknowledgment page now renders a `short_code` entry form, so the
   cross-device fallback (open the link on one device, finish on the originating device that

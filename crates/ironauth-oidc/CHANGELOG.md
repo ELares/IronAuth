@@ -6,6 +6,29 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Guarded SMS OTP with pumping defense (issue #70): new `otp/sms/send` and `otp/sms/verify`
+  handlers reuse the #68 email-OTP core (rejection-sampled numeric code, #62-pool Argon2
+  hashing, single-active-per-(subject, purpose), single-use consume, per-code attempt death,
+  reissue invalidation, #64 abuse throttle on verify) and add the SMS-specific guard layer.
+  SMS is OFF by default at two layers: a deployment kill switch (`sms_otp_enabled`, default
+  false, fails closed with a 404) and a per-tenant enablement that stays unusable until the
+  tenant explicitly turns it on AND populates a country ALLOWLIST (never a blocklist; an
+  empty allowlist means unusable, not open). A destination outside the allowlist, an
+  unparseable number, or a number that fails pre-send phone SCORING (a documented,
+  self-contained number-type table blocking toll-free / premium / virtual / malformed
+  ranges) is refused with a UNIFORM acknowledgment and an EQUAL dummy Argon2 spend, so no
+  branch is an existence / allowlist / scoring oracle. Velocity caps (per-number,
+  per-tenant, per-route send caps plus a per-number cooldown) layer on the #64 in-process
+  counters. The differentiating pumping defense tracks send-to-verify CONVERSION per route
+  (country bucket): a route whose conversion drops below a configurable threshold over a
+  sufficient sample AUTO-THROTTLES without operator intervention while HEALTHY routes keep
+  sending, emitting both an audit (`sms_route.throttled` + `sms_route.conversion_alarm`) and
+  an ops metric. A no-silent-downgrade invariant blocks SMS from completing a login/recovery
+  for an account protected by a passkey or active TOTP unless the tenant configured the
+  explicit downgrade path. New `AuthMethod::Sms` reports `amr` `sms` HONESTLY (RFC 8176),
+  distinct from the email/app `otp`. Phone-scoring heuristics and conversion-rate arithmetic
+  are pure and unit-tested; the full lifecycle, allowlist enforcement, velocity caps, the
+  pumping simulation, and the downgrade block are integration-tested against a stub provider.
 - Email OTP + magic-link adversarial-review hardening (issue #68): the `otp/send` and
   `magic/send` handlers now EQUALIZE their present-vs-absent response WORK, closing a
   timing enumeration oracle. The present path spends one #62-pool Argon2 hash (on the code /

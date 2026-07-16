@@ -6,6 +6,26 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Guarded SMS-OTP persistence (issue #70): migration 0049 adds four durable, tenant-scoped
+  tables (all with forced RLS, the (tenant, environment) isolation policy, the nonempty-scope
+  CHECK, and a query-audit registration). `sms_otp_codes` mirrors `email_otp_codes` but seals
+  and blind-indexes the recipient PHONE under the scope DEK (issue #48), never a plaintext
+  column, with the code stored only as a one-way Argon2id hash; `sms_config` holds the
+  per-tenant enablement (`enabled` DEFAULT false) and the factor-downgrade opt-in
+  (`allow_factor_downgrade` DEFAULT false), so SMS is off and non-downgrading by default
+  everywhere; `sms_country_allowlist` is the per-(tenant, environment, country) ALLOWLIST
+  (never a blocklist); `sms_route_stats` holds the per-route send-to-verify conversion
+  counters and the auto-throttle / alarm state that drives the pumping defense. New store
+  types (`NewSmsOtpCode`, `ActiveSmsOtpCode`, `SmsTenantConfig`, `SmsRouteStat`), scoped ids
+  (`sot_`, `srt_`), a read repo (`SmsOtpRepo`: resolve active code, config, allowlist, route
+  stats) and an acting repo (`ActingSmsOtpRepo`: issue / consume / record-wrong-guess,
+  set-config, add / remove allowlist country, record-send, record-verify, and the audited
+  `auto_throttle_route` that writes both the throttle and the conversion-alarm audit rows in
+  one transaction). New audit actions `sms_otp.send`, `sms_otp.verify`, `sms_route.throttled`,
+  `sms_route.conversion_alarm`, `sms_config.update`. Cheap existence probes
+  `TotpCredentialRepo::has_active` and `WebauthnCredentialRepo::has_any` back the OIDC
+  no-silent-downgrade invariant. The migration guard test asserts the new count (49), phase,
+  ledger range, and every new table / column / RLS / policy / CHECK.
 - Magic-link short-code attempt-limit hardening (issue #68, adversarial review): migration
   0048 (unshipped, amended in place, still guard count 48) adds `attempt_count` and
   `max_attempts` columns plus an `attempts_nonneg` CHECK to `magic_link_tokens`, and extends

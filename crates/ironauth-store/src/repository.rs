@@ -76,13 +76,15 @@ use crate::id::{
     InvitationId, IssuedTokenId, KekId, MagicLinkTokenId, ManagementKeyId, MigrationRunId,
     MigrationRunRecordId, OperatorId, OrganizationId, PushedRequestId, RecoveryCodeId,
     RefreshFamilyId, RefreshTokenId, ResourceServerId, ScopeStepUpPolicyId, ServiceAccountId,
-    SessionEventId, SessionId, SigningKeyId, TenantId, TotpCredentialId, TraitMigrationJobId,
-    TraitSchemaId, UserId, UserIdentifierId, VariableId, WebauthnChallengeId, WebauthnCredentialId,
+    SessionEventId, SessionId, SigningKeyId, SmsOtpCodeId, SmsRouteStatId, TenantId,
+    TotpCredentialId, TraitMigrationJobId, TraitSchemaId, UserId, UserIdentifierId, VariableId,
+    WebauthnChallengeId, WebauthnCredentialId,
 };
 use crate::identifier::{
     CanonicalIdentifier, IdentifierType, UniquenessMode, canonicalize_identifier,
 };
 use crate::scope::Scope;
+use crate::sms_otp::{ActiveSmsOtpCode, NewSmsOtpCode, SmsRouteStat, SmsTenantConfig};
 use crate::store::Store;
 use crate::trait_schema::{TraitSchema, TransformOp, ValidationFailure};
 
@@ -570,6 +572,19 @@ impl<'a> ScopedStore<'a> {
         }
     }
 
+    /// The read-only SMS-OTP repository for this scope (issue #70): resolve a
+    /// subject's ACTIVE (unconsumed, unexpired) code for a purpose, read the per-tenant
+    /// SMS configuration and country allowlist, and read the per-route conversion
+    /// stats. Issuing a code, consuming it, and writing config / route stats are
+    /// mutations on [`ActingStore::sms_otp`].
+    #[must_use]
+    pub fn sms_otp(&self) -> SmsOtpRepo<'a> {
+        SmsOtpRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
     /// The read-and-bookkeeping device-authorization repository for this scope (issue
     /// #24, RFC 8628). Resolves a presented device code at the token-endpoint poll,
     /// looks up a flow by a submitted user code on the verification page, records a
@@ -761,6 +776,22 @@ impl<'a> ActingStore<'a> {
     #[must_use]
     pub fn magic_links(&self) -> ActingMagicLinkRepo<'a> {
         ActingMagicLinkRepo {
+            store: self.store,
+            scope: self.scope,
+            acting: self.acting,
+        }
+    }
+
+    /// The mutating SMS-OTP repository for this scope and actor (issue #70): issue a
+    /// fresh code (invalidating any prior active one), consume it single-use on a
+    /// correct guess, record / retire it on a wrong guess, edit the per-tenant SMS
+    /// configuration and country allowlist, and update the per-route conversion
+    /// counters plus the auto-throttle / alarm state. Issue, consume, config edits,
+    /// the throttle, and the alarm are audited; the wrong-guess and per-route counter
+    /// bookkeeping are off the audited path (exactly like the abuse counters).
+    #[must_use]
+    pub fn sms_otp(&self) -> ActingSmsOtpRepo<'a> {
+        ActingSmsOtpRepo {
             store: self.store,
             scope: self.scope,
             acting: self.acting,
@@ -4401,6 +4432,712 @@ impl ActingEmailOtpCodeRepo<'_> {
         }
         tx.commit().await?;
         Ok(OtpAttemptOutcome::Survived)
+    }
+}
+
+// ===========================================================================
+// The guarded SMS-OTP factor (issue #70).
+//
+// The OTP semantics are IDENTICAL to the email OTP (issue #68): a code is loaded by
+// the non-secret (subject, purpose) handle and verified through the hashing pool,
+// single-active per (subject, purpose), single-use, attempt-limited, and stored ONLY
+// as a one-way Argon2id hash; the recipient PHONE is sealed and blind-indexed (issue
+// #48), never plaintext. The SMS-specific guard state (the per-tenant enablement, the
+// country allowlist, and the per-route send-to-verify conversion counters that drive
+// the pumping defense) lives alongside, all under the same forced row-level security.
+// ===========================================================================
+
+/// The read-only SMS-OTP repository (issue #70): resolve a subject's ACTIVE code, and
+/// read the per-tenant SMS configuration, the country allowlist, and the per-route
+/// conversion stats.
+pub struct SmsOtpRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl SmsOtpRepo<'_> {
+    /// Resolve the subject's single ACTIVE (unconsumed, unexpired) SMS-OTP code for
+    /// `purpose`, or [`None`] when there is none. Mirrors
+    /// [`EmailOtpCodeRepo::resolve_active`].
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn resolve_active(
+        &self,
+        subject: &UserId,
+        purpose: EmailFactorPurpose,
+        now_micros: i64,
+    ) -> Result<Option<ActiveSmsOtpCode>, StoreError> {
+        let scope = self.scope;
+        let mut tx = begin_scoped(self.store, scope).await?;
+        let row = sqlx::query(
+            "SELECT id, code_hash, attempt_count, max_attempts FROM sms_otp_codes \
+             WHERE tenant_id = $1 AND environment_id = $2 AND subject = $3 AND purpose = $4 \
+               AND consumed_at IS NULL \
+               AND expires_at > TIMESTAMPTZ 'epoch' + ($5::text || ' microseconds')::interval",
+        )
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(subject.to_string())
+        .bind(purpose.as_str())
+        .bind(now_micros)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let id = SmsOtpCodeId::parse_in_scope(&row.get::<String, _>("id"), &scope)?;
+        Ok(Some(ActiveSmsOtpCode {
+            id,
+            code_hash: row.get("code_hash"),
+            attempt_count: row.get("attempt_count"),
+            max_attempts: row.get("max_attempts"),
+        }))
+    }
+
+    /// The per (tenant, environment) SMS configuration. A scope with NO row resolves
+    /// to [`SmsTenantConfig::disabled`]: SMS OTP is off by default in every scope.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn config(&self) -> Result<SmsTenantConfig, StoreError> {
+        let scope = self.scope;
+        let mut tx = begin_scoped(self.store, scope).await?;
+        let row = sqlx::query(
+            "SELECT enabled, allow_factor_downgrade FROM sms_config \
+             WHERE tenant_id = $1 AND environment_id = $2",
+        )
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(match row {
+            Some(row) => SmsTenantConfig {
+                enabled: row.get("enabled"),
+                allow_factor_downgrade: row.get("allow_factor_downgrade"),
+            },
+            None => SmsTenantConfig::disabled(),
+        })
+    }
+
+    /// Whether `country_code` is on the scope's country ALLOWLIST (issue #70). An
+    /// absent code (including an EMPTY allowlist) is refused: this is an allowlist,
+    /// never a blocklist.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn allowlist_contains(&self, country_code: &str) -> Result<bool, StoreError> {
+        let scope = self.scope;
+        let mut tx = begin_scoped(self.store, scope).await?;
+        let row = sqlx::query(
+            "SELECT 1 AS present FROM sms_country_allowlist \
+             WHERE tenant_id = $1 AND environment_id = $2 AND country_code = $3",
+        )
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(country_code)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(row.is_some())
+    }
+
+    /// The scope's full country allowlist, ascending (issue #70): the admin view.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn allowlist(&self) -> Result<Vec<String>, StoreError> {
+        let scope = self.scope;
+        let mut tx = begin_scoped(self.store, scope).await?;
+        let rows = sqlx::query(
+            "SELECT country_code FROM sms_country_allowlist \
+             WHERE tenant_id = $1 AND environment_id = $2 ORDER BY country_code",
+        )
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| row.get("country_code"))
+            .collect())
+    }
+
+    /// The per-route send-to-verify conversion stats for `route_key`, or [`None`] when
+    /// the route has no history yet (issue #70).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn route_stat(&self, route_key: &str) -> Result<Option<SmsRouteStat>, StoreError> {
+        let scope = self.scope;
+        let mut tx = begin_scoped(self.store, scope).await?;
+        let row = sqlx::query(
+            "SELECT route_key, send_count, verify_count, \
+             (EXTRACT(EPOCH FROM throttled_until) * 1000000)::bigint AS throttled_us, \
+             alarm_active FROM sms_route_stats \
+             WHERE tenant_id = $1 AND environment_id = $2 AND route_key = $3",
+        )
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(route_key)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(row.map(|row| SmsRouteStat {
+            route_key: row.get("route_key"),
+            send_count: row.get("send_count"),
+            verify_count: row.get("verify_count"),
+            throttled_until_unix_micros: row.get::<Option<i64>, _>("throttled_us"),
+            alarm_active: row.get("alarm_active"),
+        }))
+    }
+}
+
+/// The mutating SMS-OTP repository (issue #70): issue, consume, and retire codes; edit
+/// the per-tenant configuration and allowlist; and drive the per-route conversion
+/// counters and the auto-throttle / alarm.
+pub struct ActingSmsOtpRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+    acting: ActingContext,
+}
+
+impl ActingSmsOtpRepo<'_> {
+    /// Lazily provision the scope's KEK/DEK so the recipient phone can be sealed.
+    async fn ensure_scope_keys(&self, env: &Env, master: &MasterKey) -> Result<(), StoreError> {
+        let envelope = ActingEnvelopeRepo {
+            store: self.store,
+            scope: self.scope,
+            acting: self.acting,
+        };
+        match envelope.provision_kek(env, master).await {
+            Ok(_) | Err(StoreError::Conflict) => {}
+            Err(error) => return Err(error),
+        }
+        match envelope.provision_dek(env, master).await {
+            Ok(_) | Err(StoreError::Conflict) => {}
+            Err(error) => return Err(error),
+        }
+        Ok(())
+    }
+
+    /// ISSUE a fresh SMS-OTP code (issue #70): invalidate any prior ACTIVE code for
+    /// this (subject, purpose) by deleting it, then insert the new one, sealing and
+    /// blind-indexing the recipient phone, with one `sms_otp.send` audit row in the
+    /// same transaction. Mirrors [`ActingEmailOtpCodeRepo::issue`].
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the id is out of scope; [`StoreError::Encryption`]
+    /// if no master key is configured; [`StoreError::Database`] on a persistence failure.
+    pub async fn issue(
+        &self,
+        env: &Env,
+        spec: NewSmsOtpCode<'_>,
+        created_at_micros: i64,
+    ) -> Result<SmsOtpCodeId, StoreError> {
+        if spec.id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let master = self.store.master().ok_or(StoreError::Encryption)?;
+        self.ensure_scope_keys(env, master).await?;
+        let scope = self.scope;
+        let id = *spec.id;
+        let subject = spec.subject.to_string();
+        let purpose = spec.purpose;
+        let code_hash = spec.code_hash.to_owned();
+        let recipient = spec.recipient_phone.to_owned();
+        let max_attempts = spec.max_attempts;
+        let expires = spec.expires_at_unix_micros;
+        let bidx = sms_factor_recipient_blind_index(master, scope, &recipient);
+        let detail = format!("purpose={}", purpose.as_str());
+        write_audited_detailed(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::SmsOtpSend,
+                target: &id,
+            },
+            async move |tx| {
+                sqlx::query(
+                    "DELETE FROM sms_otp_codes \
+                     WHERE tenant_id = $1 AND environment_id = $2 AND subject = $3 \
+                       AND purpose = $4 AND consumed_at IS NULL",
+                )
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(&subject)
+                .bind(purpose.as_str())
+                .execute(&mut **tx)
+                .await?;
+                let (dek_version, dek) = fetch_active_dek(tx, scope, master).await?;
+                let recipient_sealed = dek.seal(
+                    env.entropy(),
+                    &sms_factor_recipient_seal_aad(scope, dek_version),
+                    recipient.as_bytes(),
+                );
+                sqlx::query(
+                    "INSERT INTO sms_otp_codes \
+                     (id, tenant_id, environment_id, subject, purpose, code_hash, \
+                      recipient_phone_bidx, recipient_phone_sealed, pii_dek_version, \
+                      attempt_count, max_attempts, expires_at, created_at) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 0, $10, \
+                             TIMESTAMPTZ 'epoch' + ($11::text || ' microseconds')::interval, \
+                             TIMESTAMPTZ 'epoch' + ($12::text || ' microseconds')::interval)",
+                )
+                .bind(id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(&subject)
+                .bind(purpose.as_str())
+                .bind(&code_hash)
+                .bind(bidx.into_bytes())
+                .bind(recipient_sealed.into_bytes())
+                .bind(dek_version)
+                .bind(max_attempts)
+                .bind(expires)
+                .bind(created_at_micros)
+                .execute(&mut **tx)
+                .await?;
+                Ok(())
+            },
+            false,
+            Some(&detail),
+        )
+        .await?;
+        Ok(id)
+    }
+
+    /// CONSUME an SMS-OTP code single-use (issue #70): a guarded UPDATE sets
+    /// `consumed_at` WHERE it is still NULL and unexpired, so a double-submit race
+    /// consumes at most once, with one `sms_otp.verify` audit row. Mirrors
+    /// [`ActingEmailOtpCodeRepo::consume`].
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn consume(
+        &self,
+        env: &Env,
+        id: &SmsOtpCodeId,
+        now_micros: i64,
+    ) -> Result<bool, StoreError> {
+        if id.scope() != self.scope {
+            return Ok(false);
+        }
+        let scope = self.scope;
+        let id = *id;
+        let detail = "purpose=verify";
+        let result = write_audited_detailed(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::SmsOtpVerify,
+                target: &id,
+            },
+            async move |tx| {
+                let affected = sqlx::query(
+                    "UPDATE sms_otp_codes \
+                     SET consumed_at = TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval \
+                     WHERE tenant_id = $1 AND environment_id = $2 AND id = $3 \
+                       AND consumed_at IS NULL \
+                       AND expires_at > TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval",
+                )
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(id.to_string())
+                .bind(now_micros)
+                .execute(&mut **tx)
+                .await?
+                .rows_affected();
+                if affected == 0 {
+                    return Err(StoreError::NotFound);
+                }
+                Ok(())
+            },
+            false,
+            Some(detail),
+        )
+        .await;
+        match result {
+            Ok(()) => Ok(true),
+            Err(StoreError::NotFound) => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Record a WRONG guess against an SMS-OTP code (issue #70): increment the attempt
+    /// counter and DELETE the code when it reaches the budget. Mirrors
+    /// [`ActingEmailOtpCodeRepo::record_wrong_guess`] (an off-audited-path counter).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn record_wrong_guess(
+        &self,
+        id: &SmsOtpCodeId,
+        now_micros: i64,
+    ) -> Result<OtpAttemptOutcome, StoreError> {
+        if id.scope() != self.scope {
+            return Ok(OtpAttemptOutcome::Gone);
+        }
+        let scope = self.scope;
+        let mut tx = begin_scoped(self.store, scope).await?;
+        let row = sqlx::query(
+            "UPDATE sms_otp_codes SET attempt_count = attempt_count + 1 \
+             WHERE tenant_id = $1 AND environment_id = $2 AND id = $3 \
+               AND consumed_at IS NULL \
+               AND expires_at > TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval \
+             RETURNING attempt_count, max_attempts",
+        )
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(id.to_string())
+        .bind(now_micros)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(row) = row else {
+            tx.commit().await?;
+            return Ok(OtpAttemptOutcome::Gone);
+        };
+        let attempts: i32 = row.get("attempt_count");
+        let max_attempts: i32 = row.get("max_attempts");
+        if attempts >= max_attempts {
+            sqlx::query(
+                "DELETE FROM sms_otp_codes \
+                 WHERE tenant_id = $1 AND environment_id = $2 AND id = $3",
+            )
+            .bind(scope.tenant().to_string())
+            .bind(scope.environment().to_string())
+            .bind(id.to_string())
+            .execute(&mut *tx)
+            .await?;
+            tx.commit().await?;
+            return Ok(OtpAttemptOutcome::Died);
+        }
+        tx.commit().await?;
+        Ok(OtpAttemptOutcome::Survived)
+    }
+
+    /// SET the per (tenant, environment) SMS configuration (issue #70): the explicit
+    /// per-tenant enablement and the factor-downgrade opt-in. An upsert with one
+    /// `sms_config.update` audit row. Enabling SMS is an explicit act; the caller is
+    /// responsible for also populating the country allowlist (an empty allowlist keeps
+    /// SMS unusable).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn set_config(
+        &self,
+        env: &Env,
+        enabled: bool,
+        allow_factor_downgrade: bool,
+        now_micros: i64,
+    ) -> Result<(), StoreError> {
+        let scope = self.scope;
+        let detail = format!("enabled={enabled} allow_downgrade={allow_factor_downgrade}");
+        write_audited_detailed(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::SmsConfigUpdate,
+                target: &SmsConfigTarget,
+            },
+            async move |tx| {
+                sqlx::query(
+                    "INSERT INTO sms_config \
+                     (tenant_id, environment_id, enabled, allow_factor_downgrade, updated_at) \
+                     VALUES ($1, $2, $3, $4, \
+                             TIMESTAMPTZ 'epoch' + ($5::text || ' microseconds')::interval) \
+                     ON CONFLICT (tenant_id, environment_id) DO UPDATE \
+                       SET enabled = EXCLUDED.enabled, \
+                           allow_factor_downgrade = EXCLUDED.allow_factor_downgrade, \
+                           updated_at = EXCLUDED.updated_at",
+                )
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(enabled)
+                .bind(allow_factor_downgrade)
+                .bind(now_micros)
+                .execute(&mut **tx)
+                .await?;
+                Ok(())
+            },
+            false,
+            Some(&detail),
+        )
+        .await
+    }
+
+    /// ADD a country calling code to the scope's allowlist (issue #70), idempotently,
+    /// with one `sms_config.update` audit row.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn add_allowlist_country(
+        &self,
+        env: &Env,
+        country_code: &str,
+    ) -> Result<(), StoreError> {
+        let scope = self.scope;
+        let country_code = country_code.to_owned();
+        let detail = format!("allowlist_add={country_code}");
+        write_audited_detailed(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::SmsConfigUpdate,
+                target: &SmsConfigTarget,
+            },
+            async move |tx| {
+                sqlx::query(
+                    "INSERT INTO sms_country_allowlist \
+                     (tenant_id, environment_id, country_code) VALUES ($1, $2, $3) \
+                     ON CONFLICT (tenant_id, environment_id, country_code) DO NOTHING",
+                )
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(&country_code)
+                .execute(&mut **tx)
+                .await?;
+                Ok(())
+            },
+            false,
+            Some(&detail),
+        )
+        .await
+    }
+
+    /// REMOVE a country calling code from the scope's allowlist (issue #70), with one
+    /// `sms_config.update` audit row.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn remove_allowlist_country(
+        &self,
+        env: &Env,
+        country_code: &str,
+    ) -> Result<(), StoreError> {
+        let scope = self.scope;
+        let country_code = country_code.to_owned();
+        let detail = format!("allowlist_remove={country_code}");
+        write_audited_detailed(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::SmsConfigUpdate,
+                target: &SmsConfigTarget,
+            },
+            async move |tx| {
+                sqlx::query(
+                    "DELETE FROM sms_country_allowlist \
+                     WHERE tenant_id = $1 AND environment_id = $2 AND country_code = $3",
+                )
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(&country_code)
+                .execute(&mut **tx)
+                .await?;
+                Ok(())
+            },
+            false,
+            Some(&detail),
+        )
+        .await
+    }
+
+    /// Record a SEND on `route_key` and return the route's post-increment conversion
+    /// stats (issue #70). Rolls the conversion window forward when it has elapsed
+    /// (`window_started_at <= window_floor_micros`), resetting the counters and
+    /// clearing any stale throttle/alarm so a route that has recovered is not
+    /// permanently penalized. An off-audited-path counter (the pumping-defense signal),
+    /// exactly like the abuse counters.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn record_send(
+        &self,
+        env: &Env,
+        route_key: &str,
+        window_floor_micros: i64,
+        now_micros: i64,
+    ) -> Result<SmsRouteStat, StoreError> {
+        let scope = self.scope;
+        let id = SmsRouteStatId::generate(env, &scope);
+        let mut tx = begin_scoped(self.store, scope).await?;
+        // The window-elapsed predicate: reset when the window opened at or before the
+        // floor (now - window). Fresh rows insert with count 1 at `now`.
+        let row = sqlx::query(
+            "INSERT INTO sms_route_stats \
+             (id, tenant_id, environment_id, route_key, send_count, verify_count, \
+              window_started_at, throttled_until, alarm_active, created_at, updated_at) \
+             VALUES ($1, $2, $3, $4, 1, 0, \
+                     TIMESTAMPTZ 'epoch' + ($5::text || ' microseconds')::interval, NULL, false, \
+                     TIMESTAMPTZ 'epoch' + ($5::text || ' microseconds')::interval, \
+                     TIMESTAMPTZ 'epoch' + ($5::text || ' microseconds')::interval) \
+             ON CONFLICT (tenant_id, environment_id, route_key) DO UPDATE SET \
+               send_count = CASE WHEN sms_route_stats.window_started_at \
+                   <= TIMESTAMPTZ 'epoch' + ($6::text || ' microseconds')::interval \
+                 THEN 1 ELSE sms_route_stats.send_count + 1 END, \
+               verify_count = CASE WHEN sms_route_stats.window_started_at \
+                   <= TIMESTAMPTZ 'epoch' + ($6::text || ' microseconds')::interval \
+                 THEN 0 ELSE sms_route_stats.verify_count END, \
+               window_started_at = CASE WHEN sms_route_stats.window_started_at \
+                   <= TIMESTAMPTZ 'epoch' + ($6::text || ' microseconds')::interval \
+                 THEN TIMESTAMPTZ 'epoch' + ($5::text || ' microseconds')::interval \
+                 ELSE sms_route_stats.window_started_at END, \
+               throttled_until = CASE WHEN sms_route_stats.window_started_at \
+                   <= TIMESTAMPTZ 'epoch' + ($6::text || ' microseconds')::interval \
+                 THEN NULL ELSE sms_route_stats.throttled_until END, \
+               alarm_active = CASE WHEN sms_route_stats.window_started_at \
+                   <= TIMESTAMPTZ 'epoch' + ($6::text || ' microseconds')::interval \
+                 THEN false ELSE sms_route_stats.alarm_active END, \
+               updated_at = TIMESTAMPTZ 'epoch' + ($5::text || ' microseconds')::interval \
+             RETURNING id, route_key, send_count, verify_count, \
+               (EXTRACT(EPOCH FROM throttled_until) * 1000000)::bigint AS throttled_us, \
+               alarm_active",
+        )
+        .bind(id.to_string())
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(route_key)
+        .bind(now_micros)
+        .bind(window_floor_micros)
+        .fetch_one(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(SmsRouteStat {
+            route_key: row.get("route_key"),
+            send_count: row.get("send_count"),
+            verify_count: row.get("verify_count"),
+            throttled_until_unix_micros: row.get::<Option<i64>, _>("throttled_us"),
+            alarm_active: row.get("alarm_active"),
+        })
+    }
+
+    /// Record a successful VERIFY on `route_key` (issue #70): increment the route's
+    /// verification counter, best-effort, so the conversion rate reflects it. An
+    /// off-audited-path counter. A no-op when the route has no send row yet.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn record_verify(&self, route_key: &str) -> Result<(), StoreError> {
+        let scope = self.scope;
+        let mut tx = begin_scoped(self.store, scope).await?;
+        sqlx::query(
+            "UPDATE sms_route_stats SET verify_count = verify_count + 1 \
+             WHERE tenant_id = $1 AND environment_id = $2 AND route_key = $3",
+        )
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(route_key)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// AUTO-THROTTLE `route_key` and latch its low-conversion alarm (issue #70): set
+    /// `throttled_until` and `alarm_active`, and write BOTH a `sms_route.throttled` and
+    /// a `sms_route.conversion_alarm` audit row in ONE transaction, WITHOUT operator
+    /// intervention. `detail` is the operator-safe conversion summary. Returns whether
+    /// this call transitioned the route into the throttled/alarmed state (so the caller
+    /// emits the ops metric exactly once).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn auto_throttle_route(
+        &self,
+        env: &Env,
+        route_key: &str,
+        throttled_until_micros: i64,
+        detail: &str,
+    ) -> Result<bool, StoreError> {
+        let scope = self.scope;
+        let mut tx = begin_scoped(self.store, scope).await?;
+        // Only transition a route that is NOT already alarmed, so the audit + ops fire
+        // exactly once per throttle episode.
+        let row = sqlx::query(
+            "UPDATE sms_route_stats \
+             SET throttled_until = TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval, \
+                 alarm_active = true, \
+                 updated_at = TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval \
+             WHERE tenant_id = $1 AND environment_id = $2 AND route_key = $3 \
+               AND alarm_active = false \
+             RETURNING id",
+        )
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(route_key)
+        .bind(throttled_until_micros)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(row) = row else {
+            // Already alarmed: no state transition, no duplicate audit/ops.
+            tx.commit().await?;
+            return Ok(false);
+        };
+        let id = SmsRouteStatId::parse_in_scope(&row.get::<String, _>("id"), &scope)?;
+        // Both the throttle and the alarm are first-class audited events (issue #70).
+        let throttle_spec = AuditedWrite {
+            store: self.store,
+            scope,
+            acting: &self.acting,
+            env,
+            action: Action::SmsRouteThrottled,
+            target: &id,
+        };
+        insert_audit_row(&mut tx, &throttle_spec, Some(detail)).await?;
+        let alarm_spec = AuditedWrite {
+            store: self.store,
+            scope,
+            acting: &self.acting,
+            env,
+            action: Action::SmsConversionAlarm,
+            target: &id,
+        };
+        insert_audit_row(&mut tx, &alarm_spec, Some(detail)).await?;
+        tx.commit().await?;
+        Ok(true)
+    }
+}
+
+/// The audit target for a per (tenant, environment) SMS-configuration change (issue
+/// #70). The configuration is a per-scope singleton (no `id_`), so its audit rows
+/// target the scope-level `sms_config` handle.
+struct SmsConfigTarget;
+
+impl AuditTarget for SmsConfigTarget {
+    fn audit_target_kind(&self) -> &'static str {
+        "sms_config"
+    }
+
+    fn audit_target_id(&self) -> String {
+        "sms_config".to_owned()
     }
 }
 
@@ -14828,6 +15565,32 @@ impl WebauthnCredentialRepo<'_> {
         Ok(WebauthnCredentialId::parse_in_scope(raw, &self.scope)?)
     }
 
+    /// Whether `subject` has at least one registered passkey (issue #70): a cheap
+    /// existence probe (no PII opened) for the no-silent-downgrade invariant, so SMS
+    /// can never stand in for an account that is protected by a passkey unless the
+    /// tenant explicitly opts into the downgrade path.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn has_any(&self, subject: &UserId) -> Result<bool, StoreError> {
+        if subject.scope() != self.scope {
+            return Ok(false);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT 1 AS present FROM webauthn_credentials \
+             WHERE tenant_id = $1 AND environment_id = $2 AND subject = $3 LIMIT 1",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(subject.to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(row.is_some())
+    }
+
     /// One page of `subject`'s registered passkeys, ordered by `(created_at, id)`,
     /// decrypting each nickname. Filtered on the subject, so it lists ONLY that
     /// subject's own credentials.
@@ -15675,6 +16438,33 @@ impl TotpCredentialRepo<'_> {
     /// [`StoreError::NotFound`] if the identifier is malformed or out of scope.
     pub fn parse_id(&self, raw: &str) -> Result<TotpCredentialId, StoreError> {
         Ok(TotpCredentialId::parse_in_scope(raw, &self.scope)?)
+    }
+
+    /// Whether `subject` has at least one ACTIVE TOTP authenticator (issue #70): a
+    /// cheap existence probe (no PII opened) for the no-silent-downgrade invariant, so
+    /// SMS can never stand in for an account that is protected by a live TOTP factor
+    /// unless the tenant explicitly opts into the downgrade path.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn has_active(&self, subject: &UserId) -> Result<bool, StoreError> {
+        if subject.scope() != self.scope {
+            return Ok(false);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT 1 AS present FROM totp_credentials \
+             WHERE tenant_id = $1 AND environment_id = $2 AND subject = $3 \
+               AND status = 'active' LIMIT 1",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(subject.to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(row.is_some())
     }
 
     /// List `subject`'s TOTP authenticators (pending and active), opening each
@@ -20947,6 +21737,13 @@ const EMAIL_FACTOR_RECIPIENT_SEAL_LABEL: &str = "ironauth.envelope.email-factor-
 /// `email_otp_codes` / `magic_link_tokens` row (issue #68) from every other keyed
 /// derivation, so a recipient-email index tag never collides across columns or tenants.
 const EMAIL_FACTOR_RECIPIENT_BIDX_LABEL: &str = "ironauth.bidx.email-factor-recipient.v1";
+/// The AAD label domain-separating a sealed recipient phone number on an
+/// `sms_otp_codes` row (issue #70) from every other envelope context, so a phone
+/// ciphertext never authenticates under another column's context.
+const SMS_FACTOR_RECIPIENT_SEAL_LABEL: &str = "ironauth.envelope.sms-factor-recipient.v1";
+/// The AAD label domain-separating the recipient-phone blind index on an
+/// `sms_otp_codes` row (issue #70) from every other keyed derivation.
+const SMS_FACTOR_RECIPIENT_BIDX_LABEL: &str = "ironauth.bidx.sms-factor-recipient.v1";
 /// The purpose label bound into a sealed `users.identifier` (the login handle).
 const USER_IDENTIFIER_PURPOSE: &str = "identifier";
 /// The purpose label bound into a sealed `users.claims` (the standard-claim JSON).
@@ -21318,6 +22115,39 @@ fn email_factor_recipient_blind_index(
     recipient: &str,
 ) -> BlindIndex {
     master.blind_index(&email_factor_recipient_bidx_aad(scope, recipient))
+}
+
+/// The associated data binding a sealed recipient phone on an `sms_otp_codes` row
+/// (issue #70) to its scope and the DEK version that sealed it.
+fn sms_factor_recipient_seal_aad(scope: Scope, dek_version: i32) -> Aad {
+    Aad::builder()
+        .text(SMS_FACTOR_RECIPIENT_SEAL_LABEL)
+        .text(&scope.tenant().to_string())
+        .text(&scope.environment().to_string())
+        .version(i64::from(dek_version))
+        .build()
+}
+
+/// The blind-index context for a recipient phone on an `sms_otp_codes` row (issue
+/// #70): the label, the scope, and the number, length-prefixed. The per-tenant HMAC
+/// key keeps the same number in two tenants from colliding.
+fn sms_factor_recipient_bidx_aad(scope: Scope, recipient: &str) -> Aad {
+    Aad::builder()
+        .text(SMS_FACTOR_RECIPIENT_BIDX_LABEL)
+        .text(&scope.tenant().to_string())
+        .text(&scope.environment().to_string())
+        .field(recipient.as_bytes())
+        .build()
+}
+
+/// The deterministic blind index for a recipient phone in `scope` under `master`
+/// (issue #70).
+fn sms_factor_recipient_blind_index(
+    master: &MasterKey,
+    scope: Scope,
+    recipient: &str,
+) -> BlindIndex {
+    master.blind_index(&sms_factor_recipient_bidx_aad(scope, recipient))
 }
 
 /// Lowercase-hex encoding of a blind index, for use inside an `abuse:` counter key.
