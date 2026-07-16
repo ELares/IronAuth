@@ -187,6 +187,19 @@ pub async fn register_post(
             banner,
         );
     }
+    // zxcvbn password-quality scoring (issue #66) AFTER the length/composition policy and
+    // BEFORE any breach screen or hash: a password that is long enough but easily guessable
+    // is refused here, so no outbound screening call or Argon2id hash is spent on it. OFF by
+    // default (min_zxcvbn_score = 0), a pure/deterministic check that needs no env seam.
+    if let Err(rejection) = state.password_policy().evaluate_strength(&normalized) {
+        return register_error(
+            identifier,
+            &resume.return_to,
+            &rejection.message(),
+            &resume.hints,
+            banner,
+        );
+    }
     // MANDATORY breached-password screening (issue #63) BEFORE any hash is computed: only
     // the 5-char SHA-1 prefix leaves the process. A breached password is refused; a
     // provider outage follows the configured fail-open (allow + audit) or fail-closed

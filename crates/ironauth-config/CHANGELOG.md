@@ -6,6 +6,11 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Password-quality score minimum (issue #66 PR C): `password_policy.min_zxcvbn_score`
+  (integer 0-4, default 0 = scoring off, validated at most 4) wires through to
+  `PasswordPolicy`. Off by default so an existing deployment sees no regression; a higher
+  value refuses a password that is long enough but easily guessable, scored before the
+  breach screen. Config schema and docs regenerated.
 - MDS3 endpoint override (issue #66 PR B): `webauthn.mds3_base_url` (optional, validated
   as an https URL, mirroring `hibp_base_url`) lets a deployment point the FIDO MDS3 sync
   at an alternate endpoint; the pinned FIDO Alliance root stays compiled in and is never

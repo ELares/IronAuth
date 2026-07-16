@@ -110,6 +110,15 @@ name = "credential_class_policies"
 path = "tests/credential_class_policies.rs"
 required-features = ["testing"]
 
+# Passkey-only (passwordless) accounts + bidirectional password conversion (issue #66,
+# PR C): passwordless signup with no password row, handle/credential-subject
+# immutability, and the last-credential-guarded / sentinel-guarded conversions. Needs a
+# real database.
+[[test]]
+name = "passkey_only_accounts"
+path = "tests/passkey_only_accounts.rs"
+required-features = ["testing"]
+
 # Cross-tenant / cross-environment IDOR harness against every scoped repository
 # operation that exists today. Needs a real database (DATABASE_URL).
 [[test]]

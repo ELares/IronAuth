@@ -1055,6 +1055,14 @@
           "minimum": 0,
           "type": "integer"
         },
+        "min_zxcvbn_score": {
+          "default": 0,
+          "description": "The minimum zxcvbn password-quality score (0-4) required on the password set /\nchange path (issue #66), scored AFTER the length/composition policy and BEFORE\nthe breach screen. The default (`0`) turns scoring OFF so an existing deployment\nsees no regression; a higher value (a common choice is `3`) refuses a password\nthat is technically long enough but easily guessable. Must be at most `4`.",
+          "format": "uint8",
+          "maximum": 255,
+          "minimum": 0,
+          "type": "integer"
+        },
         "offline_corpus_path": {
           "default": null,
           "description": "The path to the offline corpus dataset file (a UTF-8 list of SHA-1 hashes, the\nHIBP downloadable format or a plain list), required when `screening_provider` is\n`offline` and `screening_enabled` is true. Unset for the `hibp` provider.",
@@ -1670,6 +1678,7 @@
         "max_length": 64,
         "min_length_mfa_factor": 8,
         "min_length_sole_factor": 15,
+        "min_zxcvbn_score": 0,
         "offline_corpus_path": null,
         "require_digit": false,
         "require_lowercase": false,

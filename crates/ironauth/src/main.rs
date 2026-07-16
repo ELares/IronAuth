@@ -519,6 +519,7 @@ fn build_password_policy(
         cfg.require_symbol,
         cfg.rotation_max_age_days,
         cfg.screening_enabled,
+        cfg.min_zxcvbn_score,
     );
     let failure = match cfg.screening_failure_policy {
         ScreeningFailurePolicy::FailOpen => ironauth_screening::FailurePolicy::FailOpen,

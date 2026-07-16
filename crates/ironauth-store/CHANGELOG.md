@@ -6,6 +6,18 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Passkey-only accounts and password conversion (issue #66 PR C): `register_passwordless`
+  creates a first-class passkey-only account (unusable password sentinel, `passwordless =
+  true`, and the stable WebAuthn user handle minted at INSERT to the subject id, the ONLY
+  point it can be set given the grant omission + immutability trigger). `remove_password`
+  converts a password account to passkey-only, reusing the cross-source last-credential
+  guard (blocked unless the subject retains a usable passkey/account-credential) and
+  revoking other sessions; `set_first_password` converts a passkey-only account to
+  password-holding, guarded on the sentinel so it never clobbers an existing password.
+  `is_passwordless` reports the authoritative marker. Two new audit actions
+  (`account.password.remove`, `account.password.set`). No new migration: reuses the
+  `passwordless` + `webauthn_user_handle` columns (0049). `webauthn_credentials.subject`
+  immutability (grant omission) is now covered by a test alongside the handle immutability.
 - MDS3 cache rollback protection (issue #66 PR B, adversarial review): the
   `mds3_blob_cache` upsert now enforces the documented monotonic rule with an
   `ON CONFLICT ... WHERE EXCLUDED.blob_no > mds3_blob_cache.blob_no` guard, so a replayed

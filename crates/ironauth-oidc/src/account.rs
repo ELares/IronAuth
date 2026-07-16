@@ -40,8 +40,9 @@ use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use ironauth_store::{
-    CorrelationId, CredentialRemoveOutcome, CredentialType, Scope, SessionFleetFilter, SessionId,
-    SessionSummary, StoreError, UserId,
+    CorrelationId, CredentialRemoveOutcome, CredentialType, FirstPasswordOutcome,
+    PasswordRemovalOutcome, Scope, SessionFleetFilter, SessionId, SessionSummary, StoreError,
+    UserId,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -73,6 +74,7 @@ struct Account {
     subject_str: String,
     session_id: SessionId,
     auth_time_unix_micros: i64,
+    auth_methods: String,
 }
 
 /// Resolve the scope from the path and the session cookie to an authenticated
@@ -102,7 +104,40 @@ async fn authenticate(
         subject_str: session.subject,
         session_id: session.session_id,
         auth_time_unix_micros: session.auth_time_unix_micros,
+        auth_methods: session.auth_methods,
     })
+}
+
+/// Whether the caller's session is a FRESH PASSKEY re-authentication (issue #66): its
+/// most recent authentication was a phishing-resistant passkey (never a password) AND it
+/// happened within the sensitive-operation step-up window. The passkey-only conversions
+/// demand this so a password re-login can never authorize removing the password or
+/// setting a first one, and a stale session cannot either. Mirrors the RFC 9470 step-up
+/// freshness check (issue #72): `auth_time` vs a max age.
+fn fresh_passkey_reauth(state: &OidcState, account: &Account) -> bool {
+    let now_micros = epoch_micros(state.now());
+    let age_micros = now_micros.saturating_sub(account.auth_time_unix_micros);
+    let max_age_micros = i64::try_from(STEP_UP_MAX_AGE_SECS)
+        .unwrap_or(i64::MAX)
+        .saturating_mul(1_000_000);
+    if age_micros > max_age_micros {
+        return false;
+    }
+    let methods = crate::authn::parse_methods(&account.auth_methods);
+    crate::authn::includes_passkey(&methods)
+}
+
+/// The `403` a passkey-only conversion returns when the caller's session is not a fresh
+/// passkey re-authentication (issue #66). Actionable: the client re-runs the passkey
+/// ceremony and retries. Never reveals account state.
+fn reauth_required() -> Response {
+    json_response(
+        StatusCode::FORBIDDEN,
+        json!({
+            "error": "reauthentication_required",
+            "error_description": "Re-authenticate with your passkey to change how you sign in.",
+        }),
+    )
 }
 
 /// The step-up policy object reported on a sensitive operation's response (issue
@@ -569,6 +604,24 @@ pub async fn change_password(
     if body.new_password.is_empty() {
         return bad_request("new_password must not be empty");
     }
+    // Passkey-only conversion branch (issue #66): a passwordless account has no current
+    // password to verify, so setting a FIRST password takes the dedicated path (skip the
+    // current-password check, demand a fresh passkey re-auth), never the verify path. A
+    // vanished user is unauthenticated.
+    match state
+        .store()
+        .scoped(account.scope)
+        .users()
+        .is_passwordless(&account.subject)
+        .await
+    {
+        Ok(Some(true)) => {
+            return set_first_password_flow(&state, &account, &body.new_password).await;
+        }
+        Ok(Some(false)) => {}
+        Ok(None) => return unauthenticated(),
+        Err(_) => return server_error(),
+    }
     // Read the stored verifier and verify the CURRENT password. A user that vanished
     // is unauthenticated; a wrong current password is a uniform 403 that reveals
     // nothing and changes nothing.
@@ -612,6 +665,12 @@ pub async fn change_password(
         .password_policy()
         .evaluate(&normalized, ironauth_screening::FactorContext::SoleFactor)
     {
+        return bad_request(&rejection.message());
+    }
+    // zxcvbn password-quality scoring (issue #66) AFTER the length/composition policy and
+    // BEFORE the breach screen and hash, so an easily-guessable password spends no
+    // network/hash work. OFF by default (min_zxcvbn_score = 0).
+    if let Err(rejection) = state.password_policy().evaluate_strength(&normalized) {
         return bad_request(&rejection.message());
     }
     // MANDATORY breached-password screening (issue #63) BEFORE the new hash is computed:
@@ -671,6 +730,174 @@ pub async fn change_password(
             }),
         ),
         Err(StoreError::NotFound) => unauthenticated(),
+        Err(_) => server_error(),
+    }
+}
+
+/// Set the FIRST password on a passkey-only account (issue #66, the passkey-only ->
+/// password conversion), reached from [`change_password`] when the account is
+/// passwordless. There is NO current password to verify; instead a FRESH passkey
+/// re-authentication is demanded, then the FULL set-path policy runs (length /
+/// composition, zxcvbn quality, breach screen) BEFORE the Argon2id hash, exactly as the
+/// register and change surfaces do. On success the account flips to password-holding and
+/// every OTHER session is revoked (session-fixation defense).
+async fn set_first_password_flow(
+    state: &OidcState,
+    account: &Account,
+    new_password: &str,
+) -> Response {
+    // FRESH passkey re-auth gates the conversion: a stale session, or one whose most
+    // recent factor was a password, can never set the first password.
+    if !fresh_passkey_reauth(state, account) {
+        return reauth_required();
+    }
+    // NFKC-normalize ONCE (issue #63): policy length (code points), zxcvbn scoring, and
+    // screening all operate on this form, and the hash is derived from it.
+    let normalized = ironauth_screening::normalize_nfkc(new_password);
+    if let Err(rejection) = state
+        .password_policy()
+        .evaluate(&normalized, ironauth_screening::FactorContext::SoleFactor)
+    {
+        return bad_request(&rejection.message());
+    }
+    // zxcvbn scoring AFTER length/composition and BEFORE the screen/hash (issue #66).
+    if let Err(rejection) = state.password_policy().evaluate_strength(&normalized) {
+        return bad_request(&rejection.message());
+    }
+    match state.screen_password(&account.scope, &normalized).await {
+        crate::state::ScreenDecision::Allowed => {}
+        crate::state::ScreenDecision::Breached => {
+            return json_response(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                json!({
+                    "error": "breached_password",
+                    "error_description": crate::state::BREACHED_PASSWORD_MESSAGE,
+                }),
+            );
+        }
+        crate::state::ScreenDecision::RefusedUnavailable => {
+            return json_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                json!({
+                    "error": "screening_unavailable",
+                    "error_description": crate::state::SCREENING_UNAVAILABLE_MESSAGE,
+                }),
+            );
+        }
+    }
+    let new_hash = match state.hash_password(&account.scope, new_password).await {
+        Ok(hash) => hash,
+        Err(crate::hashing_pool::HashRejection::Unavailable) => return server_error(),
+        Err(rejection) => return rejection.to_response(),
+    };
+    let actor = interaction::user_actor(&account.subject);
+    let result = state
+        .store()
+        .scoped(account.scope)
+        .acting(actor, CorrelationId::generate(state.env()))
+        .users()
+        .set_first_password(
+            state.env(),
+            &account.subject,
+            &new_hash,
+            Some(&account.session_id),
+            &step_up_detail(),
+        )
+        .await;
+    match result {
+        Ok(FirstPasswordOutcome::Set(outcome)) => json_response(
+            StatusCode::OK,
+            json!({
+                "converted": true,
+                "passwordless": false,
+                "other_sessions_revoked": outcome.sessions_revoked,
+                "step_up": step_up_status(state, account.auth_time_unix_micros),
+            }),
+        ),
+        // The account gained a password between the branch check and the guarded set: a
+        // benign race, reported as a conflict (nothing was clobbered).
+        Ok(FirstPasswordOutcome::Ineligible) => json_response(
+            StatusCode::CONFLICT,
+            json!({
+                "error": "already_has_password",
+                "error_description": "This account already has a password.",
+            }),
+        ),
+        Err(_) => server_error(),
+    }
+}
+
+/// `POST /t/{tenant}/e/{environment}/account/password/remove`: CONVERT a password
+/// account to PASSKEY-ONLY by removing the password (issue #66). A sensitive operation
+/// gated by a FRESH passkey re-authentication and the cross-source last-credential guard:
+/// the removal is refused unless the subject retains a usable passkey, so a user can
+/// never strand themselves. On success the password becomes the unusable sentinel, the
+/// account is marked passwordless, and every OTHER session is revoked (session-fixation
+/// defense). Same-origin (CSRF) guarded and audited to the end user.
+pub async fn remove_password(
+    State(state): State<OidcState>,
+    Path((tenant_id, environment_id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Response {
+    if !interaction::same_origin_ok(&headers, state.self_origin().as_deref()) {
+        return forbidden();
+    }
+    let account = match authenticate(&state, &tenant_id, &environment_id, &headers).await {
+        Ok(account) => account,
+        Err(response) => return response,
+    };
+    // Policy gate (issue #66): a passkey-only account is meaningless without WebAuthn (no
+    // passkey factor could exist), so removing the password is refused when passkeys are
+    // not enabled for this deployment. A per-tenant "allow password removal" policy knob is
+    // a documented future seam; today the guard is WebAuthn-enabled + fresh re-auth + the
+    // last-credential guard.
+    if !state.webauthn_enabled() {
+        return bad_request("Passkey sign-in is not enabled for this environment.");
+    }
+    // FRESH passkey re-auth gates the removal: a password re-login can never authorize
+    // dropping the password, and a stale session cannot either.
+    if !fresh_passkey_reauth(&state, &account) {
+        return reauth_required();
+    }
+    let actor = interaction::user_actor(&account.subject);
+    let result = state
+        .store()
+        .scoped(account.scope)
+        .acting(actor, CorrelationId::generate(state.env()))
+        .users()
+        .remove_password(
+            state.env(),
+            &account.subject,
+            Some(&account.session_id),
+            &step_up_detail(),
+        )
+        .await;
+    match result {
+        Ok(PasswordRemovalOutcome::Removed(outcome)) => json_response(
+            StatusCode::OK,
+            json!({
+                "converted": true,
+                "passwordless": true,
+                "other_sessions_revoked": outcome.sessions_revoked,
+                "step_up": step_up_status(&state, account.auth_time_unix_micros),
+            }),
+        ),
+        Ok(PasswordRemovalOutcome::BlockedLastCredential) => json_response(
+            StatusCode::CONFLICT,
+            json!({
+                "error": "last_credential",
+                "error_description": "Register a passkey before removing your password, so you \
+                     are not locked out.",
+            }),
+        ),
+        // Already passkey-only (or absent): nothing to remove.
+        Ok(PasswordRemovalOutcome::NotFound) => json_response(
+            StatusCode::CONFLICT,
+            json!({
+                "error": "no_password",
+                "error_description": "This account has no password to remove.",
+            }),
+        ),
         Err(_) => server_error(),
     }
 }

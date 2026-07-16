@@ -78,6 +78,15 @@ pub enum PolicyRejection {
         /// The missing class label (`lowercase`, `uppercase`, `digit`, `symbol`).
         class: &'static str,
     },
+    /// The password scored below the configured zxcvbn strength minimum (issue #66):
+    /// its estimated guessability was too low. The message is deliberately
+    /// NON-enumerating (it never reports the achieved score or WHY the estimator was
+    /// unhappy, which would be a hint to an attacker refining a guess), only that a
+    /// stronger password is required.
+    TooWeak {
+        /// The minimum acceptable zxcvbn score (0-4) the policy requires.
+        min_score: u8,
+    },
 }
 
 impl PolicyRejection {
@@ -93,6 +102,12 @@ impl PolicyRejection {
             }
             PolicyRejection::MissingCharacterClass { class } => {
                 format!("The password must contain at least one {class} character.")
+            }
+            // Non-enumerating on purpose: never echo the achieved score or the
+            // estimator's reasoning, only that a stronger password is needed.
+            PolicyRejection::TooWeak { .. } => {
+                "This password is too easy to guess. Choose a longer or less predictable one."
+                    .to_owned()
             }
         }
     }
@@ -126,11 +141,13 @@ pub struct PasswordPolicy {
     require_symbol: bool,
     rotation_max_age_days: u64,
     screening_enabled: bool,
+    min_zxcvbn_score: u8,
 }
 
 impl Default for PasswordPolicy {
     /// The shipped NIST SP 800-63B-4 defaults: 15 sole-factor / 8 MFA-factor minimum,
-    /// 64 maximum, NO composition, NO rotation, screening MANDATORY.
+    /// 64 maximum, NO composition, NO rotation, screening MANDATORY, zxcvbn scoring OFF
+    /// (`min_zxcvbn_score = 0`, so no surprise regression on an existing deployment).
     fn default() -> Self {
         Self {
             min_length_sole_factor: NIST_MIN_LENGTH_SOLE_FACTOR,
@@ -142,6 +159,7 @@ impl Default for PasswordPolicy {
             require_symbol: false,
             rotation_max_age_days: 0,
             screening_enabled: true,
+            min_zxcvbn_score: 0,
         }
     }
 }
@@ -161,6 +179,7 @@ impl PasswordPolicy {
         require_symbol: bool,
         rotation_max_age_days: u64,
         screening_enabled: bool,
+        min_zxcvbn_score: u8,
     ) -> Self {
         Self {
             min_length_sole_factor,
@@ -172,7 +191,52 @@ impl PasswordPolicy {
             require_symbol,
             rotation_max_age_days,
             screening_enabled,
+            min_zxcvbn_score,
         }
+    }
+
+    /// The configured strength-score minimum (0-4), or `0` when scoring is OFF (the
+    /// default). A caller can render this on an admin surface next to the deviations. The
+    /// field is named for the `min_zxcvbn_score` config key and the 0-4 zxcvbn scale it
+    /// mirrors; the backing estimator is the in-tree fallback (see [`crate::strength`]),
+    /// swappable for zxcvbn behind the same seam the day its dependency tree passes the
+    /// supply-chain gate.
+    #[must_use]
+    pub fn min_zxcvbn_score(&self) -> u8 {
+        self.min_zxcvbn_score
+    }
+
+    /// Score `normalized` (an already NFKC-normalized password) against the configured
+    /// strength minimum (issue #66). This is a SEPARATE step from [`Self::evaluate`], run
+    /// AFTER the length/composition policy passes but BEFORE the (network/hash-spending)
+    /// breach screen, so a password that fails the strength floor costs neither an
+    /// outbound screening call nor an Argon2id hash.
+    ///
+    /// The estimator is a PURE, deterministic function (no clock read, no RNG), so it
+    /// needs no environment seam. When `min_zxcvbn_score` is `0` (the shipped default)
+    /// this is an unconditional no-op, so an existing deployment sees no change. The
+    /// backing implementation is the in-tree reduced-strength estimator
+    /// ([`crate::strength::score`]); the zxcvbn crate was proposed but FAILED the
+    /// supply-chain gate under the MSRV floor (see that module), so the fallback ships
+    /// behind this same 0-4 contract.
+    ///
+    /// # Errors
+    ///
+    /// [`PolicyRejection::TooWeak`] when the estimated score is below the configured
+    /// minimum. The rejection's message is non-enumerating (it never reports the
+    /// achieved score).
+    pub fn evaluate_strength(&self, normalized: &str) -> Result<(), PolicyRejection> {
+        if self.min_zxcvbn_score == 0 {
+            return Ok(());
+        }
+        // The estimate reflects the password alone (the set/change surfaces do not thread
+        // the identifier/email through), the safe never-over-strict direction.
+        if crate::strength::score(normalized) < self.min_zxcvbn_score {
+            return Err(PolicyRejection::TooWeak {
+                min_score: self.min_zxcvbn_score,
+            });
+        }
+        Ok(())
     }
 
     /// The minimum length (code points) required for `factor`.
@@ -398,7 +462,7 @@ mod tests {
     #[test]
     fn a_legacy_override_applies_and_is_annotated_as_a_deviation() {
         // Composition (upper+digit) plus a 90-day rotation: both apply and both annotate.
-        let policy = PasswordPolicy::new(15, 8, 64, false, true, true, false, 90, true);
+        let policy = PasswordPolicy::new(15, 8, 64, false, true, true, false, 90, true, 0);
         // A passphrase lacking an uppercase or a digit is now rejected.
         assert_eq!(
             policy.evaluate("all lowercase letters here", FactorContext::SoleFactor),
@@ -418,8 +482,44 @@ mod tests {
 
     #[test]
     fn disabling_screening_is_reported_as_a_deviation() {
-        let policy = PasswordPolicy::new(15, 8, 64, false, false, false, false, 0, false);
+        let policy = PasswordPolicy::new(15, 8, 64, false, false, false, false, 0, false, 0);
         let codes: Vec<&str> = policy.nist_deviations().iter().map(|d| d.code).collect();
         assert!(codes.contains(&"screening_disabled"));
+    }
+
+    #[test]
+    fn zxcvbn_scoring_is_off_by_default() {
+        // The shipped default is min_zxcvbn_score = 0, so evaluate_strength is an
+        // unconditional no-op: even the weakest password passes the strength step (the
+        // length policy and breach screen still apply separately). No surprise
+        // regression on an existing deployment.
+        let policy = PasswordPolicy::default();
+        assert_eq!(policy.min_zxcvbn_score(), 0);
+        assert!(policy.evaluate_strength("password").is_ok());
+        assert!(policy.evaluate_strength("123456").is_ok());
+    }
+
+    #[test]
+    fn zxcvbn_threshold_rejects_below_and_accepts_at_or_above() {
+        // A policy requiring a minimum score of 3. A trivially guessable password
+        // scores 0 and is rejected as TooWeak; a high-entropy passphrase scores >= 3 and
+        // passes the strength step.
+        let policy = PasswordPolicy::new(1, 1, 64, false, false, false, false, 0, true, 3);
+        assert_eq!(
+            policy.evaluate_strength("password1"),
+            Err(PolicyRejection::TooWeak { min_score: 3 }),
+            "a common password is below the score floor"
+        );
+        // A long, unpredictable passphrase clears the floor.
+        assert!(
+            policy.evaluate_strength("7xQ!v9mLp2#wZr8Kt4").is_ok(),
+            "a high-entropy password is at or above the score floor"
+        );
+        // The rejection message never enumerates the achieved score.
+        let message = PolicyRejection::TooWeak { min_score: 3 }.message();
+        assert!(
+            !message.contains('3'),
+            "the message is non-enumerating: {message}"
+        );
     }
 }

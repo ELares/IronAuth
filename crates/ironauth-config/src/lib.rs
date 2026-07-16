@@ -1880,6 +1880,13 @@ pub struct PasswordPolicyConfig {
     /// deviation (screening is a covenant no-paywall security feature, on by default).
     pub screening_enabled: bool,
 
+    /// The minimum zxcvbn password-quality score (0-4) required on the password set /
+    /// change path (issue #66), scored AFTER the length/composition policy and BEFORE
+    /// the breach screen. The default (`0`) turns scoring OFF so an existing deployment
+    /// sees no regression; a higher value (a common choice is `3`) refuses a password
+    /// that is technically long enough but easily guessable. Must be at most `4`.
+    pub min_zxcvbn_score: u8,
+
     /// Which screening provider to use (issue #63): `hibp` (the online k-anonymity range
     /// API, the default) or `offline` (an operator-supplied corpus, fully offline).
     pub screening_provider: ScreeningProvider,
@@ -1924,6 +1931,7 @@ impl Default for PasswordPolicyConfig {
             require_symbol: false,
             rotation_max_age_days: 0,
             screening_enabled: true,
+            min_zxcvbn_score: 0,
             screening_provider: ScreeningProvider::Hibp,
             screening_failure_policy: ScreeningFailurePolicy::FailOpen,
             screen_on_login: false,
@@ -2822,6 +2830,15 @@ fn validate_password_policy(policy: &PasswordPolicyConfig) -> Result<(), ConfigE
                 "password_policy.min_length_mfa_factor ({}) must not exceed \
                  password_policy.max_length ({})",
                 policy.min_length_mfa_factor, policy.max_length
+            ),
+        });
+    }
+    if policy.min_zxcvbn_score > 4 {
+        return Err(ConfigError::Invalid {
+            message: format!(
+                "password_policy.min_zxcvbn_score ({}) must be between 0 and 4 \
+                 (0 disables zxcvbn scoring)",
+                policy.min_zxcvbn_score
             ),
         });
     }

@@ -6,6 +6,20 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Password-quality scoring (issue #66 PR C): `PasswordPolicy` gains a `min_zxcvbn_score`
+  (0-4, default 0 = off) and `evaluate_strength`, a separate step scored AFTER the
+  length/composition policy and BEFORE the breach screen, with a new non-enumerating
+  `PolicyRejection::TooWeak`. zxcvbn GATE DECISION: the `zxcvbn` crate (v3, MIT) was
+  proposed but FAILS the supply-chain gate under this repo's MSRV 1.85 floor. It
+  transitively pulls `time`, and there is NO `time` version that satisfies both the
+  advisories-as-errors gate (RUSTSEC-2026-0009 is fixed only in `time >= 0.3.47`) and MSRV
+  1.85 (every `time >= 0.3.47` requires rustc 1.88). Per the gate protocol the crate is
+  NOT forced; the documented in-tree fallback ships instead: a reduced-strength estimator
+  (`strength.rs`, Shannon-entropy-over-charset-and-length plus a compiled-in
+  common-password / keyboard / sequence pattern floor) exposing the SAME 0-4 score
+  contract behind `evaluate_strength`, so zxcvbn can be swapped back in later behind one
+  function the day its tree passes the gate. Pure and deterministic (no clock, no RNG), so
+  no env seam.
 - Documented the `FactorContext::MfaFactor` residual (issue #63 review): the 8-code-point
   MFA floor is currently INERT because every shipped credential-set path evaluates as
   `SoleFactor` (15, always 63B-4-compliant); it is wired as a policy input and activates when

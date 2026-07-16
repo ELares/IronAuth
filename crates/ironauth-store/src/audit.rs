@@ -551,6 +551,20 @@ pub enum Action {
     /// is attributed to the end user. No password or hash is ever recorded; the
     /// `detail` records the step-up policy the sensitive change declared.
     AccountPasswordChange,
+    /// An end user CONVERTED their account to passkey-only by REMOVING their password
+    /// (issue #66): the native `password_hash` was flipped to the unusable sentinel and
+    /// `passwordless` set true, gated by fresh re-authentication and the cross-source
+    /// last-credential guard (the account must retain a usable passkey). The row targets
+    /// the user and is attributed to the end user; the `detail` records the step-up
+    /// policy. No password or hash is ever recorded.
+    AccountPasswordRemove,
+    /// An end user CONVERTED a passkey-only account to password-holding by SETTING a
+    /// first password (issue #66): the sentinel `password_hash` was replaced with a fresh
+    /// Argon2id verifier and `passwordless` cleared, gated by fresh passkey
+    /// re-authentication and the full set-path policy (length, zxcvbn, breach screen).
+    /// The row targets the user and is attributed to the end user; the `detail` records
+    /// the step-up policy. No password or hash is ever recorded.
+    AccountPasswordSet,
     /// An end user ENROLLED a credential through the self-service account surface
     /// (issue #61): a passkey, TOTP authenticator, or recovery-code set was added
     /// to their own registry. The row targets the credential and is attributed to
@@ -837,6 +851,8 @@ impl Action {
             Action::EnvironmentSecretDelete => "environment_secret.delete",
             Action::ConfigPromotionApply => "config_promotion.apply",
             Action::AccountPasswordChange => "account.password.change",
+            Action::AccountPasswordRemove => "account.password.remove",
+            Action::AccountPasswordSet => "account.password.set",
             Action::AccountCredentialEnroll => "account.credential.enroll",
             Action::AccountCredentialRemove => "account.credential.remove",
             Action::WebauthnCredentialRegister => "webauthn.credential.register",

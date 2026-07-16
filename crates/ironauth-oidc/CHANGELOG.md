@@ -6,7 +6,23 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
-- Direct-mode attestation end-to-end coverage (issue #66 PR B, adversarial review): a new
+- Passkey-only accounts, bidirectional conversion, and zxcvbn scoring (issue #66 PR C,
+  CLOSES #66). A first-class passwordless account state: the new scope-routed
+  `webauthn/signup/options` + `webauthn/signup/verify` endpoints create an account with
+  the unusable password sentinel and `passwordless = true` (no session required, no
+  password screen/hash/policy reachable), run a UV-REQUIRED passkey registration, and
+  establish the HONEST passkey session (`phr`/`phrh`/`attested_passkey`, never a
+  fabricated `pwd`) that resumes the authorization request. The account is created only
+  when the passkey is verified, so an abandoned ceremony leaves no orphan. A password
+  attempt against a passwordless account fails uniformly (the sentinel never verifies), so
+  a passwordless account is never offered the password form. Bidirectional conversion:
+  `POST /account/password/remove` removes the password (password -> passkey-only), gated
+  by a FRESH passkey re-authentication and the cross-source last-credential guard; the
+  change-password endpoint gains a passwordless branch (passkey-only -> password) that
+  skips the current-password check, demands a FRESH passkey re-auth, and runs the full
+  set-path policy. zxcvbn-style quality scoring (`min_zxcvbn_score`, default 0 = off) is
+  wired into the register, account change-password, and invitation-accept set/change hooks,
+  scored after the length/composition policy and before the breach screen.
   `webauthn_attestation` integration test (real database, software authenticator) exercises
   the registration GLUE the unit tests could not: attestation mode `direct`, the AAGUID-rule
   disposition lookup, the `mds3_blob_cache` read/parse, the packed-format dispatch, and the
