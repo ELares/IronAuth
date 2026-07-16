@@ -31,8 +31,8 @@ use std::time::SystemTime;
 
 use ironauth_env::Env;
 use ironauth_store::{
-    ActorRef, CorrelationId, CredentialType, NewAdminUser, Scope, Store, StoreError, UserId,
-    UserState,
+    ActorRef, CorrelationId, CredentialType, NewAdminUser, RestoredRecoveryCode, RestoredTotp,
+    Scope, Store, StoreError, UserId, UserState,
 };
 
 use crate::record::{ImportRecord, parse_record_line};
@@ -127,6 +127,8 @@ struct PreparedCreate {
     foreign_hash: Option<String>,
     foreign_algo: Option<&'static str>,
     credentials: Vec<PreparedCredential>,
+    totp: Vec<PreparedTotp>,
+    recovery_codes: Vec<PreparedRecoveryCode>,
 }
 
 /// A validated MFA / login credential to restore alongside an imported user (issue
@@ -137,6 +139,49 @@ struct PreparedCredential {
     credential_type: CredentialType,
     friendly_name: String,
     last_used_at: Option<i64>,
+}
+
+/// A validated TOTP authenticator to restore alongside an imported user (issue
+/// #58/#69): the DECODED seed (Base32 opened back to raw bytes, ready to re-seal), the
+/// bounds-checked parameters and friendly name, the status, and the single-use step.
+/// The seed is secret material; the redacting `Debug` keeps a dump from spilling it.
+struct PreparedTotp {
+    seed: Vec<u8>,
+    friendly_name: String,
+    algorithm: String,
+    digits: i32,
+    period_secs: i32,
+    status: String,
+    last_consumed_step: Option<i64>,
+}
+
+impl std::fmt::Debug for PreparedTotp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PreparedTotp")
+            .field("seed", &"<redacted>")
+            .field("friendly_name", &"<redacted>")
+            .field("algorithm", &self.algorithm)
+            .field("digits", &self.digits)
+            .field("period_secs", &self.period_secs)
+            .field("status", &self.status)
+            .finish_non_exhaustive()
+    }
+}
+
+/// A validated recovery code to restore alongside an imported user (issue #58/#69):
+/// the one-way Argon2id hash carried verbatim and its consumed state. The hash is
+/// credential material; the redacting `Debug` renders only the consumed flag.
+struct PreparedRecoveryCode {
+    code_hash: String,
+    consumed: bool,
+}
+
+impl std::fmt::Debug for PreparedRecoveryCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PreparedRecoveryCode")
+            .field("consumed", &self.consumed)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Stream a bulk import to completion, creating each user through the audited admin
@@ -220,6 +265,12 @@ async fn create_user(
     // the friendly name against the target scope's DEK and preserving the last-used
     // instant, so the exit export round-trips the full credential registry.
     restore_credentials(ctx, &id, &prepared.credentials).await?;
+    // Restore the SECOND FACTOR (issue #58/#69): re-seal each TOTP seed under the
+    // TARGET tenant's DEK so a re-imported factor verifies against the original
+    // authenticator, and insert the recovery-code hashes so a re-imported code stays
+    // redeemable. This is the exit covenant made real for MFA, not a metadata echo.
+    restore_totp(ctx, &id, &prepared.totp).await?;
+    restore_recovery_codes(ctx, &id, &prepared.recovery_codes).await?;
     Ok(id.to_string())
 }
 
@@ -248,6 +299,67 @@ async fn restore_credentials(
                 CreateError::Failed("credential enrollment failed on restore".to_owned())
             })?;
     }
+    Ok(())
+}
+
+/// Re-home an imported user's TOTP authenticators (issue #58/#69): re-seal each
+/// exported seed under the TARGET scope's DEK and insert the row reproducing the
+/// source status and single-use step, so a re-imported active factor verifies against
+/// the ORIGINAL authenticator. A restore failure fails only THIS record.
+async fn restore_totp(
+    ctx: &ImportContext<'_>,
+    subject: &UserId,
+    factors: &[PreparedTotp],
+) -> Result<(), CreateError> {
+    for factor in factors {
+        ctx.store
+            .scoped(ctx.scope)
+            .acting(ctx.actor, CorrelationId::generate(ctx.env))
+            .totp_credentials()
+            .restore(
+                ctx.env,
+                subject,
+                &RestoredTotp {
+                    seed: &factor.seed,
+                    friendly_name: &factor.friendly_name,
+                    algorithm: &factor.algorithm,
+                    digits: factor.digits,
+                    period_secs: factor.period_secs,
+                    status: &factor.status,
+                    last_consumed_step: factor.last_consumed_step,
+                },
+            )
+            .await
+            .map_err(|_| CreateError::Failed("totp restore failed".to_owned()))?;
+    }
+    Ok(())
+}
+
+/// Re-home an imported user's recovery codes (issue #58/#69): insert each carried
+/// one-way hash with its consumed state, so a re-imported, still-unconsumed code stays
+/// redeemable. A restore failure fails only THIS record.
+async fn restore_recovery_codes(
+    ctx: &ImportContext<'_>,
+    subject: &UserId,
+    codes: &[PreparedRecoveryCode],
+) -> Result<(), CreateError> {
+    if codes.is_empty() {
+        return Ok(());
+    }
+    let restored: Vec<RestoredRecoveryCode> = codes
+        .iter()
+        .map(|code| RestoredRecoveryCode {
+            code_hash: code.code_hash.clone(),
+            consumed: code.consumed,
+        })
+        .collect();
+    ctx.store
+        .scoped(ctx.scope)
+        .acting(ctx.actor, CorrelationId::generate(ctx.env))
+        .recovery_codes()
+        .restore_all(ctx.env, subject, &restored)
+        .await
+        .map_err(|_| CreateError::Failed("recovery-code restore failed".to_owned()))?;
     Ok(())
 }
 
@@ -354,6 +466,8 @@ fn prepare_record(record: ImportRecord, scope: Scope) -> Result<PreparedCreate, 
         Some(_) => return Err("traits must be a JSON object".to_owned()),
     };
     let credentials = prepare_credentials(record.credentials)?;
+    let totp = prepare_totp(record.totp)?;
+    let recovery_codes = prepare_recovery_codes(record.recovery_codes)?;
     Ok(PreparedCreate {
         identifier: record.identifier,
         id,
@@ -365,7 +479,80 @@ fn prepare_record(record: ImportRecord, scope: Scope) -> Result<PreparedCreate, 
         foreign_hash,
         foreign_algo,
         credentials,
+        totp,
+        recovery_codes,
     })
+}
+
+/// Validate the record's TOTP authenticators (issue #58/#69): decode each Base32 seed
+/// to raw bytes, bounds-check the parameters exactly as the live enroll path and the
+/// store CHECK constraints do (digits 6..=8, period 15..=60, a known RFC 6238 hash, a
+/// known status, a 1 to 200 character friendly name), so a restored factor can never
+/// carry a malformed seed or an out-of-range parameter. An invalid factor fails ONLY
+/// its record, never the batch.
+fn prepare_totp(totp: Option<Vec<crate::record::ImportTotp>>) -> Result<Vec<PreparedTotp>, String> {
+    let Some(totp) = totp else {
+        return Ok(Vec::new());
+    };
+    let mut prepared = Vec::with_capacity(totp.len());
+    for factor in totp {
+        let seed = ironauth_jose::base32_decode(&factor.seed_base32)
+            .map_err(|_| "totp seed is not valid Base32".to_owned())?;
+        if seed.is_empty() {
+            return Err("totp seed must not be empty".to_owned());
+        }
+        if !matches!(factor.algorithm.as_str(), "SHA1" | "SHA256" | "SHA512") {
+            return Err(format!("unknown totp algorithm: {}", factor.algorithm));
+        }
+        if !(6..=8).contains(&factor.digits) {
+            return Err(format!("totp digits ({}) must be in 6..=8", factor.digits));
+        }
+        if !(15..=60).contains(&factor.period_secs) {
+            return Err(format!(
+                "totp period_secs ({}) must be in 15..=60",
+                factor.period_secs
+            ));
+        }
+        if !matches!(factor.status.as_str(), "active" | "pending") {
+            return Err(format!("unknown totp status: {}", factor.status));
+        }
+        let name = factor.friendly_name.trim();
+        if name.is_empty() || name.chars().count() > 200 {
+            return Err("totp friendly_name must be 1 to 200 characters".to_owned());
+        }
+        prepared.push(PreparedTotp {
+            seed,
+            friendly_name: name.to_owned(),
+            algorithm: factor.algorithm,
+            digits: factor.digits,
+            period_secs: factor.period_secs,
+            status: factor.status,
+            last_consumed_step: factor.last_consumed_step,
+        });
+    }
+    Ok(prepared)
+}
+
+/// Validate the record's recovery codes (issue #58/#69): each carries a non-empty
+/// one-way hash (never a plaintext code) and its consumed state. An invalid code fails
+/// ONLY its record, never the batch.
+fn prepare_recovery_codes(
+    codes: Option<Vec<crate::record::ImportRecoveryCode>>,
+) -> Result<Vec<PreparedRecoveryCode>, String> {
+    let Some(codes) = codes else {
+        return Ok(Vec::new());
+    };
+    let mut prepared = Vec::with_capacity(codes.len());
+    for code in codes {
+        if code.code_hash.trim().is_empty() {
+            return Err("recovery code_hash must not be empty".to_owned());
+        }
+        prepared.push(PreparedRecoveryCode {
+            code_hash: code.code_hash,
+            consumed: code.consumed,
+        });
+    }
+    Ok(prepared)
 }
 
 /// Validate the record's MFA / login credential enrollments (issue #58): every

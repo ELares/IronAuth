@@ -6,6 +6,21 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- TOTP review hardening (issue #69, review):
+  - Recovery-code regeneration is now behind FRESH AUTHENTICATION (MEDIUM). The
+    `recovery-codes` POST requires a current credential proof (the password verified
+    through the #62 pool, a current TOTP code, or an unconsumed recovery code) and
+    verifies it BEFORE regenerating; a request with no proof is `403 reauth_required`
+    and a wrong proof is `403 invalid_proof`, so a stolen/shared already-signed-in
+    cookie can no longer silently rotate a victim's codes (a recovery denial of
+    service). Replaces the inert `step_up.enforced=false` declaration.
+  - Recovery redemption now resolves the ONE candidate by the store's keyed blind
+    index, so a redemption verifies a single Argon2 hash instead of scanning up to 16
+    (LOW; a CPU-amplification lever while #64's throttle is a no-op).
+  - Honesty: `mfa_required` drives the enrollment PROMPT and the `/account/mfa/plan`
+    surface only; HARD login-flow enforcement (challenging the second factor before a
+    full session) lands with step-up (#72). The two login-orchestration acceptance
+    lines are scoped to #72, not claimed here.
 - TOTP second-factor and recovery-code endpoints (issue #69), a new self-service
   `totp` module mounted under `/t/{tenant}/e/{environment}/account/mfa/...`.
   `totp/enroll` mints a seed from the entropy seam, seals it (issue #48), and returns

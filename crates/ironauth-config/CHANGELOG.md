@@ -6,6 +6,12 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- `mfa_required` doc honesty (issue #69, review): the `[oidc].mfa_required` field doc
+  (and the regenerated `docs/CONFIG.md`) now states that TODAY it drives the
+  enrollment PROMPT and the `/account/mfa/plan` surface only; HARD login-flow
+  enforcement (challenging the second factor before a full session) lands with the
+  step-up issue (#72). `validate_totp` gains unit coverage for every bound (digits,
+  period, drift, recovery count, and unknown/duplicate `mfa_factor_order`).
 - TOTP second-factor settings on `[oidc]` (issue #69): `totp_enabled` (on by
   default; the endpoints fail closed with a 404 when off), `totp_issuer` (the
   authenticator-app label, derived from the serving scope when unset),

@@ -161,6 +161,15 @@ CREATE TABLE recovery_codes (
     -- The Argon2id PHC verifier of the code (issue #62). One-way, never a plaintext
     -- code: a database dump reveals no usable code.
     code_hash      text        NOT NULL,
+    -- The per-scope keyed BLIND INDEX of the normalized code (issue #69): a
+    -- deterministic HMAC (never a bare hash, never reversible) that lets a redemption
+    -- resolve the ONE candidate row for the presented code and verify a SINGLE Argon2
+    -- hash, instead of scanning every unconsumed code (a CPU-amplification lever). It
+    -- is NULL for a code RESTORED by the exit-import (issue #58): an export carries
+    -- only the one-way hash, never the plaintext, so the index cannot be recomputed;
+    -- redemption falls back to scanning only those NULL-index (imported) rows, which
+    -- stay bounded by the per-user code count.
+    code_bidx      bytea,
     -- The batch this code was minted in; regeneration bumps it and replaces the set.
     generation     integer     NOT NULL DEFAULT 1,
     -- NULL until redeemed; set exactly once at single-use redemption.
@@ -177,6 +186,10 @@ CREATE INDEX recovery_codes_scope_idx
 -- Redemption and the remaining-count read scan a subject's codes.
 CREATE INDEX recovery_codes_subject_idx
     ON recovery_codes (tenant_id, environment_id, subject, created_at, id);
+-- Redemption resolves the ONE candidate by the presented code's blind index (issue
+-- #69), so a redemption verifies a single Argon2 hash rather than scanning the set.
+CREATE INDEX recovery_codes_bidx_idx
+    ON recovery_codes (tenant_id, environment_id, subject, code_bidx);
 
 ALTER TABLE recovery_codes ENABLE ROW LEVEL SECURITY;
 ALTER TABLE recovery_codes FORCE ROW LEVEL SECURITY;

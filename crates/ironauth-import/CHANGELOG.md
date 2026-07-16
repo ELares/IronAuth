@@ -6,6 +6,16 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Second-factor restore on import (issue #58/#69, review): `ImportRecord` gains an
+  optional `totp` list (`ImportTotp`: the Base32 seed, parameters, friendly name,
+  status, and single-use step) and a `recovery_codes` list (`ImportRecoveryCode`: the
+  one-way hash and consumed state), which `to_record_line` / `parse_record_line`
+  round-trip. The engine decodes and bounds-checks each factor (Base32 seed, digits
+  6..=8, period 15..=60, known algorithm/status, 1..=200 char name) and restores it
+  through the store's `totp_credentials` / `recovery_codes` re-seal path, so a
+  re-imported TOTP factor verifies against the original authenticator and a re-imported
+  recovery code redeems. Adds an internal dependency on `ironauth-jose` for the Base32
+  decode; no new external crate.
 - Migration state-machine wrap (issue #59, exploratory): `import_into_run` drives
   `import_stream` and ingests every per-record outcome (`Created` / `Skipped` /
   `Failed`) into an `ironauth-store` migration run's accounting ledger, so a bulk import

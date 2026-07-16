@@ -20,13 +20,34 @@
 use ironauth_env::Env;
 use ironauth_store::test_support::TestDatabase;
 use ironauth_store::{
-    Action, CorrelationId, CredentialRemoveOutcome, NewTotpEnrollment, RecoveryRedeemOutcome,
-    Scope, TotpActivateOutcome, TotpCredentialId, TotpVerifyOutcome, UserId,
+    Action, CorrelationId, CredentialRemoveOutcome, NewRecoveryCode, NewTotpEnrollment,
+    RecoveryRedeemOutcome, RestoredRecoveryCode, RestoredTotp, Scope, TotpActivateOutcome,
+    TotpCredentialId, TotpVerifyOutcome, UserId,
 };
 use sqlx::Row;
 
 const SEED: &[u8] = b"12345678901234567890"; // the RFC 6238 SHA1 test seed
 const ARGON_HASH: &str = "$argon2id$v=19$m=19456,t=2,p=1$c2FsdHNhbHQ$aGFzaGhhc2g";
+
+/// A batch of `n` recovery codes to persist: distinct normalized plaintexts (so each
+/// gets its own blind index) paired with the shared test hash. Redemption in these
+/// tests is by id, so the hash need not match the normalized string.
+fn recovery_batch(n: usize) -> Vec<(String, String)> {
+    (0..n)
+        .map(|i| (format!("recovery-normalized-{i}"), ARGON_HASH.to_owned()))
+        .collect()
+}
+
+/// Borrow a [`recovery_batch`] as the `NewRecoveryCode` slice `replace_all` takes.
+fn new_codes(batch: &[(String, String)]) -> Vec<NewRecoveryCode<'_>> {
+    batch
+        .iter()
+        .map(|(code, hash)| NewRecoveryCode {
+            normalized_code: code,
+            code_hash: hash,
+        })
+        .collect()
+}
 
 async fn register_user(db: &TestDatabase, env: &Env, scope: Scope, handle: &str) -> UserId {
     db.store()
@@ -203,11 +224,12 @@ async fn recovery_codes_are_single_use_and_regeneration_invalidates_prior() {
             .scoped(scope)
             .acting(db.test_actor(&env), CorrelationId::generate(&env))
     };
-    // Store a batch of hashes (the store persists the one-way hashes it is given).
-    let hashes: Vec<String> = (0..10).map(|_| ARGON_HASH.to_owned()).collect();
+    // Store a batch of codes (the store persists the one-way hashes and the blind
+    // index derived from each normalized code).
+    let batch = recovery_batch(10);
     acting()
         .recovery_codes()
-        .replace_all(&env, &subject, &hashes)
+        .replace_all(&env, &subject, &new_codes(&batch))
         .await
         .expect("replace");
     assert_eq!(
@@ -267,7 +289,7 @@ async fn recovery_codes_are_single_use_and_regeneration_invalidates_prior() {
     // Regeneration invalidates ALL prior codes: the old id is gone entirely.
     acting()
         .recovery_codes()
-        .replace_all(&env, &subject, &hashes)
+        .replace_all(&env, &subject, &new_codes(&batch))
         .await
         .expect("regenerate");
     assert_eq!(
@@ -311,9 +333,10 @@ async fn totp_verify_and_recovery_redeem_are_audited_distinctly() {
         .record_verification(&env, &subject, &id, 101, 0)
         .await
         .expect("verify");
+    let batch = recovery_batch(1);
     acting()
         .recovery_codes()
-        .replace_all(&env, &subject, &[ARGON_HASH.to_owned()])
+        .replace_all(&env, &subject, &new_codes(&batch))
         .await
         .expect("replace");
     let rvc = db
@@ -417,13 +440,10 @@ async fn the_exit_export_carries_the_opened_seed_and_recovery_hashes() {
         .activate(&env, &subject, &id, 100)
         .await
         .expect("activate");
+    let batch = recovery_batch(2);
     acting()
         .recovery_codes()
-        .replace_all(
-            &env,
-            &subject,
-            &[ARGON_HASH.to_owned(), ARGON_HASH.to_owned()],
-        )
+        .replace_all(&env, &subject, &new_codes(&batch))
         .await
         .expect("replace");
 
@@ -452,5 +472,259 @@ async fn the_exit_export_carries_the_opened_seed_and_recovery_hashes() {
             .iter()
             .all(|c| c.code_hash.starts_with("$argon2")),
         "recovery codes export as hashes, never plaintext"
+    );
+}
+
+/// LOW-4: the seed seal AAD binds the credential id, so a seed sealed for one row
+/// cannot be transplanted into another subject's row and still open. A privileged
+/// same-scope DB write that lifts Alice's sealed seed (and its DEK version) into Bob's
+/// row must FAIL to open, not silently authenticate under Bob.
+#[tokio::test]
+async fn a_seed_sealed_for_one_row_does_not_open_in_another() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let alice = register_user(&db, &env, scope, "aad-alice@example.test").await;
+    let bob = register_user(&db, &env, scope, "aad-bob@example.test").await;
+    let alice_id = begin(&db, &env, scope, &alice).await;
+    let bob_id = begin(&db, &env, scope, &bob).await;
+
+    // Alice's sealed seed and the DEK version it was sealed under.
+    let alice_row =
+        sqlx::query("SELECT totp_seed, pii_dek_version FROM totp_credentials WHERE id = $1")
+            .bind(alice_id.to_string())
+            .fetch_one(db.owner_pool())
+            .await
+            .expect("alice row");
+    let alice_seed: Vec<u8> = alice_row.get("totp_seed");
+    let alice_dek: i32 = alice_row.get("pii_dek_version");
+
+    // A privileged same-scope write transplants Alice's sealed seed into Bob's row.
+    sqlx::query("UPDATE totp_credentials SET totp_seed = $1, pii_dek_version = $2 WHERE id = $3")
+        .bind(&alice_seed)
+        .bind(alice_dek)
+        .bind(bob_id.to_string())
+        .execute(db.owner_pool())
+        .await
+        .expect("transplant");
+
+    // Opening Bob's row now FAILS: the AAD binds Bob's credential id, but the
+    // ciphertext was sealed under Alice's id, so authentication does not match.
+    let opened = db
+        .store()
+        .scoped(scope)
+        .totp_credentials()
+        .open_material(&bob, &bob_id)
+        .await;
+    assert!(
+        opened.is_err(),
+        "a seed sealed for Alice's row must not open in Bob's row: {opened:?}"
+    );
+}
+
+/// INFO-5: removing a TOTP factor cascades to the subject's recovery codes, so a
+/// leaked recovery code is not redeemable after the authenticator is gone.
+#[tokio::test]
+async fn removing_the_totp_factor_deletes_the_recovery_codes() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let subject = register_user(&db, &env, scope, "cascade@example.test").await;
+    let acting = || {
+        db.store()
+            .scoped(scope)
+            .acting(db.test_actor(&env), CorrelationId::generate(&env))
+    };
+    let id = begin(&db, &env, scope, &subject).await;
+    acting()
+        .totp_credentials()
+        .activate(&env, &subject, &id, 100)
+        .await
+        .expect("activate");
+    let batch = recovery_batch(8);
+    acting()
+        .recovery_codes()
+        .replace_all(&env, &subject, &new_codes(&batch))
+        .await
+        .expect("replace");
+    assert_eq!(
+        db.store()
+            .scoped(scope)
+            .recovery_codes()
+            .remaining_count(&subject)
+            .await
+            .expect("count"),
+        8
+    );
+
+    // Remove the factor: the recovery codes go with it, in the same transaction.
+    assert_eq!(
+        acting()
+            .totp_credentials()
+            .remove(&env, &subject, &id)
+            .await
+            .expect("remove"),
+        CredentialRemoveOutcome::Removed
+    );
+    let survivors: i64 = sqlx::query("SELECT count(*) AS n FROM recovery_codes WHERE subject = $1")
+        .bind(subject.to_string())
+        .fetch_one(db.owner_pool())
+        .await
+        .expect("survivor probe")
+        .get("n");
+    assert_eq!(
+        survivors, 0,
+        "a prior recovery code must not survive TOTP removal"
+    );
+}
+
+/// HIGH-1 (store layer): a restored TOTP factor re-seals under the target DEK and
+/// OPENS back to the EXACT original seed, so a code from the original authenticator
+/// verifies against the re-imported factor (the covenant re-homes the second factor,
+/// not a metadata echo). Restored recovery codes stay redeemable.
+#[tokio::test]
+async fn a_restored_totp_and_recovery_codes_round_trip() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let subject = register_user(&db, &env, scope, "restore@example.test").await;
+    let acting = || {
+        db.store()
+            .scoped(scope)
+            .acting(db.test_actor(&env), CorrelationId::generate(&env))
+    };
+
+    // Restore an ACTIVE factor with the original seed and single-use position.
+    let restored = RestoredTotp {
+        seed: SEED,
+        friendly_name: "imported authenticator",
+        algorithm: "SHA1",
+        digits: 6,
+        period_secs: 30,
+        status: "active",
+        last_consumed_step: Some(100),
+    };
+    let id = acting()
+        .totp_credentials()
+        .restore(&env, &subject, &restored)
+        .await
+        .expect("restore totp");
+
+    // The seed is sealed at rest but opens back to the EXACT plaintext, so a code from
+    // the original authenticator verifies here.
+    let raw: Vec<u8> = sqlx::query("SELECT totp_seed FROM totp_credentials WHERE id = $1")
+        .bind(id.to_string())
+        .fetch_one(db.owner_pool())
+        .await
+        .expect("raw probe")
+        .get("totp_seed");
+    assert_ne!(
+        raw.as_slice(),
+        SEED,
+        "the restored seed is re-sealed at rest"
+    );
+    let material = db
+        .store()
+        .scoped(scope)
+        .totp_credentials()
+        .open_active_material(&subject)
+        .await
+        .expect("open active")
+        .expect("active factor present");
+    assert_eq!(
+        material.seed, SEED,
+        "the restored seed opens to the original"
+    );
+    assert_eq!(material.status, "active");
+    assert_eq!(
+        material.last_consumed_step,
+        Some(100),
+        "the single-use position round-trips"
+    );
+
+    // Restore a recovery code (only the one-way hash survives an export; the blind
+    // index is NULL). It stays redeemable through the NULL-index fallback.
+    acting()
+        .recovery_codes()
+        .restore_all(
+            &env,
+            &subject,
+            &[RestoredRecoveryCode {
+                code_hash: ARGON_HASH.to_owned(),
+                consumed: false,
+            }],
+        )
+        .await
+        .expect("restore recovery");
+    let candidates = db
+        .store()
+        .scoped(scope)
+        .recovery_codes()
+        .candidates_for_code(&subject, "any-presented-code")
+        .await
+        .expect("candidates");
+    assert_eq!(
+        candidates.len(),
+        1,
+        "an imported (NULL-index) code is always a redemption candidate"
+    );
+    assert_eq!(
+        acting()
+            .recovery_codes()
+            .redeem(&env, &subject, &candidates[0].id)
+            .await
+            .expect("redeem"),
+        RecoveryRedeemOutcome::Redeemed,
+        "a re-imported recovery code redeems once"
+    );
+}
+
+/// LOW-3: redemption resolves ONE candidate for a natively generated code via the
+/// blind index, so a right code costs a single Argon2 verify and a wrong code costs
+/// none, rather than scanning the whole set.
+#[tokio::test]
+async fn recovery_redemption_narrows_to_a_single_candidate_by_blind_index() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let subject = register_user(&db, &env, scope, "bidx@example.test").await;
+    let acting = || {
+        db.store()
+            .scoped(scope)
+            .acting(db.test_actor(&env), CorrelationId::generate(&env))
+    };
+    let batch = recovery_batch(16);
+    acting()
+        .recovery_codes()
+        .replace_all(&env, &subject, &new_codes(&batch))
+        .await
+        .expect("replace");
+
+    // A code that exists narrows to exactly its ONE row (a single hash to verify),
+    // never the full 16-code set.
+    let one = db
+        .store()
+        .scoped(scope)
+        .recovery_codes()
+        .candidates_for_code(&subject, "recovery-normalized-7")
+        .await
+        .expect("candidates for a real code");
+    assert_eq!(
+        one.len(),
+        1,
+        "a natively generated code resolves to exactly one candidate"
+    );
+    // A wrong code narrows to NONE (no NULL-index imported codes exist here), so a
+    // wrong guess costs zero Argon2 verifications.
+    let none = db
+        .store()
+        .scoped(scope)
+        .recovery_codes()
+        .candidates_for_code(&subject, "not-a-real-code")
+        .await
+        .expect("candidates for a wrong code");
+    assert!(
+        none.is_empty(),
+        "a wrong code resolves to no candidate: no Argon2 amplification"
     );
 }

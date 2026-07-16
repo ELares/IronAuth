@@ -295,15 +295,18 @@ async fn regeneration_invalidates_prior_recovery_codes() {
     let recovery = factor.recovery;
     let base = base(&harness);
 
-    // Regenerate the set: the prior codes are invalidated.
+    // Regenerate the set behind FRESH AUTH (the current password): the prior codes are
+    // invalidated. A regeneration without a valid proof is refused (see the dedicated
+    // fresh-auth test).
     let (status, body) = post_json(
         &harness,
         &format!("{base}/recovery-codes"),
         &cookie,
-        &json!({}),
+        &json!({ "password": "correct horse battery" }),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "regenerate: {body:?}");
+    assert_eq!(body["fresh_auth"]["method"], json!("password"));
     let fresh: Vec<String> = body["recovery_codes"]
         .as_array()
         .unwrap()
@@ -335,6 +338,113 @@ async fn regeneration_invalidates_prior_recovery_codes() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "a fresh code redeems");
+}
+
+/// MEDIUM-2: recovery-code regeneration is gated behind FRESH AUTHENTICATION. A valid
+/// session and same-origin CSRF are not enough: an actor with only a stolen/shared
+/// cookie cannot rotate the victim's codes (a recovery denial of service). A
+/// regeneration with NO
+/// credential proof is refused; the SAME set therefore still redeems afterward. A
+/// regeneration WITH a valid current password (or current TOTP code) succeeds and
+/// invalidates the prior set.
+#[tokio::test]
+async fn regeneration_requires_fresh_authentication() {
+    let harness = Harness::start().await;
+    let subject = harness
+        .seed_user("gwen@example.test", "correct horse battery")
+        .await;
+    let factor = enroll_active(&harness, &subject).await;
+    let cookie = factor.cookie;
+    let recovery = factor.recovery;
+    let base = base(&harness);
+
+    // No proof: REFUSED, and nothing is regenerated.
+    let (status, body) = post_json(
+        &harness,
+        &format!("{base}/recovery-codes"),
+        &cookie,
+        &json!({}),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "regeneration without a proof is refused: {body:?}"
+    );
+    assert_eq!(body["error"], json!("reauth_required"));
+
+    // A WRONG password: REFUSED as invalid_proof.
+    let (status, body) = post_json(
+        &harness,
+        &format!("{base}/recovery-codes"),
+        &cookie,
+        &json!({ "password": "not my password" }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "wrong proof refused: {body:?}"
+    );
+    assert_eq!(body["error"], json!("invalid_proof"));
+
+    // The prior set is untouched: an original code still redeems.
+    let (status, _) = post_json(
+        &harness,
+        &format!("{base}/recovery-codes/redeem"),
+        &cookie,
+        &json!({ "code": recovery[0] }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a refused regeneration did not invalidate the prior codes"
+    );
+
+    // A CURRENT TOTP code is also an accepted proof. Advance a period so the code is
+    // fresh (the enrollment already consumed its activating step).
+    harness.clock().advance(Duration::from_secs(30));
+    let totp_code = code_at(
+        &factor.seed,
+        TotpParams::authenticator_default(),
+        now_secs(&harness),
+    );
+    let (status, body) = post_json(
+        &harness,
+        &format!("{base}/recovery-codes"),
+        &cookie,
+        &json!({ "totp_code": totp_code }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a current TOTP code is a valid fresh-auth proof: {body:?}"
+    );
+    assert_eq!(body["fresh_auth"]["method"], json!("totp"));
+    let fresh: Vec<String> = body["recovery_codes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(fresh.len(), 10, "a fresh set is minted");
+
+    // The remaining original code (index 1, since index 0 was redeemed above) is now
+    // invalidated by the successful regeneration.
+    let (status, _) = post_json(
+        &harness,
+        &format!("{base}/recovery-codes/redeem"),
+        &cookie,
+        &json!({ "code": recovery[1] }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "a successful regeneration invalidated the prior set"
+    );
 }
 
 #[tokio::test]

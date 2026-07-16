@@ -36,7 +36,9 @@ use std::future::Future;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::Response;
-use ironauth_import::{ImportCredential, ImportRecord, to_record_line};
+use ironauth_import::{
+    ImportCredential, ImportRecord, ImportRecoveryCode, ImportTotp, to_record_line,
+};
 use ironauth_store::{
     ActorRef, CorrelationId, CursorPosition, Scope, StoreError, UserExportRecord, UserState,
 };
@@ -253,6 +255,44 @@ fn export_record_to_import(record: &UserExportRecord) -> ImportRecord {
                 .collect(),
         )
     };
+    // The second factor (issue #58/#69): a TOTP seed is a PORTABLE shared secret, so
+    // the export carries it (opened, Base32) alongside the parameters and single-use
+    // state, and the recovery-code HASHES ride verbatim (one-way, like a password), so
+    // a re-import restores a factor that VERIFIES and codes that REDEEM, not a
+    // metadata echo. An empty set is omitted to keep the line minimal.
+    let totp = if record.totp.is_empty() {
+        None
+    } else {
+        Some(
+            record
+                .totp
+                .iter()
+                .map(|factor| ImportTotp {
+                    seed_base32: factor.seed_base32.clone(),
+                    algorithm: factor.algorithm.clone(),
+                    digits: factor.digits,
+                    period_secs: factor.period_secs,
+                    friendly_name: factor.friendly_name.clone(),
+                    status: factor.status.clone(),
+                    last_consumed_step: factor.last_consumed_step,
+                })
+                .collect(),
+        )
+    };
+    let recovery_codes = if record.recovery_codes.is_empty() {
+        None
+    } else {
+        Some(
+            record
+                .recovery_codes
+                .iter()
+                .map(|code| ImportRecoveryCode {
+                    code_hash: code.code_hash.clone(),
+                    consumed: code.consumed,
+                })
+                .collect(),
+        )
+    };
     ImportRecord {
         identifier: record.identifier.clone(),
         id: None,
@@ -263,6 +303,8 @@ fn export_record_to_import(record: &UserExportRecord) -> ImportRecord {
         traits_schema_version: record.traits_schema_version,
         password_hash,
         credentials,
+        totp,
+        recovery_codes,
     }
 }
 
@@ -416,6 +458,57 @@ mod tests {
             mapped.password_hash.as_deref(),
             Some("$2b$08$abcdefghijklmnopqrstuv"),
             "a foreign-only user exports its foreign hash as the credential"
+        );
+    }
+
+    /// HIGH-1 regression: the TOTP seed and the recovery-code hashes reach the EMITTED
+    /// LINE, not merely the in-memory export record. The original bug opened the seed
+    /// under the DEK and then dropped it before serialization; this asserts on the
+    /// serialized bytes and on the parsed shape, so a classified-but-not-emitted
+    /// column is caught here (the false-positive the earlier tests missed).
+    #[test]
+    fn the_second_factor_reaches_the_emitted_line() {
+        use ironauth_store::{ExportedRecoveryCode, ExportedTotp};
+
+        let (env, _) = Env::deterministic(std::time::SystemTime::UNIX_EPOCH, 1);
+        let scope = {
+            use ironauth_store::{EnvironmentId, TenantId};
+            Scope::new(TenantId::generate(&env), EnvironmentId::generate(&env))
+        };
+        let mut record = synthetic_record(scope, &env, 3);
+        record.totp = vec![ExportedTotp {
+            friendly_name: "my phone".to_owned(),
+            seed_base32: "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ".to_owned(),
+            algorithm: "SHA1".to_owned(),
+            digits: 6,
+            period_secs: 30,
+            status: "active".to_owned(),
+            last_consumed_step: Some(42),
+        }];
+        record.recovery_codes = vec![ExportedRecoveryCode {
+            code_hash: "$argon2id$v=19$m=19456,t=2,p=1$c2FsdHNhbHQ$aGFzaGhhc2g".to_owned(),
+            consumed: false,
+        }];
+
+        // The mapping carries the factor.
+        let mapped = export_record_to_import(&record);
+        let totp = mapped.totp.as_ref().expect("totp mapped");
+        assert_eq!(totp.len(), 1);
+        assert_eq!(totp[0].seed_base32, "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ");
+        assert_eq!(totp[0].status, "active");
+        assert_eq!(totp[0].last_consumed_step, Some(42));
+        assert_eq!(mapped.recovery_codes.as_ref().expect("codes").len(), 1);
+
+        // The SERIALIZED bytes carry the seed and the hash: the covenant is emitted,
+        // not silently dropped.
+        let line = to_record_line(&mapped).expect("serialize");
+        assert!(
+            line.contains("GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ"),
+            "the emitted export line carries the opened TOTP seed: {line}"
+        );
+        assert!(
+            line.contains("aGFzaGhhc2g"),
+            "the emitted export line carries the recovery-code hash: {line}"
         );
     }
 }

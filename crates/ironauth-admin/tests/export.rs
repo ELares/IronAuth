@@ -16,8 +16,8 @@ use ironauth_env::Env;
 use ironauth_import::{ForeignHash, ImportContext, import_stream};
 use ironauth_store::test_support::TestDatabase;
 use ironauth_store::{
-    ActorRef, CorrelationId, CredentialType, HumanId, NewAdminUser, Scope, Store, UserId,
-    UserRecord, UserState,
+    ActorRef, CorrelationId, CredentialType, HumanId, NewAdminUser, NewRecoveryCode,
+    NewTotpEnrollment, RecoveryRedeemOutcome, Scope, Store, UserId, UserRecord, UserState,
 };
 
 /// A native Argon2id PHC verifier for `password`, exactly what the login path
@@ -485,6 +485,10 @@ async fn every_identity_column_is_exported_or_a_documented_non_exported_field() 
                 "environment_id", // the target scope
                 "subject",        // re-linked to the imported user's fresh usr_ id
                 "generation",     // the batch marker, re-numbered on a fresh import
+                "code_bidx",      // keyed blind index, re-derived from the plaintext at
+                                  // generation; NULL for an imported code (only the
+                                  // one-way hash survives an export, so it cannot be
+                                  // recomputed), so it is not carried across
             ],
             operational: &[
                 "created_at", // set fresh at import
@@ -880,6 +884,211 @@ async fn enrolled_credentials_round_trip_through_the_export() {
     assert!(
         !totp.usable_for_login,
         "a TOTP factor is not a primary login factor"
+    );
+}
+
+/// HIGH-1 (issue #58/#69): the exit export re-homes the SECOND FACTOR for real. A user
+/// with an ACTIVE TOTP authenticator and recovery codes exports through the management
+/// API and imports into a FRESH scope, and afterward (a) a TOTP code computed from the
+/// ORIGINAL seed verifies against the re-imported factor, and (b) an ORIGINAL recovery
+/// code redeems exactly once. This is the end-to-end proof the earlier tests lacked:
+/// they asserted on an in-memory struct, never that the emitted bytes carry a factor
+/// that verifies after a round-trip.
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // one linear seed -> export -> import -> verify -> redeem walk
+async fn totp_and_recovery_codes_round_trip_and_still_verify_after_reimport() {
+    // The RFC 6238 SHA1 test seed and a known recovery code (its Argon2id hash is what
+    // the export carries verbatim, like a password verifier).
+    const SEED: &[u8] = b"12345678901234567890";
+    let recovery_plain = "abcd-efgh-ijkl-mnop";
+    let recovery_normalized = recovery_plain.replace('-', "");
+
+    let harness = Harness::start(100).await;
+    let env = Env::system();
+    let control = harness.control_store();
+    let data = harness.store();
+    let source = harness.seed_scope().await;
+
+    // A user with a native credential.
+    let native = argon2_hash("pw");
+    seed_user(
+        control,
+        source,
+        &env,
+        NewAdminUser {
+            id: None,
+            identifier: "mfa@exit.test",
+            password_hash: Some(&native),
+            claims_json: None,
+            external_id: None,
+            state: UserState::Active,
+            foreign_password_hash: None,
+            foreign_password_algo: None,
+            traits_json: None,
+            traits_schema_version: None,
+        },
+        1_000_000,
+    )
+    .await;
+    let user = data
+        .scoped(source)
+        .users()
+        .by_identifier("mfa@exit.test")
+        .await
+        .expect("lookup")
+        .expect("user exists");
+
+    // Enroll an ACTIVE TOTP factor with the KNOWN seed, through the data plane (which
+    // holds the UPDATE grant activation needs).
+    let acting = || {
+        data.scoped(source)
+            .acting(harness.test_actor(&env), CorrelationId::generate(&env))
+    };
+    let totp_id = acting()
+        .totp_credentials()
+        .begin_enroll(
+            &env,
+            &user.id,
+            &NewTotpEnrollment {
+                seed: SEED,
+                friendly_name: "my phone",
+                algorithm: "SHA1",
+                digits: 6,
+                period_secs: 30,
+            },
+        )
+        .await
+        .expect("begin enroll");
+    acting()
+        .totp_credentials()
+        .activate(&env, &user.id, &totp_id, 42)
+        .await
+        .expect("activate");
+    // A recovery code stored as its real Argon2id hash (the plaintext never persists).
+    let recovery_hash = argon2_hash(&recovery_normalized);
+    acting()
+        .recovery_codes()
+        .replace_all(
+            &env,
+            &user.id,
+            &[NewRecoveryCode {
+                normalized_code: &recovery_normalized,
+                code_hash: &recovery_hash,
+            }],
+        )
+        .await
+        .expect("store recovery code");
+
+    // Export through the management API.
+    let path = format!(
+        "/v1/tenants/{}/environments/{}/export",
+        source.tenant(),
+        source.environment()
+    );
+    let (status, _headers, body) = harness.get(&path).await;
+    assert_eq!(status, axum::http::StatusCode::OK, "export: {body}");
+    // The emitted bytes carry the opened seed and the recovery hash (not dropped).
+    let seed_b32 = ironauth_jose::base32_encode(SEED);
+    assert!(
+        body.contains(&seed_b32),
+        "the export line carries the opened TOTP seed: {body}"
+    );
+    assert!(
+        body.contains(&recovery_hash),
+        "the export line carries the recovery-code hash: {body}"
+    );
+    let lines: Vec<String> = body
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(str::to_owned)
+        .collect();
+
+    // Import into a FRESH scope through the real streaming import engine.
+    let target = harness.seed_scope().await;
+    let actor = harness.test_actor(&env);
+    let ctx = ImportContext {
+        store: control,
+        scope: target,
+        env: &env,
+        actor,
+    };
+    let report = import_stream(&ctx, lines, |_| {}).await;
+    assert_eq!(report.succeeded, 1, "the user re-imports: {report:?}");
+    assert_eq!(report.failed, 0, "no record fails: {report:?}");
+
+    let imported = data
+        .scoped(target)
+        .users()
+        .by_identifier("mfa@exit.test")
+        .await
+        .expect("lookup")
+        .expect("imported");
+
+    // (a) A TOTP code from the ORIGINAL seed verifies against the RE-IMPORTED factor:
+    // the seed re-sealed under the target DEK opens back to the exact original.
+    let material = data
+        .scoped(target)
+        .totp_credentials()
+        .open_active_material(&imported.id)
+        .await
+        .expect("open active")
+        .expect("re-imported active factor present");
+    assert_eq!(
+        material.seed, SEED,
+        "the re-imported seed opens to the original"
+    );
+    let params = ironauth_jose::TotpParams::authenticator_default();
+    let now = 1_000_000_000u64;
+    let code = ironauth_jose::code_at(SEED, params, now);
+    assert!(
+        ironauth_jose::verify_totp(&material.seed, params, now, 1, &code).is_some(),
+        "a code from the original authenticator verifies against the re-imported factor"
+    );
+
+    // (b) The ORIGINAL recovery code redeems exactly once against the re-imported set.
+    let candidates = data
+        .scoped(target)
+        .recovery_codes()
+        .candidates_for_code(&imported.id, &recovery_normalized)
+        .await
+        .expect("candidates");
+    assert_eq!(
+        candidates.len(),
+        1,
+        "the re-imported recovery code is present"
+    );
+    assert!(
+        ForeignHash::parse(&candidates[0].code_hash)
+            .expect("parse imported hash")
+            .verify(recovery_normalized.as_bytes()),
+        "the re-imported recovery code verifies against the original plaintext"
+    );
+    let redeem_actor = ActorRef::human(HumanId::generate(&env));
+    let redeemed = data
+        .scoped(target)
+        .acting(redeem_actor, CorrelationId::generate(&env))
+        .recovery_codes()
+        .redeem(&env, &imported.id, &candidates[0].id)
+        .await
+        .expect("redeem");
+    assert_eq!(
+        redeemed,
+        RecoveryRedeemOutcome::Redeemed,
+        "a re-imported recovery code redeems"
+    );
+    // Single-use: a second redemption of the same code is refused.
+    let again_actor = ActorRef::human(HumanId::generate(&env));
+    let again = data
+        .scoped(target)
+        .acting(again_actor, CorrelationId::generate(&env))
+        .recovery_codes()
+        .redeem(&env, &imported.id, &candidates[0].id)
+        .await
+        .expect("redeem twice");
+    assert_eq!(
+        again,
+        RecoveryRedeemOutcome::NotFound,
+        "the re-imported recovery code is single-use"
     );
 }
 

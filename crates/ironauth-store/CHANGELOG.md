@@ -6,6 +6,20 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- TOTP review hardening (issue #69, review): the exit export now RE-HOMES the second
+  factor for real. New `ActingTotpCredentialRepo::restore` re-seals an exported seed
+  under the target scope's DEK and reproduces the row (status, single-use step), and
+  `ActingRecoveryCodeRepo::restore_all` inserts the carried recovery-code hashes, so a
+  re-imported active factor VERIFIES against the original authenticator and a
+  re-imported code REDEEMS. The seed seal AAD now binds the `tot_` credential id
+  (LOW-4), so a seed sealed for one row cannot be transplanted into another subject's
+  row and still open. `recovery_codes` gains a keyed `code_bidx` blind index (migration
+  0045 still count 45, still expand) and `RecoveryCodeRepo::candidates_for_code`, so a
+  redemption resolves the ONE candidate and verifies a single Argon2 hash instead of
+  scanning the set (LOW-3; imported NULL-index codes fall back to a bounded scan).
+  Removing a TOTP factor now cascade-deletes the subject's recovery codes in the same
+  transaction (INFO-5). `replace_all` takes `NewRecoveryCode` (normalized code + hash)
+  to derive the index.
 - TOTP authenticators and recovery codes (issue #69, migration 0045, expand): two
   new tenant-scoped tables with forced row-level security. `totp_credentials` holds
   one row per enrolled authenticator with the RFC 6238 SEED sealed under the scope

@@ -68,10 +68,6 @@ const TOTP_SEED_BYTES: usize = 20;
 const RECOVERY_CODE_BYTES: usize = 10;
 /// The default friendly name applied to a TOTP factor when the client sends none.
 const DEFAULT_TOTP_NAME: &str = "Authenticator app";
-/// The step-up recent-re-authentication max age (seconds) the sensitive recovery
-/// regeneration DECLARES (issue #61 seam): the declaration and enforcement seam
-/// ship now; enforcement activates end to end once M7's step-up issue lands.
-const STEP_UP_MAX_AGE_SECS: u64 = 300;
 
 /// The resolved account context of a self-service TOTP request.
 struct Account {
@@ -460,16 +456,20 @@ pub async fn recovery_redeem(
     if let Some(response) = throttle_seam(&state, account.scope, &account.subject) {
         return response;
     }
+    let presented = normalize_recovery_code(&body.code);
+    // Resolve the candidate rows by the presented code's keyed blind index (issue
+    // #69): a natively generated code narrows to its ONE row (a single Argon2 verify),
+    // a wrong code narrows to none (plus any imported NULL-index codes), so a wrong
+    // guess no longer costs a full-set scan of Argon2 verifications.
     let Ok(candidates) = state
         .store()
         .scoped(account.scope)
         .recovery_codes()
-        .unconsumed(&account.subject)
+        .candidates_for_code(&account.subject, &presented)
         .await
     else {
         return server_error();
     };
-    let presented = body.code.trim().replace(['-', ' '], "");
     // Find the matching unconsumed code by verifying through the hashing pool.
     let mut matched = None;
     for candidate in &candidates {
@@ -522,14 +522,45 @@ pub async fn recovery_redeem(
     }
 }
 
+/// The regenerate request body: a fresh-authentication proof (issue #69). Exactly
+/// one of a current password, a current TOTP code, or an unconsumed recovery code
+/// must be supplied and must verify; regeneration is refused without a valid proof.
+#[derive(Debug, Default, Deserialize)]
+pub struct RecoveryRegenerateBody {
+    /// The caller's CURRENT password, verified through the #62 hashing-pool boundary.
+    #[serde(default)]
+    password: Option<String>,
+    /// A CURRENT code from the caller's active authenticator.
+    #[serde(default)]
+    totp_code: Option<String>,
+    /// One of the caller's still-unconsumed recovery codes.
+    #[serde(default)]
+    recovery_code: Option<String>,
+}
+
+/// The method a fresh-auth proof verified through, for the honest response body.
+enum FreshAuthMethod {
+    Password,
+    Totp,
+    RecoveryCode,
+}
+
 /// `POST /t/{tenant}/e/{environment}/account/mfa/recovery-codes`: regenerate the
-/// caller's recovery-code set behind fresh authentication (a sensitive operation:
-/// it declares the step-up requirement). Regeneration invalidates ALL prior codes
-/// and returns the fresh set, shown EXACTLY ONCE.
+/// caller's recovery-code set behind fresh authentication. Regenerating is a
+/// sensitive operation (it invalidates every outstanding code and mints a fresh set),
+/// so a valid session and same-origin CSRF are NOT enough: the request must carry a
+/// CURRENT credential proof (the password, a current TOTP code, or an unconsumed
+/// recovery code) that is verified BEFORE anything is regenerated. This is a "sudo"
+/// re-auth on the single sensitive operation, so a stolen or shared already-signed-in
+/// cookie cannot silently rotate a victim's recovery codes (a recovery denial of
+/// service). It is
+/// independent of the full #72 login-flow step-up. Regeneration invalidates ALL prior
+/// codes and returns the fresh set, shown EXACTLY ONCE.
 pub async fn recovery_regenerate(
     State(state): State<OidcState>,
     Path((tenant_id, environment_id)): Path<(String, String)>,
     headers: HeaderMap,
+    body: Option<Json<RecoveryRegenerateBody>>,
 ) -> Response {
     if !state.totp_enabled() {
         return not_found();
@@ -541,6 +572,12 @@ pub async fn recovery_regenerate(
         Ok(account) => account,
         Err(response) => return response,
     };
+    let Json(body) = body.unwrap_or_default();
+    // The fresh-auth gate: refuse to regenerate without a verified current credential.
+    let method = match verify_fresh_auth(&state, &account, &body).await {
+        Ok(method) => method,
+        Err(response) => return response,
+    };
     match generate_and_store_recovery_codes(&state, &account).await {
         Ok(codes) => json_response(
             StatusCode::OK,
@@ -548,10 +585,134 @@ pub async fn recovery_regenerate(
                 "regenerated": true,
                 "recovery_codes": codes,
                 "recovery_codes_remaining": codes.len(),
-                "step_up": json!({ "max_age_secs": STEP_UP_MAX_AGE_SECS, "enforced": false }),
+                "fresh_auth": json!({ "verified": true, "method": method.as_str() }),
             }),
         ),
         Err(response) => response,
+    }
+}
+
+impl FreshAuthMethod {
+    /// The honest wire label for the method a fresh-auth proof verified through.
+    fn as_str(&self) -> &'static str {
+        match self {
+            FreshAuthMethod::Password => "password",
+            FreshAuthMethod::Totp => "totp",
+            FreshAuthMethod::RecoveryCode => "recovery_code",
+        }
+    }
+}
+
+/// Verify a fresh-authentication proof for a sensitive operation (issue #69): accept
+/// the FIRST of a current password, a current TOTP code, or an unconsumed recovery
+/// code that verifies, and return the method. A request that supplies a proof which
+/// does not verify is the uniform 403 `invalid_proof`; a request that supplies NO
+/// proof at all is the 403 `reauth_required`. The proofs are checked through the same
+/// admission-controlled boundaries the login path uses (the #62 pool for the password
+/// and the recovery hash; the constant-time drift verify for the TOTP code). A TOTP
+/// code used as a proof is NOT consumed (this is a re-auth check, not a login), and a
+/// recovery code is not redeemed (regeneration invalidates it moments later anyway).
+async fn verify_fresh_auth(
+    state: &OidcState,
+    account: &Account,
+    body: &RecoveryRegenerateBody,
+) -> Result<FreshAuthMethod, Response> {
+    let mut provided = false;
+
+    // A current password, verified against the stored verifier through the #62 pool.
+    if let Some(password) = body.password.as_deref().filter(|p| !p.is_empty()) {
+        provided = true;
+        let stored = state
+            .store()
+            .scoped(account.scope)
+            .users()
+            .password_hash_for_subject(&account.subject)
+            .await;
+        match stored {
+            Ok(Some(hash)) => match state.verify_password(&account.scope, password, &hash).await {
+                Ok(true) => return Ok(FreshAuthMethod::Password),
+                Ok(false) => {}
+                Err(HashRejection::Unavailable) => return Err(server_error()),
+                Err(rejection) => return Err(rejection.to_response()),
+            },
+            // No password credential on the account: this proof cannot verify, but a
+            // TOTP or recovery-code proof still can.
+            Ok(None) => {}
+            Err(_) => return Err(server_error()),
+        }
+    }
+
+    // A current TOTP code from the active authenticator (constant-time drift verify).
+    if let Some(code) = body
+        .totp_code
+        .as_deref()
+        .map(str::trim)
+        .filter(|c| !c.is_empty())
+    {
+        provided = true;
+        match state
+            .store()
+            .scoped(account.scope)
+            .totp_credentials()
+            .open_active_material(&account.subject)
+            .await
+        {
+            Ok(Some(material)) => {
+                let Some(params) = params_from_material(&material) else {
+                    return Err(server_error());
+                };
+                let now = now_unix_secs(state);
+                if verify_totp(
+                    &material.seed,
+                    params,
+                    now,
+                    u64::from(state.totp_drift_steps()),
+                    code,
+                )
+                .is_some()
+                {
+                    return Ok(FreshAuthMethod::Totp);
+                }
+            }
+            Ok(None) => {}
+            Err(_) => return Err(server_error()),
+        }
+    }
+
+    // An unconsumed recovery code (resolved by its blind index, verified once).
+    if let Some(raw) = body.recovery_code.as_deref() {
+        let normalized = normalize_recovery_code(raw);
+        if !normalized.is_empty() {
+            provided = true;
+            match state
+                .store()
+                .scoped(account.scope)
+                .recovery_codes()
+                .candidates_for_code(&account.subject, &normalized)
+                .await
+            {
+                Ok(candidates) => {
+                    for candidate in &candidates {
+                        match state
+                            .verify_password(&account.scope, &normalized, &candidate.code_hash)
+                            .await
+                        {
+                            Ok(true) => return Ok(FreshAuthMethod::RecoveryCode),
+                            Ok(false) => {}
+                            Err(HashRejection::Unavailable) => return Err(server_error()),
+                            Err(rejection) => return Err(rejection.to_response()),
+                        }
+                    }
+                }
+                Err(_) => return Err(server_error()),
+            }
+        }
+    }
+
+    if provided {
+        Err(invalid_proof())
+    } else {
+        Err(reauth_required())
     }
 }
 
@@ -675,30 +836,47 @@ async fn generate_and_store_recovery_codes(
 ) -> Result<Vec<String>, Response> {
     let count = state.totp_recovery_code_count() as usize;
     let mut plaintext = Vec::with_capacity(count);
-    let mut hashes = Vec::with_capacity(count);
+    // Each entry is (normalized code, Argon2id hash). The normalized code is what the
+    // store hashes AND derives the keyed blind index from (for a single-hash redeem);
+    // the plaintext (with grouping hyphens) is shown to the user exactly once.
+    let mut materials: Vec<(String, String)> = Vec::with_capacity(count);
     for _ in 0..count {
         let code = generate_recovery_code(state);
         // Hash the normalized (hyphen-free) code so redemption can normalize too.
-        let normalized = code.replace('-', "");
+        let normalized = normalize_recovery_code(&code);
         match state.hash_password(&account.scope, &normalized).await {
-            Ok(hash) => hashes.push(hash),
+            Ok(hash) => materials.push((normalized, hash)),
             Err(HashRejection::Unavailable) => return Err(server_error()),
             Err(rejection) => return Err(rejection.to_response()),
         }
         plaintext.push(code);
     }
+    let codes: Vec<ironauth_store::NewRecoveryCode<'_>> = materials
+        .iter()
+        .map(|(normalized, hash)| ironauth_store::NewRecoveryCode {
+            normalized_code: normalized,
+            code_hash: hash,
+        })
+        .collect();
     let actor = interaction::user_actor(&account.subject);
     let stored = state
         .store()
         .scoped(account.scope)
         .acting(actor, CorrelationId::generate(state.env()))
         .recovery_codes()
-        .replace_all(state.env(), &account.subject, &hashes)
+        .replace_all(state.env(), &account.subject, &codes)
         .await;
     match stored {
         Ok(_) => Ok(plaintext),
         Err(_) => Err(server_error()),
     }
+}
+
+/// Normalize a recovery code to its comparison form (issue #69): strip the grouping
+/// hyphens and any spaces the user typed, so the same code hashes and blind-indexes
+/// identically at generation and at redemption.
+fn normalize_recovery_code(code: &str) -> String {
+    code.trim().replace(['-', ' '], "")
 }
 
 /// A single recovery code: `RECOVERY_CODE_BYTES` of entropy, Base32-encoded and
@@ -762,6 +940,30 @@ fn unauthenticated() -> Response {
         json!({
             "error": "unauthenticated",
             "error_description": "Sign in to manage your account.",
+        }),
+    )
+}
+
+/// A 403 for a sensitive regeneration attempted with NO fresh-authentication proof.
+fn reauth_required() -> Response {
+    json_response(
+        StatusCode::FORBIDDEN,
+        json!({
+            "error": "reauth_required",
+            "error_description": "Confirm your identity to regenerate recovery codes: supply your \
+                 current password, a current authenticator code, or an unused recovery code.",
+        }),
+    )
+}
+
+/// A 403 for a regeneration whose supplied fresh-authentication proof did not verify.
+fn invalid_proof() -> Response {
+    json_response(
+        StatusCode::FORBIDDEN,
+        json!({
+            "error": "invalid_proof",
+            "error_description": "That credential is not valid. Try your current password, a \
+                 current authenticator code, or an unused recovery code.",
         }),
     )
 }

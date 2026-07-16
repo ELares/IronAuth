@@ -1198,11 +1198,17 @@ pub struct OidcConfig {
     /// within that bound rides the tenant-policy pipeline.
     pub totp_recovery_code_count: u32,
 
-    /// Whether MFA enrollment is REQUIRED after primary authentication (issue #69).
-    /// When true, the factor-orchestration plan marks a second-factor enrollment as
-    /// required for a user who has none, so the hosted flow prompts for it. Off by
-    /// default (MFA is offered, not forced); a per-tenant override rides the
-    /// tenant-policy pipeline.
+    /// Whether MFA is REQUIRED for a user who has no second factor (issue #69). SCOPE
+    /// TODAY: this drives the ENROLLMENT PROMPT only. When true, the
+    /// factor-orchestration plan (`/account/mfa/plan`) marks a second-factor
+    /// enrollment as `enrollment_required` for a user who has none, so the hosted flow
+    /// prompts for it after primary authentication. It does NOT today HARD-GATE the
+    /// login flow: a full session is still established after the password alone. Hard
+    /// login-flow enforcement (challenging the second factor with a partial session
+    /// BEFORE a full session is issued) is the core deliverable of the step-up issue
+    /// (#72) and lands with it, so do not rely on this to BLOCK a login until #72
+    /// ships. Off by default (MFA is offered, not forced); a per-tenant override rides
+    /// the tenant-policy pipeline.
     pub mfa_required: bool,
 
     /// The per-tenant factor order (issue #69): which second-factor kinds are
@@ -3448,5 +3454,97 @@ mod tests {
             "doc comments must flow into the schema: {bind}"
         );
         assert_eq!(bind["default"], serde_json::json!("127.0.0.1:8443"));
+    }
+
+    /// Minor-7: the TOTP config bounds are enforced at boot. The default is valid, and
+    /// each out-of-range parameter (digits, period, drift, recovery count) and a
+    /// malformed factor order (unknown or duplicate) is a boot-time `Invalid`.
+    #[test]
+    #[allow(clippy::field_reassign_with_default)] // one-field mutations off a large default read clearest
+    fn validate_totp_enforces_the_documented_bounds() {
+        // The default config is valid.
+        validate_totp(&OidcConfig::default()).expect("defaults are valid");
+
+        // digits must be in 6..=8.
+        for bad in [5u32, 9] {
+            let mut oidc = OidcConfig::default();
+            oidc.totp_digits = bad;
+            assert!(
+                matches!(validate_totp(&oidc), Err(ConfigError::Invalid { .. })),
+                "totp_digits {bad} must be rejected"
+            );
+        }
+        for ok in [6u32, 7, 8] {
+            let mut oidc = OidcConfig::default();
+            oidc.totp_digits = ok;
+            validate_totp(&oidc).unwrap_or_else(|_| panic!("totp_digits {ok} is valid"));
+        }
+
+        // period must be in 15..=60.
+        for bad in [14u64, 61] {
+            let mut oidc = OidcConfig::default();
+            oidc.totp_period_secs = bad;
+            assert!(
+                matches!(validate_totp(&oidc), Err(ConfigError::Invalid { .. })),
+                "totp_period_secs {bad} must be rejected"
+            );
+        }
+        for ok in [15u64, 30, 60] {
+            let mut oidc = OidcConfig::default();
+            oidc.totp_period_secs = ok;
+            validate_totp(&oidc).unwrap_or_else(|_| panic!("totp_period_secs {ok} is valid"));
+        }
+
+        // drift must be at most 2.
+        for ok in [0u32, 1, 2] {
+            let mut oidc = OidcConfig::default();
+            oidc.totp_drift_steps = ok;
+            validate_totp(&oidc).unwrap_or_else(|_| panic!("totp_drift_steps {ok} is valid"));
+        }
+        let mut oidc = OidcConfig::default();
+        oidc.totp_drift_steps = 3;
+        assert!(
+            matches!(validate_totp(&oidc), Err(ConfigError::Invalid { .. })),
+            "a drift window over 2 must be rejected"
+        );
+
+        // recovery count must be in 8..=16.
+        for bad in [7u32, 17] {
+            let mut oidc = OidcConfig::default();
+            oidc.totp_recovery_code_count = bad;
+            assert!(
+                matches!(validate_totp(&oidc), Err(ConfigError::Invalid { .. })),
+                "totp_recovery_code_count {bad} must be rejected"
+            );
+        }
+        for ok in [8u32, 10, 16] {
+            let mut oidc = OidcConfig::default();
+            oidc.totp_recovery_code_count = ok;
+            validate_totp(&oidc)
+                .unwrap_or_else(|_| panic!("totp_recovery_code_count {ok} is valid"));
+        }
+
+        // An unknown factor in the order is rejected.
+        let mut oidc = OidcConfig::default();
+        oidc.mfa_factor_order = vec!["passkey".to_owned(), "sms".to_owned()];
+        assert!(
+            matches!(validate_totp(&oidc), Err(ConfigError::Invalid { .. })),
+            "an unknown mfa_factor_order entry must be rejected"
+        );
+        // A duplicate factor is rejected.
+        let mut oidc = OidcConfig::default();
+        oidc.mfa_factor_order = vec!["totp".to_owned(), "totp".to_owned()];
+        assert!(
+            matches!(validate_totp(&oidc), Err(ConfigError::Invalid { .. })),
+            "a duplicate mfa_factor_order entry must be rejected"
+        );
+        // The closed set in any order is accepted.
+        let mut oidc = OidcConfig::default();
+        oidc.mfa_factor_order = vec![
+            "password".to_owned(),
+            "totp".to_owned(),
+            "passkey".to_owned(),
+        ];
+        validate_totp(&oidc).expect("the closed set is valid in any order");
     }
 }

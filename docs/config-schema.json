@@ -543,7 +543,7 @@
         },
         "mfa_required": {
           "default": false,
-          "description": "Whether MFA enrollment is REQUIRED after primary authentication (issue #69).\nWhen true, the factor-orchestration plan marks a second-factor enrollment as\nrequired for a user who has none, so the hosted flow prompts for it. Off by\ndefault (MFA is offered, not forced); a per-tenant override rides the\ntenant-policy pipeline.",
+          "description": "Whether MFA is REQUIRED for a user who has no second factor (issue #69). SCOPE\nTODAY: this drives the ENROLLMENT PROMPT only. When true, the\nfactor-orchestration plan (`/account/mfa/plan`) marks a second-factor\nenrollment as `enrollment_required` for a user who has none, so the hosted flow\nprompts for it after primary authentication. It does NOT today HARD-GATE the\nlogin flow: a full session is still established after the password alone. Hard\nlogin-flow enforcement (challenging the second factor with a partial session\nBEFORE a full session is issued) is the core deliverable of the step-up issue\n(#72) and lands with it, so do not rely on this to BLOCK a login until #72\nships. Off by default (MFA is offered, not forced); a per-tenant override rides\nthe tenant-policy pipeline.",
           "type": "boolean"
         },
         "offline_access_requires_consent": {
