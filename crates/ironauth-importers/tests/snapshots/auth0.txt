@@ -1,0 +1,15 @@
+auth0 import gap report
+users: 3 (mapped 3, dropped 0)
+
+[auth0|5f00000000000000000000c1]
+  - created_at: source activity metadata (not imported; IronAuth records its own lifecycle timestamps)
+  - updated_at: source activity metadata (not imported; IronAuth records its own lifecycle timestamps)
+  - last_login: source activity metadata (not imported; IronAuth records its own lifecycle timestamps)
+  - logins_count: source activity metadata (not imported; IronAuth records its own lifecycle timestamps)
+
+[google-oauth2|110000000000000000011]
+  - passwordHash: no row in the password-hash export (no hash was provided for this user (Auth0 gates the hash export); the user must reset their password)
+  - identities[0]: social identity (a social-connection user has no importable password; the user signs in via the social provider or resets their password)
+
+[auth0|5f00000000000000000000e2]
+  - multifactor: guardian (enrolled MFA secrets cannot ride a bulk export; the user re-enrolls them)

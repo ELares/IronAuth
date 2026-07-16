@@ -1,0 +1,27 @@
+{
+  "schemas": ["urn:ietf:params:scim:api:messages:2.0:ListResponse"],
+  "totalResults": 2,
+  "Resources": [
+    {
+      "schemas": ["urn:ietf:params:scim:schemas:core:2.0:User"],
+      "id": "sp-2c7f0001",
+      "externalId": "HR-9001",
+      "userName": "heidi",
+      "name": { "givenName": "Heidi", "familyName": "Hall", "formatted": "Heidi Hall" },
+      "displayName": "Heidi Hall",
+      "emails": [{ "value": "heidi@acme.test", "primary": true, "type": "work" }],
+      "phoneNumbers": [{ "value": "+15550004444", "primary": true }],
+      "active": true,
+      "groups": [{ "value": "grp-eng", "display": "Engineering" }],
+      "urn:ietf:params:scim:schemas:extension:enterprise:2.0:User": {
+        "employeeNumber": "9001",
+        "department": "Engineering"
+      }
+    },
+    {
+      "schemas": ["urn:ietf:params:scim:schemas:core:2.0:User"],
+      "userName": "ivan",
+      "active": false
+    }
+  ]
+}

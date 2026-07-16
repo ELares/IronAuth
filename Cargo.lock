@@ -1040,6 +1040,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "ironauth-importers"
+version = "0.1.0"
+dependencies = [
+ "argon2",
+ "base64",
+ "bcrypt",
+ "ironauth-env",
+ "ironauth-import",
+ "ironauth-store",
+ "password-hash",
+ "pbkdf2",
+ "scrypt",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "ironauth-jose"
 version = "0.1.0"
 dependencies = [
