@@ -19,7 +19,6 @@ use crate::authn::AuthenticationEvent;
 use crate::interaction::{self, parse_resume};
 use crate::login::ResumeQuery;
 use crate::pages;
-use crate::password;
 use crate::state::OidcState;
 use crate::util::epoch_micros;
 
@@ -117,8 +116,15 @@ pub async fn register_post(
         );
     }
 
-    let Ok(password_hash) = password::hash_password(state.env(), password) else {
-        return interaction::server_error_page();
+    // Hash through the dedicated, admission-controlled pool (issue #62), off the
+    // async threads. An over-share tenant or a saturated pool is the retryable
+    // 429/503; a pool fault is the generic server error page.
+    let password_hash = match state.hash_password(&resume.scope, password).await {
+        Ok(hash) => hash,
+        Err(crate::hashing_pool::HashRejection::Unavailable) => {
+            return interaction::server_error_page();
+        }
+        Err(rejection) => return rejection.to_response(),
     };
 
     // A fresh human actor for the self-registration audit; the audit target is the

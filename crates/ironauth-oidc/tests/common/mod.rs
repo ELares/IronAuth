@@ -1008,6 +1008,22 @@ impl Harness {
             .to_string()
     }
 
+    /// Register a bootstrap user with a PRE-BUILT password hash and return its
+    /// subject, so a test can seed a credential written at specific Argon2id
+    /// parameters (issue #62): the native rehash-on-login upgrade needs a user whose
+    /// stored hash was written at OLDER parameters than the current target.
+    pub async fn seed_user_with_hash(&self, identifier: &str, hash: &str) -> String {
+        let (actor, corr) = self.seeding_actor();
+        self.store()
+            .scoped(self.scope)
+            .acting(actor, corr)
+            .users()
+            .register(&self.env, identifier, hash)
+            .await
+            .expect("register user with hash")
+            .to_string()
+    }
+
     /// Register a bootstrap user with a standard-claim document (issue #15) and
     /// return its subject. `claims_json` is the OIDC standard-claim object as JSON
     /// text (for example `{"email":"a@b.test","email_verified":true}`), which

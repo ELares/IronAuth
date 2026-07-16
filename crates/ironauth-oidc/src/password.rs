@@ -43,21 +43,94 @@ const OWASP_P_COST: u32 = 1;
 /// Salt length in bytes (128 bits).
 const SALT_BYTES: usize = 16;
 
+/// The Argon2id cost parameters applied to a NEWLY set password (issue #62).
+///
+/// Verification never consults these: the parameters of an existing hash are read
+/// from its stored PHC string, so a hash written at older parameters still
+/// verifies and upgrades to the current parameters on the user's next successful
+/// login (the rehash-on-login path). These govern only the hashes this process
+/// mints today; the shipped default is the OWASP recommendation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Argon2Params {
+    /// Memory cost in KiB (`m`).
+    memory_kib: u32,
+    /// Iteration (time) cost (`t`).
+    iterations: u32,
+    /// Parallelism / lanes (`p`).
+    parallelism: u32,
+}
+
+impl Argon2Params {
+    /// Explicit parameters. Callers derive these from
+    /// [`ironauth_config::PasswordHashingConfig`], which bounds them at config
+    /// load; nothing here re-validates, but an invalid triple surfaces as
+    /// [`PasswordError::Hash`] at hash time rather than a panic.
+    #[must_use]
+    pub fn new(memory_kib: u32, iterations: u32, parallelism: u32) -> Self {
+        Self {
+            memory_kib,
+            iterations,
+            parallelism,
+        }
+    }
+
+    /// The OWASP default parameters (`m = 19456` KiB, `t = 2`, `p = 1`).
+    #[must_use]
+    pub fn owasp() -> Self {
+        Self::new(OWASP_M_COST_KIB, OWASP_T_COST, OWASP_P_COST)
+    }
+
+    /// The memory cost in KiB.
+    #[must_use]
+    pub fn memory_kib(&self) -> u32 {
+        self.memory_kib
+    }
+
+    /// The iteration (time) cost.
+    #[must_use]
+    pub fn iterations(&self) -> u32 {
+        self.iterations
+    }
+
+    /// The parallelism (lanes).
+    #[must_use]
+    pub fn parallelism(&self) -> u32 {
+        self.parallelism
+    }
+}
+
+impl Default for Argon2Params {
+    fn default() -> Self {
+        Self::owasp()
+    }
+}
+
 /// Why a password hash could not be produced. Verification never errors (it
 /// returns a bool), so this is only the hashing side; it is unreachable in
-/// practice because the parameters are fixed and valid by construction.
+/// practice for the OWASP defaults, and reachable only if a tuned parameter
+/// triple is invalid (config load bounds the parameters, so that is unreachable
+/// in a validated configuration).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PasswordError {
-    /// The Argon2id context or hashing step failed. Only reachable if the fixed
-    /// OWASP parameters became invalid, which cannot happen for the constants
-    /// above.
+    /// The Argon2id context or hashing step failed. Only reachable if the
+    /// parameters are invalid, which a validated configuration prevents.
     Hash,
 }
 
 /// The Argon2id context at the OWASP default parameters.
 fn argon2() -> Result<Argon2<'static>, PasswordError> {
-    let params = Params::new(OWASP_M_COST_KIB, OWASP_T_COST, OWASP_P_COST, None)
-        .map_err(|_| PasswordError::Hash)?;
+    argon2_with(Argon2Params::owasp())
+}
+
+/// The Argon2id context at explicit parameters.
+fn argon2_with(params: Argon2Params) -> Result<Argon2<'static>, PasswordError> {
+    let params = Params::new(
+        params.memory_kib,
+        params.iterations,
+        params.parallelism,
+        None,
+    )
+    .map_err(|_| PasswordError::Hash)?;
     Ok(Argon2::new(Algorithm::Argon2id, Version::V0x13, params))
 }
 
@@ -70,10 +143,29 @@ fn argon2() -> Result<Argon2<'static>, PasswordError> {
 /// fails (unreachable for the fixed valid parameters; surfaced rather than
 /// panicked so a caller fails closed).
 pub fn hash_password(env: &Env, password: &str) -> Result<String, PasswordError> {
+    hash_password_with(env, password, Argon2Params::owasp())
+}
+
+/// Hash `password` with Argon2id at explicit `params`, drawing the salt from the
+/// environment entropy seam, and return the PHC string to store. The chosen
+/// parameters are embedded in the emitted PHC string, so a later parameter change
+/// never invalidates this hash: it verifies unchanged and upgrades to the new
+/// parameters on the user's next successful login.
+///
+/// # Errors
+///
+/// [`PasswordError::Hash`] if the salt cannot be encoded or the hashing step
+/// fails (for example an invalid parameter triple; a validated configuration
+/// bounds the parameters so this is unreachable in practice).
+pub fn hash_password_with(
+    env: &Env,
+    password: &str,
+    params: Argon2Params,
+) -> Result<String, PasswordError> {
     let mut salt_bytes = [0_u8; SALT_BYTES];
     env.entropy().fill_bytes(&mut salt_bytes);
     let salt = SaltString::encode_b64(&salt_bytes).map_err(|_| PasswordError::Hash)?;
-    let hash = argon2()?
+    let hash = argon2_with(params)?
         .hash_password(password.as_bytes(), &salt)
         .map_err(|_| PasswordError::Hash)?;
     Ok(hash.to_string())
@@ -91,6 +183,33 @@ pub fn verify_password(password: &str, hash: &str) -> bool {
     Argon2::default()
         .verify_password(password.as_bytes(), &parsed)
         .is_ok()
+}
+
+/// Whether a stored native Argon2id `hash` was written at DIFFERENT parameters
+/// than `target`, so a successful login should transparently rehash it to the
+/// current parameters (issue #62). Returns `false` when the stored hash already
+/// matches the target, is not a parseable Argon2id PHC string, or is a non-Argon2
+/// (foreign) hash: only a genuine native-parameter drift warrants an upgrade, and
+/// the foreign path (issue #55) owns the foreign-to-native upgrade.
+///
+/// The comparison is on the cost parameters (`m`, `t`, `p`) and the algorithm, not
+/// the salt or digest, so it is purely a policy check on how the hash was derived.
+#[must_use]
+pub fn needs_rehash(hash: &str, target: Argon2Params) -> bool {
+    let Ok(parsed) = PasswordHash::new(hash) else {
+        return false;
+    };
+    // Only native Argon2id hashes are in scope; anything else is not ours to
+    // upgrade here.
+    if parsed.algorithm.as_str() != "argon2id" {
+        return false;
+    }
+    let Ok(params) = Params::try_from(&parsed) else {
+        return false;
+    };
+    params.m_cost() != target.memory_kib
+        || params.t_cost() != target.iterations
+        || params.p_cost() != target.parallelism
 }
 
 /// Run a full Argon2id verification against a fixed dummy hash and always return
@@ -173,5 +292,54 @@ mod tests {
     fn verify_absent_is_always_false() {
         assert!(!verify_absent("anything"));
         assert!(!verify_absent(""));
+    }
+
+    #[test]
+    fn tuned_parameters_are_embedded_and_still_verify() {
+        // A parameter change (issue #62) applies to NEW hashes; the chosen params
+        // are embedded in the PHC string, so the hash verifies unchanged and would
+        // upgrade on next login.
+        let (env, _) = Env::deterministic(SystemTime::UNIX_EPOCH, 5);
+        let params = Argon2Params::new(12_288, 3, 1);
+        let hash = hash_password_with(&env, "tuned password", params).expect("hash");
+        assert!(hash.contains("m=12288"), "tuned memory cost: {hash}");
+        assert!(hash.contains("t=3"), "tuned time cost: {hash}");
+        assert!(hash.contains("p=1"), "tuned parallelism: {hash}");
+        // A hash written at tuned params still verifies (params come from the PHC).
+        assert!(verify_password("tuned password", &hash));
+        assert!(!verify_password("wrong", &hash));
+    }
+
+    #[test]
+    fn needs_rehash_detects_parameter_drift() {
+        // A hash at the OWASP default needs no rehash to the OWASP target.
+        let (env, _) = Env::deterministic(SystemTime::UNIX_EPOCH, 13);
+        let owasp = hash_password_with(&env, "pw", Argon2Params::owasp()).expect("hash");
+        assert!(!needs_rehash(&owasp, Argon2Params::owasp()));
+
+        // The SAME hash needs a rehash to a stronger target (parameter drift).
+        assert!(needs_rehash(&owasp, Argon2Params::new(65_536, 3, 1)));
+
+        // A hash at weaker params needs a rehash to the OWASP default.
+        let weak = hash_password_with(&env, "pw", Argon2Params::new(8_192, 1, 1)).expect("hash");
+        assert!(needs_rehash(&weak, Argon2Params::owasp()));
+
+        // A malformed or non-argon2id stored value is never rehashed here.
+        assert!(!needs_rehash("not-a-phc-string", Argon2Params::owasp()));
+        assert!(!needs_rehash(
+            "$scrypt$ln=16,r=8,p=1$c2FsdA$aGFzaA",
+            Argon2Params::owasp()
+        ));
+    }
+
+    #[test]
+    fn owasp_default_matches_the_plain_hash_parameters() {
+        // hash_password is hash_password_with at the OWASP default, so both emit the
+        // same parameter set.
+        let (env, _) = Env::deterministic(SystemTime::UNIX_EPOCH, 9);
+        let default = hash_password(&env, "pw").expect("hash");
+        assert!(default.contains("m=19456") && default.contains("t=2") && default.contains("p=1"));
+        let explicit = hash_password_with(&env, "pw", Argon2Params::owasp()).expect("hash");
+        assert!(explicit.contains("m=19456") && explicit.contains("t=2"));
     }
 }

@@ -287,6 +287,62 @@ async fn an_existing_user_can_log_in_and_receive_tokens() {
 }
 
 #[tokio::test]
+async fn a_native_hash_at_older_parameters_upgrades_on_a_successful_login() {
+    // Issue #62 acceptance: changing environment parameters affects new hashes AND an
+    // existing user's native hash upgrades transparently on the next successful login.
+    // The default harness state mints at the OWASP target (m=19456); seed a user whose
+    // stored hash was written at WEAKER parameters, log in, and confirm the stored hash
+    // is transparently rehashed to the target.
+    let harness = Harness::start().await;
+    let client_id = harness.client_id().to_string();
+
+    let weak = ironauth_oidc::hash_password_with(
+        harness.env(),
+        "s3cr3t-passphrase",
+        ironauth_oidc::Argon2Params::new(8_192, 1, 1),
+    )
+    .expect("weak hash");
+    assert!(weak.contains("m=8192"), "seeded at weak params: {weak}");
+    harness
+        .seed_user_with_hash("upgrade@example.test", &weak)
+        .await;
+
+    // Drive the login POST (the rehash happens inside it, before the redirect).
+    let (status, headers, _) = harness.authorize(&authorize_query(&client_id, None)).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    let login_location = location(&headers).expect("login redirect");
+    let (_s, _h, login_html) = harness.get_with_cookie(&login_location, None).await;
+    let return_to = form_field(&login_html, "return_to").expect("login return_to");
+    let login_body = form(&[
+        ("identifier", "upgrade@example.test"),
+        ("password", "s3cr3t-passphrase"),
+        ("return_to", &return_to),
+    ]);
+    let (status, _headers, body) = harness.post_form("/login", &login_body, None).await;
+    assert_eq!(status, StatusCode::SEE_OTHER, "login post: {body}");
+
+    // The stored hash is now at the OWASP target, upgraded transparently.
+    let user = harness
+        .store()
+        .scoped(harness.scope())
+        .users()
+        .by_identifier("upgrade@example.test")
+        .await
+        .expect("read")
+        .expect("user present");
+    assert!(
+        user.password_hash.contains("m=19456"),
+        "the native hash upgraded to the current parameters on login: {}",
+        user.password_hash
+    );
+    // The upgraded hash still verifies the same password.
+    assert!(ironauth_oidc::verify_password(
+        "s3cr3t-passphrase",
+        &user.password_hash
+    ));
+}
+
+#[tokio::test]
 async fn a_wrong_password_re_renders_the_login_form_generically() {
     let harness = Harness::start().await;
     let client_id = harness.client_id().to_string();

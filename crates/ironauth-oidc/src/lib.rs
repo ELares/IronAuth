@@ -84,6 +84,7 @@ mod device_verify;
 mod discovery;
 mod error;
 mod global_revocation;
+mod hashing_pool;
 mod hints;
 mod interaction;
 mod introspection;
@@ -98,6 +99,7 @@ mod pages;
 mod par;
 mod password;
 mod pkce;
+mod probe;
 mod quota;
 mod register;
 mod registry;
@@ -147,6 +149,11 @@ pub use discovery::{
 };
 pub use error::{AuthorizeError, AuthzErrorCode, TokenError};
 pub use global_revocation::GLOBAL_TOKEN_REVOCATION_PATH;
+pub use hashing_pool::{
+    ADMISSION_REJECTED_TOTAL, HASH_DURATION_SECONDS, HashRejection, HashingPool,
+    POOL_ACTIVE_WORKERS, POOL_QUEUE_DEPTH, POOL_THREADS, ThreadDiagnostics, default_pool_threads,
+    describe_hashing_pool_metrics, on_hash_worker_thread,
+};
 pub use hints::{Display, InteractionHints};
 pub use introspection::{
     IntrospectionClaims, IntrospectionSerializer, JsonIntrospectionSerializer,
@@ -164,7 +171,11 @@ pub use migration::{
     LazyMigrationHook, WebhookVerifier, build_from_config as build_lazy_migration_hook,
     describe_metrics as describe_lazy_migration_metrics,
 };
-pub use password::{PasswordError, hash_password, verify_absent, verify_password};
+pub use password::{
+    Argon2Params, PasswordError, hash_password, hash_password_with, needs_rehash, verify_absent,
+    verify_password,
+};
+pub use probe::{ProbeReport, available_memory_kib, run_probe};
 pub use registry::{
     GrantType, PkceMethod, PromptSet, PromptSetError, PromptValue, ResponseMode, ResponseType,
 };

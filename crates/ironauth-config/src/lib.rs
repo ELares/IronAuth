@@ -82,6 +82,13 @@ pub struct Config {
     /// (the single-tenant self-hoster posture).
     pub quota: QuotaConfig,
 
+    /// Password-hashing settings (issue #62): the Argon2id parameters for newly
+    /// set passwords and the dedicated, admission-controlled hashing worker pool.
+    /// Argon2id at the OWASP defaults, off the async request threads, with
+    /// per-tenant fair-share admission reusing the `[quota]` layer so one tenant's
+    /// credential-stuffing storm degrades only that tenant.
+    pub password_hashing: PasswordHashingConfig,
+
     /// Bring-your-own-key (BYOK) customer-managed encryption settings (issue #49).
     /// EXPERIMENTAL and DEFAULT-OFF: an opt-in rung on the isolation ladder that
     /// lets a customer-managed root key (in an external KMS/HSM, or a
@@ -1260,6 +1267,116 @@ impl Default for LazyMigrationConfig {
     }
 }
 
+/// The OWASP-recommended Argon2id memory cost, in KiB (issue #62). The shipped
+/// default for `password_hashing.memory_kib`.
+pub const PASSWORD_HASHING_OWASP_MEMORY_KIB: u32 = 19_456;
+/// The OWASP-recommended Argon2id iteration (time) cost (issue #62).
+pub const PASSWORD_HASHING_OWASP_ITERATIONS: u32 = 2;
+/// The OWASP-recommended Argon2id parallelism (lanes) (issue #62).
+pub const PASSWORD_HASHING_OWASP_PARALLELISM: u32 = 1;
+/// The security FLOOR for `password_hashing.memory_kib` (issue #62): config load
+/// refuses a memory cost below this, so a tuning mistake cannot ship a hashing
+/// parameter weaker than a defensible minimum (8 MiB). The shipped default is far
+/// above it.
+pub const PASSWORD_HASHING_MIN_MEMORY_KIB: u32 = 8_192;
+/// The CEILING for `password_hashing.memory_kib` (issue #62): 4 GiB. A larger
+/// value is almost always a misconfiguration that would let a single hash exhaust
+/// host memory, so config load refuses it.
+pub const PASSWORD_HASHING_MAX_MEMORY_KIB: u32 = 4_194_304;
+/// The CEILING for `password_hashing.iterations` (issue #62). A value beyond this
+/// makes each hash absurdly slow; config load refuses it.
+pub const PASSWORD_HASHING_MAX_ITERATIONS: u32 = 16;
+/// The CEILING for `password_hashing.parallelism` (issue #62). Argon2 lanes above
+/// this are pointless on any realistic host; config load refuses it.
+pub const PASSWORD_HASHING_MAX_PARALLELISM: u32 = 64;
+/// The CEILING for `password_hashing.pool_threads` (issue #62). A worker count
+/// beyond this is a misconfiguration; config load refuses it. `0` (the default)
+/// derives the count from the host core count at boot.
+pub const PASSWORD_HASHING_MAX_POOL_THREADS: usize = 1_024;
+/// The CEILING for `password_hashing.probe_target_latency_ms` (issue #62): five
+/// seconds. A target beyond this would recommend an unusably slow login.
+pub const PASSWORD_HASHING_MAX_PROBE_TARGET_LATENCY_MS: u64 = 5_000;
+/// The FLOOR for `password_hashing.probe_target_latency_ms` (issue #62): ten
+/// milliseconds. A target below it cannot be met by any memory-hard hash.
+pub const PASSWORD_HASHING_MIN_PROBE_TARGET_LATENCY_MS: u64 = 10;
+
+/// Password-hashing settings (issue #62): the Argon2id parameters for NEWLY set
+/// passwords and the dedicated, admission-controlled hashing worker pool.
+///
+/// Password hashing is the hottest and most denial-of-service-prone operation an
+/// identity provider performs, so it runs in a bounded worker pool kept OFF the
+/// async request threads, fronted by the per-tenant fair-share admission of the
+/// [`QuotaConfig`] layer (issue #50): one tenant's credential-stuffing storm
+/// degrades only that tenant, never the instance.
+///
+/// The Argon2id parameters are per-environment in spirit (dev/staging/prod may
+/// differ) and safe by default (the OWASP recommendation: `m = 19456` KiB,
+/// `t = 2`, `p = 1`); a parameter change applies to NEW hashes, and an existing
+/// hash upgrades transparently through the rehash-on-successful-login path,
+/// because the parameters are stored per hash in the PHC string. The process
+/// value is the deployment default until per-environment overrides ride the M5
+/// promotion pipeline, mirroring the other promotable settings.
+///
+/// The pool sizing and queue depth are host infrastructure, not a per-environment
+/// concern: they bound the whole process. The `ironauth hash-probe` CLI (and the
+/// in-admin tuning helper) run a measured probe on the actual host and recommend
+/// parameters that meet `probe_target_latency_ms`.
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields, default)]
+pub struct PasswordHashingConfig {
+    /// Argon2id memory cost in KiB for newly set passwords. The default
+    /// (`19456`, the OWASP recommendation) is 19 MiB. Must be between
+    /// `PASSWORD_HASHING_MIN_MEMORY_KIB` (8 MiB) and
+    /// `PASSWORD_HASHING_MAX_MEMORY_KIB` (4 GiB). A change applies to new hashes;
+    /// an existing hash upgrades on the user's next successful login.
+    pub memory_kib: u32,
+
+    /// Argon2id iteration (time) cost for newly set passwords. The default (`2`,
+    /// the OWASP recommendation) pairs with the 19 MiB memory cost. Must be at
+    /// least 1 and at most `PASSWORD_HASHING_MAX_ITERATIONS`.
+    pub iterations: u32,
+
+    /// Argon2id parallelism (lanes) for newly set passwords. The default (`1`,
+    /// the OWASP recommendation). Must be at least 1 and at most
+    /// `PASSWORD_HASHING_MAX_PARALLELISM`.
+    pub parallelism: u32,
+
+    /// The number of dedicated OS threads in the hashing worker pool. Argon2 runs
+    /// ONLY on these threads, never on a tokio protocol-I/O worker, so a hash can
+    /// never block request I/O. The default (`0`) derives a safe count from the
+    /// host core count at boot. Must be at most
+    /// `PASSWORD_HASHING_MAX_POOL_THREADS`.
+    pub pool_threads: usize,
+
+    /// The maximum number of hash jobs that may wait in the pool's queue before
+    /// load-shedding kicks in. A submission that would exceed this depth is
+    /// refused with a retryable `503` and a machine-readable reason (the pool is a
+    /// bounded resource, never an unbounded inline hash). The default (`512`) is a
+    /// conservative backstop; per-tenant fairness is enforced BEFORE the queue by
+    /// the quota layer. Must be at least 1.
+    pub max_queue_depth: usize,
+
+    /// The target per-hash latency in milliseconds the tuning probe aims for when
+    /// recommending parameters (`ironauth hash-probe`). The default (`250`) is a
+    /// common interactive-login budget. Must be between
+    /// `PASSWORD_HASHING_MIN_PROBE_TARGET_LATENCY_MS` and
+    /// `PASSWORD_HASHING_MAX_PROBE_TARGET_LATENCY_MS`.
+    pub probe_target_latency_ms: u64,
+}
+
+impl Default for PasswordHashingConfig {
+    fn default() -> Self {
+        Self {
+            memory_kib: PASSWORD_HASHING_OWASP_MEMORY_KIB,
+            iterations: PASSWORD_HASHING_OWASP_ITERATIONS,
+            parallelism: PASSWORD_HASHING_OWASP_PARALLELISM,
+            pool_threads: 0,
+            max_queue_depth: 512,
+            probe_target_latency_ms: 250,
+        }
+    }
+}
+
 /// The largest number of usage-threshold percentages the quota engine will emit
 /// webhooks for (issue #50). A short list (the default is two: an early-warning
 /// and the hard limit); the cap keeps the config bounded and the per-bucket
@@ -1324,6 +1441,8 @@ impl Default for QuotaConfig {
                 token_issuance_burst: 200,
                 hook_seconds_per_second: 60,
                 hook_seconds_burst: 120,
+                password_hashing_per_second: 50,
+                password_hashing_burst: 100,
             },
             environment: ScopeQuotaConfig {
                 requests_per_second: 100,
@@ -1332,6 +1451,8 @@ impl Default for QuotaConfig {
                 token_issuance_burst: 100,
                 hook_seconds_per_second: 30,
                 hook_seconds_burst: 60,
+                password_hashing_per_second: 20,
+                password_hashing_burst: 40,
             },
             usage_thresholds_percent: vec![80, 100],
             idle_bucket_ttl_secs: 3600,
@@ -1371,6 +1492,18 @@ pub struct ScopeQuotaConfig {
 
     /// Burst capacity for the hook-seconds dimension. 0 means unlimited.
     pub hook_seconds_burst: u64,
+
+    /// Sustained password-hash admissions per second (the refill rate for the
+    /// password-hashing dimension, issue #62). This is the per-tenant fair-share
+    /// admission in front of the dedicated hashing pool: it bounds how much Argon2
+    /// work one scope may drive, so a credential-stuffing storm against one tenant
+    /// degrades only that tenant, never the instance.
+    pub password_hashing_per_second: u64,
+
+    /// Burst capacity for the password-hashing dimension (issue #62). 0 means
+    /// unlimited (the single-tenant self-hoster posture: no admission control on
+    /// hashing, though the pool queue depth still bounds it).
+    pub password_hashing_burst: u64,
 }
 
 impl Default for ScopeQuotaConfig {
@@ -1386,6 +1519,8 @@ impl Default for ScopeQuotaConfig {
             token_issuance_burst: 100,
             hook_seconds_per_second: 30,
             hook_seconds_burst: 60,
+            password_hashing_per_second: 20,
+            password_hashing_burst: 40,
         }
     }
 }
@@ -1618,8 +1753,81 @@ impl Config {
         validate_backchannel_logout(&self.oidc)?;
         validate_lazy_migration(&self.oidc)?;
         validate_quota(&self.quota)?;
+        validate_password_hashing(&self.password_hashing)?;
         Ok(())
     }
+}
+
+/// Validate the password-hashing settings (issue #62), kept out of
+/// [`Config::validate`] so each stays within the readable-length lint.
+///
+/// The Argon2id parameters are bounded so a tuning mistake can neither ship a
+/// hash weaker than a defensible floor nor one so costly it would exhaust host
+/// memory or wedge the pool; the pool sizing and probe target are bounded to
+/// sane operational ranges. Every bound has a safe default in range, so an empty
+/// `[password_hashing]` table (or none at all) is valid.
+///
+/// # Errors
+///
+/// [`ConfigError::Invalid`] if any parameter is outside its documented range.
+fn validate_password_hashing(hashing: &PasswordHashingConfig) -> Result<(), ConfigError> {
+    if !(PASSWORD_HASHING_MIN_MEMORY_KIB..=PASSWORD_HASHING_MAX_MEMORY_KIB)
+        .contains(&hashing.memory_kib)
+    {
+        return Err(ConfigError::Invalid {
+            message: format!(
+                "password_hashing.memory_kib ({}) must be between \
+                 {PASSWORD_HASHING_MIN_MEMORY_KIB} and {PASSWORD_HASHING_MAX_MEMORY_KIB} KiB",
+                hashing.memory_kib
+            ),
+        });
+    }
+    if hashing.iterations < 1 || hashing.iterations > PASSWORD_HASHING_MAX_ITERATIONS {
+        return Err(ConfigError::Invalid {
+            message: format!(
+                "password_hashing.iterations ({}) must be between 1 and \
+                 {PASSWORD_HASHING_MAX_ITERATIONS}",
+                hashing.iterations
+            ),
+        });
+    }
+    if hashing.parallelism < 1 || hashing.parallelism > PASSWORD_HASHING_MAX_PARALLELISM {
+        return Err(ConfigError::Invalid {
+            message: format!(
+                "password_hashing.parallelism ({}) must be between 1 and \
+                 {PASSWORD_HASHING_MAX_PARALLELISM}",
+                hashing.parallelism
+            ),
+        });
+    }
+    if hashing.pool_threads > PASSWORD_HASHING_MAX_POOL_THREADS {
+        return Err(ConfigError::Invalid {
+            message: format!(
+                "password_hashing.pool_threads ({}) must not exceed \
+                 {PASSWORD_HASHING_MAX_POOL_THREADS} (0 derives from the host core count)",
+                hashing.pool_threads
+            ),
+        });
+    }
+    if hashing.max_queue_depth < 1 {
+        return Err(ConfigError::Invalid {
+            message: "password_hashing.max_queue_depth must be at least 1".to_owned(),
+        });
+    }
+    if !(PASSWORD_HASHING_MIN_PROBE_TARGET_LATENCY_MS
+        ..=PASSWORD_HASHING_MAX_PROBE_TARGET_LATENCY_MS)
+        .contains(&hashing.probe_target_latency_ms)
+    {
+        return Err(ConfigError::Invalid {
+            message: format!(
+                "password_hashing.probe_target_latency_ms ({}) must be between \
+                 {PASSWORD_HASHING_MIN_PROBE_TARGET_LATENCY_MS} and \
+                 {PASSWORD_HASHING_MAX_PROBE_TARGET_LATENCY_MS} milliseconds",
+                hashing.probe_target_latency_ms
+            ),
+        });
+    }
+    Ok(())
 }
 
 /// Validate the inbound lazy-migration hook settings (issue #56), kept out of
@@ -2189,6 +2397,65 @@ mod tests {
         let err = Config::from_toml_str("[quota.tenant]\nrps = 5\n", "ironauth.toml")
             .expect_err("unknown quota key");
         assert!(err.to_string().contains("requests_per_second"), "{err}");
+
+        // The password-hashing dimension has safe defaults (issue #62).
+        let config = Config::from_toml_str("", "<inline>").expect("valid").config;
+        assert_eq!(config.quota.tenant.password_hashing_burst, 100);
+        assert_eq!(config.quota.environment.password_hashing_burst, 40);
+    }
+
+    #[test]
+    fn password_hashing_section_defaults_and_validates() {
+        // Defaults: the OWASP Argon2id parameters and a derived pool (issue #62).
+        let config = Config::from_toml_str("", "<inline>").expect("valid").config;
+        assert_eq!(config.password_hashing.memory_kib, 19_456);
+        assert_eq!(config.password_hashing.iterations, 2);
+        assert_eq!(config.password_hashing.parallelism, 1);
+        assert_eq!(config.password_hashing.pool_threads, 0); // derive from cores.
+        assert_eq!(config.password_hashing.max_queue_depth, 512);
+        assert_eq!(config.password_hashing.probe_target_latency_ms, 250);
+
+        // A memory cost below the security floor is refused (no weaker-than-defensible
+        // hash can ship).
+        let weak = "[password_hashing]\nmemory_kib = 4096\n";
+        let err = Config::from_toml_str(weak, "ironauth.toml").expect_err("below the floor");
+        assert!(err.to_string().contains("memory_kib"), "{err}");
+
+        // A memory cost above the 4 GiB ceiling is refused.
+        let huge = "[password_hashing]\nmemory_kib = 5000000\n";
+        let err = Config::from_toml_str(huge, "ironauth.toml").expect_err("above the ceiling");
+        assert!(err.to_string().contains("memory_kib"), "{err}");
+
+        // Zero iterations is refused (Argon2 needs at least one pass).
+        let zero_t = "[password_hashing]\niterations = 0\n";
+        let err = Config::from_toml_str(zero_t, "ironauth.toml").expect_err("zero iterations");
+        assert!(err.to_string().contains("iterations"), "{err}");
+
+        // A zero queue depth is refused (the pool must accept at least one job).
+        let zero_q = "[password_hashing]\nmax_queue_depth = 0\n";
+        let err = Config::from_toml_str(zero_q, "ironauth.toml").expect_err("zero queue");
+        assert!(err.to_string().contains("max_queue_depth"), "{err}");
+
+        // A probe target latency outside the range is refused.
+        let bad_target = "[password_hashing]\nprobe_target_latency_ms = 1\n";
+        let err = Config::from_toml_str(bad_target, "ironauth.toml").expect_err("target too low");
+        assert!(err.to_string().contains("probe_target_latency_ms"), "{err}");
+
+        // A valid tuned configuration loads.
+        let tuned = "[password_hashing]\nmemory_kib = 12288\niterations = 3\nparallelism = 2\n\
+                     pool_threads = 4\nmax_queue_depth = 256\nprobe_target_latency_ms = 500\n";
+        let config = Config::from_toml_str(tuned, "<inline>")
+            .expect("valid tuned config")
+            .config;
+        assert_eq!(config.password_hashing.memory_kib, 12_288);
+        assert_eq!(config.password_hashing.iterations, 3);
+        assert_eq!(config.password_hashing.parallelism, 2);
+        assert_eq!(config.password_hashing.pool_threads, 4);
+
+        // Unknown keys abort with the accepted fields.
+        let err = Config::from_toml_str("[password_hashing]\nmem = 5\n", "ironauth.toml")
+            .expect_err("unknown key");
+        assert!(err.to_string().contains("memory_kib"), "{err}");
     }
 
     #[test]

@@ -163,16 +163,22 @@ pub enum QuotaDimension {
     TokenIssuance,
     /// Hook/webhook execution seconds consumed.
     HookSeconds,
+    /// Password-hash admissions (issue #62): the per-tenant fair-share admission
+    /// in front of the dedicated Argon2id hashing pool. Its own bucket, so a
+    /// credential-stuffing storm draining a tenant's hashing share never touches
+    /// that tenant's request or token buckets, and never touches another tenant.
+    PasswordHashing,
 }
 
 impl QuotaDimension {
     /// Every dimension, for iteration.
     #[must_use]
-    pub const fn all() -> [QuotaDimension; 3] {
+    pub const fn all() -> [QuotaDimension; 4] {
         [
             QuotaDimension::Requests,
             QuotaDimension::TokenIssuance,
             QuotaDimension::HookSeconds,
+            QuotaDimension::PasswordHashing,
         ]
     }
 
@@ -183,6 +189,7 @@ impl QuotaDimension {
             QuotaDimension::Requests => "requests",
             QuotaDimension::TokenIssuance => "token_issuance",
             QuotaDimension::HookSeconds => "hook_seconds",
+            QuotaDimension::PasswordHashing => "password_hashing",
         }
     }
 }
@@ -233,6 +240,8 @@ pub struct ScopeLimits {
     pub token_issuance: Option<Limit>,
     /// The hook-seconds limit, or `None` for unlimited.
     pub hook_seconds: Option<Limit>,
+    /// The password-hashing admission limit, or `None` for unlimited (issue #62).
+    pub password_hashing: Option<Limit>,
 }
 
 impl ScopeLimits {
@@ -243,6 +252,7 @@ impl ScopeLimits {
             QuotaDimension::Requests => self.requests,
             QuotaDimension::TokenIssuance => self.token_issuance,
             QuotaDimension::HookSeconds => self.hook_seconds,
+            QuotaDimension::PasswordHashing => self.password_hashing,
         }
     }
 
@@ -257,6 +267,10 @@ impl ScopeLimits {
                 config.token_issuance_burst,
             ),
             hook_seconds: limit_from(config.hook_seconds_per_second, config.hook_seconds_burst),
+            password_hashing: limit_from(
+                config.password_hashing_per_second,
+                config.password_hashing_burst,
+            ),
         }
     }
 }
@@ -1042,6 +1056,8 @@ mod tests {
             token_issuance_burst: 5,
             hook_seconds_per_second: 1,
             hook_seconds_burst: 4,
+            password_hashing_per_second: 1,
+            password_hashing_burst: 3,
         };
         QuotaConfig {
             // Tenant envelope larger than the environment so nesting is visible.
@@ -1052,6 +1068,8 @@ mod tests {
                 token_issuance_per_second: 1,
                 hook_seconds_burst: 100,
                 hook_seconds_per_second: 1,
+                password_hashing_burst: 100,
+                password_hashing_per_second: 1,
             },
             environment: scope,
             usage_thresholds_percent: vec![80, 100],

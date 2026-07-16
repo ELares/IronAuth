@@ -490,7 +490,18 @@ pub async fn change_password(
         Ok(None) => return unauthenticated(),
         Err(_) => return server_error(),
     };
-    if !crate::password::verify_password(&body.current_password, &stored_hash) {
+    // Verify the current password through the admission-controlled pool (issue #62),
+    // off the async threads. An over-share tenant or a saturated pool is the
+    // retryable 429/503; a pool fault is a generic server error.
+    let current_ok = match state
+        .verify_password(&account.scope, &body.current_password, &stored_hash)
+        .await
+    {
+        Ok(ok) => ok,
+        Err(crate::hashing_pool::HashRejection::Unavailable) => return server_error(),
+        Err(rejection) => return rejection.to_response(),
+    };
+    if !current_ok {
         return json_response(
             StatusCode::FORBIDDEN,
             json!({
@@ -499,10 +510,15 @@ pub async fn change_password(
             }),
         );
     }
-    // Hash the new password through the entropy seam (never a raw RNG). The plaintext
-    // never reaches the store; only the one-way verifier does.
-    let Ok(new_hash) = crate::password::hash_password(state.env(), &body.new_password) else {
-        return server_error();
+    // Hash the new password through the same pool (entropy from the env seam, never a
+    // raw RNG). The plaintext never reaches the store; only the one-way verifier does.
+    let new_hash = match state
+        .hash_password(&account.scope, &body.new_password)
+        .await
+    {
+        Ok(hash) => hash,
+        Err(crate::hashing_pool::HashRejection::Unavailable) => return server_error(),
+        Err(rejection) => return rejection.to_response(),
     };
     let actor = interaction::user_actor(&account.subject);
     let result = state

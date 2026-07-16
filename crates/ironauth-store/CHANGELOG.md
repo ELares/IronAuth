@@ -6,6 +6,14 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- `UserRepo::rehash_native_password` (issue #62): lands the transparent upgrade of a
+  NATIVE Argon2id credential to the current hashing parameters after a successful login.
+  It writes the recomputed verifier onto `password_hash` and audits one
+  `user.password.upgrade` row atomically, guarded on the stored hash still equalling the
+  value the login verified (optimistic concurrency), so two concurrent logins race safely
+  and a concurrent `change_password` is never clobbered. A win returns `Ok(true)`, a
+  no-op `Ok(false)`; best-effort like the foreign `upgrade_foreign_password`. No schema
+  change (existing `users` table and `UserPasswordUpgrade` audit action).
 - Migrations as an invariant-checked state machine (issue #59, exploratory, migration
   0043, expand): a wrapped long-running migration walks an explicit, audited state
   machine (`defined -> validating -> running -> reconciling -> complete | abandoned`)

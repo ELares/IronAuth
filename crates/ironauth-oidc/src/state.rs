@@ -88,6 +88,15 @@ pub struct OidcState {
     // identifier is the uniform failure and no outbound call is made), so the many
     // DB-only OIDC tests and a deployment with no legacy store are unaffected.
     migration_hook: Option<Arc<crate::migration::LazyMigrationHook>>,
+    // The dedicated, admission-controlled Argon2id hashing pool (issue #62). Kept
+    // OUTSIDE `Inner` and installed by the boot path (built from [password_hashing]
+    // config, sharing the SAME quota enforcer as the request path so hashing
+    // admission is per-tenant fair-share). Argon2 runs ONLY on this pool's
+    // dedicated threads, never a tokio protocol-I/O worker. Default: `None`, in
+    // which case hashing runs on the tokio BLOCKING pool via spawn_blocking (still
+    // off the protocol-I/O threads) with no admission, which keeps the many DB-only
+    // OIDC tests and the self-hoster who wants no admission control unaffected.
+    hashing_pool: Option<Arc<crate::hashing_pool::HashingPool>>,
 }
 
 // The per-environment policy flags each mirror an independent, individually
@@ -341,6 +350,7 @@ impl OidcState {
             global_token_revocation_enabled: false,
             quota: None,
             migration_hook: None,
+            hashing_pool: None,
         }
     }
 
@@ -418,6 +428,101 @@ impl OidcState {
     #[must_use]
     pub(crate) fn enforce_request_quota(&self, scope: &Scope) -> Option<axum::response::Response> {
         crate::quota::enforce_request(self.quota.as_ref()?, scope)
+    }
+
+    /// Install the dedicated Argon2id hashing pool (issue #62), moving every
+    /// password hash and verification off the async request threads and behind
+    /// per-tenant fair-share admission. The boot path builds one pool from the
+    /// `[password_hashing]` config, sharing the SAME quota enforcer as the request
+    /// path; a test installs a small-pool, small-budget instance to drive the
+    /// isolation and load-shedding paths. With no pool installed hashing runs on
+    /// the tokio blocking pool (still off the protocol-I/O threads) with no
+    /// admission, the default and the self-hoster's posture.
+    #[must_use]
+    pub fn with_hashing_pool(mut self, pool: Arc<crate::hashing_pool::HashingPool>) -> Self {
+        self.hashing_pool = Some(pool);
+        self
+    }
+
+    /// The Argon2id parameters NEW hashes are minted at (issue #62): the installed
+    /// pool's configured parameters, or the OWASP defaults when no pool is installed.
+    /// The login path compares a stored native hash against these to decide whether
+    /// to transparently rehash on a successful sign-in.
+    #[must_use]
+    pub(crate) fn hashing_params(&self) -> crate::password::Argon2Params {
+        self.hashing_pool
+            .as_ref()
+            .map_or_else(crate::password::Argon2Params::owasp, |pool| pool.params())
+    }
+
+    /// Hash `password` for `scope` off the async threads (issue #62). Routes
+    /// through the installed pool (fair-share admission plus the bounded queue) or,
+    /// when none is installed, the tokio blocking pool at the OWASP defaults.
+    ///
+    /// # Errors
+    ///
+    /// [`HashRejection`] when the tenant is over its hashing share, the pool queue
+    /// is full, or the pool could not complete the hash. Never an inline hash on an
+    /// async request thread.
+    pub(crate) async fn hash_password(
+        &self,
+        scope: &Scope,
+        password: &str,
+    ) -> Result<String, crate::hashing_pool::HashRejection> {
+        if let Some(pool) = &self.hashing_pool {
+            return pool.hash(scope, password).await;
+        }
+        let env = self.env().clone();
+        let password = password.to_owned();
+        tokio::task::spawn_blocking(move || crate::password::hash_password(&env, &password))
+            .await
+            .map_err(|_| crate::hashing_pool::HashRejection::Unavailable)?
+            .map_err(|_| crate::hashing_pool::HashRejection::Unavailable)
+    }
+
+    /// Verify `password` against a stored PHC `hash` for `scope` off the async
+    /// threads (issue #62). Routes through the installed pool or the tokio blocking
+    /// pool.
+    ///
+    /// # Errors
+    ///
+    /// [`HashRejection`] on over-share, pool exhaustion, or pool fault. A wrong
+    /// password (or a malformed stored hash) is `Ok(false)`.
+    pub(crate) async fn verify_password(
+        &self,
+        scope: &Scope,
+        password: &str,
+        hash: &str,
+    ) -> Result<bool, crate::hashing_pool::HashRejection> {
+        if let Some(pool) = &self.hashing_pool {
+            return pool.verify(scope, password, hash).await;
+        }
+        let password = password.to_owned();
+        let hash = hash.to_owned();
+        tokio::task::spawn_blocking(move || crate::password::verify_password(&password, &hash))
+            .await
+            .map_err(|_| crate::hashing_pool::HashRejection::Unavailable)
+    }
+
+    /// Spend a full verification for `scope` against a fixed dummy hash and return
+    /// `false` (issue #62), so an absent account costs the same as a present one.
+    /// Still admission-controlled through the pool.
+    ///
+    /// # Errors
+    ///
+    /// [`HashRejection`] on over-share, pool exhaustion, or pool fault.
+    pub(crate) async fn verify_absent(
+        &self,
+        scope: &Scope,
+        password: &str,
+    ) -> Result<bool, crate::hashing_pool::HashRejection> {
+        if let Some(pool) = &self.hashing_pool {
+            return pool.verify_absent(scope, password).await;
+        }
+        let password = password.to_owned();
+        tokio::task::spawn_blocking(move || crate::password::verify_absent(&password))
+            .await
+            .map_err(|_| crate::hashing_pool::HashRejection::Unavailable)
     }
 
     /// Whether a Global Token Revocation hard-kills the subject's `offline_access`

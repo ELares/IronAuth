@@ -6,6 +6,18 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- `[password_hashing]` settings (issue #62): a new `PasswordHashingConfig` table for the
+  Argon2id parameters of NEWLY set passwords and the dedicated hashing worker pool.
+  `memory_kib`/`iterations`/`parallelism` default to the OWASP recommendation
+  (`19456`/`2`/`1`) and are bounded at config load (a security floor of 8 MiB up to a
+  4 GiB ceiling, iterations 1..=16, parallelism 1..=64) so a tuning mistake can neither
+  ship a weaker-than-defensible hash nor an unbootable one; they are per-environment in
+  spirit and apply to new hashes, with existing hashes upgrading on next login.
+  `pool_threads` (0 derives from the host core count), `max_queue_depth` (default 512),
+  and `probe_target_latency_ms` (default 250, bounded 10..=5000) size and tune the pool.
+  Also adds a `password_hashing` dimension to `[quota.tenant]`/`[quota.environment]`
+  (`password_hashing_per_second`/`password_hashing_burst`) so the issue #50 fair-share
+  engine admits hashing per tenant; 0 burst is unlimited (the self-hoster posture).
 - `[oidc.lazy_migration]` inbound lazy-migration hook settings (issue #56): a new nested
   config table arming the login-time verification of an unknown identifier against a legacy
   store. `enabled` (default false) gates it; `endpoint` (an https URL, required and https

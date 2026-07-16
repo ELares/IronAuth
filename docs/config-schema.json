@@ -684,6 +684,55 @@
       },
       "type": "object"
     },
+    "PasswordHashingConfig": {
+      "additionalProperties": false,
+      "description": "Password-hashing settings (issue #62): the Argon2id parameters for NEWLY set\npasswords and the dedicated, admission-controlled hashing worker pool.\n\nPassword hashing is the hottest and most denial-of-service-prone operation an\nidentity provider performs, so it runs in a bounded worker pool kept OFF the\nasync request threads, fronted by the per-tenant fair-share admission of the\n[`QuotaConfig`] layer (issue #50): one tenant's credential-stuffing storm\ndegrades only that tenant, never the instance.\n\nThe Argon2id parameters are per-environment in spirit (dev/staging/prod may\ndiffer) and safe by default (the OWASP recommendation: `m = 19456` KiB,\n`t = 2`, `p = 1`); a parameter change applies to NEW hashes, and an existing\nhash upgrades transparently through the rehash-on-successful-login path,\nbecause the parameters are stored per hash in the PHC string. The process\nvalue is the deployment default until per-environment overrides ride the M5\npromotion pipeline, mirroring the other promotable settings.\n\nThe pool sizing and queue depth are host infrastructure, not a per-environment\nconcern: they bound the whole process. The `ironauth hash-probe` CLI (and the\nin-admin tuning helper) run a measured probe on the actual host and recommend\nparameters that meet `probe_target_latency_ms`.",
+      "properties": {
+        "iterations": {
+          "default": 2,
+          "description": "Argon2id iteration (time) cost for newly set passwords. The default (`2`,\nthe OWASP recommendation) pairs with the 19 MiB memory cost. Must be at\nleast 1 and at most `PASSWORD_HASHING_MAX_ITERATIONS`.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_queue_depth": {
+          "default": 512,
+          "description": "The maximum number of hash jobs that may wait in the pool's queue before\nload-shedding kicks in. A submission that would exceed this depth is\nrefused with a retryable `503` and a machine-readable reason (the pool is a\nbounded resource, never an unbounded inline hash). The default (`512`) is a\nconservative backstop; per-tenant fairness is enforced BEFORE the queue by\nthe quota layer. Must be at least 1.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "memory_kib": {
+          "default": 19456,
+          "description": "Argon2id memory cost in KiB for newly set passwords. The default\n(`19456`, the OWASP recommendation) is 19 MiB. Must be between\n`PASSWORD_HASHING_MIN_MEMORY_KIB` (8 MiB) and\n`PASSWORD_HASHING_MAX_MEMORY_KIB` (4 GiB). A change applies to new hashes;\nan existing hash upgrades on the user's next successful login.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "parallelism": {
+          "default": 1,
+          "description": "Argon2id parallelism (lanes) for newly set passwords. The default (`1`,\nthe OWASP recommendation). Must be at least 1 and at most\n`PASSWORD_HASHING_MAX_PARALLELISM`.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "pool_threads": {
+          "default": 0,
+          "description": "The number of dedicated OS threads in the hashing worker pool. Argon2 runs\nONLY on these threads, never on a tokio protocol-I/O worker, so a hash can\nnever block request I/O. The default (`0`) derives a safe count from the\nhost core count at boot. Must be at most\n`PASSWORD_HASHING_MAX_POOL_THREADS`.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "probe_target_latency_ms": {
+          "default": 250,
+          "description": "The target per-hash latency in milliseconds the tuning probe aims for when\nrecommending parameters (`ironauth hash-probe`). The default (`250`) is a\ncommon interactive-login budget. Must be between\n`PASSWORD_HASHING_MIN_PROBE_TARGET_LATENCY_MS` and\n`PASSWORD_HASHING_MAX_PROBE_TARGET_LATENCY_MS`.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
     "ProxyConfig": {
       "additionalProperties": false,
       "description": "Trusted-proxy policy.\n\nForwarding headers (RFC 7239 `Forwarded`, `X-Forwarded-For`,\n`X-Forwarded-Proto`, `X-Forwarded-Host`) and the `Host` header are an\naccount-takeover class when trusted blindly. The default trusts NOTHING:\n`trusted_hops = 0` and `trust_forwarded = false` mean the effective client\nIP is the transport peer and the scheme, host, and issuer derive entirely\nfrom `server.public_url`. Only when the server genuinely runs behind a\nfixed number of trusted reverse proxies should these be raised, and even\nthen scheme and issuer stay config-derived.",
@@ -712,6 +761,8 @@
           "default": {
             "hook_seconds_burst": 60,
             "hook_seconds_per_second": 30,
+            "password_hashing_burst": 40,
+            "password_hashing_per_second": 20,
             "requests_burst": 200,
             "requests_per_second": 100,
             "token_issuance_burst": 100,
@@ -731,6 +782,8 @@
           "default": {
             "hook_seconds_burst": 120,
             "hook_seconds_per_second": 60,
+            "password_hashing_burst": 100,
+            "password_hashing_per_second": 50,
             "requests_burst": 1000,
             "requests_per_second": 500,
             "token_issuance_burst": 200,
@@ -789,6 +842,20 @@
         "hook_seconds_per_second": {
           "default": 30,
           "description": "Sustained hook/webhook execution seconds admitted per wall second (the\nrefill rate for the hook-seconds dimension). Bounds how much outbound\nhook execution time a scope may consume.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "password_hashing_burst": {
+          "default": 40,
+          "description": "Burst capacity for the password-hashing dimension (issue #62). 0 means\nunlimited (the single-tenant self-hoster posture: no admission control on\nhashing, though the pool queue depth still bounds it).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "password_hashing_per_second": {
+          "default": 20,
+          "description": "Sustained password-hash admissions per second (the refill rate for the\npassword-hashing dimension, issue #62). This is the per-tenant fair-share\nadmission in front of the dedicated hashing pool: it bounds how much Argon2\nwork one scope may drive, so a credential-stuffing storm against one tenant\ndegrades only that tenant, never the instance.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
@@ -1051,6 +1118,18 @@
       },
       "description": "OIDC provider settings (issue #12)."
     },
+    "password_hashing": {
+      "$ref": "#/$defs/PasswordHashingConfig",
+      "default": {
+        "iterations": 2,
+        "max_queue_depth": 512,
+        "memory_kib": 19456,
+        "parallelism": 1,
+        "pool_threads": 0,
+        "probe_target_latency_ms": 250
+      },
+      "description": "Password-hashing settings (issue #62): the Argon2id parameters for newly\nset passwords and the dedicated, admission-controlled hashing worker pool.\nArgon2id at the OWASP defaults, off the async request threads, with\nper-tenant fair-share admission reusing the `[quota]` layer so one tenant's\ncredential-stuffing storm degrades only that tenant."
+    },
     "proxy": {
       "$ref": "#/$defs/ProxyConfig",
       "default": {
@@ -1065,6 +1144,8 @@
         "environment": {
           "hook_seconds_burst": 60,
           "hook_seconds_per_second": 30,
+          "password_hashing_burst": 40,
+          "password_hashing_per_second": 20,
           "requests_burst": 200,
           "requests_per_second": 100,
           "token_issuance_burst": 100,
@@ -1074,6 +1155,8 @@
         "tenant": {
           "hook_seconds_burst": 120,
           "hook_seconds_per_second": 60,
+          "password_hashing_burst": 100,
+          "password_hashing_per_second": 50,
           "requests_burst": 1000,
           "requests_per_second": 500,
           "token_issuance_burst": 200,

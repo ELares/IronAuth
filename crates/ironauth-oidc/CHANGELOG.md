@@ -6,6 +6,33 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Argon2id hashing pool with per-tenant fair-share admission (issue #62): password
+  hashing, the hottest and most denial-of-service-prone operation, now runs in a
+  dedicated worker pool (`HashingPool`) of fixed OS threads kept OFF the async request
+  threads, so an Argon2 hash never blocks protocol I/O (a runtime check,
+  `thread_diagnostics`, proves the job runs with no tokio runtime present). In front of
+  the pool sits per-tenant fair-share admission that REUSES the issue #50 quota engine
+  (a new `PasswordHashing` dimension and its 429 block-signal contract), so one tenant's
+  credential-stuffing storm drains only that tenant's hashing bucket and is shed with a
+  retryable 429, never starving another tenant or the instance. A bounded queue depth
+  load-sheds with a retryable 503; pool exhaustion and worker faults are TYPED
+  `HashRejection` errors, and verification never falls back to an unbounded inline hash.
+  New passwords hash with Argon2id at the configured `[password_hashing]` parameters
+  (OWASP defaults `m=19456, t=2, p=1`, tunable per environment in spirit); a parameter
+  change applies to NEW hashes and an existing hash upgrades transparently on the user's
+  next successful login, because the PHC string stores parameters per hash
+  (`hash_password_with`, `Argon2Params`): a native login whose stored hash drifted from
+  the current parameters (`needs_rehash`) is rehashed to them through the store's
+  `rehash_native_password` (best-effort, race-safe), alongside the existing #55
+  foreign-to-native rehash. The login,
+  registration, and change-password surfaces route every hash and verification through
+  the pool. A measured tuning probe (`run_probe`, exposed as the `ironauth hash-probe`
+  CLI for headless installs and reusable by the in-admin tuning helper) times real
+  Argon2id hashes on the host, recommends the strongest memory cost that meets the
+  configured latency target, and projects logins/s per core. Metrics: pool queue depth,
+  active workers, worker capacity, admission rejections by reason, and a hash-latency
+  histogram; per-tenant admission counts remain observable through the quota engine's
+  per-scope samples.
 - Inbound lazy-migration hook (issue #56): when the `[oidc.lazy_migration]` config arms
   it, a login whose canonicalized identifier is UNKNOWN locally verifies the submitted
   credential against a legacy store through a pluggable `CredentialVerifier` (the only
