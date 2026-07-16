@@ -27,7 +27,7 @@ use common::{Harness, REDIRECT_URI, enc, form, form_field, json};
 use ironauth_config::{QuotaConfig, ScopeQuotaConfig};
 use ironauth_jose::verify;
 use ironauth_oidc::{Argon2Params, HashRejection, HashingPool};
-use ironauth_quota::QuotaEnforcer;
+use ironauth_quota::{Limit, QuotaEnforcer, ScopeLimits, TenantId as QuotaTenantId};
 use ironauth_store::{
     DeviceAttemptOutcome, DevicePollOutcome, DeviceUserCodeLookup, UserState, device_code_digest,
     user_code_hash,
@@ -338,13 +338,12 @@ async fn unknown_user_code_is_non_oracular() {
     assert!(html.contains("not recognized"), "non-oracular: {html}");
 }
 
-/// A quota config that grants the ENVIRONMENT scope exactly ONE `PasswordHashing`
-/// admission token with NO refill, every other dimension and the tenant scope unlimited
-/// (`burst 0 == unlimited`, see ironauth-quota `limit_from`). Config-derived limits do
-/// not refill, so once the test drains that single token the bucket stays empty: every
-/// subsequent hashing admission is deterministically over-share, with no token a slower
-/// or differently ordered request could still catch.
-fn one_shot_hashing_quota() -> QuotaConfig {
+/// A quota config with every dimension UNLIMITED (`burst 0 == unlimited`, see
+/// ironauth-quota `limit_from`). The overload in the test below is created by a per-tenant
+/// runtime OVERRIDE that pins the tenant's `PasswordHashing` bucket to ZERO capacity, not
+/// by this config, so admission is over-share from the very first call with no token that
+/// any request could catch.
+fn unlimited_quota() -> QuotaConfig {
     let unlimited = ScopeQuotaConfig {
         requests_per_second: 0,
         requests_burst: 0,
@@ -355,15 +354,9 @@ fn one_shot_hashing_quota() -> QuotaConfig {
         password_hashing_per_second: 0,
         password_hashing_burst: 0,
     };
-    let environment = ScopeQuotaConfig {
-        // Exactly one admission token, no refill: a deterministic one-shot budget.
-        password_hashing_burst: 1,
-        password_hashing_per_second: 0,
-        ..unlimited.clone()
-    };
     QuotaConfig {
-        tenant: unlimited,
-        environment,
+        tenant: unlimited.clone(),
+        environment: unlimited,
         usage_thresholds_percent: vec![],
         idle_bucket_ttl_secs: 0,
     }
@@ -391,16 +384,26 @@ async fn device_login_is_uniform_under_hashing_overload() {
         .await;
     harness.set_user_state(&fenced, UserState::Disabled).await;
 
-    // Saturate admission DETERMINISTICALLY: the environment gets exactly ONE PasswordHashing
-    // token with no refill (see one_shot_hashing_quota). We drain that single token below,
-    // after which every hashing admission is over-share with no token a later request could
-    // catch, so the outcome cannot depend on machine speed, request ordering, or memory
-    // ordering (the flaky "drain then race the refill" failure mode is impossible: refill is
-    // zero).
+    // Saturate admission DETERMINISTICALLY with a per-tenant runtime override that pins the
+    // tenant's `PasswordHashing` bucket to ZERO capacity. The bucket is created with zero
+    // burst and never refills, so EVERY hashing admission for this tenant is over-share from
+    // the very first call, on every one of its environments (the nested tenant envelope
+    // denies before any per-environment bucket is even consulted). This is strictly stronger
+    // than draining a one-token bucket: there is no token that a slower or differently
+    // ordered request could still catch, and a zero-capacity bucket cannot be over-admitted
+    // under any interleaving, so the outcome cannot depend on machine speed, request
+    // ordering, or memory ordering.
     let quota = Arc::new(QuotaEnforcer::from_config(
-        &one_shot_hashing_quota(),
+        &unlimited_quota(),
         harness.env().clock_arc(),
     ));
+    quota.set_tenant_override(
+        &QuotaTenantId::new(scope.tenant().to_string()),
+        ScopeLimits {
+            password_hashing: Some(Limit::new(0.0, 0.0)),
+            ..ScopeLimits::default()
+        },
+    );
     let pool = Arc::new(HashingPool::new(
         harness.env().clone(),
         Argon2Params::new(8, 1, 1), // cheap: cost is irrelevant to admission.
@@ -410,12 +413,9 @@ async fn device_login_is_uniform_under_hashing_overload() {
     ));
     harness.install_hashing_pool(Arc::clone(&pool));
 
-    // Drain the single admission token; with zero refill the bucket now stays empty.
-    let _ = pool.verify_absent(&scope, "drain the one admission token").await;
-
-    // Assert the saturated precondition explicitly: admission is over-share once drained. If
-    // this ever admitted, the test setup (not the code under test) would be wrong, and we
-    // fail here loudly rather than flake in the uniformity checks below.
+    // Assert the saturated precondition explicitly: admission is over-share from the first
+    // call. If this ever admitted, the test setup (not the code under test) would be wrong,
+    // and we fail here loudly rather than flake in the uniformity checks below.
     let precheck = pool.verify_absent(&scope, "precondition").await;
     assert!(
         matches!(precheck, Err(HashRejection::Overloaded(_))),
