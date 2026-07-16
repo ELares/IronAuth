@@ -95,6 +95,7 @@ pub async fn create_key(
 ) -> Result<Response, ApiError> {
     let actor = principal.require_operator()?;
     let (tenant, scope) = scope_from_path(&state, &tenant_id, &environment_id)?;
+    crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
 
     let key = idempotency::required_key(&headers)?;
     let fingerprint = idempotency::fingerprint("POST", uri.path(), &body);
@@ -288,6 +289,7 @@ pub async fn delete_key(
 ) -> Result<Response, ApiError> {
     let actor = principal.require_operator()?;
     let (_tenant, scope) = scope_from_path(&state, &tenant_id, &environment_id)?;
+    crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
     let id: ManagementKeyId = state
         .store()
         .management()

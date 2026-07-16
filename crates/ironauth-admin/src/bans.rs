@@ -168,6 +168,7 @@ pub async fn create_ban(
     body: axum::body::Bytes,
 ) -> Result<Response, ApiError> {
     let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
     let request: CreateBanRequest = crate::input::parse_json(&body)?;
     let kind = parse_subject_kind(&request.subject_kind)?;
     let path = parse_auth_path(&request.auth_path)?;
@@ -250,6 +251,7 @@ pub async fn lift_ban(
     body: axum::body::Bytes,
 ) -> Result<Response, ApiError> {
     let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
     let request: LiftBanRequest = crate::input::parse_json(&body)?;
     let kind = parse_subject_kind(&request.subject_kind)?;
     let path = parse_auth_path(&request.auth_path)?;

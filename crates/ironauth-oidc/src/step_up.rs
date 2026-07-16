@@ -198,6 +198,26 @@ fn age_lapsed(max_age_secs: u64, auth_time_micros: Option<i64>, now_micros: i64)
     elapsed > window
 }
 
+/// Whether a recorded authentication at `auth_time_micros` is still FRESH enough to
+/// authorize a privileged operation within a `window_secs` re-authentication window
+/// (issue #73, session privilege separation / sudo mode).
+///
+/// This is the REUSABLE freshness seam: it evaluates the SAME max-auth-age rule the
+/// step-up path (issue #72) evaluates, so the admin sudo gate and any future end-user
+/// application gate share ONE implementation rather than forking it. A missing
+/// `auth_time` FAILS CLOSED (an unprovable freshness is treated as lapsed and the
+/// operation is refused), exactly like a step-up max-age check on a NULL `auth_time`.
+/// The freshness always derives from a recorded authentication instant, never a
+/// client-asserted value (the #14/#72 honesty discipline).
+#[must_use]
+pub fn privilege_is_fresh(
+    auth_time_micros: Option<i64>,
+    window_secs: u64,
+    now_micros: i64,
+) -> bool {
+    !age_lapsed(window_secs, auth_time_micros, now_micros)
+}
+
 /// Evaluate a requirement against a recorded authentication: the `achieved_acr`
 /// (derived from the recorded methods, issue #14), the recorded `auth_time`, and
 /// the clock instant `now_micros`, under the tenant `order`.

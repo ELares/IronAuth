@@ -69,6 +69,7 @@ mod resource_types;
 mod response;
 mod sessions;
 mod state;
+mod sudo;
 mod tenants;
 mod users;
 mod views;
@@ -339,6 +340,14 @@ pub fn management_router(state: AdminState) -> Router {
         .route(
             "/v1/tenants/{tenant_id}/environments/{environment_id}/abuse/bans",
             post(bans::create_ban).get(bans::list_bans),
+        )
+        // Admin session privilege separation (sudo mode, issue #73): the
+        // re-authentication endpoint that records a fresh elevation, opening the
+        // freshness window admin mutations in this environment require. A uniform
+        // not-found when the sudo_mode flag is off (fully inert).
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/admin/sudo/elevate",
+            post(sudo::elevate_sudo),
         )
         .route("/openapi.json", get(serve_openapi))
         .layer(from_fn(ratelimit::rate_limit_headers))

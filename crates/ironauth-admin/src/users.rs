@@ -132,6 +132,7 @@ pub async fn create_user(
     body: Bytes,
 ) -> Result<Response, ApiError> {
     let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
 
     let key = idempotency::required_key(&headers)?;
     let fingerprint = idempotency::fingerprint("POST", uri.path(), &body);
@@ -352,6 +353,7 @@ pub async fn update_user(
     body: Bytes,
 ) -> Result<Response, ApiError> {
     let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
     let id = parse_user_id(scope, &user_id)?;
     let request: UpdateUserRequest = parse_json(&body)?;
     if let Some(claims) = request.claims.as_ref() {
@@ -401,6 +403,7 @@ pub async fn delete_user(
     Query(hard): Query<HardKillQuery>,
 ) -> Result<Response, ApiError> {
     let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
     let id = parse_user_id(scope, &user_id)?;
     state
         .store()
@@ -446,6 +449,7 @@ pub async fn set_user_state(
     body: Bytes,
 ) -> Result<Response, ApiError> {
     let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
 
     let key = idempotency::required_key(&headers)?;
     let fingerprint = idempotency::fingerprint("POST", uri.path(), &body);
@@ -545,6 +549,7 @@ pub async fn link_user_external_id(
     body: Bytes,
 ) -> Result<Response, ApiError> {
     let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
     let id = parse_user_id(scope, &user_id)?;
     let request: LinkExternalIdRequest = parse_json(&body)?;
     let external_id = require_non_empty(&request.external_id, "external_id")?;
@@ -596,6 +601,7 @@ pub async fn unlink_user_external_id(
     Path((tenant_id, environment_id, user_id)): Path<(String, String, String)>,
 ) -> Result<Response, ApiError> {
     let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id)?;
+    crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
     let id = parse_user_id(scope, &user_id)?;
     state
         .store()

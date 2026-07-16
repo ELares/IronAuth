@@ -6,6 +6,20 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Two EXPLORATORY per-environment feature flags for issue #73, both default OFF and
+  independently toggleable: `oidc.webauthn_signal_api_enabled` (the WebAuthn L3 Signal API
+  hosted-page surface) plus its `oidc.webauthn_conditional_create_enabled` policy and
+  `oidc.webauthn_conditional_create_min_interval_secs` frequency cap; and
+  `admin.sudo_mode_enabled` (admin session privilege separation) plus its
+  `admin.sudo_mode_window_secs` re-authentication window (default 600). When off, each
+  feature is fully inert. A config flag-matrix test proves both are off by default and turn
+  on independently. The `admin.sudo_mode_enabled` docstring (and the generated
+  docs/CONFIG.md row) carries the honest guarantee: the enforced property is that the
+  elevation is SERVER-RECORDED and never CLIENT-ASSERTED (a forged header cannot elevate),
+  but because the admin plane uses a single non-interactive bearer with no second factor,
+  sudo mode does NOT yet defeat a fully-stolen admin bearer (which can self-elevate);
+  binding elevation to a distinct interactive re-auth factor is a documented graduation
+  step, and the freshness seam is factored so end-user apps get the full guarantee.
 - Password-strength score minimum (issue #66 PR C): `password_policy.min_password_strength_score`
   (integer 0-4, default 0 = scoring off, validated at most 4) wires through to
   `PasswordPolicy`. Off by default so an existing deployment sees no regression; a higher

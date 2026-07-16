@@ -67,7 +67,7 @@ pub struct FleetFilterQuery {
 
 /// Resolve the `(tenant, environment)` scope from the path, parsing both ids through
 /// the management repositories (a malformed id is the uniform not-found).
-fn scope_from_path(
+pub(crate) fn scope_from_path(
     state: &AdminState,
     tenant_id: &str,
     environment_id: &str,
@@ -219,6 +219,7 @@ pub async fn revoke_session(
 ) -> Result<Response, ApiError> {
     let actor = principal.require_operator()?;
     let (_tenant, scope) = scope_from_path(&state, &tenant_id, &environment_id)?;
+    crate::sudo::require_fresh_privilege(&state, scope, principal.actor()).await?;
 
     let key = idempotency::required_key(&headers)?;
     let fingerprint = idempotency::fingerprint("POST", uri.path(), &body);
@@ -311,6 +312,7 @@ pub async fn bulk_revoke_sessions(
 ) -> Result<Response, ApiError> {
     let actor = principal.require_operator()?;
     let (_tenant, scope) = scope_from_path(&state, &tenant_id, &environment_id)?;
+    crate::sudo::require_fresh_privilege(&state, scope, principal.actor()).await?;
 
     let key = idempotency::required_key(&headers)?;
     let fingerprint = idempotency::fingerprint("POST", uri.path(), &body);
@@ -408,6 +410,7 @@ pub async fn revoke_user_sessions(
 ) -> Result<Response, ApiError> {
     let actor = principal.require_operator()?;
     let (_tenant, scope) = scope_from_path(&state, &tenant_id, &environment_id)?;
+    crate::sudo::require_fresh_privilege(&state, scope, principal.actor()).await?;
 
     let key = idempotency::required_key(&headers)?;
     let fingerprint = idempotency::fingerprint("POST", uri.path(), &body);

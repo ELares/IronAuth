@@ -1301,3 +1301,94 @@ async fn a_password_path_ban_does_not_block_the_passkey_path() {
         "a password-path ban must NOT block the passkey path: {resp}"
     );
 }
+
+/// An authenticated GET carrying the session cookie, returning status and body.
+async fn get_with_cookie(harness: &Harness, path: &str, cookie: &str) -> (StatusCode, String) {
+    let request = Request::builder()
+        .method("GET")
+        .uri(path)
+        .header(header::COOKIE, cookie)
+        .body(Body::empty())
+        .expect("request builds");
+    let (status, _headers, body) = harness.send(request).await;
+    (status, body)
+}
+
+/// Issue #73: with the Signal API enabled, the signal-data endpoint returns the
+/// authenticated caller's accepted credential id list and details; with it off, the
+/// endpoint is a uniform not-found (fully inert).
+#[tokio::test]
+async fn signal_data_returns_the_accepted_credential_list_and_is_flag_gated() {
+    let harness = Harness::start_with(OidcConfig {
+        webauthn_signal_api_enabled: true,
+        ..OidcConfig::default()
+    })
+    .await;
+    let subject = harness.seed_user("sig@example.test", "correct horse").await;
+    let (_id, cookie) = harness.session_with_id(&subject, "pwd", 0).await;
+    let (status, body) = register(&harness, &cookie).await;
+    assert_eq!(status, StatusCode::CREATED, "register: {body}");
+
+    let base = webauthn_base(&harness);
+    let (status, body) = get_with_cookie(&harness, &format!("{base}/signal"), &cookie).await;
+    assert_eq!(status, StatusCode::OK, "signal data: {body}");
+    let data: Json = serde_json::from_str(&body).expect("signal json");
+    assert_eq!(data["rpId"], RP_ID);
+    let accepted: Vec<String> = data["acceptedCredentialIds"]
+        .as_array()
+        .expect("accepted list")
+        .iter()
+        .map(|v| v.as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(
+        accepted,
+        vec![b64(CRED_ID)],
+        "the accepted list is exactly the registered credential id"
+    );
+    assert!(
+        data["userDetails"]["name"].is_string(),
+        "user details carry a name"
+    );
+
+    // Flag OFF (the default): the endpoint is a uniform not-found.
+    let off = Harness::start().await;
+    let off_subject = off.seed_user("sig2@example.test", "battery staple").await;
+    let (_id, off_cookie) = off.session_with_id(&off_subject, "pwd", 0).await;
+    let off_base = webauthn_base(&off);
+    let (status, _) = get_with_cookie(&off, &format!("{off_base}/signal"), &off_cookie).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "signal is inert when off");
+}
+
+/// Issue #73: the hosted management page emits the feature-detected signal script only
+/// when the flag is on, and no signal JavaScript when off (no page change).
+#[tokio::test]
+async fn manage_page_emits_signal_script_only_when_the_flag_is_on() {
+    let on = Harness::start_with(OidcConfig {
+        webauthn_signal_api_enabled: true,
+        ..OidcConfig::default()
+    })
+    .await;
+    let subject = on.seed_user("mng@example.test", "correct horse").await;
+    let (_id, cookie) = on.session_with_id(&subject, "pwd", 0).await;
+    let base = webauthn_base(&on);
+    let (status, body) = get_with_cookie(&on, &format!("{base}/manage"), &cookie).await;
+    assert_eq!(status, StatusCode::OK, "manage page: {body}");
+    assert!(
+        body.contains("signalAllAcceptedCredentials"),
+        "emits the signal JS"
+    );
+    assert!(body.contains("signalCurrentUserDetails"));
+
+    // Flag OFF: the page renders but carries no signal JavaScript.
+    let off = Harness::start().await;
+    let off_subject = off.seed_user("mng2@example.test", "battery staple").await;
+    let (_id, off_cookie) = off.session_with_id(&off_subject, "pwd", 0).await;
+    let off_base = webauthn_base(&off);
+    let (status, body) = get_with_cookie(&off, &format!("{off_base}/manage"), &off_cookie).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        !body.contains("signalAllAcceptedCredentials"),
+        "no signal JS when off"
+    );
+    assert!(!body.contains("<script"), "no script at all when off");
+}

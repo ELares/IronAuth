@@ -83,7 +83,10 @@ use crate::views::{
                                      system calls to migrate away"),
         (name = "migration", description = "Inbound lazy-migration progress (issue #56): how \
                                           far an environment's lazy migration has come and the \
-                                          node's circuit-breaker state")
+                                          node's circuit-breaker state"),
+        (name = "sudo", description = "Admin session privilege separation (issue #73): the \
+                                     re-authentication endpoint that records a fresh elevation \
+                                     so admin mutations pass the sudo freshness gate")
     ),
     paths(
         crate::operators::list_operators,
@@ -147,6 +150,7 @@ use crate::views::{
         crate::bans::create_ban,
         crate::bans::lift_ban,
         crate::bans::list_bans,
+        crate::sudo::elevate_sudo,
     ),
     components(schemas(
         ErrorBody,
@@ -221,6 +225,7 @@ use crate::views::{
         crate::bans::BanView,
         crate::bans::BanList,
         crate::bans::LiftBanView,
+        crate::sudo::SudoElevationView,
     ))
 )]
 struct ApiDoc;

@@ -327,7 +327,7 @@ async fn expand_contract_example_chain_runs_all_three_phases_and_contract_remove
 // per real table); splitting it would not make it clearer.
 #[allow(clippy::too_many_lines)]
 #[tokio::test]
-async fn production_chain_is_only_the_fifty_one_real_migrations_and_ships_no_demo_object() {
+async fn production_chain_is_only_the_fifty_two_real_migrations_and_ships_no_demo_object() {
     // TestDatabase::start runs Store::migrate() (the production chain) on a
     // fresh, empty database.
     let db = TestDatabase::start().await;
@@ -344,8 +344,8 @@ async fn production_chain_is_only_the_fifty_one_real_migrations_and_ships_no_dem
     );
     assert_eq!(
         report.already_applied(),
-        51,
-        "the production chain is exactly fifty-one migrations (isolation, audit log, management \
+        52,
+        "the production chain is exactly fifty-two migrations (isolation, audit log, management \
          API, OIDC authorization, signing keys, login/consent, authentication context, redirect \
          registration, UserInfo claims, consent scope upsert, resource servers, opaque access \
          tokens, client auth suite, dynamic client registration, pushed authorization requests, \
@@ -358,7 +358,7 @@ async fn production_chain_is_only_the_fifty_one_real_migrations_and_ships_no_dem
          import, user invitations, flexible identifiers, exit-export credential grants, \
          migration state machine, webauthn credentials, totp credentials, credential abuse \
          defenses, step-up policies, email OTP and scanner-safe magic links, credential-class \
-         policies, guarded SMS OTP, passkey attestation)"
+         policies, guarded SMS OTP, passkey attestation, admin sudo elevations)"
     );
 
     // The ledger holds exactly versions 1 through 51.
@@ -367,7 +367,7 @@ async fn production_chain_is_only_the_fifty_one_real_migrations_and_ships_no_dem
         vec![
             1_i64, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
             24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45,
-            46, 47, 48, 49, 50, 51
+            46, 47, 48, 49, 50, 51, 52
         ]
     );
     let phase_of = |version: i64| async move {
@@ -558,6 +558,9 @@ async fn production_chain_is_only_the_fifty_one_real_migrations_and_ships_no_dem
     // tenant-scoped tables (mds3_blob_cache, aaguid_rules) plus additive
     // webauthn_credentials attestation columns, no rewrite of existing state.
     assert_eq!(phase_of(51).await, "expand");
+    // The admin-sudo-elevations migration (issue #73) is an EXPAND: one new
+    // tenant-scoped append-only ledger table, no rewrite of existing state.
+    assert_eq!(phase_of(52).await, "expand");
 
     // The step-up second-factor abuse path (issue #72): migration 0047 WIDENED the
     // abuse_bans auth_path CHECK (0046 pinned the closed set) to also admit
@@ -2364,6 +2367,54 @@ async fn production_chain_is_only_the_fifty_one_real_migrations_and_ships_no_dem
         assert!(
             check_constraint_exists(pool, "webauthn_credentials", constraint).await,
             "webauthn_credentials must carry the {constraint} CHECK constraint"
+        );
+    }
+
+    // ---- 0052 admin sudo elevations (issue #73) ----
+    assert!(
+        table_exists(pool, "admin_sudo_elevations").await,
+        "admin_sudo_elevations exists after 0052"
+    );
+    for column in [
+        "id",
+        "tenant_id",
+        "environment_id",
+        "actor_kind",
+        "actor_id",
+        "acr",
+        "elevated_at",
+        "expires_at",
+        "created_at",
+    ] {
+        assert!(
+            column_exists(pool, "admin_sudo_elevations", column).await,
+            "admin_sudo_elevations.{column} exists after 0052"
+        );
+    }
+    // The tenant-scoped-table obligations (migrate.rs checklist): forced row-level
+    // security, the (tenant, environment) isolation policy, and the nonempty-scope
+    // CHECK.
+    assert!(
+        rls_enabled_and_forced(pool, "admin_sudo_elevations").await,
+        "admin_sudo_elevations must ENABLE and FORCE row-level security"
+    );
+    assert!(
+        policy_exists(
+            pool,
+            "admin_sudo_elevations",
+            "admin_sudo_elevations_tenant_isolation"
+        )
+        .await,
+        "the (tenant, environment) isolation policy must exist on admin_sudo_elevations"
+    );
+    for constraint in [
+        "admin_sudo_elevations_scope_nonempty",
+        "admin_sudo_elevations_actor_nonempty",
+        "admin_sudo_elevations_acr_nonempty",
+    ] {
+        assert!(
+            check_constraint_exists(pool, "admin_sudo_elevations", constraint).await,
+            "admin_sudo_elevations must carry the {constraint} CHECK constraint"
         );
     }
 }

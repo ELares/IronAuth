@@ -6,6 +6,36 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Admin session privilege separation (sudo mode), EXPLORATORY and off by default (issue
+  #73). Behind the new per-environment `admin.sudo_mode_enabled` flag, admin READS are
+  unaffected but an environment-scoped MUTATION requires a RECENT re-authentication: the
+  acting credential must have a server-recorded elevation whose freshness window
+  (`admin.sudo_mode_window_secs`, default 10 minutes) has not lapsed, evaluated by the
+  reused step-up `privilege_is_fresh` seam. A mutation without a fresh elevation returns a
+  structured RFC 9470 `insufficient_user_authentication` challenge (a 401 carrying `max_age`
+  in the body and the `WWW-Authenticate` header) and executes nothing. A new
+  `POST .../admin/sudo/elevate` endpoint records a fresh elevation, server-side, from the
+  clock seam and audits it (`admin.privilege.elevated`); a refused mutation audits
+  `admin.privilege.challenged`. The gate covers ALL environment-scoped audited mutators:
+  users, sessions, management keys, organizations, bans, invitations (create / revoke /
+  resend), DCR policy and initial-access-token creation, environment deletion, and the
+  config-promotion APPLY flagship (the most powerful environment-scoped write). It is
+  placed immediately after scope resolution and before any idempotency replay or write, so
+  a challenge never leaves a partial write. The tenant-plane operator operations (tenant
+  create / delete / suspend / resume / restore, environment create) and the promotion PLAN
+  dry-run are outside the environment-scoped prototype and are intentionally not gated. The
+  enforced guarantee is that the elevation is SERVER-RECORDED and never CLIENT-ASSERTED: it
+  derives only from the recorded event, never from any client-supplied header or flag, so a
+  forged header cannot elevate (tested with a forged-header adversarial case). When the flag
+  is off the surface behaves exactly as before and the elevate endpoint is a uniform
+  not-found. The freshness seam is factored so end-user apps can adopt the same mechanism
+  later without rework. HONESTY CAVEAT: the admin plane authenticates via a single
+  non-interactive bearer credential with no second factor, so sudo mode does NOT yet defeat
+  a fully-stolen admin bearer, which can call the elevate endpoint itself and then mutate;
+  it bounds a header-forgery or replay path, not a stolen bearer. Binding the elevation to a
+  DISTINCT interactive re-auth factor (an operator passkey) is a documented graduation step;
+  end-user application sessions, which have that factor split, get the full guarantee
+  through the same seam.
 - OpenAPI contract sync for the MDS3 health route (issue #66 PR B, adversarial review):
   the hardcoded `openapi_contract` assertions now include `getMds3Health` and its
   `GET .../webauthn/mds3/health` path and pin the served-route count at 61, matching the

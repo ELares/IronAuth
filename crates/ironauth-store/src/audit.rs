@@ -662,6 +662,17 @@ pub enum Action {
     /// `step_up_max_age_secs` registration floor was configured through the
     /// management seam. The row targets the `cli_` client.
     ClientStepUpPolicySet,
+    /// An admin sudo elevation was RECORDED (issue #73): a management credential
+    /// completed a re-authentication that opens a freshness window for admin
+    /// mutations in a (tenant, environment). The row targets the `elv_` elevation; the
+    /// `detail` records the achieved acr and the window expiry.
+    AdminPrivilegeElevated,
+    /// An admin mutation was REFUSED because the sudo freshness window had lapsed
+    /// (issue #73): the recorded elevation was absent or expired, so a structured
+    /// re-authentication challenge was returned instead of executing the mutation. The
+    /// row targets the `elv_` elevation handle; the freshness expiry is the audited
+    /// fact (a stolen credential without a fresh re-auth cannot mutate).
+    AdminPrivilegeChallenged,
     /// A credential-class policy was SET (created or updated) through the management
     /// seam (issue #66): the minimum credential class required of a login for a
     /// subject (the tenant, a group, or an org). The row targets the `ccp_` policy;
@@ -873,6 +884,8 @@ impl Action {
             Action::ScopeStepUpPolicySet => "step_up.scope_policy.set",
             Action::ScopeStepUpPolicyRemove => "step_up.scope_policy.remove",
             Action::ClientStepUpPolicySet => "client.step_up_policy.set",
+            Action::AdminPrivilegeElevated => "admin.privilege.elevated",
+            Action::AdminPrivilegeChallenged => "admin.privilege.challenged",
             Action::CredentialClassPolicySet => "credential_class.policy.set",
             Action::CredentialClassPolicyRemove => "credential_class.policy.remove",
             Action::AttestationConfigSet => "attestation.config.set",

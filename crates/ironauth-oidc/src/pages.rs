@@ -275,10 +275,13 @@ fn passkey_step_up_block(ui: &PasskeyUi<'_>, return_to: &str) -> String {
     let target = serde_json::to_string(return_to)
         .unwrap_or_else(|_| "\"/\"".to_owned())
         .replace("</", "<\\/");
-    let script = PASSKEY_SCRIPT.replace("__BASE__", ui.scope_path).replace(
-        "window.location.reload();",
-        &format!("window.location.assign({target});"),
-    );
+    let script = PASSKEY_SCRIPT
+        .replace("__BASE__", ui.scope_path)
+        .replace("__SIGNAL__", signal_unknown_snippet(ui.signal_api))
+        .replace(
+            "window.location.reload();",
+            &format!("window.location.assign({target});"),
+        );
     format!(
         "<p><button type=\"button\" id=\"passkey-btn\">Sign in with a passkey</button></p>\
          <script nonce=\"{nonce}\">{script}</script>",
@@ -294,6 +297,28 @@ pub struct PasskeyUi<'a> {
     pub nonce: &'a str,
     /// The `/t/{tenant}/e/{environment}` prefix the webauthn endpoints live under.
     pub scope_path: &'a str,
+    /// Whether the exploratory WebAuthn L3 Signal API is enabled (issue #73): when on,
+    /// the ceremony script additionally calls `signalUnknownCredential` on a failed
+    /// assertion the server reports as a ghost credential, so the authenticator drops
+    /// it. When off, that snippet is not emitted at all (no page change).
+    pub signal_api: bool,
+}
+
+/// The `signalUnknownCredential` snippet spliced into the ceremony script's
+/// failed-assertion path when the Signal API is enabled (issue #73), or the empty
+/// string when it is off (so the login page carries no signal JavaScript). It reads the
+/// server's ghost-credential advisory and asks the authenticator to drop the
+/// credential it just presented; every call is feature-detected, so an unsupported
+/// browser sees no behavior change and no error.
+fn signal_unknown_snippet(signal_api: bool) -> &'static str {
+    if signal_api {
+        "try { const err = await vResp.json(); if (err && err.unknownCredential && \
+         window.PublicKeyCredential && PublicKeyCredential.signalUnknownCredential) { \
+         await PublicKeyCredential.signalUnknownCredential({rpId: err.rpId, credentialId: \
+         err.credentialId}); } } catch(e){}"
+    } else {
+        ""
+    }
 }
 
 /// The passkey button and the conditional-UI / button-path script for the login
@@ -302,7 +327,9 @@ pub struct PasskeyUi<'a> {
 /// assertion to the scope's `authenticate/verify` endpoint.
 fn passkey_block(ui: &PasskeyUi<'_>) -> String {
     // The scope path is server-known (a validated Scope), so it is safe to embed.
-    let script = PASSKEY_SCRIPT.replace("__BASE__", ui.scope_path);
+    let script = PASSKEY_SCRIPT
+        .replace("__BASE__", ui.scope_path)
+        .replace("__SIGNAL__", signal_unknown_snippet(ui.signal_api));
     format!(
         "<p><button type=\"button\" id=\"passkey-btn\">Sign in with a passkey</button></p>\
          <script nonce=\"{nonce}\">{script}</script>",
@@ -336,7 +363,8 @@ const PASSKEY_SCRIPT: &str = r#"(async () => {
       userHandle: assertion.response.userHandle ? enc(assertion.response.userHandle) : null } };
     let vResp;
     try { vResp = await fetch(base+"/authenticate/verify", {method:"POST", headers:{"content-type":"application/json"}, credentials:"same-origin", body: JSON.stringify({challengeId: data.challengeId, credential})}); } catch(e){ return; }
-    if (vResp.ok) window.location.reload();
+    if (vResp.ok) { window.location.reload(); return; }
+    __SIGNAL__
   }
   const btn = document.getElementById("passkey-btn");
   if (btn) btn.addEventListener("click", ()=>signIn("optional"));
@@ -377,6 +405,103 @@ pub fn login_html(status: StatusCode, body: String, nonce: &str) -> Response {
     )
         .into_response()
 }
+
+/// The wiring for the hosted WebAuthn passkey-management page (issue #73): the
+/// per-response nonce, the scope path the ceremony/signal endpoints live under, and the
+/// two feature gates.
+#[derive(Debug, Clone, Copy)]
+pub struct SignalManageUi<'a> {
+    /// The per-response CSP script nonce (also set in the page CSP).
+    pub nonce: &'a str,
+    /// The `/t/{tenant}/e/{environment}` prefix the endpoints live under.
+    pub scope_path: &'a str,
+    /// Whether the WebAuthn L3 Signal API is enabled. When false the page emits NO
+    /// script at all (no signal JavaScript, no page change).
+    pub signal_api: bool,
+    /// Whether to additionally emit the conditional-create silent-upgrade script: the
+    /// per-tenant policy allows it, the user has no passkey yet, and the frequency cap
+    /// is not hit. Only ever consulted when `signal_api` is true.
+    pub conditional_create: bool,
+}
+
+/// The hosted WebAuthn passkey-management page (issue #73). Authenticated. When the
+/// Signal API is enabled it emits ONE nonce-guarded, feature-detected script that
+/// fetches the signal-data endpoint and calls `signalAllAcceptedCredentials` (which
+/// drops server-deleted ghost credentials) and `signalCurrentUserDetails` (which keeps
+/// the authenticator UI's name current); when conditional-create is offered it also
+/// attempts a `mediation: 'conditional'` passkey creation recorded through the STANDARD
+/// registration ceremony (issue #65), wrapped so a failure is always a silent no-op.
+/// Every call is feature-detected, so an unsupported browser sees no behavior change and
+/// no errors. With the Signal API off, the page carries NO script (fully inert).
+#[must_use]
+pub fn signal_manage_page(ui: &SignalManageUi<'_>, environment_banner: Option<&str>) -> String {
+    let script_block = if ui.signal_api {
+        // The scope path is server-known (a validated Scope), so it is safe to embed;
+        // the script interpolates no untrusted input.
+        let conditional = if ui.conditional_create {
+            CONDITIONAL_CREATE_SCRIPT.replace("__BASE__", ui.scope_path)
+        } else {
+            String::new()
+        };
+        let script = SIGNAL_SCRIPT
+            .replace("__BASE__", ui.scope_path)
+            .replace("__CONDITIONAL_CREATE__", &conditional);
+        format!(
+            "<script nonce=\"{nonce}\">{script}</script>",
+            nonce = escape_html(ui.nonce),
+        )
+    } else {
+        String::new()
+    };
+    let body = format!(
+        "<h1>Passkeys</h1>\
+         <p>Manage the passkeys registered for your account.</p>{script_block}"
+    );
+    document("Passkeys", &body, "en", "page", environment_banner)
+}
+
+/// The WebAuthn L3 Signal API reconciliation script (issue #73). `__BASE__` is the
+/// per-environment scope path and `__CONDITIONAL_CREATE__` the (optional)
+/// conditional-create block. It fetches the authenticated signal-data endpoint and
+/// feature-detects each signal call, so no unsupported browser ever errors.
+const SIGNAL_SCRIPT: &str = r#"(async () => {
+  let data;
+  try { const r = await fetch("__BASE__/webauthn/signal", {credentials:"same-origin"}); if (!r.ok) return; data = await r.json(); } catch(e){ return; }
+  const PKC = window.PublicKeyCredential;
+  if (PKC && PKC.signalAllAcceptedCredentials) {
+    try { await PKC.signalAllAcceptedCredentials({rpId: data.rpId, userId: data.userId, allAcceptedCredentialIds: data.acceptedCredentialIds}); } catch(e){}
+  }
+  if (PKC && PKC.signalCurrentUserDetails) {
+    try { await PKC.signalCurrentUserDetails({rpId: data.rpId, userId: data.userId, name: data.userDetails.name, displayName: data.userDetails.displayName}); } catch(e){}
+  }
+  __CONDITIONAL_CREATE__
+})();"#;
+
+/// The conditional-create silent-upgrade block (issue #73), spliced into
+/// [`SIGNAL_SCRIPT`] only when an offer is due. It requests registration options and
+/// runs `navigator.credentials.create` with `mediation: 'conditional'`, then posts the
+/// attestation back to the STANDARD registration-verify endpoint (issue #65). Every step
+/// is wrapped so a failure or an unsupported browser is a silent no-op that never
+/// interrupts anything.
+const CONDITIONAL_CREATE_SCRIPT: &str = r#"try {
+    if (window.PublicKeyCredential && PublicKeyCredential.isConditionalMediationAvailable && await PublicKeyCredential.isConditionalMediationAvailable()) {
+      const enc = (buf) => { const u = new Uint8Array(buf); let s=''; for (const c of u) s+=String.fromCharCode(c); return btoa(s).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,''); };
+      const dec = (s) => { s = s.replace(/-/g,'+').replace(/_/g,'/'); const p = s.length%4?4-s.length%4:0; s += '='.repeat(p); const b = atob(s); const u = new Uint8Array(b.length); for (let i=0;i<b.length;i++) u[i]=b.charCodeAt(i); return u.buffer; };
+      let oResp;
+      try { oResp = await fetch("__BASE__/webauthn/register/options", {method:"POST", headers:{"content-type":"application/json"}, body:"{}", credentials:"same-origin"}); } catch(e){ oResp = null; }
+      if (oResp && oResp.ok) {
+        const od = await oResp.json(); const pk = od.publicKey;
+        pk.challenge = dec(pk.challenge); pk.user.id = dec(pk.user.id);
+        (pk.excludeCredentials||[]).forEach((c)=>{ c.id = dec(c.id); });
+        let cred;
+        try { cred = await navigator.credentials.create({publicKey: pk, mediation: "conditional"}); } catch(e){ cred = null; }
+        if (cred) {
+          const att = { id: cred.id, rawId: enc(cred.rawId), type: cred.type, response: { clientDataJSON: enc(cred.response.clientDataJSON), attestationObject: enc(cred.response.attestationObject) } };
+          try { await fetch("__BASE__/webauthn/register/verify", {method:"POST", headers:{"content-type":"application/json"}, credentials:"same-origin", body: JSON.stringify({challengeId: od.challengeId, credential: att})}); } catch(e){}
+        }
+      }
+    }
+  } catch(e){}"#;
 
 /// The minimal registration page: an identifier and password form posting to
 /// `/register`. Reached directly and as the target of `prompt=create`. `hints` is
@@ -1067,6 +1192,73 @@ pub fn frontchannel_logout_response(iframe_urls: &[String], frame_origins: &[Str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Issue #73: the Signal API management page emits the feature-detected signal calls
+    // (under a nonce) only when the flag is on, and the conditional-create block only
+    // when an offer is due.
+    #[test]
+    fn signal_manage_page_emits_the_signal_calls_only_when_enabled() {
+        let ui_on = SignalManageUi {
+            nonce: "abc123",
+            scope_path: "/t/ten_x/e/env_y",
+            signal_api: true,
+            conditional_create: false,
+        };
+        let html = signal_manage_page(&ui_on, None);
+        assert!(html.contains("signalAllAcceptedCredentials"));
+        assert!(html.contains("signalCurrentUserDetails"));
+        // Feature-detected and nonce-guarded.
+        assert!(html.contains("window.PublicKeyCredential"));
+        assert!(html.contains("<script nonce=\"abc123\">"));
+        // The signal-data endpoint is scoped to the request.
+        assert!(html.contains("/t/ten_x/e/env_y/webauthn/signal"));
+        // No conditional-create block when not offered.
+        assert!(!html.contains("navigator.credentials.create"));
+
+        // Flag off: no signal JavaScript at all (no page change).
+        let ui_off = SignalManageUi {
+            signal_api: false,
+            ..ui_on
+        };
+        let html_off = signal_manage_page(&ui_off, None);
+        assert!(!html_off.contains("signalAllAcceptedCredentials"));
+        assert!(!html_off.contains("signalCurrentUserDetails"));
+        assert!(!html_off.contains("<script"));
+    }
+
+    #[test]
+    fn signal_manage_page_emits_conditional_create_only_when_offered() {
+        let ui = SignalManageUi {
+            nonce: "n",
+            scope_path: "/t/ten_x/e/env_y",
+            signal_api: true,
+            conditional_create: true,
+        };
+        let html = signal_manage_page(&ui, None);
+        // The conditional-create block runs mediation:'conditional' create and records
+        // through the STANDARD registration ceremony (issue #65).
+        assert!(html.contains("navigator.credentials.create"));
+        assert!(html.contains("mediation: \"conditional\""));
+        assert!(html.contains("/t/ten_x/e/env_y/webauthn/register/options"));
+        assert!(html.contains("/t/ten_x/e/env_y/webauthn/register/verify"));
+    }
+
+    #[test]
+    fn login_passkey_block_emits_signal_unknown_credential_only_when_enabled() {
+        let on = PasskeyUi {
+            nonce: "n",
+            scope_path: "/t/ten_x/e/env_y",
+            signal_api: true,
+        };
+        assert!(passkey_block(&on).contains("signalUnknownCredential"));
+        let off = PasskeyUi {
+            signal_api: false,
+            ..on
+        };
+        assert!(!passkey_block(&off).contains("signalUnknownCredential"));
+        // The placeholder is always resolved (never leaks into the page).
+        assert!(!passkey_block(&off).contains("__SIGNAL__"));
+    }
 
     #[test]
     fn escape_html_neutralizes_every_breakout_character() {

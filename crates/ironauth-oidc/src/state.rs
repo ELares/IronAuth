@@ -417,6 +417,16 @@ struct Inner {
     webauthn_challenge_ttl_secs: u64,
     webauthn_require_user_verification: bool,
     webauthn_clone_detection_block: bool,
+    // The exploratory WebAuthn L3 Signal API surface (issue #73): whether the hosted
+    // passkey-management page emits the feature-detected signal JavaScript and the
+    // signal-data endpoint is served. Off by default; when off no signal JS is emitted
+    // and the endpoint is a uniform 404 (fully inert).
+    webauthn_signal_api_enabled: bool,
+    // Conditional-create passkey enrollment after a password login (issue #73), and its
+    // per-tenant frequency cap. Off by default and gated additionally by the signal-api
+    // and webauthn flags.
+    webauthn_conditional_create_enabled: bool,
+    webauthn_conditional_create_min_interval_secs: u64,
     // Credential-abuse regulation policy (issue #64): the resolved risk-based escalation
     // and ban policy. Config-derived and immutable. The in-process L1 counter store for
     // the fast request-shaping layer lives OUTSIDE Inner (like the hashing pool) so it
@@ -580,6 +590,10 @@ impl OidcState {
                 webauthn_challenge_ttl_secs: config.webauthn_challenge_ttl_secs,
                 webauthn_require_user_verification: config.webauthn_require_user_verification,
                 webauthn_clone_detection_block: config.webauthn_clone_detection_block,
+                webauthn_signal_api_enabled: config.webauthn_signal_api_enabled,
+                webauthn_conditional_create_enabled: config.webauthn_conditional_create_enabled,
+                webauthn_conditional_create_min_interval_secs: config
+                    .webauthn_conditional_create_min_interval_secs,
                 regulation: crate::abuse::RegulationSettings::from_config(&config.regulation),
                 totp_enabled: config.totp_enabled,
                 totp_issuer: config.totp_issuer.clone(),
@@ -1803,6 +1817,33 @@ impl OidcState {
     #[must_use]
     pub fn webauthn_enabled(&self) -> bool {
         self.inner.webauthn_enabled
+    }
+
+    /// Whether the exploratory WebAuthn L3 Signal API surface is active (issue #73):
+    /// the hosted passkey-management page emits the feature-detected signal JavaScript
+    /// and the signal-data endpoint is served. Requires [`Self::webauthn_enabled`] too;
+    /// off by default, and fully inert when off (no signal JS, a 404 endpoint).
+    #[must_use]
+    pub fn webauthn_signal_api_enabled(&self) -> bool {
+        self.inner.webauthn_signal_api_enabled
+    }
+
+    /// Whether conditional-create passkey enrollment is offered after a password login
+    /// (issue #73). Gated by [`Self::webauthn_enabled`] AND
+    /// [`Self::webauthn_signal_api_enabled`] AND this per-tenant policy flag, so the
+    /// silent upgrade only runs when all three are on. Off by default.
+    #[must_use]
+    pub fn webauthn_conditional_create_enabled(&self) -> bool {
+        self.inner.webauthn_enabled
+            && self.inner.webauthn_signal_api_enabled
+            && self.inner.webauthn_conditional_create_enabled
+    }
+
+    /// The minimum interval, in seconds, between conditional-create enrollment offers to
+    /// the same browser (issue #73): the per-tenant frequency cap.
+    #[must_use]
+    pub fn webauthn_conditional_create_min_interval_secs(&self) -> u64 {
+        self.inner.webauthn_conditional_create_min_interval_secs
     }
 
     /// The effective WebAuthn Relying Party ID and allowed origins for a ceremony

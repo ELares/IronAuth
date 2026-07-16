@@ -61,6 +61,7 @@ fn operation_ids_are_the_stable_set() {
             "deleteOrganization",
             "deleteTenant",
             "deleteUser",
+            "elevateAdminSudo",
             "exportConfigSnapshot",
             "exportIdentities",
             "getDcrClient",
@@ -255,6 +256,7 @@ fn documented_paths_are_the_expected_set() {
             "POST /v1/tenants/{tenant_id}/environments",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/abuse/bans",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/abuse/bans/lift",
+            "POST /v1/tenants/{tenant_id}/environments/{environment_id}/admin/sudo/elevate",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/clients/{client_id}/verify",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/config/promotion/apply",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/config/promotion/plan",
@@ -314,7 +316,7 @@ fn committed_artifact_matches_generated_spec() {
 async fn served_routes_match_documented_routes() {
     let router = db_free_router();
     let documented = documented_method_paths();
-    assert_eq!(documented.len(), 61, "the documented route count is pinned");
+    assert_eq!(documented.len(), 62, "the documented route count is pinned");
 
     // The OUTBOUND lazy-migration endpoint (issue #58) is the one documented route
     // that is NOT gated by the management `Principal` at 401. It is DISABLED BY

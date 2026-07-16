@@ -323,6 +323,19 @@ impl ScopedKind for ScopeStepUpPolicyKind {
     const PREFIX: &'static str = "sup";
 }
 
+/// Marker for an admin sudo elevation (`elv_`), one row in the append-only
+/// privilege-elevation ledger (issue #73): a recorded re-authentication event that
+/// opens a freshness window for admin mutations. A tenant-scoped resource: the id
+/// embeds its (tenant, environment), so an elevation minted in one scope parses as a
+/// uniform not-found under another. It is an INTERNAL audit/ledger row (never a bearer
+/// credential); the values it points at are a public acr string and two timestamps, so
+/// its debug form stays legible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct AdminSudoElevationKind;
+impl ScopedKind for AdminSudoElevationKind {
+    const PREFIX: &'static str = "elv";
+}
+
 /// Marker for a credential-class policy (`ccp_`), one row in a tenant's
 /// minimum-credential-class ladder (issue #66): the minimum class (`any` < `mfa` <
 /// `passkey` < `attested_passkey`) required of a login for a policy subject (the
@@ -947,6 +960,11 @@ pub type RecoveryCodeId = ScopedId<RecoveryCodeKind>;
 /// set (issue #72): the (acr floor, max auth age) requirement governing an OAuth
 /// scope token.
 pub type ScopeStepUpPolicyId = ScopedId<ScopeStepUpPolicyKind>;
+
+/// An admin sudo elevation id (`elv_...`), one row in the append-only
+/// privilege-elevation ledger (issue #73): a recorded re-authentication event that
+/// opens a freshness window for admin mutations.
+pub type AdminSudoElevationId = ScopedId<AdminSudoElevationKind>;
 
 /// A credential-class policy id (`ccp_...`), one row in a tenant's
 /// minimum-credential-class ladder (issue #66).

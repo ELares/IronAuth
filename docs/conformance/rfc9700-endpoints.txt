@@ -53,8 +53,10 @@
 /t/{tenant_id}/e/{environment_id}/webauthn/credentials
 /t/{tenant_id}/e/{environment_id}/webauthn/credentials/remove
 /t/{tenant_id}/e/{environment_id}/webauthn/credentials/rename
+/t/{tenant_id}/e/{environment_id}/webauthn/manage
 /t/{tenant_id}/e/{environment_id}/webauthn/register/options
 /t/{tenant_id}/e/{environment_id}/webauthn/register/verify
+/t/{tenant_id}/e/{environment_id}/webauthn/signal
 /t/{tenant_id}/e/{environment_id}/webauthn/signup/options
 /t/{tenant_id}/e/{environment_id}/webauthn/signup/verify
 /token
