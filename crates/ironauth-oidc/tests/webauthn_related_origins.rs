@@ -17,6 +17,7 @@
 
 mod common;
 
+use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
 use base64::Engine as _;
@@ -413,5 +414,174 @@ async fn an_unlisted_client_data_origin_fails_the_ceremony_without_enumerating()
     assert!(
         status == StatusCode::BAD_REQUEST || status == StatusCode::UNAUTHORIZED,
         "the uniform non-enumerating ceremony error, got {status}: {body}"
+    );
+}
+
+// --- RP-ID continuity across a serving-host cutover (acceptance criterion 5) ---
+
+// The RP ID stays the stable registrable domain across the cutover; the two serving
+// hosts are DIFFERENT subdomains under it, both valid registrable suffixes. The RP ID
+// equals the existing `RP_ID` constant, so `auth_data`'s RP-ID-hash (sha256(RP_ID)) is
+// already the stable hash both ceremonies present.
+const CUTOVER_HOST_A: &str = "https://a.issuer.test";
+const CUTOVER_HOST_B: &str = "https://b.issuer.test";
+
+/// Config for the cutover test: the RP ID is pinned to the stable registrable domain
+/// (`issuer.test`), independent of whichever serving host is live.
+fn config_cutover() -> OidcConfig {
+    OidcConfig {
+        require_pkce_for_confidential_clients: false,
+        webauthn_rp_id: Some(RP_ID.to_owned()),
+        ..OidcConfig::default()
+    }
+}
+
+/// POST a JSON body through a specific router (a given serving host), returning the
+/// status and parsed JSON.
+async fn post_through(
+    router: &Router,
+    path: &str,
+    cookie: Option<&str>,
+    origin: &str,
+    body: &Json,
+) -> (StatusCode, Json) {
+    let mut builder = Request::builder()
+        .method("POST")
+        .uri(path)
+        .header(header::CONTENT_TYPE, "application/json")
+        .header("origin", origin);
+    if let Some(cookie) = cookie {
+        builder = builder.header(header::COOKIE, cookie);
+    }
+    let (status, _headers, response) = common::send_through(
+        router.clone(),
+        builder
+            .body(Body::from(body.to_string()))
+            .expect("request builds"),
+    )
+    .await;
+    let parsed = if response.is_empty() {
+        Json::Null
+    } else {
+        serde_json::from_str(&response).unwrap_or(Json::Null)
+    };
+    (status, parsed)
+}
+
+#[tokio::test]
+async fn a_passkey_survives_a_serving_host_cutover_under_a_stable_rp_id() {
+    // Acceptance criterion 5 (issue #67): a domain-cutover test proving passkeys survive
+    // a hostname change under a stable RP ID, at the CEREMONY layer (not just config
+    // load). The authData RP-ID-hash is sha256(rp_id), independent of the serving host,
+    // so a passkey registered while the server is host A verifies after the server cuts
+    // over to host B (a different registrable suffix of the same stable RP ID).
+    let harness = Harness::start_with(config_cutover()).await;
+    let subject = harness
+        .seed_user("ada@example.test", "correct horse battery")
+        .await;
+    let (_id, cookie) = harness.session_with_id(&subject, "pwd", 0).await;
+    let base = webauthn_base(&harness);
+
+    // Host A is live: register a passkey. The clientData origin is host A; the authData
+    // RP-ID-hash is sha256(issuer.test), the STABLE RP ID.
+    let router_a = harness.serving_router(&config_cutover(), CUTOVER_HOST_A);
+    let (status, opts) = post_through(
+        &router_a,
+        &format!("{base}/register/options"),
+        Some(&cookie),
+        CUTOVER_HOST_A,
+        &json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "register options on host A: {opts}");
+    let challenge_id = opts["challengeId"].as_str().unwrap().to_owned();
+    let challenge_b64 = opts["publicKey"]["challenge"].as_str().unwrap().to_owned();
+
+    let attestation_object = cbor(&Value::Map(vec![
+        (Value::Text("fmt".into()), Value::Text("none".into())),
+        (Value::Text("attStmt".into()), Value::Map(vec![])),
+        (
+            Value::Text("authData".into()),
+            Value::Bytes(auth_data(0b0101_1101, 0, true)), // UP|UV|BE|BS|AT
+        ),
+    ]));
+    let credential = json!({
+        "id": b64(CRED_ID),
+        "rawId": b64(CRED_ID),
+        "type": "public-key",
+        "response": {
+            "clientDataJSON": b64(&client_data("webauthn.create", &challenge_b64, CUTOVER_HOST_A)),
+            "attestationObject": b64(&attestation_object),
+            "transports": ["internal"],
+        },
+        "clientExtensionResults": { "credProps": { "rk": true } },
+    });
+    let (status, body) = post_through(
+        &router_a,
+        &format!("{base}/register/verify"),
+        Some(&cookie),
+        CUTOVER_HOST_A,
+        &json!({ "challengeId": challenge_id, "credential": credential }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "register verify on host A: {body}"
+    );
+
+    // CUT OVER: the serving host is now host B, same stable RP ID, same shared database
+    // (the credential persists). Sign in from host B with the passkey registered on A.
+    let router_b = harness.serving_router(&config_cutover(), CUTOVER_HOST_B);
+    let (status, opts) = post_through(
+        &router_b,
+        &format!("{base}/authenticate/options"),
+        None,
+        CUTOVER_HOST_B,
+        &json!({}),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "authenticate options on host B: {opts}"
+    );
+    let challenge_id = opts["challengeId"].as_str().unwrap().to_owned();
+    let challenge_b64 = opts["publicKey"]["challenge"].as_str().unwrap().to_owned();
+
+    // The assertion's clientData origin is host B; the authData RP-ID-hash is STILL
+    // sha256(issuer.test), the stable RP ID the passkey was registered against.
+    let authenticator_data = auth_data(0b0001_1101, 1, false); // UP|UV|BE|BS
+    let client = client_data("webauthn.get", &challenge_b64, CUTOVER_HOST_B);
+    let mut signed = authenticator_data.clone();
+    signed.extend_from_slice(&sha256(&client));
+    let signature = test_util::ed25519_sign(&SEED, &signed);
+    let credential = json!({
+        "id": b64(CRED_ID),
+        "rawId": b64(CRED_ID),
+        "type": "public-key",
+        "response": {
+            "clientDataJSON": b64(&client),
+            "authenticatorData": b64(&authenticator_data),
+            "signature": b64(&signature),
+            "userHandle": b64(subject.as_bytes()),
+        },
+    });
+    let (status, body) = post_through(
+        &router_b,
+        &format!("{base}/authenticate/verify"),
+        None,
+        CUTOVER_HOST_B,
+        &json!({ "challengeId": challenge_id, "credential": credential }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the passkey registered on host A still verifies after the cutover to host B: {body}"
+    );
+    assert_eq!(
+        body["acr"], "phr",
+        "the surviving passkey sign-in is still phishing-resistant"
     );
 }

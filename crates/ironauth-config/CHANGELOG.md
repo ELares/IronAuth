@@ -12,10 +12,18 @@ range per docs/RELEASING.md.
   multi-brand or ccTLD estate). The serving origin is always permitted implicitly;
   this list adds the others, published at `GET /.well-known/webauthn`. Each entry is
   validated at STARTUP to be a well-formed https origin (`scheme://host[:port]`, no
-  path); a malformed entry is a boot error. The distinct registrable-label count of
-  the estate (serving origin plus related origins) is checked against the browser
-  budget of five: EXCEEDING it is a boot error (browsers silently ignore origins past
-  it), and sitting AT it emits the new `Warning::WebauthnRelatedOriginLabelBudget`.
+  path). A malformed entry is a boot error, and validation now also rejects the
+  malformed-but-inert forms `http::Uri` tolerated (a non-numeric port, a trailing-dot
+  host, a bracketed IP-literal host), so the allowlist stays clean. The distinct
+  registrable-label count of the estate (serving origin plus related origins) is an
+  ADVISORY soft-guard against the browser budget of five: reaching OR exceeding it
+  emits `Warning::WebauthnRelatedOriginLabelBudget`, never a boot error (the browser
+  is the real enforcer of its own cap, and an over-budget boot error would wrongly
+  reject a valid one-brand-many-ccTLD estate, which is a single label to a browser).
+  The label count now groups by the SLD label of the registrable domain (matching the
+  browser), using a curated common multi-part-suffix table (`co.uk`, `com.au`, ...) so
+  `example.co.uk` counts as the label `example`, not `co.uk`; it is a documented
+  conservative approximation, not a public-suffix-list dependency.
   Unlike the RP ID, a related origin need not be a registrable-suffix of the RP ID
   (that cross-domain reach is the point); the authorization is this explicit list. The
   existing `oidc.webauthn_rp_id` continuity rule (the RP ID must be a

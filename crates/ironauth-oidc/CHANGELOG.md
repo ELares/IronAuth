@@ -22,9 +22,18 @@ range per docs/RELEASING.md.
   ceremony error. A related-origin ceremony is a legitimately cross-site POST, so the
   four ceremony endpoints now guard with the new `interaction::related_origin_ok`
   (accept a request whose browser-set, script-unforgeable `Origin` is in the operator
-  allowlist; fail closed on a missing or opaque origin) instead of the strict
-  same-origin check; the passkey management endpoints stay strictly same-origin. RP ID
-  continuity is documented in `docs/design/PASSKEY-RP-ID-MIGRATION.md`.
+  allowlist) instead of the strict same-origin check; the passkey management endpoints
+  stay strictly same-origin. Without a usable `Origin`, `related_origin_ok` now FAILS
+  CLOSED: it admits a request only on a positive, unforgeable `Sec-Fetch-Site:
+  same-origin` signal, so a fully header-less ceremony request is refused (issue #67
+  review, acceptance criterion 2); the legitimate related-origin flow (which always
+  carries a real `Origin`) and the `#196` bootstrap `same_origin_ok` path are
+  unchanged. RP ID continuity is documented in
+  `docs/design/PASSKEY-RP-ID-MIGRATION.md` and proven end to end by a ceremony-layer
+  domain-cutover test (acceptance criterion 5): a passkey registered while the server
+  is host A still verifies after the serving host cuts over to host B under the same
+  stable RP ID, since the authData RP-ID-hash is `sha256(rp_id)`, independent of the
+  serving host.
 - Credential-abuse defenses (issue #64): a new `abuse` module with the counter INTERFACE
   (`CounterStore` trait + in-process L1 `MemoryCounterStore`, shaped so an optional
   IronCache L2 slots in behind the same trait later), the risk-based escalation

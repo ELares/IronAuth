@@ -1156,10 +1156,12 @@ pub struct OidcConfig {
     /// assertion from a listed origin against the RP ID. Each entry must be a
     /// well-formed https origin (`scheme://host[:port]`, no path), validated at
     /// STARTUP; a malformed entry is a boot-time [`ConfigError::Invalid`]. Browsers
-    /// cap the document at about five distinct registrable labels, so a list whose
-    /// distinct-label count EXCEEDS that budget is a boot error (some origins would
-    /// be silently ignored by the browser) and a list that sits AT the budget emits
-    /// a [`Warning`]. Unlike the RP ID, a related origin need NOT be a
+    /// cap the document at about five distinct registrable labels; the label budget
+    /// is ADVISORY (the browser is the real enforcer of its own cap), so a list whose
+    /// distinct-label count reaches OR exceeds that budget emits a [`Warning`] rather
+    /// than failing startup (an over-budget boot error would wrongly reject a valid
+    /// one-brand-many-ccTLD estate, which counts as a single label to a browser).
+    /// Unlike the RP ID, a related origin need NOT be a
     /// registrable-suffix of the RP ID (that cross-domain reach is the whole point);
     /// the authorization is this explicit, operator-controlled list served from the
     /// RP ID's own domain. Empty by default (single-origin deployments serve no
@@ -1809,14 +1811,16 @@ pub enum Warning {
         /// `database.password`).
         key: String,
     },
-    /// The WebAuthn related-origins estate sits AT the browser label budget
-    /// (issue #67): the document is still fully honored, but there is no headroom
-    /// for another registrable domain before browsers begin ignoring origins.
+    /// The WebAuthn related-origins estate has reached OR exceeded the browser
+    /// label budget (issue #67). At the budget there is simply no headroom for
+    /// another registrable label; over the budget a browser silently ignores the
+    /// origins past its cap, so some listed origins may never work. This is
+    /// advisory (the browser enforces its own cap); it never gates startup.
     WebauthnRelatedOriginLabelBudget {
         /// The distinct registrable-label count of the estate (serving origin plus
-        /// related origins).
+        /// related origins), approximated by SLD label.
         count: usize,
-        /// The browser label budget the count has reached.
+        /// The browser label budget the count has reached or exceeded.
         budget: usize,
     },
 }
@@ -1830,12 +1834,22 @@ impl fmt::Display for Warning {
                  use {{ file = \"/path\" }} or {{ env = \"VAR\" }} instead \
                  (or set dev_mode = true in development)"
             ),
+            Warning::WebauthnRelatedOriginLabelBudget { count, budget } if count == budget => {
+                write!(
+                    f,
+                    "oidc.webauthn_related_origins (with the serving origin) spans {count} distinct \
+                     registrable labels, the browser related-origin budget of {budget}; there is no \
+                     headroom for another registrable label before browsers begin ignoring origins \
+                     in the /.well-known/webauthn document"
+                )
+            }
             Warning::WebauthnRelatedOriginLabelBudget { count, budget } => write!(
                 f,
                 "oidc.webauthn_related_origins (with the serving origin) spans {count} distinct \
-                 registrable labels, the browser related-origin budget of {budget}; there is no \
-                 headroom for another registrable domain before browsers begin ignoring origins \
-                 in the /.well-known/webauthn document"
+                 registrable labels, exceeding the browser related-origin budget of {budget}; a \
+                 browser silently ignores origins past its cap, so some listed origins may never \
+                 work (this is an advisory approximation by SLD label; the browser enforces the \
+                 real limit)"
             ),
         }
     }
@@ -1901,12 +1915,14 @@ impl Config {
                 });
             }
         });
-        // The related-origins estate sitting exactly at the browser label budget is
-        // a warn (still fully honored, but no headroom); exceeding it is a hard error
-        // in validate_webauthn_related_origins (issue #67).
+        // The related-origins estate reaching OR exceeding the browser label budget
+        // is an advisory warn (issue #67), never a boot error: the browser is the real
+        // enforcer of its own cap, and an over-budget error would wrongly reject a valid
+        // one-brand-many-ccTLD estate (which is a single label to a browser). At the
+        // budget = no headroom; over it = the browser will ignore origins past its cap.
         if self.oidc.webauthn_enabled && !self.oidc.webauthn_related_origins.is_empty() {
             let count = webauthn_related_origin_labels(&self.oidc, &self.server).len();
-            if count == WEBAUTHN_RELATED_ORIGIN_LABEL_BUDGET {
+            if count >= WEBAUTHN_RELATED_ORIGIN_LABEL_BUDGET {
                 warnings.push(Warning::WebauthnRelatedOriginLabelBudget {
                     count,
                     budget: WEBAUTHN_RELATED_ORIGIN_LABEL_BUDGET,
@@ -2295,56 +2311,56 @@ fn validate_webauthn(oidc: &OidcConfig, server: &ServerConfig) -> Result<(), Con
             });
         }
     }
-    validate_webauthn_related_origins(oidc, server)?;
+    validate_webauthn_related_origins(oidc)?;
     Ok(())
 }
 
 /// The browser related-origin label budget (issue #67): current implementations
 /// (Chrome, Safari) accept a `/.well-known/webauthn` document that spans at most
-/// this many DISTINCT registrable labels, silently ignoring origins beyond it. A
-/// configured estate that exceeds this is a boot error (some origins would never
-/// work); one that sits exactly at it emits a [`Warning`].
+/// this many DISTINCT registrable labels, silently ignoring origins beyond it.
+/// This is ADVISORY: the browser is the real enforcer of its own cap, so an estate
+/// that reaches or exceeds this budget emits a [`Warning`], never a boot error.
 pub(crate) const WEBAUTHN_RELATED_ORIGIN_LABEL_BUDGET: usize = 5;
 
+/// A curated set of common multi-label public suffixes (issue #67). A browser groups
+/// related origins by the leading label of the registrable domain (the eTLD+1), so
+/// `example.co.uk` is the label `example`, not `co.uk`. To approximate that leading
+/// label without a heavy public-suffix-list dependency (which the repo deliberately
+/// avoids), we treat a host whose last two labels appear here as having a two-label
+/// public suffix. This is a CONSERVATIVE approximation for an advisory soft-guard: an
+/// uncommon multi-label suffix not listed here is treated as a single-label suffix, so
+/// the label count may be off for exotic ccTLD structures; the browser enforces the
+/// real limit. It is deliberately short and covers the common ccTLD second levels.
+const WEBAUTHN_COMMON_MULTI_LABEL_SUFFIXES: &[&str] = &[
+    "co.uk", "org.uk", "gov.uk", "ac.uk", "me.uk", "ltd.uk", "plc.uk", "net.uk", "sch.uk",
+    "com.au", "net.au", "org.au", "edu.au", "gov.au", "id.au", "co.jp", "or.jp", "ne.jp", "ac.jp",
+    "go.jp", "co.nz", "org.nz", "net.nz", "govt.nz", "ac.nz", "co.za", "org.za", "com.br",
+    "net.br", "org.br", "gov.br", "com.mx", "org.mx", "gob.mx", "co.in", "net.in", "org.in",
+    "gov.in", "ac.in", "com.cn", "net.cn", "org.cn", "gov.cn", "com.sg", "com.tr", "com.ar",
+    "com.hk", "co.kr", "co.il", "co.id", "com.tw",
+];
+
 /// Validate the WebAuthn related origins (issue #67, WebAuthn Level 3 Related Origin
-/// Requests). Each entry must be a well-formed https origin, and the estate (the
-/// serving origin plus the related origins) must not exceed the browser label
-/// budget, since a browser silently ignores origins past that budget.
+/// Requests). Each entry must be a well-formed https origin. The label-budget check
+/// is NOT here: it is advisory (a [`Warning`] in [`Config::collect_warnings`]), not a
+/// boot error, because the browser enforces its own label cap and an over-budget error
+/// would wrongly reject a valid one-brand-many-ccTLD estate.
 ///
 /// # Errors
 ///
-/// [`ConfigError::Invalid`] if a related origin is not a well-formed https origin,
-/// or the distinct registrable-label count exceeds
-/// [`WEBAUTHN_RELATED_ORIGIN_LABEL_BUDGET`].
-fn validate_webauthn_related_origins(
-    oidc: &OidcConfig,
-    server: &ServerConfig,
-) -> Result<(), ConfigError> {
-    if oidc.webauthn_related_origins.is_empty() {
-        return Ok(());
-    }
+/// [`ConfigError::Invalid`] if a related origin is not a well-formed https origin.
+fn validate_webauthn_related_origins(oidc: &OidcConfig) -> Result<(), ConfigError> {
     for origin in &oidc.webauthn_related_origins {
         if !is_well_formed_https_origin(origin) {
             return Err(ConfigError::Invalid {
                 message: format!(
                     "oidc.webauthn_related_origins entry ({origin}) is not a well-formed https \
                      origin; a related origin must be an absolute https origin of the form \
-                     scheme://host[:port] with no path, query, or fragment"
+                     scheme://host[:port] with a numeric port, no trailing-dot or bracketed-IP \
+                     host, and no path, query, or fragment"
                 ),
             });
         }
-    }
-    let count = webauthn_related_origin_labels(oidc, server).len();
-    if count > WEBAUTHN_RELATED_ORIGIN_LABEL_BUDGET {
-        return Err(ConfigError::Invalid {
-            message: format!(
-                "oidc.webauthn_related_origins (with the serving origin) spans {count} distinct \
-                 registrable labels, exceeding the browser related-origin budget of \
-                 {WEBAUTHN_RELATED_ORIGIN_LABEL_BUDGET}; browsers silently ignore origins past \
-                 that budget, so reduce the estate to at most {WEBAUTHN_RELATED_ORIGIN_LABEL_BUDGET} \
-                 registrable domains"
-            ),
-        });
     }
     Ok(())
 }
@@ -2355,48 +2371,96 @@ fn validate_webauthn_related_origins(
 fn webauthn_related_origin_labels(oidc: &OidcConfig, server: &ServerConfig) -> BTreeSet<String> {
     let mut labels = BTreeSet::new();
     if let Some(host) = server.public_url.as_deref().and_then(uri_host) {
-        labels.insert(registrable_label(&host));
+        labels.insert(registrable_domain_label(&host));
     }
     for origin in &oidc.webauthn_related_origins {
         if let Some(host) = uri_host(origin) {
-            labels.insert(registrable_label(&host));
+            labels.insert(registrable_domain_label(&host));
         }
     }
     labels
 }
 
-/// An approximate registrable label (effective-TLD-plus-one) of a host: the last
-/// two dot-separated labels, or the whole host when it has fewer. Without a
-/// public-suffix-list dependency this over-counts a few multi-part suffixes (for
-/// example `co.uk`), which only makes the budget check MORE conservative (it can
-/// warn or error a shade early, never accept an over-budget estate as under), so it
-/// is a safe approximation for the browser label cap (issue #67).
-fn registrable_label(host: &str) -> String {
+/// The registrable-domain label of a host: the leading label of the eTLD+1, which is
+/// how a browser groups related origins for its label budget (issue #67). For
+/// `auth.example.com` and `example.de` and `example.co.uk` this is `example`, so one
+/// brand across many ccTLDs counts as ONE label (the feature's headline estate), while
+/// `a.co.uk` and `b.co.uk` are the distinct labels `a` and `b`.
+///
+/// The eTLD is approximated from a curated common multi-label suffix table
+/// ([`WEBAUTHN_COMMON_MULTI_LABEL_SUFFIXES`]), defaulting to a single-label suffix; a
+/// host that is itself a public suffix (or shorter) falls back to the whole host so
+/// distinct suffix-only hosts still count distinctly. This is a conservative
+/// approximation for an advisory soft-guard, NOT an authoritative registrable-domain
+/// computation; the browser enforces the real label cap.
+fn registrable_domain_label(host: &str) -> String {
     let host = host.trim_end_matches('.').to_ascii_lowercase();
     let labels: Vec<&str> = host.split('.').filter(|label| !label.is_empty()).collect();
-    if labels.len() <= 2 {
+    if labels.is_empty() {
         return host;
     }
-    labels[labels.len() - 2..].join(".")
+    let suffix_len = if labels.len() >= 2
+        && WEBAUTHN_COMMON_MULTI_LABEL_SUFFIXES.contains(
+            &format!("{}.{}", labels[labels.len() - 2], labels[labels.len() - 1]).as_str(),
+        ) {
+        2
+    } else {
+        1
+    };
+    // The registrable domain's leading label sits just before the public suffix.
+    if labels.len() > suffix_len {
+        labels[labels.len() - suffix_len - 1].to_owned()
+    } else {
+        // The host IS a public suffix (or shorter than one): no registrable label to
+        // group by, so treat the whole host as its own distinct label.
+        host
+    }
 }
 
 /// Whether `origin` is a well-formed absolute https origin: `scheme://host[:port]`
 /// with the https scheme, a non-empty host, no userinfo, and no path, query, or
 /// fragment (issue #67). An origin is stricter than an endpoint URL: it carries no
 /// path. Purely syntactic; it never resolves DNS or touches the network.
+///
+/// `http::Uri` is lenient about several malformed-but-inert authorities that no
+/// browser ever emits as a `clientData.origin` (a non-numeric port
+/// `https://host:notaport`, a trailing-root-dot host `https://host.`, a bracketed
+/// IP-literal host `https://[::1]`). Those are dead weight in the allowlist rather
+/// than an exploit, but a related origin must be a clean `https://host[:port]`, so we
+/// reject them at load to keep the allowlist honest and the doc claim true.
 fn is_well_formed_https_origin(origin: &str) -> bool {
     if origin.contains(|c: char| c.is_whitespace() || c.is_control()) || origin.contains('#') {
         return false;
     }
-    http::Uri::try_from(origin).is_ok_and(|uri| {
-        uri.scheme_str() == Some("https")
-            && uri.host().is_some_and(|host| !host.is_empty())
-            && uri
-                .authority()
-                .is_some_and(|authority| !authority.as_str().contains('@'))
-            && matches!(uri.path(), "" | "/")
-            && uri.query().is_none()
-    })
+    let Ok(uri) = http::Uri::try_from(origin) else {
+        return false;
+    };
+    if uri.scheme_str() != Some("https") || !matches!(uri.path(), "" | "/") || uri.query().is_some()
+    {
+        return false;
+    }
+    let Some(authority) = uri.authority().map(http::uri::Authority::as_str) else {
+        return false;
+    };
+    if authority.contains('@') {
+        return false;
+    }
+    let Some(host) = uri.host().filter(|host| !host.is_empty()) else {
+        return false;
+    };
+    // Reject a bracketed IP-literal host (`[::1]`) and a trailing-root-dot host
+    // (`host.`): both canonicalize to something no browser reports as an origin.
+    if host.contains(['[', ']', ':']) || host.ends_with('.') {
+        return false;
+    }
+    // Reject a non-numeric port. With userinfo already excluded, the authority is
+    // `host[:port]`; a longer authority than the host means a `:port` suffix is
+    // present, and it must parse as a valid numeric port (`http::Uri` keeps a
+    // non-numeric port in the authority while returning `None` from `port_u16`).
+    if authority.len() > host.len() && uri.port_u16().is_none() {
+        return false;
+    }
+    true
 }
 
 /// The host of an absolute URL, or [`None`] if it does not parse or has no host.
@@ -3117,20 +3181,101 @@ mod tests {
             err.to_string().contains("well-formed https origin"),
             "{err}"
         );
+
+        // LOW-2 (issue #67 review): malformed-but-inert forms `http::Uri` tolerates are
+        // now rejected at load so the allowlist is clean and the doc claim is true. Each
+        // canonicalizes to something no browser reports as clientData.origin.
+        for bad in [
+            "https://example.de:notaport", // non-numeric port
+            "https://example.de.",         // trailing-root-dot host
+            "https://[::1]",               // bracketed IP-literal host
+            "https://[::1]:8443",          // bracketed IP-literal host with port
+        ] {
+            let toml = format!(
+                "[server]\npublic_url = \"https://auth.example.com\"\n\
+                 [oidc]\nwebauthn_related_origins = [\"{bad}\"]\n"
+            );
+            let err = Config::from_toml_str(&toml, "ironauth.toml")
+                .expect_err(&format!("{bad} must be rejected at load"));
+            assert!(
+                err.to_string().contains("well-formed https origin"),
+                "{bad}: {err}"
+            );
+        }
+
+        // Valid `https://host` and `https://host:port` still load.
+        let ports = "[server]\npublic_url = \"https://auth.example.com\"\n\
+                     [oidc]\nwebauthn_related_origins = [\
+                     \"https://example.de\", \"https://example.de:8443\"]\n";
+        Config::from_toml_str(ports, "ironauth.toml").expect("host and host:port load");
     }
 
     #[test]
-    fn webauthn_related_origins_enforce_the_browser_label_budget() {
-        // Six distinct registrable domains (the serving one plus five related) exceed
-        // the browser budget of five: a boot error, since browsers ignore the overflow.
+    fn webauthn_related_origins_label_budget_is_advisory_not_a_boot_error() {
+        // The feature's HEADLINE estate: one brand across five ccTLDs (auth.example.com
+        // plus example.de/.fr/.es/.it/.co.uk) is a SINGLE registrable label (`example`)
+        // to a browser, so it must LOAD with no boot error and no label-budget warning.
+        // The old last-two-labels count saw six labels here and wrongly boot-errored.
+        let cctld = "[server]\npublic_url = \"https://auth.example.com\"\n\
+                     [oidc]\nwebauthn_rp_id = \"example.com\"\n\
+                     webauthn_related_origins = [\
+                     \"https://example.de\", \"https://example.fr\", \"https://example.es\", \
+                     \"https://example.it\", \"https://example.co.uk\"]\n";
+        let loaded = Config::from_toml_str(cctld, "ironauth.toml")
+            .expect("the one-brand five-ccTLD estate loads (a single label to a browser)");
+        assert!(
+            !loaded
+                .warnings
+                .iter()
+                .any(|w| matches!(w, Warning::WebauthnRelatedOriginLabelBudget { .. })),
+            "one brand across ccTLDs is one label, so no budget warning: {:?}",
+            loaded.warnings
+        );
+
+        // A genuinely oversized SINGLE-registrable-domain estate: seven distinct SLD
+        // labels under `.com` (serving `example` plus six brands) exceeds the budget.
+        // This is advisory now: it LOADS but WARNS (the browser enforces the real cap).
         let over = "[server]\npublic_url = \"https://auth.example.com\"\n\
                     [oidc]\nwebauthn_related_origins = [\
-                    \"https://a.test\", \"https://b.test\", \"https://c.test\", \
-                    \"https://d.test\", \"https://e.test\"]\n";
-        let err = Config::from_toml_str(over, "ironauth.toml").expect_err("over budget");
-        assert!(err.to_string().contains("label"), "{err}");
+                    \"https://brand1.com\", \"https://brand2.com\", \"https://brand3.com\", \
+                    \"https://brand4.com\", \"https://brand5.com\", \"https://brand6.com\"]\n";
+        let loaded = Config::from_toml_str(over, "ironauth.toml")
+            .expect("an over-budget estate loads (advisory warn, never a boot error)");
+        assert!(
+            loaded.warnings.iter().any(|w| matches!(
+                w,
+                Warning::WebauthnRelatedOriginLabelBudget {
+                    count: 7,
+                    budget: 5
+                }
+            )),
+            "seven distinct SLD labels warn over the budget: {:?}",
+            loaded.warnings
+        );
 
-        // Exactly at the budget (serving + four related = five labels) loads but warns.
+        // Distinct registrable domains that share the multi-label suffix `co.uk` are
+        // counted by their SLD label, matching the browser: six `x.co.uk` are six
+        // labels (a..f), NOT the single label `co.uk`. Warns over the budget.
+        let couk = "[server]\npublic_url = \"https://a.co.uk\"\n\
+                    [oidc]\nwebauthn_rp_id = \"a.co.uk\"\n\
+                    webauthn_related_origins = [\
+                    \"https://b.co.uk\", \"https://c.co.uk\", \"https://d.co.uk\", \
+                    \"https://e.co.uk\", \"https://f.co.uk\"]\n";
+        let loaded = Config::from_toml_str(couk, "ironauth.toml").expect("six co.uk labels load");
+        assert!(
+            loaded.warnings.iter().any(|w| matches!(
+                w,
+                Warning::WebauthnRelatedOriginLabelBudget {
+                    count: 6,
+                    budget: 5
+                }
+            )),
+            "six distinct x.co.uk are six SLD labels, warning over budget: {:?}",
+            loaded.warnings
+        );
+
+        // Exactly at the budget (serving + four distinct brands = five labels) loads
+        // but warns (no headroom).
         let at = "[server]\npublic_url = \"https://auth.example.com\"\n\
                   [oidc]\nwebauthn_related_origins = [\
                   \"https://a.test\", \"https://b.test\", \"https://c.test\", \"https://d.test\"]\n";
@@ -3147,8 +3292,8 @@ mod tests {
             loaded.warnings
         );
 
-        // Multiple origins that share ONE registrable domain count as one label, so a
-        // large same-domain estate stays under budget.
+        // A valid small estate (multiple origins sharing ONE registrable domain count
+        // as one label) loads clean with no warning.
         let same_domain = "[server]\npublic_url = \"https://auth.example.com\"\n\
                            [oidc]\nwebauthn_related_origins = [\
                            \"https://app.example.com\", \"https://id.example.com\", \
@@ -3156,6 +3301,21 @@ mod tests {
         let loaded =
             Config::from_toml_str(same_domain, "ironauth.toml").expect("same registrable domain");
         assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
+    }
+
+    #[test]
+    fn registrable_domain_label_groups_by_sld_label() {
+        // One brand across ccTLDs shares a single SLD label.
+        assert_eq!(registrable_domain_label("auth.example.com"), "example");
+        assert_eq!(registrable_domain_label("example.de"), "example");
+        assert_eq!(registrable_domain_label("example.co.uk"), "example");
+        assert_eq!(registrable_domain_label("EXAMPLE.CO.UK."), "example");
+        // Distinct registrable domains under a shared multi-label suffix are distinct
+        // labels (co.uk is the suffix, not the label).
+        assert_eq!(registrable_domain_label("a.co.uk"), "a");
+        assert_eq!(registrable_domain_label("b.co.uk"), "b");
+        // A host that is itself a public suffix falls back to the whole host.
+        assert_eq!(registrable_domain_label("co.uk"), "co.uk");
     }
 
     #[test]

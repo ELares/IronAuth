@@ -91,10 +91,16 @@ non-enumerating ceremony error.
 
 Current browser implementations (Chrome 128+, Safari 18+) honor the
 `/.well-known/webauthn` document only up to about **five distinct registrable
-labels**, silently ignoring origins beyond that. The config enforces this: an estate
-(the serving origin plus related origins) whose distinct registrable-label count
-**exceeds** the budget is a boot error, and one that sits exactly **at** it emits a
-startup warning. Keep the estate within five registrable domains.
+labels**, silently ignoring origins beyond that. A browser groups origins by the SLD
+label of the registrable domain, so **one brand across many ccTLDs** (`example.com`,
+`example.de`, `example.co.uk`) is a **single** label, not one per domain. The config
+treats the budget as an **advisory soft-guard**: an estate (the serving origin plus
+related origins) whose distinct-label count reaches **or exceeds** the budget emits a
+startup **warning**, never a boot error (the browser is the real enforcer of its own
+cap, and a boot error would wrongly reject the valid multi-brand / ccTLD estate this
+feature exists to serve). The label count is a documented conservative approximation
+(a curated common multi-part-suffix table, not a full public-suffix-list dependency).
+Keep the estate within about five distinct registrable labels.
 
 ## The honest lock-in statement
 
