@@ -1612,9 +1612,12 @@ pub enum ScreeningProvider {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ScreeningFailurePolicy {
-    /// Allow the password (do not block the set) and emit an audit event. The safe
-    /// availability default: a screening-provider outage must not lock every user out of
-    /// setting a password.
+    /// Allow the password (do not block the set) and emit an audit event. The default, and
+    /// AVAILABILITY-BIASED: a screening-provider outage must not lock every user out of
+    /// setting a password, so under an outage a KNOWN-breached password can be accepted
+    /// (audited and detectable via the `fail_open` metric/log). For hard enforcement that
+    /// never accepts an unscreened password use `fail_closed`, or the `offline` provider
+    /// (an operator-supplied corpus is immune to an outbound-provider outage).
     #[default]
     FailOpen,
     /// Refuse the set until screening succeeds. The strict-compliance posture: a password
@@ -1696,8 +1699,13 @@ pub struct PasswordPolicyConfig {
     pub screening_provider: ScreeningProvider,
 
     /// What to do when the screening provider cannot answer: `fail_open` (allow the
-    /// password and emit an audit event, the safe availability default) or `fail_closed`
-    /// (refuse the set until screening succeeds).
+    /// password and emit an audit event) or `fail_closed` (refuse the set until screening
+    /// succeeds). The default (`fail_open`) is AVAILABILITY-BIASED: a HIBP outage lets a
+    /// known-breached password through (audited and detectable via the `fail_open`
+    /// metric/log), so a provider outage never locks every user out of setting a password.
+    /// For HARD enforcement that never accepts an unscreened password, set `fail_closed`, or
+    /// use the `offline` provider (an operator-supplied corpus is immune to an
+    /// outbound-provider outage).
     pub screening_failure_policy: ScreeningFailurePolicy,
 
     /// Screen the presented password at LOGIN too (issue #63), so a password that has

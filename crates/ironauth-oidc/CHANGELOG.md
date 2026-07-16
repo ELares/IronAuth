@@ -6,6 +6,23 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Breached-password screening adversarial-review fixes (issue #63). Closed a MEDIUM: the
+  invitation-accept password path (`accept_invitation`) now runs the SAME
+  evaluate-policy-then-screen-BEFORE-hash sequence as register and account change-password,
+  so an invitee who chooses their own password can no longer set a breached or
+  sub-15-code-point password on a real credential-set path (a breached or policy-violating
+  password is refused with a non-enumerating error and the pending user is not activated; a
+  passkey invitation is unaffected). Made on-login screening NON-BLOCKING: when
+  `screen_on_login` is enabled the (potentially outbound HIBP) screen is now spawned DETACHED
+  instead of awaited inline, so a slow or hung provider can no longer add latency to (or
+  stall) the login hot path; the detached task still emits the breached-at-login audit event
+  and metric and never changes the login outcome, and it clones only what it needs (never
+  logging the plaintext). Documented residuals: the `FactorContext::MfaFactor` 8-code-point
+  floor is inert until the MFA-enrollment context drives it; no password reset/recovery
+  surface exists yet (a future one must wire the same evaluate+screen-before-hash); screening
+  digests the NFKC-normalized (canonical stored) form while HIBP is raw-byte SHA-1; and the
+  `fail_open` default is availability-biased (use `fail_closed` or the offline corpus for
+  hard enforcement).
 - Breached-password screening and the NIST SP 800-63B-4 policy on set/change/login (issue
   #63). The register (set) and account change-password paths now, BEFORE any hash is
   computed, evaluate the 800-63B-4 policy (length in code points, sole-factor 15 by default;

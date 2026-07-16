@@ -431,9 +431,10 @@ pub async fn login_post(
                     .await;
                 // On-login breached detection (issue #63): when screen_on_login is enabled,
                 // screen the just-verified password and, if it is NOW breached, emit an
-                // audit event so a change can be required. Best-effort: it never blocks or
-                // changes this already-successful sign-in.
-                screen_after_login(&state, resume.scope, &user, password).await;
+                // audit event so a change can be required. Spawned DETACHED (the outbound
+                // HIBP call must not block the login hot path); it never blocks or changes
+                // this already-successful sign-in.
+                screen_after_login(&state, resume.scope, &user, password);
                 let actor = interaction::user_actor(&user.id);
                 let subject = user.id.to_string();
                 // The recorded authentication event: a password login (RFC 8176
@@ -523,21 +524,33 @@ pub async fn login_post(
 /// sign-in and never changes the login outcome. A not-breached verdict or a provider
 /// outage is a no-op (the forced-change surface lands with the hosted change-password page
 /// and M11 messaging). Only the 5-char SHA-1 prefix ever leaves the process.
-async fn screen_after_login(state: &OidcState, scope: Scope, user: &UserRecord, password: &str) {
+///
+/// The screen runs FULLY DETACHED (issue #63 INFO/LOW-2): the potentially outbound HIBP
+/// call must never sit on the login hot path, so a slow or hung provider cannot add latency
+/// to (or stall) sign-in. The detached task owns its clones (the cheaply cloneable
+/// `OidcState`, the `Copy` scope, the subject id, and the NFKC-normalized password) and
+/// carries its own audit/metric emission. It is fire-and-forget: the login has already
+/// succeeded, so a dropped task simply means this one login was not screened. The plaintext
+/// is normalized into an owned `String` and moved into the task; it is never logged.
+fn screen_after_login(state: &OidcState, scope: Scope, user: &UserRecord, password: &str) {
     if !state.screen_on_login() {
         return;
     }
+    let state = state.clone();
     let normalized = ironauth_screening::normalize_nfkc(password);
-    if let crate::state::ScreenDecision::Breached = state.screen_password(&scope, &normalized).await
-    {
-        metrics::counter!(crate::state::PASSWORD_BREACHED_AT_LOGIN_TOTAL).increment(1);
-        let subject = user.id.to_string();
-        tracing::warn!(
-            subject,
-            "a successful login used a password now found in the breach corpus; a password \
-             change should be required"
-        );
-    }
+    let subject = user.id.to_string();
+    tokio::spawn(async move {
+        if let crate::state::ScreenDecision::Breached =
+            state.screen_password(&scope, &normalized).await
+        {
+            metrics::counter!(crate::state::PASSWORD_BREACHED_AT_LOGIN_TOTAL).increment(1);
+            tracing::warn!(
+                subject,
+                "a successful login used a password now found in the breach corpus; a password \
+                 change should be required"
+            );
+        }
+    });
 }
 
 /// Transparently upgrade a user's stored credential after a successful login,

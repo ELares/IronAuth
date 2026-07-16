@@ -937,7 +937,7 @@
         "screening_failure_policy": {
           "$ref": "#/$defs/ScreeningFailurePolicy",
           "default": "fail_open",
-          "description": "What to do when the screening provider cannot answer: `fail_open` (allow the\npassword and emit an audit event, the safe availability default) or `fail_closed`\n(refuse the set until screening succeeds)."
+          "description": "What to do when the screening provider cannot answer: `fail_open` (allow the\npassword and emit an audit event) or `fail_closed` (refuse the set until screening\nsucceeds). The default (`fail_open`) is AVAILABILITY-BIASED: a HIBP outage lets a\nknown-breached password through (audited and detectable via the `fail_open`\nmetric/log), so a provider outage never locks every user out of setting a password.\nFor HARD enforcement that never accepts an unscreened password, set `fail_closed`, or\nuse the `offline` provider (an operator-supplied corpus is immune to an\noutbound-provider outage)."
         },
         "screening_provider": {
           "$ref": "#/$defs/ScreeningProvider",
@@ -1174,7 +1174,7 @@
       "oneOf": [
         {
           "const": "fail_open",
-          "description": "Allow the password (do not block the set) and emit an audit event. The safe\navailability default: a screening-provider outage must not lock every user out of\nsetting a password.",
+          "description": "Allow the password (do not block the set) and emit an audit event. The default, and\nAVAILABILITY-BIASED: a screening-provider outage must not lock every user out of\nsetting a password, so under an outage a KNOWN-breached password can be accepted\n(audited and detectable via the `fail_open` metric/log). For hard enforcement that\nnever accepts an unscreened password use `fail_closed`, or the `offline` provider\n(an operator-supplied corpus is immune to an outbound-provider outage).",
           "type": "string"
         },
         {

@@ -22,10 +22,14 @@ mod common;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
-use common::{Harness, ScreeningSetup, enc, form, location_param, set_cookie_pair};
+use common::{
+    Harness, ScreeningSetup, enc, form, form_field, location, location_param, set_cookie_pair,
+};
 use ironauth_screening::{
     BreachRange, BreachRangeProvider, FailurePolicy, PasswordPolicy, ProviderError, Sha1Digest,
     Sha1Prefix, digest_password,
@@ -393,4 +397,226 @@ async fn a_unicode_password_round_trips_nfkc_between_set_and_verify() {
         "the precomposed spelling verifies against the decomposed-set hash (NFKC once): {body}"
     );
     assert_eq!(body["changed"], json!(true));
+}
+
+// -- On-login screening (issue #63 criterion 6 + INFO/LOW-2) -----------------------------
+
+/// A screening provider that reports a fixed corpus as breached AND counts every range
+/// query, so a test can prove whether the on-login screen ran (the provider was called) or
+/// was skipped (zero calls) WITHOUT depending on process-global metrics. The call counter is
+/// a shared `Arc` so the test keeps a handle after the provider is boxed into the state.
+struct CountingProvider {
+    breached: Vec<Sha1Digest>,
+    calls: Arc<AtomicUsize>,
+}
+
+impl CountingProvider {
+    /// A provider reporting `passwords` as breached; returns it alongside a handle to its
+    /// call counter.
+    fn new(passwords: &[&str]) -> (Arc<Self>, Arc<AtomicUsize>) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = Arc::new(Self {
+            breached: passwords.iter().map(|p| digest_password(p)).collect(),
+            calls: Arc::clone(&calls),
+        });
+        (provider, calls)
+    }
+}
+
+impl BreachRangeProvider for CountingProvider {
+    fn range(
+        &self,
+        prefix: Sha1Prefix,
+    ) -> Pin<Box<dyn Future<Output = Result<BreachRange, ProviderError>> + Send + '_>> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let suffixes = self
+            .breached
+            .iter()
+            .filter(|digest| digest.prefix() == prefix)
+            .map(Sha1Digest::suffix)
+            .collect();
+        Box::pin(async move { Ok(BreachRange::new(suffixes)) })
+    }
+
+    fn label(&self) -> &'static str {
+        "counting-stub"
+    }
+}
+
+/// The screening setup for the on-login path: default policy, fail-open, `screen_on_login`
+/// toggled by the caller, and an injected counting provider.
+fn login_setup(provider: Arc<CountingProvider>, screen_on_login: bool) -> ScreeningSetup {
+    ScreeningSetup {
+        policy: PasswordPolicy::default(),
+        failure: FailurePolicy::FailOpen,
+        screen_on_login,
+        provider: Some(provider as Arc<dyn BreachRangeProvider>),
+    }
+}
+
+/// Drive `/authorize` -> `/login` GET and return the hidden `return_to` for a login POST
+/// (there is no session yet, so authorize redirects to the hosted login page).
+async fn login_return_to(harness: &Harness) -> String {
+    let client_id = harness.client_id().to_string();
+    let query = format!(
+        "response_type=code&client_id={client_id}&redirect_uri={}&scope={}&state=xyz&nonce=n-1&\
+         code_challenge={}&code_challenge_method=S256",
+        enc(common::REDIRECT_URI),
+        enc("openid profile"),
+        common::PKCE_CHALLENGE,
+    );
+    let (status, headers, _) = harness.authorize(&query).await;
+    assert_eq!(
+        status,
+        StatusCode::SEE_OTHER,
+        "authorize redirects to login"
+    );
+    let login_location = location(&headers).expect("login redirect");
+    let (_status, _headers, html) = harness.get_with_cookie(&login_location, None).await;
+    form_field(&html, "return_to").expect("login return_to")
+}
+
+/// POST `/login` with `identifier`/`password` against `return_to`.
+async fn login(
+    harness: &Harness,
+    identifier: &str,
+    password: &str,
+    return_to: &str,
+) -> (StatusCode, axum::http::HeaderMap, String) {
+    let body = form(&[
+        ("identifier", identifier),
+        ("password", password),
+        ("return_to", return_to),
+    ]);
+    harness.post_form("/login", &body, None).await
+}
+
+// A >= 15-code-point password that is NOW in the breach corpus but was fine when set (the
+// corpus grew), so it round-trips login yet trips the on-login screen.
+const NOW_BREACHED_PW: &str = "once-fine-now-breached-2026";
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn on_login_screening_flags_a_now_breached_password_without_blocking() {
+    // Issue #63 criterion 6: with screen_on_login ON, a login whose stored password has SINCE
+    // become breached SUCCEEDS (the on-login screen never blocks or changes the outcome) and
+    // fires the breached-at-login audit event/metric. The screen runs DETACHED (INFO/LOW-2),
+    // so it must not sit on the login hot path; the test observes it via the provider call
+    // count and the Prometheus metric AFTER the login has already returned.
+    let handle = metrics_exporter_prometheus::PrometheusBuilder::new()
+        .install_recorder()
+        .expect("no recorder installed yet in this test binary");
+    ironauth_oidc::describe_screening_metrics();
+
+    let (provider, calls) = CountingProvider::new(&[NOW_BREACHED_PW]);
+    let harness = Harness::start_store_backed_with_screening(
+        ironauth_config::OidcConfig::default(),
+        login_setup(provider, true),
+    )
+    .await;
+    // Seed the credential directly (bypassing set-time screening), simulating a password that
+    // was clean when set but is breached now.
+    harness
+        .seed_user("relogin@example.test", NOW_BREACHED_PW)
+        .await;
+
+    let return_to = login_return_to(&harness).await;
+    let (status, headers, body) = login(
+        &harness,
+        "relogin@example.test",
+        NOW_BREACHED_PW,
+        &return_to,
+    )
+    .await;
+    // The login SUCCEEDS and is never blocked by the (now-breached) on-login screen.
+    assert_eq!(
+        status,
+        StatusCode::SEE_OTHER,
+        "the login succeeds despite the now-breached password: {body}"
+    );
+    assert!(
+        set_cookie_pair(&headers).is_some(),
+        "a successful login sets a session cookie"
+    );
+
+    // The detached screen runs AFTER the response: poll until the provider was queried, which
+    // proves the screen executed off the hot path. Bounded so a regression cannot hang.
+    let ran = tokio::time::timeout(Duration::from_secs(5), async {
+        while calls.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert!(
+        ran.is_ok(),
+        "the detached on-login screen ran (provider queried)"
+    );
+
+    // The breached-at-login metric fired (the audit signal an operator keys a forced change
+    // off). Poll the exposition for the metric's SAMPLE line (not the HELP/TYPE comments)
+    // carrying a value >= 1; only this test increments it in this binary, so it is exactly 1.
+    let name = ironauth_oidc::PASSWORD_BREACHED_AT_LOGIN_TOTAL;
+    let fired = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if breached_at_login_value(&handle.render(), name) >= 1.0 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert!(
+        fired.is_ok(),
+        "the breached-at-login metric fired:\n{}",
+        handle.render()
+    );
+}
+
+/// The value of the (unlabeled) `name` counter in a Prometheus exposition, or 0.0 if it has
+/// not been recorded. Skips the `#`-prefixed HELP/TYPE comment lines and reads the trailing
+/// numeric token of the sample line.
+fn breached_at_login_value(text: &str, name: &str) -> f64 {
+    text.lines()
+        .filter(|line| !line.starts_with('#'))
+        .find_map(|line| {
+            let rest = line.strip_prefix(name)?;
+            // The sample line is `name value` (no labels on this counter).
+            rest.split_whitespace()
+                .next_back()
+                .and_then(|v| v.parse::<f64>().ok())
+        })
+        .unwrap_or(0.0)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn on_login_screening_does_not_run_when_the_flag_is_off() {
+    // Issue #63: with screen_on_login OFF, a login performs NO screening at all, even if the
+    // stored password is breached. Observed via the provider call count (per-provider, so it
+    // is robust under parallel tests): the provider is never queried on the login path.
+    let (provider, calls) = CountingProvider::new(&[NOW_BREACHED_PW]);
+    let harness = Harness::start_store_backed_with_screening(
+        ironauth_config::OidcConfig::default(),
+        login_setup(provider, false),
+    )
+    .await;
+    harness
+        .seed_user("noscan@example.test", NOW_BREACHED_PW)
+        .await;
+
+    let return_to = login_return_to(&harness).await;
+    let (status, headers, body) =
+        login(&harness, "noscan@example.test", NOW_BREACHED_PW, &return_to).await;
+    assert_eq!(status, StatusCode::SEE_OTHER, "the login succeeds: {body}");
+    assert!(
+        set_cookie_pair(&headers).is_some(),
+        "a successful login sets a session cookie"
+    );
+
+    // Give any (erroneously) spawned screen a chance to run, then assert the provider was
+    // NEVER queried: on-login screening is fully gated off.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "no on-login screening occurs when screen_on_login is off"
+    );
 }

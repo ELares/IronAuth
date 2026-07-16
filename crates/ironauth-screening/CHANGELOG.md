@@ -6,6 +6,10 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Documented the `FactorContext::MfaFactor` residual (issue #63 review): the 8-code-point
+  MFA floor is currently INERT because every shipped credential-set path evaluates as
+  `SoleFactor` (15, always 63B-4-compliant); it is wired as a policy input and activates when
+  the MFA-enrollment context drives an `MfaFactor` evaluation. Documentation only.
 - Initial breached-password screening and NIST SP 800-63B-4 password policy (issue #63).
   - K-anonymity screening core: `digest_password` computes the password's SHA-1 LOCALLY
     and splits it into a 5-character `Sha1Prefix` (the only part ever put on the wire) and

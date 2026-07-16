@@ -48,6 +48,13 @@ pub enum FactorContext {
     /// The password is the only authentication factor: the 15-character SHALL applies.
     SoleFactor,
     /// The password is one factor of an MFA: the 8-character floor is permitted.
+    ///
+    /// NOTE (issue #63 residual): this context is currently INERT on the shipped set/change
+    /// paths. Every credential-set surface today (register, account change-password,
+    /// invitation-accept) evaluates as [`FactorContext::SoleFactor`], whose 15 floor is
+    /// always 63B-4-compliant, so the 8-code-point MFA floor never relaxes anything yet. The
+    /// floor is wired here as a policy INPUT and activates only when the MFA-enrollment
+    /// context (#69/#65) drives an evaluation with `MfaFactor`.
     MfaFactor,
 }
 

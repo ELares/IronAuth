@@ -27,7 +27,11 @@
 //!   password (the Zitadel deep-link pattern): the flow contract activates the user
 //!   without a password and the concrete passkey ceremony wires in with the M7 factor
 //!   issues. A `password` invitation sets an Argon2id verifier through the #20 path;
-//!   the plaintext never reaches the store and is never logged.
+//!   the plaintext never reaches the store and is never logged. Because the invitee
+//!   CHOOSES that password, the accept path enforces the SAME 800-63B-4 policy and
+//!   MANDATORY breach screening as `register`/`change_password` (issue #63): a breached or
+//!   policy-violating password is refused BEFORE any hash, so an invitation is never a
+//!   bypass around the set-path screening covenant.
 //!
 //! # No CSRF check
 //!
@@ -110,6 +114,32 @@ pub async fn accept_invitation(
         if password.is_empty() {
             return password_required();
         }
+        // Invitation-accept is a credential SET path (issue #63), so it enforces the SAME
+        // evaluate-policy-then-screen-BEFORE-hash sequence as `register` and account
+        // `change_password`: a breached or policy-violating password must never reach a
+        // real credential. NFKC-normalize ONCE (the 800-63B-4 length check counted in code
+        // points and breach screening both operate on this form; the hash is derived from
+        // the same normalized form at the hashing seam, so a Unicode password round-trips).
+        let normalized = ironauth_screening::normalize_nfkc(password);
+        // 800-63B-4 policy: an invitee choosing their own password sets the SOLE
+        // authentication factor (15 code points by default, no composition unless a legacy
+        // tenant enabled it). A policy failure refuses BEFORE any hash is spent.
+        if let Err(rejection) = state
+            .password_policy()
+            .evaluate(&normalized, ironauth_screening::FactorContext::SoleFactor)
+        {
+            return password_rejected(&rejection.message());
+        }
+        // MANDATORY breached-password screening (issue #63) BEFORE any hash is computed:
+        // only the 5-char SHA-1 prefix leaves the process. A breached password is refused; a
+        // provider outage follows the configured fail-open (allow) or fail-closed (refuse)
+        // policy. These refusals are reachable ONLY after a valid token resolves, so they
+        // reveal no more than the accept flow already does (never a token-guessing oracle).
+        match state.screen_password(&scope, &normalized).await {
+            crate::state::ScreenDecision::Allowed => {}
+            crate::state::ScreenDecision::Breached => return breached_password(),
+            crate::state::ScreenDecision::RefusedUnavailable => return screening_unavailable(),
+        }
         // Hash THROUGH THE ADMISSION-CONTROLLED POOL (issue #62), never an inline
         // Argon2 on a protocol-I/O thread: this public endpoint must not be a
         // cross-tenant DoS lever. A pool shed surfaces the retryable 429/503.
@@ -183,6 +213,46 @@ fn password_required() -> Response {
         json!({
             "error": "password_required",
             "error_description": "This invitation enrolls a password; provide one to continue.",
+        }),
+    )
+}
+
+/// A `422` refusing an invitation password that failed the 800-63B-4 policy (issue #63),
+/// for example below the 15 code-point sole-factor floor. Reachable ONLY after a valid
+/// token resolves, so it reveals no more than the accept flow already does; the message is
+/// the policy's own non-enumerating text (the missed length/composition bound).
+fn password_rejected(message: &str) -> Response {
+    json_response(
+        StatusCode::UNPROCESSABLE_ENTITY,
+        json!({
+            "error": "weak_password",
+            "error_description": message,
+        }),
+    )
+}
+
+/// A `422` refusing an invitation password found in the breach corpus (issue #63), with the
+/// SAME non-enumerating message the register/change paths use. Reachable only after a valid
+/// token resolves.
+fn breached_password() -> Response {
+    json_response(
+        StatusCode::UNPROCESSABLE_ENTITY,
+        json!({
+            "error": "breached_password",
+            "error_description": crate::state::BREACHED_PASSWORD_MESSAGE,
+        }),
+    )
+}
+
+/// A `503` when breach screening could not run under a fail-closed policy (issue #63):
+/// retryable and non-specific, mirroring the register/change surfaces. Reachable only after
+/// a valid token resolves.
+fn screening_unavailable() -> Response {
+    json_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        json!({
+            "error": "screening_unavailable",
+            "error_description": crate::state::SCREENING_UNAVAILABLE_MESSAGE,
         }),
     )
 }

@@ -6,6 +6,10 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Clarified the `screening_failure_policy` documentation (issue #63 review): the default
+  `fail_open` is availability-biased and lets a known-breached password through during a
+  provider outage (audited/detectable); hard enforcement uses `fail_closed` or the offline
+  corpus provider. Documentation only; no schema or behavior change.
 - `[password_policy]` section and the `ScreeningProvider` / `ScreeningFailurePolicy` enums
   (breached-password screening and NIST SP 800-63B-4, issue #63). The shipped defaults are
   the modern 63B-4 posture: `min_length_sole_factor = 15` (SHALL), `min_length_mfa_factor =

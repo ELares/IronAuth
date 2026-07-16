@@ -831,6 +831,23 @@ impl OidcState {
     /// ever sent to the provider; the full password and hash never leave the process. Emits
     /// the screening metric and, on a fail-open provider outage, an audit log recording the
     /// unscreened acceptance.
+    ///
+    /// Two documented issue #63 residuals apply here:
+    ///
+    /// - **Canonical-form screening (NFKC vs HIBP raw bytes).** This screens the SHA-1 of the
+    ///   NFKC-normalized form, i.e. exactly the canonical form that is hashed and stored,
+    ///   while HIBP's corpus is raw-byte SHA-1. So a non-ASCII password whose RAW spelling is
+    ///   breached but whose NFKC form differs is not matched. Screening the canonical stored
+    ///   form is the intended, defensible behavior (it is the identity on ASCII, where the
+    ///   overwhelming majority of breach-corpus entries live, and it keeps set/verify/screen
+    ///   consistent on one normalized form).
+    /// - **Fail-open default is availability-biased.** Under the default `fail_open` failure
+    ///   policy an HIBP outage lets a KNOWN-breached password through (audited and detectable
+    ///   via the `fail_open` metric/log). This is the issue's deliberate configurable
+    ///   tradeoff: the offline corpus provider is immune to the outage, and hard enforcement
+    ///   is available by setting `fail_closed`. A future password RESET/RECOVERY surface
+    ///   ("reset" is vacuously satisfied today, no such surface exists) MUST route through
+    ///   this same evaluate-policy-then-screen-before-hash sequence.
     pub(crate) async fn screen_password(&self, scope: &Scope, normalized: &str) -> ScreenDecision {
         use ironauth_screening::{FailurePolicy, ScreenOutcome, Screener};
 
