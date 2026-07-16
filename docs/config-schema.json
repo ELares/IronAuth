@@ -783,6 +783,14 @@
           "description": "Whether the WebAuthn passkey ceremony endpoints are mounted and the hosted\nlogin page offers conditional-UI passkey sign-in (issue #65). On by default:\npasskeys are the headline primary credential for the platform. When on,\ndiscovery advertises the ceremony endpoints and the passkey `phr`/`phrh`\nACRs are achievable.",
           "type": "boolean"
         },
+        "webauthn_related_origins": {
+          "default": [],
+          "description": "The additional origins permitted to run a WebAuthn ceremony for this\nenvironment's RP ID (issue #67, WebAuthn Level 3 Related Origin Requests).\nThe serving origin is ALWAYS permitted implicitly; this list adds the OTHER\norigins, including ones on a different registrable domain (a multi-brand or\nccTLD estate: `example.com`, `example.de`, `brand2.com`), which the standard\nregistrable-suffix rule would reject. The platform publishes these at\n`GET /.well-known/webauthn` as `{\"origins\": [...]}` so a browser that\nsupports related origin requests (Chrome 128+, Safari 18+) accepts an\nassertion from a listed origin against the RP ID. Each entry must be a\nwell-formed https origin (`scheme://host[:port]`, no path), validated at\nSTARTUP; a malformed entry is a boot-time [`ConfigError::Invalid`]. Browsers\ncap the document at about five distinct registrable labels; the label budget\nis ADVISORY (the browser is the real enforcer of its own cap), so a list whose\ndistinct-label count reaches OR exceeds that budget emits a [`Warning`] rather\nthan failing startup (an over-budget boot error would wrongly reject a valid\none-brand-many-ccTLD estate, which counts as a single label to a browser).\nUnlike the RP ID, a related origin need NOT be a\nregistrable-suffix of the RP ID (that cross-domain reach is the whole point);\nthe authorization is this explicit, operator-controlled list served from the\nRP ID's own domain. Empty by default (single-origin deployments serve no\nrelated-origins document and 404 the well-known path).",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
         "webauthn_require_user_verification": {
           "default": true,
           "description": "Whether a WebAuthn ceremony requires user verification (issue #65). On by\ndefault. Phishing resistance comes from WebAuthn's origin binding, which every\nceremony has, so the `phr`/`phrh` ACRs do NOT require user verification; what\nuser verification governs is the `amr` (a UV assertion additionally carries\n`mfa`, since the possession of the key plus the verification are two factors,\nwhile a user-presence-only assertion does not). Turning it off allows\nuser-presence-only assertions (not recommended).",
@@ -1325,6 +1333,7 @@
         "webauthn_challenge_ttl_secs": 300,
         "webauthn_clone_detection_block": false,
         "webauthn_enabled": true,
+        "webauthn_related_origins": [],
         "webauthn_require_user_verification": true,
         "webauthn_rp_id": null
       },

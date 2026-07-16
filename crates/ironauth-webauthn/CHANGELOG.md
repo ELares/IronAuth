@@ -6,6 +6,12 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Related-origin coverage (issue #67): a `client_data` test documents that with the
+  serving origin AND a related origin in the allowed set, a ceremony from either
+  verifies while an unlisted origin still fails with `OriginMismatch`. No code change:
+  `validate_client_data`/`VerificationParams` already take the full `allowed_origins`
+  slice, so WebAuthn Level 3 Related Origin Requests is served entirely by the caller
+  (ironauth-oidc) widening that set; the RP-ID-hash and signature checks are untouched.
 - RSA modulus floor at registration (issue #65 review hardening): an RS256 COSE key
   whose modulus is outside 2048..=8192 bits is now rejected when the credential is
   parsed. `ring` rejects such a key at verify time, so a sub-2048-bit key would have

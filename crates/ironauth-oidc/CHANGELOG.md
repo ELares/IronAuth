@@ -47,6 +47,34 @@ range per docs/RELEASING.md.
   contract for resource servers is documented in `docs/design/step-up-authentication.md`, with
   a minimal sample resource server (`examples/step_up_resource_server.rs`) and an integration
   suite that drives the full round trip (challenge, re-authorization, real step-up, acceptance).
+- WebAuthn Related Origin Requests (issue #67, WebAuthn Level 3): a new
+  `GET /.well-known/webauthn` endpoint serving the `{"origins": [...]}` document, and
+  related-origin acceptance in the passkey ceremony. The document is generated from
+  live per-environment config at request time (never a baked static asset), served as
+  `application/json` with the shared well-known cache discipline (an explicit
+  `Cache-Control` plus a strong `ETag` and `304` on a matching `If-None-Match`), and a
+  uniform `404` when the feature is unconfigured (WebAuthn disabled or no related
+  origins). `OidcState::webauthn_relying_party` now returns the serving origin plus the
+  configured related origins as the accepted origin set, and a new
+  `webauthn_related_origins_document` renders the well-known body. This BROADENS ONLY
+  the accepted origin set: the RP-ID-hash, the assertion signature, and the single-use
+  challenge checks are unchanged, so an assertion from a listed related origin verifies
+  end to end while an unlisted origin still fails with the uniform non-enumerating
+  ceremony error. A related-origin ceremony is a legitimately cross-site POST, so the
+  four ceremony endpoints now guard with the new `interaction::related_origin_ok`
+  (accept a request whose browser-set, script-unforgeable `Origin` is in the operator
+  allowlist) instead of the strict same-origin check; the passkey management endpoints
+  stay strictly same-origin. Without a usable `Origin`, `related_origin_ok` now FAILS
+  CLOSED: it admits a request only on a positive, unforgeable `Sec-Fetch-Site:
+  same-origin` signal, so a fully header-less ceremony request is refused (issue #67
+  review, acceptance criterion 2); the legitimate related-origin flow (which always
+  carries a real `Origin`) and the `#196` bootstrap `same_origin_ok` path are
+  unchanged. RP ID continuity is documented in
+  `docs/design/PASSKEY-RP-ID-MIGRATION.md` and proven end to end by a ceremony-layer
+  domain-cutover test (acceptance criterion 5): a passkey registered while the server
+  is host A still verifies after the serving host cuts over to host B under the same
+  stable RP ID, since the authData RP-ID-hash is `sha256(rp_id)`, independent of the
+  serving host.
 - Credential-abuse defenses (issue #64): a new `abuse` module with the counter INTERFACE
   (`CounterStore` trait + in-process L1 `MemoryCounterStore`, shaped so an optional
   IronCache L2 slots in behind the same trait later), the risk-based escalation

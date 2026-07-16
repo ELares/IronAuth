@@ -129,6 +129,33 @@ mod tests {
     }
 
     #[test]
+    fn accepts_a_listed_related_origin_and_rejects_an_unlisted_one() {
+        // WebAuthn Related Origin Requests (issue #67): with the serving origin AND a
+        // related origin in the allowed set, a ceremony from EITHER verifies, while an
+        // origin outside the set still fails with OriginMismatch. This is the whole of
+        // the origin-set widening at the core; the RP-ID-hash and signature live in
+        // verify.rs and are unchanged.
+        let origins = vec![
+            "https://auth.example.test".to_string(),
+            "https://example.de".to_string(),
+        ];
+        let related = client_json(TYPE_GET, b"c", "https://example.de");
+        assert_eq!(
+            validate_client_data(&related, TYPE_GET, b"c", &origins)
+                .unwrap()
+                .origin,
+            "https://example.de"
+        );
+        let serving = client_json(TYPE_GET, b"c", "https://auth.example.test");
+        assert!(validate_client_data(&serving, TYPE_GET, b"c", &origins).is_ok());
+        let unlisted = client_json(TYPE_GET, b"c", "https://brand2.com");
+        assert_eq!(
+            validate_client_data(&unlisted, TYPE_GET, b"c", &origins),
+            Err(CeremonyError::OriginMismatch)
+        );
+    }
+
+    #[test]
     fn rejects_foreign_origin() {
         let origins = vec!["https://auth.example.test".to_string()];
         let json = client_json(TYPE_GET, b"c", "https://evil.example.test");

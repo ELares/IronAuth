@@ -807,6 +807,26 @@ impl Harness {
         oidc_router(state)
     }
 
+    /// Build a protocol router over the SAME database, environment, and issuer
+    /// registry but a DIFFERENT serving origin and config (issue #67 RP-ID continuity).
+    /// A test registers a passkey while the server is host A, then reissues the ceremony
+    /// after "cutting over" to host B, with the credential persisting in the shared
+    /// database. The RP ID is set by `config.webauthn_rp_id` INDEPENDENT of the serving
+    /// host, which is exactly what makes the passkey survive the hostname change. The
+    /// data-plane store is the harness's own master-key-wired store (cloned, so it shares
+    /// the same pool and rows), so credential registration and session establishment
+    /// seal and open PII compatibly.
+    pub fn serving_router(&self, config: &OidcConfig, serving_origin: &str) -> Router {
+        let state = OidcState::new(
+            self.db.store().clone(),
+            self.env.clone(),
+            Arc::clone(&self.registry),
+            config,
+            serving_origin,
+        );
+        oidc_router(state)
+    }
+
     /// Install a dedicated Argon2id hashing pool (issue #62) on the state and
     /// rebuild the protocol router, so the public hashing surfaces (login,
     /// register, account, device-flow verify, invitation accept) route through the
