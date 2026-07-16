@@ -17,20 +17,75 @@
 
 mod common;
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
-use common::Harness;
+use common::{Harness, ScreeningSetup};
 use ironauth_config::{QuotaConfig, ScopeQuotaConfig};
 use ironauth_oidc::{Argon2Params, HashingPool};
 use ironauth_quota::QuotaEnforcer;
+use ironauth_screening::{
+    BreachRange, BreachRangeProvider, FailurePolicy, PasswordPolicy, ProviderError, Sha1Digest,
+    Sha1Prefix, digest_password,
+};
 use ironauth_store::{
     CorrelationId, InvitationCredentialType, MintedInvitationToken, NewAdminUser, NewInvitation,
     Scope, UserId, UserState, mint_invitation_token,
 };
 use serde_json::Value;
+
+/// A stub k-anonymity screening provider (never the real HIBP API): it reports a fixed set
+/// of passwords as breached, driving the invitation-accept screening wiring faithfully.
+struct StubProvider {
+    breached: Vec<Sha1Digest>,
+}
+
+impl StubProvider {
+    fn corpus(passwords: &[&str]) -> Self {
+        Self {
+            breached: passwords.iter().map(|p| digest_password(p)).collect(),
+        }
+    }
+}
+
+impl BreachRangeProvider for StubProvider {
+    fn range(
+        &self,
+        prefix: Sha1Prefix,
+    ) -> Pin<Box<dyn Future<Output = Result<BreachRange, ProviderError>> + Send + '_>> {
+        let suffixes = self
+            .breached
+            .iter()
+            .filter(|digest| digest.prefix() == prefix)
+            .map(Sha1Digest::suffix)
+            .collect();
+        Box::pin(async move { Ok(BreachRange::new(suffixes)) })
+    }
+
+    fn label(&self) -> &'static str {
+        "stub"
+    }
+}
+
+/// The default 800-63B-4 policy plus an injected screening provider, fail-open.
+fn screening(provider: StubProvider) -> ScreeningSetup {
+    ScreeningSetup {
+        policy: PasswordPolicy::default(),
+        failure: FailurePolicy::FailOpen,
+        screen_on_login: false,
+        provider: Some(Arc::new(provider) as Arc<dyn BreachRangeProvider>),
+    }
+}
+
+// A >= 15-code-point password used as a "breached" fixture (long enough to clear the length
+// floor, so a rejection is attributable to SCREENING, not to policy).
+const BREACHED_PW: &str = "Breached-Passphrase-2026";
+// A clean >= 15-code-point passphrase absent from the stub corpus.
+const CLEAN_PW: &str = "a-fresh-unbreached-passphrase-2026";
 
 /// The current clock-seam time in microseconds since the Unix epoch.
 fn now_micros(harness: &Harness) -> i64 {
@@ -376,11 +431,13 @@ async fn a_token_cannot_be_accepted_at_another_tenants_path() {
         "A's user is untouched by the cross-tenant accept attempt"
     );
 
-    // A's token still works at A's own path (isolation is directional).
+    // A's token still works at A's own path (isolation is directional). A compliant,
+    // non-breached 800-63B-4 password (>= 15 code points), since the accept path now
+    // evaluates policy and screens before hashing (issue #63).
     let (ok_status, ok_body) = accept(
         &harness,
         &accept_path(scope_a),
-        &serde_json::json!({ "token": token_a, "password": "x" }),
+        &serde_json::json!({ "token": token_a, "password": "correct horse battery staple" }),
     )
     .await;
     assert_eq!(ok_status, StatusCode::OK, "own-path accept: {ok_body}");
@@ -482,4 +539,139 @@ async fn invitation_accept_hashing_is_admission_controlled() {
         "the second accept is admission-shed (429), proving it is not an inline hash: {second_body}"
     );
     assert_eq!(second_body["error"], "rate_limited");
+}
+
+#[tokio::test]
+async fn a_breached_password_invitation_is_refused_without_activating() {
+    // Issue #63 MEDIUM-1 regression: the invitation-accept password path is a credential SET
+    // path and MUST screen. An invitee who chooses a breached password is REFUSED and the
+    // pending user is NOT activated (a breach on a real credential-set path is a bypass of
+    // the mandatory-screening covenant).
+    let harness = Harness::start_store_backed_with_screening(
+        ironauth_config::OidcConfig::default(),
+        screening(StubProvider::corpus(&[BREACHED_PW])),
+    )
+    .await;
+    let scope = harness.scope();
+    let (user_id, token) = create_invitation(
+        &harness,
+        scope,
+        "breach-inv@example.test",
+        InvitationCredentialType::Password,
+        1_000_000_000,
+    )
+    .await;
+
+    let (status, body) = accept(
+        &harness,
+        &accept_path(scope),
+        &serde_json::json!({ "token": token, "password": BREACHED_PW }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "a breached invitation password is refused: {body}"
+    );
+    assert_eq!(body["error"], "breached_password");
+    assert_eq!(
+        user_state(&harness, scope, &user_id).await,
+        UserState::PendingVerification,
+        "a refused accept never activates the user"
+    );
+
+    // The token was NOT consumed by the refused attempt: a CLEAN password now accepts and
+    // activates (proving the refusal is pre-hash, not a spent-token failure).
+    let (ok_status, ok_body) = accept(
+        &harness,
+        &accept_path(scope),
+        &serde_json::json!({ "token": token, "password": CLEAN_PW }),
+    )
+    .await;
+    assert_eq!(ok_status, StatusCode::OK, "clean retry accepts: {ok_body}");
+    assert_eq!(
+        user_state(&harness, scope, &user_id).await,
+        UserState::Active
+    );
+}
+
+#[tokio::test]
+async fn a_too_short_password_invitation_is_refused_by_the_63b4_floor() {
+    // Issue #63 MEDIUM-1 regression: the invitation-accept path enforces the 800-63B-4
+    // sole-factor length floor (15 code points) before any hash. A trivially short password
+    // (e.g. 1 char) is refused by policy and the user stays pending.
+    let harness = Harness::start_store_backed_with_screening(
+        ironauth_config::OidcConfig::default(),
+        screening(StubProvider::corpus(&[])),
+    )
+    .await;
+    let scope = harness.scope();
+    let (user_id, token) = create_invitation(
+        &harness,
+        scope,
+        "short-inv@example.test",
+        InvitationCredentialType::Password,
+        1_000_000_000,
+    )
+    .await;
+
+    let (status, body) = accept(
+        &harness,
+        &accept_path(scope),
+        &serde_json::json!({ "token": token, "password": "x" }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "a too-short invitation password is refused: {body}"
+    );
+    assert_eq!(body["error"], "weak_password");
+    assert!(
+        body["error_description"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("at least 15"),
+        "the 15 code-point floor message is shown: {body}"
+    );
+    assert_eq!(
+        user_state(&harness, scope, &user_id).await,
+        UserState::PendingVerification,
+        "a policy-refused accept never activates the user"
+    );
+}
+
+#[tokio::test]
+async fn a_compliant_non_breached_password_invitation_activates_the_user() {
+    // Issue #63 MEDIUM-1 regression: a policy-compliant, non-breached password passes the
+    // evaluate-then-screen gate and activates the invited user (the happy path still works
+    // once screening/policy are wired into the accept flow).
+    let harness = Harness::start_store_backed_with_screening(
+        ironauth_config::OidcConfig::default(),
+        screening(StubProvider::corpus(&[BREACHED_PW])),
+    )
+    .await;
+    let scope = harness.scope();
+    let (user_id, token) = create_invitation(
+        &harness,
+        scope,
+        "clean-inv@example.test",
+        InvitationCredentialType::Password,
+        1_000_000_000,
+    )
+    .await;
+
+    let (status, body) = accept(
+        &harness,
+        &accept_path(scope),
+        &serde_json::json!({ "token": token, "password": CLEAN_PW }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "compliant accept: {body}");
+    assert_eq!(body["accepted"], true);
+    assert_eq!(body["credential_type"], "password");
+    assert_eq!(
+        user_state(&harness, scope, &user_id).await,
+        UserState::Active
+    );
 }

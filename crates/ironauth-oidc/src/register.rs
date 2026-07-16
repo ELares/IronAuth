@@ -22,11 +22,6 @@ use crate::pages;
 use crate::state::OidcState;
 use crate::util::epoch_micros;
 
-/// The minimum bootstrap password length. The full password policy (breach
-/// screening, composition, and the rest) is M7; the bootstrap enforces only a
-/// floor so a trivially short password cannot be registered.
-const MIN_PASSWORD_LEN: usize = 8;
-
 /// The posted registration form.
 #[derive(Deserialize)]
 pub struct RegisterForm {
@@ -173,14 +168,49 @@ pub async fn register_post(
             banner,
         );
     }
-    if password.len() < MIN_PASSWORD_LEN {
+    // NFKC-normalize ONCE (issue #63): the 800-63B-4 length check (counted in code
+    // points) and breach screening both operate on the normalized form, and the hash is
+    // derived from the same normalized form, so a Unicode password round-trips.
+    let normalized = ironauth_screening::normalize_nfkc(password);
+    // 800-63B-4 policy: a registration password is the SOLE authentication factor (15
+    // code points by default, no composition unless a legacy tenant enabled it). A policy
+    // failure re-renders the form with a clear, non-enumerating message; NO hash is spent.
+    if let Err(rejection) = state
+        .password_policy()
+        .evaluate(&normalized, ironauth_screening::FactorContext::SoleFactor)
+    {
         return register_error(
             identifier,
             &resume.return_to,
-            "The password must be at least 8 characters.",
+            &rejection.message(),
             &resume.hints,
             banner,
         );
+    }
+    // MANDATORY breached-password screening (issue #63) BEFORE any hash is computed: only
+    // the 5-char SHA-1 prefix leaves the process. A breached password is refused; a
+    // provider outage follows the configured fail-open (allow + audit) or fail-closed
+    // (refuse) policy.
+    match state.screen_password(&resume.scope, &normalized).await {
+        crate::state::ScreenDecision::Allowed => {}
+        crate::state::ScreenDecision::Breached => {
+            return register_error(
+                identifier,
+                &resume.return_to,
+                crate::state::BREACHED_PASSWORD_MESSAGE,
+                &resume.hints,
+                banner,
+            );
+        }
+        crate::state::ScreenDecision::RefusedUnavailable => {
+            return register_error(
+                identifier,
+                &resume.return_to,
+                crate::state::SCREENING_UNAVAILABLE_MESSAGE,
+                &resume.hints,
+                banner,
+            );
+        }
     }
 
     // Hash through the dedicated, admission-controlled pool (issue #62), off the

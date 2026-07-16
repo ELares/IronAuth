@@ -110,6 +110,71 @@ pub enum ResourceTargetError {
     ServerError,
 }
 
+/// Breached-password screening outcomes, labeled by `outcome` (issue #63):
+/// `not_breached`, `breached`, `fail_open` (a provider outage allowed under fail-open,
+/// an audited unscreened acceptance), or `fail_closed` (a provider outage refused).
+pub const PASSWORD_SCREEN_TOTAL: &str = "ironauth_password_screen_total";
+
+/// A count of successful logins whose password was found BREACHED by the on-login screen
+/// (issue #63): the now-compromised-credential signal. Each increment is also a
+/// structured audit log naming the subject, so an operator can require a change.
+pub const PASSWORD_BREACHED_AT_LOGIN_TOTAL: &str = "ironauth_password_breached_at_login_total";
+
+/// The non-enumerating message shown when a password is refused for being in the breach
+/// corpus (issue #63). It names the reason ("a known data breach") without revealing the
+/// corpus, the provider, or anything account-specific.
+pub(crate) const BREACHED_PASSWORD_MESSAGE: &str = "That password has appeared in a known data breach and cannot be used. Choose a \
+     different password.";
+
+/// The message shown when screening is refused under a fail-closed policy because the
+/// provider was unavailable (issue #63): a retryable, non-specific server-side message.
+pub(crate) const SCREENING_UNAVAILABLE_MESSAGE: &str = "We could not check your password against the breach corpus right now. Please try \
+     again in a moment.";
+
+/// The decision a breached-password screen yields for the set/change/reset paths (issue
+/// #63): the password is allowed (not breached, screening disabled, or a fail-open
+/// outage that was audited), rejected as breached, or refused because the provider was
+/// unavailable under a fail-closed policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ScreenDecision {
+    /// The password may be set: it is not breached, or screening is disabled, or a
+    /// fail-open provider outage was audited and allowed.
+    Allowed,
+    /// The password is present in the breach corpus: reject the set.
+    Breached,
+    /// The provider could not answer and the policy is fail-closed: refuse the set until
+    /// screening succeeds.
+    RefusedUnavailable,
+}
+
+/// Register the screening metric description, mirroring the server's metrics-describe
+/// pattern. Safe to call after the recorder is installed; a no-op with no recorder.
+pub fn describe_screening_metrics() {
+    metrics::describe_counter!(
+        PASSWORD_SCREEN_TOTAL,
+        "Breached-password screening outcomes by outcome \
+         (not_breached/breached/fail_open/fail_closed)"
+    );
+    metrics::describe_counter!(
+        PASSWORD_BREACHED_AT_LOGIN_TOTAL,
+        "Successful logins whose password was found breached by the on-login screen"
+    );
+}
+
+/// Record the audit event for a fail-open screening acceptance (issue #63): the password
+/// was accepted WITHOUT a successful screen because the provider was unavailable and the
+/// policy is fail-open. A bounded metric plus a structured log, matching the platform's
+/// other observable security events.
+fn audit_screening_fail_open(scope: &Scope, provider: &str) {
+    metrics::counter!(PASSWORD_SCREEN_TOTAL, "outcome" => "fail_open").increment(1);
+    tracing::warn!(
+        tenant = %scope.tenant(),
+        environment = %scope.environment(),
+        provider,
+        "breach screening provider unavailable; failing open (password allowed unscreened)"
+    );
+}
+
 /// Cheaply cloneable state shared by every OIDC handler.
 #[derive(Clone)]
 pub struct OidcState {
@@ -167,6 +232,29 @@ pub struct OidcState {
     // Default: the no-op NullVerificationSender (no transport wired yet), so the
     // closed-registration acknowledgment is identical whether or not a send goes out.
     verification_sender: Arc<dyn crate::verification::VerificationSender>,
+    // The resolved NIST SP 800-63B-4 password policy (issue #63): length floors, the
+    // composition/rotation legacy overrides, and whether screening is enabled. Kept
+    // OUTSIDE `Inner` and installed by the boot path from the top-level `[password_policy]`
+    // config via `with_password_policy` (like the hashing pool from `[password_hashing]`).
+    // Default: the shipped 63B-4 posture (`PasswordPolicy::default`), so a state built
+    // without the builder still enforces the modern length/no-composition defaults.
+    password_policy: ironauth_screening::PasswordPolicy,
+    // What to do when the screening provider cannot answer (issue #63): fail-open (allow
+    // and audit) or fail-closed (refuse). Config-derived, installed alongside the policy.
+    screening_failure: ironauth_screening::FailurePolicy,
+    // Whether to screen the presented password at LOGIN too (issue #63), so a
+    // now-breached password is detected on the next sign-in. Default false (no per-login
+    // outbound call); the boot path sets it from config.
+    screen_on_login: bool,
+    // The installed breached-password screening provider (issue #63): the online HIBP
+    // range provider or the offline corpus provider, both behind the k-anonymity
+    // `BreachRangeProvider` interface. Kept OUTSIDE `Inner` and installed by the boot path
+    // (the HIBP provider needs a fetcher). Default: `None`. When screening is enabled in
+    // policy but no provider is installed, screening treats the provider as unavailable and
+    // applies the fail-open/closed policy, so the mandatory-screening default never
+    // silently no-ops. The many DB-only OIDC tests install a stub provider to drive the
+    // breached/clean/fail paths deterministically without the network.
+    breach_provider: Option<Arc<dyn ironauth_screening::BreachRangeProvider>>,
 }
 
 // The per-environment policy flags each mirror an independent, individually
@@ -493,6 +581,10 @@ impl OidcState {
             hashing_pool: None,
             abuse_counters: Arc::new(crate::abuse::MemoryCounterStore::new()),
             verification_sender: Arc::new(crate::verification::NullVerificationSender),
+            password_policy: ironauth_screening::PasswordPolicy::default(),
+            screening_failure: ironauth_screening::FailurePolicy::FailOpen,
+            screen_on_login: false,
+            breach_provider: None,
         }
     }
 
@@ -614,11 +706,15 @@ impl OidcState {
         scope: &Scope,
         password: &str,
     ) -> Result<String, crate::hashing_pool::HashRejection> {
+        // NFKC-normalize ONCE at the hashing seam (issue #63): the stored verifier is
+        // derived from the normalized form, and verify normalizes identically, so a
+        // Unicode password round-trips (63B-4: NFKC applied once, consistent set/verify).
+        // NFKC is identity on ASCII, so existing ASCII passwords are unaffected.
+        let password = ironauth_screening::normalize_nfkc(password);
         if let Some(pool) = &self.hashing_pool {
-            return pool.hash(scope, password).await;
+            return pool.hash(scope, &password).await;
         }
         let env = self.env().clone();
-        let password = password.to_owned();
         bounded_inline(move || crate::password::hash_password(&env, &password))
             .await?
             .map_err(|_| crate::hashing_pool::HashRejection::Unavailable)
@@ -638,10 +734,12 @@ impl OidcState {
         password: &str,
         hash: &str,
     ) -> Result<bool, crate::hashing_pool::HashRejection> {
+        // Verify against the SAME NFKC-normalized form the stored verifier was minted from
+        // (issue #63), so a Unicode password verifies. Identity on ASCII.
+        let password = ironauth_screening::normalize_nfkc(password);
         if let Some(pool) = &self.hashing_pool {
-            return pool.verify(scope, password, hash).await;
+            return pool.verify(scope, &password, hash).await;
         }
-        let password = password.to_owned();
         let hash = hash.to_owned();
         bounded_inline(move || crate::password::verify_password(&password, &hash)).await
     }
@@ -658,10 +756,12 @@ impl OidcState {
         scope: &Scope,
         password: &str,
     ) -> Result<bool, crate::hashing_pool::HashRejection> {
+        // Normalize identically to the present-account verify path (issue #63) so an
+        // absent account is timing-symmetric with a present one on the same input.
+        let password = ironauth_screening::normalize_nfkc(password);
         if let Some(pool) = &self.hashing_pool {
-            return pool.verify_absent(scope, password).await;
+            return pool.verify_absent(scope, &password).await;
         }
-        let password = password.to_owned();
         bounded_inline(move || crate::password::verify_absent(&password)).await
     }
 
@@ -692,6 +792,119 @@ impl OidcState {
     ) -> Self {
         self.verification_sender = sender;
         self
+    }
+
+    /// Install the resolved NIST SP 800-63B-4 password policy (issue #63): the length
+    /// floors and any legacy composition/rotation overrides, the provider-failure policy
+    /// (fail-open/closed), and whether to screen at login. The boot path builds these from
+    /// the top-level `[password_policy]` config; a test installs a policy to drive the
+    /// length/composition/deviation and fail-open/closed paths. With no policy installed
+    /// the state uses the shipped 63B-4 defaults.
+    #[must_use]
+    pub fn with_password_policy(
+        mut self,
+        policy: ironauth_screening::PasswordPolicy,
+        on_provider_failure: ironauth_screening::FailurePolicy,
+        screen_on_login: bool,
+    ) -> Self {
+        self.password_policy = policy;
+        self.screening_failure = on_provider_failure;
+        self.screen_on_login = screen_on_login;
+        self
+    }
+
+    /// Install the breached-password screening provider (issue #63): the online HIBP range
+    /// provider or the offline corpus provider, both behind the k-anonymity
+    /// [`BreachRangeProvider`](ironauth_screening::BreachRangeProvider) interface. The boot
+    /// path builds one from `[password_policy]` (the HIBP provider needs a fetcher; the
+    /// offline provider loads the corpus file); a test installs a stub provider to drive
+    /// the breached / clean / provider-failure paths without the network. With no provider
+    /// installed and screening enabled in policy, screening treats the provider as
+    /// unavailable and applies the fail-open/closed policy.
+    #[must_use]
+    pub fn with_breach_provider(
+        mut self,
+        provider: Arc<dyn ironauth_screening::BreachRangeProvider>,
+    ) -> Self {
+        self.breach_provider = Some(provider);
+        self
+    }
+
+    /// The resolved 800-63B-4 password policy (issue #63): the length floors, the
+    /// composition/rotation legacy settings, and the deviation annotations.
+    #[must_use]
+    pub(crate) fn password_policy(&self) -> &ironauth_screening::PasswordPolicy {
+        &self.password_policy
+    }
+
+    /// Whether to screen the presented password at login (issue #63).
+    #[must_use]
+    pub(crate) fn screen_on_login(&self) -> bool {
+        self.screen_on_login
+    }
+
+    /// Screen a NFKC-normalized `normalized` password against the installed provider under
+    /// the configured fail-open/closed policy (issue #63). Only the 5-char SHA-1 prefix is
+    /// ever sent to the provider; the full password and hash never leave the process. Emits
+    /// the screening metric and, on a fail-open provider outage, an audit log recording the
+    /// unscreened acceptance.
+    ///
+    /// Two documented issue #63 residuals apply here:
+    ///
+    /// - **Canonical-form screening (NFKC vs HIBP raw bytes).** This screens the SHA-1 of the
+    ///   NFKC-normalized form, i.e. exactly the canonical form that is hashed and stored,
+    ///   while HIBP's corpus is raw-byte SHA-1. So a non-ASCII password whose RAW spelling is
+    ///   breached but whose NFKC form differs is not matched. Screening the canonical stored
+    ///   form is the intended, defensible behavior (it is the identity on ASCII, where the
+    ///   overwhelming majority of breach-corpus entries live, and it keeps set/verify/screen
+    ///   consistent on one normalized form).
+    /// - **Fail-open default is availability-biased.** Under the default `fail_open` failure
+    ///   policy an HIBP outage lets a KNOWN-breached password through (audited and detectable
+    ///   via the `fail_open` metric/log). This is the issue's deliberate configurable
+    ///   tradeoff: the offline corpus provider is immune to the outage, and hard enforcement
+    ///   is available by setting `fail_closed`. A future password RESET/RECOVERY surface
+    ///   ("reset" is vacuously satisfied today, no such surface exists) MUST route through
+    ///   this same evaluate-policy-then-screen-before-hash sequence.
+    pub(crate) async fn screen_password(&self, scope: &Scope, normalized: &str) -> ScreenDecision {
+        use ironauth_screening::{FailurePolicy, ScreenOutcome, Screener};
+
+        if !self.password_policy.screening_enabled() {
+            return ScreenDecision::Allowed;
+        }
+        let Some(provider) = &self.breach_provider else {
+            // Screening is mandatory in policy but no provider is installed: treat it as a
+            // provider outage so the mandatory default never silently no-ops.
+            return match self.screening_failure {
+                FailurePolicy::FailOpen => {
+                    audit_screening_fail_open(scope, "none");
+                    ScreenDecision::Allowed
+                }
+                FailurePolicy::FailClosed => {
+                    metrics::counter!(PASSWORD_SCREEN_TOTAL, "outcome" => "fail_closed")
+                        .increment(1);
+                    ScreenDecision::RefusedUnavailable
+                }
+            };
+        };
+        let screener = Screener::new(Arc::clone(provider), self.screening_failure);
+        match screener.screen(normalized).await {
+            ScreenOutcome::NotBreached => {
+                metrics::counter!(PASSWORD_SCREEN_TOTAL, "outcome" => "not_breached").increment(1);
+                ScreenDecision::Allowed
+            }
+            ScreenOutcome::Breached => {
+                metrics::counter!(PASSWORD_SCREEN_TOTAL, "outcome" => "breached").increment(1);
+                ScreenDecision::Breached
+            }
+            ScreenOutcome::AllowedProviderFailure { provider } => {
+                audit_screening_fail_open(scope, provider);
+                ScreenDecision::Allowed
+            }
+            ScreenOutcome::RefusedProviderFailure { .. } => {
+                metrics::counter!(PASSWORD_SCREEN_TOTAL, "outcome" => "fail_closed").increment(1);
+                ScreenDecision::RefusedUnavailable
+            }
+        }
     }
 
     /// Whether self-service registration is CLOSED (issue #64): the Logto send-suppression

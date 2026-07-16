@@ -1,0 +1,66 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+[package]
+name = "ironauth-screening"
+version = "0.1.0"
+description = "IronAuth breached-password screening and NIST SP 800-63B-4 password policy: HIBP k-anonymity and offline-corpus providers, plus the memorized-secret verifier defaults"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# Explicit target list: the k-anonymity request-shape test drives the online HIBP
+# provider through ironauth-fetch's injected resolver/dialer seams, which live
+# behind that crate's `test-harness` feature. Auto-discovery is off so a new test
+# file cannot silently run without the seam it needs (and its required-features gate).
+autotests = false
+
+[dependencies]
+# The ONE allowed outbound HTTP path (issue #10): the HIBP range call rides the
+# SSRF-hardened fetcher, never a direct HTTP client, so scripts/http-audit.sh stays
+# clean. Only the online provider uses it; the offline provider needs no network.
+ironauth-fetch.workspace = true
+# SHA-1 of the password for the HIBP range key, computed LOCALLY. Only the 5-char
+# hex prefix ever leaves the process (see the crate docs).
+sha1.workspace = true
+# NFKC normalization applied ONCE before length counting, screening, and hashing
+# (issue #54 handling, NIST SP 800-63B-4). Already in the tree; a direct edge only.
+unicode-normalization.workspace = true
+# http types for the HIBP request (method, header names/values). No HTTP client:
+# the request is dispatched by ironauth-fetch. Pulled in as a lightweight shared
+# type crate, exactly as ironauth-fetch and ironauth-oidc use it.
+http.workspace = true
+# Structured diagnostics and a bounded metric for a provider outage. Routes to
+# whatever recorder the binary installed; no exporter enters this crate's graph.
+tracing.workspace = true
+
+[dev-dependencies]
+# The k-anonymity request-shape test drives the HIBP provider through the fetcher's
+# injected dialer against an in-process loopback server, capturing the exact bytes
+# that cross the wire to prove only the 5-char prefix is ever sent.
+ironauth-fetch = { workspace = true, features = ["test-harness"] }
+tokio = { workspace = true, features = [
+    "rt-multi-thread",
+    "macros",
+    "net",
+    "io-util",
+    "time",
+] }
+
+[features]
+# Default build is production-shaped: only the two providers over their real paths.
+default = []
+# Test-support surface: exposes HibpRangeProvider::new_allow_http so the request-shape
+# test can drive a loopback server through the fetcher's injected dialer over plaintext
+# http. It adds no production code path (the constructor is unreachable without it).
+testing = []
+
+# The online HIBP provider's request shape (only the 5-char prefix leaves; the
+# Add-Padding header is set) and the padded-response parse, driven against a
+# loopback server through ironauth-fetch's injected dialer.
+[[test]]
+name = "hibp_range"
+path = "tests/hibp_range.rs"
+required-features = ["testing"]
+
+[lints]
+workspace = true

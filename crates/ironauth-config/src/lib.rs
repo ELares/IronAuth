@@ -89,6 +89,13 @@ pub struct Config {
     /// credential-stuffing storm degrades only that tenant.
     pub password_hashing: PasswordHashingConfig,
 
+    /// Breached-password screening and NIST SP 800-63B-4 password policy (issue #63).
+    /// The shipped defaults are the modern 63B-4 posture (length primacy, no composition,
+    /// no forced rotation, Unicode accepted, screening MANDATORY over the free HIBP
+    /// k-anonymity provider). Legacy compliance regimes are per-tenant SETTINGS here, each
+    /// annotated to the admin surface as a deviation from 63B-4.
+    pub password_policy: PasswordPolicyConfig,
+
     /// Bring-your-own-key (BYOK) customer-managed encryption settings (issue #49).
     /// EXPERIMENTAL and DEFAULT-OFF: an opt-in rung on the isolation ladder that
     /// lets a customer-managed root key (in an external KMS/HSM, or a
@@ -1632,6 +1639,183 @@ pub const PASSWORD_HASHING_MAX_PROBE_TARGET_LATENCY_MS: u64 = 5_000;
 /// milliseconds. A target below it cannot be met by any memory-hard hash.
 pub const PASSWORD_HASHING_MIN_PROBE_TARGET_LATENCY_MS: u64 = 10;
 
+/// The NIST SP 800-63B-4 minimum length (code points) when the password is the SOLE
+/// authentication factor (section 3.1.1.2 SHALL). The shipped default for
+/// `password_policy.min_length_sole_factor`; a lower value is a documented deviation.
+pub const PASSWORD_POLICY_NIST_MIN_LENGTH_SOLE_FACTOR: usize = 15;
+/// The NIST SP 800-63B-4 minimum length permitted when the password is ONE factor of a
+/// multi-factor authentication. The shipped default for
+/// `password_policy.min_length_mfa_factor`.
+pub const PASSWORD_POLICY_NIST_MIN_LENGTH_MFA_FACTOR: usize = 8;
+/// The NIST SP 800-63B-4 recommended minimum for the maximum acceptable length (SHOULD
+/// be at least this). The shipped default for `password_policy.max_length`.
+pub const PASSWORD_POLICY_NIST_MIN_MAX_LENGTH: usize = 64;
+/// The CEILING for `password_policy.max_length` (issue #63): a very long accepted
+/// password is an Argon2id input-size denial-of-service vector, so config load bounds
+/// it. Far above the 64-code-point recommendation.
+pub const PASSWORD_POLICY_MAX_LENGTH_CEILING: usize = 1_024;
+/// The CEILING for `password_policy.rotation_max_age_days` (issue #63): ten years. `0`
+/// (the default) disables forced rotation, per 63B-4; any positive value is a
+/// documented deviation.
+pub const PASSWORD_POLICY_MAX_ROTATION_DAYS: u64 = 3_650;
+
+/// Which breached-password screening provider an environment uses (issue #63). A closed
+/// set matching the first-party `ironauth-screening` providers. Neither is paywalled and
+/// neither depends on a first-party IronAuth service (the covenant).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ScreeningProvider {
+    /// The online Have I Been Pwned range API over the SSRF-hardened fetcher, using the
+    /// k-anonymity protocol (only a 5-character SHA-1 prefix ever leaves the process).
+    /// The zero-configuration default; free and public.
+    #[default]
+    Hibp,
+    /// An operator-supplied offline corpus, screened entirely locally with no outbound
+    /// access (for air-gapped or callout-restricted deployments). Requires
+    /// `password_policy.offline_corpus_path`.
+    Offline,
+}
+
+/// What to do when the screening provider cannot answer (issue #63), consistent with
+/// the platform's documented fail-open/closed conventions.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ScreeningFailurePolicy {
+    /// Allow the password (do not block the set) and emit an audit event. The default, and
+    /// AVAILABILITY-BIASED: a screening-provider outage must not lock every user out of
+    /// setting a password, so under an outage a KNOWN-breached password can be accepted
+    /// (audited and detectable via the `fail_open` metric/log). For hard enforcement that
+    /// never accepts an unscreened password use `fail_closed`, or the `offline` provider
+    /// (an operator-supplied corpus is immune to an outbound-provider outage).
+    #[default]
+    FailOpen,
+    /// Refuse the set until screening succeeds. The strict-compliance posture: a password
+    /// is never accepted unscreened.
+    FailClosed,
+}
+
+/// The breached-password screening and NIST SP 800-63B-4 password policy (issue #63).
+///
+/// The shipped defaults are the modern 800-63B-4 memorized-secret posture: a 15
+/// code-point minimum when the password is the SOLE factor (an 8 code-point floor only
+/// when it is one factor of MFA), a 64 code-point maximum, NO composition rules, NO
+/// forced rotation, Unicode accepted (NFKC-normalized once, length counted in code
+/// points), and compromised-list screening MANDATORY (on by default, over the online
+/// HIBP k-anonymity provider). Legacy compliance regimes are expressed as SETTINGS here
+/// (enable composition, set a rotation interval, change the lengths); each deviating
+/// setting is reported to the admin surface as a documented deviation from 63B-4, so a
+/// deviation is a configuration, never a fork.
+///
+/// This is a promotable per-environment setting in spirit; the process value is the
+/// deployment default until per-environment overrides ride the M5 promotion pipeline,
+/// mirroring the other promotable settings.
+// Each composition flag plus the screening/on-login flags is an INDEPENDENT, individually
+// documented TOML toggle keyed by its field name in the published schema; folding them
+// into enums would corrupt the config contract and the generated docs, so the
+// excessive-bools lint is deliberately allowed here.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields, default)]
+pub struct PasswordPolicyConfig {
+    /// The minimum length in CODE POINTS when the password is the SOLE authentication
+    /// factor. The 800-63B-4 default (`15`) is a SHALL; a lower value is accepted but is
+    /// annotated to the admin surface as a deviation. Must be at least 1 and at most
+    /// `max_length`.
+    pub min_length_sole_factor: usize,
+
+    /// The minimum length in CODE POINTS permitted when the password is ONE factor of a
+    /// multi-factor authentication. The 800-63B-4 default (`8`). Must be at least 1 and
+    /// at most `max_length`.
+    pub min_length_mfa_factor: usize,
+
+    /// The maximum acceptable length in CODE POINTS. The default (`64`) meets the
+    /// 800-63B-4 SHOULD (accept at least 64); a value below 64 is annotated as a
+    /// deviation. Must be at least `min_length_sole_factor` and `min_length_mfa_factor`,
+    /// and at most `PASSWORD_POLICY_MAX_LENGTH_CEILING` (a very long accepted password is
+    /// an Argon2id input-size denial-of-service vector).
+    pub max_length: usize,
+
+    /// Require at least one lowercase letter (a legacy composition rule). The
+    /// 800-63B-4-conform default (`false`) imposes NO composition; enabling this is a
+    /// documented deviation.
+    pub require_lowercase: bool,
+
+    /// Require at least one uppercase letter (a legacy composition rule). Default
+    /// `false`; enabling it is a documented deviation.
+    pub require_uppercase: bool,
+
+    /// Require at least one digit (a legacy composition rule). Default `false`; enabling
+    /// it is a documented deviation.
+    pub require_digit: bool,
+
+    /// Require at least one symbol (a legacy composition rule). Default `false`; enabling
+    /// it is a documented deviation.
+    pub require_symbol: bool,
+
+    /// The forced-rotation interval in days (a legacy policy). The 800-63B-4-conform
+    /// default (`0`) DISABLES periodic rotation (63B-4 forbids rotation without evidence
+    /// of compromise); a positive value is a documented deviation. At most
+    /// `PASSWORD_POLICY_MAX_ROTATION_DAYS`.
+    pub rotation_max_age_days: u64,
+
+    /// Whether compromised-list screening runs on set / change / reset. The 800-63B-4
+    /// default (`true`) makes screening MANDATORY; setting it to `false` is a documented
+    /// deviation (screening is a covenant no-paywall security feature, on by default).
+    pub screening_enabled: bool,
+
+    /// Which screening provider to use (issue #63): `hibp` (the online k-anonymity range
+    /// API, the default) or `offline` (an operator-supplied corpus, fully offline).
+    pub screening_provider: ScreeningProvider,
+
+    /// What to do when the screening provider cannot answer: `fail_open` (allow the
+    /// password and emit an audit event) or `fail_closed` (refuse the set until screening
+    /// succeeds). The default (`fail_open`) is AVAILABILITY-BIASED: a HIBP outage lets a
+    /// known-breached password through (audited and detectable via the `fail_open`
+    /// metric/log), so a provider outage never locks every user out of setting a password.
+    /// For HARD enforcement that never accepts an unscreened password, set `fail_closed`, or
+    /// use the `offline` provider (an operator-supplied corpus is immune to an
+    /// outbound-provider outage).
+    pub screening_failure_policy: ScreeningFailurePolicy,
+
+    /// Screen the presented password at LOGIN too (issue #63), so a password that has
+    /// since become breached (the corpus grew after it was set) is detected on the user's
+    /// next sign-in and surfaced (an audit event; a forced change once the hosted
+    /// change-password surface lands). The safe default (`false`) avoids an outbound
+    /// screening call on every login; enable it for continuous detection.
+    pub screen_on_login: bool,
+
+    /// An alternate base URL for the online HIBP provider (an https URL, base only, no
+    /// `/range` and no trailing slash), for a deployment that fronts HIBP with its own
+    /// compatible mirror. Unset (the default) uses the canonical public range API.
+    pub hibp_base_url: Option<String>,
+
+    /// The path to the offline corpus dataset file (a UTF-8 list of SHA-1 hashes, the
+    /// HIBP downloadable format or a plain list), required when `screening_provider` is
+    /// `offline` and `screening_enabled` is true. Unset for the `hibp` provider.
+    pub offline_corpus_path: Option<String>,
+}
+
+impl Default for PasswordPolicyConfig {
+    fn default() -> Self {
+        Self {
+            min_length_sole_factor: PASSWORD_POLICY_NIST_MIN_LENGTH_SOLE_FACTOR,
+            min_length_mfa_factor: PASSWORD_POLICY_NIST_MIN_LENGTH_MFA_FACTOR,
+            max_length: PASSWORD_POLICY_NIST_MIN_MAX_LENGTH,
+            require_lowercase: false,
+            require_uppercase: false,
+            require_digit: false,
+            require_symbol: false,
+            rotation_max_age_days: 0,
+            screening_enabled: true,
+            screening_provider: ScreeningProvider::Hibp,
+            screening_failure_policy: ScreeningFailurePolicy::FailOpen,
+            screen_on_login: false,
+            hibp_base_url: None,
+            offline_corpus_path: None,
+        }
+    }
+}
+
 /// Password-hashing settings (issue #62): the Argon2id parameters for NEWLY set
 /// passwords and the dedicated, admission-controlled hashing worker pool.
 ///
@@ -2139,6 +2323,7 @@ impl Config {
         validate_email_otp(&self.oidc)?;
         validate_quota(&self.quota)?;
         validate_password_hashing(&self.password_hashing)?;
+        validate_password_policy(&self.password_policy)?;
         Ok(())
     }
 }
@@ -2388,6 +2573,88 @@ fn validate_password_hashing(hashing: &PasswordHashingConfig) -> Result<(), Conf
                  {PASSWORD_HASHING_MAX_PROBE_TARGET_LATENCY_MS} milliseconds",
                 hashing.probe_target_latency_ms
             ),
+        });
+    }
+    Ok(())
+}
+
+/// Validate the breached-password screening and 800-63B-4 policy settings (issue #63),
+/// kept out of [`Config::validate`] for readability. The numeric bounds ensure a policy
+/// is always usable (a minimum never exceeds the maximum, lengths are non-zero and
+/// bounded); the 63B-4 SHALLs (15 / 8 / 64) are DEFAULTS, not floors, so a lower value
+/// is accepted and surfaced as a deviation rather than refused. A provider that needs an
+/// input (the offline corpus path, an https HIBP base) is checked so a misconfiguration
+/// fails fast at boot rather than silently screening nothing.
+///
+/// # Errors
+///
+/// [`ConfigError::Invalid`] if a length is zero, a minimum exceeds the maximum, the
+/// maximum exceeds the ceiling, the rotation interval exceeds its ceiling, an alternate
+/// HIBP base is not https, or the offline provider is selected with no corpus path.
+fn validate_password_policy(policy: &PasswordPolicyConfig) -> Result<(), ConfigError> {
+    if policy.min_length_sole_factor < 1 {
+        return Err(ConfigError::Invalid {
+            message: "password_policy.min_length_sole_factor must be at least 1".to_owned(),
+        });
+    }
+    if policy.min_length_mfa_factor < 1 {
+        return Err(ConfigError::Invalid {
+            message: "password_policy.min_length_mfa_factor must be at least 1".to_owned(),
+        });
+    }
+    if !(1..=PASSWORD_POLICY_MAX_LENGTH_CEILING).contains(&policy.max_length) {
+        return Err(ConfigError::Invalid {
+            message: format!(
+                "password_policy.max_length ({}) must be between 1 and \
+                 {PASSWORD_POLICY_MAX_LENGTH_CEILING}",
+                policy.max_length
+            ),
+        });
+    }
+    if policy.min_length_sole_factor > policy.max_length {
+        return Err(ConfigError::Invalid {
+            message: format!(
+                "password_policy.min_length_sole_factor ({}) must not exceed \
+                 password_policy.max_length ({})",
+                policy.min_length_sole_factor, policy.max_length
+            ),
+        });
+    }
+    if policy.min_length_mfa_factor > policy.max_length {
+        return Err(ConfigError::Invalid {
+            message: format!(
+                "password_policy.min_length_mfa_factor ({}) must not exceed \
+                 password_policy.max_length ({})",
+                policy.min_length_mfa_factor, policy.max_length
+            ),
+        });
+    }
+    if policy.rotation_max_age_days > PASSWORD_POLICY_MAX_ROTATION_DAYS {
+        return Err(ConfigError::Invalid {
+            message: format!(
+                "password_policy.rotation_max_age_days ({}) must not exceed \
+                 {PASSWORD_POLICY_MAX_ROTATION_DAYS} (0 disables forced rotation)",
+                policy.rotation_max_age_days
+            ),
+        });
+    }
+    if let Some(base) = &policy.hibp_base_url {
+        if !base.starts_with("https://") {
+            return Err(ConfigError::Invalid {
+                message: format!("password_policy.hibp_base_url ({base}) must be an https URL"),
+            });
+        }
+    }
+    // The offline provider needs a corpus; screening enabled with the offline provider
+    // and no dataset would silently screen NOTHING, so fail fast at config load.
+    if policy.screening_enabled
+        && policy.screening_provider == ScreeningProvider::Offline
+        && policy.offline_corpus_path.is_none()
+    {
+        return Err(ConfigError::Invalid {
+            message: "password_policy.offline_corpus_path must be set when \
+                      screening_provider is 'offline' and screening_enabled is true"
+                .to_owned(),
         });
     }
     Ok(())
@@ -4142,6 +4409,78 @@ mod tests {
         // Guards the expect() in DatabaseConfig::default.
         let config = DatabaseConfig::default();
         assert_eq!(config.url.scheme(), "postgres");
+    }
+
+    #[test]
+    fn password_policy_defaults_are_the_63b4_posture() {
+        let config = Config::from_toml_str("", "<inline>").expect("valid").config;
+        let policy = &config.password_policy;
+        assert_eq!(policy.min_length_sole_factor, 15);
+        assert_eq!(policy.min_length_mfa_factor, 8);
+        assert_eq!(policy.max_length, 64);
+        assert!(!policy.require_lowercase && !policy.require_uppercase);
+        assert!(!policy.require_digit && !policy.require_symbol);
+        assert_eq!(policy.rotation_max_age_days, 0);
+        assert!(
+            policy.screening_enabled,
+            "screening is mandatory by default"
+        );
+        assert_eq!(policy.screening_provider, ScreeningProvider::Hibp);
+        assert_eq!(
+            policy.screening_failure_policy,
+            ScreeningFailurePolicy::FailOpen
+        );
+        assert!(!policy.screen_on_login);
+    }
+
+    #[test]
+    fn password_policy_rejects_a_minimum_above_the_maximum() {
+        let bad = "[password_policy]\nmin_length_sole_factor = 100\nmax_length = 64\n";
+        let err = Config::from_toml_str(bad, "ironauth.toml").expect_err("min > max");
+        assert!(err.to_string().contains("min_length_sole_factor"), "{err}");
+    }
+
+    #[test]
+    fn offline_provider_requires_a_corpus_path() {
+        let bad = "[password_policy]\nscreening_provider = \"offline\"\n";
+        let err = Config::from_toml_str(bad, "ironauth.toml").expect_err("offline needs a corpus");
+        assert!(err.to_string().contains("offline_corpus_path"), "{err}");
+
+        // With a path it loads.
+        let ok = "[password_policy]\nscreening_provider = \"offline\"\n\
+                  offline_corpus_path = \"/var/lib/ironauth/breach-corpus.txt\"\n";
+        Config::from_toml_str(ok, "<inline>").expect("offline with a corpus path loads");
+
+        // Disabling screening also lets the offline provider load without a corpus.
+        let disabled = "[password_policy]\nscreening_provider = \"offline\"\n\
+                        screening_enabled = false\n";
+        Config::from_toml_str(disabled, "<inline>").expect("disabled screening needs no corpus");
+    }
+
+    #[test]
+    fn hibp_base_url_must_be_https() {
+        let bad = "[password_policy]\nhibp_base_url = \"http://mirror.internal\"\n";
+        let err = Config::from_toml_str(bad, "ironauth.toml").expect_err("plaintext base");
+        assert!(err.to_string().contains("https"), "{err}");
+        let ok = "[password_policy]\nhibp_base_url = \"https://mirror.example.test\"\n";
+        Config::from_toml_str(ok, "<inline>").expect("https base loads");
+    }
+
+    #[test]
+    fn a_legacy_composition_and_rotation_override_loads_as_settings() {
+        // A legacy regime enables composition and a 90-day rotation via settings only.
+        let legacy = "[password_policy]\nrequire_uppercase = true\nrequire_digit = true\n\
+                      rotation_max_age_days = 90\nscreening_failure_policy = \"fail_closed\"\n";
+        let config = Config::from_toml_str(legacy, "<inline>")
+            .expect("legacy override loads")
+            .config;
+        let policy = &config.password_policy;
+        assert!(policy.require_uppercase && policy.require_digit);
+        assert_eq!(policy.rotation_max_age_days, 90);
+        assert_eq!(
+            policy.screening_failure_policy,
+            ScreeningFailurePolicy::FailClosed
+        );
     }
 
     #[test]

@@ -134,6 +134,13 @@ pub enum FetchPurpose {
     /// every other external fetch: a verification URL that resolves to an internal or
     /// loopback address is refused, and a plaintext `http` target is refused.
     LazyMigration,
+    /// Querying an external breached-password range API for compromised-credential
+    /// screening (the HIBP k-anonymity protocol, issue #63). ONLY the 5-character SHA-1
+    /// prefix is ever placed on the wire (never the password or its full hash), and the
+    /// endpoint is outbound, so it rides the same SSRF-hardened path as every other
+    /// external fetch: a range URL that resolves to an internal or loopback address is
+    /// refused exactly like any other blocked destination.
+    BreachScreening,
 }
 
 impl FetchPurpose {
@@ -149,6 +156,7 @@ impl FetchPurpose {
             FetchPurpose::AcmeDirectory => "acme_directory",
             FetchPurpose::KmsRequest => "kms_request",
             FetchPurpose::LazyMigration => "lazy_migration",
+            FetchPurpose::BreachScreening => "breach_screening",
         }
     }
 }

@@ -201,6 +201,21 @@ impl HarnessKey {
 }
 
 /// A running OIDC provider over a fresh database.
+/// The breached-password screening setup a store-backed harness can be given (issue #63):
+/// the 800-63B-4 policy, the provider-failure policy, whether to screen at login, and an
+/// optional injected STUB provider (tests never hit the real HIBP API).
+pub struct ScreeningSetup {
+    /// The resolved 800-63B-4 policy (length floors, composition/rotation overrides).
+    pub policy: ironauth_screening::PasswordPolicy,
+    /// The provider-failure policy (fail-open or fail-closed).
+    pub failure: ironauth_screening::FailurePolicy,
+    /// Whether to screen the password at login too.
+    pub screen_on_login: bool,
+    /// The injected screening provider; `None` exercises the no-provider (unavailable)
+    /// path under the failure policy.
+    pub provider: Option<Arc<dyn ironauth_screening::BreachRangeProvider>>,
+}
+
 pub struct Harness {
     // Held so the database and its pools outlive the router.
     db: TestDatabase,
@@ -459,7 +474,8 @@ impl Harness {
         kind: &str,
         custom_domain: Option<&str>,
     ) -> Self {
-        Self::build_store_backed_kind(config, HarnessKey::Ed25519, kind, custom_domain, None).await
+        Self::build_store_backed_kind(config, HarnessKey::Ed25519, kind, custom_domain, None, None)
+            .await
     }
 
     /// Build a store-backed harness whose environment is provisioned with `key`,
@@ -468,7 +484,7 @@ impl Harness {
     /// fetch the LIVE discovery document whose per-environment policy is derived from
     /// the loaded key set.
     async fn build_store_backed(config: OidcConfig, key: HarnessKey) -> Self {
-        Self::build_store_backed_kind(config, key, "dev", None, None).await
+        Self::build_store_backed_kind(config, key, "dev", None, None, None).await
     }
 
     /// Like [`Harness::start_store_backed_with`] but installs an inbound lazy-migration
@@ -478,18 +494,38 @@ impl Harness {
         config: OidcConfig,
         hook: Arc<ironauth_oidc::LazyMigrationHook>,
     ) -> Self {
-        Self::build_store_backed_kind(config, HarnessKey::Ed25519, "dev", None, Some(hook)).await
+        Self::build_store_backed_kind(config, HarnessKey::Ed25519, "dev", None, Some(hook), None)
+            .await
     }
 
     /// Like [`Harness::build_store_backed`] but seeds the environment with an
     /// explicit `kind` and optional `custom_domain` (issue #42), and optionally installs
     /// a lazy-migration hook on the login path (issue #56).
+    /// Install a breached-password screening policy and provider on a store-backed harness
+    /// (issue #63), so a test can drive the set/change screening and fail-open/closed paths
+    /// end to end against an injected STUB provider (never the real HIBP API).
+    pub async fn start_store_backed_with_screening(
+        config: OidcConfig,
+        screening: ScreeningSetup,
+    ) -> Self {
+        Self::build_store_backed_kind(
+            config,
+            HarnessKey::Ed25519,
+            "dev",
+            None,
+            None,
+            Some(screening),
+        )
+        .await
+    }
+
     async fn build_store_backed_kind(
         config: OidcConfig,
         key: HarnessKey,
         kind: &str,
         custom_domain: Option<&str>,
         migration_hook: Option<Arc<ironauth_oidc::LazyMigrationHook>>,
+        screening: Option<ScreeningSetup>,
     ) -> Self {
         let (db, env, clock, scope, client_id) = Self::seed_common_kind(kind, custom_domain).await;
 
@@ -543,6 +579,16 @@ impl Harness {
         );
         if let Some(hook) = migration_hook {
             state = state.with_migration_hook(hook);
+        }
+        if let Some(screening) = screening {
+            state = state.with_password_policy(
+                screening.policy,
+                screening.failure,
+                screening.screen_on_login,
+            );
+            if let Some(provider) = screening.provider {
+                state = state.with_breach_provider(provider);
+            }
         }
         let issuer = state.issuer_for(&scope);
         let router = oidc_router(state.clone())
