@@ -313,6 +313,12 @@ impl GatingVerifier {
     fn set_block(&self) {
         self.mode.store(1, Ordering::SeqCst);
     }
+
+    /// Switch back to fail-fast mode (return a timeout error immediately), so a later
+    /// recovery trial resolves promptly instead of parking on the gate.
+    fn set_fail(&self) {
+        self.mode.store(0, Ordering::SeqCst);
+    }
 }
 
 impl CredentialVerifier for GatingVerifier {
@@ -442,9 +448,10 @@ async fn the_orchestrator_timeout_bounds_a_verifier_that_does_not_self_bound() {
     // enforce its own 100ms timeout, the block-forever verifier would hang and this outer
     // timeout would fire (an `Err`), failing the test. That it resolves proves the
     // orchestrator bounded the non-self-bounding verifier well within the outer bound.
-    let outcome = tokio::time::timeout(Duration::from_secs(5), hook.attempt("u@example.test", "pw"))
-        .await
-        .expect("the orchestrator bounds the verifier; the attempt must not hang");
+    let outcome =
+        tokio::time::timeout(Duration::from_secs(5), hook.attempt("u@example.test", "pw"))
+            .await
+            .expect("the orchestrator bounds the verifier; the attempt must not hang");
 
     assert!(
         matches!(outcome, HookOutcome::Unavailable),
@@ -455,5 +462,201 @@ async fn the_orchestrator_timeout_bounds_a_verifier_that_does_not_self_bound() {
         hook.breaker_state(),
         BreakerState::Open,
         "an orchestrator timeout counts as a failure toward the breaker"
+    );
+}
+
+#[tokio::test]
+async fn a_dropped_half_open_trial_re_opens_the_breaker_and_recovers() {
+    // The login handler awaits `attempt` INLINE, so a client disconnect / request timeout /
+    // graceful-shutdown cancellation drops the future mid-trial. Before the fix that left
+    // `trial_in_progress` set forever, wedging the breaker in half-open and disabling lazy
+    // migration on the node until restart. The RAII trial guard must release the slot and
+    // re-open the breaker so it recovers on the next cooldown.
+    let verifier = Arc::new(GatingVerifier::new());
+    let clock = Arc::new(ManualClock::new(SystemTime::UNIX_EPOCH));
+    let breaker = CircuitBreaker::new(
+        Arc::clone(&clock) as Arc<dyn Clock>,
+        1,
+        Duration::from_secs(30),
+        Duration::from_secs(30),
+    );
+    let hook = LazyMigrationHook::new(
+        Arc::clone(&verifier) as Arc<dyn CredentialVerifier>,
+        breaker,
+        Arc::clone(&clock) as Arc<dyn Clock>,
+        // A large orchestrator timeout so the DROP, not the timeout, ends the trial.
+        Duration::from_secs(3600),
+    );
+
+    // Open the breaker (one failure at threshold 1), then let the cooldown elapse so the
+    // next attempt half-opens and takes the single trial slot.
+    assert!(matches!(
+        hook.attempt("u@example.test", "pw").await,
+        HookOutcome::Unavailable
+    ));
+    assert_eq!(hook.breaker_state(), BreakerState::Open);
+    clock.advance(Duration::from_secs(30));
+
+    // Start a half-open trial that blocks in the backend holding the slot, then DROP the
+    // attempt future mid-await while that single probe is in flight.
+    verifier.set_block();
+    {
+        let mut fut = Box::pin(hook.attempt("u@example.test", "pw"));
+        tokio::select! {
+            biased;
+            _ = &mut fut => panic!("the blocking trial must not resolve on its own"),
+            () = verifier.entered.notified() => {}
+        }
+        assert_eq!(
+            verifier.calls(),
+            2,
+            "the half-open trial reached the backend"
+        );
+        assert_eq!(
+            hook.breaker_state(),
+            BreakerState::HalfOpen,
+            "the single probe is in flight"
+        );
+        // `fut` drops HERE (end of block), running the trial guard's Drop on an unresolved
+        // trial.
+    }
+
+    // The RAII guard released the abandoned slot and re-opened the breaker IMMEDIATELY
+    // (proof the guard fired, not merely the lazy allow() self-heal).
+    assert_eq!(
+        hook.breaker_state(),
+        BreakerState::Open,
+        "a dropped half-open trial re-opens the breaker instead of wedging it half-open"
+    );
+
+    // After the next cooldown a FRESH trial is admitted and EXACTLY ONE new outbound call
+    // fires: proof the slot was truly released and the breaker recovered.
+    clock.advance(Duration::from_secs(30));
+    verifier.set_fail();
+    let before = verifier.calls();
+    assert!(matches!(
+        hook.attempt("u@example.test", "pw").await,
+        HookOutcome::Unavailable
+    ));
+    assert_eq!(
+        verifier.calls(),
+        before + 1,
+        "recovery admits exactly one fresh trial after a dropped one (breaker not wedged)"
+    );
+}
+
+/// A verifier that either fails fast (open the breaker) or PANICS across an await, so a
+/// test can drive a panicking half-open trial and prove the guard still releases the slot.
+struct PanicVerifier {
+    calls: AtomicUsize,
+    /// 0 = fail immediately with a timeout error; 1 = panic across an await point.
+    mode: AtomicU8,
+}
+
+impl PanicVerifier {
+    fn new() -> Self {
+        Self {
+            calls: AtomicUsize::new(0),
+            mode: AtomicU8::new(0),
+        }
+    }
+
+    fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+
+    fn set_panic(&self) {
+        self.mode.store(1, Ordering::SeqCst);
+    }
+
+    fn set_fail(&self) {
+        self.mode.store(0, Ordering::SeqCst);
+    }
+}
+
+impl CredentialVerifier for PanicVerifier {
+    fn verify<'a>(
+        &'a self,
+        _identifier: &'a str,
+        _credential: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<HookVerdict, HookError>> + Send + 'a>> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let mode = self.mode.load(Ordering::SeqCst);
+        Box::pin(async move {
+            if mode == 0 {
+                return Err(HookError::Timeout);
+            }
+            // Panic ACROSS an await point, so the `attempt` future is unwound mid-poll and
+            // the trial guard's Drop runs on the way out.
+            tokio::task::yield_now().await;
+            panic!("verifier panicked mid-trial");
+        })
+    }
+}
+
+#[tokio::test]
+async fn a_panicking_half_open_trial_re_opens_the_breaker_and_recovers() {
+    // A verifier that PANICS across the await also skips `record_success`/`record_failure`.
+    // The trial guard's Drop, which runs as the panicking future unwinds, must release the
+    // slot and re-open the breaker so the node is not stuck in half-open until restart.
+    let verifier = Arc::new(PanicVerifier::new());
+    let clock = Arc::new(ManualClock::new(SystemTime::UNIX_EPOCH));
+    let breaker = CircuitBreaker::new(
+        Arc::clone(&clock) as Arc<dyn Clock>,
+        1,
+        Duration::from_secs(30),
+        Duration::from_secs(30),
+    );
+    let hook = Arc::new(LazyMigrationHook::new(
+        Arc::clone(&verifier) as Arc<dyn CredentialVerifier>,
+        breaker,
+        Arc::clone(&clock) as Arc<dyn Clock>,
+        Duration::from_secs(3600),
+    ));
+
+    // Open the breaker (fail mode), then let the cooldown elapse.
+    assert!(matches!(
+        hook.attempt("u@example.test", "pw").await,
+        HookOutcome::Unavailable
+    ));
+    assert_eq!(hook.breaker_state(), BreakerState::Open);
+    clock.advance(Duration::from_secs(30));
+
+    // The next attempt takes the half-open trial slot; the verifier PANICS. Run it in a
+    // task so the panic is caught at the task boundary; the attempt future unwinds through
+    // the trial guard's Drop on the way out.
+    verifier.set_panic();
+    let hook_task = Arc::clone(&hook);
+    let joined = tokio::spawn(async move { hook_task.attempt("u@example.test", "pw").await }).await;
+    match joined {
+        Ok(_) => panic!("the panicking trial should have aborted the task, not resolved"),
+        Err(err) => assert!(err.is_panic(), "the task ended by panic, as staged"),
+    }
+    assert_eq!(
+        verifier.calls(),
+        2,
+        "the half-open trial reached the panicking verifier"
+    );
+
+    // The guard released the slot on unwind and re-opened the breaker: not wedged.
+    assert_eq!(
+        hook.breaker_state(),
+        BreakerState::Open,
+        "a panicking half-open trial re-opens the breaker instead of wedging it half-open"
+    );
+
+    // After the next cooldown a fresh trial is admitted (exactly one new outbound), proving
+    // recovery.
+    clock.advance(Duration::from_secs(30));
+    verifier.set_fail();
+    let before = verifier.calls();
+    assert!(matches!(
+        hook.attempt("u@example.test", "pw").await,
+        HookOutcome::Unavailable
+    ));
+    assert_eq!(
+        verifier.calls(),
+        before + 1,
+        "recovery admits exactly one fresh trial after a panicked one (breaker not wedged)"
     );
 }

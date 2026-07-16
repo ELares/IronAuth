@@ -39,7 +39,13 @@ range per docs/RELEASING.md.
   - The circuit breaker admits exactly ONE half-open trial at a time. Previously, after the
     cooldown a burst of concurrent logins all saw the half-open state and fired outbound at
     a possibly-still-dead backend; a trial-in-progress flag now fast-fails the others until
-    the single probe resolves.
+    the single probe resolves. The trial slot is released even when the trial is ABANDONED:
+    an RAII guard in `attempt` re-opens the breaker (a fresh cooldown) if the future is
+    dropped mid-await (client disconnect, request timeout, shutdown cancellation) or the
+    verifier panics, and `allow` self-heals an outstanding trial that has been in flight
+    past the cooldown, so a wedged trial-in-progress flag can never disable lazy migration
+    on a node until restart (an availability regression the first version of the flag
+    introduced).
   - `LazyMigrationHook::attempt` now wraps the verifier in the configured timeout, so a
     verifier that does not self-bound (a future non-webhook impl) cannot stall the login
     path; an elapsed timeout counts as a failure toward the breaker. The shipped

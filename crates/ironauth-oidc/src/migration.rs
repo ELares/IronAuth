@@ -385,8 +385,31 @@ struct BreakerInner {
     /// Whether a HALF-OPEN trial call is currently outstanding. While it is, the breaker
     /// admits NO further calls: exactly one probe is in flight at a time, so a burst of
     /// concurrent logins after the cooldown does not stampede a still-dead backend. Reset
-    /// on every transition out of half-open (success closes, failure re-opens).
+    /// on every transition out of half-open (success closes, failure re-opens), and also
+    /// released by the orchestrator's RAII trial guard if a trial's future is abandoned
+    /// (dropped mid-await or a panicking verifier) so the flag cannot stay set forever.
     trial_in_progress: bool,
+    /// When the outstanding half-open trial was admitted, on the monotonic clock. Used by
+    /// the [`allow`](CircuitBreaker::allow) self-heal backstop: if a trial has been
+    /// in-flight longer than the cooldown (its future leaked without the guard or a
+    /// `record_*` ever resolving it), the slot is treated as abandoned and reclaimed, so a
+    /// dropped/forgotten trial can never wedge the breaker in half-open. `None` when no
+    /// trial is outstanding.
+    trial_started_at: Option<Instant>,
+}
+
+/// The breaker's decision for one call (the richer result of
+/// [`CircuitBreaker::admit`]): whether the call may proceed, and if so whether this caller
+/// took the single half-open trial slot. The orchestrator needs the latter so it can
+/// arm the RAII guard that releases the slot when a trial is abandoned.
+enum Admission {
+    /// Fail fast: the breaker denied the call (open and still cooling, or a half-open
+    /// trial is already outstanding and still fresh).
+    Denied,
+    /// The call may proceed to the verifier. `half_open_trial` is `true` when this caller
+    /// took the single half-open trial slot and therefore owns it: it must resolve the
+    /// trial (via `record_success`/`record_failure`) or release it on abandonment.
+    Admitted { half_open_trial: bool },
 }
 
 /// An in-memory, per-node circuit breaker for the lazy-migration hook (issue #56).
@@ -435,36 +458,60 @@ impl CircuitBreaker {
                 failures: Vec::new(),
                 opened_at: None,
                 trial_in_progress: false,
+                trial_started_at: None,
             }),
         }
     }
 
-    /// Whether a call may proceed to the verifier. When the breaker is OPEN and the
-    /// cooldown has elapsed, this transitions it to HALF-OPEN and admits ONE trial call;
-    /// while still cooling down it returns `false` (the caller fails fast, uniform). In
-    /// HALF-OPEN it admits exactly one outstanding trial at a time: a further caller while
-    /// that trial is in flight fails fast (as if still open), so a concurrent burst after
-    /// the cooldown produces a single probe, not a stampede against a possibly-dead
-    /// backend. The trial resolves through [`record_success`](Self::record_success) (close)
-    /// or [`record_failure`](Self::record_failure) (re-open).
+    /// Whether a call may proceed to the verifier, and whether this caller took the single
+    /// half-open trial slot (so the orchestrator can release it if it abandons the call).
     ///
-    /// # Panics
+    /// When the breaker is OPEN and the cooldown has elapsed, this transitions it to
+    /// HALF-OPEN and admits ONE trial call; while still cooling down it denies (the caller
+    /// fails fast, uniform). In HALF-OPEN it admits exactly one outstanding trial at a
+    /// time: a further caller while that trial is in flight fails fast (as if still open),
+    /// so a concurrent burst after the cooldown produces a single probe, not a stampede
+    /// against a possibly-dead backend. The trial resolves through
+    /// [`record_success`](Self::record_success) (close) or
+    /// [`record_failure`](Self::record_failure) (re-open).
     ///
-    /// Panics if the internal lock is poisoned, which only happens after a panic on
-    /// another thread holding it.
-    #[must_use]
-    pub fn allow(&self) -> bool {
+    /// Self-heal backstop: if an outstanding half-open trial has been in flight LONGER than
+    /// the cooldown, its future was abandoned without ever resolving (dropped mid-await or a
+    /// panicking verifier that also somehow bypassed the RAII guard); the slot is then
+    /// reclaimed and a fresh trial admitted, so an abandoned trial can never wedge the
+    /// breaker in half-open. This complements the orchestrator's trial guard (belt and
+    /// suspenders): the guard releases the slot promptly on a normal drop, and this covers
+    /// a future refactor that bypasses it.
+    fn admit(&self) -> Admission {
         let now = self.clock.monotonic();
         let mut inner = self.inner.lock().expect("breaker lock poisoned");
         match inner.state {
-            BreakerState::Closed => true,
+            BreakerState::Closed => Admission::Admitted {
+                half_open_trial: false,
+            },
             BreakerState::HalfOpen => {
-                // A trial is already outstanding: admit no second concurrent probe.
                 if inner.trial_in_progress {
-                    false
+                    // A trial is already outstanding. Admit no second concurrent probe
+                    // UNLESS it has been in flight past the cooldown, in which case it was
+                    // abandoned: reclaim the slot and admit a fresh trial rather than stay
+                    // wedged forever.
+                    let abandoned = inner.trial_started_at.is_none_or(|started| {
+                        now.saturating_duration_since(started) >= self.cooldown
+                    });
+                    if abandoned {
+                        inner.trial_started_at = Some(now);
+                        Admission::Admitted {
+                            half_open_trial: true,
+                        }
+                    } else {
+                        Admission::Denied
+                    }
                 } else {
                     inner.trial_in_progress = true;
-                    true
+                    inner.trial_started_at = Some(now);
+                    Admission::Admitted {
+                        half_open_trial: true,
+                    }
                 }
             }
             BreakerState::Open => {
@@ -476,12 +523,28 @@ impl CircuitBreaker {
                     // This caller takes the single trial slot; concurrent callers that now
                     // see HalfOpen with a trial in progress fail fast until it resolves.
                     inner.trial_in_progress = true;
-                    true
+                    inner.trial_started_at = Some(now);
+                    Admission::Admitted {
+                        half_open_trial: true,
+                    }
                 } else {
-                    false
+                    Admission::Denied
                 }
             }
         }
+    }
+
+    /// Whether a call may proceed to the verifier. A thin boolean view of
+    /// [`admit`](Self::admit) for the management API and tests; the orchestrator uses
+    /// `admit` so it learns whether it took the half-open trial slot.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal lock is poisoned, which only happens after a panic on
+    /// another thread holding it.
+    #[must_use]
+    pub fn allow(&self) -> bool {
+        matches!(self.admit(), Admission::Admitted { .. })
     }
 
     /// Record a HEALTHY call (a verdict): clears the failure window and closes the
@@ -495,6 +558,7 @@ impl CircuitBreaker {
         inner.failures.clear();
         // The trial (if any) resolved; free the slot regardless of the prior state.
         inner.trial_in_progress = false;
+        inner.trial_started_at = None;
         if inner.state != BreakerState::Closed {
             inner.opened_at = None;
             Self::transition(&mut inner, BreakerState::Closed);
@@ -519,8 +583,10 @@ impl CircuitBreaker {
         match inner.state {
             BreakerState::HalfOpen => {
                 inner.opened_at = Some(now);
-                // The trial failed and resolved; free the slot and cool down again.
+                // The trial failed and resolved (or was abandoned by the orchestrator's
+                // guard); free the slot and cool down again.
                 inner.trial_in_progress = false;
+                inner.trial_started_at = None;
                 Self::transition(&mut inner, BreakerState::Open);
             }
             BreakerState::Closed => {
@@ -599,6 +665,57 @@ impl std::fmt::Debug for LazyMigrationHook {
     }
 }
 
+/// An RAII guard for the single half-open trial slot, held across the verifier await in
+/// [`LazyMigrationHook::attempt`].
+///
+/// The breaker admits exactly one half-open probe by setting `trial_in_progress`, which is
+/// cleared only when the trial RESOLVES through `record_success`/`record_failure`. Those run
+/// only if `attempt` reaches the `match result` arm AFTER the `tokio::time::timeout(..).await`.
+/// If that future is DROPPED at the await point (the login handler awaits `attempt` INLINE, so
+/// a client disconnect, request timeout, or graceful-shutdown cancellation drops it mid-trial)
+/// or the verifier PANICS across the await, neither reset runs and the slot would stay taken
+/// forever, wedging the breaker in half-open until process restart.
+///
+/// This guard closes that hole: when a trial's future is abandoned before it resolves, the
+/// guard's `Drop` records a FAILURE on the breaker, which frees the slot AND re-opens the
+/// breaker with a fresh cooldown, so the next cooldown admits a clean new probe. On the normal
+/// path `attempt` marks the guard [`resolved`](Self::resolve) before recording the verdict, so
+/// the drop is a no-op (no double count). The guard holds only a shared `&CircuitBreaker` (not a
+/// live `MutexGuard`), so it is safe to carry across the await and its `Drop` takes the breaker
+/// lock only briefly.
+struct HalfOpenTrialGuard<'a> {
+    breaker: &'a CircuitBreaker,
+    resolved: bool,
+}
+
+impl<'a> HalfOpenTrialGuard<'a> {
+    /// Arm a guard for a freshly-taken half-open trial slot.
+    fn new(breaker: &'a CircuitBreaker) -> Self {
+        Self {
+            breaker,
+            resolved: false,
+        }
+    }
+
+    /// Mark the trial as resolved through the normal success/failure path, so `Drop`
+    /// no-ops (the caller is about to record the verdict itself; do not double-count).
+    fn resolve(&mut self) {
+        self.resolved = true;
+    }
+}
+
+impl Drop for HalfOpenTrialGuard<'_> {
+    fn drop(&mut self) {
+        if !self.resolved {
+            // The trial was abandoned before it resolved: the `attempt` future was dropped
+            // mid-await (client disconnect / request timeout / shutdown cancellation) or the
+            // verifier panicked across the await. Release the slot and re-open with a fresh
+            // cooldown so the breaker recovers instead of wedging in half-open.
+            self.breaker.record_failure();
+        }
+    }
+}
+
 impl LazyMigrationHook {
     /// Assemble a hook from a verifier, a breaker, the clock seam (for the latency
     /// measurement), and the per-call `timeout` the orchestrator enforces around the
@@ -627,10 +744,19 @@ impl LazyMigrationHook {
     /// the breaker closed; a timeout or an error trips it. Never logs the identifier or
     /// the credential.
     pub async fn attempt(&self, identifier: &str, credential: &str) -> HookOutcome {
-        if !self.breaker.allow() {
-            record_outcome("breaker_open");
-            return HookOutcome::Unavailable;
-        }
+        let half_open_trial = match self.breaker.admit() {
+            Admission::Denied => {
+                record_outcome("breaker_open");
+                return HookOutcome::Unavailable;
+            }
+            Admission::Admitted { half_open_trial } => half_open_trial,
+        };
+        // If we took the single half-open trial slot, guard it: should THIS future be
+        // dropped mid-await (client disconnect / request timeout / shutdown cancellation)
+        // or the verifier panic across the await, the guard's Drop releases the slot and
+        // re-opens the breaker, so an abandoned trial cannot wedge it in half-open. A
+        // Closed-state admission took no trial slot, so it needs no guard.
+        let mut trial_guard = half_open_trial.then(|| HalfOpenTrialGuard::new(&self.breaker));
         let start = self.clock.monotonic();
         // Bound the verifier with the configured per-call timeout. The shipped
         // WebhookVerifier already self-bounds via the fetcher deadline, so this never fires
@@ -648,6 +774,11 @@ impl LazyMigrationHook {
             };
         let elapsed = self.clock.monotonic().saturating_duration_since(start);
         metrics::histogram!(LAZY_MIGRATION_HOOK_LATENCY_SECONDS).record(elapsed.as_secs_f64());
+        // The trial (if any) is resolving through the normal path below; disarm the guard
+        // so its Drop is a no-op and we record the verdict exactly once.
+        if let Some(guard) = trial_guard.as_mut() {
+            guard.resolve();
+        }
         match result {
             Ok(HookVerdict::Verified(profile)) => {
                 self.breaker.record_success();
@@ -890,6 +1021,49 @@ mod tests {
         clock.advance(Duration::from_secs(30));
         assert!(b.allow(), "a fresh single trial after the next cooldown");
         assert!(!b.allow(), "still only one at a time");
+    }
+
+    #[test]
+    fn allow_self_heals_an_abandoned_half_open_trial_after_the_cooldown() {
+        // Belt-and-suspenders backstop for the orchestrator's RAII trial guard: even if a
+        // half-open trial is NEVER resolved (its future leaked without the guard or a
+        // record_* ever running), the breaker must not stay wedged in half-open. `allow()`
+        // reclaims a trial that has been outstanding longer than the cooldown and admits a
+        // fresh one, so an abandoned trial self-heals on the next cooldown instead of
+        // disabling lazy migration on the node until restart.
+        let clock = Arc::new(ManualClock::new(SystemTime::UNIX_EPOCH));
+        let b = breaker(Arc::clone(&clock), 1, 30, 30);
+        b.record_failure();
+        clock.advance(Duration::from_secs(30));
+        assert!(
+            b.allow(),
+            "the first caller after cooldown takes the trial slot"
+        );
+        assert_eq!(b.state(), BreakerState::HalfOpen);
+        // The trial is deliberately NEVER resolved (models a leaked/forgotten future). A
+        // fresh caller before the cooldown still fast-fails: exactly one probe at a time.
+        assert!(
+            !b.allow(),
+            "a still-fresh outstanding trial keeps admitting exactly one probe"
+        );
+        assert_eq!(b.state(), BreakerState::HalfOpen);
+        // Once the trial has been outstanding past the cooldown, the slot is treated as
+        // abandoned: a new caller is admitted rather than wedged out forever.
+        clock.advance(Duration::from_secs(30));
+        assert!(
+            b.allow(),
+            "an outstanding trial past the cooldown is reclaimed and a fresh trial admitted"
+        );
+        assert_eq!(
+            b.state(),
+            BreakerState::HalfOpen,
+            "still trialing, not wedged"
+        );
+        // And it is still one-at-a-time immediately after the self-heal.
+        assert!(
+            !b.allow(),
+            "the self-heal admits exactly one fresh probe, not a burst"
+        );
     }
 
     #[test]
