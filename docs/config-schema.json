@@ -1055,6 +1055,14 @@
           "minimum": 0,
           "type": "integer"
         },
+        "min_password_strength_score": {
+          "default": 0,
+          "description": "The minimum in-tree password-strength score (0-4) required on the password set /\nchange path (issue #66), scored AFTER the length/composition policy and BEFORE the\nbreach screen; `0` (the default) turns scoring OFF. COARSENESS (read before raising\nthis): this is a COARSE length/charset/pattern floor that is BLIND to dictionary\nwords and l33t substitution (e.g. `summer2024` scores the MAXIMUM 4 and clears every\nthreshold, including `4`), NOT a zxcvbn-equivalent guard, so the mandatory\nHIBP/offline breach screen is the PRIMARY defense that backstops it. Must be at most\n`4`.\n\nThe default (`0`) means an existing deployment sees no regression; a higher value\nonly ever TIGHTENS admission. The real `zxcvbn` crate can be swapped in behind the\nsame seam once its dependency tree passes cargo-deny (today a\n`time`/RUSTSEC-vs-MSRV-1.85 conflict blocks it).",
+          "format": "uint8",
+          "maximum": 4,
+          "minimum": 0,
+          "type": "integer"
+        },
         "offline_corpus_path": {
           "default": null,
           "description": "The path to the offline corpus dataset file (a UTF-8 list of SHA-1 hashes, the\nHIBP downloadable format or a plain list), required when `screening_provider` is\n`offline` and `screening_enabled` is true. Unset for the `hibp` provider.",
@@ -1670,6 +1678,7 @@
         "max_length": 64,
         "min_length_mfa_factor": 8,
         "min_length_sole_factor": 15,
+        "min_password_strength_score": 0,
         "offline_corpus_path": null,
         "require_digit": false,
         "require_lowercase": false,

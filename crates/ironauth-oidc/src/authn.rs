@@ -321,6 +321,29 @@ pub fn acr_for_mfa() -> &'static str {
     ACR_MFA
 }
 
+/// Whether a set of recorded methods includes a phishing-resistant PASSKEY factor
+/// (issue #66): any of the eight plain/attested, synced/device-bound, presence/verified
+/// passkey rows. The FRESH-re-authentication gate on the sensitive passkey-only
+/// conversions reads this to require that the session's most recent authentication was a
+/// passkey (never a password), so a password re-login can never authorize removing the
+/// password or setting a first one.
+#[must_use]
+pub fn includes_passkey(methods: &[AuthMethod]) -> bool {
+    methods.iter().any(|method| {
+        matches!(
+            method,
+            AuthMethod::Passkey
+                | AuthMethod::PasskeyVerified
+                | AuthMethod::PasskeyHardware
+                | AuthMethod::PasskeyHardwareVerified
+                | AuthMethod::AttestedPasskey
+                | AuthMethod::AttestedPasskeyVerified
+                | AuthMethod::AttestedPasskeyHardware
+                | AuthMethod::AttestedPasskeyHardwareVerified
+        )
+    })
+}
+
 /// The credential-class ladder (issue #66): the minimum authenticator assurance a
 /// tenant/group/org policy can require of a login, weakest to strongest.
 ///
@@ -1194,6 +1217,48 @@ mod tests {
             satisfied_class(&attested, &CredentialFacts::default()),
             CredentialClass::Passkey
         );
+    }
+
+    #[test]
+    fn includes_passkey_detects_every_passkey_row_and_no_password_factor() {
+        // The fresh-re-auth gate (issue #66) reads includes_passkey to require that a
+        // conversion is authorized by a PASSKEY re-authentication, never a password one.
+        for method in [
+            AuthMethod::Passkey,
+            AuthMethod::PasskeyVerified,
+            AuthMethod::PasskeyHardware,
+            AuthMethod::PasskeyHardwareVerified,
+            AuthMethod::AttestedPasskey,
+            AuthMethod::AttestedPasskeyVerified,
+            AuthMethod::AttestedPasskeyHardware,
+            AuthMethod::AttestedPasskeyHardwareVerified,
+        ] {
+            assert!(
+                includes_passkey(&[method]),
+                "{method:?} is a passkey factor"
+            );
+        }
+        // A password / OTP / TOTP session is NOT a passkey re-auth, so it can never
+        // authorize a passkey-only conversion.
+        assert!(!includes_passkey(&[AuthMethod::Password]));
+        assert!(!includes_passkey(&[AuthMethod::EmailOtp]));
+        assert!(!includes_passkey(&[AuthMethod::Password, AuthMethod::Totp]));
+    }
+
+    #[test]
+    fn a_passkey_only_login_has_an_honest_phr_acr_and_never_a_pwd_amr() {
+        // The honesty crux (issue #66): a passkey-only account's UV login derives an
+        // honest phishing-resistant acr and NEVER fabricates a password factor, because
+        // the recorded event carries only a passkey method (no pwd is anywhere on the
+        // signup/login path). A synced UV passkey -> phr with swk+user+mfa.
+        let synced = AuthenticationEvent::passkey(TIME, true, true);
+        assert_eq!(achieved_acr(synced.methods()), ACR_PHR);
+        assert!(!amr_values(synced.methods()).contains(&"pwd"));
+        assert!(includes_passkey(synced.methods()));
+        // A device-bound UV passkey -> phrh, still no pwd.
+        let device = AuthenticationEvent::passkey(TIME, false, true);
+        assert_eq!(achieved_acr(device.methods()), ACR_PHRH);
+        assert!(!amr_values(device.methods()).contains(&"pwd"));
     }
 
     #[test]

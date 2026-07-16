@@ -10728,6 +10728,19 @@ pub struct UserRecord {
     pub foreign_password_algo: Option<String>,
 }
 
+impl UserRecord {
+    /// Whether the stored native `password_hash` is a USABLE Argon2id verifier rather than
+    /// the unusable sentinel (issue #66). A passkey-only / credential-less / not-yet-migrated
+    /// foreign account carries the sentinel; the password login path uses this to keep the
+    /// timing of a sentinel-hash account uniform with an absent account (a sentinel would
+    /// otherwise fail-fast with no Argon2 work, a login-timing enumeration oracle), instead
+    /// of duplicating the sentinel literal outside the store.
+    #[must_use]
+    pub fn has_usable_password_hash(&self) -> bool {
+        self.password_hash != USER_UNUSABLE_PASSWORD_HASH
+    }
+}
+
 impl fmt::Debug for UserRecord {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("UserRecord")
@@ -11447,6 +11460,33 @@ impl UserRepo<'_> {
         Ok(row.map(|row| row.get::<String, _>("password_hash")))
     }
 
+    /// Whether `subject` is a PASSKEY-ONLY (passwordless) account (issue #66): the
+    /// authoritative `passwordless` marker, so the change-password surface can branch to
+    /// the set-first-password path (skip the current-password check, demand a fresh
+    /// passkey re-auth) without inferring state from the sentinel hash. Returns [`None`]
+    /// when no such user exists in this scope.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn is_passwordless(&self, subject: &UserId) -> Result<Option<bool>, StoreError> {
+        if subject.scope() != self.scope {
+            return Ok(None);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT passwordless FROM users \
+             WHERE id = $1 AND tenant_id = $2 AND environment_id = $3 AND deleted_at IS NULL",
+        )
+        .bind(subject.to_string())
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(row.map(|row| row.get::<bool, _>("passwordless")))
+    }
+
     /// One page of the FULL identity export (issue #58), ordered by `(created_at,
     /// id)` and starting strictly after `after`, opening every sealed field and
     /// returning the credential material. This is the read half of the
@@ -11529,8 +11569,44 @@ impl ActingUserRepo<'_> {
     ) -> Result<UserId, StoreError> {
         // The registration surface (issue #20) records no standard claims; the
         // column defaults to the empty object, released as no claims by UserInfo.
-        self.register_inner(env, identifier, password_hash, "{}")
+        self.register_inner(env, None, identifier, password_hash, "{}", false)
             .await
+    }
+
+    /// Register a PASSKEY-ONLY (passwordless) user with a PRE-ALLOCATED id (issue #66):
+    /// a first-class account state where no password hash ever existed. The row is
+    /// created with the unusable password sentinel AND `passwordless = true`, and its
+    /// stable WebAuthn user handle is minted at INSERT to the supplied id's bytes (the
+    /// ONLY point it can be set: the column is omitted from every `GRANT UPDATE` and
+    /// guarded by the immutability trigger, so it can never be mutated afterward).
+    ///
+    /// The id is pre-allocated by the signup ceremony's `options` step so the same
+    /// value binds the registration challenge and the created account, and so the
+    /// account is created only when the UV-required passkey is VERIFIED (no orphaned
+    /// passwordless row on an abandoned ceremony). There is NO password parameter and no
+    /// hash is ever computed on this path: the account is passwordless by construction,
+    /// so the signup surface reaches no screen/hash/policy step (the structural "no
+    /// password code path").
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Conflict`] if the login handle is already registered in this scope;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn register_passwordless(
+        &self,
+        env: &Env,
+        id: &UserId,
+        identifier: &str,
+    ) -> Result<UserId, StoreError> {
+        self.register_inner(
+            env,
+            Some(id),
+            identifier,
+            USER_UNUSABLE_PASSWORD_HASH,
+            "{}",
+            true,
+        )
+        .await
     }
 
     /// Register a bootstrap user with a precomputed Argon2id `password_hash` and a
@@ -11555,7 +11631,7 @@ impl ActingUserRepo<'_> {
         password_hash: &str,
         claims_json: &str,
     ) -> Result<UserId, StoreError> {
-        self.register_inner(env, identifier, password_hash, claims_json)
+        self.register_inner(env, None, identifier, password_hash, claims_json, false)
             .await
     }
 
@@ -11588,16 +11664,32 @@ impl ActingUserRepo<'_> {
     async fn register_inner(
         &self,
         env: &Env,
+        supplied_id: Option<&UserId>,
         identifier: &str,
         password_hash: &str,
         claims_json: &str,
+        passwordless: bool,
     ) -> Result<UserId, StoreError> {
         let master = self.store.master().ok_or(StoreError::Encryption)?;
         // The scope needs a live KEK/DEK before the first PII seal; provision them
         // lazily (idempotent) outside the register transaction.
         self.ensure_scope_keys(env, master).await?;
-        let id = UserId::generate(env, &self.scope);
+        // A pre-allocated id (the passwordless-signup ceremony binds the challenge to it
+        // before the account exists) must be in THIS scope; otherwise mint a fresh one.
+        let id = match supplied_id {
+            Some(supplied) if supplied.scope() == self.scope => *supplied,
+            Some(_) => return Err(StoreError::NotFound),
+            None => UserId::generate(env, &self.scope),
+        };
         let scope = self.scope;
+        // A passkey-only account (issue #66) mints its stable WebAuthn user handle HERE,
+        // at INSERT, which is the ONLY point it can ever be set: the column is omitted
+        // from every users GRANT UPDATE and guarded by the immutability trigger. The
+        // handle is the opaque usr_ id bytes (exactly what the ceremony advertises and a
+        // discoverable assertion is checked against), so it is stable and non-PII. A
+        // password account stores NULL (no passkey identity yet).
+        let webauthn_user_handle: Option<Vec<u8>> =
+            passwordless.then(|| id.to_string().into_bytes());
         // The blind index is deterministic under the master key alone (no DEK), so
         // compute it up front; it is what a later `by_identifier` lookup queries.
         let bidx = user_identifier_blind_index(master, scope, identifier);
@@ -11625,8 +11717,9 @@ impl ActingUserRepo<'_> {
                 let result = sqlx::query(
                     "INSERT INTO users \
                      (id, tenant_id, environment_id, identifier_bidx, identifier_sealed, \
-                      password_hash, claims_sealed, pii_dek_version) \
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+                      password_hash, claims_sealed, pii_dek_version, passwordless, \
+                      webauthn_user_handle) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
                 )
                 .bind(id.to_string())
                 .bind(scope.tenant().to_string())
@@ -11636,6 +11729,8 @@ impl ActingUserRepo<'_> {
                 .bind(password_hash)
                 .bind(claims_sealed.into_bytes())
                 .bind(dek_version)
+                .bind(passwordless)
+                .bind(webauthn_user_handle.clone())
                 .execute(&mut **tx)
                 .await;
                 match result {
@@ -12414,6 +12509,221 @@ impl ActingUserRepo<'_> {
         )
         .await?;
         Ok(outcome)
+    }
+
+    /// REMOVE `subject`'s password, converting a password account to passkey-only
+    /// (issue #66): flip `password_hash` to the unusable sentinel and `passwordless` to
+    /// true, reusing the cross-source last-credential guard so the subject is never
+    /// stranded, and revoke every OTHER session in the SAME transaction
+    /// (session-fixation defense). Writes one `account.password.remove` audit row on
+    /// success; a blocked or not-found removal writes nothing.
+    ///
+    /// The guard is READ and the flip is APPLIED in one transaction, so a concurrent
+    /// credential removal cannot race the subject into a lockout: removal is BLOCKED
+    /// ([`PasswordRemovalOutcome::BlockedLastCredential`]) unless the subject retains at
+    /// least one usable login factor across sources (a registered passkey, or an
+    /// `account_credentials` row usable for login). The FRESH-re-authentication gate is
+    /// enforced at the surface (the caller), like the sibling sensitive operations.
+    ///
+    /// `webauthn_user_handle` is deliberately NOT touched (it is omitted from every
+    /// users GRANT UPDATE and guarded by the immutability trigger), so the conversion
+    /// can never mutate a stable handle.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn remove_password(
+        &self,
+        env: &Env,
+        subject: &UserId,
+        keep: Option<&SessionId>,
+        step_up_detail: &str,
+    ) -> Result<PasswordRemovalOutcome, StoreError> {
+        if subject.scope() != self.scope {
+            return Ok(PasswordRemovalOutcome::NotFound);
+        }
+        let scope = self.scope;
+        let subject_text = subject.to_string();
+        let tenant = scope.tenant().to_string();
+        let environment = scope.environment().to_string();
+        let now_micros = epoch_micros(env.clock().now_utc());
+        let keep_text = keep
+            .filter(|keep| keep.scope() == scope)
+            .map(ToString::to_string);
+        let emit = SessionEndedEmit::from_acting(env, &self.acting);
+        let mut tx = begin_scoped(self.store, scope).await?;
+        // The account must currently HOLD a usable password; an already passkey-only (or
+        // absent) account is the uniform not-found (nothing to remove).
+        let has_password: bool = sqlx::query(
+            "SELECT count(*) AS n FROM users \
+             WHERE id = $1 AND tenant_id = $2 AND environment_id = $3 \
+             AND deleted_at IS NULL AND password_hash <> $4",
+        )
+        .bind(&subject_text)
+        .bind(&tenant)
+        .bind(&environment)
+        .bind(USER_UNUSABLE_PASSWORD_HASH)
+        .fetch_one(&mut *tx)
+        .await?
+        .get::<i64, _>("n")
+            > 0;
+        if !has_password {
+            tx.commit().await?;
+            return Ok(PasswordRemovalOutcome::NotFound);
+        }
+        // The cross-source last-credential guard (issue #66): the subject must retain a
+        // usable login factor after the password goes away. Counted inside the same
+        // transaction so a concurrent removal cannot slip a lockout past it. A passkey is
+        // the passwordless account's primary factor; an account_credential usable for
+        // login also counts. (A foreign-only hash is deliberately not counted here: the
+        // safe direction for a lockout guard is to block, recoverable at the surface.)
+        let usable_passkeys: i64 = sqlx::query(
+            "SELECT count(*) AS n FROM webauthn_credentials \
+             WHERE tenant_id = $1 AND environment_id = $2 AND subject = $3",
+        )
+        .bind(&tenant)
+        .bind(&environment)
+        .bind(&subject_text)
+        .fetch_one(&mut *tx)
+        .await?
+        .get("n");
+        let usable_account_credentials: i64 = sqlx::query(
+            "SELECT count(*) AS n FROM account_credentials \
+             WHERE tenant_id = $1 AND environment_id = $2 AND subject = $3 \
+             AND usable_for_login = true",
+        )
+        .bind(&tenant)
+        .bind(&environment)
+        .bind(&subject_text)
+        .fetch_one(&mut *tx)
+        .await?
+        .get("n");
+        if usable_passkeys == 0 && usable_account_credentials == 0 {
+            tx.commit().await?;
+            return Ok(PasswordRemovalOutcome::BlockedLastCredential);
+        }
+        // Flip to passkey-only: the unusable sentinel + passwordless true. The immutable
+        // webauthn_user_handle is untouched.
+        sqlx::query(
+            "UPDATE users SET password_hash = $1, passwordless = true \
+             WHERE id = $2 AND tenant_id = $3 AND environment_id = $4",
+        )
+        .bind(USER_UNUSABLE_PASSWORD_HASH)
+        .bind(&subject_text)
+        .bind(&tenant)
+        .bind(&environment)
+        .execute(&mut *tx)
+        .await?;
+        // Session-fixation defense: revoke every OTHER session (keep the one the change
+        // is made from) in the same transaction, exactly as a password change does.
+        let revocation = revoke_other_sessions_in_tx(
+            &mut tx,
+            scope,
+            &subject_text,
+            keep_text.as_deref(),
+            SessionEndCause::PasswordChanged,
+            now_micros,
+            &emit,
+        )
+        .await?;
+        insert_audit_row(
+            &mut tx,
+            &AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::AccountPasswordRemove,
+                target: subject,
+            },
+            Some(step_up_detail),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(PasswordRemovalOutcome::Removed(revocation))
+    }
+
+    /// SET `subject`'s FIRST password, converting a passkey-only account to
+    /// password-holding (issue #66): replace the unusable sentinel `password_hash` with
+    /// the precomputed Argon2id `new_password_hash` and clear `passwordless`, and revoke
+    /// every OTHER session in the SAME transaction (session-fixation defense). Writes one
+    /// `account.password.set` audit row on success.
+    ///
+    /// The UPDATE is GUARDED on the stored hash still being the unusable sentinel, so it
+    /// can never clobber an existing password (a concurrent set, or a caller that
+    /// mis-routed a password account here, flips zero rows and is the benign
+    /// [`FirstPasswordOutcome::Ineligible`]). The caller runs the full set-path policy
+    /// (length, strength, breach screen) and the FRESH passkey re-authentication gate
+    /// BEFORE calling this, exactly as the register/change surfaces do; the plaintext
+    /// never reaches the store and the hash is never logged.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn set_first_password(
+        &self,
+        env: &Env,
+        subject: &UserId,
+        new_password_hash: &str,
+        keep: Option<&SessionId>,
+        step_up_detail: &str,
+    ) -> Result<FirstPasswordOutcome, StoreError> {
+        if subject.scope() != self.scope {
+            return Ok(FirstPasswordOutcome::Ineligible);
+        }
+        let scope = self.scope;
+        let subject_text = subject.to_string();
+        let tenant = scope.tenant().to_string();
+        let environment = scope.environment().to_string();
+        let now_micros = epoch_micros(env.clock().now_utc());
+        let keep_text = keep
+            .filter(|keep| keep.scope() == scope)
+            .map(ToString::to_string);
+        let emit = SessionEndedEmit::from_acting(env, &self.acting);
+        let mut tx = begin_scoped(self.store, scope).await?;
+        // Guarded on the sentinel so an account that already holds a password (or is
+        // absent) flips zero rows and is the benign Ineligible: never clobber a password.
+        let updated = sqlx::query(
+            "UPDATE users SET password_hash = $1, passwordless = false \
+             WHERE id = $2 AND tenant_id = $3 AND environment_id = $4 \
+             AND deleted_at IS NULL AND password_hash = $5",
+        )
+        .bind(new_password_hash)
+        .bind(&subject_text)
+        .bind(&tenant)
+        .bind(&environment)
+        .bind(USER_UNUSABLE_PASSWORD_HASH)
+        .execute(&mut *tx)
+        .await?;
+        if updated.rows_affected() == 0 {
+            tx.commit().await?;
+            return Ok(FirstPasswordOutcome::Ineligible);
+        }
+        let revocation = revoke_other_sessions_in_tx(
+            &mut tx,
+            scope,
+            &subject_text,
+            keep_text.as_deref(),
+            SessionEndCause::PasswordChanged,
+            now_micros,
+            &emit,
+        )
+        .await?;
+        insert_audit_row(
+            &mut tx,
+            &AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::AccountPasswordSet,
+                target: subject,
+            },
+            Some(step_up_detail),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(FirstPasswordOutcome::Set(revocation))
     }
 
     /// Land the verify-then-rehash upgrade of an imported FOREIGN credential (issue
@@ -15000,6 +15310,41 @@ pub struct UserRevocation {
     /// The ids of the sessions this call actually revoked (`ses_...`), in no
     /// guaranteed order. Empty when the subject had no live session.
     pub revoked_session_ids: Vec<String>,
+}
+
+/// The outcome of converting a password account to passkey-only by REMOVING the
+/// password (issue #66).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PasswordRemovalOutcome {
+    /// The password was removed and the account flipped to passkey-only (`password_hash`
+    /// set to the unusable sentinel, `passwordless` set true). The carried revocation
+    /// reports the OTHER sessions ended in the same transaction (session-fixation
+    /// defense).
+    Removed(UserRevocation),
+    /// Blocked by the cross-source last-credential guard: removing the password would
+    /// leave the subject with NO usable login factor (no passkey, no usable account
+    /// credential), so the user is not silently stranded. Nothing changed and no audit
+    /// row was written.
+    BlockedLastCredential,
+    /// No such user, or the account already held no usable password (already
+    /// passkey-only): the uniform not-found, never actionable.
+    NotFound,
+}
+
+/// The outcome of converting a passkey-only account to password-holding by SETTING a
+/// first password (issue #66).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FirstPasswordOutcome {
+    /// The first password was set and the account flipped to password-holding
+    /// (`password_hash` replaced, `passwordless` cleared). The carried revocation
+    /// reports the OTHER sessions ended in the same transaction (session-fixation
+    /// defense).
+    Set(UserRevocation),
+    /// No eligible passkey-only user: the subject is absent, or the account already
+    /// holds a usable password (so its first password was never set here). Nothing
+    /// changed and no audit row was written; the guard never clobbers an existing
+    /// password.
+    Ineligible,
 }
 
 /// Revoke a user's refresh families inside an OPEN transaction (issue #32): the

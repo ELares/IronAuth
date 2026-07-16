@@ -345,6 +345,15 @@ pub fn oidc_router(state: OidcState) -> Router {
             "/t/{tenant_id}/e/{environment_id}/account/password",
             post(account::change_password),
         )
+        // Passkey-only conversion (issue #66): remove the password, converting a password
+        // account to passkey-only. Gated by a fresh passkey re-authentication and the
+        // cross-source last-credential guard (the reverse direction, setting a first
+        // password on a passkey-only account, is the passwordless branch of the change
+        // endpoint above).
+        .route(
+            "/t/{tenant_id}/e/{environment_id}/account/password/remove",
+            post(account::remove_password),
+        )
         // WebAuthn Related Origin Requests document (issue #67, WebAuthn Level 3):
         // GET /.well-known/webauthn serves the {"origins": [...]} list a browser
         // fetches from the RP ID's own origin to accept a ceremony from a related
@@ -377,6 +386,20 @@ pub fn oidc_router(state: OidcState) -> Router {
         .route(
             "/t/{tenant_id}/e/{environment_id}/webauthn/authenticate/verify",
             post(webauthn::authenticate_verify),
+        )
+        // Passwordless (passkey-only) SIGNUP ceremony (issue #66): no session required
+        // (the account does not exist yet). `options` mints a subject and a UV-required
+        // registration challenge; `verify` creates the passkey-only account (no password
+        // code path), persists the passkey, and establishes the HONEST passkey session
+        // that resumes the authorization request. Fail closed with a 404 when WebAuthn is
+        // off, so the route literals stay unconditional for the RFC 9700 inventory.
+        .route(
+            "/t/{tenant_id}/e/{environment_id}/webauthn/signup/options",
+            post(webauthn::register_passkey_signup_options),
+        )
+        .route(
+            "/t/{tenant_id}/e/{environment_id}/webauthn/signup/verify",
+            post(webauthn::register_passkey_signup_verify),
         )
         // The authenticated passkey management surface (issue #65): the caller lists,
         // renames, and removes their OWN passkeys (subject-bound, IDOR-safe, audited

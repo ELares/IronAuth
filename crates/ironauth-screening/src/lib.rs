@@ -39,6 +39,7 @@ mod hibp;
 mod offline;
 mod policy;
 mod provider;
+mod strength;
 
 pub use digest::{Sha1Digest, Sha1Prefix, Sha1Suffix, digest_password};
 pub use hibp::{HIBP_BASE_URL, HibpRangeProvider};
