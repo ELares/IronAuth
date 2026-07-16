@@ -49,5 +49,25 @@ range per docs/RELEASING.md.
     proving credential intactness and the rehash to Argon2id, the Firebase
     modified-scrypt verification against fixture project parameters, per-record gap
     reporting with field-level detail, and a cargo-fuzz target per export parser.
+  - **Per-record isolation at the document-parse layer.** Every vendor document
+    parser now deserializes each user object INDIVIDUALLY: the top-level container
+    is parsed, then each record is turned into a typed user on its own. A record
+    that cannot be parsed (a wrong-typed field, or an Auth0 NDJSON line that is not
+    JSON) is reported as a dropped record with a field-level reason ("malformed
+    record: ...") and skipped, so one bad user never fails the rest of the import.
+    Keycloak, Auth0 (array and NDJSON), Firebase, and SCIM are now consistent with
+    the LDAP path, which already routed through `serde_json::Value`.
+  - **Validation and commit cannot diverge for Keycloak.** The Keycloak credential
+    path round-trips its re-encoded hash through the same `ForeignHash::parse` the
+    #55 engine runs at commit. A credential the engine would reject (for example
+    `hashIterations` past the bound, or an oversized operand) is now reported as a
+    gap and the user imported CREDENTIAL-LESS, instead of emitting a hash that fails
+    the whole record at commit, matching the Auth0, Firebase, and LDAP importers.
+  - **No nested or multi-valued sub-field is silently dropped.** Nested catch-alls
+    now report every unmapped sub-field: SCIM `name` sub-attributes (`middleName`,
+    `honorificPrefix`, ...), every SECONDARY `emails` / `phoneNumbers` value (real
+    user data beyond the primary that is carried into claims) plus each entry's
+    `type` / `display`, Firebase `providerUserInfo` sub-fields (`federatedId`,
+    `photoUrl`, ...), and Keycloak per-credential sub-fields (`priority`, ...).
   - **Scope.** One-shot correctness over a static export. Scheduled or continuous
     sync is a documented later extension, not part of this crate.

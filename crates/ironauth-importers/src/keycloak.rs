@@ -41,10 +41,14 @@ use crate::phc::{self, Pbkdf2Prf};
 /// A Keycloak realm export document. Only the `users` array is consumed; the
 /// realm-level configuration (clients, role definitions, identity-provider config)
 /// is not per-user record data and is not reported as a per-record gap.
+///
+/// The `users` are held as raw JSON values so each user object is deserialized
+/// INDIVIDUALLY: one malformed user is reported as a dropped record and skipped,
+/// never failing the whole import.
 #[derive(Debug, Deserialize)]
 struct Realm {
     #[serde(default)]
-    users: Vec<KcUser>,
+    users: Vec<Value>,
 }
 
 /// One Keycloak user. Named fields are handled explicitly; anything else lands in
@@ -116,6 +120,11 @@ struct KcCredential {
     /// The legacy top-level algorithm name.
     #[serde(default)]
     algorithm: Option<String>,
+    /// Every credential sub-field the importer does not name (for example
+    /// `priority`, `userLabel`, `createdDate`): reported as a per-field gap so no
+    /// nested credential detail is silently dropped.
+    #[serde(flatten)]
+    extra: Map<String, Value>,
 }
 
 /// The resolved operands of a Keycloak password credential.
@@ -137,16 +146,39 @@ struct KcPassword {
 /// returned [`Mapping`], so a single bad user never fails the whole import.
 pub fn map_realm(json: &str) -> Result<Mapping, ParseError> {
     let realm: Realm = serde_json::from_str(json).map_err(ParseError::from_serde)?;
-    let users = realm.users.into_iter().enumerate().map(map_user).collect();
+    let users = realm
+        .users
+        .into_iter()
+        .enumerate()
+        .map(|(index, value)| map_value(index, value))
+        .collect();
     Ok(Mapping {
         source: Source::Keycloak,
         users,
     })
 }
 
+/// Deserialize one raw user value into the typed shape and map it. A value that
+/// cannot be parsed into a Keycloak user (a wrong-typed field) becomes a dropped
+/// record with a field-level reason and is skipped, so a single bad user never
+/// fails the rest of the import.
+fn map_value(index: usize, value: Value) -> MappedUser {
+    let source_key = crate::parse::source_key_from_value(
+        &value,
+        &["id", "username"],
+        format!("keycloak-user-{index}"),
+    );
+    match serde_json::from_value::<KcUser>(value) {
+        Ok(user) => map_user(index, &user),
+        Err(error) => {
+            MappedUser::dropped(source_key, format!("malformed record: {error}"), Vec::new())
+        }
+    }
+}
+
 /// Map one Keycloak user, accumulating gaps for every construct not carried
 /// forward.
-fn map_user((index, user): (usize, KcUser)) -> MappedUser {
+fn map_user(index: usize, user: &KcUser) -> MappedUser {
     let source_key = user
         .id
         .clone()
@@ -163,7 +195,7 @@ fn map_user((index, user): (usize, KcUser)) -> MappedUser {
     };
 
     // Claims: email, verification flag, and name parts.
-    let claims = build_claims(&user);
+    let claims = build_claims(user);
 
     // State: an explicitly disabled account maps to the disabled lifecycle state.
     let state = match user.enabled {
@@ -172,7 +204,7 @@ fn map_user((index, user): (usize, KcUser)) -> MappedUser {
     };
 
     // Password: the first password credential, re-encoded to a canonical hash.
-    let password_hash = map_password(&user, &mut gaps);
+    let password_hash = map_password(user, &mut gaps);
 
     // Traits: the custom attribute document, carried verbatim (unversioned).
     let traits = match &user.attributes {
@@ -180,7 +212,7 @@ fn map_user((index, user): (usize, KcUser)) -> MappedUser {
         _ => None,
     };
 
-    record_membership_gaps(&user, &mut gaps);
+    record_membership_gaps(user, &mut gaps);
 
     let record = ironauth_import::ImportRecord {
         identifier,
@@ -236,6 +268,15 @@ fn build_claims(user: &KcUser) -> Option<Value> {
 fn map_password(user: &KcUser, gaps: &mut Vec<Gap>) -> Option<String> {
     let mut mapped: Option<String> = None;
     for (i, cred) in user.credentials.iter().enumerate() {
+        // No credential sub-field is silently dropped: report each unmodeled key
+        // (for example `priority`) on this credential entry.
+        for key in cred.extra.keys() {
+            gaps.push(Gap::new(
+                format!("credentials[{i}].{key}"),
+                "unmodeled credential sub-field",
+                "present on the credential entry but not consumed by the Keycloak importer",
+            ));
+        }
         let kind = cred.credential_type.as_deref().unwrap_or("");
         if kind != "password" {
             gaps.push(Gap::new(
@@ -255,7 +296,21 @@ fn map_password(user: &KcUser, gaps: &mut Vec<Gap>) -> Option<String> {
         }
         match resolve_password(cred) {
             Ok(password) => match encode_password(&password) {
-                Ok(hash) => mapped = Some(hash),
+                // Round-trip the emitted hash through the SAME `ForeignHash::parse`
+                // the #55 engine runs at commit, so a credential the engine would
+                // reject (for example `hashIterations` past the bound, or an
+                // oversized operand) is reported here as a gap and the user is
+                // imported CREDENTIAL-LESS, rather than emitting a hash that fails
+                // the whole record at commit. The validation pass and the commit
+                // pass cannot diverge.
+                Ok(hash) => match ironauth_import::ForeignHash::parse(&hash) {
+                    Ok(parsed) => mapped = Some(parsed.stored().to_owned()),
+                    Err(error) => gaps.push(Gap::new(
+                        format!("credentials[{i}]"),
+                        format!("{} password hash", password.algorithm),
+                        format!("the re-encoded hash was rejected by the scheme layer ({error}); the user must reset their password"),
+                    )),
+                },
                 Err(reason) => gaps.push(Gap::new(
                     format!("credentials[{i}]"),
                     format!("{} password hash", password.algorithm),
@@ -505,5 +560,82 @@ mod tests {
     #[test]
     fn malformed_json_is_an_error_not_a_panic() {
         assert!(map_realm("{not json").is_err());
+    }
+
+    #[test]
+    fn one_malformed_user_does_not_fail_the_whole_import() {
+        // MEDIUM 1: per-record isolation at the document-parse layer. The middle
+        // user's `credentials` is the wrong shape (a string, not an array), so it
+        // cannot deserialize; it must be reported as a dropped record and skipped
+        // while the good users import, never failing the rest.
+        let json = r#"{"users":[
+            {"id":"u1","username":"alice"},
+            {"id":"u2","username":"bad","credentials":"not-an-array"},
+            {"id":"u3","username":"carol"}
+        ]}"#;
+        let mapping = map_realm(json).expect("the top-level document still parses");
+        assert_eq!(mapping.users.len(), 3);
+        assert!(
+            !mapping.users[0].is_dropped(),
+            "the first good user imports"
+        );
+        assert!(!mapping.users[2].is_dropped(), "the last good user imports");
+        let bad = &mapping.users[1];
+        assert!(bad.is_dropped(), "the malformed user is dropped, not fatal");
+        assert_eq!(bad.source_key, "u2", "the dropped record still has a key");
+        let MapOutcome::Dropped(reason) = &bad.outcome else {
+            panic!("dropped");
+        };
+        assert!(reason.contains("malformed record"), "{reason}");
+    }
+
+    #[test]
+    fn out_of_bounds_iterations_import_credential_less_with_a_gap() {
+        // MEDIUM 2: the emitted hash is round-tripped through the SAME
+        // `ForeignHash::parse` the #55 engine runs at commit. `hashIterations`
+        // beyond MAX_PBKDF2_ITERATIONS would be rejected there, so the importer must
+        // report a gap and import the user CREDENTIAL-LESS rather than emitting a
+        // hash that fails (loses) the whole record at commit.
+        let value = base64::engine::general_purpose::STANDARD.encode([0_u8; 32]);
+        let salt = base64::engine::general_purpose::STANDARD.encode(b"sixteen-byte-slt");
+        let json = format!(
+            r#"{{"users":[{{"username":"dave","credentials":[{{
+                "type":"password",
+                "secretData":"{{\"value\":\"{value}\",\"salt\":\"{salt}\"}}",
+                "credentialData":"{{\"hashIterations\":20000000,\"algorithm\":\"pbkdf2-sha256\"}}"
+            }}]}}]}}"#
+        );
+        let mapping = map_realm(&json).expect("parse");
+        let user = &mapping.users[0];
+        let MapOutcome::Mapped(record) = &user.outcome else {
+            panic!("the user is mapped, not lost");
+        };
+        assert!(
+            record.password_hash.is_none(),
+            "an out-of-bounds hash is never emitted"
+        );
+        assert!(
+            user.gaps
+                .iter()
+                .any(|g| g.field == "credentials[0]" && g.reason.contains("rejected")),
+            "the rejected credential is reported as a gap in the validation-only pass"
+        );
+    }
+
+    #[test]
+    fn credential_sub_fields_are_reported_not_silently_dropped() {
+        // MEDIUM 3: nested per-credential sub-fields (for example `priority`) must
+        // be reported, not silently dropped.
+        let json = r#"{"users":[{"username":"peggy","credentials":[
+            {"type":"password","priority":10,"userLabel":"my password"}
+        ]}]}"#;
+        let mapping = map_realm(json).expect("parse");
+        let fields: Vec<&str> = mapping.users[0]
+            .gaps
+            .iter()
+            .map(|g| g.field.as_str())
+            .collect();
+        assert!(fields.contains(&"credentials[0].priority"), "{fields:?}");
+        assert!(fields.contains(&"credentials[0].userLabel"), "{fields:?}");
     }
 }

@@ -115,34 +115,55 @@ pub fn map_export(
         Some(text) => parse_hash_export(text),
         None => HashMap::new(),
     };
-    let users = parse_users(users_json)?;
-    let mapped = users
-        .into_iter()
-        .enumerate()
-        .map(|(index, user)| map_user(index, user, &hashes))
-        .collect();
+    let mut mapped = Vec::new();
+    let trimmed = users_json.trim_start();
+    if trimmed.starts_with('[') {
+        // A JSON array: parse the top-level container, then deserialize each user
+        // object INDIVIDUALLY so one malformed user is reported and skipped rather
+        // than failing the whole import.
+        let values: Vec<Value> = serde_json::from_str(trimmed).map_err(ParseError::from_serde)?;
+        for (index, value) in values.into_iter().enumerate() {
+            mapped.push(map_value(index, value, &hashes));
+        }
+    } else {
+        // NDJSON: a malformed line is skipped and reported (mirroring the
+        // hash-export parser's tolerance), never failing the rest of the import.
+        for (line_no, line) in users_json.lines().enumerate() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            match serde_json::from_str::<Value>(line) {
+                Ok(value) => mapped.push(map_value(line_no, value, &hashes)),
+                Err(error) => mapped.push(MappedUser::dropped(
+                    format!("auth0-line-{}", line_no + 1),
+                    format!("malformed record: line {}: {error}", line_no + 1),
+                    Vec::new(),
+                )),
+            }
+        }
+    }
     Ok(Mapping {
         source: Source::Auth0,
         users: mapped,
     })
 }
 
-/// Parse the profile export as either a JSON array or NDJSON.
-fn parse_users(text: &str) -> Result<Vec<Auth0User>, ParseError> {
-    let trimmed = text.trim_start();
-    if trimmed.starts_with('[') {
-        return serde_json::from_str(trimmed).map_err(ParseError::from_serde);
-    }
-    let mut users = Vec::new();
-    for (line_no, line) in text.lines().enumerate() {
-        if line.trim().is_empty() {
-            continue;
+/// Deserialize one raw user value into the typed shape, join its hash, and map it.
+/// A value that cannot be parsed into an Auth0 user becomes a dropped record with a
+/// field-level reason and is skipped, so a single bad user never fails the rest of
+/// the import.
+fn map_value(index: usize, value: Value, hashes: &HashMap<String, String>) -> MappedUser {
+    let source_key = crate::parse::source_key_from_value(
+        &value,
+        &["user_id", "email"],
+        format!("auth0-user-{index}"),
+    );
+    match serde_json::from_value::<Auth0User>(value) {
+        Ok(user) => map_user(index, user, hashes),
+        Err(error) => {
+            MappedUser::dropped(source_key, format!("malformed record: {error}"), Vec::new())
         }
-        let user = serde_json::from_str(line)
-            .map_err(|error| ParseError::new(format!("line {}: {error}", line_no + 1)))?;
-        users.push(user);
     }
-    Ok(users)
 }
 
 /// Build the email -> bcrypt-hash join map from the hash export. A malformed line
@@ -424,5 +445,47 @@ mod tests {
     #[test]
     fn malformed_json_is_an_error() {
         assert!(map_export("[not json", None).is_err());
+    }
+
+    #[test]
+    fn one_malformed_user_in_an_array_does_not_fail_the_import() {
+        // MEDIUM 1: per-record isolation. The middle user's `identities` is the
+        // wrong shape, so it cannot deserialize; it is reported as a dropped record
+        // and skipped while the good users import.
+        let users = r#"[
+            {"user_id":"auth0|1","email":"a@x.test"},
+            {"user_id":"auth0|2","email":"b@x.test","identities":"nope"},
+            {"user_id":"auth0|3","email":"c@x.test"}
+        ]"#;
+        let mapping = map_export(users, None).expect("the top-level array still parses");
+        assert_eq!(mapping.users.len(), 3);
+        assert!(!mapping.users[0].is_dropped());
+        assert!(!mapping.users[2].is_dropped());
+        let bad = &mapping.users[1];
+        assert!(bad.is_dropped());
+        assert_eq!(bad.source_key, "auth0|2");
+        let MapOutcome::Dropped(reason) = &bad.outcome else {
+            panic!("dropped");
+        };
+        assert!(reason.contains("malformed record"), "{reason}");
+    }
+
+    #[test]
+    fn a_malformed_ndjson_line_is_skipped_and_reported() {
+        // MEDIUM 1: an NDJSON profile export mirrors the hash-export parser's
+        // tolerance: a bad line is skipped and reported, never failing the import.
+        let users = "{\"user_id\":\"auth0|1\",\"email\":\"a@x.test\"}\n{not json}\n{\"user_id\":\"auth0|2\",\"email\":\"b@x.test\"}\n";
+        let mapping = map_export(users, None).expect("ndjson tolerates a bad line");
+        assert_eq!(
+            mapping.users.len(),
+            3,
+            "the bad line is reported, not dropped"
+        );
+        let dropped: Vec<&MappedUser> = mapping.users.iter().filter(|u| u.is_dropped()).collect();
+        assert_eq!(dropped.len(), 1);
+        let MapOutcome::Dropped(reason) = &dropped[0].outcome else {
+            panic!("dropped");
+        };
+        assert!(reason.contains("malformed record"), "{reason}");
     }
 }

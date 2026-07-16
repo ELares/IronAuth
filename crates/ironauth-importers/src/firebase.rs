@@ -123,10 +123,14 @@ impl FirebaseHashParams {
 }
 
 /// A Firebase `auth:export` document.
+///
+/// The `users` are held as raw JSON values so each user object is deserialized
+/// INDIVIDUALLY: one malformed user is reported as a dropped record and skipped,
+/// never failing the whole import.
 #[derive(Debug, Deserialize)]
 struct Export {
     #[serde(default)]
-    users: Vec<FbUser>,
+    users: Vec<Value>,
 }
 
 /// One Firebase user. Named fields are handled explicitly; anything else lands in
@@ -173,6 +177,11 @@ struct FbUser {
 struct FbProvider {
     #[serde(default)]
     provider_id: Option<String>,
+    /// Every provider sub-field the importer does not name (for example
+    /// `screenName`, `federatedId`, `photoUrl`, `rawId`, `email`): reported as a
+    /// per-field gap so no nested provider detail is silently dropped.
+    #[serde(flatten)]
+    extra: Map<String, Value>,
 }
 
 /// Map a Firebase `auth:export` document into the #55 record format plus a
@@ -189,12 +198,30 @@ pub fn map_export(json: &str, params: &FirebaseHashParams) -> Result<Mapping, Pa
         .users
         .into_iter()
         .enumerate()
-        .map(|(index, user)| map_user(index, user, params))
+        .map(|(index, value)| map_value(index, value, params))
         .collect();
     Ok(Mapping {
         source: Source::Firebase,
         users,
     })
+}
+
+/// Deserialize one raw user value into the typed shape and map it. A value that
+/// cannot be parsed into a Firebase user becomes a dropped record with a
+/// field-level reason and is skipped, so a single bad user never fails the rest of
+/// the import.
+fn map_value(index: usize, value: Value, params: &FirebaseHashParams) -> MappedUser {
+    let source_key = crate::parse::source_key_from_value(
+        &value,
+        &["localId", "email"],
+        format!("firebase-user-{index}"),
+    );
+    match serde_json::from_value::<FbUser>(value) {
+        Ok(user) => map_user(index, user, params),
+        Err(error) => {
+            MappedUser::dropped(source_key, format!("malformed record: {error}"), Vec::new())
+        }
+    }
 }
 
 /// Map one Firebase user, re-encoding its modified-scrypt hash and accumulating
@@ -342,6 +369,17 @@ fn record_gaps(user: &FbUser, gaps: &mut Vec<Gap>) {
             "social/federated linked identities are not represented; only the password login is imported",
         ));
     }
+    // No provider sub-field is silently dropped: report each unmodeled key on every
+    // provider entry (for example `federatedId`, `rawId`, `email`, `photoUrl`).
+    for (i, provider) in user.provider_user_info.iter().enumerate() {
+        for key in provider.extra.keys() {
+            gaps.push(Gap::new(
+                format!("providerUserInfo[{i}].{key}"),
+                "unmodeled provider sub-field",
+                "present on the provider entry but not consumed by the Firebase importer",
+            ));
+        }
+    }
     for (field, present) in [
         ("createdAt", user.created_at.is_some()),
         ("lastLoginAt", user.last_login_at.is_some()),
@@ -431,5 +469,49 @@ mod tests {
     fn hash_config_parses_scrypt() {
         let config = r#"{"algorithm":"SCRYPT","base64_signer_key":"a","base64_salt_separator":"Bw==","rounds":8,"mem_cost":14}"#;
         assert!(FirebaseHashParams::from_hash_config(config).is_ok());
+    }
+
+    #[test]
+    fn one_malformed_user_does_not_fail_the_whole_import() {
+        // MEDIUM 1: per-record isolation. The middle user's `providerUserInfo` is
+        // the wrong shape, so it cannot deserialize; it is reported as a dropped
+        // record and skipped while the good users import.
+        let json = r#"{"users":[
+            {"localId":"a","email":"a@x.test"},
+            {"localId":"b","email":"b@x.test","providerUserInfo":"not-an-array"},
+            {"localId":"c","email":"c@x.test"}
+        ]}"#;
+        let mapping = map_export(json, &published_params()).expect("top-level parse");
+        assert_eq!(mapping.users.len(), 3);
+        assert!(!mapping.users[0].is_dropped());
+        assert!(!mapping.users[2].is_dropped());
+        let bad = &mapping.users[1];
+        assert!(bad.is_dropped());
+        let MapOutcome::Dropped(reason) = &bad.outcome else {
+            panic!("dropped");
+        };
+        assert!(reason.contains("malformed record"), "{reason}");
+    }
+
+    #[test]
+    fn provider_sub_fields_are_reported_not_silently_dropped() {
+        // MEDIUM 3: nested provider sub-fields (federatedId, photoUrl, ...) must be
+        // reported, not silently dropped.
+        let json = r#"{"users":[{"localId":"h","email":"h@x.test",
+            "providerUserInfo":[{"providerId":"google.com","federatedId":"https://accounts.google.com/123","photoUrl":"http://x/p.png"}]}]}"#;
+        let mapping = map_export(json, &published_params()).expect("map");
+        let fields: Vec<&str> = mapping.users[0]
+            .gaps
+            .iter()
+            .map(|g| g.field.as_str())
+            .collect();
+        assert!(
+            fields.contains(&"providerUserInfo[0].federatedId"),
+            "{fields:?}"
+        );
+        assert!(
+            fields.contains(&"providerUserInfo[0].photoUrl"),
+            "{fields:?}"
+        );
     }
 }

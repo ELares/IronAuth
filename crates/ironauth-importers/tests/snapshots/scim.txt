@@ -3,6 +3,7 @@ users: 2 (mapped 2, dropped 0)
 
 [sp-2c7f0001]
   - groups: 1 group membership(s) (IronAuth has no representable group target)
+  - emails[0].type: unmodeled sub-attribute (present on the multi-valued entry but not consumed by the SCIM importer)
   - id: SCIM service-provider id (the SP-assigned id is not preserved; externalId is used as the correlation key)
   - schemas: unmodeled attribute (present in the resource but not consumed by the SCIM importer)
   - urn:ietf:params:scim:schemas:extension:enterprise:2.0:User: unmodeled attribute (present in the resource but not consumed by the SCIM importer)

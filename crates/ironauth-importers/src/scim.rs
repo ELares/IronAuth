@@ -30,14 +30,6 @@ use serde_json::{Map, Value};
 use crate::gap::{Gap, MappedUser, Mapping, Source};
 use crate::parse::ParseError;
 
-/// A SCIM `ListResponse` envelope or a bare resource / array, distinguished by
-/// shape at parse time.
-#[derive(Debug, Deserialize)]
-struct ListResponse {
-    #[serde(default, rename = "Resources")]
-    resources: Vec<ScimUser>,
-}
-
 /// A SCIM core user resource. Named attributes are handled explicitly; anything
 /// else lands in `extra` and is reported as a gap.
 #[derive(Debug, Deserialize)]
@@ -81,6 +73,11 @@ struct ScimName {
     family_name: Option<String>,
     #[serde(default)]
     formatted: Option<String>,
+    /// Every nested name sub-attribute the importer does not name (for example
+    /// `middleName`, `honorificPrefix`, `honorificSuffix`): reported as a per-field
+    /// gap so no nested name detail is silently dropped.
+    #[serde(flatten)]
+    extra: Map<String, Value>,
 }
 
 /// A SCIM multi-valued attribute entry (`emails`, `phoneNumbers`).
@@ -90,6 +87,11 @@ struct ScimValue {
     value: Option<String>,
     #[serde(default)]
     primary: Option<bool>,
+    /// Every entry sub-attribute the importer does not name (for example `type`,
+    /// `display`): reported as a per-field gap so no nested multi-valued detail is
+    /// silently dropped.
+    #[serde(flatten)]
+    extra: Map<String, Value>,
 }
 
 /// Map SCIM core user resources into the #55 record format plus a per-record gap
@@ -105,34 +107,56 @@ struct ScimValue {
 pub fn map_users(json: &str) -> Result<Mapping, ParseError> {
     let value: Value = serde_json::from_str(json).map_err(ParseError::from_serde)?;
     let resources = extract_resources(value)?;
-    let users = resources.into_iter().enumerate().map(map_user).collect();
+    let users = resources
+        .into_iter()
+        .enumerate()
+        .map(|(index, value)| map_value(index, value))
+        .collect();
     Ok(Mapping {
         source: Source::Scim,
         users,
     })
 }
 
-/// Pull the resource list out of whichever SCIM shape was supplied.
-fn extract_resources(value: Value) -> Result<Vec<ScimUser>, ParseError> {
+/// Pull the raw resource values out of whichever SCIM shape was supplied. Each
+/// resource is deserialized INDIVIDUALLY by [`map_value`], so one malformed
+/// resource is reported and skipped rather than failing the whole import.
+fn extract_resources(value: Value) -> Result<Vec<Value>, ParseError> {
     match value {
-        Value::Array(_) => serde_json::from_value(value).map_err(ParseError::from_serde),
-        Value::Object(ref map) if map.contains_key("Resources") => {
-            let envelope: ListResponse =
-                serde_json::from_value(value).map_err(ParseError::from_serde)?;
-            Ok(envelope.resources)
-        }
-        Value::Object(_) => {
-            let single: ScimUser = serde_json::from_value(value).map_err(ParseError::from_serde)?;
-            Ok(vec![single])
-        }
+        Value::Array(items) => Ok(items),
+        Value::Object(mut map) if map.contains_key("Resources") => match map.remove("Resources") {
+            Some(Value::Array(items)) => Ok(items),
+            _ => Err(ParseError::new(
+                "SCIM ListResponse Resources is not an array",
+            )),
+        },
+        Value::Object(_) => Ok(vec![value]),
         _ => Err(ParseError::new(
             "SCIM document is neither a resource, an array, nor a ListResponse",
         )),
     }
 }
 
+/// Deserialize one raw resource value into the typed shape and map it. A value that
+/// cannot be parsed into a SCIM user becomes a dropped record with a field-level
+/// reason and is skipped, so a single bad resource never fails the rest of the
+/// import.
+fn map_value(index: usize, value: Value) -> MappedUser {
+    let source_key = crate::parse::source_key_from_value(
+        &value,
+        &["id", "externalId", "userName"],
+        format!("scim-user-{index}"),
+    );
+    match serde_json::from_value::<ScimUser>(value) {
+        Ok(user) => map_user(index, &user),
+        Err(error) => {
+            MappedUser::dropped(source_key, format!("malformed record: {error}"), Vec::new())
+        }
+    }
+}
+
 /// Map one SCIM user, accumulating gaps.
-fn map_user((index, user): (usize, ScimUser)) -> MappedUser {
+fn map_user(index: usize, user: &ScimUser) -> MappedUser {
     let source_key = user
         .id
         .clone()
@@ -149,12 +173,12 @@ fn map_user((index, user): (usize, ScimUser)) -> MappedUser {
         );
     };
 
-    let claims = build_claims(&user);
+    let claims = build_claims(user);
     let state = match user.active {
         Some(false) => Some("disabled".to_owned()),
         _ => None,
     };
-    record_gaps(&user, &mut gaps);
+    record_gaps(user, &mut gaps);
 
     let record = ironauth_import::ImportRecord {
         identifier,
@@ -217,6 +241,34 @@ fn primary_or_first(values: &[ScimValue]) -> Option<String> {
         .and_then(|v| v.value.clone())
 }
 
+/// Report every dropped secondary value and every unmodeled entry sub-attribute in
+/// a SCIM multi-valued attribute (`emails`, `phoneNumbers`), so no nested value is
+/// silently dropped. The one entry [`primary_or_first`] carries into claims is not
+/// reported as a secondary drop; every other entry with a value is.
+fn report_multivalue_gaps(field: &str, values: &[ScimValue], gaps: &mut Vec<Gap>) {
+    // The index carried into claims: the first primary entry, else the first entry.
+    let kept = values
+        .iter()
+        .position(|v| v.primary == Some(true))
+        .or(if values.is_empty() { None } else { Some(0) });
+    for (i, entry) in values.iter().enumerate() {
+        if Some(i) != kept && entry.value.is_some() {
+            gaps.push(Gap::new(
+                format!("{field}[{i}]"),
+                "secondary value",
+                "only the primary (or first) value is carried into claims; secondary values are not imported",
+            ));
+        }
+        for key in entry.extra.keys() {
+            gaps.push(Gap::new(
+                format!("{field}[{i}].{key}"),
+                "unmodeled sub-attribute",
+                "present on the multi-valued entry but not consumed by the SCIM importer",
+            ));
+        }
+    }
+}
+
 /// Record a gap for every construct with no representable target and any unconsumed
 /// attribute.
 fn record_gaps(user: &ScimUser, gaps: &mut Vec<Gap>) {
@@ -248,6 +300,22 @@ fn record_gaps(user: &ScimUser, gaps: &mut Vec<Gap>) {
             "a plaintext password is never stored; the user sets a credential after import",
         ));
     }
+    // Nested name sub-attributes with no modeled target (middleName, honorific*).
+    if let Some(name) = &user.name {
+        for key in name.extra.keys() {
+            gaps.push(Gap::new(
+                format!("name.{key}"),
+                "unmodeled name sub-attribute",
+                "present on the name attribute but not consumed by the SCIM importer",
+            ));
+        }
+    }
+    // Multi-valued attributes: only the primary (or first) value is carried into
+    // claims, so every SECONDARY value is real user data that would otherwise be
+    // dropped un-reported. Report each secondary value and each entry sub-attribute
+    // (type, display, ...).
+    report_multivalue_gaps("emails", &user.emails, gaps);
+    report_multivalue_gaps("phoneNumbers", &user.phone_numbers, gaps);
     if user.id.is_some() {
         gaps.push(Gap::new(
             "id",
@@ -314,5 +382,62 @@ mod tests {
     #[test]
     fn malformed_json_is_an_error() {
         assert!(map_users("{not json").is_err());
+    }
+
+    #[test]
+    fn one_malformed_resource_does_not_fail_the_import() {
+        // MEDIUM 1: per-record isolation. The middle resource's `emails` is the
+        // wrong shape, so it cannot deserialize; it is reported as a dropped record
+        // and skipped while the good resources import.
+        let json = r#"{"Resources":[
+            {"userName":"alice"},
+            {"userName":"bad","emails":"not-an-array"},
+            {"userName":"carol"}
+        ]}"#;
+        let mapping = map_users(json).expect("the ListResponse still parses");
+        assert_eq!(mapping.users.len(), 3);
+        assert!(!mapping.users[0].is_dropped());
+        assert!(!mapping.users[2].is_dropped());
+        let bad = &mapping.users[1];
+        assert!(bad.is_dropped());
+        assert_eq!(bad.source_key, "bad");
+        let MapOutcome::Dropped(reason) = &bad.outcome else {
+            panic!("dropped");
+        };
+        assert!(reason.contains("malformed record"), "{reason}");
+    }
+
+    #[test]
+    fn secondary_emails_phones_and_nested_name_fields_are_reported() {
+        // MEDIUM 3: only the primary/first email and phone are carried into claims,
+        // so every SECONDARY value is real user data that must be reported, along
+        // with nested name and entry sub-attributes; nothing is silently dropped.
+        let json = r#"{"userName":"nina",
+            "name":{"givenName":"Nina","familyName":"Nolan","middleName":"Q","honorificPrefix":"Dr"},
+            "emails":[
+                {"value":"nina@work.test","primary":true,"type":"work"},
+                {"value":"nina@home.test","type":"home"},
+                {"value":"nina@alt.test"}
+            ],
+            "phoneNumbers":[
+                {"value":"+15550001111","primary":true},
+                {"value":"+15550002222"}
+            ]}"#;
+        let mapping = map_users(json).expect("map");
+        let fields: Vec<&str> = mapping.users[0]
+            .gaps
+            .iter()
+            .map(|g| g.field.as_str())
+            .collect();
+        // Nested name sub-attributes.
+        assert!(fields.contains(&"name.middleName"), "{fields:?}");
+        assert!(fields.contains(&"name.honorificPrefix"), "{fields:?}");
+        // Secondary email and phone values (the primary is the one kept).
+        assert!(fields.contains(&"emails[1]"), "{fields:?}");
+        assert!(fields.contains(&"emails[2]"), "{fields:?}");
+        assert!(fields.contains(&"phoneNumbers[1]"), "{fields:?}");
+        // Entry sub-attributes (type/display).
+        assert!(fields.contains(&"emails[0].type"), "{fields:?}");
+        assert!(fields.contains(&"emails[1].type"), "{fields:?}");
     }
 }

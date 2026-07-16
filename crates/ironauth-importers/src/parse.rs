@@ -48,3 +48,28 @@ impl core::fmt::Display for ParseError {
 }
 
 impl std::error::Error for ParseError {}
+
+/// A best-effort, non-secret source key for a raw user record that FAILED to
+/// deserialize into its typed shape.
+///
+/// Per-record resilience deserializes each user object individually, so a record
+/// the importer cannot parse is reported as a dropped gap rather than failing the
+/// whole import. Reporting needs a stable key even for that unparsed record: this
+/// reads the first present, non-empty string among `fields` (the vendor id or login
+/// handle) directly off the raw JSON value, falling back to the positional
+/// `fallback` when none is usable. It never surfaces a secret (the caller passes
+/// only identity fields, never a credential).
+pub(crate) fn source_key_from_value(
+    value: &serde_json::Value,
+    fields: &[&str],
+    fallback: String,
+) -> String {
+    for field in fields {
+        if let Some(text) = value.get(field).and_then(serde_json::Value::as_str) {
+            if !text.is_empty() {
+                return text.to_owned();
+            }
+        }
+    }
+    fallback
+}
