@@ -14,7 +14,12 @@ range per docs/RELEASING.md.
   hash-probe [--config PATH] [--json]` subcommand: a headless-install tuning helper that
   measures Argon2id on this host and recommends parameters meeting the configured latency
   target, printing projected logins/s per core (the same probe backs the in-admin tuning
-  helper). Registers the pool metric descriptions.
+  helper). Registers the pool metric descriptions. The probe's default per-hash memory
+  budget now derives from TOTAL host RAM (Linux `MemTotal / 2`, or a 1 GiB fallback on
+  hosts without a dependency-free total-RAM read) instead of the currently-configured
+  memory cost, so the default probe can explore the full ladder and recommend stronger
+  parameters than the host is presently configured for (issue #62 hardening); a new
+  `--memory-budget KIB` flag overrides it explicitly.
 - Wire the inbound lazy-migration hook (issue #56): when the OIDC provider is mounted and
   `[oidc.lazy_migration]` is enabled, the boot path builds ONE `LazyMigrationHook` (a
   dedicated SSRF-hardened fetcher with the configured per-call timeout, the resolved shared

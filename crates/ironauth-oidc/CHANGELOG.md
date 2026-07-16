@@ -33,6 +33,33 @@ range per docs/RELEASING.md.
   active workers, worker capacity, admission rejections by reason, and a hash-latency
   histogram; per-tenant admission counts remain observable through the quota engine's
   per-scope samples.
+- Argon2id hashing pool hardening (issue #62, adversarial-review follow-up):
+  - Two public endpoints that ran Argon2 INLINE on protocol-I/O threads (bypassing the
+    pool and admission) now route through the pool: the RFC 8628 device-flow sign-in
+    (`POST .../device`) verifies through `OidcState::verify_password`/`verify_absent`,
+    and invitation accept (`POST .../invitations/accept`) hashes through
+    `OidcState::hash_password`. A new structural lint (`scripts/hashing-pool-boundary.sh`,
+    wired into CI and the gate) fails the build if a raw `password::hash_password`,
+    `verify_password`, or `verify_absent` is called anywhere outside the pool-boundary
+    modules, so this cross-tenant DoS lever cannot regress.
+  - The pool queue is now PER-TENANT fair-queued instead of one global FIFO: each
+    `(tenant, environment)` gets its own sub-queue and the workers dequeue round-robin
+    across tenants with waiting work, so one tenant's admitted backlog can no longer
+    head-of-line-block another tenant's already-admitted hash. Load-shedding is
+    per-tenant (a tenant exceeding its own bounded depth is shed, never an innocent
+    tenant), with a generous global memory backstop charged only to the submitting
+    tenant. `[password_hashing].max_queue_depth` is now the PER-TENANT bound.
+  - The no-pool `spawn_blocking` fallback (the self-hoster and test posture) is now
+    bounded by a semaphore capped at the host core count, so a flood cannot pin the
+    tokio blocking pool (~512 threads). The installed pool remains the production path.
+  - `needs_rehash` no longer upgrades on a DOWNWARD parameter drift: a rehash happens
+    only when the configured parameters are at least as strong as the stored hash on
+    every axis (and stronger on one), so lowering `[password_hashing]` never downgrades
+    an existing stronger hash.
+  - The admission-rejection metric exposes the machine-readable rejection REASON today
+    (`over_share`, `per_tenant_queue_full`, `global_backstop_full`, `shutting_down`); a
+    per-tenant breakdown deliberately rides the same bounded-cardinality scrape-hook
+    follow-up as issue #50 rather than an unbounded per-tenant label (cardinality-safe).
 - Inbound lazy-migration hook (issue #56): when the `[oidc.lazy_migration]` config arms
   it, a login whose canonicalized identifier is UNKNOWN locally verifies the submitted
   credential against a legacy store through a pluggable `CredentialVerifier` (the only

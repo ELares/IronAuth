@@ -175,7 +175,9 @@ pub use password::{
     Argon2Params, PasswordError, hash_password, hash_password_with, needs_rehash, verify_absent,
     verify_password,
 };
-pub use probe::{ProbeReport, available_memory_kib, run_probe};
+pub use probe::{
+    ProbeReport, available_memory_kib, default_memory_budget_kib, run_probe, total_memory_kib,
+};
 pub use registry::{
     GrantType, PkceMethod, PromptSet, PromptSetError, PromptValue, ResponseMode, ResponseType,
 };

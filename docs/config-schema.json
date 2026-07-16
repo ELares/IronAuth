@@ -697,7 +697,7 @@
         },
         "max_queue_depth": {
           "default": 512,
-          "description": "The maximum number of hash jobs that may wait in the pool's queue before\nload-shedding kicks in. A submission that would exceed this depth is\nrefused with a retryable `503` and a machine-readable reason (the pool is a\nbounded resource, never an unbounded inline hash). The default (`512`) is a\nconservative backstop; per-tenant fairness is enforced BEFORE the queue by\nthe quota layer. Must be at least 1.",
+          "description": "The maximum number of hash jobs ONE `(tenant, environment)` may have waiting\nin the pool's queue before that tenant is load-shed (issue #62). This is the\nper-tenant FAIR-SHARE bound: the pool keeps a separate sub-queue per tenant\nand dequeues round-robin across them, so one tenant's backlog can never\nhead-of-line-block or shed another tenant's already-admitted work. A\nsubmission that would exceed this per-tenant depth is refused with a\nretryable `503` and a machine-readable reason (the pool is a bounded\nresource, never an unbounded inline hash). A generous global memory backstop\n(a multiple of this bound) caps total waiting work and is charged only to the\nsubmitting tenant. Per-tenant fairness is also enforced BEFORE the queue by\nthe quota admission layer. The default (`512`) is a conservative bound. Must\nbe at least 1.",
           "format": "uint",
           "minimum": 0,
           "type": "integer"

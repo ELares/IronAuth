@@ -89,6 +89,7 @@ fn operation_ids_are_the_stable_set() {
             "listTenants",
             "listUsers",
             "planConfigPromotion",
+            "probePasswordHashing",
             "resendInvitation",
             "restoreTenant",
             "resumeTenant",
@@ -257,6 +258,7 @@ fn documented_paths_are_the_expected_set() {
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/keys",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/migration/verify-credential",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations",
+            "POST /v1/tenants/{tenant_id}/environments/{environment_id}/password-hashing/probe",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/sessions/revoke",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/sessions/{session_id}/revoke",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/users",
@@ -304,7 +306,7 @@ fn committed_artifact_matches_generated_spec() {
 async fn served_routes_match_documented_routes() {
     let router = db_free_router();
     let documented = documented_method_paths();
-    assert_eq!(documented.len(), 56, "the documented route count is pinned");
+    assert_eq!(documented.len(), 57, "the documented route count is pinned");
 
     // The OUTBOUND lazy-migration endpoint (issue #58) is the one documented route
     // that is NOT gated by the management `Principal` at 401. It is DISABLED BY

@@ -163,6 +163,8 @@ jobs:
         run: scripts/classification-lint.sh
       - name: canonicalization seam (every identifier comparison routes through the one seam)
         run: scripts/canonicalization-seam.sh
+      - name: hashing pool boundary (every request-path hash routes through the admission-controlled pool)
+        run: scripts/hashing-pool-boundary.sh
       - name: http audit (no outbound HTTP client outside the fetch dispatcher)
         run: scripts/http-audit.sh
       - name: no M2M metering (no metering/billing/quota hook on the client-credentials path)

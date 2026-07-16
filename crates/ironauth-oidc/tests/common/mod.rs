@@ -789,6 +789,19 @@ impl Harness {
         self.router.clone()
     }
 
+    /// Install a dedicated Argon2id hashing pool (issue #62) on the state and
+    /// rebuild the protocol router, so the public hashing surfaces (login,
+    /// register, account, device-flow verify, invitation accept) route through the
+    /// pool and its per-tenant fair-share admission. Used to prove those endpoints
+    /// are admission-controlled rather than running Argon2 inline on an I/O thread.
+    /// Only the protocol router is rebuilt (the issuer/discovery routers are not
+    /// needed by the hashing endpoints).
+    pub fn install_hashing_pool(&mut self, pool: Arc<ironauth_oidc::HashingPool>) {
+        let state = self.state.clone().with_hashing_pool(pool);
+        self.router = oidc_router(state.clone());
+        self.state = state;
+    }
+
     /// The environment's public verifying key, for building a verification policy
     /// under a non-EdDSA algorithm (for example the ES256 environment, issue #29).
     #[must_use]

@@ -191,6 +191,143 @@ async fn two_tenant_stuffing_storm_degrades_only_the_noisy_tenant() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn one_tenants_backlog_does_not_delay_another_tenants_admitted_work() {
+    // The HIGH-2 acceptance-critical FAIR-QUEUING test. Unlike the admission-rate
+    // test above, this saturates the QUEUE itself: a SINGLE worker (so the queue
+    // genuinely backs up) and NO admission limit, so every hash is admitted and the
+    // only thing standing between tenant B and its result is the queue discipline.
+    //
+    // Tenant A floods a large backlog of admitted hashes; tenant B then submits ONE.
+    // A single global FIFO would force B behind A's entire backlog (the shipped
+    // head-of-line bug: B ~9s behind A's 50 jobs). Per-tenant fair queuing
+    // (round-robin across tenant sub-queues) must instead serve B after only a
+    // couple of A's jobs, so B stays within SLO while A's backlog drains fairly.
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // Tens of ms per hash so the single worker stays busy and the backlog is real.
+    let params = Argon2Params::new(65_536, 2, 1);
+    let pool = Arc::new(HashingPool::new(Env::system(), params, 1, 4_096, None));
+    let clock = Env::system().clock_arc();
+
+    let noisy = fresh_scope();
+    let quiet = fresh_scope();
+    let total_a: usize = 20;
+
+    // A shared count of completed A hashes; B snapshots it when B finishes.
+    let a_done = Arc::new(AtomicUsize::new(0));
+
+    // Flood tenant A's backlog first (all admitted, no quota).
+    let mut a_handles = Vec::new();
+    for _ in 0..total_a {
+        let pool = Arc::clone(&pool);
+        let a_done = Arc::clone(&a_done);
+        let scope = noisy;
+        a_handles.push(tokio::spawn(async move {
+            let result = pool.hash(&scope, "pw").await;
+            a_done.fetch_add(1, Ordering::SeqCst);
+            result
+        }));
+    }
+    // Let A's tasks run their synchronous admit+enqueue before B joins the queue, so
+    // A's backlog is genuinely built up behind the busy worker (no timer needed).
+    for _ in 0..16 {
+        tokio::task::yield_now().await;
+    }
+
+    // Tenant B submits ONE admitted hash, timing it and snapshotting A's progress.
+    let overall_start = clock.monotonic();
+    let b_handle = {
+        let pool = Arc::clone(&pool);
+        let clock = Arc::clone(&clock);
+        let a_done = Arc::clone(&a_done);
+        let scope = quiet;
+        tokio::spawn(async move {
+            let start = clock.monotonic();
+            let result = pool.hash(&scope, "pw").await;
+            let elapsed = clock.monotonic().saturating_duration_since(start);
+            let a_done_at_b = a_done.load(Ordering::SeqCst);
+            (result, elapsed, a_done_at_b)
+        })
+    };
+
+    let (b_result, b_latency, a_done_at_b) = b_handle.await.expect("b task");
+    let mut a_admitted = 0;
+    for handle in a_handles {
+        if handle.await.expect("a task").is_ok() {
+            a_admitted += 1;
+        }
+    }
+    let a_total_latency = clock.monotonic().saturating_duration_since(overall_start);
+
+    assert!(
+        b_result.is_ok(),
+        "B's admitted hash must complete: {b_result:?}"
+    );
+    // Fairness never starves A either: every A hash is admitted and completes.
+    assert_eq!(
+        a_admitted, total_a,
+        "every A hash is admitted (no quota) and completes"
+    );
+    // THE proof: B did NOT wait behind A's whole backlog. Round-robin bounds the A
+    // jobs served before B to a small handful; a global FIFO would be ~total_a.
+    assert!(
+        a_done_at_b < total_a / 2,
+        "B jumped A's backlog via fair queuing: only {a_done_at_b} of {total_a} A-hashes \
+         finished before B (a single global FIFO would be ~{total_a})"
+    );
+    // And B stayed within SLO: it finished well before A's backlog drained.
+    assert!(
+        b_latency < a_total_latency,
+        "B's latency stayed within SLO under A's backlog: B={b_latency:?}, A total={a_total_latency:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_noisy_tenant_is_shed_without_shedding_an_innocent_tenant() {
+    // Issue #62 HIGH-2: load-shedding is PER-TENANT. A single worker with a
+    // per-tenant queue depth of 1 means tenant A (busy worker + one queued + a flood)
+    // sheds its OWN overflow, while tenant B, whose sub-queue is empty, is admitted
+    // to the queue and never shed for A's fill.
+    let params = Argon2Params::new(65_536, 2, 1); // slow enough that the worker stays busy.
+    let pool = Arc::new(HashingPool::new(Env::system(), params, 1, 1, None));
+    let noisy = fresh_scope();
+    let quiet = fresh_scope();
+
+    // A floods far past its per-tenant depth: some shed as PoolExhausted (503).
+    let mut a_handles = Vec::new();
+    for _ in 0..24 {
+        let pool = Arc::clone(&pool);
+        let scope = noisy;
+        a_handles.push(tokio::spawn(async move { pool.hash(&scope, "pw").await }));
+    }
+    // B submits one hash; its OWN sub-queue is empty, so it is never shed for A.
+    let b_result = {
+        let pool = Arc::clone(&pool);
+        tokio::spawn(async move { pool.hash(&quiet, "pw").await })
+    }
+    .await
+    .expect("b task");
+
+    let mut a_shed = 0;
+    for handle in a_handles {
+        if matches!(
+            handle.await.expect("a task"),
+            Err(HashRejection::PoolExhausted)
+        ) {
+            a_shed += 1;
+        }
+    }
+    assert!(
+        a_shed > 0,
+        "A's overflow is shed per-tenant (PoolExhausted)"
+    );
+    assert!(
+        b_result.is_ok(),
+        "innocent tenant B is never shed for A's fill: {b_result:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_saturated_pool_sheds_with_a_typed_error_not_an_inline_hash() {
     // The bounded queue load-sheds with a TYPED PoolExhausted (retryable 503), and
     // verification never falls back to an unbounded inline hash. One worker plus a

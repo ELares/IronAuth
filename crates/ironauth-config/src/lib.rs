@@ -1348,12 +1348,18 @@ pub struct PasswordHashingConfig {
     /// `PASSWORD_HASHING_MAX_POOL_THREADS`.
     pub pool_threads: usize,
 
-    /// The maximum number of hash jobs that may wait in the pool's queue before
-    /// load-shedding kicks in. A submission that would exceed this depth is
-    /// refused with a retryable `503` and a machine-readable reason (the pool is a
-    /// bounded resource, never an unbounded inline hash). The default (`512`) is a
-    /// conservative backstop; per-tenant fairness is enforced BEFORE the queue by
-    /// the quota layer. Must be at least 1.
+    /// The maximum number of hash jobs ONE `(tenant, environment)` may have waiting
+    /// in the pool's queue before that tenant is load-shed (issue #62). This is the
+    /// per-tenant FAIR-SHARE bound: the pool keeps a separate sub-queue per tenant
+    /// and dequeues round-robin across them, so one tenant's backlog can never
+    /// head-of-line-block or shed another tenant's already-admitted work. A
+    /// submission that would exceed this per-tenant depth is refused with a
+    /// retryable `503` and a machine-readable reason (the pool is a bounded
+    /// resource, never an unbounded inline hash). A generous global memory backstop
+    /// (a multiple of this bound) caps total waiting work and is charged only to the
+    /// submitting tenant. Per-tenant fairness is also enforced BEFORE the queue by
+    /// the quota admission layer. The default (`512`) is a conservative bound. Must
+    /// be at least 1.
     pub max_queue_depth: usize,
 
     /// The target per-hash latency in milliseconds the tuning probe aims for when

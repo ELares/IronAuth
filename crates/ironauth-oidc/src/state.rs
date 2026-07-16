@@ -18,8 +18,10 @@
 //! serves (they read the same registry entry).
 
 use std::collections::BTreeSet;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime};
+
+use tokio::sync::Semaphore;
 
 use ironauth_config::{
     ClientAssertionAudience, ClientCredentialsAudience, OidcConfig, RegistrationMode,
@@ -36,6 +38,58 @@ use crate::registry::{ResponseMode, ResponseType};
 use crate::revocation::{RevocationEventSink, default_sink};
 use crate::subject::{PairwiseSalt, SubjectCache, SubjectConfig};
 use crate::tokens::AccessTokenTarget;
+
+/// The process-wide bound on CONCURRENT inline Argon2id hashes for the no-pool
+/// fallback posture (issue #62).
+///
+/// Production always installs the dedicated pool ([`OidcState::with_hashing_pool`]),
+/// which is the production path; this semaphore only guards the self-hoster,
+/// embedded, and test posture where hashing runs on the tokio blocking pool. That
+/// pool defaults to ~512 threads, so an unbounded flood could pin ~512 concurrent
+/// Argon2id contexts (tens of MiB each, ~9.5 GiB) and exhaust threads and memory.
+/// Capping concurrent inline hashes at the host core count keeps the fallback
+/// bounded without admission, mirroring the pool's default worker sizing.
+fn inline_hash_semaphore() -> &'static Arc<Semaphore> {
+    static SEM: OnceLock<Arc<Semaphore>> = OnceLock::new();
+    SEM.get_or_init(|| Arc::new(Semaphore::new(crate::hashing_pool::default_pool_threads())))
+}
+
+/// Run `f` on the tokio blocking pool while holding a permit from `sem`, so the
+/// number of concurrent inline hashes never exceeds the semaphore's capacity. The
+/// permit is moved into the blocking closure and released when the hash finishes.
+///
+/// # Errors
+///
+/// [`HashRejection::Unavailable`] if the semaphore is closed or the blocking task
+/// could not be joined; never an unbounded inline hash.
+async fn bounded_inline_on<T, F>(
+    sem: &Arc<Semaphore>,
+    f: F,
+) -> Result<T, crate::hashing_pool::HashRejection>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    let permit = Arc::clone(sem)
+        .acquire_owned()
+        .await
+        .map_err(|_| crate::hashing_pool::HashRejection::Unavailable)?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        f()
+    })
+    .await
+    .map_err(|_| crate::hashing_pool::HashRejection::Unavailable)
+}
+
+/// [`bounded_inline_on`] against the process-wide [`inline_hash_semaphore`].
+async fn bounded_inline<T, F>(f: F) -> Result<T, crate::hashing_pool::HashRejection>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    bounded_inline_on(inline_hash_semaphore(), f).await
+}
 
 /// Why resolving a set of RFC 8707 resource indicators to an access-token target
 /// failed (issue #28). The token/authorization endpoints map [`InvalidTarget`] to
@@ -437,7 +491,10 @@ impl OidcState {
     /// path; a test installs a small-pool, small-budget instance to drive the
     /// isolation and load-shedding paths. With no pool installed hashing runs on
     /// the tokio blocking pool (still off the protocol-I/O threads) with no
-    /// admission, the default and the self-hoster's posture.
+    /// admission but a bounded concurrency cap (issue #62,
+    /// [`inline_hash_semaphore`]) so the fallback cannot exhaust threads or memory:
+    /// the default and the self-hoster's posture. The installed pool is the
+    /// production path.
     #[must_use]
     pub fn with_hashing_pool(mut self, pool: Arc<crate::hashing_pool::HashingPool>) -> Self {
         self.hashing_pool = Some(pool);
@@ -474,9 +531,8 @@ impl OidcState {
         }
         let env = self.env().clone();
         let password = password.to_owned();
-        tokio::task::spawn_blocking(move || crate::password::hash_password(&env, &password))
-            .await
-            .map_err(|_| crate::hashing_pool::HashRejection::Unavailable)?
+        bounded_inline(move || crate::password::hash_password(&env, &password))
+            .await?
             .map_err(|_| crate::hashing_pool::HashRejection::Unavailable)
     }
 
@@ -499,9 +555,7 @@ impl OidcState {
         }
         let password = password.to_owned();
         let hash = hash.to_owned();
-        tokio::task::spawn_blocking(move || crate::password::verify_password(&password, &hash))
-            .await
-            .map_err(|_| crate::hashing_pool::HashRejection::Unavailable)
+        bounded_inline(move || crate::password::verify_password(&password, &hash)).await
     }
 
     /// Spend a full verification for `scope` against a fixed dummy hash and return
@@ -520,9 +574,7 @@ impl OidcState {
             return pool.verify_absent(scope, password).await;
         }
         let password = password.to_owned();
-        tokio::task::spawn_blocking(move || crate::password::verify_absent(&password))
-            .await
-            .map_err(|_| crate::hashing_pool::HashRejection::Unavailable)
+        bounded_inline(move || crate::password::verify_absent(&password)).await
     }
 
     /// Whether a Global Token Revocation hard-kills the subject's `offline_access`
@@ -1424,6 +1476,53 @@ mod tests {
         assert_eq!(
             origin_of("https://issuer.test:80").as_deref(),
             Some("https://issuer.test:80")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn bounded_inline_caps_concurrent_inline_hashes() {
+        // Issue #62 MEDIUM-3: the no-pool fallback bounds CONCURRENT inline hashes
+        // with a semaphore, so a flood cannot pin the whole tokio blocking pool
+        // (~512 threads). Drive many concurrent jobs through a cap-2 semaphore and
+        // assert the observed concurrency never exceeds the cap. Without the
+        // semaphore the observed maximum would climb to the job count.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let cap = 2;
+        let sem = std::sync::Arc::new(super::Semaphore::new(cap));
+        let current = std::sync::Arc::new(AtomicUsize::new(0));
+        let observed_max = std::sync::Arc::new(AtomicUsize::new(0));
+
+        let mut handles = Vec::new();
+        for _ in 0..12 {
+            let sem = std::sync::Arc::clone(&sem);
+            let current = std::sync::Arc::clone(&current);
+            let observed_max = std::sync::Arc::clone(&observed_max);
+            handles.push(tokio::spawn(async move {
+                super::bounded_inline_on(&sem, move || {
+                    let now = current.fetch_add(1, Ordering::SeqCst) + 1;
+                    observed_max.fetch_max(now, Ordering::SeqCst);
+                    // Hold the permit long enough to overlap with the other jobs.
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                    current.fetch_sub(1, Ordering::SeqCst);
+                })
+                .await
+                .expect("bounded inline runs");
+            }));
+        }
+        for handle in handles {
+            handle.await.expect("task");
+        }
+
+        let peak = observed_max.load(Ordering::SeqCst);
+        assert!(
+            peak >= 1 && peak <= cap,
+            "concurrent inline hashes stayed within the cap ({cap}); observed peak {peak}"
+        );
+        assert_eq!(
+            current.load(Ordering::SeqCst),
+            0,
+            "every permit was released"
         );
     }
 }

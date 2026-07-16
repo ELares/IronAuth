@@ -185,15 +185,21 @@ pub fn verify_password(password: &str, hash: &str) -> bool {
         .is_ok()
 }
 
-/// Whether a stored native Argon2id `hash` was written at DIFFERENT parameters
-/// than `target`, so a successful login should transparently rehash it to the
-/// current parameters (issue #62). Returns `false` when the stored hash already
-/// matches the target, is not a parseable Argon2id PHC string, or is a non-Argon2
-/// (foreign) hash: only a genuine native-parameter drift warrants an upgrade, and
-/// the foreign path (issue #55) owns the foreign-to-native upgrade.
+/// Whether a stored native Argon2id `hash` should be transparently UPGRADED to the
+/// current `target` parameters on a successful login (issue #62). Returns `true`
+/// only when `target` is at least as strong as the stored parameters on EVERY axis
+/// (`m`, `t`, `p`) AND stronger on at least one, so a rehash never weakens a hash.
+///
+/// Returns `false` when the stored hash already matches the target, when `target`
+/// is WEAKER on any axis (a config lowering must never downgrade an existing
+/// stronger hash, issue #62 LOW-5: it just stops strengthening), when the stored
+/// value is not a parseable Argon2id PHC string, or when it is a non-Argon2
+/// (foreign) hash: the foreign path (issue #55) owns the foreign-to-native upgrade.
 ///
 /// The comparison is on the cost parameters (`m`, `t`, `p`) and the algorithm, not
 /// the salt or digest, so it is purely a policy check on how the hash was derived.
+/// Higher memory, more iterations, and more lanes each represent strictly more
+/// attacker work, so per-axis non-decrease is the non-downgrade guarantee.
 #[must_use]
 pub fn needs_rehash(hash: &str, target: Argon2Params) -> bool {
     let Ok(parsed) = PasswordHash::new(hash) else {
@@ -207,9 +213,17 @@ pub fn needs_rehash(hash: &str, target: Argon2Params) -> bool {
     let Ok(params) = Params::try_from(&parsed) else {
         return false;
     };
-    params.m_cost() != target.memory_kib
-        || params.t_cost() != target.iterations
-        || params.p_cost() != target.parallelism
+    let (stored_m, stored_t, stored_p) = (params.m_cost(), params.t_cost(), params.p_cost());
+    // Never downgrade: rehash only when the target is >= the stored work on every
+    // axis. A lowering below the stored strength (even if still above the config
+    // floor) leaves the stronger existing hash untouched.
+    let no_downgrade = target.memory_kib >= stored_m
+        && target.iterations >= stored_t
+        && target.parallelism >= stored_p;
+    let strengthens = target.memory_kib > stored_m
+        || target.iterations > stored_t
+        || target.parallelism > stored_p;
+    no_downgrade && strengthens
 }
 
 /// Run a full Argon2id verification against a fixed dummy hash and always return
@@ -320,9 +334,31 @@ mod tests {
         // The SAME hash needs a rehash to a stronger target (parameter drift).
         assert!(needs_rehash(&owasp, Argon2Params::new(65_536, 3, 1)));
 
-        // A hash at weaker params needs a rehash to the OWASP default.
+        // A hash at weaker params needs a rehash to the OWASP default (upgrade).
         let weak = hash_password_with(&env, "pw", Argon2Params::new(8_192, 1, 1)).expect("hash");
         assert!(needs_rehash(&weak, Argon2Params::owasp()));
+
+        // NON-DOWNGRADE (issue #62 LOW-5): a stored hash STRONGER than the configured
+        // target is NOT rehashed, so lowering the config never downgrades an existing
+        // hash; it just stops strengthening.
+        let strong = hash_password_with(&env, "pw", Argon2Params::new(65_536, 3, 2)).expect("hash");
+        assert!(
+            !needs_rehash(&strong, Argon2Params::owasp()),
+            "a stronger stored hash must never be downgraded to weaker config params"
+        );
+        // A mixed change that is weaker on even ONE axis is also not a rehash (no
+        // per-axis downgrade), even though the other axes would strengthen.
+        let mixed = hash_password_with(&env, "pw", Argon2Params::new(19_456, 4, 1)).expect("hash");
+        assert!(
+            !needs_rehash(&mixed, Argon2Params::new(65_536, 2, 1)),
+            "a target weaker on any axis (t: 4 -> 2) must not rehash"
+        );
+        // The weaker stored hash still upgrades to that same target (t and m both
+        // grow, p unchanged): the upgrade direction is unaffected.
+        assert!(needs_rehash(
+            &hash_password_with(&env, "pw", Argon2Params::new(19_456, 2, 1)).expect("hash"),
+            Argon2Params::new(65_536, 3, 1)
+        ));
 
         // A malformed or non-argon2id stored value is never rehashed here.
         assert!(!needs_rehash("not-a-phc-string", Argon2Params::owasp()));

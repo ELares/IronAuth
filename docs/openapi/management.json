@@ -3485,6 +3485,115 @@
         ]
       }
     },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/password-hashing/probe": {
+      "post": {
+        "tags": [
+          "password-hashing"
+        ],
+        "summary": "Run the Argon2id tuning probe on this host and return a recommendation.",
+        "operationId": "probePasswordHashing",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Optional. A probe is a read-only host measurement that changes nothing, so a replay is inherently safe.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "requestBody": {
+          "description": "Optional tuning inputs (target latency, memory budget); an empty body uses the shipped default target and a host-derived memory budget.",
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PasswordHashingProbeRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The measured recommendation: the Argon2id parameters whose measured hash met the target latency, the measured latency, whether the target was met, and the projected logins/s per core and across the host.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PasswordHashingProbeReport"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The request body is invalid",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Environment not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/v1/tenants/{tenant_id}/environments/{environment_id}/refresh-families": {
       "get": {
         "tags": [
@@ -6652,6 +6761,114 @@
             "description": "The tenant the organization belongs to (`ten_...`)."
           }
         }
+      },
+      "PasswordHashingProbeReport": {
+        "type": "object",
+        "description": "A parameter recommendation produced from a host-measured probe (issue #62).",
+        "required": [
+          "memory_kib",
+          "iterations",
+          "parallelism",
+          "measured_latency_ms",
+          "target_latency_ms",
+          "within_target",
+          "projected_logins_per_sec_per_core",
+          "projected_logins_per_sec_total",
+          "host_threads",
+          "memory_budget_kib"
+        ],
+        "properties": {
+          "available_memory_kib": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "The host's available memory in KiB, when measurable, else null.",
+            "minimum": 0
+          },
+          "host_threads": {
+            "type": "integer",
+            "description": "The host parallelism the total projection multiplies by.",
+            "minimum": 0
+          },
+          "iterations": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Recommended Argon2id iteration (time) cost.",
+            "minimum": 0
+          },
+          "measured_latency_ms": {
+            "type": "number",
+            "format": "double",
+            "description": "The measured per-hash latency of the recommendation, in milliseconds."
+          },
+          "memory_budget_kib": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The per-hash memory budget the probe capped candidates at, in KiB.",
+            "minimum": 0
+          },
+          "memory_kib": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Recommended Argon2id memory cost in KiB.",
+            "minimum": 0
+          },
+          "parallelism": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Recommended Argon2id parallelism (lanes).",
+            "minimum": 0
+          },
+          "projected_logins_per_sec_per_core": {
+            "type": "number",
+            "format": "double",
+            "description": "Projected logins per second a single core sustains at the recommendation."
+          },
+          "projected_logins_per_sec_total": {
+            "type": "number",
+            "format": "double",
+            "description": "Projected logins per second the whole host sustains."
+          },
+          "target_latency_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The target per-hash latency the probe aimed for, in milliseconds.",
+            "minimum": 0
+          },
+          "within_target": {
+            "type": "boolean",
+            "description": "Whether the recommendation met the target (`measured <= target`). False on a\nhost too slow to hit the target even at the memory floor."
+          }
+        }
+      },
+      "PasswordHashingProbeRequest": {
+        "type": "object",
+        "description": "The optional tuning inputs for a probe run. Both fields default, so an empty\nbody runs the probe at the shipped default target and a host-derived memory\nbudget.",
+        "properties": {
+          "memory_budget_kib": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "The per-hash memory budget in KiB to cap candidates at. Defaults to a\nfraction of total host RAM (issue #62) when omitted, so the probe can\nexplore the full ladder.",
+            "default": null,
+            "minimum": 0
+          },
+          "target_latency_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "The target per-hash latency in milliseconds the probe aims for. Clamped to\nthe configured bounds (`PASSWORD_HASHING_MIN/MAX_PROBE_TARGET_LATENCY_MS`);\ndefaults to 250 when omitted.",
+            "default": null,
+            "minimum": 0
+          }
+        },
+        "additionalProperties": false
       },
       "RefreshFamilyList": {
         "type": "object",

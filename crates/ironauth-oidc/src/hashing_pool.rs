@@ -20,10 +20,18 @@
 //!    tenant over its share is shed with a retryable `429` carrying the quota
 //!    layer's machine-readable block signal, so one tenant's storm drains only
 //!    that tenant's hashing bucket, never another tenant's and never the pool.
-//! 3. **A bounded queue.** Admitted jobs enter a fixed-depth queue; a submission
-//!    that would exceed the depth is shed with a retryable `503`. Verification
-//!    NEVER falls back to an unbounded inline hash: pool exhaustion and worker
-//!    faults are typed [`HashRejection`] errors the caller surfaces.
+//! 3. **A per-tenant fair queue.** Admitted jobs enter a PER-`(tenant, environment)`
+//!    sub-queue, and the workers dequeue round-robin across every sub-queue with
+//!    waiting work, so one tenant's admitted backlog can never head-of-line-block
+//!    another tenant's already-admitted job (a worker takes at most ONE job from a
+//!    tenant before serving the next tenant in line). Load-shedding is PER-TENANT:
+//!    a tenant whose own sub-queue is at its bounded depth is shed with a retryable
+//!    `503`, and an idle tenant is NEVER shed for a noisy tenant's fill. A generous
+//!    global backstop caps total memory; because it is charged only to the
+//!    SUBMITTING tenant and sits far above the per-tenant bound, one tenant's fill
+//!    cannot shed another. Verification NEVER falls back to an unbounded inline
+//!    hash: pool exhaustion and worker faults are typed [`HashRejection`] errors
+//!    the caller surfaces.
 //!
 //! # Determinism seam
 //!
@@ -31,7 +39,7 @@
 //! a direct process-clock read, so the invariant lints stay satisfied and a
 //! deterministic test drives the timing. The salt still comes from the entropy seam.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
@@ -46,6 +54,13 @@ use tokio::sync::oneshot;
 
 use crate::password::{self, Argon2Params};
 
+/// How many per-tenant queue-depths the global memory backstop allows in total.
+/// The global cap is `per_tenant_max_depth * GLOBAL_BACKSTOP_FANOUT`, so it sits
+/// far above any one tenant's bound: a single tenant filling its own sub-queue can
+/// never reach it, and only a broad multi-tenant flood ever trips it (shedding the
+/// submitter, never an idle tenant).
+const GLOBAL_BACKSTOP_FANOUT: usize = 16;
+
 /// Per-hash latency histogram, in seconds, labeled by operation (`hash`/`verify`).
 pub const HASH_DURATION_SECONDS: &str = "ironauth_password_hash_duration_seconds";
 /// Current depth of the hashing pool's queue (jobs waiting for a worker).
@@ -54,7 +69,12 @@ pub const POOL_QUEUE_DEPTH: &str = "ironauth_password_hash_pool_queue_depth";
 pub const POOL_ACTIVE_WORKERS: &str = "ironauth_password_hash_pool_active_workers";
 /// The fixed worker-thread capacity of the pool (a gauge set once at boot).
 pub const POOL_THREADS: &str = "ironauth_password_hash_pool_threads";
-/// Admission rejections, labeled by `reason` (`over_share`/`pool_exhausted`).
+/// Admission rejections, labeled by `reason`: `over_share` (per-tenant fair-share
+/// admission, issue #50), `per_tenant_queue_full` (the tenant's own fair-share
+/// queue is full), `global_backstop_full` (the global memory valve), or
+/// `shutting_down`. The label carries the machine-readable rejection REASON; a
+/// per-tenant breakdown deliberately rides the same bounded-cardinality scrape-hook
+/// follow-up as issue #50 rather than an unbounded per-tenant label here.
 pub const ADMISSION_REJECTED_TOTAL: &str = "ironauth_password_hash_admission_rejected_total";
 
 thread_local! {
@@ -189,31 +209,130 @@ pub struct ThreadDiagnostics {
     pub tokio_runtime_present: bool,
 }
 
+/// A key identifying one tenant's fair-share sub-queue: `(tenant, environment)`.
+type TenantKey = (String, String);
+
+/// The synthetic key for internal, tenant-less jobs (the diagnostics probe). It
+/// gets its own sub-queue so it never draws from, or is charged against, a real
+/// tenant's fair share.
+fn system_key() -> TenantKey {
+    (String::new(), String::new())
+}
+
+/// Why a submission was shed, as the machine-readable metric `reason` label. Every
+/// value maps to a retryable [`HashRejection::PoolExhausted`]; the label only
+/// distinguishes which bound tripped, for operability. Fairness (the per-tenant
+/// bound and the round-robin dequeue) means one tenant's fill produces
+/// `per_tenant_queue_full` for THAT tenant, never for an innocent one.
+mod shed_reason {
+    /// The submitting tenant's own sub-queue is at its bounded depth.
+    pub const PER_TENANT: &str = "per_tenant_queue_full";
+    /// The global memory backstop is full (only reachable when many tenants are
+    /// each near their per-tenant bound); charged to the submitting tenant.
+    pub const GLOBAL: &str = "global_backstop_full";
+    /// The pool is shutting down and no longer accepts work.
+    pub const SHUTDOWN: &str = "shutting_down";
+}
+
+/// The per-tenant fair queue: one sub-queue per `(tenant, environment)`, plus a
+/// round-robin schedule so no tenant's backlog head-of-line-blocks another's.
+struct FairQueue {
+    /// Per-tenant sub-queues of admitted jobs, keyed by `(tenant, environment)`.
+    tenants: HashMap<TenantKey, VecDeque<Op>>,
+    /// The round-robin schedule of tenant keys with at least one waiting job. Each
+    /// active key appears EXACTLY once; a worker pops the front key, takes one job,
+    /// and re-appends the key to the BACK if it still has work, so service rotates
+    /// fairly across tenants regardless of any one tenant's backlog size.
+    order: VecDeque<TenantKey>,
+    /// Total jobs across every sub-queue (the global backstop counter and gauge).
+    total: usize,
+}
+
+impl FairQueue {
+    fn new() -> Self {
+        Self {
+            tenants: HashMap::new(),
+            order: VecDeque::new(),
+            total: 0,
+        }
+    }
+
+    /// Push `op` into `key`'s sub-queue, enforcing the per-tenant depth bound first
+    /// (so a noisy tenant sheds only its OWN overflow) and the global memory
+    /// backstop second (charged to the submitter). Returns the new total on success
+    /// or the metric `reason` the submission was shed for.
+    fn push(
+        &mut self,
+        key: TenantKey,
+        op: Op,
+        per_tenant_max_depth: usize,
+        global_max_depth: usize,
+    ) -> Result<usize, &'static str> {
+        let sub = self.tenants.entry(key.clone()).or_default();
+        if sub.len() >= per_tenant_max_depth {
+            return Err(shed_reason::PER_TENANT);
+        }
+        if self.total >= global_max_depth {
+            return Err(shed_reason::GLOBAL);
+        }
+        let was_empty = sub.is_empty();
+        sub.push_back(op);
+        self.total += 1;
+        if was_empty {
+            self.order.push_back(key);
+        }
+        Ok(self.total)
+    }
+
+    /// Pop one job in round-robin order across tenants with waiting work, or `None`
+    /// when every sub-queue is empty. Takes at most ONE job from the front tenant,
+    /// then rotates it to the back, bounding any one tenant's head-of-line effect on
+    /// the others to a single job.
+    fn pop(&mut self) -> Option<Op> {
+        let key = self.order.pop_front()?;
+        let sub = self.tenants.get_mut(&key)?;
+        let op = sub.pop_front()?;
+        self.total -= 1;
+        if sub.is_empty() {
+            self.tenants.remove(&key);
+        } else {
+            self.order.push_back(key);
+        }
+        Some(op)
+    }
+}
+
 /// The shared queue and its signaling, owned by the pool and every worker.
 struct Shared {
-    /// The FIFO of pending jobs, guarded together with the shutdown flag.
-    queue: Mutex<VecDeque<Op>>,
+    /// The per-tenant fair queue, guarded together with the shutdown flag.
+    queue: Mutex<FairQueue>,
     /// Signaled when a job is enqueued or shutdown begins.
     available: Condvar,
     /// Set once at drop; workers drain then exit.
     shutdown: AtomicBool,
-    /// The maximum number of jobs that may wait before load-shedding.
-    max_queue_depth: usize,
+    /// The maximum jobs ONE `(tenant, environment)` may have waiting before it is
+    /// load-shed. This is the fair-share bound: an innocent tenant is never shed for
+    /// a noisy tenant reaching it.
+    per_tenant_max_depth: usize,
+    /// The global backstop on total waiting jobs across all tenants (a memory
+    /// valve). Set far above the per-tenant bound so one tenant's fill cannot reach
+    /// it; when it does trip, only the submitting tenant is shed.
+    global_max_depth: usize,
     /// Current number of workers executing a job (for the utilization gauge).
     active: AtomicI64,
 }
 
 impl Shared {
-    /// Try to enqueue a job, failing closed when the queue is at its bound.
-    fn enqueue(&self, op: Op) -> Result<(), Op> {
+    /// Try to enqueue `op` under `key`, failing closed on shutdown or when a bound
+    /// is reached. The `Err` is the machine-readable metric `reason`.
+    fn enqueue(&self, key: TenantKey, op: Op) -> Result<(), &'static str> {
         let mut queue = self.queue.lock().expect("hashing queue lock poisoned");
-        if self.shutdown.load(Ordering::Acquire) || queue.len() >= self.max_queue_depth {
-            return Err(op);
+        if self.shutdown.load(Ordering::Acquire) {
+            return Err(shed_reason::SHUTDOWN);
         }
-        queue.push_back(op);
-        let depth = queue.len();
+        let total = queue.push(key, op, self.per_tenant_max_depth, self.global_max_depth)?;
         drop(queue);
-        record_queue_depth(depth);
+        record_queue_depth(total);
         self.available.notify_one();
         Ok(())
     }
@@ -238,7 +357,8 @@ impl std::fmt::Debug for HashingPool {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HashingPool")
             .field("threads", &self.workers.len())
-            .field("max_queue_depth", &self.shared.max_queue_depth)
+            .field("per_tenant_max_depth", &self.shared.per_tenant_max_depth)
+            .field("global_max_depth", &self.shared.global_max_depth)
             .field("params", &self.params)
             .field("admission", &self.quota.is_some())
             .finish_non_exhaustive()
@@ -247,8 +367,13 @@ impl std::fmt::Debug for HashingPool {
 
 impl HashingPool {
     /// Build a pool of `threads` workers (at least one) with a `max_queue_depth`
-    /// bound, minting new hashes at `params`, and admission through `quota` (when
-    /// `Some`). The salt and latency clock come from `env`.
+    /// bound applied PER `(tenant, environment)` (the fair-share bound), minting new
+    /// hashes at `params`, and admission through `quota` (when `Some`). The salt and
+    /// latency clock come from `env`.
+    ///
+    /// The global memory backstop across all tenants is derived as
+    /// `max_queue_depth * GLOBAL_BACKSTOP_FANOUT`, so it sits far above any single
+    /// tenant's bound and one tenant's fill can never shed another.
     ///
     /// # Panics
     ///
@@ -264,12 +389,14 @@ impl HashingPool {
         quota: Option<Arc<QuotaEnforcer>>,
     ) -> Self {
         let threads = threads.max(1);
-        let max_queue_depth = max_queue_depth.max(1);
+        let per_tenant_max_depth = max_queue_depth.max(1);
+        let global_max_depth = per_tenant_max_depth.saturating_mul(GLOBAL_BACKSTOP_FANOUT);
         let shared = Arc::new(Shared {
-            queue: Mutex::new(VecDeque::new()),
+            queue: Mutex::new(FairQueue::new()),
             available: Condvar::new(),
             shutdown: AtomicBool::new(false),
-            max_queue_depth,
+            per_tenant_max_depth,
+            global_max_depth,
             active: AtomicI64::new(0),
         });
         let clock = env.clock_arc();
@@ -314,10 +441,18 @@ impl HashingPool {
         Ok(())
     }
 
-    /// Submit an already-admitted job, mapping a full queue to `PoolExhausted`.
-    fn submit(&self, op: Op) -> Result<(), HashRejection> {
-        self.shared.enqueue(op).map_err(|_| {
-            metrics::counter!(ADMISSION_REJECTED_TOTAL, "reason" => "pool_exhausted").increment(1);
+    /// The fair-queue key for `scope`: its `(tenant, environment)` pair.
+    fn key_of(scope: &Scope) -> TenantKey {
+        (scope.tenant().to_string(), scope.environment().to_string())
+    }
+
+    /// Submit an already-admitted job into `key`'s fair-share sub-queue, mapping any
+    /// shed (per-tenant depth, global backstop, or shutdown) to `PoolExhausted` and
+    /// recording the machine-readable reason. Load-shedding is per-tenant, so this
+    /// never sheds an innocent tenant for a noisy one's fill.
+    fn submit(&self, key: TenantKey, op: Op) -> Result<(), HashRejection> {
+        self.shared.enqueue(key, op).map_err(|reason| {
+            metrics::counter!(ADMISSION_REJECTED_TOTAL, "reason" => reason).increment(1);
             HashRejection::PoolExhausted
         })
     }
@@ -333,11 +468,14 @@ impl HashingPool {
     pub async fn hash(&self, scope: &Scope, password: &str) -> Result<String, HashRejection> {
         self.admit(scope)?;
         let (reply, rx) = oneshot::channel();
-        self.submit(Op::Hash {
-            password: password.to_owned(),
-            params: self.params,
-            reply,
-        })?;
+        self.submit(
+            Self::key_of(scope),
+            Op::Hash {
+                password: password.to_owned(),
+                params: self.params,
+                reply,
+            },
+        )?;
         match rx.await {
             Ok(Ok(hash)) => Ok(hash),
             Ok(Err(())) | Err(_) => Err(HashRejection::Unavailable),
@@ -359,11 +497,14 @@ impl HashingPool {
     ) -> Result<bool, HashRejection> {
         self.admit(scope)?;
         let (reply, rx) = oneshot::channel();
-        self.submit(Op::Verify {
-            password: password.to_owned(),
-            stored: hash.to_owned(),
-            reply,
-        })?;
+        self.submit(
+            Self::key_of(scope),
+            Op::Verify {
+                password: password.to_owned(),
+                stored: hash.to_owned(),
+                reply,
+            },
+        )?;
         rx.await.map_err(|_| HashRejection::Unavailable)
     }
 
@@ -382,10 +523,13 @@ impl HashingPool {
     ) -> Result<bool, HashRejection> {
         self.admit(scope)?;
         let (reply, rx) = oneshot::channel();
-        self.submit(Op::VerifyAbsent {
-            password: password.to_owned(),
-            reply,
-        })?;
+        self.submit(
+            Self::key_of(scope),
+            Op::VerifyAbsent {
+                password: password.to_owned(),
+                reply,
+            },
+        )?;
         rx.await.map_err(|_| HashRejection::Unavailable)
     }
 
@@ -410,7 +554,7 @@ impl HashingPool {
     /// [`HashRejection::Unavailable`] if the worker could not answer.
     pub async fn thread_diagnostics(&self) -> Result<ThreadDiagnostics, HashRejection> {
         let (reply, rx) = oneshot::channel();
-        self.submit(Op::Diagnostics { reply })?;
+        self.submit(system_key(), Op::Diagnostics { reply })?;
         rx.await.map_err(|_| HashRejection::Unavailable)
     }
 }
@@ -442,8 +586,8 @@ fn worker_loop(shared: &Shared, env: &Env, clock: &dyn ironauth_env::Clock) {
         let op = {
             let mut queue = shared.queue.lock().expect("hashing queue lock poisoned");
             loop {
-                if let Some(op) = queue.pop_front() {
-                    let depth = queue.len();
+                if let Some(op) = queue.pop() {
+                    let depth = queue.total;
                     drop(queue);
                     record_queue_depth(depth);
                     break op;
@@ -556,7 +700,8 @@ pub fn describe_hashing_pool_metrics() {
     metrics::describe_gauge!(POOL_THREADS, "Configured hashing-pool worker capacity");
     metrics::describe_counter!(
         ADMISSION_REJECTED_TOTAL,
-        "Password-hash admissions rejected, by reason (over_share/pool_exhausted)"
+        "Password-hash admissions rejected, by reason \
+         (over_share/per_tenant_queue_full/global_backstop_full/shutting_down)"
     );
 }
 

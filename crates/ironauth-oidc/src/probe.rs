@@ -179,19 +179,58 @@ fn duration_to_ms(duration: std::time::Duration) -> f64 {
 /// failure, in which case the probe relies on the configured memory budget alone.
 #[must_use]
 pub fn available_memory_kib() -> Option<u64> {
-    #[cfg(target_os = "linux")]
-    {
-        let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
-        for line in meminfo.lines() {
-            if let Some(rest) = line.strip_prefix("MemAvailable:") {
-                let kib = rest.split_whitespace().next()?;
-                return kib.parse::<u64>().ok();
-            }
+    meminfo_field_kib("MemAvailable:")
+}
+
+/// Best-effort TOTAL host memory in KiB. Reads Linux `/proc/meminfo` `MemTotal`;
+/// returns `None` on any other platform or on a read/parse failure. Used to derive
+/// a sensible DEFAULT per-hash memory budget so the probe can explore the full
+/// ladder out of the box, rather than being capped at the currently-configured
+/// memory cost (issue #62 LOW-6).
+#[must_use]
+pub fn total_memory_kib() -> Option<u64> {
+    meminfo_field_kib("MemTotal:")
+}
+
+/// Read a KiB-valued `/proc/meminfo` field on Linux; `None` elsewhere. A portable
+/// total-RAM read needs a platform crate on macOS/Windows, which this feature is
+/// not worth adding, so non-Linux hosts fall back to the fixed default budget and
+/// the documented `--memory-budget` override.
+#[cfg(target_os = "linux")]
+fn meminfo_field_kib(field: &str) -> Option<u64> {
+    let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
+    for line in meminfo.lines() {
+        if let Some(rest) = line.strip_prefix(field) {
+            let kib = rest.split_whitespace().next()?;
+            return kib.parse::<u64>().ok();
         }
-        None
     }
-    #[cfg(not(target_os = "linux"))]
-    {
-        None
-    }
+    None
+}
+
+/// Non-Linux hosts have no dependency-free total/available-memory read.
+#[cfg(not(target_os = "linux"))]
+fn meminfo_field_kib(_field: &str) -> Option<u64> {
+    None
+}
+
+/// The fixed per-hash memory-budget fallback in KiB (1 GiB) when total host memory
+/// is not readable (macOS, Windows, some containers). It exceeds the top of
+/// [`PROBE_MEMORY_LADDER_KIB`] (512 MiB), so the default probe can still explore
+/// the full ladder rather than stopping at the currently-configured cost; the
+/// probe's own [`available_memory_kib`]-based cap protects the host where it is
+/// measurable. An operator on a smaller host uses `--memory-budget`.
+pub const DEFAULT_MEMORY_BUDGET_FALLBACK_KIB: u64 = 1_048_576;
+
+/// The default per-hash memory budget the probe caps candidates at: half of TOTAL
+/// host memory when measurable (Linux `MemTotal`), else
+/// [`DEFAULT_MEMORY_BUDGET_FALLBACK_KIB`]. Deriving from total RAM (not the
+/// currently-configured `memory_kib`) lets the default probe recommend stronger
+/// parameters than the host is presently configured for, which is the whole point
+/// of a host-measured tuning probe (issue #62 LOW-6).
+#[must_use]
+pub fn default_memory_budget_kib() -> u64 {
+    total_memory_kib().map_or(DEFAULT_MEMORY_BUDGET_FALLBACK_KIB, |total| {
+        (total / 2).max(u64::from(PROBE_MIN_MEMORY_KIB))
+    })
 }

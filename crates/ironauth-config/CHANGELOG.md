@@ -11,7 +11,11 @@ range per docs/RELEASING.md.
   `memory_kib`/`iterations`/`parallelism` default to the OWASP recommendation
   (`19456`/`2`/`1`) and are bounded at config load (a security floor of 8 MiB up to a
   4 GiB ceiling, iterations 1..=16, parallelism 1..=64) so a tuning mistake can neither
-  ship a weaker-than-defensible hash nor an unbootable one; they are per-environment in
+  ship a weaker-than-defensible hash nor an unbootable one. `max_queue_depth` is the
+  PER-TENANT fair-share queue bound (issue #62 hardening): the pool keeps a sub-queue per
+  `(tenant, environment)` and dequeues round-robin, and a generous global memory backstop
+  (a multiple of this bound) caps total waiting work, so one tenant's fill can neither
+  head-of-line-block nor shed another tenant. They are per-environment in
   spirit and apply to new hashes, with existing hashes upgrading on next login.
   `pool_threads` (0 derives from the host core count), `max_queue_depth` (default 512),
   and `probe_target_latency_ms` (default 250, bounded 10..=5000) size and tune the pool.

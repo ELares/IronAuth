@@ -648,12 +648,15 @@ fn parse_config_path(
 
 /// Run the `hash-probe` subcommand (issue #62): measure Argon2id on this host and
 /// recommend parameters that meet the target per-hash latency, showing projected
-/// logins/s per core. Reads the target and memory budget from `[password_hashing]`
-/// when `--config PATH` is given, else uses the shipped defaults. Prints a
-/// human-readable report, or machine-readable JSON with `--json`.
+/// logins/s per core. Reads the target latency from `[password_hashing]` when
+/// `--config PATH` is given, else the shipped default; the per-hash memory budget
+/// defaults to a fraction of total host RAM (issue #62 LOW-6) and is overridable
+/// with `--memory-budget KIB`. Prints a human-readable report, or machine-readable
+/// JSON with `--json`.
 fn hash_probe(args: &mut impl Iterator<Item = String>) -> ExitCode {
     let mut config_path: Option<String> = None;
     let mut json = false;
+    let mut memory_budget_override: Option<u64> = None;
     while let Some(arg) = args.next() {
         if let Some(value) = arg.strip_prefix("--config=") {
             config_path = Some(value.to_owned());
@@ -663,11 +666,27 @@ fn hash_probe(args: &mut impl Iterator<Item = String>) -> ExitCode {
                 return ExitCode::FAILURE;
             };
             config_path = Some(path);
+        } else if let Some(value) = arg.strip_prefix("--memory-budget=") {
+            let Ok(kib) = value.parse::<u64>() else {
+                eprintln!("ironauth hash-probe: --memory-budget expects KiB (a u64)");
+                return ExitCode::FAILURE;
+            };
+            memory_budget_override = Some(kib);
+        } else if arg == "--memory-budget" {
+            let Some(value) = args.next() else {
+                eprintln!("ironauth hash-probe: --memory-budget requires a KiB value");
+                return ExitCode::FAILURE;
+            };
+            let Ok(kib) = value.parse::<u64>() else {
+                eprintln!("ironauth hash-probe: --memory-budget expects KiB (a u64)");
+                return ExitCode::FAILURE;
+            };
+            memory_budget_override = Some(kib);
         } else if arg == "--json" {
             json = true;
         } else {
             eprintln!("ironauth hash-probe: unrecognized argument '{arg}'");
-            eprintln!("usage: ironauth hash-probe [--config PATH] [--json]");
+            eprintln!("usage: ironauth hash-probe [--config PATH] [--memory-budget KIB] [--json]");
             return ExitCode::FAILURE;
         }
     }
@@ -685,11 +704,15 @@ fn hash_probe(args: &mut impl Iterator<Item = String>) -> ExitCode {
     };
 
     let hashing = &config.password_hashing;
-    // The per-hash memory budget the probe caps candidates at: the operator's own
-    // configured memory cost, so the probe never recommends more memory per hash
-    // than the deployment already budgets. The probe also caps against measurable
-    // host memory (Linux MemAvailable / 2) on its own.
-    let memory_budget_kib = u64::from(hashing.memory_kib);
+    // The per-hash memory budget the probe caps candidates at. Default: a sensible
+    // fraction of TOTAL host memory (Linux MemTotal / 2) or a fixed 1 GiB fallback
+    // on hosts without a dependency-free total-RAM read (issue #62 LOW-6), so the
+    // default probe can explore the full ladder and recommend STRONGER parameters
+    // than the deployment is presently configured for. An operator caps it
+    // explicitly with --memory-budget. The probe also caps against measurable host
+    // memory (Linux MemAvailable / 2) on its own.
+    let memory_budget_kib =
+        memory_budget_override.unwrap_or_else(ironauth_oidc::default_memory_budget_kib);
     let env = Env::system();
     let report = ironauth_oidc::run_probe(&env, hashing.probe_target_latency_ms, memory_budget_kib);
 
@@ -771,7 +794,7 @@ fn print_help() {
     println!();
     println!("USAGE:");
     println!("  ironauth serve [--config PATH]   Run the server until SIGTERM/SIGINT");
-    println!("  ironauth hash-probe [--config PATH] [--json]");
+    println!("  ironauth hash-probe [--config PATH] [--memory-budget KIB] [--json]");
     println!("                                   Measure Argon2id on this host and");
     println!("                                   recommend parameters (issue #62)");
     println!("  ironauth validate <document>     Validate a config document (local)");
