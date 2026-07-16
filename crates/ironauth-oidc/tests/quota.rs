@@ -52,6 +52,8 @@ fn request_quota(env_burst: u64) -> QuotaConfig {
         token_issuance_burst: 0, // unlimited (not charged on this path).
         hook_seconds_per_second: 0,
         hook_seconds_burst: 0, // unlimited (not charged on this path).
+        password_hashing_per_second: 0,
+        password_hashing_burst: 0, // unlimited (not charged on this path).
     };
     QuotaConfig {
         tenant: unlimited_others(10_000),
@@ -309,6 +311,8 @@ fn tenant_limited_quota(tenant_burst: u64) -> QuotaConfig {
         token_issuance_burst: 0,
         hook_seconds_per_second: 0,
         hook_seconds_burst: 0,
+        password_hashing_per_second: 0,
+        password_hashing_burst: 0,
     };
     QuotaConfig {
         tenant: scope(tenant_burst),

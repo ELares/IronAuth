@@ -9387,6 +9387,85 @@ impl ActingUserRepo<'_> {
             Err(other) => Err(other),
         }
     }
+
+    /// Land the transparent rehash of a NATIVE Argon2id credential to the current
+    /// hashing parameters (issue #62). The login surface has already VERIFIED the
+    /// presented password against `expected_current_hash` (the value stored now) and
+    /// computed `new_password_hash` at the current parameters through the entropy
+    /// seam. This writes the new verifier onto `password_hash`, atomically per user,
+    /// and writes one `user.password.upgrade` audit row in the same transaction, so
+    /// a hash written at older parameters is upgraded transparently on sign-in.
+    ///
+    /// The UPDATE is guarded on `password_hash` still equalling
+    /// `expected_current_hash` (optimistic concurrency), so two concurrent logins for
+    /// the same user race safely (exactly one wins; the loser flips zero rows) and a
+    /// concurrent `change_password` is never clobbered (its newer hash no longer
+    /// matches the expected value, so this no-ops rather than reverting it). A win
+    /// returns `Ok(true)`; a no-op returns `Ok(false)`.
+    ///
+    /// The caller treats the result as best-effort: the login has already succeeded,
+    /// so a no-op (a race) or a transient failure simply leaves the older-parameter
+    /// hash to be upgraded on the next login. No plaintext ever reaches the store and
+    /// the hash is never logged.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if `subject` is out of this scope or names no user;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn rehash_native_password(
+        &self,
+        env: &Env,
+        subject: &UserId,
+        expected_current_hash: &str,
+        new_password_hash: &str,
+    ) -> Result<bool, StoreError> {
+        if subject.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let subject_text = subject.to_string();
+        let result = write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::UserPasswordUpgrade,
+                target: subject,
+            },
+            async move |tx| {
+                // Guard on the stored hash still being the one we verified, so a
+                // concurrent upgrade or a concurrent password change flips zero rows
+                // and rolls this whole audited write back (no change, no audit row).
+                let updated = sqlx::query(
+                    "UPDATE users \
+                     SET password_hash = $1 \
+                     WHERE id = $2 AND tenant_id = $3 AND environment_id = $4 \
+                     AND deleted_at IS NULL AND password_hash = $5",
+                )
+                .bind(new_password_hash)
+                .bind(&subject_text)
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(expected_current_hash)
+                .execute(&mut **tx)
+                .await?;
+                if updated.rows_affected() == 0 {
+                    return Err(StoreError::NotFound);
+                }
+                Ok(())
+            },
+            false,
+        )
+        .await;
+        match result {
+            Ok(()) => Ok(true),
+            // No row to upgrade: the stored hash changed under us (a concurrent
+            // upgrade or password change). A benign no-op; the audit row rolled back.
+            Err(StoreError::NotFound) => Ok(false),
+            Err(other) => Err(other),
+        }
+    }
 }
 
 /// The sentinel `password_hash` stored for an admin-created user with no credential

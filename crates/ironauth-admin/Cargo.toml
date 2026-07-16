@@ -43,6 +43,11 @@ base64.workspace = true
 # Pure Rust, permissive, already in the tree via ironauth-store; no new crate.
 sha2.workspace = true
 tracing.workspace = true
+# The in-admin Argon2id tuning probe (issue #62) spends real CPU, so it runs on a
+# blocking thread (spawn_blocking) rather than inline on the async request thread,
+# matching the issue's rule that hashing never blocks protocol I/O. Only the `rt`
+# surface (spawn_blocking) is needed; the server crate drives the runtime.
+tokio = { workspace = true, features = ["rt"] }
 # OpenAPI 3.1 source of truth. utoipa derives the spec from the `#[utoipa::path]`
 # annotations on the handlers (listed once in `#[derive(OpenApi)]` paths(...)),
 # and scripts/openapi-check.sh git-diffs the regenerated spec so drift fails the
@@ -91,6 +96,14 @@ required-features = ["testing"]
 [[test]]
 name = "config_snapshot"
 path = "tests/config_snapshot.rs"
+required-features = ["testing"]
+
+# The in-admin Argon2id tuning probe (issue #62): an operator runs the
+# host-measured probe and gets a sane recommendation; an invalid credential is
+# refused (permission-gated). Needs a real database (DATABASE_URL).
+[[test]]
+name = "password_hashing_probe"
+path = "tests/password_hashing_probe.rs"
 required-features = ["testing"]
 
 # Idempotency-Key replay: a replay returns the original response and writes no

@@ -13,7 +13,8 @@ use std::sync::Arc;
 use axum::Router;
 use ironauth_admin::AdminState;
 use ironauth_config::{
-    Config, FeatureRegistry, GLOBAL_TOKEN_REVOCATION_FEATURE, Loaded, OidcConfig, QuotaConfig,
+    Config, FeatureRegistry, GLOBAL_TOKEN_REVOCATION_FEATURE, Loaded, OidcConfig,
+    PasswordHashingConfig, QuotaConfig,
 };
 use ironauth_env::Env;
 use ironauth_jose::MasterKey;
@@ -40,6 +41,10 @@ fn main() -> ExitCode {
             subcommand_args.extend(args);
             ironauth_apply::run(&subcommand_args)
         }
+        // The Argon2id tuning probe (issue #62): a headless-install helper that
+        // measures the host and recommends parameters. The same probe backs the
+        // in-admin tuning helper; both call ironauth_oidc::run_probe.
+        Some("hash-probe") => hash_probe(&mut args),
         Some("--version" | "-V" | "version") => {
             println!("ironauth {VERSION}");
             ExitCode::SUCCESS
@@ -151,6 +156,7 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
                 env.clone(),
                 resolve_master_key(&config),
                 config.quota.clone(),
+                config.password_hashing.clone(),
             ))
         } else {
             None
@@ -172,7 +178,9 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
         }
         // Mount the OIDC provider on the PUBLIC plane when enabled. The issuer root
         // is the server's config-derived base URL, so issuers are per environment.
-        if let Some((oidc_config, dsn, oidc_env, master_key, quota_config)) = oidc_inputs {
+        if let Some((oidc_config, dsn, oidc_env, master_key, quota_config, hashing_config)) =
+            oidc_inputs
+        {
             let issuer_base = server.base_url();
             if let Some(router) = build_oidc_router(
                 &oidc_config,
@@ -182,6 +190,7 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
                 global_revocation_enabled,
                 master_key,
                 &quota_config,
+                &hashing_config,
                 migration_hook,
             )
             .await
@@ -314,6 +323,7 @@ async fn build_oidc_router(
     global_revocation_enabled: bool,
     master_key: Option<Arc<MasterKey>>,
     quota_config: &QuotaConfig,
+    hashing_config: &PasswordHashingConfig,
     migration_hook: Option<Arc<LazyMigrationHook>>,
 ) -> Option<Router> {
     let store = match Store::connect(data_plane_dsn).await {
@@ -372,9 +382,41 @@ async fn build_oidc_router(
     // wants no quota expresses it; enforcement then admits every request.
     let quota_enforcer = Arc::new(QuotaEnforcer::from_config(quota_config, env.clock_arc()));
 
+    // The dedicated, admission-controlled Argon2id hashing pool (issue #62): Argon2
+    // runs ONLY on these threads, never a tokio protocol-I/O worker, and each hash
+    // is admission-controlled through the SAME quota enforcer (the PasswordHashing
+    // dimension), so one tenant's credential-stuffing storm degrades only that
+    // tenant. The parameters (OWASP defaults, tunable per environment in spirit via
+    // the tuning probe) apply to NEW hashes; existing hashes upgrade on next login.
+    let pool_threads = if hashing_config.pool_threads == 0 {
+        ironauth_oidc::default_pool_threads()
+    } else {
+        hashing_config.pool_threads
+    };
+    let hashing_pool = Arc::new(ironauth_oidc::HashingPool::new(
+        env.clone(),
+        ironauth_oidc::Argon2Params::new(
+            hashing_config.memory_kib,
+            hashing_config.iterations,
+            hashing_config.parallelism,
+        ),
+        pool_threads,
+        hashing_config.max_queue_depth,
+        Some(Arc::clone(&quota_enforcer)),
+    ));
+    ironauth_oidc::describe_hashing_pool_metrics();
+    tracing::info!(
+        pool_threads,
+        memory_kib = hashing_config.memory_kib,
+        iterations = hashing_config.iterations,
+        parallelism = hashing_config.parallelism,
+        "Argon2id hashing pool started with per-tenant fair-share admission (issue #62)"
+    );
+
     let mut state = OidcState::new(store, env, registry, oidc_config, issuer_base)
         .with_global_token_revocation_enabled(global_revocation_enabled)
-        .with_quota_enforcer(quota_enforcer);
+        .with_quota_enforcer(quota_enforcer)
+        .with_hashing_pool(hashing_pool);
     // Arm the inbound lazy-migration hook on the login path (issue #56) when one is
     // configured; without it an unknown-identifier login is the uniform failure.
     if let Some(hook) = migration_hook {
@@ -604,12 +646,157 @@ fn parse_config_path(
     Ok(config_path)
 }
 
+/// Run the `hash-probe` subcommand (issue #62): measure Argon2id on this host and
+/// recommend parameters that meet the target per-hash latency, showing projected
+/// logins/s per core. Reads the target latency from `[password_hashing]` when
+/// `--config PATH` is given, else the shipped default; the per-hash memory budget
+/// defaults to a fraction of total host RAM (issue #62 LOW-6) and is overridable
+/// with `--memory-budget KIB`. Prints a human-readable report, or machine-readable
+/// JSON with `--json`.
+fn hash_probe(args: &mut impl Iterator<Item = String>) -> ExitCode {
+    let mut config_path: Option<String> = None;
+    let mut json = false;
+    let mut memory_budget_override: Option<u64> = None;
+    while let Some(arg) = args.next() {
+        if let Some(value) = arg.strip_prefix("--config=") {
+            config_path = Some(value.to_owned());
+        } else if arg == "--config" {
+            let Some(path) = args.next() else {
+                eprintln!("ironauth hash-probe: --config requires a PATH");
+                return ExitCode::FAILURE;
+            };
+            config_path = Some(path);
+        } else if let Some(value) = arg.strip_prefix("--memory-budget=") {
+            let Ok(kib) = value.parse::<u64>() else {
+                eprintln!("ironauth hash-probe: --memory-budget expects KiB (a u64)");
+                return ExitCode::FAILURE;
+            };
+            memory_budget_override = Some(kib);
+        } else if arg == "--memory-budget" {
+            let Some(value) = args.next() else {
+                eprintln!("ironauth hash-probe: --memory-budget requires a KiB value");
+                return ExitCode::FAILURE;
+            };
+            let Ok(kib) = value.parse::<u64>() else {
+                eprintln!("ironauth hash-probe: --memory-budget expects KiB (a u64)");
+                return ExitCode::FAILURE;
+            };
+            memory_budget_override = Some(kib);
+        } else if arg == "--json" {
+            json = true;
+        } else {
+            eprintln!("ironauth hash-probe: unrecognized argument '{arg}'");
+            eprintln!("usage: ironauth hash-probe [--config PATH] [--memory-budget KIB] [--json]");
+            return ExitCode::FAILURE;
+        }
+    }
+
+    let loaded = match &config_path {
+        Some(path) => Config::load(path),
+        None => Config::from_toml_str("", "<defaults>"),
+    };
+    let config = match loaded {
+        Ok(Loaded { config, .. }) => config,
+        Err(error) => {
+            eprintln!("ironauth hash-probe: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let hashing = &config.password_hashing;
+    // The per-hash memory budget the probe caps candidates at. Default: a sensible
+    // fraction of TOTAL host memory (Linux MemTotal / 2) or a fixed 1 GiB fallback
+    // on hosts without a dependency-free total-RAM read (issue #62 LOW-6), so the
+    // default probe can explore the full ladder and recommend STRONGER parameters
+    // than the deployment is presently configured for. An operator caps it
+    // explicitly with --memory-budget. The probe also caps against measurable host
+    // memory (Linux MemAvailable / 2) on its own.
+    let memory_budget_kib =
+        memory_budget_override.unwrap_or_else(ironauth_oidc::default_memory_budget_kib);
+    let env = Env::system();
+    let report = ironauth_oidc::run_probe(&env, hashing.probe_target_latency_ms, memory_budget_kib);
+
+    if json {
+        println!("{}", probe_report_json(&report));
+    } else {
+        print_probe_report(&report);
+    }
+    ExitCode::SUCCESS
+}
+
+/// Render a probe report as a machine-readable JSON object for `--json`.
+fn probe_report_json(report: &ironauth_oidc::ProbeReport) -> String {
+    let available = report
+        .available_memory_kib
+        .map_or_else(|| "null".to_owned(), |kib| kib.to_string());
+    format!(
+        "{{\"memory_kib\":{},\"iterations\":{},\"parallelism\":{},\
+         \"measured_latency_ms\":{:.3},\"target_latency_ms\":{},\"within_target\":{},\
+         \"projected_logins_per_sec_per_core\":{:.3},\"projected_logins_per_sec_total\":{:.3},\
+         \"host_threads\":{},\"available_memory_kib\":{},\"memory_budget_kib\":{}}}",
+        report.recommended.memory_kib(),
+        report.recommended.iterations(),
+        report.recommended.parallelism(),
+        report.measured_latency_ms,
+        report.target_latency_ms,
+        report.within_target,
+        report.projected_logins_per_sec_per_core,
+        report.projected_logins_per_sec_total,
+        report.host_threads,
+        available,
+        report.memory_budget_kib,
+    )
+}
+
+/// Print a probe report as a human-readable summary.
+fn print_probe_report(report: &ironauth_oidc::ProbeReport) {
+    println!("Argon2id tuning probe (issue #62)");
+    println!(
+        "  recommended:  memory_kib={} iterations={} parallelism={}",
+        report.recommended.memory_kib(),
+        report.recommended.iterations(),
+        report.recommended.parallelism(),
+    );
+    println!(
+        "  measured:     {:.1} ms/hash (target {} ms; {})",
+        report.measured_latency_ms,
+        report.target_latency_ms,
+        if report.within_target {
+            "within target"
+        } else {
+            "host too slow for target: recommending the memory floor"
+        },
+    );
+    println!(
+        "  throughput:   {:.1} logins/s per core, {:.1} logins/s across {} core(s)",
+        report.projected_logins_per_sec_per_core,
+        report.projected_logins_per_sec_total,
+        report.host_threads,
+    );
+    match report.available_memory_kib {
+        Some(kib) => println!(
+            "  host memory:  {kib} KiB available; per-hash budget {} KiB",
+            report.memory_budget_kib
+        ),
+        None => println!(
+            "  host memory:  unavailable on this platform; per-hash budget {} KiB",
+            report.memory_budget_kib
+        ),
+    }
+    println!();
+    println!("Set these under [password_hashing] in your config; they apply to NEW hashes.");
+    println!("An existing user's hash upgrades on their next successful login.");
+}
+
 fn print_help() {
     println!("ironauth {VERSION}");
     println!("A standards-first OpenID Connect identity platform.");
     println!();
     println!("USAGE:");
     println!("  ironauth serve [--config PATH]   Run the server until SIGTERM/SIGINT");
+    println!("  ironauth hash-probe [--config PATH] [--memory-budget KIB] [--json]");
+    println!("                                   Measure Argon2id on this host and");
+    println!("                                   recommend parameters (issue #62)");
     println!("  ironauth validate <document>     Validate a config document (local)");
     println!("  ironauth plan <document> ...      Render the server-computed promotion plan");
     println!("  ironauth apply <document> ...     Apply a config document to a target");

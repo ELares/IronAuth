@@ -789,6 +789,19 @@ impl Harness {
         self.router.clone()
     }
 
+    /// Install a dedicated Argon2id hashing pool (issue #62) on the state and
+    /// rebuild the protocol router, so the public hashing surfaces (login,
+    /// register, account, device-flow verify, invitation accept) route through the
+    /// pool and its per-tenant fair-share admission. Used to prove those endpoints
+    /// are admission-controlled rather than running Argon2 inline on an I/O thread.
+    /// Only the protocol router is rebuilt (the issuer/discovery routers are not
+    /// needed by the hashing endpoints).
+    pub fn install_hashing_pool(&mut self, pool: Arc<ironauth_oidc::HashingPool>) {
+        let state = self.state.clone().with_hashing_pool(pool);
+        self.router = oidc_router(state.clone());
+        self.state = state;
+    }
+
     /// The environment's public verifying key, for building a verification policy
     /// under a non-EdDSA algorithm (for example the ES256 environment, issue #29).
     #[must_use]
@@ -1005,6 +1018,22 @@ impl Harness {
             .register(&self.env, identifier, &hash)
             .await
             .expect("register user")
+            .to_string()
+    }
+
+    /// Register a bootstrap user with a PRE-BUILT password hash and return its
+    /// subject, so a test can seed a credential written at specific Argon2id
+    /// parameters (issue #62): the native rehash-on-login upgrade needs a user whose
+    /// stored hash was written at OLDER parameters than the current target.
+    pub async fn seed_user_with_hash(&self, identifier: &str, hash: &str) -> String {
+        let (actor, corr) = self.seeding_actor();
+        self.store()
+            .scoped(self.scope)
+            .acting(actor, corr)
+            .users()
+            .register(&self.env, identifier, hash)
+            .await
+            .expect("register user with hash")
             .to_string()
     }
 

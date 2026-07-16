@@ -46,7 +46,6 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::interaction;
-use crate::password::hash_password;
 use crate::state::OidcState;
 use crate::util::epoch_micros;
 use crate::wellknown::{not_found, parse_scope};
@@ -111,9 +110,12 @@ pub async fn accept_invitation(
         if password.is_empty() {
             return password_required();
         }
-        match hash_password(state.env(), password) {
+        // Hash THROUGH THE ADMISSION-CONTROLLED POOL (issue #62), never an inline
+        // Argon2 on a protocol-I/O thread: this public endpoint must not be a
+        // cross-tenant DoS lever. A pool shed surfaces the retryable 429/503.
+        match state.hash_password(&scope, password).await {
             Ok(hash) => Some(hash),
-            Err(_) => return server_error(),
+            Err(rejection) => return rejection.to_response(),
         }
     } else {
         None

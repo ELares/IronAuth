@@ -6,6 +6,14 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- `PasswordHashing` quota dimension (issue #62): a fourth independently enforced
+  dimension so the Argon2id hashing pool admits per tenant and per environment through
+  the SAME fair-share engine (and its 429 block-signal contract) the request path uses,
+  rather than a second fairness mechanism. `QuotaDimension::all()`/`as_str()`,
+  `ScopeLimits`, and `ScopeLimits::from_config` all carry it; a scope's hashing-share
+  bucket is disjoint from its request/token buckets, so a credential-stuffing storm that
+  drains one tenant's hashing share never touches that tenant's other buckets nor
+  another tenant.
 - Initial per-tenant and per-environment quota fairness core (issue #50): the
   operator-plane noisy-neighbor guard.
   - `QuotaEnforcer`: single-node, process-local nested token buckets over three

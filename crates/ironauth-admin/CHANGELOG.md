@@ -6,6 +6,15 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- In-admin Argon2id tuning probe (issue #62): a new env-scoped, permission-gated
+  `POST /v1/tenants/{tenant}/environments/{environment}/password-hashing/probe` runs the
+  host-measured `ironauth_oidc::run_probe` (on a blocking thread, never inline on the
+  request thread) and returns the recommended parameters, the measured latency, whether
+  the target was met, and the projected logins/s per core and across the host. It closes
+  the acceptance requirement that the tuning helper ship in BOTH the admin UI and the
+  CLI. The probe is a read-only measurement, so it carries only an optional
+  Idempotency-Key; an optional JSON body overrides the target latency and memory budget.
+  The OpenAPI spec and the committed `docs/openapi/management.json` gain the endpoint.
 - Export field-coverage extended for WebAuthn passkeys (issue #65): the exit-covenant
   field-coverage guard now classifies the new `webauthn_credentials` table. A
   registered passkey is DEVICE-BOUND and not portable across IdP instances (the

@@ -34,6 +34,9 @@ scripts/pii-encryption-scan.sh
 echo "==> canonicalization seam (every identifier comparison routes through the one seam)"
 scripts/canonicalization-seam.sh
 
+echo "==> hashing pool boundary (every request-path hash routes through the admission-controlled pool)"
+scripts/hashing-pool-boundary.sh
+
 echo "==> http audit (ironauth-fetch is the only outbound HTTP path)"
 scripts/http-audit.sh
 

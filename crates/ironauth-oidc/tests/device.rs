@@ -24,9 +24,12 @@ use std::time::Duration;
 
 use axum::http::StatusCode;
 use common::{Harness, REDIRECT_URI, enc, form, form_field, json};
+use ironauth_config::{QuotaConfig, ScopeQuotaConfig};
 use ironauth_jose::verify;
+use ironauth_oidc::{Argon2Params, HashRejection, HashingPool};
+use ironauth_quota::{Limit, QuotaEnforcer, ScopeLimits, TenantId as QuotaTenantId};
 use ironauth_store::{
-    DeviceAttemptOutcome, DevicePollOutcome, DeviceUserCodeLookup, device_code_digest,
+    DeviceAttemptOutcome, DevicePollOutcome, DeviceUserCodeLookup, UserState, device_code_digest,
     user_code_hash,
 };
 use serde_json::Value;
@@ -333,6 +336,140 @@ async fn unknown_user_code_is_non_oracular() {
     assert_eq!(status, StatusCode::OK);
     assert!(!html.contains("Approve"));
     assert!(html.contains("not recognized"), "non-oracular: {html}");
+}
+
+/// A quota config with every dimension UNLIMITED (`burst 0 == unlimited`, see
+/// ironauth-quota `limit_from`). The overload in the test below is created by a per-tenant
+/// runtime OVERRIDE that pins the tenant's `PasswordHashing` bucket to ZERO capacity, not
+/// by this config, so admission is over-share from the very first call with no token that
+/// any request could catch.
+fn unlimited_quota() -> QuotaConfig {
+    let unlimited = ScopeQuotaConfig {
+        requests_per_second: 0,
+        requests_burst: 0,
+        token_issuance_per_second: 0,
+        token_issuance_burst: 0,
+        hook_seconds_per_second: 0,
+        hook_seconds_burst: 0,
+        password_hashing_per_second: 0,
+        password_hashing_burst: 0,
+    };
+    QuotaConfig {
+        tenant: unlimited.clone(),
+        environment: unlimited,
+        usage_thresholds_percent: vec![],
+        idle_bucket_ttl_secs: 0,
+    }
+}
+
+#[tokio::test]
+async fn device_login_is_uniform_under_hashing_overload() {
+    // MEDIUM-2 regression (issue #62 re-review): the device sign-in step must surface
+    // the pool rejection UNIFORMLY on all three identifier branches (present-and-
+    // loginable, FENCED, and ABSENT). If the fenced/absent branches swallowed the
+    // rejection and fell back to the generic 200 failure page while the present branch
+    // surfaced the 429, the differing status under an attacker-inducible hashing
+    // overload would be a username/status enumeration oracle. All three must return the
+    // SAME retryable rejection, exactly as the hardened /login path does.
+    let mut harness = Harness::start().await;
+    let scope = harness.scope();
+
+    // Seed a present-and-loginable user and a FENCED (disabled) user; a third identifier
+    // is absent (never seeded).
+    let _present = harness
+        .seed_user("present@example.test", "correct horse battery staple")
+        .await;
+    let fenced = harness
+        .seed_user("fenced@example.test", "correct horse battery staple")
+        .await;
+    harness.set_user_state(&fenced, UserState::Disabled).await;
+
+    // Saturate admission DETERMINISTICALLY with a per-tenant runtime override that pins the
+    // tenant's `PasswordHashing` bucket to ZERO capacity. The bucket is created with zero
+    // burst and never refills, so EVERY hashing admission for this tenant is over-share from
+    // the very first call, on every one of its environments (the nested tenant envelope
+    // denies before any per-environment bucket is even consulted). This is strictly stronger
+    // than draining a one-token bucket: there is no token that a slower or differently
+    // ordered request could still catch, and a zero-capacity bucket cannot be over-admitted
+    // under any interleaving, so the outcome cannot depend on machine speed, request
+    // ordering, or memory ordering.
+    let quota = Arc::new(QuotaEnforcer::from_config(
+        &unlimited_quota(),
+        harness.env().clock_arc(),
+    ));
+    quota.set_tenant_override(
+        &QuotaTenantId::new(scope.tenant().to_string()),
+        ScopeLimits {
+            password_hashing: Some(Limit::new(0.0, 0.0)),
+            ..ScopeLimits::default()
+        },
+    );
+    let pool = Arc::new(HashingPool::new(
+        harness.env().clone(),
+        Argon2Params::new(8, 1, 1), // cheap: cost is irrelevant to admission.
+        1,
+        64,
+        Some(quota),
+    ));
+    harness.install_hashing_pool(Arc::clone(&pool));
+
+    // Assert the saturated precondition explicitly: admission is over-share from the first
+    // call. If this ever admitted, the test setup (not the code under test) would be wrong,
+    // and we fail here loudly rather than flake in the uniformity checks below.
+    let precheck = pool.verify_absent(&scope, "precondition").await;
+    assert!(
+        matches!(precheck, Err(HashRejection::Overloaded(_))),
+        "the pool must be saturated (over-share) before the probes: {precheck:?}"
+    );
+
+    let path = device_path(&harness);
+    // All three sign-in submissions carry an identifier+password (routing to the device
+    // login step) plus a throwaway user code. A wrong password on the present user means
+    // no session is minted, so every branch resolves through the (now saturated) pool.
+    // The requests run sequentially; because admission is over-share from the first call
+    // (zero-burst override, no token to hand out), the outcome does not depend on how long
+    // the sequence takes or on the order of the three probes.
+    let form_for = |identifier: &str| {
+        form(&[
+            ("identifier", identifier),
+            ("password", "nope"),
+            ("user_code", "AAAA-BBBB"),
+        ])
+    };
+    let present = form_for("present@example.test");
+    let fenced_form = form_for("fenced@example.test");
+    let absent = form_for("absent@example.test");
+    let (present_status, _hp, present_body) = harness.post_form(&path, &present, None).await;
+    let (fenced_status, _hf, fenced_body) = harness.post_form(&path, &fenced_form, None).await;
+    let (absent_status, _ha, absent_body) = harness.post_form(&path, &absent, None).await;
+
+    // Every branch sheds with the SAME retryable 429, not a mix of 429 and generic 200.
+    assert_eq!(
+        present_status,
+        StatusCode::TOO_MANY_REQUESTS,
+        "present-and-loginable sheds 429 under overload: {present_body}"
+    );
+    assert_eq!(
+        fenced_status,
+        StatusCode::TOO_MANY_REQUESTS,
+        "a FENCED identifier sheds the SAME 429, not a generic 200 oracle: {fenced_body}"
+    );
+    assert_eq!(
+        absent_status,
+        StatusCode::TOO_MANY_REQUESTS,
+        "an ABSENT identifier sheds the SAME 429, not a generic 200 oracle: {absent_body}"
+    );
+    // Indistinguishable: same status AND same machine-readable rejection body.
+    assert_eq!(
+        json(&present_body)["error"],
+        json(&fenced_body)["error"],
+        "present and fenced return an identical rejection body"
+    );
+    assert_eq!(
+        json(&present_body)["error"],
+        json(&absent_body)["error"],
+        "present and absent return an identical rejection body"
+    );
 }
 
 #[tokio::test]

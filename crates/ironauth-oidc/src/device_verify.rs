@@ -45,7 +45,6 @@ use crate::authn::AuthenticationEvent;
 use crate::device::{PeerIp, normalize_user_code};
 use crate::interaction::{self, AuthenticatedSession};
 use crate::pages::{self, DeviceConfirmPage};
-use crate::password;
 use crate::state::OidcState;
 use crate::util::epoch_micros;
 use crate::wellknown::parse_scope;
@@ -247,36 +246,69 @@ async fn device_login(
         .by_identifier(identifier)
         .await;
     match lookup {
-        // A user whose lifecycle state cannot authenticate (blocked, disabled, or
-        // pending verification) is FENCED (issue #52): spend comparable password time,
-        // then return the SAME generic failure as a wrong password (no oracle).
-        Ok(Some(user)) if !user.state.can_authenticate() => {
-            let _ = password::verify_password(password, &user.password_hash);
-            failed_login(action, raw_code)
-        }
-        Ok(Some(user)) if password::verify_password(password, &user.password_hash) => {
-            let actor = interaction::user_actor(&user.id);
-            let subject = user.id.to_string();
-            let event = AuthenticationEvent::password(epoch_micros(state.now()));
-            // A privilege transition (issue #32): establish_session mints a fresh
-            // session id and rotates away any prior one the request presented.
-            match interaction::establish_session(state, scope, &subject, &event, actor, headers)
+        Ok(Some(user)) => {
+            // A user whose lifecycle state cannot authenticate (blocked, disabled, or
+            // pending verification) is FENCED (issue #52): spend comparable password
+            // time THROUGH THE ADMISSION-CONTROLLED POOL (issue #62, never an inline
+            // hash on a protocol-I/O thread), then return the SAME generic failure as
+            // a wrong password (no oracle). A pool shed is SURFACED as the retryable
+            // 429/503 here, exactly as the present-and-loginable branch below does, so
+            // an overload response does not distinguish a fenced identifier from a
+            // present one (no username/status enumeration oracle under load).
+            if !user.state.can_authenticate() {
+                match state
+                    .verify_password(&scope, password, &user.password_hash)
+                    .await
+                {
+                    Ok(_) => {}
+                    Err(rejection) => return rejection.to_response(),
+                }
+                return failed_login(action, raw_code);
+            }
+            // The credential check runs on the dedicated hashing pool behind
+            // per-tenant fair-share admission (issue #62), so a device-flow stuffing
+            // storm degrades only the offending tenant and never blocks I/O; a shed
+            // surfaces the retryable 429/503, never an inline hash.
+            match state
+                .verify_password(&scope, password, &user.password_hash)
                 .await
             {
-                // The GET is prefill-only, so we cannot bounce through it to render the
-                // next step; render the confirmation directly and set the freshly
-                // established session cookie on that same response.
-                Ok(cookie) => {
-                    let response = render_after_login(state, scope, action, raw_code).await;
-                    with_set_cookie(response, &cookie)
+                Ok(true) => {
+                    let actor = interaction::user_actor(&user.id);
+                    let subject = user.id.to_string();
+                    let event = AuthenticationEvent::password(epoch_micros(state.now()));
+                    // A privilege transition (issue #32): establish_session mints a
+                    // fresh session id and rotates away any prior one the request
+                    // presented.
+                    match interaction::establish_session(
+                        state, scope, &subject, &event, actor, headers,
+                    )
+                    .await
+                    {
+                        // The GET is prefill-only, so we cannot bounce through it to
+                        // render the next step; render the confirmation directly and
+                        // set the freshly established session cookie on that response.
+                        Ok(cookie) => {
+                            let response = render_after_login(state, scope, action, raw_code).await;
+                            with_set_cookie(response, &cookie)
+                        }
+                        Err(_) => server_error(),
+                    }
                 }
-                Err(_) => server_error(),
+                Ok(false) => failed_login(action, raw_code),
+                Err(rejection) => rejection.to_response(),
             }
         }
-        Ok(Some(_)) => failed_login(action, raw_code),
         Ok(None) => {
-            // Spend comparable Argon2id time, then the SAME generic failure.
-            let _ = password::verify_absent(password);
+            // Spend comparable Argon2id time through the pool (admission-controlled),
+            // then the SAME generic failure. A pool shed is SURFACED as the retryable
+            // 429/503 (not swallowed into the generic failure), so an absent identifier
+            // is indistinguishable from a present one under overload (no enumeration
+            // oracle), matching the fenced and present-and-loginable branches.
+            match state.verify_absent(&scope, password).await {
+                Ok(_) => {}
+                Err(rejection) => return rejection.to_response(),
+            }
             failed_login(action, raw_code)
         }
         Err(_) => server_error(),

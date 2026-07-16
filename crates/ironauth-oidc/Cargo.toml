@@ -523,6 +523,16 @@ name = "quota"
 path = "tests/quota.rs"
 required-features = ["testing"]
 
+# The dedicated, admission-controlled Argon2id hashing pool (issue #62), DB-FREE: hashing
+# runs off the tokio threads (a runtime check), new hashes carry the configured parameters,
+# a two-tenant stuffing storm degrades only the noisy tenant (per-tenant fair-share
+# admission reusing the #50 engine), a saturated bounded queue sheds with a TYPED error
+# (never an inline hash), the tuning probe returns sane params within the target on the
+# runner, and the pool metrics export. Runs on every lane.
+[[test]]
+name = "hashing_pool"
+path = "tests/hashing_pool.rs"
+
 # The inbound lazy-migration hook against a STUB verifier (issue #56), DB-FREE: the
 # circuit-breaker orchestration (success, wrong-password, timeout, open-breaker,
 # half-open recovery), the SSRF-only + plaintext-refused webhook posture through the

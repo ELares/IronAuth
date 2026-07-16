@@ -17,11 +17,15 @@
 
 mod common;
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
 use common::Harness;
+use ironauth_config::{QuotaConfig, ScopeQuotaConfig};
+use ironauth_oidc::{Argon2Params, HashingPool};
+use ironauth_quota::QuotaEnforcer;
 use ironauth_store::{
     CorrelationId, InvitationCredentialType, MintedInvitationToken, NewAdminUser, NewInvitation,
     Scope, UserId, UserState, mint_invitation_token,
@@ -380,4 +384,102 @@ async fn a_token_cannot_be_accepted_at_another_tenants_path() {
     )
     .await;
     assert_eq!(ok_status, StatusCode::OK, "own-path accept: {ok_body}");
+}
+
+/// A quota whose `PasswordHashing` environment bucket admits exactly ONE hash
+/// (`burst = 1`, no refill) before shedding, so a second admitted hash is
+/// over-share. A `burst` of 0 would mean UNLIMITED (the self-hoster posture), so
+/// the smallest genuine bound is 1. Other dimensions are unused by the pool.
+fn one_hash_quota() -> QuotaConfig {
+    let base = ScopeQuotaConfig {
+        requests_per_second: 0,
+        requests_burst: 0,
+        token_issuance_per_second: 0,
+        token_issuance_burst: 0,
+        hook_seconds_per_second: 0,
+        hook_seconds_burst: 0,
+        password_hashing_per_second: 0, // no refill: an exact budget.
+        password_hashing_burst: 1,
+    };
+    QuotaConfig {
+        // A generous tenant envelope so the ENVIRONMENT bucket is the limiter.
+        tenant: ScopeQuotaConfig {
+            password_hashing_burst: 1_000_000,
+            ..base.clone()
+        },
+        environment: base,
+        usage_thresholds_percent: vec![100],
+        idle_bucket_ttl_secs: 0,
+    }
+}
+
+#[tokio::test]
+async fn invitation_accept_hashing_is_admission_controlled() {
+    // Issue #62 HIGH-1 regression: the public invitation-accept endpoint must hash
+    // THROUGH the admission-controlled pool, not inline on the I/O thread. With a
+    // pool that admits exactly ONE hash per tenant before shedding, a first accept
+    // succeeds (consuming the admission) and a second is SHED with a retryable 429.
+    // If the endpoint reverted to the raw inline hasher, it would charge no
+    // admission and BOTH accepts would succeed, failing this test.
+    let mut harness = Harness::start().await;
+    let scope = harness.scope();
+
+    // Share the harness clock so the single admission does not refill mid-test.
+    let quota = Arc::new(QuotaEnforcer::from_config(
+        &one_hash_quota(),
+        harness.env().clock_arc(),
+    ));
+    let pool = Arc::new(HashingPool::new(
+        harness.env().clone(),
+        Argon2Params::new(8, 1, 1), // cheap: cost is irrelevant to admission.
+        1,
+        64,
+        Some(quota),
+    ));
+    harness.install_hashing_pool(pool);
+
+    let (_id_a, token_a) = create_invitation(
+        &harness,
+        scope,
+        "grace@example.test",
+        InvitationCredentialType::Password,
+        1_000_000_000,
+    )
+    .await;
+    let (_id_b, token_b) = create_invitation(
+        &harness,
+        scope,
+        "hopper@example.test",
+        InvitationCredentialType::Password,
+        1_000_000_000,
+    )
+    .await;
+
+    // The first accept hashes through the pool, consuming the single admission.
+    let (first_status, first_body) = accept(
+        &harness,
+        &accept_path(scope),
+        &serde_json::json!({ "token": token_a, "password": "correct horse battery staple" }),
+    )
+    .await;
+    assert_eq!(
+        first_status,
+        StatusCode::OK,
+        "the first accept is admitted: {first_body}"
+    );
+
+    // The second accept's hash is over the tenant's fair share and is SHED with a
+    // retryable 429, proving the accept hash routes through admission control.
+    let (second_status, second_body) = accept(
+        &harness,
+        &accept_path(scope),
+        &serde_json::json!({ "token": token_b, "password": "correct horse battery staple" }),
+    )
+    .await;
+    assert_eq!(
+        second_status,
+        StatusCode::TOO_MANY_REQUESTS,
+        "the second accept is admission-shed (429), proving it is not an inline hash: {second_body}"
+    );
+    assert_eq!(second_body["error"], "rate_limited");
 }

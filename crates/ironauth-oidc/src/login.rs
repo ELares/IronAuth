@@ -23,7 +23,6 @@ use crate::authn::AuthenticationEvent;
 use crate::interaction::{self, parse_resume};
 use crate::migration::{HookOutcome, HookProfile, LazyMigrationHook};
 use crate::pages;
-use crate::password;
 use crate::state::OidcState;
 use crate::util::epoch_micros;
 
@@ -159,25 +158,39 @@ pub async fn login_post(
         // (so a fenced account is timing-indistinguishable from a wrong password),
         // then the SAME generic failure is returned, never a distinct signal.
         Ok(Some(user)) if !user.state.can_authenticate() => {
-            let _ = password::verify_password(password, &user.password_hash);
+            // Spend the verification through the admission-controlled pool (issue
+            // #62), off the async threads; an over-share tenant or a saturated pool
+            // is the retryable 429/503, never an inline hash on this thread.
+            match state
+                .verify_password(&resume.scope, password, &user.password_hash)
+                .await
+            {
+                Ok(_) => {}
+                Err(rejection) => return rejection.to_response(),
+            }
             failed_login_page(identifier, &resume.return_to, &resume.hints, banner)
         }
         Ok(Some(user)) => {
             // Verify the native Argon2id hash first; if the account was imported with
             // a FOREIGN hash (issue #55) and has not yet logged in, the native hash is
-            // the unusable sentinel, so fall through to the foreign verify.
-            let native_ok = password::verify_password(password, &user.password_hash);
+            // the unusable sentinel, so fall through to the foreign verify. The native
+            // verification runs on the admission-controlled hashing pool (issue #62).
+            let native_ok = match state
+                .verify_password(&resume.scope, password, &user.password_hash)
+                .await
+            {
+                Ok(ok) => ok,
+                Err(rejection) => return rejection.to_response(),
+            };
             let foreign_ok = !native_ok && verify_foreign(&user, password);
             if native_ok || foreign_ok {
-                // First successful FOREIGN login: transparently rehash the password
-                // to the native Argon2id verifier and retire the foreign hash
-                // (verify-then-rehash), so the second login verifies natively. This
-                // is best-effort: the login has already succeeded, so a rehash
-                // failure leaves the foreign hash in place for the next login rather
-                // than failing the sign-in.
-                if foreign_ok {
-                    rehash_foreign_credential(&state, resume.scope, &user.id, password).await;
-                }
+                // Transparently upgrade the stored credential when due (best-effort;
+                // the login has already succeeded): a first FOREIGN login rehashes to
+                // the native Argon2id verifier (#55), and a NATIVE login whose hash was
+                // written at OLDER parameters rehashes to the current ones (#62), so a
+                // per-environment parameter change reaches existing users on next login.
+                upgrade_credential_after_login(&state, resume.scope, &user, password, native_ok)
+                    .await;
                 let actor = interaction::user_actor(&user.id);
                 let subject = user.id.to_string();
                 // The recorded authentication event: a password login (RFC 8176
@@ -233,11 +246,38 @@ pub async fn login_post(
                 }
             }
             // No hook, a non-success verdict, or a refused/failed create: spend comparable
-            // Argon2id time, then the SAME generic failure (no user-enumeration oracle).
-            let _ = password::verify_absent(password);
+            // Argon2id time (through the admission-controlled pool, issue #62), then the
+            // SAME generic failure (no user-enumeration oracle). Admission is charged here
+            // too, so stuffing unknown identifiers cannot bypass fair-share admission.
+            match state.verify_absent(&resume.scope, password).await {
+                Ok(_) => {}
+                Err(rejection) => return rejection.to_response(),
+            }
             failed_login_page(identifier, &resume.return_to, &resume.hints, banner)
         }
         Err(_) => interaction::server_error_page(),
+    }
+}
+
+/// Transparently upgrade a user's stored credential after a successful login,
+/// best-effort. When the login succeeded on the NATIVE hash (`native_ok`), rehash
+/// it to the current parameters if it drifted (issue #62); otherwise the login
+/// succeeded on an imported FOREIGN hash, so rehash it to the native verifier and
+/// retire the foreign hash (issue #55). Any failure is swallowed: the sign-in has
+/// already succeeded and the credential simply upgrades on the next login.
+async fn upgrade_credential_after_login(
+    state: &OidcState,
+    scope: Scope,
+    user: &UserRecord,
+    password: &str,
+    native_ok: bool,
+) {
+    if native_ok {
+        if crate::password::needs_rehash(&user.password_hash, state.hashing_params()) {
+            rehash_native_credential(state, scope, &user.id, &user.password_hash, password).await;
+        }
+    } else {
+        rehash_foreign_credential(state, scope, &user.id, password).await;
     }
 }
 
@@ -268,7 +308,10 @@ async fn rehash_foreign_credential(
     subject: &UserId,
     password: &str,
 ) {
-    let Ok(new_hash) = password::hash_password(state.env(), password) else {
+    // Rehash through the admission-controlled pool (issue #62). Best-effort: the
+    // login already succeeded, so an over-share/pool-exhausted/fault rejection just
+    // leaves the foreign hash to upgrade on the next login rather than failing here.
+    let Ok(new_hash) = state.hash_password(&scope, password).await else {
         return;
     };
     let actor = interaction::user_actor(subject);
@@ -278,6 +321,35 @@ async fn rehash_foreign_credential(
         .acting(actor, CorrelationId::generate(state.env()))
         .users()
         .upgrade_foreign_password(state.env(), subject, &new_hash)
+        .await;
+}
+
+/// Land the transparent native-parameter rehash after a successful native login
+/// (issue #62): hash `password` at the CURRENT parameters through the
+/// admission-controlled pool and hand it, with the verified `current_hash`, to the
+/// audited store upgrade, which writes it onto the user only while the stored hash
+/// still equals `current_hash` (so a concurrent change is never clobbered).
+/// Best-effort: any rejection or fault (an over-share pool, a lost race, a
+/// transient persistence fault) is swallowed so the sign-in still succeeds; the
+/// older-parameter hash simply upgrades on the next login. The plaintext never
+/// leaves this function and the hash is never logged.
+async fn rehash_native_credential(
+    state: &OidcState,
+    scope: Scope,
+    subject: &UserId,
+    current_hash: &str,
+    password: &str,
+) {
+    let Ok(new_hash) = state.hash_password(&scope, password).await else {
+        return;
+    };
+    let actor = interaction::user_actor(subject);
+    let _ = state
+        .store()
+        .scoped(scope)
+        .acting(actor, CorrelationId::generate(state.env()))
+        .users()
+        .rehash_native_password(state.env(), subject, current_hash, &new_hash)
         .await;
 }
 
@@ -299,8 +371,10 @@ async fn complete_lazy_migration(
     headers: &HeaderMap,
     profile: Option<HookProfile>,
 ) -> Option<Response> {
-    // Hash the in-flight password to the native Argon2id verifier (the migration target).
-    let Ok(new_hash) = password::hash_password(state.env(), password) else {
+    // Hash the in-flight password to the native Argon2id verifier (the migration
+    // target) through the admission-controlled pool (issue #62); an over-share or
+    // saturated pool falls through to the uniform failure and persists nothing.
+    let Ok(new_hash) = state.hash_password(&scope, password).await else {
         return None;
     };
 

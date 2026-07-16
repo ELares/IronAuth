@@ -59,6 +59,7 @@ mod openapi;
 mod operators;
 mod organizations;
 mod pagination;
+mod password_hashing;
 mod promotion;
 mod provision;
 mod ratelimit;
@@ -179,6 +180,13 @@ pub fn management_router(state: AdminState) -> Router {
         .route(
             "/v1/tenants/{tenant_id}/environments/{environment_id}/migration/progress",
             get(migration_status::get_migration_progress),
+        )
+        // The in-admin Argon2id tuning probe (issue #62): a host-measured parameter
+        // recommendation, the same probe the CLI wraps. Environment-scoped, read-only.
+        // Static `password-hashing` suffix, matched before the parameterized routes.
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/password-hashing/probe",
+            post(password_hashing::probe_password_hashing),
         )
         // The migration state-machine operator view (issue #59): list a scope's runs,
         // read one run's state with its per-state counts and LIVE invariant evaluations,

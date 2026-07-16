@@ -6,6 +6,14 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- `UserRepo::rehash_native_password` (issue #62): lands the transparent upgrade of a
+  NATIVE Argon2id credential to the current hashing parameters after a successful login.
+  It writes the recomputed verifier onto `password_hash` and audits one
+  `user.password.upgrade` row atomically, guarded on the stored hash still equalling the
+  value the login verified (optimistic concurrency), so two concurrent logins race safely
+  and a concurrent `change_password` is never clobbered. A win returns `Ok(true)`, a
+  no-op `Ok(false)`; best-effort like the foreign `upgrade_foreign_password`. No schema
+  change (existing `users` table and `UserPasswordUpgrade` audit action).
 - Last-usable-login-factor guard on passkey removal (issue #65 review hardening):
   `ActingWebauthnCredentialRepo::remove` now takes an `acknowledge_recovery` flag and
   returns the shared `CredentialRemoveOutcome`. In the removal transaction it counts
