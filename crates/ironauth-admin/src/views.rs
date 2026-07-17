@@ -809,6 +809,10 @@ pub enum UserStateView {
     /// Scheduled for offboarding at a recorded instant; still able to authenticate
     /// until the worker executes it.
     ScheduledOffboarding,
+    /// Waitlisted (issue #80): a self-service signup awaiting admin approval. Cannot
+    /// authenticate until an admin approves it (transition to active) or rejects it
+    /// (transition to disabled).
+    Waitlisted,
 }
 
 impl From<UserState> for UserStateView {
@@ -819,6 +823,7 @@ impl From<UserState> for UserStateView {
             UserState::Disabled => UserStateView::Disabled,
             UserState::PendingVerification => UserStateView::PendingVerification,
             UserState::ScheduledOffboarding => UserStateView::ScheduledOffboarding,
+            UserState::Waitlisted => UserStateView::Waitlisted,
         }
     }
 }
@@ -831,6 +836,7 @@ impl From<UserStateView> for UserState {
             UserStateView::Disabled => UserState::Disabled,
             UserStateView::PendingVerification => UserState::PendingVerification,
             UserStateView::ScheduledOffboarding => UserState::ScheduledOffboarding,
+            UserStateView::Waitlisted => UserState::Waitlisted,
         }
     }
 }

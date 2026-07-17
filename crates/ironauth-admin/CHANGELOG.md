@@ -6,6 +6,12 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Waitlist approval via the existing user-lifecycle management API (issue #80): the
+  `UserStateView` wire enum gains a `waitlisted` variant (round-tripping the new
+  `UserState::Waitlisted`), so a waitlisted self-service signup is listable and filterable,
+  and an admin APPROVES it by transitioning it to `active` (or REJECTS it to `disabled`)
+  through the existing `setUserState` operation; no new endpoint is added, so the OpenAPI
+  operation-id/path/count contract is unchanged (only the served schema regenerates).
 - Declarative federation connector management (issue #75, PR A): CRUD plus a
   capability-matrix read endpoint on the management API. `POST .../connectors` parses
   the body with the strict, I/O-free `ironauth-connector` layer (`deny_unknown_fields`

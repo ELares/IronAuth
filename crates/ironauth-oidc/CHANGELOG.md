@@ -6,6 +6,34 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Registration abuse defenses (issue #80), all OFF by default. An invisible, SELF-CONTAINED
+  proof-of-work challenge (a Rauthy-spow-style hashcash) issued on the registration,
+  password-reset, and OTP-send surfaces: the server issues a random challenge and a
+  difficulty via the env entropy/clock seam, the client finds a nonce such that
+  `SHA-256(challenge || nonce)` has N leading zero bits, and the server verifies it FULLY
+  server-side with ZERO third-party calls (so it works self-hosted and air-gapped and can
+  never fail open/closed on an outage). Challenges are SINGLE-USE (an atomic spent-latch
+  consume in the new `pow_challenges` store table), EXPIRING (`env.clock()`), and
+  CONTEXT-BOUND to the endpoint plus a request context (a solution for one endpoint/context
+  cannot be replayed or outsourced to another). Issuance is CONDITIONED on the #79 risk
+  level (`pow.challenge_at` reuses the `off`/`low`/`med`/`high` threshold vocabulary via a
+  new subject-less `anonymous_challenge_level`), and a new `POST /pow/challenge` endpoint
+  mints a challenge for the built-in path. A pluggable `ChallengeProvider` trait (`pow`
+  module) has the built-in `BuiltinPowProvider` as the DEFAULT and ships Turnstile and
+  reCAPTCHA as `SiteverifyProvider` adapters behind a `RemoteChallengeVerifier` seam (the
+  real verify goes through `ironauth-fetch`; a mock satisfies the contract test); an adapter
+  outage degrades per a configurable fail-open/fail-closed policy, and the built-in PoW is
+  installed via `OidcState::with_challenge_provider`.
+- Disposable / low-reputation email defense (issue #80): evaluated at signup on the
+  NFKC-normalized email domain, per-environment `off` / `flag` (feed the risk engine a MED
+  signal) / `block`. A BLOCK is an ANTI-ENUMERATION uniform failure (an ordinary validation
+  re-render that never leaks whether the account exists), reusing the #64/#68 discipline.
+  The deny list and an allow override are updateable per-environment config data (the #79 IP
+  allow/deny-list precedent) that promotes with the config snapshot.
+- Waitlist gate (issue #80): a per-environment toggle that lands a self-service signup in a
+  PENDING `waitlisted` lifecycle state that CANNOT authenticate (fenced at login, holds no
+  session/token capability) until an admin approves it (transition to active) or rejects it
+  (transition to disabled) through the existing user-lifecycle management API.
 - Account recovery as a first-class subsystem (issue #81): a distinct recovery state
   machine, NOT a branch of password reset, governed by three pillars. DELAY as a security
   feature: a recovery that would REDUCE account security is HELD for the configured

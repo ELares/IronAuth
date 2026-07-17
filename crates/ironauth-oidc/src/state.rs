@@ -254,6 +254,14 @@ pub struct OidcState {
     // NullIpReputationProvider (verdict Neutral), so the only built-in IP-reputation
     // input is the per-environment allow/deny lists.
     ip_reputation_provider: Arc<dyn crate::risk::IpReputationProvider>,
+    // The pluggable registration-abuse challenge provider seam (issue #80). Kept OUTSIDE
+    // Inner so a deployment installs an adapter here without a wire change; NO third-party
+    // provider is bundled. Default: the built-in self-contained hashcash PoW
+    // (BuiltinPowProvider), which makes ZERO third-party calls, so the defense runs
+    // complete with no external service. A deployment that opts into Turnstile/reCAPTCHA
+    // installs a SiteverifyProvider here (built from the resolved adapter secret and an
+    // ironauth-fetch-backed verifier); the built-in PoW never depends on it.
+    challenge_provider: Arc<dyn crate::pow::ChallengeProvider>,
     // The resolved NIST SP 800-63B-4 password policy (issue #63): length floors, the
     // composition/rotation legacy overrides, and whether screening is enabled. Kept
     // OUTSIDE `Inner` and installed by the boot path from the top-level `[password_policy]`
@@ -470,6 +478,11 @@ struct Inner {
     // the engine reads every per-signal toggle, threshold, and allow/deny list from one
     // immutable, config-derived source. Off by default (the engine is fully inert).
     risk: ironauth_config::RiskConfig,
+    // Registration abuse defenses (issue #80): the whole validated config held verbatim
+    // so the proof-of-work gate, the disposable-email defense, and the waitlist gate read
+    // their per-environment settings (and the promotable domain allow/deny lists) from one
+    // immutable, config-derived source. All OFF by default (fully inert).
+    registration_abuse: ironauth_config::RegistrationAbuseConfig,
     // Email OTP + scanner-safe magic links (issue #68). All validated at startup.
     email_otp_enabled: bool,
     email_otp_code_digits: u32,
@@ -642,6 +655,7 @@ impl OidcState {
                 trusted_device_revoke_on_password_change: config
                     .trusted_device_revoke_on_password_change,
                 risk: config.risk.clone(),
+                registration_abuse: config.registration_abuse.clone(),
                 email_otp_enabled: config.email_otp_enabled,
                 email_otp_code_digits: config.email_otp_code_digits,
                 email_otp_code_ttl_secs: config.email_otp_code_ttl_secs,
@@ -679,6 +693,7 @@ impl OidcState {
             abuse_counters: Arc::new(crate::abuse::MemoryCounterStore::new()),
             geoip_provider: Arc::new(crate::risk::NullGeoIpProvider),
             ip_reputation_provider: Arc::new(crate::risk::NullIpReputationProvider),
+            challenge_provider: Arc::new(crate::pow::BuiltinPowProvider),
             verification_sender: Arc::new(crate::verification::NullVerificationSender),
             sms_sender: Arc::new(crate::verification::NullSmsSender),
             risk_evaluator: Arc::new(crate::recovery::NullRiskEvaluator),
@@ -942,11 +957,40 @@ impl OidcState {
         self
     }
 
+    /// Install the registration-abuse challenge provider (issue #80), replacing the default
+    /// built-in self-contained `PoW` ([`BuiltinPowProvider`](crate::pow::BuiltinPowProvider)).
+    /// A deployment that opts into Turnstile/reCAPTCHA installs a
+    /// [`SiteverifyProvider`](crate::pow::SiteverifyProvider) here (built from the resolved
+    /// adapter secret and an ironauth-fetch-backed verifier); the built-in `PoW` never depends
+    /// on it. Called only before the state is shared.
+    #[must_use]
+    pub fn with_challenge_provider(
+        mut self,
+        provider: Arc<dyn crate::pow::ChallengeProvider>,
+    ) -> Self {
+        self.challenge_provider = provider;
+        self
+    }
+
     /// The minimal risk-engine settings (issue #79): the per-signal toggles, the step-up
     /// threshold, and the allow/deny lists. Off by default (the engine is inert).
     #[must_use]
     pub(crate) fn risk_config(&self) -> &ironauth_config::RiskConfig {
         &self.inner.risk
+    }
+
+    /// The registration abuse defenses config (issue #80): the proof-of-work settings, the
+    /// disposable-email defense, and the waitlist gate. All off by default (inert).
+    #[must_use]
+    pub(crate) fn registration_abuse_config(&self) -> &ironauth_config::RegistrationAbuseConfig {
+        &self.inner.registration_abuse
+    }
+
+    /// The installed registration-abuse challenge provider (issue #80). Default: the
+    /// built-in self-contained `PoW`.
+    #[must_use]
+    pub(crate) fn challenge_provider(&self) -> &Arc<dyn crate::pow::ChallengeProvider> {
+        &self.challenge_provider
     }
 
     /// Whether the minimal risk engine is enabled (issue #79). Off by default.

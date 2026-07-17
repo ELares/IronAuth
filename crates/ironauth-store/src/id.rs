@@ -840,6 +840,19 @@ impl ScopedKind for RiskDisavowalKind {
     const REDACT_DEBUG: bool = true;
 }
 
+/// Marker for a proof-of-work challenge (`pow_`), one row in the per-scope `PoW`
+/// challenge state (issue #80): a random challenge and a difficulty the server issued,
+/// bound to an endpoint plus a request context, single-use and expiring. The id embeds
+/// its `(tenant, environment)` AND doubles as the routing handle the client returns with
+/// its nonce, so the scope is recoverable from the presented id without a database hit.
+/// The challenge is NOT a bearer credential (it is handed to the client to solve), so its
+/// debug form is not redacted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PowChallengeKind;
+impl ScopedKind for PowChallengeKind {
+    const PREFIX: &'static str = "pow";
+}
+
 /// Marker for a human actor (an interactive user). One of the three actor kinds
 /// an audit envelope can name (see [`crate::audit::ActorRef`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1094,6 +1107,10 @@ pub type RiskLoginGeoId = ScopedId<RiskLoginGeoKind>;
 /// A "this wasn't me" disavowal-token id (`dis_...`), one row in the per-subject
 /// disavowal set and the routing handle embedded in its single-use token (issue #79).
 pub type RiskDisavowalId = ScopedId<RiskDisavowalKind>;
+
+/// A proof-of-work challenge id (`pow_...`), one row in the per-scope `PoW` challenge
+/// state and the routing handle the client returns with its nonce (issue #80).
+pub type PowChallengeId = ScopedId<PowChallengeKind>;
 
 /// A flexible-login-identifier row id (`uid_...`), one typed login identifier
 /// (email, username, or phone) a user can authenticate with (issue #54).

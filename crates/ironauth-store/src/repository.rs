@@ -77,15 +77,17 @@ use crate::id::{
     EncryptedSecretId, EnvironmentId, EnvironmentSecretId, ExternalIssuerId, GrantId,
     InitialAccessTokenId, InvitationId, IssuedTokenId, KekId, MagicLinkTokenId, ManagementKeyId,
     Mds3BlobCacheId, MigrationRunId, MigrationRunRecordId, OperatorId, OrganizationId,
-    PushedRequestId, RecoveryCodeId, RecoveryFlowId, RefreshFamilyId, RefreshTokenId,
-    ResourceServerId, RiskDecisionId, RiskDisavowalId, RiskLoginGeoId, ScopeStepUpPolicyId,
-    ServiceAccountId, SessionEventId, SessionId, SigningKeyId, SmsOtpCodeId, SmsRouteStatId,
-    TenantId, TotpCredentialId, TraitMigrationJobId, TraitSchemaId, TrustedDeviceId, UserId,
-    UserIdentifierId, VariableId, WebauthnChallengeId, WebauthnCredentialId,
+    PowChallengeId, PushedRequestId, RecoveryCodeId, RecoveryFlowId, RefreshFamilyId,
+    RefreshTokenId, ResourceServerId, RiskDecisionId, RiskDisavowalId, RiskLoginGeoId,
+    ScopeStepUpPolicyId, ServiceAccountId, SessionEventId, SessionId, SigningKeyId, SmsOtpCodeId,
+    SmsRouteStatId, TenantId, TotpCredentialId, TraitMigrationJobId, TraitSchemaId,
+    TrustedDeviceId, UserId, UserIdentifierId, VariableId, WebauthnChallengeId,
+    WebauthnCredentialId,
 };
 use crate::identifier::{
     CanonicalIdentifier, IdentifierType, UniquenessMode, canonicalize_identifier,
 };
+use crate::pow_challenge::{NewPowChallenge, PowChallengeView};
 use crate::recovery::{
     NewRecoveryFlow, RecoveryCancelReason, RecoveryEntryPoint, RecoveryFlowRecord, RecoveryState,
 };
@@ -399,6 +401,18 @@ impl<'a> ScopedStore<'a> {
     #[must_use]
     pub fn risk(&self) -> RiskRepo<'a> {
         RiskRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
+    /// The proof-of-work challenge repository for this scope (issue #80): mint a
+    /// challenge, and atomically verify-and-consume a presented one. Data-plane state
+    /// (minted and consumed on the request path, not the management API); the challenge
+    /// is single-use, expiring, and context-bound. Every read and write is scope bound.
+    #[must_use]
+    pub fn pow_challenges(&self) -> PowChallengeRepo<'a> {
+        PowChallengeRepo {
             store: self.store,
             scope: self.scope,
         }
@@ -11078,6 +11092,12 @@ pub enum UserState {
     /// SCHEDULED for offboarding at a recorded instant. Still able to authenticate
     /// until the worker executes the offboarding (which disables it and cascades).
     ScheduledOffboarding,
+    /// WAITLISTED (issue #80): a self-service signup made while waitlist mode is on.
+    /// It CANNOT authenticate (it holds no privileges and no session/token capability)
+    /// until an admin APPROVES it (transition to active) or REJECTS it (transition to
+    /// disabled) through the user-lifecycle management API. Like pending-verification it
+    /// is a creation-time state only, never a transition target.
+    Waitlisted,
 }
 
 impl UserState {
@@ -11090,6 +11110,7 @@ impl UserState {
             UserState::Disabled => "disabled",
             UserState::PendingVerification => "pending_verification",
             UserState::ScheduledOffboarding => "scheduled_offboarding",
+            UserState::Waitlisted => "waitlisted",
         }
     }
 
@@ -11105,6 +11126,7 @@ impl UserState {
             "disabled" => Some(UserState::Disabled),
             "pending_verification" => Some(UserState::PendingVerification),
             "scheduled_offboarding" => Some(UserState::ScheduledOffboarding),
+            "waitlisted" => Some(UserState::Waitlisted),
             _ => None,
         }
     }
@@ -11134,8 +11156,10 @@ impl UserState {
     }
 
     /// The state machine: whether a live user may move from `self` to `to`. A no-op
-    /// (same state) is refused, and pending-verification is a creation-time state
-    /// only (never a transition target). Every other move between live states is
+    /// (same state) is refused, and pending-verification and waitlisted are
+    /// creation-time states only (never a transition target: a waitlisted account is
+    /// APPROVED by transitioning it TO active or REJECTED by transitioning it TO
+    /// disabled, never the reverse). Every other move between live states is
     /// permitted; the store additionally requires a timestamp for a move to
     /// scheduled-offboarding. An invalid transition is refused fail closed.
     #[must_use]
@@ -11143,7 +11167,7 @@ impl UserState {
         if self == to {
             return false;
         }
-        !matches!(to, UserState::PendingVerification)
+        !matches!(to, UserState::PendingVerification | UserState::Waitlisted)
     }
 }
 
@@ -11876,7 +11900,42 @@ impl ActingUserRepo<'_> {
     ) -> Result<UserId, StoreError> {
         // The registration surface (issue #20) records no standard claims; the
         // column defaults to the empty object, released as no claims by UserInfo.
-        self.register_inner(env, None, identifier, password_hash, "{}", false)
+        self.register_inner(
+            env,
+            None,
+            identifier,
+            password_hash,
+            "{}",
+            false,
+            UserState::Active,
+        )
+        .await
+    }
+
+    /// Register a bootstrap user with a precomputed Argon2id `password_hash` in an
+    /// explicit initial lifecycle `state` (issue #80), returning the fresh identifier.
+    /// The waitlist gate uses this to land a self-service signup in
+    /// [`UserState::Waitlisted`], which CANNOT authenticate until an admin approves it.
+    /// The `state` must be a valid creation-time state
+    /// ([`UserState::is_creatable`]); a non-creatable state is refused fail-closed.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Conflict`] if the login handle is already registered in this
+    /// scope or if `state` is not a valid initial state
+    /// ([`UserState::is_creatable`]); [`StoreError::Database`] on a persistence
+    /// failure.
+    pub async fn register_in_state(
+        &self,
+        env: &Env,
+        identifier: &str,
+        password_hash: &str,
+        state: UserState,
+    ) -> Result<UserId, StoreError> {
+        if !state.is_creatable() {
+            return Err(StoreError::Conflict);
+        }
+        self.register_inner(env, None, identifier, password_hash, "{}", false, state)
             .await
     }
 
@@ -11912,6 +11971,7 @@ impl ActingUserRepo<'_> {
             USER_UNUSABLE_PASSWORD_HASH,
             "{}",
             true,
+            UserState::Active,
         )
         .await
     }
@@ -11938,8 +11998,16 @@ impl ActingUserRepo<'_> {
         password_hash: &str,
         claims_json: &str,
     ) -> Result<UserId, StoreError> {
-        self.register_inner(env, None, identifier, password_hash, claims_json, false)
-            .await
+        self.register_inner(
+            env,
+            None,
+            identifier,
+            password_hash,
+            claims_json,
+            false,
+            UserState::Active,
+        )
+        .await
     }
 
     /// Ensure the scope has a live KEK and DEK to seal PII under, provisioning each
@@ -11968,6 +12036,11 @@ impl ActingUserRepo<'_> {
     /// for lookup) and its audit row in one transaction, and map a duplicate login
     /// handle to the caller-facing [`StoreError::Conflict`]. The plaintext handle
     /// and claims never reach a column.
+    // The shared registration body threads the small set of per-variant inputs (a
+    // pre-allocated id, the sealed claim document, the passwordless flag, and the initial
+    // lifecycle state) through one insert; grouping them into a struct would only obscure a
+    // linear seal-and-insert, so the argument-count lint is allowed here.
+    #[allow(clippy::too_many_arguments)]
     async fn register_inner(
         &self,
         env: &Env,
@@ -11976,6 +12049,7 @@ impl ActingUserRepo<'_> {
         password_hash: &str,
         claims_json: &str,
         passwordless: bool,
+        state: UserState,
     ) -> Result<UserId, StoreError> {
         let master = self.store.master().ok_or(StoreError::Encryption)?;
         // The scope needs a live KEK/DEK before the first PII seal; provision them
@@ -12025,8 +12099,8 @@ impl ActingUserRepo<'_> {
                     "INSERT INTO users \
                      (id, tenant_id, environment_id, identifier_bidx, identifier_sealed, \
                       password_hash, claims_sealed, pii_dek_version, passwordless, \
-                      webauthn_user_handle) \
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+                      webauthn_user_handle, state) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
                 )
                 .bind(id.to_string())
                 .bind(scope.tenant().to_string())
@@ -12038,6 +12112,7 @@ impl ActingUserRepo<'_> {
                 .bind(dek_version)
                 .bind(passwordless)
                 .bind(webauthn_user_handle.clone())
+                .bind(state.as_str())
                 .execute(&mut **tx)
                 .await;
                 match result {
@@ -17903,6 +17978,103 @@ impl RiskRepo<'_> {
         .get("present");
         tx.commit().await?;
         Ok(present)
+    }
+}
+
+/// The proof-of-work challenge repository (issue #80): mint a challenge, and atomically
+/// verify-and-consume a presented one. Data-plane, scope-bound state; no audit row (a `PoW`
+/// challenge is a high-frequency request-shaping artifact, like the #64 request counters,
+/// not an auditable identity event).
+pub struct PowChallengeRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl PowChallengeRepo<'_> {
+    /// Mint a proof-of-work challenge (issue #80): insert the random challenge, its
+    /// difficulty, the context binding, and the expiry, keyed by a fresh `pow_` id. The
+    /// challenge is NOT a secret (it is handed to the client to solve), so it is stored
+    /// in the clear; the single-use latch and the context binding are the security state.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn mint(
+        &self,
+        id: &PowChallengeId,
+        challenge: &NewPowChallenge<'_>,
+    ) -> Result<(), StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let mut tx = begin_scoped(self.store, scope).await?;
+        sqlx::query(
+            "INSERT INTO pow_challenges \
+             (id, tenant_id, environment_id, challenge, difficulty_bits, context_hash, \
+              expires_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, \
+                     TIMESTAMPTZ 'epoch' + ($7::text || ' microseconds')::interval)",
+        )
+        .bind(id.to_string())
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(challenge.challenge)
+        .bind(challenge.difficulty_bits)
+        .bind(challenge.context_hash)
+        .bind(challenge.expires_at_micros)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Atomically CONSUME a presented challenge (issue #80): flip `spent_at` for the ONE
+    /// row whose id AND `context_hash` match, that is UNSPENT and UNEXPIRED at
+    /// `now_micros`, and return its challenge bytes and difficulty so the caller can
+    /// verify the presented nonce. Returns `None` when the id is out of scope, malformed,
+    /// unknown, already spent (replay), expired, or presented with a mismatched context
+    /// (endpoint/context binding). The `spent_at IS NULL ... RETURNING` clause makes the
+    /// spend single-use under concurrency: at most one caller wins it, so a solved
+    /// challenge can never be replayed. A mismatched context leaves the challenge UNSPENT
+    /// (it can still be consumed with its correct context), so a solution for one
+    /// endpoint/context does not spend or satisfy another.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn consume(
+        &self,
+        id: &PowChallengeId,
+        context_hash: &[u8],
+        now_micros: i64,
+    ) -> Result<Option<PowChallengeView>, StoreError> {
+        if id.scope() != self.scope {
+            return Ok(None);
+        }
+        let scope = self.scope;
+        let mut tx = begin_scoped(self.store, scope).await?;
+        let row = sqlx::query(
+            "UPDATE pow_challenges SET \
+             spent_at = TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval \
+             WHERE tenant_id = $1 AND environment_id = $2 AND id = $3 \
+             AND context_hash = $5 \
+             AND spent_at IS NULL \
+             AND expires_at > (TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval) \
+             RETURNING challenge, difficulty_bits",
+        )
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(id.to_string())
+        .bind(now_micros)
+        .bind(context_hash)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(row.map(|row| PowChallengeView {
+            challenge: row.get("challenge"),
+            difficulty_bits: row.get("difficulty_bits"),
+        }))
     }
 }
 

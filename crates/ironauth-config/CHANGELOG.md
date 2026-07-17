@@ -6,6 +6,18 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Registration abuse defenses config for issue #80, off by default: the
+  `oidc.registration_abuse` block (`RegistrationAbuseConfig`). `pow` (`PowConfig`) holds
+  `enabled`, `difficulty_bits` (bounded 1..=24), `challenge_at` (`off`/`low`/`med`/`high`
+  reusing the #79 threshold set), `challenge_ttl_secs`, `provider` (`builtin`/`turnstile`/
+  `recaptcha`, the built-in self-contained PoW is the DEFAULT), `fail_policy`
+  (`fail_closed`/`fail_open` for adapter outages only), and `adapter_secret` (a `Secret`
+  indirection, so the VALUE never lands in a config dump or snapshot; only a named reference
+  travels). `disposable_email` (`DisposableEmailConfig`) holds `mode` (`off`/`flag`/`block`)
+  plus updateable per-environment `denylist`/`allowlist` domain data. `waitlist`
+  (`WaitlistConfig`) holds `enabled`. Every field is validated at load (closed sets and
+  bounds) so a misconfiguration fails fast, and the whole block promotes with the config
+  snapshot.
 - Account-recovery windows for issue #81: the `oidc.recovery_cooldown_secs` per-account
   cooldown between recovery initiations (at least 1 second, default 300, five minutes) and
   the `oidc.recovery_delay_secs` delay a security-reducing recovery is HELD for (bounded to
