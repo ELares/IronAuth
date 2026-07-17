@@ -53,7 +53,8 @@ use ironauth_store::{
 };
 use sha2::{Digest, Sha256};
 
-use crate::authn::AuthenticationEvent;
+use crate::authn::{self, AuthenticationEvent};
+use crate::broker_overlay;
 use crate::federation_client_secret::{SignedJwtInputs, generate_signed_jwt};
 use crate::federation_health::{Admission, ConnectorHealthRegistry};
 use crate::federation_jwks::FederationKeyResolver;
@@ -883,6 +884,11 @@ pub async fn federation_callback(
                 runtime: runtime_ref,
                 connector_key: &connector_key,
                 connector_slug: &connector_slug,
+                // The consumed correlation row carries the server-authenticated org binding
+                // (written by the authorize leg from the routing token, never the browser);
+                // thread it so an overlay on an OAuth 2.0 backed org connection is enforced
+                // through the same shared finalize path as OIDC (issue #77 PR 2).
+                org_connection_id: consumed.org_connection_id.as_deref(),
                 tenant_id: &tenant_id,
                 environment_id: &environment_id,
                 fingerprint,
@@ -1270,8 +1276,35 @@ pub(crate) async fn finalize_federated_login(finalize: FinalizeLogin<'_>) -> Res
         .health()
         .record_success(now, connector_key, fingerprint);
 
-    // Resume the pending LOCAL authorization request, which now sees the authenticated session.
-    interaction::redirect_setting_cookie(return_to, &cookies)
+    // Broker overlay (issue #77 PR 2): layer the org connection's MFA / passkey / max-age
+    // policy ON TOP of the (possibly permissive) upstream, reading it from the org
+    // connection re-derived from the CONSUMED correlation row (never the browser). On an
+    // unmet overlay the user is routed STRAIGHT to a real local ceremony (carrying the
+    // session cookies and the return_to) whose completion records the honest combined
+    // factors. The authorization gate enforces the SAME overlay independently on every
+    // request, so it is never bypassable. (The broker-then-migrate lazy-migration cutover is
+    // DEFERRED to a follow-up; it needs a per-account cutover marker the 0059 columns lack.)
+    match broker_overlay::enforce_on_callback(broker_overlay::CallbackContext {
+        state,
+        scope,
+        org_connection_id,
+        return_to,
+        subject: &user_id,
+        achieved_acr: authn::achieved_acr(event.methods()),
+        auth_time_micros: event.auth_time_unix_micros(),
+        now_micros,
+        cookies: &cookies,
+    })
+    .await
+    {
+        // No overlay or already satisfied: resume the pending request, which now sees the
+        // authenticated session, exactly as a plain federated login does.
+        broker_overlay::CallbackOverlay::Resume => {
+            interaction::redirect_setting_cookie(return_to, &cookies)
+        }
+        // An unmet overlay: return the ceremony redirect (or fail-closed page) instead.
+        broker_overlay::CallbackOverlay::Respond(response) => response,
+    }
 }
 
 /// The namespaced external-id for a federated identity (issue #75, HIGH-1): the upstream

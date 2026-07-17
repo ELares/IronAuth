@@ -19345,7 +19345,9 @@ fn org_connection_record_from_row(
         organization_id: row.get("organization_id"),
         connector_id: row.get("connector_id"),
         overlay_min_acr: row.get("overlay_min_acr"),
-        max_age_secs: row.get("max_age_secs"),
+        // The column is `integer` (INT4); widen to i64 for the record so the enforcement
+        // path composes it as an age window without a narrowing cast at every read site.
+        max_age_secs: row.get::<Option<i32>, _>("max_age_secs").map(i64::from),
         overlay_min_class: row.get("overlay_min_class"),
         capture_upstream_tokens: row.get("capture_upstream_tokens"),
         enabled: row.get("enabled"),
@@ -19739,6 +19741,21 @@ pub struct NewOrgConnection<'a> {
     pub organization_id: &'a OrganizationId,
     /// The connector describing the organization's upstream (validated in scope).
     pub connector_id: &'a ConnectorId,
+    /// The broker overlay minimum `acr` this binding layers on top of the upstream
+    /// (issue #77 PR 2), or [`None`] for no `acr` floor. Persisted verbatim; the
+    /// federation callback and the authorization step-up gate canonicalize and enforce
+    /// it. The control-plane grant is `SELECT, INSERT` only, so overlay policy is set at
+    /// creation time (there is no in-place update path).
+    pub overlay_min_acr: Option<&'a str>,
+    /// The broker overlay maximum authentication age in seconds (issue #77 PR 2), or
+    /// [`None`] for no age bound. An older authentication must be repeated. The `integer`
+    /// (INT4) column, so it is an `i32` here (the read widens it to `i64` on the record).
+    pub max_age_secs: Option<i32>,
+    /// The broker overlay minimum credential class (a rung of the ladder: `any`, `mfa`,
+    /// `passkey`, or `attested_passkey`, issue #77 PR 2), or [`None`]. The database CHECK
+    /// pins the accepted set; the enforcement path maps it through the one credential
+    /// class ladder.
+    pub overlay_min_class: Option<&'a str>,
     /// Whether a later PR captures the upstream tokens after a brokered login.
     pub capture_upstream_tokens: bool,
     /// Whether the binding is active.
@@ -19808,6 +19825,9 @@ impl ActingOrgConnectionRepo<'_> {
         let scope = self.scope;
         let organization_id = params.organization_id.to_string();
         let connector_id = params.connector_id.to_string();
+        let overlay_min_acr = params.overlay_min_acr.map(str::to_owned);
+        let max_age_secs = params.max_age_secs;
+        let overlay_min_class = params.overlay_min_class.map(str::to_owned);
         let capture = params.capture_upstream_tokens;
         let enabled = params.enabled;
         let detail = format!("organization={organization_id} connector={connector_id}");
@@ -19824,16 +19844,20 @@ impl ActingOrgConnectionRepo<'_> {
                 let result = sqlx::query(
                     "INSERT INTO org_connections \
                      (id, tenant_id, environment_id, organization_id, connector_id, \
+                      overlay_min_acr, max_age_secs, overlay_min_class, \
                       capture_upstream_tokens, enabled, created_at, updated_at) \
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, \
-                             TIMESTAMPTZ 'epoch' + ($8::text || ' microseconds')::interval, \
-                             TIMESTAMPTZ 'epoch' + ($8::text || ' microseconds')::interval)",
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, \
+                             TIMESTAMPTZ 'epoch' + ($11::text || ' microseconds')::interval, \
+                             TIMESTAMPTZ 'epoch' + ($11::text || ' microseconds')::interval)",
                 )
                 .bind(id.to_string())
                 .bind(scope.tenant().to_string())
                 .bind(scope.environment().to_string())
                 .bind(&organization_id)
                 .bind(&connector_id)
+                .bind(overlay_min_acr.as_deref())
+                .bind(max_age_secs)
+                .bind(overlay_min_class.as_deref())
                 .bind(capture)
                 .bind(enabled)
                 .bind(created_at_micros)

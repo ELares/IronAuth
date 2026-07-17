@@ -91,6 +91,9 @@ async fn seed_binding(
             NewOrgConnection {
                 organization_id: &org_id,
                 connector_id: &connector_id,
+                overlay_min_acr: None,
+                max_age_secs: None,
+                overlay_min_class: None,
                 capture_upstream_tokens: false,
                 enabled: true,
             },
@@ -246,6 +249,9 @@ async fn a_second_domain_mapping_is_rejected_by_the_per_scope_unique_index() {
                 NewOrgConnection {
                     organization_id: &org_b,
                     connector_id: &connector_b,
+                    overlay_min_acr: None,
+                    max_age_secs: None,
+                    overlay_min_class: None,
                     capture_upstream_tokens: false,
                     enabled: true,
                 },
@@ -443,4 +449,106 @@ async fn an_org_connection_and_routing_rule_and_token_are_cross_scope_isolated()
             .is_none(),
         "the token must not verify in a foreign scope"
     );
+}
+
+#[tokio::test]
+async fn the_broker_overlay_columns_round_trip_through_a_binding()
+-> Result<(), Box<dyn std::error::Error>> {
+    // The overlay policy columns (issue #77 PR 2) are set at INSERT (the control-plane grant
+    // is SELECT + INSERT, no UPDATE) and read back on the data plane exactly as stored, so
+    // the federation callback and the authorization gate enforce the operator's configured
+    // policy.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+
+    let control = db.control_store();
+    let org_id = OrganizationId::generate(&env, &scope);
+    control
+        .management()
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .organizations(scope)
+        .create(&env, &org_id, 1_000_000, "Acme Corp", None)
+        .await?;
+    let connector_id = ConnectorId::generate(&env, &scope);
+    control
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .connectors()
+        .create(
+            &env,
+            &connector_id,
+            1_000_000,
+            NewConnector {
+                slug: CONNECTOR_SLUG,
+                definition_json: &definition_json(CONNECTOR_SLUG),
+                client_secret: b"upstream-secret",
+                capabilities: caps(),
+                enabled: true,
+            },
+            None,
+        )
+        .await?;
+
+    let ocn_id = OrgConnectionId::generate(&env, &scope);
+    control
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .org_connections()
+        .create(
+            &env,
+            &ocn_id,
+            1_000_000,
+            NewOrgConnection {
+                organization_id: &org_id,
+                connector_id: &connector_id,
+                overlay_min_acr: Some("urn:ironauth:acr:mfa"),
+                max_age_secs: Some(3_600),
+                overlay_min_class: Some("passkey"),
+                capture_upstream_tokens: false,
+                enabled: true,
+            },
+        )
+        .await?;
+
+    let record = db
+        .store()
+        .scoped(scope)
+        .org_connections()
+        .get(&ocn_id)
+        .await?;
+    assert_eq!(
+        record.overlay_min_acr.as_deref(),
+        Some("urn:ironauth:acr:mfa")
+    );
+    assert_eq!(record.max_age_secs, Some(3_600));
+    assert_eq!(record.overlay_min_class.as_deref(), Some("passkey"));
+
+    // The overlay_min_class CHECK constraint rejects a value outside the ladder, so a
+    // malformed policy can never be persisted.
+    let bad_ocn = OrgConnectionId::generate(&env, &scope);
+    let result = control
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .org_connections()
+        .create(
+            &env,
+            &bad_ocn,
+            1_000_000,
+            NewOrgConnection {
+                organization_id: &org_id,
+                connector_id: &connector_id,
+                overlay_min_acr: None,
+                max_age_secs: None,
+                overlay_min_class: Some("not_a_rung"),
+                capture_upstream_tokens: false,
+                enabled: true,
+            },
+        )
+        .await;
+    assert!(
+        result.is_err(),
+        "an unknown overlay class must be refused by the CHECK"
+    );
+    Ok(())
 }

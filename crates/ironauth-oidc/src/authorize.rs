@@ -36,6 +36,7 @@ use ironauth_store::{
 use serde::{Deserialize, Serialize};
 
 use crate::authn;
+use crate::broker_overlay;
 use crate::claims_request::{ClaimsRequest, ClaimsRequestError};
 use crate::client_auth::ClientAuthMethod;
 use crate::consent::ConsentMode;
@@ -1426,6 +1427,36 @@ async fn evaluate_step_up(
         }
     }
 
+    // The subject the overlay lookup, the factor probe, and the trusted-device validation
+    // bind to. A session subject that will not parse in scope cannot be probed, so the
+    // requirement can never be met here.
+    let Ok(subject) = UserId::parse_in_scope(&session.subject, &scope) else {
+        return StepUpOutcome::Fail(
+            AuthzErrorCode::UnmetAuthenticationRequirements,
+            "the requested authentication context cannot be satisfied",
+        );
+    };
+
+    // Broker overlay (issue #77 PR 2): the session subject's STAMPED org connection may
+    // layer an MFA / passkey / max-age policy ON TOP of the (possibly permissive) upstream
+    // that authenticated it. It composes through the SAME strongest-wins merge as every
+    // other floor, so a stronger client or scope requirement is never weakened. It is
+    // enforced HERE, at the single non-bypassable gate that re-runs on every authorization
+    // request, so a user cannot skip a federation-callback redirect and reach a code at
+    // the unranked federated acr. The stamped org connection id was written FROM the
+    // consumed, single-use correlation row (PR 1), never a browser value, so the overlay
+    // source is server-authenticated. A store fault FAILS CLOSED: an org's overlay must
+    // never be silently skipped because a read blipped.
+    match broker_overlay::requirement_for_session_org(state, scope, &subject, &order).await {
+        Ok(overlay) => requirement.merge_stronger(&overlay, &order),
+        Err(()) => {
+            return StepUpOutcome::Fail(
+                AuthzErrorCode::UnmetAuthenticationRequirements,
+                "the broker overlay policy could not be evaluated",
+            );
+        }
+    }
+
     let age_bound = requirement.max_auth_age_secs.is_some();
 
     // The recorded methods drive both the achieved acr (the EXPLICIT step-up floors) and
@@ -1457,16 +1488,6 @@ async fn evaluate_step_up(
                 age_lapsed,
             } => Some((acr_unmet, age_lapsed)),
         }
-    };
-
-    // The subject the factor probe (and the trusted-device validation) binds to. A
-    // session subject that will not parse in scope cannot be probed, so the requirement
-    // can never be met here.
-    let Ok(subject) = UserId::parse_in_scope(&session.subject, &scope) else {
-        return StepUpOutcome::Fail(
-            AuthzErrorCode::UnmetAuthenticationRequirements,
-            "the requested authentication context cannot be satisfied",
-        );
     };
 
     // 2. Compose the requirement to remediate. The explicit step-up (if any) is stricter
