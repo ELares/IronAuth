@@ -140,6 +140,31 @@ impl Harness {
         }
     }
 
+    /// Start a fresh database and router with a federation runtime installed (issue #76),
+    /// so the per-connector health-diagnostics read reports the SAME in-memory health the
+    /// caller records into `runtime.health()`.
+    pub async fn start_with_federation(
+        default_page_size: u32,
+        runtime: std::sync::Arc<ironauth_oidc::FederationRuntime>,
+    ) -> Self {
+        let db = TestDatabase::start().await;
+        let config = AdminConfig {
+            bootstrap_operator_token: Some(Secret::Literal(SecretString::new(OPERATOR_TOKEN))),
+            max_page_size: 200,
+            default_page_size,
+            ..AdminConfig::default()
+        };
+        let state = AdminState::new(db.control_store().clone(), Env::system(), &config)
+            .expect("admin state builds")
+            .with_federation(runtime);
+        let router = management_router(state);
+        Self {
+            db,
+            router,
+            outbound_scope: None,
+        }
+    }
+
     /// The `(tenant, environment)` the OUTBOUND verification endpoint was configured
     /// for (issue #58). Panics if the harness was not built through
     /// [`Harness::start_with_outbound_verification`].

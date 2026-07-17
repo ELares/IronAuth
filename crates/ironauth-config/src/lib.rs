@@ -1871,6 +1871,15 @@ pub struct FederationConfig {
     /// naming a new `kid` is picked up immediately by the kid-miss refetch, so this TTL need
     /// not be short. Must be at least 1 and at most `OIDC_MAX_FEDERATION_TTL_SECS`.
     pub jwks_ttl_secs: u64,
+
+    /// The per-connector health probe window, in seconds (issue #76): the BASE health-driven
+    /// backoff interval. When a connector's upstream is unavailable the runtime waits at least
+    /// this long (growing exponentially per consecutive failure, capped) before probing it
+    /// again, so a dead upstream is not hammered while a transiently-down one is retried and
+    /// recovers. It is also the window over which the exported per-connector error rate is
+    /// measured. The default (30) is a responsive-but-gentle probe cadence. Must be at least 1
+    /// and at most `OIDC_MAX_FEDERATION_TTL_SECS`.
+    pub health_probe_window_secs: u64,
 }
 
 impl Default for FederationConfig {
@@ -1879,6 +1888,7 @@ impl Default for FederationConfig {
             enabled: false,
             discovery_ttl_secs: 3600,
             jwks_ttl_secs: 3600,
+            health_probe_window_secs: 30,
         }
     }
 }
@@ -4023,6 +4033,10 @@ fn validate_federation(oidc: &OidcConfig) -> Result<(), ConfigError> {
     for (name, value) in [
         ("discovery_ttl_secs", federation.discovery_ttl_secs),
         ("jwks_ttl_secs", federation.jwks_ttl_secs),
+        (
+            "health_probe_window_secs",
+            federation.health_probe_window_secs,
+        ),
     ] {
         if value < 1 {
             return Err(ConfigError::Invalid {

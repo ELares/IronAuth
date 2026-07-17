@@ -6,6 +6,14 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Per-connector downstream-parameter passthrough policy for issue #76: the `passthrough` block
+  on `ConnectorDefinition` (and mirrored on the secret-free `ConnectorRuntimeConfig` read
+  projection), a `PassthroughPolicy` with three `deny_unknown_fields` booleans -- `prompt`,
+  `login_hint`, `ui_locales` -- each defaulting to `true`. It governs which of exactly those
+  three OIDC Core 3.1.2.1 authentication-request parameters the federation authorize leg
+  forwards to the upstream; setting any to `false` DISABLES forwarding that one for the
+  connector. PRIVACY: `login_hint` discloses an identifier to the upstream, so it is the one
+  most likely disabled. The connector JSON schema (`docs/connector-schema.json`) regenerates.
 - Federation login wiring (issue #75, PR B, follow-on): the secret-free `ConnectorRuntimeConfig`
   read projection (endpoints, scopes, client id, PKCE policy) the federation login path
   deserializes from the STORED `definition_json` (which strips the client secret, so it

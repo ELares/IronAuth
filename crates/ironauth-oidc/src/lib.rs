@@ -87,6 +87,7 @@ mod disposable;
 mod email_otp;
 mod error;
 mod federation;
+mod federation_health;
 mod federation_jwks;
 mod global_revocation;
 mod hashing_pool;
@@ -177,6 +178,11 @@ pub use error::{AuthorizeError, AuthzErrorCode, TokenError};
 pub use federation::{
     FederationRuntime, TokenExchange, UpstreamTokenPolicy, VerifiedUpstreamIdentity, exchange_code,
     federated_external_id, fetch_discovery, resolve_alg_allowlist, validate_upstream_id_token,
+};
+pub use federation_health::{
+    Admission, CONNECTOR_HEALTHY, CONNECTOR_UPSTREAM_ERROR_TOTAL, CONNECTOR_UPSTREAM_SUCCESS_TOTAL,
+    ConnectorHealthRegistry, ConnectorHealthSnapshot, DenyReason, HealthState,
+    describe_connector_health_metrics,
 };
 pub use federation_jwks::FederationKeyResolver;
 pub use global_revocation::GLOBAL_TOKEN_REVOCATION_PATH;

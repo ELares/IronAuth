@@ -85,6 +85,12 @@ struct Inner {
     // counts. `None` when no hook is configured, or on a node that does not run the data
     // plane; the endpoint then reports progress with no breaker block.
     migration_hook: Option<Arc<ironauth_oidc::LazyMigrationHook>>,
+    // The federation runtime (issue #76), shared with the OIDC data plane in the same process
+    // when federation is enabled. Held so the management-plane per-connector health-diagnostics
+    // read reports THIS node's live connector health (the SAME in-memory registry the login path
+    // records into). `None` when federation is disabled or on a node that does not run the data
+    // plane; the health read then reports every connector as never-exercised.
+    federation: Option<Arc<ironauth_oidc::FederationRuntime>>,
     // Admin sudo mode (session privilege separation, issue #73): whether admin
     // mutations require a recent recorded re-authentication, and the freshness window in
     // seconds. Off by default; when off the mutation guard is a no-op and the admin
@@ -173,6 +179,7 @@ impl AdminState {
                     .clone()
                     .filter(|value| !value.trim().is_empty()),
                 migration_hook: None,
+                federation: None,
                 sudo_mode_enabled: config.sudo_mode_enabled,
                 sudo_mode_window_secs: config.sudo_mode_window_secs,
             }),
@@ -203,6 +210,35 @@ impl AdminState {
             .migration_hook
             .as_ref()
             .map(|hook| hook.breaker_state())
+    }
+
+    /// Share the federation runtime (issue #76) with the management plane, so the
+    /// per-connector health-diagnostics read reports the live health the OIDC data plane
+    /// records into. The boot path installs the SAME `Arc` it installs on the data plane; with
+    /// no runtime installed the health read reports every connector as never-exercised. Kept a
+    /// builder so the many admin tests need not stand a runtime up.
+    #[must_use]
+    pub fn with_federation(mut self, runtime: Arc<ironauth_oidc::FederationRuntime>) -> Self {
+        if let Some(inner) = Arc::get_mut(&mut self.inner) {
+            inner.federation = Some(runtime);
+        }
+        self
+    }
+
+    /// This node's live health snapshot for one connector (issue #76), read against the
+    /// admin clock seam, or `None` when no federation runtime is installed or the connector
+    /// has never been exercised on this node.
+    #[must_use]
+    pub(crate) fn connector_health(
+        &self,
+        connector_id: &str,
+    ) -> Option<ironauth_oidc::ConnectorHealthSnapshot> {
+        let now = self.inner.env.clock().now_utc();
+        self.inner
+            .federation
+            .as_ref()?
+            .health()
+            .snapshot(now, connector_id)
     }
 
     /// Whether the outbound lazy-migration credential-verification endpoint is

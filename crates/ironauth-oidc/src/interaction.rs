@@ -782,6 +782,36 @@ pub fn federation_unsupported_page() -> Response {
     )
 }
 
+/// The page shown when a federated login is attempted through a connector whose
+/// upstream is currently UNAVAILABLE or whose definition is CONFIG-broken (issue #76,
+/// the failure-isolation crux).
+///
+/// This is the TYPED, diagnosable connector-unavailable error: a broken upstream
+/// degrades EXACTLY its own connector's login option while every OTHER connector and the
+/// core OP surface keep serving. `kind` is the stable taxonomy label
+/// (`config` / `upstream_unavailable`) an operator reads to tell a permanent
+/// misconfiguration from a transient outage; it is a fixed, non-sensitive token (never an
+/// upstream address or message), so it is safe to render. The status is `503` so a probe
+/// sees the connector is temporarily unavailable, not a client error.
+#[must_use]
+pub fn connector_unavailable_page(kind: &str) -> Response {
+    let detail = match kind {
+        "config" => {
+            "This sign-in method is misconfigured and unavailable. \
+             An administrator must correct the connector configuration."
+        }
+        _ => {
+            "This sign-in method is temporarily unavailable because its identity \
+             provider could not be reached. Please try again shortly or choose another \
+             sign-in method."
+        }
+    };
+    pages::secure_html(
+        StatusCode::SERVICE_UNAVAILABLE,
+        pages::notice_page("Sign-in method unavailable", detail),
+    )
+}
+
 /// The `403` page shown when a state-changing POST is refused by the CSRF
 /// header allowlist ([`same_origin_ok`], issue #196). Generic on purpose: it never
 /// reveals WHICH signal (Origin or Sec-Fetch-Site) failed, and NO action is

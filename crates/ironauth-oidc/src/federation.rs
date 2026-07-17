@@ -53,6 +53,7 @@ use ironauth_store::{
 use sha2::{Digest, Sha256};
 
 use crate::authn::AuthenticationEvent;
+use crate::federation_health::{Admission, ConnectorHealthRegistry};
 use crate::federation_jwks::FederationKeyResolver;
 use crate::interaction;
 use crate::state::OidcState;
@@ -375,6 +376,10 @@ pub struct FederationRuntime {
     // A bounded cache of resolved discovery endpoints, keyed by connector id and read
     // against the application clock seam for expiry (deterministic under a manual clock).
     discovery_cache: Mutex<HashMap<String, CachedDiscovery>>,
+    // The per-connector health registry (issue #76): the in-memory health record every
+    // upstream operation records into, the health-driven backoff `admit` consults, and the
+    // management-API read snapshots. Shared so the admin plane can read the SAME live state.
+    health: Arc<ConnectorHealthRegistry>,
 }
 
 /// A cached discovery resolution and the instant it was fetched.
@@ -393,12 +398,14 @@ impl std::fmt::Debug for FederationRuntime {
 
 impl FederationRuntime {
     /// A production runtime over `fetcher` and the upstream JWKS `keys` cache, caching a
-    /// discovery resolution for `discovery_ttl`. Upstream fetches are https-only.
+    /// discovery resolution for `discovery_ttl` and driving per-connector health-backoff off
+    /// `probe_window` (issue #76). Upstream fetches are https-only.
     #[must_use]
     pub fn new(
         fetcher: Arc<Fetcher>,
         keys: Arc<FederationKeyResolver>,
         discovery_ttl: Duration,
+        probe_window: Duration,
     ) -> Self {
         Self {
             fetcher,
@@ -406,6 +413,7 @@ impl FederationRuntime {
             discovery_ttl,
             allow_http: false,
             discovery_cache: Mutex::new(HashMap::new()),
+            health: Arc::new(ConnectorHealthRegistry::new(probe_window)),
         }
     }
 
@@ -418,6 +426,7 @@ impl FederationRuntime {
         fetcher: Arc<Fetcher>,
         keys: Arc<FederationKeyResolver>,
         discovery_ttl: Duration,
+        probe_window: Duration,
     ) -> Self {
         Self {
             fetcher,
@@ -425,7 +434,15 @@ impl FederationRuntime {
             discovery_ttl,
             allow_http: true,
             discovery_cache: Mutex::new(HashMap::new()),
+            health: Arc::new(ConnectorHealthRegistry::new(probe_window)),
         }
+    }
+
+    /// The per-connector health registry (issue #76): the live in-memory health state the
+    /// management-API diagnostics read snapshots and the failure-isolation backoff consults.
+    #[must_use]
+    pub fn health(&self) -> &Arc<ConnectorHealthRegistry> {
+        &self.health
     }
 
     /// Resolve a connector's endpoints: an explicit set directly, or a discovery-form
@@ -487,6 +504,11 @@ impl FederationRuntime {
 /// persists the single-use correlation row (the sealed verifier, the nonce, the connector,
 /// and the pending local resume target), and 302s to the upstream authorization endpoint.
 /// Adding a provider is a stored connector definition, never a code change here.
+// The authorize leg is one linear flow (scope -> connector load -> health gate -> resolve ->
+// state/nonce/PKCE -> persist -> build the upstream URL with the passthrough allowlist); the
+// issue #76 health gate and passthrough push it just over the line-length lint, and splitting
+// the single top-to-bottom flow would scatter the one sequence the reviewer must read.
+#[allow(clippy::too_many_lines)]
 pub async fn federation_authorize(
     State(state): State<OidcState>,
     Path((tenant_id, environment_id, connector_slug)): Path<(String, String, String)>,
@@ -539,13 +561,38 @@ pub async fn federation_authorize(
     }
 
     let now = state.now();
-    // A discovery fetch that is blocked, times out, or returns a malformed document fails
-    // the login without provisioning anything.
-    let Ok(resolved) = runtime
-        .resolve_endpoints(now, &record.id.to_string(), &definition.endpoints)
+    let connector_key = record.id.to_string();
+    // The connector-definition fingerprint (issue #76): the store row's update instant. A
+    // change is a RECONFIGURATION, which resets the connector's health WITHOUT touching siblings.
+    let fingerprint = record.updated_at_unix_micros;
+
+    // Failure isolation (issue #76): consult the per-connector health-driven backoff BEFORE any
+    // upstream fetch. A config-broken connector (permanent until reconfigured) or an unavailable
+    // upstream still inside its backoff window fails THIS connector cleanly and typed, without
+    // hammering the upstream, while every sibling connector and the core OP surface keep serving.
+    if let Admission::Deny(reason) = runtime.health().admit(now, &connector_key, fingerprint) {
+        return interaction::connector_unavailable_page(reason.as_str());
+    }
+    // Resolve the connector's endpoints, recording the outcome against the connector's health. A
+    // blocked, timed-out, or malformed discovery fetch is an UpstreamUnavailable / UpstreamProtocol
+    // fault: it arms the backoff and surfaces the TYPED connector-unavailable error for this
+    // connector only, never a process-wide failure.
+    let resolved = match runtime
+        .resolve_endpoints(now, &connector_key, &definition.endpoints)
         .await
-    else {
-        return interaction::server_error_page();
+    {
+        Ok(resolved) => {
+            runtime
+                .health()
+                .record_success(now, &connector_key, fingerprint);
+            resolved
+        }
+        Err(error) => {
+            runtime
+                .health()
+                .record_failure(now, &connector_key, fingerprint, &error);
+            return interaction::connector_unavailable_page(error.kind());
+        }
     };
 
     let state_value = random_token(&state);
@@ -603,6 +650,21 @@ pub async fn federation_authorize(
     if let Some(challenge) = code_challenge.as_deref() {
         params.push(("code_challenge", Some(challenge)));
         params.push(("code_challenge_method", Some("S256")));
+    }
+    // Parameter passthrough (issue #76): forward EXACTLY the three OIDC Core 3.1.2.1
+    // authentication-request params on the STRICT allowlist (prompt, login_hint, ui_locales)
+    // from the DOWNSTREAM authorization request (the validated resume target's query) to the
+    // UPSTREAM authorize request, each gated by the connector's per-param disable flag. NOTHING
+    // outside the allowlist is ever read or forwarded (a downstream param not on the list can
+    // never reach the upstream). Each value is bounded and rides ONLY this query, percent-encoded
+    // by append_query -- never a header, path, or log (no injection surface).
+    let downstream_query = resume
+        .return_to
+        .split_once('?')
+        .map_or("", |(_, query)| query);
+    let forwarded = passthrough_params(downstream_query, definition.passthrough);
+    for (name, value) in &forwarded {
+        params.push((name, Some(value.as_str())));
     }
     let location = append_query(&resolved.authorize_url, &params);
     interaction::redirect(&location)
@@ -694,11 +756,24 @@ pub async fn federation_callback(
     };
 
     let now = state.now();
-    let Ok(resolved) = runtime
-        .resolve_endpoints(now, &connector_id.to_string(), &definition.endpoints)
+    let connector_key = connector_id.to_string();
+    // The connector-definition fingerprint (issue #76) for the per-connector health record;
+    // a change (a reconfiguration) resets this connector's health without touching siblings.
+    let fingerprint = record.updated_at_unix_micros;
+    let resolved = match runtime
+        .resolve_endpoints(now, &connector_key, &definition.endpoints)
         .await
-    else {
-        return interaction::server_error_page();
+    {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            // A mid-run upstream discovery outage flips ONLY this connector's health (issue
+            // #76), arming its backoff so the NEXT authorize is denied cleanly; siblings and
+            // the core OP surface are untouched.
+            runtime
+                .health()
+                .record_failure(now, &connector_key, fingerprint, &error);
+            return interaction::server_error_page();
+        }
     };
     // Only a discovery-form connector carries the issuer the upstream ID token's `iss` is
     // matched against (the mix-up-checked document issuer). PR B validates issuer-form
@@ -714,8 +789,9 @@ pub async fn federation_callback(
     let verifier = verifier.as_deref().filter(|v| !v.is_empty());
 
     // Exchange the code at the upstream token endpoint. Any failure fails the login WITHOUT
-    // provisioning a user.
-    let Ok(id_token) = exchange_code(
+    // provisioning a user. A dead or misbehaving token endpoint mid-run is recorded against
+    // THIS connector's health (a token-endpoint outage the discovery cache would otherwise hide).
+    let id_token = match exchange_code(
         &runtime.fetcher,
         TokenExchange {
             token_url: &resolved.token_url,
@@ -728,8 +804,14 @@ pub async fn federation_callback(
         runtime.allow_http,
     )
     .await
-    else {
-        return interaction::server_error_page();
+    {
+        Ok(id_token) => id_token,
+        Err(error) => {
+            runtime
+                .health()
+                .record_failure(now, &connector_key, fingerprint, &error);
+            return interaction::server_error_page();
+        }
     };
 
     // Resolve the upstream signing keys through the SSRF-hardened fetcher (a private-range
@@ -752,7 +834,7 @@ pub async fn federation_callback(
         .await;
     let allowed_algs =
         resolve_alg_allowlist(resolved.id_token_signing_alg_values_supported.as_deref());
-    let Ok(identity) = validate_upstream_id_token(
+    let identity = match validate_upstream_id_token(
         &id_token,
         keys,
         UpstreamTokenPolicy {
@@ -762,8 +844,18 @@ pub async fn federation_callback(
             allowed_algs: &allowed_algs,
         },
         state.env().clock(),
-    ) else {
-        return interaction::server_error_page();
+    ) {
+        Ok(identity) => identity,
+        Err(error) => {
+            // A token-validation rejection (a forged / expired / wrong-audience token) or an
+            // empty-JWKS unavailability is recorded against the connector's health (feeding the
+            // error rate). A protocol rejection is a per-login fault and does not blacklist the
+            // connector; an empty-JWKS unavailability arms the backoff. No user is provisioned.
+            runtime
+                .health()
+                .record_failure(now, &connector_key, fingerprint, &error);
+            return interaction::server_error_page();
+        }
     };
 
     // Provision a MINIMAL local identity from the VERIFIED upstream sub (PR C generalizes
@@ -800,6 +892,12 @@ pub async fn federation_callback(
     else {
         return interaction::server_error_page();
     };
+
+    // The full upstream exchange + validation succeeded: mark this connector healthy (issue
+    // #76), clearing any prior backoff so a recovered upstream is immediately trusted again.
+    runtime
+        .health()
+        .record_success(now, &connector_key, fingerprint);
 
     // Resume the pending LOCAL authorization request, which now sees the authenticated
     // session and issues LOCAL tokens as usual (carrying the honest federated acr/amr).
@@ -892,6 +990,46 @@ async fn provision_federated_user(
             None,
         )
         .await
+}
+
+/// The maximum length, in bytes after percent-decoding, of a passthrough value forwarded
+/// to the upstream authorize request (issue #76). A value over the cap is DROPPED (never
+/// truncated, which could mangle it or an encoded sequence), bounding what any single
+/// downstream-supplied value can push onto the upstream query.
+const PASSTHROUGH_MAX_LEN: usize = 256;
+
+/// Read one allowlisted passthrough value from the downstream authorization request
+/// `query`, when the connector permits forwarding it and it is present, non-empty, and
+/// within the length cap (issue #76). Returns the VERBATIM decoded value (`append_query`
+/// re-encodes it for the upstream query); [`None`] otherwise.
+fn passthrough_value(query: &str, name: &str, allowed: bool) -> Option<String> {
+    if !allowed {
+        return None;
+    }
+    query_get(query, name).filter(|value| !value.is_empty() && value.len() <= PASSTHROUGH_MAX_LEN)
+}
+
+/// Build the allowlisted passthrough parameters to forward to the upstream authorize
+/// request from the downstream `query`, honoring the per-connector `policy` (issue #76).
+///
+/// EXACTLY `prompt`, `login_hint`, and `ui_locales` are ever considered, in that fixed
+/// order; every value is bounded and taken verbatim. A downstream parameter outside this
+/// three-name allowlist is never read here, so it can never be forwarded upstream.
+fn passthrough_params(
+    query: &str,
+    policy: ironauth_connector::PassthroughPolicy,
+) -> Vec<(&'static str, String)> {
+    let mut out = Vec::new();
+    for (name, allowed) in [
+        ("prompt", policy.prompt),
+        ("login_hint", policy.login_hint),
+        ("ui_locales", policy.ui_locales),
+    ] {
+        if let Some(value) = passthrough_value(query, name, allowed) {
+            out.push((name, value));
+        }
+    }
+    out
 }
 
 /// Generate an unguessable URL-safe token from the entropy seam (256 bits): used for the
@@ -1213,6 +1351,86 @@ mod tests {
         );
     }
 
+    // ---- Parameter passthrough: the strict 3-param allowlist (issue #76) ----
+
+    #[test]
+    fn passthrough_forwards_exactly_the_three_allowlisted_params_verbatim() {
+        use ironauth_connector::PassthroughPolicy;
+        // The downstream authorize query carries the three allowlisted params (percent-encoded)
+        // plus arbitrary others. Only the three are forwarded, verbatim (decoded values).
+        let query = "response_type=code&client_id=cli_x&prompt=login%20consent&\
+             login_hint=ada%40example.test&ui_locales=fr-CA%20en&redirect_uri=https%3A%2F%2Fevil\
+             &scope=openid&state=abc";
+        let forwarded = passthrough_params(query, PassthroughPolicy::default());
+        assert_eq!(
+            forwarded,
+            vec![
+                ("prompt", "login consent".to_owned()),
+                ("login_hint", "ada@example.test".to_owned()),
+                ("ui_locales", "fr-CA en".to_owned()),
+            ],
+            "exactly the three allowlisted params, decoded verbatim"
+        );
+    }
+
+    #[test]
+    fn a_param_outside_the_allowlist_is_never_forwarded() {
+        use ironauth_connector::PassthroughPolicy;
+        // Arbitrary downstream params (including sensitive ones like redirect_uri and a
+        // hostile injected key) are NEVER read or forwarded upstream (the negative test).
+        let query = "redirect_uri=https%3A%2F%2Fattacker.example&max_age=0&\
+             acr_values=urn%3Aevil&foo=bar&nonce=downstream-nonce&client_id=cli_x";
+        let forwarded = passthrough_params(query, PassthroughPolicy::default());
+        assert!(
+            forwarded.is_empty(),
+            "no non-allowlisted param is ever forwarded: {forwarded:?}"
+        );
+    }
+
+    #[test]
+    fn per_connector_disable_flags_are_honored() {
+        use ironauth_connector::PassthroughPolicy;
+        let query = "prompt=login&login_hint=ada%40example.test&ui_locales=fr";
+        // Disable login_hint (the privacy-sensitive one) and ui_locales; keep prompt.
+        let policy = PassthroughPolicy {
+            prompt: true,
+            login_hint: false,
+            ui_locales: false,
+        };
+        let forwarded = passthrough_params(query, policy);
+        assert_eq!(
+            forwarded,
+            vec![("prompt", "login".to_owned())],
+            "only the enabled param is forwarded"
+        );
+        // All disabled: nothing is forwarded even when present downstream.
+        let none = PassthroughPolicy {
+            prompt: false,
+            login_hint: false,
+            ui_locales: false,
+        };
+        assert!(passthrough_params(query, none).is_empty());
+    }
+
+    #[test]
+    fn an_oversized_or_empty_passthrough_value_is_dropped() {
+        use ironauth_connector::PassthroughPolicy;
+        // An empty value is treated as absent; an over-cap value is dropped (never truncated).
+        let long = "a".repeat(PASSTHROUGH_MAX_LEN + 1);
+        let query = format!("prompt=&login_hint={long}&ui_locales=fr");
+        let forwarded = passthrough_params(&query, PassthroughPolicy::default());
+        assert_eq!(
+            forwarded,
+            vec![("ui_locales", "fr".to_owned())],
+            "empty prompt and over-cap login_hint are both dropped"
+        );
+        // A value exactly at the cap is forwarded.
+        let at_cap = "b".repeat(PASSTHROUGH_MAX_LEN);
+        let query = format!("prompt={at_cap}");
+        let forwarded = passthrough_params(&query, PassthroughPolicy::default());
+        assert_eq!(forwarded, vec![("prompt", at_cap)]);
+    }
+
     // ---- SSRF through the fetcher: private-range jwks_uri is Blocked ----
 
     /// Start an in-process loopback HTTP server that serves `body` as JSON to every
@@ -1531,7 +1749,12 @@ mod tests {
             Arc::clone(&fetcher),
             Duration::from_secs(300),
         ));
-        let runtime = FederationRuntime::new_allow_http(fetcher, keys, Duration::from_secs(300));
+        let runtime = FederationRuntime::new_allow_http(
+            fetcher,
+            keys,
+            Duration::from_secs(300),
+            Duration::from_secs(30),
+        );
         let endpoints = Endpoints::Discovery(ironauth_connector::DiscoveryEndpoints {
             issuer: http_issuer.to_owned(),
         });

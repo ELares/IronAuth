@@ -33,7 +33,8 @@ use crate::pagination::{ListQuery, Pagination};
 use crate::response::{json, no_content};
 use crate::state::AdminState;
 use crate::views::{
-    ConnectorCapabilitiesView, ConnectorList, ConnectorView, CreateConnectorRequest,
+    ConnectorCapabilitiesView, ConnectorHealthView, ConnectorList, ConnectorView,
+    CreateConnectorRequest,
 };
 
 /// Resolve the `(tenant, environment)` scope from the path, parsing both ids through
@@ -351,6 +352,80 @@ pub async fn get_connector_capabilities(
     };
     let body = serde_json::to_string(&view).map_err(|_| ApiError::Internal)?;
     Ok(json(StatusCode::OK, body))
+}
+
+/// Get a federation connector's live health for admin diagnostics (issue #76). Reports
+/// THIS node's in-memory federation health for the connector: its health state, recent
+/// upstream error rate, last success / failure, and backoff retry instant. A connector that
+/// exists but has never been exercised on this node (or when federation is not installed here)
+/// reports `state = "unknown"`. SECRET-FREE.
+#[utoipa::path(
+    get,
+    path = "/v1/tenants/{tenant_id}/environments/{environment_id}/connectors/{connector_id}/health",
+    operation_id = "getConnectorHealth",
+    tag = "connectors",
+    params(
+        ("tenant_id" = String, Path, description = "The tenant identifier"),
+        ("environment_id" = String, Path, description = "The environment identifier"),
+        ("connector_id" = String, Path, description = "The connector identifier (cnr_...)")
+    ),
+    security(("bearer" = [])),
+    responses(
+        (status = 200, description = "The connector's live health", body = ConnectorHealthView),
+        (status = 401, description = "Missing or invalid credential", body = ErrorBody),
+        (status = 403, description = "Wrong plane or scope", body = ErrorBody),
+        (status = 404, description = "Not found (absent or in another scope)", body = ErrorBody)
+    )
+)]
+pub async fn get_connector_health(
+    State(state): State<AdminState>,
+    principal: Principal,
+    Path((tenant_id, environment_id, connector_id)): Path<(String, String, String)>,
+) -> Result<Response, ApiError> {
+    principal.require_operator()?;
+    let (_tenant, scope) = scope_from_path(&state, &tenant_id, &environment_id)?;
+    let connectors = state.store().scoped(scope).connectors();
+    let id = connectors.parse_id(&connector_id)?;
+    // Confirm the connector EXISTS in this scope (a uniform not-found otherwise), so the
+    // health read is not an oracle for arbitrary ids.
+    let _record = connectors.get(&id).await?;
+    let key = id.to_string();
+    let view = match state.connector_health(&key) {
+        Some(snapshot) => ConnectorHealthView {
+            id: key,
+            state: snapshot.state.as_str().to_owned(),
+            last_error_kind: snapshot.last_error_kind.map(str::to_owned),
+            consecutive_failures: snapshot.consecutive_failures,
+            last_success_at_unix_ms: snapshot.last_success_at.map(unix_ms),
+            last_failure_at_unix_ms: snapshot.last_failure_at.map(unix_ms),
+            next_retry_at_unix_ms: snapshot.next_retry_at.map(unix_ms),
+            recent_error_rate: snapshot.recent_error_rate,
+            success_total: snapshot.success_total,
+            error_total: snapshot.error_total,
+        },
+        None => ConnectorHealthView {
+            id: key,
+            state: "unknown".to_owned(),
+            last_error_kind: None,
+            consecutive_failures: 0,
+            last_success_at_unix_ms: None,
+            last_failure_at_unix_ms: None,
+            next_retry_at_unix_ms: None,
+            recent_error_rate: 0.0,
+            success_total: 0,
+            error_total: 0,
+        },
+    };
+    let body = serde_json::to_string(&view).map_err(|_| ApiError::Internal)?;
+    Ok(json(StatusCode::OK, body))
+}
+
+/// Milliseconds since the Unix epoch for a wall-clock instant (issue #76), saturating.
+fn unix_ms(at: std::time::SystemTime) -> i64 {
+    match at.duration_since(std::time::UNIX_EPOCH) {
+        Ok(delta) => i64::try_from(delta.as_millis()).unwrap_or(i64::MAX),
+        Err(_) => 0,
+    }
 }
 
 /// Update (replace) a federation connector definition.

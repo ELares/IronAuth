@@ -156,6 +156,28 @@
         }
       ]
     },
+    "PassthroughPolicy": {
+      "additionalProperties": false,
+      "description": "The per-connector downstream-parameter passthrough policy (issue #76).\n\nDuring brokering, IronAuth forwards a STRICT ALLOWLIST of exactly three OIDC Core\n3.1.2.1 authentication-request parameters from the DOWNSTREAM authorization request\nto the UPSTREAM identity provider: `prompt`, `login_hint`, and `ui_locales`. No\nother downstream parameter is ever forwarded. Each of the three can be DISABLED\nper connector; the default forwards all three (the whole point of the feature, and\nwhat a brokered login needs so the upstream account picker preselects and localizes).\n\n# Privacy\n\n`login_hint` discloses an end-user identifier (typically an email) to the upstream\nprovider. Forwarding is on by default because a brokered login normally wants it,\nbut a deployment that must not leak the local identifier to the upstream sets\n`login_hint = false` to suppress it.",
+      "properties": {
+        "login_hint": {
+          "default": true,
+          "description": "Whether to forward the downstream `login_hint` to the upstream authorize\nrequest. See the type-level privacy note: `login_hint` discloses an identifier.",
+          "type": "boolean"
+        },
+        "prompt": {
+          "default": true,
+          "description": "Whether to forward the downstream `prompt` to the upstream authorize request.",
+          "type": "boolean"
+        },
+        "ui_locales": {
+          "default": true,
+          "description": "Whether to forward the downstream `ui_locales` to the upstream authorize request.",
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
     "PkceMode": {
       "description": "How PKCE is applied to the UPSTREAM authorization request (RFC 7636). Only the\n`S256` challenge method is ever used; `plain` is never offered.",
       "oneOf": [
@@ -289,6 +311,15 @@
     "endpoints": {
       "$ref": "#/$defs/Endpoints",
       "description": "The upstream endpoints: a discovery issuer or an explicit set."
+    },
+    "passthrough": {
+      "$ref": "#/$defs/PassthroughPolicy",
+      "default": {
+        "login_hint": true,
+        "prompt": true,
+        "ui_locales": true
+      },
+      "description": "The downstream-parameter passthrough policy (issue #76): which of `prompt`,\n`login_hint`, and `ui_locales` are forwarded to the upstream authorize request.\nDefaults to forwarding all three."
     },
     "pkce": {
       "$ref": "#/$defs/PkceMode",

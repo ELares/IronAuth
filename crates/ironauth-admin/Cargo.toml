@@ -77,6 +77,11 @@ bcrypt = "0.16"
 # the original seed to prove a re-imported TOTP factor still verifies, and Base32
 # encodes the seed to assert the export line carries it. Already in the tree.
 ironauth-jose.workspace = true
+# The per-connector health-read test (issue #76) builds a real FederationRuntime (which
+# needs an SSRF-hardened fetcher; no network is touched, only the in-memory health registry)
+# and installs it on the AdminState to prove the mgmt read reflects an induced outage.
+# Already in the tree; no fetch is ever performed by the test.
+ironauth-fetch.workspace = true
 # Database-FREE test support only: builds a LAZY pool (parses the URL, never
 # connects) so the unit tests and the router/spec contract test can construct an
 # AdminState without a database. No connection is ever opened (auth rejects at the
@@ -222,6 +227,11 @@ required-features = ["testing"]
 [[test]]
 name = "connectors"
 path = "tests/connectors.rs"
+required-features = ["testing"]
+
+[[test]]
+name = "connector_health"
+path = "tests/connector_health.rs"
 required-features = ["testing"]
 
 [lints]

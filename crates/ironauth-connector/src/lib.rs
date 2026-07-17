@@ -131,6 +131,44 @@ pub enum EmailSource {
     FallbackOrder,
 }
 
+/// The per-connector downstream-parameter passthrough policy (issue #76).
+///
+/// During brokering, IronAuth forwards a STRICT ALLOWLIST of exactly three OIDC Core
+/// 3.1.2.1 authentication-request parameters from the DOWNSTREAM authorization request
+/// to the UPSTREAM identity provider: `prompt`, `login_hint`, and `ui_locales`. No
+/// other downstream parameter is ever forwarded. Each of the three can be DISABLED
+/// per connector; the default forwards all three (the whole point of the feature, and
+/// what a brokered login needs so the upstream account picker preselects and localizes).
+///
+/// # Privacy
+///
+/// `login_hint` discloses an end-user identifier (typically an email) to the upstream
+/// provider. Forwarding is on by default because a brokered login normally wants it,
+/// but a deployment that must not leak the local identifier to the upstream sets
+/// `login_hint = false` to suppress it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields, default)]
+pub struct PassthroughPolicy {
+    /// Whether to forward the downstream `prompt` to the upstream authorize request.
+    pub prompt: bool,
+    /// Whether to forward the downstream `login_hint` to the upstream authorize
+    /// request. See the type-level privacy note: `login_hint` discloses an identifier.
+    pub login_hint: bool,
+    /// Whether to forward the downstream `ui_locales` to the upstream authorize request.
+    pub ui_locales: bool,
+}
+
+impl Default for PassthroughPolicy {
+    /// Forward all three allowlisted parameters (the brokered-login default).
+    fn default() -> Self {
+        Self {
+            prompt: true,
+            login_hint: true,
+            ui_locales: true,
+        }
+    }
+}
+
 /// The machine-readable, per-connector capability record (issue #75).
 ///
 /// "Which upstream supports refresh, groups, logout propagation, or a trustworthy
@@ -415,6 +453,11 @@ pub struct ConnectorDefinition {
     /// Provider quirks expressed as data.
     #[serde(default)]
     pub quirks: Quirks,
+    /// The downstream-parameter passthrough policy (issue #76): which of `prompt`,
+    /// `login_hint`, and `ui_locales` are forwarded to the upstream authorize request.
+    /// Defaults to forwarding all three.
+    #[serde(default)]
+    pub passthrough: PassthroughPolicy,
     /// Whether the connector is active. Defaults to `true` (a new connector is
     /// enabled); an operator can set it `false` on an update to disable the
     /// connector without deleting it. This is operational state the management API
@@ -450,6 +493,10 @@ pub struct ConnectorRuntimeConfig {
     /// How PKCE is applied to the upstream authorization request.
     #[serde(default)]
     pub pkce: PkceMode,
+    /// The downstream-parameter passthrough policy (issue #76), read back so the
+    /// federation authorize leg knows which of the three allowlisted params to forward.
+    #[serde(default)]
+    pub passthrough: PassthroughPolicy,
 }
 
 /// One semantic validation failure, carrying an RFC 6901 JSON POINTER to the
@@ -948,6 +995,54 @@ mod tests {
         assert!(
             errors.iter().any(|error| error.pointer == "/connector_id"),
             "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn passthrough_defaults_to_forwarding_all_three() {
+        // Absent, passthrough forwards all three allowlisted params (issue #76).
+        let def = parse(VALID).expect("parses");
+        assert!(def.passthrough.prompt);
+        assert!(def.passthrough.login_hint);
+        assert!(def.passthrough.ui_locales);
+        // The Default impl is the single source of the forward-all default.
+        assert_eq!(PassthroughPolicy::default(), def.passthrough);
+        // The runtime read projection carries the same default.
+        let runtime: ConnectorRuntimeConfig =
+            serde_json::from_str(VALID).expect("runtime projection parses");
+        assert_eq!(runtime.passthrough, PassthroughPolicy::default());
+    }
+
+    #[test]
+    fn passthrough_disable_flags_round_trip() {
+        // A connector can DISABLE any of the three; the flags round-trip as submitted.
+        let json = VALID.replace(
+            "\"client_id\": \"ironauth-at-acme\",",
+            "\"client_id\": \"ironauth-at-acme\", \
+             \"passthrough\": { \"login_hint\": false, \"prompt\": true, \"ui_locales\": false },",
+        );
+        let def = parse(&json).expect("parses");
+        def.validate().expect("valid");
+        assert!(def.passthrough.prompt);
+        assert!(!def.passthrough.login_hint, "login_hint disabled");
+        assert!(!def.passthrough.ui_locales, "ui_locales disabled");
+        // The runtime read projection sees the same disable flags.
+        let runtime: ConnectorRuntimeConfig = serde_json::from_str(&json).expect("runtime parses");
+        assert!(runtime.passthrough.prompt);
+        assert!(!runtime.passthrough.login_hint);
+        assert!(!runtime.passthrough.ui_locales);
+    }
+
+    #[test]
+    fn an_unknown_passthrough_key_is_rejected() {
+        let json = VALID.replace(
+            "\"client_id\": \"ironauth-at-acme\",",
+            "\"client_id\": \"ironauth-at-acme\", \"passthrough\": { \"redirect_uri\": true },",
+        );
+        let err = parse(&json).expect_err("unknown passthrough key rejected");
+        assert!(
+            err.to_string().contains("redirect_uri") || err.to_string().contains("unknown field"),
+            "{err}"
         );
     }
 

@@ -124,6 +124,8 @@ fn build_runtime(addr: SocketAddr, resolver_ips: Vec<IpAddr>) -> Arc<FederationR
         fetcher,
         keys,
         Duration::from_secs(300),
+        // A short probe window keeps the health-backoff timings readable under the harness clock.
+        Duration::from_secs(30),
     ))
 }
 
@@ -906,6 +908,338 @@ async fn an_upstream_token_with_nbf_in_the_future_is_rejected() {
     assert!(
         !user_provisioned(&harness, &federated_external_id(UPSTREAM_ISSUER, "sub-nbf")).await,
         "no user from a not-yet-valid token"
+    );
+}
+
+// ---- Issue #76: failure isolation, health, and parameter passthrough ----
+
+const UNAVAILABLE_STATUS: StatusCode = StatusCode::SERVICE_UNAVAILABLE;
+
+/// Seed a connector from a full definition JSON string, returning its id.
+async fn seed_definition(harness: &Harness, slug: &str, definition_json: &str) -> ConnectorId {
+    let env = harness.env().clone();
+    let scope = harness.scope();
+    let id = ConnectorId::generate(&env, &scope);
+    harness
+        .db()
+        .control_store()
+        .scoped(scope)
+        .acting(harness.db().test_actor(&env), CorrelationId::generate(&env))
+        .connectors()
+        .create(
+            &env,
+            &id,
+            1_000_000,
+            NewConnector {
+                slug,
+                definition_json,
+                client_secret: b"upstream-client-secret",
+                capabilities: ConnectorCapabilities {
+                    refresh: false,
+                    groups: false,
+                    logout_propagation: false,
+                    email_verified_trust: "untrusted",
+                },
+                enabled: true,
+            },
+            None,
+        )
+        .await
+        .expect("seed connector");
+    id
+}
+
+/// Drive the federated authorize leg for `slug` with an explicit `return_to`, returning
+/// the response (whatever its status).
+async fn authorize_with_return_to(
+    harness: &Harness,
+    router: Router,
+    slug: &str,
+    return_to: &str,
+) -> axum::response::Response {
+    let scope = harness.scope();
+    let uri = format!(
+        "/t/{}/e/{}/federation/{slug}/authorize?return_to={}",
+        scope.tenant(),
+        scope.environment(),
+        encode(return_to),
+    );
+    router
+        .oneshot(
+            Request::builder()
+                .uri(&uri)
+                .body(Body::empty())
+                .expect("req"),
+        )
+        .await
+        .expect("authorize")
+}
+
+/// The upstream redirect Location of a successful authorize leg.
+fn location_of(response: &axum::response::Response) -> String {
+    response
+        .headers()
+        .get(header::LOCATION)
+        .expect("location")
+        .to_str()
+        .expect("location str")
+        .to_owned()
+}
+
+#[tokio::test]
+async fn a_broken_connector_is_typed_unavailable_and_never_affects_a_healthy_sibling() {
+    // The failure-isolation crux (issue #76): with one connector whose upstream is broken and
+    // one healthy connector, the healthy connector keeps serving logins and the broken one
+    // returns a TYPED connector-unavailable error -- one dead upstream never takes down a sibling.
+    let harness = Harness::start().await;
+    // GOOD points at the real mock issuer; BROKEN points at a DIFFERENT issuer, so the mock's
+    // discovery document (issuer = UPSTREAM_ISSUER) fails BROKEN's mix-up check (an upstream
+    // protocol fault) while GOOD resolves cleanly. Both share the one runtime and dialer.
+    seed_named_connector(&harness, "good", UPSTREAM_ISSUER, UPSTREAM_CLIENT_ID, true).await;
+    let broken_id =
+        seed_named_connector(&harness, "broken", "http://broken.example", "cid", true).await;
+    let upstream = start_upstream().await;
+    let runtime = build_runtime(upstream.addr, vec![IpAddr::from([93, 184, 216, 34])]);
+
+    // The healthy sibling serves a login (302 to the upstream).
+    let good = authorize_for(
+        &harness,
+        federation_router(&harness, Arc::clone(&runtime)),
+        "good",
+    )
+    .await;
+    assert_eq!(
+        good.status(),
+        StatusCode::SEE_OTHER,
+        "the healthy connector serves logins"
+    );
+
+    // The broken connector returns a TYPED connector-unavailable error, not a 302 and not a crash.
+    let broken = authorize_for(
+        &harness,
+        federation_router(&harness, Arc::clone(&runtime)),
+        "broken",
+    )
+    .await;
+    assert_eq!(
+        broken.status(),
+        UNAVAILABLE_STATUS,
+        "the broken connector returns a typed connector-unavailable error"
+    );
+
+    // The healthy sibling STILL serves after the broken connector failed (no process impact).
+    let good_again = authorize_for(
+        &harness,
+        federation_router(&harness, Arc::clone(&runtime)),
+        "good",
+    )
+    .await;
+    assert_eq!(
+        good_again.status(),
+        StatusCode::SEE_OTHER,
+        "the sibling is unaffected"
+    );
+
+    // Per-connector health flipped for exactly the broken connector; the sibling is healthy.
+    let now = harness.env().clock().now_utc();
+    let broken_health = runtime
+        .health()
+        .snapshot(now, &broken_id.to_string())
+        .expect("broken health recorded");
+    assert_eq!(broken_health.last_error_kind, Some("upstream_protocol"));
+    assert!(broken_health.error_total >= 1);
+}
+
+#[tokio::test]
+async fn a_dead_upstream_is_typed_unavailable_and_backoff_prevents_rehammering() {
+    // A connector pointed at a DEAD upstream (its issuer resolves to a blocked private address)
+    // returns a typed connector-unavailable error and flips to the unavailable state with a
+    // backoff. A SECOND immediate authorize is denied by the backoff WITHOUT re-attempting the
+    // upstream (do not hammer a dead upstream), so no second failure is recorded.
+    let harness = Harness::start().await;
+    let id = seed_named_connector(
+        &harness,
+        CONNECTOR_SLUG,
+        UPSTREAM_ISSUER,
+        UPSTREAM_CLIENT_ID,
+        true,
+    )
+    .await;
+    let upstream = start_upstream().await;
+    // The metadata address is blocked on the wire, so discovery fails as UpstreamUnavailable.
+    let runtime = build_runtime(upstream.addr, vec![IpAddr::from([169, 254, 169, 254])]);
+
+    let first = drive_authorize_expect_unavailable(&harness, Arc::clone(&runtime)).await;
+    assert_eq!(
+        first.status(),
+        UNAVAILABLE_STATUS,
+        "a dead upstream is typed unavailable"
+    );
+    let now = harness.env().clock().now_utc();
+    let health = runtime
+        .health()
+        .snapshot(now, &id.to_string())
+        .expect("health recorded");
+    assert_eq!(health.state.as_str(), "unavailable");
+    assert_eq!(health.error_total, 1);
+    assert!(
+        health.next_retry_at.is_some(),
+        "a backoff retry instant is armed"
+    );
+
+    // A second authorize at the same clock instant is denied by the backoff: the upstream is
+    // NOT re-attempted, so the failure count does not grow.
+    let second = drive_authorize_expect_unavailable(&harness, Arc::clone(&runtime)).await;
+    assert_eq!(second.status(), UNAVAILABLE_STATUS);
+    let health = runtime
+        .health()
+        .snapshot(now, &id.to_string())
+        .expect("health present");
+    assert_eq!(
+        health.error_total, 1,
+        "the backoff prevented a second upstream attempt (no re-hammering)"
+    );
+}
+
+/// Drive the standard authorize leg and return the response (used where a non-302 is expected).
+async fn drive_authorize_expect_unavailable(
+    harness: &Harness,
+    runtime: Arc<FederationRuntime>,
+) -> axum::response::Response {
+    let scope = harness.scope();
+    let return_to = format!("/authorize?client_id={}", harness.client_id());
+    let uri = format!(
+        "/t/{}/e/{}/federation/{CONNECTOR_SLUG}/authorize?return_to={}",
+        scope.tenant(),
+        scope.environment(),
+        encode(&return_to),
+    );
+    federation_router(harness, runtime)
+        .oneshot(
+            Request::builder()
+                .uri(&uri)
+                .body(Body::empty())
+                .expect("req"),
+        )
+        .await
+        .expect("authorize")
+}
+
+#[tokio::test]
+async fn passthrough_forwards_the_three_allowlisted_params_verbatim_and_never_others() {
+    // The passthrough contract (issue #76): prompt, login_hint, ui_locales supplied downstream
+    // are observed VERBATIM (bounded + encoded) in the upstream authorize request; a param
+    // OUTSIDE the allowlist (redirect_uri, foo) is NEVER forwarded (the negative test).
+    let harness = Harness::start().await;
+    seed_named_connector(
+        &harness,
+        CONNECTOR_SLUG,
+        UPSTREAM_ISSUER,
+        UPSTREAM_CLIENT_ID,
+        true,
+    )
+    .await;
+    let upstream = start_upstream().await;
+    let runtime = build_runtime(upstream.addr, vec![IpAddr::from([93, 184, 216, 34])]);
+
+    // The downstream authorization request carries the three allowlisted params (percent-encoded
+    // in the return_to, printable-ASCII per the resume validator) plus non-allowlisted params.
+    let return_to = format!(
+        "/authorize?client_id={}&prompt=login%20consent&login_hint=ada%40example.test&\
+         ui_locales=fr-CA%20en&redirect_uri=https%3A%2F%2Fattacker.example&foo=bar",
+        harness.client_id()
+    );
+    let response = authorize_with_return_to(
+        &harness,
+        federation_router(&harness, runtime),
+        CONNECTOR_SLUG,
+        &return_to,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    let location = location_of(&response);
+
+    // The three allowlisted params ride the UPSTREAM query, re-encoded verbatim.
+    assert_eq!(param(&location, "prompt"), "login%20consent");
+    assert_eq!(param(&location, "login_hint"), "ada%40example.test");
+    assert_eq!(param(&location, "ui_locales"), "fr-CA%20en");
+    // Nothing outside the allowlist is forwarded, even a sensitive downstream redirect_uri.
+    assert!(!location.contains("foo="), "{location}");
+    assert!(
+        !location.contains("attacker.example"),
+        "a non-allowlisted downstream param must never reach the upstream: {location}"
+    );
+}
+
+#[tokio::test]
+async fn per_connector_passthrough_disable_flags_are_honored() {
+    // A connector can disable any of the three; a disabled param is not forwarded even when the
+    // downstream request supplies it. Here login_hint (the privacy-sensitive one) is disabled.
+    let harness = Harness::start().await;
+    let definition = format!(
+        r#"{{"connector_id":"{CONNECTOR_SLUG}","display_name":"Acme","protocol":"oidc","endpoints":{{"issuer":"{UPSTREAM_ISSUER}"}},"scopes":["openid","email"],"client_id":"{UPSTREAM_CLIENT_ID}","passthrough":{{"login_hint":false,"prompt":true,"ui_locales":true}}}}"#
+    );
+    seed_definition(&harness, CONNECTOR_SLUG, &definition).await;
+    let upstream = start_upstream().await;
+    let runtime = build_runtime(upstream.addr, vec![IpAddr::from([93, 184, 216, 34])]);
+
+    let return_to = format!(
+        "/authorize?client_id={}&prompt=login&login_hint=ada%40example.test&ui_locales=fr",
+        harness.client_id()
+    );
+    let response = authorize_with_return_to(
+        &harness,
+        federation_router(&harness, runtime),
+        CONNECTOR_SLUG,
+        &return_to,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    let location = location_of(&response);
+    assert_eq!(param(&location, "prompt"), "login");
+    assert_eq!(param(&location, "ui_locales"), "fr");
+    assert!(
+        !location.contains("login_hint="),
+        "a per-connector-disabled login_hint is not forwarded: {location}"
+    );
+}
+
+#[tokio::test]
+async fn per_connector_health_metrics_are_exported_with_the_connector_label() {
+    // The connector-labeled health metrics reflect an induced upstream outage (issue #76): the
+    // error series is present with the connector label and the error kind.
+    let handle = metrics_exporter_prometheus::PrometheusBuilder::new()
+        .install_recorder()
+        .expect("no recorder installed yet in this test binary");
+    ironauth_oidc::describe_connector_health_metrics();
+
+    let harness = Harness::start().await;
+    let id = seed_named_connector(
+        &harness,
+        CONNECTOR_SLUG,
+        UPSTREAM_ISSUER,
+        UPSTREAM_CLIENT_ID,
+        true,
+    )
+    .await;
+    let upstream = start_upstream().await;
+    // A blocked upstream induces an UpstreamUnavailable failure that records the metric.
+    let runtime = build_runtime(upstream.addr, vec![IpAddr::from([169, 254, 169, 254])]);
+    let response = drive_authorize_expect_unavailable(&harness, runtime).await;
+    assert_eq!(response.status(), UNAVAILABLE_STATUS);
+
+    let rendered = handle.render();
+    assert!(
+        rendered.contains("ironauth_connector_upstream_error_total"),
+        "the connector error series is exported: {rendered}"
+    );
+    assert!(
+        rendered.contains(&format!("connector=\"{id}\"")),
+        "the series carries the connector label: {rendered}"
+    );
+    assert!(
+        rendered.contains("kind=\"upstream_unavailable\""),
+        "the series carries the error kind label: {rendered}"
     );
 }
 

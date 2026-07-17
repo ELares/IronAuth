@@ -6,6 +6,15 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Per-connector health-diagnostics read for issue #76:
+  `GET .../connectors/{connector_id}/health` (`getConnectorHealth`, operator-gated,
+  secret-free) returns THIS node's live federation health for a connector (state, recent
+  upstream error rate, consecutive failures, last success / failure, and the backoff retry
+  instant). It reads the SAME in-memory `FederationRuntime` health registry the OIDC data
+  plane records into (shared as one `Arc` by the boot path via `AdminState::with_federation`);
+  a connector that exists but has never been exercised on this node reports `state = "unknown"`,
+  and an absent id is a uniform not-found. The OpenAPI op-id/path/count contract and
+  `docs/openapi/management.json` are updated accordingly (68 -> 69 routes).
 - Waitlist approval via the existing user-lifecycle management API (issue #80): the
   `UserStateView` wire enum gains a `waitlisted` variant (round-tripping the new
   `UserState::Waitlisted`), so a waitlisted self-service signup is listable and filterable,

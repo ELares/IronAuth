@@ -6,6 +6,13 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Connector failure-isolation health probe window for issue #76:
+  `oidc.federation.health_probe_window_secs` (default 30, bounded 1..=86400 via
+  `OIDC_MAX_FEDERATION_TTL_SECS`, validated at load even while federation is disabled). It is
+  the BASE health-driven backoff interval a per-connector unavailable upstream waits (growing
+  exponentially per consecutive failure, capped) before it is probed again, and the window
+  over which the exported per-connector error rate is measured. Threaded into
+  `FederationRuntime::new` by the boot path.
 - Generic OIDC upstream federation settings for issue #75 (PR B), off by default: the
   `oidc.federation` block (`FederationConfig`). `oidc.federation.enabled` (default false) is
   the master switch the server boot path reads to wire inbound federation (with it off the

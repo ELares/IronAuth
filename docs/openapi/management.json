@@ -2254,6 +2254,91 @@
         ]
       }
     },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/connectors/{connector_id}/health": {
+      "get": {
+        "tags": [
+          "connectors"
+        ],
+        "summary": "Get a federation connector's live health for admin diagnostics (issue #76). Reports\nTHIS node's in-memory federation health for the connector: its health state, recent\nupstream error rate, last success / failure, and backoff retry instant. A connector that\nexists but has never been exercised on this node (or when federation is not installed here)\nreports `state = \"unknown\"`. SECRET-FREE.",
+        "operationId": "getConnectorHealth",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "connector_id",
+            "in": "path",
+            "description": "The connector identifier (cnr_...)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The connector's live health",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConnectorHealthView"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found (absent or in another scope)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/v1/tenants/{tenant_id}/environments/{environment_id}/dcr/initial-access-tokens": {
       "post": {
         "tags": [
@@ -6671,6 +6756,83 @@
           "refresh": {
             "type": "boolean",
             "description": "Whether the upstream supports refresh tokens."
+          }
+        }
+      },
+      "ConnectorHealthView": {
+        "type": "object",
+        "description": "The live per-connector health for admin diagnostics (issue #76). Reports THIS node's\nin-memory federation health: its initialization/health state, the recent upstream error\nrate over the probe window, the last success / failure, and the backoff retry instant.\nA connector that has never been exercised on this node reports `state = \"unknown\"` with\nno timestamps.",
+        "required": [
+          "id",
+          "state",
+          "consecutive_failures",
+          "recent_error_rate",
+          "success_total",
+          "error_total"
+        ],
+        "properties": {
+          "consecutive_failures": {
+            "type": "integer",
+            "format": "int32",
+            "description": "The number of consecutive upstream failures (0 while healthy).",
+            "minimum": 0
+          },
+          "error_total": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The lifetime count of failed upstream operations.",
+            "minimum": 0
+          },
+          "id": {
+            "type": "string",
+            "description": "The connector identifier (`cnr_...`)."
+          },
+          "last_error_kind": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The stable kind of the last error, if any (`config` / `upstream_protocol` /\n`upstream_unavailable`)."
+          },
+          "last_failure_at_unix_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "The last upstream failure, milliseconds since the Unix epoch."
+          },
+          "last_success_at_unix_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "The last successful upstream operation, milliseconds since the Unix epoch."
+          },
+          "next_retry_at_unix_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "When a backed-off connector may be probed again, milliseconds since the Unix epoch."
+          },
+          "recent_error_rate": {
+            "type": "number",
+            "format": "double",
+            "description": "The recent upstream error rate over the probe window, in `0.0..=1.0`."
+          },
+          "state": {
+            "type": "string",
+            "description": "The coarse health state: `unknown`, `healthy`, `config_error`, or `unavailable`.",
+            "example": "healthy"
+          },
+          "success_total": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The lifetime count of successful upstream operations.",
+            "minimum": 0
           }
         }
       },
