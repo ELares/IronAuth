@@ -290,6 +290,17 @@ name = "trusted_devices"
 path = "tests/trusted_devices.rs"
 required-features = ["testing"]
 
+# The minimal risk engine end to end (issue #79): a MED signal forces step-up and a LOW
+# one does not; the decision record enumerates its signals and is reconstructable from the
+# audit trail; a new-device login notifies and the "this wasn't me" path revokes the
+# sessions and flags the credentials; a block is indistinguishable from an ordinary
+# failure; the engine runs with zero third-party services; each signal (new device,
+# impossible travel, velocity flood, suspect IP) is driven. Needs a real database.
+[[test]]
+name = "risk"
+path = "tests/risk.rs"
+required-features = ["testing"]
+
 # WebAuthn passkey ceremonies end to end (issue #65): the four ceremony endpoints
 # driven through the real router by a software authenticator (a CBOR
 # attestationObject / COSE key, real Ed25519 assertion signatures). A passkey

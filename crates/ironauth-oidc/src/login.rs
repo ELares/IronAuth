@@ -455,6 +455,15 @@ pub async fn login_post(
         );
     }
 
+    // Risk velocity (issue #79): count this attempt against the per-account, per-IP, and
+    // per-ASN velocity counters (reusing the #64 counter layer), so a flood accumulates.
+    // Inert unless the risk engine and the velocity signal are enabled.
+    let risk_subject = match &lookup {
+        Ok(Some(user)) => Some(user.id),
+        _ => None,
+    };
+    crate::risk::record_attempt(&state, risk_subject.as_ref(), ctx.ip.as_deref());
+
     match lookup {
         // A user whose lifecycle state cannot authenticate (blocked, disabled, or
         // pending verification) is FENCED (issue #52): the password is still spent
@@ -500,6 +509,31 @@ pub async fn login_post(
                 // HIBP call must not block the login hot path); it never blocks or changes
                 // this already-successful sign-in.
                 screen_after_login(&state, resume.scope, &user, password);
+                // Risk evaluation (issue #79): evaluate BEFORE establishing the session so
+                // a BLOCK action yields the SAME uniform failure an ordinary wrong password
+                // does (anti-enumeration), with no session created. The decision is still
+                // recorded and audited, so a blocked attempt is reconstructable.
+                let risk_user_agent = headers
+                    .get(axum::http::header::USER_AGENT)
+                    .and_then(|value| value.to_str().ok())
+                    .map_or_else(|| "unknown".to_owned(), str::to_owned);
+                let risk_ctx = crate::risk::RiskContext {
+                    ip: ctx.ip.as_deref(),
+                    user_agent: &risk_user_agent,
+                    headers: &headers,
+                };
+                let risk_decision =
+                    crate::risk::evaluate(&state, resume.scope, &user.id, &risk_ctx).await;
+                if matches!(risk_decision.action, crate::risk::RiskAction::Block) {
+                    let _ = crate::risk::record_decision(
+                        &state,
+                        resume.scope,
+                        &user.id,
+                        &risk_decision,
+                    )
+                    .await;
+                    return failed_login_page(identifier, &resume.return_to, &resume.hints, banner);
+                }
                 let actor = interaction::user_actor(&user.id);
                 let subject = user.id.to_string();
                 // The recorded authentication event: a password login (RFC 8176
@@ -524,6 +558,19 @@ pub async fn login_post(
                         // counters so a user who typoed past the soft threshold is not
                         // throttled for the rest of the window (issue #64 LOW-6).
                         state.reset_after_success(&ctx).await;
+                        // Risk follow-through (issue #79): persist the audited decision and,
+                        // on a new-device login, notify the user with the device/UA/geo
+                        // context and the single-use "this wasn't me" link, then refresh the
+                        // login geo for the next impossible-travel check. All best-effort.
+                        crate::risk::after_successful_login(
+                            &state,
+                            resume.scope,
+                            &user.id,
+                            &risk_decision,
+                            &risk_ctx,
+                            identifier,
+                        )
+                        .await;
                         interaction::redirect_setting_cookie(&resume.return_to, &cookie)
                     }
                     Err(_) => interaction::server_error_page(),

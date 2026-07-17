@@ -61,6 +61,7 @@ mod migrate;
 pub mod promotion;
 mod redirect;
 mod repository;
+pub mod risk;
 mod scope;
 pub mod sms_otp;
 pub mod snapshot;
@@ -114,7 +115,8 @@ pub use id::{
     MigrationRunId, MigrationRunKind, MigrationRunRecordId, MigrationRunRecordKind, NotInScope,
     OperatorId, OperatorKind, OrganizationId, OrganizationKind, PushedRequestId, PushedRequestKind,
     RecoveryCodeId, RecoveryCodeKind, RefreshFamilyId, RefreshFamilyKind, RefreshTokenId,
-    RefreshTokenKind, ResourceServerId, ResourceServerKind, ScopeStepUpPolicyId,
+    RefreshTokenKind, ResourceServerId, ResourceServerKind, RiskDecisionId, RiskDecisionKind,
+    RiskDisavowalId, RiskDisavowalKind, RiskLoginGeoId, RiskLoginGeoKind, ScopeStepUpPolicyId,
     ScopeStepUpPolicyKind, ScopedId, ScopedKind, ServiceAccountId, ServiceAccountKind, ServiceId,
     ServiceKind, SessionEventId, SessionEventKind, SessionId, SessionKind, SigningKeyId,
     SigningKeyKind, SmsOtpCodeId, SmsOtpCodeKind, SmsRouteStatId, SmsRouteStatKind, TenantId,
@@ -199,6 +201,10 @@ pub use repository::{
     device_code_digest, invitation_token_digest, magic_link_binding_digest,
     magic_link_token_digest, mint_invitation_token, mint_invitation_token_for,
     opaque_access_token_digest, refresh_token_digest, user_code_hash,
+};
+pub use risk::{
+    DisavowalResolution, LoginGeoView, NewDisavowalToken, NewLoginGeo, NewRiskDecision,
+    RiskDecisionView,
 };
 pub use scope::Scope;
 pub use sms_otp::{ActiveSmsOtpCode, NewSmsOtpCode, SmsRouteStat, SmsTenantConfig};

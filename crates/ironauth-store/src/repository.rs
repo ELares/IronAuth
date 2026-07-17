@@ -76,13 +76,18 @@ use crate::id::{
     EnvironmentId, EnvironmentSecretId, ExternalIssuerId, GrantId, InitialAccessTokenId,
     InvitationId, IssuedTokenId, KekId, MagicLinkTokenId, ManagementKeyId, Mds3BlobCacheId,
     MigrationRunId, MigrationRunRecordId, OperatorId, OrganizationId, PushedRequestId,
-    RecoveryCodeId, RefreshFamilyId, RefreshTokenId, ResourceServerId, ScopeStepUpPolicyId,
-    ServiceAccountId, SessionEventId, SessionId, SigningKeyId, SmsOtpCodeId, SmsRouteStatId,
-    TenantId, TotpCredentialId, TraitMigrationJobId, TraitSchemaId, TrustedDeviceId, UserId,
-    UserIdentifierId, VariableId, WebauthnChallengeId, WebauthnCredentialId,
+    RecoveryCodeId, RefreshFamilyId, RefreshTokenId, ResourceServerId, RiskDecisionId,
+    RiskDisavowalId, RiskLoginGeoId, ScopeStepUpPolicyId, ServiceAccountId, SessionEventId,
+    SessionId, SigningKeyId, SmsOtpCodeId, SmsRouteStatId, TenantId, TotpCredentialId,
+    TraitMigrationJobId, TraitSchemaId, TrustedDeviceId, UserId, UserIdentifierId, VariableId,
+    WebauthnChallengeId, WebauthnCredentialId,
 };
 use crate::identifier::{
     CanonicalIdentifier, IdentifierType, UniquenessMode, canonicalize_identifier,
+};
+use crate::risk::{
+    DisavowalResolution, LoginGeoView, NewDisavowalToken, NewLoginGeo, NewRiskDecision,
+    RiskDecisionView,
 };
 use crate::scope::Scope;
 use crate::sms_otp::{ActiveSmsOtpCode, NewSmsOtpCode, SmsRouteStat, SmsTenantConfig};
@@ -363,6 +368,20 @@ impl<'a> ScopedStore<'a> {
     #[must_use]
     pub fn trusted_devices(&self) -> TrustedDeviceRepo<'a> {
         TrustedDeviceRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
+    /// The read-only risk-engine repository for this scope (issue #79): read a subject's
+    /// previous login geo (for the impossible-travel signal), resolve a presented "this
+    /// wasn't me" disavowal token, and check whether a subject's credentials are flagged
+    /// for review. Every read is subject or scope bound; the writes (record a decision,
+    /// refresh the login geo, mint and consume a disavowal) live on
+    /// [`ActingStore::risk`].
+    #[must_use]
+    pub fn risk(&self) -> RiskRepo<'a> {
+        RiskRepo {
             store: self.store,
             scope: self.scope,
         }
@@ -956,6 +975,19 @@ impl<'a> ActingStore<'a> {
     #[must_use]
     pub fn trusted_devices(&self) -> ActingTrustedDeviceRepo<'a> {
         ActingTrustedDeviceRepo {
+            store: self.store,
+            scope: self.scope,
+            acting: self.acting,
+        }
+    }
+
+    /// The mutating risk-engine repository for this scope and actor (issue #79): record
+    /// a decision (audited), refresh a subject's last-seen login geo, mint a "this wasn't
+    /// me" disavowal token (audited), and consume one (audited). Every write is subject
+    /// or scope bound.
+    #[must_use]
+    pub fn risk(&self) -> ActingRiskRepo<'a> {
+        ActingRiskRepo {
             store: self.store,
             scope: self.scope,
             acting: self.acting,
@@ -17135,6 +17167,519 @@ impl ActingTrustedDeviceRepo<'_> {
 }
 
 // ===========================================================================
+// Minimal risk engine (issue #79)
+// ===========================================================================
+
+/// The read-only risk-engine repository (issue #79): the impossible-travel signal reads
+/// a subject's previous login geo, the "this wasn't me" endpoint resolves a presented
+/// disavowal token, and the account surface checks whether a subject's credentials are
+/// flagged for review. Every read is subject or scope bound.
+pub struct RiskRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl RiskRepo<'_> {
+    /// The subject's PREVIOUS login geo (issue #79), opened from the sealed row, for the
+    /// impossible-travel signal to compute geo-velocity against the current login.
+    /// Returns `None` when the subject has no recorded prior login. Subject-bound.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Encryption`] if no platform master key is configured or a sealed
+    /// value cannot be authenticated and decrypted; [`StoreError::Database`] on a
+    /// persistence failure.
+    pub async fn previous_login_geo(
+        &self,
+        subject: &UserId,
+    ) -> Result<Option<LoginGeoView>, StoreError> {
+        if subject.scope() != self.scope {
+            return Ok(None);
+        }
+        let master = self.store.master().ok_or(StoreError::Encryption)?;
+        let subject_text = subject.to_string();
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT geo_sealed, pii_dek_version, \
+             (EXTRACT(EPOCH FROM observed_at) * 1000000)::bigint AS observed_us \
+             FROM risk_login_geo \
+             WHERE tenant_id = $1 AND environment_id = $2 AND subject = $3",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(&subject_text)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(row) = row else {
+            tx.commit().await?;
+            return Ok(None);
+        };
+        let dek_version: i32 = row.get("pii_dek_version");
+        let dek = fetch_dek_by_version(&mut tx, self.scope, master, dek_version).await?;
+        let geo_sealed: Vec<u8> = row.get("geo_sealed");
+        let geo_plain = dek.open(
+            &risk_login_geo_seal_aad(
+                self.scope,
+                &subject_text,
+                RISK_LOGIN_GEO_GEO_PURPOSE,
+                dek_version,
+            ),
+            &Sealed::from_bytes(geo_sealed)?,
+        )?;
+        tx.commit().await?;
+        Ok(Some(LoginGeoView {
+            geo_json: String::from_utf8(geo_plain).map_err(|_| StoreError::Encryption)?,
+            observed_at_unix_micros: row.get("observed_us"),
+        }))
+    }
+
+    /// A recorded risk decision by id (issue #79), for reconstruction and the account
+    /// view. Returns `None` when the id is malformed, out of scope, or absent.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn get_decision(
+        &self,
+        id: &RiskDecisionId,
+    ) -> Result<Option<RiskDecisionView>, StoreError> {
+        if id.scope() != self.scope {
+            return Ok(None);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT id, subject, score, action, signals::text AS signals, \
+             (EXTRACT(EPOCH FROM created_at) * 1000000)::bigint AS created_us \
+             FROM risk_decisions \
+             WHERE tenant_id = $1 AND environment_id = $2 AND id = $3",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(id.to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        Ok(Some(risk_decision_view_from_row(&row, self.scope)?))
+    }
+
+    /// The most recent risk decision for a subject (issue #79), newest first.
+    /// Subject-bound. Returns `None` when the subject has no recorded decision.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn latest_decision(
+        &self,
+        subject: &UserId,
+    ) -> Result<Option<RiskDecisionView>, StoreError> {
+        if subject.scope() != self.scope {
+            return Ok(None);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT id, subject, score, action, signals::text AS signals, \
+             (EXTRACT(EPOCH FROM created_at) * 1000000)::bigint AS created_us \
+             FROM risk_decisions \
+             WHERE tenant_id = $1 AND environment_id = $2 AND subject = $3 \
+             ORDER BY created_at DESC, id DESC LIMIT 1",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(subject.to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        Ok(Some(risk_decision_view_from_row(&row, self.scope)?))
+    }
+
+    /// Resolve a presented "this wasn't me" disavowal token to the subject and sessions
+    /// it revokes (issue #79), for the confirmation page. Read-only: it does NOT consume
+    /// the token. Returns `None` unless the ONE row whose `token_digest` matches is
+    /// live (not consumed, not expired at `now_micros`). A forged or tampered token whose
+    /// secret does not hash to a stored digest finds no row.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn resolve_disavowal(
+        &self,
+        token_digest: &[u8],
+        now_micros: i64,
+    ) -> Result<Option<DisavowalResolution>, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT id, subject, session_ids FROM risk_disavowal_tokens \
+             WHERE tenant_id = $1 AND environment_id = $2 AND token_digest = $3 \
+             AND consumed_at IS NULL \
+             AND expires_at > (TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval)",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(token_digest)
+        .bind(now_micros)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        row.map(|row| disavowal_resolution_from_row(&row, self.scope))
+            .transpose()
+    }
+
+    /// Whether the subject's credentials are FLAGGED for review (issue #79): a consumed
+    /// disavowal token exists for the subject. The flag is durable (it survives token
+    /// expiry), so a completed "this wasn't me" is legible to the account surface and an
+    /// admin indefinitely. Subject-bound.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn credentials_flagged_for_review(
+        &self,
+        subject: &UserId,
+    ) -> Result<bool, StoreError> {
+        if subject.scope() != self.scope {
+            return Ok(false);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let present: bool = sqlx::query(
+            "SELECT EXISTS ( \
+                 SELECT 1 FROM risk_disavowal_tokens \
+                 WHERE tenant_id = $1 AND environment_id = $2 AND subject = $3 \
+                 AND consumed_at IS NOT NULL \
+             ) AS present",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(subject.to_string())
+        .fetch_one(&mut *tx)
+        .await?
+        .get("present");
+        tx.commit().await?;
+        Ok(present)
+    }
+}
+
+/// Reconstruct a [`RiskDecisionView`] from a decision row.
+fn risk_decision_view_from_row(row: &PgRow, scope: Scope) -> Result<RiskDecisionView, StoreError> {
+    let id_text: String = row.get("id");
+    let id = RiskDecisionId::parse_in_scope(&id_text, &scope).map_err(|_| StoreError::NotFound)?;
+    Ok(RiskDecisionView {
+        id,
+        subject: row.get("subject"),
+        score: row.get("score"),
+        action: row.get("action"),
+        signals_json: row.get("signals"),
+        created_at_unix_micros: row.get("created_us"),
+    })
+}
+
+/// Reconstruct a [`DisavowalResolution`] from a disavowal row.
+fn disavowal_resolution_from_row(
+    row: &PgRow,
+    scope: Scope,
+) -> Result<DisavowalResolution, StoreError> {
+    let subject_text: String = row.get("subject");
+    let subject =
+        UserId::parse_in_scope(&subject_text, &scope).map_err(|_| StoreError::NotFound)?;
+    Ok(DisavowalResolution {
+        id: row.get("id"),
+        subject,
+        session_ids: row.get("session_ids"),
+    })
+}
+
+/// The mutating risk-engine repository (issue #79): record a decision (audited), refresh
+/// a subject's last-seen login geo, mint a "this wasn't me" disavowal token (audited),
+/// and consume one (audited). Every write is subject or scope bound.
+pub struct ActingRiskRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+    acting: ActingContext,
+}
+
+impl ActingRiskRepo<'_> {
+    /// Ensure the scope has a live KEK and DEK to seal the login-geo metadata under,
+    /// provisioning each lazily on first use (idempotent). Mirrors the trusted-device
+    /// path so login-geo metadata is sealed exactly like device metadata.
+    async fn ensure_scope_keys(&self, env: &Env, master: &MasterKey) -> Result<(), StoreError> {
+        let envelope = ActingEnvelopeRepo {
+            store: self.store,
+            scope: self.scope,
+            acting: self.acting,
+        };
+        match envelope.provision_kek(env, master).await {
+            Ok(_) | Err(StoreError::Conflict) => {}
+            Err(error) => return Err(error),
+        }
+        match envelope.provision_dek(env, master).await {
+            Ok(_) | Err(StoreError::Conflict) => {}
+            Err(error) => return Err(error),
+        }
+        Ok(())
+    }
+
+    /// RECORD (upsert) the subject's last-seen login geo (issue #79), sealing the observed
+    /// IP, coarse location, and User-Agent under the scope's DEK (issue #48). Exactly one
+    /// row per subject: a subsequent login overwrites it. A hot-path observation, so it is
+    /// NOT audited (like the trusted-device idle slide). Subject-bound.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if `subject` is out of this scope;
+    /// [`StoreError::Encryption`] if no platform master key is configured;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn record_login_geo(
+        &self,
+        env: &Env,
+        subject: &UserId,
+        geo: NewLoginGeo<'_>,
+    ) -> Result<(), StoreError> {
+        if subject.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let master = self.store.master().ok_or(StoreError::Encryption)?;
+        self.ensure_scope_keys(env, master).await?;
+        let scope = self.scope;
+        let subject_text = subject.to_string();
+        let id = RiskLoginGeoId::generate(env, &scope);
+        let mut tx = begin_scoped(self.store, scope).await?;
+        let (dek_version, dek) = fetch_active_dek(&mut tx, scope, master).await?;
+        let ip_sealed = dek.seal(
+            env.entropy(),
+            &risk_login_geo_seal_aad(scope, &subject_text, RISK_LOGIN_GEO_IP_PURPOSE, dek_version),
+            geo.ip.as_bytes(),
+        );
+        let geo_sealed = dek.seal(
+            env.entropy(),
+            &risk_login_geo_seal_aad(
+                scope,
+                &subject_text,
+                RISK_LOGIN_GEO_GEO_PURPOSE,
+                dek_version,
+            ),
+            geo.geo_json.as_bytes(),
+        );
+        let ua_sealed = dek.seal(
+            env.entropy(),
+            &risk_login_geo_seal_aad(
+                scope,
+                &subject_text,
+                RISK_LOGIN_GEO_USER_AGENT_PURPOSE,
+                dek_version,
+            ),
+            geo.user_agent.as_bytes(),
+        );
+        sqlx::query(
+            "INSERT INTO risk_login_geo \
+             (id, tenant_id, environment_id, subject, ip_sealed, geo_sealed, \
+              user_agent_sealed, pii_dek_version, observed_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, \
+              TIMESTAMPTZ 'epoch' + ($9::text || ' microseconds')::interval) \
+             ON CONFLICT (tenant_id, environment_id, subject) DO UPDATE SET \
+              ip_sealed = EXCLUDED.ip_sealed, geo_sealed = EXCLUDED.geo_sealed, \
+              user_agent_sealed = EXCLUDED.user_agent_sealed, \
+              pii_dek_version = EXCLUDED.pii_dek_version, \
+              observed_at = EXCLUDED.observed_at, updated_at = now()",
+        )
+        .bind(id.to_string())
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(&subject_text)
+        .bind(ip_sealed.into_bytes())
+        .bind(geo_sealed.into_bytes())
+        .bind(ua_sealed.into_bytes())
+        .bind(dek_version)
+        .bind(geo.observed_at_micros)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// RECORD a risk decision (issue #79): the LOW/MED/HIGH score, the dispatched action,
+    /// and the enumerated contributing signals, in one row plus one
+    /// `risk.decision` audit row (so a sampled decision is reconstructable from the audit
+    /// trail alone). Returns the fresh `rsk_` id. Subject-bound.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if `subject` is out of this scope;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn record_decision(
+        &self,
+        env: &Env,
+        subject: &UserId,
+        decision: NewRiskDecision<'_>,
+    ) -> Result<RiskDecisionId, StoreError> {
+        if subject.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let id = RiskDecisionId::generate(env, &scope);
+        let id_text = id.to_string();
+        let subject_text = subject.to_string();
+        let detail = format!("score={} action={}", decision.score, decision.action);
+        write_audited_detailed(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::RiskDecisionRecord,
+                target: &id,
+            },
+            async move |tx| {
+                sqlx::query(
+                    "INSERT INTO risk_decisions \
+                     (id, tenant_id, environment_id, subject, correlation_id, score, action, \
+                      signals) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb)",
+                )
+                .bind(&id_text)
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(&subject_text)
+                .bind(decision.correlation_id)
+                .bind(decision.score)
+                .bind(decision.action)
+                .bind(decision.signals_json)
+                .execute(&mut **tx)
+                .await?;
+                Ok(())
+            },
+            false,
+            Some(&detail),
+        )
+        .await?;
+        Ok(id)
+    }
+
+    /// MINT a "this wasn't me" disavowal token (issue #79): store the SHA-256 digest of
+    /// the single-use secret, the sessions the disavowal revokes, and the expiry, plus one
+    /// `risk.disavowal.issue` audit row. Returns the fresh `dis_` id (the routing handle
+    /// in the token wire form). Subject-bound.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if `subject` is out of this scope;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn issue_disavowal(
+        &self,
+        env: &Env,
+        subject: &UserId,
+        token: NewDisavowalToken<'_>,
+    ) -> Result<RiskDisavowalId, StoreError> {
+        if subject.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let id = RiskDisavowalId::generate(env, &scope);
+        let id_text = id.to_string();
+        let subject_text = subject.to_string();
+        let detail = token
+            .decision_id
+            .map(|decision| format!("decision={decision}"));
+        write_audited_detailed(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::RiskDisavowalIssue,
+                target: &id,
+            },
+            async move |tx| {
+                sqlx::query(
+                    "INSERT INTO risk_disavowal_tokens \
+                     (id, tenant_id, environment_id, subject, token_digest, decision_id, \
+                      session_ids, expires_at) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, \
+                      TIMESTAMPTZ 'epoch' + ($8::text || ' microseconds')::interval)",
+                )
+                .bind(&id_text)
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(&subject_text)
+                .bind(token.token_digest)
+                .bind(token.decision_id)
+                .bind(token.session_ids)
+                .bind(token.expires_at_micros)
+                .execute(&mut **tx)
+                .await?;
+                Ok(())
+            },
+            false,
+            detail.as_deref(),
+        )
+        .await?;
+        Ok(id)
+    }
+
+    /// CONSUME a presented disavowal token single-use (issue #79): atomically latch
+    /// `consumed_at` on the ONE live row whose `token_digest` matches, and return the
+    /// subject and sessions the caller must revoke (plus the marker that the subject's
+    /// credentials are now flagged for review). A replayed or expired token flips nothing
+    /// and returns `None`, so the revoke-and-flag runs exactly once. On a successful flip
+    /// one `risk.disavow` audit row is written IN THE SAME transaction; a no-op writes
+    /// nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn consume_disavowal(
+        &self,
+        env: &Env,
+        token_digest: &[u8],
+        now_micros: i64,
+    ) -> Result<Option<DisavowalResolution>, StoreError> {
+        let scope = self.scope;
+        let mut tx = begin_scoped(self.store, scope).await?;
+        let row = sqlx::query(
+            "UPDATE risk_disavowal_tokens SET \
+             consumed_at = TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval \
+             WHERE tenant_id = $1 AND environment_id = $2 AND token_digest = $3 \
+             AND consumed_at IS NULL \
+             AND expires_at > (TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval) \
+             RETURNING id, subject, session_ids",
+        )
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(token_digest)
+        .bind(now_micros)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(row) = row else {
+            tx.commit().await?;
+            return Ok(None);
+        };
+        let resolution = disavowal_resolution_from_row(&row, scope)?;
+        let id = RiskDisavowalId::parse_in_scope(&resolution.id, &scope)
+            .map_err(|_| StoreError::NotFound)?;
+        let detail = format!("sessions={}", resolution.session_ids.len());
+        insert_audit_row(
+            &mut tx,
+            &AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::RiskDisavow,
+                target: &id,
+            },
+            Some(&detail),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(Some(resolution))
+    }
+}
+
+// ===========================================================================
 // WebAuthn passkeys (issue #65)
 // ===========================================================================
 
@@ -23616,6 +24161,17 @@ const TRUSTED_DEVICE_META_SEAL_LABEL: &str = "ironauth.envelope.trusted-device-m
 const TRUSTED_DEVICE_USER_AGENT_PURPOSE: &str = "user_agent";
 /// The purpose label bound into a sealed `trusted_devices.geo_sealed` value.
 const TRUSTED_DEVICE_GEO_PURPOSE: &str = "geo";
+/// The AAD label domain-separating a sealed `risk_login_geo` PII payload (the observed
+/// IP, coarse location, or User-Agent at a login, issue #79) from every other envelope
+/// context. The per-column `purpose` and the `rgl_` row id are additionally bound in
+/// the AAD (see [`risk_login_geo_seal_aad`]).
+const RISK_LOGIN_GEO_SEAL_LABEL: &str = "ironauth.envelope.risk-login-geo.v1";
+/// The purpose label bound into a sealed `risk_login_geo.ip_sealed` value.
+const RISK_LOGIN_GEO_IP_PURPOSE: &str = "ip";
+/// The purpose label bound into a sealed `risk_login_geo.geo_sealed` value.
+const RISK_LOGIN_GEO_GEO_PURPOSE: &str = "geo";
+/// The purpose label bound into a sealed `risk_login_geo.user_agent_sealed` value.
+const RISK_LOGIN_GEO_USER_AGENT_PURPOSE: &str = "user_agent";
 /// The AAD label domain-separating a sealed `abuse_bans.subject` value (the regulated
 /// dimension value, issue #64) from every other envelope context, so a ban-subject
 /// seal never authenticates under the users-PII, invitation, or secret-store context.
@@ -23741,6 +24297,23 @@ fn trusted_device_meta_seal_aad(
         .text(&scope.tenant().to_string())
         .text(&scope.environment().to_string())
         .field(device_id.as_bytes())
+        .text(purpose)
+        .version(i64::from(dek_version))
+        .build()
+}
+
+/// The AAD binding a sealed `risk_login_geo` metadata value (issue #79): the label, the
+/// scope, the per-column `purpose` (`ip`, `geo`, or `user_agent`), the `usr_` subject
+/// (the per-subject transplant binding; the table upserts exactly one row per subject,
+/// so the subject is the stable natural key), and the DEK version. A login-geo
+/// ciphertext therefore cannot be lifted to another subject, tenant, environment,
+/// column, or key version and still open.
+fn risk_login_geo_seal_aad(scope: Scope, subject: &str, purpose: &str, dek_version: i32) -> Aad {
+    Aad::builder()
+        .text(RISK_LOGIN_GEO_SEAL_LABEL)
+        .text(&scope.tenant().to_string())
+        .text(&scope.environment().to_string())
+        .field(subject.as_bytes())
         .text(purpose)
         .version(i64::from(dek_version))
         .build()

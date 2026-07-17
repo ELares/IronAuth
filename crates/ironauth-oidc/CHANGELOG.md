@@ -6,6 +6,31 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Minimal risk engine (issue #79), off by default behind `oidc.risk.enabled`. The design
+  bet is LEGIBILITY over ML: a small set of explainable signals feed a LOW/MED/HIGH score
+  through a documented, deterministic combination rule (the base is the max signal
+  contribution; two or more MED-or-higher signals escalate a MED base to HIGH) and a
+  three-verb action vocabulary (block / challenge / notify). Signals, each independently
+  toggleable per environment: NEW-DEVICE (reuses the #71 trusted-device state, read-only),
+  IMPOSSIBLE-TRAVEL (geo-velocity via a PLUGGABLE `GeoIpProvider` seam, null default, no
+  bundled dependency), IP-REPUTATION (per-environment allow/deny lists plus a pluggable
+  `IpReputationProvider` seam, null default), and VELOCITY (per-account/IP/ASN rates on the
+  #64 `CounterStore` layer). Every decision is persisted and audited (`risk.decision`),
+  enumerating each contributing signal so a sampled decision is reconstructable from the
+  audit trail. The score feeds the #72 step-up seam: at `oidc.risk.require_mfa_at=med` a
+  MED-or-stronger score raises the effective requirement so `evaluate_step_up` challenges a
+  second factor, while a LOW score does not. A `block` returns the SAME uniform failure as
+  an ordinary wrong password (only an explicit IP deny-list hit blocks; a velocity flood
+  raises the score but never blocks, so a shared NAT cannot lock a victim out). A new-device
+  login sends a notification (through the #68 `VerificationSender` seam, extended with
+  `deliver_new_device_notice`; the default sender performs no delivery) carrying the device,
+  User-Agent, and geo context plus a single-use "this wasn't me" link. The global
+  `/risk/disavow` endpoint (GET a scanner-safe confirmation page, POST to execute) consumes
+  the single-use token, revokes the flagged sessions (all of the subject's, signing out
+  everywhere) and every trusted device, and marks the credentials for review, all audited
+  and uniform. The engine runs COMPLETE with zero IronCache and zero third-party services
+  (the null-provider default path). Providers install via `OidcState::with_geoip_provider`
+  / `with_ip_reputation_provider`.
 - Trusted devices (remember-device 2FA) and the conditional-credential skip (issue #71),
   off by default behind `oidc.trusted_devices_enabled`. After a COMPLETED multi-factor
   login the `POST /login/mfa` path may plant a `__Host-ironauth_trusted_device` cookie

@@ -207,6 +207,42 @@ pub(crate) async fn validate_and_consume(
     Some(validated)
 }
 
+/// Whether the presented remember-device cookie names a LIVE device for `subject` (issue
+/// #79 reuses the #71 server-side state for new-device DETECTION). A pure, READ-ONLY
+/// check: unlike [`validate_and_consume`] it never slides the idle window or stamps
+/// last-seen, so the risk engine can ask "is this a recognized device?" without mutating
+/// the device on a mere risk evaluation. Returns `false` when the feature is off, no
+/// cookie is present, or the cookie is malformed, tampered, out of scope, for another
+/// subject, revoked, or expired, so an unrecognized login reads as a NEW device.
+pub(crate) async fn is_recognized(
+    state: &OidcState,
+    scope: Scope,
+    subject: &UserId,
+    headers: &HeaderMap,
+) -> bool {
+    if !state.trusted_devices_enabled() {
+        return false;
+    }
+    let Some(raw) = session::trusted_device_from_cookie_header(interaction::cookie_header(headers))
+    else {
+        return false;
+    };
+    let Some((id_str, secret)) = split_cookie(raw) else {
+        return false;
+    };
+    let read = state.store().scoped(scope).trusted_devices();
+    let Ok(device_id) = read.parse_id(id_str) else {
+        return false;
+    };
+    let digest = secret_digest(secret);
+    let now_micros = epoch_micros(state.now());
+    read.validate(&device_id, subject, &digest, now_micros)
+        .await
+        .ok()
+        .flatten()
+        .is_some()
+}
+
 /// INVALIDATE every remembered device of `subject` (issue #71): the server-side kill
 /// switch a password change/reset (per tenant policy) or an admin action runs. A
 /// best-effort bulk revoke; a fault never blocks the credential change that triggered

@@ -6,6 +6,19 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Minimal risk-engine settings for issue #79, off by default: the `oidc.risk` block
+  (`RiskConfig`). `oidc.risk.enabled` (default false) is the master switch; each signal is
+  independently toggleable per environment (`new_device_enabled`,
+  `impossible_travel_enabled`, `ip_reputation_enabled`, `velocity_enabled`, all default
+  true but gated by the master switch). `oidc.risk.require_mfa_at` (`off` / `low` / `med` /
+  `high`, default `off`) is the step-up threshold a MED-or-stronger score forces MFA at;
+  `block_on_high` (default true) blocks a hard-deny HIGH with a uniform failure;
+  `notify_on_new_device` (default true) sends the new-device notification. The velocity
+  window and MED/HIGH thresholds, the impossible-travel km/h floor, the per-environment IP
+  allow/deny lists, and the disavowal-token TTL round it out. All bounds are validated at
+  load even when the engine is off (the threshold is a closed set, the velocity thresholds
+  are ordered, the km/h floor stays above ordinary travel, the TTL is bounded), so an
+  out-of-band value cannot take effect the moment it is enabled.
 - Remember-device (trusted-device) policy for issue #71, off by default: the
   `oidc.trusted_devices_enabled` toggle, the `oidc.trusted_device_user_opt_in` choice
   (user checkbox vs the tenant decides), the `oidc.trusted_device_max_age_secs` absolute

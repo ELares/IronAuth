@@ -327,7 +327,7 @@ async fn expand_contract_example_chain_runs_all_three_phases_and_contract_remove
 // per real table); splitting it would not make it clearer.
 #[allow(clippy::too_many_lines)]
 #[tokio::test]
-async fn production_chain_is_only_the_fifty_three_real_migrations_and_ships_no_demo_object() {
+async fn production_chain_is_only_the_fifty_four_real_migrations_and_ships_no_demo_object() {
     // TestDatabase::start runs Store::migrate() (the production chain) on a
     // fresh, empty database.
     let db = TestDatabase::start().await;
@@ -344,8 +344,8 @@ async fn production_chain_is_only_the_fifty_three_real_migrations_and_ships_no_d
     );
     assert_eq!(
         report.already_applied(),
-        53,
-        "the production chain is exactly fifty-three migrations (isolation, audit log, management \
+        54,
+        "the production chain is exactly fifty-four migrations (isolation, audit log, management \
          API, OIDC authorization, signing keys, login/consent, authentication context, redirect \
          registration, UserInfo claims, consent scope upsert, resource servers, opaque access \
          tokens, client auth suite, dynamic client registration, pushed authorization requests, \
@@ -358,16 +358,17 @@ async fn production_chain_is_only_the_fifty_three_real_migrations_and_ships_no_d
          import, user invitations, flexible identifiers, exit-export credential grants, \
          migration state machine, webauthn credentials, totp credentials, credential abuse \
          defenses, step-up policies, email OTP and scanner-safe magic links, credential-class \
-         policies, guarded SMS OTP, passkey attestation, admin sudo elevations, trusted devices)"
+         policies, guarded SMS OTP, passkey attestation, admin sudo elevations, trusted devices, \
+         risk engine)"
     );
 
-    // The ledger holds exactly versions 1 through 53.
+    // The ledger holds exactly versions 1 through 54.
     assert_eq!(
         applied_versions(pool).await,
         vec![
             1_i64, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
             24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45,
-            46, 47, 48, 49, 50, 51, 52, 53
+            46, 47, 48, 49, 50, 51, 52, 53, 54
         ]
     );
     let phase_of = |version: i64| async move {
@@ -564,6 +565,9 @@ async fn production_chain_is_only_the_fifty_three_real_migrations_and_ships_no_d
     // The trusted-devices migration (issue #71) is an EXPAND: one new tenant-scoped
     // remember-device state table, no rewrite of existing state.
     assert_eq!(phase_of(53).await, "expand");
+    // The risk-engine migration (issue #79) is an EXPAND: three new tenant-scoped tables
+    // (risk_login_geo, risk_decisions, risk_disavowal_tokens), no rewrite of existing state.
+    assert_eq!(phase_of(54).await, "expand");
 
     // The step-up second-factor abuse path (issue #72): migration 0047 WIDENED the
     // abuse_bans auth_path CHECK (0046 pinned the closed set) to also admit
@@ -2480,6 +2484,131 @@ async fn production_chain_is_only_the_fifty_three_real_migrations_and_ships_no_d
         assert!(
             check_constraint_exists(pool, "admin_sudo_elevations", constraint).await,
             "admin_sudo_elevations must carry the {constraint} CHECK constraint"
+        );
+    }
+
+    // ---- 0054 minimal risk engine (issue #79) ----
+    // The per-subject last-seen login geo the impossible-travel signal reads: the observed
+    // IP, coarse location, and User-Agent are end-user device metadata (PII), each SEALED
+    // under the scope DEK (issue #48), never a plaintext column.
+    assert!(
+        table_exists(pool, "risk_login_geo").await,
+        "risk_login_geo exists after 0054"
+    );
+    for column in [
+        "id",
+        "tenant_id",
+        "environment_id",
+        "subject",
+        "ip_sealed",
+        "geo_sealed",
+        "user_agent_sealed",
+        "pii_dek_version",
+        "observed_at",
+        "created_at",
+        "updated_at",
+    ] {
+        assert!(
+            column_exists(pool, "risk_login_geo", column).await,
+            "risk_login_geo.{column} exists after 0054"
+        );
+    }
+    // The observed IP / location / User-Agent are PII, sealed under the scope DEK (issue
+    // #48): no plaintext column ever lands.
+    for forbidden in ["ip", "geo", "user_agent", "location", "ip_address"] {
+        assert!(
+            !column_exists(pool, "risk_login_geo", forbidden).await,
+            "risk_login_geo must have no plaintext PII column ({forbidden}) after 0054"
+        );
+    }
+    assert_eq!(
+        column_data_type(pool, "risk_login_geo", "geo_sealed").await,
+        "bytea",
+        "the login geo must be a sealed bytea, never plaintext"
+    );
+
+    // The persisted decision record: the LOW/MED/HIGH score, the dispatched action, and the
+    // enumerated contributing signals (no plaintext PII).
+    assert!(
+        table_exists(pool, "risk_decisions").await,
+        "risk_decisions exists after 0054"
+    );
+    for column in [
+        "id",
+        "tenant_id",
+        "environment_id",
+        "subject",
+        "correlation_id",
+        "score",
+        "action",
+        "signals",
+        "created_at",
+    ] {
+        assert!(
+            column_exists(pool, "risk_decisions", column).await,
+            "risk_decisions.{column} exists after 0054"
+        );
+    }
+
+    // The "this wasn't me" disavowal token: the SHA-256 digest of the single-use secret
+    // (server-side state), the sessions it revokes, and the single-use consumed_at latch.
+    assert!(
+        table_exists(pool, "risk_disavowal_tokens").await,
+        "risk_disavowal_tokens exists after 0054"
+    );
+    for column in [
+        "id",
+        "tenant_id",
+        "environment_id",
+        "subject",
+        "token_digest",
+        "decision_id",
+        "session_ids",
+        "consumed_at",
+        "expires_at",
+        "created_at",
+    ] {
+        assert!(
+            column_exists(pool, "risk_disavowal_tokens", column).await,
+            "risk_disavowal_tokens.{column} exists after 0054"
+        );
+    }
+    // The disavowal token is stored ONLY as its SHA-256 digest, never a plaintext bearer
+    // value.
+    assert_eq!(
+        column_data_type(pool, "risk_disavowal_tokens", "token_digest").await,
+        "bytea",
+        "the disavowal token is stored as a digest, never plaintext"
+    );
+    for forbidden in ["token", "secret", "plaintext", "raw_token"] {
+        assert!(
+            !column_exists(pool, "risk_disavowal_tokens", forbidden).await,
+            "risk_disavowal_tokens must have no plaintext-token column ({forbidden})"
+        );
+    }
+
+    // The tenant-scoped-table obligations for every new risk table: forced row-level
+    // security, the (tenant, environment) isolation policy, and the nonempty-scope CHECK.
+    for table in ["risk_login_geo", "risk_decisions", "risk_disavowal_tokens"] {
+        assert!(
+            rls_enabled_and_forced(pool, table).await,
+            "{table} must ENABLE and FORCE row-level security"
+        );
+        assert!(
+            policy_exists(pool, table, &format!("{table}_tenant_isolation")).await,
+            "the (tenant, environment) isolation policy must exist on {table}"
+        );
+        assert!(
+            check_constraint_exists(pool, table, &format!("{table}_scope_nonempty")).await,
+            "{table} must carry the scope-nonempty CHECK constraint"
+        );
+    }
+    // The decision score and action are closed sets: a corrupt or unknown value can never
+    // be written.
+    for constraint in ["risk_decisions_score_known", "risk_decisions_action_known"] {
+        assert!(
+            check_constraint_exists(pool, "risk_decisions", constraint).await,
+            "risk_decisions must carry the {constraint} CHECK constraint"
         );
     }
 }

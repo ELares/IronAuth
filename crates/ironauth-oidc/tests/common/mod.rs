@@ -907,6 +907,26 @@ impl Harness {
         self.state = state;
     }
 
+    /// Install a risk-engine `GeoIP` provider (issue #79) on the state and rebuild the
+    /// protocol router, so a test can drive the impossible-travel and per-ASN velocity
+    /// signals with a fixture provider.
+    pub fn install_geoip_provider(&mut self, provider: Arc<dyn ironauth_oidc::GeoIpProvider>) {
+        let state = self.state.clone().with_geoip_provider(provider);
+        self.router = oidc_router(state.clone());
+        self.state = state;
+    }
+
+    /// Install a risk-engine IP-reputation provider (issue #79) on the state and rebuild
+    /// the protocol router, so a test can drive the IP-reputation signal with a stub.
+    pub fn install_ip_reputation_provider(
+        &mut self,
+        provider: Arc<dyn ironauth_oidc::IpReputationProvider>,
+    ) {
+        let state = self.state.clone().with_ip_reputation_provider(provider);
+        self.router = oidc_router(state.clone());
+        self.state = state;
+    }
+
     /// Enable the guarded SMS-OTP factor for the harness scope (issue #70): the explicit
     /// per-tenant enablement, the factor-downgrade opt-in, and the country allowlist. This
     /// is the deliberate per-tenant action the off-by-default posture requires.
