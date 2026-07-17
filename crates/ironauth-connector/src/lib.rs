@@ -712,6 +712,13 @@ pub struct ConnectorRuntimeConfig {
     /// mapping resolves email through, and whether `UserInfo` is required.
     #[serde(default)]
     pub quirks: Quirks,
+    /// The machine-readable capability matrix (issue #75), read back so the brokered
+    /// login can gate upstream token capture on the upstream's refresh support (issue
+    /// #77, PR 3). Deserialized from the stored secret-free projection, which already
+    /// carries the full capability matrix; defaulted so an older stored projection that
+    /// predates a capability parses forward-compatibly.
+    #[serde(default)]
+    pub capabilities: CapabilityMatrix,
 }
 
 /// One semantic validation failure, carrying an RFC 6901 JSON POINTER to the

@@ -25,6 +25,8 @@ use std::time::Duration;
 use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD;
 use common::{
     Harness, PKCE_CHALLENGE, PKCE_VERIFIER, REDIRECT_URI, enc, form, json, location_param,
     verify_clock,
@@ -32,11 +34,13 @@ use common::{
 use ironauth_env::Clock;
 use ironauth_fetch::{FetchLimits, Fetcher, RecordingDialer, StaticResolver};
 use ironauth_jose::{EmissionOptions, JwkSet, SigningKey, TotpParams, code_at, sign_jws, verify};
-use ironauth_oidc::{FederationKeyResolver, FederationRuntime, federated_external_id, oidc_router};
+use ironauth_oidc::{
+    ClientAuthMethod, FederationKeyResolver, FederationRuntime, federated_external_id, oidc_router,
+};
 use ironauth_store::{
-    ConnectorCapabilities, ConnectorId, CorrelationId, NewConnector, NewOrgConnection,
-    NewRoutingRule, OrgConnectionId, OrganizationId, RoutingRuleId, RoutingSelector, Scope,
-    SessionId,
+    ClientId, ConnectorCapabilities, ConnectorId, CorrelationId, NewConnector, NewOrgConnection,
+    NewRoutingRule, NewUpstreamTokenGrant, OrgConnectionId, OrganizationId, RoutingRuleId,
+    RoutingSelector, Scope, SessionId, UpstreamTokenGrantId,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -211,6 +215,151 @@ async fn seed_binding_with_overlay(
     ocn_id
 }
 
+/// Seed a capture-ENABLED binding (issue #77, PR 3): a connector whose capability matrix
+/// advertises `refresh` (both the stored columns and the secret-free `definition_json` the
+/// callback parses), and a binding whose `capture_upstream_tokens` flag is set, so a
+/// brokered login through it captures the upstream tokens into the vault.
+async fn seed_capture_binding(harness: &Harness, slug: &str) -> OrgConnectionId {
+    let env = harness.env().clone();
+    let scope = harness.scope();
+    let control = harness.db().control_store();
+
+    let org_id = OrganizationId::generate(&env, &scope);
+    control
+        .management()
+        .acting(harness.db().test_actor(&env), CorrelationId::generate(&env))
+        .organizations(scope)
+        .create(&env, &org_id, 1_000_000, "Capture Corp", None)
+        .await
+        .expect("create organization");
+
+    let connector_id = ConnectorId::generate(&env, &scope);
+    // The definition_json is the secret-free projection the callback parses; it MUST carry
+    // the capability matrix (refresh) so the capture gate reads it, exactly as the
+    // management API's secret_free_json projection stores it in production.
+    let definition = format!(
+        r#"{{"connector_id":"{slug}","display_name":"Capture","protocol":"oidc","endpoints":{{"issuer":"{UPSTREAM_ISSUER}"}},"scopes":["openid","email"],"client_id":"{UPSTREAM_CLIENT_ID}","capabilities":{{"refresh":true}}}}"#
+    );
+    control
+        .scoped(scope)
+        .acting(harness.db().test_actor(&env), CorrelationId::generate(&env))
+        .connectors()
+        .create(
+            &env,
+            &connector_id,
+            1_000_000,
+            NewConnector {
+                slug,
+                definition_json: &definition,
+                client_secret: b"upstream-secret",
+                capabilities: ConnectorCapabilities {
+                    refresh: true,
+                    groups: false,
+                    logout_propagation: false,
+                    email_verified_trust: "untrusted",
+                },
+                enabled: true,
+            },
+            None,
+        )
+        .await
+        .expect("create connector");
+
+    let ocn_id = OrgConnectionId::generate(&env, &scope);
+    control
+        .scoped(scope)
+        .acting(harness.db().test_actor(&env), CorrelationId::generate(&env))
+        .org_connections()
+        .create(
+            &env,
+            &ocn_id,
+            1_000_000,
+            NewOrgConnection {
+                organization_id: &org_id,
+                connector_id: &connector_id,
+                overlay_min_acr: None,
+                max_age_secs: None,
+                overlay_min_class: None,
+                capture_upstream_tokens: true,
+                enabled: true,
+            },
+        )
+        .await
+        .expect("create org connection");
+    ocn_id
+}
+
+/// Seed an upstream-token retrieval grant (issue #77, PR 3): authorize `client_id` to
+/// retrieve captured tokens for `ocn_id`.
+async fn seed_grant(harness: &Harness, client_id: &ClientId, ocn_id: &OrgConnectionId) {
+    let env = harness.env().clone();
+    let scope = harness.scope();
+    harness
+        .db()
+        .control_store()
+        .scoped(scope)
+        .acting(harness.db().test_actor(&env), CorrelationId::generate(&env))
+        .upstream_token_grants()
+        .create(
+            &env,
+            &UpstreamTokenGrantId::generate(&env, &scope),
+            1_000_000,
+            NewUpstreamTokenGrant {
+                client_id,
+                org_connection_id: ocn_id,
+                enabled: true,
+            },
+        )
+        .await
+        .expect("create upstream token grant");
+}
+
+/// POST the upstream-token retrieval endpoint as `client` (Basic auth) carrying the
+/// `session_cookie` value (the caller's OWN session), returning the response.
+async fn retrieve(
+    harness: &Harness,
+    runtime: &Arc<FederationRuntime>,
+    client_id: &str,
+    client_secret: &str,
+    session_cookie: &str,
+) -> axum::response::Response {
+    let scope = harness.scope();
+    let uri = format!(
+        "/t/{}/e/{}/federation/upstream-token",
+        scope.tenant(),
+        scope.environment(),
+    );
+    let basic = format!(
+        "Basic {}",
+        STANDARD.encode(format!("{client_id}:{client_secret}"))
+    );
+    let request = Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header(header::AUTHORIZATION, basic)
+        .header(header::COOKIE, session_cookie)
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body(Body::empty())
+        .expect("build retrieval request");
+    router(harness, runtime)
+        .oneshot(request)
+        .await
+        .expect("retrieval response")
+}
+
+/// The `__Host-ironauth_session` cookie header value for a session id.
+fn session_cookie(session_id: &SessionId) -> String {
+    format!("__Host-ironauth_session={session_id}")
+}
+
+/// Read the JSON body of a response as a serde value.
+async fn json_body(response: axum::response::Response) -> serde_json::Value {
+    let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .expect("read body");
+    serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null)
+}
+
 /// Seed a routing rule mapping `selector` to `ocn_id`.
 async fn seed_rule(harness: &Harness, selector: RoutingSelector<'_>, ocn_id: &OrgConnectionId) {
     let env = harness.env().clone();
@@ -327,7 +476,12 @@ fn id_token(key: &SigningKey, nonce: &str, sub: &str) -> String {
 }
 
 fn token_response(id_token: &str) -> String {
-    format!(r#"{{"access_token":"upstream-at","token_type":"Bearer","id_token":"{id_token}"}}"#)
+    // Carries an access + refresh token and their metadata so the PR 3 vault has something
+    // to capture. Capture is GATED on the org connection + connector, so a login through a
+    // non-capturing binding still persists nothing.
+    format!(
+        r#"{{"access_token":"upstream-at","refresh_token":"upstream-rt","expires_in":3600,"scope":"openid email","token_type":"Bearer","id_token":"{id_token}"}}"#
+    )
 }
 
 fn session_id_from_cookies(
@@ -1716,5 +1870,197 @@ async fn a_no_overlay_oauth2_federated_login_resumes_unchanged() {
             .expect("stamped")
             .to_string(),
         ocn_id.to_string()
+    );
+}
+
+// ===========================================================================
+// Upstream token vault: capture + client-authorized retrieval (issue #77, PR 3)
+// ===========================================================================
+
+#[tokio::test]
+async fn a_captured_upstream_token_is_retrievable_only_by_a_granted_client() {
+    let harness = Harness::start().await;
+    let ocn_id = seed_capture_binding(&harness, "capco").await;
+    seed_rule(&harness, RoutingSelector::Domain(ROUTED_DOMAIN), &ocn_id).await;
+    let upstream = start_upstream().await;
+    let runtime = build_runtime(upstream.addr);
+
+    // A brokered login through the capture-enabled binding captures the upstream tokens.
+    let response = routed_login(
+        &harness,
+        &runtime,
+        &upstream,
+        "alice@acme.example",
+        "capture-sub-1",
+    )
+    .await;
+    let session_id = session_id_from_cookies(&response, &harness.scope())
+        .expect("the brokered login established a session");
+    let cookie = session_cookie(&session_id);
+
+    let (client_id, secret) = harness
+        .create_confidential_client(ClientAuthMethod::Basic)
+        .await;
+
+    // WITHOUT a grant: the authenticated client gets a TYPED unauthorized_client denial,
+    // never a 500 and never a token.
+    let denied = retrieve(&harness, &runtime, &client_id.to_string(), &secret, &cookie).await;
+    assert_eq!(
+        denied.status(),
+        StatusCode::FORBIDDEN,
+        "an ungranted client is denied"
+    );
+    let body = json_body(denied).await;
+    assert_eq!(
+        body.get("error").and_then(|v| v.as_str()),
+        Some("unauthorized_client"),
+        "the denial is the typed unauthorized_client: {body}"
+    );
+
+    // WITH a grant: the client retrieves the captured access AND refresh tokens.
+    seed_grant(&harness, &client_id, &ocn_id).await;
+    let ok = retrieve(&harness, &runtime, &client_id.to_string(), &secret, &cookie).await;
+    assert_eq!(ok.status(), StatusCode::OK, "a granted client retrieves");
+    let body = json_body(ok).await;
+    assert_eq!(
+        body.get("access_token").and_then(|v| v.as_str()),
+        Some("upstream-at"),
+        "the granted client gets the upstream access token: {body}"
+    );
+    assert_eq!(
+        body.get("refresh_token").and_then(|v| v.as_str()),
+        Some("upstream-rt"),
+        "the granted client gets the upstream refresh token: {body}"
+    );
+}
+
+#[tokio::test]
+async fn capture_is_gated_when_the_binding_opts_out() {
+    let harness = Harness::start().await;
+    // The default binding does NOT capture (capture_upstream_tokens=false, connector has no
+    // refresh capability): a plain brokered login persists nothing.
+    let ocn_id = seed_binding(&harness, "nocap").await;
+    seed_rule(&harness, RoutingSelector::Domain(ROUTED_DOMAIN), &ocn_id).await;
+    let upstream = start_upstream().await;
+    let runtime = build_runtime(upstream.addr);
+
+    let response = routed_login(
+        &harness,
+        &runtime,
+        &upstream,
+        "bob@acme.example",
+        "nocap-sub-1",
+    )
+    .await;
+    let session_id = session_id_from_cookies(&response, &harness.scope())
+        .expect("the brokered login established a session");
+    let cookie = session_cookie(&session_id);
+
+    // A granted client still gets a uniform not-found, because nothing was captured.
+    let (client_id, secret) = harness
+        .create_confidential_client(ClientAuthMethod::Basic)
+        .await;
+    seed_grant(&harness, &client_id, &ocn_id).await;
+    let response = retrieve(&harness, &runtime, &client_id.to_string(), &secret, &cookie).await;
+    assert_eq!(
+        response.status(),
+        StatusCode::NOT_FOUND,
+        "no capture on an opted-out binding means a uniform not-found"
+    );
+}
+
+#[tokio::test]
+async fn token_retrieval_is_idor_proof_across_clients_and_sessions() {
+    let harness = Harness::start().await;
+    // Two capture-enabled orgs, each on its own domain.
+    let ocn_x = seed_capture_binding(&harness, "orgx").await;
+    seed_rule(&harness, RoutingSelector::Domain("acme.example"), &ocn_x).await;
+    let ocn_y = seed_capture_binding(&harness, "orgy").await;
+    seed_rule(&harness, RoutingSelector::Domain("other.example"), &ocn_y).await;
+    let upstream = start_upstream().await;
+    let runtime = build_runtime(upstream.addr);
+
+    // Session A belongs to org X; session B belongs to org Y.
+    let response_a = routed_login(&harness, &runtime, &upstream, "alice@acme.example", "x-1").await;
+    let session_a = session_id_from_cookies(&response_a, &harness.scope()).expect("session A");
+    let response_b = routed_login(&harness, &runtime, &upstream, "bob@other.example", "y-1").await;
+    let session_b = session_id_from_cookies(&response_b, &harness.scope()).expect("session B");
+
+    // Client cA is granted for org X only.
+    let (client_a, secret_a) = harness
+        .create_confidential_client(ClientAuthMethod::Basic)
+        .await;
+    seed_grant(&harness, &client_a, &ocn_x).await;
+
+    // cA + session A cookie -> gets A's token (the legitimate path).
+    let ok = retrieve(
+        &harness,
+        &runtime,
+        &client_a.to_string(),
+        &secret_a,
+        &session_cookie(&session_a),
+    )
+    .await;
+    assert_eq!(
+        ok.status(),
+        StatusCode::OK,
+        "cA reads its own org's session"
+    );
+
+    // IDOR across SESSIONS: cA presenting session B's cookie (org Y, cA has no grant there)
+    // is a typed unauthorized_client, never B's token. A granted client cannot jump to
+    // another org's session even by presenting its cookie.
+    let cross = retrieve(
+        &harness,
+        &runtime,
+        &client_a.to_string(),
+        &secret_a,
+        &session_cookie(&session_b),
+    )
+    .await;
+    assert_eq!(
+        cross.status(),
+        StatusCode::FORBIDDEN,
+        "cA cannot read a session in an org it has no grant for"
+    );
+    assert_eq!(
+        json_body(cross).await.get("error").and_then(|v| v.as_str()),
+        Some("unauthorized_client"),
+    );
+
+    // IDOR across CLIENTS: a DIFFERENT client with no grant at all, presenting session A's
+    // cookie, is denied unauthorized_client (it cannot read cA's org's token).
+    let (client_b, secret_b) = harness
+        .create_confidential_client(ClientAuthMethod::Basic)
+        .await;
+    let other_client = retrieve(
+        &harness,
+        &runtime,
+        &client_b.to_string(),
+        &secret_b,
+        &session_cookie(&session_a),
+    )
+    .await;
+    assert_eq!(
+        other_client.status(),
+        StatusCode::FORBIDDEN,
+        "an ungranted client cannot read another's token"
+    );
+
+    // The anti-oracle boundary: a FOREIGN / made-up session id in the cookie is a uniform
+    // not-found (the endpoint never honors a client-supplied session id).
+    let foreign = SessionId::generate(harness.env(), &harness.scope());
+    let garbage = retrieve(
+        &harness,
+        &runtime,
+        &client_a.to_string(),
+        &secret_a,
+        &session_cookie(&foreign),
+    )
+    .await;
+    assert_eq!(
+        garbage.status(),
+        StatusCode::NOT_FOUND,
+        "a foreign session cookie is a uniform not-found (no oracle)"
     );
 }

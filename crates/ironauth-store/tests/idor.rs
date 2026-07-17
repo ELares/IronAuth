@@ -9,8 +9,8 @@ use ironauth_store::test_support::TestDatabase;
 use ironauth_store::{
     AuthorizationCodeId, ClientId, ConnectorCapabilities, ConnectorId, CorrelationId,
     CredentialType, FederationLoginStateId, GrantId, IssueCode, NewConnector,
-    NewFederationLoginState, NewRefreshFamily, NewSession, RefreshFamilyId, RefreshTokenId, Scope,
-    SessionId, StoreError, UserId, refresh_token_digest,
+    NewFederationLoginState, NewRefreshFamily, NewSession, NewUpstreamTokens, RefreshFamilyId,
+    RefreshTokenId, Scope, SessionId, StoreError, UpstreamTokenId, UserId, refresh_token_digest,
 };
 
 /// A timestamp far past any test's clock, so a planted fixture never expires mid-test.
@@ -503,4 +503,81 @@ async fn plant_refresh_family(
         .await
         .expect("plant refresh family");
     family_id
+}
+
+#[tokio::test]
+async fn upstream_token_read_is_cross_scope_isolated() {
+    // A session's captured upstream tokens (issue #77, PR 3) planted in another tenant or
+    // environment must never resolve under the caller's scope, or a retrieval could
+    // exfiltrate a foreign tenant's upstream access and refresh tokens. The probe's foreign
+    // identifier is the SESSION id (the vault's read key). Run on the DATA store
+    // (ironauth_app), which carries the platform master key the seal path needs.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+
+    let scope_a = db.seed_scope(&env).await;
+    let scope_b = db.seed_scope(&env).await;
+    let env_a2 = db.seed_environment(&env, scope_a.tenant()).await;
+    let scope_a2 = Scope::new(scope_a.tenant(), env_a2);
+
+    let victim_b = plant_upstream_token(&db, &env, scope_b).await;
+    let victim_a2 = plant_upstream_token(&db, &env, scope_a2).await;
+
+    let mut harness = IdorHarness::new();
+    harness.register_upstream_token_probes();
+    assert_eq!(
+        harness.probe_names(),
+        vec!["upstream_tokens.read_for_session"],
+        "the upstream token vault surface is registered with the harness"
+    );
+
+    let foreign = [victim_b.to_string(), victim_a2.to_string()];
+    let refs: Vec<&str> = foreign.iter().map(String::as_str).collect();
+    let leaks = harness.run(db.store(), scope_a, &refs).await;
+    assert!(leaks.is_empty(), "cross-scope leak detected: {leaks:?}");
+
+    // Each victim's token is STILL readable in its OWN scope (the cross-scope probe never
+    // touched it), proving the isolation is a genuine scope boundary, not a global miss.
+    for (scope, session) in [(scope_b, &victim_b), (scope_a2, &victim_a2)] {
+        let material = db
+            .store()
+            .scoped(scope)
+            .acting(db.test_actor(&env), CorrelationId::generate(&env))
+            .upstream_tokens()
+            .read_for_session(&env, session)
+            .await
+            .expect("read in own scope")
+            .expect("the token survives every cross-scope probe");
+        assert_eq!(
+            material.access_token.open(),
+            b"upstream-at",
+            "the token round-trips in its own scope"
+        );
+    }
+}
+
+/// Plant a captured upstream token keyed on a fresh session in `scope`, returning the
+/// session id (the vault's read key).
+async fn plant_upstream_token(db: &TestDatabase, env: &Env, scope: Scope) -> SessionId {
+    let session = plant_session(db, env, scope).await;
+    db.store()
+        .scoped(scope)
+        .acting(db.test_actor(env), CorrelationId::generate(env))
+        .upstream_tokens()
+        .capture(
+            env,
+            &UpstreamTokenId::generate(env, &scope),
+            1_000_000,
+            NewUpstreamTokens {
+                session_id: &session,
+                connector_id: "cnr_probe",
+                access_token: b"upstream-at",
+                refresh_token: Some(b"upstream-rt"),
+                access_expires_at_unix_micros: Some(FAR_FUTURE_MICROS),
+                token_scope: "openid",
+            },
+        )
+        .await
+        .expect("capture upstream token");
+    session
 }

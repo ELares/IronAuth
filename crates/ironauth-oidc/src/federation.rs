@@ -48,8 +48,8 @@ use ironauth_env::Clock;
 use ironauth_fetch::{FetchError, FetchPurpose, FetchRequest, Fetcher};
 use ironauth_jose::{JwsAlgorithm, TrustedKey, VerificationPolicy, verify};
 use ironauth_store::{
-    ConnectorId, FederationLoginStateId, NewAdminUser, NewFederationLoginState, OrgConnectionId,
-    Scope, StoreError, TraitSchema, UserId, UserState,
+    ConnectorId, FederationLoginStateId, NewAdminUser, NewFederationLoginState, NewUpstreamTokens,
+    OrgConnectionId, Scope, SessionId, StoreError, TraitSchema, UpstreamTokenId, UserId, UserState,
 };
 use sha2::{Digest, Sha256};
 
@@ -203,8 +203,76 @@ pub async fn fetch_discovery(
     parse_discovery(response.body(), issuer)
 }
 
+/// The upstream tokens captured from a token-endpoint response (issue #77, PR 3),
+/// alongside the metadata the vault records. A REDACTING struct: its `Debug` never
+/// renders the access or refresh token bytes, so a captured response can never be logged
+/// into an existence/value oracle. The token bytes flow ONLY into the sealing store; the
+/// metadata (`expires_in_secs`, `scope`) is non-secret.
+#[derive(Default, Clone)]
+pub struct CapturedUpstreamTokens {
+    /// The upstream access token bytes, when the response carried one.
+    pub access_token: Option<Vec<u8>>,
+    /// The upstream refresh token bytes, when the response carried one.
+    pub refresh_token: Option<Vec<u8>>,
+    /// The access token lifetime in seconds (`expires_in`), when advertised.
+    pub expires_in_secs: Option<i64>,
+    /// The granted upstream OAuth scope, when advertised (non-secret metadata).
+    pub scope: Option<String>,
+}
+
+impl std::fmt::Debug for CapturedUpstreamTokens {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CapturedUpstreamTokens")
+            .field(
+                "access_token",
+                &self.access_token.as_ref().map(|_| "[redacted]"),
+            )
+            .field(
+                "refresh_token",
+                &self.refresh_token.as_ref().map(|_| "[redacted]"),
+            )
+            .field("expires_in_secs", &self.expires_in_secs)
+            .field("scope", &self.scope)
+            .finish()
+    }
+}
+
+/// Read the capturable upstream tokens (access, refresh) and their metadata from a
+/// token-endpoint response body (issue #77, PR 3). Absent fields are simply [`None`];
+/// this is best-effort metadata, never a hard failure (the login already succeeded).
+pub(crate) fn captured_from_token_response(body: &serde_json::Value) -> CapturedUpstreamTokens {
+    CapturedUpstreamTokens {
+        access_token: body
+            .get("access_token")
+            .and_then(|v| v.as_str())
+            .map(|s| s.as_bytes().to_vec()),
+        refresh_token: body
+            .get("refresh_token")
+            .and_then(|v| v.as_str())
+            .map(|s| s.as_bytes().to_vec()),
+        expires_in_secs: body.get("expires_in").and_then(serde_json::Value::as_i64),
+        scope: body
+            .get("scope")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned),
+    }
+}
+
+/// The result of an OIDC token exchange (issue #77, PR 3): the raw upstream ID token
+/// (still to be VALIDATED) plus the capturable upstream tokens. The captured tokens are
+/// used ONLY when the org connection and connector permit capture; otherwise they are
+/// dropped unread.
+#[derive(Debug)]
+pub struct TokenExchangeResponse {
+    /// The raw upstream ID token string, validated by [`validate_upstream_id_token`].
+    pub id_token: String,
+    /// The capturable upstream tokens (issue #77, PR 3), never logged.
+    pub captured: CapturedUpstreamTokens,
+}
+
 /// Exchange an authorization `code` at the upstream token endpoint, returning the raw
-/// upstream ID token string (still to be VALIDATED by [`validate_upstream_id_token`]).
+/// upstream ID token string (still to be VALIDATED by [`validate_upstream_id_token`])
+/// AND the capturable upstream tokens (issue #77, PR 3).
 ///
 /// The connector's client secret authenticates the request (form-encoded client
 /// credentials) alongside the PKCE `code_verifier` when one was used. The request rides
@@ -221,7 +289,7 @@ pub async fn exchange_code(
     fetcher: &Fetcher,
     request: TokenExchange<'_>,
     allow_http: bool,
-) -> Result<String, ConnectorError> {
+) -> Result<TokenExchangeResponse, ConnectorError> {
     let mut form = format!(
         "grant_type=authorization_code&code={}&redirect_uri={}&client_id={}&client_secret={}",
         percent_encode_query(request.code),
@@ -256,12 +324,17 @@ pub async fn exchange_code(
     let body: serde_json::Value = serde_json::from_slice(response.body()).map_err(|_| {
         ConnectorError::UpstreamProtocol("the token response is not JSON".to_owned())
     })?;
-    body.get("id_token")
+    let id_token = body
+        .get("id_token")
         .and_then(|v| v.as_str())
         .map(str::to_owned)
         .ok_or_else(|| {
             ConnectorError::UpstreamProtocol("the token response carried no id_token".to_owned())
-        })
+        })?;
+    Ok(TokenExchangeResponse {
+        id_token,
+        captured: captured_from_token_response(&body),
+    })
 }
 
 /// The inputs for a token exchange, bundled to keep the argument count readable.
@@ -969,7 +1042,7 @@ pub async fn federation_callback(
     // Exchange the code at the upstream token endpoint. Any failure fails the login WITHOUT
     // provisioning a user. A dead or misbehaving token endpoint mid-run is recorded against
     // THIS connector's health (a token-endpoint outage the discovery cache would otherwise hide).
-    let id_token = match exchange_code(
+    let exchanged = match exchange_code(
         &runtime.fetcher,
         TokenExchange {
             token_url: &resolved.token_url,
@@ -983,7 +1056,7 @@ pub async fn federation_callback(
     )
     .await
     {
-        Ok(id_token) => id_token,
+        Ok(exchanged) => exchanged,
         Err(error) => {
             runtime
                 .health()
@@ -991,6 +1064,10 @@ pub async fn federation_callback(
             return interaction::server_error_page();
         }
     };
+    let TokenExchangeResponse {
+        id_token,
+        captured: captured_tokens,
+    } = exchanged;
 
     // Resolve the upstream signing keys through the SSRF-hardened fetcher (a private-range
     // jwks_uri is Blocked here, so validation then fails closed as UpstreamUnavailable), and
@@ -1064,6 +1141,7 @@ pub async fn federation_callback(
         definition: &definition,
         identity: &identity,
         org_connection_id: consumed.org_connection_id.as_deref(),
+        captured_tokens,
         headers: &headers,
         return_to: &consumed.return_to,
         now,
@@ -1099,6 +1177,11 @@ pub(crate) struct FinalizeLogin<'a> {
     /// (issue #77), re-derived from the CONSUMED correlation row (never the browser), or
     /// [`None`] for a direct federated login. Stamped on the provisioned user.
     pub org_connection_id: Option<&'a str>,
+    /// The capturable upstream tokens from the token exchange (issue #77, PR 3). Sealed
+    /// and persisted keyed on the just-established session ONLY when the org connection's
+    /// `capture_upstream_tokens` flag AND the connector's refresh capability both permit
+    /// it; otherwise dropped unread (a plain social login persists nothing).
+    pub captured_tokens: CapturedUpstreamTokens,
     /// The inbound request headers (for the session cookie binding).
     pub headers: &'a HeaderMap,
     /// The pending LOCAL authorization request to resume after the federated login.
@@ -1133,6 +1216,7 @@ pub(crate) async fn finalize_federated_login(finalize: FinalizeLogin<'_>) -> Res
         definition,
         identity,
         org_connection_id,
+        captured_tokens,
         headers,
         return_to,
         now,
@@ -1275,6 +1359,25 @@ pub(crate) async fn finalize_federated_login(finalize: FinalizeLogin<'_>) -> Res
     runtime
         .health()
         .record_success(now, connector_key, fingerprint);
+
+    // Upstream token vault (issue #77, PR 3): AFTER the session is established, seal and
+    // persist the captured upstream tokens keyed on THAT session, but ONLY when the org
+    // connection's capture flag AND the connector's refresh capability both permit it. A
+    // direct (non-routed) login, an org that opted out, or a connector with no refresh
+    // support persists NOTHING (the safe default). A capture failure NEVER fails the login
+    // (the user is already authenticated); it is a best-effort side effect.
+    capture_upstream_tokens(
+        state,
+        scope,
+        org_connection_id,
+        connector_key,
+        definition,
+        &captured_tokens,
+        cookies.session_id(),
+        &user_id,
+        now_micros,
+    )
+    .await;
 
     // Broker overlay (issue #77 PR 2): layer the org connection's MFA / passkey / max-age
     // policy ON TOP of the (possibly permissive) upstream, reading it from the org
@@ -1489,6 +1592,84 @@ async fn stamp_org_binding(
         .users()
         .set_org_connection(state.env(), user_id, &ocn_id)
         .await
+}
+
+/// Seal and persist the captured upstream tokens keyed on the just-established session
+/// (issue #77, PR 3), GATED so a plain social login persists nothing.
+///
+/// The capture happens ONLY when ALL of these hold: the login was routed to an org
+/// connection (a direct federated login carries none), the connector's capability matrix
+/// advertises `refresh` (a capture with no renewal path is not worth persisting), the org
+/// connection's `capture_upstream_tokens` flag is set (the operator opted in), and the
+/// exchange actually returned an access token. Otherwise NOTHING is persisted, which is
+/// the safe default. The access-token expiry is derived from the clock seam (`now_micros`
+/// plus the advertised `expires_in`), never the wall clock. A capture failure is
+/// swallowed: the user is already authenticated, so a vault write must never fail a login.
+#[allow(clippy::too_many_arguments)]
+async fn capture_upstream_tokens(
+    state: &OidcState,
+    scope: Scope,
+    org_connection_id: Option<&str>,
+    connector_id: &str,
+    definition: &ConnectorRuntimeConfig,
+    captured: &CapturedUpstreamTokens,
+    session_id: &SessionId,
+    user_id: &UserId,
+    now_micros: i64,
+) {
+    // A direct (non-routed) federated login carries no org connection, so it never captures.
+    let Some(raw_ocn) = org_connection_id else {
+        return;
+    };
+    // The connector must support refresh: a captured access token with no renewal path
+    // cannot be silently refreshed later, so capturing it is not worth the secret at rest.
+    if !definition.capabilities.refresh {
+        return;
+    }
+    // There must be an access token to seal.
+    let Some(access_token) = captured.access_token.as_deref() else {
+        return;
+    };
+    // Load the org connection (re-derived from the CONSUMED correlation row upstream, never
+    // the browser) and honor its capture opt-in.
+    let scoped = state.store().scoped(scope);
+    let Ok(ocn_id) = scoped.org_connections().parse_id(raw_ocn) else {
+        return;
+    };
+    let Ok(binding) = scoped.org_connections().get(&ocn_id).await else {
+        return;
+    };
+    if !binding.capture_upstream_tokens {
+        return;
+    }
+    // The access-token expiry from the clock seam (never SystemTime): the callback instant
+    // plus the advertised lifetime.
+    let access_expires_at = captured
+        .expires_in_secs
+        .map(|secs| now_micros.saturating_add(secs.saturating_mul(1_000_000)));
+    let utk_id = UpstreamTokenId::generate(state.env(), &scope);
+    let actor = interaction::user_actor(user_id);
+    let correlation = ironauth_store::CorrelationId::generate(state.env());
+    // A capture failure never fails the already-successful login.
+    let _ = state
+        .store()
+        .scoped(scope)
+        .acting(actor, correlation)
+        .upstream_tokens()
+        .capture(
+            state.env(),
+            &utk_id,
+            now_micros,
+            NewUpstreamTokens {
+                session_id,
+                connector_id,
+                access_token,
+                refresh_token: captured.refresh_token.as_deref(),
+                access_expires_at_unix_micros: access_expires_at,
+                token_scope: captured.scope.as_deref().unwrap_or(""),
+            },
+        )
+        .await;
 }
 
 /// The maximum length, in bytes after percent-decoding, of a passthrough value forwarded

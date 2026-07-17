@@ -82,7 +82,7 @@ pub const CONNECTOR_CLIENT_SECRET_REFERENCE: &str = "connector_client_secret";
 /// (and by the export), and an environment-identity or runtime type can never be
 /// added without failing it. This is the live binding between the snapshot and the
 /// single source of truth, not a hand-maintained parallel list.
-pub const SNAPSHOT_RESOURCE_TYPES: [ResourceType; 7] = [
+pub const SNAPSHOT_RESOURCE_TYPES: [ResourceType; 8] = [
     ResourceType::Client,
     ResourceType::ResourceServer,
     ResourceType::DcrPolicy,
@@ -90,6 +90,7 @@ pub const SNAPSHOT_RESOURCE_TYPES: [ResourceType; 7] = [
     ResourceType::Connector,
     ResourceType::OrgConnection,
     ResourceType::RoutingRule,
+    ResourceType::UpstreamTokenGrant,
 ];
 
 /// A named reference to a secret in the environment-scoped secret store (issue
@@ -289,6 +290,22 @@ pub struct RoutingRuleSnapshot {
     pub enabled: bool,
 }
 
+/// The secret-free projection of one upstream-token retrieval grant (issue #77, PR 3):
+/// the authorization config naming WHICH client may retrieve a session's captured
+/// upstream tokens. It holds NO secret (the tokens themselves are Runtime and never
+/// exported); only the client and org-connection references and the enabled flag travel.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpstreamTokenGrantSnapshot {
+    /// The client authorized to retrieve upstream tokens. Part of the stable natural
+    /// key the export orders by.
+    pub client_id: String,
+    /// The org connection whose sessions' tokens the client may retrieve. Part of the
+    /// stable natural key the export orders by.
+    pub org_connection_id: String,
+    /// Whether the grant is active.
+    pub enabled: bool,
+}
+
 /// The promotable resources a snapshot carries, keyed by resource-type wire name
 /// (issue #41 classification). Each array is ordered by its type's stable natural
 /// key, so the collection order is deterministic and documented.
@@ -320,6 +337,11 @@ pub struct SnapshotResources {
     /// selector, never a plaintext identifier (issue #77).
     #[serde(default)]
     pub routing_rule: Vec<RoutingRuleSnapshot>,
+    /// The environment's upstream-token retrieval grants (`upstream_token_grant`). Each
+    /// is secret-free authorization config; the captured tokens themselves are Runtime
+    /// and never exported (issue #77, PR 3).
+    #[serde(default)]
+    pub upstream_token_grant: Vec<UpstreamTokenGrantSnapshot>,
 }
 
 /// A canonical, deterministic, secret-free snapshot of one environment's
@@ -612,6 +634,26 @@ pub async fn export(scoped: &ScopedStore<'_>) -> Result<Snapshot, StoreError> {
         .collect();
     routing_rule.sort_by(|a, b| routing_rule_order_key(a).cmp(&routing_rule_order_key(b)));
 
+    // Upstream-token retrieval grants (issue #77, PR 3): secret-free per-environment
+    // authorization config. The captured tokens themselves are Runtime and never read
+    // here, so the export stays free of token material by construction. Ordered by the
+    // stable (client_id, org_connection_id) natural key.
+    let mut upstream_token_grant: Vec<UpstreamTokenGrantSnapshot> = scoped
+        .upstream_token_grants()
+        .list_all()
+        .await?
+        .into_iter()
+        .map(|record| UpstreamTokenGrantSnapshot {
+            client_id: record.client_id,
+            org_connection_id: record.org_connection_id,
+            enabled: record.enabled,
+        })
+        .collect();
+    upstream_token_grant.sort_by(|a, b| {
+        (a.client_id.as_str(), a.org_connection_id.as_str())
+            .cmp(&(b.client_id.as_str(), b.org_connection_id.as_str()))
+    });
+
     Ok(Snapshot {
         schema_version: SNAPSHOT_SCHEMA_VERSION.to_string(),
         resources: SnapshotResources {
@@ -622,6 +664,7 @@ pub async fn export(scoped: &ScopedStore<'_>) -> Result<Snapshot, StoreError> {
             connector,
             org_connection,
             routing_rule,
+            upstream_token_grant,
         },
     })
 }
@@ -796,6 +839,10 @@ const ROUTING_RULE_KEYS: [&str; 7] = [
 
 /// The recognized `rule_kind` values a snapshot routing rule may carry (issue #77).
 const ROUTING_RULE_KINDS: [&str; 3] = ["domain", "app", "user"];
+
+/// Every key a snapshot `upstream_token_grant` element may carry (issue #77, PR 3). It
+/// is secret-free: only the client and org-connection references and the enabled flag.
+const UPSTREAM_TOKEN_GRANT_KEYS: [&str; 3] = ["client_id", "org_connection_id", "enabled"];
 
 /// Object keys that would carry RAW secret material and must never appear in a
 /// snapshot: the presence of any is a hard rejection (issue #43, "an import
@@ -1051,6 +1098,11 @@ fn validate_resource(
         ResourceType::RoutingRule => {
             reject_unknown_keys(object, &ROUTING_RULE_KEYS, None, path, violations);
             require_enum(object, "rule_kind", &ROUTING_RULE_KINDS, path, violations);
+            require_nonempty_string(object, "org_connection_id", path, violations);
+        }
+        ResourceType::UpstreamTokenGrant => {
+            reject_unknown_keys(object, &UPSTREAM_TOKEN_GRANT_KEYS, None, path, violations);
+            require_nonempty_string(object, "client_id", path, violations);
             require_nonempty_string(object, "org_connection_id", path, violations);
         }
         // Only the promotable set is ever passed here (the caller iterates
@@ -1338,8 +1390,8 @@ mod tests {
         assert_eq!(
             text,
             "{\"resources\":{\"client\":[],\"connector\":[],\"dcr_policy\":[],\"org_connection\":[],\
-             \"resource_server\":[],\"routing_rule\":[],\"variable\":[]},\
-             \"schema_version\":\"ironauth.config-snapshot/v1\"}"
+             \"resource_server\":[],\"routing_rule\":[],\"upstream_token_grant\":[],\
+             \"variable\":[]},\"schema_version\":\"ironauth.config-snapshot/v1\"}"
         );
     }
 

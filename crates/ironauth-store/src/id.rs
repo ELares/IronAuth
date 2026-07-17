@@ -535,6 +535,29 @@ impl ScopedKind for RoutingRuleKind {
     const PREFIX: &'static str = "rrl";
 }
 
+/// Marker for an upstream token vault row (`utk_`), one per (session, connector)
+/// binding that holds the SEALED upstream access and refresh tokens captured after a
+/// brokered login (issue #77, PR 3). A tenant-scoped resource: the id embeds its
+/// (tenant, environment), so a row minted in one scope parses as a uniform not-found
+/// under another, and the seal AAD for its two token ciphertexts binds to the session
+/// and the token kind (so an access ciphertext can never be opened as a refresh nor
+/// lifted to another session's row). The vault is Runtime (never exported).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct UpstreamTokenKind;
+impl ScopedKind for UpstreamTokenKind {
+    const PREFIX: &'static str = "utk";
+}
+
+/// Marker for an upstream-token retrieval grant (`utg_`), the authorization config for
+/// WHICH client may retrieve a session's captured upstream tokens (issue #77, PR 3).
+/// One per (client, org connection) per environment. A tenant-scoped resource holding
+/// no secret; Promotable config a snapshot carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct UpstreamTokenGrantKind;
+impl ScopedKind for UpstreamTokenGrantKind {
+    const PREFIX: &'static str = "utg";
+}
+
 /// Marker for a signing key (`sik_`), an environment's per-issuer signing key
 /// (issue #19). A tenant-scoped resource: the identifier embeds its
 /// `(tenant, environment)`, so a key row can never be read across a tenant or
@@ -1174,6 +1197,12 @@ pub type OrgConnectionId = ScopedId<OrgConnectionKind>;
 /// A routing-rule identifier (`rrl_...`), one per domain / app / user routing rule per
 /// environment (issue #77).
 pub type RoutingRuleId = ScopedId<RoutingRuleKind>;
+/// An upstream token vault identifier (`utk_...`), one per (session, connector) row of
+/// sealed captured upstream tokens (issue #77, PR 3).
+pub type UpstreamTokenId = ScopedId<UpstreamTokenKind>;
+/// An upstream-token retrieval grant identifier (`utg_...`), one per (client, org
+/// connection) retrieval authorization (issue #77, PR 3).
+pub type UpstreamTokenGrantId = ScopedId<UpstreamTokenGrantKind>;
 /// A signing-key identifier (`sik_...`), which doubles as the JOSE `kid` of a
 /// per-environment signing key (issue #19).
 pub type SigningKeyId = ScopedId<SigningKeyKind>;
