@@ -161,13 +161,22 @@ pub enum ResourceType {
     /// right organization. Promotable per-environment configuration (its user selector
     /// is an opaque blind index, never a plaintext identifier).
     RoutingRule,
+    /// A captured upstream token vault row (issue #77): the session-scoped, envelope
+    /// sealed upstream access and refresh tokens persisted after a brokered login.
+    /// Runtime data (bound to a specific session's lifetime) that STRUCTURALLY never
+    /// enters a config snapshot; its token values live only as sealed ciphertext.
+    UpstreamToken,
+    /// An upstream-token retrieval grant (issue #77): the authorization config naming
+    /// WHICH client may retrieve a session's captured upstream tokens. Promotable
+    /// per-environment configuration with NO secret column.
+    UpstreamTokenGrant,
 }
 
 impl ResourceType {
     /// Every resource type, in a stable order. The classification lint and the
     /// metadata endpoint both iterate this; a variant missing here is caught by
     /// the `all_lists_every_variant` test and by `scripts/classification-lint.sh`.
-    pub const ALL: [ResourceType; 21] = [
+    pub const ALL: [ResourceType; 23] = [
         ResourceType::Operator,
         ResourceType::Tenant,
         ResourceType::Environment,
@@ -189,6 +198,8 @@ impl ResourceType {
         ResourceType::Connector,
         ResourceType::OrgConnection,
         ResourceType::RoutingRule,
+        ResourceType::UpstreamToken,
+        ResourceType::UpstreamTokenGrant,
     ];
 
     /// The stable wire name of this resource type (for example `organization`).
@@ -216,6 +227,8 @@ impl ResourceType {
             ResourceType::Connector => "connector",
             ResourceType::OrgConnection => "org_connection",
             ResourceType::RoutingRule => "routing_rule",
+            ResourceType::UpstreamToken => "upstream_token",
+            ResourceType::UpstreamTokenGrant => "upstream_token_grant",
         }
     }
 
@@ -244,7 +257,9 @@ impl ResourceType {
             | ResourceType::RecoveryFlow
             | ResourceType::Connector
             | ResourceType::OrgConnection
-            | ResourceType::RoutingRule => ResourceLevel::Environment,
+            | ResourceType::RoutingRule
+            | ResourceType::UpstreamToken
+            | ResourceType::UpstreamTokenGrant => ResourceLevel::Environment,
         }
     }
 
@@ -281,13 +296,18 @@ pub fn classify(resource: ResourceType) -> ResourceClassification {
         // replays: a binding holds no secret (only a reference to the connector, whose
         // own upstream secret never travels), and a routing rule's user selector is an
         // opaque blind index, so both are Promotable and snapshot-exported.
+        // An upstream-token retrieval grant (issue #77) is per-environment
+        // authorization config a snapshot carries and a promotion replays: it names
+        // which client may retrieve a session's captured upstream tokens and holds no
+        // secret, so it is Promotable and snapshot-exported.
         ResourceType::Client
         | ResourceType::ResourceServer
         | ResourceType::DcrPolicy
         | ResourceType::Variable
         | ResourceType::Connector
         | ResourceType::OrgConnection
-        | ResourceType::RoutingRule => Promotable,
+        | ResourceType::RoutingRule
+        | ResourceType::UpstreamTokenGrant => Promotable,
 
         // Environment-intrinsic identity, excluded from every snapshot so a
         // promotion never copies one environment's identity onto another: the
@@ -319,7 +339,12 @@ pub fn classify(resource: ResourceType) -> ResourceClassification {
         | ResourceType::TrustedDevice
         // A recovery flow (issue #81) is dynamic per-environment data, bound to a
         // specific environment's users: it never travels in a config snapshot.
-        | ResourceType::RecoveryFlow => Runtime,
+        | ResourceType::RecoveryFlow
+        // A captured upstream token vault row (issue #77) is dynamic per-environment
+        // data bound to a specific session's lifetime, and its token values are
+        // high-value secrets sealed at rest: it STRUCTURALLY never enters a config
+        // snapshot (only Promotable types are exported), so it is Runtime.
+        | ResourceType::UpstreamToken => Runtime,
     }
 }
 

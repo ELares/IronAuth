@@ -82,8 +82,9 @@ use crate::id::{
     RecoveryFlowId, RefreshFamilyId, RefreshTokenId, ResourceServerId, RiskDecisionId,
     RiskDisavowalId, RiskLoginGeoId, RoutingRuleId, ScopeStepUpPolicyId, ServiceAccountId,
     SessionEventId, SessionId, SigningKeyId, SmsOtpCodeId, SmsRouteStatId, TenantId,
-    TotpCredentialId, TraitMigrationJobId, TraitSchemaId, TrustedDeviceId, UserId,
-    UserIdentifierId, VariableId, WebauthnChallengeId, WebauthnCredentialId,
+    TotpCredentialId, TraitMigrationJobId, TraitSchemaId, TrustedDeviceId, UpstreamTokenGrantId,
+    UpstreamTokenId, UserId, UserIdentifierId, VariableId, WebauthnChallengeId,
+    WebauthnCredentialId,
 };
 use crate::identifier::{
     CanonicalIdentifier, IdentifierType, UniquenessMode, canonicalize_identifier,
@@ -464,6 +465,19 @@ impl<'a> ScopedStore<'a> {
     #[must_use]
     pub fn routing_rules(&self) -> RoutingRuleRepo<'a> {
         RoutingRuleRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
+    /// The read-only upstream-token retrieval-grant repository for this scope (issue
+    /// #77, PR 3): decide whether a client is authorized to retrieve a session's
+    /// captured upstream tokens for a given org connection, and list the scope's grants
+    /// for the config-snapshot export. The mutating create lives on
+    /// [`ActingStore::upstream_token_grants`].
+    #[must_use]
+    pub fn upstream_token_grants(&self) -> UpstreamTokenGrantRepo<'a> {
+        UpstreamTokenGrantRepo {
             store: self.store,
             scope: self.scope,
         }
@@ -1121,6 +1135,31 @@ impl<'a> ActingStore<'a> {
     #[must_use]
     pub fn routing_rules(&self) -> ActingRoutingRuleRepo<'a> {
         ActingRoutingRuleRepo {
+            store: self.store,
+            scope: self.scope,
+            acting: self.acting,
+        }
+    }
+
+    /// The mutating upstream-token vault repository for this scope and actor (issue
+    /// #77, PR 3): CAPTURE the sealed upstream tokens after a brokered login (audited),
+    /// and READ them back for an authorized retrieval (also audited: every read of a
+    /// session's captured tokens leaves an audit trail, never the token value).
+    #[must_use]
+    pub fn upstream_tokens(&self) -> ActingUpstreamTokenRepo<'a> {
+        ActingUpstreamTokenRepo {
+            store: self.store,
+            scope: self.scope,
+            acting: self.acting,
+        }
+    }
+
+    /// The mutating upstream-token retrieval-grant repository for this scope and actor
+    /// (issue #77, PR 3): create the authorization naming which client may retrieve a
+    /// session's captured upstream tokens (audited).
+    #[must_use]
+    pub fn upstream_token_grants(&self) -> ActingUpstreamTokenGrantRepo<'a> {
+        ActingUpstreamTokenGrantRepo {
             store: self.store,
             scope: self.scope,
             acting: self.acting,
@@ -19986,6 +20025,521 @@ impl ActingRoutingRuleRepo<'_> {
 }
 
 // ===========================================================================
+// Upstream token vault (issue #77, PR 3)
+// ===========================================================================
+
+/// The domain-separation label of the upstream token seal AAD (issue #77, PR 3).
+/// Distinct from every other seal label so an upstream token ciphertext can never be
+/// opened under any other sealed-payload context.
+const UPSTREAM_TOKEN_SEAL_LABEL: &str = "ironauth.envelope.upstream-token.v1";
+
+/// The associated data binding a sealed upstream token (issue #77, PR 3) to its scope,
+/// the SESSION it was captured for, the token KIND (`access` or `refresh`), and the DEK
+/// version that sealed it. Binding the session and the kind means a sealed access token
+/// can NEVER be opened as a refresh token (different `kind`), nor lifted to another
+/// session's row (different `session_id`), nor across a scope or key rotation.
+fn upstream_token_seal_aad(scope: Scope, session_id: &str, kind: &str, dek_version: i32) -> Aad {
+    Aad::builder()
+        .text(UPSTREAM_TOKEN_SEAL_LABEL)
+        .text(&scope.tenant().to_string())
+        .text(&scope.environment().to_string())
+        .text("upstream_token")
+        .text(session_id)
+        .text(kind)
+        .version(i64::from(dek_version))
+        .build()
+}
+
+/// A captured upstream token value, unsealed for return to an authorized retrieval
+/// (issue #77, PR 3). A REDACTING newtype: its `Debug` and `Display` render
+/// `[redacted]`, never the bytes, so the token value can never land in a log, an error,
+/// or an audit field. The ONLY way to read the value is [`UpstreamToken::open`], whose
+/// single caller is the retrieval endpoint writing the HTTP response body.
+pub struct UpstreamToken(Vec<u8>);
+
+impl UpstreamToken {
+    /// Wrap plaintext token bytes.
+    #[must_use]
+    pub fn from_bytes(bytes: Vec<u8>) -> Self {
+        Self(bytes)
+    }
+
+    /// Consume the newtype and yield the plaintext bytes. The ONE sanctioned exit for
+    /// the value: the retrieval endpoint calls it to write the HTTP response body, never
+    /// to log or audit.
+    #[must_use]
+    pub fn open(self) -> Vec<u8> {
+        self.0
+    }
+}
+
+impl std::fmt::Debug for UpstreamToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("UpstreamToken([redacted])")
+    }
+}
+
+impl std::fmt::Display for UpstreamToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("[redacted]")
+    }
+}
+
+/// The unsealed material of a captured upstream token row (issue #77, PR 3), returned to
+/// an authorized retrieval. The two token values are [`UpstreamToken`] newtypes that
+/// redact themselves in `Debug`, so this struct's derived `Debug` never renders a token.
+#[derive(Debug)]
+pub struct UpstreamTokenMaterial {
+    /// The `cnr_` connector the tokens are for.
+    pub connector_id: String,
+    /// The unsealed upstream access token (redacting newtype).
+    pub access_token: UpstreamToken,
+    /// The unsealed upstream refresh token, when one was captured (redacting newtype).
+    pub refresh_token: Option<UpstreamToken>,
+    /// When the access token expires (non-secret metadata), in epoch microseconds.
+    pub access_expires_at_unix_micros: Option<i64>,
+    /// The granted upstream OAuth scope (non-secret metadata).
+    pub token_scope: String,
+}
+
+/// The inputs to CAPTURE a set of upstream tokens (issue #77, PR 3). The token bytes are
+/// borrowed (never owned by a long-lived struct) and are sealed immediately.
+pub struct NewUpstreamTokens<'a> {
+    /// The session the tokens were captured for (the IDOR scoping key).
+    pub session_id: &'a SessionId,
+    /// The `cnr_` connector describing the upstream.
+    pub connector_id: &'a str,
+    /// The upstream access token plaintext (sealed before it lands).
+    pub access_token: &'a [u8],
+    /// The upstream refresh token plaintext, if the upstream issued one.
+    pub refresh_token: Option<&'a [u8]>,
+    /// When the access token expires (non-secret metadata), in epoch microseconds.
+    pub access_expires_at_unix_micros: Option<i64>,
+    /// The granted upstream OAuth scope (non-secret metadata).
+    pub token_scope: &'a str,
+}
+
+/// A retrieval-grant record (issue #77, PR 3): the authorization naming which client may
+/// retrieve a session's captured upstream tokens for an org connection. Holds no secret.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpstreamTokenGrantRecord {
+    /// The `utg_` grant id.
+    pub id: UpstreamTokenGrantId,
+    /// The `cli_` client authorized to retrieve.
+    pub client_id: String,
+    /// The `ocn_` org connection whose sessions' tokens the client may retrieve.
+    pub org_connection_id: String,
+    /// Whether the grant is active.
+    pub enabled: bool,
+    /// The creation instant in epoch microseconds.
+    pub created_at_unix_micros: i64,
+    /// The last-update instant in epoch microseconds.
+    pub updated_at_unix_micros: i64,
+}
+
+/// The columns a retrieval-grant read projects (issue #77, PR 3). No secret column.
+const UPSTREAM_TOKEN_GRANT_READ_COLUMNS: &str = "id, client_id, org_connection_id, enabled, \
+     (EXTRACT(EPOCH FROM created_at) * 1000000)::bigint AS created_us, \
+     (EXTRACT(EPOCH FROM updated_at) * 1000000)::bigint AS updated_us";
+
+/// Reconstruct an [`UpstreamTokenGrantRecord`] from a read row.
+fn upstream_token_grant_record_from_row(
+    row: &sqlx::postgres::PgRow,
+    scope: Scope,
+) -> Result<UpstreamTokenGrantRecord, StoreError> {
+    let id_text: String = row.get("id");
+    let id =
+        UpstreamTokenGrantId::parse_in_scope(&id_text, &scope).map_err(|_| StoreError::NotFound)?;
+    Ok(UpstreamTokenGrantRecord {
+        id,
+        client_id: row.get("client_id"),
+        org_connection_id: row.get("org_connection_id"),
+        enabled: row.get("enabled"),
+        created_at_unix_micros: row.get("created_us"),
+        updated_at_unix_micros: row.get("updated_us"),
+    })
+}
+
+/// The mutating upstream-token vault repository (issue #77, PR 3): CAPTURE the sealed
+/// upstream tokens after a brokered login and READ them back for an authorized
+/// retrieval, both audited in one scoped, row-level-security-forced transaction.
+pub struct ActingUpstreamTokenRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+    acting: ActingContext,
+}
+
+impl ActingUpstreamTokenRepo<'_> {
+    /// Ensure the scope has a live KEK and DEK to seal the tokens under, provisioning
+    /// each lazily on first use (idempotent). Mirrors the abuse/invitation seal paths.
+    async fn ensure_scope_keys(&self, env: &Env, master: &MasterKey) -> Result<(), StoreError> {
+        let envelope = ActingEnvelopeRepo {
+            store: self.store,
+            scope: self.scope,
+            acting: self.acting,
+        };
+        match envelope.provision_kek(env, master).await {
+            Ok(_) | Err(StoreError::Conflict) => {}
+            Err(error) => return Err(error),
+        }
+        match envelope.provision_dek(env, master).await {
+            Ok(_) | Err(StoreError::Conflict) => {}
+            Err(error) => return Err(error),
+        }
+        Ok(())
+    }
+
+    /// CAPTURE the upstream tokens for a session (issue #77, PR 3): seal the access and
+    /// refresh tokens under the scope DEK with the session-and-kind-bound AAD, and write
+    /// the row with one `upstream_token.capture` audit row (its operator-safe `detail`
+    /// records the session and connector, NEVER a token value) in the same transaction.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the id or session is out of scope;
+    /// [`StoreError::Encryption`] if no master key is configured;
+    /// [`StoreError::Conflict`] if a row for the same (session, connector) already
+    /// exists; [`StoreError::Database`] on a persistence failure.
+    pub async fn capture(
+        &self,
+        env: &Env,
+        id: &UpstreamTokenId,
+        created_at_micros: i64,
+        params: NewUpstreamTokens<'_>,
+    ) -> Result<(), StoreError> {
+        if id.scope() != self.scope || params.session_id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let master = self.store.master().ok_or(StoreError::Encryption)?;
+        self.ensure_scope_keys(env, master).await?;
+        let scope = self.scope;
+        let id = *id;
+        let session_str = params.session_id.to_string();
+        let connector_id = params.connector_id.to_owned();
+        let access_plain = params.access_token.to_vec();
+        let refresh_plain = params.refresh_token.map(<[u8]>::to_vec);
+        let access_expires = params.access_expires_at_unix_micros;
+        let token_scope = params.token_scope.to_owned();
+        let detail = format!("session={session_str} connector={connector_id}");
+        write_audited_detailed(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::UpstreamTokenCapture,
+                target: &id,
+            },
+            async move |tx| {
+                let (dek_version, dek) = fetch_active_dek(tx, scope, master).await?;
+                let access_sealed = dek.seal(
+                    env.entropy(),
+                    &upstream_token_seal_aad(scope, &session_str, "access", dek_version),
+                    &access_plain,
+                );
+                let refresh_sealed = refresh_plain.as_ref().map(|refresh| {
+                    dek.seal(
+                        env.entropy(),
+                        &upstream_token_seal_aad(scope, &session_str, "refresh", dek_version),
+                        refresh,
+                    )
+                });
+                let result = sqlx::query(
+                    "INSERT INTO upstream_tokens \
+                     (id, tenant_id, environment_id, session_id, connector_id, \
+                      access_token_sealed, refresh_token_sealed, pii_dek_version, \
+                      access_expires_at, token_scope, created_at) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, \
+                             CASE WHEN $9::bigint IS NULL THEN NULL \
+                                  ELSE TIMESTAMPTZ 'epoch' + ($9::text || ' microseconds')::interval END, \
+                             $10, \
+                             TIMESTAMPTZ 'epoch' + ($11::text || ' microseconds')::interval)",
+                )
+                .bind(id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(&session_str)
+                .bind(&connector_id)
+                .bind(access_sealed.into_bytes())
+                .bind(refresh_sealed.map(Sealed::into_bytes))
+                .bind(dek_version)
+                .bind(access_expires)
+                .bind(&token_scope)
+                .bind(created_at_micros)
+                .execute(&mut **tx)
+                .await;
+                match result {
+                    Ok(_) => {}
+                    Err(error) if is_unique_violation(&error) => return Err(StoreError::Conflict),
+                    Err(error) => return Err(error.into()),
+                }
+                Ok(())
+            },
+            false,
+            Some(&detail),
+        )
+        .await
+    }
+
+    /// READ the captured upstream tokens for the CALLER's OWN session (issue #77, PR 3),
+    /// unsealing them under the session-and-kind-bound AAD, and auditing the read
+    /// (`upstream_token.read`: who read whose session's token, NEVER the token value) in
+    /// the same transaction. `session_id` is the caller's OWN session (resolved from
+    /// their session cookie), never a client-supplied arbitrary id; a session with no
+    /// captured token is a uniform [`None`] (the anti-oracle boundary), so the endpoint
+    /// renders it as the same not-found a foreign id produces.
+    ///
+    /// `connector_id` is the connector of the GRANT-AUTHORIZED org connection (the
+    /// endpoint resolves the session's org connection to check the client capability, then
+    /// passes THAT org connection's connector here). The read is filtered on BOTH the
+    /// session AND that connector, so a client granted for one org connection can never
+    /// read a token captured while the same session was routed through a DIFFERENT org
+    /// connection that happens to share a connector (a coherence gap if an operator ever
+    /// maps two org connections onto one shared connector with different grant policies).
+    /// The `(session, connector)` pair is UNIQUE per scope, so at most one row matches; the
+    /// explicit `LIMIT 1` is belt and suspenders with that constraint for any future flow.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the session is out of scope or the stored id is
+    /// malformed; [`StoreError::Encryption`] if no master key is configured or a token
+    /// fails to unseal; [`StoreError::Database`] on a persistence failure.
+    pub async fn read_for_session(
+        &self,
+        env: &Env,
+        session_id: &SessionId,
+        connector_id: &str,
+    ) -> Result<Option<UpstreamTokenMaterial>, StoreError> {
+        if session_id.scope() != self.scope {
+            return Ok(None);
+        }
+        let master = self.store.master().ok_or(StoreError::Encryption)?;
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT id, connector_id, access_token_sealed, refresh_token_sealed, \
+                    pii_dek_version, \
+                    (EXTRACT(EPOCH FROM access_expires_at) * 1000000)::bigint AS access_expires_us, \
+                    token_scope \
+             FROM upstream_tokens \
+             WHERE tenant_id = $1 AND environment_id = $2 AND session_id = $3 \
+                   AND connector_id = $4 \
+             LIMIT 1",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(session_id.to_string())
+        .bind(connector_id.to_owned())
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(row) = row else {
+            tx.commit().await?;
+            return Ok(None);
+        };
+        let dek_version: i32 = row.get("pii_dek_version");
+        let dek = fetch_dek_by_version(&mut tx, self.scope, master, dek_version).await?;
+        let session_str = session_id.to_string();
+        let access_sealed: Vec<u8> = row.get("access_token_sealed");
+        let access = dek.open(
+            &upstream_token_seal_aad(self.scope, &session_str, "access", dek_version),
+            &Sealed::from_bytes(access_sealed)?,
+        )?;
+        let refresh = match row.get::<Option<Vec<u8>>, _>("refresh_token_sealed") {
+            Some(sealed) => Some(dek.open(
+                &upstream_token_seal_aad(self.scope, &session_str, "refresh", dek_version),
+                &Sealed::from_bytes(sealed)?,
+            )?),
+            None => None,
+        };
+        let utk_id_text: String = row.get("id");
+        let utk_id = UpstreamTokenId::parse_in_scope(&utk_id_text, &self.scope)
+            .map_err(|_| StoreError::NotFound)?;
+        let connector_id: String = row.get("connector_id");
+        // Audit the read: who read whose session's token, never the value.
+        let detail = format!("session={session_str} connector={connector_id}");
+        insert_audit_row(
+            &mut tx,
+            &AuditedWrite {
+                store: self.store,
+                scope: self.scope,
+                acting: &self.acting,
+                env,
+                action: Action::UpstreamTokenRead,
+                target: &utk_id,
+            },
+            Some(&detail),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(Some(UpstreamTokenMaterial {
+            connector_id,
+            access_token: UpstreamToken(access),
+            refresh_token: refresh.map(UpstreamToken),
+            access_expires_at_unix_micros: row.get("access_expires_us"),
+            token_scope: row.get("token_scope"),
+        }))
+    }
+}
+
+/// The read-only upstream-token retrieval-grant repository (issue #77, PR 3): decide
+/// whether a client may retrieve a session's captured tokens for an org connection, and
+/// list the scope's grants for the config-snapshot export. Every read is scope-bound; a
+/// grant holds no secret, so a read is secret-free by construction.
+pub struct UpstreamTokenGrantRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl UpstreamTokenGrantRepo<'_> {
+    /// Parse a grant id string, confirming it is in this scope. A malformed or
+    /// out-of-scope id is the uniform [`StoreError::NotFound`].
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the id is malformed or out of scope.
+    pub fn parse_id(&self, raw: &str) -> Result<UpstreamTokenGrantId, StoreError> {
+        UpstreamTokenGrantId::parse_in_scope(raw, &self.scope).map_err(|_| StoreError::NotFound)
+    }
+
+    /// Whether an ENABLED grant exists for `(client_id, org_connection_id)` in this scope
+    /// (issue #77, PR 3): the CLIENT CAPABILITY check the retrieval endpoint gates on. A
+    /// disabled or absent grant is `false` (a typed `unauthorized_client` denial at the
+    /// endpoint, never a leak).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn is_authorized(
+        &self,
+        client_id: &str,
+        org_connection_id: &str,
+    ) -> Result<bool, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT 1 AS present FROM upstream_token_grants \
+             WHERE tenant_id = $1 AND environment_id = $2 \
+               AND client_id = $3 AND org_connection_id = $4 AND enabled",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(client_id)
+        .bind(org_connection_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(row.is_some())
+    }
+
+    /// Every grant in the scope, ordered by the stable `(created_at, id)` key, for the
+    /// config-snapshot export (issue #77, PR 3). Scope-bound.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn list_all(&self) -> Result<Vec<UpstreamTokenGrantRecord>, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let rows = sqlx::query(&format!(
+            "SELECT {UPSTREAM_TOKEN_GRANT_READ_COLUMNS} FROM upstream_token_grants \
+             WHERE tenant_id = $1 AND environment_id = $2 ORDER BY created_at, id"
+        ))
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        rows.iter()
+            .map(|row| upstream_token_grant_record_from_row(row, self.scope))
+            .collect()
+    }
+}
+
+/// The inputs to CREATE a retrieval grant (issue #77, PR 3).
+pub struct NewUpstreamTokenGrant<'a> {
+    /// The client authorized to retrieve upstream tokens.
+    pub client_id: &'a ClientId,
+    /// The org connection whose sessions' tokens the client may retrieve.
+    pub org_connection_id: &'a OrgConnectionId,
+    /// Whether the grant is active.
+    pub enabled: bool,
+}
+
+/// The mutating retrieval-grant repository (issue #77, PR 3): create the authorization
+/// naming which client may retrieve a session's captured upstream tokens (audited).
+pub struct ActingUpstreamTokenGrantRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+    acting: ActingContext,
+}
+
+impl ActingUpstreamTokenGrantRepo<'_> {
+    /// CREATE a retrieval grant (issue #77, PR 3), auditing `upstream_token_grant.create`
+    /// in the same transaction. The client and org connection must both be in this scope.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the id, client, or org connection is out of scope;
+    /// [`StoreError::Conflict`] if a grant for the same (client, org connection) already
+    /// exists; [`StoreError::Database`] on a persistence failure.
+    pub async fn create(
+        &self,
+        env: &Env,
+        id: &UpstreamTokenGrantId,
+        created_at_micros: i64,
+        params: NewUpstreamTokenGrant<'_>,
+    ) -> Result<(), StoreError> {
+        if id.scope() != self.scope
+            || params.client_id.scope() != self.scope
+            || params.org_connection_id.scope() != self.scope
+        {
+            return Err(StoreError::NotFound);
+        }
+        let id = *id;
+        let scope = self.scope;
+        let client_id = params.client_id.to_string();
+        let org_connection_id = params.org_connection_id.to_string();
+        let enabled = params.enabled;
+        let detail = format!("client={client_id} org_connection={org_connection_id}");
+        write_audited_detailed(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::UpstreamTokenGrantCreate,
+                target: &id,
+            },
+            async move |tx| {
+                let result = sqlx::query(
+                    "INSERT INTO upstream_token_grants \
+                     (id, tenant_id, environment_id, client_id, org_connection_id, enabled, \
+                      created_at, updated_at) \
+                     VALUES ($1, $2, $3, $4, $5, $6, \
+                             TIMESTAMPTZ 'epoch' + ($7::text || ' microseconds')::interval, \
+                             TIMESTAMPTZ 'epoch' + ($7::text || ' microseconds')::interval)",
+                )
+                .bind(id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(&client_id)
+                .bind(&org_connection_id)
+                .bind(enabled)
+                .bind(created_at_micros)
+                .execute(&mut **tx)
+                .await;
+                match result {
+                    Ok(_) => {}
+                    Err(error) if is_unique_violation(&error) => return Err(StoreError::Conflict),
+                    Err(error) => return Err(error.into()),
+                }
+                Ok(())
+            },
+            false,
+            Some(&detail),
+        )
+        .await
+    }
+}
+
+// ===========================================================================
 // WebAuthn passkeys (issue #65)
 // ===========================================================================
 
@@ -29782,6 +30336,8 @@ async fn read_promoted_snapshot(
             // by the engine yet, so the promoted target read omits them too.
             org_connection: Vec::new(),
             routing_rule: Vec::new(),
+            // Upstream-token grants (issue #77, PR 3) are likewise not promoted yet.
+            upstream_token_grant: Vec::new(),
         },
     })
 }
@@ -32495,5 +33051,66 @@ impl<'a> ActingStore<'a> {
             scope: self.scope,
             acting: self.acting,
         }
+    }
+}
+
+#[cfg(test)]
+mod upstream_token_seal_tests {
+    use ironauth_env::Env;
+    use ironauth_jose::{Dek, Sealed};
+
+    use super::upstream_token_seal_aad;
+    use crate::id::{EnvironmentId, TenantId};
+    use crate::scope::Scope;
+
+    /// The upstream token seal AAD (issue #77, PR 3) binds the SESSION and the KIND, so a
+    /// sealed access token can never be opened as a refresh token, nor lifted to another
+    /// session's row: opening the ciphertext under any AAD but the exact one it was sealed
+    /// with fails, while the exact AAD round-trips.
+    #[test]
+    fn upstream_token_seal_aad_binds_session_and_kind() {
+        let (env, _clock) = Env::deterministic(std::time::SystemTime::UNIX_EPOCH, 7);
+        let scope = Scope::new(TenantId::generate(&env), EnvironmentId::generate(&env));
+        let dek = Dek::generate(env.entropy());
+        let token = b"upstream-access-token-value";
+        let dek_version = 1;
+
+        // Seal under the (session_a, access) AAD; keep the ciphertext bytes to re-wrap.
+        let sealed_bytes = dek
+            .seal(
+                env.entropy(),
+                &upstream_token_seal_aad(scope, "ses_session_a", "access", dek_version),
+                token,
+            )
+            .into_bytes();
+
+        // The exact AAD opens it.
+        let opened = dek
+            .open(
+                &upstream_token_seal_aad(scope, "ses_session_a", "access", dek_version),
+                &Sealed::from_bytes(sealed_bytes.clone()).expect("sealed decodes"),
+            )
+            .expect("the exact AAD opens the ciphertext");
+        assert_eq!(opened, token);
+
+        // The refresh KIND cannot open an access ciphertext (kind binding).
+        assert!(
+            dek.open(
+                &upstream_token_seal_aad(scope, "ses_session_a", "refresh", dek_version),
+                &Sealed::from_bytes(sealed_bytes.clone()).expect("sealed decodes"),
+            )
+            .is_err(),
+            "an access ciphertext must NOT open under the refresh AAD"
+        );
+
+        // A DIFFERENT session cannot open it (session binding = the anti-lift defence).
+        assert!(
+            dek.open(
+                &upstream_token_seal_aad(scope, "ses_session_b", "access", dek_version),
+                &Sealed::from_bytes(sealed_bytes).expect("sealed decodes"),
+            )
+            .is_err(),
+            "an access ciphertext must NOT open under another session's AAD"
+        );
     }
 }

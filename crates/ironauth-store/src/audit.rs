@@ -810,6 +810,18 @@ pub enum Action {
     /// mapped to an org connection through the management API. The row targets the
     /// `rrl_` rule; the `detail` records the rule kind.
     RoutingRuleCreate,
+    /// Upstream tokens were CAPTURED (issue #77, PR 3): the sealed upstream access and
+    /// refresh tokens were persisted after a brokered login. The row targets the `utk_`
+    /// vault row; the `detail` records the session and connector, NEVER a token value.
+    UpstreamTokenCapture,
+    /// A session's captured upstream tokens were READ (issue #77, PR 3) by an authorized
+    /// client. The row targets the `utk_` vault row; the `detail` records the session and
+    /// connector, so the trail shows WHO read WHOSE session's token, NEVER the value.
+    UpstreamTokenRead,
+    /// An upstream-token retrieval grant was CREATED (issue #77, PR 3): a client was
+    /// authorized to retrieve a session's captured upstream tokens for an org connection.
+    /// The row targets the `utg_` grant; the `detail` records the client and org connection.
+    UpstreamTokenGrantCreate,
 }
 
 impl Action {
@@ -984,6 +996,9 @@ impl Action {
             Action::ConnectorUpdate => "connector.update",
             Action::ConnectorDelete => "connector.delete",
             Action::OrgConnectionCreate => "org_connection.create",
+            Action::UpstreamTokenCapture => "upstream_token.capture",
+            Action::UpstreamTokenRead => "upstream_token.read",
+            Action::UpstreamTokenGrantCreate => "upstream_token_grant.create",
             Action::RoutingRuleCreate => "routing_rule.create",
         }
     }

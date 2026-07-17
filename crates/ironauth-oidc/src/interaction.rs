@@ -560,6 +560,7 @@ pub async fn establish_session(
         session::build_op_browser_state_cookie(&opbs, state.session_ttl())
     });
     Ok(SessionCookies {
+        session_id,
         session: session_cookie,
         op_browser_state: op_browser_state_cookie,
     })
@@ -570,6 +571,10 @@ pub async fn establish_session(
 /// cookie the `check_session_iframe` reads. With session management off the second is
 /// [`None`] and nothing beyond the session cookie is emitted.
 pub struct SessionCookies {
+    /// The just-established session's id (issue #77, PR 3), so a caller that must key
+    /// server-side state on the SAME session it just minted (the upstream token vault
+    /// keys capture on it) reads it here rather than re-parsing the cookie string.
+    session_id: SessionId,
     /// The hardened `__Host-ironauth_session` cookie (see [`session::build_set_cookie`]).
     session: String,
     /// The `__ironauth_opbs` cookie (see [`session::build_op_browser_state_cookie`]),
@@ -582,6 +587,12 @@ impl SessionCookies {
     /// the OP browser-state cookie when session management is enabled.
     pub(crate) fn header_values(&self) -> impl Iterator<Item = &str> {
         std::iter::once(self.session.as_str()).chain(self.op_browser_state.as_deref())
+    }
+
+    /// The just-established session's id (issue #77, PR 3): the key the upstream token
+    /// vault captures on, so the tokens share the exact session's lifetime.
+    pub(crate) fn session_id(&self) -> &SessionId {
+        &self.session_id
     }
 }
 

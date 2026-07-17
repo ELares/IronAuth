@@ -262,6 +262,18 @@ impl IdorHarness {
         self
     }
 
+    /// Register the upstream token vault probe (issue #77, PR 3): a session's captured
+    /// upstream tokens must never be readable under another tenant or environment's
+    /// scope, or a stolen retrieval could exfiltrate a foreign tenant's upstream access
+    /// and refresh tokens. The read is keyed on the session id (the IDOR scoping key), so
+    /// the probe's `foreign_id` is a session id planted in another scope: it must parse as
+    /// a uniform not-found (or resolve to no row) under the caller's scope. Run with the
+    /// data-plane store (`ironauth_app`), which carries the platform master key.
+    pub fn register_upstream_token_probes(&mut self) -> &mut Self {
+        self.register(Box::new(UpstreamTokenReadProbe));
+        self
+    }
+
     /// The names of the registered probes, in registration order.
     #[must_use]
     pub fn probe_names(&self) -> Vec<&'static str> {
@@ -1384,6 +1396,58 @@ impl IsolationProbe for AccountCredentialRemoveProbe {
                 // Removing a foreign credential would be a cross-tenant deletion.
                 Ok(CredentialRemoveOutcome::Removed) => ProbeOutcome::Leaked,
                 Ok(_) | Err(_) => ProbeOutcome::Denied,
+            }
+        })
+    }
+}
+
+/// The connector id the upstream-token IDOR probe reads under, and the one a planting
+/// helper MUST capture the victim token beneath, so the probe's read is filtered on the
+/// SAME connector the victim was captured under (issue #77, PR 3 coherence hardening). If
+/// the probe read a different connector the read would return no row for a benign reason
+/// (the connector filter, not the scope boundary), making the isolation assertion vacuous;
+/// pinning both sides to this one connector keeps ONLY the scope boundary between the
+/// probe and the victim token.
+pub const UPSTREAM_TOKEN_PROBE_CONNECTOR: &str = "cnr_probe";
+
+/// Built-in probe for `ActingUpstreamTokenRepo::read_for_session` (issue #77, PR 3): a
+/// session's captured upstream tokens must never resolve under another tenant or
+/// environment's scope. The `foreign_id` is a session id planted in another scope; it is
+/// parsed under the caller's OWN scope (a cross-scope id fails there as a uniform
+/// not-found), so a resolved token row would be a genuine cross-tenant leak of the
+/// upstream access and refresh tokens. Run with the data-plane store (`ironauth_app`).
+struct UpstreamTokenReadProbe;
+
+impl IsolationProbe for UpstreamTokenReadProbe {
+    fn name(&self) -> &'static str {
+        "upstream_tokens.read_for_session"
+    }
+
+    fn probe<'a>(
+        &'a self,
+        store: &'a Store,
+        caller: Scope,
+        foreign_id: &'a str,
+    ) -> BoxProbeFuture<'a> {
+        Box::pin(async move {
+            let env = Env::system();
+            // Parse the untrusted session id under the caller's OWN scope; a session
+            // minted in another scope fails here as a uniform not-found.
+            let Ok(session_id) = SessionId::parse_in_scope(foreign_id, &caller) else {
+                return ProbeOutcome::Denied;
+            };
+            let actor = ActorRef::service(ServiceId::generate(&env));
+            let correlation = CorrelationId::generate(&env);
+            match store
+                .scoped(caller)
+                .acting(actor, correlation)
+                .upstream_tokens()
+                .read_for_session(&env, &session_id, UPSTREAM_TOKEN_PROBE_CONNECTOR)
+                .await
+            {
+                // Resolving a foreign session's captured tokens would be a leak.
+                Ok(Some(_)) => ProbeOutcome::Leaked,
+                Ok(None) | Err(_) => ProbeOutcome::Denied,
             }
         })
     }

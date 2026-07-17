@@ -140,6 +140,7 @@ mod token_hash;
 mod tokens;
 mod totp;
 mod trusted_device;
+mod upstream_token;
 mod userinfo;
 mod util;
 mod verification;
@@ -331,6 +332,14 @@ pub fn oidc_router(state: OidcState) -> Router {
         .route(
             "/t/{tenant_id}/e/{environment_id}/federation/{connector_slug}/callback",
             get(federation::federation_callback),
+        )
+        // The upstream token vault retrieval endpoint (issue #77, PR 3): an authorized
+        // client POSTs here to retrieve its own session's captured upstream tokens, behind
+        // session-ownership and client-capability checks. Inert (a uniform not-found) until
+        // a federation runtime is installed on the state.
+        .route(
+            "/t/{tenant_id}/e/{environment_id}/federation/upstream-token",
+            post(upstream_token::retrieve_upstream_token),
         )
         // The "this wasn't me" disavowal endpoint (issue #79): a new-device notification
         // links here with a single-use token. GET renders a scanner-safe confirmation

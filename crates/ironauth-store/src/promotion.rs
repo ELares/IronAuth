@@ -347,6 +347,10 @@ fn promoted_projection(snapshot: &Snapshot) -> Snapshot {
             // projection omits them exactly like `connector`.
             org_connection: Vec::new(),
             routing_rule: Vec::new(),
+            // Upstream-token grants (issue #77) are likewise not promoted by the engine
+            // yet (a grant's client / org-connection references must resolve against the
+            // target env, a later slice), so the promoted projection omits them.
+            upstream_token_grant: Vec::new(),
         },
     }
 }

@@ -106,6 +106,27 @@ async fn check_constraint_exists(pool: &sqlx::PgPool, table: &str, constraint_na
     .get("present")
 }
 
+/// Whether `table` has a FOREIGN KEY on `column` whose `ON DELETE` action is CASCADE
+/// (`pg_constraint.confdeltype = 'c'`). Used to prove the upstream token vault shares the
+/// session's lifetime: deleting the session CASCADE-deletes its captured tokens.
+async fn fk_on_delete_cascade(pool: &sqlx::PgPool, table: &str, column: &str) -> bool {
+    sqlx::query(
+        "SELECT EXISTS ( \
+            SELECT 1 FROM pg_catalog.pg_constraint con \
+            JOIN pg_catalog.pg_attribute att \
+              ON att.attrelid = con.conrelid AND att.attnum = ANY (con.conkey) \
+            WHERE con.conrelid = $1::regclass AND con.contype = 'f' \
+              AND con.confdeltype = 'c' AND att.attname = $2 \
+         ) AS present",
+    )
+    .bind(table)
+    .bind(column)
+    .fetch_one(pool)
+    .await
+    .expect("fk cascade lookup")
+    .get("present")
+}
+
 /// Whether a PARTIAL UNIQUE index named `index` exists on `table` (unique with a
 /// `WHERE` predicate).
 async fn partial_unique_index_exists(pool: &sqlx::PgPool, table: &str, index: &str) -> bool {
@@ -327,7 +348,7 @@ async fn expand_contract_example_chain_runs_all_three_phases_and_contract_remove
 // per real table); splitting it would not make it clearer.
 #[allow(clippy::too_many_lines)]
 #[tokio::test]
-async fn production_chain_is_only_the_fifty_nine_real_migrations_and_ships_no_demo_object() {
+async fn production_chain_is_only_the_sixty_real_migrations_and_ships_no_demo_object() {
     // TestDatabase::start runs Store::migrate() (the production chain) on a
     // fresh, empty database.
     let db = TestDatabase::start().await;
@@ -344,8 +365,8 @@ async fn production_chain_is_only_the_fifty_nine_real_migrations_and_ships_no_de
     );
     assert_eq!(
         report.already_applied(),
-        59,
-        "the production chain is exactly fifty-nine migrations (isolation, audit log, management \
+        60,
+        "the production chain is exactly sixty migrations (isolation, audit log, management \
          API, OIDC authorization, signing keys, login/consent, authentication context, redirect \
          registration, UserInfo claims, consent scope upsert, resource servers, opaque access \
          tokens, client auth suite, dynamic client registration, pushed authorization requests, \
@@ -360,16 +381,16 @@ async fn production_chain_is_only_the_fifty_nine_real_migrations_and_ships_no_de
          defenses, step-up policies, email OTP and scanner-safe magic links, credential-class \
          policies, guarded SMS OTP, passkey attestation, admin sudo elevations, trusted devices, \
          risk engine, account recovery, federation connectors, registration abuse defenses, \
-         federation login state, enterprise inbound routing)"
+         federation login state, enterprise inbound routing, upstream token vault)"
     );
 
-    // The ledger holds exactly versions 1 through 59.
+    // The ledger holds exactly versions 1 through 60.
     assert_eq!(
         applied_versions(pool).await,
         vec![
             1_i64, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
             24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45,
-            46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59
+            46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60
         ]
     );
     let phase_of = |version: i64| async move {
@@ -588,6 +609,10 @@ async fn production_chain_is_only_the_fifty_nine_real_migrations_and_ships_no_de
     // org_connection_id columns on federation_login_states and users, no rewrite of
     // existing state.
     assert_eq!(phase_of(59).await, "expand");
+    // The upstream-token-vault migration (issue #77, PR 3) is an EXPAND: two new
+    // tenant-scoped tables (upstream_tokens, upstream_token_grants), no rewrite of
+    // existing state.
+    assert_eq!(phase_of(60).await, "expand");
 
     // The step-up second-factor abuse path (issue #72): migration 0047 WIDENED the
     // abuse_bans auth_path CHECK (0046 pinned the closed set) to also admit
@@ -3002,6 +3027,111 @@ async fn production_chain_is_only_the_fifty_nine_real_migrations_and_ships_no_de
             "routing_rules must carry the partial unique index {index} after 0059"
         );
     }
+
+    // The upstream token vault (issue #77, migration 0060): the per-session table of
+    // SEALED upstream tokens, and the per-client retrieval-grant table.
+    assert!(
+        table_exists(pool, "upstream_tokens").await,
+        "upstream_tokens exists after 0060"
+    );
+    for column in [
+        "id",
+        "tenant_id",
+        "environment_id",
+        "session_id",
+        "connector_id",
+        "access_token_sealed",
+        "refresh_token_sealed",
+        "pii_dek_version",
+        "access_expires_at",
+        "token_scope",
+    ] {
+        assert!(
+            column_exists(pool, "upstream_tokens", column).await,
+            "upstream_tokens.{column} exists after 0060"
+        );
+    }
+    // The captured tokens are envelope ciphertext at rest (issue #48): the two token
+    // columns are `bytea`, never a plaintext column.
+    for sealed in ["access_token_sealed", "refresh_token_sealed"] {
+        assert_eq!(
+            column_data_type(pool, "upstream_tokens", sealed).await,
+            "bytea",
+            "upstream_tokens.{sealed} must be a sealed envelope-ciphertext bytea column"
+        );
+    }
+    for forbidden in ["access_token", "refresh_token", "secret", "token"] {
+        assert!(
+            !column_exists(pool, "upstream_tokens", forbidden).await,
+            "upstream_tokens must have no plaintext token column ({forbidden}) after 0060"
+        );
+    }
+    // The session-scoped lifetime: the session_id FK is ON DELETE CASCADE, so deleting
+    // the session destroys its captured tokens.
+    assert!(
+        fk_on_delete_cascade(pool, "upstream_tokens", "session_id").await,
+        "upstream_tokens.session_id must be a FOREIGN KEY with ON DELETE CASCADE from sessions"
+    );
+    assert!(
+        rls_enabled_and_forced(pool, "upstream_tokens").await,
+        "upstream_tokens must ENABLE and FORCE row-level security"
+    );
+    assert!(
+        policy_exists(pool, "upstream_tokens", "upstream_tokens_tenant_isolation").await,
+        "the (tenant, environment) isolation policy must exist on upstream_tokens"
+    );
+    assert!(
+        check_constraint_exists(pool, "upstream_tokens", "upstream_tokens_scope_nonempty").await,
+        "upstream_tokens must carry the nonempty-scope CHECK constraint"
+    );
+
+    // The retrieval-grant table.
+    assert!(
+        table_exists(pool, "upstream_token_grants").await,
+        "upstream_token_grants exists after 0060"
+    );
+    for column in [
+        "id",
+        "tenant_id",
+        "environment_id",
+        "client_id",
+        "org_connection_id",
+        "enabled",
+    ] {
+        assert!(
+            column_exists(pool, "upstream_token_grants", column).await,
+            "upstream_token_grants.{column} exists after 0060"
+        );
+    }
+    // A grant holds NO secret column (classified Promotable).
+    for forbidden in ["secret", "sealed", "token"] {
+        assert!(
+            !column_exists(pool, "upstream_token_grants", forbidden).await,
+            "upstream_token_grants must have no secret column ({forbidden}) after 0060"
+        );
+    }
+    assert!(
+        rls_enabled_and_forced(pool, "upstream_token_grants").await,
+        "upstream_token_grants must ENABLE and FORCE row-level security"
+    );
+    assert!(
+        policy_exists(
+            pool,
+            "upstream_token_grants",
+            "upstream_token_grants_tenant_isolation"
+        )
+        .await,
+        "the (tenant, environment) isolation policy must exist on upstream_token_grants"
+    );
+    assert!(
+        check_constraint_exists(
+            pool,
+            "upstream_token_grants",
+            "upstream_token_grants_scope_nonempty"
+        )
+        .await,
+        "upstream_token_grants must carry the nonempty-scope CHECK constraint"
+    );
 }
 
 #[tokio::test]

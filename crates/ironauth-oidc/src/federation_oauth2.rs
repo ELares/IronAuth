@@ -33,8 +33,9 @@ use ironauth_fetch::{FetchPurpose, FetchRequest};
 use ironauth_store::Scope;
 
 use crate::federation::{
-    FederationRuntime, FinalizeLogin, VerifiedUpstreamIdentity, classify_upstream_status,
-    federation_callback_url, finalize_federated_login,
+    CapturedUpstreamTokens, FederationRuntime, FinalizeLogin, VerifiedUpstreamIdentity,
+    captured_from_token_response, classify_upstream_status, federation_callback_url,
+    finalize_federated_login,
 };
 use crate::interaction;
 use crate::state::OidcState;
@@ -96,9 +97,9 @@ pub(crate) async fn oauth2_callback(cb: Oauth2Callback<'_>) -> Response {
         return interaction::server_error_page();
     };
 
-    let access_token =
+    let exchanged =
         match exchange_code_for_access_token(&cb, &redirect_uri, client_secret, allow_http).await {
-            Ok(token) => token,
+            Ok(exchanged) => exchanged,
             Err(error) => {
                 cb.runtime.health().record_failure(
                     cb.now,
@@ -109,6 +110,10 @@ pub(crate) async fn oauth2_callback(cb: Oauth2Callback<'_>) -> Response {
                 return interaction::server_error_page();
             }
         };
+    let Oauth2TokenExchange {
+        access_token,
+        captured: captured_tokens,
+    } = exchanged;
 
     let identity = match resolve_identity(&cb, &access_token, allow_http).await {
         Ok(identity) => identity,
@@ -137,6 +142,10 @@ pub(crate) async fn oauth2_callback(cb: Oauth2Callback<'_>) -> Response {
         // OAuth 2.0 backed org connection (for example a GitHub connector fronting an MFA
         // overlay) is stamped and enforced identically (issue #77 PR 2).
         org_connection_id: cb.org_connection_id,
+        // The OAuth 2.0 token response's access / refresh tokens ride the SAME shared
+        // capture path as OIDC (issue #77 PR 3): finalize seals and persists them keyed on
+        // the session only when the org connection and connector both permit it.
+        captured_tokens,
         headers: cb.headers,
         return_to: cb.return_to,
         now: cb.now,
@@ -145,15 +154,25 @@ pub(crate) async fn oauth2_callback(cb: Oauth2Callback<'_>) -> Response {
     .await
 }
 
-/// Exchange the authorization code at the OAuth 2.0 token endpoint and return the access token.
-/// The request asks for a JSON response (GitHub otherwise form-encodes) and rides the
-/// hardened fetcher through [`FetchPurpose::FederationToken`].
+/// The result of an OAuth 2.0 token exchange (issue #77, PR 3): the access token (needed
+/// for the profile and email fetches) plus the capturable upstream tokens.
+struct Oauth2TokenExchange {
+    /// The upstream access token, used to read the profile and email over TLS.
+    access_token: String,
+    /// The capturable upstream tokens (issue #77, PR 3), never logged.
+    captured: CapturedUpstreamTokens,
+}
+
+/// Exchange the authorization code at the OAuth 2.0 token endpoint and return the access token
+/// alongside the capturable upstream tokens (issue #77, PR 3). The request asks for a JSON
+/// response (GitHub otherwise form-encodes) and rides the hardened fetcher through
+/// [`FetchPurpose::FederationToken`].
 async fn exchange_code_for_access_token(
     cb: &Oauth2Callback<'_>,
     redirect_uri: &str,
     client_secret: &str,
     allow_http: bool,
-) -> Result<String, ConnectorError> {
+) -> Result<Oauth2TokenExchange, ConnectorError> {
     let form = format!(
         "grant_type=authorization_code&code={}&redirect_uri={}&client_id={}&client_secret={}",
         percent_encode_query(cb.code),
@@ -190,14 +209,19 @@ async fn exchange_code_for_access_token(
     let body: serde_json::Value = serde_json::from_slice(response.body()).map_err(|_| {
         ConnectorError::UpstreamProtocol("the token response is not JSON".to_owned())
     })?;
-    body.get("access_token")
+    let access_token = body
+        .get("access_token")
         .and_then(|v| v.as_str())
         .map(str::to_owned)
         .ok_or_else(|| {
             ConnectorError::UpstreamProtocol(
                 "the token response carried no access_token".to_owned(),
             )
-        })
+        })?;
+    Ok(Oauth2TokenExchange {
+        access_token,
+        captured: captured_from_token_response(&body),
+    })
 }
 
 /// Read the profile and resolve the primary verified email, building the verified upstream
