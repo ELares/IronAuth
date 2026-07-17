@@ -179,6 +179,13 @@ pub enum FetchPurpose {
     /// resolves to an internal or loopback address is refused exactly like any other
     /// blocked destination. Unused until the federation upstream slice.
     FederationUserinfo,
+    /// Exchanging an authorization code at an upstream federation connector's token
+    /// endpoint (issue #75, PR B): the federated callback POSTs the code plus the
+    /// connector's client authentication and PKCE `code_verifier` to the upstream token
+    /// URL. The token endpoint is tenant-controlled and outbound, so it rides the same
+    /// SSRF-hardened path: a token URL that resolves to an internal or loopback address
+    /// is refused exactly like any other blocked destination.
+    FederationToken,
 }
 
 impl FetchPurpose {
@@ -199,6 +206,7 @@ impl FetchPurpose {
             FetchPurpose::FederationDiscovery => "federation_discovery",
             FetchPurpose::FederationJwks => "federation_jwks",
             FetchPurpose::FederationUserinfo => "federation_userinfo",
+            FetchPurpose::FederationToken => "federation_token",
         }
     }
 

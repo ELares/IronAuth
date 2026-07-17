@@ -23,6 +23,7 @@ generator="crates/ironauth-oidc/src/discovery.rs"
 # the ironauth-fetch FederationDiscovery purpose doc.
 federation_allow=(
   "crates/ironauth-connector/src/lib.rs"
+  "crates/ironauth-connector/src/discovery.rs"
   "crates/ironauth-admin/src/views.rs"
   "crates/ironauth-fetch/src/lib.rs"
 )

@@ -6,6 +6,23 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Upstream discovery-document parsing and the federation error taxonomy (issue #75, PR B),
+  both still I/O-free (the crate remains fetch-free by construction):
+  - **`discovery` module.** Parses a REMOTE provider's OIDC discovery metadata from bytes the
+    federation slice fetches through the hardened path, enforcing the MIX-UP defence (the
+    document's own `issuer` must byte-for-byte equal the configured issuer) and returning a
+    `ResolvedEndpoints` with the upstream authorize / token / userinfo URLs, `jwks_uri`, and the
+    advertised signing-algorithm and PKCE-method lists. It lives HERE (not in `ironauth-oidc`) so
+    the crate that reads the hostile upstream metadata is structurally incapable of fetching it,
+    and so the exposed struct field names never collide with the self-discovery lint's reserved
+    served-document keys. A malformed document or an issuer mismatch is an `UpstreamProtocol`
+    fault, never trusted.
+  - **`ConnectorError` taxonomy.** The stable `#[non_exhaustive]` three-way classification issue
+    #76 consumes: `Config` (the definition or mapping is wrong; not retryable), `UpstreamProtocol`
+    (the upstream spoke incorrectly, e.g. a bad ID token or a mismatched discovery issuer; not
+    retryable), and `UpstreamUnavailable` (the exchange could not complete, e.g. a blocked SSRF
+    target, a timeout, a non-2xx, or an empty JWKS; transient). Carries only a non-sensitive
+    description, plus a bounded `kind()` metric label and an `is_retryable()` predicate.
 - New crate: declarative federation connector definitions and the capability
   matrix (issue #75, PR A). A pure, I/O-free crate that parses and strictly
   validates an OIDC-shaped upstream connector as DATA, so adding a provider is a

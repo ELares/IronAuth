@@ -47,6 +47,12 @@
 //! are later slices; [`ClaimMapping`] here is the parsed-and-stored declarative
 //! SHAPE only, with no evaluator.
 
+pub mod discovery;
+pub mod error;
+
+pub use discovery::{ResolvedEndpoints, discovery_url, parse_discovery, resolve_explicit};
+pub use error::ConnectorError;
+
 use std::collections::BTreeMap;
 use std::fmt;
 

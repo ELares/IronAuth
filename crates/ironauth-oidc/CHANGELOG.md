@@ -6,6 +6,38 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Generic OIDC UPSTREAM for inbound federation (issue #75, PR B): the wire that turns a
+  declarative connector (PR A) into a federated login with ZERO per-provider code. This slice
+  ships the security-critical core (the HTTP authorize/callback routes and the single-use
+  correlation-state persistence are the remaining sub-slice of PR B).
+  - **Upstream ID-token validation through the ONE JOSE entry point** (`federation` module, the
+    security crux). Building a `VerificationPolicy` that pins the algorithm allowlist (the
+    upstream-advertised or connector algorithms INTERSECTED with the JOSE core's allowlist, so
+    `none`/HMAC are inexpressible), the cached upstream trusted keys (never a token-embedded key),
+    the expected issuer (the configured connector issuer), and the expected audience (the
+    connector client id), then verifying the bound `nonce`. It writes NO crypto: `alg: none`,
+    algorithm confusion, an unknown `kid`, a forged issuer, a wrong audience, an expired token, a
+    forged signature, and a `nonce` mismatch ALL die in `ironauth_jose::verify` and yield
+    `ConnectorError::UpstreamProtocol` with NO identity produced.
+  - **Per-connector upstream JWKS cache through the hardened fetcher** (`federation_jwks` module),
+    copied from the `private_key_jwt` client-key resolver and keyed per `(connector_id, jwks_uri)`,
+    SEPARATE from the local signing keys. A private-range `jwks_uri` is `FetchError::Blocked` on the
+    wire (resolve-once, no rebind), so resolution yields no keys and validation fails closed as
+    `UpstreamUnavailable`. A non-empty resolution is cached for a bounded, clock-seam TTL.
+  - **Discovery + code exchange over the hardened fetcher.** `fetch_discovery` resolves an
+    issuer-form connector through `FetchPurpose::FederationDiscovery` (parsing and mix-up-checking
+    via `ironauth-connector`), and `exchange_code` posts the code through `FetchPurpose::FederationToken`.
+    Every federation outbound rides `ironauth-fetch`; a private-range issuer is likewise Blocked.
+  - **Honest `AuthMethod::Federated`** (the covenant). A new registry row achieving the DISTINCT
+    `urn:ironauth:acr:federated` context, deliberately unranked against the local ladder (IronAuth
+    cannot vouch for another operator's assurance level). It contributes NO local `amr` factor: the
+    upstream's OWN asserted `amr` tokens are carried as passthrough DATA on a new
+    `AuthenticationEvent::federated` constructor (never re-asserted as a local factor), and if the
+    upstream asserted no `amr`, IronAuth asserts none. `auth_time` is the upstream `auth_time` when
+    present, else the callback instant. `authn.rs` stays the single honest source for `acr`/`amr`.
+  - **Error taxonomy mapping.** `FetchError` -> `UpstreamUnavailable`, a JOSE verify failure ->
+    `UpstreamProtocol`, a policy/config fault -> `Config`, consuming the `ironauth-connector`
+    `ConnectorError` contract issue #76 builds on.
 - Account recovery as a first-class subsystem (issue #81): a distinct recovery state
   machine, NOT a branch of password reset, governed by three pillars. DELAY as a security
   feature: a recovery that would REDUCE account security is HELD for the configured

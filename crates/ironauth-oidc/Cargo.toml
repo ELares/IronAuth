@@ -39,6 +39,12 @@ ironauth-quota.workspace = true
 # validation reaches the network through. Depending on ironauth-fetch (not an
 # HTTP-client crate) keeps scripts/http-audit.sh satisfied.
 ironauth-fetch.workspace = true
+# The declarative federation connector definitions and the upstream discovery-document
+# parser (issue #75, PR A/PR B): the generic OIDC upstream reads a ConnectorDefinition
+# and resolves an issuer-form connector's endpoints through ironauth_connector's pure,
+# I/O-free discovery parser (which owns the upstream metadata field names, keeping the
+# self-discovery lint's generator the single place IronAuth's OWN document is built).
+ironauth-connector.workspace = true
 # Breached-password screening and the NIST SP 800-63B-4 policy (issue #63): the
 # k-anonymity screening providers, the Screener, and the PasswordPolicy evaluator plus
 # NFKC normalization the set/change/reset and login paths call. The HIBP provider's only

@@ -85,6 +85,8 @@ mod device_verify;
 mod discovery;
 mod email_otp;
 mod error;
+mod federation;
+mod federation_jwks;
 mod global_revocation;
 mod hashing_pool;
 mod hints;
@@ -169,6 +171,11 @@ pub use discovery::{
     claims_supported, discovery_document, discovery_router, id_token_signing_alg_values,
 };
 pub use error::{AuthorizeError, AuthzErrorCode, TokenError};
+pub use federation::{
+    TokenExchange, UpstreamTokenPolicy, VerifiedUpstreamIdentity, exchange_code, fetch_discovery,
+    resolve_alg_allowlist, validate_upstream_id_token,
+};
+pub use federation_jwks::FederationKeyResolver;
 pub use global_revocation::GLOBAL_TOKEN_REVOCATION_PATH;
 pub use hashing_pool::{
     ADMISSION_REJECTED_TOTAL, HASH_DURATION_SECONDS, HashRejection, HashingPool,
