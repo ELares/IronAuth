@@ -16,8 +16,27 @@ range per docs/RELEASING.md.
     `.../callback` consumes the correlation row by `state` SINGLE-USE (the CSRF defence),
     exchanges the code with the PRODUCTION-unsealed client secret and the bound verifier,
     VALIDATES the upstream ID token through the JOSE core, and only then provisions and
-    resumes. Both mapped in `docs/conformance/rfc9700-checklist.md`. Inert until a
-    `FederationRuntime` is installed on the state (`OidcState::with_federation`).
+    resumes. Both mapped in `docs/conformance/rfc9700-checklist.md`. WIRED by the server boot
+    path (`build_oidc_router`) when `oidc.federation.enabled` is set (OFF by default), which
+    constructs the `FederationRuntime` (its own SSRF-hardened fetcher plus the configured
+    discovery / JWKS TTLs) and installs it via `OidcState::with_federation`; with federation
+    disabled the `/federation` routes stay a uniform not-found.
+  - **Cross-connector takeover fix** (issue #75, HIGH-1). The local federated identity is keyed
+    on the upstream ISSUER + `sub`, not the bare `sub`: an OIDC `sub` is unique only within one
+    issuer (OIDC Core section 2), so keying on the bare `sub` let two connectors to DIFFERENT
+    IdPs that emit the same `sub` resolve to the SAME local user (an account takeover by anyone
+    running a second connector's IdP). The external-id is now a length-prefixed
+    `(issuer, sub)` composite (`federated_external_id`): same issuer + same `sub` still shares
+    one user; different issuers with the same `sub` are distinct users. A downstream RS MUST key
+    trust on `acr` (`urn:ironauth:acr:federated`), NOT on the passed-through `amr`, which merely
+    reflects the UPSTREAM's own assertion.
+  - **Upstream key rotation without waiting out the TTL** (issue #75, LOW-1). When an upstream ID
+    token names a `kid` the cached JWKS does not answer to, the resolver triggers ONE bounded
+    refetch (`resolve_for_kid`, the `kid` a REFETCH HINT via `ironauth_jose::compact_jws_kid`,
+    never a key source) before failing closed, so a rotated-in upstream key is picked up on the
+    next login. Explicit-endpoint connectors are rejected CLEANLY at the authorize leg (LOW-3),
+    and `enabled` is RE-CHECKED at the callback (INFO-2) so a connector disabled mid-flow fails
+    closed.
   - **Minimal provisioning + honest LOCAL token.** From the VERIFIED upstream `sub` it
     find-or-creates a local user by external id (no local password) and establishes a local
     session, then resumes the pending local `/authorize` so the LOCAL token flow issues the

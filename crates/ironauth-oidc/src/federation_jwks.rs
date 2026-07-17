@@ -102,10 +102,57 @@ impl FederationKeyResolver {
         connector_id: &str,
         jwks_uri: &str,
     ) -> Vec<TrustedKey> {
+        self.resolve_for_kid(now, connector_id, jwks_uri, None)
+            .await
+    }
+
+    /// Like [`FederationKeyResolver::resolve`] but with a kid-miss REFETCH (issue #75):
+    /// when the upstream ID token names a `kid` (`wanted_kid`) that the cached key set
+    /// does NOT answer to, a SINGLE bounded refetch is triggered before the caller is
+    /// failed closed.
+    ///
+    /// This is how most OIDC RPs pick up an upstream key ROTATION (a new `kid`) WITHOUT
+    /// waiting for the TTL: the previous behaviour rejected every validly-signed login
+    /// for up to the whole JWKS TTL after a rotation. The refetch is bounded to ONE fetch
+    /// per validation, still rides the hardened fetcher, and still fails closed (the
+    /// caller's `validate` rejects an unknown `kid`) if the refetched set also lacks it.
+    /// A `wanted_kid` of [`None`] (a token with no `kid`) keeps the pure TTL behaviour.
+    pub async fn resolve_for_kid(
+        &self,
+        now: SystemTime,
+        connector_id: &str,
+        jwks_uri: &str,
+        wanted_kid: Option<&str>,
+    ) -> Vec<TrustedKey> {
         let key = cache_key(connector_id, jwks_uri);
-        if let Some(keys) = self.cached(now, &key) {
-            return keys;
+        if let Some(cached) = self.cached(now, &key) {
+            // A fresh cache entry serves the token UNLESS it names a `kid` the cached set
+            // does not answer to: that is the rotation case, so fall through to ONE refetch.
+            if key_set_satisfies(&cached, wanted_kid) {
+                return cached;
+            }
+            let refetched = self.fetch_keys(jwks_uri).await;
+            if !refetched.is_empty() {
+                self.store(now, key, refetched.clone());
+                return refetched;
+            }
+            // The refetch failed or was empty (a transient outage): fall back to the still
+            // valid cached set. It lacks the `kid`, so `validate` fails closed on it.
+            return cached;
         }
+        let keys = self.fetch_keys(jwks_uri).await;
+        // Cache only a usable resolution, so a transient failure or an empty document
+        // never sticks a connector into a fail-closed state for the TTL.
+        if !keys.is_empty() {
+            self.store(now, key, keys.clone());
+        }
+        keys
+    }
+
+    /// Fetch and parse the `jwks_uri` through the hardened fetcher, returning the trusted
+    /// keys (an EMPTY set on any transport failure, non-2xx, or unusable document). Shared
+    /// by the initial resolution and the kid-miss refetch; never touches the cache itself.
+    async fn fetch_keys(&self, jwks_uri: &str) -> Vec<TrustedKey> {
         let mut request = FetchRequest::get(FetchPurpose::FederationJwks, jwks_uri);
         if self.allow_http {
             request = request.allow_plaintext_http();
@@ -116,13 +163,7 @@ impl FederationKeyResolver {
         if !response.status().is_success() {
             return Vec::new();
         }
-        let keys = ironauth_jose::trusted_keys_from_jwks(response.body());
-        // Cache only a usable resolution, so a transient failure or an empty document
-        // never sticks a connector into a fail-closed state for the TTL.
-        if !keys.is_empty() {
-            self.store(now, key, keys.clone());
-        }
-        keys
+        ironauth_jose::trusted_keys_from_jwks(response.body())
     }
 
     /// The cached keys for `key` if a non-expired entry exists.
@@ -160,4 +201,15 @@ impl FederationKeyResolver {
 /// `(connector, uri)` pairs can never collide onto one entry.
 fn cache_key(connector_id: &str, jwks_uri: &str) -> String {
     format!("{connector_id}\u{0}{jwks_uri}")
+}
+
+/// Whether `keys` can serve a token naming `wanted_kid`. A `None` kid (the token
+/// named none) is always served by whatever keys are present (verification then
+/// tries each). A named kid is served only when SOME trusted key answers to it; a
+/// miss is the upstream-rotation signal that a refetch may resolve.
+fn key_set_satisfies(keys: &[TrustedKey], wanted_kid: Option<&str>) -> bool {
+    match wanted_kid {
+        None => true,
+        Some(kid) => keys.iter().any(|key| key.kid() == Some(kid)),
+    }
 }

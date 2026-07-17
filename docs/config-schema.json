@@ -255,6 +255,32 @@
       },
       "type": "object"
     },
+    "FederationConfig": {
+      "additionalProperties": false,
+      "description": "The generic OIDC upstream federation settings (issue #75, PR B).\n\nWhen enabled, the boot path builds the federation runtime that turns a declarative,\nDATA-ONLY connector (issue #75, PR A) into a full inbound federated login WITHOUT any\nper-provider code: it resolves the connector's endpoints (discovery), exchanges the\nauthorization code, and validates the upstream ID token through the one JOSE core, then\nprovisions a local identity keyed on the upstream ISSUER + `sub`. Every federation\noutbound rides the one SSRF-hardened fetcher.\n\nDISABLED BY DEFAULT (`enabled = false`): the `/federation` routes are a uniform\nnot-found, so an existing deployment is unaffected. The TTLs govern how long a resolved\ndiscovery document and a fetched upstream key set are cached (both refetched on expiry,\nand a JWKS is refetched immediately when an ID token names an unknown `kid`).",
+      "properties": {
+        "discovery_ttl_secs": {
+          "default": 3600,
+          "description": "How long a resolved upstream discovery document is cached, in seconds (issue #75).\nThe default (3600, one hour) balances freshness against refetch load; a change to an\nupstream's advertised endpoints propagates within it. Must be at least 1 and at most\n`OIDC_MAX_FEDERATION_TTL_SECS`.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "enabled": {
+          "default": false,
+          "description": "Whether inbound federation is wired. False (the default) leaves the `/federation`\nroutes a uniform not-found and builds no federation runtime. When true, the boot\npath constructs the runtime (a dedicated SSRF-hardened fetcher plus the caches\nbelow) and installs it, so a stored connector's federated login legs go live.",
+          "type": "boolean"
+        },
+        "jwks_ttl_secs": {
+          "default": 3600,
+          "description": "How long a fetched upstream JWKS is cached, in seconds (issue #75). The default\n(3600, one hour) bounds how long a rotated-OUT key stays trusted; a rotated-IN key\nnaming a new `kid` is picked up immediately by the kid-miss refetch, so this TTL need\nnot be short. Must be at least 1 and at most `OIDC_MAX_FEDERATION_TTL_SECS`.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
     "IdentifierUniqueness": {
       "description": "The per-environment login-identifier UNIQUENESS mode (issue #54).\n\nUniqueness is a POLICY, not a fixed schema rule: a greenfield identity model\nbakes scoped uniqueness in on day one rather than retrofitting it later (Zitadel\n#9535, Auth0's multi-year path to non-unique emails). The safe default\n(`environment_wide`) gives one canonical identifier at most one user per\n(tenant, environment). `org_scoped` makes an identifier unique only within an\norganization (meaningful once M10 org membership ships; a membership-free user\nfalls back to the environment scope). `non_unique` allows several accounts to\nshare one identifier (identifier-first login still resolves deterministically:\nthe M7 factor step disambiguates). Changing the mode on a POPULATED environment\nrequires a validation pass that reports post-canonicalization collisions before\nthe change applies. This is a promotable per-environment setting in spirit; the\nprocess value is the deployment default until per-environment overrides ride the\nM5 promotion pipeline.",
       "oneOf": [
@@ -547,6 +573,15 @@
           "default": false,
           "description": "Whether to mount the public OIDC endpoints (`/authorize`, `/token`). Off\nby default so the default boot serves only the skeleton and needs no\ndatabase. When on, the provider connects the data-plane store using\n`database.url`.",
           "type": "boolean"
+        },
+        "federation": {
+          "$ref": "#/$defs/FederationConfig",
+          "default": {
+            "discovery_ttl_secs": 3600,
+            "enabled": false,
+            "jwks_ttl_secs": 3600
+          },
+          "description": "Generic OIDC UPSTREAM federation (issue #75, PR B): turn a declarative connector\ninto an inbound federated login with zero per-provider code. OFF by default (the\n`/federation` routes stay a uniform not-found), so an existing deployment is\nunaffected. When enabled, the boot path builds the federation runtime (its own\nSSRF-hardened fetcher plus the discovery / JWKS cache TTLs). The connectors\nthemselves are per-connector STORED data, not config. See [`FederationConfig`]."
         },
         "frontchannel_logout_enabled": {
           "default": false,
@@ -1775,6 +1810,11 @@
         "enable_response_type_id_token": false,
         "enable_response_type_none": false,
         "enabled": false,
+        "federation": {
+          "discovery_ttl_secs": 3600,
+          "enabled": false,
+          "jwks_ttl_secs": 3600
+        },
         "frontchannel_logout_enabled": false,
         "global_token_revocation_hard_kill": false,
         "issue_refresh_tokens": true,

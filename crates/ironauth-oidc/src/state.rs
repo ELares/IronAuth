@@ -279,11 +279,12 @@ pub struct OidcState {
     breach_provider: Option<Arc<dyn ironauth_screening::BreachRangeProvider>>,
     // The generic OIDC upstream runtime for inbound federation (issue #75, PR B): the
     // SSRF-hardened fetcher, the per-connector upstream JWKS cache, and the discovery
-    // cache. Kept OUTSIDE `Inner` and installed by the boot path (built from the federation
-    // config with a dedicated fetcher and the same env clock), so its TTLs advance
-    // deterministically under a test's ManualClock. Default: `None`, which leaves the
-    // /federation routes a uniform not-found (federation disabled), so the many DB-only
-    // OIDC tests and a deployment with no connectors are unaffected.
+    // cache. Kept OUTSIDE `Inner` and installed by the boot path (via `with_federation`)
+    // ONLY when `oidc.federation.enabled` is set, built from the federation config with a
+    // dedicated fetcher and the same env clock so its TTLs advance deterministically under
+    // a test's ManualClock. Default: `None`, which leaves the /federation routes a uniform
+    // not-found (federation disabled), so the many DB-only OIDC tests and a deployment that
+    // has not enabled federation are unaffected.
     federation: Option<Arc<crate::federation::FederationRuntime>>,
 }
 
@@ -700,9 +701,10 @@ impl OidcState {
 
     /// Install the generic OIDC upstream runtime for inbound federation (issue #75, PR B):
     /// the SSRF-hardened fetcher, the per-connector upstream JWKS cache, and the discovery
-    /// cache. The boot path builds one from the federation config; a test installs one over
-    /// the fetch test-harness injected dialer. With no runtime installed (the default) the
-    /// `/federation` routes are a uniform not-found (federation disabled).
+    /// cache. The boot path calls this when `oidc.federation.enabled` is set, building the
+    /// runtime from the federation config; a test installs one over the fetch test-harness
+    /// injected dialer. With no runtime installed (the default) the `/federation` routes are
+    /// a uniform not-found (federation disabled).
     #[must_use]
     pub fn with_federation(mut self, runtime: Arc<crate::federation::FederationRuntime>) -> Self {
         self.federation = Some(runtime);

@@ -709,6 +709,28 @@ pub fn server_error_page() -> Response {
     )
 }
 
+/// The page shown when a federated login is attempted through a connector whose
+/// endpoints are an EXPLICIT set rather than issuer discovery (issue #75, LOW-3).
+///
+/// PR B binds the upstream ID token's `iss` only for an ISSUER-form (discovery)
+/// connector; an explicit-endpoint set carries no mix-up-checked issuer to bind, so
+/// federation is not yet supported for it. This fails the flow CLEANLY and EARLY (at
+/// the authorize leg, before any `state` is persisted or secret unsealed) so an
+/// operator gets a documented misconfiguration error instead of a mid-flow 500 after
+/// the user has authenticated at the upstream. Full explicit-endpoint support is a
+/// later slice.
+#[must_use]
+pub fn federation_unsupported_page() -> Response {
+    pages::secure_html(
+        StatusCode::BAD_REQUEST,
+        pages::notice_page(
+            "Sign-in method not available",
+            "This federated sign-in is not available. \
+             Explicit-endpoint federation is not yet supported; use issuer discovery.",
+        ),
+    )
+}
+
 /// The `403` page shown when a state-changing POST is refused by the CSRF
 /// header allowlist ([`same_origin_ok`], issue #196). Generic on purpose: it never
 /// reveals WHICH signal (Origin or Sec-Fetch-Site) failed, and NO action is

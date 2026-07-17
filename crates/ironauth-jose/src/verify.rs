@@ -130,6 +130,34 @@ pub fn verify(
     })
 }
 
+/// Extract the `kid` from a compact JWS/JWT's protected header WITHOUT verifying
+/// the token, for the narrow purpose of a JWKS-refetch HINT on upstream key
+/// rotation (issue #75).
+///
+/// This reads NO trust from the token: the returned `kid` is a bare selector value.
+/// A caller may only use it to decide whether an already-trusted key set answers to
+/// this `kid` (and so whether to refetch a connector's JWKS); it can never introduce
+/// a key or steer verification, which stays entirely inside [`verify`]. The read is
+/// bounded (a header segment above `MAX_HINT_HEADER_B64` yields [`None`]) and never
+/// touches key material. Returns [`None`] when the token is malformed, the header is
+/// not a JSON object, or no string `kid` is present.
+#[must_use]
+pub fn compact_jws_kid(token: &str) -> Option<String> {
+    // A generous cap for a HEADER segment: enough for any realistic `kid`, small
+    // enough that a hostile token cannot force a large base64/JSON decode here.
+    const MAX_HINT_HEADER_B64: usize = 8192;
+    let header_b64 = token.split('.').next()?;
+    if header_b64.is_empty() || header_b64.len() > MAX_HINT_HEADER_B64 {
+        return None;
+    }
+    let bytes = URL_SAFE_NO_PAD.decode(header_b64.as_bytes()).ok()?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    match value.get("kid") {
+        Some(serde_json::Value::String(kid)) => Some(kid.clone()),
+        _ => None,
+    }
+}
+
 /// Split into exactly three non-empty `.`-separated segments.
 ///
 /// Returns `None` for any other shape (two segments, four, five as in a JWE, an
@@ -225,4 +253,35 @@ fn now_seconds(clock: &dyn Clock) -> i64 {
 /// looks identical from the outside.
 fn reject<T>(reason: RejectReason) -> Result<T, VerifyError> {
     Err(VerifyError::new(reason))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::compact_jws_kid;
+    use base64::Engine;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
+    fn token_with_header(header: &str) -> String {
+        let head = URL_SAFE_NO_PAD.encode(header.as_bytes());
+        format!("{head}.eyJ9.c2ln")
+    }
+
+    #[test]
+    fn compact_jws_kid_reads_the_header_kid_without_verifying() {
+        let token = token_with_header(r#"{"alg":"EdDSA","kid":"up-2"}"#);
+        assert_eq!(compact_jws_kid(&token).as_deref(), Some("up-2"));
+    }
+
+    #[test]
+    fn compact_jws_kid_is_none_when_absent_or_malformed() {
+        assert_eq!(
+            compact_jws_kid(&token_with_header(r#"{"alg":"EdDSA"}"#)),
+            None
+        );
+        // A non-string kid is not a usable selector.
+        assert_eq!(compact_jws_kid(&token_with_header(r#"{"kid":42}"#)), None);
+        // Not base64, not JSON, and the empty string all yield None (never a panic).
+        assert_eq!(compact_jws_kid("not-a-token"), None);
+        assert_eq!(compact_jws_kid(""), None);
+    }
 }

@@ -30,7 +30,8 @@ use common::Harness;
 use ironauth_fetch::{FetchLimits, Fetcher, RecordingDialer, StaticResolver};
 use ironauth_jose::{EmissionOptions, JwkSet, SigningKey, sign_jws};
 use ironauth_oidc::{
-    FederationKeyResolver, FederationRuntime, federated_amr_from_auth_methods, oidc_router,
+    FederationKeyResolver, FederationRuntime, federated_amr_from_auth_methods,
+    federated_external_id, oidc_router,
 };
 use ironauth_store::{
     ConnectorCapabilities, ConnectorId, CorrelationId, NewConnector, Scope, SessionId,
@@ -358,10 +359,19 @@ async fn a_full_federated_login_provisions_a_user_and_an_honest_session_with_zer
         format!("/authorize?client_id={}", harness.client_id()),
     );
 
-    // A local identity was provisioned from the VERIFIED upstream sub.
+    // A local identity was provisioned from the VERIFIED upstream sub, keyed on the
+    // issuer-namespaced external id (issue #75, HIGH-1), not the bare sub.
     assert!(
-        user_provisioned(&harness, "upstream-sub-1").await,
+        user_provisioned(
+            &harness,
+            &federated_external_id(UPSTREAM_ISSUER, "upstream-sub-1")
+        )
+        .await,
         "the federated user is provisioned"
+    );
+    assert!(
+        !user_provisioned(&harness, "upstream-sub-1").await,
+        "the local identity is keyed on issuer+sub, never the bare sub"
     );
 
     // The established session carries the HONEST federated auth event: the federated method
@@ -544,4 +554,489 @@ async fn malicious_upstream_id_tokens_are_rejected_and_provision_no_user() {
             "{label}: NO user is provisioned from an unverified upstream token"
         );
     }
+}
+
+// ---- Cross-connector external-id isolation (issue #75, HIGH-1) ----
+
+const ISSUER_A: &str = "http://issuer-a.example";
+const ISSUER_B: &str = "http://issuer-b.example";
+const SLUG_A: &str = "conn-a";
+const SLUG_B: &str = "conn-b";
+
+/// A mock upstream that serves discovery keyed on the request `Host`, so several connectors
+/// with DIFFERENT configured issuers drive their whole flow through the one injected dialer:
+/// the served document's `issuer` is derived from the `Host`, so each connector's mix-up
+/// check passes. One shared signing key; a settable token response (sequenced per login).
+async fn start_host_routed_upstream() -> (SocketAddr, SigningKey, Arc<Mutex<String>>) {
+    let key = SigningKey::ed25519_from_seed(Some("up-kid".to_owned()), &[7_u8; 32]).expect("key");
+    let jwks = JwkSet::from_signing_keys([&key])
+        .expect("jwk set")
+        .to_json()
+        .expect("jwks json");
+    let token_response = Arc::new(Mutex::new(String::from("{}")));
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let token_for_server = Arc::clone(&token_response);
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                break;
+            };
+            let jwks = jwks.clone();
+            let token = Arc::clone(&token_for_server);
+            tokio::spawn(async move {
+                let mut buf = vec![0_u8; 8192];
+                let n = socket.read(&mut buf).await.unwrap_or(0);
+                let request = String::from_utf8_lossy(&buf[..n]);
+                let first = request.lines().next().unwrap_or("").to_owned();
+                // The Host header names the connector's issuer host (port stripped).
+                let host = request
+                    .lines()
+                    .find(|line| line.to_ascii_lowercase().starts_with("host:"))
+                    .and_then(|line| line.split_once(':').map(|(_, value)| value.trim()))
+                    .map(|value| value.split(':').next().unwrap_or(value).to_owned())
+                    .unwrap_or_default();
+                let body = if first.contains("openid-configuration") {
+                    let issuer = format!("http://{host}");
+                    format!(
+                        r#"{{"issuer":"{issuer}","authorization_endpoint":"{issuer}/authorize","token_endpoint":"{issuer}/token","jwks_uri":"{issuer}/jwks","id_token_signing_alg_values_supported":["EdDSA"],"code_challenge_methods_supported":["S256"]}}"#
+                    )
+                } else if first.contains("/jwks") {
+                    jwks
+                } else if first.contains("/token") {
+                    token.lock().expect("token lock").clone()
+                } else {
+                    String::from("{}")
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.flush().await;
+            });
+        }
+    });
+    (addr, key, token_response)
+}
+
+/// Seed an issuer-form connector with an explicit `slug`, `issuer`, and `client_id`, returning
+/// its id. A DATA-ONLY definition, created on the control plane (which provisions the envelope
+/// keys). `enabled` is set from the argument so the enabled-recheck test can seed a live one.
+async fn seed_named_connector(
+    harness: &Harness,
+    slug: &str,
+    issuer: &str,
+    client_id: &str,
+    enabled: bool,
+) -> ConnectorId {
+    let env = harness.env().clone();
+    let scope = harness.scope();
+    let id = ConnectorId::generate(&env, &scope);
+    let definition = format!(
+        r#"{{"connector_id":"{slug}","display_name":"C","protocol":"oidc","endpoints":{{"issuer":"{issuer}"}},"scopes":["openid","email"],"client_id":"{client_id}"}}"#
+    );
+    harness
+        .db()
+        .control_store()
+        .scoped(scope)
+        .acting(harness.db().test_actor(&env), CorrelationId::generate(&env))
+        .connectors()
+        .create(
+            &env,
+            &id,
+            1_000_000,
+            NewConnector {
+                slug,
+                definition_json: &definition,
+                client_secret: b"upstream-client-secret",
+                capabilities: ConnectorCapabilities {
+                    refresh: false,
+                    groups: false,
+                    logout_propagation: false,
+                    email_verified_trust: "untrusted",
+                },
+                enabled,
+            },
+            None,
+        )
+        .await
+        .expect("seed connector");
+    id
+}
+
+/// Drive the federated authorize leg for `slug` and return the response (whatever its status).
+async fn authorize_for(harness: &Harness, router: Router, slug: &str) -> axum::response::Response {
+    let scope = harness.scope();
+    let return_to = format!("/authorize?client_id={}", harness.client_id());
+    let uri = format!(
+        "/t/{}/e/{}/federation/{slug}/authorize?return_to={}",
+        scope.tenant(),
+        scope.environment(),
+        encode(&return_to),
+    );
+    router
+        .oneshot(
+            Request::builder()
+                .uri(&uri)
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("authorize")
+}
+
+/// Drive the callback for `slug` with a `state`, returning the response.
+async fn callback_for(
+    harness: &Harness,
+    router: Router,
+    slug: &str,
+    state: &str,
+) -> axum::response::Response {
+    let scope = harness.scope();
+    let uri = format!(
+        "/t/{}/e/{}/federation/{slug}/callback?state={state}&code=upstream-code",
+        scope.tenant(),
+        scope.environment(),
+    );
+    router
+        .oneshot(
+            Request::builder()
+                .uri(&uri)
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("callback")
+}
+
+/// Mint a valid upstream `id_token` for `issuer` / `client_id` / `nonce` / `sub`.
+fn mint(key: &SigningKey, issuer: &str, client_id: &str, nonce: &str, sub: &str) -> String {
+    let claims = serde_json::json!({
+        "iss": issuer,
+        "sub": sub,
+        "aud": client_id,
+        "exp": 4_102_444_800_i64,
+        "iat": 0,
+        "nonce": nonce,
+    });
+    let payload = serde_json::to_vec(&claims).expect("payload");
+    sign_jws(key, &payload, &EmissionOptions::new().with_typ("JWT")).expect("sign")
+}
+
+/// The user id the session cookie of a successful callback resolves to.
+async fn session_subject(harness: &Harness, response: &axum::response::Response) -> String {
+    let session_id = session_id_from_cookies(response, &harness.scope()).expect("session cookie");
+    harness
+        .store()
+        .scoped(harness.scope())
+        .sessions()
+        .get(&session_id, 1, i64::MAX / 2)
+        .await
+        .expect("session get")
+        .expect("session exists")
+        .subject
+}
+
+/// Run one full federated login for `slug` (its `issuer` and upstream `sub`, audienced to the
+/// shared `UPSTREAM_CLIENT_ID`), returning the local user id the established session belongs
+/// to. Sequences the shared token response.
+async fn login_subject(
+    harness: &Harness,
+    runtime: &Arc<FederationRuntime>,
+    token_slot: &Arc<Mutex<String>>,
+    key: &SigningKey,
+    slug: &str,
+    issuer: &str,
+    sub: &str,
+) -> String {
+    let response = authorize_for(
+        harness,
+        federation_router(harness, Arc::clone(runtime)),
+        slug,
+    )
+    .await;
+    assert_eq!(
+        response.status(),
+        StatusCode::SEE_OTHER,
+        "authorize for {slug}"
+    );
+    let location = response
+        .headers()
+        .get(header::LOCATION)
+        .expect("location")
+        .to_str()
+        .expect("location str")
+        .to_owned();
+    let state = param(&location, "state");
+    let nonce = param(&location, "nonce");
+    *token_slot.lock().unwrap() =
+        token_response(&mint(key, issuer, UPSTREAM_CLIENT_ID, &nonce, sub));
+    let response = callback_for(
+        harness,
+        federation_router(harness, Arc::clone(runtime)),
+        slug,
+        &state,
+    )
+    .await;
+    assert_eq!(
+        response.status(),
+        StatusCode::SEE_OTHER,
+        "callback for {slug}"
+    );
+    session_subject(harness, &response).await
+}
+
+#[tokio::test]
+async fn two_connectors_with_distinct_issuers_and_the_same_sub_resolve_to_two_users() {
+    // The account-takeover the namespacing fixes: two connectors pointing at DIFFERENT
+    // upstream IdPs that both assert sub=1001 must map to TWO DISTINCT local users, so an
+    // attacker who controls a second connector's IdP and picks a victim's sub does NOT bind
+    // to the victim's account.
+    let harness = Harness::start().await;
+    seed_named_connector(&harness, SLUG_A, ISSUER_A, UPSTREAM_CLIENT_ID, true).await;
+    seed_named_connector(&harness, SLUG_B, ISSUER_B, UPSTREAM_CLIENT_ID, true).await;
+    let (addr, key, token_slot) = start_host_routed_upstream().await;
+    let runtime = build_runtime(addr, vec![IpAddr::from([93, 184, 216, 34])]);
+
+    let subject_a = login_subject(
+        &harness,
+        &runtime,
+        &token_slot,
+        &key,
+        SLUG_A,
+        ISSUER_A,
+        "1001",
+    )
+    .await;
+    let subject_b = login_subject(
+        &harness,
+        &runtime,
+        &token_slot,
+        &key,
+        SLUG_B,
+        ISSUER_B,
+        "1001",
+    )
+    .await;
+
+    assert_ne!(
+        subject_a, subject_b,
+        "the SAME sub from DIFFERENT issuers must not collide onto one local user (no takeover)"
+    );
+    // Both issuer-namespaced identities exist and are distinct.
+    assert!(user_provisioned(&harness, &federated_external_id(ISSUER_A, "1001")).await);
+    assert!(user_provisioned(&harness, &federated_external_id(ISSUER_B, "1001")).await);
+    // The bare sub is NOT the key any longer (the old, vulnerable lookup finds nothing).
+    assert!(
+        !user_provisioned(&harness, "1001").await,
+        "the local identity is keyed on issuer+sub, never the bare sub"
+    );
+}
+
+#[tokio::test]
+async fn two_connectors_to_the_same_issuer_with_the_same_sub_share_one_user() {
+    // The identity-sharing half: two DIFFERENT connectors to the SAME issuer asserting the
+    // same sub are the same upstream identity, so they resolve to ONE local user.
+    let harness = Harness::start().await;
+    seed_named_connector(&harness, SLUG_A, ISSUER_A, UPSTREAM_CLIENT_ID, true).await;
+    seed_named_connector(&harness, SLUG_B, ISSUER_A, UPSTREAM_CLIENT_ID, true).await;
+    let (addr, key, token_slot) = start_host_routed_upstream().await;
+    let runtime = build_runtime(addr, vec![IpAddr::from([93, 184, 216, 34])]);
+
+    let subject_a = login_subject(
+        &harness,
+        &runtime,
+        &token_slot,
+        &key,
+        SLUG_A,
+        ISSUER_A,
+        "2002",
+    )
+    .await;
+    let subject_b = login_subject(
+        &harness,
+        &runtime,
+        &token_slot,
+        &key,
+        SLUG_B,
+        ISSUER_A,
+        "2002",
+    )
+    .await;
+
+    assert_eq!(
+        subject_a, subject_b,
+        "the same issuer + same sub is one upstream identity, so it shares one local user"
+    );
+}
+
+#[tokio::test]
+async fn an_upstream_token_with_nbf_in_the_future_is_rejected() {
+    // Defence in depth for the nbf enforcement the JOSE core owns: a not-yet-valid token
+    // (nbf far in the future of the harness clock at the epoch) provisions no user.
+    let harness = Harness::start().await;
+    seed_connector(&harness).await;
+    let upstream = start_upstream().await;
+    let runtime = build_runtime(upstream.addr, vec![IpAddr::from([93, 184, 216, 34])]);
+
+    let location =
+        drive_authorize(&harness, federation_router(&harness, Arc::clone(&runtime))).await;
+    let state = param(&location, "state");
+    let nonce = param(&location, "nonce");
+    let token = id_token(
+        &upstream.key,
+        base_claims(&nonce, "sub-nbf"),
+        serde_json::json!({ "nbf": 4_100_000_000_i64 }),
+    );
+    *upstream.token_response.lock().unwrap() = token_response(&token);
+
+    let response = drive_callback(
+        &harness,
+        federation_router(&harness, Arc::clone(&runtime)),
+        &state,
+    )
+    .await;
+    assert_ne!(
+        response.status(),
+        StatusCode::SEE_OTHER,
+        "an nbf-in-future token is rejected"
+    );
+    assert!(session_id_from_cookies(&response, &harness.scope()).is_none());
+    assert!(
+        !user_provisioned(&harness, &federated_external_id(UPSTREAM_ISSUER, "sub-nbf")).await,
+        "no user from a not-yet-valid token"
+    );
+}
+
+#[tokio::test]
+async fn an_explicit_endpoint_connector_is_rejected_cleanly_at_the_authorize_leg() {
+    // An explicit-endpoint connector cannot bind an iss yet (PR B), so it must fail CLEANLY
+    // and EARLY at the authorize leg (a 400), not 302 to the upstream and then 500 the
+    // callback after the user has authenticated.
+    let harness = Harness::start().await;
+    let env = harness.env().clone();
+    let scope = harness.scope();
+    let id = ConnectorId::generate(&env, &scope);
+    let definition = r#"{"connector_id":"expl","display_name":"E","protocol":"oidc","endpoints":{"authorization_endpoint":"https://x.example/a","token_endpoint":"https://x.example/t","jwks_uri":"https://x.example/j"},"scopes":["openid"],"client_id":"cid"}"#;
+    harness
+        .db()
+        .control_store()
+        .scoped(scope)
+        .acting(harness.db().test_actor(&env), CorrelationId::generate(&env))
+        .connectors()
+        .create(
+            &env,
+            &id,
+            1_000_000,
+            NewConnector {
+                slug: "expl",
+                definition_json: definition,
+                client_secret: b"secret",
+                capabilities: ConnectorCapabilities {
+                    refresh: false,
+                    groups: false,
+                    logout_propagation: false,
+                    email_verified_trust: "untrusted",
+                },
+                enabled: true,
+            },
+            None,
+        )
+        .await
+        .expect("seed explicit connector");
+    let upstream = start_upstream().await;
+    let runtime = build_runtime(upstream.addr, vec![IpAddr::from([93, 184, 216, 34])]);
+
+    let response = authorize_for(&harness, federation_router(&harness, runtime), "expl").await;
+    assert_eq!(
+        response.status(),
+        StatusCode::BAD_REQUEST,
+        "explicit-endpoint federation fails cleanly at authorize, before any redirect or state"
+    );
+}
+
+#[tokio::test]
+async fn a_connector_disabled_between_authorize_and_callback_fails_closed_at_the_callback() {
+    // INFO-2: the callback re-checks `enabled`, so a connector disabled mid-flow completes
+    // no login even with an otherwise-valid upstream token.
+    let harness = Harness::start().await;
+    let id = seed_named_connector(
+        &harness,
+        CONNECTOR_SLUG,
+        UPSTREAM_ISSUER,
+        UPSTREAM_CLIENT_ID,
+        true,
+    )
+    .await;
+    let upstream = start_upstream().await;
+    let runtime = build_runtime(upstream.addr, vec![IpAddr::from([93, 184, 216, 34])]);
+
+    let location =
+        drive_authorize(&harness, federation_router(&harness, Arc::clone(&runtime))).await;
+    let state = param(&location, "state");
+    let nonce = param(&location, "nonce");
+    let token = id_token(
+        &upstream.key,
+        base_claims(&nonce, "sub-disabled"),
+        serde_json::json!({}),
+    );
+    *upstream.token_response.lock().unwrap() = token_response(&token);
+
+    // Disable the connector AFTER the authorize leg, BEFORE the callback.
+    let env = harness.env().clone();
+    let scope = harness.scope();
+    let record = harness
+        .db()
+        .control_store()
+        .scoped(scope)
+        .connectors()
+        .get(&id)
+        .await
+        .expect("get connector");
+    harness
+        .db()
+        .control_store()
+        .scoped(scope)
+        .acting(harness.db().test_actor(&env), CorrelationId::generate(&env))
+        .connectors()
+        .update(
+            &env,
+            &id,
+            NewConnector {
+                slug: &record.slug,
+                definition_json: &record.definition_json,
+                client_secret: b"upstream-client-secret",
+                capabilities: ConnectorCapabilities {
+                    refresh: record.capabilities.refresh,
+                    groups: record.capabilities.groups,
+                    logout_propagation: record.capabilities.logout_propagation,
+                    email_verified_trust: &record.capabilities.email_verified_trust,
+                },
+                enabled: false,
+            },
+        )
+        .await
+        .expect("disable connector");
+
+    let response = drive_callback(
+        &harness,
+        federation_router(&harness, Arc::clone(&runtime)),
+        &state,
+    )
+    .await;
+    assert_ne!(
+        response.status(),
+        StatusCode::SEE_OTHER,
+        "a connector disabled mid-flow must not complete the login"
+    );
+    assert!(session_id_from_cookies(&response, &harness.scope()).is_none());
+    assert!(
+        !user_provisioned(
+            &harness,
+            &federated_external_id(UPSTREAM_ISSUER, "sub-disabled")
+        )
+        .await,
+        "no user is provisioned once the connector is disabled"
+    );
 }

@@ -164,7 +164,7 @@ pub use totp::{
     Base32Error, TotpAlgorithm, TotpParams, TotpParamsError, base32_decode, base32_encode, code_at,
     grouped_secret, provisioning_uri, verify as verify_totp,
 };
-pub use verify::{VerifiedToken, verify};
+pub use verify::{VerifiedToken, compact_jws_kid, verify};
 pub use webauthn::{
     WebauthnKey, WebauthnSignatureError, verify_jws_signature, verify_webauthn_signature,
 };

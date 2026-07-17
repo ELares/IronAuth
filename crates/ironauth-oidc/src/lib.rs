@@ -173,7 +173,7 @@ pub use discovery::{
 pub use error::{AuthorizeError, AuthzErrorCode, TokenError};
 pub use federation::{
     FederationRuntime, TokenExchange, UpstreamTokenPolicy, VerifiedUpstreamIdentity, exchange_code,
-    fetch_discovery, resolve_alg_allowlist, validate_upstream_id_token,
+    federated_external_id, fetch_discovery, resolve_alg_allowlist, validate_upstream_id_token,
 };
 pub use federation_jwks::FederationKeyResolver;
 pub use global_revocation::GLOBAL_TOKEN_REVOCATION_PATH;

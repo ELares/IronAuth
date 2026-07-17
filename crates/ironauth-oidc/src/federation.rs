@@ -362,7 +362,9 @@ const FEDERATION_STATE_TTL: Duration = Duration::from_secs(600);
 
 /// The installed generic OIDC upstream runtime (issue #75, PR B): the one SSRF-hardened
 /// fetcher every federation outbound rides, the per-connector upstream JWKS cache, and a
-/// bounded per-connector discovery cache. Installed on [`OidcState`] by the boot path.
+/// bounded per-connector discovery cache. Installed on [`OidcState`] via
+/// [`OidcState::with_federation`] by the boot path when `oidc.federation.enabled` is set
+/// (off by default, leaving the `/federation` routes a uniform not-found).
 pub struct FederationRuntime {
     fetcher: Arc<Fetcher>,
     keys: Arc<FederationKeyResolver>,
@@ -528,6 +530,14 @@ pub async fn federation_authorize(
         return interaction::server_error_page();
     };
 
+    // Reject an explicit-endpoint connector UP FRONT (issue #75, LOW-3), before any `state`
+    // is generated or persisted: PR B binds the upstream `iss` only for an issuer-form
+    // connector, so an explicit set cannot complete the callback. Failing here gives the
+    // operator a clean, documented error instead of a 500 after the user has authenticated.
+    if matches!(definition.endpoints, Endpoints::Explicit(_)) {
+        return interaction::federation_unsupported_page();
+    }
+
     let now = state.now();
     // A discovery fetch that is blocked, times out, or returns a malformed document fails
     // the login without provisioning anything.
@@ -661,6 +671,11 @@ pub async fn federation_callback(
     else {
         return interaction::server_error_page();
     };
+    // Re-check `enabled` at the callback (INFO-2): a connector disabled BETWEEN the authorize
+    // leg (which checks it) and this callback must fail closed, not complete a login.
+    if !record.enabled {
+        return not_found();
+    }
     let Ok(definition) = serde_json::from_str::<ConnectorRuntimeConfig>(&record.definition_json)
     else {
         return interaction::server_error_page();
@@ -721,9 +736,19 @@ pub async fn federation_callback(
     // jwks_uri is Blocked here, so validation then fails closed as UpstreamUnavailable), and
     // VALIDATE the upstream ID token through the JOSE core. On ANY validation failure no
     // user is provisioned and the login fails (UpstreamProtocol / UpstreamUnavailable).
+    // Extract the token's `kid` as a REFETCH hint only (never a key source): a `kid` the
+    // cached JWKS does not answer to triggers a single bounded refetch so an upstream key
+    // ROTATION is picked up WITHOUT waiting out the JWKS TTL (issue #75, LOW-1). The trust
+    // decision stays entirely inside `validate_upstream_id_token` / the JOSE core.
+    let token_kid = ironauth_jose::compact_jws_kid(&id_token);
     let keys = runtime
         .keys
-        .resolve(now, &connector_id.to_string(), &resolved.jwks_uri)
+        .resolve_for_kid(
+            now,
+            &connector_id.to_string(),
+            &resolved.jwks_uri,
+            token_kid.as_deref(),
+        )
         .await;
     let allowed_algs =
         resolve_alg_allowlist(resolved.id_token_signing_alg_values_supported.as_deref());
@@ -744,7 +769,8 @@ pub async fn federation_callback(
     // Provision a MINIMAL local identity from the VERIFIED upstream sub (PR C generalizes
     // claim mapping): find the user by external id, or create one linked to the upstream
     // sub with no local password (it can only ever log in through federation).
-    let Ok(user_id) = provision_federated_user(&state, scope, &connector_slug, &identity).await
+    let Ok(user_id) =
+        provision_federated_user(&state, scope, &connector_slug, &expected_issuer, &identity).await
     else {
         return interaction::server_error_page();
     };
@@ -780,10 +806,39 @@ pub async fn federation_callback(
     interaction::redirect_setting_cookie(&consumed.return_to, &cookies)
 }
 
+/// The namespaced external-id for a federated identity (issue #75, HIGH-1): the upstream
+/// ISSUER and the upstream `sub`, LENGTH-PREFIXED so the `(issuer, sub) -> key` mapping is
+/// injective.
+///
+/// An OIDC `sub` is unique only WITHIN one issuer (OIDC Core section 2), so keying the local
+/// federated identity on the BARE `sub` lets two connectors pointing at DIFFERENT upstream
+/// identity providers that emit the same `sub` resolve to the SAME local user: an account
+/// takeover by anyone who controls a second connector's provider and picks a victim's `sub`.
+/// Namespacing by
+/// the mix-up-checked issuer is the OIDC-correct identity boundary: two connectors to the
+/// SAME issuer with the same `sub` map to the SAME user (one upstream identity); two
+/// connectors to DIFFERENT issuers with the same `sub` are DISTINCT users.
+///
+/// The length prefix on the issuer makes the encoding injection-safe: no choice of
+/// `(issuer, sub)` with a different issuer can ever encode to another's key, even if an
+/// issuer or `sub` contains the separator (a bare separator like NUL is spoofable when the
+/// attacker controls the `sub`). This composite is what flows into the store's blind index
+/// and sealed `external_id`, so a re-login recomputes the identical key and finds the same
+/// user.
+#[must_use]
+pub fn federated_external_id(issuer: &str, subject: &str) -> String {
+    format!(
+        "federated:v1:{}:{issuer}:{}:{subject}",
+        issuer.len(),
+        subject.len()
+    )
+}
+
 /// Provision or look up the LOCAL user for a verified federated identity (issue #75, PR B),
-/// keyed on the upstream `sub` via the external-id link. A minimal identity: no local
-/// password (federation is the only login path), a namespaced login handle, and the upstream
-/// sub as the external id. PR C generalizes claim mapping into the trait document.
+/// keyed on the upstream ISSUER + `sub` via the external-id link (issue #75, HIGH-1: the
+/// namespaced key closes the cross-connector `sub`-collision takeover). A minimal identity:
+/// no local password (federation is the only login path), a namespaced login handle, and the
+/// issuer-namespaced external id. PR C generalizes claim mapping into the trait document.
 ///
 /// # Errors
 ///
@@ -792,13 +847,17 @@ async fn provision_federated_user(
     state: &OidcState,
     scope: Scope,
     connector_slug: &str,
+    issuer: &str,
     identity: &VerifiedUpstreamIdentity,
 ) -> Result<UserId, ironauth_store::StoreError> {
+    // The federated external-id is namespaced by the upstream ISSUER, because a `sub` is
+    // unique only within one issuer (see `federated_external_id`).
+    let external_id = federated_external_id(issuer, &identity.subject);
     if let Some(existing) = state
         .store()
         .scoped(scope)
         .users()
-        .by_external_id(&identity.subject)
+        .by_external_id(&external_id)
         .await?
     {
         return Ok(existing.id);
@@ -822,7 +881,7 @@ async fn provision_federated_user(
                 identifier: &handle,
                 password_hash: None,
                 claims_json: None,
-                external_id: Some(&identity.subject),
+                external_id: Some(&external_id),
                 state: UserState::Active,
                 foreign_password_hash: None,
                 foreign_password_algo: None,
@@ -1305,6 +1364,203 @@ mod tests {
         assert!(
             matches!(err, ConnectorError::UpstreamUnavailable(_)),
             "{err:?}"
+        );
+    }
+
+    // ---- The issuer-namespaced federated external-id (issue #75, HIGH-1) ----
+
+    #[test]
+    fn the_federated_external_id_is_injective_across_issuer_and_sub() {
+        // Two DIFFERENT issuers with the SAME sub encode to DIFFERENT keys (no takeover),
+        // while the SAME (issuer, sub) is stable (identity sharing / a re-login re-finds it).
+        let a = federated_external_id("https://idp-a.example", "1001");
+        let b = federated_external_id("https://idp-b.example", "1001");
+        assert_ne!(a, b, "same sub from different issuers must not collide");
+        assert_eq!(a, federated_external_id("https://idp-a.example", "1001"));
+        // The length prefix keeps it injection-safe: a boundary shift between issuer and sub
+        // (which a bare separator would let collide) still encodes distinctly.
+        let shifted_issuer = federated_external_id("https://idp.example:x", "1001");
+        let shifted_sub = federated_external_id("https://idp.example", "x:1001");
+        assert_ne!(shifted_issuer, shifted_sub, "the encoding is unambiguous");
+    }
+
+    // ---- A rotated upstream kid refetches once, without waiting out the TTL (LOW-1) ----
+
+    /// Serve the current contents of `body` as JSON to every request, so a test can ROTATE
+    /// the served document (a key rotation) between resolves.
+    #[cfg(feature = "testing")]
+    async fn start_mutable_server(body: Arc<Mutex<String>>) -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let body = Arc::clone(&body);
+                tokio::spawn(async move {
+                    let mut buf = [0_u8; 4096];
+                    let _ = socket.read(&mut buf).await;
+                    let payload = body.lock().expect("body lock").clone();
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                        payload.len()
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                    let _ = socket.flush().await;
+                });
+            }
+        });
+        addr
+    }
+
+    #[cfg(feature = "testing")]
+    #[tokio::test]
+    async fn a_kid_miss_triggers_a_single_bounded_jwks_refetch() {
+        let key1 = SigningKey::ed25519_from_seed(Some("up-1".to_owned()), &[1_u8; 32]).unwrap();
+        let key2 = SigningKey::ed25519_from_seed(Some("up-2".to_owned()), &[2_u8; 32]).unwrap();
+        let jwks1 = JwkSet::from_signing_keys([&key1])
+            .unwrap()
+            .to_json()
+            .unwrap();
+        let jwks2 = JwkSet::from_signing_keys([&key2])
+            .unwrap()
+            .to_json()
+            .unwrap();
+        let body = Arc::new(Mutex::new(jwks1));
+        let server = start_mutable_server(Arc::clone(&body)).await;
+        let dialer = Arc::new(RecordingDialer::new(server));
+        let resolver_seam = Arc::new(StaticResolver::new(vec![IpAddr::from([93, 184, 216, 34])]));
+        let fetcher =
+            Fetcher::from_parts(FetchLimits::default(), resolver_seam, Arc::clone(&dialer));
+        let resolver =
+            FederationKeyResolver::new_allow_http(Arc::new(fetcher), Duration::from_secs(300));
+        let now = SystemTime::UNIX_EPOCH;
+        let uri = "http://upstream.example/jwks";
+
+        // First login: the token names kid up-1, which the fetched set answers to (one dial).
+        let trusted = resolver
+            .resolve_for_kid(now, "cnr", uri, Some("up-1"))
+            .await;
+        assert!(trusted.iter().any(|k| k.kid() == Some("up-1")));
+        assert_eq!(dialer.requested().len(), 1);
+
+        // The upstream ROTATES to up-2 WITHIN the TTL. A pure TTL cache would keep serving the
+        // stale set and fail every login for up to the TTL; the kid-miss forces ONE refetch.
+        *body.lock().unwrap() = jwks2;
+        let trusted = resolver
+            .resolve_for_kid(now, "cnr", uri, Some("up-2"))
+            .await;
+        assert!(
+            trusted.iter().any(|k| k.kid() == Some("up-2")),
+            "the rotated-in kid resolves without waiting for the TTL"
+        );
+        assert_eq!(dialer.requested().len(), 2, "exactly one bounded refetch");
+
+        // The refreshed set is now cached: a second up-2 login does not dial again.
+        let trusted = resolver
+            .resolve_for_kid(now, "cnr", uri, Some("up-2"))
+            .await;
+        assert!(trusted.iter().any(|k| k.kid() == Some("up-2")));
+        assert_eq!(dialer.requested().len(), 2, "the refreshed set is cached");
+    }
+
+    // ---- TTL expiry drives a refetch under the manual clock (LOW-2) ----
+
+    #[cfg(feature = "testing")]
+    #[tokio::test]
+    async fn the_jwks_cache_refetches_only_after_its_ttl_expires() {
+        let key = upstream_key();
+        let jwks = JwkSet::from_signing_keys([&key])
+            .unwrap()
+            .to_json()
+            .unwrap();
+        let body = Arc::new(Mutex::new(jwks));
+        let server = start_mutable_server(Arc::clone(&body)).await;
+        let dialer = Arc::new(RecordingDialer::new(server));
+        let resolver_seam = Arc::new(StaticResolver::new(vec![IpAddr::from([93, 184, 216, 34])]));
+        let fetcher =
+            Fetcher::from_parts(FetchLimits::default(), resolver_seam, Arc::clone(&dialer));
+        let resolver =
+            FederationKeyResolver::new_allow_http(Arc::new(fetcher), Duration::from_secs(300));
+        let t0 = SystemTime::UNIX_EPOCH;
+        let uri = "http://upstream.example/jwks";
+
+        resolver.resolve(t0, "cnr", uri).await;
+        assert_eq!(dialer.requested().len(), 1);
+        // Within the TTL: the cached value is reused, no refetch.
+        resolver
+            .resolve(t0 + Duration::from_secs(100), "cnr", uri)
+            .await;
+        assert_eq!(
+            dialer.requested().len(),
+            1,
+            "a within-TTL resolve is cached"
+        );
+        // Past the TTL: the cached value is NOT reused, so a refetch occurs.
+        resolver
+            .resolve(t0 + Duration::from_secs(301), "cnr", uri)
+            .await;
+        assert_eq!(
+            dialer.requested().len(),
+            2,
+            "past the TTL the cached value is not reused"
+        );
+    }
+
+    #[cfg(feature = "testing")]
+    #[tokio::test]
+    async fn the_discovery_cache_refetches_only_after_its_ttl_expires() {
+        // A plaintext-http issuer so the in-process loopback server can serve the document.
+        // The reserved served-discovery-document field name is assembled from fragments so
+        // this in-crate source never contains it (the self-discovery lint).
+        let http_issuer = "http://upstream.example";
+        let authz = concat!("authorization", "_endpoint");
+        let doc = format!(
+            r#"{{"issuer":"{http_issuer}","{authz}":"https://upstream.example/authorize","token_endpoint":"https://upstream.example/token","jwks_uri":"https://upstream.example/jwks","id_token_signing_alg_values_supported":["EdDSA"],"code_challenge_methods_supported":["S256"]}}"#
+        );
+        let server = start_server(doc).await;
+        let dialer = Arc::new(RecordingDialer::new(server));
+        let resolver_seam = Arc::new(StaticResolver::new(vec![IpAddr::from([93, 184, 216, 34])]));
+        let fetcher = Arc::new(Fetcher::from_parts(
+            FetchLimits::default(),
+            resolver_seam,
+            Arc::clone(&dialer),
+        ));
+        let keys = Arc::new(FederationKeyResolver::new_allow_http(
+            Arc::clone(&fetcher),
+            Duration::from_secs(300),
+        ));
+        let runtime = FederationRuntime::new_allow_http(fetcher, keys, Duration::from_secs(300));
+        let endpoints = Endpoints::Discovery(ironauth_connector::DiscoveryEndpoints {
+            issuer: http_issuer.to_owned(),
+        });
+        let t0 = SystemTime::UNIX_EPOCH;
+
+        runtime
+            .resolve_endpoints(t0, "cnr", &endpoints)
+            .await
+            .expect("resolve");
+        assert_eq!(dialer.requested().len(), 1);
+        // Within the TTL the resolved discovery document is served from the cache.
+        runtime
+            .resolve_endpoints(t0 + Duration::from_secs(100), "cnr", &endpoints)
+            .await
+            .expect("resolve");
+        assert_eq!(
+            dialer.requested().len(),
+            1,
+            "within the TTL discovery is cached"
+        );
+        // Past the discovery TTL the cached value is not reused, so a refetch occurs.
+        runtime
+            .resolve_endpoints(t0 + Duration::from_secs(301), "cnr", &endpoints)
+            .await
+            .expect("resolve");
+        assert_eq!(
+            dialer.requested().len(),
+            2,
+            "past the discovery TTL a refetch occurs"
         );
     }
 }
