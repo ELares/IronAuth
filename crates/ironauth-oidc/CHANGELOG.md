@@ -7,9 +7,27 @@ range per docs/RELEASING.md.
 ## Unreleased
 
 - Generic OIDC UPSTREAM for inbound federation (issue #75, PR B): the wire that turns a
-  declarative connector (PR A) into a federated login with ZERO per-provider code. This slice
-  ships the security-critical core (the HTTP authorize/callback routes and the single-use
-  correlation-state persistence are the remaining sub-slice of PR B).
+  declarative connector (PR A) into a full federated login with ZERO per-provider code.
+  - **The federated login legs** (string-literal routes on `oidc_router`):
+    `GET /t/{tenant}/e/{env}/federation/{connector_slug}/authorize` loads the DATA-ONLY
+    connector by slug, generates an unguessable `state`/`nonce` (and a PKCE `S256` challenge
+    when the upstream advertises it) from the entropy seam, persists the single-use
+    correlation row (migration 0057, the PKCE verifier SEALED), and 302s to the upstream;
+    `.../callback` consumes the correlation row by `state` SINGLE-USE (the CSRF defence),
+    exchanges the code with the PRODUCTION-unsealed client secret and the bound verifier,
+    VALIDATES the upstream ID token through the JOSE core, and only then provisions and
+    resumes. Both mapped in `docs/conformance/rfc9700-checklist.md`. Inert until a
+    `FederationRuntime` is installed on the state (`OidcState::with_federation`).
+  - **Minimal provisioning + honest LOCAL token.** From the VERIFIED upstream `sub` it
+    find-or-creates a local user by external id (no local password) and establishes a local
+    session, then resumes the pending local `/authorize` so the LOCAL token flow issues the
+    token. The session's `auth_methods` carries the federated method PLUS the upstream `amr`
+    passthrough (base64url-encoded in one reserved token that survives the persistence
+    channel), so the MINTED local token's `amr` is the upstream's asserted `amr` VERBATIM and
+    its `acr` is the federated context, never a fabricated local factor (proven end to end by
+    the `federation` suite and the `tokens` mint test). The federated context is deliberately
+    UNRANKED (excluded from `acr_values_supported` and the step-up ladder): IronAuth cannot
+    vouch for another operator's assurance level.
   - **Upstream ID-token validation through the ONE JOSE entry point** (`federation` module, the
     security crux). Building a `VerificationPolicy` that pins the algorithm allowlist (the
     upstream-advertised or connector algorithms INTERSECTED with the JOSE core's allowlist, so

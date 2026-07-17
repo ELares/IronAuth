@@ -69,19 +69,21 @@ use crate::email_otp::{
 };
 use crate::environment::{EnvironmentType, GuardrailSet};
 use crate::error::StoreError;
+use crate::federation_state::{ConsumedFederationLoginState, NewFederationLoginState};
 use crate::id::{
     AaguidRuleId, AbuseBanId, AcmeChallengeId, AdminSudoElevationId, AssertionMappingId,
     AttestationConfigId, AuditId, AuditTarget, AuthorizationCodeId, BackChannelDeliveryId,
     ClientId, ClientSessionId, ConnectorId, ConsentId, CorrelationId, CredentialClassPolicyId,
     CredentialId, CustomDomainId, DcrPolicyId, DekId, DeviceCodeId, EmailOtpCodeId,
-    EncryptedSecretId, EnvironmentId, EnvironmentSecretId, ExternalIssuerId, GrantId,
-    InitialAccessTokenId, InvitationId, IssuedTokenId, KekId, MagicLinkTokenId, ManagementKeyId,
-    Mds3BlobCacheId, MigrationRunId, MigrationRunRecordId, OperatorId, OrganizationId,
-    PushedRequestId, RecoveryCodeId, RecoveryFlowId, RefreshFamilyId, RefreshTokenId,
-    ResourceServerId, RiskDecisionId, RiskDisavowalId, RiskLoginGeoId, ScopeStepUpPolicyId,
-    ServiceAccountId, SessionEventId, SessionId, SigningKeyId, SmsOtpCodeId, SmsRouteStatId,
-    TenantId, TotpCredentialId, TraitMigrationJobId, TraitSchemaId, TrustedDeviceId, UserId,
-    UserIdentifierId, VariableId, WebauthnChallengeId, WebauthnCredentialId,
+    EncryptedSecretId, EnvironmentId, EnvironmentSecretId, ExternalIssuerId,
+    FederationLoginStateId, GrantId, InitialAccessTokenId, InvitationId, IssuedTokenId, KekId,
+    MagicLinkTokenId, ManagementKeyId, Mds3BlobCacheId, MigrationRunId, MigrationRunRecordId,
+    OperatorId, OrganizationId, PushedRequestId, RecoveryCodeId, RecoveryFlowId, RefreshFamilyId,
+    RefreshTokenId, ResourceServerId, RiskDecisionId, RiskDisavowalId, RiskLoginGeoId,
+    ScopeStepUpPolicyId, ServiceAccountId, SessionEventId, SessionId, SigningKeyId, SmsOtpCodeId,
+    SmsRouteStatId, TenantId, TotpCredentialId, TraitMigrationJobId, TraitSchemaId,
+    TrustedDeviceId, UserId, UserIdentifierId, VariableId, WebauthnChallengeId,
+    WebauthnCredentialId,
 };
 use crate::identifier::{
     CanonicalIdentifier, IdentifierType, UniquenessMode, canonicalize_identifier,
@@ -412,6 +414,18 @@ impl<'a> ScopedStore<'a> {
     #[must_use]
     pub fn connectors(&self) -> ConnectorRepo<'a> {
         ConnectorRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
+    /// The data-plane federation outbound-login correlation store for this scope
+    /// (issue #75, PR B): persist an outbound authorize leg's correlation row (state,
+    /// nonce, sealed PKCE verifier, connector, resume target) and consume it ATOMICALLY
+    /// exactly once at the callback (the single-use CSRF defence).
+    #[must_use]
+    pub fn federation_login_states(&self) -> FederationLoginStateRepo<'a> {
+        FederationLoginStateRepo {
             store: self.store,
             scope: self.scope,
         }
@@ -18318,6 +18332,73 @@ impl ConnectorRepo<'_> {
         connector_record_from_row(&row, self.scope)
     }
 
+    /// A connector's secret-free record by its per-environment slug (issue #75, PR B),
+    /// the federation login path's entry point: the browser reaches
+    /// `/federation/{connector_slug}/authorize`, and the handler loads the connector by
+    /// that slug. Returns [`None`] when no connector of that slug exists in scope.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn by_slug(&self, slug: &str) -> Result<Option<ConnectorRecord>, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(&format!(
+            "SELECT {CONNECTOR_READ_COLUMNS} FROM connectors \
+             WHERE tenant_id = $1 AND environment_id = $2 AND connector_slug = $3"
+        ))
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(slug)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        row.map(|row| connector_record_from_row(&row, self.scope))
+            .transpose()
+    }
+
+    /// Open the inline-sealed upstream client secret for a connector on the DATA plane
+    /// (issue #75, PR B): the production unseal the federated code exchange uses to
+    /// authenticate to the upstream token endpoint. The seal AAD is reconstructed from
+    /// the connector's IMMUTABLE id, so a resealed secret still authenticates across any
+    /// definition edit. The platform master key is resolved internally, so the caller
+    /// (the OIDC federation handler) never touches key material.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the connector is out of scope or absent;
+    /// [`StoreError::Encryption`] if no platform master key is configured or the
+    /// ciphertext cannot be authenticated and decrypted; [`StoreError::Database`] on a
+    /// persistence failure.
+    pub async fn open_client_secret(&self, id: &ConnectorId) -> Result<Vec<u8>, StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let master = self.store.master().ok_or(StoreError::Encryption)?;
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT client_secret_sealed, client_secret_dek_version FROM connectors \
+             WHERE tenant_id = $1 AND environment_id = $2 AND id = $3",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(id.to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(row) = row else {
+            tx.commit().await?;
+            return Err(StoreError::NotFound);
+        };
+        let sealed: Vec<u8> = row.get("client_secret_sealed");
+        let dek_version: i32 = row.get("client_secret_dek_version");
+        let dek = fetch_dek_by_version(&mut tx, self.scope, master, dek_version).await?;
+        let plaintext = dek.open(
+            &secret_seal_aad(self.scope, &connector_secret_purpose(id), dek_version),
+            &Sealed::from_bytes(sealed)?,
+        )?;
+        tx.commit().await?;
+        Ok(plaintext)
+    }
+
     /// A page of the scope's connectors, ordered by the stable `(created_at, id)`
     /// key, for the management list endpoint (issue #75). `limit` rows after the
     /// optional `after` cursor.
@@ -18434,6 +18515,137 @@ impl ConnectorRepo<'_> {
         )?;
         tx.commit().await?;
         Ok(plaintext)
+    }
+}
+
+/// The seal-purpose string for a federation correlation row's PKCE code verifier,
+/// bound into the seal AAD on the row's IMMUTABLE `fls_` id so a sealed verifier lifted
+/// to another row, scope, or DEK version fails authenticated decryption (issue #75).
+fn federation_verifier_purpose(id: &FederationLoginStateId) -> String {
+    format!("federation_code_verifier:{id}")
+}
+
+/// The data-plane federation outbound-login correlation store (issue #75, PR B): a
+/// short-lived, single-use row correlating an upstream authorize leg to its callback.
+/// Every operation is scope-bound and runs on the least-privilege `ironauth_app` role.
+pub struct FederationLoginStateRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl FederationLoginStateRepo<'_> {
+    /// Persist a correlation row for an outbound authorize leg (issue #75): SEAL the PKCE
+    /// `code_verifier` under the scope's active DEK (so a leaked row carries no usable
+    /// verifier) and INSERT it with its single-use `expires_at`. The `id` is minted from
+    /// the entropy seam by the caller; `env` supplies the seal nonce entropy.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if `id` is out of scope; [`StoreError::Encryption`] if the
+    /// scope has no platform master key or active DEK; [`StoreError::Conflict`] if the
+    /// state already exists in scope; [`StoreError::Database`] on a persistence failure.
+    pub async fn create(
+        &self,
+        env: &Env,
+        id: &FederationLoginStateId,
+        params: NewFederationLoginState<'_>,
+    ) -> Result<(), StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let master = self.store.master().ok_or(StoreError::Encryption)?;
+        let scope = self.scope;
+        let mut tx = begin_scoped(self.store, scope).await?;
+        let (dek_version, dek) = fetch_active_dek(&mut tx, scope, master).await?;
+        let sealed = dek.seal(
+            env.entropy(),
+            &secret_seal_aad(scope, &federation_verifier_purpose(id), dek_version),
+            params.code_verifier,
+        );
+        let result = sqlx::query(
+            "INSERT INTO federation_login_states \
+             (id, tenant_id, environment_id, state, nonce, code_verifier_sealed, \
+              code_verifier_dek_version, connector_id, return_to, expires_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, \
+                     TIMESTAMPTZ 'epoch' + ($10::text || ' microseconds')::interval)",
+        )
+        .bind(id.to_string())
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(params.state)
+        .bind(params.nonce)
+        .bind(sealed.into_bytes())
+        .bind(dek_version)
+        .bind(params.connector_id)
+        .bind(params.return_to)
+        .bind(params.expires_at_unix_micros)
+        .execute(&mut *tx)
+        .await;
+        match result {
+            Ok(_) => {}
+            Err(error) if is_unique_violation(&error) => return Err(StoreError::Conflict),
+            Err(error) => return Err(error.into()),
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Consume the correlation row for `state` ATOMICALLY exactly once (issue #75, the
+    /// CSRF crux): one guarded `UPDATE` filtered on an unconsumed, unexpired row that
+    /// returns its correlation values, so a replayed, forged, or expired state matches no
+    /// consumable row and yields [`None`]. On a hit, the sealed PKCE verifier is UNSEALED
+    /// and the correlation values are returned. `now_unix_micros` is the application clock
+    /// instant (never the database clock), so expiry is deterministic under a manual clock.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Encryption`] if the master key is absent or the verifier cannot be
+    /// unsealed; [`StoreError::Database`] on a persistence failure.
+    pub async fn consume(
+        &self,
+        state: &str,
+        now_unix_micros: i64,
+    ) -> Result<Option<ConsumedFederationLoginState>, StoreError> {
+        let master = self.store.master().ok_or(StoreError::Encryption)?;
+        let scope = self.scope;
+        let mut tx = begin_scoped(self.store, scope).await?;
+        let row = sqlx::query(
+            "UPDATE federation_login_states \
+             SET consumed_at = TIMESTAMPTZ 'epoch' + ($2::text || ' microseconds')::interval \
+             WHERE tenant_id = $3 AND environment_id = $4 AND state = $1 \
+               AND consumed_at IS NULL \
+               AND expires_at > TIMESTAMPTZ 'epoch' + ($2::text || ' microseconds')::interval \
+             RETURNING id, nonce, code_verifier_sealed, code_verifier_dek_version, \
+                       connector_id, return_to",
+        )
+        .bind(state)
+        .bind(now_unix_micros)
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(row) = row else {
+            tx.commit().await?;
+            return Ok(None);
+        };
+        let id_text: String = row.get("id");
+        let id = FederationLoginStateId::parse_in_scope(&id_text, &scope)
+            .map_err(|_| StoreError::NotFound)?;
+        let sealed: Vec<u8> = row.get("code_verifier_sealed");
+        let dek_version: i32 = row.get("code_verifier_dek_version");
+        let dek = fetch_dek_by_version(&mut tx, scope, master, dek_version).await?;
+        let code_verifier = dek.open(
+            &secret_seal_aad(scope, &federation_verifier_purpose(&id), dek_version),
+            &Sealed::from_bytes(sealed)?,
+        )?;
+        let consumed = ConsumedFederationLoginState {
+            nonce: row.get("nonce"),
+            code_verifier,
+            connector_id: row.get("connector_id"),
+            return_to: row.get("return_to"),
+        };
+        tx.commit().await?;
+        Ok(Some(consumed))
     }
 }
 

@@ -123,12 +123,24 @@ pub fn parse_discovery(
         ));
     }
 
-    let authorization_endpoint = required_https(object, "authorization_endpoint")?;
-    let token_endpoint = required_https(object, "token_endpoint")?;
-    let jwks_uri = required_https(object, "jwks_uri")?;
-    // UserInfo is optional; when present it must still be a well-formed https URL.
+    // Endpoints must not DOWNGRADE the issuer's transport security: a production issuer is
+    // https, so its endpoints must be https too (no plaintext downgrade). An http issuer is
+    // only ever reachable through the fetcher's explicit plaintext opt-in (a loopback test
+    // upstream, never production), so http endpoints are admitted only there.
+    let require_https = expected_issuer
+        .get(..5)
+        .is_none_or(|prefix| prefix.eq_ignore_ascii_case("https"));
+    let authorization_endpoint =
+        required_endpoint(object, "authorization_endpoint", require_https)?;
+    let token_endpoint = required_endpoint(object, "token_endpoint", require_https)?;
+    let jwks_uri = required_endpoint(object, "jwks_uri", require_https)?;
+    // UserInfo is optional; when present it must still be a well-formed endpoint URL.
     let userinfo_endpoint = match string_member(object, "userinfo_endpoint") {
-        Some(value) => Some(check_https(value, "userinfo_endpoint")?),
+        Some(value) => Some(check_endpoint_url(
+            value,
+            "userinfo_endpoint",
+            require_https,
+        )?),
         None => None,
     };
 
@@ -176,28 +188,38 @@ fn string_array_member(
     )
 }
 
-/// A REQUIRED string member that must be an absolute `https` URL.
-fn required_https(
+/// A REQUIRED string member that must be an absolute endpoint URL (https, or http only
+/// when `require_https` is false, i.e. a plaintext-loopback test issuer).
+fn required_endpoint(
     object: &serde_json::Map<String, serde_json::Value>,
     name: &str,
+    require_https: bool,
 ) -> Result<String, ConnectorError> {
     let value = string_member(object, name).ok_or_else(|| {
         ConnectorError::UpstreamProtocol(format!("the discovery document is missing {name}"))
     })?;
-    check_https(value, name)
+    check_endpoint_url(value, name, require_https)
 }
 
-/// Confirm `value` is a syntactically absolute `https` URL with a host, returning it
-/// unchanged. Syntactic only: the SSRF network check happens at fetch time.
-fn check_https(value: String, name: &str) -> Result<String, ConnectorError> {
-    let scheme_len = "https://".len();
-    let starts_https =
-        value.len() >= scheme_len && value[..scheme_len].eq_ignore_ascii_case("https://");
-    if !starts_https {
+/// Confirm `value` is a syntactically absolute endpoint URL with a host, returning it
+/// unchanged. When `require_https` is set, only `https` is accepted (a production issuer
+/// never downgrades to plaintext); otherwise `http` is also accepted (a plaintext-loopback
+/// test issuer). Syntactic only: the SSRF network check happens at fetch time.
+fn check_endpoint_url(
+    value: String,
+    name: &str,
+    require_https: bool,
+) -> Result<String, ConnectorError> {
+    let starts_https = has_scheme(&value, "https://");
+    let scheme_len = if starts_https {
+        "https://".len()
+    } else if !require_https && has_scheme(&value, "http://") {
+        "http://".len()
+    } else {
         return Err(ConnectorError::UpstreamProtocol(format!(
             "the discovery document {name} is not an absolute https URL"
         )));
-    }
+    };
     let rest = &value[scheme_len..];
     let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
     if rest[..authority_end].is_empty() {
@@ -206,6 +228,11 @@ fn check_https(value: String, name: &str) -> Result<String, ConnectorError> {
         )));
     }
     Ok(value)
+}
+
+/// Whether `value` begins with `scheme` (case-insensitively).
+fn has_scheme(value: &str, scheme: &str) -> bool {
+    value.len() >= scheme.len() && value[..scheme.len()].eq_ignore_ascii_case(scheme)
 }
 
 /// Resolve a connector's endpoints WITHOUT discovery: an explicit-endpoint connector
@@ -326,6 +353,28 @@ mod tests {
             "an omitted list is treated as no S256"
         );
         assert!(resolved.code_challenge_methods_supported.is_none());
+    }
+
+    #[test]
+    fn an_http_issuer_admits_http_endpoints_but_https_never_downgrades() {
+        // A plaintext-loopback test issuer (http) admits http endpoints, so an in-process
+        // upstream can be driven over the fetcher's plaintext opt-in.
+        let http_issuer = "http://upstream.example";
+        let doc = format!(
+            r#"{{"issuer":"{http_issuer}","authorization_endpoint":"http://upstream.example/authorize","token_endpoint":"http://upstream.example/token","jwks_uri":"http://upstream.example/jwks"}}"#
+        );
+        let resolved = parse_discovery(doc.as_bytes(), http_issuer).expect("http issuer parses");
+        assert_eq!(resolved.token_url, "http://upstream.example/token");
+        // A production HTTPS issuer must NOT accept a plaintext-downgraded endpoint.
+        let downgrade = format!(
+            r#"{{"issuer":"{ISSUER}","authorization_endpoint":"http://issuer.example.com/authorize","token_endpoint":"https://issuer.example.com/token","jwks_uri":"https://issuer.example.com/jwks"}}"#
+        );
+        let err = parse_discovery(downgrade.as_bytes(), ISSUER)
+            .expect_err("an https issuer rejects a plaintext endpoint");
+        assert!(
+            matches!(err, ConnectorError::UpstreamProtocol(_)),
+            "{err:?}"
+        );
     }
 
     #[test]

@@ -361,7 +361,22 @@ pub(crate) fn build_id_token_claims(
     // request parameter. amr reflects the factors actually used; acr is the
     // achieved level (never a copied-through requested value).
     let methods = authn::parse_methods(request.auth_methods);
-    claims["amr"] = json!(authn::amr_values(&methods));
+    // The LOCAL factors IronAuth actually performed, plus the honest UPSTREAM `amr`
+    // passthrough for a FEDERATED login (issue #75). The passthrough is emitted VERBATIM,
+    // never converted into a local method (which would falsely claim IronAuth ran it): for a
+    // pure federated login the local set is empty ([`AuthMethod::Federated`] emits no `amr`),
+    // so the token's `amr` is exactly what the upstream asserted, and if the upstream
+    // asserted none the token asserts none.
+    let mut amr: Vec<String> = authn::amr_values(&methods)
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+    for upstream in authn::federated_amr_from_auth_methods(request.auth_methods) {
+        if !amr.contains(&upstream) {
+            amr.push(upstream);
+        }
+    }
+    claims["amr"] = json!(amr);
     claims["acr"] = json!(authn::achieved_acr(&methods));
 
     // auth_time: present iff frozen onto the code (max_age requested or the
@@ -938,6 +953,33 @@ mod tests {
         for absent in ["nonce", "auth_time", "at_hash", "c_hash", "azp"] {
             assert!(claims.get(absent).is_none(), "{absent} must be absent");
         }
+    }
+
+    #[test]
+    fn a_federated_login_mints_the_honest_upstream_amr_passthrough_and_federated_acr() {
+        // Issue #75, PR B, the honesty crux AT THE MINT: the auth_methods string a federated
+        // callback persists (federated + the encoded upstream amr passthrough) flows verbatim
+        // to build_id_token_claims, which emits the UPSTREAM's asserted amr VERBATIM (never a
+        // fabricated local factor) and the federated-context acr.
+        let event = authn::AuthenticationEvent::federated(
+            0,
+            &["hwk".to_owned(), "mfa".to_owned()],
+            Some("aal2"),
+        );
+        let auth_methods = event.methods_token();
+        let claims = build_id_token_claims(&request("usr_fed", &auth_methods), 1, 2, "tok")
+            .expect("claims build");
+        // The minted amr is EXACTLY the upstream passthrough; no local factor is invented.
+        assert_eq!(claims["amr"], json!(["hwk", "mfa"]));
+        assert!(!claims["amr"].as_array().unwrap().iter().any(|v| v == "pwd"));
+        assert_eq!(claims["acr"], "urn:ironauth:acr:federated");
+
+        // When the upstream asserted NO amr, the minted token asserts none.
+        let silent = authn::AuthenticationEvent::federated(0, &[], None).methods_token();
+        let claims =
+            build_id_token_claims(&request("usr_fed", &silent), 1, 2, "tok").expect("claims build");
+        assert_eq!(claims["amr"], json!([] as [&str; 0]));
+        assert_eq!(claims["acr"], "urn:ironauth:acr:federated");
     }
 
     #[test]

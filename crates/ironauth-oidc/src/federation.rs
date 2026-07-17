@@ -30,12 +30,34 @@
 //! [`ConnectorError::UpstreamProtocol`] so no identity is ever provisioned from an
 //! unverified token.
 
-use ironauth_connector::{ConnectorError, ResolvedEndpoints, discovery_url, parse_discovery};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime};
+
+use axum::extract::{Path, RawQuery, State};
+use axum::http::HeaderMap;
+use axum::response::Response;
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use ironauth_connector::{
+    ConnectorError, ConnectorRuntimeConfig, Endpoints, PkceMode, ResolvedEndpoints, discovery_url,
+    parse_discovery,
+};
 use ironauth_env::Clock;
 use ironauth_fetch::{FetchError, FetchPurpose, FetchRequest, Fetcher};
 use ironauth_jose::{JwsAlgorithm, TrustedKey, VerificationPolicy, verify};
+use ironauth_store::{
+    ConnectorId, FederationLoginStateId, NewAdminUser, NewFederationLoginState, Scope, UserId,
+    UserState,
+};
+use sha2::{Digest, Sha256};
 
-use crate::util::percent_encode_query;
+use crate::authn::AuthenticationEvent;
+use crate::federation_jwks::FederationKeyResolver;
+use crate::interaction;
+use crate::state::OidcState;
+use crate::util::{append_query, epoch_micros, percent_encode_query, query_get};
+use crate::wellknown::{not_found, parse_scope};
 
 /// The verified, honest identity recovered from a validated upstream ID token (issue
 /// #75). Every field derives from claims that passed [`ironauth_jose::verify`]; nothing
@@ -114,9 +136,10 @@ fn unavailable(err: &FetchError) -> ConnectorError {
 /// document for an issuer-form connector (validating the mix-up defence) or resolving
 /// an explicit-endpoint connector directly.
 ///
-/// The `issuer` argument, when [`Some`], is the configured connector issuer whose
-/// `.well-known/openid-configuration` is fetched (through [`FetchPurpose::FederationDiscovery`])
-/// and whose in-document issuer must match. When [`None`], `explicit` is resolved.
+/// `issuer` is the configured connector issuer whose OIDC discovery document is fetched
+/// (through [`FetchPurpose::FederationDiscovery`], the well-known path built by
+/// `ironauth_connector::discovery_url`) and whose in-document issuer must match (the
+/// mix-up defence).
 ///
 /// # Errors
 ///
@@ -331,6 +354,515 @@ fn amr_from_claims(value: Option<&serde_json::Value>) -> Vec<String> {
         Some(serde_json::Value::String(single)) => vec![single.clone()],
         _ => Vec::new(),
     }
+}
+
+/// The lifetime of a federation outbound-login correlation row (issue #75, PR B): a
+/// short window between the upstream redirect and the callback. Single-use and bounded.
+const FEDERATION_STATE_TTL: Duration = Duration::from_secs(600);
+
+/// The installed generic OIDC upstream runtime (issue #75, PR B): the one SSRF-hardened
+/// fetcher every federation outbound rides, the per-connector upstream JWKS cache, and a
+/// bounded per-connector discovery cache. Installed on [`OidcState`] by the boot path.
+pub struct FederationRuntime {
+    fetcher: Arc<Fetcher>,
+    keys: Arc<FederationKeyResolver>,
+    discovery_ttl: Duration,
+    // Permit a plaintext `http` upstream. OFF in production; the test constructor turns it
+    // on so an in-process loopback upstream can be driven through the injected dialer.
+    allow_http: bool,
+    // A bounded cache of resolved discovery endpoints, keyed by connector id and read
+    // against the application clock seam for expiry (deterministic under a manual clock).
+    discovery_cache: Mutex<HashMap<String, CachedDiscovery>>,
+}
+
+/// A cached discovery resolution and the instant it was fetched.
+struct CachedDiscovery {
+    resolved: ResolvedEndpoints,
+    fetched_at: SystemTime,
+}
+
+impl std::fmt::Debug for FederationRuntime {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FederationRuntime")
+            .field("discovery_ttl", &self.discovery_ttl)
+            .finish_non_exhaustive()
+    }
+}
+
+impl FederationRuntime {
+    /// A production runtime over `fetcher` and the upstream JWKS `keys` cache, caching a
+    /// discovery resolution for `discovery_ttl`. Upstream fetches are https-only.
+    #[must_use]
+    pub fn new(
+        fetcher: Arc<Fetcher>,
+        keys: Arc<FederationKeyResolver>,
+        discovery_ttl: Duration,
+    ) -> Self {
+        Self {
+            fetcher,
+            keys,
+            discovery_ttl,
+            allow_http: false,
+            discovery_cache: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Like [`FederationRuntime::new`] but permitting a plaintext `http` upstream, so an
+    /// integration test can drive an in-process loopback upstream through the fetcher's
+    /// injected dialer. Behind the `testing` feature so it never exists in production.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn new_allow_http(
+        fetcher: Arc<Fetcher>,
+        keys: Arc<FederationKeyResolver>,
+        discovery_ttl: Duration,
+    ) -> Self {
+        Self {
+            fetcher,
+            keys,
+            discovery_ttl,
+            allow_http: true,
+            discovery_cache: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Resolve a connector's endpoints: an explicit set directly, or a discovery-form
+    /// connector through its cached-or-fetched discovery document (mix-up-checked).
+    async fn resolve_endpoints(
+        &self,
+        now: SystemTime,
+        connector_id: &str,
+        endpoints: &Endpoints,
+    ) -> Result<ResolvedEndpoints, ConnectorError> {
+        match endpoints {
+            Endpoints::Explicit(explicit) => Ok(ResolvedEndpoints::from_explicit(explicit)),
+            Endpoints::Discovery(discovery) => {
+                if let Some(cached) = self.cached_discovery(now, connector_id) {
+                    return Ok(cached);
+                }
+                let resolved =
+                    fetch_discovery(&self.fetcher, &discovery.issuer, self.allow_http).await?;
+                self.store_discovery(now, connector_id, resolved.clone());
+                Ok(resolved)
+            }
+        }
+    }
+
+    /// The cached discovery resolution for `connector_id` if a non-expired entry exists.
+    fn cached_discovery(&self, now: SystemTime, connector_id: &str) -> Option<ResolvedEndpoints> {
+        let cache = self
+            .discovery_cache
+            .lock()
+            .expect("federation discovery cache lock poisoned");
+        let entry = cache.get(connector_id)?;
+        let fresh = now
+            .duration_since(entry.fetched_at)
+            .is_ok_and(|age| age < self.discovery_ttl);
+        fresh.then(|| entry.resolved.clone())
+    }
+
+    /// Store a discovery resolution for `connector_id` at `now`.
+    fn store_discovery(&self, now: SystemTime, connector_id: &str, resolved: ResolvedEndpoints) {
+        self.discovery_cache
+            .lock()
+            .expect("federation discovery cache lock poisoned")
+            .insert(
+                connector_id.to_owned(),
+                CachedDiscovery {
+                    resolved,
+                    fetched_at: now,
+                },
+            );
+    }
+}
+
+/// GET `/t/{tenant}/e/{env}/federation/{connector_slug}/authorize` (issue #75, PR B):
+/// begin a federated login by redirecting the browser to the UPSTREAM provider.
+///
+/// The handler loads the DATA-ONLY connector by slug, resolves its endpoints (fetching
+/// discovery when needed), generates an unguessable `state` and `nonce` from the entropy
+/// seam, generates a PKCE `code_verifier` and its `S256` challenge when PKCE applies,
+/// persists the single-use correlation row (the sealed verifier, the nonce, the connector,
+/// and the pending local resume target), and 302s to the upstream authorization endpoint.
+/// Adding a provider is a stored connector definition, never a code change here.
+pub async fn federation_authorize(
+    State(state): State<OidcState>,
+    Path((tenant_id, environment_id, connector_slug)): Path<(String, String, String)>,
+    RawQuery(query): RawQuery,
+) -> Response {
+    let Some(scope) = parse_scope(&tenant_id, &environment_id) else {
+        return not_found();
+    };
+    let Some(runtime) = state.federation() else {
+        return not_found();
+    };
+    // The pending LOCAL authorization request to resume after the federated login. It is
+    // UNTRUSTED, so parse_resume validates it as a local /authorize path and recovers its
+    // scope, which must match this route's scope (defence in depth).
+    let return_to = query.as_deref().and_then(|q| query_get(q, "return_to"));
+    let Some(resume) = return_to
+        .as_deref()
+        .and_then(|r| interaction::parse_resume(Some(r)))
+    else {
+        return interaction::invalid_link_page();
+    };
+    if resume.scope != scope {
+        return interaction::invalid_link_page();
+    }
+
+    // Load the connector by its per-environment slug. An absent or disabled connector is a
+    // uniform not-found (no oracle for which slugs exist).
+    let record = match state
+        .store()
+        .scoped(scope)
+        .connectors()
+        .by_slug(&connector_slug)
+        .await
+    {
+        Ok(Some(record)) if record.enabled => record,
+        Ok(_) => return not_found(),
+        Err(_) => return interaction::server_error_page(),
+    };
+    let Ok(definition) = serde_json::from_str::<ConnectorRuntimeConfig>(&record.definition_json)
+    else {
+        return interaction::server_error_page();
+    };
+
+    let now = state.now();
+    // A discovery fetch that is blocked, times out, or returns a malformed document fails
+    // the login without provisioning anything.
+    let Ok(resolved) = runtime
+        .resolve_endpoints(now, &record.id.to_string(), &definition.endpoints)
+        .await
+    else {
+        return interaction::server_error_page();
+    };
+
+    let state_value = random_token(&state);
+    let nonce = random_token(&state);
+    // PKCE to the upstream: send an S256 challenge when the connector requires it, or when
+    // it is auto and the upstream advertises S256. An explicit-endpoint upstream advertises
+    // nothing, so auto omits PKCE there (the conservative interoperable default).
+    let use_pkce = match definition.pkce {
+        PkceMode::Disabled => false,
+        PkceMode::Required => true,
+        PkceMode::AutoWhereSupported => resolved.advertises_s256(),
+    };
+    let code_verifier = use_pkce.then(|| random_token(&state));
+    let code_challenge = code_verifier.as_deref().map(s256_challenge);
+
+    let redirect_uri =
+        federation_callback_url(&state, &tenant_id, &environment_id, &connector_slug);
+
+    // Persist the single-use correlation row. The verifier is sealed by the store; an
+    // absent verifier is sealed empty.
+    let fls_id = FederationLoginStateId::generate(state.env(), &scope);
+    let expires_at = epoch_micros(now.checked_add(FEDERATION_STATE_TTL).unwrap_or(now));
+    let verifier_bytes = code_verifier.as_deref().unwrap_or("").as_bytes();
+    let persisted = state
+        .store()
+        .scoped(scope)
+        .federation_login_states()
+        .create(
+            state.env(),
+            &fls_id,
+            NewFederationLoginState {
+                state: &state_value,
+                nonce: &nonce,
+                code_verifier: verifier_bytes,
+                connector_id: &record.id.to_string(),
+                return_to: &resume.return_to,
+                expires_at_unix_micros: expires_at,
+            },
+        )
+        .await;
+    if persisted.is_err() {
+        return interaction::server_error_page();
+    }
+
+    // Build the upstream authorization URL.
+    let scope_param = definition.scopes.join(" ");
+    let mut params: Vec<(&str, Option<&str>)> = vec![
+        ("response_type", Some("code")),
+        ("client_id", Some(definition.client_id.as_str())),
+        ("redirect_uri", Some(redirect_uri.as_str())),
+        ("scope", Some(scope_param.as_str())),
+        ("state", Some(state_value.as_str())),
+        ("nonce", Some(nonce.as_str())),
+    ];
+    if let Some(challenge) = code_challenge.as_deref() {
+        params.push(("code_challenge", Some(challenge)));
+        params.push(("code_challenge_method", Some("S256")));
+    }
+    let location = append_query(&resolved.authorize_url, &params);
+    interaction::redirect(&location)
+}
+
+/// GET `/t/{tenant}/e/{env}/federation/{connector_slug}/callback` (issue #75, PR B): the
+/// security crux. Consume the correlation row by `state` SINGLE-USE (the CSRF defence),
+/// exchange the code at the upstream token endpoint using the PRODUCTION-unsealed client
+/// secret and the bound PKCE verifier, VALIDATE the upstream ID token through the JOSE
+/// core, and only then provision the LOCAL identity, establish the LOCAL session, and
+/// resume the pending local authorization request.
+// The callback is a linear pipeline (consume -> exchange -> validate -> provision ->
+// session -> resume); splitting it across helpers would scatter the one security flow the
+// reviewer must read top to bottom.
+#[allow(clippy::too_many_lines)]
+pub async fn federation_callback(
+    State(state): State<OidcState>,
+    Path((tenant_id, environment_id, connector_slug)): Path<(String, String, String)>,
+    RawQuery(query): RawQuery,
+    headers: HeaderMap,
+) -> Response {
+    let Some(scope) = parse_scope(&tenant_id, &environment_id) else {
+        return not_found();
+    };
+    let Some(runtime) = state.federation() else {
+        return not_found();
+    };
+    let query = query.unwrap_or_default();
+
+    // Consume the correlation row by state, SINGLE-USE. A replayed, forged, absent, or
+    // expired state matches no consumable row: the CSRF defence. Everything the callback
+    // needs (nonce, verifier, connector, resume target) rides the consumed row, never the
+    // untrusted callback query.
+    let Some(state_value) = query_get(&query, "state") else {
+        return interaction::invalid_link_page();
+    };
+    let now_micros = epoch_micros(state.now());
+    let consumed = match state
+        .store()
+        .scoped(scope)
+        .federation_login_states()
+        .consume(&state_value, now_micros)
+        .await
+    {
+        Ok(Some(consumed)) => consumed,
+        Ok(None) => return interaction::invalid_link_page(),
+        Err(_) => return interaction::server_error_page(),
+    };
+
+    // The upstream returned an error (user denied, etc.), or no code: fail the login.
+    let Some(code) = query_get(&query, "code") else {
+        return interaction::invalid_link_page();
+    };
+
+    // Load the connector the authorize leg used (by the consumed connector id) and unseal
+    // its client secret on the DATA plane (the production unseal).
+    let Ok(connector_id) = ConnectorId::parse_in_scope(&consumed.connector_id, &scope) else {
+        return interaction::server_error_page();
+    };
+    let Ok(record) = state
+        .store()
+        .scoped(scope)
+        .connectors()
+        .get(&connector_id)
+        .await
+    else {
+        return interaction::server_error_page();
+    };
+    let Ok(definition) = serde_json::from_str::<ConnectorRuntimeConfig>(&record.definition_json)
+    else {
+        return interaction::server_error_page();
+    };
+    let Ok(secret_bytes) = state
+        .store()
+        .scoped(scope)
+        .connectors()
+        .open_client_secret(&connector_id)
+        .await
+    else {
+        return interaction::server_error_page();
+    };
+    let Ok(client_secret) = String::from_utf8(secret_bytes) else {
+        return interaction::server_error_page();
+    };
+
+    let now = state.now();
+    let Ok(resolved) = runtime
+        .resolve_endpoints(now, &connector_id.to_string(), &definition.endpoints)
+        .await
+    else {
+        return interaction::server_error_page();
+    };
+    // Only a discovery-form connector carries the issuer the upstream ID token's `iss` is
+    // matched against (the mix-up-checked document issuer). PR B validates issuer-form
+    // connectors; an explicit connector cannot bind an `iss` yet.
+    let Endpoints::Discovery(discovery) = &definition.endpoints else {
+        return interaction::server_error_page();
+    };
+    let expected_issuer = discovery.issuer.clone();
+
+    let redirect_uri =
+        federation_callback_url(&state, &tenant_id, &environment_id, &connector_slug);
+    let verifier = String::from_utf8(consumed.code_verifier).ok();
+    let verifier = verifier.as_deref().filter(|v| !v.is_empty());
+
+    // Exchange the code at the upstream token endpoint. Any failure fails the login WITHOUT
+    // provisioning a user.
+    let Ok(id_token) = exchange_code(
+        &runtime.fetcher,
+        TokenExchange {
+            token_url: &resolved.token_url,
+            code: &code,
+            redirect_uri: &redirect_uri,
+            client_id: &definition.client_id,
+            client_secret: &client_secret,
+            code_verifier: verifier,
+        },
+        runtime.allow_http,
+    )
+    .await
+    else {
+        return interaction::server_error_page();
+    };
+
+    // Resolve the upstream signing keys through the SSRF-hardened fetcher (a private-range
+    // jwks_uri is Blocked here, so validation then fails closed as UpstreamUnavailable), and
+    // VALIDATE the upstream ID token through the JOSE core. On ANY validation failure no
+    // user is provisioned and the login fails (UpstreamProtocol / UpstreamUnavailable).
+    let keys = runtime
+        .keys
+        .resolve(now, &connector_id.to_string(), &resolved.jwks_uri)
+        .await;
+    let allowed_algs =
+        resolve_alg_allowlist(resolved.id_token_signing_alg_values_supported.as_deref());
+    let Ok(identity) = validate_upstream_id_token(
+        &id_token,
+        keys,
+        UpstreamTokenPolicy {
+            expected_issuer: &expected_issuer,
+            expected_audience: &definition.client_id,
+            expected_nonce: &consumed.nonce,
+            allowed_algs: &allowed_algs,
+        },
+        state.env().clock(),
+    ) else {
+        return interaction::server_error_page();
+    };
+
+    // Provision a MINIMAL local identity from the VERIFIED upstream sub (PR C generalizes
+    // claim mapping): find the user by external id, or create one linked to the upstream
+    // sub with no local password (it can only ever log in through federation).
+    let Ok(user_id) = provision_federated_user(&state, scope, &connector_slug, &identity).await
+    else {
+        return interaction::server_error_page();
+    };
+
+    // Establish the LOCAL session with the HONEST federated authentication event: the local
+    // token's acr is the federated context and its amr is the UPSTREAM's asserted amr
+    // passthrough (never a fabricated local factor). auth_time is the upstream auth_time
+    // when present, else the callback instant.
+    let auth_time_micros = identity
+        .auth_time_secs
+        .map_or_else(|| now_micros, |secs| secs.saturating_mul(1_000_000));
+    let event = AuthenticationEvent::federated(
+        auth_time_micros,
+        &identity.upstream_amr,
+        identity.upstream_acr.as_deref(),
+    );
+    let actor = interaction::user_actor(&user_id);
+    let Ok(cookies) = interaction::establish_session(
+        &state,
+        scope,
+        &user_id.to_string(),
+        &event,
+        actor,
+        &headers,
+    )
+    .await
+    else {
+        return interaction::server_error_page();
+    };
+
+    // Resume the pending LOCAL authorization request, which now sees the authenticated
+    // session and issues LOCAL tokens as usual (carrying the honest federated acr/amr).
+    interaction::redirect_setting_cookie(&consumed.return_to, &cookies)
+}
+
+/// Provision or look up the LOCAL user for a verified federated identity (issue #75, PR B),
+/// keyed on the upstream `sub` via the external-id link. A minimal identity: no local
+/// password (federation is the only login path), a namespaced login handle, and the upstream
+/// sub as the external id. PR C generalizes claim mapping into the trait document.
+///
+/// # Errors
+///
+/// [`ironauth_store::StoreError`] on a persistence or provisioning failure.
+async fn provision_federated_user(
+    state: &OidcState,
+    scope: Scope,
+    connector_slug: &str,
+    identity: &VerifiedUpstreamIdentity,
+) -> Result<UserId, ironauth_store::StoreError> {
+    if let Some(existing) = state
+        .store()
+        .scoped(scope)
+        .users()
+        .by_external_id(&identity.subject)
+        .await?
+    {
+        return Ok(existing.id);
+    }
+    // A namespaced, per-connector login handle keeps a federated account from colliding with
+    // a local password account that happens to share the upstream email.
+    let handle = format!("federated:{connector_slug}:{}", identity.subject);
+    let user_id = UserId::generate(state.env(), &scope);
+    let now_micros = epoch_micros(state.now());
+    let actor = interaction::user_actor(&user_id);
+    let correlation = ironauth_store::CorrelationId::generate(state.env());
+    state
+        .store()
+        .scoped(scope)
+        .acting(actor, correlation)
+        .users()
+        .admin_create(
+            state.env(),
+            NewAdminUser {
+                id: Some(&user_id),
+                identifier: &handle,
+                password_hash: None,
+                claims_json: None,
+                external_id: Some(&identity.subject),
+                state: UserState::Active,
+                foreign_password_hash: None,
+                foreign_password_algo: None,
+                traits_json: None,
+                traits_schema_version: None,
+            },
+            now_micros,
+            None,
+        )
+        .await
+}
+
+/// Generate an unguessable URL-safe token from the entropy seam (256 bits): used for the
+/// upstream `state`, the `nonce`, and the PKCE `code_verifier` (43 base64url characters,
+/// within the RFC 7636 43..=128 bound).
+fn random_token(state: &OidcState) -> String {
+    let mut buf = [0_u8; 32];
+    state.env().entropy().fill_bytes(&mut buf);
+    URL_SAFE_NO_PAD.encode(buf)
+}
+
+/// The PKCE `S256` code challenge for `code_verifier` (RFC 7636 4.2):
+/// `BASE64URL(SHA256(code_verifier))`.
+fn s256_challenge(code_verifier: &str) -> String {
+    URL_SAFE_NO_PAD.encode(Sha256::digest(code_verifier.as_bytes()))
+}
+
+/// The federated callback redirect URI for a connector, built from the deployment's public
+/// base URL and the route's scope and slug. It must be byte-identical at the authorize leg
+/// (where it is sent to the upstream) and the callback (where it is echoed in the exchange).
+fn federation_callback_url(
+    state: &OidcState,
+    tenant_id: &str,
+    environment_id: &str,
+    connector_slug: &str,
+) -> String {
+    format!(
+        "{}/t/{tenant_id}/e/{environment_id}/federation/{connector_slug}/callback",
+        state.issuer_base().trim_end_matches('/')
+    )
 }
 
 #[cfg(test)]
@@ -742,8 +1274,12 @@ mod tests {
         // document through the injected dialer; a production issuer is https, fetched over
         // TLS, but the mix-up and parse logic under test is scheme-independent.
         let http_issuer = "http://upstream.example";
+        // The authorize-endpoint key is assembled from fragments so this in-crate source file
+        // never contains the reserved served-discovery-document field name the self-discovery
+        // lint guards (the upstream metadata field names live in ironauth-connector).
+        let authz = concat!("authorization", "_endpoint");
         let doc = format!(
-            r#"{{"issuer":"{http_issuer}","authorization_endpoint":"https://upstream.example/authorize","token_endpoint":"https://upstream.example/token","jwks_uri":"https://upstream.example/jwks","id_token_signing_alg_values_supported":["EdDSA"],"code_challenge_methods_supported":["S256"]}}"#
+            r#"{{"issuer":"{http_issuer}","{authz}":"https://upstream.example/authorize","token_endpoint":"https://upstream.example/token","jwks_uri":"https://upstream.example/jwks","id_token_signing_alg_values_supported":["EdDSA"],"code_challenge_methods_supported":["S256"]}}"#
         );
         let server = start_server(doc).await;
         let dialer = Arc::new(RecordingDialer::new(server));

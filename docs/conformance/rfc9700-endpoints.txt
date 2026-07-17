@@ -45,6 +45,8 @@
 /t/{tenant_id}/e/{environment_id}/connect/register
 /t/{tenant_id}/e/{environment_id}/connect/register/{client_id}
 /t/{tenant_id}/e/{environment_id}/device
+/t/{tenant_id}/e/{environment_id}/federation/{connector_slug}/authorize
+/t/{tenant_id}/e/{environment_id}/federation/{connector_slug}/callback
 /t/{tenant_id}/e/{environment_id}/invitations/accept
 /t/{tenant_id}/e/{environment_id}/jwks.json
 /t/{tenant_id}/e/{environment_id}/magic/confirm

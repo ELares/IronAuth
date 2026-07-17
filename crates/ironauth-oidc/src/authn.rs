@@ -29,6 +29,9 @@
 
 use std::fmt;
 
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
 /// The IronAuth ACR for a single password (knowledge) factor.
 ///
 /// A namespaced URN rather than a bare number or an ISO/IEC 29115 level: it
@@ -397,6 +400,16 @@ pub fn acr_for_mfa() -> &'static str {
     ACR_MFA
 }
 
+/// The FEDERATED-context `acr` (issue #75): the value a federated login's token carries.
+/// Exposed so the step-up gate can EXCLUDE it from the ranked credential ladder: IronAuth
+/// cannot vouch for another operator's assurance level, so the federated context is
+/// deliberately UNRANKED (it satisfies only an exact `federated` floor and never a local
+/// `pwd`/`mfa`/`phr` floor, and no local floor is ever satisfied BY it).
+#[must_use]
+pub fn acr_federated() -> &'static str {
+    ACR_FEDERATED
+}
+
 /// Whether a set of recorded methods actually PERFORMED a genuine second factor THIS
 /// login (issue #71, the conditional-credential-skip honesty predicate): the derived
 /// `amr` carries `mfa`. This is TRUE for a TOTP or recovery-code second factor and for
@@ -724,17 +737,25 @@ pub fn achieved_acr(methods: &[AuthMethod]) -> &'static str {
 }
 
 /// The `acr_values_supported` the discovery document advertises: the achieved
-/// ACR of every ACTIVE method, de-duplicated in registry order.
+/// ACR of every ACTIVE method a relying party can REQUEST and step up to, de-duplicated
+/// in registry order.
 ///
-/// This is the consumable data the discovery generator (issue #18) reads; it is
-/// deliberately NOT wired into the discovery document here, to keep this issue
-/// off the discovery-generation surface. Dormant methods (the passkeys) are
-/// excluded until M7 activates them, so the provider never advertises a level it
-/// cannot actually achieve.
+/// Dormant methods (the passkeys before M7) are excluded until active, so the provider
+/// never advertises a level it cannot achieve. The FEDERATED context (issue #75) is also
+/// excluded: it is a minted-token OUTCOME `acr` (a token honestly carries it after a
+/// federated login), NOT a level a client requests via `acr_values` or steps up TO. Were
+/// it advertised, a client requesting it would face a step-up it cannot satisfy locally;
+/// leaving it out means such a floor is cleanly UNACHIEVABLE (an
+/// `unmet_authentication_requirements`), never a loop. IronAuth cannot vouch for another
+/// operator's assurance level, so the federated context is deliberately unranked here and
+/// in the step-up ladder ([`crate::step_up::default_acr_order`]).
 #[must_use]
 pub fn acr_values_supported() -> Vec<&'static str> {
     let mut out: Vec<&'static str> = Vec::new();
     for method in AuthMethod::ALL {
+        if method == AuthMethod::Federated {
+            continue;
+        }
         if method.is_active() && !out.contains(&method.acr()) {
             out.push(method.acr());
         }
@@ -1022,11 +1043,70 @@ impl AuthenticationEvent {
         self.auth_time_unix_micros
     }
 
-    /// The persistence token string for the recorded methods.
+    /// The persistence token string for the recorded methods, INCLUDING the federated
+    /// `amr` passthrough (issue #75) when present.
+    ///
+    /// A pure federated login persists `federated` (which derives the federated-context
+    /// `acr`) plus a single reserved [`FEDERATED_AMR_TOKEN_PREFIX`] token that carries the
+    /// UPSTREAM's OWN asserted `amr` array, base64url-encoded so it survives the
+    /// whitespace-split persistence channel intact and cannot be confused with a local
+    /// method token ([`parse_methods`] and [`AuthMethod::from_token`] both ignore it). This
+    /// is how the honest upstream `amr` passthrough reaches the MINTED token: the session,
+    /// the frozen authorization code, and the token mint all carry this one string, and
+    /// [`federated_amr_from_auth_methods`] reads the passthrough back at mint time. It is
+    /// never turned into a local factor: the [`AuthMethod::Federated`] row emits no `amr` of
+    /// its own.
     #[must_use]
     pub fn methods_token(&self) -> String {
-        methods_token(&self.methods)
+        let mut token = methods_token(&self.methods);
+        if !self.federated_amr.is_empty() {
+            let encoded = URL_SAFE_NO_PAD.encode(self.federated_amr.join(FEDERATED_AMR_SEPARATOR));
+            token.push(' ');
+            token.push_str(FEDERATED_AMR_TOKEN_PREFIX);
+            token.push_str(&encoded);
+        }
+        token
     }
+}
+
+/// The reserved token prefix that carries a federated login's UPSTREAM `amr`
+/// passthrough through the space-separated `auth_methods` persistence channel (issue
+/// #75). It is not a method token, so [`AuthMethod::from_token`] returns [`None`] for it
+/// and [`parse_methods`] drops it; only [`federated_amr_from_auth_methods`] reads it.
+const FEDERATED_AMR_TOKEN_PREFIX: &str = "fedamr:";
+
+/// The separator joining the upstream `amr` tokens INSIDE the base64url-encoded
+/// passthrough payload. A NUL can never appear in an `amr` token, so the join is
+/// unambiguous even for an upstream `amr` value that itself contains a space.
+const FEDERATED_AMR_SEPARATOR: &str = "\u{0}";
+
+/// The UPSTREAM `amr` passthrough encoded in a federated login's `auth_methods` string
+/// (issue #75), decoded back to the upstream's asserted tokens. Empty for any
+/// non-federated `auth_methods` (no [`FEDERATED_AMR_TOKEN_PREFIX`] token is present).
+///
+/// This is the read side of [`AuthenticationEvent::methods_token`]: the token mint calls
+/// it to emit the honest upstream `amr` on the LOCAL token, WITHOUT ever converting an
+/// upstream factor into a local [`AuthMethod`] (which would falsely claim IronAuth ran
+/// it). A malformed payload yields an empty passthrough (fail closed to asserting no
+/// upstream `amr`, never a fabricated one).
+#[must_use]
+pub fn federated_amr_from_auth_methods(auth_methods: &str) -> Vec<String> {
+    for token in auth_methods.split_whitespace() {
+        if let Some(encoded) = token.strip_prefix(FEDERATED_AMR_TOKEN_PREFIX) {
+            let Ok(bytes) = URL_SAFE_NO_PAD.decode(encoded) else {
+                return Vec::new();
+            };
+            let Ok(joined) = String::from_utf8(bytes) else {
+                return Vec::new();
+            };
+            return joined
+                .split(FEDERATED_AMR_SEPARATOR)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+                .collect();
+        }
+    }
+    Vec::new()
 }
 
 impl fmt::Debug for AuthenticationEvent {
@@ -1141,13 +1221,12 @@ mod tests {
         // order. TOTP and recovery code share the multi-factor ACR, so it appears once.
         // The attested ACR is LAST (strongest), which is what ranks it at the top of the
         // default step-up order.
+        // The federated context (issue #75) is DELIBERATELY absent: it is a minted-token
+        // outcome acr, not an advertised requestable/rankable level.
         assert_eq!(
             acr_values_supported(),
             vec![
                 ACR_PWD,
-                // The federated context (issue #75) is advertised right after the
-                // single-factor password ACR, in registry order.
-                ACR_FEDERATED,
                 ACR_MFA_REMEMBERED,
                 ACR_MFA,
                 ACR_PHR,
@@ -1155,6 +1234,7 @@ mod tests {
                 ACR_ATTESTED
             ]
         );
+        assert!(!acr_values_supported().contains(&ACR_FEDERATED));
     }
 
     #[test]
@@ -1330,11 +1410,21 @@ mod tests {
             Some("http://upstream.example/acr/aal2")
         );
         assert_eq!(event.auth_time_unix_micros(), 1_700_000_000_000_000);
-        // The method token round-trips end to end, so the LOCAL token's federated-context
-        // acr survives persistence and re-derivation.
-        assert_eq!(event.methods_token(), "federated");
+        // The method token round-trips end to end: the federated method drives the
+        // federated-context acr, and the reserved passthrough token carries the upstream amr
+        // without becoming a local method. parse_methods sees only [Federated] (the
+        // passthrough token is ignored), while federated_amr_from_auth_methods recovers it.
+        let persisted = event.methods_token();
+        assert!(persisted.starts_with("federated "), "{persisted}");
+        assert_eq!(parse_methods(&persisted), vec![AuthMethod::Federated]);
+        assert_eq!(achieved_acr(&parse_methods(&persisted)), ACR_FEDERATED);
+        assert_eq!(
+            federated_amr_from_auth_methods(&persisted),
+            vec!["mfa".to_owned(), "hwk".to_owned()]
+        );
+        // A bare "federated" (no passthrough) still parses honestly.
         assert_eq!(parse_methods("federated"), vec![AuthMethod::Federated]);
-        assert_eq!(achieved_acr(&parse_methods("federated")), ACR_FEDERATED);
+        assert!(federated_amr_from_auth_methods("pwd").is_empty());
         // A federated login satisfies only the honest local floor: IronAuth cannot vouch for
         // the upstream's assurance level, so it never folds up the local credential ladder.
         assert_eq!(

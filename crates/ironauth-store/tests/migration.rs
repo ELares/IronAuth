@@ -327,7 +327,7 @@ async fn expand_contract_example_chain_runs_all_three_phases_and_contract_remove
 // per real table); splitting it would not make it clearer.
 #[allow(clippy::too_many_lines)]
 #[tokio::test]
-async fn production_chain_is_only_the_fifty_six_real_migrations_and_ships_no_demo_object() {
+async fn production_chain_is_only_the_fifty_seven_real_migrations_and_ships_no_demo_object() {
     // TestDatabase::start runs Store::migrate() (the production chain) on a
     // fresh, empty database.
     let db = TestDatabase::start().await;
@@ -344,8 +344,8 @@ async fn production_chain_is_only_the_fifty_six_real_migrations_and_ships_no_dem
     );
     assert_eq!(
         report.already_applied(),
-        56,
-        "the production chain is exactly fifty-six migrations (isolation, audit log, management \
+        57,
+        "the production chain is exactly fifty-seven migrations (isolation, audit log, management \
          API, OIDC authorization, signing keys, login/consent, authentication context, redirect \
          registration, UserInfo claims, consent scope upsert, resource servers, opaque access \
          tokens, client auth suite, dynamic client registration, pushed authorization requests, \
@@ -359,16 +359,16 @@ async fn production_chain_is_only_the_fifty_six_real_migrations_and_ships_no_dem
          migration state machine, webauthn credentials, totp credentials, credential abuse \
          defenses, step-up policies, email OTP and scanner-safe magic links, credential-class \
          policies, guarded SMS OTP, passkey attestation, admin sudo elevations, trusted devices, \
-         risk engine, account recovery, federation connectors)"
+         risk engine, account recovery, federation connectors, federation login state)"
     );
 
-    // The ledger holds exactly versions 1 through 56.
+    // The ledger holds exactly versions 1 through 57.
     assert_eq!(
         applied_versions(pool).await,
         vec![
             1_i64, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
             24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45,
-            46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56
+            46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57
         ]
     );
     let phase_of = |version: i64| async move {
@@ -574,6 +574,10 @@ async fn production_chain_is_only_the_fifty_six_real_migrations_and_ships_no_dem
     // The federation-connectors migration (issue #75) is an EXPAND: one new tenant-scoped
     // table (connectors), no rewrite of existing state.
     assert_eq!(phase_of(56).await, "expand");
+    // The federation-login-state migration (issue #75, PR B) is an EXPAND: one new
+    // tenant-scoped single-use correlation table (federation_login_states), no rewrite of
+    // existing state.
+    assert_eq!(phase_of(57).await, "expand");
 
     // The step-up second-factor abuse path (issue #72): migration 0047 WIDENED the
     // abuse_bans auth_path CHECK (0046 pinned the closed set) to also admit
@@ -2749,6 +2753,66 @@ async fn production_chain_is_only_the_fifty_six_real_migrations_and_ships_no_dem
             "connectors must carry the {constraint} CHECK constraint"
         );
     }
+
+    // Federation login state (issue #75, PR B, migration 0057): one new tenant-scoped,
+    // single-use correlation table.
+    assert!(
+        table_exists(pool, "federation_login_states").await,
+        "federation_login_states exists after 0057"
+    );
+    for column in [
+        "id",
+        "tenant_id",
+        "environment_id",
+        "state",
+        "nonce",
+        "code_verifier_sealed",
+        "code_verifier_dek_version",
+        "connector_id",
+        "return_to",
+        "consumed_at",
+        "expires_at",
+    ] {
+        assert!(
+            column_exists(pool, "federation_login_states", column).await,
+            "federation_login_states.{column} exists after 0057"
+        );
+    }
+    // The PKCE code_verifier is a secret SEALED under the scope DEK: a bytea ciphertext,
+    // never a plaintext column.
+    assert_eq!(
+        column_data_type(pool, "federation_login_states", "code_verifier_sealed").await,
+        "bytea",
+        "the federation code_verifier must be a sealed bytea column, never plaintext"
+    );
+    assert!(
+        !column_exists(pool, "federation_login_states", "code_verifier").await,
+        "federation_login_states must have no plaintext code_verifier column after 0057"
+    );
+    // The tenant-scoped-table obligations: forced RLS, the isolation policy, and the
+    // nonempty-scope CHECK.
+    assert!(
+        rls_enabled_and_forced(pool, "federation_login_states").await,
+        "federation_login_states must ENABLE and FORCE row-level security"
+    );
+    assert!(
+        policy_exists(
+            pool,
+            "federation_login_states",
+            "federation_login_states_tenant_isolation"
+        )
+        .await,
+        "the (tenant, environment) isolation policy must exist on federation_login_states"
+    );
+    assert!(
+        check_constraint_exists(
+            pool,
+            "federation_login_states",
+            "federation_login_states_scope_nonempty"
+        )
+        .await,
+        "federation_login_states must carry the nonempty-scope CHECK constraint"
+    );
 }
 
 #[tokio::test]

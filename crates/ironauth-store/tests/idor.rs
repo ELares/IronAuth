@@ -8,8 +8,9 @@ use ironauth_store::idor_harness::IdorHarness;
 use ironauth_store::test_support::TestDatabase;
 use ironauth_store::{
     AuthorizationCodeId, ClientId, ConnectorCapabilities, ConnectorId, CorrelationId,
-    CredentialType, GrantId, IssueCode, NewConnector, NewRefreshFamily, NewSession,
-    RefreshFamilyId, RefreshTokenId, Scope, SessionId, StoreError, UserId, refresh_token_digest,
+    CredentialType, FederationLoginStateId, GrantId, IssueCode, NewConnector,
+    NewFederationLoginState, NewRefreshFamily, NewSession, RefreshFamilyId, RefreshTokenId, Scope,
+    SessionId, StoreError, UserId, refresh_token_digest,
 };
 
 /// A timestamp far past any test's clock, so a planted fixture never expires mid-test.
@@ -279,6 +280,79 @@ async fn connector_surfaces_are_cross_tenant_and_cross_environment_isolated() {
             .await
             .expect("a foreign connector must survive every probe");
     }
+}
+
+#[tokio::test]
+async fn federation_login_state_consume_is_cross_scope_isolated() {
+    // A federation correlation row (issue #75, PR B) planted in another tenant or environment
+    // must never be CONSUMED under the caller's scope, or a callback could burn a foreign
+    // tenant's pending federated login (and recover its sealed PKCE verifier). The probe's
+    // foreign identifier is the row's opaque STATE (the natural consume key). Run on the DATA
+    // store (ironauth_app), which owns the correlation-store grants.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+
+    let scope_a = db.seed_scope(&env).await;
+    let scope_b = db.seed_scope(&env).await;
+    let env_a2 = db.seed_environment(&env, scope_a.tenant()).await;
+    let scope_a2 = Scope::new(scope_a.tenant(), env_a2);
+
+    let victim_b = plant_federation_state(&db, &env, scope_b).await;
+    let victim_a2 = plant_federation_state(&db, &env, scope_a2).await;
+
+    let mut harness = IdorHarness::new();
+    harness.register_federation_probes();
+    assert_eq!(
+        harness.probe_names(),
+        vec!["federation_login_states.consume"],
+        "the federation correlation surface is registered with the harness"
+    );
+
+    let foreign = [victim_b.clone(), victim_a2.clone()];
+    let refs: Vec<&str> = foreign.iter().map(String::as_str).collect();
+    let leaks = harness.run(db.store(), scope_a, &refs).await;
+    assert!(leaks.is_empty(), "cross-scope leak detected: {leaks:?}");
+
+    // Each victim row is STILL consumable in its OWN scope (the cross-scope probe never
+    // burned it), proving the isolation is a genuine scope boundary, not a global miss.
+    for (scope, state) in [(scope_b, victim_b), (scope_a2, victim_a2)] {
+        let consumed = db
+            .store()
+            .scoped(scope)
+            .federation_login_states()
+            .consume(&state, 1_000_000)
+            .await
+            .expect("consume in own scope")
+            .expect("the row survives every cross-scope probe");
+        assert_eq!(consumed.connector_id, "cnr_probe");
+    }
+}
+
+/// Plant a federation correlation row in `scope` (provisioning the scope's envelope keys via
+/// a connector first, since sealing the PKCE verifier needs a DEK) and return its `state`.
+async fn plant_federation_state(db: &TestDatabase, env: &Env, scope: Scope) -> String {
+    // Provision the scope's KEK/DEK (the connector create does this on the control plane).
+    plant_connector(db, env, scope).await;
+    let id = FederationLoginStateId::generate(env, &scope);
+    let state = format!("state-{id}");
+    db.store()
+        .scoped(scope)
+        .federation_login_states()
+        .create(
+            env,
+            &id,
+            NewFederationLoginState {
+                state: &state,
+                nonce: "nonce-probe",
+                code_verifier: b"verifier-probe",
+                connector_id: "cnr_probe",
+                return_to: "/authorize?client_id=probe",
+                expires_at_unix_micros: FAR_FUTURE_MICROS,
+            },
+        )
+        .await
+        .expect("plant federation login state");
+    state
 }
 
 /// Plant a federation connector in `scope` and return its id string.

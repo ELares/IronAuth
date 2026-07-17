@@ -608,6 +608,12 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0056_connectors.sql"),
         },
+        Migration {
+            version: 57,
+            name: "federation_login_state",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0057_federation_login_state.sql"),
+        },
     ]
 }
 

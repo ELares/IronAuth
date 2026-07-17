@@ -6,6 +6,19 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Federation outbound-login correlation state (issue #75, PR B): migration 0057 adds the
+  tenant-scoped, forced-RLS `federation_login_states` table (a NEW `fls_` scope-embedded
+  `ScopedKind`) and its data-plane `FederationLoginStateRepo`. A row correlates an upstream
+  authorize leg to its callback: the opaque `state` (the single-use consume key, the CSRF
+  defence), the bound `nonce`, the PKCE `code_verifier` SEALED under the scope DEK (issue
+  #48, so a leaked row carries no usable verifier), the `cnr_` connector, and the pending
+  local resume target. `create` seals the verifier on the data plane and INSERTs with a
+  clock-seam `expires_at`; `consume` runs one atomic single-use `UPDATE ... RETURNING`
+  (unconsumed and unexpired) and unseals the verifier, so a replayed, forged, or expired
+  state matches no consumable row. Column-scoped grants (SELECT/INSERT/UPDATE, NO DELETE),
+  registered in `scripts/query-audit.sh` and the `idor_harness` (a cross-scope consume
+  probe). Also adds the connector read repo's `by_slug` (the federation login entry point)
+  and the PRODUCTION `open_client_secret` (the data-plane unseal PR A left to PR B).
 - Declarative federation connectors (issue #75, PR A): migration 0056 adds the
   tenant-scoped, forced-RLS `connectors` table and the `ConnectorRepo` /
   `ActingConnectorRepo` accessors. A connector row holds a `cnr_` scope-embedded id

@@ -502,6 +502,17 @@ impl ScopedKind for ConnectorKind {
     const PREFIX: &'static str = "cnr";
 }
 
+/// Marker for a federation outbound-login correlation-state row (`fls_`), the
+/// short-lived single-use row that correlates an upstream authorize leg to its
+/// callback (issue #75, PR B). A tenant-scoped resource: the id embeds its (tenant,
+/// environment), so a row minted in one scope parses as a uniform not-found under
+/// another, and the seal AAD for its PKCE verifier binds to this immutable id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct FederationLoginStateKind;
+impl ScopedKind for FederationLoginStateKind {
+    const PREFIX: &'static str = "fls";
+}
+
 /// Marker for a signing key (`sik_`), an environment's per-issuer signing key
 /// (issue #19). A tenant-scoped resource: the identifier embeds its
 /// `(tenant, environment)`, so a key row can never be read across a tenant or
@@ -1114,6 +1125,10 @@ pub type ConsentId = ScopedId<ConsentKind>;
 /// inbound-federation upstream definition per environment (issue #75). The prefix
 /// is `cnr` (distinct from consent's `con`).
 pub type ConnectorId = ScopedId<ConnectorKind>;
+/// A federation outbound-login correlation-state identifier (`fls_...`), the
+/// short-lived single-use row correlating an upstream authorize leg to its callback
+/// (issue #75, PR B).
+pub type FederationLoginStateId = ScopedId<FederationLoginStateKind>;
 /// A signing-key identifier (`sik_...`), which doubles as the JOSE `kid` of a
 /// per-environment signing key (issue #19).
 pub type SigningKeyId = ScopedId<SigningKeyKind>;

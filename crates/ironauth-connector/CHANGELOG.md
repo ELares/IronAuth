@@ -6,6 +6,14 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Federation login wiring (issue #75, PR B, follow-on): the secret-free `ConnectorRuntimeConfig`
+  read projection (endpoints, scopes, client id, PKCE policy) the federation login path
+  deserializes from the STORED `definition_json` (which strips the client secret, so it
+  cannot round-trip into the strict `ConnectorDefinition`); it ignores unknown fields (a
+  forward-compatible read view, not the exhaustive write-time parse). The discovery parser
+  now forbids a transport DOWNGRADE: an https issuer's endpoints must be https (no plaintext
+  downgrade), while an http issuer (only reachable through the fetcher's explicit plaintext
+  opt-in, a loopback test upstream) may carry http endpoints.
 - Upstream discovery-document parsing and the federation error taxonomy (issue #75, PR B),
   both still I/O-free (the crate remains fetch-free by construction):
   - **`discovery` module.** Parses a REMOTE provider's OIDC discovery metadata from bytes the

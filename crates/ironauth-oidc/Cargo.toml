@@ -551,6 +551,13 @@ name = "device"
 path = "tests/device.rs"
 required-features = ["testing"]
 
+# The generic OIDC upstream federated login (issue #75, PR B): the end-to-end and
+# adversarial flow against a mock upstream driven through the fetch test-harness.
+[[test]]
+name = "federation"
+path = "tests/federation.rs"
+required-features = ["testing"]
+
 # The session model on the OIDC surface (issue #32): the per-(client, session) `sid`
 # claim (stable across issuances for one pair, distinct across two clients of the same
 # SSO session, never the session id itself) and the immediate effect of a revocation
