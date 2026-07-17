@@ -61,6 +61,55 @@ async fn column_data_type(pool: &sqlx::PgPool, table: &str, column: &str) -> Str
     .get("data_type")
 }
 
+/// Whether `table.column` is declared `NOT NULL` (`information_schema.columns`).
+async fn column_is_not_null(pool: &sqlx::PgPool, table: &str, column: &str) -> bool {
+    let is_nullable: String = sqlx::query(
+        "SELECT is_nullable FROM information_schema.columns \
+         WHERE table_name = $1 AND column_name = $2",
+    )
+    .bind(table)
+    .bind(column)
+    .fetch_one(pool)
+    .await
+    .expect("nullability lookup")
+    .get("is_nullable");
+    is_nullable == "NO"
+}
+
+/// The `column_default` expression of `table.column` (`information_schema.columns`), or
+/// `None` when the column carries no default.
+async fn column_default(pool: &sqlx::PgPool, table: &str, column: &str) -> Option<String> {
+    sqlx::query(
+        "SELECT column_default FROM information_schema.columns \
+         WHERE table_name = $1 AND column_name = $2",
+    )
+    .bind(table)
+    .bind(column)
+    .fetch_one(pool)
+    .await
+    .expect("default lookup")
+    .get("column_default")
+}
+
+/// Whether `role` holds `privilege` (e.g. `UPDATE`) on `table` (`has_table_privilege`).
+/// Used to prove a security-immutability property physically: the app role must NOT hold
+/// UPDATE on an immutable snapshot table, so a widened grant fails the guard closed.
+async fn role_has_table_privilege(
+    pool: &sqlx::PgPool,
+    role: &str,
+    table: &str,
+    privilege: &str,
+) -> bool {
+    sqlx::query("SELECT has_table_privilege($1, $2, $3) AS present")
+        .bind(role)
+        .bind(table)
+        .bind(privilege)
+        .fetch_one(pool)
+        .await
+        .expect("table privilege lookup")
+        .get("present")
+}
+
 /// Whether `table` has BOTH `ENABLE` and `FORCE` row-level security on (`pg_class`).
 async fn rls_enabled_and_forced(pool: &sqlx::PgPool, table: &str) -> bool {
     sqlx::query(
@@ -3224,6 +3273,31 @@ async fn production_chain_is_only_the_sixty_one_real_migrations_and_ships_no_dem
         "boolean",
         "account_links.email_verified must be a boolean trust snapshot"
     );
+    // The email_verified trust snapshot is IMMUTABLE (a security property of issue #78):
+    // captured at link time and never rewritten. Its immutability is enforced physically,
+    // not by convention:
+    //   1. the column is NOT NULL DEFAULT false, so a link always carries a definite,
+    //      fail-safe (untrusted) snapshot rather than a NULL that could read as trusted;
+    //   2. the data-plane app role holds NO UPDATE privilege on account_links at all, so
+    //      the snapshot cannot be flipped after the fact even by the application. Asserted
+    //      here so a future grant widening (or a dropped NOT NULL / DEFAULT) fails closed.
+    assert!(
+        column_is_not_null(pool, "account_links", "email_verified").await,
+        "account_links.email_verified must be NOT NULL (a link always carries a definite \
+         trust snapshot)"
+    );
+    assert_eq!(
+        column_default(pool, "account_links", "email_verified")
+            .await
+            .as_deref(),
+        Some("false"),
+        "account_links.email_verified must DEFAULT false (fail-safe untrusted)"
+    );
+    assert!(
+        !role_has_table_privilege(pool, "ironauth_app", "account_links", "UPDATE").await,
+        "the app role must hold NO UPDATE on account_links: the email_verified trust \
+         snapshot is physically immutable"
+    );
     assert!(
         rls_enabled_and_forced(pool, "account_links").await,
         "account_links must ENABLE and FORCE row-level security"
@@ -3249,8 +3323,9 @@ async fn production_chain_is_only_the_sixty_one_real_migrations_and_ships_no_dem
         unique_constraint_exists(pool, "account_links", "account_links_identity_uniq").await,
         "account_links must carry the (connector, external_id_bidx) UNIQUE anti-takeover constraint"
     );
-    // The user_id FK CASCADEs on the users lifecycle exactly like user_identifiers: a
-    // link references its owning local user.
+    // The user_id column is a PLAIN foreign key into users(id), exactly like
+    // user_identifiers: no ON DELETE CASCADE (users are soft-deleted, so a link is never
+    // hard-deleted out from under an account by the users lifecycle).
     assert!(
         fk_references(pool, "account_links", "user_id").await,
         "account_links.user_id must be a FOREIGN KEY into users"

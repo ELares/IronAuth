@@ -13156,6 +13156,11 @@ impl ActingUserRepo<'_> {
             .map(ToString::to_string);
         let emit = SessionEndedEmit::from_acting(env, &self.acting);
         let mut tx = begin_scoped(self.store, scope).await?;
+        // Serialize all last-usable-method-affecting mutations for this user on the user
+        // row BEFORE the cross-source counts, so a concurrent unlink or credential removal
+        // cannot race a lockout past the guard (write-skew safe under READ COMMITTED). The
+        // FOR UPDATE is free here: this handler already updates the same users row below.
+        lock_user_for_last_method_guard(&mut tx, scope, &subject_text).await?;
         // The account must currently HOLD a usable password; an already passkey-only (or
         // absent) account is the uniform not-found (nothing to remove).
         let has_password: bool = sqlx::query(
@@ -14073,6 +14078,43 @@ async fn login_methods_for_user(
         methods.push(LoginMethod::Passkey);
     }
     Ok(methods)
+}
+
+/// Serialize every last-usable-method-affecting mutation for one user by taking that
+/// user's row lock (`SELECT ... FOR UPDATE`) at the TOP of the removal transaction,
+/// BEFORE the cross-source method counts run.
+///
+/// `begin_scoped` pins READ COMMITTED (to keep short scoped writes off the 40001 path),
+/// so the last-method guard cannot rely on snapshot isolation to see a concurrent
+/// removal: two racing "remove the last method" transactions each write a DISJOINT row
+/// (the `users` password flip, an `account_credentials` delete, an `account_links`
+/// unlink, a `webauthn_credentials` delete) and each non-locking `count(*)` reads the
+/// OTHER's still-committed method as surviving, so both pass the guard and both commit,
+/// leaving the account with ZERO usable methods (the Zitadel #6081 anti-bricking class).
+///
+/// Taking the SAME per-user key (the user row) first in every last-method handler makes
+/// them mutually exclude: the losing writer BLOCKS until the winner commits, then
+/// re-reads the now-committed state and its guard sees the method as gone and refuses.
+/// The user row is the natural key -- it always exists for a live subject and every
+/// last-method handler has the subject in scope -- and locking it first (before any
+/// other row this transaction touches) keeps a consistent lock order, so the handlers
+/// cannot deadlock against each other. Fail closed: a lock error propagates via `?` and
+/// the removal never proceeds.
+async fn lock_user_for_last_method_guard(
+    tx: &mut Transaction<'_, Postgres>,
+    scope: Scope,
+    subject: &str,
+) -> Result<(), StoreError> {
+    sqlx::query(
+        "SELECT id FROM users \
+         WHERE id = $1 AND tenant_id = $2 AND environment_id = $3 FOR UPDATE",
+    )
+    .bind(subject)
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .fetch_optional(&mut **tx)
+    .await?;
+    Ok(())
 }
 
 /// An SSO session read back within scope (issue #20, extended by issue #32).
@@ -16984,6 +17026,11 @@ impl ActingAccountCredentialRepo<'_> {
         let subject_text = subject.to_string();
         let id_text = id.to_string();
         let mut tx = begin_scoped(self.store, scope).await?;
+        // Serialize all last-usable-method-affecting mutations for this user on the user
+        // row BEFORE the cross-source counts, so a concurrent unlink, password removal, or
+        // passkey removal cannot race a lockout past the guard (write-skew safe under READ
+        // COMMITTED). Locking the user row first keeps a consistent lock order.
+        lock_user_for_last_method_guard(&mut tx, scope, &subject_text).await?;
         // Resolve the credential WITH its subject bound: another subject's id finds
         // no row and is the uniform not-found.
         let row = sqlx::query(
@@ -20973,6 +21020,12 @@ impl ActingAccountLinkRepo<'_> {
         let tenant = scope.tenant().to_string();
         let environment = scope.environment().to_string();
         let mut tx = begin_scoped(self.store, scope).await?;
+        // Serialize all last-usable-method-affecting mutations for this user on the user
+        // row BEFORE the cross-source counts, so two racing unlinks (or an unlink racing a
+        // password or credential removal) cannot each read the OTHER's method as surviving
+        // and both brick the account (write-skew safe under READ COMMITTED, Zitadel #6081).
+        // Locking the user row first keeps a consistent lock order with the sibling paths.
+        lock_user_for_last_method_guard(&mut tx, scope, &subject_text).await?;
         // Resolve the link WITH its subject bound: another subject's link finds no row and
         // is the uniform not-found (never an oracle for a foreign link's existence).
         let exists: bool = sqlx::query(
@@ -21922,6 +21975,11 @@ impl ActingWebauthnCredentialRepo<'_> {
         let tenant = scope.tenant().to_string();
         let environment = scope.environment().to_string();
         let mut tx = begin_scoped(self.store, scope).await?;
+        // Serialize all last-usable-method-affecting mutations for this user on the user
+        // row BEFORE the cross-source counts, so a concurrent unlink, password removal, or
+        // credential removal cannot race a lockout past the guard (write-skew safe under
+        // READ COMMITTED). Locking the user row first keeps a consistent lock order.
+        lock_user_for_last_method_guard(&mut tx, scope, &subject_text).await?;
         // Resolve the passkey WITH its subject bound: another subject's id finds no
         // row and is the uniform not-found, never actionable.
         let exists = sqlx::query(

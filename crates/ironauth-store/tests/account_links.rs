@@ -19,8 +19,8 @@
 use ironauth_env::Env;
 use ironauth_store::test_support::TestDatabase;
 use ironauth_store::{
-    AccountLinkId, AccountLinkMethod, CorrelationId, NewAccountLink, PasswordRemovalOutcome, Scope,
-    StoreError, UnlinkOutcome, UserId,
+    AccountLinkId, AccountLinkMethod, ActorRef, CorrelationId, HumanId, NewAccountLink,
+    PasswordRemovalOutcome, Scope, StoreError, UnlinkOutcome, UserId,
 };
 
 /// A well-formed Argon2id verifier used where a real password hash is needed.
@@ -466,4 +466,194 @@ async fn unlinking_a_foreign_or_absent_link_is_the_uniform_not_found() {
         .await
         .expect("unlink cross scope");
     assert_eq!(cross, UnlinkOutcome::NotFound);
+}
+
+/// A fresh actor for a spawned concurrency task (no `&TestDatabase` is in scope inside
+/// the task closure to hand out one).
+fn task_actor(env: &Env) -> ActorRef {
+    ActorRef::human(HumanId::generate(env))
+}
+
+/// The permanent adversarial concurrency guard issue #78 mandates: two racing removals
+/// of the LAST two usable methods must never BOTH pass the last-usable-method count and
+/// leave the account with ZERO methods.
+///
+/// Before the per-user serialization lock this bricked 78 of 80 trials: each racer
+/// writes a DISJOINT row (an `account_links` delete), and under READ COMMITTED each
+/// non-locking `count(*)` reads the OTHER's still-committed link as a surviving method,
+/// so both pass the guard and both commit (the Zitadel #6081 class). Taking the user
+/// row `FOR UPDATE` first makes the racers mutually exclude on the same per-user key, so
+/// exactly one wins and the loser re-reads the committed state and is refused.
+#[tokio::test]
+async fn two_concurrent_unlinks_of_the_last_two_links_never_brick_the_account() {
+    let env = Env::system();
+    let db = TestDatabase::start().await;
+    let scope = db.seed_scope(&env).await;
+    // A wider pool so the two racers run truly in parallel rather than serializing on a
+    // single pooled connection (which would blunt the very race this test exists to catch).
+    let store = db.app_store_with_pool(8).await;
+
+    // Enough iterations to have caught the pre-fix 78/80 brick rate. The lock makes each
+    // iteration deterministic (exactly one winner), so a single brick fails the suite.
+    for i in 0..40 {
+        // A passwordless account whose ONLY two usable methods are these two links.
+        let subject =
+            register_passwordless(&db, &env, scope, &format!("race-links-{i}@example.test")).await;
+        let link_a = create_link(
+            &db,
+            &env,
+            scope,
+            &subject,
+            "cnr_google",
+            &format!("federated:google:a-{i}"),
+            true,
+            AccountLinkMethod::Manual,
+        )
+        .await;
+        let link_b = create_link(
+            &db,
+            &env,
+            scope,
+            &subject,
+            "cnr_apple",
+            &format!("federated:apple:b-{i}"),
+            false,
+            AccountLinkMethod::Manual,
+        )
+        .await;
+
+        let mut handles = Vec::new();
+        for link_id in [link_a, link_b] {
+            let store = store.clone();
+            let env = env.clone();
+            handles.push(tokio::spawn(async move {
+                store
+                    .scoped(scope)
+                    .acting(task_actor(&env), CorrelationId::generate(&env))
+                    .account_links()
+                    .unlink(&env, &subject, &link_id, "step_up_max_age_secs=300")
+                    .await
+                    .expect("unlink")
+            }));
+        }
+
+        let mut removed = 0_u32;
+        let mut blocked = 0_u32;
+        for handle in handles {
+            match handle.await.expect("task joins") {
+                UnlinkOutcome::Removed => removed += 1,
+                UnlinkOutcome::BlockedLastMethod => blocked += 1,
+                other @ UnlinkOutcome::NotFound => {
+                    panic!("unexpected unlink outcome in the race: {other:?}")
+                }
+            }
+        }
+        assert_eq!(
+            removed, 1,
+            "exactly one racer removes a link (iteration {i})"
+        );
+        assert_eq!(
+            blocked, 1,
+            "the other racer is refused by the guard (iteration {i})"
+        );
+
+        // The account is never bricked: exactly one usable link survives.
+        let surviving = db
+            .store()
+            .scoped(scope)
+            .account_links()
+            .list_for_user(&subject)
+            .await
+            .expect("list");
+        assert_eq!(
+            surviving.len(),
+            1,
+            "the account retains exactly one usable method (iteration {i})"
+        );
+    }
+}
+
+/// The same guard across DIFFERENT handlers taking the SAME per-user key: a password
+/// removal racing an unlink of the account's last link. Both mutate DISJOINT rows (the
+/// `users` password flip vs the `account_links` delete), so without the shared users-row
+/// lock both could pass their own cross-source count and strand the account. The lock
+/// serializes them on the user row, so exactly one of the two wins and the other is
+/// refused, proving the two handlers take the same per-user key (a mix of keys would not
+/// serialize them).
+#[tokio::test]
+async fn a_concurrent_password_removal_and_unlink_never_brick_the_account() {
+    let env = Env::system();
+    let db = TestDatabase::start().await;
+    let scope = db.seed_scope(&env).await;
+    let store = db.app_store_with_pool(8).await;
+
+    for i in 0..40 {
+        // Exactly two usable methods: a native password and one federated link.
+        let subject =
+            register_password_user(&db, &env, scope, &format!("race-pw-{i}@example.test")).await;
+        let link_id = create_link(
+            &db,
+            &env,
+            scope,
+            &subject,
+            "cnr_google",
+            &format!("federated:google:pw-{i}"),
+            true,
+            AccountLinkMethod::AutoVerified,
+        )
+        .await;
+
+        let unlink_task = {
+            let store = store.clone();
+            let env = env.clone();
+            tokio::spawn(async move {
+                store
+                    .scoped(scope)
+                    .acting(task_actor(&env), CorrelationId::generate(&env))
+                    .account_links()
+                    .unlink(&env, &subject, &link_id, "step_up_max_age_secs=300")
+                    .await
+                    .expect("unlink")
+            })
+        };
+        let remove_pw_task = {
+            let store = store.clone();
+            let env = env.clone();
+            tokio::spawn(async move {
+                store
+                    .scoped(scope)
+                    .acting(task_actor(&env), CorrelationId::generate(&env))
+                    .users()
+                    .remove_password(&env, &subject, None, "step_up_max_age_secs=300")
+                    .await
+                    .expect("remove_password")
+            })
+        };
+
+        let unlink_outcome = unlink_task.await.expect("unlink task joins");
+        let remove_pw_outcome = remove_pw_task.await.expect("remove_password task joins");
+
+        let unlink_removed = matches!(unlink_outcome, UnlinkOutcome::Removed);
+        let pw_removed = matches!(remove_pw_outcome, PasswordRemovalOutcome::Removed(_));
+        // Exactly ONE of the two racers removes a method; the other is refused, so the
+        // account is never left with zero usable methods (iteration {i}).
+        assert!(
+            unlink_removed ^ pw_removed,
+            "exactly one of (unlink, remove_password) wins the race (iteration {i}): \
+             unlink={unlink_outcome:?} remove_password={remove_pw_outcome:?}"
+        );
+        if unlink_removed {
+            assert_eq!(
+                remove_pw_outcome,
+                PasswordRemovalOutcome::BlockedLastCredential,
+                "the password removal is the refused racer (iteration {i})"
+            );
+        } else {
+            assert_eq!(
+                unlink_outcome,
+                UnlinkOutcome::BlockedLastMethod,
+                "the unlink is the refused racer (iteration {i})"
+            );
+        }
+    }
 }
