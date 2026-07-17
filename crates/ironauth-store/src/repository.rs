@@ -18076,6 +18076,43 @@ impl PowChallengeRepo<'_> {
             difficulty_bits: row.get("difficulty_bits"),
         }))
     }
+
+    /// Reclaim up to `limit` ALREADY-EXPIRED challenge rows in this scope (issue #80
+    /// LOW-3): a BOUNDED, best-effort DELETE the issue path runs when minting, so a stream
+    /// of `/pow/challenge` calls keeps the table from accumulating dead rows on the request
+    /// path without waiting on an external janitor. The `LIMIT` (via a bounded subselect,
+    /// since Postgres `DELETE` takes no direct `LIMIT`) caps the work a single mint does, so
+    /// it can never turn one request into an unbounded scan/delete. Only rows whose
+    /// `expires_at <= now_micros` are eligible, so a LIVE (unspent, unexpired) challenge is
+    /// never touched, and the RLS policy confines the delete to the caller's
+    /// `(tenant, environment)`. Returns the number of rows reclaimed.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn reclaim_expired(&self, now_micros: i64, limit: i64) -> Result<u64, StoreError> {
+        let scope = self.scope;
+        let mut tx = begin_scoped(self.store, scope).await?;
+        let result = sqlx::query(
+            "DELETE FROM pow_challenges \
+             WHERE id IN ( \
+                 SELECT id FROM pow_challenges \
+                 WHERE tenant_id = $1 AND environment_id = $2 \
+                 AND expires_at <= \
+                     (TIMESTAMPTZ 'epoch' + ($3::text || ' microseconds')::interval) \
+                 ORDER BY expires_at ASC \
+                 LIMIT $4 \
+             )",
+        )
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(now_micros)
+        .bind(limit)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(result.rows_affected())
+    }
 }
 
 /// Reconstruct a [`RiskDecisionView`] from a decision row.

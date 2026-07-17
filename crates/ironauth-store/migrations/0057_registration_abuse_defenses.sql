@@ -103,9 +103,15 @@ CREATE POLICY pow_challenges_tenant_isolation ON pow_challenges
 
 -- The data plane mints a challenge (INSERT), resolves a presented one (SELECT), and
 -- consumes it single-use (a COLUMN-scoped UPDATE to spent_at). COLUMN-scoped UPDATE
--- only (the #31 least-privilege lesson); no DELETE from the request path (a future
--- janitor sweep runs as a separate role).
-GRANT SELECT, INSERT ON pow_challenges TO ironauth_app;
+-- only (the #31 least-privilege lesson). It also RECLAIMS its own EXPIRED rows with a
+-- BOUNDED DELETE on the issue path (issue #80 LOW-3): every mint eagerly deletes a small,
+-- capped batch of this scope's already-expired challenges, so a stream of `/pow/challenge`
+-- calls cannot grow the table without bound and no external janitor is required. The DELETE
+-- is RLS-scoped to the caller's (tenant, environment) exactly like every other grant here,
+-- and only ever removes rows already past `expires_at`, so it can never reclaim a live
+-- (unspent, unexpired) challenge. A heavier out-of-band sweep may still run as a separate
+-- role later; this grant only enables the bounded request-path reclaim.
+GRANT SELECT, INSERT, DELETE ON pow_challenges TO ironauth_app;
 GRANT UPDATE (spent_at) ON pow_challenges TO ironauth_app;
 
 -- ---------------------------------------------------------------------------

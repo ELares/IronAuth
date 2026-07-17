@@ -36,6 +36,17 @@ pub(crate) const ENDPOINT_REGISTER: &str = "register";
 pub(crate) const ENDPOINT_RECOVER: &str = "recover";
 /// The OTP-send endpoint label.
 pub(crate) const ENDPOINT_OTP_SEND: &str = "otp_send";
+/// The magic-link send endpoint label (issue #80): a sibling email-send in the same
+/// OTP-send-pumping family, gated the SAME way as `otp_send`. It carries its OWN label
+/// (not `otp_send`) so the context binding still holds: a solution minted for one
+/// endpoint can never be consumed at the other.
+pub(crate) const ENDPOINT_MAGIC_SEND: &str = "magic_send";
+
+/// The maximum number of already-expired challenge rows a single issue call reclaims
+/// (issue #80 LOW-3). Bounded so one mint never turns into an unbounded delete; since the
+/// mint rate is itself throttled, reclaiming a small batch per mint keeps the table's
+/// steady-state size bounded.
+const RECLAIM_BATCH: i64 = 32;
 
 /// Whether a challenge is REQUIRED for this attempt (issue #80): the `PoW` feature is on AND
 /// the anonymous risk level meets the configured `challenge_at` threshold. Reuses the #79
@@ -81,6 +92,17 @@ pub(crate) async fn issue_builtin_challenge(
     endpoint: &str,
     context: &str,
 ) -> Option<IssuedChallenge> {
+    // Eager expiry reclamation (issue #80 LOW-3): before minting, reclaim a BOUNDED batch of
+    // this scope's already-expired challenge rows, so a stream of issue calls keeps the
+    // table from accumulating dead rows on the request path (no external janitor needed).
+    // Best-effort and capped (never an unbounded delete), so a reclaim fault never fails the
+    // mint below; only rows past their expiry are eligible, so a live challenge is untouched.
+    let _ = state
+        .store()
+        .scoped(scope)
+        .pow_challenges()
+        .reclaim_expired(epoch_micros(state.now()), RECLAIM_BATCH)
+        .await;
     let pow = &state.registration_abuse_config().pow;
     let difficulty = pow.difficulty_bits;
     let mut challenge = [0_u8; 32];
@@ -210,7 +232,8 @@ pub(crate) async fn verify_solution(
 /// and an optional caller-supplied request context to bind it to.
 #[derive(Debug, Deserialize)]
 pub struct IssueRequest {
-    /// The endpoint label the challenge is for (`register`, `recover`, or `otp_send`).
+    /// The endpoint label the challenge is for (`register`, `recover`, `otp_send`, or
+    /// `magic_send`).
     pub endpoint: Option<String>,
     /// An optional caller-supplied request context the challenge is bound to. The client
     /// echoes it back on submit; a solution issued for one context does not satisfy
@@ -231,7 +254,6 @@ pub async fn pow_challenge_issue(
     headers: HeaderMap,
     axum::Json(body): axum::Json<IssueRequest>,
 ) -> Response {
-    let _ = &headers;
     let Some(scope) = crate::wellknown::parse_scope(&tenant_id, &environment_id) else {
         return not_found_json();
     };
@@ -242,10 +264,37 @@ pub async fn pow_challenge_issue(
     if !pow.enabled || state.challenge_provider().kind().is_external() {
         return not_found_json();
     }
+    // Per-IP mint-rate THROTTLE (issue #80 LOW-3): the issue endpoint is unauthenticated and
+    // each call INSERTs a challenge row, so bound the mint rate through the #64 abuse layer
+    // BEFORE minting. It keys on the resolved peer IP within the registration-abuse family's
+    // counter (this challenge is issued only to precede a register / recover / OTP-send
+    // attempt, so it shares that family's per-IP budget), so a single source cannot mint
+    // unbounded challenge rows. Existence-independent (no identifier/account), so it is never
+    // an enumeration oracle; fail-open on the counter store (availability-biased).
+    let peer_ip = crate::abuse::resolved_client_ip(&headers);
+    let regulation_ctx = crate::abuse::AttemptContext {
+        path: ironauth_store::AuthPath::Register,
+        scope,
+        ip: peer_ip,
+        identifier: None,
+        account_id: None,
+        client_id: None,
+    };
+    if let crate::abuse::RegulationOutcome::Throttled(snapshot) =
+        state.regulate_before(&regulation_ctx).await
+    {
+        let mut response = json_response(
+            StatusCode::TOO_MANY_REQUESTS,
+            &serde_json::json!({"error": "rate_limited"}),
+        );
+        crate::abuse::stamp_rate_limit_headers(&mut response, &snapshot);
+        return response;
+    }
     let endpoint = match body.endpoint.as_deref() {
         Some(ENDPOINT_REGISTER) => ENDPOINT_REGISTER,
         Some(ENDPOINT_RECOVER) => ENDPOINT_RECOVER,
         Some(ENDPOINT_OTP_SEND) => ENDPOINT_OTP_SEND,
+        Some(ENDPOINT_MAGIC_SEND) => ENDPOINT_MAGIC_SEND,
         _ => return bad_request_json("unknown endpoint"),
     };
     let Some(issued) = issue_builtin_challenge(&state, scope, endpoint, &body.context).await else {

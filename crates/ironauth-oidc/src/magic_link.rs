@@ -63,6 +63,15 @@ pub struct SendBody {
     pub identifier: Option<String>,
     /// The flow the link authorizes. Defaults to `login`.
     pub purpose: Option<String>,
+    /// The proof-of-work challenge id the client solved (issue #80), when a challenge is
+    /// required on this OTP-send-class surface.
+    pub pow_challenge_id: Option<String>,
+    /// The proof-of-work nonce (base64url no-pad) the client found (issue #80).
+    pub pow_nonce: Option<String>,
+    /// The request context the challenge was issued for (issue #80), echoed back.
+    pub pow_context: Option<String>,
+    /// An external adapter (Turnstile/reCAPTCHA) response token (issue #80).
+    pub pow_token: Option<String>,
 }
 
 /// Handle an unknown / suppressed magic-link recipient (issue #68): burn the anti-
@@ -113,6 +122,10 @@ pub struct ConsumeForm {
 /// binding cookie is set for EVERY request (present and unknown recipient alike), so its
 /// presence is never an existence oracle. Abuse-throttled per recipient and per tenant;
 /// a send to an unknown recipient is SUPPRESSED with an identical acknowledgment.
+// The linear send flow (enable/quota gate, PoW gate, throttle, existence-independent
+// resolve, issue-or-suppress) reads best as one function; splitting it would scatter the
+// anti-enumeration invariant, so the length lint is allowed here (issues #64, #68, #80).
+#[allow(clippy::too_many_lines)]
 pub async fn send(
     State(state): State<OidcState>,
     Path((tenant_id, environment_id)): Path<(String, String)>,
@@ -145,6 +158,33 @@ pub async fn send(
 
     if identifier.is_empty() {
         return set_cookie(ack_page(scope), &binding_cookie);
+    }
+
+    // Proof-of-work gate (issue #80), conditioned on the #79 risk level -- the SAME gate the
+    // OTP-send surface runs, so every OTP-send-class endpoint (register, recover, otp/send,
+    // magic/send) is protected consistently when PoW is enabled. Runs BEFORE the recipient
+    // lookup and keys only on the challenge and the IP, so it is existence-INDEPENDENT (no
+    // enumeration oracle). The binding cookie is still set on the refusal, keeping the
+    // response shape uniform with the ack.
+    let peer_ip = crate::abuse::resolved_client_ip(&headers);
+    if crate::pow_gate::challenge_required(&state, peer_ip.as_deref(), false) {
+        let solution = crate::pow_gate::PresentedSolution {
+            challenge_id: body.pow_challenge_id.as_deref(),
+            nonce: body.pow_nonce.as_deref(),
+            context: body.pow_context.as_deref().unwrap_or_default(),
+            token: body.pow_token.as_deref(),
+            remote_ip: peer_ip.as_deref(),
+        };
+        if !crate::pow_gate::verify_solution(
+            &state,
+            scope,
+            crate::pow_gate::ENDPOINT_MAGIC_SEND,
+            &solution,
+        )
+        .await
+        {
+            return set_cookie(challenge_required_page(), &binding_cookie);
+        }
     }
 
     // Throttle the SEND per recipient and per tenant before resolving existence (#64).
@@ -488,7 +528,12 @@ async fn establish_session_page(
             );
             interaction::attach_session_cookies(page, &cookies)
         }
-        Err(_) => interaction::server_error_page(),
+        // The central lifecycle fence refused (issue #80 / #52): a waitlisted, blocked,
+        // disabled, or pending-verification account. Render the SAME uniform invalid-link
+        // page a spent/expired link returns, so a fenced-but-valid link is not an
+        // account-state oracle.
+        Err(interaction::EstablishSessionError::NotAuthenticatable) => invalid_page(),
+        Err(interaction::EstablishSessionError::Store) => interaction::server_error_page(),
     }
 }
 
@@ -571,6 +616,20 @@ fn ack_page(scope: Scope) -> Response {
     pages::secure_html(
         StatusCode::OK,
         pages::magic_ack_page(&consume_action(scope)),
+    )
+}
+
+/// The uniform "solve the challenge first" refusal (issue #80): when proof-of-work is
+/// enabled and required, the magic-link send is gated exactly like the OTP send, so a
+/// missing / unsolved challenge is refused here. It keys only on the challenge and the IP
+/// (existence-independent), so it is never an enumeration oracle.
+fn challenge_required_page() -> Response {
+    pages::secure_html(
+        StatusCode::BAD_REQUEST,
+        pages::notice_page(
+            "Additional verification required",
+            "Please complete the verification challenge and try again.",
+        ),
     )
 }
 

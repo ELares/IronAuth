@@ -620,7 +620,12 @@ async fn establish_and_respond(
             );
             interaction::attach_session_cookies(body, &cookies)
         }
-        Err(_) => server_error(),
+        // The central lifecycle fence refused (issue #80 / #52): a waitlisted, blocked,
+        // disabled, or pending-verification account. Render the SAME uniform invalid-code
+        // result a wrong/expired code returns, so a fenced-but-correct code is not an
+        // account-state oracle.
+        Err(interaction::EstablishSessionError::NotAuthenticatable) => invalid_code(),
+        Err(interaction::EstablishSessionError::Store) => server_error(),
     }
 }
 

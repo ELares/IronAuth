@@ -14,6 +14,7 @@
 
 mod common;
 
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::body::Body;
@@ -24,8 +25,57 @@ use common::{Harness, PKCE_CHALLENGE, REDIRECT_URI, form, form_field};
 use ironauth_config::{
     DisposableEmailConfig, OidcConfig, PowConfig, RegistrationAbuseConfig, WaitlistConfig,
 };
-use ironauth_oidc::pow;
+use ironauth_oidc::{EmailOtpMessage, MagicLinkMessage, SESSION_COOKIE, VerificationSender, pow};
 use serde_json::{Value, json};
+
+/// A recording verification sender: captures the delivered OTP code so the waitlist test
+/// can drive the passwordless email-OTP path end to end.
+#[derive(Debug, Default)]
+struct RecordingSender {
+    otp: Mutex<Vec<(String, String)>>,
+}
+
+impl VerificationSender for RecordingSender {
+    fn send(
+        &self,
+        _scope: ironauth_store::Scope,
+        _purpose: ironauth_oidc::VerificationPurpose,
+        _recipient: &str,
+    ) {
+    }
+
+    fn deliver_email_otp(&self, message: &EmailOtpMessage<'_>) {
+        self.otp
+            .lock()
+            .expect("lock")
+            .push((message.recipient.to_owned(), message.code.to_owned()));
+    }
+
+    fn deliver_magic_link(&self, _message: &MagicLinkMessage<'_>) {}
+}
+
+/// The last OTP code delivered to `recipient`.
+fn last_otp(sender: &RecordingSender, recipient: &str) -> String {
+    sender
+        .otp
+        .lock()
+        .expect("lock")
+        .iter()
+        .rev()
+        .find(|(to, _)| to == recipient)
+        .map(|(_, code)| code.clone())
+        .expect("a code was delivered")
+}
+
+/// Whether the response sets a session cookie.
+fn sets_session(headers: &axum::http::HeaderMap) -> bool {
+    headers.get_all(header::SET_COOKIE).iter().any(|value| {
+        value
+            .to_str()
+            .unwrap_or_default()
+            .starts_with(SESSION_COOKIE)
+    })
+}
 
 /// The registration password, long enough for the default 800-63B length policy.
 const PASSWORD: &str = "hunter2trombone";
@@ -71,6 +121,36 @@ async fn post_json(harness: &Harness, path: &str, body: &Value) -> (StatusCode, 
         )
         .await;
     (status, serde_json::from_str(&text).unwrap_or(Value::Null))
+}
+
+/// POST a JSON body and return the status, RESPONSE HEADERS, and parsed JSON (so a test
+/// can assert whether a session cookie was set).
+async fn post_json_full(
+    harness: &Harness,
+    path: &str,
+    body: &Value,
+) -> (StatusCode, axum::http::HeaderMap, Value) {
+    let (status, headers, text) = harness
+        .send(
+            Request::builder()
+                .method("POST")
+                .uri(path)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .expect("request builds"),
+        )
+        .await;
+    (
+        status,
+        headers,
+        serde_json::from_str(&text).unwrap_or(Value::Null),
+    )
+}
+
+/// The tenant/environment base path for the harness scope.
+fn scope_base(harness: &Harness) -> String {
+    let scope = harness.scope();
+    format!("/t/{}/e/{}", scope.tenant(), scope.environment())
 }
 
 /// The `/pow/challenge` path for the harness scope.
@@ -415,12 +495,22 @@ async fn a_flagged_disposable_domain_feeds_the_risk_engine_and_raises_the_challe
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn a_waitlisted_signup_cannot_authenticate_until_admin_approval() {
     let abuse = RegistrationAbuseConfig {
         waitlist: WaitlistConfig { enabled: true },
         ..RegistrationAbuseConfig::default()
     };
-    let harness = Harness::start_with(config_with(abuse)).await;
+    // Enable the email-OTP factor too, so this test proves the fence on a PASSWORDLESS path
+    // (issue #80 HIGH-1) as well as the password path.
+    let mut harness = Harness::start_with(OidcConfig {
+        email_otp_enabled: true,
+        ..config_with(abuse)
+    })
+    .await;
+    let sender = Arc::new(RecordingSender::default());
+    harness.install_verification_sender(sender.clone());
+    let base = scope_base(&harness);
     let return_to = return_to(&harness).await;
 
     // A self-service signup lands PENDING: a 200 acknowledgment, NOT a session-establishing
@@ -472,6 +562,33 @@ async fn a_waitlisted_signup_cannot_authenticate_until_admin_approval() {
         "a waitlisted account is fenced at login"
     );
 
+    // The SAME fence covers the PASSWORDLESS email-OTP path (issue #80 HIGH-1): the send is
+    // uniform and delivers a code, but verifying the CORRECT code mints NO session while the
+    // account is waitlisted, and the refusal is the uniform invalid-code shape (no oracle).
+    let (status, _) = post_json(
+        &harness,
+        &format!("{base}/otp/send"),
+        &json!({ "identifier": "pending@example.test", "purpose": "login" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "the OTP send is uniform");
+    let code = last_otp(&sender, "pending@example.test");
+    let (otp_status, otp_headers, otp_body) = post_json_full(
+        &harness,
+        &format!("{base}/otp/verify"),
+        &json!({ "identifier": "pending@example.test", "purpose": "login", "code": code }),
+    )
+    .await;
+    assert_eq!(
+        otp_status,
+        StatusCode::UNAUTHORIZED,
+        "the email-OTP path is fenced while waitlisted: {otp_body}"
+    );
+    assert!(
+        !sets_session(&otp_headers),
+        "a waitlisted account mints NO session on the email-OTP path"
+    );
+
     // An admin APPROVES the account (transition waitlisted -> active).
     harness
         .set_user_state(&user.id.to_string(), ironauth_store::UserState::Active)
@@ -496,5 +613,126 @@ async fn a_waitlisted_signup_cannot_authenticate_until_admin_approval() {
     assert!(
         common::set_cookie_pair(&headers).is_some(),
         "an approved login mints a session"
+    );
+
+    // Approval also lets the PASSWORDLESS email-OTP path mint a session (the fence lifts on
+    // every path at once, since it is centralized in establish_session).
+    let (status, _) = post_json(
+        &harness,
+        &format!("{base}/otp/send"),
+        &json!({ "identifier": "pending@example.test", "purpose": "login" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let code = last_otp(&sender, "pending@example.test");
+    let (otp_status, otp_headers, otp_body) = post_json_full(
+        &harness,
+        &format!("{base}/otp/verify"),
+        &json!({ "identifier": "pending@example.test", "purpose": "login", "code": code }),
+    )
+    .await;
+    assert_eq!(
+        otp_status,
+        StatusCode::OK,
+        "the email-OTP path authenticates after approval: {otp_body}"
+    );
+    assert!(
+        sets_session(&otp_headers),
+        "an approved account mints a session on the email-OTP path"
+    );
+}
+
+#[tokio::test]
+async fn magic_send_requires_a_solved_pow_challenge_at_parity_with_otp_send() {
+    // Parity with otp/send (issue #80 MEDIUM-2): magic/send is an OTP-send-class endpoint, so
+    // with PoW enabled it too requires a solved challenge. The harness wires NO external
+    // adapter, so the built-in PoW is the only path (zero third-party calls).
+    let harness = Harness::start_with(OidcConfig {
+        magic_link_enabled: true,
+        ..config_with(pow_on())
+    })
+    .await;
+    let base = scope_base(&harness);
+    harness.seed_user("ada@example.test", PASSWORD).await;
+
+    // Without a solution the magic-link send is refused (challenge required), exactly like
+    // otp/send. The gate runs BEFORE the recipient lookup, so it is existence-independent.
+    let (status, _headers, _body) = harness
+        .post_form(
+            &format!("{base}/magic/send"),
+            &form(&[("identifier", "ada@example.test"), ("purpose", "login")]),
+            None,
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "magic/send without a PoW solution is refused when PoW is enabled"
+    );
+
+    // A solved challenge for the magic_send endpoint lets the send through (the uniform ack).
+    let (challenge_id, nonce) = issue_and_solve(&harness, "magic_send", "").await;
+    let (status, _headers, _body) = harness
+        .post_form(
+            &format!("{base}/magic/send"),
+            &form(&[
+                ("identifier", "ada@example.test"),
+                ("purpose", "login"),
+                ("pow_challenge_id", &challenge_id),
+                ("pow_nonce", &nonce),
+                ("pow_context", ""),
+            ]),
+            None,
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "magic/send with a solved PoW challenge is accepted (parity with otp/send)"
+    );
+}
+
+#[tokio::test]
+async fn the_pow_challenge_mint_rate_is_bounded_per_ip() {
+    // /pow/challenge is unauthenticated and INSERTs a row per call (issue #80 LOW-3), so its
+    // mint rate is THROTTLED per peer IP through the #64 abuse layer: a single source is cut
+    // off with a 429 once it exceeds the soft threshold, bounding unbounded row growth.
+    let harness = Harness::start_with(config_with(pow_on())).await;
+    let path = challenge_path(&harness);
+    let mut statuses = Vec::new();
+    for _ in 0..12 {
+        let (status, _headers, _text) = harness
+            .send(
+                Request::builder()
+                    .method("POST")
+                    .uri(&path)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(ironauth_config::PEER_IP_HEADER, "203.0.113.7")
+                    .body(Body::from(
+                        json!({ "endpoint": "register", "context": "" }).to_string(),
+                    ))
+                    .expect("request builds"),
+            )
+            .await;
+        statuses.push(status);
+    }
+    // The early mints succeed, and the source is eventually throttled: the mint rate (and so
+    // the row growth) is bounded, not unbounded.
+    assert!(
+        statuses.contains(&StatusCode::OK),
+        "some early challenge mints succeed: {statuses:?}"
+    );
+    assert!(
+        statuses.contains(&StatusCode::TOO_MANY_REQUESTS),
+        "the mint rate is bounded with a 429 once the soft threshold is crossed: {statuses:?}"
+    );
+    let minted = statuses
+        .iter()
+        .filter(|status| **status == StatusCode::OK)
+        .count();
+    assert!(
+        minted < statuses.len(),
+        "not every request mints a row (growth is bounded): {minted} of {}",
+        statuses.len()
     );
 }
