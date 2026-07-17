@@ -6,6 +6,13 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Add three federation `FetchPurpose` variants (issue #75, PR A): `FederationDiscovery`,
+  `FederationJwks`, and `FederationUserinfo`, for the inbound-federation connector's outbound
+  fetches (a connector's issuer / `jwks_uri` / `userinfo_endpoint` are all tenant-controlled,
+  attacker-influenced URLs). They are declared NOW but unused, so the federation upstream slice
+  touches no fetch-crate code; each rides the same SSRF-hardened path, so a discovery, JWKS, or
+  `UserInfo` URL that resolves to an internal or loopback address is refused exactly like any
+  other blocked destination. Each carries a stable metric label.
 - Raise the MDS3 response cap so the feature works (issue #66 PR B, adversarial review):
   the real FIDO MDS3 BLOB is several megabytes, past the 1 MiB default cap, so a sync would
   fail closed with `ResponseTooLarge` and leave `direct` attestation inert. A new per-purpose

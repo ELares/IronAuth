@@ -44,6 +44,7 @@
 mod auth;
 mod bans;
 mod config;
+mod connectors;
 mod dcr;
 mod environments;
 mod error;
@@ -255,6 +256,24 @@ pub fn management_router(state: AdminState) -> Router {
         .route(
             "/v1/tenants/{tenant_id}/environments/{environment_id}/clients/{client_id}/verify",
             post(dcr::verify_dcr_client),
+        )
+        // Declarative federation connectors (issue #75): CRUD plus a capability-matrix
+        // read endpoint. The static `.../capabilities` suffix is a sibling of the
+        // parameterized `.../connectors/{connector_id}`; the router matches the static
+        // segment first.
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/connectors",
+            post(connectors::create_connector).get(connectors::list_connectors),
+        )
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/connectors/{connector_id}/capabilities",
+            get(connectors::get_connector_capabilities),
+        )
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/connectors/{connector_id}",
+            get(connectors::get_connector)
+                .put(connectors::update_connector)
+                .delete(connectors::delete_connector),
         )
         // Session and refresh-family fleet operations (issue #32). The static
         // `/sessions/revoke` (the bulk surface) and the parameterized

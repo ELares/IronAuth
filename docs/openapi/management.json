@@ -1686,6 +1686,574 @@
         ]
       }
     },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/connectors": {
+      "get": {
+        "tags": [
+          "connectors"
+        ],
+        "summary": "List federation connectors in an environment (cursor paginated).",
+        "operationId": "listConnectors",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "The desired page size, a positive integer. Clamped to\n`[1, max_page_size]`; defaults to the configured default when absent.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "The opaque cursor from a previous page's `next_cursor`. Absent for the\nfirst page (keyset pagination; there is no offset).",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "A page of connectors",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConnectorList"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed cursor",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      },
+      "post": {
+        "tags": [
+          "connectors"
+        ],
+        "summary": "Create a declarative federation connector.",
+        "operationId": "createConnector",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Required. Replaying a POST with the same key returns the original response without re-executing.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateConnectorRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Created",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConnectorView"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed or invalid definition (JSON-pointer error)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Environment not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "A connector with this slug already exists",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency-Key reused with a different request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/connectors/{connector_id}": {
+      "get": {
+        "tags": [
+          "connectors"
+        ],
+        "summary": "Get a federation connector's secret-free definition and capability matrix.",
+        "operationId": "getConnector",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "connector_id",
+            "in": "path",
+            "description": "The connector identifier (cnr_...)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The connector (secret-free)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConnectorView"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found (absent or in another scope)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      },
+      "put": {
+        "tags": [
+          "connectors"
+        ],
+        "summary": "Update (replace) a federation connector definition.",
+        "operationId": "updateConnector",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "connector_id",
+            "in": "path",
+            "description": "The connector identifier (cnr_...)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateConnectorRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Updated",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConnectorView"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed or invalid definition (JSON-pointer error)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found (absent or in another scope)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      },
+      "delete": {
+        "tags": [
+          "connectors"
+        ],
+        "summary": "Delete a federation connector.",
+        "operationId": "deleteConnector",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "connector_id",
+            "in": "path",
+            "description": "The connector identifier (cnr_...)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Deleted"
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found (absent or in another scope)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/connectors/{connector_id}/capabilities": {
+      "get": {
+        "tags": [
+          "connectors"
+        ],
+        "summary": "Get a federation connector's capability matrix (issue #75). SECRET-FREE: the\nupstream client secret is never returned.",
+        "operationId": "getConnectorCapabilities",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "connector_id",
+            "in": "path",
+            "description": "The connector identifier (cnr_...)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The capability matrix",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConnectorCapabilitiesView"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found (absent or in another scope)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/v1/tenants/{tenant_id}/environments/{environment_id}/dcr/initial-access-tokens": {
       "post": {
         "tags": [
@@ -6077,6 +6645,102 @@
           }
         }
       },
+      "ConnectorCapabilitiesView": {
+        "type": "object",
+        "description": "The per-connector capability matrix (issue #75), exposed by the management API.\nSECRET-FREE: the upstream client secret is never part of this view.",
+        "required": [
+          "refresh",
+          "groups",
+          "logout_propagation",
+          "email_verified_trust"
+        ],
+        "properties": {
+          "email_verified_trust": {
+            "type": "string",
+            "description": "How much the upstream's `email_verified` claim is trusted (`untrusted` /\n`trusted`); defaults to `untrusted` for a new connector.",
+            "example": "untrusted"
+          },
+          "groups": {
+            "type": "boolean",
+            "description": "Whether the upstream delivers group memberships."
+          },
+          "logout_propagation": {
+            "type": "boolean",
+            "description": "Whether the upstream supports logout propagation."
+          },
+          "refresh": {
+            "type": "boolean",
+            "description": "Whether the upstream supports refresh tokens."
+          }
+        }
+      },
+      "ConnectorList": {
+        "type": "object",
+        "description": "A cursor-paginated page of federation connectors (issue #75).",
+        "required": [
+          "items"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ConnectorView"
+            },
+            "description": "The connectors on this page."
+          },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The opaque cursor for the next page, or absent on the last page."
+          }
+        }
+      },
+      "ConnectorView": {
+        "type": "object",
+        "description": "A federation connector, as returned by the management API (issue #75). SECRET-FREE:\nthe `definition` carries no `client_secret` and the sealed upstream secret is never\nprojected.",
+        "required": [
+          "id",
+          "connector_slug",
+          "definition",
+          "enabled",
+          "capabilities",
+          "created_at_unix_ms",
+          "updated_at_unix_ms"
+        ],
+        "properties": {
+          "capabilities": {
+            "$ref": "#/components/schemas/ConnectorCapabilitiesView",
+            "description": "The capability matrix derived from the definition."
+          },
+          "connector_slug": {
+            "type": "string",
+            "description": "The connector slug (unique per environment)."
+          },
+          "created_at_unix_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Creation time, milliseconds since the Unix epoch."
+          },
+          "definition": {
+            "description": "The connector's secret-free definition document (no `client_secret`)."
+          },
+          "enabled": {
+            "type": "boolean",
+            "description": "Whether the connector is active."
+          },
+          "id": {
+            "type": "string",
+            "description": "The connector identifier (`cnr_...`)."
+          },
+          "updated_at_unix_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Last-update time, milliseconds since the Unix epoch."
+          }
+        }
+      },
       "CreateBanRequest": {
         "type": "object",
         "description": "The request body to place a ban.",
@@ -6112,6 +6776,68 @@
           "subject_kind": {
             "type": "string",
             "description": "The regulated dimension: `ip`, `account`, or `identifier`."
+          }
+        }
+      },
+      "CreateConnectorRequest": {
+        "type": "object",
+        "description": "The body to create or replace a federation connector (issue #75): the declarative\nconnector definition itself. The management API parses it with the strict\n`ironauth-connector` layer (`deny_unknown_fields` plus the semantic validator), so\nan unknown key or a semantic fault is a 400 carrying a JSON-pointer error. This\nview documents the top-level shape; the FULL, authoritative JSON Schema is\npublished at `docs/connector-schema.json`.",
+        "required": [
+          "connector_id",
+          "display_name",
+          "protocol",
+          "endpoints",
+          "scopes",
+          "client_id",
+          "client_secret"
+        ],
+        "properties": {
+          "capabilities": {
+            "description": "The capability matrix (conservative defaults; `email_verified_trust` defaults\nto `untrusted`)."
+          },
+          "claim_mapping": {
+            "description": "The declarative claim mapping (the stored shape)."
+          },
+          "client_id": {
+            "type": "string",
+            "description": "The client identifier IronAuth registers at the upstream."
+          },
+          "client_secret": {
+            "description": "The upstream client secret by indirection (`\"...\"`, `{ \"file\": \"/path\" }`, or\n`{ \"env\": \"VAR\" }`); sealed at rest, never returned by a read."
+          },
+          "connector_id": {
+            "type": "string",
+            "description": "The connector slug (lowercase ASCII alphanumerics, hyphen, underscore), unique\nper environment.",
+            "example": "acme-oidc"
+          },
+          "display_name": {
+            "type": "string",
+            "description": "The human-facing display name."
+          },
+          "endpoints": {
+            "description": "The upstream endpoints: EITHER `{ \"issuer\": \"...\" }` OR\n`{ \"authorization_endpoint\", \"token_endpoint\", \"jwks_uri\", \"userinfo_endpoint\"? }`."
+          },
+          "pkce": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "How PKCE is applied to the upstream (`auto_where_supported` / `required` /\n`disabled`)."
+          },
+          "protocol": {
+            "type": "string",
+            "description": "The federation protocol (`oidc` only in this slice).",
+            "example": "oidc"
+          },
+          "quirks": {
+            "description": "Provider quirks expressed as data."
+          },
+          "scopes": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The scopes requested from the upstream (`openid` is required)."
           }
         }
       },
@@ -8213,6 +8939,10 @@
     {
       "name": "dcr",
       "description": "Dynamic Client Registration abuse controls: policies, initial access tokens, client verification"
+    },
+    {
+      "name": "connectors",
+      "description": "Declarative inbound-federation connectors: strict-validated OIDC-shaped upstream definitions (CRUD) and the machine-readable capability matrix"
     },
     {
       "name": "sessions",

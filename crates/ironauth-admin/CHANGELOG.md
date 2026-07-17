@@ -6,6 +6,18 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Declarative federation connector management (issue #75, PR A): CRUD plus a
+  capability-matrix read endpoint on the management API. `POST .../connectors` parses
+  the body with the strict, I/O-free `ironauth-connector` layer (`deny_unknown_fields`
+  plus the semantic validator) and REJECTS an unknown key or a semantic fault with a 400
+  carrying its RFC 6901 JSON POINTER; a valid definition seals the upstream client
+  secret and writes the capability matrix. `GET .../connectors` (cursor paginated),
+  `GET .../connectors/{id}`, `GET .../connectors/{id}/capabilities`,
+  `PUT .../connectors/{id}`, and `DELETE .../connectors/{id}` round out the surface.
+  Every response is SECRET-FREE: the sealed upstream secret is never returned, and a
+  new connector's `email_verified_trust` reads back `untrusted`. Six routes and their
+  schemas are added to the OpenAPI spec, the served router, and the hardcoded contract
+  test (op-id set, path set, and the served-route count 62 -> 68).
 - Admin session privilege separation (sudo mode), EXPLORATORY and off by default (issue
   #73). Behind the new per-environment `admin.sudo_mode_enabled` flag, admin READS are
   unaffected but an environment-scoped MUTATION requires a RECENT re-authentication: the

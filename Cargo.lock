@@ -996,6 +996,7 @@ dependencies = [
  "http",
  "http-body-util",
  "ironauth-config",
+ "ironauth-connector",
  "ironauth-env",
  "ironauth-import",
  "ironauth-jose",
@@ -1040,6 +1041,16 @@ dependencies = [
  "serde",
  "serde_json",
  "toml 0.9.12+spec-1.1.0",
+]
+
+[[package]]
+name = "ironauth-connector"
+version = "0.1.0"
+dependencies = [
+ "ironauth-config",
+ "schemars",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

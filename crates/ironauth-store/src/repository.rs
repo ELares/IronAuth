@@ -58,6 +58,7 @@ use sqlx::{PgConnection, Postgres, Row, Transaction};
 use crate::abuse::{AbuseBanView, AbuseSubject, AbuseSubjectKind, AuthPath, NewBan};
 use crate::audit::{ActingContext, Action, ActorRef};
 use crate::classification::ResourceType;
+use crate::connector::{ConnectorCapabilities, ConnectorRecord, NewConnector, StoredCapabilities};
 use crate::custom_domain::{
     AcmeChallengeRecord, ChallengeOutcome, ChallengeStatus, ChallengeType, CustomDomainRecord,
     VerificationStatus,
@@ -71,16 +72,16 @@ use crate::error::StoreError;
 use crate::id::{
     AaguidRuleId, AbuseBanId, AcmeChallengeId, AdminSudoElevationId, AssertionMappingId,
     AttestationConfigId, AuditId, AuditTarget, AuthorizationCodeId, BackChannelDeliveryId,
-    ClientId, ClientSessionId, ConsentId, CorrelationId, CredentialClassPolicyId, CredentialId,
-    CustomDomainId, DcrPolicyId, DekId, DeviceCodeId, EmailOtpCodeId, EncryptedSecretId,
-    EnvironmentId, EnvironmentSecretId, ExternalIssuerId, GrantId, InitialAccessTokenId,
-    InvitationId, IssuedTokenId, KekId, MagicLinkTokenId, ManagementKeyId, Mds3BlobCacheId,
-    MigrationRunId, MigrationRunRecordId, OperatorId, OrganizationId, PushedRequestId,
-    RecoveryCodeId, RefreshFamilyId, RefreshTokenId, ResourceServerId, RiskDecisionId,
-    RiskDisavowalId, RiskLoginGeoId, ScopeStepUpPolicyId, ServiceAccountId, SessionEventId,
-    SessionId, SigningKeyId, SmsOtpCodeId, SmsRouteStatId, TenantId, TotpCredentialId,
-    TraitMigrationJobId, TraitSchemaId, TrustedDeviceId, UserId, UserIdentifierId, VariableId,
-    WebauthnChallengeId, WebauthnCredentialId,
+    ClientId, ClientSessionId, ConnectorId, ConsentId, CorrelationId, CredentialClassPolicyId,
+    CredentialId, CustomDomainId, DcrPolicyId, DekId, DeviceCodeId, EmailOtpCodeId,
+    EncryptedSecretId, EnvironmentId, EnvironmentSecretId, ExternalIssuerId, GrantId,
+    InitialAccessTokenId, InvitationId, IssuedTokenId, KekId, MagicLinkTokenId, ManagementKeyId,
+    Mds3BlobCacheId, MigrationRunId, MigrationRunRecordId, OperatorId, OrganizationId,
+    PushedRequestId, RecoveryCodeId, RefreshFamilyId, RefreshTokenId, ResourceServerId,
+    RiskDecisionId, RiskDisavowalId, RiskLoginGeoId, ScopeStepUpPolicyId, ServiceAccountId,
+    SessionEventId, SessionId, SigningKeyId, SmsOtpCodeId, SmsRouteStatId, TenantId,
+    TotpCredentialId, TraitMigrationJobId, TraitSchemaId, TrustedDeviceId, UserId,
+    UserIdentifierId, VariableId, WebauthnChallengeId, WebauthnCredentialId,
 };
 use crate::identifier::{
     CanonicalIdentifier, IdentifierType, UniquenessMode, canonicalize_identifier,
@@ -382,6 +383,19 @@ impl<'a> ScopedStore<'a> {
     #[must_use]
     pub fn risk(&self) -> RiskRepo<'a> {
         RiskRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
+    /// The read-only federation connector repository for this scope (issue #75):
+    /// read a connector's SECRET-FREE definition and its capability matrix, and list
+    /// the scope's connectors (for the management API and the config-snapshot
+    /// export). A read never returns the sealed upstream client secret. The mutating
+    /// create / update / delete live on [`ActingStore::connectors`].
+    #[must_use]
+    pub fn connectors(&self) -> ConnectorRepo<'a> {
+        ConnectorRepo {
             store: self.store,
             scope: self.scope,
         }
@@ -988,6 +1002,19 @@ impl<'a> ActingStore<'a> {
     #[must_use]
     pub fn risk(&self) -> ActingRiskRepo<'a> {
         ActingRiskRepo {
+            store: self.store,
+            scope: self.scope,
+            acting: self.acting,
+        }
+    }
+
+    /// The mutating federation connector repository for this scope and actor (issue
+    /// #75): create (seal the upstream client secret inline, audited), update (replace
+    /// the definition and reseal, audited), and delete (audited). Every write carries
+    /// the actor and correlation id into its audit row.
+    #[must_use]
+    pub fn connectors(&self) -> ActingConnectorRepo<'a> {
+        ActingConnectorRepo {
             store: self.store,
             scope: self.scope,
             acting: self.acting,
@@ -17686,6 +17713,431 @@ impl ActingRiskRepo<'_> {
 }
 
 // ===========================================================================
+// Federation connectors (issue #75)
+// ===========================================================================
+
+/// The `client_secret_sealed` column purpose for a connector's sealed upstream
+/// client secret, bound into the seal AAD so a ciphertext lifted to another
+/// connector slug, row, scope, or DEK version fails authenticated decryption.
+fn connector_secret_purpose(slug: &str) -> String {
+    format!("connector_client_secret:{slug}")
+}
+
+/// Reconstruct a secret-free [`ConnectorRecord`] from a connector row. The sealed
+/// client secret column is never selected, so a read is secret-free by construction.
+fn connector_record_from_row(row: &PgRow, scope: Scope) -> Result<ConnectorRecord, StoreError> {
+    let id_text: String = row.get("id");
+    let id = ConnectorId::parse_in_scope(&id_text, &scope).map_err(|_| StoreError::NotFound)?;
+    Ok(ConnectorRecord {
+        id,
+        slug: row.get("connector_slug"),
+        definition_json: row.get("definition_json"),
+        capabilities: StoredCapabilities {
+            refresh: row.get("cap_refresh"),
+            groups: row.get("cap_groups"),
+            logout_propagation: row.get("cap_logout_propagation"),
+            email_verified_trust: row.get("cap_email_verified_trust"),
+        },
+        enabled: row.get("enabled"),
+        created_at_unix_micros: row.get("created_us"),
+        updated_at_unix_micros: row.get("updated_us"),
+    })
+}
+
+/// The columns a connector read projects: everything EXCEPT the sealed client secret
+/// (which a read never returns), so the read is secret-free by construction.
+const CONNECTOR_READ_COLUMNS: &str = "id, connector_slug, definition_json::text AS definition_json, \
+     cap_refresh, cap_groups, cap_logout_propagation, cap_email_verified_trust, enabled, \
+     (EXTRACT(EPOCH FROM created_at) * 1000000)::bigint AS created_us, \
+     (EXTRACT(EPOCH FROM updated_at) * 1000000)::bigint AS updated_us";
+
+/// The read-only federation connector repository (issue #75). Every read is
+/// scope-bound and SECRET-FREE: the sealed upstream client secret is never
+/// projected.
+pub struct ConnectorRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl ConnectorRepo<'_> {
+    /// Parse a connector id string, confirming it is in this scope. A malformed id or
+    /// one from another scope is the uniform [`StoreError::NotFound`] (the anti-oracle
+    /// boundary), exactly like every other scoped-resource parse.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the id is malformed or out of scope.
+    pub fn parse_id(&self, raw: &str) -> Result<ConnectorId, StoreError> {
+        ConnectorId::parse_in_scope(raw, &self.scope).map_err(|_| StoreError::NotFound)
+    }
+
+    /// A connector's secret-free definition and capability matrix by id (issue #75).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the id is out of scope or absent;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn get(&self, id: &ConnectorId) -> Result<ConnectorRecord, StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(&format!(
+            "SELECT {CONNECTOR_READ_COLUMNS} FROM connectors \
+             WHERE tenant_id = $1 AND environment_id = $2 AND id = $3"
+        ))
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(id.to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        let row = row.ok_or(StoreError::NotFound)?;
+        connector_record_from_row(&row, self.scope)
+    }
+
+    /// A page of the scope's connectors, ordered by the stable `(created_at, id)`
+    /// key, for the management list endpoint (issue #75). `limit` rows after the
+    /// optional `after` cursor.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn list(
+        &self,
+        limit: i64,
+        after: Option<&CursorPosition>,
+    ) -> Result<Vec<ConnectorRecord>, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let capped = limit.clamp(1, MANAGEMENT_LIST_HARD_CAP + 1);
+        let rows = match after {
+            Some(cursor) => {
+                sqlx::query(&format!(
+                    "SELECT {CONNECTOR_READ_COLUMNS} FROM connectors \
+                     WHERE tenant_id = $1 AND environment_id = $2 \
+                     AND (created_at, id) > \
+                         (TIMESTAMPTZ 'epoch' + ($3::text || ' microseconds')::interval, $4) \
+                     ORDER BY created_at, id LIMIT $5"
+                ))
+                .bind(self.scope.tenant().to_string())
+                .bind(self.scope.environment().to_string())
+                .bind(cursor.created_at_unix_micros)
+                .bind(&cursor.id)
+                .bind(capped)
+                .fetch_all(&mut *tx)
+                .await?
+            }
+            None => {
+                sqlx::query(&format!(
+                    "SELECT {CONNECTOR_READ_COLUMNS} FROM connectors \
+                     WHERE tenant_id = $1 AND environment_id = $2 \
+                     ORDER BY created_at, id LIMIT $3"
+                ))
+                .bind(self.scope.tenant().to_string())
+                .bind(self.scope.environment().to_string())
+                .bind(capped)
+                .fetch_all(&mut *tx)
+                .await?
+            }
+        };
+        tx.commit().await?;
+        rows.iter()
+            .map(|row| connector_record_from_row(row, self.scope))
+            .collect()
+    }
+
+    /// Every connector in the scope, ordered by the stable `(created_at, id)` key,
+    /// for the config-snapshot export (issue #75). Scope-bound: a snapshot exports
+    /// only its own scope's connectors.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn list_all(&self) -> Result<Vec<ConnectorRecord>, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let rows = sqlx::query(&format!(
+            "SELECT {CONNECTOR_READ_COLUMNS} FROM connectors \
+             WHERE tenant_id = $1 AND environment_id = $2 ORDER BY created_at, id"
+        ))
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        rows.iter()
+            .map(|row| connector_record_from_row(row, self.scope))
+            .collect()
+    }
+}
+
+/// The mutating federation connector repository (issue #75): create (seal the
+/// upstream client secret inline, audited), update (replace and reseal, audited),
+/// and delete (audited). Every write is scope-bound.
+pub struct ActingConnectorRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+    acting: ActingContext,
+}
+
+impl ActingConnectorRepo<'_> {
+    /// Ensure the scope has a live KEK and DEK to seal the client secret under,
+    /// provisioning each lazily on first use (idempotent). Mirrors the risk / user-PII
+    /// paths so a connector secret is sealed exactly like every other envelope payload.
+    async fn ensure_scope_keys(&self, env: &Env, master: &MasterKey) -> Result<(), StoreError> {
+        let envelope = ActingEnvelopeRepo {
+            store: self.store,
+            scope: self.scope,
+            acting: self.acting,
+        };
+        match envelope.provision_kek(env, master).await {
+            Ok(_) | Err(StoreError::Conflict) => {}
+            Err(error) => return Err(error),
+        }
+        match envelope.provision_dek(env, master).await {
+            Ok(_) | Err(StoreError::Conflict) => {}
+            Err(error) => return Err(error),
+        }
+        Ok(())
+    }
+
+    /// CREATE a connector (issue #75): seal the upstream client secret INLINE under
+    /// the scope's active DEK, store the secret-free definition and the capability
+    /// columns (written from the definition), and audit `connector.create` in the same
+    /// transaction. The `id` and `created_at_micros` are supplied by the caller (minted
+    /// from the entropy and clock seams), so the HTTP response can be built before the
+    /// write and stored verbatim for idempotent replay.
+    ///
+    /// `idempotency` writes the caller's Idempotency-Key replay row in the SAME
+    /// transaction as the create and its audit row.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if `id` is out of scope; [`StoreError::Conflict`] if a
+    /// connector of the same slug already exists in this scope;
+    /// [`StoreError::IdempotencyConflict`] if a concurrent request already stored this
+    /// Idempotency-Key; [`StoreError::Encryption`] if the scope has no platform master
+    /// key; [`StoreError::Database`] on a persistence failure.
+    pub async fn create(
+        &self,
+        env: &Env,
+        id: &ConnectorId,
+        created_at_micros: i64,
+        params: NewConnector<'_>,
+        idempotency: Option<IdempotencyWrite<'_>>,
+    ) -> Result<(), StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let master = self.store.master().ok_or(StoreError::Encryption)?;
+        self.ensure_scope_keys(env, master).await?;
+        let id = *id;
+        let scope = self.scope;
+        let created_micros = created_at_micros;
+        let slug = params.slug.to_owned();
+        let definition = params.definition_json.to_owned();
+        let secret = params.client_secret.to_vec();
+        let caps = OwnedConnectorCapabilities::from(params.capabilities);
+        let enabled = params.enabled;
+        let detail = format!("slug={slug}");
+        write_audited_detailed(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::ConnectorCreate,
+                target: &id,
+            },
+            async move |tx| {
+                let (dek_version, dek) = fetch_active_dek(tx, scope, master).await?;
+                let sealed = dek.seal(
+                    env.entropy(),
+                    &secret_seal_aad(scope, &connector_secret_purpose(&slug), dek_version),
+                    &secret,
+                );
+                let result = sqlx::query(
+                    "INSERT INTO connectors \
+                     (id, tenant_id, environment_id, connector_slug, definition_json, \
+                      client_secret_sealed, client_secret_dek_version, cap_refresh, cap_groups, \
+                      cap_logout_propagation, cap_email_verified_trust, enabled, created_at, updated_at) \
+                     VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7, $8, $9, $10, $11, $12, \
+                             TIMESTAMPTZ 'epoch' + ($13::text || ' microseconds')::interval, \
+                             TIMESTAMPTZ 'epoch' + ($13::text || ' microseconds')::interval)",
+                )
+                .bind(id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(&slug)
+                .bind(&definition)
+                .bind(sealed.into_bytes())
+                .bind(dek_version)
+                .bind(caps.refresh)
+                .bind(caps.groups)
+                .bind(caps.logout_propagation)
+                .bind(&caps.email_verified_trust)
+                .bind(enabled)
+                .bind(created_micros)
+                .execute(&mut **tx)
+                .await;
+                match result {
+                    Ok(_) => {}
+                    Err(error) if is_unique_violation(&error) => return Err(StoreError::Conflict),
+                    Err(error) => return Err(error.into()),
+                }
+                insert_idempotency(tx, idempotency).await?;
+                Ok(())
+            },
+            false,
+            Some(&detail),
+        )
+        .await
+    }
+
+    /// UPDATE a connector (issue #75): replace the definition, RESEAL the client
+    /// secret under the scope's active DEK, rewrite the capability columns from the new
+    /// definition, and audit `connector.update` in the same transaction. `updated_at`
+    /// is stamped from the clock seam.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the connector is out of scope or absent;
+    /// [`StoreError::Encryption`] if the scope has no platform master key;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn update(
+        &self,
+        env: &Env,
+        id: &ConnectorId,
+        params: NewConnector<'_>,
+    ) -> Result<(), StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let master = self.store.master().ok_or(StoreError::Encryption)?;
+        self.ensure_scope_keys(env, master).await?;
+        let id = *id;
+        let scope = self.scope;
+        let updated_micros = epoch_micros(env.clock().now_utc());
+        let slug = params.slug.to_owned();
+        let definition = params.definition_json.to_owned();
+        let secret = params.client_secret.to_vec();
+        let caps = OwnedConnectorCapabilities::from(params.capabilities);
+        let enabled = params.enabled;
+        let detail = format!("slug={slug}");
+        write_audited_detailed(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::ConnectorUpdate,
+                target: &id,
+            },
+            async move |tx| {
+                let (dek_version, dek) = fetch_active_dek(tx, scope, master).await?;
+                let sealed = dek.seal(
+                    env.entropy(),
+                    &secret_seal_aad(scope, &connector_secret_purpose(&slug), dek_version),
+                    &secret,
+                );
+                let affected = sqlx::query(
+                    "UPDATE connectors SET \
+                     definition_json = $4::jsonb, client_secret_sealed = $5, \
+                     client_secret_dek_version = $6, cap_refresh = $7, cap_groups = $8, \
+                     cap_logout_propagation = $9, cap_email_verified_trust = $10, enabled = $11, \
+                     updated_at = TIMESTAMPTZ 'epoch' + ($12::text || ' microseconds')::interval \
+                     WHERE tenant_id = $1 AND environment_id = $2 AND id = $3",
+                )
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(id.to_string())
+                .bind(&definition)
+                .bind(sealed.into_bytes())
+                .bind(dek_version)
+                .bind(caps.refresh)
+                .bind(caps.groups)
+                .bind(caps.logout_propagation)
+                .bind(&caps.email_verified_trust)
+                .bind(enabled)
+                .bind(updated_micros)
+                .execute(&mut **tx)
+                .await?
+                .rows_affected();
+                if affected == 0 {
+                    return Err(StoreError::NotFound);
+                }
+                Ok(())
+            },
+            false,
+            Some(&detail),
+        )
+        .await
+    }
+
+    /// DELETE a connector (issue #75), auditing `connector.delete` in the same
+    /// transaction. The sealed client secret is removed with the row.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the connector is out of scope or absent;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn delete(&self, env: &Env, id: &ConnectorId) -> Result<(), StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let id = *id;
+        let scope = self.scope;
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::ConnectorDelete,
+                target: &id,
+            },
+            async move |tx| {
+                let affected = sqlx::query(
+                    "DELETE FROM connectors \
+                     WHERE tenant_id = $1 AND environment_id = $2 AND id = $3",
+                )
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(id.to_string())
+                .execute(&mut **tx)
+                .await?
+                .rows_affected();
+                if affected == 0 {
+                    return Err(StoreError::NotFound);
+                }
+                Ok(())
+            },
+            false,
+        )
+        .await
+    }
+}
+
+/// An owned copy of the capability columns, so they can move into the audited-write
+/// closure without borrowing the caller's [`NewConnector`].
+struct OwnedConnectorCapabilities {
+    refresh: bool,
+    groups: bool,
+    logout_propagation: bool,
+    email_verified_trust: String,
+}
+
+impl From<ConnectorCapabilities<'_>> for OwnedConnectorCapabilities {
+    fn from(caps: ConnectorCapabilities<'_>) -> Self {
+        Self {
+            refresh: caps.refresh,
+            groups: caps.groups,
+            logout_propagation: caps.logout_propagation,
+            email_verified_trust: caps.email_verified_trust.to_owned(),
+        }
+    }
+}
+
+// ===========================================================================
 // WebAuthn passkeys (issue #65)
 // ===========================================================================
 
@@ -27370,6 +27822,11 @@ async fn read_promoted_snapshot(
             resource_server,
             dcr_policy,
             variable,
+            // Connectors (issue #75) are not promoted by the transactional engine yet
+            // (their upstream secret reference must resolve against the target env, a
+            // later slice), so the promoted target read omits them exactly like
+            // `client`, keeping the promotion revision consistent.
+            connector: Vec::new(),
         },
     })
 }

@@ -143,13 +143,18 @@ pub enum ResourceType {
     /// A remembered device (issue #71): the server-side trusted-device state a
     /// subsequent login skips the second factor against.
     TrustedDevice,
+    /// A declarative inbound-federation connector (issue #75): the OIDC-shaped
+    /// upstream definition the generic federation upstream reads. Promotable
+    /// configuration; its upstream client SECRET never travels (only a named
+    /// reference does).
+    Connector,
 }
 
 impl ResourceType {
     /// Every resource type, in a stable order. The classification lint and the
     /// metadata endpoint both iterate this; a variant missing here is caught by
     /// the `all_lists_every_variant` test and by `scripts/classification-lint.sh`.
-    pub const ALL: [ResourceType; 17] = [
+    pub const ALL: [ResourceType; 18] = [
         ResourceType::Operator,
         ResourceType::Tenant,
         ResourceType::Environment,
@@ -167,6 +172,7 @@ impl ResourceType {
         ResourceType::AccountCredential,
         ResourceType::Invitation,
         ResourceType::TrustedDevice,
+        ResourceType::Connector,
     ];
 
     /// The stable wire name of this resource type (for example `organization`).
@@ -190,6 +196,7 @@ impl ResourceType {
             ResourceType::AccountCredential => "account_credential",
             ResourceType::Invitation => "invitation",
             ResourceType::TrustedDevice => "trusted_device",
+            ResourceType::Connector => "connector",
         }
     }
 
@@ -214,7 +221,8 @@ impl ResourceType {
             | ResourceType::Session
             | ResourceType::AccountCredential
             | ResourceType::Invitation
-            | ResourceType::TrustedDevice => ResourceLevel::Environment,
+            | ResourceType::TrustedDevice
+            | ResourceType::Connector => ResourceLevel::Environment,
         }
     }
 
@@ -240,10 +248,17 @@ pub fn classify(resource: ResourceType) -> ResourceClassification {
         // A non-secret environment VARIABLE (issue #45) joins them: its name and
         // value are promotable config a snapshot carries and a target environment
         // may override.
+        // A federation connector definition (issue #75) is static configuration a
+        // config snapshot carries and a promotion replays: its non-secret
+        // definition is exactly the "static configuration" the promotion story
+        // moves between environments. The upstream client SECRET is NOT part of the
+        // promotable projection (only a named reference travels; the value is sealed
+        // per environment, issue #48), exactly like a confidential client's secret.
         ResourceType::Client
         | ResourceType::ResourceServer
         | ResourceType::DcrPolicy
-        | ResourceType::Variable => Promotable,
+        | ResourceType::Variable
+        | ResourceType::Connector => Promotable,
 
         // Environment-intrinsic identity, excluded from every snapshot so a
         // promotion never copies one environment's identity onto another: the

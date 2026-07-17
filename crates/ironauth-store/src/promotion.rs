@@ -321,9 +321,17 @@ pub fn revision(snapshot: &Snapshot) -> Result<String, StoreError> {
     Ok(hex_lower(&digest))
 }
 
-/// The snapshot projected to exactly the promoted resource types (the `client` set
-/// emptied), so a revision and a round-trip diff ignore the non-promoted `client`
-/// divergence between environments.
+/// The snapshot projected to exactly the promoted resource types (the `client` and
+/// `connector` sets emptied), so a revision and a round-trip diff ignore their
+/// non-promoted divergence between environments.
+//
+// `connector` (issue #75) is carried in the config-snapshot EXPORT (it is a
+// promotable definition, diffable and committable), but the transactional promotion
+// ENGINE does not yet apply it: promoting a connector requires resolving its upstream
+// client-secret reference against the target environment's secret store, which is a
+// later slice. It is therefore emptied here exactly like `client`, so the promotion
+// revision stays consistent (source projection and target read both omit it) rather
+// than the engine attempting an apply it cannot complete.
 fn promoted_projection(snapshot: &Snapshot) -> Snapshot {
     Snapshot {
         schema_version: snapshot.schema_version.clone(),
@@ -332,6 +340,7 @@ fn promoted_projection(snapshot: &Snapshot) -> Snapshot {
             resource_server: snapshot.resources.resource_server.clone(),
             dcr_policy: snapshot.resources.dcr_policy.clone(),
             variable: snapshot.resources.variable.clone(),
+            connector: Vec::new(),
         },
     }
 }

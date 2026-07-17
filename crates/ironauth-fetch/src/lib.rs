@@ -157,6 +157,28 @@ pub enum FetchPurpose {
     /// SSRF-hardened path as every other external fetch: an MDS3 URL that resolves to an
     /// internal or loopback address is refused exactly like any other blocked destination.
     Mds3Sync,
+    /// Fetching an upstream federation connector's OIDC discovery document
+    /// (`{issuer}/.well-known/openid-configuration`) for inbound federation (issue
+    /// #75). The issuer is a value a TENANT controls (a connector definition carries
+    /// attacker-influenced URLs), so this rides the same SSRF-hardened path as every
+    /// other outbound fetch: a discovery URL that resolves to a loopback or internal
+    /// address is refused exactly like any other blocked destination. Unused until
+    /// the federation upstream slice; declared now so that slice touches no
+    /// fetch-crate code.
+    FederationDiscovery,
+    /// Fetching an upstream federation connector's JWKS (its `jwks_uri`) to verify
+    /// the upstream ID token's signature (issue #75). The `jwks_uri` is
+    /// tenant-controlled and outbound, so it rides the same SSRF-hardened path: a
+    /// `jwks_uri` that resolves to an internal or loopback address is refused
+    /// exactly like any other blocked destination. Unused until the federation
+    /// upstream slice.
+    FederationJwks,
+    /// Fetching an upstream federation connector's `UserInfo` endpoint to assemble
+    /// the federated identity (issue #75). The endpoint is tenant-controlled and
+    /// outbound, so it rides the same SSRF-hardened path: a `userinfo_endpoint` that
+    /// resolves to an internal or loopback address is refused exactly like any other
+    /// blocked destination. Unused until the federation upstream slice.
+    FederationUserinfo,
 }
 
 impl FetchPurpose {
@@ -174,6 +196,9 @@ impl FetchPurpose {
             FetchPurpose::LazyMigration => "lazy_migration",
             FetchPurpose::BreachScreening => "breach_screening",
             FetchPurpose::Mds3Sync => "mds3_sync",
+            FetchPurpose::FederationDiscovery => "federation_discovery",
+            FetchPurpose::FederationJwks => "federation_jwks",
+            FetchPurpose::FederationUserinfo => "federation_userinfo",
         }
     }
 

@@ -62,6 +62,10 @@ echo "==> config schema freshness"
 scripts/config-schema.sh
 git diff --exit-code docs/config-schema.json docs/CONFIG.md
 
+echo "==> connector schema freshness (definition + capability matrix)"
+scripts/connector-schema.sh
+git diff --exit-code docs/connector-schema.json docs/capability-matrix.schema.json
+
 echo "==> openapi freshness (served management spec vs committed artifact)"
 scripts/openapi-check.sh
 

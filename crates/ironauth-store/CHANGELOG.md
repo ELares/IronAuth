@@ -6,6 +6,26 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Declarative federation connectors (issue #75, PR A): migration 0055 adds the
+  tenant-scoped, forced-RLS `connectors` table and the `ConnectorRepo` /
+  `ActingConnectorRepo` accessors. A connector row holds a `cnr_` scope-embedded id
+  (a NEW `ScopedKind`; the prefix is `cnr`, distinct from consent's `con`, so the two
+  kinds never share a wire prefix), a SECRET-FREE `definition_json`, the capability
+  columns written from the definition, and the upstream client secret SEALED INLINE
+  under the scope DEK (issue #48) rather than in the shared `encrypted_secrets` store:
+  the management API seals it on the control-plane role, which holds the KEK/DEK
+  provisioning grants (issue #37) but is deliberately NOT granted the shared secret
+  store. A read never returns the sealed secret. `ResourceType::Connector` is added and
+  classified PROMOTABLE; the snapshot export carries the connector definition and a
+  NAMED REFERENCE to its upstream secret (`connector_client_secret`), never the value
+  (the #58 proof, covered by a real-database test and the classification-binding test).
+  The transactional promotion ENGINE does not yet apply connectors (their secret
+  reference must resolve against the target environment, a later slice), so they are
+  emptied from the promoted projection exactly like clients. `connectors` is registered
+  in the query-audit lint and the IDOR harness (`connectors.get` / `connectors.delete`).
+  The migration guard pins the chain at 55 and asserts the table's forced RLS, isolation
+  policy, scope-nonempty and email-verified-trust CHECKs, sealed-secret column, and the
+  absence of any plaintext `client_secret` column.
 - Minimal risk engine state (issue #79): migration 0054 adds three tenant-scoped,
   forced-RLS tables and the `RiskRepo` / `ActingRiskRepo` accessors. `risk_login_geo`
   holds one per-subject last-seen login geo (the observed IP, coarse location, and

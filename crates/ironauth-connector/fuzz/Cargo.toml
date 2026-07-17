@@ -1,0 +1,33 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+#
+# The cargo-fuzz harness for the ironauth-connector definition parser and
+# validator (issue #75). Deliberately NOT a workspace member (the empty
+# [workspace] table below detaches it): its libFuzzer dependency needs a nightly
+# toolchain and must not constrain the stable workspace or enter the cargo-deny
+# graph, mirroring ironauth-jose's fuzz/, ironauth-importers's fuzz/, and the
+# sibling Iron projects. The one target proves that arbitrary (malformed) bytes
+# never panic the deserializer or the semantic validator, and that a def that
+# fails to validate is REJECTED, never accepted. The same input space has stable,
+# in-CI coverage in the crate's unit tests.
+[package]
+name = "ironauth-connector-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+ironauth-connector = { path = ".." }
+serde_json = "1.0"
+
+[[bin]]
+name = "connector_def"
+path = "fuzz_targets/connector_def.rs"
+test = false
+doc = false
+bench = false

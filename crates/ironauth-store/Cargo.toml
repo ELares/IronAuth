@@ -96,6 +96,15 @@ name = "rls"
 path = "tests/rls.rs"
 required-features = ["testing"]
 
+# Declarative federation connectors (issue #75): the connector CRUD repo (secret
+# sealed inline, capability columns from the definition), the secret-free snapshot
+# export (the client secret is a reference, never the value), and cross-tenant RLS,
+# against a real database.
+[[test]]
+name = "connectors"
+path = "tests/connectors.rs"
+required-features = ["testing"]
+
 # Credential-abuse defenses (issue #64): the durable ban registry (per-dimension,
 # per-path, sealed subject) and the layered failure counters, against a real database.
 [[test]]

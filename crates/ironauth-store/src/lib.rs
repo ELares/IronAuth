@@ -50,6 +50,7 @@
 pub mod abuse;
 pub mod audit;
 pub mod classification;
+pub mod connector;
 pub mod custom_domain;
 pub mod email_otp;
 pub mod environment;
@@ -81,6 +82,7 @@ pub mod test_support;
 pub use abuse::{AbuseBanView, AbuseSubject, AbuseSubjectKind, AuthPath, NewBan};
 pub use audit::{ActingContext, Action, ActorRef};
 pub use classification::{ResourceClassification, ResourceLevel, ResourceType, classify};
+pub use connector::{ConnectorCapabilities, ConnectorRecord, NewConnector, StoredCapabilities};
 pub use custom_domain::{
     AcmeChallengeRecord, ChallengeOutcome, ChallengeStatus, ChallengeType, CustomDomainError,
     CustomDomainRecord, VerificationStatus, domain_is_registrable, normalize_domain,
@@ -103,8 +105,8 @@ pub use id::{
     AdminSudoElevationKind, AgentId, AgentKind, AssertionMappingId, AssertionMappingKind,
     AttestationConfigId, AttestationConfigKind, AuditId, AuditKind, AuditTarget,
     AuthorizationCodeId, AuthorizationCodeKind, BackChannelDeliveryId, BackChannelDeliveryKind,
-    COMPONENT_BYTES, ClientId, ClientKind, ClientSessionId, ClientSessionKind, ConsentId,
-    ConsentKind, CorrelationId, CorrelationKind, CredentialClassPolicyId,
+    COMPONENT_BYTES, ClientId, ClientKind, ClientSessionId, ClientSessionKind, ConnectorId,
+    ConnectorKind, ConsentId, ConsentKind, CorrelationId, CorrelationKind, CredentialClassPolicyId,
     CredentialClassPolicyKind, CredentialId, CredentialKind, CustomDomainId, CustomDomainKind,
     DcrPolicyId, DcrPolicyKind, DekId, DekKind, DeviceCodeId, DeviceCodeKind, EmailOtpCodeId,
     EmailOtpCodeKind, EncryptedSecretId, EncryptedSecretKind, EnvironmentId, EnvironmentKind,

@@ -48,6 +48,7 @@ fn operation_ids_are_the_stable_set() {
             "applyConfigPromotion",
             "bulkRevokeSessions",
             "createBan",
+            "createConnector",
             "createDcrInitialAccessToken",
             "createDcrPolicy",
             "createEnvironment",
@@ -56,6 +57,7 @@ fn operation_ids_are_the_stable_set() {
             "createOrganization",
             "createTenant",
             "createUser",
+            "deleteConnector",
             "deleteEnvironment",
             "deleteManagementKey",
             "deleteOrganization",
@@ -64,6 +66,8 @@ fn operation_ids_are_the_stable_set() {
             "elevateAdminSudo",
             "exportConfigSnapshot",
             "exportIdentities",
+            "getConnector",
+            "getConnectorCapabilities",
             "getDcrClient",
             "getEnvironment",
             "getInvitation",
@@ -80,6 +84,7 @@ fn operation_ids_are_the_stable_set() {
             "liftBan",
             "linkUserExternalId",
             "listBans",
+            "listConnectors",
             "listDcrPolicies",
             "listEnvironments",
             "listInvitations",
@@ -104,6 +109,7 @@ fn operation_ids_are_the_stable_set() {
             "setUserState",
             "suspendTenant",
             "unlinkUserExternalId",
+            "updateConnector",
             "updateUser",
             "verifyDcrClient",
             "verifyMigrationCredential",
@@ -133,6 +139,7 @@ fn every_list_endpoint_documents_cursor_pagination() {
         "listEnvironments",
         "listOrganizations",
         "listManagementKeys",
+        "listConnectors",
         "listDcrPolicies",
         "listSessions",
         "listRefreshFamilies",
@@ -166,6 +173,7 @@ fn every_post_documents_the_idempotency_key_header() {
         "createManagementKey",
         "createDcrPolicy",
         "createDcrInitialAccessToken",
+        "createConnector",
         "verifyDcrClient",
         "revokeSession",
         "bulkRevokeSessions",
@@ -218,6 +226,7 @@ fn documented_paths_are_the_expected_set() {
         vec![
             "DELETE /v1/tenants/{tenant_id}",
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}",
+            "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/connectors/{connector_id}",
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/keys/{key_id}",
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}",
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}",
@@ -232,6 +241,9 @@ fn documented_paths_are_the_expected_set() {
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/abuse/bans",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/clients/{client_id}",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/config/snapshot",
+            "GET /v1/tenants/{tenant_id}/environments/{environment_id}/connectors",
+            "GET /v1/tenants/{tenant_id}/environments/{environment_id}/connectors/{connector_id}",
+            "GET /v1/tenants/{tenant_id}/environments/{environment_id}/connectors/{connector_id}/capabilities",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/dcr/policies",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/export",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/invitations",
@@ -260,6 +272,7 @@ fn documented_paths_are_the_expected_set() {
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/clients/{client_id}/verify",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/config/promotion/apply",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/config/promotion/plan",
+            "POST /v1/tenants/{tenant_id}/environments/{environment_id}/connectors",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/dcr/initial-access-tokens",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/dcr/policies",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/invitations",
@@ -277,6 +290,7 @@ fn documented_paths_are_the_expected_set() {
             "POST /v1/tenants/{tenant_id}/restore",
             "POST /v1/tenants/{tenant_id}/resume",
             "POST /v1/tenants/{tenant_id}/suspend",
+            "PUT /v1/tenants/{tenant_id}/environments/{environment_id}/connectors/{connector_id}",
             "PUT /v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}/external-id",
         ]
     );
@@ -316,7 +330,7 @@ fn committed_artifact_matches_generated_spec() {
 async fn served_routes_match_documented_routes() {
     let router = db_free_router();
     let documented = documented_method_paths();
-    assert_eq!(documented.len(), 62, "the documented route count is pinned");
+    assert_eq!(documented.len(), 68, "the documented route count is pinned");
 
     // The OUTBOUND lazy-migration endpoint (issue #58) is the one documented route
     // that is NOT gated by the management `Principal` at 401. It is DISABLED BY

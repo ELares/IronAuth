@@ -28,6 +28,7 @@ members = [
     "crates/ironauth-apply",
     "crates/ironauth-import",
     "crates/ironauth-importers",
+    "crates/ironauth-connector",
     "crates/ironauth",
 ]
 
@@ -40,6 +41,7 @@ repository = "https://github.com/ELares/IronAuth"
 [workspace.dependencies]
 ironauth-env = { path = "crates/ironauth-env", version = "0.1.0" }
 ironauth-config = { path = "crates/ironauth-config", version = "0.1.0" }
+ironauth-connector = { path = "crates/ironauth-connector", version = "0.1.0" }
 ironauth-server = { path = "crates/ironauth-server", version = "0.1.0" }
 ironauth-store = { path = "crates/ironauth-store", version = "0.1.0" }
 ironauth-fetch = { path = "crates/ironauth-fetch", version = "0.1.0" }
