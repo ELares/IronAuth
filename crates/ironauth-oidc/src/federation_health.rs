@@ -108,8 +108,10 @@ impl HealthState {
 /// touching the upstream (issue #76).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Admission {
-    /// Attempt the upstream operation. Either the connector is healthy / unknown, or a
-    /// backoff window has elapsed and this is a single half-open probe.
+    /// Attempt the upstream operation. Either the connector is healthy / unknown, or a backoff
+    /// window has elapsed so the first request(s) after it may probe. The probe is NOT serialized:
+    /// concurrent authorizes crossing the backoff boundary are all admitted (a small, self-limiting
+    /// thundering herd against a recovering upstream), not gated to exactly one in-flight probe.
     Allow,
     /// Do NOT touch the upstream; surface a typed connector-unavailable error. The
     /// reason distinguishes a permanent config fault from a transient backoff.
@@ -141,10 +143,14 @@ impl DenyReason {
 /// the window is `probe_window * 2^min(failures-1, SHIFT_CAP)` and can never overflow.
 const BACKOFF_SHIFT_CAP: u32 = 6;
 
-/// The hard cap on distinct connectors tracked, bounding both memory and exported
-/// metric cardinality (connectors are operator-provisioned store rows, already bounded,
-/// but this fails safe against a runaway). Beyond it a new connector is simply not
-/// tracked (admitted untracked), never blocked.
+/// The hard cap on distinct connectors tracked in the registry MAP, bounding its memory
+/// (connectors are operator-provisioned store rows, already bounded, but this fails safe against a
+/// runaway). Beyond the cap a new connector is admitted UNTRACKED (folded onto a reserved overflow
+/// slot), never blocked -- so the failure-isolation layer FAILS OPEN past the cap.
+///
+/// Note this bounds the MAP, not the exported metric-label cardinality: [`emit_metrics`] always
+/// labels with the connector's REAL id, so the `connector` label set is bounded by how many
+/// connectors an operator actually provisions and exercises, independent of this cap.
 const MAX_TRACKED_CONNECTORS: usize = 4096;
 
 /// One connector's mutable health record.
@@ -247,7 +253,8 @@ impl ConnectorHealthRegistry {
     /// Decide whether a connector operation may touch the upstream, WITHOUT recording
     /// anything (issue #76). A config-broken connector is denied permanently (until its
     /// fingerprint changes); an unavailable one is denied until its backoff window
-    /// elapses, then admitted as a single half-open probe.
+    /// elapses, then admitted as a probe (the first request(s) after the window; the probe is
+    /// not serialized to exactly one in-flight request).
     ///
     /// `fingerprint` is the connector-definition version (the store row `updated_at`
     /// micros): a change resets the record so a RECONFIGURED connector is retried at once.
@@ -336,12 +343,30 @@ impl ConnectorHealthRegistry {
         emit_metrics(connector_id, state, Some(kind));
     }
 
-    /// A read-only snapshot of one connector's health for the management-API read, or
-    /// [`None`] when the connector has never been exercised (issue #76).
+    /// A read-only snapshot of one connector's health for the management-API read, or [`None`]
+    /// when the connector has never been exercised OR its record predates the current
+    /// `fingerprint` (issue #76).
+    ///
+    /// `fingerprint` is the connector-definition version (the store row `updated_at` micros), the
+    /// SAME value the record- and admit- paths key on. A record whose fingerprint differs is
+    /// STALE: it describes the connector BEFORE a reconfiguration, so reporting it would surface a
+    /// stale `config_error` (or a stale backoff) for a definition that has since changed. Treating
+    /// a fingerprint mismatch as never-exercised makes the health read reflect the reconfiguration
+    /// promptly (the handler renders it as `unknown` until the new definition is next exercised),
+    /// exactly mirroring how [`ConnectorHealthRegistry::admit`] resets a reconfigured connector.
     #[must_use]
-    pub fn snapshot(&self, now: SystemTime, connector_id: &str) -> Option<ConnectorHealthSnapshot> {
+    pub fn snapshot(
+        &self,
+        now: SystemTime,
+        connector_id: &str,
+        fingerprint: i64,
+    ) -> Option<ConnectorHealthSnapshot> {
         let records = self.lock();
         let record = records.get(connector_id)?;
+        // A reconfiguration (changed fingerprint) voids the stale record for the read.
+        if record.fingerprint != fingerprint {
+            return None;
+        }
         // The error rate reflects the CURRENT window: an elapsed window reads as zero
         // recent errors without mutating the record on a read.
         let window_fresh = now
@@ -443,7 +468,7 @@ mod tests {
     fn an_unexercised_connector_is_admitted_and_has_no_snapshot() {
         let reg = registry();
         assert_eq!(reg.admit(at(0), CID, FP), Admission::Allow);
-        assert!(reg.snapshot(at(0), CID).is_none());
+        assert!(reg.snapshot(at(0), CID, FP).is_none());
     }
 
     #[test]
@@ -451,7 +476,7 @@ mod tests {
         let reg = registry();
         reg.record_success(at(0), CID, FP);
         assert_eq!(reg.admit(at(0), CID, FP), Admission::Allow);
-        let snap = reg.snapshot(at(0), CID).expect("snapshot");
+        let snap = reg.snapshot(at(0), CID, FP).expect("snapshot");
         assert_eq!(snap.state, HealthState::Healthy);
         assert_eq!(snap.success_total, 1);
         assert_eq!(snap.consecutive_failures, 0);
@@ -477,7 +502,7 @@ mod tests {
             Admission::Deny(DenyReason::Config),
             "no backoff elapses a config fault"
         );
-        let snap = reg.snapshot(at(0), CID).expect("snapshot");
+        let snap = reg.snapshot(at(0), CID, FP).expect("snapshot");
         assert_eq!(snap.state, HealthState::ConfigError);
         assert_eq!(snap.last_error_kind, Some("config"));
 
@@ -522,7 +547,7 @@ mod tests {
         // A success clears the backoff and marks it healthy again.
         reg.record_success(at(90), CID, FP);
         assert_eq!(reg.admit(at(90), CID, FP), Admission::Allow);
-        let snap = reg.snapshot(at(90), CID).expect("snapshot");
+        let snap = reg.snapshot(at(90), CID, FP).expect("snapshot");
         assert_eq!(snap.state, HealthState::Healthy);
         assert_eq!(snap.consecutive_failures, 0);
     }
@@ -544,7 +569,7 @@ mod tests {
             Admission::Allow,
             "a protocol fault never denies the connector"
         );
-        let snap = reg.snapshot(at(1), CID).expect("snapshot");
+        let snap = reg.snapshot(at(1), CID, FP).expect("snapshot");
         assert_eq!(snap.error_total, 1);
         assert_eq!(snap.last_error_kind, Some("upstream_protocol"));
         // One error out of two attempts in the window.
@@ -560,11 +585,34 @@ mod tests {
             FP,
             &ConnectorError::UpstreamProtocol("x".to_owned()),
         );
-        let snap = reg.snapshot(at(0), CID).expect("snapshot");
+        let snap = reg.snapshot(at(0), CID, FP).expect("snapshot");
         assert!((snap.recent_error_rate - 1.0).abs() < f64::EPSILON);
         // Past the probe window with no new activity, the recent rate reads as zero.
-        let snap = reg.snapshot(at(31), CID).expect("snapshot");
+        let snap = reg.snapshot(at(31), CID, FP).expect("snapshot");
         assert!(snap.recent_error_rate.abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn a_snapshot_under_a_new_fingerprint_reads_as_never_exercised() {
+        // The health READ accounts for the fingerprint (issue #76 review LOW): a record left by
+        // the OLD definition is voided for a read under a NEW fingerprint, so a reconfigured
+        // connector does not report a stale config_error until its next login.
+        let reg = registry();
+        reg.record_failure(
+            at(0),
+            CID,
+            FP,
+            &ConnectorError::Config("bad url".to_owned()),
+        );
+        assert_eq!(
+            reg.snapshot(at(0), CID, FP).expect("snapshot").state,
+            HealthState::ConfigError,
+            "the current-fingerprint read still reports the recorded state"
+        );
+        assert!(
+            reg.snapshot(at(0), CID, FP + 1).is_none(),
+            "a reconfiguration (new fingerprint) voids the stale record for the read"
+        );
     }
 
     #[test]
@@ -581,7 +629,7 @@ mod tests {
         assert_eq!(reg.admit(at(0), "cnr_a", 2), Admission::Allow);
         assert_eq!(reg.admit(at(0), "cnr_b", 9), Admission::Allow);
         assert_eq!(
-            reg.snapshot(at(0), "cnr_b").expect("b snapshot").state,
+            reg.snapshot(at(0), "cnr_b", 9).expect("b snapshot").state,
             HealthState::Healthy,
             "a sibling's health is never disturbed by another's reconfiguration"
         );

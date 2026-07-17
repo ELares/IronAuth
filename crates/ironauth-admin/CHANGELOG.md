@@ -15,6 +15,10 @@ range per docs/RELEASING.md.
   a connector that exists but has never been exercised on this node reports `state = "unknown"`,
   and an absent id is a uniform not-found. The OpenAPI op-id/path/count contract and
   `docs/openapi/management.json` are updated accordingly (68 -> 69 routes).
+  - Review hardening (issue #76): the read is now FINGERPRINT-aware. It passes the connector's
+    current definition version (its store-row `updated_at` micros) to the health snapshot, so a
+    record left by a PRIOR definition reads as never-exercised (`state = "unknown"`) rather than
+    reporting a stale `config_error` after a reconfiguration until the next login.
 - Waitlist approval via the existing user-lifecycle management API (issue #80): the
   `UserStateView` wire enum gains a `waitlisted` variant (round-tripping the new
   `UserState::Waitlisted`), so a waitlisted self-service signup is listable and filterable,

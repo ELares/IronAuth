@@ -6,6 +6,11 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Federation privacy note surfaced in the operator-facing config docs (issue #76 review): the
+  `oidc.federation` description now records that a connector may forward the downstream
+  `login_hint` to its upstream provider, DISCLOSING an end-user identifier, and that a connector
+  suppresses it with the per-connector stored `passthrough.login_hint = false`. Docs-only (the
+  passthrough itself is per-connector stored data, not config); `docs/CONFIG.md` regenerates.
 - Connector failure-isolation health probe window for issue #76:
   `oidc.federation.health_probe_window_secs` (default 30, bounded 1..=86400 via
   `OIDC_MAX_FEDERATION_TTL_SECS`, validated at load even while federation is disabled). It is

@@ -40,7 +40,27 @@ range per docs/RELEASING.md.
     disable-able per connector via the connector definition's `passthrough` block.
     - PRIVACY: `login_hint` discloses an end-user identifier (typically an email) to the
       upstream provider. Forwarding is on by default (a brokered login normally wants it) but a
-      deployment sets `passthrough.login_hint = false` per connector to suppress it.
+      deployment sets `passthrough.login_hint = false` per connector to suppress it. Surfaced in
+      the operator-facing `docs/CONFIG.md` under `oidc.federation`, not only the type doc.
+  - **Review hardening (adversarial review of issue #76).**
+    - Upstream responses are now classified by CLASS, closing an unauthenticated connector-wide
+      DoS: a per-request token-endpoint `4xx` (a `400 invalid_grant` for a bad, expired, or
+      replayed authorization code -- reachable by anyone GETting the public `/callback`) maps to
+      `UpstreamProtocol` (feeds the error rate, NEVER arms backoff), while only a real outage
+      (`5xx`/`429`/timeout/blocked) maps to `UpstreamUnavailable` and arms the backoff. The same
+      split applies to discovery and JWKS fetches (`classify_upstream_status`, `fetch_keys`).
+      One failed login can no longer trip a whole connector into an escalating backoff.
+    - The authorize leg no longer records a health SUCCESS on discovery/endpoint resolution: for
+      a discovery-form connector that resolves from the CACHE, doing so flapped the health gauge
+      to healthy and PINNED the backoff at its base window while the token endpoint / JWKS was
+      down. `record_success` is now reserved for the CALLBACK's completed login, so the backoff
+      GROWS across repeated failing logins and the health state stays accurate.
+    - The mgmt health read is FINGERPRINT-aware (`snapshot` takes the connector's `updated_at`):
+      a record left by a prior definition reads as never-exercised, so a reconfiguration is
+      reflected promptly instead of reporting a stale `config_error`. Doc corrections: the
+      registry cap bounds the map (not metric-label cardinality; connectors beyond it are
+      admitted UNTRACKED = fail-open), and the backoff probe is the first request(s) after the
+      window (not a single serialized in-flight probe).
 - Generic OIDC UPSTREAM for inbound federation (issue #75, PR B): the wire that turns a
   declarative connector (PR A) into a full federated login with ZERO per-provider code.
   - **The federated login legs** (string-literal routes on `oidc_router`):

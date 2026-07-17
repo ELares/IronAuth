@@ -225,20 +225,25 @@ impl AdminState {
         self
     }
 
-    /// This node's live health snapshot for one connector (issue #76), read against the
-    /// admin clock seam, or `None` when no federation runtime is installed or the connector
-    /// has never been exercised on this node.
+    /// This node's live health snapshot for one connector (issue #76), read against the admin
+    /// clock seam, or `None` when no federation runtime is installed, the connector has never been
+    /// exercised on this node, or its recorded health predates the current `fingerprint`.
+    ///
+    /// `fingerprint` is the connector's current definition version (its store row `updated_at`
+    /// micros): passing it lets the read discount a record left by a PRIOR definition, so the
+    /// health surface reflects a reconfiguration promptly instead of reporting a stale state.
     #[must_use]
     pub(crate) fn connector_health(
         &self,
         connector_id: &str,
+        fingerprint: i64,
     ) -> Option<ironauth_oidc::ConnectorHealthSnapshot> {
         let now = self.inner.env.clock().now_utc();
         self.inner
             .federation
             .as_ref()?
             .health()
-            .snapshot(now, connector_id)
+            .snapshot(now, connector_id, fingerprint)
     }
 
     /// Whether the outbound lazy-migration credential-verification endpoint is

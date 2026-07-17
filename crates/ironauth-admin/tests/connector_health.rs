@@ -15,6 +15,7 @@ use ironauth_connector::ConnectorError;
 use ironauth_env::Env;
 use ironauth_fetch::{FetchLimits, Fetcher};
 use ironauth_oidc::{FederationKeyResolver, FederationRuntime};
+use ironauth_store::{EnvironmentId, Scope, TenantId};
 
 /// A minimal valid connector create body for `slug`.
 fn connector_body(slug: &str) -> String {
@@ -71,16 +72,37 @@ async fn the_health_read_reflects_an_induced_outage_and_isolates_siblings() {
         .expect("id")
         .to_owned();
 
-    // Induce an upstream outage on the broken connector and a success on the sibling,
-    // recorded (via the injected clock seam) into the SAME registry the admin plane reads.
+    // Induce an upstream outage on the broken connector and a success on the sibling, recorded
+    // (via the injected clock seam) into the SAME registry the admin plane reads. The record must
+    // key on each connector's REAL definition fingerprint (its store-row updated_at micros), the
+    // value the mgmt read now discounts a stale record against (issue #76), exactly as the OIDC
+    // data plane records it.
+    let scope = Scope::new(
+        TenantId::parse(&tenant).expect("tenant id"),
+        EnvironmentId::parse(&environment).expect("environment id"),
+    );
+    let scoped = harness.control_store().scoped(scope);
+    let connectors = scoped.connectors();
+    let broken_fp = connectors
+        .get(&connectors.parse_id(&broken_id).expect("parse broken id"))
+        .await
+        .expect("broken record")
+        .updated_at_unix_micros;
+    let healthy_fp = connectors
+        .get(&connectors.parse_id(&healthy_id).expect("parse healthy id"))
+        .await
+        .expect("healthy record")
+        .updated_at_unix_micros;
     let now = Env::system().clock().now_utc();
     runtime.health().record_failure(
         now,
         &broken_id,
-        1,
+        broken_fp,
         &ConnectorError::UpstreamUnavailable("dead upstream".to_owned()),
     );
-    runtime.health().record_success(now, &healthy_id, 1);
+    runtime
+        .health()
+        .record_success(now, &healthy_id, healthy_fp);
 
     // The mgmt read for the broken connector reports the typed unavailable state.
     let (status, _, body) = harness.get(&format!("{base}/{broken_id}/health")).await;

@@ -1238,7 +1238,11 @@ pub struct OidcConfig {
     /// `/federation` routes stay a uniform not-found), so an existing deployment is
     /// unaffected. When enabled, the boot path builds the federation runtime (its own
     /// SSRF-hardened fetcher plus the discovery / JWKS cache TTLs). The connectors
-    /// themselves are per-connector STORED data, not config. See [`FederationConfig`].
+    /// themselves are per-connector STORED data, not config. PRIVACY NOTE (issue #76): a
+    /// connector may forward the downstream `login_hint` to its upstream provider, which
+    /// DISCLOSES an end-user identifier (typically an email) to that upstream; a connector
+    /// that must not leak identifiers sets its `passthrough.login_hint = false` (per-connector
+    /// stored data) to suppress it. See [`FederationConfig`].
     pub federation: FederationConfig,
 
     /// Credential-abuse regulation and anti-enumeration posture (issue #64): the

@@ -632,7 +632,7 @@
             "health_probe_window_secs": 30,
             "jwks_ttl_secs": 3600
           },
-          "description": "Generic OIDC UPSTREAM federation (issue #75, PR B): turn a declarative connector\ninto an inbound federated login with zero per-provider code. OFF by default (the\n`/federation` routes stay a uniform not-found), so an existing deployment is\nunaffected. When enabled, the boot path builds the federation runtime (its own\nSSRF-hardened fetcher plus the discovery / JWKS cache TTLs). The connectors\nthemselves are per-connector STORED data, not config. See [`FederationConfig`]."
+          "description": "Generic OIDC UPSTREAM federation (issue #75, PR B): turn a declarative connector\ninto an inbound federated login with zero per-provider code. OFF by default (the\n`/federation` routes stay a uniform not-found), so an existing deployment is\nunaffected. When enabled, the boot path builds the federation runtime (its own\nSSRF-hardened fetcher plus the discovery / JWKS cache TTLs). The connectors\nthemselves are per-connector STORED data, not config. PRIVACY NOTE (issue #76): a\nconnector may forward the downstream `login_hint` to its upstream provider, which\nDISCLOSES an end-user identifier (typically an email) to that upstream; a connector\nthat must not leak identifiers sets its `passthrough.login_hint = false` (per-connector\nstored data) to suppress it. See [`FederationConfig`]."
         },
         "frontchannel_logout_enabled": {
           "default": false,

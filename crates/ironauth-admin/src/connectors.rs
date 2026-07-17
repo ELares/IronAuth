@@ -387,10 +387,11 @@ pub async fn get_connector_health(
     let connectors = state.store().scoped(scope).connectors();
     let id = connectors.parse_id(&connector_id)?;
     // Confirm the connector EXISTS in this scope (a uniform not-found otherwise), so the
-    // health read is not an oracle for arbitrary ids.
-    let _record = connectors.get(&id).await?;
+    // health read is not an oracle for arbitrary ids. Its `updated_at` is the definition
+    // fingerprint the health read discounts a stale (pre-reconfiguration) record against.
+    let record = connectors.get(&id).await?;
     let key = id.to_string();
-    let view = match state.connector_health(&key) {
+    let view = match state.connector_health(&key, record.updated_at_unix_micros) {
         Some(snapshot) => ConnectorHealthView {
             id: key,
             state: snapshot.state.as_str().to_owned(),

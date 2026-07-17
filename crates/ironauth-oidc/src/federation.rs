@@ -35,7 +35,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use axum::extract::{Path, RawQuery, State};
-use axum::http::HeaderMap;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -133,6 +133,28 @@ fn unavailable(err: &FetchError) -> ConnectorError {
     ConnectorError::UpstreamUnavailable(err.to_string())
 }
 
+/// Classify a NON-2xx upstream response by CLASS (issue #76, HIGH-1): the split that keeps a
+/// single per-request upstream fault from tripping the whole connector into backoff.
+///
+/// A `5xx` or `429` is a real upstream OUTAGE, so it maps to
+/// [`ConnectorError::UpstreamUnavailable`], which correctly ARMS the health-driven backoff (the
+/// upstream could not serve the request and hammering it helps nobody). A `4xx` is a PER-REQUEST
+/// protocol or config condition -- a token endpoint's `400 invalid_grant` for a bad, expired, or
+/// replayed authorization code (RFC 6749 5.2), a `401 invalid_client`, a discovery/JWKS `404` --
+/// so it maps to [`ConnectorError::UpstreamProtocol`], which feeds the error rate WITHOUT
+/// changing admission. That is what stops one failed (or replayed / double-submitted) login from
+/// blacklisting a whole connector into an escalating, attacker-sustainable backoff. Every
+/// federation outbound (token exchange, discovery, JWKS) runs its non-2xx through here so the
+/// class split is uniform. The message is non-sensitive: a bare status code and a context label.
+pub(crate) fn classify_upstream_status(status: StatusCode, context: &str) -> ConnectorError {
+    let code = status.as_u16();
+    if status.is_server_error() || status == StatusCode::TOO_MANY_REQUESTS {
+        ConnectorError::UpstreamUnavailable(format!("{context} returned HTTP {code}"))
+    } else {
+        ConnectorError::UpstreamProtocol(format!("{context} returned HTTP {code}"))
+    }
+}
+
 /// Resolve a connector's endpoints, fetching and parsing the upstream discovery
 /// document for an issuer-form connector (validating the mix-up defence) or resolving
 /// an explicit-endpoint connector directly.
@@ -144,10 +166,12 @@ fn unavailable(err: &FetchError) -> ConnectorError {
 ///
 /// # Errors
 ///
-/// [`ConnectorError::UpstreamUnavailable`] if the discovery fetch is blocked, times
-/// out, or returns a non-2xx; [`ConnectorError::UpstreamProtocol`] if the document is
-/// malformed or its issuer does not match (the mix-up defence); or
-/// [`ConnectorError::Config`] if neither an issuer nor an explicit set was supplied.
+/// [`ConnectorError::UpstreamUnavailable`] if the discovery fetch is blocked, times out, or
+/// returns a `5xx`/`429` (a real outage, which arms the backoff);
+/// [`ConnectorError::UpstreamProtocol`] if it returns a `4xx` (a per-request config/protocol
+/// problem, not an outage), or if the document is malformed or its issuer does not match (the
+/// mix-up defence); or [`ConnectorError::Config`] if neither an issuer nor an explicit set was
+/// supplied.
 pub async fn fetch_discovery(
     fetcher: &Fetcher,
     issuer: &str,
@@ -163,10 +187,10 @@ pub async fn fetch_discovery(
         .await
         .map_err(|err| unavailable(&err))?;
     if !response.status().is_success() {
-        return Err(ConnectorError::UpstreamUnavailable(format!(
-            "the discovery endpoint returned HTTP {}",
-            response.status().as_u16()
-        )));
+        return Err(classify_upstream_status(
+            response.status(),
+            "the discovery endpoint",
+        ));
     }
     parse_discovery(response.body(), issuer)
 }
@@ -180,9 +204,11 @@ pub async fn fetch_discovery(
 ///
 /// # Errors
 ///
-/// [`ConnectorError::UpstreamUnavailable`] if the exchange is blocked, times out, or
-/// returns a non-2xx; [`ConnectorError::UpstreamProtocol`] if the response is not JSON
-/// or carries no `id_token`.
+/// [`ConnectorError::UpstreamUnavailable`] if the exchange is blocked, times out, or returns a
+/// `5xx`/`429` (a real outage, which arms the backoff); [`ConnectorError::UpstreamProtocol`] if
+/// it returns a `4xx` (a per-request condition -- a `400 invalid_grant` for a bad, expired, or
+/// replayed code, a `401 invalid_client` -- which must NOT trip the connector down), or if the
+/// response is not JSON or carries no `id_token`.
 pub async fn exchange_code(
     fetcher: &Fetcher,
     request: TokenExchange<'_>,
@@ -214,10 +240,10 @@ pub async fn exchange_code(
     }
     let response = fetcher.fetch(http).await.map_err(|err| unavailable(&err))?;
     if !response.status().is_success() {
-        return Err(ConnectorError::UpstreamUnavailable(format!(
-            "the token endpoint returned HTTP {}",
-            response.status().as_u16()
-        )));
+        return Err(classify_upstream_status(
+            response.status(),
+            "the token endpoint",
+        ));
     }
     let body: serde_json::Value = serde_json::from_slice(response.body()).map_err(|_| {
         ConnectorError::UpstreamProtocol("the token response is not JSON".to_owned())
@@ -573,20 +599,23 @@ pub async fn federation_authorize(
     if let Admission::Deny(reason) = runtime.health().admit(now, &connector_key, fingerprint) {
         return interaction::connector_unavailable_page(reason.as_str());
     }
-    // Resolve the connector's endpoints, recording the outcome against the connector's health. A
+    // Resolve the connector's endpoints, recording a FAILURE against the connector's health. A
     // blocked, timed-out, or malformed discovery fetch is an UpstreamUnavailable / UpstreamProtocol
     // fault: it arms the backoff and surfaces the TYPED connector-unavailable error for this
     // connector only, never a process-wide failure.
+    //
+    // The success side is DELIBERATELY not recorded here (issue #76, review MEDIUM): a discovery-
+    // form connector resolves from the discovery CACHE with no network, so treating that as a
+    // success would clear the backoff and flap the health gauge to healthy for a connector whose
+    // token endpoint / JWKS / ID-token validation is down -- pinning the backoff at its base
+    // window and lying about the connector's health. record_success is reserved for the CALLBACK's
+    // COMPLETED login (a fully provisioned session), the only real success signal. The authorize
+    // leg still admit-gates above (denying during backoff); resolving cached discovery is not a win.
     let resolved = match runtime
         .resolve_endpoints(now, &connector_key, &definition.endpoints)
         .await
     {
-        Ok(resolved) => {
-            runtime
-                .health()
-                .record_success(now, &connector_key, fingerprint);
-            resolved
-        }
+        Ok(resolved) => resolved,
         Err(error) => {
             runtime
                 .health()
@@ -823,7 +852,7 @@ pub async fn federation_callback(
     // ROTATION is picked up WITHOUT waiting out the JWKS TTL (issue #75, LOW-1). The trust
     // decision stays entirely inside `validate_upstream_id_token` / the JOSE core.
     let token_kid = ironauth_jose::compact_jws_kid(&id_token);
-    let keys = runtime
+    let keys = match runtime
         .keys
         .resolve_for_kid(
             now,
@@ -831,7 +860,19 @@ pub async fn federation_callback(
             &resolved.jwks_uri,
             token_kid.as_deref(),
         )
-        .await;
+        .await
+    {
+        Ok(keys) => keys,
+        Err(error) => {
+            // The JWKS fetch failed by CLASS (issue #76): a 5xx/timeout/blocked jwks_uri is an
+            // outage (UpstreamUnavailable, arms the backoff); a 4xx is a per-request config/
+            // protocol fault (UpstreamProtocol, no blacklist). Either way no user is provisioned.
+            runtime
+                .health()
+                .record_failure(now, &connector_key, fingerprint, &error);
+            return interaction::server_error_page();
+        }
+    };
     let allowed_algs =
         resolve_alg_allowlist(resolved.id_token_signing_alg_values_supported.as_deref());
     let identity = match validate_upstream_id_token(
@@ -1479,7 +1520,8 @@ mod tests {
         let now = SystemTime::UNIX_EPOCH;
         let keys = resolver
             .resolve(now, "cnr_a", "http://upstream.example/jwks")
-            .await;
+            .await
+            .expect("resolve");
         assert_eq!(
             keys.len(),
             1,
@@ -1488,7 +1530,8 @@ mod tests {
         // A second resolve hits the cache: the fetcher is not dialed again.
         let again = resolver
             .resolve(now, "cnr_a", "http://upstream.example/jwks")
-            .await;
+            .await
+            .expect("resolve");
         assert_eq!(again.len(), 1);
         assert_eq!(dialer.requested().len(), 1, "the second resolve was cached");
         // The dial went to the PUBLIC pinned address, never the loopback (resolve-once).
@@ -1517,30 +1560,23 @@ mod tests {
         let resolver =
             FederationKeyResolver::new_allow_http(Arc::new(fetcher), Duration::from_secs(300));
 
-        let keys = resolver
+        let err = resolver
             .resolve(
                 SystemTime::UNIX_EPOCH,
                 "cnr_b",
                 "http://upstream.example/jwks",
             )
-            .await;
+            .await
+            .expect_err("a blocked jwks_uri fails closed");
+        // A blocked SSRF target is a real outage, so it fails closed as UpstreamUnavailable (which
+        // arms the connector backoff), never yielding keys.
         assert!(
-            keys.is_empty(),
-            "a private-range jwks_uri resolves to no keys"
+            matches!(err, ConnectorError::UpstreamUnavailable(_)),
+            "{err:?}"
         );
         assert!(
             dialer.requested().is_empty(),
             "the blocked address is never dialed (resolve-once, no rebind)"
-        );
-        // Validation then fails closed as unavailable.
-        let (env, _clock) = manual_clock();
-        let token = id_token(&key, serde_json::json!({}));
-        let algs = jose_supported_algs();
-        let err = validate_upstream_id_token(&token, keys, policy(&algs), env.clock())
-            .expect_err("blocked jwks fails closed");
-        assert!(
-            matches!(err, ConnectorError::UpstreamUnavailable(_)),
-            "{err:?}"
         );
     }
 
@@ -1659,7 +1695,8 @@ mod tests {
         // First login: the token names kid up-1, which the fetched set answers to (one dial).
         let trusted = resolver
             .resolve_for_kid(now, "cnr", uri, Some("up-1"))
-            .await;
+            .await
+            .expect("resolve");
         assert!(trusted.iter().any(|k| k.kid() == Some("up-1")));
         assert_eq!(dialer.requested().len(), 1);
 
@@ -1668,7 +1705,8 @@ mod tests {
         *body.lock().unwrap() = jwks2;
         let trusted = resolver
             .resolve_for_kid(now, "cnr", uri, Some("up-2"))
-            .await;
+            .await
+            .expect("resolve");
         assert!(
             trusted.iter().any(|k| k.kid() == Some("up-2")),
             "the rotated-in kid resolves without waiting for the TTL"
@@ -1678,7 +1716,8 @@ mod tests {
         // The refreshed set is now cached: a second up-2 login does not dial again.
         let trusted = resolver
             .resolve_for_kid(now, "cnr", uri, Some("up-2"))
-            .await;
+            .await
+            .expect("resolve");
         assert!(trusted.iter().any(|k| k.kid() == Some("up-2")));
         assert_eq!(dialer.requested().len(), 2, "the refreshed set is cached");
     }
@@ -1704,12 +1743,13 @@ mod tests {
         let t0 = SystemTime::UNIX_EPOCH;
         let uri = "http://upstream.example/jwks";
 
-        resolver.resolve(t0, "cnr", uri).await;
+        resolver.resolve(t0, "cnr", uri).await.expect("resolve");
         assert_eq!(dialer.requested().len(), 1);
         // Within the TTL: the cached value is reused, no refetch.
         resolver
             .resolve(t0 + Duration::from_secs(100), "cnr", uri)
-            .await;
+            .await
+            .expect("resolve");
         assert_eq!(
             dialer.requested().len(),
             1,
@@ -1718,7 +1758,8 @@ mod tests {
         // Past the TTL: the cached value is NOT reused, so a refetch occurs.
         resolver
             .resolve(t0 + Duration::from_secs(301), "cnr", uri)
-            .await;
+            .await
+            .expect("resolve");
         assert_eq!(
             dialer.requested().len(),
             2,

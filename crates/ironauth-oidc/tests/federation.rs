@@ -44,16 +44,20 @@ const UPSTREAM_ISSUER: &str = "http://upstream.example";
 const UPSTREAM_CLIENT_ID: &str = "ironauth-at-upstream";
 const CONNECTOR_SLUG: &str = "acme";
 
-/// A mock upstream OIDC provider: its address, its signing key, and the `id_token` JSON its
-/// token endpoint currently returns (settable per test after the nonce is known).
+/// A mock upstream OIDC provider: its address, its signing key, the `id_token` JSON its token
+/// endpoint currently returns (settable per test after the nonce is known), and the HTTP STATUS
+/// its token endpoint currently returns (settable so a test can drive a per-request `400` or a
+/// real `5xx` outage, issue #76).
 struct Upstream {
     addr: SocketAddr,
     key: SigningKey,
     token_response: Arc<Mutex<String>>,
+    token_status: Arc<Mutex<u16>>,
 }
 
-/// Start the mock upstream. It dispatches by request path: discovery, JWKS, and a token
-/// endpoint whose body is the shared, test-settable `token_response`.
+/// Start the mock upstream. It dispatches by request path: discovery (always `200`), JWKS
+/// (always `200`), and a token endpoint whose body AND status are the shared, test-settable
+/// `token_response` / `token_status` (the status defaults to `200`).
 async fn start_upstream() -> Upstream {
     let key = SigningKey::ed25519_from_seed(Some("up-kid".to_owned()), &[7_u8; 32]).expect("key");
     let jwks = JwkSet::from_signing_keys([&key])
@@ -64,9 +68,11 @@ async fn start_upstream() -> Upstream {
         r#"{{"issuer":"{UPSTREAM_ISSUER}","authorization_endpoint":"{UPSTREAM_ISSUER}/authorize","token_endpoint":"{UPSTREAM_ISSUER}/token","jwks_uri":"{UPSTREAM_ISSUER}/jwks","id_token_signing_alg_values_supported":["EdDSA"],"code_challenge_methods_supported":["S256"]}}"#
     );
     let token_response = Arc::new(Mutex::new(String::from("{}")));
+    let token_status = Arc::new(Mutex::new(200_u16));
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("addr");
     let token_for_server = Arc::clone(&token_response);
+    let status_for_server = Arc::clone(&token_status);
     tokio::spawn(async move {
         loop {
             let Ok((mut socket, _)) = listener.accept().await else {
@@ -75,22 +81,26 @@ async fn start_upstream() -> Upstream {
             let discovery = discovery.clone();
             let jwks = jwks.clone();
             let token = Arc::clone(&token_for_server);
+            let status = Arc::clone(&status_for_server);
             tokio::spawn(async move {
                 let mut buf = vec![0_u8; 8192];
                 let n = socket.read(&mut buf).await.unwrap_or(0);
                 let request = String::from_utf8_lossy(&buf[..n]);
                 let first = request.lines().next().unwrap_or("");
-                let body = if first.contains("openid-configuration") {
-                    discovery
+                let (code, body) = if first.contains("openid-configuration") {
+                    (200_u16, discovery)
                 } else if first.contains("/jwks") {
-                    jwks
+                    (200, jwks)
                 } else if first.contains("/token") {
-                    token.lock().expect("token lock").clone()
+                    (
+                        *status.lock().expect("status lock"),
+                        token.lock().expect("token lock").clone(),
+                    )
                 } else {
-                    String::from("{}")
+                    (200, String::from("{}"))
                 };
                 let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    "HTTP/1.1 {code} S\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                     body.len()
                 );
                 let _ = socket.write_all(response.as_bytes()).await;
@@ -102,6 +112,7 @@ async fn start_upstream() -> Upstream {
         addr,
         key,
         token_response,
+        token_status,
     }
 }
 
@@ -915,6 +926,12 @@ async fn an_upstream_token_with_nbf_in_the_future_is_rejected() {
 
 const UNAVAILABLE_STATUS: StatusCode = StatusCode::SERVICE_UNAVAILABLE;
 
+/// The `created_at`/`updated_at` micros every seeded connector is created with (the third
+/// argument to `connectors().create`). It is the connector-definition FINGERPRINT the health
+/// record and the health read key on (issue #76), so a health snapshot in these tests reads under
+/// it.
+const SEED_FINGERPRINT: i64 = 1_000_000;
+
 /// Seed a connector from a full definition JSON string, returning its id.
 async fn seed_definition(harness: &Harness, slug: &str, definition_json: &str) -> ConnectorId {
     let env = harness.env().clone();
@@ -1044,7 +1061,7 @@ async fn a_broken_connector_is_typed_unavailable_and_never_affects_a_healthy_sib
     let now = harness.env().clock().now_utc();
     let broken_health = runtime
         .health()
-        .snapshot(now, &broken_id.to_string())
+        .snapshot(now, &broken_id.to_string(), SEED_FINGERPRINT)
         .expect("broken health recorded");
     assert_eq!(broken_health.last_error_kind, Some("upstream_protocol"));
     assert!(broken_health.error_total >= 1);
@@ -1078,7 +1095,7 @@ async fn a_dead_upstream_is_typed_unavailable_and_backoff_prevents_rehammering()
     let now = harness.env().clock().now_utc();
     let health = runtime
         .health()
-        .snapshot(now, &id.to_string())
+        .snapshot(now, &id.to_string(), SEED_FINGERPRINT)
         .expect("health recorded");
     assert_eq!(health.state.as_str(), "unavailable");
     assert_eq!(health.error_total, 1);
@@ -1093,7 +1110,7 @@ async fn a_dead_upstream_is_typed_unavailable_and_backoff_prevents_rehammering()
     assert_eq!(second.status(), UNAVAILABLE_STATUS);
     let health = runtime
         .health()
-        .snapshot(now, &id.to_string())
+        .snapshot(now, &id.to_string(), SEED_FINGERPRINT)
         .expect("health present");
     assert_eq!(
         health.error_total, 1,
@@ -1123,6 +1140,260 @@ async fn drive_authorize_expect_unavailable(
         )
         .await
         .expect("authorize")
+}
+
+#[tokio::test]
+async fn a_per_request_upstream_4xx_does_not_trip_the_connector_into_backoff() {
+    // HIGH-1 (issue #76): a token endpoint 400 (RFC 6749 5.2 invalid_grant for a bad, expired, or
+    // replayed authorization code) is a PER-REQUEST condition, not a connector outage. Both
+    // /federation routes are PUBLIC, so mapping it to the connector backoff would be an
+    // unauthenticated connector-wide DoS: one garbage /callback would 503 the NEXT /authorize for
+    // every user. The 4xx-vs-5xx class split maps it to UpstreamProtocol, which feeds the error
+    // rate WITHOUT changing admission, so one bad code can never blacklist the connector.
+    let harness = Harness::start().await;
+    let id = seed_named_connector(
+        &harness,
+        CONNECTOR_SLUG,
+        UPSTREAM_ISSUER,
+        UPSTREAM_CLIENT_ID,
+        true,
+    )
+    .await;
+    let upstream = start_upstream().await;
+    let runtime = build_runtime(upstream.addr, vec![IpAddr::from([93, 184, 216, 34])]);
+
+    // Begin a login (discovery resolves and caches), then submit a GARBAGE code at the callback:
+    // the upstream token endpoint answers 400 invalid_grant (the attacker / back-button / expired
+    // code path).
+    let location =
+        drive_authorize(&harness, federation_router(&harness, Arc::clone(&runtime))).await;
+    let state = param(&location, "state");
+    *upstream.token_status.lock().unwrap() = 400;
+    *upstream.token_response.lock().unwrap() = r#"{"error":"invalid_grant"}"#.to_owned();
+    let response = drive_callback(
+        &harness,
+        federation_router(&harness, Arc::clone(&runtime)),
+        &state,
+    )
+    .await;
+    // The login FAILS (no session, no user), but not by tripping the connector down.
+    assert_ne!(
+        response.status(),
+        StatusCode::SEE_OTHER,
+        "a bad code fails the login"
+    );
+    assert!(session_id_from_cookies(&response, &harness.scope()).is_none());
+    assert!(
+        !user_provisioned(&harness, &federated_external_id(UPSTREAM_ISSUER, "any")).await,
+        "no user is provisioned from a rejected code"
+    );
+
+    // The health record shows a PER-REQUEST protocol fault: NO backoff armed, admission unchanged,
+    // but the error-rate counter still increments (health visibility).
+    let now = harness.env().clock().now_utc();
+    let health = runtime
+        .health()
+        .snapshot(now, &id.to_string(), SEED_FINGERPRINT)
+        .expect("health recorded");
+    assert_ne!(
+        health.state.as_str(),
+        "unavailable",
+        "a per-request 4xx must not flip the connector unavailable"
+    );
+    assert!(
+        health.next_retry_at.is_none(),
+        "a per-request 4xx must not arm the connector backoff"
+    );
+    assert_eq!(health.last_error_kind, Some("upstream_protocol"));
+    assert!(
+        health.error_total >= 1,
+        "the error-rate counter still increments without flipping admission"
+    );
+
+    // The attack's payoff would be denying the NEXT authorize. It is still Allowed (302): a single
+    // bad token never blacklists the connector.
+    let again = authorize_for(
+        &harness,
+        federation_router(&harness, Arc::clone(&runtime)),
+        CONNECTOR_SLUG,
+    )
+    .await;
+    assert_eq!(
+        again.status(),
+        StatusCode::SEE_OTHER,
+        "a subsequent authorize for another user still Allows (no connector-wide DoS)"
+    );
+}
+
+#[tokio::test]
+async fn a_real_upstream_5xx_outage_arms_the_connector_backoff() {
+    // The other half of the HIGH-1 class split (issue #76): a token endpoint 5xx is a REAL outage,
+    // so it MUST map to UpstreamUnavailable and arm the backoff -- the exact opposite of the 4xx
+    // case -- so a subsequent authorize is DENIED within the window (do not hammer a dead upstream).
+    let harness = Harness::start().await;
+    let id = seed_named_connector(
+        &harness,
+        CONNECTOR_SLUG,
+        UPSTREAM_ISSUER,
+        UPSTREAM_CLIENT_ID,
+        true,
+    )
+    .await;
+    let upstream = start_upstream().await;
+    let runtime = build_runtime(upstream.addr, vec![IpAddr::from([93, 184, 216, 34])]);
+
+    let location =
+        drive_authorize(&harness, federation_router(&harness, Arc::clone(&runtime))).await;
+    let state = param(&location, "state");
+    // The token endpoint is genuinely down (503), a real outage.
+    *upstream.token_status.lock().unwrap() = 503;
+    let response = drive_callback(
+        &harness,
+        federation_router(&harness, Arc::clone(&runtime)),
+        &state,
+    )
+    .await;
+    assert_ne!(response.status(), StatusCode::SEE_OTHER, "the login fails");
+
+    let now = harness.env().clock().now_utc();
+    let health = runtime
+        .health()
+        .snapshot(now, &id.to_string(), SEED_FINGERPRINT)
+        .expect("health recorded");
+    assert_eq!(
+        health.state.as_str(),
+        "unavailable",
+        "a 5xx is a real outage that flips the connector unavailable"
+    );
+    assert_eq!(health.last_error_kind, Some("upstream_unavailable"));
+    assert!(
+        health.next_retry_at.is_some(),
+        "a real outage arms the connector backoff"
+    );
+
+    // A subsequent authorize is DENIED inside the backoff window (the correct outage behaviour).
+    let again = authorize_for(
+        &harness,
+        federation_router(&harness, Arc::clone(&runtime)),
+        CONNECTOR_SLUG,
+    )
+    .await;
+    assert_eq!(
+        again.status(),
+        UNAVAILABLE_STATUS,
+        "a real outage backs the connector off (a subsequent authorize is denied)"
+    );
+}
+
+#[tokio::test]
+async fn a_cached_discovery_with_a_dead_token_endpoint_stays_unavailable_and_grows_backoff() {
+    // MEDIUM (issue #76): when discovery is CACHED but the token endpoint / JWKS / validation is
+    // down, the authorize leg only resolves cached discovery -- which is NOT a login success. It
+    // must therefore NOT record_success, or it would flap the health gauge to healthy between a
+    // failed callback and the next authorize AND pin the backoff at its base window (never growing).
+    // With the fix the connector STAYS unavailable across repeated logins and the backoff GROWS.
+    let harness = Harness::start().await;
+    let id = seed_named_connector(
+        &harness,
+        CONNECTOR_SLUG,
+        UPSTREAM_ISSUER,
+        UPSTREAM_CLIENT_ID,
+        true,
+    )
+    .await;
+    let upstream = start_upstream().await;
+    let runtime = build_runtime(upstream.addr, vec![IpAddr::from([93, 184, 216, 34])]);
+    // The token endpoint is dead for the whole test; discovery and JWKS stay reachable, so
+    // discovery caches on the first authorize and every later authorize is a pure cache hit.
+    *upstream.token_status.lock().unwrap() = 503;
+
+    // Cycle 1: authorize (fetches + caches discovery) then a failing callback (token 503).
+    let location =
+        drive_authorize(&harness, federation_router(&harness, Arc::clone(&runtime))).await;
+    let state = param(&location, "state");
+    drive_callback(
+        &harness,
+        federation_router(&harness, Arc::clone(&runtime)),
+        &state,
+    )
+    .await;
+    let now = harness.env().clock().now_utc();
+    let after_one = runtime
+        .health()
+        .snapshot(now, &id.to_string(), SEED_FINGERPRINT)
+        .expect("health recorded");
+    assert_eq!(after_one.state.as_str(), "unavailable");
+    assert_eq!(after_one.consecutive_failures, 1);
+
+    // Advance past the base backoff window (30s) so the next authorize is admitted as a probe.
+    harness.clock().advance(Duration::from_secs(31));
+
+    // Cycle 2: the authorize leg resolves discovery from the CACHE. The health must STILL read
+    // unavailable right after it (the bug would have flapped it to healthy here).
+    let location =
+        drive_authorize(&harness, federation_router(&harness, Arc::clone(&runtime))).await;
+    let state = param(&location, "state");
+    let after_authorize = runtime
+        .health()
+        .snapshot(
+            harness.env().clock().now_utc(),
+            &id.to_string(),
+            SEED_FINGERPRINT,
+        )
+        .expect("health present");
+    assert_eq!(
+        after_authorize.state.as_str(),
+        "unavailable",
+        "the authorize leg must not flap a cached-discovery connector to healthy"
+    );
+    assert_eq!(
+        after_authorize.consecutive_failures, 1,
+        "the authorize leg must not clear the consecutive-failure count"
+    );
+    drive_callback(
+        &harness,
+        federation_router(&harness, Arc::clone(&runtime)),
+        &state,
+    )
+    .await;
+    let after_two = runtime
+        .health()
+        .snapshot(
+            harness.env().clock().now_utc(),
+            &id.to_string(),
+            SEED_FINGERPRINT,
+        )
+        .expect("health present");
+    assert_eq!(after_two.state.as_str(), "unavailable");
+    assert_eq!(
+        after_two.consecutive_failures, 2,
+        "the backoff GROWS: a second failed login escalates the consecutive-failure count"
+    );
+
+    // Advance past the now-doubled window (60s) and run a third cycle: the count keeps growing,
+    // proving the backoff is not pinned at the base window.
+    harness.clock().advance(Duration::from_secs(61));
+    let location =
+        drive_authorize(&harness, federation_router(&harness, Arc::clone(&runtime))).await;
+    let state = param(&location, "state");
+    drive_callback(
+        &harness,
+        federation_router(&harness, Arc::clone(&runtime)),
+        &state,
+    )
+    .await;
+    let after_three = runtime
+        .health()
+        .snapshot(
+            harness.env().clock().now_utc(),
+            &id.to_string(),
+            SEED_FINGERPRINT,
+        )
+        .expect("health present");
+    assert_eq!(
+        after_three.consecutive_failures, 3,
+        "consecutive failures keep escalating (the backoff window keeps growing, never pinned)"
+    );
 }
 
 #[tokio::test]
