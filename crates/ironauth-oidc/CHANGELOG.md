@@ -6,6 +6,61 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Connector failure isolation and upstream parameter passthrough (issue #76): hardens the
+  federation runtime's operational behavior with ZERO schema change (health is in-memory
+  runtime state; passthrough is per-connector config).
+  - **Failure isolation.** A broken upstream degrades EXACTLY its own connector: its login
+    leg returns a TYPED, diagnosable connector-unavailable error (`503`, from the #75
+    `ConnectorError` taxonomy) while every OTHER connector and the core OP surface keep
+    serving (Dex crash-looped the whole issuer on one broken connector; this does not). No
+    eager connector init exists to crash boot; connectors stay per-env store rows loaded
+    lazily. A connector RECONFIGURATION (a changed store-row `updated_at` fingerprint) resets
+    ONLY that connector's health, never a sibling's.
+  - **Per-connector health tracking** (`ConnectorHealthRegistry`, `federation_health`): an
+    in-memory record per connector id (initialization/health state, recent upstream error
+    rate over the probe window, last success / failure, consecutive failures), all timed via
+    `env.clock()` (never the wall clock directly). CONFIG faults (`ConnectorError::Config`)
+    are permanent until reconfigured; UPSTREAM-UNAVAILABLE faults are retried under a
+    health-driven exponential backoff (a dead upstream is not hammered; a transiently-down one
+    is not permanently blacklisted); an UPSTREAM-PROTOCOL fault (a bad token) feeds the error
+    rate without blacklisting the connector. Installed on `FederationRuntime` and SHARED with
+    the management plane so the admin health read reports the same live state.
+  - **Connector-labeled metrics** (`ironauth_connector_healthy` gauge,
+    `ironauth_connector_upstream_success_total` / `ironauth_connector_upstream_error_total`
+    counters, labeled by `connector` and, for errors, `kind`), described via
+    `describe_connector_health_metrics`. Cardinality is bounded (connectors are
+    operator-provisioned, and the registry caps tracked entries).
+  - **Parameter passthrough.** The federation authorize leg forwards a STRICT allowlist of
+    exactly `prompt`, `login_hint`, and `ui_locales` from the downstream authorization request
+    (the validated resume target's query) to the UPSTREAM authorize request. Nothing outside
+    the allowlist is ever read or forwarded (a downstream `redirect_uri` or arbitrary param can
+    never reach the upstream). Each value is bounded (256-byte cap, over-cap dropped, empty
+    treated as absent) and rides ONLY the upstream authorize query, percent-encoded by
+    `append_query` (never a header, path, or log). Each of the three is individually
+    disable-able per connector via the connector definition's `passthrough` block.
+    - PRIVACY: `login_hint` discloses an end-user identifier (typically an email) to the
+      upstream provider. Forwarding is on by default (a brokered login normally wants it) but a
+      deployment sets `passthrough.login_hint = false` per connector to suppress it. Surfaced in
+      the operator-facing `docs/CONFIG.md` under `oidc.federation`, not only the type doc.
+  - **Review hardening (adversarial review of issue #76).**
+    - Upstream responses are now classified by CLASS, closing an unauthenticated connector-wide
+      DoS: a per-request token-endpoint `4xx` (a `400 invalid_grant` for a bad, expired, or
+      replayed authorization code -- reachable by anyone GETting the public `/callback`) maps to
+      `UpstreamProtocol` (feeds the error rate, NEVER arms backoff), while only a real outage
+      (`5xx`/`429`/timeout/blocked) maps to `UpstreamUnavailable` and arms the backoff. The same
+      split applies to discovery and JWKS fetches (`classify_upstream_status`, `fetch_keys`).
+      One failed login can no longer trip a whole connector into an escalating backoff.
+    - The authorize leg no longer records a health SUCCESS on discovery/endpoint resolution: for
+      a discovery-form connector that resolves from the CACHE, doing so flapped the health gauge
+      to healthy and PINNED the backoff at its base window while the token endpoint / JWKS was
+      down. `record_success` is now reserved for the CALLBACK's completed login, so the backoff
+      GROWS across repeated failing logins and the health state stays accurate.
+    - The mgmt health read is FINGERPRINT-aware (`snapshot` takes the connector's `updated_at`):
+      a record left by a prior definition reads as never-exercised, so a reconfiguration is
+      reflected promptly instead of reporting a stale `config_error`. Doc corrections: the
+      registry cap bounds the map (not metric-label cardinality; connectors beyond it are
+      admitted UNTRACKED = fail-open), and the backoff probe is the first request(s) after the
+      window (not a single serialized in-flight probe).
 - Declarative claim-mapped provisioning for federated login (issue #75, PR C): the callback now
   provisions a federated user's identity TRAITS from the connector's declarative claim mapping,
   completing the "login works with zero code changes" acceptance criterion (PR B half-met it).

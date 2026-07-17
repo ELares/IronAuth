@@ -314,6 +314,13 @@
           "description": "Whether inbound federation is wired. False (the default) leaves the `/federation`\nroutes a uniform not-found and builds no federation runtime. When true, the boot\npath constructs the runtime (a dedicated SSRF-hardened fetcher plus the caches\nbelow) and installs it, so a stored connector's federated login legs go live.",
           "type": "boolean"
         },
+        "health_probe_window_secs": {
+          "default": 30,
+          "description": "The per-connector health probe window, in seconds (issue #76): the BASE health-driven\nbackoff interval. When a connector's upstream is unavailable the runtime waits at least\nthis long (growing exponentially per consecutive failure, capped) before probing it\nagain, so a dead upstream is not hammered while a transiently-down one is retried and\nrecovers. It is also the window over which the exported per-connector error rate is\nmeasured. The default (30) is a responsive-but-gentle probe cadence. Must be at least 1\nand at most `OIDC_MAX_FEDERATION_TTL_SECS`.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
         "jwks_ttl_secs": {
           "default": 3600,
           "description": "How long a fetched upstream JWKS is cached, in seconds (issue #75). The default\n(3600, one hour) bounds how long a rotated-OUT key stays trusted; a rotated-IN key\nnaming a new `kid` is picked up immediately by the kid-miss refetch, so this TTL need\nnot be short. Must be at least 1 and at most `OIDC_MAX_FEDERATION_TTL_SECS`.",
@@ -622,9 +629,10 @@
           "default": {
             "discovery_ttl_secs": 3600,
             "enabled": false,
+            "health_probe_window_secs": 30,
             "jwks_ttl_secs": 3600
           },
-          "description": "Generic OIDC UPSTREAM federation (issue #75, PR B): turn a declarative connector\ninto an inbound federated login with zero per-provider code. OFF by default (the\n`/federation` routes stay a uniform not-found), so an existing deployment is\nunaffected. When enabled, the boot path builds the federation runtime (its own\nSSRF-hardened fetcher plus the discovery / JWKS cache TTLs). The connectors\nthemselves are per-connector STORED data, not config. See [`FederationConfig`]."
+          "description": "Generic OIDC UPSTREAM federation (issue #75, PR B): turn a declarative connector\ninto an inbound federated login with zero per-provider code. OFF by default (the\n`/federation` routes stay a uniform not-found), so an existing deployment is\nunaffected. When enabled, the boot path builds the federation runtime (its own\nSSRF-hardened fetcher plus the discovery / JWKS cache TTLs). The connectors\nthemselves are per-connector STORED data, not config. PRIVACY NOTE (issue #76): a\nconnector may forward the downstream `login_hint` to its upstream provider, which\nDISCLOSES an end-user identifier (typically an email) to that upstream; a connector\nthat must not leak identifiers sets its `passthrough.login_hint = false` (per-connector\nstored data) to suppress it. See [`FederationConfig`]."
         },
         "frontchannel_logout_enabled": {
           "default": false,
@@ -2001,6 +2009,7 @@
         "federation": {
           "discovery_ttl_secs": 3600,
           "enabled": false,
+          "health_probe_window_secs": 30,
           "jwks_ttl_secs": 3600
         },
         "frontchannel_logout_enabled": false,

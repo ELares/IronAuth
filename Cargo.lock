@@ -998,6 +998,7 @@ dependencies = [
  "ironauth-config",
  "ironauth-connector",
  "ironauth-env",
+ "ironauth-fetch",
  "ironauth-import",
  "ironauth-jose",
  "ironauth-oidc",

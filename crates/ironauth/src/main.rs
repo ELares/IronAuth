@@ -164,11 +164,28 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
             None
         };
 
+        // The generic OIDC UPSTREAM federation runtime (issue #75), built once and shared: it
+        // powers the /federation login legs (OIDC data plane) AND its per-connector health
+        // registry (issue #76) is the SAME Arc handed to the management plane, so the admin
+        // health-diagnostics read reports the live health the login path records into. Built only
+        // when OIDC is mounted and federation is enabled; otherwise `None`.
+        let federation_runtime = if config.oidc.enabled {
+            build_federation_runtime(&config.oidc)
+        } else {
+            None
+        };
+
         // Build the management API router (issue #11) before moving config into
         // the server. It mounts on the management plane only when a bootstrap
         // operator token is configured; otherwise the server boots exactly as the
         // DB-free skeleton it was, serving only health, readiness, and metrics.
-        let management = build_management_router(&config, &env, migration_hook.clone()).await;
+        let management = build_management_router(
+            &config,
+            &env,
+            migration_hook.clone(),
+            federation_runtime.clone(),
+        )
+        .await;
 
         // Capture what the OIDC mount (issue #12) needs before config and env
         // move into the server: the OIDC settings, the data-plane DSN, and an env
@@ -225,6 +242,7 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
                 &hashing_config,
                 &policy_config,
                 migration_hook,
+                federation_runtime,
             )
             .await
             {
@@ -267,6 +285,7 @@ async fn build_management_router(
     config: &Config,
     env: &Env,
     migration_hook: Option<Arc<LazyMigrationHook>>,
+    federation_runtime: Option<Arc<FederationRuntime>>,
 ) -> Option<Router> {
     if config.admin.bootstrap_operator_token.is_none() {
         tracing::info!(
@@ -303,6 +322,12 @@ async fn build_management_router(
             // can report this node's circuit-breaker state alongside the DB progress counts.
             let state = match migration_hook {
                 Some(hook) => state.with_migration_hook(hook),
+                None => state,
+            };
+            // Share the federation runtime (issue #76) so the per-connector health-diagnostics
+            // read reports the live health the OIDC data plane records into (the SAME Arc).
+            let state = match federation_runtime {
+                Some(runtime) => state.with_federation(runtime),
                 None => state,
             };
             tracing::info!("management API mounted on the management plane");
@@ -359,6 +384,7 @@ async fn build_oidc_router(
     hashing_config: &PasswordHashingConfig,
     policy_config: &PasswordPolicyConfig,
     migration_hook: Option<Arc<LazyMigrationHook>>,
+    federation_runtime: Option<Arc<FederationRuntime>>,
 ) -> Option<Router> {
     let store = match Store::connect(data_plane_dsn).await {
         Ok(store) => store,
@@ -455,6 +481,9 @@ async fn build_oidc_router(
     let (password_policy, screening_failure, screen_on_login) =
         build_password_policy(policy_config);
     ironauth_oidc::describe_screening_metrics();
+    // Register the per-connector federation health metric descriptions (issue #76), so the
+    // connector-labeled health gauge and success/error counters carry help/type text.
+    ironauth_oidc::describe_connector_health_metrics();
 
     let mut state = OidcState::new(store, env, registry, oidc_config, issuer_base)
         .with_global_token_revocation_enabled(global_revocation_enabled)
@@ -485,10 +514,10 @@ async fn build_oidc_router(
     if let Some(hook) = migration_hook {
         state = state.with_migration_hook(hook);
     }
-    // Wire the generic OIDC UPSTREAM federation runtime (issue #75) when
-    // `oidc.federation.enabled` is set; OFF by default, so a deployment that has not
-    // enabled federation leaves the `/federation` routes a uniform not-found.
-    if let Some(federation) = build_federation_runtime(oidc_config) {
+    // Wire the generic OIDC UPSTREAM federation runtime (issue #75), built once by the boot
+    // path and shared with the management plane (issue #76). OFF by default, so a deployment
+    // that has not enabled federation leaves the `/federation` routes a uniform not-found.
+    if let Some(federation) = federation_runtime {
         state = state.with_federation(federation);
         tracing::info!(
             "inbound OIDC federation wired (issue #75); the /federation routes are live for \
@@ -534,11 +563,13 @@ fn build_federation_runtime(cfg: &OidcConfig) -> Option<Arc<FederationRuntime>> 
     };
     let jwks_ttl = std::time::Duration::from_secs(cfg.federation.jwks_ttl_secs);
     let discovery_ttl = std::time::Duration::from_secs(cfg.federation.discovery_ttl_secs);
+    let probe_window = std::time::Duration::from_secs(cfg.federation.health_probe_window_secs);
     let keys = Arc::new(FederationKeyResolver::new(Arc::clone(&fetcher), jwks_ttl));
     Some(Arc::new(FederationRuntime::new(
         fetcher,
         keys,
         discovery_ttl,
+        probe_window,
     )))
 }
 

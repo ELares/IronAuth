@@ -269,6 +269,12 @@ pub fn management_router(state: AdminState) -> Router {
             "/v1/tenants/{tenant_id}/environments/{environment_id}/connectors/{connector_id}/capabilities",
             get(connectors::get_connector_capabilities),
         )
+        // The per-connector health-diagnostics read (issue #76): another static suffix sibling
+        // of the parameterized `.../{connector_id}`, matched before it.
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/connectors/{connector_id}/health",
+            get(connectors::get_connector_health),
+        )
         .route(
             "/v1/tenants/{tenant_id}/environments/{environment_id}/connectors/{connector_id}",
             get(connectors::get_connector)

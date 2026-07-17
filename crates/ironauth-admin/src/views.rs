@@ -1261,6 +1261,41 @@ pub struct ConnectorView {
     pub updated_at_unix_ms: i64,
 }
 
+/// The live per-connector health for admin diagnostics (issue #76). Reports THIS node's
+/// in-memory federation health: its initialization/health state, the recent upstream error
+/// rate over the probe window, the last success / failure, and the backoff retry instant.
+/// A connector that has never been exercised on this node reports `state = "unknown"` with
+/// no timestamps.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct ConnectorHealthView {
+    /// The connector identifier (`cnr_...`).
+    pub id: String,
+    /// The coarse health state: `unknown`, `healthy`, `config_error`, or `unavailable`.
+    #[schema(example = "healthy")]
+    pub state: String,
+    /// The stable kind of the last error, if any (`config` / `upstream_protocol` /
+    /// `upstream_unavailable`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error_kind: Option<String>,
+    /// The number of consecutive upstream failures (0 while healthy).
+    pub consecutive_failures: u32,
+    /// The last successful upstream operation, milliseconds since the Unix epoch.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_success_at_unix_ms: Option<i64>,
+    /// The last upstream failure, milliseconds since the Unix epoch.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_failure_at_unix_ms: Option<i64>,
+    /// When a backed-off connector may be probed again, milliseconds since the Unix epoch.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_retry_at_unix_ms: Option<i64>,
+    /// The recent upstream error rate over the probe window, in `0.0..=1.0`.
+    pub recent_error_rate: f64,
+    /// The lifetime count of successful upstream operations.
+    pub success_total: u64,
+    /// The lifetime count of failed upstream operations.
+    pub error_total: u64,
+}
+
 /// A cursor-paginated page of federation connectors (issue #75).
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct ConnectorList {

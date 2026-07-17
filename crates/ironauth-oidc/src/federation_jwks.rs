@@ -30,8 +30,11 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
+use ironauth_connector::ConnectorError;
 use ironauth_fetch::{FetchPurpose, FetchRequest, Fetcher};
 use ironauth_jose::TrustedKey;
+
+use crate::federation::classify_upstream_status;
 
 /// A cached upstream key-set resolution and the instant it was fetched.
 struct CachedKeys {
@@ -91,17 +94,23 @@ impl FederationKeyResolver {
     /// Resolve the upstream keys for `connector_id`'s `jwks_uri`, using `now` (from the
     /// application clock seam) for cache expiry.
     ///
-    /// Returns the cached keys when a non-expired entry exists, otherwise fetches
-    /// through the hardened fetcher, parses, and (only on a non-empty success) caches.
-    /// Any failure (a blocked SSRF target, a non-2xx, a malformed document, or a
-    /// document naming no usable key) yields an EMPTY set, which fails the caller closed
-    /// (a verification policy cannot be built without a key).
+    /// Returns the cached keys when a non-expired entry exists, otherwise fetches through the
+    /// hardened fetcher, parses, and (only on a non-empty success) caches. A blocked SSRF target,
+    /// a timeout, a `5xx`/`429`, or any transport failure is an [`ConnectorError::UpstreamUnavailable`]
+    /// (a real outage); a `4xx` is an [`ConnectorError::UpstreamProtocol`] (a per-request config/
+    /// protocol fault, issue #76). A `2xx` that names no usable key yields an EMPTY `Ok` set, which
+    /// still fails the caller closed (a verification policy cannot be built without a key).
+    ///
+    /// # Errors
+    ///
+    /// [`ConnectorError::UpstreamUnavailable`] on a blocked/timed-out/transport failure or a
+    /// `5xx`/`429`; [`ConnectorError::UpstreamProtocol`] on a `4xx`.
     pub async fn resolve(
         &self,
         now: SystemTime,
         connector_id: &str,
         jwks_uri: &str,
-    ) -> Vec<TrustedKey> {
+    ) -> Result<Vec<TrustedKey>, ConnectorError> {
         self.resolve_for_kid(now, connector_id, jwks_uri, None)
             .await
     }
@@ -117,53 +126,69 @@ impl FederationKeyResolver {
     /// per validation, still rides the hardened fetcher, and still fails closed (the
     /// caller's `validate` rejects an unknown `kid`) if the refetched set also lacks it.
     /// A `wanted_kid` of [`None`] (a token with no `kid`) keeps the pure TTL behaviour.
+    ///
+    /// # Errors
+    ///
+    /// [`ConnectorError::UpstreamUnavailable`] on a blocked/timed-out/transport failure or a
+    /// `5xx`/`429`; [`ConnectorError::UpstreamProtocol`] on a `4xx` (issue #76). A kid-miss whose
+    /// refetch fails falls back to the still-valid cached set (the caller's `validate` then fails
+    /// closed on the unknown `kid`), so a transient outage during a rotation is not surfaced here.
     pub async fn resolve_for_kid(
         &self,
         now: SystemTime,
         connector_id: &str,
         jwks_uri: &str,
         wanted_kid: Option<&str>,
-    ) -> Vec<TrustedKey> {
+    ) -> Result<Vec<TrustedKey>, ConnectorError> {
         let key = cache_key(connector_id, jwks_uri);
         if let Some(cached) = self.cached(now, &key) {
             // A fresh cache entry serves the token UNLESS it names a `kid` the cached set
             // does not answer to: that is the rotation case, so fall through to ONE refetch.
             if key_set_satisfies(&cached, wanted_kid) {
-                return cached;
-            }
-            let refetched = self.fetch_keys(jwks_uri).await;
-            if !refetched.is_empty() {
-                self.store(now, key, refetched.clone());
-                return refetched;
+                return Ok(cached);
             }
             // The refetch failed or was empty (a transient outage): fall back to the still
             // valid cached set. It lacks the `kid`, so `validate` fails closed on it.
-            return cached;
+            match self.fetch_keys(jwks_uri).await {
+                Ok(refetched) if !refetched.is_empty() => {
+                    self.store(now, key, refetched.clone());
+                    Ok(refetched)
+                }
+                _ => Ok(cached),
+            }
+        } else {
+            let keys = self.fetch_keys(jwks_uri).await?;
+            // Cache only a usable resolution, so a transient failure or an empty document
+            // never sticks a connector into a fail-closed state for the TTL.
+            if !keys.is_empty() {
+                self.store(now, key, keys.clone());
+            }
+            Ok(keys)
         }
-        let keys = self.fetch_keys(jwks_uri).await;
-        // Cache only a usable resolution, so a transient failure or an empty document
-        // never sticks a connector into a fail-closed state for the TTL.
-        if !keys.is_empty() {
-            self.store(now, key, keys.clone());
-        }
-        keys
     }
 
-    /// Fetch and parse the `jwks_uri` through the hardened fetcher, returning the trusted
-    /// keys (an EMPTY set on any transport failure, non-2xx, or unusable document). Shared
-    /// by the initial resolution and the kid-miss refetch; never touches the cache itself.
-    async fn fetch_keys(&self, jwks_uri: &str) -> Vec<TrustedKey> {
+    /// Fetch and parse the `jwks_uri` through the hardened fetcher (issue #76): an
+    /// [`ConnectorError::UpstreamUnavailable`] on a blocked/timed-out/transport failure or a
+    /// `5xx`/`429`, an [`ConnectorError::UpstreamProtocol`] on a `4xx`, otherwise the parsed
+    /// trusted keys (possibly EMPTY when the `2xx` document names no usable key). Shared by the
+    /// initial resolution and the kid-miss refetch; never touches the cache itself.
+    async fn fetch_keys(&self, jwks_uri: &str) -> Result<Vec<TrustedKey>, ConnectorError> {
         let mut request = FetchRequest::get(FetchPurpose::FederationJwks, jwks_uri);
         if self.allow_http {
             request = request.allow_plaintext_http();
         }
-        let Ok(response) = self.fetcher.fetch(request).await else {
-            return Vec::new();
-        };
+        let response = self
+            .fetcher
+            .fetch(request)
+            .await
+            .map_err(|err| ConnectorError::UpstreamUnavailable(err.to_string()))?;
         if !response.status().is_success() {
-            return Vec::new();
+            return Err(classify_upstream_status(
+                response.status(),
+                "the JWKS endpoint",
+            ));
         }
-        ironauth_jose::trusted_keys_from_jwks(response.body())
+        Ok(ironauth_jose::trusted_keys_from_jwks(response.body()))
     }
 
     /// The cached keys for `key` if a non-expired entry exists.
