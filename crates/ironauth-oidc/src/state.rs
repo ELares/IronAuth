@@ -243,6 +243,17 @@ pub struct OidcState {
     // path), so an un-wired deployment behaves exactly as before and this subsystem
     // takes no hard dependency on #79.
     risk_evaluator: Arc<dyn crate::recovery::RiskEvaluator>,
+    // The risk-engine `GeoIP` provider seam (issue #79). Kept OUTSIDE `Inner` so a
+    // deployment installs a provider here without a wire change; NO third-party provider
+    // is bundled. Default: the NullGeoIpProvider (resolves no coordinates), so the
+    // impossible-travel signal is inert until a provider is wired and the engine runs
+    // complete with ZERO third-party services.
+    geoip_provider: Arc<dyn crate::risk::GeoIpProvider>,
+    // The risk-engine IP-reputation provider seam (issue #79). Kept OUTSIDE `Inner`,
+    // same rationale; NO third-party provider is bundled. Default: the
+    // NullIpReputationProvider (verdict Neutral), so the only built-in IP-reputation
+    // input is the per-environment allow/deny lists.
+    ip_reputation_provider: Arc<dyn crate::risk::IpReputationProvider>,
     // The resolved NIST SP 800-63B-4 password policy (issue #63): length floors, the
     // composition/rotation legacy overrides, and whether screening is enabled. Kept
     // OUTSIDE `Inner` and installed by the boot path from the top-level `[password_policy]`
@@ -455,6 +466,10 @@ struct Inner {
     trusted_device_max_age_secs: u64,
     trusted_device_idle_secs: u64,
     trusted_device_revoke_on_password_change: bool,
+    // Minimal risk engine (issue #79): the whole validated RiskConfig, held verbatim so
+    // the engine reads every per-signal toggle, threshold, and allow/deny list from one
+    // immutable, config-derived source. Off by default (the engine is fully inert).
+    risk: ironauth_config::RiskConfig,
     // Email OTP + scanner-safe magic links (issue #68). All validated at startup.
     email_otp_enabled: bool,
     email_otp_code_digits: u32,
@@ -626,6 +641,7 @@ impl OidcState {
                 trusted_device_idle_secs: config.trusted_device_idle_secs,
                 trusted_device_revoke_on_password_change: config
                     .trusted_device_revoke_on_password_change,
+                risk: config.risk.clone(),
                 email_otp_enabled: config.email_otp_enabled,
                 email_otp_code_digits: config.email_otp_code_digits,
                 email_otp_code_ttl_secs: config.email_otp_code_ttl_secs,
@@ -661,6 +677,8 @@ impl OidcState {
             migration_hook: None,
             hashing_pool: None,
             abuse_counters: Arc::new(crate::abuse::MemoryCounterStore::new()),
+            geoip_provider: Arc::new(crate::risk::NullGeoIpProvider),
+            ip_reputation_provider: Arc::new(crate::risk::NullIpReputationProvider),
             verification_sender: Arc::new(crate::verification::NullVerificationSender),
             sms_sender: Arc::new(crate::verification::NullSmsSender),
             risk_evaluator: Arc::new(crate::recovery::NullRiskEvaluator),
@@ -898,6 +916,62 @@ impl OidcState {
     ) -> Self {
         self.risk_evaluator = evaluator;
         self
+    }
+
+    /// Install the risk-engine `GeoIP` provider (issue #79), replacing the default no-op
+    /// [`NullGeoIpProvider`](crate::risk::NullGeoIpProvider). NO third-party provider is
+    /// bundled; a deployment wires its own resolver here, and a test wires a fixture
+    /// provider to drive the impossible-travel signal. Called only before the state is
+    /// shared across request threads.
+    #[must_use]
+    pub fn with_geoip_provider(mut self, provider: Arc<dyn crate::risk::GeoIpProvider>) -> Self {
+        self.geoip_provider = provider;
+        self
+    }
+
+    /// Install the risk-engine IP-reputation provider (issue #79), replacing the default
+    /// no-op [`NullIpReputationProvider`](crate::risk::NullIpReputationProvider). NO
+    /// third-party provider is bundled; a deployment wires its own here, and a test wires
+    /// a stub to drive the IP-reputation signal. Called only before the state is shared.
+    #[must_use]
+    pub fn with_ip_reputation_provider(
+        mut self,
+        provider: Arc<dyn crate::risk::IpReputationProvider>,
+    ) -> Self {
+        self.ip_reputation_provider = provider;
+        self
+    }
+
+    /// The minimal risk-engine settings (issue #79): the per-signal toggles, the step-up
+    /// threshold, and the allow/deny lists. Off by default (the engine is inert).
+    #[must_use]
+    pub(crate) fn risk_config(&self) -> &ironauth_config::RiskConfig {
+        &self.inner.risk
+    }
+
+    /// Whether the minimal risk engine is enabled (issue #79). Off by default.
+    #[must_use]
+    pub fn risk_enabled(&self) -> bool {
+        self.inner.risk.enabled
+    }
+
+    /// The installed risk-engine `GeoIP` provider (issue #79).
+    #[must_use]
+    pub(crate) fn geoip_provider(&self) -> &Arc<dyn crate::risk::GeoIpProvider> {
+        &self.geoip_provider
+    }
+
+    /// The installed risk-engine IP-reputation provider (issue #79).
+    #[must_use]
+    pub(crate) fn ip_reputation_provider(&self) -> &Arc<dyn crate::risk::IpReputationProvider> {
+        &self.ip_reputation_provider
+    }
+
+    /// The in-process counter store (issue #79 reuses the #64 fast counter layer for the
+    /// velocity signal).
+    #[must_use]
+    pub(crate) fn risk_counters(&self) -> &Arc<dyn crate::abuse::CounterStore> {
+        &self.abuse_counters
     }
 
     /// Install the resolved NIST SP 800-63B-4 password policy (issue #63): the length
@@ -2191,6 +2265,18 @@ impl OidcState {
         } else {
             Self::record_suppressed_send(message.scope, "sms_otp");
         }
+    }
+
+    /// Deliver a new-device (or new-location) notification through the verification seam
+    /// (issue #79): the message carries the device, User-Agent, and geo context plus the
+    /// single-use "this wasn't me" link. Delivery reuses the #68 `VerificationSender`
+    /// stub (the default sender performs no delivery; the full messaging platform is M11),
+    /// so a deployment with no transport wired behaves exactly as before.
+    pub(crate) fn deliver_new_device_notice(
+        &self,
+        message: &crate::verification::NewDeviceNotice<'_>,
+    ) {
+        self.verification_sender.deliver_new_device_notice(message);
     }
 
     /// Deliver an email-OTP code through the verification seam (issue #68), applying the

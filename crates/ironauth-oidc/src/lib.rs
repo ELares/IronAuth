@@ -113,6 +113,7 @@ mod registry;
 mod resource;
 mod response;
 mod revocation;
+mod risk;
 mod scope_claims;
 mod sector;
 mod session;
@@ -209,6 +210,10 @@ pub use revocation::{
     NoopRevocationSink, RevocationEvent, RevocationEventSink, RevokedTokenType,
     SessionLifecycleEvent, SessionSignalCause,
 };
+pub use risk::{
+    GeoIpProvider, GeoLocation, IpReputation, IpReputationProvider, NullGeoIpProvider,
+    NullIpReputationProvider, RiskAction, RiskDecision, RiskLevel, SignalOutcome,
+};
 pub use sector::{
     SectorError, check_sector_document, sector_uri_required, validate_sector_identifier,
 };
@@ -228,8 +233,9 @@ pub use tokens::{
     OPAQUE_REFRESH_TOKEN_PREFIX,
 };
 pub use verification::{
-    EmailOtpMessage, LoggingSmsSender, LoggingVerificationSender, MagicLinkMessage, NullSmsSender,
-    NullVerificationSender, SmsOtpMessage, SmsSender, VerificationPurpose, VerificationSender,
+    EmailOtpMessage, LoggingSmsSender, LoggingVerificationSender, MagicLinkMessage,
+    NewDeviceNotice, NullSmsSender, NullVerificationSender, SmsOtpMessage, SmsSender,
+    VerificationPurpose, VerificationSender,
 };
 
 /// Build the OIDC provider router.
@@ -287,6 +293,15 @@ pub fn oidc_router(state: OidcState) -> Router {
         // HUMAN account registration; the DCR CLIENT registration below is a
         // distinct concept mounted at a distinct `/connect/register` path.
         .route("/login", get(login::login_get).post(login::login_post))
+        // The "this wasn't me" disavowal endpoint (issue #79): a new-device notification
+        // links here with a single-use token. GET renders a scanner-safe confirmation
+        // page; POST consumes the token, revokes the flagged sessions and trusted devices,
+        // and marks the credentials for review. The handler recovers the scope from the
+        // token, so the route is global (mounted once, not per environment).
+        .route(
+            risk::DISAVOWAL_PATH,
+            get(risk::disavow_get).post(risk::disavow_post),
+        )
         // The RFC 9470 step-up second-factor challenge (issue #72): shown when an
         // authorization request needs an authentication context the current session
         // has not achieved. Verifies a TOTP or recovery code and upgrades the session

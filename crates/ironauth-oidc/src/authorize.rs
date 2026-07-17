@@ -1394,6 +1394,38 @@ async fn evaluate_step_up(
             &order,
         );
     }
+
+    // Risk-forced step-up (issue #79): when the minimal risk engine scores this login at or
+    // above the configured `oidc.risk.require_mfa_at` threshold, RAISE the effective
+    // requirement to the MFA floor, so the SAME step-up gate challenges a second factor
+    // (the score is available WHEREVER step-up policy is evaluated). It composes with every
+    // other source through `merge_stronger`, so a stronger explicit floor still wins, and a
+    // session that already achieved MFA is Satisfied. Inert when the engine is off or the
+    // threshold is `off`, so this adds nothing on the default posture.
+    if state.risk_enabled() {
+        if let Ok(risk_subject) = UserId::parse_in_scope(&session.subject, &scope) {
+            let risk_ip = crate::abuse::resolved_client_ip(headers);
+            let risk_ua = headers
+                .get(axum::http::header::USER_AGENT)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("unknown");
+            let risk_ctx = crate::risk::RiskContext {
+                ip: risk_ip.as_deref(),
+                user_agent: risk_ua,
+                headers,
+            };
+            if crate::risk::forces_step_up(state, scope, &risk_subject, &risk_ctx).await {
+                requirement.merge_stronger(
+                    &step_up::AuthnRequirement {
+                        min_acr: Some(authn::acr_for_mfa().to_owned()),
+                        max_auth_age_secs: None,
+                    },
+                    &order,
+                );
+            }
+        }
+    }
+
     let age_bound = requirement.max_auth_age_secs.is_some();
 
     // The recorded methods drive both the achieved acr (the EXPLICIT step-up floors) and

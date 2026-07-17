@@ -92,6 +92,27 @@ impl VerificationPurpose {
     }
 }
 
+/// A new-device (or new-location) login notification (issue #79): the risk engine detected
+/// a login from a device it does not recognize, so the user is alerted with the device
+/// context and given a single-use "this wasn't me" path. The concrete transport is a
+/// documented seam (M11 messaging); the disavowal link carries a live single-use token, so
+/// an implementation MUST NOT log it at a level that reaches production sinks.
+#[derive(Debug, Clone, Copy)]
+pub struct NewDeviceNotice<'a> {
+    /// The tenant/environment scope.
+    pub scope: Scope,
+    /// The recipient (the account's notification address or identifier).
+    pub recipient: &'a str,
+    /// The observed User-Agent at the new-device login (for the message copy).
+    pub user_agent: &'a str,
+    /// A human-readable coarse-location or IP hint for the message copy (never precise
+    /// PII beyond what the user needs to recognize the login).
+    pub location_hint: &'a str,
+    /// The full "this wasn't me" confirmation-page URL the user opens (carries the
+    /// single-use disavowal token).
+    pub disavowal_link: &'a str,
+}
+
 /// The SMS delivery seam (issue #70): the provider boundary the guarded SMS-OTP factor
 /// delivers through. The concrete transport (Twilio Verify, Vonage, SNS) is M11 and out
 /// of scope here; this issue ships and tests against a local STUB, exactly like the
@@ -172,6 +193,14 @@ pub trait VerificationSender: Send + Sync + std::fmt::Debug {
     fn deliver_magic_link(&self, message: &MagicLinkMessage<'_>) {
         let _ = message;
     }
+
+    /// Deliver a new-device (or new-location) login notification (issue #79) with the
+    /// device context and the single-use "this wasn't me" link. The default is a no-op, so
+    /// a deployment with no transport wired behaves as before; a real transport (M11)
+    /// overrides it.
+    fn deliver_new_device_notice(&self, message: &NewDeviceNotice<'_>) {
+        let _ = message;
+    }
 }
 
 /// The default sender: it performs NO delivery (issue #64). The verification/OTP
@@ -238,6 +267,23 @@ impl VerificationSender for LoggingVerificationSender {
             link = message.link,
             short_code = message.short_code,
             "magic link and short code (dev transport, debug only)"
+        );
+    }
+
+    fn deliver_new_device_notice(&self, message: &NewDeviceNotice<'_>) {
+        tracing::info!(
+            target: "ironauth.verification",
+            tenant = %message.scope.tenant(),
+            environment = %message.scope.environment(),
+            user_agent = message.user_agent,
+            location = message.location_hint,
+            "new-device notification delivered (dev transport)"
+        );
+        // The disavowal link carries a live single-use token: only at debug, never info.
+        tracing::debug!(
+            target: "ironauth.verification",
+            disavowal_link = message.disavowal_link,
+            "new-device disavowal link (dev transport, debug only)"
         );
     }
 }

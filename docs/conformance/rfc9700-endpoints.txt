@@ -14,6 +14,7 @@
 /consent
 /device_authorization
 /end_session
+/global-token-revocation
 /introspect
 /login
 /login/mfa
@@ -22,6 +23,7 @@
 /recover/cancel
 /register
 /revoke
+/risk/disavow
 /t/{tenant_id}/e/{environment_id}/.well-known/openid-configuration
 /t/{tenant_id}/e/{environment_id}/account/credentials
 /t/{tenant_id}/e/{environment_id}/account/credentials/remove

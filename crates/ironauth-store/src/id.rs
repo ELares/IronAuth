@@ -776,6 +776,44 @@ impl ScopedKind for SmsRouteStatKind {
     const PREFIX: &'static str = "srt";
 }
 
+/// Marker for a recorded risk decision (`rsk_`), one row in the per-scope risk
+/// decision ledger (issue #79): the LOW/MED/HIGH score, the action taken
+/// (allow/block/challenge/notify), and the enumerated contributing signals of a
+/// single login evaluation. An INTERNAL, auditable operational row, never a bearer
+/// credential; it carries no plaintext PII (only derived signal names, typed values,
+/// and counts).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RiskDecisionKind;
+impl ScopedKind for RiskDecisionKind {
+    const PREFIX: &'static str = "rsk";
+}
+
+/// Marker for a per-subject login-geo observation (`rgl_`), the last-seen coarse
+/// location and instant a login was observed from (issue #79), read by the
+/// impossible-travel signal to compute geo-velocity against the current login. A
+/// tenant-scoped INTERNAL row; the observed IP, coarse location, and User-Agent are
+/// end-user device metadata (PII), sealed under the scope DEK (issue #48), never a
+/// plaintext column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RiskLoginGeoKind;
+impl ScopedKind for RiskLoginGeoKind {
+    const PREFIX: &'static str = "rgl";
+}
+
+/// Marker for a "this wasn't me" disavowal token (`dis_`), one row in the per-subject
+/// disavowal set (issue #79): the SHA-256 digest of a high-entropy single-use token
+/// carried in the new-device notification. The id embeds its `(tenant, environment)`
+/// AND doubles as the routing handle in the token wire form `ira_dis_<id>~<secret>`,
+/// so the scope is recoverable from the token without a database hit. Because that
+/// token is a live bearer credential, the id's debug form REDACTS its payload (like a
+/// magic-link id), so a disavowal id is never rendered into a log line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RiskDisavowalKind;
+impl ScopedKind for RiskDisavowalKind {
+    const PREFIX: &'static str = "dis";
+    const REDACT_DEBUG: bool = true;
+}
+
 /// Marker for a human actor (an interactive user). One of the three actor kinds
 /// an audit envelope can name (see [`crate::audit::ActorRef`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1017,6 +1055,19 @@ pub type Mds3BlobCacheId = ScopedId<Mds3BlobCacheKind>;
 /// A per-scope AAGUID rule id (`aag_...`), one authenticator-model allow/deny rule the
 /// 'direct' attestation path consults (issue #66, PR B).
 pub type AaguidRuleId = ScopedId<AaguidRuleKind>;
+
+/// A recorded risk-decision id (`rsk_...`), one row in the per-scope risk decision
+/// ledger (issue #79): the score, the action taken, and the enumerated contributing
+/// signals of a single login evaluation.
+pub type RiskDecisionId = ScopedId<RiskDecisionKind>;
+
+/// A per-subject login-geo observation id (`rgl_...`), the last-seen coarse location
+/// and instant the impossible-travel signal computes geo-velocity against (issue #79).
+pub type RiskLoginGeoId = ScopedId<RiskLoginGeoKind>;
+
+/// A "this wasn't me" disavowal-token id (`dis_...`), one row in the per-subject
+/// disavowal set and the routing handle embedded in its single-use token (issue #79).
+pub type RiskDisavowalId = ScopedId<RiskDisavowalKind>;
 
 /// A flexible-login-identifier row id (`uid_...`), one typed login identifier
 /// (email, username, or phone) a user can authenticate with (issue #54).

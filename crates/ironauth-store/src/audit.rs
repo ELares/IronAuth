@@ -772,6 +772,22 @@ pub enum Action {
     /// `detail` records the decision and the target factor strength (acr), so an
     /// attacker-initiated downgrade attempt is always reconstructable from the log.
     RecoveryFactorChange,
+    /// A risk decision was RECORDED (issue #79): the minimal risk engine scored a
+    /// login LOW/MED/HIGH from its enumerated signals and dispatched an action
+    /// (allow/block/challenge/notify). The row targets the `rsk_` decision; the
+    /// `detail` records the score, the action, and each contributing signal with its
+    /// typed value (never plaintext PII), so a sampled decision is fully
+    /// reconstructable from the audit trail alone.
+    RiskDecisionRecord,
+    /// A "this wasn't me" disavowal token was ISSUED (issue #79): a new-device login
+    /// planted a single-use, digest-only token in the notification. The row targets
+    /// the `dis_` disavowal; the `detail` records the risk decision it descends from.
+    RiskDisavowalIssue,
+    /// A "this wasn't me" disavowal was CONSUMED (issue #79): the end user followed the
+    /// single-use notification link, so the flagged sessions were revoked and the
+    /// subject's credentials were marked for review. The row targets the `dis_`
+    /// disavowal; the `detail` records how many sessions and devices were revoked.
+    RiskDisavow,
 }
 
 impl Action {
@@ -939,6 +955,9 @@ impl Action {
             Action::RecoveryCancel => "recovery.cancel",
             Action::RecoveryComplete => "recovery.complete",
             Action::RecoveryFactorChange => "recovery.factor_change",
+            Action::RiskDecisionRecord => "risk.decision",
+            Action::RiskDisavowalIssue => "risk.disavowal.issue",
+            Action::RiskDisavow => "risk.disavow",
         }
     }
 }
