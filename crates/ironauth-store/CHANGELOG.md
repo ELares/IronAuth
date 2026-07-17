@@ -6,6 +6,18 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Account recovery (issue #81): migration 0054 adds the tenant-scoped, forced-RLS
+  `recovery_flows` table (the recovery state machine position and entry point as closed
+  CHECK sets, the `recover_acr` credential-ladder strength the downgrade invariant
+  protects, the SHA-256 DIGEST of the notification-link cancellation token as server-side
+  state, the SEALED recipient with its DEK version, and the delay-window / lifecycle
+  timestamps stamped from the env clock), a `rcv_` scoped id, the `RecoveryFlow` resource
+  classification (runtime), and the `RecoveryFlowRepo` (`get`, `by_cancel_digest`,
+  `initiations_since` for the cooldown) / `ActingRecoveryFlowRepo` (`initiate` sealing the
+  recipient and stamping the delay, `cancel`, `complete`, `record_factor_change`). Adds the
+  `recovery.initiate` / `recovery.cancel` / `recovery.complete` / `recovery.factor_change`
+  audit actions, so every recovery state transition is audited with actor, action, and
+  factor/channel context.
 - Trusted devices (issue #71): migration 0053 adds the tenant-scoped, forced-RLS
   `trusted_devices` table (the SHA-256 DIGEST of the cookie secret as server-side state,
   the subject + `ses_` session-lineage binding, the SEALED User-Agent and coarse geo, the

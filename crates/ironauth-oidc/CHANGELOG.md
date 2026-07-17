@@ -6,6 +6,31 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Account recovery as a first-class subsystem (issue #81): a distinct recovery state
+  machine, NOT a branch of password reset, governed by three pillars. DELAY as a security
+  feature: a recovery that would REDUCE account security is HELD for the configured
+  `oidc.recovery_delay_secs` window before it can complete, cancellable throughout.
+  NOTIFICATION everywhere: initiating recovery notifies EVERY registered channel (all
+  verified emails and phone numbers) through the #68 verification seam, with a
+  cancellation path; completion and factor changes notify again. THE DOWNGRADE INVARIANT:
+  recovery can NEVER silently remove or bypass a factor STRONGER than the one used to
+  recover; removing such a factor requires EITHER a fresh equal-or-stronger re-verification
+  OR the elapsed delay window. "Stronger" REUSES the issue #66 credential-ladder / `acr`
+  strength order via `step_up::acr_satisfies` and `AuthMethod::acr` (no parallel ordering):
+  an email-OTP recovery restores access but leaves a passkey or TOTP intact and its removal
+  BLOCKED until the rule is satisfied. Adds the `recovery` domain module
+  (`initiate_recovery`, `cancel_from_token`, `evaluate_factor_change`,
+  `factor_change_decision`, the `RecoveryFactor` projection onto `AuthMethod`), the
+  `RiskEvaluator` SEAM (a null/allow default, installed with `OidcState::with_risk_evaluator`)
+  so issue #79's risk engine can force the delay path or block a recovery without a hard
+  dependency, and a `POST /recover/cancel` scanner-safe cancellation surface (a GET renders
+  a confirm page but never cancels; a same-origin POST with the high-entropy token revokes
+  the pending recovery). The `POST /recover` surface now, for a KNOWN account, creates the
+  (possibly delay-held) flow and notifies every channel side-effect-only, so it stays
+  byte-identical to an unknown identifier (anti-enumeration). The per-account cooldown
+  (`oidc.recovery_cooldown_secs`) rate-limits repeated initiations. All timers run through
+  the env clock seam (no wall-clock sleeps) and the cancellation token through the entropy
+  seam.
 - Trusted devices (remember-device 2FA) and the conditional-credential skip (issue #71),
   off by default behind `oidc.trusted_devices_enabled`. After a COMPLETED multi-factor
   login the `POST /login/mfa` path may plant a `__Host-ironauth_trusted_device` cookie

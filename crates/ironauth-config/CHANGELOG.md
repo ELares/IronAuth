@@ -6,6 +6,12 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Account-recovery windows for issue #81: the `oidc.recovery_cooldown_secs` per-account
+  cooldown between recovery initiations (at least 1 second, default 300, five minutes) and
+  the `oidc.recovery_delay_secs` delay a security-reducing recovery is HELD for (bounded to
+  1..=2592000, the 30-day ceiling, default 259200, 72 hours, matching the Apple/Google
+  platform recovery-delay patterns). Both are validated at load even when recovery is
+  otherwise idle, so a misconfigured window fails fast.
 - Remember-device (trusted-device) policy for issue #71, off by default: the
   `oidc.trusted_devices_enabled` toggle, the `oidc.trusted_device_user_opt_in` choice
   (user checkbox vs the tenant decides), the `oidc.trusted_device_max_age_secs` absolute

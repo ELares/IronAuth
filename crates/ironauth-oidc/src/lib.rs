@@ -107,6 +107,7 @@ mod pkce;
 mod probe;
 mod quota;
 mod recover;
+pub mod recovery;
 mod register;
 mod registry;
 mod resource;
@@ -196,6 +197,10 @@ pub use password::{
 };
 pub use probe::{
     ProbeReport, available_memory_kib, default_memory_budget_kib, run_probe, total_memory_kib,
+};
+pub use recovery::{
+    FactorChangeDecision, NullRiskEvaluator, RecoveryFactor, RecoverySettings, RiskDirective,
+    RiskEvaluator, RiskEvent, factor_change_decision,
 };
 pub use registry::{
     GrantType, PkceMethod, PromptSet, PromptSetError, PromptValue, ResponseMode, ResponseType,
@@ -299,6 +304,12 @@ pub fn oidc_router(state: OidcState) -> Router {
         .route(
             "/recover",
             get(recover::recover_get).post(recover::recover_post),
+        )
+        // The recovery cancellation-from-notification-link surface (issue #81): the
+        // "this was not me" path that revokes a pending recovery in its delay window.
+        .route(
+            "/recover/cancel",
+            get(recover::recover_cancel_get).post(recover::recover_cancel_post),
         )
         .route(
             "/consent",

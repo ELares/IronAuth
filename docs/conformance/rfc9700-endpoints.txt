@@ -19,6 +19,7 @@
 /login/mfa
 /par
 /recover
+/recover/cancel
 /register
 /revoke
 /t/{tenant_id}/e/{environment_id}/.well-known/openid-configuration

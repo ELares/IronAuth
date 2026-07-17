@@ -657,6 +657,20 @@
           "minimum": 0,
           "type": "integer"
         },
+        "recovery_cooldown_secs": {
+          "default": 300,
+          "description": "The cooldown between two account-recovery initiations for the SAME account, in\nseconds (issue #81): a repeated recovery request inside this window is refused, so\nrecovery-request spam against one account is rate-limited on the recovery path\nindependently of the login path. Must be at least 1. The default (300) is five\nminutes.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "recovery_delay_secs": {
+          "default": 259200,
+          "description": "The delay window a security-REDUCING account recovery is HELD for before it can\ncomplete, in seconds (issue #81): a recovery that would remove or bypass a factor\nSTRONGER than the one used to recover is held for this long, notified on every\nregistered channel and cancellable throughout, so an attacker-initiated recovery\ncan never silently downgrade an account inside the window. Must be between 1 and\n2592000 (30 days). The default (259200) is 72 hours, matching the platform-level\nrecovery-delay patterns Apple and Google ship.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
         "refresh_idle_ttl_secs": {
           "default": 1209600,
           "description": "The IDLE timeout in seconds of a SESSION-bound refresh token (issue #21):\none issued without `offline_access`. A refresh token unused for longer than\nthis expires. The default (1209600) is fourteen days. Must be at least 1 and\nat most `OIDC_MAX_REFRESH_IDLE_TTL_SECS`.",
@@ -1661,6 +1675,8 @@
         "offline_idle_ttl_secs": 2592000,
         "offline_max_lifetime_secs": 7776000,
         "par_ttl_secs": 60,
+        "recovery_cooldown_secs": 300,
+        "recovery_delay_secs": 259200,
         "refresh_idle_ttl_secs": 1209600,
         "refresh_max_lifetime_secs": 2592000,
         "refresh_rotation_grace_secs": 10,

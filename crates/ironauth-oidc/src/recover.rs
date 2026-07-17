@@ -101,25 +101,103 @@ pub async fn recover_post(
     // processed attempt is counted, throttled or allowed), so recovery-request spam climbs
     // the per-identifier and per-IP throttle without a hard lockout (issue #64).
 
-    // Look the identifier up ONLY to decide whether the recovery send is permitted; the
-    // lookup runs for both present and absent identifiers, so the work is uniform. A send
-    // to an unknown recipient is SUPPRESSED, but the acknowledgment is identical.
-    let recipient_known = matches!(
-        state
-            .store()
-            .scoped(resume.scope)
-            .users()
-            .by_identifier(identifier)
-            .await,
-        Ok(Some(_))
-    );
-    state.dispatch_verification(
-        resume.scope,
-        VerificationPurpose::Recovery,
-        identifier,
-        recipient_known,
-    );
+    // Look the identifier up ONLY to decide whether the recovery is permitted; the
+    // lookup runs for both present and absent identifiers, so the work is uniform. A
+    // recovery for an unknown recipient is SUPPRESSED, but the acknowledgment is identical.
+    let resolved = state
+        .store()
+        .scoped(resume.scope)
+        .users()
+        .by_identifier(identifier)
+        .await;
+    if let Ok(Some(user)) = resolved {
+        // KNOWN account: run the first-class recovery state machine (issue #81) -- risk
+        // score, per-account cooldown, create the (possibly delay-held) flow, and notify
+        // EVERY verified channel with a cancellation path. All of this is side-effect
+        // only, so a known account stays byte-identical to an unknown one in the response.
+        // The entry point defaults to a lost-password recovery (the common /recover case;
+        // the finer entry-point selection is a hosted-page concern) and the recovery
+        // factor is the email one-time proof this surface delivers through (issue #68).
+        let client_ip = crate::abuse::resolved_client_ip(&headers);
+        let _ = crate::recovery::initiate_recovery(
+            &state,
+            resume.scope,
+            &user.id,
+            ironauth_store::RecoveryEntryPoint::LostPassword,
+            crate::recovery::RecoveryFactor::EmailOtp,
+            identifier,
+            client_ip.as_deref(),
+        )
+        .await;
+    } else {
+        // UNKNOWN identifier: the suppressed send keeps the response uniform (the Logto
+        // pattern), so a recovery init for a non-existent account looks identical.
+        state.dispatch_verification(
+            resume.scope,
+            VerificationPurpose::Recovery,
+            identifier,
+            false,
+        );
+    }
     recovery_ack_page(banner)
+}
+
+/// The query carrying a recovery cancellation token on the notification link.
+#[derive(Deserialize)]
+pub struct CancelTokenQuery {
+    /// The high-entropy cancellation token from the notification link.
+    pub token: Option<String>,
+}
+
+/// `GET /recover/cancel`: render the cancellation CONFIRM page for a recovery
+/// notification link (issue #81). Scanner-safe: a prefetching GET renders this page but
+/// NEVER cancels; the user must POST the token back to actually revoke the pending
+/// recovery.
+pub async fn recover_cancel_get(
+    State(state): State<OidcState>,
+    Query(query): Query<CancelTokenQuery>,
+) -> Response {
+    let _ = &state;
+    let Some(token) = query.token.as_deref().filter(|token| !token.is_empty()) else {
+        return interaction::invalid_link_page();
+    };
+    pages::secure_html(
+        StatusCode::OK,
+        pages::recover_cancel_page("/recover/cancel", token),
+    )
+}
+
+/// The posted cancellation form.
+#[derive(Deserialize)]
+pub struct CancelForm {
+    /// The high-entropy cancellation token to revoke the pending recovery with.
+    pub token: Option<String>,
+}
+
+/// `POST /recover/cancel`: revoke a pending recovery from its notification-link token
+/// (issue #81). ALWAYS returns the SAME uniform acknowledgment: a valid token cancels the
+/// pending recovery (and notifies every channel), an invalid or stale one is a no-op,
+/// neither observable in the response.
+pub async fn recover_cancel_post(
+    State(state): State<OidcState>,
+    headers: HeaderMap,
+    Form(form): Form<CancelForm>,
+) -> Response {
+    // CSRF defense-in-depth (issue #196): a conclusively cross-site POST is a generic 403.
+    if !interaction::same_origin_ok(&headers, state.self_origin().as_deref()) {
+        return interaction::forbidden_page();
+    }
+    let token = form.token.as_deref().unwrap_or_default();
+    // Uniform: a valid or invalid token both return the same acknowledgment.
+    let _ = crate::recovery::cancel_from_token(&state, token).await;
+    pages::secure_html(
+        StatusCode::OK,
+        pages::notice_page(
+            "Recovery cancelled",
+            "If a recovery request was pending, we have cancelled it and alerted your \
+             registered channels.",
+        ),
+    )
 }
 
 /// The UNIFORM recovery acknowledgment (issue #64): the SAME body and status for a known

@@ -273,6 +273,19 @@ impl ScopedKind for TrustedDeviceKind {
     const PREFIX: &'static str = "tdv";
 }
 
+/// Marker for a recovery-flow id (`rcv_`), one row of the account-recovery state
+/// machine (issue #81): the first-class recovery request the delay/notification/
+/// downgrade-invariant pillars govern. The id embeds its (tenant, environment) so a
+/// flow minted in one scope parses as a uniform not-found under another, and a flow
+/// is only ever reachable by the subject it targets. The id is NOT a bearer secret:
+/// the notification link additionally carries a high-entropy cancellation token whose
+/// digest is the server-side state, so a stolen id alone cancels nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RecoveryFlowKind;
+impl ScopedKind for RecoveryFlowKind {
+    const PREFIX: &'static str = "rcv";
+}
+
 /// Marker for a registered WebAuthn passkey credential (`pky_`), one row in the
 /// per-user passkey registry (issue #65): the COSE public key, sign counter,
 /// AAGUID, transports, BE/BS flags, and the sealed nickname of one authenticator.
@@ -960,6 +973,10 @@ pub type CredentialId = ScopedId<CredentialKind>;
 /// A remembered-device id (`tdv_...`), one row in a user's trusted-device
 /// registry and the value the `__Host-` device cookie names (issue #71).
 pub type TrustedDeviceId = ScopedId<TrustedDeviceKind>;
+
+/// A recovery-flow id (`rcv_...`), one row of the account-recovery state machine
+/// (issue #81) and the routing handle the notification/cancellation links carry.
+pub type RecoveryFlowId = ScopedId<RecoveryFlowKind>;
 
 /// A registered WebAuthn passkey credential id (`pky_`, issue #65).
 pub type WebauthnCredentialId = ScopedId<WebauthnCredentialKind>;

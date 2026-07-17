@@ -327,7 +327,7 @@ async fn expand_contract_example_chain_runs_all_three_phases_and_contract_remove
 // per real table); splitting it would not make it clearer.
 #[allow(clippy::too_many_lines)]
 #[tokio::test]
-async fn production_chain_is_only_the_fifty_three_real_migrations_and_ships_no_demo_object() {
+async fn production_chain_is_only_the_fifty_four_real_migrations_and_ships_no_demo_object() {
     // TestDatabase::start runs Store::migrate() (the production chain) on a
     // fresh, empty database.
     let db = TestDatabase::start().await;
@@ -344,8 +344,8 @@ async fn production_chain_is_only_the_fifty_three_real_migrations_and_ships_no_d
     );
     assert_eq!(
         report.already_applied(),
-        53,
-        "the production chain is exactly fifty-three migrations (isolation, audit log, management \
+        54,
+        "the production chain is exactly fifty-four migrations (isolation, audit log, management \
          API, OIDC authorization, signing keys, login/consent, authentication context, redirect \
          registration, UserInfo claims, consent scope upsert, resource servers, opaque access \
          tokens, client auth suite, dynamic client registration, pushed authorization requests, \
@@ -358,16 +358,17 @@ async fn production_chain_is_only_the_fifty_three_real_migrations_and_ships_no_d
          import, user invitations, flexible identifiers, exit-export credential grants, \
          migration state machine, webauthn credentials, totp credentials, credential abuse \
          defenses, step-up policies, email OTP and scanner-safe magic links, credential-class \
-         policies, guarded SMS OTP, passkey attestation, admin sudo elevations, trusted devices)"
+         policies, guarded SMS OTP, passkey attestation, admin sudo elevations, trusted devices, \
+         account recovery)"
     );
 
-    // The ledger holds exactly versions 1 through 53.
+    // The ledger holds exactly versions 1 through 54.
     assert_eq!(
         applied_versions(pool).await,
         vec![
             1_i64, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
             24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45,
-            46, 47, 48, 49, 50, 51, 52, 53
+            46, 47, 48, 49, 50, 51, 52, 53, 54
         ]
     );
     let phase_of = |version: i64| async move {
@@ -564,6 +565,9 @@ async fn production_chain_is_only_the_fifty_three_real_migrations_and_ships_no_d
     // The trusted-devices migration (issue #71) is an EXPAND: one new tenant-scoped
     // remember-device state table, no rewrite of existing state.
     assert_eq!(phase_of(53).await, "expand");
+    // The account-recovery migration (issue #81) is an EXPAND: one new tenant-scoped
+    // recovery-flow state-machine table, no rewrite of existing state.
+    assert_eq!(phase_of(54).await, "expand");
 
     // The step-up second-factor abuse path (issue #72): migration 0047 WIDENED the
     // abuse_bans auth_path CHECK (0046 pinned the closed set) to also admit
@@ -723,6 +727,82 @@ async fn production_chain_is_only_the_fifty_three_real_migrations_and_ships_no_d
             trusted_device_revoke_check.contains(reason),
             "the trusted_devices revoke-reason CHECK must admit {reason}, got: \
              {trusted_device_revoke_check}"
+        );
+    }
+    // The account-recovery state machine (issue #81): a tenant-scoped, RLS-forced table
+    // with the recovery state / entry point (closed sets), the recover-factor strength
+    // the downgrade invariant protects, the cancellation-token digest (never the token),
+    // the sealed recipient (PII), and the delay-window / lifecycle timestamps.
+    assert!(
+        table_exists(pool, "recovery_flows").await,
+        "recovery_flows exists after 0054"
+    );
+    assert!(
+        rls_enabled_and_forced(pool, "recovery_flows").await,
+        "recovery_flows has row-level security ENABLED and FORCED"
+    );
+    for column in [
+        "id",
+        "tenant_id",
+        "environment_id",
+        "subject",
+        "state",
+        "entry_point",
+        "recover_acr",
+        "cancel_token_digest",
+        "recipient_sealed",
+        "pii_dek_version",
+        "initiated_at",
+        "hold_until",
+        "cancelled_at",
+        "cancel_reason",
+        "completed_at",
+    ] {
+        assert!(
+            column_exists(pool, "recovery_flows", column).await,
+            "recovery_flows.{column} exists after 0054"
+        );
+    }
+    // The recovery recipient is end-user PII, sealed under the scope DEK (issue #48): the
+    // plaintext recipient never lands on a column.
+    assert!(
+        !column_exists(pool, "recovery_flows", "recipient").await,
+        "recovery_flows must have no plaintext recipient column after 0054"
+    );
+    assert!(
+        check_constraint_exists(pool, "recovery_flows", "recovery_flows_scope_nonempty").await,
+        "recovery_flows has the nonempty-scope CHECK"
+    );
+    // The state CHECK pins the closed recovery state-machine set.
+    let recovery_state_check: String = sqlx::query(
+        "SELECT pg_get_constraintdef(oid) AS def FROM pg_catalog.pg_constraint \
+         WHERE conrelid = 'recovery_flows'::regclass \
+         AND conname = 'recovery_flows_state_known'",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("recovery_flows state check lookup")
+    .get("def");
+    for state in ["initiated", "held", "cancelled", "completed"] {
+        assert!(
+            recovery_state_check.contains(state),
+            "the recovery_flows state CHECK must admit {state}, got: {recovery_state_check}"
+        );
+    }
+    // The entry-point CHECK pins the closed entry-point set.
+    let recovery_entry_check: String = sqlx::query(
+        "SELECT pg_get_constraintdef(oid) AS def FROM pg_catalog.pg_constraint \
+         WHERE conrelid = 'recovery_flows'::regclass \
+         AND conname = 'recovery_flows_entry_point_known'",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("recovery_flows entry-point check lookup")
+    .get("def");
+    for entry in ["lost_password", "lost_second_factor", "lost_all_factors"] {
+        assert!(
+            recovery_entry_check.contains(entry),
+            "the recovery_flows entry-point CHECK must admit {entry}, got: {recovery_entry_check}"
         );
     }
     // The authentication-context columns (issue #14) exist: the recorded login

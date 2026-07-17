@@ -290,6 +290,16 @@ name = "trusted_devices"
 path = "tests/trusted_devices.rs"
 required-features = ["testing"]
 
+# The account-recovery subsystem end to end (issue #81): the downgrade invariant (an
+# email-OTP recovery cannot remove a passkey without a fresh equal-or-stronger reverify or
+# the elapsed delay window), multi-channel notification, cancellation-revokes-the-pending
+# recovery, the per-account cooldown, audit completeness, and the risk seam. Needs a real
+# database (DATABASE_URL) and drives the injected clock.
+[[test]]
+name = "recovery"
+path = "tests/recovery.rs"
+required-features = ["testing"]
+
 # WebAuthn passkey ceremonies end to end (issue #65): the four ceremony endpoints
 # driven through the real router by a software authenticator (a CBOR
 # attestationObject / COSE key, real Ed25519 assertion signatures). A passkey

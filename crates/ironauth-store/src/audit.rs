@@ -749,6 +749,29 @@ pub enum Action {
     /// SMS OTP was enabled/disabled, the factor-downgrade path was set, or the
     /// country allowlist was edited. The row records what changed in `detail`.
     SmsConfigUpdate,
+    /// An account-recovery flow was INITIATED (issue #81): the first-class recovery
+    /// state machine started for a subject. The row targets the `rcv_` flow; the
+    /// `detail` records the entry point, the recover-factor strength (acr), whether a
+    /// delay was applied, and the number of channels notified (never the plaintext
+    /// recipient, which is sealed on the row). A recovery init for a NON-EXISTENT
+    /// account writes no row (the anti-enumeration suppressed path).
+    RecoveryInitiate,
+    /// An account-recovery flow was CANCELLED (issue #81): a held recovery was
+    /// revoked from a notification link (or superseded by a newer request), so the
+    /// pending recovery can never complete. The row targets the `rcv_` flow; the
+    /// `detail` records the cancellation reason.
+    RecoveryCancel,
+    /// An account-recovery flow COMPLETED (issue #81): the recovery restored access
+    /// after the delay elapsed or the challenge was satisfied. The row targets the
+    /// `rcv_` flow; the `detail` records the recover-factor strength (acr).
+    RecoveryComplete,
+    /// A factor change was evaluated against an active recovery (issue #81, the
+    /// downgrade invariant): removing or replacing a factor STRONGER than the one used
+    /// to recover was either ALLOWED (the delay elapsed or a fresh equal-or-stronger
+    /// re-verification was presented) or BLOCKED. The row targets the `rcv_` flow; the
+    /// `detail` records the decision and the target factor strength (acr), so an
+    /// attacker-initiated downgrade attempt is always reconstructable from the log.
+    RecoveryFactorChange,
 }
 
 impl Action {
@@ -912,6 +935,10 @@ impl Action {
             Action::SmsConfigUpdate => "sms_config.update",
             Action::MagicLinkSend => "magic_link.send",
             Action::MagicLinkConsume => "magic_link.consume",
+            Action::RecoveryInitiate => "recovery.initiate",
+            Action::RecoveryCancel => "recovery.cancel",
+            Action::RecoveryComplete => "recovery.complete",
+            Action::RecoveryFactorChange => "recovery.factor_change",
         }
     }
 }

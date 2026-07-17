@@ -590,6 +590,12 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0053_trusted_devices.sql"),
         },
+        Migration {
+            version: 54,
+            name: "account_recovery",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0054_account_recovery.sql"),
+        },
     ]
 }
 

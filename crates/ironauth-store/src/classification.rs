@@ -143,13 +143,17 @@ pub enum ResourceType {
     /// A remembered device (issue #71): the server-side trusted-device state a
     /// subsequent login skips the second factor against.
     TrustedDevice,
+    /// A recovery flow (issue #81): one row of the account-recovery state machine
+    /// (the delay window, the notification/cancellation context, and the factor
+    /// strength the downgrade invariant protects). Dynamic per-environment data.
+    RecoveryFlow,
 }
 
 impl ResourceType {
     /// Every resource type, in a stable order. The classification lint and the
     /// metadata endpoint both iterate this; a variant missing here is caught by
     /// the `all_lists_every_variant` test and by `scripts/classification-lint.sh`.
-    pub const ALL: [ResourceType; 17] = [
+    pub const ALL: [ResourceType; 18] = [
         ResourceType::Operator,
         ResourceType::Tenant,
         ResourceType::Environment,
@@ -167,6 +171,7 @@ impl ResourceType {
         ResourceType::AccountCredential,
         ResourceType::Invitation,
         ResourceType::TrustedDevice,
+        ResourceType::RecoveryFlow,
     ];
 
     /// The stable wire name of this resource type (for example `organization`).
@@ -190,6 +195,7 @@ impl ResourceType {
             ResourceType::AccountCredential => "account_credential",
             ResourceType::Invitation => "invitation",
             ResourceType::TrustedDevice => "trusted_device",
+            ResourceType::RecoveryFlow => "recovery_flow",
         }
     }
 
@@ -214,7 +220,8 @@ impl ResourceType {
             | ResourceType::Session
             | ResourceType::AccountCredential
             | ResourceType::Invitation
-            | ResourceType::TrustedDevice => ResourceLevel::Environment,
+            | ResourceType::TrustedDevice
+            | ResourceType::RecoveryFlow => ResourceLevel::Environment,
         }
     }
 
@@ -272,7 +279,10 @@ pub fn classify(resource: ResourceType) -> ResourceClassification {
         // A remembered device (issue #71) is dynamic per-environment data, bound to a
         // specific environment's users and sessions: it never travels in a config
         // snapshot, exactly like a session or an account credential.
-        | ResourceType::TrustedDevice => Runtime,
+        | ResourceType::TrustedDevice
+        // A recovery flow (issue #81) is dynamic per-environment data, bound to a
+        // specific environment's users: it never travels in a config snapshot.
+        | ResourceType::RecoveryFlow => Runtime,
     }
 }
 
