@@ -136,17 +136,24 @@ async fn post_login_with_ip(
     harness.send(request).await
 }
 
-/// The most recent risk decision's parsed signals JSON for a subject.
+/// The most recent risk decision's parsed signals JSON for a subject. Polls briefly: the
+/// BLOCK path records its decision DETACHED (issue #79 MEDIUM-1), so the row may land just
+/// after the response returns; the synchronous (non-block) paths resolve on the first read.
 async fn latest_decision_json(harness: &Harness, subject: &str) -> serde_json::Value {
     let scoped = harness.store().scoped(harness.scope());
     let id = scoped.users().parse_id(subject).expect("parse subject");
-    let decision = scoped
-        .risk()
-        .latest_decision(&id)
-        .await
-        .expect("read decision")
-        .expect("a decision was recorded");
-    serde_json::from_str(&decision.signals_json).expect("signals json")
+    for _ in 0..100 {
+        if let Some(decision) = scoped
+            .risk()
+            .latest_decision(&id)
+            .await
+            .expect("read decision")
+        {
+            return serde_json::from_str(&decision.signals_json).expect("signals json");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    panic!("a decision was recorded (waited for the detached write)");
 }
 
 // ---------------------------------------------------------------------------
@@ -252,6 +259,14 @@ async fn a_decision_enumerates_its_signals_and_is_reconstructable_from_the_audit
     assert!(
         row.0.contains("score=") && row.0.contains("action="),
         "the audit detail reconstructs the decision, got {}",
+        row.0
+    );
+    // The audit detail ALONE enumerates the contributing signals (issue #79 LOW doc fix):
+    // the compact signal summary (signal kinds + levels, PII-free) is present, so the audit
+    // row explains WHY the decision was reached even if the risk_decisions row is pruned.
+    assert!(
+        row.0.contains("signals=[") && row.0.contains("new_device:med"),
+        "the audit detail enumerates the signal set, got {}",
         row.0
     );
 }
@@ -612,5 +627,109 @@ async fn a_notification_flood_via_failed_attempts_is_bounded() {
         recorder.notices.lock().expect("lock").len(),
         0,
         "no notification is sent for failed attempts (notifications gate behind auth)"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Adversarial: a new-device notification flood is deduped/rate-limited (LOW-1)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn repeated_new_device_notifications_are_throttled_within_the_cooldown() {
+    // An attacker WITH valid credentials who logs in repeatedly WITHOUT the remember-device
+    // cookie is read as a new device each time. The per-(subject, device) notify throttle
+    // suppresses the repeats within the cooldown window: exactly ONE notice (and one minted
+    // "this wasn't me" token) per new device per window, so the victim's inbox is not
+    // flooded and disavowal-token rows do not accumulate unbounded. After the window a fresh
+    // notice is sent again.
+    let mut config = risk_base();
+    config.risk.new_device_enabled = true;
+    config.risk.notify_on_new_device = true;
+    config.risk.notify_cooldown_secs = 60;
+    config.trusted_devices_enabled = true;
+    let mut harness = Harness::start_store_backed_with(config).await;
+    let recorder = Arc::new(RecordingSender::default());
+    harness.install_verification_sender(recorder.clone());
+
+    harness
+        .seed_user("throttle@example.test", "correct-horse-battery")
+        .await;
+    let return_to = return_to(&harness).await;
+    let body = form(&[
+        ("identifier", "throttle@example.test"),
+        ("password", "correct-horse-battery"),
+        ("return_to", &return_to),
+    ]);
+
+    // Three new-device logins within the window: only the FIRST notifies.
+    for _ in 0..3 {
+        let (status, _h, _b) = harness.post_form("/login", &body, None).await;
+        assert_eq!(status, StatusCode::SEE_OTHER, "the login succeeds");
+    }
+    assert_eq!(
+        recorder.notices.lock().expect("lock").len(),
+        1,
+        "repeated new-device logins within the cooldown notify exactly once"
+    );
+
+    // Past the cooldown window a later new-device login notifies again.
+    harness.clock().advance(std::time::Duration::from_secs(61));
+    let (status, _h, _b) = harness.post_form("/login", &body, None).await;
+    assert_eq!(status, StatusCode::SEE_OTHER, "the login succeeds");
+    assert_eq!(
+        recorder.notices.lock().expect("lock").len(),
+        2,
+        "a new-device login after the cooldown notifies again"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// HIGH-1: the disavow GET escapes reflected input and carries the strict CSP
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn the_disavow_get_escapes_the_token_and_carries_the_strict_csp() {
+    let harness = Harness::start_store_backed_with(risk_base()).await;
+    // A crafted token that tries to break out of the value="..." attribute and inject a
+    // <script> into the IronAuth origin (the reflected-XSS attempt).
+    let request = Request::builder()
+        .method("GET")
+        .uri("/risk/disavow?token=%22%3E%3Cscript%3Ealert(1)%3C%2Fscript%3E")
+        .body(Body::empty())
+        .expect("request builds");
+    let (status, headers, page) = harness.send(request).await;
+    assert_eq!(status, StatusCode::OK, "the confirmation page renders");
+    // The reflected token is neutralized: no raw script tag, no attribute breakout.
+    assert!(
+        !page.contains("<script>"),
+        "the reflected token must not inject a raw script tag: {page}"
+    );
+    assert!(
+        page.contains("&lt;script&gt;"),
+        "the reflected token is HTML-escaped into entities: {page}"
+    );
+    // The page carries the SAME strict CSP the other hosted pages do.
+    let csp = headers
+        .get(header::CONTENT_SECURITY_POLICY)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    assert!(
+        csp.contains("default-src 'none'") && csp.contains("frame-ancestors 'none'"),
+        "the disavow GET carries the strict CSP, got {csp:?}"
+    );
+    // The frame-deny and nosniff hardening headers are present too.
+    assert_eq!(
+        headers
+            .get(header::X_FRAME_OPTIONS)
+            .and_then(|v| v.to_str().ok()),
+        Some("DENY"),
+        "the disavow GET denies framing"
+    );
+    assert_eq!(
+        headers
+            .get(header::X_CONTENT_TYPE_OPTIONS)
+            .and_then(|v| v.to_str().ok()),
+        Some("nosniff"),
+        "the disavow GET sets nosniff"
     );
 }

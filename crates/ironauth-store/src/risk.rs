@@ -52,6 +52,11 @@ pub struct NewRiskDecision<'a> {
     pub action: &'a str,
     /// The enumerated contributing signals and their typed values, as a JSON document.
     pub signals_json: &'a str,
+    /// A COMPACT, operator-safe enumerated signal summary (`kind:level` pairs, PII-free)
+    /// written to the audit detail alongside the score and action, so a sampled decision is
+    /// reconstructable from the audit trail ALONE even if the append-only `risk_decisions`
+    /// row is pruned. Carries only signal kinds and levels, never the raw IP/geo/counts.
+    pub signals_summary: &'a str,
     /// The request correlation id the decision belongs to, if any.
     pub correlation_id: Option<&'a str>,
 }

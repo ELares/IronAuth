@@ -525,13 +525,20 @@ pub async fn login_post(
                 let risk_decision =
                     crate::risk::evaluate(&state, resume.scope, &user.id, &risk_ctx).await;
                 if matches!(risk_decision.action, crate::risk::RiskAction::Block) {
-                    let _ = crate::risk::record_decision(
+                    // Timing-uniformity (issue #79 MEDIUM-1): record the block decision OFF
+                    // the synchronous response path (a detached spawn, like
+                    // `screen_after_login`), so a blocked (deny-listed) correct-password
+                    // attempt returns the SAME uniform failure doing NO more synchronous work
+                    // than a wrong-password return. Awaiting the risk_decisions + audit INSERT
+                    // here would make a block measurably slower than an ordinary failure,
+                    // leaking BOTH that the client is blocked AND that the password was valid.
+                    // The decision/audit row is still written, just not awaited (append-only).
+                    crate::risk::record_decision_detached(
                         &state,
                         resume.scope,
                         &user.id,
                         &risk_decision,
-                    )
-                    .await;
+                    );
                     return failed_login_page(identifier, &resume.return_to, &resume.hints, banner);
                 }
                 let actor = interaction::user_actor(&user.id);

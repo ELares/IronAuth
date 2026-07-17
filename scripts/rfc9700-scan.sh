@@ -40,16 +40,71 @@ if ! grep -q '^name = "rfc9700"$' "$cargo" || ! grep -q '^path = "tests/rfc9700.
 fi
 
 # 2. Regenerate the endpoint inventory from EVERY router in the crate and diff it.
-#    The inventory is every .route() literal under crates/ironauth-oidc/src, so it
-#    is bound to the whole mounted surface (oidc_router, discovery_router, and the
+#    The inventory is every .route() mount under crates/ironauth-oidc/src, so it is
+#    bound to the whole mounted surface (oidc_router, discovery_router, and the
 #    issuer/JWKS router) rather than to one function that a new router could bypass.
+#    A .route() path is resolved whether it is a string LITERAL or a `const NAME: &str`
+#    PATH CONST (the one shape the string-only scan used to miss); a non-literal path
+#    that resolves to no known const FAILS the scan, so a const/computed route can never
+#    silently evade the inventory.
 python3 - "$src" "$inventory" <<'PY'
 import pathlib, re, sys
 src, out = pathlib.Path(sys.argv[1]), sys.argv[2]
+files = sorted(src.rglob("*.rs"))
+
+# Map every `const NAME: &str = "literal";` path const, so a `.route()` mounted at a
+# CONST path can be RESOLVED to its literal rather than silently evade the inventory (a
+# const path is the one shape the old string-only scan could not capture, so a new
+# const/computed route could ship uncovered while the scan still printed "clean").
+const_re = re.compile(r"const\s+([A-Z][A-Z0-9_]*)\s*:\s*&\s*(?:'static\s+)?str\s*=\s*\"([^\"]+)\"")
+consts = {}
+for path in files:
+    for name, value in const_re.findall(path.read_text(encoding="utf-8")):
+        consts[name] = value
+
+# Resolve the FIRST argument of EVERY `.route(...)` mount: a string literal is taken
+# verbatim; a bare/pathed SCREAMING_SNAKE const is resolved through the const map above.
+# Anything else (a computed or unknown path, or a const we cannot resolve) is UNRESOLVED
+# and FAILS the scan with its file:line, so a const/computed route can never again evade
+# this inventory (the systemic hardening: the scan cannot silently miss a mounted route).
+ident_re = re.compile(r"(?:[A-Za-z_]\w*::)*([A-Z][A-Z0-9_]*)")
 routes = set()
-for path in sorted(src.rglob("*.rs")):
+unresolved = []
+for path in files:
     text = path.read_text(encoding="utf-8")
-    routes.update(re.findall(r'\.route\(\s*"([^"]+)"', text))
+    for m in re.finditer(r"\.route\(", text):
+        i, n = m.end(), len(text)
+        while i < n and text[i] in " \t\r\n":
+            i += 1
+        if i >= n or text[i] == ")":
+            # `.route()` with no argument is a doc/comment reference, not a real mount.
+            continue
+        if text[i] == '"':
+            j = text.find('"', i + 1)
+            if j != -1:
+                routes.add(text[i + 1 : j])
+            continue
+        im = ident_re.match(text, i)
+        if im and im.group(1) in consts:
+            routes.add(consts[im.group(1)])
+            continue
+        line = text.count("\n", 0, m.start()) + 1
+        snippet = text[i : i + 48].splitlines()[0]
+        unresolved.append(
+            f"{path}:{line}: .route() path `{snippet}` is not a string literal or a "
+            "resolvable path const"
+        )
+
+if unresolved:
+    sys.stderr.write(
+        "rfc9700-scan: a .route() mounts a non-literal, unresolvable path (a const or "
+        "computed route path must be a string literal or a resolvable `const NAME: &str` "
+        "path const, so it cannot silently evade the endpoint inventory):\n"
+    )
+    for item in unresolved:
+        sys.stderr.write("  " + item + "\n")
+    sys.exit(1)
+
 header = (
     "# RFC 9700 endpoint inventory (generated)\n"
     "#\n"

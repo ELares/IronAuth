@@ -767,6 +767,7 @@
             "ip_denylist": [],
             "ip_reputation_enabled": true,
             "new_device_enabled": true,
+            "notify_cooldown_secs": 3600,
             "notify_on_new_device": true,
             "require_mfa_at": "off",
             "velocity_enabled": true,
@@ -1367,7 +1368,7 @@
       "properties": {
         "block_on_high": {
           "default": true,
-          "description": "Whether a hard-deny HIGH score BLOCKS the login with a uniform, anti-enumeration\nfailure (issue #79): an IP deny-list hit or a velocity flood. On by default. When\noff, a would-be block degrades to a challenge. A block is indistinguishable from an\nordinary login failure (reusing the #64 uniformity discipline).",
+          "description": "Whether a hard-deny HIGH score BLOCKS the login with a uniform, anti-enumeration\nfailure (issue #79). ONLY an explicit IP deny-list hit is a hard deny (a block);\nevery other signal, including a VELOCITY flood, raises the score (and can force\nstep-up via `require_mfa_at`) but NEVER blocks, so a shared NAT or ASN cannot become\na victim lockout. On by default. When off, a would-be block degrades to a challenge.\nA block is indistinguishable from an ordinary login failure (reusing the #64\nuniformity discipline).",
           "type": "boolean"
         },
         "disavowal_ttl_secs": {
@@ -1420,6 +1421,13 @@
           "description": "Whether the NEW-DEVICE signal is evaluated (issue #79): a login from a device with\nno valid trusted-device row (the #71 signed cookie / `trusted_devices` state) is a\nnew device. On by default (consulted only when `enabled`). Drives the new-device\nnotification and contributes MED to the score.",
           "type": "boolean"
         },
+        "notify_cooldown_secs": {
+          "default": 3600,
+          "description": "The cooldown window, in seconds, over which repeated new-device notifications to the\nSAME (subject, device/User-Agent fingerprint) are SUPPRESSED (issue #79). At most one\nnew-device notice (and one minted \"this wasn't me\" token) is sent per new device per\nwindow, so an attacker WITH valid credentials who logs in repeatedly WITHOUT the\nremember-device cookie (each read as a new device) cannot flood the victim's inbox or\naccumulate unbounded disavowal-token rows. Reuses the #64 counter layer. Default 3600\n(one hour). 0 disables the throttle (every new device notifies).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
         "notify_on_new_device": {
           "default": true,
           "description": "Whether a new-device (or new-location) login sends the user a notification (issue\n#79) with the device, User-Agent, and geo context plus the single-use \"this wasn't\nme\" link. On by default (consulted only when `new_device_enabled`). The delivery\nuses the #68 `VerificationSender` seam (the default sender performs no delivery).",
@@ -1427,7 +1435,7 @@
         },
         "require_mfa_at": {
           "default": "off",
-          "description": "The risk-score threshold at or above which the authentication policy forces step-up\n(issue #79): one of `off` (never), `low`, `med`, or `high`. The canonical\n\"require MFA at MED or above\" is `med`: a MED-or-stronger score raises the effective\nrequirement so the step-up gate (issue #72) challenges a second factor, while a LOW\nscore does not. Default `off`.",
+          "description": "The risk-score threshold at or above which the authentication policy forces step-up\n(issue #79): one of `off` (never), `low`, `med`, or `high`. The canonical\n\"require MFA at MED or above\" is `med`: a MED-or-stronger score raises the effective\nrequirement so the step-up gate (issue #72) challenges a second factor, while a LOW\nscore does not. Default `off`.\n\nNOTE (enforcement): with `require_mfa_at=\"off\"` and no IP deny-list configured,\nenabling the engine does NOTHING enforcement-wise for a non-deny HIGH score (a new\ndevice, impossible travel, a velocity flood, or a provider \"suspect\" verdict): such a\nscore only Allows or Notifies. To actually ENFORCE on risk, set `require_mfa_at` to\n`low`/`med`/`high` (so a qualifying score forces step-up) and/or populate the IP\ndeny-list (a deny-list hit hard-blocks when `block_on_high`).",
           "type": "string"
         },
         "velocity_enabled": {
@@ -1814,6 +1822,7 @@
           "ip_denylist": [],
           "ip_reputation_enabled": true,
           "new_device_enabled": true,
+          "notify_cooldown_secs": 3600,
           "notify_on_new_device": true,
           "require_mfa_at": "off",
           "velocity_enabled": true,

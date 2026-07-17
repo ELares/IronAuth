@@ -31,6 +31,23 @@ range per docs/RELEASING.md.
   and uniform. The engine runs COMPLETE with zero IronCache and zero third-party services
   (the null-provider default path). Providers install via `OidcState::with_geoip_provider`
   / `with_ip_reputation_provider`.
+- Adversarial-review hardening (issue #79): the `GET /risk/disavow` confirmation page now
+  HTML-escapes the reflected `token` query parameter before interpolating it into the
+  hidden-field attribute (closing a reflected XSS: a `token` of `"><script>...` is
+  neutralized), and both the disavow GET and the POST result page now serve through the
+  shared `pages::secure_html` seam, so they carry the SAME strict hosted-page hardening
+  headers as every other page (CSP `default-src 'none'`/`form-action 'self'`/`frame-ancestors
+  'none'`, X-Frame-Options DENY, nosniff, no-store, same-origin referrer). A blocked
+  (deny-listed) login now records its risk decision OFF the synchronous response path (a
+  detached spawn, like the on-login breach screen), so a block is timing-uniform with an
+  ordinary wrong-password failure and leaks neither the block nor password validity to the
+  deny-listed client (the decision/audit row is still written). New-device notifications are
+  now deduped per (subject, device/User-Agent fingerprint) over `oidc.risk.notify_cooldown_secs`
+  (reusing the #64 counter layer), bounding a repeated-new-device notification flood to at
+  most one notice (and one minted disavowal token) per new device per window. The audit
+  `risk.decision` detail now also carries a compact PII-free enumerated signal summary
+  (signal kinds + levels), so a decision is reconstructable from the audit trail alone even
+  if the `risk_decisions` row is pruned.
 - Trusted devices (remember-device 2FA) and the conditional-credential skip (issue #71),
   off by default behind `oidc.trusted_devices_enabled`. After a COMPLETED multi-factor
   login the `POST /login/mfa` path may plant a `__Host-ironauth_trusted_device` cookie

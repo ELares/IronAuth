@@ -6,8 +6,10 @@
 //! three-level score (LOW/MED/HIGH) through a DOCUMENTED, DETERMINISTIC combination rule,
 //! and a three-verb action vocabulary (block/challenge/notify) dispatches the outcome.
 //! Every decision is TRACEABLE and AUDITABLE: the emitted [`RiskDecision`] enumerates each
-//! contributing signal with its typed value, and the same enumeration is persisted and
-//! written to the audit log, so a sampled decision is fully reconstructable.
+//! contributing signal with its typed value, the full enumeration is persisted on the
+//! append-only `risk_decisions` row, and the audit log carries the score, the action, AND
+//! a compact enumerated signal summary (signal kinds plus levels, PII-free), so a sampled
+//! decision is fully reconstructable from the audit trail alone even if the row is pruned.
 //!
 //! # Signals (each independently toggleable per environment)
 //!
@@ -31,7 +33,7 @@
 
 use std::net::IpAddr;
 
-use axum::http::HeaderMap;
+use axum::http::{HeaderMap, StatusCode};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use ironauth_store::{
@@ -432,6 +434,24 @@ impl RiskDecision {
         })
         .to_string()
     }
+
+    /// A COMPACT, PII-free enumerated signal summary for the audit detail (issue #79): the
+    /// `kind:level` pair for each contributing signal, joined by commas (for example
+    /// `new_device:med,velocity:med`), so the audit row alone explains WHY the decision was
+    /// reached even if the append-only `risk_decisions` row is later pruned. It carries only
+    /// signal kinds and levels (never the raw IP, geo, or velocity counts), so it is
+    /// operator-safe. An empty set yields `none`.
+    #[must_use]
+    pub fn signals_summary(&self) -> String {
+        if self.outcomes.is_empty() {
+            return "none".to_owned();
+        }
+        self.outcomes
+            .iter()
+            .map(|outcome| format!("{}:{}", outcome.name, outcome.level.as_str()))
+            .collect::<Vec<_>>()
+            .join(",")
+    }
 }
 
 // ===========================================================================
@@ -763,6 +783,7 @@ pub(crate) async fn record_decision(
     decision: &RiskDecision,
 ) -> Option<String> {
     let signals_json = decision.signals_json();
+    let signals_summary = decision.signals_summary();
     let actor = crate::interaction::user_actor(subject);
     state
         .store()
@@ -776,12 +797,37 @@ pub(crate) async fn record_decision(
                 score: decision.level.as_str(),
                 action: decision.action.as_str(),
                 signals_json: &signals_json,
+                signals_summary: &signals_summary,
                 correlation_id: None,
             },
         )
         .await
         .ok()
         .map(|id| id.to_string())
+}
+
+/// RECORD a risk decision OFF the synchronous response path (issue #79): spawn the
+/// `record_decision` write (a `risk_decisions` INSERT plus an audit INSERT) DETACHED on the
+/// runtime, exactly like `screen_after_login` spawns the breach screen. This keeps the
+/// BLOCK branch of the login path timing-uniform with an ordinary wrong-password return: a
+/// blocked (deny-listed) correct-password attempt returns the SAME uniform failure doing NO
+/// more synchronous work than a wrong password, so a block is not distinguishable from an
+/// ordinary failure by latency, and password validity is not leaked to the deny-listed
+/// client. The decision/audit row is STILL written (both tables are append-only), just not
+/// awaited on the response path. Fire-and-forget: a dropped task simply means this one
+/// blocked attempt was not persisted, which never affects the (already-refused) login.
+pub(crate) fn record_decision_detached(
+    state: &OidcState,
+    scope: Scope,
+    subject: &UserId,
+    decision: &RiskDecision,
+) {
+    let state = state.clone();
+    let subject = *subject;
+    let decision = decision.clone();
+    tokio::spawn(async move {
+        let _ = record_decision(&state, scope, &subject, &decision).await;
+    });
 }
 
 /// REFRESH the subject's last-seen login geo (issue #79) so the NEXT login can compute
@@ -841,7 +887,10 @@ pub(crate) async fn after_successful_login(
     recipient: &str,
 ) {
     let decision_id = record_decision(state, scope, subject, decision).await;
-    if decision.new_device_fired && state.risk_config().notify_on_new_device {
+    if decision.new_device_fired
+        && state.risk_config().notify_on_new_device
+        && !notify_suppressed(state, subject, ctx.user_agent)
+    {
         if let Some(token) =
             mint_disavowal_token(state, scope, subject, &[], decision_id.as_deref()).await
         {
@@ -858,6 +907,50 @@ pub(crate) async fn after_successful_login(
         }
     }
     record_login_geo(state, scope, subject, ctx).await;
+}
+
+/// A compact, PII-free fingerprint of the login device for the notification throttle
+/// (issue #79): the first 64 bits of the SHA-256 of the observed User-Agent, hex-encoded.
+/// It is a coarse device key, NOT the raw User-Agent, so the throttle counter key carries
+/// no plaintext PII.
+fn notify_device_fingerprint(user_agent: &str) -> String {
+    let digest = Sha256::digest(user_agent.as_bytes());
+    let mut out = String::with_capacity(16);
+    for byte in &digest[..8] {
+        use std::fmt::Write as _;
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
+}
+
+/// The per-(subject, device) new-device NOTIFICATION throttle key (issue #79).
+fn notify_throttle_key(subject: &UserId, fingerprint: &str) -> String {
+    format!("risk:notify:{subject}:{fingerprint}")
+}
+
+/// Whether a new-device notification to `subject` from this device should be SUPPRESSED
+/// (issue #79): reuse the #64 [`crate::abuse::CounterStore`] layer as a short cooldown
+/// window keyed on the (subject, device/UA fingerprint). The FIRST notification in a
+/// `notify_cooldown_secs` window is delivered (the count rolls to 1); a repeated new-device
+/// login for the SAME (subject, device) within the window is suppressed (count > 1), so an
+/// attacker WITH valid credentials who logs in repeatedly WITHOUT the remember-device cookie
+/// (each read as a new device) cannot flood the victim's inbox or accumulate unbounded
+/// `risk_disavowal_tokens` rows: at most one notice (and one minted token) per new device
+/// per cooldown. A `notify_cooldown_secs` of 0 disables the throttle (every new device
+/// notifies). A counter-store fault fails OPEN (delivers), so a transient fault never
+/// silently swallows a genuine new-device alert.
+fn notify_suppressed(state: &OidcState, subject: &UserId, user_agent: &str) -> bool {
+    let window = state.risk_config().notify_cooldown_secs;
+    if window == 0 {
+        return false;
+    }
+    let fingerprint = notify_device_fingerprint(user_agent);
+    let key = notify_throttle_key(subject, &fingerprint);
+    let now = epoch_micros(state.now());
+    match state.risk_counters().incr(&key, window, now) {
+        Ok(count) => count > 1,
+        Err(_) => false,
+    }
 }
 
 /// The number of random bytes in a disavowal-token secret (issue #79): 256 bits, out of
@@ -1055,9 +1148,14 @@ pub(crate) async fn disavow_get(
     axum::extract::State(_state): axum::extract::State<OidcState>,
     axum::extract::Query(query): axum::extract::Query<DisavowQuery>,
 ) -> axum::response::Response {
-    use axum::response::IntoResponse as _;
     let token = query.token.unwrap_or_default();
-    axum::response::Html(confirm_page(&token)).into_response()
+    // Serve the SAME strict hardening header set (`default-src 'none'`, `form-action
+    // 'self'`, `frame-ancestors 'none'`, X-Frame-Options DENY, nosniff, no-store,
+    // same-origin referrer) every other hosted page carries, via the single `secure_html`
+    // seam; the attacker-controlled `token` is HTML-escaped by `confirm_page` before it is
+    // interpolated, so a `token` of `"><script>...` cannot break out of the attribute and
+    // execute in the IronAuth origin.
+    crate::pages::secure_html(StatusCode::OK, confirm_page(&token))
 }
 
 /// POST the "this wasn't me" execution (issue #79): consume the single-use token, revoke
@@ -1068,7 +1166,6 @@ pub(crate) async fn disavow_post(
     headers: HeaderMap,
     axum::extract::Form(form): axum::extract::Form<DisavowForm>,
 ) -> axum::response::Response {
-    use axum::response::IntoResponse as _;
     // A same-origin guard mirroring the login POST: a conclusively cross-site POST is
     // refused, so the destructive consume cannot be driven by a cross-site auto-submit.
     if !crate::interaction::same_origin_ok(&headers, state.self_origin().as_deref()) {
@@ -1085,12 +1182,19 @@ pub(crate) async fn disavow_post(
             "this-wasn't-me disavowal consumed"
         );
     }
-    axum::response::Html(done_page()).into_response()
+    // The uniform completion page under the SAME strict hardening headers as every other
+    // hosted page (via `secure_html`).
+    crate::pages::secure_html(StatusCode::OK, done_page())
 }
 
 /// The confirmation page HTML (issue #79): a minimal, script-free page with a POST form
-/// carrying the token, so consuming the token is an explicit user action.
+/// carrying the token, so consuming the token is an explicit user action. The
+/// attacker-controlled `token` (a query parameter reflected into a double-quoted attribute)
+/// is HTML-escaped through [`crate::pages::escape_html`] FIRST, so a value like
+/// `"><script>...` is neutralized (no attribute breakout, no reflected XSS); the escaping
+/// is lossless for a real base64url token, so a genuine token still round-trips to the POST.
 fn confirm_page(token: &str) -> String {
+    let token = crate::pages::escape_html(token);
     format!(
         "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
          <title>Secure your account</title></head><body>\
@@ -1433,6 +1537,62 @@ mod tests {
         assert_eq!(
             NullIpReputationProvider.reputation("8.8.8.8"),
             IpReputation::Neutral
+        );
+    }
+
+    #[test]
+    fn the_confirm_page_neutralizes_a_breakout_token() {
+        // A crafted token that tries to break out of the value="..." attribute and inject a
+        // <script> is HTML-escaped, so no attribute breakout and no raw script survive in
+        // the rendered page (the HIGH-1 reflected-XSS fix).
+        let hostile = "\"><script>alert(1)</script>";
+        let page = confirm_page(hostile);
+        assert!(
+            !page.contains("<script>"),
+            "the raw script tag must not survive: {page}"
+        );
+        assert!(
+            !page.contains("value=\"\"><script>"),
+            "the token must not break out of the attribute: {page}"
+        );
+        // The escaped entities are present instead.
+        assert!(
+            page.contains("&lt;script&gt;") && page.contains("&quot;&gt;"),
+            "the token is escaped into entities: {page}"
+        );
+    }
+
+    #[test]
+    fn the_signals_summary_is_a_compact_pii_free_kind_level_list() {
+        let decision = RiskDecision {
+            level: RiskLevel::High,
+            action: RiskAction::Challenge,
+            outcomes: vec![
+                outcome("new_device", RiskLevel::Med, false),
+                outcome("velocity", RiskLevel::Med, false),
+            ],
+            new_device_fired: true,
+        };
+        assert_eq!(decision.signals_summary(), "new_device:med,velocity:med");
+        // An empty signal set is a legible sentinel, never a blank string.
+        let empty = RiskDecision {
+            level: RiskLevel::Low,
+            action: RiskAction::Allow,
+            outcomes: Vec::new(),
+            new_device_fired: false,
+        };
+        assert_eq!(empty.signals_summary(), "none");
+    }
+
+    #[test]
+    fn the_notify_fingerprint_is_stable_and_not_the_raw_user_agent() {
+        let a = notify_device_fingerprint("Mozilla/5.0 (device A)");
+        let b = notify_device_fingerprint("Mozilla/5.0 (device B)");
+        assert_eq!(a, notify_device_fingerprint("Mozilla/5.0 (device A)"));
+        assert_ne!(a, b, "distinct devices get distinct fingerprints");
+        assert!(
+            !a.contains("Mozilla"),
+            "the fingerprint carries no raw User-Agent: {a}"
         );
     }
 

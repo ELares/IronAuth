@@ -21,6 +21,13 @@ range per docs/RELEASING.md.
   `scripts/query-audit.sh`. `record_decision`, `issue_disavowal`, and `consume_disavowal`
   are audited; `consume_disavowal` atomically claims the single-use token and revokes the
   named sessions (or all of the subject's, signing out everywhere).
+- Adversarial-review hardening (issue #79): `NewRiskDecision` gains a `signals_summary`
+  field, and `record_decision` now writes a compact, operator-safe enumerated signal
+  summary (`signals=[kind:level,...]`, PII-free) into the `risk.decision` audit detail
+  alongside the score and action, so a sampled decision is reconstructable from the audit
+  trail ALONE even if the append-only `risk_decisions` row is pruned (both tables are
+  append-only). The migration 0054 comment is corrected to describe this (previously it
+  claimed the full signal set was in the audit row). Migration count unchanged (54).
 - Trusted devices (issue #71): migration 0053 adds the tenant-scoped, forced-RLS
   `trusted_devices` table (the SHA-256 DIGEST of the cookie secret as server-side state,
   the subject + `ses_` session-lineage binding, the SEALED User-Agent and coarse geo, the

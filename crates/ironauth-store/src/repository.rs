@@ -17523,7 +17523,13 @@ impl ActingRiskRepo<'_> {
         let id = RiskDecisionId::generate(env, &scope);
         let id_text = id.to_string();
         let subject_text = subject.to_string();
-        let detail = format!("score={} action={}", decision.score, decision.action);
+        // The audit detail carries the score, the action, AND the compact enumerated signal
+        // summary (signal kinds + levels, PII-free), so a sampled decision is reconstructable
+        // from the audit trail alone even if the append-only risk_decisions row is pruned.
+        let detail = format!(
+            "score={} action={} signals=[{}]",
+            decision.score, decision.action, decision.signals_summary
+        );
         write_audited_detailed(
             AuditedWrite {
                 store: self.store,

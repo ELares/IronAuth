@@ -25,9 +25,10 @@
 --     enumerated contributing signals with their typed values in a jsonb document, so
 --     a sampled decision is fully RECONSTRUCTABLE. The record carries NO plaintext PII:
 --     only derived signal names, booleans, enums, and counts (never the raw IP, the
---     raw location, or the User-Agent). The same enumeration is written to the audit
---     log (Action::RiskDecisionRecord), so the decision is reconstructable from the
---     audit trail alone even if the row is pruned.
+--     raw location, or the User-Agent). The audit log (Action::RiskDecisionRecord)
+--     carries the score, the action, AND a compact enumerated signal summary (the signal
+--     kinds plus levels, PII-free), so the decision is reconstructable from the audit
+--     trail alone even if this row is pruned (both tables are append-only).
 --
 --   risk_disavowal_tokens: one row per "this wasn't me" token planted in a new-device
 --     notification. Only the SHA-256 DIGEST of the high-entropy single-use token is

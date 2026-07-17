@@ -1961,12 +1961,22 @@ pub struct RiskConfig {
     /// "require MFA at MED or above" is `med`: a MED-or-stronger score raises the effective
     /// requirement so the step-up gate (issue #72) challenges a second factor, while a LOW
     /// score does not. Default `off`.
+    ///
+    /// NOTE (enforcement): with `require_mfa_at="off"` and no IP deny-list configured,
+    /// enabling the engine does NOTHING enforcement-wise for a non-deny HIGH score (a new
+    /// device, impossible travel, a velocity flood, or a provider "suspect" verdict): such a
+    /// score only Allows or Notifies. To actually ENFORCE on risk, set `require_mfa_at` to
+    /// `low`/`med`/`high` (so a qualifying score forces step-up) and/or populate the IP
+    /// deny-list (a deny-list hit hard-blocks when `block_on_high`).
     pub require_mfa_at: String,
 
     /// Whether a hard-deny HIGH score BLOCKS the login with a uniform, anti-enumeration
-    /// failure (issue #79): an IP deny-list hit or a velocity flood. On by default. When
-    /// off, a would-be block degrades to a challenge. A block is indistinguishable from an
-    /// ordinary login failure (reusing the #64 uniformity discipline).
+    /// failure (issue #79). ONLY an explicit IP deny-list hit is a hard deny (a block);
+    /// every other signal, including a VELOCITY flood, raises the score (and can force
+    /// step-up via `require_mfa_at`) but NEVER blocks, so a shared NAT or ASN cannot become
+    /// a victim lockout. On by default. When off, a would-be block degrades to a challenge.
+    /// A block is indistinguishable from an ordinary login failure (reusing the #64
+    /// uniformity discipline).
     pub block_on_high: bool,
 
     /// Whether a new-device (or new-location) login sends the user a notification (issue
@@ -1974,6 +1984,15 @@ pub struct RiskConfig {
     /// me" link. On by default (consulted only when `new_device_enabled`). The delivery
     /// uses the #68 `VerificationSender` seam (the default sender performs no delivery).
     pub notify_on_new_device: bool,
+
+    /// The cooldown window, in seconds, over which repeated new-device notifications to the
+    /// SAME (subject, device/User-Agent fingerprint) are SUPPRESSED (issue #79). At most one
+    /// new-device notice (and one minted "this wasn't me" token) is sent per new device per
+    /// window, so an attacker WITH valid credentials who logs in repeatedly WITHOUT the
+    /// remember-device cookie (each read as a new device) cannot flood the victim's inbox or
+    /// accumulate unbounded disavowal-token rows. Reuses the #64 counter layer. Default 3600
+    /// (one hour). 0 disables the throttle (every new device notifies).
+    pub notify_cooldown_secs: u64,
 
     /// The fixed window, in seconds, over which the velocity signal counts attempts per
     /// dimension (issue #79). Default 300 (five minutes). Must be at least 1 and at most
@@ -2020,6 +2039,7 @@ impl Default for RiskConfig {
             require_mfa_at: "off".to_owned(),
             block_on_high: true,
             notify_on_new_device: true,
+            notify_cooldown_secs: 3600,
             velocity_window_secs: 300,
             velocity_med_threshold: 10,
             velocity_high_threshold: 30,
@@ -2846,6 +2866,15 @@ fn validate_risk(oidc: &OidcConfig) -> Result<(), ConfigError> {
                 "oidc.risk.velocity_window_secs ({}) must be between 1 and \
                  {OIDC_MAX_LIFETIME_SECS} seconds",
                 risk.velocity_window_secs
+            ),
+        });
+    }
+    if risk.notify_cooldown_secs > OIDC_MAX_LIFETIME_SECS {
+        return Err(ConfigError::Invalid {
+            message: format!(
+                "oidc.risk.notify_cooldown_secs ({}) must be at most \
+                 {OIDC_MAX_LIFETIME_SECS} seconds (0 disables the throttle)",
+                risk.notify_cooldown_secs
             ),
         });
     }
