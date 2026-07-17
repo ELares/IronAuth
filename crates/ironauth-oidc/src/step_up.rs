@@ -281,7 +281,7 @@ pub(crate) async fn requirement_for_request(
     requested_scope: Option<&str>,
     acr_values: Option<&str>,
     max_age_secs: Option<u64>,
-) -> (AuthnRequirement, bool) {
+) -> RequirementForRequest {
     let order = state.acr_order();
     // The request `acr_values` is a VOLUNTARY preference (OIDC Core 3.1.2.1): an
     // UNACHIEVABLE requested value (no method can ever reach it) is best-effort and
@@ -339,15 +339,27 @@ pub(crate) async fn requirement_for_request(
             Err(_) => policy_read_faulted = true,
         }
     }
-    // The credential-class floor (issue #66): the tenant's minimum-credential-class
-    // ladder folds into the SAME requirement as an acr floor, so the one step-up gate
-    // enforces it and steers an under-class session to the right remediation (a plain
-    // password login that yields `pwd` cannot satisfy a `passkey` class floor, so the
-    // gate routes to the passkey ceremony; an `attested_passkey` floor is unranked
-    // while the rung is dormant, so it fails closed). The token acr still derives from
-    // the SATISFIED class (the frozen event), never from this floor. A read fault here
-    // is surfaced on the same flag so the token/refresh path can fail closed.
+    // The credential-class floor (issue #66) composes with the acr floors above, but
+    // the MFA rung is handled DISTINCTLY from the stronger passkey rungs so the
+    // conditional-credential skip (issue #71) can gate on a GENUINE second factor:
+    //
+    // - a `Passkey`/`AttestedPasskey` class floor folds into the acr requirement here,
+    //   exactly as before (a plain password session cannot satisfy a `passkey` floor, so
+    //   the gate routes to the passkey ceremony; a trusted device never satisfies it);
+    // - an `Mfa` class floor (the tenant's BASELINE MFA requirement) is returned as a
+    //   SEPARATE `mfa_baseline_required` flag rather than an `mfa` acr floor, because the
+    //   acr ladder ranks a phishing-resistant `phr` ABOVE `mfa` and so would let a
+    //   PRESENCE-ONLY (non-UV) passkey satisfy it. The caller instead requires a GENUINE
+    //   second factor (issue #71 `performed_second_factor`: a real TOTP/recovery code or
+    //   a USER-VERIFIED passkey), OR a valid remembered-device cookie, so a non-UV passkey
+    //   does NOT get the skip and a remembered device does. The token acr still derives
+    //   from the frozen event, never from this floor.
+    //
+    // A read fault here is surfaced on the same flag so the token/refresh path can fail
+    // closed.
+    let mut mfa_baseline_required = false;
     match credential_class_floor(state, scope).await {
+        Ok(Some(authn::CredentialClass::Mfa)) => mfa_baseline_required = true,
         Ok(Some(class)) => {
             requirement.merge_stronger(
                 &AuthnRequirement {
@@ -360,7 +372,27 @@ pub(crate) async fn requirement_for_request(
         Ok(None) => {}
         Err(()) => policy_read_faulted = true,
     }
-    (requirement, policy_read_faulted)
+    RequirementForRequest {
+        requirement,
+        mfa_baseline_required,
+        policy_read_faulted,
+    }
+}
+
+/// The assembled authentication requirement for a request (issue #72, extended by issue
+/// #71): the merged acr/max-age `requirement` (the request, client, per-scope, essential
+/// and passkey/attested credential-class floors), the `mfa_baseline_required` flag (the
+/// tenant's baseline MFA credential-class floor, which the conditional-credential skip
+/// and remembered devices compose with), and `policy_read_faulted` (a per-scope or
+/// credential-class policy read hit a store fault, so the token/refresh path fails
+/// closed).
+pub(crate) struct RequirementForRequest {
+    /// The merged acr/max-age requirement (NOT including the tenant baseline MFA floor).
+    pub requirement: AuthnRequirement,
+    /// Whether the tenant's baseline credential-class MFA floor applies.
+    pub mfa_baseline_required: bool,
+    /// Whether a policy read faulted (the token/refresh path fails closed on this).
+    pub policy_read_faulted: bool,
 }
 
 /// The required credential class for a scope (issue #66): the strictest-wins
@@ -515,6 +547,7 @@ mod tests {
     use super::*;
 
     const PWD: &str = "urn:ironauth:acr:pwd";
+    const MFA_REMEMBERED: &str = "urn:ironauth:acr:mfa_remembered";
     const MFA: &str = "urn:ironauth:acr:mfa";
     const PHR: &str = "phr";
     const PHRH: &str = "phrh";
@@ -527,7 +560,36 @@ mod tests {
     fn default_order_is_the_credential_ladder() {
         // PR B (issue #66) ranks the attested_passkey acr at the TOP (strongest), so
         // strictest-wins composition of an attested floor with any ranked floor is exact.
-        assert_eq!(default_acr_order(), vec![PWD, MFA, PHR, PHRH, ATTESTED]);
+        assert_eq!(
+            default_acr_order(),
+            vec![PWD, MFA_REMEMBERED, MFA, PHR, PHRH, ATTESTED]
+        );
+        // Issue #71: the remembered-device acr ranks BELOW genuine mfa, so a remembered
+        // device NEVER satisfies an explicit mfa step-up floor (step-up overrides).
+        assert!(!acr_satisfies(MFA_REMEMBERED, MFA, &default_acr_order()));
+        // But it outranks a bare password, so it satisfies a weaker pwd floor.
+        assert!(acr_satisfies(MFA_REMEMBERED, PWD, &default_acr_order()));
+    }
+
+    #[test]
+    fn config_default_matches_the_canonical_ladder() {
+        // The shipped config default (`OidcConfig::acr_order`) MUST equal the canonical
+        // code order (issues #66/#71/#72). Pinning them together means a future acr rung
+        // added to `AuthMethod::ALL` cannot silently drift out of the default config,
+        // leaving a level unranked at runtime (which fails closed and spuriously blocks a
+        // legitimate login).
+        assert_eq!(
+            ironauth_config::OidcConfig::default().acr_order,
+            default_acr_order()
+        );
+        // And the config crate's exported canonical list is the same order.
+        assert_eq!(
+            ironauth_config::OIDC_DEFAULT_ACR_ORDER
+                .iter()
+                .map(|acr| (*acr).to_owned())
+                .collect::<Vec<_>>(),
+            default_acr_order()
+        );
     }
 
     #[test]

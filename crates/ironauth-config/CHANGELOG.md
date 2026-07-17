@@ -6,6 +6,26 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Remember-device (trusted-device) policy for issue #71, off by default: the
+  `oidc.trusted_devices_enabled` toggle, the `oidc.trusted_device_user_opt_in` choice
+  (user checkbox vs the tenant decides), the `oidc.trusted_device_max_age_secs` absolute
+  cap (bounded to 3600..=2592000, the NIST SP 800-63B 30-day reauthentication ceiling,
+  default 30 days), the `oidc.trusted_device_idle_secs` idle window (at least one hour and
+  never wider than the max age, default 7 days), and the
+  `oidc.trusted_device_revoke_on_password_change` invalidation policy (default on). The
+  duration bounds are validated at load even when the feature is off, so an out-of-band
+  value cannot take effect the moment it is enabled.
+- Review fix (issue #71): the shipped `oidc.acr_order` default now matches the canonical
+  code ladder `OIDC_DEFAULT_ACR_ORDER` (`pwd`, `mfa_remembered`, `mfa`, `phr`, `phrh`,
+  `attested_passkey`), deriving the default from a single source of truth so a new acr
+  rung cannot silently drift out of the default; a pinning test in the oidc crate asserts
+  the config default equals `step_up::default_acr_order()`. This also repairs a
+  pre-existing #66 gap where `attested_passkey` was unranked under the default config
+  (an attested login could not satisfy a lower floor by rank). A non-empty operator
+  override is now validated at load to be a PERMUTATION of the known rungs (no unknown
+  value, no duplicate, nothing left unranked) and to keep `mfa_remembered` STRICTLY below
+  `mfa`, closing the honesty footgun where a remembered device could satisfy a genuine
+  `mfa` floor.
 - Two EXPLORATORY per-environment feature flags for issue #73, both default OFF and
   independently toggleable: `oidc.webauthn_signal_api_enabled` (the WebAuthn L3 Signal API
   hosted-page surface) plus its `oidc.webauthn_conditional_create_enabled` policy and

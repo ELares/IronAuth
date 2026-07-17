@@ -36,6 +36,9 @@
 /t/{tenant_id}/e/{environment_id}/account/sessions
 /t/{tenant_id}/e/{environment_id}/account/sessions/revoke
 /t/{tenant_id}/e/{environment_id}/account/sessions/revoke-others
+/t/{tenant_id}/e/{environment_id}/account/trusted-devices
+/t/{tenant_id}/e/{environment_id}/account/trusted-devices/revoke
+/t/{tenant_id}/e/{environment_id}/account/trusted-devices/revoke-all
 /t/{tenant_id}/e/{environment_id}/connect/register
 /t/{tenant_id}/e/{environment_id}/connect/register/{client_id}
 /t/{tenant_id}/e/{environment_id}/device

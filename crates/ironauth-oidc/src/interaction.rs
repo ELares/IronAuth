@@ -669,6 +669,19 @@ pub fn attach_session_cookies(mut response: Response, cookies: &SessionCookies) 
     response
 }
 
+/// Append one additional `Set-Cookie` header value to an already-built response (issue
+/// #71): the remember-device cookie a completed multi-factor login plants alongside the
+/// rotated session cookie, so a subsequent login from this device skips the second
+/// factor. A malformed header value is silently dropped (the remember is best-effort and
+/// never fails the successful login).
+#[must_use]
+pub fn append_set_cookie(mut response: Response, value: &str) -> Response {
+    if let Ok(value) = header::HeaderValue::from_str(value) {
+        response.headers_mut().append(header::SET_COOKIE, value);
+    }
+    response
+}
+
 /// The page shown when an interaction is reached without a usable resume target
 /// (a missing, malformed, or non-local `return_to`). A hardened HTML page, never a
 /// redirect (the value is untrusted).

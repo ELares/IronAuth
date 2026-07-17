@@ -376,11 +376,13 @@
         "acr_order": {
           "default": [
             "urn:ironauth:acr:pwd",
+            "urn:ironauth:acr:mfa_remembered",
             "urn:ironauth:acr:mfa",
             "phr",
-            "phrh"
+            "phrh",
+            "urn:ironauth:acr:attested_passkey"
           ],
-          "description": "The DEPLOYMENT-level `acr` order for step-up comparison (RFC 9470, issue #72),\nweakest first. A step-up requirement's `acr` floor is satisfied when the\nachieved `acr` is the same value or ranks at least as strong under this\norder. The default is the credential-ladder order the provider advertises\n(`urn:ironauth:acr:pwd`, `urn:ironauth:acr:mfa`, `phr`, `phrh`); a deployment\nthat trusts its factors differently (for example ranking a verified TOTP\nabove a synced passkey) reorders them here. An empty list falls back to the\ndefault ladder. Duplicate entries are a boot-time [`ConfigError::Invalid`].\nThis is resolved ONCE from configuration and applied across the deployment;\nper-(tenant, environment) resolution is a future enhancement, consistent with\nhow the other per-environment config is handled.",
+          "description": "The DEPLOYMENT-level `acr` order for step-up comparison (RFC 9470, issue #72),\nweakest first. A step-up requirement's `acr` floor is satisfied when the\nachieved `acr` is the same value or ranks at least as strong under this\norder. The default is the canonical credential-ladder order the provider\nadvertises ([`OIDC_DEFAULT_ACR_ORDER`]: `pwd`, `mfa_remembered`, `mfa`, `phr`,\n`phrh`, `attested_passkey`); a deployment that trusts its factors differently\n(for example ranking a verified TOTP above a synced passkey) reorders them here.\nAn empty list falls back to the default ladder. A non-empty override must be a\nPERMUTATION of the known rungs (no unknown value, no duplicate, nothing left\nunranked) and must keep `mfa_remembered` STRICTLY below `mfa` (a remembered\ndevice must never satisfy a genuine `mfa` floor); any violation is a boot-time\n[`ConfigError::Invalid`].\nThis is resolved ONCE from configuration and applied across the deployment;\nper-(tenant, environment) resolution is a future enhancement, consistent with\nhow the other per-environment config is handled.",
           "items": {
             "type": "string"
           },
@@ -935,6 +937,35 @@
           "format": "uint32",
           "minimum": 0,
           "type": "integer"
+        },
+        "trusted_device_idle_secs": {
+          "default": 604800,
+          "description": "The idle window of a remembered device, in seconds (issue #71): an unused device\nexpires after this, while an actively used one lives to the absolute max age. Must\nbe at least `OIDC_TRUSTED_DEVICE_MIN_IDLE_SECS` (3600) and no greater than\n[`OidcConfig::trusted_device_max_age_secs`] (a boot-time [`ConfigError::Invalid`]\notherwise, since an idle window wider than the absolute cap is meaningless); the\ndefault (604800) is seven days.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "trusted_device_max_age_secs": {
+          "default": 2592000,
+          "description": "The absolute maximum age of a remembered device, in seconds (issue #71): past it\nthe device never skips again and must re-prove a second factor. Bounded to\n`OIDC_TRUSTED_DEVICE_MIN_MAX_AGE_SECS..=OIDC_TRUSTED_DEVICE_MAX_MAX_AGE_SECS`\n(3600..=2592000), so a misconfiguration cannot extend trust indefinitely; the\ndefault (2592000) is the NIST SP 800-63B reauthentication ceiling of 30 days.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "trusted_device_revoke_on_password_change": {
+          "default": true,
+          "description": "Whether a password change or reset INVALIDATES the subject's remembered devices\n(issue #71). On by default: a credential change is a strong signal that trust\nshould be re-established, so every remembered device is revoked server-side. A\ntenant that separates device trust from password lifecycle can turn it off. Only\nconsulted when [`OidcConfig::trusted_devices_enabled`] is on.",
+          "type": "boolean"
+        },
+        "trusted_device_user_opt_in": {
+          "default": true,
+          "description": "Whether the user gets an OPT-IN \"remember this device\" checkbox (issue #71) or the\nTENANT decides. When true (the safer default), the device is remembered only if the\nuser checks the box after a completed multi-factor login; when false, a completed\nmulti-factor login always remembers the device (the tenant's choice). Only\nconsulted when [`OidcConfig::trusted_devices_enabled`] is on.",
+          "type": "boolean"
+        },
+        "trusted_devices_enabled": {
+          "default": false,
+          "description": "Whether the remember-device (trusted-device) feature is enabled (issue #71). OFF\nby default: a tenant opts INTO letting a completed multi-factor login remember the\ndevice so a subsequent login from it skips the second factor (primary\nauthentication is still required). When off, no remember-device cookie is ever\nissued, a presented one is ignored, and the account device list shows no trusted\ndevices, so the feature is fully inert. The skip NEVER satisfies a step-up acr\nfloor (RFC 9470 / issue #72 always overrides a remembered device) or a\npasskey/attested credential-class floor; it only satisfies a tenant's baseline\nMFA requirement.",
+          "type": "boolean"
         },
         "userinfo_cors_origins": {
           "default": [],
@@ -1571,9 +1602,11 @@
         "access_token_ttl_secs": 300,
         "acr_order": [
           "urn:ironauth:acr:pwd",
+          "urn:ironauth:acr:mfa_remembered",
           "urn:ironauth:acr:mfa",
           "phr",
-          "phrh"
+          "phrh",
+          "urn:ironauth:acr:attested_passkey"
         ],
         "authorization_code_ttl_secs": 60,
         "backchannel_logout_enabled": false,
@@ -1680,6 +1713,11 @@
         "totp_issuer": null,
         "totp_period_secs": 30,
         "totp_recovery_code_count": 10,
+        "trusted_device_idle_secs": 604800,
+        "trusted_device_max_age_secs": 2592000,
+        "trusted_device_revoke_on_password_change": true,
+        "trusted_device_user_opt_in": true,
+        "trusted_devices_enabled": false,
         "userinfo_cors_origins": [],
         "webauthn_challenge_ttl_secs": 300,
         "webauthn_clone_detection_block": false,

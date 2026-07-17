@@ -1376,10 +1376,17 @@ pub async fn remove_credential(
         .remove(state.env(), &subject, &id, body.acknowledge_recovery)
         .await;
     match outcome {
-        Ok(CredentialRemoveOutcome::Removed) => json_response(
-            StatusCode::OK,
-            json!({ "id": id.to_string(), "removed": true }),
-        ),
+        Ok(CredentialRemoveOutcome::Removed) => {
+            // Removing a passkey/webauthn factor changes the credential landscape (issue
+            // #71), so invalidate the subject's remembered devices (reason FactorChange):
+            // a replayed device cookie then re-prompts. Best-effort; a no-op when the
+            // trusted-device feature is off.
+            crate::trusted_device::invalidate_on_factor_change(&state, scope, &subject).await;
+            json_response(
+                StatusCode::OK,
+                json!({ "id": id.to_string(), "removed": true }),
+            )
+        }
         Ok(CredentialRemoveOutcome::NotFound) => credential_not_found(),
         Ok(CredentialRemoveOutcome::BlockedLastCredential) => json_response(
             StatusCode::CONFLICT,

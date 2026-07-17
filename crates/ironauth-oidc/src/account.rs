@@ -42,7 +42,7 @@ use axum::response::{IntoResponse, Response};
 use ironauth_store::{
     CorrelationId, CredentialRemoveOutcome, CredentialType, FirstPasswordOutcome,
     PasswordRemovalOutcome, Scope, SessionFleetFilter, SessionId, SessionSummary, StoreError,
-    UserId,
+    TrustedDeviceRevokeReason, UserId,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -304,6 +304,158 @@ pub async fn revoke_other_sessions(
     }
 }
 
+/// `GET /t/{tenant}/e/{environment}/account/trusted-devices`: list the caller's OWN
+/// remembered devices (issue #71), each with its lineage, User-Agent, coarse location,
+/// and created / last-seen / expiry timestamps. Reads ONLY the caller's own devices
+/// (filtered on the authenticated subject), so another user's devices are never listed.
+/// When the feature is disabled the list is empty.
+pub async fn list_trusted_devices(
+    State(state): State<OidcState>,
+    Path((tenant_id, environment_id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Response {
+    let account = match authenticate(&state, &tenant_id, &environment_id, &headers).await {
+        Ok(account) => account,
+        Err(response) => return response,
+    };
+    if !state.trusted_devices_enabled() {
+        return json_response(StatusCode::OK, json!({ "trusted_devices": [] }));
+    }
+    let now_micros = epoch_micros(state.now());
+    let listed = state
+        .store()
+        .scoped(account.scope)
+        .trusted_devices()
+        .list(&account.subject, now_micros, i64::from(u8::MAX), None)
+        .await;
+    let Ok(devices) = listed else {
+        return server_error();
+    };
+    let items: Vec<Value> = devices
+        .iter()
+        .map(|device| {
+            json!({
+                "id": device.id,
+                "session_lineage": device.session_lineage,
+                "user_agent": device.user_agent,
+                "coarse_location": device.coarse_location,
+                "created_at": device.created_at_unix_micros,
+                "last_seen_at": device.last_seen_at_unix_micros,
+                "max_age_expires_at": device.max_age_expires_at_unix_micros,
+                "idle_expires_at": device.idle_expires_at_unix_micros,
+            })
+        })
+        .collect();
+    json_response(StatusCode::OK, json!({ "trusted_devices": items }))
+}
+
+/// The revoke-one-trusted-device request body.
+#[derive(Deserialize)]
+pub struct RevokeTrustedDeviceBody {
+    /// The `tdv_` device id to revoke. Must be one of the caller's OWN devices; any
+    /// other value is the uniform not-found.
+    device_id: String,
+}
+
+/// `POST /t/{tenant}/e/{environment}/account/trusted-devices/revoke`: revoke ONE of the
+/// caller's own remembered devices (issue #71). The device id is bound to the
+/// authenticated subject: another subject's device is the uniform not-found and is never
+/// revoked. Revocation takes effect SERVER-SIDE IMMEDIATELY, so a replayed device cookie
+/// fails the next validation. Audited to the end user.
+pub async fn revoke_trusted_device(
+    State(state): State<OidcState>,
+    Path((tenant_id, environment_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    Json(body): Json<RevokeTrustedDeviceBody>,
+) -> Response {
+    if !interaction::same_origin_ok(&headers, state.self_origin().as_deref()) {
+        return forbidden();
+    }
+    let account = match authenticate(&state, &tenant_id, &environment_id, &headers).await {
+        Ok(account) => account,
+        Err(response) => return response,
+    };
+    // Parse the untrusted id under the caller's OWN scope; a malformed or cross-scope id
+    // is the uniform not-found.
+    let Ok(target) = state
+        .store()
+        .scoped(account.scope)
+        .trusted_devices()
+        .parse_id(&body.device_id)
+    else {
+        return not_found_json();
+    };
+    let actor = interaction::user_actor(&account.subject);
+    let result = state
+        .store()
+        .scoped(account.scope)
+        .acting(actor, CorrelationId::generate(state.env()))
+        .trusted_devices()
+        .self_revoke(
+            state.env(),
+            &account.subject,
+            &target,
+            TrustedDeviceRevokeReason::User,
+        )
+        .await;
+    match result {
+        Ok(flipped) if flipped => json_response(
+            StatusCode::OK,
+            json!({ "device_id": target.to_string(), "revoked": true }),
+        ),
+        // Not found or already revoked: the uniform not-found (never an existence oracle).
+        Ok(_) => not_found_json(),
+        Err(_) => server_error(),
+    }
+}
+
+/// `POST /t/{tenant}/e/{environment}/account/trusted-devices/revoke-all`: revoke EVERY
+/// remembered device of the caller (issue #71): the "forget all my devices" action. A
+/// sensitive operation: it declares the step-up requirement and is audited. Each device
+/// stops skipping the second factor server-side immediately, and the current browser's
+/// remember-device cookie is cleared.
+pub async fn revoke_all_trusted_devices(
+    State(state): State<OidcState>,
+    Path((tenant_id, environment_id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Response {
+    if !interaction::same_origin_ok(&headers, state.self_origin().as_deref()) {
+        return forbidden();
+    }
+    let account = match authenticate(&state, &tenant_id, &environment_id, &headers).await {
+        Ok(account) => account,
+        Err(response) => return response,
+    };
+    let actor = interaction::user_actor(&account.subject);
+    let result = state
+        .store()
+        .scoped(account.scope)
+        .acting(actor, CorrelationId::generate(state.env()))
+        .trusted_devices()
+        .self_revoke_all(
+            state.env(),
+            &account.subject,
+            TrustedDeviceRevokeReason::User,
+        )
+        .await;
+    match result {
+        Ok(revoked) => {
+            let response = json_response(
+                StatusCode::OK,
+                json!({
+                    "devices_revoked": revoked,
+                    "step_up": step_up_status(&state, account.auth_time_unix_micros),
+                }),
+            );
+            // Clear this browser's remember-device cookie too: its server-side row is now
+            // revoked, so the cookie is dead regardless, but clearing it stops the browser
+            // from presenting a value that can never skip again.
+            interaction::append_set_cookie(response, &crate::session::clear_trusted_device_cookie())
+        }
+        Err(_) => server_error(),
+    }
+}
+
 /// `GET /t/{tenant}/e/{environment}/account/credentials`: list the caller's OWN
 /// enrolled credentials (passkeys, TOTP, recovery-code sets) with their metadata.
 /// Filtered on the authenticated subject, so another user's credentials are never
@@ -545,14 +697,26 @@ pub async fn remove_credential(
         )
         .await;
     match result {
-        Ok(CredentialRemoveOutcome::Removed) => json_response(
-            StatusCode::OK,
-            json!({
-                "id": id.to_string(),
-                "removed": true,
-                "step_up": step_up_status(&state, account.auth_time_unix_micros),
-            }),
-        ),
+        Ok(CredentialRemoveOutcome::Removed) => {
+            // Removing an MFA/login factor changes the credential landscape (issue #71),
+            // so invalidate the subject's remembered devices (reason FactorChange). A
+            // replayed device cookie then re-prompts for a second factor. Best-effort; a
+            // no-op when the feature is off.
+            crate::trusted_device::invalidate_on_factor_change(
+                &state,
+                account.scope,
+                &account.subject,
+            )
+            .await;
+            json_response(
+                StatusCode::OK,
+                json!({
+                    "id": id.to_string(),
+                    "removed": true,
+                    "step_up": step_up_status(&state, account.auth_time_unix_micros),
+                }),
+            )
+        }
         Ok(CredentialRemoveOutcome::NotFound) => not_found_json(),
         Ok(CredentialRemoveOutcome::BlockedLastCredential) => json_response(
             StatusCode::CONFLICT,
@@ -723,17 +887,51 @@ pub async fn change_password(
         )
         .await;
     match result {
-        Ok(outcome) => json_response(
-            StatusCode::OK,
-            json!({
-                "changed": true,
-                "other_sessions_revoked": outcome.sessions_revoked,
-                "step_up": step_up_status(&state, account.auth_time_unix_micros),
-            }),
-        ),
+        Ok(outcome) => {
+            // Invalidate the subject's remembered devices on a password change (issue
+            // #71), per tenant policy: a credential change is a strong signal that device
+            // trust should be re-established, so every remembered device is revoked
+            // server-side (a replayed device cookie then fails). Best-effort; it never
+            // fails the successful password change.
+            let devices_revoked = invalidate_trusted_devices_on_password_change(
+                &state,
+                account.scope,
+                &account.subject,
+            )
+            .await;
+            json_response(
+                StatusCode::OK,
+                json!({
+                    "changed": true,
+                    "other_sessions_revoked": outcome.sessions_revoked,
+                    "trusted_devices_revoked": devices_revoked,
+                    "step_up": step_up_status(&state, account.auth_time_unix_micros),
+                }),
+            )
+        }
         Err(StoreError::NotFound) => unauthenticated(),
         Err(_) => server_error(),
     }
+}
+
+/// Invalidate a subject's remembered devices after a password change or reset (issue
+/// #71), gated by the per-tenant `trusted_device_revoke_on_password_change` policy.
+/// Best-effort and returns the number revoked; a disabled feature or policy is a no-op.
+pub(crate) async fn invalidate_trusted_devices_on_password_change(
+    state: &OidcState,
+    scope: Scope,
+    subject: &UserId,
+) -> u64 {
+    if !state.trusted_device_revoke_on_password_change() {
+        return 0;
+    }
+    crate::trusted_device::invalidate_all(
+        state,
+        scope,
+        subject,
+        TrustedDeviceRevokeReason::PasswordChange,
+    )
+    .await
 }
 
 /// Set the FIRST password on a passkey-only account (issue #66, the passkey-only ->
@@ -808,15 +1006,28 @@ async fn set_first_password_flow(
         )
         .await;
     match result {
-        Ok(FirstPasswordOutcome::Set(outcome)) => json_response(
-            StatusCode::OK,
-            json!({
-                "converted": true,
-                "passwordless": false,
-                "other_sessions_revoked": outcome.sessions_revoked,
-                "step_up": step_up_status(state, account.auth_time_unix_micros),
-            }),
-        ),
+        Ok(FirstPasswordOutcome::Set(outcome)) => {
+            // Setting the first password changes the credential landscape exactly as a
+            // password change does (issue #71), so invalidate the subject's remembered
+            // devices through the same seam (reason PasswordChange), per tenant policy.
+            // Best-effort; it never fails the successful conversion.
+            let devices_revoked = invalidate_trusted_devices_on_password_change(
+                state,
+                account.scope,
+                &account.subject,
+            )
+            .await;
+            json_response(
+                StatusCode::OK,
+                json!({
+                    "converted": true,
+                    "passwordless": false,
+                    "other_sessions_revoked": outcome.sessions_revoked,
+                    "trusted_devices_revoked": devices_revoked,
+                    "step_up": step_up_status(state, account.auth_time_unix_micros),
+                }),
+            )
+        }
         // The account gained a password between the branch check and the guarded set: a
         // benign race, reported as a conflict (nothing was clobbered).
         Ok(FirstPasswordOutcome::Ineligible) => json_response(
@@ -957,7 +1168,7 @@ fn session_json(summary: &SessionSummary, current_id: &str) -> Value {
 /// address) are zeroed, so the value can never single out a host, and a richer
 /// geo-IP enrichment is a later, optional layer. A value that does not parse as an IP
 /// yields [`None`] rather than echoing untrusted input.
-fn coarse_location(peer_ip: Option<&str>) -> Option<String> {
+pub(crate) fn coarse_location(peer_ip: Option<&str>) -> Option<String> {
     let raw = peer_ip?.trim();
     if let Ok(v4) = raw.parse::<std::net::Ipv4Addr>() {
         let [a, b, c, _] = v4.octets();

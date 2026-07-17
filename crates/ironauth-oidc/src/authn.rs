@@ -44,6 +44,20 @@ const ACR_PWD: &str = "urn:ironauth:acr:pwd";
 /// assurance level. It sits above the single-factor password ACR and below the
 /// phishing-resistant passkey ACRs (TOTP is a shared secret, not origin-bound).
 const ACR_MFA: &str = "urn:ironauth:acr:mfa";
+/// The IronAuth ACR for a REMEMBERED-DEVICE login (issue #71): a primary factor was
+/// performed THIS login and a trusted-device cookie, bound to server-side state,
+/// ATTESTS that a second factor was performed on a PRIOR login from this same device.
+/// It is deliberately DISTINCT from and WEAKER than [`ACR_MFA`]: a namespaced URN that
+/// says exactly what happened, so a relying party can tell a remembered-device login
+/// (no second factor THIS login) apart from a genuine multi-factor one (a second factor
+/// verified now). It ranks BELOW `mfa` in the default order, which is the honesty and
+/// precedence crux of the whole feature: the trusted device satisfies a tenant's
+/// baseline MFA requirement (so the second factor is skipped) but can NEVER satisfy an
+/// explicit step-up `mfa` acr floor (RFC 9470 / issue #72 ALWAYS overrides a remembered
+/// device), because `acr_satisfies(mfa_remembered, mfa)` is false. The `amr` carries
+/// NO `mfa`/`otp`: no second factor was performed this login, and the token never
+/// fabricates one from the cookie alone.
+const ACR_MFA_REMEMBERED: &str = "urn:ironauth:acr:mfa_remembered";
 /// The OpenID Connect EAP ACR value for a phishing-resistant authenticator
 /// (a synced passkey). Per OpenID Connect EAP ACR Values 1.0 `phr` means
 /// PHISHING-RESISTANT (origin-bound, which every WebAuthn ceremony is); it does
@@ -95,6 +109,17 @@ pub enum AuthMethod {
     /// invariant be enforced at all. On its own it achieves the single-factor
     /// `pwd`-level ACR.
     Sms,
+    /// A REMEMBERED DEVICE (issue #71): a trusted-device cookie, bound to server-side
+    /// state, that ATTESTS a second factor was performed on a PRIOR login from this
+    /// same device, so the second factor is skipped THIS login. It contributes NO
+    /// `amr` factor (no factor was performed now; the token never fabricates an `mfa`
+    /// from the cookie alone) and achieves the DISTINCT, weaker `mfa_remembered` ACR.
+    /// It is recorded ALONGSIDE the primary method (for example `[Password,
+    /// TrustedDevice]`), so the honest reading is "a password was used now, and a prior
+    /// second factor is attested by a remembered device", never "a second factor ran
+    /// now". Because its ACR ranks BELOW `mfa`, a remembered device satisfies a tenant's
+    /// baseline MFA requirement but NEVER an explicit step-up `mfa` acr floor.
+    TrustedDevice,
     /// A TOTP code (a possession factor: an authenticator app holding the shared
     /// seed). RFC 8176 `otp`. Used as a SECOND factor, so combined with a primary it
     /// achieves the multi-factor ACR (issue #69).
@@ -145,7 +170,7 @@ impl AuthMethod {
     /// ACR (the verified and presence-only variants of one passkey class) sit
     /// adjacent; their relative order does not matter to [`achieved_acr`] because
     /// their ACR is identical.
-    const ALL: [AuthMethod; 13] = [
+    const ALL: [AuthMethod; 14] = [
         AuthMethod::Password,
         // Email OTP / magic link is a single-factor PRIMARY passwordless proof at the
         // same `pwd`-level ACR as a password (adjacent, relative order immaterial since
@@ -158,6 +183,12 @@ impl AuthMethod {
         // by the off-by-default guard layer and the no-silent-downgrade invariant, not by
         // the ACR ladder.
         AuthMethod::Sms,
+        // A remembered device (issue #71) sits ABOVE the single-factor `pwd` ACR (it
+        // attests a prior second factor, so it outranks a bare password) and BELOW the
+        // genuine multi-factor `mfa` ACR (no second factor was performed THIS login, so
+        // it must never satisfy an explicit `mfa` step-up floor). Its `mfa_remembered`
+        // ACR therefore ranks exactly between them, which is the precedence crux.
+        AuthMethod::TrustedDevice,
         // The second-factor methods sit above the single password ACR and below the
         // phishing-resistant passkey ACRs: pwd+otp is multi-factor but not
         // phishing-resistant, so a passkey login still outranks it.
@@ -185,6 +216,7 @@ impl AuthMethod {
             AuthMethod::Password => "pwd",
             AuthMethod::EmailOtp => "email_otp",
             AuthMethod::Sms => "sms",
+            AuthMethod::TrustedDevice => "trusted_device",
             AuthMethod::Totp => "totp",
             AuthMethod::RecoveryCode => "recovery_code",
             AuthMethod::Passkey => "passkey",
@@ -227,6 +259,12 @@ impl AuthMethod {
             // Named DISTINCTLY from `otp` so an SMS login never masquerades as a
             // stronger app-based OTP. A single primary factor, so no `mfa` here.
             AuthMethod::Sms => &["sms"],
+            // A remembered device (issue #71) performed NO factor this login: it only
+            // attests a prior second factor. So it contributes NO `amr` token at all,
+            // and the token's `amr` reflects only the primary factor actually used now
+            // (never a fabricated `mfa`/`otp`). Its honest, distinguishable signal is
+            // the `mfa_remembered` ACR, not an amr value.
+            AuthMethod::TrustedDevice => &[],
             // `otp`: a one-time password (RFC 6238); `mfa`: the second factor plus
             // the primary make multiple factors.
             AuthMethod::Totp => &["otp", "mfa"],
@@ -259,6 +297,7 @@ impl AuthMethod {
     pub fn acr(self) -> &'static str {
         match self {
             AuthMethod::Password | AuthMethod::EmailOtp | AuthMethod::Sms => ACR_PWD,
+            AuthMethod::TrustedDevice => ACR_MFA_REMEMBERED,
             AuthMethod::Totp | AuthMethod::RecoveryCode => ACR_MFA,
             AuthMethod::Passkey | AuthMethod::PasskeyVerified => ACR_PHR,
             AuthMethod::PasskeyHardware | AuthMethod::PasskeyHardwareVerified => ACR_PHRH,
@@ -299,6 +338,7 @@ impl AuthMethod {
             AuthMethod::Password
                 | AuthMethod::EmailOtp
                 | AuthMethod::Sms
+                | AuthMethod::TrustedDevice
                 | AuthMethod::Totp
                 | AuthMethod::RecoveryCode
                 | AuthMethod::Passkey
@@ -319,6 +359,28 @@ impl AuthMethod {
 #[must_use]
 pub fn acr_for_mfa() -> &'static str {
     ACR_MFA
+}
+
+/// Whether a set of recorded methods actually PERFORMED a genuine second factor THIS
+/// login (issue #71, the conditional-credential-skip honesty predicate): the derived
+/// `amr` carries `mfa`. This is TRUE for a TOTP or recovery-code second factor and for
+/// a USER-VERIFIED passkey (a UV passkey IS phishing-resistant multi-factor, so it
+/// carries `mfa`), and FALSE for a bare password, a presence-only (non-UV) passkey, and
+/// a REMEMBERED DEVICE (which attests a prior factor but performed none now). It is the
+/// single honest signal the tenant baseline-MFA gate consults, so a UV-passkey login
+/// satisfies the MFA requirement and NO additional factor is prompted, while a non-UV
+/// passkey does NOT get the skip.
+#[must_use]
+pub fn performed_second_factor(methods: &[AuthMethod]) -> bool {
+    amr_values(methods).contains(&"mfa")
+}
+
+/// Whether a set of recorded methods includes a remembered-device contribution (issue
+/// #71): the login skipped the second factor on the strength of a trusted-device
+/// cookie. The token's `acr` is `mfa_remembered` and its `amr` carries no `mfa`.
+#[must_use]
+pub fn includes_trusted_device(methods: &[AuthMethod]) -> bool {
+    methods.contains(&AuthMethod::TrustedDevice)
 }
 
 /// Whether a set of recorded methods includes a phishing-resistant PASSKEY factor
@@ -800,6 +862,34 @@ impl AuthenticationEvent {
         }
     }
 
+    /// The primary methods of `base` PLUS a remembered-device contribution at
+    /// `auth_time_unix_micros` (issue #71): the second factor was skipped on the
+    /// strength of a trusted-device cookie bound to server-side state. `base` is the
+    /// session's primary authentication (for example a bare `[Password]`); this appends
+    /// [`AuthMethod::TrustedDevice`], so the honest reading is "the primary factor was
+    /// performed now, and a prior second factor is attested by this remembered device".
+    /// The derived `acr` becomes `mfa_remembered` (distinct from and weaker than `mfa`)
+    /// and the `amr` gains NO factor, so the token never fabricates an `mfa` from the
+    /// cookie alone. `auth_time` MUST be the primary login instant (the trusted device
+    /// performs no fresh authentication), so a remembered-device token carries the
+    /// honest time of the authentication that actually occurred.
+    #[must_use]
+    pub fn with_trusted_device(base: &[AuthMethod], auth_time_unix_micros: i64) -> Self {
+        let mut methods: Vec<AuthMethod> = Vec::with_capacity(base.len() + 1);
+        for &method in base {
+            if method.is_active() && !methods.contains(&method) {
+                methods.push(method);
+            }
+        }
+        if !methods.contains(&AuthMethod::TrustedDevice) {
+            methods.push(AuthMethod::TrustedDevice);
+        }
+        Self {
+            methods,
+            auth_time_unix_micros,
+        }
+    }
+
     /// The recorded methods.
     #[must_use]
     pub fn methods(&self) -> &[AuthMethod] {
@@ -931,8 +1021,62 @@ mod tests {
         // default step-up order.
         assert_eq!(
             acr_values_supported(),
-            vec![ACR_PWD, ACR_MFA, ACR_PHR, ACR_PHRH, ACR_ATTESTED]
+            vec![
+                ACR_PWD,
+                ACR_MFA_REMEMBERED,
+                ACR_MFA,
+                ACR_PHR,
+                ACR_PHRH,
+                ACR_ATTESTED
+            ]
         );
+    }
+
+    #[test]
+    fn a_remembered_device_is_honest_and_ranks_below_genuine_mfa() {
+        // Issue #71: a remembered-device login records the primary factor PLUS the
+        // trusted-device contribution. The derived amr carries ONLY the primary factor
+        // (never a fabricated mfa/otp), and the acr is the DISTINCT `mfa_remembered`,
+        // weaker than a genuine `mfa`.
+        let event = AuthenticationEvent::with_trusted_device(
+            &[AuthMethod::Password],
+            1_700_000_000_000_000,
+        );
+        assert_eq!(
+            event.methods(),
+            &[AuthMethod::Password, AuthMethod::TrustedDevice]
+        );
+        assert_eq!(amr_values(event.methods()), vec!["pwd"]);
+        assert!(
+            !amr_values(event.methods()).contains(&"mfa"),
+            "a remembered-device login must NEVER claim an mfa amr"
+        );
+        assert!(!amr_values(event.methods()).contains(&"otp"));
+        assert_eq!(achieved_acr(event.methods()), ACR_MFA_REMEMBERED);
+        assert_eq!(event.methods_token(), "pwd trusted_device");
+        assert_eq!(parse_methods("pwd trusted_device"), event.methods());
+        // The remembered device did NOT perform a genuine second factor this login.
+        assert!(!performed_second_factor(event.methods()));
+        assert!(includes_trusted_device(event.methods()));
+    }
+
+    #[test]
+    fn performed_second_factor_is_true_only_for_a_genuine_factor() {
+        // A genuine second factor (TOTP) and a UV passkey both carry mfa: they DID
+        // perform a second factor and satisfy the MFA requirement (the conditional skip).
+        assert!(performed_second_factor(
+            AuthenticationEvent::password_and_totp(0).methods()
+        ));
+        assert!(performed_second_factor(
+            AuthenticationEvent::passkey(0, true, true).methods()
+        ));
+        // A bare password, a presence-only (non-UV) passkey, and a remembered device did
+        // NOT perform a second factor, so none of them gets the skip on its own.
+        assert!(!performed_second_factor(&[AuthMethod::Password]));
+        assert!(!performed_second_factor(
+            AuthenticationEvent::passkey(0, true, false).methods()
+        ));
+        assert!(!performed_second_factor(&[AuthMethod::TrustedDevice]));
     }
 
     #[test]

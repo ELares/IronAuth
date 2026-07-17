@@ -1353,6 +1353,21 @@ impl Harness {
             .expect("set scope step-up policy");
     }
 
+    /// Set the tenant-wide minimum credential class (issue #66): the baseline the
+    /// step-up gate composes with. `min_class` is one of `any`/`mfa`/`passkey`/
+    /// `attested_passkey`. Used by the trusted-device tests (issue #71) to require the
+    /// tenant baseline MFA a remembered device can satisfy.
+    pub async fn set_tenant_min_class(&self, min_class: &str) {
+        let (actor, corr) = self.seeding_actor();
+        self.store()
+            .scoped(self.scope)
+            .acting(actor, corr)
+            .credential_class_policies()
+            .set(&self.env, "tenant", None, min_class)
+            .await
+            .expect("set tenant min class");
+    }
+
     /// Seed a registered passkey credential for `subject` (issue #72), so the step-up
     /// factor probe (`has_passkey`) sees a phishing-resistant factor without driving the
     /// full WebAuthn ceremony. The credential material is a throwaway placeholder: the
@@ -2131,6 +2146,28 @@ pub fn location(headers: &HeaderMap) -> Option<String> {
 pub fn set_cookie_pair(headers: &HeaderMap) -> Option<String> {
     let value = headers.get(header::SET_COOKIE)?.to_str().ok()?;
     Some(value.split(';').next()?.trim().to_owned())
+}
+
+/// The `name=value` pair of the Set-Cookie header whose cookie name is `name`, across
+/// ALL Set-Cookie headers on the response (issue #71): a completed multi-factor login
+/// sets both the rotated session cookie and the remember-device cookie, so a test needs
+/// to pick the one it wants by name. Returns `None` when no Set-Cookie names `name`, or
+/// when it is a CLEAR (empty value + Max-Age=0), so a cookie the server is expiring is
+/// not mistaken for a live one.
+#[must_use]
+pub fn named_cookie_pair(headers: &HeaderMap, name: &str) -> Option<String> {
+    for value in headers.get_all(header::SET_COOKIE) {
+        let Ok(value) = value.to_str() else {
+            continue;
+        };
+        let pair = value.split(';').next().unwrap_or("").trim();
+        if let Some((cookie_name, cookie_value)) = pair.split_once('=') {
+            if cookie_name == name && !cookie_value.is_empty() {
+                return Some(pair.to_owned());
+            }
+        }
+    }
+    None
 }
 
 /// Extract the value of a form input by `name` from a rendered HTML page. Used by

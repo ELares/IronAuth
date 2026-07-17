@@ -198,6 +198,59 @@ pub fn magic_binding_from_cookie_header(header: Option<&str>) -> Option<&str> {
     })
 }
 
+/// The remember-device (trusted-device) cookie name (issue #71). Like the session
+/// cookie it carries the `__Host-` prefix (so a conformant browser accepts it only when
+/// `Secure`, `Path=/`, and no `Domain`, pinning it to exactly the auth host over HTTPS),
+/// is `HttpOnly` (script cannot read the device secret, so an XSS cannot exfiltrate it),
+/// and `SameSite=Lax` (it rides the top-level login navigation but is withheld from
+/// cross-site subrequests). Its value is `<tdv_ device id>.<high-entropy secret>`; the
+/// server stores only the SHA-256 digest of the secret (server-side state), so the
+/// cookie is NOT a self-contained skip token: a forged or tampered value whose secret
+/// does not hash to a stored digest, or whose device id/subject does not match a LIVE
+/// row, is rejected. This is the same opaque-value-bound-to-server-state discipline the
+/// session cookie uses, hardened by the digest match that stands in for a signature.
+pub const TRUSTED_DEVICE_COOKIE: &str = "__Host-ironauth_trusted_device";
+
+/// The `.` separator between the device id and the secret in the trusted-device cookie
+/// value (issue #71). Neither half (a URL-safe base64 `tdv_` id, a URL-safe base64
+/// secret) contains a `.`, so it is an unambiguous split point.
+pub const TRUSTED_DEVICE_COOKIE_SEP: char = '.';
+
+/// Build the `Set-Cookie` header that remembers a device after a completed multi-factor
+/// login (issue #71): the `<device id>.<secret>` value under the hardened `__Host-`,
+/// `Secure`, `HttpOnly`, `SameSite=Lax` attributes. `Max-Age` matches the server-side
+/// max-age policy so the browser drops the cookie when the row would have expired anyway;
+/// the server still enforces the max-age AND idle windows authoritatively at read time.
+#[must_use]
+pub fn build_trusted_device_cookie(value: &str, ttl: Duration) -> String {
+    let max_age = i64::try_from(ttl.as_secs()).unwrap_or(i64::MAX);
+    format!(
+        "{TRUSTED_DEVICE_COOKIE}={value}; Path=/; Secure; HttpOnly; SameSite=Lax; \
+         Max-Age={max_age}"
+    )
+}
+
+/// Build the `Set-Cookie` header that CLEARS the trusted-device cookie (issue #71): the
+/// same hardened attributes with an empty value and `Max-Age=0`, so a conformant browser
+/// drops it. Emitted when the device is revoked or its server-side row is gone, so the
+/// browser stops presenting a value that can no longer skip anything.
+#[must_use]
+pub fn clear_trusted_device_cookie() -> String {
+    format!("{TRUSTED_DEVICE_COOKIE}=; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=0")
+}
+
+/// The trusted-device cookie value presented on the request, if any (issue #71). A
+/// missing cookie means this browser has no remembered device, so the second factor is
+/// not skipped.
+#[must_use]
+pub fn trusted_device_from_cookie_header(header: Option<&str>) -> Option<&str> {
+    let header = header?;
+    header.split(';').find_map(|pair| {
+        let (name, value) = pair.trim().split_once('=')?;
+        (name == TRUSTED_DEVICE_COOKIE).then_some(value)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -346,6 +399,45 @@ mod tests {
             session_value_from_cookie_header(Some("__Host-ironauth_session=ses_only")),
             Some("ses_only")
         );
+    }
+
+    #[test]
+    fn trusted_device_cookie_is_host_prefixed_and_fully_hardened() {
+        // Issue #71: the remember-device cookie carries the __Host- prefix, Secure,
+        // HttpOnly, SameSite=Lax, Path=/, and NO Domain, exactly like the session cookie.
+        let cookie = build_trusted_device_cookie("tdv_abc.secret", Duration::from_secs(2_592_000));
+        assert!(cookie.starts_with("__Host-ironauth_trusted_device=tdv_abc.secret; "));
+        for attr in [
+            "Path=/",
+            "Secure",
+            "HttpOnly",
+            "SameSite=Lax",
+            "Max-Age=2592000",
+        ] {
+            assert!(cookie.contains(attr), "missing {attr}: {cookie}");
+        }
+        assert!(!cookie.contains("Domain"), "{cookie}");
+        // The clear mirrors the shape with Max-Age=0 and an empty value.
+        let clear = clear_trusted_device_cookie();
+        assert!(clear.starts_with("__Host-ironauth_trusted_device=; "));
+        assert!(clear.contains("Max-Age=0"));
+        assert!(!clear.contains("Domain"));
+    }
+
+    #[test]
+    fn trusted_device_cookie_parses_among_others_and_ignores_decoys() {
+        assert_eq!(
+            trusted_device_from_cookie_header(Some(
+                "a=1; __Host-ironauth_trusted_device=tdv_x.s; b=2"
+            )),
+            Some("tdv_x.s")
+        );
+        // A same-suffix decoy name must not match.
+        assert_eq!(
+            trusted_device_from_cookie_header(Some("ironauth_trusted_device=nope")),
+            None
+        );
+        assert_eq!(trusted_device_from_cookie_header(None), None);
     }
 
     #[test]

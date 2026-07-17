@@ -126,6 +126,7 @@ mod token_credential;
 mod token_hash;
 mod tokens;
 mod totp;
+mod trusted_device;
 mod userinfo;
 mod util;
 mod verification;
@@ -332,6 +333,23 @@ pub fn oidc_router(state: OidcState) -> Router {
         .route(
             "/t/{tenant_id}/e/{environment_id}/account/sessions/revoke-others",
             post(account::revoke_other_sessions),
+        )
+        // The remembered-device (trusted-device) surface (issue #71): list the caller's
+        // OWN remembered devices with their metadata, and revoke one or all. Revocation
+        // takes effect server-side IMMEDIATELY (a replayed device cookie fails). Every
+        // endpoint acts ONLY on the authenticated subject; the POSTs carry the #196
+        // same-origin CSRF check.
+        .route(
+            "/t/{tenant_id}/e/{environment_id}/account/trusted-devices",
+            get(account::list_trusted_devices),
+        )
+        .route(
+            "/t/{tenant_id}/e/{environment_id}/account/trusted-devices/revoke",
+            post(account::revoke_trusted_device),
+        )
+        .route(
+            "/t/{tenant_id}/e/{environment_id}/account/trusted-devices/revoke-all",
+            post(account::revoke_all_trusted_devices),
         )
         .route(
             "/t/{tenant_id}/e/{environment_id}/account/credentials",

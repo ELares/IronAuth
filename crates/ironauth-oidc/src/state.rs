@@ -442,6 +442,13 @@ struct Inner {
     mfa_required: bool,
     mfa_factor_order: Vec<String>,
     acr_order: Vec<String>,
+    // Remember-device (trusted-device) policy (issue #71). Off by default; the duration
+    // bounds are validated at startup. The skip never satisfies a step-up acr floor.
+    trusted_devices_enabled: bool,
+    trusted_device_user_opt_in: bool,
+    trusted_device_max_age_secs: u64,
+    trusted_device_idle_secs: u64,
+    trusted_device_revoke_on_password_change: bool,
     // Email OTP + scanner-safe magic links (issue #68). All validated at startup.
     email_otp_enabled: bool,
     email_otp_code_digits: u32,
@@ -604,6 +611,12 @@ impl OidcState {
                 mfa_required: config.mfa_required,
                 mfa_factor_order: config.mfa_factor_order.clone(),
                 acr_order: config.acr_order.clone(),
+                trusted_devices_enabled: config.trusted_devices_enabled,
+                trusted_device_user_opt_in: config.trusted_device_user_opt_in,
+                trusted_device_max_age_secs: config.trusted_device_max_age_secs,
+                trusted_device_idle_secs: config.trusted_device_idle_secs,
+                trusted_device_revoke_on_password_change: config
+                    .trusted_device_revoke_on_password_change,
                 email_otp_enabled: config.email_otp_enabled,
                 email_otp_code_digits: config.email_otp_code_digits,
                 email_otp_code_ttl_secs: config.email_otp_code_ttl_secs,
@@ -1921,6 +1934,42 @@ impl OidcState {
     #[must_use]
     pub fn totp_enabled(&self) -> bool {
         self.inner.totp_enabled
+    }
+
+    /// Whether the remember-device (trusted-device) feature is enabled for this
+    /// deployment (issue #71). Off by default; when off no remember-device cookie is
+    /// issued, a presented one is ignored, and the account device list shows none.
+    #[must_use]
+    pub fn trusted_devices_enabled(&self) -> bool {
+        self.inner.trusted_devices_enabled
+    }
+
+    /// Whether the user gets an OPT-IN "remember this device" checkbox (issue #71), or
+    /// the tenant always remembers a completed multi-factor login's device. Only
+    /// meaningful when [`Self::trusted_devices_enabled`] is on.
+    #[must_use]
+    pub fn trusted_device_user_opt_in(&self) -> bool {
+        self.inner.trusted_device_user_opt_in
+    }
+
+    /// The absolute maximum age of a remembered device (issue #71).
+    #[must_use]
+    pub fn trusted_device_max_age(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.inner.trusted_device_max_age_secs)
+    }
+
+    /// The idle window of a remembered device (issue #71): an unused device expires
+    /// after this, while an actively used one lives to the absolute max age.
+    #[must_use]
+    pub fn trusted_device_idle(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.inner.trusted_device_idle_secs)
+    }
+
+    /// Whether a password change or reset invalidates the subject's remembered devices
+    /// (issue #71). On by default.
+    #[must_use]
+    pub fn trusted_device_revoke_on_password_change(&self) -> bool {
+        self.inner.trusted_device_revoke_on_password_change
     }
 
     /// Whether the email-OTP factor endpoints are mounted (issue #68). When off, the

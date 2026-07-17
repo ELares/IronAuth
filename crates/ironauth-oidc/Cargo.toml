@@ -279,6 +279,17 @@ name = "step_up"
 path = "tests/step_up.rs"
 required-features = ["testing"]
 
+# Trusted devices (remember-device 2FA) and the conditional-credential skip end to end
+# (issue #71): a completed multi-factor login remembers the device; a subsequent login
+# from it skips the second factor with an honest mfa_remembered acr (no fabricated mfa
+# amr); revocation is server-side immediate (a replayed cookie fails); a step-up acr
+# floor overrides a remembered device; a cross-account or tampered cookie does not skip;
+# a password change invalidates trust. Needs a real database (DATABASE_URL).
+[[test]]
+name = "trusted_devices"
+path = "tests/trusted_devices.rs"
+required-features = ["testing"]
+
 # WebAuthn passkey ceremonies end to end (issue #65): the four ceremony endpoints
 # driven through the real router by a software authenticator (a CBOR
 # attestationObject / COSE key, real Ed25519 assertion signatures). A passkey

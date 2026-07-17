@@ -606,6 +606,45 @@ pub const OIDC_EMAIL_OTP_MAX_TTL_SECS: u64 = 600;
 /// short-lived; a per-tenant value sits inside 300..=3600.
 pub const OIDC_MAGIC_LINK_MAX_TTL_SECS: u64 = 3_600;
 
+/// The FLOOR of the remembered-device max-age band, in seconds (issue #71): one hour. A
+/// device remembered for less than this is not worth the state; the real value sits far
+/// higher, up to the NIST SP 800-63B reauthentication ceiling.
+pub const OIDC_TRUSTED_DEVICE_MIN_MAX_AGE_SECS: u64 = 3_600;
+/// The CEILING of the remembered-device max-age band, in seconds (issue #71): thirty
+/// days, the NIST SP 800-63B reauthentication ceiling. Trust must be re-established at
+/// least this often, so a misconfiguration cannot extend a remembered device indefinitely.
+pub const OIDC_TRUSTED_DEVICE_MAX_MAX_AGE_SECS: u64 = 2_592_000;
+/// The FLOOR of the remembered-device idle window, in seconds (issue #71): one hour. The
+/// idle window must be at least this and never wider than the absolute max age.
+pub const OIDC_TRUSTED_DEVICE_MIN_IDLE_SECS: u64 = 3_600;
+
+// The canonical `acr` rungs (weakest to strongest, issues #66/#71/#72). These MIRROR the
+// OIDC step-up ladder (`ironauth_oidc::step_up::default_acr_order`, derived from the fixed
+// `AuthMethod::ALL`); a pinning test in the oidc crate asserts the two stay identical, so a
+// new rung added to the ladder cannot silently drift out of the shipped config default.
+const OIDC_ACR_PWD: &str = "urn:ironauth:acr:pwd";
+// `mfa_remembered` (issue #71) sits STRICTLY between `pwd` and `mfa`: a remembered device
+// outranks a bare password but must never satisfy a genuine `mfa` floor.
+const OIDC_ACR_MFA_REMEMBERED: &str = "urn:ironauth:acr:mfa_remembered";
+const OIDC_ACR_MFA: &str = "urn:ironauth:acr:mfa";
+const OIDC_ACR_PHR: &str = "phr";
+const OIDC_ACR_PHRH: &str = "phrh";
+const OIDC_ACR_ATTESTED: &str = "urn:ironauth:acr:attested_passkey";
+
+/// The canonical `acr` order (weakest to strongest, issue #72): the single source of truth
+/// the shipped [`OidcConfig::acr_order`] default and the boot validation both derive from,
+/// kept identical to `ironauth_oidc::step_up::default_acr_order` by a pinning test. Includes
+/// `mfa_remembered` (issue #71) between `pwd` and `mfa`, and `attested_passkey` (issue #66)
+/// at the top, so neither is left unranked under the default configuration.
+pub const OIDC_DEFAULT_ACR_ORDER: &[&str] = &[
+    OIDC_ACR_PWD,
+    OIDC_ACR_MFA_REMEMBERED,
+    OIDC_ACR_MFA,
+    OIDC_ACR_PHR,
+    OIDC_ACR_PHRH,
+    OIDC_ACR_ATTESTED,
+];
+
 /// The FLOOR of the SMS-OTP TTL band, in seconds (issue #70): two minutes. An SMS
 /// arrives quickly, so a short window is both usable and tighter than the email band;
 /// a shorter lifetime than this risks expiring before a slow carrier delivers the text.
@@ -1359,15 +1398,59 @@ pub struct OidcConfig {
     /// The DEPLOYMENT-level `acr` order for step-up comparison (RFC 9470, issue #72),
     /// weakest first. A step-up requirement's `acr` floor is satisfied when the
     /// achieved `acr` is the same value or ranks at least as strong under this
-    /// order. The default is the credential-ladder order the provider advertises
-    /// (`urn:ironauth:acr:pwd`, `urn:ironauth:acr:mfa`, `phr`, `phrh`); a deployment
-    /// that trusts its factors differently (for example ranking a verified TOTP
-    /// above a synced passkey) reorders them here. An empty list falls back to the
-    /// default ladder. Duplicate entries are a boot-time [`ConfigError::Invalid`].
+    /// order. The default is the canonical credential-ladder order the provider
+    /// advertises ([`OIDC_DEFAULT_ACR_ORDER`]: `pwd`, `mfa_remembered`, `mfa`, `phr`,
+    /// `phrh`, `attested_passkey`); a deployment that trusts its factors differently
+    /// (for example ranking a verified TOTP above a synced passkey) reorders them here.
+    /// An empty list falls back to the default ladder. A non-empty override must be a
+    /// PERMUTATION of the known rungs (no unknown value, no duplicate, nothing left
+    /// unranked) and must keep `mfa_remembered` STRICTLY below `mfa` (a remembered
+    /// device must never satisfy a genuine `mfa` floor); any violation is a boot-time
+    /// [`ConfigError::Invalid`].
     /// This is resolved ONCE from configuration and applied across the deployment;
     /// per-(tenant, environment) resolution is a future enhancement, consistent with
     /// how the other per-environment config is handled.
     pub acr_order: Vec<String>,
+
+    /// Whether the remember-device (trusted-device) feature is enabled (issue #71). OFF
+    /// by default: a tenant opts INTO letting a completed multi-factor login remember the
+    /// device so a subsequent login from it skips the second factor (primary
+    /// authentication is still required). When off, no remember-device cookie is ever
+    /// issued, a presented one is ignored, and the account device list shows no trusted
+    /// devices, so the feature is fully inert. The skip NEVER satisfies a step-up acr
+    /// floor (RFC 9470 / issue #72 always overrides a remembered device) or a
+    /// passkey/attested credential-class floor; it only satisfies a tenant's baseline
+    /// MFA requirement.
+    pub trusted_devices_enabled: bool,
+
+    /// Whether the user gets an OPT-IN "remember this device" checkbox (issue #71) or the
+    /// TENANT decides. When true (the safer default), the device is remembered only if the
+    /// user checks the box after a completed multi-factor login; when false, a completed
+    /// multi-factor login always remembers the device (the tenant's choice). Only
+    /// consulted when [`OidcConfig::trusted_devices_enabled`] is on.
+    pub trusted_device_user_opt_in: bool,
+
+    /// The absolute maximum age of a remembered device, in seconds (issue #71): past it
+    /// the device never skips again and must re-prove a second factor. Bounded to
+    /// `OIDC_TRUSTED_DEVICE_MIN_MAX_AGE_SECS..=OIDC_TRUSTED_DEVICE_MAX_MAX_AGE_SECS`
+    /// (3600..=2592000), so a misconfiguration cannot extend trust indefinitely; the
+    /// default (2592000) is the NIST SP 800-63B reauthentication ceiling of 30 days.
+    pub trusted_device_max_age_secs: u64,
+
+    /// The idle window of a remembered device, in seconds (issue #71): an unused device
+    /// expires after this, while an actively used one lives to the absolute max age. Must
+    /// be at least `OIDC_TRUSTED_DEVICE_MIN_IDLE_SECS` (3600) and no greater than
+    /// [`OidcConfig::trusted_device_max_age_secs`] (a boot-time [`ConfigError::Invalid`]
+    /// otherwise, since an idle window wider than the absolute cap is meaningless); the
+    /// default (604800) is seven days.
+    pub trusted_device_idle_secs: u64,
+
+    /// Whether a password change or reset INVALIDATES the subject's remembered devices
+    /// (issue #71). On by default: a credential change is a strong signal that trust
+    /// should be re-established, so every remembered device is revoked server-side. A
+    /// tenant that separates device trust from password lifecycle can turn it off. Only
+    /// consulted when [`OidcConfig::trusted_devices_enabled`] is on.
+    pub trusted_device_revoke_on_password_change: bool,
 
     /// Whether the email-OTP factor endpoints are mounted (issue #68). On by default:
     /// email OTP is the recovery-of-last-resort factor every product ships. When off,
@@ -1577,12 +1660,15 @@ impl Default for OidcConfig {
             totp_recovery_code_count: 10,
             mfa_required: false,
             mfa_factor_order: vec!["passkey".to_owned(), "totp".to_owned()],
-            acr_order: vec![
-                "urn:ironauth:acr:pwd".to_owned(),
-                "urn:ironauth:acr:mfa".to_owned(),
-                "phr".to_owned(),
-                "phrh".to_owned(),
-            ],
+            acr_order: OIDC_DEFAULT_ACR_ORDER
+                .iter()
+                .map(|acr| (*acr).to_owned())
+                .collect(),
+            trusted_devices_enabled: false,
+            trusted_device_user_opt_in: true,
+            trusted_device_max_age_secs: 2_592_000,
+            trusted_device_idle_secs: 604_800,
+            trusted_device_revoke_on_password_change: true,
             email_otp_enabled: true,
             email_otp_code_digits: 6,
             email_otp_code_ttl_secs: 600,
@@ -2531,6 +2617,7 @@ impl Config {
         validate_regulation(&self.oidc)?;
         validate_webauthn(&self.oidc, &self.server)?;
         validate_totp(&self.oidc)?;
+        validate_trusted_device(&self.oidc)?;
         validate_email_otp(&self.oidc)?;
         validate_sms_otp(&self.oidc)?;
         validate_quota(&self.quota)?;
@@ -2647,17 +2734,59 @@ fn validate_totp(oidc: &OidcConfig) -> Result<(), ConfigError> {
             });
         }
     }
-    // The step-up acr order (issue #72) must not repeat a value: a duplicate would
-    // make the rank comparison ambiguous. An empty list is allowed (it falls back to
-    // the default credential-ladder order at read time).
-    let mut seen_acr = std::collections::BTreeSet::new();
-    for acr in &oidc.acr_order {
-        if !seen_acr.insert(acr.clone()) {
+    // The step-up acr order (issue #72) must be a PERMUTATION of the canonical rung set
+    // ([`OIDC_DEFAULT_ACR_ORDER`]): no unknown value (a silently-unranked floor), no
+    // duplicate (an ambiguous rank comparison), and every known rung present (so nothing
+    // the ladder can ACHIEVE is left unranked, which would fail closed and spuriously
+    // block a legitimate login). An EMPTY list is allowed: it falls back to the canonical
+    // order at read time.
+    if !oidc.acr_order.is_empty() {
+        let known: std::collections::BTreeSet<&str> =
+            OIDC_DEFAULT_ACR_ORDER.iter().copied().collect();
+        let mut seen_acr = std::collections::BTreeSet::new();
+        for acr in &oidc.acr_order {
+            if !known.contains(acr.as_str()) {
+                return Err(ConfigError::Invalid {
+                    message: format!(
+                        "oidc.acr_order contains an unknown acr '{acr}'; the known rungs are \
+                         {OIDC_DEFAULT_ACR_ORDER:?}"
+                    ),
+                });
+            }
+            if !seen_acr.insert(acr.as_str()) {
+                return Err(ConfigError::Invalid {
+                    message: format!(
+                        "oidc.acr_order lists '{acr}' more than once; each acr appears at most once"
+                    ),
+                });
+            }
+        }
+        if seen_acr.len() != known.len() {
             return Err(ConfigError::Invalid {
                 message: format!(
-                    "oidc.acr_order lists '{acr}' more than once; each acr appears at most once"
+                    "oidc.acr_order must rank every known acr (a permutation of \
+                     {OIDC_DEFAULT_ACR_ORDER:?}); otherwise an achievable level is left \
+                     unranked and would fail closed"
                 ),
             });
+        }
+        // The remembered-device honesty floor (issue #71): `mfa_remembered` MUST rank
+        // strictly BELOW `mfa`, so a remembered device (which attests only a PRIOR second
+        // factor) can never satisfy a genuine `mfa` step-up floor. Both are guaranteed
+        // present by the permutation check above.
+        let rank = |value: &str| oidc.acr_order.iter().position(|acr| acr == value);
+        if let (Some(remembered_rank), Some(mfa_rank)) =
+            (rank(OIDC_ACR_MFA_REMEMBERED), rank(OIDC_ACR_MFA))
+        {
+            if remembered_rank >= mfa_rank {
+                return Err(ConfigError::Invalid {
+                    message: format!(
+                        "oidc.acr_order must rank '{OIDC_ACR_MFA_REMEMBERED}' strictly below \
+                         '{OIDC_ACR_MFA}': a remembered device attests only a prior second \
+                         factor and must never satisfy a genuine mfa step-up floor"
+                    ),
+                });
+            }
         }
     }
     Ok(())
@@ -2670,6 +2799,40 @@ fn validate_totp(oidc: &OidcConfig) -> Result<(), ConfigError> {
 /// # Errors
 ///
 /// [`ConfigError::Invalid`] if any parameter is outside its documented range.
+/// Validate the remembered-device (trusted-device) duration policy (issue #71): the
+/// absolute max age must sit inside the accepted band, and the idle window must be at
+/// least the floor and no wider than the absolute max age (an idle window wider than the
+/// absolute cap is meaningless). The bounds hold even when the feature is off, so a
+/// deployment cannot ship an out-of-band value that would take effect the moment it is
+/// enabled.
+fn validate_trusted_device(oidc: &OidcConfig) -> Result<(), ConfigError> {
+    if !(OIDC_TRUSTED_DEVICE_MIN_MAX_AGE_SECS..=OIDC_TRUSTED_DEVICE_MAX_MAX_AGE_SECS)
+        .contains(&oidc.trusted_device_max_age_secs)
+    {
+        return Err(ConfigError::Invalid {
+            message: format!(
+                "oidc.trusted_device_max_age_secs ({}) must be in \
+                 {OIDC_TRUSTED_DEVICE_MIN_MAX_AGE_SECS}..={OIDC_TRUSTED_DEVICE_MAX_MAX_AGE_SECS} \
+                 (up to the NIST SP 800-63B 30-day reauthentication ceiling)",
+                oidc.trusted_device_max_age_secs
+            ),
+        });
+    }
+    if oidc.trusted_device_idle_secs < OIDC_TRUSTED_DEVICE_MIN_IDLE_SECS
+        || oidc.trusted_device_idle_secs > oidc.trusted_device_max_age_secs
+    {
+        return Err(ConfigError::Invalid {
+            message: format!(
+                "oidc.trusted_device_idle_secs ({}) must be at least \
+                 {OIDC_TRUSTED_DEVICE_MIN_IDLE_SECS} and no greater than \
+                 oidc.trusted_device_max_age_secs ({})",
+                oidc.trusted_device_idle_secs, oidc.trusted_device_max_age_secs
+            ),
+        });
+    }
+    Ok(())
+}
+
 fn validate_email_otp(oidc: &OidcConfig) -> Result<(), ConfigError> {
     if !(6..=8).contains(&oidc.email_otp_code_digits) {
         return Err(ConfigError::Invalid {
@@ -5007,5 +5170,148 @@ mod tests {
             "passkey".to_owned(),
         ];
         validate_totp(&oidc).expect("the closed set is valid in any order");
+    }
+
+    /// The step-up acr order (issues #66/#71/#72): the shipped default is valid, an empty
+    /// list is allowed (it falls back to the canonical order), and a non-empty override
+    /// must be a permutation of the known rungs that keeps `mfa_remembered` strictly below
+    /// `mfa`.
+    #[test]
+    #[allow(clippy::field_reassign_with_default)] // one-field mutations off a large default read clearest
+    fn validate_acr_order_enforces_permutation_and_the_remembered_floor() {
+        // The shipped default is the canonical order and is valid.
+        let default = OidcConfig::default();
+        assert_eq!(
+            default.acr_order,
+            OIDC_DEFAULT_ACR_ORDER
+                .iter()
+                .map(|acr| (*acr).to_owned())
+                .collect::<Vec<_>>()
+        );
+        validate_totp(&default).expect("the canonical default acr order is valid");
+
+        // An empty list is allowed: it falls back to the canonical order at read time.
+        let mut empty = OidcConfig::default();
+        empty.acr_order = Vec::new();
+        validate_totp(&empty).expect("an empty acr order falls back to the default");
+
+        // Ranking mfa_remembered AT or ABOVE mfa is the honesty footgun and is rejected.
+        let mut remembered_too_high = OidcConfig::default();
+        remembered_too_high.acr_order = vec![
+            OIDC_ACR_PWD.to_owned(),
+            OIDC_ACR_MFA.to_owned(),
+            OIDC_ACR_MFA_REMEMBERED.to_owned(),
+            OIDC_ACR_PHR.to_owned(),
+            OIDC_ACR_PHRH.to_owned(),
+            OIDC_ACR_ATTESTED.to_owned(),
+        ];
+        assert!(
+            matches!(
+                validate_totp(&remembered_too_high),
+                Err(ConfigError::Invalid { .. })
+            ),
+            "mfa_remembered ranked at or above mfa must be rejected"
+        );
+
+        // An unknown acr value is rejected (a silently-unranked floor).
+        let mut unknown = OidcConfig::default();
+        unknown.acr_order = vec![
+            OIDC_ACR_PWD.to_owned(),
+            OIDC_ACR_MFA_REMEMBERED.to_owned(),
+            OIDC_ACR_MFA.to_owned(),
+            OIDC_ACR_PHR.to_owned(),
+            OIDC_ACR_PHRH.to_owned(),
+            "urn:custom:acr:made_up".to_owned(),
+        ];
+        assert!(
+            matches!(validate_totp(&unknown), Err(ConfigError::Invalid { .. })),
+            "an unknown acr value must be rejected"
+        );
+
+        // A partial order that leaves a known rung unranked is rejected.
+        let mut partial = OidcConfig::default();
+        partial.acr_order = vec![
+            OIDC_ACR_PWD.to_owned(),
+            OIDC_ACR_MFA.to_owned(),
+            OIDC_ACR_PHR.to_owned(),
+            OIDC_ACR_PHRH.to_owned(),
+        ];
+        assert!(
+            matches!(validate_totp(&partial), Err(ConfigError::Invalid { .. })),
+            "an order missing a known rung must be rejected"
+        );
+
+        // A duplicate value is rejected.
+        let mut duplicate = OidcConfig::default();
+        duplicate.acr_order = vec![
+            OIDC_ACR_PWD.to_owned(),
+            OIDC_ACR_PWD.to_owned(),
+            OIDC_ACR_MFA_REMEMBERED.to_owned(),
+            OIDC_ACR_MFA.to_owned(),
+            OIDC_ACR_PHR.to_owned(),
+            OIDC_ACR_PHRH.to_owned(),
+        ];
+        assert!(
+            matches!(validate_totp(&duplicate), Err(ConfigError::Invalid { .. })),
+            "a duplicate acr value must be rejected"
+        );
+
+        // A valid permutation that trusts TOTP over synced passkeys (mfa above phr) is
+        // accepted as long as mfa_remembered stays below mfa.
+        let mut reordered = OidcConfig::default();
+        reordered.acr_order = vec![
+            OIDC_ACR_PWD.to_owned(),
+            OIDC_ACR_MFA_REMEMBERED.to_owned(),
+            OIDC_ACR_PHR.to_owned(),
+            OIDC_ACR_MFA.to_owned(),
+            OIDC_ACR_PHRH.to_owned(),
+            OIDC_ACR_ATTESTED.to_owned(),
+        ];
+        validate_totp(&reordered).expect("a valid permutation with mfa_remembered below mfa");
+    }
+
+    /// The remembered-device duration policy (issue #71): the defaults are valid and off,
+    /// the max age must sit inside the accepted band, and the idle window must be at least
+    /// the floor and never wider than the absolute max age.
+    #[test]
+    #[allow(clippy::field_reassign_with_default)] // one-field mutations off a large default read clearest
+    fn validate_trusted_device_enforces_the_duration_bounds() {
+        let default = OidcConfig::default();
+        assert!(!default.trusted_devices_enabled);
+        validate_trusted_device(&default).expect("defaults are valid");
+
+        // The max age must sit inside the accepted band (up to the NIST 30-day ceiling).
+        for bad in [
+            OIDC_TRUSTED_DEVICE_MIN_MAX_AGE_SECS - 1,
+            OIDC_TRUSTED_DEVICE_MAX_MAX_AGE_SECS + 1,
+        ] {
+            let mut oidc = OidcConfig::default();
+            oidc.trusted_device_max_age_secs = bad;
+            assert!(
+                matches!(
+                    validate_trusted_device(&oidc),
+                    Err(ConfigError::Invalid { .. })
+                ),
+                "trusted_device_max_age_secs {bad} must be rejected"
+            );
+        }
+
+        // The idle window must be at least the floor and never wider than the max age.
+        let mut too_small = OidcConfig::default();
+        too_small.trusted_device_idle_secs = OIDC_TRUSTED_DEVICE_MIN_IDLE_SECS - 1;
+        assert!(matches!(
+            validate_trusted_device(&too_small),
+            Err(ConfigError::Invalid { .. })
+        ));
+        let mut wider_than_max = OidcConfig::default();
+        wider_than_max.trusted_device_max_age_secs = OIDC_TRUSTED_DEVICE_MIN_MAX_AGE_SECS;
+        wider_than_max.trusted_device_idle_secs = OIDC_TRUSTED_DEVICE_MIN_MAX_AGE_SECS + 1;
+        assert!(
+            matches!(
+                validate_trusted_device(&wider_than_max),
+                Err(ConfigError::Invalid { .. })
+            ),
+            "an idle window wider than the absolute max age must be rejected"
+        );
     }
 }

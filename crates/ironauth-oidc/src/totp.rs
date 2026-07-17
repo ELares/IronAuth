@@ -596,10 +596,22 @@ pub async fn remove(
         .remove(state.env(), &account.subject, &id)
         .await;
     match result {
-        Ok(CredentialRemoveOutcome::Removed) => json_response(
-            StatusCode::OK,
-            json!({ "id": id.to_string(), "removed": true }),
-        ),
+        Ok(CredentialRemoveOutcome::Removed) => {
+            // Removing a TOTP second factor changes the credential landscape (issue #71),
+            // so invalidate the subject's remembered devices (reason FactorChange): a
+            // replayed device cookie then re-prompts for a second factor. Best-effort; a
+            // no-op when the trusted-device feature is off.
+            crate::trusted_device::invalidate_on_factor_change(
+                &state,
+                account.scope,
+                &account.subject,
+            )
+            .await;
+            json_response(
+                StatusCode::OK,
+                json!({ "id": id.to_string(), "removed": true }),
+            )
+        }
         Ok(_) => not_found_json(),
         Err(_) => server_error(),
     }
