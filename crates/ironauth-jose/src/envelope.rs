@@ -477,6 +477,25 @@ impl BlindIndex {
     pub fn into_bytes(self) -> Vec<u8> {
         self.bytes
     }
+
+    /// Constant-time equality of this index against an untrusted `candidate` tag: the
+    /// comparison never short-circuits, so its time does not depend on WHERE the first
+    /// differing byte sits. Use this to verify a recomputed keyed MAC against a presented
+    /// one where a plain `==` on the raw bytes would be a timing oracle (a routing token,
+    /// issue #77). The tag is not a secret key, so exposing a constant-time compare here
+    /// does not weaken the envelope. A length mismatch is a non-match; the tag length (a
+    /// fixed 32-byte HMAC output) is public, so leaking it is harmless.
+    #[must_use]
+    pub fn ct_eq(&self, candidate: &[u8]) -> bool {
+        if self.bytes.len() != candidate.len() {
+            return false;
+        }
+        let mut diff: u8 = 0;
+        for (x, y) in self.bytes.iter().zip(candidate.iter()) {
+            diff |= x ^ y;
+        }
+        diff == 0
+    }
 }
 
 impl core::fmt::Debug for BlindIndex {
@@ -730,6 +749,22 @@ mod tests {
         // Per-tenant: the SAME value under two tenants yields different tags, so an
         // index collision cannot leak across tenants.
         assert_ne!(master.blind_index(&ctx_b).as_bytes(), one.as_bytes());
+    }
+
+    #[test]
+    fn blind_index_ct_eq_matches_only_the_exact_tag() {
+        let master = MasterKey::generate("master-ct", &FixedEntropy::new(50));
+        let index = master.blind_index(&aad("ten_a", "env_a", "routing.token", 7));
+        // The exact tag bytes match; a flipped byte, a truncation, and an extension all
+        // fail (a length mismatch is a non-match).
+        assert!(index.ct_eq(index.as_bytes()));
+        let mut flipped = index.as_bytes().to_vec();
+        flipped[0] ^= 0x01;
+        assert!(!index.ct_eq(&flipped));
+        assert!(!index.ct_eq(&index.as_bytes()[..index.as_bytes().len() - 1]));
+        let mut longer = index.as_bytes().to_vec();
+        longer.push(0);
+        assert!(!index.ct_eq(&longer));
     }
 
     #[test]

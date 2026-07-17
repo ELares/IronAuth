@@ -238,6 +238,15 @@ fn case_fold(value: &str) -> String {
 /// This is the ONE definition of routing-domain normalization: the login routing
 /// lookup and the routing-rule write both go through it, so a stored domain and a
 /// submitted email's domain fold identically.
+///
+/// # Documented limitation (NOT a bug; issue #77, L1)
+///
+/// This normalization does NOT apply IDNA/punycode mapping and does NOT strip a trailing
+/// FQDN dot. A unicode domain (`café.example`), its punycode A-label
+/// (`xn--caf-dma.example`), and a trailing-dot form (`example.com.`) are therefore
+/// DISTINCT routing selectors, each folding only by NFKC and case. An operator must store
+/// the domain in the representation their clients actually emit in the submitted email
+/// (adding a separate IDNA-mapping dependency is deliberately out of scope here).
 #[must_use]
 pub fn normalize_routing_domain(raw: &str) -> Option<String> {
     // Steps 1..3 of canonicalize_identifier: strip invisibles/controls, NFKC, then

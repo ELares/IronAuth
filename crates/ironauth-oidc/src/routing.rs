@@ -62,9 +62,17 @@ pub fn resolve_route(candidates: &RouteCandidates) -> Option<&RoutingRuleRecord>
 /// normalization (NFKC plus case-fold, `ironauth_store::normalize_routing_domain`), the
 /// SAME normalization a routing rule's domain selector is stored under, so a rule stored
 /// for `Example.COM` matches a login submitted as `alice@example.com`. Pure.
+///
+/// The split is on the ASCII `@` AND the compatibility at-signs that NFKC folds onto it
+/// (the fullwidth commercial at U+FF20 and the small commercial at U+FE6B), so an
+/// identifier written with a fullwidth at-sign routes by domain identically to its ASCII
+/// form. Folding these BEFORE the split keeps the split consistent with the rest of the
+/// identifier seam, which NFKC-folds them (issue #77, L2): otherwise `alice＠acme.example`
+/// would find no domain while the store canonicalized it to `alice@acme.example`.
 #[must_use]
 pub fn normalize_email_domain(identifier: &str) -> Option<String> {
-    let (_local, domain) = identifier.rsplit_once('@')?;
+    let folded = identifier.replace(['\u{FF20}', '\u{FE6B}'], "@");
+    let (_local, domain) = folded.rsplit_once('@')?;
     ironauth_store::normalize_routing_domain(domain)
 }
 
@@ -159,6 +167,17 @@ mod tests {
         // The LAST @ splits, so a quoted local part keeps its own @ out of the domain.
         assert_eq!(
             normalize_email_domain("weird@name@acme.example").as_deref(),
+            Some("acme.example")
+        );
+        // A FULLWIDTH commercial at (U+FF20) routes by domain identically to the ASCII
+        // form: the identifier seam NFKC-folds it, so the split must agree (issue #77, L2).
+        assert_eq!(
+            normalize_email_domain("alice\u{FF20}acme.example").as_deref(),
+            normalize_email_domain("alice@acme.example").as_deref(),
+            "a fullwidth at-sign routes like an ASCII at-sign"
+        );
+        assert_eq!(
+            normalize_email_domain("alice\u{FF20}acme.example").as_deref(),
             Some("acme.example")
         );
     }

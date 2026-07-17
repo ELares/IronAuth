@@ -682,20 +682,29 @@ pub async fn federation_authorize(
     let redirect_uri =
         federation_callback_url(&state, &tenant_id, &environment_id, &connector_slug);
 
-    // The routed org connection (issue #77): the login surface, having routed a login
-    // by domain/app/user, passes the `ocn_` id it resolved. Validate here that it is in
-    // scope, references THIS connector, and is enabled, so the org binding the callback
-    // provisions against is bound to the connector the user must actually authenticate
-    // at; a browser-supplied id for another connector fails closed. An ABSENT param is a
-    // direct (non-routed) federated login, which carries no org binding. The callback
-    // re-derives the org from the CONSUMED row, never from the callback query.
-    let routed_org_connection = match query
-        .as_deref()
-        .and_then(|q| query_get(q, "org_connection"))
-    {
+    // The routed org connection (issue #77 security fix): the login surface, having routed
+    // a login by domain/app/user, passes a server-authenticated ROUTING TOKEN (a keyed MAC
+    // minted in the store, binding the org connection to THIS connector, this scope, and a
+    // short expiry). We verify the token here, so the browser cannot swap the org to a
+    // sibling that shares the connector, replay it on another connector, or replay it after
+    // expiry: a tampered, cross-connector, cross-scope, or expired token fails closed to the
+    // uniform not-found (no oracle). An ABSENT param is a direct (non-routed) federated
+    // login, which carries no org binding. Verifying the token proves PROVENANCE; the store
+    // lookup below still re-proves the binding is in scope, references this connector, and is
+    // enabled (defence in depth). The callback re-derives the org from the CONSUMED row,
+    // never from the callback query.
+    let routed_org_connection = match query.as_deref().and_then(|q| query_get(q, "routing")) {
         Some(raw) => {
             let scoped = state.store().scoped(scope);
-            let Ok(ocn_id) = scoped.org_connections().parse_id(&raw) else {
+            let now_micros = epoch_micros(now);
+            let Some(ocn_string) =
+                scoped
+                    .org_connections()
+                    .verify_routing_token(&raw, &connector_slug, now_micros)
+            else {
+                return not_found();
+            };
+            let Ok(ocn_id) = scoped.org_connections().parse_id(&ocn_string) else {
                 return not_found();
             };
             match scoped.org_connections().get(&ocn_id).await {

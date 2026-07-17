@@ -365,3 +365,82 @@ async fn the_snapshot_export_carries_the_binding_and_rule_secret_free() {
         "the plaintext user identifier must never appear in a snapshot export"
     );
 }
+
+#[tokio::test]
+async fn an_org_connection_and_routing_rule_and_token_are_cross_scope_isolated() {
+    // A cross-scope IDOR probe (issue #77, L3): a binding, a routing rule, AND a routing
+    // token minted in scope A must all read empty / fail to verify from a sibling scope B.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope_a = db.seed_scope(&env).await;
+    let scope_b = db.seed_scope(&env).await;
+
+    let ocn_a = seed_binding(&db, &env, scope_a).await;
+    db.control_store()
+        .scoped(scope_a)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .routing_rules()
+        .create(
+            &env,
+            &RoutingRuleId::generate(&env, &scope_a),
+            1_000_000,
+            NewRoutingRule {
+                selector: RoutingSelector::Domain(ROUTED_DOMAIN),
+                org_connection_id: &ocn_a,
+                priority: 0,
+                enabled: true,
+            },
+        )
+        .await
+        .expect("scope A claims the domain");
+
+    // Scope B must not resolve scope A's domain rule (a cross-tenant selector read).
+    let normalized = ironauth_store::normalize_routing_domain(ROUTED_DOMAIN).expect("normalize");
+    assert!(
+        db.store()
+            .scoped(scope_b)
+            .routing_rules()
+            .by_domain(&normalized)
+            .await
+            .expect("by_domain")
+            .is_none(),
+        "scope B must not resolve scope A's routing rule"
+    );
+
+    // Scope A's org-connection id is out of scope in B: the uniform not-found.
+    assert!(
+        matches!(
+            db.store()
+                .scoped(scope_b)
+                .org_connections()
+                .parse_id(&ocn_a.to_string()),
+            Err(StoreError::NotFound)
+        ),
+        "scope A's org connection id must be out of scope in B"
+    );
+
+    // A routing token minted in scope A verifies in A but NOT in B: the MAC binds the scope
+    // (tenant + environment), so a token cannot be replayed cross-scope.
+    let token = db
+        .store()
+        .scoped(scope_a)
+        .org_connections()
+        .mint_routing_token(&ocn_a.to_string(), CONNECTOR_SLUG, 1_000_000_000)
+        .expect("mint token");
+    assert!(
+        db.store()
+            .scoped(scope_a)
+            .org_connections()
+            .verify_routing_token(&token, CONNECTOR_SLUG, 0)
+            .is_some(),
+        "the token verifies in its own scope"
+    );
+    assert!(
+        db.store()
+            .scoped(scope_b)
+            .org_connections()
+            .verify_routing_token(&token, CONNECTOR_SLUG, 0)
+            .is_none(),
+        "the token must not verify in a foreign scope"
+    );
+}

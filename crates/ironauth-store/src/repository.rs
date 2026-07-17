@@ -19410,6 +19410,77 @@ fn routing_user_blind_index(master: &MasterKey, scope: Scope, raw_identifier: &s
     master.blind_index(&routing_user_bidx_aad(scope, canonical.as_str()))
 }
 
+/// The domain-separation label of a federation routing token's keyed MAC (issue #77
+/// security fix). Distinct from every other blind-index label so a token MAC can never
+/// be confused with, or replayed as, another index under the same master key.
+const ROUTING_TOKEN_LABEL: &str = "federation.routing.token.v1";
+
+/// The maximum accepted length of a routing token string. A well-formed token is well
+/// under this (an `ocn_` id, an 8-byte expiry, and a 32-byte MAC, each base64url). The
+/// bound makes `verify_routing_token` fail closed on a hostile oversized input before it
+/// allocates, rather than decode an unbounded blob.
+const ROUTING_TOKEN_MAX_LEN: usize = 256;
+
+/// The keyed-MAC context for a federation routing token (issue #77 security fix). It
+/// binds, length-prefixed and domain-separated: the token label, the scope
+/// (tenant + environment), the connector slug the token is minted for, the org
+/// connection id it authorizes, and the expiry instant. Because ALL of these are under
+/// the MAC, a token cannot be swapped to another org connection under the same
+/// connector, replayed on another connector, used cross-scope, or replayed after expiry.
+fn routing_token_aad(
+    scope: Scope,
+    connector_slug: &str,
+    org_connection_id: &str,
+    expires_at_micros: i64,
+) -> Aad {
+    Aad::builder()
+        .text(ROUTING_TOKEN_LABEL)
+        .text(&scope.tenant().to_string())
+        .text(&scope.environment().to_string())
+        .text(connector_slug)
+        .text(org_connection_id)
+        .version(expires_at_micros)
+        .build()
+}
+
+/// Encode a routing token as `base64url(org_connection_id) "." base64url(expiry LE) "."
+/// base64url(mac)` (issue #77 security fix). The three parts are the value the verifier
+/// re-binds into the MAC context; the MAC authenticates all of them.
+fn encode_routing_token(org_connection_id: &str, expires_at_micros: i64, mac: &[u8]) -> String {
+    format!(
+        "{}.{}.{}",
+        URL_SAFE_NO_PAD.encode(org_connection_id.as_bytes()),
+        URL_SAFE_NO_PAD.encode(expires_at_micros.to_le_bytes()),
+        URL_SAFE_NO_PAD.encode(mac),
+    )
+}
+
+/// Parse a routing token into `(org_connection_id, expires_at_micros, mac)`, failing
+/// closed to [`None`] on ANY malformed or oversized input (issue #77 security fix): an
+/// oversized string, not exactly three `.`-separated parts, a non-base64url part, a
+/// non-UTF-8 org connection id, or an expiry that is not exactly eight bytes. No branch
+/// here depends on the MAC value, so a malformed token is uniformly rejected.
+fn decode_routing_token(token: &str) -> Option<(String, i64, Vec<u8>)> {
+    if token.len() > ROUTING_TOKEN_MAX_LEN {
+        return None;
+    }
+    let mut parts = token.split('.');
+    let ocn_b64 = parts.next()?;
+    let expiry_b64 = parts.next()?;
+    let mac_b64 = parts.next()?;
+    if parts.next().is_some() {
+        // More than three parts: not a well-formed token.
+        return None;
+    }
+    let ocn_bytes = URL_SAFE_NO_PAD.decode(ocn_b64).ok()?;
+    let org_connection_id = String::from_utf8(ocn_bytes).ok()?;
+    let expiry_bytes = URL_SAFE_NO_PAD.decode(expiry_b64).ok()?;
+    let expiry_arr: [u8; 8] = expiry_bytes.try_into().ok()?;
+    let expires_at_micros = i64::from_le_bytes(expiry_arr);
+    let mac = URL_SAFE_NO_PAD.decode(mac_b64).ok()?;
+    Some((org_connection_id, expires_at_micros, mac))
+}
+
 /// The read-only organization-to-connector binding repository (issue #77). Every read
 /// is scope-bound; a binding holds no secret, so a read is secret-free by construction.
 pub struct OrgConnectionRepo<'a> {
@@ -19453,6 +19524,76 @@ impl OrgConnectionRepo<'_> {
         tx.commit().await?;
         let row = row.ok_or(StoreError::NotFound)?;
         org_connection_record_from_row(&row, self.scope)
+    }
+
+    /// Mint a server-authenticated routing token for a login that has been routed to
+    /// `org_connection_id` under this connector (issue #77 security fix). The token is a
+    /// keyed MAC (a domain-separated subkey of the master key, the SAME primitive as the
+    /// blind indexes) over the scope, the connector slug, the org connection id, and the
+    /// expiry, so the browser cannot swap the org connection to another one that shares
+    /// the connector on the login -> authorize redirect hop. `expires_at_micros` is the
+    /// CALLER's clock plus a short TTL (the token only needs to survive that one hop); the
+    /// store never reads the wall clock. The verifier is [`Self::verify_routing_token`].
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Encryption`] if no platform master key is configured (the token path
+    /// fails closed rather than mint an unauthenticated selector).
+    pub fn mint_routing_token(
+        &self,
+        org_connection_id: &str,
+        connector_slug: &str,
+        expires_at_micros: i64,
+    ) -> Result<String, StoreError> {
+        let master = self.store.master().ok_or(StoreError::Encryption)?;
+        let mac = master.blind_index(&routing_token_aad(
+            self.scope,
+            connector_slug,
+            org_connection_id,
+            expires_at_micros,
+        ));
+        Ok(encode_routing_token(
+            org_connection_id,
+            expires_at_micros,
+            mac.as_bytes(),
+        ))
+    }
+
+    /// Verify a routing token presented at the federated authorize leg (issue #77
+    /// security fix), returning the org connection id it authorizes ONLY when the MAC is
+    /// valid and the token is unexpired, else [`None`]. Fail-closed and oracle-free: any
+    /// malformed, oversized, tampered, cross-connector, cross-scope, or expired token is
+    /// uniformly [`None`]. The MAC is recomputed under THIS scope and the passed
+    /// `connector_slug` and compared in CONSTANT TIME, so a token minted for one org
+    /// connection cannot be swapped to a sibling under the same connector, replayed on
+    /// another connector, used cross-scope, or replayed past `now_micros`. `now_micros` is
+    /// the CALLER's clock; the store never reads the wall clock.
+    #[must_use]
+    pub fn verify_routing_token(
+        &self,
+        token: &str,
+        connector_slug: &str,
+        now_micros: i64,
+    ) -> Option<String> {
+        // No master key means no way to authenticate the token: fail closed.
+        let master = self.store.master()?;
+        let (org_connection_id, expires_at_micros, presented_mac) = decode_routing_token(token)?;
+        // Expiry via the caller's clock. Reject at or after the expiry instant.
+        if now_micros >= expires_at_micros {
+            return None;
+        }
+        let expected = master.blind_index(&routing_token_aad(
+            self.scope,
+            connector_slug,
+            &org_connection_id,
+            expires_at_micros,
+        ));
+        // Constant-time compare: never `==` on the raw MAC bytes.
+        if expected.ct_eq(&presented_mac) {
+            Some(org_connection_id)
+        } else {
+            None
+        }
     }
 
     /// Every binding in the scope, ordered by the stable `(created_at, id)` key, for

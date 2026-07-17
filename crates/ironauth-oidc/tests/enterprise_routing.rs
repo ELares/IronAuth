@@ -342,12 +342,24 @@ async fn routed_login(
     );
     let authorize_uri = location(&login);
     assert!(
-        authorize_uri.contains("/federation/") && authorize_uri.contains("org_connection="),
-        "the redirect carries the routed org connection: {authorize_uri}"
+        authorize_uri.contains("/federation/") && authorize_uri.contains("routing="),
+        "the redirect carries the server-authenticated routing token: {authorize_uri}"
     );
 
-    // 2. GET the federated authorize leg: 302 to the upstream with state + nonce.
-    let authorize = get(router(harness, runtime), &authorize_uri).await;
+    // 2-3. Follow the authorize leg to the upstream and drive the callback.
+    complete_federation(harness, runtime, upstream, &authorize_uri, sub).await
+}
+
+/// Follow a federated `authorize_uri` (302 to the upstream), have the mock upstream issue
+/// an `id_token` bound to the nonce, and drive the callback, returning its response.
+async fn complete_federation(
+    harness: &Harness,
+    runtime: &Arc<FederationRuntime>,
+    upstream: &Upstream,
+    authorize_uri: &str,
+    sub: &str,
+) -> axum::response::Response {
+    let authorize = get(router(harness, runtime), authorize_uri).await;
     assert_eq!(
         authorize.status(),
         StatusCode::SEE_OTHER,
@@ -357,7 +369,6 @@ async fn routed_login(
     let state = param(&upstream_redirect, "state");
     let nonce = param(&upstream_redirect, "nonce");
 
-    // 3. The upstream issues an id_token bound to that nonce; drive the callback.
     *upstream.token_response.lock().unwrap() =
         token_response(&id_token(&upstream.key, &nonce, sub));
     let scope = harness.scope();
@@ -373,6 +384,25 @@ async fn routed_login(
             .expect("slug"),
     );
     get(router(harness, runtime), &callback_uri).await
+}
+
+/// Build a federated authorize URI for connector `slug`, carrying the local `return_to`
+/// and, when `routing` is `Some`, that routing token as the `routing` query param.
+fn authorize_uri(harness: &Harness, slug: &str, routing: Option<&str>) -> String {
+    let scope = harness.scope();
+    let return_to = format!("/authorize?client_id={}", harness.client_id());
+    let mut uri = format!(
+        "/t/{}/e/{}/federation/{}/authorize?return_to={}",
+        scope.tenant(),
+        scope.environment(),
+        slug,
+        encode(&return_to),
+    );
+    if let Some(token) = routing {
+        use std::fmt::Write as _;
+        let _ = write!(uri, "&routing={}", encode(token));
+    }
+    uri
 }
 
 #[tokio::test]
@@ -576,9 +606,12 @@ async fn per_app_and_per_user_rules_override_a_domain_rule() {
         "the app rule overrides the domain rule: {}",
         location(&app_routed)
     );
+    // The routed org connection now travels as an OPAQUE server-authenticated token (its
+    // id is no longer a browser-visible plaintext param); the end-to-end stamp test proves
+    // the correct org is bound. Here we assert the token is present on the winning route.
     assert!(
-        location(&app_routed).contains(&format!("org_connection={override_ocn}")),
-        "the routed org connection is the app rule's: {}",
+        location(&app_routed).contains("routing="),
+        "the app-rule route carries a routing token: {}",
         location(&app_routed)
     );
 
@@ -622,5 +655,282 @@ async fn a_no_match_identifier_falls_through_to_local_login() {
     assert!(
         !is_federation_redirect,
         "an unrouted identifier must not be redirected to federation"
+    );
+}
+
+/// Seed an org, a connector at `slug` (pointing at the mock upstream), and a binding
+/// between them; return the connector id and the binding id.
+async fn seed_connector_and_binding(
+    harness: &Harness,
+    slug: &str,
+) -> (ConnectorId, OrgConnectionId) {
+    let env = harness.env().clone();
+    let scope = harness.scope();
+    let control = harness.db().control_store();
+
+    let org_id = OrganizationId::generate(&env, &scope);
+    control
+        .management()
+        .acting(harness.db().test_actor(&env), CorrelationId::generate(&env))
+        .organizations(scope)
+        .create(&env, &org_id, 1_000_000, "Acme Corp", None)
+        .await
+        .expect("create organization");
+
+    let connector_id = ConnectorId::generate(&env, &scope);
+    let definition = format!(
+        r#"{{"connector_id":"{slug}","display_name":"Acme","protocol":"oidc","endpoints":{{"issuer":"{UPSTREAM_ISSUER}"}},"scopes":["openid","email"],"client_id":"{UPSTREAM_CLIENT_ID}"}}"#
+    );
+    control
+        .scoped(scope)
+        .acting(harness.db().test_actor(&env), CorrelationId::generate(&env))
+        .connectors()
+        .create(
+            &env,
+            &connector_id,
+            1_000_000,
+            NewConnector {
+                slug,
+                definition_json: &definition,
+                client_secret: b"upstream-secret",
+                capabilities: ConnectorCapabilities {
+                    refresh: false,
+                    groups: false,
+                    logout_propagation: false,
+                    email_verified_trust: "untrusted",
+                },
+                enabled: true,
+            },
+            None,
+        )
+        .await
+        .expect("create connector");
+
+    let ocn_id = OrgConnectionId::generate(&env, &scope);
+    control
+        .scoped(scope)
+        .acting(harness.db().test_actor(&env), CorrelationId::generate(&env))
+        .org_connections()
+        .create(
+            &env,
+            &ocn_id,
+            1_000_000,
+            NewOrgConnection {
+                organization_id: &org_id,
+                connector_id: &connector_id,
+                capture_upstream_tokens: false,
+                enabled: true,
+            },
+        )
+        .await
+        .expect("create org connection");
+    (connector_id, ocn_id)
+}
+
+/// Seed a fresh org and a SECOND binding on the EXISTING `connector_id` (two orgs
+/// legitimately sharing one connector), returning the new binding id.
+async fn seed_extra_binding(harness: &Harness, connector_id: &ConnectorId) -> OrgConnectionId {
+    let env = harness.env().clone();
+    let scope = harness.scope();
+    let control = harness.db().control_store();
+
+    let org_id = OrganizationId::generate(&env, &scope);
+    control
+        .management()
+        .acting(harness.db().test_actor(&env), CorrelationId::generate(&env))
+        .organizations(scope)
+        .create(&env, &org_id, 1_000_000, "Rival Corp", None)
+        .await
+        .expect("create organization");
+
+    let ocn_id = OrgConnectionId::generate(&env, &scope);
+    control
+        .scoped(scope)
+        .acting(harness.db().test_actor(&env), CorrelationId::generate(&env))
+        .org_connections()
+        .create(
+            &env,
+            &ocn_id,
+            1_000_000,
+            NewOrgConnection {
+                organization_id: &org_id,
+                connector_id,
+                capture_upstream_tokens: false,
+                enabled: true,
+            },
+        )
+        .await
+        .expect("create second org connection");
+    ocn_id
+}
+
+/// Flip the first character of a routing token's MAC part to a different base64url char,
+/// so the recomputed MAC no longer matches (the `.`-separated layout is
+/// `b64(ocn).b64(expiry).b64(mac)`).
+fn flip_mac(token: &str) -> String {
+    let (rest, mac) = token.rsplit_once('.').expect("mac part");
+    let first = mac.chars().next().expect("non-empty mac");
+    let replacement = if first == 'A' { 'B' } else { 'A' };
+    let flipped: String = std::iter::once(replacement)
+        .chain(mac.chars().skip(1))
+        .collect();
+    format!("{rest}.{flipped}")
+}
+
+/// Replace the org-connection part (part 0) of a routing token with `new_ocn_b64`, keeping
+/// the original expiry and MAC (the swap the fix must reject).
+fn replace_ocn_part(token: &str, new_ocn_b64: &str) -> String {
+    let (_old_ocn, rest) = token.split_once('.').expect("ocn part");
+    format!("{new_ocn_b64}.{rest}")
+}
+
+#[tokio::test]
+async fn a_browser_tampered_routing_token_fails_closed_with_no_org_stamped() {
+    let harness = Harness::start().await;
+    let scope = harness.scope();
+    let upstream = start_upstream().await;
+    let runtime = build_runtime(upstream.addr);
+
+    // Two org connections legitimately SHARE connector "acme" ((orgA, acme) and (orgB, acme)
+    // coexist under the (tenant, env, org, connector) unique index), plus a second connector
+    // "other" pointing at the same upstream. This is the exact shape the swap and
+    // cross-connector attacks target.
+    let (acme_connector, ocn_a) = seed_connector_and_binding(&harness, "acme").await;
+    let ocn_b = seed_extra_binding(&harness, &acme_connector).await;
+    let _other = seed_connector_and_binding(&harness, "other").await;
+
+    // A valid routing token for ocn_a under connector "acme", minted through the STORE the
+    // way the login surface does. The harness clock is frozen at the epoch, so the authorize
+    // leg reads now = 0 micros; a future expiry keeps the token live.
+    let expiry = 1_000_000_000_i64;
+    let valid = harness
+        .store()
+        .scoped(scope)
+        .org_connections()
+        .mint_routing_token(&ocn_a.to_string(), "acme", expiry)
+        .expect("mint valid token");
+
+    // Control: the untampered token is accepted, so the authorize leg redirects upstream.
+    let ok = get(
+        router(&harness, &runtime),
+        &authorize_uri(&harness, "acme", Some(&valid)),
+    )
+    .await;
+    assert_eq!(
+        ok.status(),
+        StatusCode::SEE_OTHER,
+        "a valid routing token routes to the upstream"
+    );
+
+    // (a) A flipped MAC byte fails closed with the uniform not-found.
+    let flipped = flip_mac(&valid);
+    assert_eq!(
+        get(
+            router(&harness, &runtime),
+            &authorize_uri(&harness, "acme", Some(&flipped)),
+        )
+        .await
+        .status(),
+        StatusCode::NOT_FOUND,
+        "a tampered MAC fails closed"
+    );
+
+    // (b) Swapping the org-connection part to a SIBLING under the SAME connector fails
+    // closed: the MAC covers ocn_a, not ocn_b, so the browser cannot downgrade the org.
+    let sibling_ocn_part = harness
+        .store()
+        .scoped(scope)
+        .org_connections()
+        .mint_routing_token(&ocn_b.to_string(), "acme", expiry)
+        .expect("mint sibling token")
+        .split('.')
+        .next()
+        .expect("ocn part")
+        .to_owned();
+    let swapped = replace_ocn_part(&valid, &sibling_ocn_part);
+    assert_eq!(
+        get(
+            router(&harness, &runtime),
+            &authorize_uri(&harness, "acme", Some(&swapped)),
+        )
+        .await
+        .status(),
+        StatusCode::NOT_FOUND,
+        "a browser-swapped org connection under the same connector fails closed"
+    );
+
+    // (c) A token minted for connector "acme" presented at connector "other" fails closed:
+    // the connector slug is bound into the MAC, so cross-connector replay is rejected.
+    assert_eq!(
+        get(
+            router(&harness, &runtime),
+            &authorize_uri(&harness, "other", Some(&valid)),
+        )
+        .await
+        .status(),
+        StatusCode::NOT_FOUND,
+        "a token replayed on another connector fails closed"
+    );
+
+    // (d) An expired token (expiry at the epoch, which the authorize clock reads as now)
+    // fails closed.
+    let expired = harness
+        .store()
+        .scoped(scope)
+        .org_connections()
+        .mint_routing_token(&ocn_a.to_string(), "acme", 0)
+        .expect("mint expired token");
+    assert_eq!(
+        get(
+            router(&harness, &runtime),
+            &authorize_uri(&harness, "acme", Some(&expired)),
+        )
+        .await
+        .status(),
+        StatusCode::NOT_FOUND,
+        "an expired token fails closed"
+    );
+
+    // No org was stamped by any failed authorize: JIT provisioning happens only at a
+    // COMPLETED callback, and every tampered token stopped at the authorize leg. The
+    // end-to-end happy-path tests prove a VALID token stamps the correct org.
+}
+
+#[tokio::test]
+async fn a_direct_federated_login_without_a_routing_token_stamps_no_org() {
+    let harness = Harness::start().await;
+    let _seeded = seed_connector_and_binding(&harness, "acme").await;
+    let upstream = start_upstream().await;
+    let runtime = build_runtime(upstream.addr);
+
+    // Hit the federated authorize leg DIRECTLY with NO routing token (a non-routed
+    // "log in with Acme" style federated login): the safe default is no org binding.
+    let uri = authorize_uri(&harness, "acme", None);
+    let response = complete_federation(&harness, &runtime, &upstream, &uri, "direct-sub-1").await;
+    assert_eq!(
+        response.status(),
+        StatusCode::SEE_OTHER,
+        "a direct federated login completes and resumes the local authorize"
+    );
+
+    let external_id = federated_external_id(UPSTREAM_ISSUER, "direct-sub-1");
+    let user = harness
+        .store()
+        .scoped(harness.scope())
+        .users()
+        .by_external_id(&external_id)
+        .await
+        .expect("by_external_id")
+        .expect("the federated user is provisioned");
+    let stamped = harness
+        .store()
+        .scoped(harness.scope())
+        .users()
+        .org_connection(&user.id)
+        .await
+        .expect("org_connection read");
+    assert!(
+        stamped.is_none(),
+        "a direct federated login with no routing token carries no org binding"
     );
 }

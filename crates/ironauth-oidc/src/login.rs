@@ -10,6 +10,8 @@
 //! unknown account), and an unknown account still spends a full Argon2id
 //! verification so the endpoint is not a user-enumeration oracle.
 
+use std::time::Duration;
+
 use axum::extract::{Form, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
@@ -26,6 +28,11 @@ use crate::pages;
 use crate::state::OidcState;
 use crate::totp::{self, SecondFactorOutcome};
 use crate::util::epoch_micros;
+
+/// How long a federation routing token (issue #77 security fix) stays valid. The token
+/// only needs to survive the login -> authorize redirect hop, so a short window is
+/// enough and bounds any replay of a leaked redirect URL.
+const ROUTING_TOKEN_TTL: Duration = Duration::from_secs(300);
 
 /// The `return_to` carried on the `GET /login` query.
 #[derive(Deserialize)]
@@ -437,16 +444,28 @@ async fn federation_route_redirect(
         return None;
     }
 
+    // Mint a server-authenticated routing token (issue #77 security fix): a keyed MAC,
+    // minted in the STORE where the master key lives, binding the routed org connection to
+    // THIS connector, this scope, and a short expiry. The token, not a plaintext org
+    // connection id, travels in the redirect, so the browser can neither swap the org to a
+    // sibling under the same connector nor replay the id on another connector. The master
+    // key never leaves the store.
+    let now = state.now();
+    let expires_at_micros = epoch_micros(now.checked_add(ROUTING_TOKEN_TTL).unwrap_or(now));
+    let token = org_connections
+        .mint_routing_token(&ocn_id.to_string(), &connector.slug, expires_at_micros)
+        .ok()?;
+
     // Build the redirect to the federated authorize leg, carrying the ORIGINAL local
-    // resume target (so a successful federated login resumes it) and the routed org
-    // connection id (validated at the authorize leg against this connector).
+    // resume target (so a successful federated login resumes it) and the routing token
+    // (verified at the authorize leg against this connector and this scope).
     let location = format!(
-        "/t/{}/e/{}/federation/{}/authorize?return_to={}&org_connection={}",
+        "/t/{}/e/{}/federation/{}/authorize?return_to={}&routing={}",
         scope.tenant(),
         scope.environment(),
         crate::util::percent_encode_query(&connector.slug),
         crate::util::percent_encode_query(&resume.return_to),
-        crate::util::percent_encode_query(&ocn_id.to_string()),
+        crate::util::percent_encode_query(&token),
     );
     Some(interaction::redirect(&location))
 }
