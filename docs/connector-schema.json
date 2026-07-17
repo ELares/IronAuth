@@ -30,7 +30,7 @@
     },
     "ClaimMapping": {
       "additionalProperties": false,
-      "description": "The declarative mapping from upstream claims to IronAuth identity traits (issue\n#75). The parsed-and-stored SHAPE only in this slice; the evaluator is later.",
+      "description": "The declarative mapping from upstream claims to IronAuth identity traits (issue\n#75). The stored SHAPE; [`claim_mapping::evaluate`] is its evaluator.",
       "properties": {
         "subject": {
           "anyOf": [
@@ -56,7 +56,7 @@
     },
     "ClaimRule": {
       "additionalProperties": false,
-      "description": "One declarative claim-mapping rule: an ordered list of upstream claim paths to\ntry (the first that resolves wins) and whether a value is required.\n\nThis is the parsed-and-stored SHAPE only. The evaluator (resolving a path\nagainst merged ID-token / `UserInfo` claims, type-checking against the trait\nschema, and fail-closed provisioning) is a later slice.",
+      "description": "One declarative claim-mapping rule: an ordered list of upstream claim paths to\ntry (the first that resolves wins) and whether a value is required.\n\n[`claim_mapping::evaluate`] resolves a rule against the merged ID-token /\n`UserInfo` claims, type-checks the assembled document against the trait schema,\nand fails closed on a missing required or malformed claim.",
       "properties": {
         "required": {
           "default": true,

@@ -40,16 +40,24 @@
 //! passes syntax here and blocks on the wire later. No `url` crate is pulled in
 //! for the syntactic check; it is done inline.
 //!
-//! # What is deferred
+//! # The claim-mapping evaluator
 //!
-//! This crate is the data plane. The generic OIDC upstream (discovery, JWKS
-//! cache, ID-token validation, federated login) and the claim-mapping EVALUATOR
-//! are later slices; [`ClaimMapping`] here is the parsed-and-stored declarative
-//! SHAPE only, with no evaluator.
+//! [`ClaimMapping`] is the parsed-and-stored declarative SHAPE; the [`claim_mapping`]
+//! module is its EVALUATOR (issue #75, PR C). [`claim_mapping::evaluate`] is a pure,
+//! I/O-free transform from an upstream's verified claims to an IronAuth trait
+//! document, with a fail-closed contract: on any missing required claim, malformed
+//! claim, or trait-schema type-check failure it returns a typed error and NO document,
+//! so a mapping failure never provisions a partial identity. It stays store-free (the
+//! trait-schema type check is injected via [`claim_mapping::TraitSchemaView`]), so this
+//! crate remains pure and fetch-free.
 
+pub mod claim_mapping;
 pub mod discovery;
 pub mod error;
 
+pub use claim_mapping::{
+    ClaimMappingError, ClaimSources, TraitDocument, TraitPointerFailure, TraitSchemaView, evaluate,
+};
 pub use discovery::{ResolvedEndpoints, discovery_url, parse_discovery, resolve_explicit};
 pub use error::ConnectorError;
 
@@ -184,9 +192,9 @@ pub struct Quirks {
 /// One declarative claim-mapping rule: an ordered list of upstream claim paths to
 /// try (the first that resolves wins) and whether a value is required.
 ///
-/// This is the parsed-and-stored SHAPE only. The evaluator (resolving a path
-/// against merged ID-token / `UserInfo` claims, type-checking against the trait
-/// schema, and fail-closed provisioning) is a later slice.
+/// [`claim_mapping::evaluate`] resolves a rule against the merged ID-token /
+/// `UserInfo` claims, type-checks the assembled document against the trait schema,
+/// and fails closed on a missing required or malformed claim.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ClaimRule {
@@ -205,7 +213,7 @@ const fn default_true() -> bool {
 }
 
 /// The declarative mapping from upstream claims to IronAuth identity traits (issue
-/// #75). The parsed-and-stored SHAPE only in this slice; the evaluator is later.
+/// #75). The stored SHAPE; [`claim_mapping::evaluate`] is its evaluator.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields, default)]
 pub struct ClaimMapping {
@@ -450,6 +458,14 @@ pub struct ConnectorRuntimeConfig {
     /// How PKCE is applied to the upstream authorization request.
     #[serde(default)]
     pub pkce: PkceMode,
+    /// The declarative claim mapping the callback evaluates the verified upstream claims
+    /// through to assemble the local identity's traits (issue #75, PR C).
+    #[serde(default)]
+    pub claim_mapping: ClaimMapping,
+    /// Provider quirks read as data (issue #75, PR C): the email source order the claim
+    /// mapping resolves email through, and whether `UserInfo` is required.
+    #[serde(default)]
+    pub quirks: Quirks,
 }
 
 /// One semantic validation failure, carrying an RFC 6901 JSON POINTER to the
@@ -560,6 +576,55 @@ impl ConnectorDefinition {
                     );
                 }
             }
+        }
+
+        // The subject cannot be remapped. A federated identity is ALWAYS keyed on the
+        // verified, issuer-namespaced upstream `sub` (the composite the federation layer
+        // establishes), never on the mapped subject; the mapping's `subject` rule feeds
+        // only a cosmetic view. So a CUSTOM subject rule can never change the identity and
+        // can only FAIL a login (when the mapped claim is absent or the wrong type) for
+        // zero benefit. Reject anything other than the canonical default (`sub`, required)
+        // at write time, so an operator gets a clear config error instead of a login-time
+        // trap. The default (an absent `subject`, or an explicit `{ source: ["sub"] }`) is
+        // accepted.
+        if let Some(subject_rule) = &self.claim_mapping.subject {
+            let is_default = subject_rule.required
+                && subject_rule.source.len() == 1
+                && subject_rule.source[0] == "sub";
+            if !is_default {
+                errors.push(ValidationError::new(
+                    "/claim_mapping/subject",
+                    "the subject cannot be remapped: a federated identity is always keyed on \
+                     the verified upstream `sub` claim, so a custom subject rule can only fail \
+                     logins for no benefit; remove the subject rule (the default `sub` is \
+                     always used)",
+                ));
+            }
+        }
+
+        // Reject a connector that REQUIRES a UserInfo fetch to assemble the identity. The
+        // federation callback passes `userinfo: None` (the UserInfo fetch is deferred to
+        // issue #74), so any connector that sources a claim from UserInfo would fail EVERY
+        // login. Rejecting at write time turns a silent, per-login availability cliff (a
+        // failure that would even be misclassified as an upstream fault) into one actionable
+        // config error. Two forms require UserInfo: `email_source: "userinfo"` (email sourced
+        // ONLY from UserInfo) and `userinfo_required: true`. `fallback_order` always tries the
+        // ID token first, so it does not require UserInfo and is accepted.
+        if self.quirks.userinfo_required {
+            errors.push(ValidationError::new(
+                "/quirks/userinfo_required",
+                "userinfo_required is not yet supported: the UserInfo fetch is deferred \
+                 (issue #74), so a userinfo-required connector would fail every login; set it \
+                 false until UserInfo fetch lands",
+            ));
+        }
+        if self.quirks.email_source == EmailSource::Userinfo {
+            errors.push(ValidationError::new(
+                "/quirks/email_source",
+                "email_source \"userinfo\" is not yet supported: the UserInfo fetch is deferred \
+                 (issue #74), so a userinfo-sourced email would fail every login; use \
+                 \"id_token\" or \"fallback_order\" until UserInfo fetch lands",
+            ));
         }
 
         if errors.is_empty() {
@@ -949,6 +1014,87 @@ mod tests {
             errors.iter().any(|error| error.pointer == "/connector_id"),
             "{errors:?}"
         );
+    }
+
+    #[test]
+    fn a_custom_subject_rule_is_rejected_but_the_default_is_accepted() {
+        // The default (an absent subject rule) validates: the identity is always keyed on
+        // the verified upstream `sub`, which the evaluator uses by default.
+        let def = parse(VALID).expect("parses");
+        def.validate().expect("the default subject is accepted");
+
+        // An explicit-but-equivalent `{ source: ["sub"] }` is still the default and accepted.
+        let json = VALID.replace(
+            "\"client_id\": \"ironauth-at-acme\",",
+            "\"client_id\": \"ironauth-at-acme\", \"claim_mapping\": { \
+               \"subject\": { \"source\": [\"sub\"] } },",
+        );
+        let def = parse(&json).expect("parses");
+        def.validate()
+            .expect("an explicit default subject is accepted");
+
+        // A CUSTOM subject rule (a different claim path) is rejected at validation with a
+        // pointer to the subject rule, because it can only ever break a login for no benefit.
+        let json = VALID.replace(
+            "\"client_id\": \"ironauth-at-acme\",",
+            "\"client_id\": \"ironauth-at-acme\", \"claim_mapping\": { \
+               \"subject\": { \"source\": [\"oid\"] } },",
+        );
+        let def = parse(&json).expect("parses");
+        let errors = def.validate().expect_err("custom subject rejected");
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.pointer == "/claim_mapping/subject"),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn a_userinfo_requiring_connector_is_rejected_until_userinfo_lands() {
+        // An id_token-only connector (the default email_source, userinfo_required false) is
+        // accepted: it needs no UserInfo fetch.
+        let def = parse(VALID).expect("parses");
+        def.validate()
+            .expect("an id_token-only connector validates");
+
+        // `userinfo_required: true` is rejected (the UserInfo fetch is deferred to #74, so it
+        // would fail every login).
+        let json = VALID.replace(
+            "\"client_id\": \"ironauth-at-acme\",",
+            "\"client_id\": \"ironauth-at-acme\", \"quirks\": { \"userinfo_required\": true },",
+        );
+        let def = parse(&json).expect("parses");
+        let errors = def.validate().expect_err("userinfo_required rejected");
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.pointer == "/quirks/userinfo_required"),
+            "{errors:?}"
+        );
+
+        // `email_source: "userinfo"` (email sourced only from UserInfo) is rejected too.
+        let json = VALID.replace(
+            "\"client_id\": \"ironauth-at-acme\",",
+            "\"client_id\": \"ironauth-at-acme\", \"quirks\": { \"email_source\": \"userinfo\" },",
+        );
+        let def = parse(&json).expect("parses");
+        let errors = def.validate().expect_err("userinfo email_source rejected");
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.pointer == "/quirks/email_source"),
+            "{errors:?}"
+        );
+
+        // `fallback_order` tries the ID token first, so it does not require UserInfo: accepted.
+        let json = VALID.replace(
+            "\"client_id\": \"ironauth-at-acme\",",
+            "\"client_id\": \"ironauth-at-acme\", \"quirks\": { \"email_source\": \"fallback_order\" },",
+        );
+        let def = parse(&json).expect("parses");
+        def.validate()
+            .expect("a fallback_order email_source validates");
     }
 
     #[test]

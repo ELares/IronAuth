@@ -40,15 +40,15 @@ use axum::response::Response;
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use ironauth_connector::{
-    ConnectorError, ConnectorRuntimeConfig, Endpoints, PkceMode, ResolvedEndpoints, discovery_url,
-    parse_discovery,
+    ClaimSources, ConnectorError, ConnectorRuntimeConfig, Endpoints, PkceMode, ResolvedEndpoints,
+    TraitDocument, TraitPointerFailure, TraitSchemaView, discovery_url, evaluate, parse_discovery,
 };
 use ironauth_env::Clock;
 use ironauth_fetch::{FetchError, FetchPurpose, FetchRequest, Fetcher};
 use ironauth_jose::{JwsAlgorithm, TrustedKey, VerificationPolicy, verify};
 use ironauth_store::{
-    ConnectorId, FederationLoginStateId, NewAdminUser, NewFederationLoginState, Scope, UserId,
-    UserState,
+    ConnectorId, FederationLoginStateId, NewAdminUser, NewFederationLoginState, Scope, StoreError,
+    TraitSchema, UserId, UserState,
 };
 use sha2::{Digest, Sha256};
 
@@ -80,6 +80,10 @@ pub struct VerifiedUpstreamIdentity {
     /// The upstream `auth_time` in epoch SECONDS, if the token asserted one. When
     /// absent the callback instant (from the clock seam) is the honest `auth_time`.
     pub auth_time_secs: Option<i64>,
+    /// The full set of VERIFIED ID-token claims, retained so the declarative claim
+    /// mapping (issue #75, PR C) can resolve trait fields from them. Every claim here
+    /// passed [`ironauth_jose::verify`]; nothing unverified is carried.
+    pub claims: serde_json::Map<String, serde_json::Value>,
 }
 
 /// The JOSE core's full signature-algorithm allowlist. HMAC and `none` are absent by
@@ -340,6 +344,7 @@ pub fn validate_upstream_id_token(
             .and_then(|v| v.as_str())
             .map(str::to_owned),
         auth_time_secs: claims.get("auth_time").and_then(serde_json::Value::as_i64),
+        claims: claims.raw().clone(),
     })
 }
 
@@ -766,11 +771,64 @@ pub async fn federation_callback(
         return interaction::server_error_page();
     };
 
-    // Provision a MINIMAL local identity from the VERIFIED upstream sub (PR C generalizes
-    // claim mapping): find the user by external id, or create one linked to the upstream
-    // sub with no local password (it can only ever log in through federation).
-    let Ok(user_id) =
-        provision_federated_user(&state, scope, &connector_slug, &expected_issuer, &identity).await
+    // Evaluate the declarative claim mapping (issue #75, PR C) against the VERIFIED upstream
+    // claims to assemble the local identity's trait document, TYPE-CHECKED against the scope's
+    // active trait schema. This is the acceptance-critical fail-closed crux: on ANY mapping
+    // failure (a missing required claim, a wrong type, a trait the schema does not declare) the
+    // evaluator returns a typed error and the login aborts HERE, BEFORE any user row is written.
+    // A mapping-definition fault is a Config error and an upstream claim fault is an
+    // UpstreamProtocol error; both fail the login with NO partial identity provisioned.
+    let Ok(active_schema) = state.store().scoped(scope).trait_schemas().active().await else {
+        return interaction::server_error_page();
+    };
+    let compiled = match active_schema
+        .as_ref()
+        .map(|version| TraitSchema::compile(&version.schema_json))
+    {
+        Some(Ok(schema)) => Some(schema),
+        // An active schema that fails to compile is a server-side fault, not a login the user
+        // can fix; fail closed without provisioning.
+        Some(Err(_)) => return interaction::server_error_page(),
+        None => None,
+    };
+    let schema_view = compiled.as_ref().map(StoreTraitSchema);
+    let schema_arg: Option<&dyn TraitSchemaView> = schema_view
+        .as_ref()
+        .map(|view| view as &dyn TraitSchemaView);
+
+    // The evaluator NFKC-normalizes the resolved `email` trait value itself, BEFORE its type
+    // check, so the mapped email is canonicalized regardless of the claim path it resolves from
+    // (a top-level `email` or a nested path like `emails.0`) and the type-checked and provisioned
+    // values are the same canonical form. `userinfo: None` because the UserInfo fetch is deferred
+    // to issue #74; a connector that requires UserInfo is rejected at write-time validation.
+    let Ok(trait_doc) = evaluate(
+        &definition.claim_mapping,
+        &definition.quirks,
+        ClaimSources {
+            id_token: &identity.claims,
+            userinfo: None,
+        },
+        schema_arg,
+    ) else {
+        // Fail-closed: NO user is provisioned from a mapping/type-check failure.
+        return interaction::server_error_page();
+    };
+
+    // Provision the local identity from the mapped traits (PR C), still keying on the VERIFIED,
+    // issuer-namespaced (issuer, sub) composite PR B established (never the mapped subject). A
+    // first login provisions the mapped traits; a returning login refreshes them. Only a fully
+    // valid, type-checked document ever reaches this write.
+    let schema_version = active_schema.as_ref().map(|version| version.version);
+    let Ok(user_id) = provision_federated_user(
+        &state,
+        scope,
+        &connector_slug,
+        &expected_issuer,
+        &identity,
+        &trait_doc,
+        schema_version,
+    )
+    .await
     else {
         return interaction::server_error_page();
     };
@@ -834,25 +892,62 @@ pub fn federated_external_id(issuer: &str, subject: &str) -> String {
     )
 }
 
-/// Provision or look up the LOCAL user for a verified federated identity (issue #75, PR B),
-/// keyed on the upstream ISSUER + `sub` via the external-id link (issue #75, HIGH-1: the
-/// namespaced key closes the cross-connector `sub`-collision takeover). A minimal identity:
-/// no local password (federation is the only login path), a namespaced login handle, and the
-/// issuer-namespaced external id. PR C generalizes claim mapping into the trait document.
+/// The store's compiled [`TraitSchema`] adapted to the connector crate's store-free
+/// [`TraitSchemaView`] seam (issue #75, PR C), so the pure evaluator can type-check an
+/// assembled trait document without depending on `ironauth-store`. It maps the store's
+/// per-field [`ironauth_store::ValidationFailure`]s (RFC 6901 pointer + operator-safe
+/// message, never a claim value) into the evaluator's [`TraitPointerFailure`].
+struct StoreTraitSchema<'a>(&'a TraitSchema);
+
+impl TraitSchemaView for StoreTraitSchema<'_> {
+    fn type_check(&self, document: &serde_json::Value) -> Vec<TraitPointerFailure> {
+        self.0
+            .validate(document)
+            .into_iter()
+            .map(|failure| TraitPointerFailure {
+                pointer: failure.pointer,
+                message: failure.message,
+            })
+            .collect()
+    }
+}
+
+/// Provision or look up the LOCAL user for a verified federated identity (issue #75), keyed on
+/// the upstream ISSUER + `sub` via the external-id link (issue #75, HIGH-1: the namespaced key
+/// closes the cross-connector `sub`-collision takeover), and carrying the DECLARATIVE
+/// claim-mapped traits (PR C).
+///
+/// The identity KEY stays the verified, issuer-namespaced `(issuer, sub)` composite, NEVER the
+/// mapped subject. A first login creates the user with the mapped traits (or a minimal identity
+/// when the mapping maps none); a returning login refreshes the mapped traits (a documented
+/// policy: a re-login re-applies the mapping so upstream trait drift is reflected), or leaves a
+/// trait-free identity untouched. `trait_doc` has ALREADY been type-checked against the active
+/// schema, so no partial or invalid document reaches a write here.
 ///
 /// # Errors
 ///
-/// [`ironauth_store::StoreError`] on a persistence or provisioning failure.
+/// [`StoreError`] on a persistence, serialization, or trait-validation failure.
 async fn provision_federated_user(
     state: &OidcState,
     scope: Scope,
     connector_slug: &str,
     issuer: &str,
     identity: &VerifiedUpstreamIdentity,
-) -> Result<UserId, ironauth_store::StoreError> {
+    trait_doc: &TraitDocument,
+    schema_version: Option<i32>,
+) -> Result<UserId, StoreError> {
     // The federated external-id is namespaced by the upstream ISSUER, because a `sub` is
     // unique only within one issuer (see `federated_external_id`).
     let external_id = federated_external_id(issuer, &identity.subject);
+    // The mapped traits as a JSON string, when the mapping produced any (a trait-free mapping
+    // provisions a minimal identity, exactly as PR B did). Serializing a JSON object never
+    // fails; a fault is surfaced rather than silently persisting an empty document.
+    let traits_json = if trait_doc.is_traitless() {
+        None
+    } else {
+        Some(serde_json::to_string(&trait_doc.traits_value()).map_err(|_| StoreError::Encryption)?)
+    };
+
     if let Some(existing) = state
         .store()
         .scoped(scope)
@@ -860,6 +955,19 @@ async fn provision_federated_user(
         .by_external_id(&external_id)
         .await?
     {
+        // Returning login: refresh the mapped traits (fully re-validated by set_traits against
+        // the active schema). A trait-free mapping leaves the existing identity untouched.
+        if let Some(traits_json) = traits_json.as_deref() {
+            let actor = interaction::user_actor(&existing.id);
+            let correlation = ironauth_store::CorrelationId::generate(state.env());
+            state
+                .store()
+                .scoped(scope)
+                .acting(actor, correlation)
+                .users()
+                .set_traits(state.env(), &existing.id, traits_json)
+                .await?;
+        }
         return Ok(existing.id);
     }
     // A namespaced, per-connector login handle keeps a federated account from colliding with
@@ -885,8 +993,10 @@ async fn provision_federated_user(
                 state: UserState::Active,
                 foreign_password_hash: None,
                 foreign_password_algo: None,
-                traits_json: None,
-                traits_schema_version: None,
+                traits_json: traits_json.as_deref(),
+                // The schema version accompanies the traits; the two are set together, and a
+                // non-empty document only reaches here when an active schema was present.
+                traits_schema_version: traits_json.as_ref().and(schema_version),
             },
             now_micros,
             None,
