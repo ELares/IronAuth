@@ -31,6 +31,33 @@ range per docs/RELEASING.md.
   (`oidc.recovery_cooldown_secs`) rate-limits repeated initiations. All timers run through
   the env clock seam (no wall-clock sleeps) and the cancellation token through the entropy
   seam.
+- Review fix (issue #81): the downgrade invariant is now ENFORCED on the LIVE
+  factor-removal surface, not just in `evaluate_factor_change`. The three removal handlers
+  (`POST /webauthn/credentials/remove`, `POST /account/credentials/remove`,
+  `POST /account/mfa/totp/remove`) and the password-removal path
+  (`POST /account/password/remove`) consult a subject's pending recovery flow before
+  removing a factor: if a recovery is pending, removing a factor STRONGER than the one the
+  recovery was performed with is refused with a non-enumerating `409`
+  (`recovery_downgrade_blocked`) while the flow is held (`hold_until` in the future) and no
+  fresh equal-or-stronger re-verification is proven, and the `recovery.factor_change`
+  transition is audited live either way. The webauthn removal projects the credential's TRUE
+  passkey rung (attested > device-bound `phrh` > synced `phr`); a fresh session within the
+  step-up window unblocks a downgrade at its achieved strength (`AllowedByReverify`), and a
+  removal past `hold_until` proceeds (`AllowedByDelay`), so a stale delay-elapsed flow never
+  perpetually locks removals. The gate keys off the PRESENCE of a pending recovery flow
+  (recovery access is an ordinary email-OTP session, not a special session type). The
+  `POST /recover` unknown-identifier branch now runs an anti-timing DECOY performing the
+  SAME risk-seam call and store round-trips as a known initiation before the identical
+  acknowledgment, so a registered identifier is not distinguishable by latency (the #68/#70
+  discipline). The recovery hold decision now fails CLOSED (a strongest-factor read fault is
+  treated as the ladder's top rung, routing to the HELD delay path) and projects the TRUE
+  strongest enrolled passkey rung, so a device-bound / attested passkey holder is never
+  under-held.
+- Known limitation (issue #81, M11): the recovery cancellation link is minted but not yet
+  DELIVERED. `recover_post` discards the cancellation token and the notify transport is the
+  M11 stub, so the "cancellable from a notification link" path is structurally correct
+  (token minted, digest stored, `GET/POST /recover/cancel` wired) but not reachable end to
+  end until M11 wires the token into the delivered message.
 - Trusted devices (remember-device 2FA) and the conditional-credential skip (issue #71),
   off by default behind `oidc.trusted_devices_enabled`. After a COMPLETED multi-factor
   login the `POST /login/mfa` path may plant a `__Host-ironauth_trusted_device` cookie

@@ -18,6 +18,16 @@ range per docs/RELEASING.md.
   `recovery.initiate` / `recovery.cancel` / `recovery.complete` / `recovery.factor_change`
   audit actions, so every recovery state transition is audited with actor, action, and
   factor/channel context.
+- Review fix (issue #81): adds `RecoveryFlowRepo::pending_for_subject` (the newest
+  `initiated`/`held` flow for a subject, `initiated_at DESC, id DESC` so two flows racing
+  the cooldown boundary resolve deterministically to the newest and a terminal flow is
+  never returned) so the live factor-removal gate can consult a pending recovery;
+  `WebauthnCredentialRepo::factor_strength` / `strongest_strength` (a passkey's
+  backup-eligible + attestation-verified flags, for one credential and for the strongest
+  enrolled rung) and `AccountCredentialRepo::factor_kind`, so the gate compares a removal at
+  its TRUE factor strength. `ActingRecoveryFlowRepo::complete` now REFUSES to complete a
+  `held` flow whose `hold_until` is still in the FUTURE (defense in depth for M9), so
+  completion can never erase the delay gate early.
 - Trusted devices (issue #71): migration 0053 adds the tenant-scoped, forced-RLS
   `trusted_devices` table (the SHA-256 DIGEST of the cookie secret as server-side state,
   the subject + `ses_` session-lineage binding, the SEALED User-Agent and coarse geo, the

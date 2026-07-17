@@ -16381,6 +16381,37 @@ impl AccountCredentialRepo<'_> {
         tx.commit().await?;
         Ok(out)
     }
+
+    /// The factor KIND wire string (`passkey`, `totp`, `recovery_code`) of `subject`'s
+    /// credential `id` (issue #81 HIGH-1): the recovery downgrade gate reads it to compare
+    /// a credential REMOVAL at its factor strength. Subject-bound, so another subject's id
+    /// (or a cross-scope id) is the uniform not-found (`None`). No PII is opened.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn factor_kind(
+        &self,
+        subject: &UserId,
+        id: &CredentialId,
+    ) -> Result<Option<String>, StoreError> {
+        if id.scope() != self.scope || subject.scope() != self.scope {
+            return Ok(None);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT credential_type FROM account_credentials \
+             WHERE tenant_id = $1 AND environment_id = $2 AND subject = $3 AND id = $4",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(subject.to_string())
+        .bind(id.to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(row.map(|row| row.get::<String, _>("credential_type")))
+    }
 }
 
 /// The operator-safe step-up detail recorded on the audit row of a credential
@@ -17248,6 +17279,47 @@ impl RecoveryFlowRepo<'_> {
         Ok(row.and_then(|row| recovery_flow_from_row(&row)))
     }
 
+    /// Resolve the ONE pending recovery flow for `subject` (issue #81 HIGH-1): the
+    /// newest flow still `initiated` or `held`, which the live factor-removal gate reads
+    /// to enforce the downgrade invariant. Filtered on the subject (the anti-IDOR
+    /// contract) and bounded by the `recovery_flows_subject_idx`.
+    ///
+    /// Two initiations racing at the cooldown boundary can both create pending flows (the
+    /// cooldown is a read-then-insert without a uniqueness constraint); rather than a
+    /// unique index (which would also refuse a legitimate post-cooldown re-initiation
+    /// while an earlier flow is still non-terminal), this deterministically returns the
+    /// NEWEST by `initiated_at`, so the gate always evaluates against the most recent
+    /// recovery (issue #81 LOW).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn pending_for_subject(
+        &self,
+        subject: &UserId,
+    ) -> Result<Option<RecoveryFlowRecord>, StoreError> {
+        if subject.scope() != self.scope {
+            return Ok(None);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT id, subject, state, entry_point, recover_acr, \
+             (EXTRACT(EPOCH FROM initiated_at) * 1000000)::bigint AS initiated_us, \
+             (EXTRACT(EPOCH FROM hold_until) * 1000000)::bigint AS hold_us \
+             FROM recovery_flows \
+             WHERE tenant_id = $1 AND environment_id = $2 AND subject = $3 \
+             AND state IN ('initiated', 'held') \
+             ORDER BY initiated_at DESC, id DESC LIMIT 1",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(subject.to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(row.and_then(|row| recovery_flow_from_row(&row)))
+    }
+
     /// Count `subject`'s recovery flows initiated at or after `since_micros` (issue
     /// #81): the per-account COOLDOWN signal. A non-zero count inside the cooldown
     /// window means a repeated initiation must be refused.
@@ -17485,6 +17557,12 @@ impl ActingRecoveryFlowRepo<'_> {
     /// completion writes one `recovery.complete` audit row targeting the flow with the
     /// recover-factor strength in `detail`. Returns whether a row was flipped.
     ///
+    /// DEFENSE IN DEPTH (issue #81 MEDIUM-3): a `held` flow whose `hold_until` is still in
+    /// the FUTURE is REFUSED (the UPDATE guards `hold_until IS NULL OR hold_until <= now`),
+    /// so completion can never erase the delay gate before the notified window has elapsed.
+    /// An `initiated` flow (no hold) completes as before. Completion is M9-deferred, so
+    /// there is no live caller today; the guard closes the trap for whoever wires it.
+    ///
     /// # Errors
     ///
     /// [`StoreError::Database`] on a persistence failure.
@@ -17515,7 +17593,9 @@ impl ActingRecoveryFlowRepo<'_> {
                     "UPDATE recovery_flows SET state = 'completed', \
                      completed_at = TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval \
                      WHERE id = $1 AND tenant_id = $2 AND environment_id = $3 \
-                     AND state IN ('initiated', 'held')",
+                     AND state IN ('initiated', 'held') \
+                     AND (hold_until IS NULL OR hold_until <= \
+                          TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval)",
                 )
                 .bind(&id_text)
                 .bind(scope.tenant().to_string())
@@ -17681,6 +17761,21 @@ pub struct WebauthnAssertionTarget {
     pub backup_eligible: bool,
     /// Whether the credential's attestation was verified at registration (issue #66,
     /// PR B). The login path reads this to record an attested-passkey sign-in event.
+    pub attestation_verified: bool,
+}
+
+/// The strength-defining flags of ONE registered passkey (issue #81 HIGH-1): its
+/// registration-time backup eligibility (synced vs device-bound) and whether its
+/// attestation was verified. The recovery downgrade gate projects these onto the issue
+/// #66 credential ladder (attested > device-bound `phrh` > synced `phr`) so a passkey
+/// removal is compared at its TRUE strength, never under-counted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WebauthnFactorStrength {
+    /// Backup-eligible (BE): a synced passkey sets it (`phr`), a device-bound key
+    /// clears it (`phrh`).
+    pub backup_eligible: bool,
+    /// Whether the credential's attestation was verified at registration (issue #66):
+    /// the strongest rung (`attested_passkey`).
     pub attestation_verified: bool,
 }
 
@@ -17983,6 +18078,74 @@ impl WebauthnCredentialRepo<'_> {
                 backup_eligible: row.get("backup_eligible"),
                 attestation_verified: row.get("attestation_verified"),
             }
+        }))
+    }
+
+    /// The strength-defining flags of `subject`'s passkey `id` (issue #81 HIGH-1): the
+    /// recovery downgrade gate reads these to compare a passkey REMOVAL at its true rung.
+    /// Subject-bound, so another subject's id (or a cross-scope id) is the uniform
+    /// not-found (`None`), never actionable. No PII is opened (no nickname decrypt).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn factor_strength(
+        &self,
+        subject: &UserId,
+        id: &WebauthnCredentialId,
+    ) -> Result<Option<WebauthnFactorStrength>, StoreError> {
+        if id.scope() != self.scope || subject.scope() != self.scope {
+            return Ok(None);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT backup_eligible, attestation_verified FROM webauthn_credentials \
+             WHERE tenant_id = $1 AND environment_id = $2 AND subject = $3 AND id = $4",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(subject.to_string())
+        .bind(id.to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(row.map(|row| WebauthnFactorStrength {
+            backup_eligible: row.get("backup_eligible"),
+            attestation_verified: row.get("attestation_verified"),
+        }))
+    }
+
+    /// The STRONGEST enrolled passkey rung for `subject` (issue #81): the recovery
+    /// hold decision projects the true strongest factor so an attested/device-bound
+    /// passkey holder is never under-held. Ordered attestation-verified first, then
+    /// device-bound (BE false) ahead of synced (BE true), so the returned row is the
+    /// top rung the subject holds. `None` when the subject has no passkey.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn strongest_strength(
+        &self,
+        subject: &UserId,
+    ) -> Result<Option<WebauthnFactorStrength>, StoreError> {
+        if subject.scope() != self.scope {
+            return Ok(None);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT backup_eligible, attestation_verified FROM webauthn_credentials \
+             WHERE tenant_id = $1 AND environment_id = $2 AND subject = $3 \
+             ORDER BY attestation_verified DESC, backup_eligible ASC LIMIT 1",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(subject.to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(row.map(|row| WebauthnFactorStrength {
+            backup_eligible: row.get("backup_eligible"),
+            attestation_verified: row.get("attestation_verified"),
         }))
     }
 }

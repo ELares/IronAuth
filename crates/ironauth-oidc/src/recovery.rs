@@ -318,17 +318,154 @@ fn cancel_link(state: &OidcState, token: &str) -> String {
 }
 
 /// The account's strongest enrolled factor strength (issue #81), used to decide whether a
-/// recovery would REDUCE security. Reuses the issue #66 ladder: a passkey holder is at
-/// the `phr` rung, a TOTP holder at `mfa`, otherwise `pwd`. A read fault degrades to the
-/// strongest posture (fail closed toward the DELAY path), so a store blip can never skip
-/// the hold.
+/// recovery would REDUCE security. Reuses the issue #66 ladder and projects the TRUE
+/// strongest passkey rung (attested > device-bound `phrh` > synced `phr`), a TOTP holder
+/// at `mfa`, otherwise `pwd`, so an attested/device-bound passkey holder is never
+/// under-held.
+///
+/// Both probes fail CLOSED (issue #81 MEDIUM-2): a store read fault is treated as "the
+/// factor is present" at the STRONGEST posture, so a store blip routes the recovery to the
+/// HELD/delay path instead of silently misclassifying a protected account as `pwd`-only and
+/// skipping the delay window. `is_ok_and`-style fail-OPEN here would create a
+/// security-reducing recovery as `initiated` on any transient error.
 async fn account_strength_acr(state: &OidcState, scope: Scope, subject: &UserId) -> &'static str {
-    if crate::totp::has_passkey(state, scope, subject).await {
-        AuthMethod::PasskeyVerified.acr()
-    } else if crate::totp::has_active_totp(state, scope, subject).await {
-        authn::acr_for_mfa()
+    if state.webauthn_enabled() {
+        match state
+            .store()
+            .scoped(scope)
+            .webauthn_credentials()
+            .strongest_strength(subject)
+            .await
+        {
+            Ok(Some(flags)) => {
+                return passkey_factor(flags.backup_eligible, flags.attestation_verified)
+                    .strength_acr();
+            }
+            Ok(None) => {}
+            // Fail CLOSED: a read fault posture is the ladder's strongest rung, so the
+            // recovery is held.
+            Err(_) => return RecoveryFactor::AttestedPasskey.strength_acr(),
+        }
+    }
+    match state
+        .store()
+        .scoped(scope)
+        .totp_credentials()
+        .has_active(subject)
+        .await
+    {
+        Ok(false) => AuthMethod::Password.acr(),
+        // An active TOTP is `mfa`; a read fault fails CLOSED, treated as an active second
+        // factor present (so a store blip routes to the HELD delay path, never `pwd`).
+        Ok(true) | Err(_) => authn::acr_for_mfa(),
+    }
+}
+
+/// Project a passkey's registration-time strength flags (issue #66 BE + attestation) onto
+/// the recovery-factor ladder (issue #81): an attested passkey is the strongest rung, a
+/// device-bound (non-backup-eligible) key is `phrh`, a synced key is `phr`. The recovery
+/// downgrade gate compares a passkey REMOVAL at exactly this rung.
+#[must_use]
+pub fn passkey_factor(backup_eligible: bool, attestation_verified: bool) -> RecoveryFactor {
+    if attestation_verified {
+        RecoveryFactor::AttestedPasskey
+    } else if backup_eligible {
+        RecoveryFactor::Passkey
     } else {
-        AuthMethod::Password.acr()
+        RecoveryFactor::HardwarePasskey
+    }
+}
+
+/// Project an `account_credentials.credential_type` wire string (issue #61) onto the
+/// recovery-factor ladder (issue #81), so the downgrade gate compares an account-credential
+/// REMOVAL at its factor strength. An unknown kind yields [`None`] (the removal is not
+/// recovery-gated), never a guess. A `passkey` account credential is projected to the
+/// synced `phr` FLOOR: it carries no backup/attestation flags here, and the floor still
+/// blocks a weaker-than-`phr` recovery from removing it.
+#[must_use]
+pub fn factor_for_account_credential(kind: &str) -> Option<RecoveryFactor> {
+    match kind {
+        "passkey" => Some(RecoveryFactor::Passkey),
+        "totp" => Some(RecoveryFactor::Totp),
+        "recovery_code" => Some(RecoveryFactor::RecoveryCode),
+        _ => None,
+    }
+}
+
+/// The sensitive-operation re-verification window (issue #81), mirroring the account
+/// step-up max age: a session authenticated within this window counts as a FRESH
+/// re-verification of the downgrade invariant AT ITS ACHIEVED STRENGTH. A stale session
+/// yields no re-verify, so it can never unblock a downgrade.
+const REVERIFY_MAX_AGE_SECS: u64 = 300;
+
+/// The achieved-`acr` a caller's session may present as a FRESH re-verification for the
+/// downgrade gate (issue #81), or [`None`] when the session is too old to count. The
+/// recovered access itself is an ordinary email-OTP (`pwd`) session, so its achieved acr is
+/// `pwd` and can never satisfy a `phr`/`mfa` target: only a genuinely fresh
+/// equal-or-stronger re-authentication (a passkey/second-factor step-up) unblocks a
+/// downgrade via [`FactorChangeDecision::AllowedByReverify`].
+#[must_use]
+pub fn fresh_session_reverify_acr(
+    state: &OidcState,
+    auth_time_unix_micros: i64,
+    auth_methods: &str,
+) -> Option<&'static str> {
+    let now = epoch_micros(state.now());
+    let age = now.saturating_sub(auth_time_unix_micros);
+    let max = i64::try_from(REVERIFY_MAX_AGE_SECS)
+        .unwrap_or(i64::MAX)
+        .saturating_mul(1_000_000);
+    if age > max {
+        return None;
+    }
+    let methods = authn::parse_methods(auth_methods);
+    if methods.is_empty() {
+        return None;
+    }
+    Some(authn::achieved_acr(&methods))
+}
+
+/// THE live downgrade-invariant GATE a factor-removal handler calls (issue #81 HIGH-1).
+///
+/// If a recovery flow is PENDING for `subject`, evaluate removing `target_factor` under the
+/// downgrade invariant and AUDIT the decision (via [`evaluate_factor_change`], which writes
+/// the `recovery.factor_change` row either way and notifies on an allowed downgrade). A
+/// [`FactorChangeDecision::Blocked`] result means the handler MUST refuse the removal.
+///
+/// With NO pending flow the removal is not recovery-gated and this returns
+/// [`FactorChangeDecision::NotADowngrade`]. A store read fault fails CLOSED to
+/// [`FactorChangeDecision::Blocked`]: rather than let a transient error open the gate, the
+/// removal is refused (the removal write would almost certainly fail too), matching the
+/// subsystem's fail-closed discipline.
+///
+/// DESIGN NOTE: the gate keys off the PRESENCE of a pending recovery flow for the subject.
+/// Recovery access today is an ordinary email-OTP session, not a special session type, so
+/// the invariant cannot rely on a session marker; it relies on the pending flow. A
+/// stronger-factor removal is BLOCKED while the flow is `held` with `hold_until` in the
+/// future. Once `hold_until` passes (the delay served, every channel notified) the removal
+/// is permitted ([`FactorChangeDecision::AllowedByDelay`]); a fresh equal-or-stronger
+/// re-verify permits it immediately ([`FactorChangeDecision::AllowedByReverify`]). A
+/// stale delay-elapsed flow therefore stops blocking, so there is no perpetual lock. This
+/// is the spec's "delay window with notifications OR fresh re-verify" rule.
+pub async fn gate_factor_removal(
+    state: &OidcState,
+    scope: Scope,
+    subject: &UserId,
+    target_factor: RecoveryFactor,
+    reverify_acr: Option<&str>,
+) -> FactorChangeDecision {
+    match state
+        .store()
+        .scoped(scope)
+        .recovery_flows()
+        .pending_for_subject(subject)
+        .await
+    {
+        Ok(Some(flow)) => {
+            evaluate_factor_change(state, scope, &flow.id, target_factor, reverify_acr).await
+        }
+        Ok(None) => FactorChangeDecision::NotADowngrade,
+        Err(_) => FactorChangeDecision::Blocked,
     }
 }
 
@@ -472,6 +609,70 @@ pub async fn initiate_recovery(
         },
         Err(_) => RecoveryInitiation::Suppressed,
     }
+}
+
+/// The anti-timing DECOY for an UNKNOWN recovery identifier (issue #81 MEDIUM-1). A KNOWN
+/// identifier runs [`initiate_recovery`]: a risk-seam call + the cooldown COUNT + the
+/// strongest-factor projection + the channel fan-out read + a flow INSERT + N sends. An
+/// unknown identifier must NOT collapse to a bare tracing log, or the response LATENCY would
+/// distinguish a registered identifier from an unknown one (the #68/#70 anti-timing
+/// discipline; acceptance criterion 6 is timing, not just body shape).
+///
+/// This performs the SAME risk-seam evaluation and the SAME subject-bound store round-trips
+/// against a SYNTHESIZED in-scope subject (the cooldown COUNT, the strongest-factor
+/// projection, the channel fan-out read), all of which resolve to no rows, then SUPPRESSES
+/// the send. Nothing is written. The reads share the exact helpers the known path uses, so
+/// the two branches issue the same query shapes and comparable DB work before the identical
+/// acknowledgment.
+pub async fn decoy_recovery_work(
+    state: &OidcState,
+    scope: Scope,
+    entry_point: RecoveryEntryPoint,
+    recover_factor: RecoveryFactor,
+    recipient: &str,
+    client_ip: Option<&str>,
+) {
+    let settings = state.recovery_settings();
+    let recover_acr = recover_factor.strength_acr();
+    let now_micros = epoch_micros(state.now());
+    // A synthesized in-scope subject drives the same subject-bound reads as a real account;
+    // every read resolves to no rows, and nothing is ever persisted under it.
+    let decoy_subject = UserId::generate(state.env(), &scope);
+
+    // The SAME risk-seam evaluation the known path runs (the directive is discarded).
+    let _ = state.evaluate_recovery_risk(&RiskEvent {
+        scope,
+        subject: &decoy_subject,
+        entry_point,
+        recover_acr,
+        client_ip,
+    });
+
+    // The SAME per-account cooldown COUNT round-trip.
+    let cooldown_micros = i64::try_from(settings.cooldown_secs)
+        .unwrap_or(i64::MAX)
+        .saturating_mul(1_000_000);
+    let cooldown_cutoff = now_micros.saturating_sub(cooldown_micros);
+    let _ = state
+        .store()
+        .scoped(scope)
+        .recovery_flows()
+        .initiations_since(&decoy_subject, cooldown_cutoff)
+        .await;
+
+    // The SAME strongest-factor projection reads (the hold decision's inputs).
+    let _ = account_strength_acr(state, scope, &decoy_subject).await;
+
+    // The SAME channel fan-out READ (list the subject's identifiers), then a SUPPRESSED
+    // send: no delivery goes to an unknown recipient, but the read work matches the known
+    // path's `notify_all_channels`.
+    let _ = state
+        .store()
+        .scoped(scope)
+        .user_identifiers()
+        .list_for_user(&decoy_subject)
+        .await;
+    state.dispatch_verification(scope, VerificationPurpose::Recovery, recipient, false);
 }
 
 /// CANCEL a recovery from a presented cancellation token (issue #81): resolve the flow by

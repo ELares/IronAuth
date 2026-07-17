@@ -201,7 +201,7 @@ pub use repository::{
     UserRepo, UserRevocation, UserState, WEBAUTHN_CHALLENGE_TTL_SECS, WebauthnAssertionTarget,
     WebauthnCeremony, WebauthnChallengeRepo, WebauthnCredentialDescriptor,
     WebauthnCredentialOutcome, WebauthnCredentialRecord, WebauthnCredentialRepo,
-    device_code_digest, invitation_token_digest, magic_link_binding_digest,
+    WebauthnFactorStrength, device_code_digest, invitation_token_digest, magic_link_binding_digest,
     magic_link_token_digest, mint_invitation_token, mint_invitation_token_for,
     opaque_access_token_digest, refresh_token_digest, user_code_hash,
 };

@@ -1353,9 +1353,16 @@ pub async fn remove_credential(
     if !interaction::same_origin_ok(&headers, state.self_origin().as_deref()) {
         return forbidden();
     }
-    let (scope, subject) = match authenticate(&state, &tenant_id, &environment_id, &headers).await {
-        Ok(pair) => pair,
-        Err(response) => return response,
+    // Resolve the session directly (not the shared `authenticate`) so the downgrade gate
+    // can read the session's freshness/strength for a fresh-reverify unblock (issue #81).
+    let Some(scope) = parse_scope(&tenant_id, &environment_id) else {
+        return not_found();
+    };
+    let Some(session) = interaction::resolve_session(&state, scope, &headers).await else {
+        return unauthenticated();
+    };
+    let Ok(subject) = UserId::parse_in_scope(&session.subject, &scope) else {
+        return unauthenticated();
     };
     let Ok(id) = state
         .store()
@@ -1365,6 +1372,37 @@ pub async fn remove_credential(
     else {
         return credential_not_found();
     };
+    // THE downgrade-invariant gate (issue #81 HIGH-1): if a recovery is pending for this
+    // subject, removing a passkey STRONGER than the factor the recovery was performed with
+    // is BLOCKED while the flow is held (hold_until in the future) unless a fresh
+    // equal-or-stronger re-verify is proven; the decision is audited either way. An absent
+    // credential falls through to the uniform not-found below (nothing to gate).
+    match state
+        .store()
+        .scoped(scope)
+        .webauthn_credentials()
+        .factor_strength(&subject, &id)
+        .await
+    {
+        Ok(Some(flags)) => {
+            let target =
+                crate::recovery::passkey_factor(flags.backup_eligible, flags.attestation_verified);
+            let reverify = crate::recovery::fresh_session_reverify_acr(
+                &state,
+                session.auth_time_unix_micros,
+                &session.auth_methods,
+            );
+            if !crate::recovery::gate_factor_removal(&state, scope, &subject, target, reverify)
+                .await
+                .is_allowed()
+            {
+                return recovery_downgrade_blocked();
+            }
+        }
+        Ok(None) => {}
+        // Fail CLOSED on a strength read fault: refuse rather than remove blind.
+        Err(_) => return recovery_downgrade_blocked(),
+    }
     let outcome = state
         .store()
         .scoped(scope)
@@ -1499,6 +1537,23 @@ fn passkey_json(record: &WebauthnCredentialRecord) -> Value {
 /// resource, so it is never an existence oracle.
 fn credential_not_found() -> Response {
     json_response(StatusCode::NOT_FOUND, json!({ "error": "not_found" }))
+}
+
+/// The `409` a removal returns when THE downgrade invariant blocks it (issue #81 HIGH-1):
+/// a recovery is pending and removing this passkey would silently drop a factor STRONGER
+/// than the one used to recover, before the delay window has elapsed and without a fresh
+/// equal-or-stronger re-verification. The body is non-enumerating (it names the invariant,
+/// never account state) and actionable (re-verify or wait out the delay, then retry).
+fn recovery_downgrade_blocked() -> Response {
+    json_response(
+        StatusCode::CONFLICT,
+        json!({
+            "error": "recovery_downgrade_blocked",
+            "error_description": "A recovery is pending on this account. Removing a stronger \
+                 sign-in factor is held until the recovery delay elapses, or until you \
+                 re-verify with an equal-or-stronger factor.",
+        }),
+    )
 }
 
 fn json_response(status: StatusCode, body: Value) -> Response {

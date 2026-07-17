@@ -20,7 +20,6 @@ use crate::interaction::{self, parse_resume};
 use crate::login::ResumeQuery;
 use crate::pages;
 use crate::state::OidcState;
-use crate::verification::VerificationPurpose;
 
 /// The posted recovery form.
 #[derive(Deserialize)]
@@ -130,14 +129,21 @@ pub async fn recover_post(
         )
         .await;
     } else {
-        // UNKNOWN identifier: the suppressed send keeps the response uniform (the Logto
-        // pattern), so a recovery init for a non-existent account looks identical.
-        state.dispatch_verification(
+        // UNKNOWN identifier: run the anti-timing DECOY (issue #81 MEDIUM-1). It performs
+        // the SAME risk-seam call and store round-trips the known path does (so the response
+        // LATENCY does not distinguish a registered identifier from an unknown one) and then
+        // SUPPRESSES the send (the Logto pattern), so a recovery init for a non-existent
+        // account is indistinguishable in both body and timing.
+        let client_ip = crate::abuse::resolved_client_ip(&headers);
+        crate::recovery::decoy_recovery_work(
+            &state,
             resume.scope,
-            VerificationPurpose::Recovery,
+            ironauth_store::RecoveryEntryPoint::LostPassword,
+            crate::recovery::RecoveryFactor::EmailOtp,
             identifier,
-            false,
-        );
+            client_ip.as_deref(),
+        )
+        .await;
     }
     recovery_ack_page(banner)
 }

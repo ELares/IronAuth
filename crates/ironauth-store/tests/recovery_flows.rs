@@ -75,13 +75,17 @@ async fn a_flow_round_trips_and_completes() {
     let scope = db.seed_scope(&env).await;
     let subject = register_user(&db, &env, scope, RECIPIENT).await;
 
+    // A held flow whose delay horizon has already ELAPSED (a past `hold_until`): it is
+    // held but past its window, so completion is permitted (the MEDIUM-3 guard refuses
+    // completion only while `hold_until` is still in the FUTURE).
+    let elapsed_hold: i64 = 1_000_000_000_000; // year 2001, comfortably in the past.
     let id = initiate(
         &db,
         &env,
         scope,
         &subject,
         "ira_rcv_tok~secret",
-        Some(9_999_999_999_000_000),
+        Some(elapsed_hold),
     )
     .await;
 
@@ -97,9 +101,9 @@ async fn a_flow_round_trips_and_completes() {
     assert_eq!(record.state, RecoveryState::Held);
     assert_eq!(record.entry_point, RecoveryEntryPoint::LostPassword);
     assert_eq!(record.recover_acr, "urn:ironauth:acr:pwd");
-    assert_eq!(record.hold_until_unix_micros, Some(9_999_999_999_000_000));
+    assert_eq!(record.hold_until_unix_micros, Some(elapsed_hold));
 
-    // Complete it.
+    // Complete it (the delay has elapsed).
     let completed = db
         .store()
         .scoped(scope)
@@ -129,6 +133,150 @@ async fn a_flow_round_trips_and_completes() {
         .await
         .expect("complete");
     assert!(!recompleted, "a completed flow does not complete again");
+}
+
+#[tokio::test]
+async fn completing_a_held_flow_before_its_hold_until_is_refused() {
+    // MEDIUM-3 defense in depth: a `held` flow whose `hold_until` is still in the FUTURE
+    // can NOT be completed, so whoever wires completion in M9 cannot erase the delay gate
+    // early. Once the horizon has elapsed, completion is permitted.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let subject = register_user(&db, &env, scope, RECIPIENT).await;
+
+    // A far-future hold horizon: the delay window has NOT elapsed.
+    let id = initiate(
+        &db,
+        &env,
+        scope,
+        &subject,
+        "ira_rcv_future~s",
+        Some(9_999_999_999_000_000),
+    )
+    .await;
+
+    // Completion is REFUSED while the hold is in the future, and the flow stays held.
+    let refused = db
+        .store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .recovery_flows()
+        .complete(&env, &id, "urn:ironauth:acr:pwd")
+        .await
+        .expect("complete");
+    assert!(
+        !refused,
+        "a held flow with a future hold_until must not complete"
+    );
+    let record = db
+        .store()
+        .scoped(scope)
+        .recovery_flows()
+        .get(&id)
+        .await
+        .expect("get")
+        .expect("exists");
+    assert_eq!(
+        record.state,
+        RecoveryState::Held,
+        "the flow remains held; the delay gate was not erased"
+    );
+
+    // A DIFFERENT flow whose hold has already elapsed completes as before.
+    let elapsed = initiate(
+        &db,
+        &env,
+        scope,
+        &subject,
+        "ira_rcv_past~s",
+        Some(1_000_000_000_000),
+    )
+    .await;
+    let completed = db
+        .store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .recovery_flows()
+        .complete(&env, &elapsed, "urn:ironauth:acr:pwd")
+        .await
+        .expect("complete");
+    assert!(completed, "an elapsed-delay held flow completes");
+}
+
+#[tokio::test]
+async fn pending_for_subject_returns_the_newest_pending_flow() {
+    // The live factor-removal gate (issue #81 HIGH-1) reads the ONE pending flow; two
+    // initiations racing at the cooldown boundary can both persist, so the read
+    // deterministically returns the NEWEST, and a terminal flow is never returned.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let subject = register_user(&db, &env, scope, RECIPIENT).await;
+
+    // No pending flow yet.
+    assert!(
+        db.store()
+            .scoped(scope)
+            .recovery_flows()
+            .pending_for_subject(&subject)
+            .await
+            .expect("pending")
+            .is_none()
+    );
+
+    let first = initiate(
+        &db,
+        &env,
+        scope,
+        &subject,
+        "ira_rcv_p1~s",
+        Some(9_999_999_999_000_000),
+    )
+    .await;
+    let second = initiate(
+        &db,
+        &env,
+        scope,
+        &subject,
+        "ira_rcv_p2~s",
+        Some(9_999_999_999_000_000),
+    )
+    .await;
+
+    // A single pending flow is resolved (one of the two).
+    let pending = db
+        .store()
+        .scoped(scope)
+        .recovery_flows()
+        .pending_for_subject(&subject)
+        .await
+        .expect("pending")
+        .expect("a pending flow");
+    assert!(
+        pending.id == first || pending.id == second,
+        "the resolved flow is one of the pending flows"
+    );
+
+    // Cancel whichever was resolved: the read then returns the OTHER still-pending flow,
+    // never the cancelled (terminal) one.
+    let other = if pending.id == second { first } else { second };
+    db.store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .recovery_flows()
+        .cancel(&env, &pending.id, RecoveryCancelReason::UserNotification)
+        .await
+        .expect("cancel");
+    let pending = db
+        .store()
+        .scoped(scope)
+        .recovery_flows()
+        .pending_for_subject(&subject)
+        .await
+        .expect("pending")
+        .expect("a pending flow");
+    assert_eq!(pending.id, other, "a terminal flow is skipped");
 }
 
 #[tokio::test]

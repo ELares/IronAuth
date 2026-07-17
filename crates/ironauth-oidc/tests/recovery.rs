@@ -20,12 +20,18 @@
 
 mod common;
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, UNIX_EPOCH};
 
+use axum::body::Body;
+use axum::http::{Request, StatusCode, header};
 use common::Harness;
+use ironauth_env::Clock;
+use ironauth_jose::{TotpParams, base32_decode, code_at};
 use ironauth_oidc::recovery::{
-    RecoveryInitiation, cancel_from_token, evaluate_factor_change, initiate_recovery,
+    RecoveryInitiation, cancel_from_token, decoy_recovery_work, evaluate_factor_change,
+    initiate_recovery,
 };
 use ironauth_oidc::{
     FactorChangeDecision, RecoveryFactor, RiskDirective, RiskEvaluator, RiskEvent,
@@ -34,6 +40,7 @@ use ironauth_oidc::{
 use ironauth_store::{
     IdentifierType, NewUserIdentifier, RecoveryEntryPoint, RecoveryState, UniquenessMode, UserId,
 };
+use serde_json::{Value, json};
 use sqlx::Row;
 
 /// A recording verification sender: captures every channel a recovery notification was
@@ -587,5 +594,483 @@ async fn a_risk_forced_delay_holds_an_otherwise_immediate_recovery() {
     assert!(
         held,
         "a risk-forced delay holds an otherwise-immediate recovery"
+    );
+}
+
+// ===========================================================================
+// HIGH-1: the downgrade invariant is enforced on the LIVE factor-removal HTTP
+// surface (the acceptance-critical crux). These drive the ACTUAL endpoints on
+// real Postgres, not `evaluate_factor_change` directly.
+// ===========================================================================
+
+/// POST a JSON body to `path` with a session cookie; return the status and parsed body.
+async fn post_json(
+    harness: &Harness,
+    path: &str,
+    cookie: &str,
+    body: &Value,
+) -> (StatusCode, Value) {
+    let (status, _headers, response) = harness
+        .send(
+            Request::builder()
+                .method("POST")
+                .uri(path)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::COOKIE, cookie)
+                .body(Body::from(body.to_string()))
+                .expect("request builds"),
+        )
+        .await;
+    let parsed = if response.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_str(&response).unwrap_or(Value::Null)
+    };
+    (status, parsed)
+}
+
+/// The `/t/{tenant}/e/{env}/account` base path for the harness scope.
+fn account_base(harness: &Harness) -> String {
+    let scope = harness.scope();
+    format!("/t/{}/e/{}/account", scope.tenant(), scope.environment())
+}
+
+/// The live WebAuthn credential-removal endpoint path.
+fn webauthn_remove_path(harness: &Harness) -> String {
+    let scope = harness.scope();
+    format!(
+        "/t/{}/e/{}/webauthn/credentials/remove",
+        scope.tenant(),
+        scope.environment()
+    )
+}
+
+/// The `pky_` ids of `subject`'s registered passkeys (for the removal endpoint).
+async fn passkey_ids(harness: &Harness, subject: &UserId) -> Vec<String> {
+    harness
+        .store()
+        .scoped(harness.scope())
+        .webauthn_credentials()
+        .list(subject, 10, None)
+        .await
+        .expect("list passkeys")
+        .into_iter()
+        .map(|record| record.id)
+        .collect()
+}
+
+/// The `detail` strings of every `recovery.factor_change` audit row in the harness scope,
+/// so a test can prove the transition fired LIVE with the expected decision.
+async fn factor_change_details(harness: &Harness) -> Vec<String> {
+    let scope = harness.scope();
+    sqlx::query(
+        "SELECT detail FROM audit_log \
+         WHERE tenant_id = $1 AND environment_id = $2 AND action = 'recovery.factor_change' \
+         ORDER BY occurred_at, id",
+    )
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .fetch_all(harness.db().owner_pool())
+    .await
+    .expect("read factor_change audit")
+    .into_iter()
+    .filter_map(|row| row.get::<Option<String>, _>("detail"))
+    .collect()
+}
+
+/// Drive a TOTP enrollment to ACTIVE through the live HTTP endpoints and return the
+/// (pwd) session cookie it was enrolled from.
+async fn enroll_active_totp(harness: &Harness, subject: &str) -> String {
+    let base = account_base(harness);
+    let cookie = harness.session_cookie(subject).await;
+    let (status, begun) = post_json(
+        harness,
+        &format!("{base}/mfa/totp/enroll"),
+        &cookie,
+        &json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "enroll begin: {begun:?}");
+    let credential_id = begun["credential_id"].as_str().expect("credential_id");
+    let secret = begun["secret"].as_str().expect("secret");
+    let seed = base32_decode(secret).expect("decode secret");
+    let now_secs = harness
+        .clock()
+        .now_utc()
+        .duration_since(UNIX_EPOCH)
+        .expect("after epoch")
+        .as_secs();
+    let code = code_at(&seed, TotpParams::authenticator_default(), now_secs);
+    let (status, activated) = post_json(
+        harness,
+        &format!("{base}/mfa/totp/verify-enrollment"),
+        &cookie,
+        &json!({ "credential_id": credential_id, "code": code }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "activate: {activated:?}");
+    assert_eq!(activated["activated"], json!(true));
+    cookie
+}
+
+#[tokio::test]
+async fn live_endpoint_a_held_recovery_blocks_passkey_removal_until_a_fresh_reverify() {
+    let mut harness = Harness::start_store_backed().await;
+    harness.install_verification_sender(Arc::new(RecordingSender::default()));
+    let subject_str = harness
+        .seed_user("ada@example.test", "correct horse battery staple")
+        .await;
+    let subject = subject_id(&harness, &subject_str);
+    harness.seed_passkey(&subject_str, true).await; // a synced passkey (phr).
+    let pky = passkey_ids(&harness, &subject).await;
+    let pky = pky.first().expect("a seeded passkey").clone();
+
+    // A pending email-OTP recovery against a passkey account is HELD (security-reducing).
+    let outcome = initiate_recovery(
+        harness.state(),
+        harness.scope(),
+        &subject,
+        RecoveryEntryPoint::LostPassword,
+        RecoveryFactor::EmailOtp,
+        "ada@example.test",
+        None,
+    )
+    .await;
+    assert!(matches!(
+        outcome,
+        RecoveryInitiation::Created { held: true, .. }
+    ));
+
+    let remove = webauthn_remove_path(&harness);
+    // (a) The ordinary (pwd) recovered session CANNOT remove the passkey: 409, and the
+    // recovery.factor_change transition fires LIVE with a blocked decision.
+    let pwd_cookie = harness.session_cookie(&subject_str).await;
+    let (status, body) = post_json(
+        &harness,
+        &remove,
+        &pwd_cookie,
+        &json!({ "credentialId": pky }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body:?}");
+    assert_eq!(body["error"], json!("recovery_downgrade_blocked"));
+    let details = factor_change_details(&harness).await;
+    assert!(
+        details.iter().any(|d| d.contains("decision=blocked")),
+        "a blocked recovery.factor_change audit row must be written live: {details:?}"
+    );
+    // The passkey is intact.
+    assert_eq!(
+        passkey_ids(&harness, &subject).await.len(),
+        1,
+        "the passkey must not have been removed while blocked"
+    );
+
+    // (c) A FRESH equal-or-stronger passkey re-verification unblocks it immediately.
+    let phr_cookie = harness
+        .session_cookie_at(&subject_str, "passkey_uv", 0)
+        .await;
+    let (status, body) = post_json(
+        &harness,
+        &remove,
+        &phr_cookie,
+        &json!({ "credentialId": pky }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["removed"], json!(true));
+    assert!(
+        passkey_ids(&harness, &subject).await.is_empty(),
+        "a fresh equal-or-stronger re-verify permits the removal"
+    );
+}
+
+#[tokio::test]
+async fn live_endpoint_a_held_recovery_blocks_passkey_removal_until_the_delay_elapses() {
+    let mut harness = Harness::start_store_backed().await;
+    harness.install_verification_sender(Arc::new(RecordingSender::default()));
+    let subject_str = harness
+        .seed_user("bob@example.test", "correct horse battery staple")
+        .await;
+    let subject = subject_id(&harness, &subject_str);
+    harness.seed_passkey(&subject_str, true).await;
+    let pky = passkey_ids(&harness, &subject).await;
+    let pky = pky.first().expect("a seeded passkey").clone();
+
+    let outcome = initiate_recovery(
+        harness.state(),
+        harness.scope(),
+        &subject,
+        RecoveryEntryPoint::LostPassword,
+        RecoveryFactor::EmailOtp,
+        "bob@example.test",
+        None,
+    )
+    .await;
+    assert!(matches!(
+        outcome,
+        RecoveryInitiation::Created { held: true, .. }
+    ));
+
+    let remove = webauthn_remove_path(&harness);
+    let cookie = harness.session_cookie(&subject_str).await;
+    // Before the delay elapses: BLOCKED.
+    let (status, _) = post_json(&harness, &remove, &cookie, &json!({ "credentialId": pky })).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+
+    // Advance past the delay horizon: the removal is now permitted (AllowedByDelay).
+    harness.clock().advance(Duration::from_secs(
+        harness.state().recovery_settings().delay_secs + 1,
+    ));
+    let (status, body) =
+        post_json(&harness, &remove, &cookie, &json!({ "credentialId": pky })).await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["removed"], json!(true));
+}
+
+#[tokio::test]
+async fn live_endpoint_passkey_removal_with_no_pending_recovery_still_works() {
+    let mut harness = Harness::start_store_backed().await;
+    harness.install_verification_sender(Arc::new(RecordingSender::default()));
+    let subject_str = harness
+        .seed_user("carol@example.test", "correct horse battery staple")
+        .await;
+    let subject = subject_id(&harness, &subject_str);
+    harness.seed_passkey(&subject_str, true).await;
+    let pky = passkey_ids(&harness, &subject).await;
+    let pky = pky.first().expect("a seeded passkey").clone();
+
+    // No recovery is pending, so the removal is not recovery-gated.
+    let remove = webauthn_remove_path(&harness);
+    let cookie = harness.session_cookie(&subject_str).await;
+    let (status, body) =
+        post_json(&harness, &remove, &cookie, &json!({ "credentialId": pky })).await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["removed"], json!(true));
+    // No factor_change audit row was written (no recovery to protect against).
+    assert!(
+        factor_change_details(&harness).await.is_empty(),
+        "an un-gated removal writes no recovery.factor_change row"
+    );
+}
+
+#[tokio::test]
+async fn live_endpoint_a_held_recovery_blocks_totp_removal_until_the_delay_elapses() {
+    let mut harness = Harness::start_store_backed().await;
+    harness.install_verification_sender(Arc::new(RecordingSender::default()));
+    let subject_str = harness
+        .seed_user("dave@example.test", "correct horse battery staple")
+        .await;
+    let subject = subject_id(&harness, &subject_str);
+    // An active TOTP makes `mfa` the account's strongest factor.
+    let cookie = enroll_active_totp(&harness, &subject_str).await;
+
+    let outcome = initiate_recovery(
+        harness.state(),
+        harness.scope(),
+        &subject,
+        RecoveryEntryPoint::LostSecondFactor,
+        RecoveryFactor::EmailOtp,
+        "dave@example.test",
+        None,
+    )
+    .await;
+    assert!(
+        matches!(outcome, RecoveryInitiation::Created { held: true, .. }),
+        "an email-OTP recovery against a TOTP account is held"
+    );
+
+    let remove = format!("{}/mfa/totp/remove", account_base(&harness));
+    let totp_id = harness
+        .store()
+        .scoped(harness.scope())
+        .totp_credentials()
+        .list(&subject)
+        .await
+        .expect("list totp")
+        .first()
+        .expect("an active totp")
+        .id
+        .clone();
+
+    // Before the delay elapses: BLOCKED, with the live factor_change audit row.
+    let (status, body) = post_json(
+        &harness,
+        &remove,
+        &cookie,
+        &json!({ "credential_id": totp_id }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body:?}");
+    assert_eq!(body["error"], json!("recovery_downgrade_blocked"));
+    assert!(
+        factor_change_details(&harness)
+            .await
+            .iter()
+            .any(|d| d.contains("decision=blocked")),
+        "the TOTP removal must write a blocked recovery.factor_change row"
+    );
+
+    // Advance past the delay: the removal is now permitted.
+    harness.clock().advance(Duration::from_secs(
+        harness.state().recovery_settings().delay_secs + 1,
+    ));
+    let (status, body) = post_json(
+        &harness,
+        &remove,
+        &cookie,
+        &json!({ "credential_id": totp_id }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["removed"], json!(true));
+}
+
+#[tokio::test]
+async fn live_endpoint_password_removal_still_works_via_fresh_passkey_reauth() {
+    let mut harness = Harness::start_store_backed().await;
+    harness.install_verification_sender(Arc::new(RecordingSender::default()));
+    let subject_str = harness
+        .seed_user("erin@example.test", "correct horse battery staple")
+        .await;
+    let subject = subject_id(&harness, &subject_str);
+    harness.seed_passkey(&subject_str, true).await; // a surviving passkey.
+
+    // A pending recovery is HELD, but removing the PASSWORD is not a downgrade and a fresh
+    // passkey re-auth proves an equal-or-stronger factor, so the conversion still succeeds.
+    let outcome = initiate_recovery(
+        harness.state(),
+        harness.scope(),
+        &subject,
+        RecoveryEntryPoint::LostPassword,
+        RecoveryFactor::EmailOtp,
+        "erin@example.test",
+        None,
+    )
+    .await;
+    assert!(matches!(
+        outcome,
+        RecoveryInitiation::Created { held: true, .. }
+    ));
+
+    let remove_password = format!("{}/password/remove", account_base(&harness));
+    let phr_cookie = harness
+        .session_cookie_at(&subject_str, "passkey_uv", 0)
+        .await;
+    let (status, _headers, response) = harness
+        .send(
+            Request::builder()
+                .method("POST")
+                .uri(&remove_password)
+                .header(header::COOKIE, phr_cookie)
+                .body(Body::empty())
+                .expect("request builds"),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    let body: Value = serde_json::from_str(&response).unwrap_or(Value::Null);
+    assert_eq!(body["converted"], json!(true));
+}
+
+// ===========================================================================
+// MEDIUM-1: recovery initiation is not a TIMING enumeration oracle -- the
+// unknown-identifier path does the same risk-scored, store-read work.
+// ===========================================================================
+
+/// A risk evaluator that COUNTS how many recovery events it scored, so a test can assert
+/// the unknown-identifier decoy runs the SAME risk-scored pipeline as the known path
+/// (not a bare tracing log).
+#[derive(Debug, Default)]
+struct CountingRisk {
+    scored: AtomicUsize,
+}
+
+impl RiskEvaluator for CountingRisk {
+    fn evaluate_recovery(&self, _event: &RiskEvent<'_>) -> RiskDirective {
+        self.scored.fetch_add(1, Ordering::SeqCst);
+        RiskDirective::Allow
+    }
+}
+
+#[tokio::test]
+async fn the_known_and_unknown_init_paths_do_comparable_work() {
+    let mut harness = Harness::start_store_backed().await;
+    harness.install_verification_sender(Arc::new(RecordingSender::default()));
+    let counter = Arc::new(CountingRisk::default());
+    let state = harness.state().clone().with_risk_evaluator(counter.clone());
+    let subject_str = harness
+        .seed_user("frank@example.test", "correct horse battery staple")
+        .await;
+    let subject = subject_id(&harness, &subject_str);
+
+    // The KNOWN path scores exactly one recovery event through the risk seam.
+    let _ = initiate_recovery(
+        &state,
+        harness.scope(),
+        &subject,
+        RecoveryEntryPoint::LostPassword,
+        RecoveryFactor::EmailOtp,
+        "frank@example.test",
+        None,
+    )
+    .await;
+    let after_known = counter.scored.load(Ordering::SeqCst);
+    assert_eq!(after_known, 1, "the known path scores one risk event");
+
+    // The UNKNOWN path (the decoy) must run the SAME risk-scored, store-read pipeline: it
+    // scores one risk event too, rather than collapsing to a bare tracing log (which would
+    // make the response latency an existence oracle).
+    decoy_recovery_work(
+        &state,
+        harness.scope(),
+        RecoveryEntryPoint::LostPassword,
+        RecoveryFactor::EmailOtp,
+        "nobody@example.test",
+        None,
+    )
+    .await;
+    let after_unknown = counter.scored.load(Ordering::SeqCst);
+    assert_eq!(
+        after_unknown - after_known,
+        1,
+        "the unknown-identifier decoy runs the same risk-scored pipeline"
+    );
+}
+
+// ===========================================================================
+// MEDIUM-2: the hold decision fails CLOSED and projects the TRUE strongest rung.
+// ===========================================================================
+
+#[tokio::test]
+async fn a_device_bound_passkey_holder_is_held_at_its_true_rung() {
+    // The account's strongest factor is a DEVICE-BOUND passkey (`phrh`), stronger than a
+    // synced passkey (`phr`). A recovery performed at the synced-passkey rung therefore
+    // REDUCES security and must be HELD. Before the fix, `account_strength_acr` projected
+    // ANY passkey to `phr`, so a `phr` recovery matched and was NOT held (the under-hold
+    // bug this pins).
+    let mut harness = Harness::start_store_backed().await;
+    harness.install_verification_sender(Arc::new(RecordingSender::default()));
+    let subject_str = harness
+        .seed_user("grace@example.test", "correct horse battery staple")
+        .await;
+    let subject = subject_id(&harness, &subject_str);
+    harness.seed_passkey(&subject_str, false).await; // device-bound (phrh).
+
+    let outcome = initiate_recovery(
+        harness.state(),
+        harness.scope(),
+        &subject,
+        RecoveryEntryPoint::LostPassword,
+        RecoveryFactor::Passkey, // recover at the synced-passkey rung (phr).
+        "grace@example.test",
+        None,
+    )
+    .await;
+    let RecoveryInitiation::Created { held, .. } = outcome else {
+        panic!("recovery should have been created");
+    };
+    assert!(
+        held,
+        "a phr recovery against a device-bound (phrh) passkey holder must be held"
     );
 }
