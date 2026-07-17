@@ -41,6 +41,7 @@
 //! operator-safe messages, and NEVER a claim VALUE (no PII leaks into an error).
 
 use serde_json::{Map, Value};
+use unicode_normalization::UnicodeNormalization;
 
 use crate::error::ConnectorError;
 use crate::{ClaimMapping, ClaimRule, EmailSource, Quirks};
@@ -255,6 +256,16 @@ pub fn evaluate(
         let views = views_for_field(field, quirks, &sources);
         match resolve_rule(rule, &views) {
             Some(value) => {
+                // Canonicalize the resolved `email` value with NFKC BEFORE the type check,
+                // so the mapped email is normalized regardless of the claim path it came from
+                // (a top-level `email` or a nested path like `emails.0`) and the value that is
+                // type-checked is byte-identical to the value that is provisioned. Only the
+                // `email` trait is normalized; every other trait is passed through unchanged.
+                let value = if field == EMAIL_FIELD {
+                    normalize_email_value(value)
+                } else {
+                    value
+                };
                 traits.insert(field.clone(), value);
             }
             None if rule.required => missing.push(pointer_for(field)),
@@ -366,6 +377,18 @@ fn resolve_path<'a>(root: &'a Map<String, Value>, path: &str) -> Option<&'a Valu
         };
     }
     Some(current)
+}
+
+/// NFKC-normalize a resolved `email` trait value so the mapped email is canonicalized
+/// regardless of the claim path it resolved from. NFKC folds the compatibility-confusable
+/// class (fullwidth ASCII, ligatures, circled forms) onto ordinary forms, mirroring the
+/// email NFKC boundary IronAuth applies elsewhere. Only a string is normalized; a
+/// non-string value is passed through unchanged for the trait-schema type check to reject.
+fn normalize_email_value(value: Value) -> Value {
+    match value {
+        Value::String(email) => Value::String(email.nfkc().collect()),
+        other => other,
+    }
 }
 
 /// Resolve a single top-level string claim, or [`None`] when absent or not a string.
@@ -659,6 +682,19 @@ mod tests {
         let doc =
             evaluate(&map, &Quirks::default(), sources_of(&id), None).expect("custom subject");
         assert_eq!(doc.subject, "provider-oid-9");
+    }
+
+    #[test]
+    fn a_mapped_email_is_nfkc_normalized_from_any_path() {
+        // The email resolves from a NON-top-level path (`emails.0`), and the value carries a
+        // compatibility-confusable (the fullwidth commercial-at U+FF20). It must be NFKC-folded
+        // to the ordinary ASCII form the schema type-checks and the identity is provisioned with.
+        let id = obj(json!({ "sub": "u-1", "emails": ["user\u{FF20}x.test"] }));
+        let schema = schema(vec![("email", "string")]);
+        let map = mapping(vec![("email", rule(&["emails.0"], true))]);
+        let doc = evaluate(&map, &Quirks::default(), sources_of(&id), Some(&schema))
+            .expect("resolves and normalizes");
+        assert_eq!(doc.traits.get("email"), Some(&json!("user@x.test")));
     }
 
     #[test]

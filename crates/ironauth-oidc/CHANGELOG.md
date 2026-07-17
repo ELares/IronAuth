@@ -12,8 +12,11 @@ range per docs/RELEASING.md.
   - **The evaluator seam.** After the upstream ID token is validated, the callback evaluates the
     connector's `claim_mapping` (via `ironauth_connector::evaluate`) against the VERIFIED
     id-token claims, type-checked against the scope's active `TraitSchema` (adapted to the
-    connector crate's store-free `TraitSchemaView`). The upstream `email` claim is NFKC-normalized
-    before mapping so the type-checked and stored values are the same canonical form.
+    connector crate's store-free `TraitSchemaView`). The evaluator NFKC-normalizes the resolved
+    `email` trait value itself (before its type check), so the mapped email is canonicalized
+    regardless of the claim path it resolves from (a top-level `email` or a nested path like
+    `emails.0`) and the type-checked and stored values are the same canonical form; the callback
+    no longer pre-normalizes only the top-level `email` claim.
   - **Fail-closed (the acceptance-critical crux).** On ANY mapping failure (a missing required
     claim, a wrong type, an undeclared trait, or no active schema for mapped traits) the login
     aborts BEFORE any user row is written or mutated: NO partial identity is ever provisioned. A

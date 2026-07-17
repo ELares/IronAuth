@@ -796,22 +796,16 @@ pub async fn federation_callback(
         .as_ref()
         .map(|view| view as &dyn TraitSchemaView);
 
-    // NFKC-normalize the upstream `email` claim BEFORE mapping, so the value the trait schema
-    // type-checks and the value provisioned are the same canonical form.
-    let mut id_claims = identity.claims.clone();
-    if let Some(email) = id_claims
-        .get("email")
-        .and_then(serde_json::Value::as_str)
-        .map(ironauth_screening::normalize_nfkc)
-    {
-        id_claims.insert("email".to_owned(), serde_json::Value::String(email));
-    }
-
+    // The evaluator NFKC-normalizes the resolved `email` trait value itself, BEFORE its type
+    // check, so the mapped email is canonicalized regardless of the claim path it resolves from
+    // (a top-level `email` or a nested path like `emails.0`) and the type-checked and provisioned
+    // values are the same canonical form. `userinfo: None` because the UserInfo fetch is deferred
+    // to issue #74; a connector that requires UserInfo is rejected at write-time validation.
     let Ok(trait_doc) = evaluate(
         &definition.claim_mapping,
         &definition.quirks,
         ClaimSources {
-            id_token: &id_claims,
+            id_token: &identity.claims,
             userinfo: None,
         },
         schema_arg,

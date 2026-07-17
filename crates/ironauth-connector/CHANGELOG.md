@@ -6,6 +6,26 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Connector-definition validation hardening (issue #75, PR C follow-up): three write-time
+  guards so an operator gets an actionable config error instead of a silent per-login trap.
+  - **A custom `subject` rule is rejected.** A federated identity is ALWAYS keyed on the
+    verified, issuer-namespaced upstream `sub`, never the mapped subject, so a custom subject
+    rule can only FAIL a login (a missing or wrong-typed mapped claim) for zero benefit.
+    `ConnectorDefinition::validate` now rejects anything other than the canonical default
+    (`sub`, required) at `/claim_mapping/subject`; an absent or explicit-default `subject` is
+    accepted and the evaluator still keys on the verified `sub`.
+  - **A UserInfo-requiring connector is rejected until issue #74 lands.** The federation
+    callback passes `userinfo: None` (the UserInfo fetch is deferred to #74), so a connector
+    that sources a claim from UserInfo would fail EVERY login (and be misclassified as an
+    upstream fault). `validate` now rejects `quirks.userinfo_required = true` (at
+    `/quirks/userinfo_required`) and `quirks.email_source = "userinfo"` (at
+    `/quirks/email_source`); `fallback_order` (ID token first) and `id_token` are accepted.
+  - **The mapped `email` trait is NFKC-normalized in the evaluator, regardless of claim
+    path.** `claim_mapping::evaluate` now NFKC-normalizes a resolved `email` string BEFORE the
+    trait-schema type check, so an email mapped from a nested path (for example `emails.0`) is
+    canonicalized the same as a top-level `email` and the type-checked and provisioned values
+    are byte-identical. Adds a pure, table-only `unicode-normalization` dependency (already in
+    the workspace tree via ironauth-screening); the crate stays fetch-free and store-free.
 - Declarative claim-mapping EVALUATOR (issue #75, PR C), still pure and I/O-free (the crate
   stays fetch-free and now also store-free): the new `claim_mapping` module turns the stored
   `ClaimMapping` SHAPE into a transform.

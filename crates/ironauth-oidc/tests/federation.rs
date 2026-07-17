@@ -481,6 +481,56 @@ async fn a_data_only_connector_provisions_mapped_traits_end_to_end_with_zero_cod
 }
 
 #[tokio::test]
+async fn a_mapped_email_from_a_nested_path_is_nfkc_normalized_when_provisioned() {
+    // INFO fix: the email trait is NFKC-normalized regardless of the claim PATH it maps from.
+    // Here `email` maps from a NESTED path (`emails.0`) and the upstream value carries a
+    // fullwidth commercial-at (U+FF20); the provisioned trait must be the ordinary ASCII form,
+    // proving the resolved email is canonicalized in the evaluator (not only the top-level claim).
+    let harness = Harness::start().await;
+    seed_trait_schema(&harness, &mapping_trait_schema()).await;
+    let slug = "nested-email";
+    let definition = format!(
+        r#"{{"connector_id":"{slug}","display_name":"Nested","protocol":"oidc","endpoints":{{"issuer":"{UPSTREAM_ISSUER}"}},"scopes":["openid","email"],"client_id":"{UPSTREAM_CLIENT_ID}","claim_mapping":{{"traits":{{"email":{{"source":["emails.0"]}}}}}}}}"#
+    );
+    seed_connector_json(&harness, slug, &definition).await;
+    let upstream = start_upstream().await;
+    let runtime = build_runtime(upstream.addr, vec![IpAddr::from([93, 184, 216, 34])]);
+
+    let response = login_with_overrides(
+        &harness,
+        &runtime,
+        &upstream,
+        slug,
+        "nested-email-sub",
+        serde_json::json!({ "emails": ["user\u{FF20}x.example"] }),
+    )
+    .await;
+    assert_eq!(
+        response.status(),
+        StatusCode::SEE_OTHER,
+        "the nested-path mapped login resumes the local authorize"
+    );
+
+    let external_id = federated_external_id(UPSTREAM_ISSUER, "nested-email-sub");
+    let user_id = provisioned_user_id(&harness, &external_id)
+        .await
+        .expect("the federated user is provisioned");
+    let (_, traits) = harness
+        .store()
+        .scoped(harness.scope())
+        .users()
+        .traits(&user_id)
+        .await
+        .expect("traits read")
+        .expect("the provisioned user carries mapped traits");
+    assert_eq!(
+        traits.get("email"),
+        Some(&serde_json::json!("user@x.example")),
+        "the nested-path email is NFKC-normalized before it is provisioned"
+    );
+}
+
+#[tokio::test]
 async fn a_missing_required_claim_fails_closed_and_provisions_no_user_upstream_protocol() {
     // FAIL-CLOSED (UpstreamProtocol class): the mapping requires `email` but the upstream
     // OMITS it, so the evaluator returns an UpstreamClaim error and the login aborts BEFORE
