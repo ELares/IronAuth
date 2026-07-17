@@ -21,6 +21,16 @@
 //! The honest acr/amr contribution lives in [`crate::authn`]: a remembered-device login
 //! records `[<primary>, TrustedDevice]`, so the token's `acr` is the DISTINCT, weaker
 //! `mfa_remembered` and its `amr` carries NO fabricated `mfa`/`otp`.
+//!
+//! # Revocation scope
+//!
+//! Revoking a remembered device (self-service, a password change, or an MFA factor
+//! change) is IMMEDIATE for the MFA-SKIP: the row's `revoked_at` is checked in the same
+//! read [`validate`] performs, so a replayed device cookie fails server-side at once and
+//! the next login from that device re-prompts for the second factor. It does NOT
+//! retroactively kill SESSIONS or REFRESH-TOKEN FAMILIES already issued from the device;
+//! those are governed by the separate session-revocation surface (issue #61). Revoking a
+//! device stops it from SKIPPING again; ending an existing session is a distinct action.
 
 use axum::http::HeaderMap;
 use base64::Engine as _;
@@ -219,6 +229,27 @@ pub(crate) async fn invalidate_all(
         .self_revoke_all(state.env(), subject, reason)
         .await
         .unwrap_or(0)
+}
+
+/// INVALIDATE every remembered device of `subject` after an MFA factor is removed or
+/// regenerated (issue #71): the self-service removal of a TOTP factor or a
+/// passkey/webauthn credential. UNLIKE the password-change seam this is UNCONDITIONAL
+/// (there is no per-tenant factor-change toggle): a removed second factor is a strong
+/// signal that device trust should be re-established, so the safe default always revokes.
+/// [`invalidate_all`] is itself a no-op when the trusted-device feature is off. Returns
+/// the number of devices revoked.
+pub(crate) async fn invalidate_on_factor_change(
+    state: &OidcState,
+    scope: Scope,
+    subject: &UserId,
+) -> u64 {
+    invalidate_all(
+        state,
+        scope,
+        subject,
+        TrustedDeviceRevokeReason::FactorChange,
+    )
+    .await
 }
 
 #[cfg(test)]

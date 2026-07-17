@@ -87,8 +87,9 @@ CREATE TABLE trusted_devices (
     -- The absolute max-age cap the device was minted under: past it the device
     -- never skips again (enforced authoritatively in the read query).
     max_age_expires_at  timestamptz NOT NULL,
-    -- The sliding idle window: a use past roughly half the window advances it, so an
-    -- unused device expires at idle while an active one lives to the absolute cap.
+    -- The sliding idle window: EVERY successful use advances it (idle_expires_at is
+    -- reset to now + idle_ttl, capped at the absolute max-age), so an unused device
+    -- expires at idle while an actively used one lives to the absolute cap.
     idle_expires_at     timestamptz NOT NULL,
     -- Set exactly once when the device is revoked (user, admin, or a
     -- password/factor-change invalidation). A revoked row stops skipping IMMEDIATELY.

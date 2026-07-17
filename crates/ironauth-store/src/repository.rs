@@ -16631,7 +16631,10 @@ impl ActingAccountCredentialRepo<'_> {
 pub enum TrustedDeviceRevokeReason {
     /// The end user revoked it through the self-service account surface.
     User,
-    /// An admin revoked it.
+    /// An admin revoked it. RESERVED for the M9 admin surface: no admin trusted-device
+    /// action exists yet, so this arm is wired but not reached today. The `0053` CHECK
+    /// already admits it so the M9 admin action needs no migration. Not silently dead:
+    /// it is the documented seam the admin revoke will use.
     Admin,
     /// A password change or reset invalidated the device's trust (per policy).
     PasswordChange,
@@ -16760,10 +16763,12 @@ impl TrustedDeviceRepo<'_> {
 
     /// One page of `subject`'s remembered devices, ordered by `(created_at, id)`,
     /// starting strictly after `after`. Filtered on the subject, so it lists ONLY that
-    /// subject's own devices. Only LIVE devices (not revoked, still within their
-    /// max-age window at `now_micros`) are returned, so the account UI never shows a
-    /// device that can no longer skip. The User-Agent and coarse location are decrypted
-    /// from their sealed columns under the row's DEK version.
+    /// subject's own devices. Only LIVE devices (not revoked, still within BOTH their
+    /// max-age AND idle windows at `now_micros`) are returned, matching exactly what
+    /// [`Self::validate`] accepts, so the account UI never shows a device that could no
+    /// longer skip (a device past its idle window but within max-age is already dead to
+    /// `validate` and must not read as "live" here). The User-Agent and coarse location
+    /// are decrypted from their sealed columns under the row's DEK version.
     ///
     /// # Errors
     ///
@@ -16793,6 +16798,7 @@ impl TrustedDeviceRepo<'_> {
              WHERE tenant_id = $1 AND environment_id = $2 AND subject = $3 \
              AND revoked_at IS NULL \
              AND max_age_expires_at > (TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval) \
+             AND idle_expires_at > (TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval) \
              AND ($5::bigint IS NULL OR (created_at, id) > \
                   (TIMESTAMPTZ 'epoch' + ($5::text || ' microseconds')::interval, $6::text)) \
              ORDER BY created_at, id LIMIT $7",

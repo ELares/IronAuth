@@ -572,6 +572,27 @@ mod tests {
     }
 
     #[test]
+    fn config_default_matches_the_canonical_ladder() {
+        // The shipped config default (`OidcConfig::acr_order`) MUST equal the canonical
+        // code order (issues #66/#71/#72). Pinning them together means a future acr rung
+        // added to `AuthMethod::ALL` cannot silently drift out of the default config,
+        // leaving a level unranked at runtime (which fails closed and spuriously blocks a
+        // legitimate login).
+        assert_eq!(
+            ironauth_config::OidcConfig::default().acr_order,
+            default_acr_order()
+        );
+        // And the config crate's exported canonical list is the same order.
+        assert_eq!(
+            ironauth_config::OIDC_DEFAULT_ACR_ORDER
+                .iter()
+                .map(|acr| (*acr).to_owned())
+                .collect::<Vec<_>>(),
+            default_acr_order()
+        );
+    }
+
+    #[test]
     fn acr_satisfaction_honors_rank() {
         let order = order();
         // mfa satisfies a pwd floor (stronger), pwd does not satisfy an mfa floor.

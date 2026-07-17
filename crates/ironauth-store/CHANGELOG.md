@@ -18,6 +18,13 @@ range per docs/RELEASING.md.
   per-column AAD. Classified `Runtime` in the resource-model registry, granted to the app
   and control-plane roles, and registered in the migration guard test and
   `scripts/query-audit.sh`.
+- Review fix (issue #71): `TrustedDeviceRepo::list` now also filters `idle_expires_at >
+  now`, matching exactly what `validate` accepts, so a device past its idle window but
+  within max-age no longer reads as "live" in the account list. The `FactorChange` revoke
+  reason is now wired (invalidation on MFA-factor removal, driven from the oidc account
+  surface); the `Admin` reason is documented as a reserved M9 admin-surface seam. The
+  `0053` comment on the sliding idle window is corrected to state it advances on EVERY
+  successful use (capped at max-age), not past roughly half the window.
 - Admin sudo elevation ledger (issue #73): migration 0052 adds the tenant-scoped,
   forced-RLS `admin_sudo_elevations` append-only table (the acting principal, the achieved
   acr, the recorded elevation instant, and the window expiry), an `elv_` scoped id, the

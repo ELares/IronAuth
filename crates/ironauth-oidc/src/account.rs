@@ -697,14 +697,26 @@ pub async fn remove_credential(
         )
         .await;
     match result {
-        Ok(CredentialRemoveOutcome::Removed) => json_response(
-            StatusCode::OK,
-            json!({
-                "id": id.to_string(),
-                "removed": true,
-                "step_up": step_up_status(&state, account.auth_time_unix_micros),
-            }),
-        ),
+        Ok(CredentialRemoveOutcome::Removed) => {
+            // Removing an MFA/login factor changes the credential landscape (issue #71),
+            // so invalidate the subject's remembered devices (reason FactorChange). A
+            // replayed device cookie then re-prompts for a second factor. Best-effort; a
+            // no-op when the feature is off.
+            crate::trusted_device::invalidate_on_factor_change(
+                &state,
+                account.scope,
+                &account.subject,
+            )
+            .await;
+            json_response(
+                StatusCode::OK,
+                json!({
+                    "id": id.to_string(),
+                    "removed": true,
+                    "step_up": step_up_status(&state, account.auth_time_unix_micros),
+                }),
+            )
+        }
         Ok(CredentialRemoveOutcome::NotFound) => not_found_json(),
         Ok(CredentialRemoveOutcome::BlockedLastCredential) => json_response(
             StatusCode::CONFLICT,
@@ -994,15 +1006,28 @@ async fn set_first_password_flow(
         )
         .await;
     match result {
-        Ok(FirstPasswordOutcome::Set(outcome)) => json_response(
-            StatusCode::OK,
-            json!({
-                "converted": true,
-                "passwordless": false,
-                "other_sessions_revoked": outcome.sessions_revoked,
-                "step_up": step_up_status(state, account.auth_time_unix_micros),
-            }),
-        ),
+        Ok(FirstPasswordOutcome::Set(outcome)) => {
+            // Setting the first password changes the credential landscape exactly as a
+            // password change does (issue #71), so invalidate the subject's remembered
+            // devices through the same seam (reason PasswordChange), per tenant policy.
+            // Best-effort; it never fails the successful conversion.
+            let devices_revoked = invalidate_trusted_devices_on_password_change(
+                state,
+                account.scope,
+                &account.subject,
+            )
+            .await;
+            json_response(
+                StatusCode::OK,
+                json!({
+                    "converted": true,
+                    "passwordless": false,
+                    "other_sessions_revoked": outcome.sessions_revoked,
+                    "trusted_devices_revoked": devices_revoked,
+                    "step_up": step_up_status(state, account.auth_time_unix_micros),
+                }),
+            )
+        }
         // The account gained a password between the branch check and the guarded set: a
         // benign race, reported as a conflict (nothing was clobbered).
         Ok(FirstPasswordOutcome::Ineligible) => json_response(

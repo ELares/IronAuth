@@ -28,6 +28,14 @@ range per docs/RELEASING.md.
   IMMEDIATE (a replayed cookie then fails), and a password change invalidates trust per
   the `oidc.trusted_device_revoke_on_password_change` policy. The token endpoint mirrors
   the composition, honoring a frozen `trusted_device` contribution.
+- Review fix (issue #71): removing an MFA/login factor now invalidates the subject's
+  remembered devices (reason `FactorChange`) from the TOTP-remove, passkey/webauthn-remove,
+  and account credential-remove surfaces, so a replayed device cookie re-prompts after a
+  factor change. Setting a FIRST password (the passkey-only conversion) now invalidates
+  trusted devices through the same seam a password change uses, for consistency. Documented
+  the revocation scope: a device revoke is IMMEDIATE for the MFA-skip but does NOT
+  retroactively kill sessions or refresh-token families already issued from the device
+  (those are the issue #61 session-revocation domain).
 - WebAuthn Level 3 Signal API and conditional-create, EXPLORATORY and off by default
   (issue #73). Behind the new per-environment `oidc.webauthn_signal_api_enabled` flag, the
   hosted passkey-management page (`GET .../webauthn/manage`) emits ONE nonce-guarded,

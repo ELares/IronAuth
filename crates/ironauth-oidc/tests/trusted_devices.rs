@@ -106,8 +106,9 @@ async fn post_json(h: &Harness, path: &str, cookie: &str, body: &Value) -> (Stat
     (status, value)
 }
 
-/// Drive a TOTP enrollment to ACTIVE for `subject` and return the opened seed.
-async fn enroll_active_totp(h: &Harness, subject: &str) -> Vec<u8> {
+/// Drive a TOTP enrollment to ACTIVE for `subject` and return the opened seed together
+/// with the `tot_` credential id (so a test can later remove the factor).
+async fn enroll_active_totp(h: &Harness, subject: &str) -> (Vec<u8>, String) {
     let scope = h.scope();
     let base = format!(
         "/t/{}/e/{}/account/mfa",
@@ -131,7 +132,7 @@ async fn enroll_active_totp(h: &Harness, subject: &str) -> Vec<u8> {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "activate: {activated:?}");
-    seed
+    (seed, credential_id)
 }
 
 /// Complete a full multi-factor login for `subject` from a fresh password session and
@@ -175,7 +176,7 @@ async fn a_remembered_device_skips_the_second_factor_and_the_token_is_honest() {
         .await;
     h.set_tenant_min_class("mfa").await;
     let subject = h.seed_unique_user().await;
-    let seed = enroll_active_totp(&h, &subject).await;
+    let (seed, _) = enroll_active_totp(&h, &subject).await;
 
     // First login: a completed multi-factor login remembers the device.
     let device_cookie = login_and_remember(&h, &subject, &seed, &client).await;
@@ -241,7 +242,7 @@ async fn revocation_is_immediate_and_a_replayed_cookie_fails_server_side() {
         .await;
     h.set_tenant_min_class("mfa").await;
     let subject = h.seed_unique_user().await;
-    let seed = enroll_active_totp(&h, &subject).await;
+    let (seed, _) = enroll_active_totp(&h, &subject).await;
     let device_cookie = login_and_remember(&h, &subject, &seed, &client).await;
 
     // The device appears in the account list, and the user revokes it.
@@ -299,7 +300,7 @@ async fn a_step_up_acr_floor_overrides_a_remembered_device() {
     h.set_scope_step_up_policy("payments:write", Some(ACR_MFA), None)
         .await;
     let subject = h.seed_unique_user().await;
-    let seed = enroll_active_totp(&h, &subject).await;
+    let (seed, _) = enroll_active_totp(&h, &subject).await;
     let device_cookie = login_and_remember(&h, &subject, &seed, &client).await;
 
     // The remembered device satisfies the tenant BASELINE mfa, but the EXPLICIT step-up
@@ -325,7 +326,7 @@ async fn a_stolen_or_tampered_device_cookie_does_not_skip() {
         .await;
     h.set_tenant_min_class("mfa").await;
     let alice = h.seed_unique_user().await;
-    let seed = enroll_active_totp(&h, &alice).await;
+    let (seed, _) = enroll_active_totp(&h, &alice).await;
     let alice_device = login_and_remember(&h, &alice, &seed, &client).await;
 
     // Cross-account: Bob presents Alice's device cookie. It is subject-bound, so Bob is
@@ -373,7 +374,7 @@ async fn a_password_change_invalidates_trusted_devices() {
     let subject = h
         .seed_user(&identifier, "correct horse battery staple")
         .await;
-    let seed = enroll_active_totp(&h, &subject).await;
+    let (seed, _) = enroll_active_totp(&h, &subject).await;
     let device_cookie = login_and_remember(&h, &subject, &seed, &client).await;
 
     // Change the password through the self-service surface.
@@ -411,6 +412,99 @@ async fn a_password_change_invalidates_trusted_devices() {
     assert!(
         location(&headers).expect("loc").starts_with("/login/mfa"),
         "a password change must invalidate the remembered device"
+    );
+}
+
+/// The account device list matches exactly what `validate` accepts (INFO-3, issue #71): a
+/// device past its idle window but still within its absolute max-age is NOT shown as live,
+/// because a subsequent skip attempt would be rejected.
+#[tokio::test]
+async fn the_account_list_hides_a_device_past_its_idle_window() {
+    let h = harness().await;
+    let client = h.client_id().to_string();
+    h.configure_client_policy(h.client_id(), "explicit", true, false, None)
+        .await;
+    h.set_tenant_min_class("mfa").await;
+    let subject = h.seed_unique_user().await;
+    let (seed, _) = enroll_active_totp(&h, &subject).await;
+    let _device_cookie = login_and_remember(&h, &subject, &seed, &client).await;
+
+    let scope = h.scope();
+    let base = format!(
+        "/t/{}/e/{}/account/trusted-devices",
+        scope.tenant(),
+        scope.environment()
+    );
+
+    // Freshly remembered: the device is live and listed.
+    let account_cookie = h.session_cookie_at(&subject, "pwd", now_micros(&h)).await;
+    let (status, listed) = get_json(&h, &base, &account_cookie).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        listed["trusted_devices"].as_array().expect("devices").len(),
+        1,
+        "the freshly remembered device is live: {listed}"
+    );
+
+    // Advance PAST the idle window (default 7 days) but WITHIN the absolute max-age
+    // (default 30 days). The device is now idle-expired, so `validate` would reject it and
+    // the account list must not report it as live.
+    h.clock().advance(Duration::from_secs(8 * 24 * 60 * 60));
+    let account_cookie = h.session_cookie_at(&subject, "pwd", now_micros(&h)).await;
+    let (status, listed) = get_json(&h, &base, &account_cookie).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        listed["trusted_devices"]
+            .as_array()
+            .expect("devices")
+            .is_empty(),
+        "a device past its idle window must not be listed as live: {listed}"
+    );
+}
+
+/// Removing an MFA factor (here the subject's TOTP) INVALIDATES the subject's remembered
+/// devices (reason `FactorChange`, issue #71), so a replayed cookie after the removal fails
+/// and the second factor is challenged again.
+#[tokio::test]
+async fn an_mfa_factor_removal_invalidates_trusted_devices() {
+    let h = harness().await;
+    let client = h.client_id().to_string();
+    h.configure_client_policy(h.client_id(), "explicit", true, false, None)
+        .await;
+    h.set_tenant_min_class("mfa").await;
+    let subject = h.seed_unique_user().await;
+    let (seed, totp_id) = enroll_active_totp(&h, &subject).await;
+    let device_cookie = login_and_remember(&h, &subject, &seed, &client).await;
+
+    // Remove the TOTP second factor through the self-service surface.
+    let account_cookie = h.session_cookie_at(&subject, "pwd", now_micros(&h)).await;
+    let scope = h.scope();
+    let path = format!(
+        "/t/{}/e/{}/account/mfa/totp/remove",
+        scope.tenant(),
+        scope.environment()
+    );
+    let (status, removed) = post_json(
+        &h,
+        &path,
+        &account_cookie,
+        &json!({ "credential_id": totp_id }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "totp remove: {removed:?}");
+    assert_eq!(removed["removed"], json!(true), "the factor is removed");
+
+    // The remembered device no longer skips: the replayed cookie fails server-side and the
+    // second factor is challenged again.
+    let session = h.session_cookie_at(&subject, "pwd", now_micros(&h)).await;
+    let combined = format!("{session}; {device_cookie}");
+    let (status, headers, _) = h
+        .authorize_with_cookie(&authorize_query(&client, "openid", &[]), &combined)
+        .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert!(
+        location(&headers).expect("loc").starts_with("/login/mfa"),
+        "an MFA factor removal must invalidate the remembered device"
     );
 }
 

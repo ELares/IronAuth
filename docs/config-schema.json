@@ -376,11 +376,13 @@
         "acr_order": {
           "default": [
             "urn:ironauth:acr:pwd",
+            "urn:ironauth:acr:mfa_remembered",
             "urn:ironauth:acr:mfa",
             "phr",
-            "phrh"
+            "phrh",
+            "urn:ironauth:acr:attested_passkey"
           ],
-          "description": "The DEPLOYMENT-level `acr` order for step-up comparison (RFC 9470, issue #72),\nweakest first. A step-up requirement's `acr` floor is satisfied when the\nachieved `acr` is the same value or ranks at least as strong under this\norder. The default is the credential-ladder order the provider advertises\n(`urn:ironauth:acr:pwd`, `urn:ironauth:acr:mfa`, `phr`, `phrh`); a deployment\nthat trusts its factors differently (for example ranking a verified TOTP\nabove a synced passkey) reorders them here. An empty list falls back to the\ndefault ladder. Duplicate entries are a boot-time [`ConfigError::Invalid`].\nThis is resolved ONCE from configuration and applied across the deployment;\nper-(tenant, environment) resolution is a future enhancement, consistent with\nhow the other per-environment config is handled.",
+          "description": "The DEPLOYMENT-level `acr` order for step-up comparison (RFC 9470, issue #72),\nweakest first. A step-up requirement's `acr` floor is satisfied when the\nachieved `acr` is the same value or ranks at least as strong under this\norder. The default is the canonical credential-ladder order the provider\nadvertises ([`OIDC_DEFAULT_ACR_ORDER`]: `pwd`, `mfa_remembered`, `mfa`, `phr`,\n`phrh`, `attested_passkey`); a deployment that trusts its factors differently\n(for example ranking a verified TOTP above a synced passkey) reorders them here.\nAn empty list falls back to the default ladder. A non-empty override must be a\nPERMUTATION of the known rungs (no unknown value, no duplicate, nothing left\nunranked) and must keep `mfa_remembered` STRICTLY below `mfa` (a remembered\ndevice must never satisfy a genuine `mfa` floor); any violation is a boot-time\n[`ConfigError::Invalid`].\nThis is resolved ONCE from configuration and applied across the deployment;\nper-(tenant, environment) resolution is a future enhancement, consistent with\nhow the other per-environment config is handled.",
           "items": {
             "type": "string"
           },
@@ -1600,9 +1602,11 @@
         "access_token_ttl_secs": 300,
         "acr_order": [
           "urn:ironauth:acr:pwd",
+          "urn:ironauth:acr:mfa_remembered",
           "urn:ironauth:acr:mfa",
           "phr",
-          "phrh"
+          "phrh",
+          "urn:ironauth:acr:attested_passkey"
         ],
         "authorization_code_ttl_secs": 60,
         "backchannel_logout_enabled": false,
