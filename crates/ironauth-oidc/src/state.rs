@@ -2221,10 +2221,23 @@ impl OidcState {
     /// PER-ENVIRONMENT override from the `environments` table when the operator set one,
     /// else the deployment-config default. The override is read through the scope-forced
     /// `environment_guardrails` projection (the data plane holds no direct grant on the
-    /// level table), so an environment can only ever read its own posture. A store fault
-    /// or an unprovisioned/unparseable value falls back to the deployment default, so the
-    /// resolution is fail-safe (never MORE permissive than the default on an error, since
-    /// the default is the conservative `Off`).
+    /// level table), so an environment can only ever read its own posture.
+    ///
+    /// A successfully-read NULL/absent override means "not configured" and uses the
+    /// deployment-config default (the intended path). A STORE FAULT, by contrast, means an
+    /// EXPECTED override could not be read: it fails closed to the SAFE posture
+    /// (`AutoLinkPosture::Off`), NEVER to the deployment default. That distinction matters
+    /// when the deployment default is permissive (e.g. `VerifiedToVerified`) but an operator
+    /// set a stricter `Off` override on this env: a transient read fault must not momentarily
+    /// degrade that env back to the more-permissive default. The resolution is therefore
+    /// fail-closed on error rather than merely fail-to-default.
+    ///
+    /// Residual (documented, no behavior change): a federated identity provisioned as a
+    /// SEPARATE account while posture was `Off` will, after a flip to `VerifiedToVerified`,
+    /// auto-link into a matching VERIFIED local account on its next login, orphaning the prior
+    /// separate account. This is same-email, all-green-gated (still requires L && U && T), so
+    /// it is acceptable and accepted, mirroring the connector-disable residual: a posture flip
+    /// is a forward-looking policy change, not a retroactive re-home of past provisioning.
     pub(crate) async fn effective_auto_link_posture(
         &self,
         scope: Scope,
@@ -2238,7 +2251,12 @@ impl OidcState {
         {
             Ok(Some(token)) => ironauth_config::AutoLinkPosture::parse(&token)
                 .unwrap_or(self.inner.auto_link_posture),
-            Ok(None) | Err(_) => self.inner.auto_link_posture,
+            // A successfully-read absent override is "not configured": use the deployment
+            // default.
+            Ok(None) => self.inner.auto_link_posture,
+            // A store fault reading an EXPECTED override fails closed to the safe posture,
+            // never to a possibly-more-permissive deployment default.
+            Err(_) => ironauth_config::AutoLinkPosture::Off,
         }
     }
 

@@ -1662,7 +1662,8 @@ async fn resolve_local_email_match(
 /// all-green arm of the decision table. Creates the `account_links` row (`auto_verified`,
 /// audited), alerts the account's verified channels, and binds the session to the local
 /// user. A concurrent first login that already linked the identity (a UNIQUE violation)
-/// resolves to that same local user rather than failing the login.
+/// resolves to that same local user rather than failing the login; the re-resolved binding
+/// is asserted to point at the INTENDED local user and fails closed on any divergence.
 async fn complete_auto_link(
     state: &OidcState,
     scope: Scope,
@@ -1701,7 +1702,20 @@ async fn complete_auto_link(
             .await
         {
             Ok(Some(link)) => match UserId::parse_in_scope(&link.user_id, &scope) {
-                Ok(user_id) => LinkDispatch::Session(user_id),
+                // Belt-and-suspenders (issue #78 section 2): the re-resolved row MUST bind
+                // the SAME local user this auto-link decided on. A future `resolve` refactor
+                // that ever returned a different user would otherwise establish a session as
+                // whoever the row points to, a silent account takeover. Assert the identity
+                // and fail closed on any divergence rather than trusting the re-resolved row.
+                Ok(user_id) if user_id == *local_user => LinkDispatch::Session(user_id),
+                Ok(_) => {
+                    tracing::error!(
+                        connector = %connector_key,
+                        "auto-link conflict re-resolution bound a different local user than \
+                         the intended target; failing closed without a session",
+                    );
+                    LinkDispatch::Respond(interaction::server_error_page())
+                }
                 Err(_) => LinkDispatch::Respond(interaction::server_error_page()),
             },
             _ => LinkDispatch::Respond(interaction::server_error_page()),

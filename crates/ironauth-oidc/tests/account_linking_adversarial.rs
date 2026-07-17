@@ -187,7 +187,8 @@ async fn seed_trait_schema(harness: &Harness) {
         "type": "object",
         "properties": {
             "email": {"type": "string", "minLength": 3},
-            "name": {"type": "string"}
+            "name": {"type": "string"},
+            "email_relay": {"type": "boolean"}
         },
         "additionalProperties": false
     })
@@ -262,6 +263,59 @@ async fn seed_connector(harness: &Harness, trust: &str) {
         )
         .await
         .expect("seed connector");
+}
+
+/// Seed a TRUSTED Apple-style OIDC connector (mirroring the shipped `apple_definition`) that
+/// names the Hide My Email relay domain as a quirk (issue #74), so the callback runs the SAME
+/// relay classification the real Apple connector does. It is mounted at the test `SLUG` route
+/// so every shared login/callback helper applies unchanged; only the relay quirk and the
+/// `email_relay` trait mapping differ from `seed_connector`.
+async fn seed_relay_connector(harness: &Harness) {
+    let definition = json!({
+        "connector_id": SLUG,
+        "display_name": "apple",
+        "protocol": "oidc",
+        "endpoints": {"issuer": MOCK_ISSUER},
+        "scopes": ["openid", "email", "name"],
+        "client_id": CLIENT_ID,
+        "capabilities": {"email_verified_trust": "trusted"},
+        "claim_mapping": {"traits": {
+            "email": {"source": ["email"], "required": true},
+            "name": {"source": ["name"], "required": false},
+            "email_relay": {"source": ["email_relay"], "required": false}
+        }},
+        "quirks": {"relay_email_domain": "privaterelay.appleid.com"}
+    })
+    .to_string();
+    let env = harness.env().clone();
+    let scope = harness.scope();
+    let id = ConnectorId::generate(&env, &scope);
+    harness
+        .db()
+        .control_store()
+        .scoped(scope)
+        .acting(harness.db().test_actor(&env), CorrelationId::generate(&env))
+        .connectors()
+        .create(
+            &env,
+            &id,
+            1_000_000,
+            NewConnector {
+                slug: SLUG,
+                definition_json: &definition,
+                client_secret: b"secret",
+                capabilities: ConnectorCapabilities {
+                    refresh: false,
+                    groups: false,
+                    logout_propagation: false,
+                    email_verified_trust: "trusted",
+                },
+                enabled: true,
+            },
+            None,
+        )
+        .await
+        .expect("seed relay connector");
 }
 
 async fn connector_id(harness: &Harness) -> String {
@@ -695,6 +749,63 @@ async fn scenario_c_trusted_connector_but_upstream_omits_email_verified_never_au
     );
     assert!(links_for(&harness, &owner).await.is_empty());
     assert!(provisioned(&harness, "attacker-sub").await.is_none());
+}
+
+// ===========================================================================
+// Relay class (issue #78 dependency note + plan section 8): an Apple Hide My Email
+// relay login NEVER auto-links across accounts, even all-green.
+// ===========================================================================
+
+#[tokio::test]
+async fn relay_apple_hide_my_email_login_never_auto_links_into_a_victim() {
+    let harness = Harness::start().await;
+    seed_trait_schema(&harness).await;
+    // A TRUSTED Apple-style connector with the Hide My Email relay quirk configured.
+    seed_relay_connector(&harness).await;
+    // The MOST permissive posture: only the relay-address non-match stops a merge.
+    set_env_posture(&harness, Some("verified_to_verified")).await;
+
+    // A genuine VERIFIED local victim whose real email an attacker would love to merge into.
+    let victim = subject_id(&harness, &harness.seed_user("victim-acct", "pw").await);
+    add_email(&harness, &victim, "victim@example.test", true).await;
+
+    // An Apple login whose ONLY asserted email is a per-app Hide My Email relay alias, even
+    // asserting email_verified on the trusted connector under the opt-in posture.
+    let mock = start_mock().await;
+    let relay = "abc123def@privaterelay.appleid.com";
+    let status = login(
+        &harness,
+        &mock,
+        "apple-relay-sub",
+        json!({"email": relay, "email_verified": true, "name": "Relay User"}),
+    )
+    .await;
+
+    // A relay alias matches NO verified local identifier (resolve_local_email_match yields no
+    // verified user), so the all-green tuple is never formed: the login provisions its OWN
+    // separate federated account and NEVER auto-links into the victim (never a silent merge).
+    assert_eq!(
+        status,
+        StatusCode::SEE_OTHER,
+        "the relay login provisions a separate account and signs in as it"
+    );
+    assert!(
+        links_for(&harness, &victim).await.is_empty(),
+        "a relay login must NOT create a link binding the relay identity to the victim"
+    );
+    let separate = provisioned(&harness, "apple-relay-sub")
+        .await
+        .expect("the relay login provisions a SEPARATE federated account, never a merge");
+    assert_ne!(
+        separate, victim,
+        "the separately provisioned account is NOT the victim (no silent re-home)"
+    );
+    // The separate federated account carries no account_links row into any local user, and the
+    // session runs as that separate subject, never as the victim.
+    assert!(
+        links_for(&harness, &separate).await.is_empty(),
+        "a separately provisioned relay account holds no link into a local user"
+    );
 }
 
 // ===========================================================================

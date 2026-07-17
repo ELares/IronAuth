@@ -110,6 +110,48 @@ async fn role_has_table_privilege(
         .get("present")
 }
 
+/// Whether `role` holds `privilege` on the specific `table`.`column`
+/// (`has_column_privilege`). Used to prove a grant is COLUMN-scoped: the control role may
+/// UPDATE only the named column, and the app role holds no such grant, so a widened grant
+/// (table-wide, or reaching the app role) fails the guard closed.
+async fn role_has_column_privilege(
+    pool: &sqlx::PgPool,
+    role: &str,
+    table: &str,
+    column: &str,
+    privilege: &str,
+) -> bool {
+    sqlx::query("SELECT has_column_privilege($1, $2, $3, $4) AS present")
+        .bind(role)
+        .bind(table)
+        .bind(column)
+        .bind(privilege)
+        .fetch_one(pool)
+        .await
+        .expect("column privilege lookup")
+        .get("present")
+}
+
+/// Whether the VIEW `view` exposes an output column named `column` (`pg_class` relkind `v`).
+/// Used to prove the scope-forced guardrail projection actually SURFACES a column to the data
+/// plane, not merely that the base table carries it.
+async fn view_exposes_column(pool: &sqlx::PgPool, view: &str, column: &str) -> bool {
+    sqlx::query(
+        "SELECT EXISTS ( \
+            SELECT 1 FROM pg_catalog.pg_attribute att \
+            JOIN pg_catalog.pg_class c ON c.oid = att.attrelid \
+            WHERE c.relname = $1 AND c.relkind = 'v' \
+              AND att.attname = $2 AND att.attnum > 0 AND NOT att.attisdropped \
+         ) AS present",
+    )
+    .bind(view)
+    .bind(column)
+    .fetch_one(pool)
+    .await
+    .expect("view column lookup")
+    .get("present")
+}
+
 /// Whether `table` has BOTH `ENABLE` and `FORCE` row-level security on (`pg_class`).
 async fn rls_enabled_and_forced(pool: &sqlx::PgPool, table: &str) -> bool {
     sqlx::query(
@@ -3355,6 +3397,47 @@ async fn production_chain_is_only_the_sixty_two_real_migrations_and_ships_no_dem
     assert!(
         check_constraint_exists(pool, "environments", "environments_auto_link_posture_valid").await,
         "environments must carry the auto_link_posture closed-vocabulary CHECK"
+    );
+    // The scope-forced guardrail projection (0029) must EXPOSE the new posture column: the
+    // data plane reads the per-environment override ONLY through this view, never through a
+    // direct grant on the environments level table, so a view replace that dropped the column
+    // would silently break the read.
+    assert!(
+        view_exposes_column(pool, "environment_guardrails", "auto_link_posture").await,
+        "the environment_guardrails view must expose the auto_link_posture column"
+    );
+    // The posture UPDATE grant is COLUMN-scoped to the control role: control may set the
+    // per-environment posture, the app (data-plane) role may NEVER update it, and the grant is
+    // narrow enough that control cannot rewrite another environment identity column (e.g. kind)
+    // through it. A grant that ever widened to the app role would be a data-plane privilege
+    // escalation, so this guard fails closed on it.
+    assert!(
+        role_has_column_privilege(
+            pool,
+            "ironauth_control",
+            "environments",
+            "auto_link_posture",
+            "UPDATE"
+        )
+        .await,
+        "the control role must hold column-scoped UPDATE on environments.auto_link_posture"
+    );
+    assert!(
+        !role_has_column_privilege(
+            pool,
+            "ironauth_app",
+            "environments",
+            "auto_link_posture",
+            "UPDATE"
+        )
+        .await,
+        "the app (data-plane) role must NOT hold UPDATE on environments.auto_link_posture"
+    );
+    assert!(
+        !role_has_column_privilege(pool, "ironauth_control", "environments", "kind", "UPDATE")
+            .await,
+        "the posture grant must stay column-scoped: control must NOT gain UPDATE on other \
+         environment identity columns (kind)"
     );
 }
 
