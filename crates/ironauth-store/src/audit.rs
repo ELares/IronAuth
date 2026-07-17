@@ -577,6 +577,19 @@ pub enum Action {
     /// acknowledgment. The row targets the credential and is attributed to the end
     /// user; the `detail` records the step-up policy the sensitive change declared.
     AccountCredentialRemove,
+    /// An end user (or an auto link at a federated login) BOUND a federated identity to
+    /// their local account through the guarded account linking subsystem (issue #78): a
+    /// new `account_links` row was written. The row targets the `alk_` link and is
+    /// attributed to the end user; the `detail` records the connector and link method,
+    /// NEVER the raw federated identifier. No verified flag of the local identity is ever
+    /// touched (the link stores its OWN immutable trust snapshot).
+    AccountIdentityLink,
+    /// An end user UNLINKED a federated identity from their local account (issue #78): an
+    /// `account_links` row was removed. Blocked by the last usable method guard when the
+    /// link is the account's sole surviving authentication method. The row targets the
+    /// `alk_` link and is attributed to the end user; the `detail` records the step-up
+    /// policy the sensitive change declared.
+    AccountIdentityUnlink,
     /// An end user REGISTERED a WebAuthn passkey (issue #65): a verified
     /// registration ceremony persisted a new credential (its COSE public key,
     /// AAGUID, transports, and BE/BS flags). The row targets the `pky_` credential
@@ -948,6 +961,8 @@ impl Action {
             Action::AccountPasswordSet => "account.password.set",
             Action::AccountCredentialEnroll => "account.credential.enroll",
             Action::AccountCredentialRemove => "account.credential.remove",
+            Action::AccountIdentityLink => "account.identity.link",
+            Action::AccountIdentityUnlink => "account.identity.unlink",
             Action::WebauthnCredentialRegister => "webauthn.credential.register",
             Action::WebauthnCredentialRename => "webauthn.credential.rename",
             Action::WebauthnCredentialRemove => "webauthn.credential.remove",

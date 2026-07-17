@@ -175,3 +175,55 @@ fn parse(input: &str) -> Config {
         .expect("test config parses")
         .config
 }
+
+#[test]
+fn account_linking_posture_defaults_to_off_with_a_five_minute_reauth_window() {
+    // The guarded-linking defaults (issue #78): the conservative posture is Off (a
+    // federated login never silently merges), and the manual-link fresh-re-auth window is
+    // 300 seconds. An empty config carries exactly these.
+    let config = parse("");
+    assert_eq!(
+        config.oidc.federation.auto_link_posture,
+        ironauth_config::AutoLinkPosture::Off,
+        "the default auto-link posture must be Off (the conservative default)"
+    );
+    assert_eq!(
+        config.oidc.federation.link_reauth_max_age_secs, 300,
+        "the default manual-link fresh-re-auth window must be 300 seconds"
+    );
+}
+
+#[test]
+fn account_linking_posture_and_window_parse_from_toml() {
+    let config = parse(
+        "[oidc.federation]\nauto_link_posture = \"verified_to_verified\"\n\
+         link_reauth_max_age_secs = 120\n",
+    );
+    assert_eq!(
+        config.oidc.federation.auto_link_posture,
+        ironauth_config::AutoLinkPosture::VerifiedToVerified
+    );
+    assert_eq!(config.oidc.federation.link_reauth_max_age_secs, 120);
+}
+
+#[test]
+fn a_zero_or_oversized_link_reauth_window_is_rejected_at_load() {
+    let zero = Config::from_toml_str(
+        "[oidc.federation]\nlink_reauth_max_age_secs = 0\n",
+        "<inline>",
+    )
+    .expect_err("a zero link-reauth window must be refused");
+    assert!(
+        zero.to_string().contains("link_reauth_max_age_secs"),
+        "the error must name the field, got: {zero}"
+    );
+    let oversized = Config::from_toml_str(
+        "[oidc.federation]\nlink_reauth_max_age_secs = 100000\n",
+        "<inline>",
+    )
+    .expect_err("a link-reauth window beyond the cap must be refused");
+    assert!(
+        oversized.to_string().contains("link_reauth_max_age_secs"),
+        "the error must name the field, got: {oversized}"
+    );
+}

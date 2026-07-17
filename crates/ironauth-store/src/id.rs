@@ -558,6 +558,18 @@ impl ScopedKind for UpstreamTokenGrantKind {
     const PREFIX: &'static str = "utg";
 }
 
+/// Marker for an account link (`alk_`), one row per (local user) to (federated
+/// identity) binding of the guarded account linking subsystem (issue #78). A
+/// tenant-scoped resource: the id embeds its (tenant, environment), so a link minted
+/// in one scope parses as a uniform not found under another. Runtime end user identity
+/// state (never exported); its raw federated composite lives only as a keyed blind
+/// index and a sealed ciphertext.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct AccountLinkKind;
+impl ScopedKind for AccountLinkKind {
+    const PREFIX: &'static str = "alk";
+}
+
 /// Marker for a signing key (`sik_`), an environment's per-issuer signing key
 /// (issue #19). A tenant-scoped resource: the identifier embeds its
 /// `(tenant, environment)`, so a key row can never be read across a tenant or
@@ -1203,6 +1215,9 @@ pub type UpstreamTokenId = ScopedId<UpstreamTokenKind>;
 /// An upstream-token retrieval grant identifier (`utg_...`), one per (client, org
 /// connection) retrieval authorization (issue #77, PR 3).
 pub type UpstreamTokenGrantId = ScopedId<UpstreamTokenGrantKind>;
+/// An account-link identifier (`alk_...`), one per (local user) to (federated identity)
+/// binding of the guarded account linking subsystem (issue #78).
+pub type AccountLinkId = ScopedId<AccountLinkKind>;
 /// A signing-key identifier (`sik_...`), which doubles as the JOSE `kid` of a
 /// per-environment signing key (issue #19).
 pub type SigningKeyId = ScopedId<SigningKeyKind>;

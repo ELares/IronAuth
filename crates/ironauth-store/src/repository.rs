@@ -71,11 +71,11 @@ use crate::environment::{EnvironmentType, GuardrailSet};
 use crate::error::StoreError;
 use crate::federation_state::{ConsumedFederationLoginState, NewFederationLoginState};
 use crate::id::{
-    AaguidRuleId, AbuseBanId, AcmeChallengeId, AdminSudoElevationId, AssertionMappingId,
-    AttestationConfigId, AuditId, AuditTarget, AuthorizationCodeId, BackChannelDeliveryId,
-    ClientId, ClientSessionId, ConnectorId, ConsentId, CorrelationId, CredentialClassPolicyId,
-    CredentialId, CustomDomainId, DcrPolicyId, DekId, DeviceCodeId, EmailOtpCodeId,
-    EncryptedSecretId, EnvironmentId, EnvironmentSecretId, ExternalIssuerId,
+    AaguidRuleId, AbuseBanId, AccountLinkId, AcmeChallengeId, AdminSudoElevationId,
+    AssertionMappingId, AttestationConfigId, AuditId, AuditTarget, AuthorizationCodeId,
+    BackChannelDeliveryId, ClientId, ClientSessionId, ConnectorId, ConsentId, CorrelationId,
+    CredentialClassPolicyId, CredentialId, CustomDomainId, DcrPolicyId, DekId, DeviceCodeId,
+    EmailOtpCodeId, EncryptedSecretId, EnvironmentId, EnvironmentSecretId, ExternalIssuerId,
     FederationLoginStateId, GrantId, InitialAccessTokenId, InvitationId, IssuedTokenId, KekId,
     MagicLinkTokenId, ManagementKeyId, Mds3BlobCacheId, MigrationRunId, MigrationRunRecordId,
     OperatorId, OrgConnectionId, OrganizationId, PowChallengeId, PushedRequestId, RecoveryCodeId,
@@ -478,6 +478,20 @@ impl<'a> ScopedStore<'a> {
     #[must_use]
     pub fn upstream_token_grants(&self) -> UpstreamTokenGrantRepo<'a> {
         UpstreamTokenGrantRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
+    /// The read-only account-link repository for this scope (issue #78): resolve the
+    /// local user a federated identity is linked to (the returning-linked-login
+    /// lookup, keyed on the connector plus the federated composite blind index), and
+    /// list a user's linked identities (the self-service list read). The mutating
+    /// create and unlink live on [`ActingStore::account_links`]. Correct-but-unwired in
+    /// PR 1: no live federated-login path consults it yet.
+    #[must_use]
+    pub fn account_links(&self) -> AccountLinkRepo<'a> {
+        AccountLinkRepo {
             store: self.store,
             scope: self.scope,
         }
@@ -1160,6 +1174,20 @@ impl<'a> ActingStore<'a> {
     #[must_use]
     pub fn upstream_token_grants(&self) -> ActingUpstreamTokenGrantRepo<'a> {
         ActingUpstreamTokenGrantRepo {
+            store: self.store,
+            scope: self.scope,
+            acting: self.acting,
+        }
+    }
+
+    /// The mutating account-link repository for this scope and actor (issue #78): CREATE
+    /// a guarded (local user) to (federated identity) binding (audited), and UNLINK one
+    /// under the cross-source last-usable-method guard (audited). Correct-but-unwired in
+    /// PR 1: the federated-login callback does not call it yet, so live federated-login
+    /// behavior is unchanged (a federated login still provisions a separate account).
+    #[must_use]
+    pub fn account_links(&self) -> ActingAccountLinkRepo<'a> {
+        ActingAccountLinkRepo {
             store: self.store,
             scope: self.scope,
             acting: self.acting,
@@ -13104,6 +13132,10 @@ impl ActingUserRepo<'_> {
     /// # Errors
     ///
     /// [`StoreError::Database`] on a persistence failure.
+    // A linear guard-then-flip transaction that now counts a fourth surviving method
+    // source (account links, issue #78); splitting it would obscure the single-transaction
+    // atomicity the lockout guard depends on.
+    #[allow(clippy::too_many_lines)]
     pub async fn remove_password(
         &self,
         env: &Env,
@@ -13170,7 +13202,22 @@ impl ActingUserRepo<'_> {
         .fetch_one(&mut *tx)
         .await?
         .get("n");
-        if usable_passkeys == 0 && usable_account_credentials == 0 {
+        // A surviving federated account link (issue #78) is ALSO a usable authentication
+        // method: a user whose sole remaining method is a linked Google/Apple identity
+        // must not be stranded by removing their password. Counted in the SAME
+        // transaction so a concurrent unlink cannot race a lockout past this guard. Fail
+        // closed: a store fault propagates the `?` error and the removal never proceeds.
+        let usable_account_links: i64 = sqlx::query(
+            "SELECT count(*) AS n FROM account_links \
+             WHERE tenant_id = $1 AND environment_id = $2 AND user_id = $3",
+        )
+        .bind(&tenant)
+        .bind(&environment)
+        .bind(&subject_text)
+        .fetch_one(&mut *tx)
+        .await?
+        .get("n");
+        if usable_passkeys == 0 && usable_account_credentials == 0 && usable_account_links == 0 {
             tx.commit().await?;
             return Ok(PasswordRemovalOutcome::BlockedLastCredential);
         }
@@ -16971,7 +17018,21 @@ impl ActingAccountCredentialRepo<'_> {
             .fetch_one(&mut *tx)
             .await?
             .get("n");
-            if remaining == 0 {
+            // A surviving federated account link (issue #78) is ALSO a usable method, so
+            // the last-primary-credential guard must count it too: removing the last
+            // usable credential is not stranding when a linked federated identity
+            // remains. Counted in the SAME transaction; fail closed on a store fault.
+            let usable_links: i64 = sqlx::query(
+                "SELECT count(*) AS n FROM account_links \
+                 WHERE tenant_id = $1 AND environment_id = $2 AND user_id = $3",
+            )
+            .bind(scope.tenant().to_string())
+            .bind(scope.environment().to_string())
+            .bind(&subject_text)
+            .fetch_one(&mut *tx)
+            .await?
+            .get("n");
+            if remaining == 0 && usable_links == 0 {
                 tx.commit().await?;
                 return Ok(CredentialRemoveOutcome::BlockedLastCredential);
             }
@@ -20536,6 +20597,481 @@ impl ActingUpstreamTokenGrantRepo<'_> {
             Some(&detail),
         )
         .await
+    }
+}
+
+// ===========================================================================
+// Guarded account linking (issue #78)
+// ===========================================================================
+
+/// The seal label binding a sealed `account_links.external_id_sealed` (the raw
+/// federated composite, issue #78) to its scope and DEK version. The distinct label
+/// keeps a link's sealed identifier from ever authenticating under the users PII or the
+/// generic secret store context, exactly like every other sealed payload's label.
+const ACCOUNT_LINK_EXTERNAL_ID_SEAL_LABEL: &str = "ironauth.envelope.account-link-external-id.v1";
+
+/// The associated data binding a sealed `account_links.external_id_sealed` to its scope
+/// and the DEK version that sealed it (issue #78).
+fn account_link_external_id_seal_aad(scope: Scope, dek_version: i32) -> Aad {
+    Aad::builder()
+        .text(ACCOUNT_LINK_EXTERNAL_ID_SEAL_LABEL)
+        .text(&scope.tenant().to_string())
+        .text(&scope.environment().to_string())
+        .version(i64::from(dek_version))
+        .build()
+}
+
+/// How a federated identity was bound to a local account (issue #78): the closed set
+/// the `account_links_link_method_known` CHECK enforces, so an unknown method can never
+/// be written. A `Manual` link is the self-service, fresh-re-auth-gated binding; an
+/// `AutoVerified` link is the one the trust decision table auto-links (posture
+/// `VerifiedToVerified`, verified local, upstream `email_verified`, trusted connector).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccountLinkMethod {
+    /// A deliberate self-service link, authorized by a fresh re-authentication of the
+    /// target account (never merely an active session).
+    Manual,
+    /// An auto-link the trust decision table permitted (the single `AutoLink` arm).
+    AutoVerified,
+}
+
+impl AccountLinkMethod {
+    /// The stored wire string (`manual`, `auto_verified`), the closed CHECK set.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AccountLinkMethod::Manual => "manual",
+            AccountLinkMethod::AutoVerified => "auto_verified",
+        }
+    }
+
+    /// Parse the stored wire string back into a method. An unknown value is the uniform
+    /// [`StoreError::NotFound`] (the CHECK makes it unreachable in practice).
+    fn from_wire(value: &str) -> Result<Self, StoreError> {
+        match value {
+            "manual" => Ok(AccountLinkMethod::Manual),
+            "auto_verified" => Ok(AccountLinkMethod::AutoVerified),
+            _ => Err(StoreError::NotFound),
+        }
+    }
+}
+
+/// A read projection of one `account_links` row (issue #78). The raw federated
+/// identifier is NOT opened here (it lives only as a keyed blind index and a sealed
+/// ciphertext); a read is secret-free by construction. The self-service list (PR 2)
+/// opens and masks the display address from the sealed column separately.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountLinkRecord {
+    /// The `alk_` link id.
+    pub id: AccountLinkId,
+    /// The LOCAL user this federated identity is linked to.
+    pub user_id: String,
+    /// The `cnr_` connector the federated identity came through.
+    pub connector_id: String,
+    /// The link's OWN immutable trust snapshot at link time (never the local identity's
+    /// verification state).
+    pub email_verified: bool,
+    /// How the binding was made.
+    pub link_method: AccountLinkMethod,
+    /// The creation instant in epoch microseconds.
+    pub created_at_unix_micros: i64,
+}
+
+/// The columns an account-link read projects (issue #78). No sealed or blind-index
+/// column: a read is secret-free.
+const ACCOUNT_LINK_READ_COLUMNS: &str = "id, user_id, connector_id, email_verified, link_method, \
+     (EXTRACT(EPOCH FROM created_at) * 1000000)::bigint AS created_us";
+
+/// Reconstruct an [`AccountLinkRecord`] from a read row.
+fn account_link_record_from_row(
+    row: &sqlx::postgres::PgRow,
+    scope: Scope,
+) -> Result<AccountLinkRecord, StoreError> {
+    let id_text: String = row.get("id");
+    let id = AccountLinkId::parse_in_scope(&id_text, &scope).map_err(|_| StoreError::NotFound)?;
+    let method_text: String = row.get("link_method");
+    Ok(AccountLinkRecord {
+        id,
+        user_id: row.get("user_id"),
+        connector_id: row.get("connector_id"),
+        email_verified: row.get("email_verified"),
+        link_method: AccountLinkMethod::from_wire(&method_text)?,
+        created_at_unix_micros: row.get("created_us"),
+    })
+}
+
+/// The read-only account-link repository (issue #78): resolve the local user a
+/// federated identity is linked to (the returning-linked-login lookup) and list a
+/// user's linked identities. Every read is scope-bound and secret-free.
+///
+/// Correct-but-unwired in PR 1: no live federated-login path consults it yet, so a
+/// federated login still provisions a separate account exactly as before.
+pub struct AccountLinkRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl AccountLinkRepo<'_> {
+    /// Resolve the link a federated identity resolves to, keyed on the connector and the
+    /// federated composite `federated_external_id(issuer, sub)` (issue #78). The raw
+    /// composite is blind-indexed under the scope key (never queried in plaintext); the
+    /// per-scope UNIQUE (connector, `external_id_bidx`) constraint means at most one row
+    /// matches. A federated identity linked to no local user is a uniform [`None`].
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Encryption`] if no master key is configured;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn resolve(
+        &self,
+        connector_id: &str,
+        external_id: &str,
+    ) -> Result<Option<AccountLinkRecord>, StoreError> {
+        let master = self.store.master().ok_or(StoreError::Encryption)?;
+        let bidx = user_external_id_blind_index(master, self.scope, external_id).into_bytes();
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(&format!(
+            "SELECT {ACCOUNT_LINK_READ_COLUMNS} FROM account_links \
+             WHERE tenant_id = $1 AND environment_id = $2 \
+               AND connector_id = $3 AND external_id_bidx = $4 \
+             LIMIT 1"
+        ))
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(connector_id)
+        .bind(bidx)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        row.as_ref()
+            .map(|row| account_link_record_from_row(row, self.scope))
+            .transpose()
+    }
+
+    /// Every federated identity linked to `user_id`, ordered by the stable
+    /// `(created_at, id)` key (issue #78): the self-service list read and the input to
+    /// the last-usable-method count. A foreign or out-of-scope user resolves to an empty
+    /// list (scope-bound, subject-bound).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn list_for_user(
+        &self,
+        user_id: &UserId,
+    ) -> Result<Vec<AccountLinkRecord>, StoreError> {
+        if user_id.scope() != self.scope {
+            return Ok(Vec::new());
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let rows = sqlx::query(&format!(
+            "SELECT {ACCOUNT_LINK_READ_COLUMNS} FROM account_links \
+             WHERE tenant_id = $1 AND environment_id = $2 AND user_id = $3 \
+             ORDER BY created_at, id"
+        ))
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(user_id.to_string())
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        rows.iter()
+            .map(|row| account_link_record_from_row(row, self.scope))
+            .collect()
+    }
+}
+
+/// The inputs to CREATE an account link (issue #78). The raw federated composite is
+/// borrowed (never owned by a long-lived struct); it is sealed and blind-indexed
+/// immediately and never lands in plaintext.
+pub struct NewAccountLink<'a> {
+    /// The LOCAL user the federated identity is linked to.
+    pub user_id: &'a UserId,
+    /// The `cnr_` connector the federated identity came through.
+    pub connector_id: &'a str,
+    /// The federated composite `federated_external_id(issuer, sub)` (sealed and
+    /// blind-indexed before it lands).
+    pub external_id: &'a str,
+    /// The link's OWN immutable trust snapshot at link time. This is a property OF THE
+    /// LINK; it NEVER promotes the local identity's `user_identifiers.verified` flag.
+    pub email_verified: bool,
+    /// How the binding was made.
+    pub link_method: AccountLinkMethod,
+}
+
+/// The outcome of an unlink (issue #78), paralleling [`PasswordRemovalOutcome`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnlinkOutcome {
+    /// The link was removed.
+    Removed,
+    /// The unlink was REFUSED because the link is the account's sole surviving usable
+    /// authentication method (the Zitadel #6081 anti-bricking guard). Nothing was
+    /// deleted. The caller maps this to a typed `409 last_authentication_method`.
+    BlockedLastMethod,
+    /// No such link owned by the subject in this scope (the uniform IDOR not-found).
+    NotFound,
+}
+
+/// The mutating account-link repository (issue #78): CREATE a guarded binding (audited)
+/// and UNLINK one under the cross-source last-usable-method guard (audited), each in one
+/// scoped, row-level-security-forced transaction.
+///
+/// Correct-but-unwired in PR 1: the federated-login callback and the self-service API
+/// do not call these yet (PR 2 wires them). The methods are DB-tested in isolation, so
+/// the model and the guard are proven correct before they go live.
+pub struct ActingAccountLinkRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+    acting: ActingContext,
+}
+
+impl ActingAccountLinkRepo<'_> {
+    /// Ensure the scope has a live KEK and DEK to seal the federated identifier under,
+    /// provisioning each lazily on first use (idempotent). Mirrors the upstream-token
+    /// and invitation seal paths.
+    async fn ensure_scope_keys(&self, env: &Env, master: &MasterKey) -> Result<(), StoreError> {
+        let envelope = ActingEnvelopeRepo {
+            store: self.store,
+            scope: self.scope,
+            acting: self.acting,
+        };
+        match envelope.provision_kek(env, master).await {
+            Ok(_) | Err(StoreError::Conflict) => {}
+            Err(error) => return Err(error),
+        }
+        match envelope.provision_dek(env, master).await {
+            Ok(_) | Err(StoreError::Conflict) => {}
+            Err(error) => return Err(error),
+        }
+        Ok(())
+    }
+
+    /// CREATE a link (issue #78): seal the federated composite under the scope DEK, blind
+    /// index it, and write the row with one `account.identity.link` audit row (its
+    /// operator-safe `detail` records the connector and link method, NEVER the raw
+    /// identifier) in the same transaction.
+    ///
+    /// The per-scope UNIQUE (connector, `external_id_bidx`) constraint makes a federated
+    /// identity already linked elsewhere a [`StoreError::Conflict`], never a silent
+    /// re-home: the structural anti-takeover invariant. This write touches `account_links`
+    /// ONLY; it never sets a local identity's `verified` flag (the server-controlled
+    /// verified invariant, issue #78 section 5).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the id or user is out of scope;
+    /// [`StoreError::Encryption`] if no master key is configured;
+    /// [`StoreError::Conflict`] if the federated identity is already linked in this scope;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn create(
+        &self,
+        env: &Env,
+        id: &AccountLinkId,
+        params: NewAccountLink<'_>,
+    ) -> Result<(), StoreError> {
+        if id.scope() != self.scope || params.user_id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let master = self.store.master().ok_or(StoreError::Encryption)?;
+        self.ensure_scope_keys(env, master).await?;
+        let scope = self.scope;
+        let id = *id;
+        let user_id = params.user_id.to_string();
+        let connector_id = params.connector_id.to_owned();
+        let external_id = params.external_id.to_owned();
+        let email_verified = params.email_verified;
+        let link_method = params.link_method;
+        let bidx = user_external_id_blind_index(master, scope, &external_id).into_bytes();
+        let detail = format!("connector={connector_id} method={}", link_method.as_str());
+        write_audited_detailed(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::AccountIdentityLink,
+                target: &id,
+            },
+            async move |tx| {
+                let (dek_version, dek) = fetch_active_dek(tx, scope, master).await?;
+                let external_id_sealed = dek
+                    .seal(
+                        env.entropy(),
+                        &account_link_external_id_seal_aad(scope, dek_version),
+                        external_id.as_bytes(),
+                    )
+                    .into_bytes();
+                let result = sqlx::query(
+                    "INSERT INTO account_links \
+                     (id, tenant_id, environment_id, user_id, connector_id, external_id_bidx, \
+                      external_id_sealed, external_id_dek_version, email_verified, link_method) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+                )
+                .bind(id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(&user_id)
+                .bind(&connector_id)
+                .bind(bidx)
+                .bind(external_id_sealed)
+                .bind(dek_version)
+                .bind(email_verified)
+                .bind(link_method.as_str())
+                .execute(&mut **tx)
+                .await;
+                match result {
+                    Ok(_) => {}
+                    Err(error) if is_unique_violation(&error) => return Err(StoreError::Conflict),
+                    Err(error) => return Err(error.into()),
+                }
+                Ok(())
+            },
+            false,
+            Some(&detail),
+        )
+        .await
+    }
+
+    /// UNLINK a federated identity (issue #78): resolve the target link owned by
+    /// `subject` (subject-bound; a foreign or absent link is the uniform
+    /// [`UnlinkOutcome::NotFound`], the IDOR discipline), then count the subject's
+    /// surviving usable authentication methods across ALL FOUR sources EXCLUDING the link
+    /// being removed, in the SAME transaction:
+    ///   1. `webauthn_credentials` (registered passkeys);
+    ///   2. `account_credentials WHERE usable_for_login = true`;
+    ///   3. `users.password_hash` usable (not the unusable sentinel);
+    ///   4. OTHER `account_links` (`id <> link_id`).
+    ///
+    /// If the total across all four is 0 the unlink is REFUSED with
+    /// [`UnlinkOutcome::BlockedLastMethod`] and nothing is deleted (the Zitadel #6081
+    /// anti-bricking guard). The count and the DELETE share one transaction, so a
+    /// concurrent credential removal cannot race a lockout past the guard, and it is FAIL
+    /// CLOSED: a store fault counting methods propagates the `?` error and the delete
+    /// never proceeds. On success the link is deleted and one `account.identity.unlink`
+    /// audit row is written in the same transaction.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    // A linear resolve-then-count-then-delete transaction over four surviving-method
+    // sources; splitting it would obscure the single-transaction atomicity the anti
+    // bricking guard depends on.
+    #[allow(clippy::too_many_lines)]
+    pub async fn unlink(
+        &self,
+        env: &Env,
+        subject: &UserId,
+        id: &AccountLinkId,
+        step_up_detail: &str,
+    ) -> Result<UnlinkOutcome, StoreError> {
+        if id.scope() != self.scope || subject.scope() != self.scope {
+            return Ok(UnlinkOutcome::NotFound);
+        }
+        let scope = self.scope;
+        let subject_text = subject.to_string();
+        let id_text = id.to_string();
+        let tenant = scope.tenant().to_string();
+        let environment = scope.environment().to_string();
+        let mut tx = begin_scoped(self.store, scope).await?;
+        // Resolve the link WITH its subject bound: another subject's link finds no row and
+        // is the uniform not-found (never an oracle for a foreign link's existence).
+        let exists: bool = sqlx::query(
+            "SELECT count(*) AS n FROM account_links \
+             WHERE id = $1 AND tenant_id = $2 AND environment_id = $3 AND user_id = $4",
+        )
+        .bind(&id_text)
+        .bind(&tenant)
+        .bind(&environment)
+        .bind(&subject_text)
+        .fetch_one(&mut *tx)
+        .await?
+        .get::<i64, _>("n")
+            > 0;
+        if !exists {
+            tx.commit().await?;
+            return Ok(UnlinkOutcome::NotFound);
+        }
+        // The cross-source last-usable-method guard (issue #78): count the subject's
+        // surviving usable methods across all four sources, EXCLUDING the link being
+        // removed. Counted inside this transaction so a concurrent removal cannot slip a
+        // lockout past it; fail closed on any store fault via `?`.
+        let usable_passkeys: i64 = sqlx::query(
+            "SELECT count(*) AS n FROM webauthn_credentials \
+             WHERE tenant_id = $1 AND environment_id = $2 AND subject = $3",
+        )
+        .bind(&tenant)
+        .bind(&environment)
+        .bind(&subject_text)
+        .fetch_one(&mut *tx)
+        .await?
+        .get("n");
+        let usable_account_credentials: i64 = sqlx::query(
+            "SELECT count(*) AS n FROM account_credentials \
+             WHERE tenant_id = $1 AND environment_id = $2 AND subject = $3 \
+             AND usable_for_login = true",
+        )
+        .bind(&tenant)
+        .bind(&environment)
+        .bind(&subject_text)
+        .fetch_one(&mut *tx)
+        .await?
+        .get("n");
+        let usable_password: i64 = sqlx::query(
+            "SELECT count(*) AS n FROM users \
+             WHERE id = $1 AND tenant_id = $2 AND environment_id = $3 \
+             AND deleted_at IS NULL AND password_hash <> $4",
+        )
+        .bind(&subject_text)
+        .bind(&tenant)
+        .bind(&environment)
+        .bind(USER_UNUSABLE_PASSWORD_HASH)
+        .fetch_one(&mut *tx)
+        .await?
+        .get("n");
+        let surviving_links: i64 = sqlx::query(
+            "SELECT count(*) AS n FROM account_links \
+             WHERE tenant_id = $1 AND environment_id = $2 AND user_id = $3 AND id <> $4",
+        )
+        .bind(&tenant)
+        .bind(&environment)
+        .bind(&subject_text)
+        .bind(&id_text)
+        .fetch_one(&mut *tx)
+        .await?
+        .get("n");
+        if usable_passkeys == 0
+            && usable_account_credentials == 0
+            && usable_password == 0
+            && surviving_links == 0
+        {
+            tx.commit().await?;
+            return Ok(UnlinkOutcome::BlockedLastMethod);
+        }
+        sqlx::query(
+            "DELETE FROM account_links \
+             WHERE id = $1 AND tenant_id = $2 AND environment_id = $3 AND user_id = $4",
+        )
+        .bind(&id_text)
+        .bind(&tenant)
+        .bind(&environment)
+        .bind(&subject_text)
+        .execute(&mut *tx)
+        .await?;
+        insert_audit_row(
+            &mut tx,
+            &AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::AccountIdentityUnlink,
+                target: id,
+            },
+            Some(step_up_detail),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(UnlinkOutcome::Removed)
     }
 }
 

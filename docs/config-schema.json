@@ -121,6 +121,21 @@
       },
       "type": "object"
     },
+    "AutoLinkPosture": {
+      "description": "The posture governing whether a federated login may AUTO-LINK into a pre-existing\nlocal account (issue #78). The default is the most conservative one: a federated\nlogin NEVER silently merges into a pre-existing local account. An operator opts into\nverified-to-verified auto-linking per environment.\n\nThis is one structural floor of the guarded linking subsystem: even under\n`VerifiedToVerified` an auto-link fires only when the FULL trust decision table\nagrees (a verified local email, an upstream `email_verified`, and a trusted\nconnector), so the \"unverified local\" and \"untrusted upstream\" cells are unreachable\nTWICE OVER (once by this posture, once by the trust table). Under `Off` (the default)\nno arm of the trust table can return `AutoLink` at all.\n\nFORK B (issue #78): the intended tenancy grain is PER ENVIRONMENT. In PR 1 this ships\nas the deployment default; the per-environment override the pure trust decision\nconsumes is threaded by the PR 2 wiring (the decision function takes the posture as an\ninput, so its source is the caller's concern).",
+      "oneOf": [
+        {
+          "const": "off",
+          "description": "A federated login NEVER auto-links into a pre-existing local account (the\nconservative default). A first-ever federated login still provisions its own\nseparate account; a collision with an existing local account is surfaced for a\ndeliberate, fresh-re-auth-gated manual link, never merged automatically.",
+          "type": "string"
+        },
+        {
+          "const": "verified_to_verified",
+          "description": "A federated login MAY auto-link into a pre-existing local account, but ONLY when\nthe full trust decision table agrees (verified local email, upstream\n`email_verified` true, and a trusted connector). Any weaker cell falls back to the\nmanual-link interstitial or a separate account.",
+          "type": "string"
+        }
+      ]
+    },
     "ByokConfig": {
       "additionalProperties": false,
       "description": "Bring-your-own-key (BYOK) customer-managed encryption settings (issue #49).\n\nEXPERIMENTAL and DEFAULT-OFF. When `enabled` is false (the default) no BYOK\npath is reachable and the platform envelope keys behave exactly as before. When\nenabled, a customer-managed root (selected by `provider`) wraps a tenant's\nkey-encryption key. The external-KMS `endpoint` is outbound and rides the\nSSRF-hardened fetcher; its live use is owner/infra-gated.",
@@ -302,6 +317,11 @@
       "additionalProperties": false,
       "description": "The generic OIDC upstream federation settings (issue #75, PR B).\n\nWhen enabled, the boot path builds the federation runtime that turns a declarative,\nDATA-ONLY connector (issue #75, PR A) into a full inbound federated login WITHOUT any\nper-provider code: it resolves the connector's endpoints (discovery), exchanges the\nauthorization code, and validates the upstream ID token through the one JOSE core, then\nprovisions a local identity keyed on the upstream ISSUER + `sub`. Every federation\noutbound rides the one SSRF-hardened fetcher.\n\nDISABLED BY DEFAULT (`enabled = false`): the `/federation` routes are a uniform\nnot-found, so an existing deployment is unaffected. The TTLs govern how long a resolved\ndiscovery document and a fetched upstream key set are cached (both refetched on expiry,\nand a JWKS is refetched immediately when an ID token names an unknown `kid`).",
       "properties": {
+        "auto_link_posture": {
+          "$ref": "#/$defs/AutoLinkPosture",
+          "default": "off",
+          "description": "The posture governing whether a federated login may AUTO-LINK into a pre-existing\nlocal account (issue #78). `Off` (the default) is the most conservative posture: a\nfederated login never silently merges into a pre-existing local account. An\noperator opts into `verified_to_verified` to permit auto-linking, and even then an\nauto-link fires only when the full trust decision table agrees (verified local\nemail, upstream `email_verified`, trusted connector). See [`AutoLinkPosture`]."
+        },
         "discovery_ttl_secs": {
           "default": 3600,
           "description": "How long a resolved upstream discovery document is cached, in seconds (issue #75).\nThe default (3600, one hour) balances freshness against refetch load; a change to an\nupstream's advertised endpoints propagates within it. Must be at least 1 and at most\n`OIDC_MAX_FEDERATION_TTL_SECS`.",
@@ -324,6 +344,13 @@
         "jwks_ttl_secs": {
           "default": 3600,
           "description": "How long a fetched upstream JWKS is cached, in seconds (issue #75). The default\n(3600, one hour) bounds how long a rotated-OUT key stays trusted; a rotated-IN key\nnaming a new `kid` is picked up immediately by the kid-miss refetch, so this TTL need\nnot be short. Must be at least 1 and at most `OIDC_MAX_FEDERATION_TTL_SECS`.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "link_reauth_max_age_secs": {
+          "default": 300,
+          "description": "The maximum age, in seconds, of the caller's re-authentication that a manual\naccount link accepts (issue #78, FORK C). Manual linking requires a FRESH\nre-authentication of the TARGET account (never merely an active session): the\n`start` leg refuses unless `now - auth_time <= link_reauth_max_age_secs`. The\ndefault (300, five minutes) matches the passkey-conversion freshness window\nwithout reusing that hardcoded const, so linking freshness is tunable\nindependently. Must be at least 1 and at most `OIDC_MAX_LINK_REAUTH_MAX_AGE_SECS`.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
@@ -627,10 +654,12 @@
         "federation": {
           "$ref": "#/$defs/FederationConfig",
           "default": {
+            "auto_link_posture": "off",
             "discovery_ttl_secs": 3600,
             "enabled": false,
             "health_probe_window_secs": 30,
-            "jwks_ttl_secs": 3600
+            "jwks_ttl_secs": 3600,
+            "link_reauth_max_age_secs": 300
           },
           "description": "Generic OIDC UPSTREAM federation (issue #75, PR B): turn a declarative connector\ninto an inbound federated login with zero per-provider code. OFF by default (the\n`/federation` routes stay a uniform not-found), so an existing deployment is\nunaffected. When enabled, the boot path builds the federation runtime (its own\nSSRF-hardened fetcher plus the discovery / JWKS cache TTLs). The connectors\nthemselves are per-connector STORED data, not config. PRIVACY NOTE (issue #76): a\nconnector may forward the downstream `login_hint` to its upstream provider, which\nDISCLOSES an end-user identifier (typically an email) to that upstream; a connector\nthat must not leak identifiers sets its `passthrough.login_hint = false` (per-connector\nstored data) to suppress it. See [`FederationConfig`]."
         },
@@ -2007,10 +2036,12 @@
         "enable_response_type_none": false,
         "enabled": false,
         "federation": {
+          "auto_link_posture": "off",
           "discovery_ttl_secs": 3600,
           "enabled": false,
           "health_probe_window_secs": 30,
-          "jwks_ttl_secs": 3600
+          "jwks_ttl_secs": 3600,
+          "link_reauth_max_age_secs": 300
         },
         "frontchannel_logout_enabled": false,
         "global_token_revocation_hard_kill": false,
