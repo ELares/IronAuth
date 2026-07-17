@@ -47,6 +47,12 @@
 //! are later slices; [`ClaimMapping`] here is the parsed-and-stored declarative
 //! SHAPE only, with no evaluator.
 
+pub mod discovery;
+pub mod error;
+
+pub use discovery::{ResolvedEndpoints, discovery_url, parse_discovery, resolve_explicit};
+pub use error::ConnectorError;
+
 use std::collections::BTreeMap;
 use std::fmt;
 
@@ -421,6 +427,29 @@ pub struct ConnectorDefinition {
 /// A connector is enabled by default (the `enabled` field's serde default).
 fn default_enabled() -> bool {
     true
+}
+
+/// The SECRET-FREE runtime view of a connector definition (issue #75, PR B): exactly the
+/// fields the federation login path reads back from the stored `definition_json`.
+///
+/// The stored projection ([`ConnectorDefinition::secret_free_json`]) STRIPS the
+/// `client_secret`, so it cannot be deserialized into a [`ConnectorDefinition`] (whose
+/// `client_secret` is mandatory). This projection deserializes what the login path needs
+/// (the endpoints, the requested scopes, the client id, and the PKCE policy) and IGNORES
+/// every other field, so it round-trips the secret-free document. It is deliberately NOT
+/// `deny_unknown_fields`: it is a forward-compatible READ projection, not the strict,
+/// exhaustive write-time parse.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct ConnectorRuntimeConfig {
+    /// The upstream endpoints (a discovery issuer or an explicit set).
+    pub endpoints: Endpoints,
+    /// The scopes requested from the upstream.
+    pub scopes: Vec<String>,
+    /// The client identifier IronAuth registers at the upstream (the ID token audience).
+    pub client_id: String,
+    /// How PKCE is applied to the upstream authorization request.
+    #[serde(default)]
+    pub pkce: PkceMode,
 }
 
 /// One semantic validation failure, carrying an RFC 6901 JSON POINTER to the

@@ -21,9 +21,9 @@ use ironauth_env::Env;
 use ironauth_jose::MasterKey;
 use ironauth_oidc::{
     BackChannelLogoutWorker, CredentialClass, DiscoveryCapabilities, DiscoveryState,
-    FetchLogoutSender, IssuerRegistry, IssuerState, JwksCacheWindow, LazyMigrationHook, OidcState,
-    WorkerSettings, canonical_login_identifier, canonical_step_up_acr, discovery_router,
-    issuer_router, oidc_router,
+    FederationKeyResolver, FederationRuntime, FetchLogoutSender, IssuerRegistry, IssuerState,
+    JwksCacheWindow, LazyMigrationHook, OidcState, WorkerSettings, canonical_login_identifier,
+    canonical_step_up_acr, discovery_router, issuer_router, oidc_router,
 };
 use ironauth_quota::QuotaEnforcer;
 use ironauth_server::Server;
@@ -485,6 +485,16 @@ async fn build_oidc_router(
     if let Some(hook) = migration_hook {
         state = state.with_migration_hook(hook);
     }
+    // Wire the generic OIDC UPSTREAM federation runtime (issue #75) when
+    // `oidc.federation.enabled` is set; OFF by default, so a deployment that has not
+    // enabled federation leaves the `/federation` routes a uniform not-found.
+    if let Some(federation) = build_federation_runtime(oidc_config) {
+        state = state.with_federation(federation);
+        tracing::info!(
+            "inbound OIDC federation wired (issue #75); the /federation routes are live for \
+             stored connectors, over a dedicated SSRF-hardened fetcher"
+        );
+    }
     if global_revocation_enabled {
         tracing::info!(
             "experimental Global Token Revocation receiver mounted (issue #36); the draft \
@@ -496,6 +506,40 @@ async fn build_oidc_router(
          per-environment signing keys load lazily from the store on first use"
     );
     Some(oidc_router(state).merge(discovery).merge(jwks))
+}
+
+/// Build the generic OIDC upstream federation runtime (issue #75, PR B) from
+/// `oidc.federation`, or [`None`] when federation is disabled (the default).
+///
+/// When enabled, the runtime gets its OWN SSRF-hardened outbound fetcher (every federation
+/// outbound -- discovery, JWKS, token exchange -- rides `ironauth-fetch`, never an ad hoc
+/// client) and the configured discovery / JWKS cache TTLs, read against the same env clock
+/// so they advance deterministically (the runtime reads the application clock at call time
+/// through the state). A fetcher-setup failure logs and yields [`None`] (federation then
+/// stays a uniform not-found rather than mounting a broken surface).
+fn build_federation_runtime(cfg: &OidcConfig) -> Option<Arc<FederationRuntime>> {
+    if !cfg.federation.enabled {
+        return None;
+    }
+    let fetcher = match ironauth_fetch::Fetcher::new(ironauth_fetch::FetchLimits::default()) {
+        Ok(fetcher) => Arc::new(fetcher),
+        Err(error) => {
+            tracing::error!(
+                %error,
+                "inbound OIDC federation: outbound fetcher setup failed; federation is not \
+                 mounted (issue #75)"
+            );
+            return None;
+        }
+    };
+    let jwks_ttl = std::time::Duration::from_secs(cfg.federation.jwks_ttl_secs);
+    let discovery_ttl = std::time::Duration::from_secs(cfg.federation.discovery_ttl_secs);
+    let keys = Arc::new(FederationKeyResolver::new(Arc::clone(&fetcher), jwks_ttl));
+    Some(Arc::new(FederationRuntime::new(
+        fetcher,
+        keys,
+        discovery_ttl,
+    )))
 }
 
 /// Resolve the top-level `[password_policy]` config into the runtime 800-63B-4 policy
@@ -1914,6 +1958,25 @@ mod tests {
         assert!(
             select_control_dsn(&cfg).is_none(),
             "production without the control DSN must refuse to mount"
+        );
+    }
+
+    #[test]
+    fn federation_runtime_is_off_by_default_and_built_when_enabled() {
+        // MEDIUM-1: the boot path must actually install the federation runtime. By default
+        // federation is disabled, so no runtime is built (the /federation routes 404).
+        let default = config("");
+        assert!(
+            build_federation_runtime(&default.oidc).is_none(),
+            "federation is off by default, so the boot path installs no runtime"
+        );
+
+        // When `oidc.federation.enabled` is set, the boot path builds a runtime, which is
+        // then installed on the OidcState via with_federation so the routes go live.
+        let enabled = config("[oidc.federation]\nenabled = true\n");
+        assert!(
+            build_federation_runtime(&enabled.oidc).is_some(),
+            "an enabled federation config builds the runtime the boot path installs"
         );
     }
 }

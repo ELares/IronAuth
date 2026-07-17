@@ -86,6 +86,8 @@ mod discovery;
 mod disposable;
 mod email_otp;
 mod error;
+mod federation;
+mod federation_jwks;
 mod global_revocation;
 mod hashing_pool;
 mod hints;
@@ -148,9 +150,9 @@ pub use abuse::{
 };
 pub use acme::{AcmeDirectory, AcmeDirectoryClient, AcmeError};
 pub use authn::{
-    AuthMethod, AuthenticationEvent, CredentialClass, CredentialFacts, achieved_acr, acr_for_class,
-    acr_for_mfa, acr_values_supported, amr_values, methods_token, parse_methods, required_class,
-    satisfied_class,
+    AuthMethod, AuthenticationEvent, CredentialClass, CredentialFacts, achieved_acr, acr_federated,
+    acr_for_class, acr_for_mfa, acr_values_supported, amr_values, federated_amr_from_auth_methods,
+    methods_token, parse_methods, required_class, satisfied_class,
 };
 pub use backchannel::{
     BACKCHANNEL_LOGOUT_EVENT, BackChannelLogoutWorker, DrainStats, FetchLogoutSender,
@@ -172,6 +174,11 @@ pub use discovery::{
     claims_supported, discovery_document, discovery_router, id_token_signing_alg_values,
 };
 pub use error::{AuthorizeError, AuthzErrorCode, TokenError};
+pub use federation::{
+    FederationRuntime, TokenExchange, UpstreamTokenPolicy, VerifiedUpstreamIdentity, exchange_code,
+    federated_external_id, fetch_discovery, resolve_alg_allowlist, validate_upstream_id_token,
+};
+pub use federation_jwks::FederationKeyResolver;
 pub use global_revocation::GLOBAL_TOKEN_REVOCATION_PATH;
 pub use hashing_pool::{
     ADMISSION_REJECTED_TOTAL, HASH_DURATION_SECONDS, HashRejection, HashingPool,
@@ -296,6 +303,21 @@ pub fn oidc_router(state: OidcState) -> Router {
         // HUMAN account registration; the DCR CLIENT registration below is a
         // distinct concept mounted at a distinct `/connect/register` path.
         .route("/login", get(login::login_get).post(login::login_post))
+        // The generic OIDC UPSTREAM federated login legs (issue #75, PR B): begin a
+        // federated login by redirecting to a declarative connector's upstream provider,
+        // and receive the callback, where the correlation row is consumed SINGLE-USE (the
+        // CSRF defence), the upstream ID token is validated through the JOSE core, and a
+        // minimal local identity is provisioned. Adding a provider is a stored connector
+        // definition, never a route. Inert (a uniform not-found) until a federation runtime
+        // is installed on the state.
+        .route(
+            "/t/{tenant_id}/e/{environment_id}/federation/{connector_slug}/authorize",
+            get(federation::federation_authorize),
+        )
+        .route(
+            "/t/{tenant_id}/e/{environment_id}/federation/{connector_slug}/callback",
+            get(federation::federation_callback),
+        )
         // The "this wasn't me" disavowal endpoint (issue #79): a new-device notification
         // links here with a single-use token. GET renders a scanner-safe confirmation
         // page; POST consumes the token, revokes the flagged sessions and trusted devices,

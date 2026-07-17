@@ -6,6 +6,15 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Generic OIDC upstream federation settings for issue #75 (PR B), off by default: the
+  `oidc.federation` block (`FederationConfig`). `oidc.federation.enabled` (default false) is
+  the master switch the server boot path reads to wire inbound federation (with it off the
+  `/federation` routes stay a uniform not-found, so an existing deployment is unaffected).
+  `oidc.federation.discovery_ttl_secs` and `oidc.federation.jwks_ttl_secs` (both default 3600,
+  one hour, bounded 1..=86400 via `OIDC_MAX_FEDERATION_TTL_SECS`) govern the discovery / JWKS
+  cache windows; both are validated at load even while federation is disabled, so a
+  misconfigured window fails fast. The connectors themselves are per-connector STORED data,
+  not config.
 - Registration abuse defenses config for issue #80, off by default: the
   `oidc.registration_abuse` block (`RegistrationAbuseConfig`). `pow` (`PowConfig`) holds
   `enabled`, `difficulty_bits` (bounded 1..=24), `challenge_at` (`off`/`low`/`med`/`high`

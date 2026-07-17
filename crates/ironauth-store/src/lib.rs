@@ -56,6 +56,7 @@ pub mod email_otp;
 pub mod environment;
 mod error;
 pub mod esv;
+pub mod federation_state;
 mod id;
 pub mod identifier;
 mod migrate;
@@ -102,6 +103,7 @@ pub use esv::{
     MAX_NAME_LEN, Reference, ReferenceError, ReferenceKind, ResolveError, Resolved, name_is_valid,
     reference_resolves, resolve_value,
 };
+pub use federation_state::{ConsumedFederationLoginState, NewFederationLoginState};
 pub use id::{
     AbuseBanId, AbuseBanKind, AcmeChallengeId, AcmeChallengeKind, AdminSudoElevationId,
     AdminSudoElevationKind, AgentId, AgentKind, AssertionMappingId, AssertionMappingKind,
@@ -112,23 +114,24 @@ pub use id::{
     CredentialClassPolicyKind, CredentialId, CredentialKind, CustomDomainId, CustomDomainKind,
     DcrPolicyId, DcrPolicyKind, DekId, DekKind, DeviceCodeId, DeviceCodeKind, EmailOtpCodeId,
     EmailOtpCodeKind, EncryptedSecretId, EncryptedSecretKind, EnvironmentId, EnvironmentKind,
-    EnvironmentSecretId, EnvironmentSecretKind, ExternalIssuerId, ExternalIssuerKind, GrantId,
-    GrantKind, HumanId, HumanKind, IdParseError, InitialAccessTokenId, InitialAccessTokenKind,
-    InvitationId, InvitationKind, IssuedTokenId, IssuedTokenKind, KekId, KekKind, LevelId,
-    LevelKind, MagicLinkTokenId, MagicLinkTokenKind, ManagementKeyId, ManagementKeyKind,
-    MigrationRunId, MigrationRunKind, MigrationRunRecordId, MigrationRunRecordKind, NotInScope,
-    OperatorId, OperatorKind, OrganizationId, OrganizationKind, PowChallengeId, PowChallengeKind,
-    PushedRequestId, PushedRequestKind, RecoveryCodeId, RecoveryCodeKind, RecoveryFlowId,
-    RecoveryFlowKind, RefreshFamilyId, RefreshFamilyKind, RefreshTokenId, RefreshTokenKind,
-    ResourceServerId, ResourceServerKind, RiskDecisionId, RiskDecisionKind, RiskDisavowalId,
-    RiskDisavowalKind, RiskLoginGeoId, RiskLoginGeoKind, ScopeStepUpPolicyId,
-    ScopeStepUpPolicyKind, ScopedId, ScopedKind, ServiceAccountId, ServiceAccountKind, ServiceId,
-    ServiceKind, SessionEventId, SessionEventKind, SessionId, SessionKind, SigningKeyId,
-    SigningKeyKind, SmsOtpCodeId, SmsOtpCodeKind, SmsRouteStatId, SmsRouteStatKind, TenantId,
-    TenantKind, TotpCredentialId, TotpCredentialKind, TraitMigrationJobId, TraitMigrationJobKind,
-    TraitSchemaId, TraitSchemaKind, TrustedDeviceId, TrustedDeviceKind, UserId, UserIdentifierId,
-    UserIdentifierKind, UserKind, VariableId, VariableKind, WebauthnChallengeId,
-    WebauthnChallengeKind, WebauthnCredentialId, WebauthnCredentialKind,
+    EnvironmentSecretId, EnvironmentSecretKind, ExternalIssuerId, ExternalIssuerKind,
+    FederationLoginStateId, FederationLoginStateKind, GrantId, GrantKind, HumanId, HumanKind,
+    IdParseError, InitialAccessTokenId, InitialAccessTokenKind, InvitationId, InvitationKind,
+    IssuedTokenId, IssuedTokenKind, KekId, KekKind, LevelId, LevelKind, MagicLinkTokenId,
+    MagicLinkTokenKind, ManagementKeyId, ManagementKeyKind, MigrationRunId, MigrationRunKind,
+    MigrationRunRecordId, MigrationRunRecordKind, NotInScope, OperatorId, OperatorKind,
+    OrganizationId, OrganizationKind, PowChallengeId, PowChallengeKind, PushedRequestId,
+    PushedRequestKind, RecoveryCodeId, RecoveryCodeKind, RecoveryFlowId, RecoveryFlowKind,
+    RefreshFamilyId, RefreshFamilyKind, RefreshTokenId, RefreshTokenKind, ResourceServerId,
+    ResourceServerKind, RiskDecisionId, RiskDecisionKind, RiskDisavowalId, RiskDisavowalKind,
+    RiskLoginGeoId, RiskLoginGeoKind, ScopeStepUpPolicyId, ScopeStepUpPolicyKind, ScopedId,
+    ScopedKind, ServiceAccountId, ServiceAccountKind, ServiceId, ServiceKind, SessionEventId,
+    SessionEventKind, SessionId, SessionKind, SigningKeyId, SigningKeyKind, SmsOtpCodeId,
+    SmsOtpCodeKind, SmsRouteStatId, SmsRouteStatKind, TenantId, TenantKind, TotpCredentialId,
+    TotpCredentialKind, TraitMigrationJobId, TraitMigrationJobKind, TraitSchemaId, TraitSchemaKind,
+    TrustedDeviceId, TrustedDeviceKind, UserId, UserIdentifierId, UserIdentifierKind, UserKind,
+    VariableId, VariableKind, WebauthnChallengeId, WebauthnChallengeKind, WebauthnCredentialId,
+    WebauthnCredentialKind,
 };
 pub use identifier::{
     CanonicalIdentifier, IdentifierType, UniquenessMode, canonicalize_identifier,

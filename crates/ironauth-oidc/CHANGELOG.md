@@ -6,6 +6,75 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Generic OIDC UPSTREAM for inbound federation (issue #75, PR B): the wire that turns a
+  declarative connector (PR A) into a full federated login with ZERO per-provider code.
+  - **The federated login legs** (string-literal routes on `oidc_router`):
+    `GET /t/{tenant}/e/{env}/federation/{connector_slug}/authorize` loads the DATA-ONLY
+    connector by slug, generates an unguessable `state`/`nonce` (and a PKCE `S256` challenge
+    when the upstream advertises it) from the entropy seam, persists the single-use
+    correlation row (migration 0058, the PKCE verifier SEALED), and 302s to the upstream;
+    `.../callback` consumes the correlation row by `state` SINGLE-USE (the CSRF defence),
+    exchanges the code with the PRODUCTION-unsealed client secret and the bound verifier,
+    VALIDATES the upstream ID token through the JOSE core, and only then provisions and
+    resumes. Both mapped in `docs/conformance/rfc9700-checklist.md`. WIRED by the server boot
+    path (`build_oidc_router`) when `oidc.federation.enabled` is set (OFF by default), which
+    constructs the `FederationRuntime` (its own SSRF-hardened fetcher plus the configured
+    discovery / JWKS TTLs) and installs it via `OidcState::with_federation`; with federation
+    disabled the `/federation` routes stay a uniform not-found.
+  - **Cross-connector takeover fix** (issue #75, HIGH-1). The local federated identity is keyed
+    on the upstream ISSUER + `sub`, not the bare `sub`: an OIDC `sub` is unique only within one
+    issuer (OIDC Core section 2), so keying on the bare `sub` let two connectors to DIFFERENT
+    IdPs that emit the same `sub` resolve to the SAME local user (an account takeover by anyone
+    running a second connector's IdP). The external-id is now a length-prefixed
+    `(issuer, sub)` composite (`federated_external_id`): same issuer + same `sub` still shares
+    one user; different issuers with the same `sub` are distinct users. A downstream RS MUST key
+    trust on `acr` (`urn:ironauth:acr:federated`), NOT on the passed-through `amr`, which merely
+    reflects the UPSTREAM's own assertion.
+  - **Upstream key rotation without waiting out the TTL** (issue #75, LOW-1). When an upstream ID
+    token names a `kid` the cached JWKS does not answer to, the resolver triggers ONE bounded
+    refetch (`resolve_for_kid`, the `kid` a REFETCH HINT via `ironauth_jose::compact_jws_kid`,
+    never a key source) before failing closed, so a rotated-in upstream key is picked up on the
+    next login. Explicit-endpoint connectors are rejected CLEANLY at the authorize leg (LOW-3),
+    and `enabled` is RE-CHECKED at the callback (INFO-2) so a connector disabled mid-flow fails
+    closed.
+  - **Minimal provisioning + honest LOCAL token.** From the VERIFIED upstream `sub` it
+    find-or-creates a local user by external id (no local password) and establishes a local
+    session, then resumes the pending local `/authorize` so the LOCAL token flow issues the
+    token. The session's `auth_methods` carries the federated method PLUS the upstream `amr`
+    passthrough (base64url-encoded in one reserved token that survives the persistence
+    channel), so the MINTED local token's `amr` is the upstream's asserted `amr` VERBATIM and
+    its `acr` is the federated context, never a fabricated local factor (proven end to end by
+    the `federation` suite and the `tokens` mint test). The federated context is deliberately
+    UNRANKED (excluded from `acr_values_supported` and the step-up ladder): IronAuth cannot
+    vouch for another operator's assurance level.
+  - **Upstream ID-token validation through the ONE JOSE entry point** (`federation` module, the
+    security crux). Building a `VerificationPolicy` that pins the algorithm allowlist (the
+    upstream-advertised or connector algorithms INTERSECTED with the JOSE core's allowlist, so
+    `none`/HMAC are inexpressible), the cached upstream trusted keys (never a token-embedded key),
+    the expected issuer (the configured connector issuer), and the expected audience (the
+    connector client id), then verifying the bound `nonce`. It writes NO crypto: `alg: none`,
+    algorithm confusion, an unknown `kid`, a forged issuer, a wrong audience, an expired token, a
+    forged signature, and a `nonce` mismatch ALL die in `ironauth_jose::verify` and yield
+    `ConnectorError::UpstreamProtocol` with NO identity produced.
+  - **Per-connector upstream JWKS cache through the hardened fetcher** (`federation_jwks` module),
+    copied from the `private_key_jwt` client-key resolver and keyed per `(connector_id, jwks_uri)`,
+    SEPARATE from the local signing keys. A private-range `jwks_uri` is `FetchError::Blocked` on the
+    wire (resolve-once, no rebind), so resolution yields no keys and validation fails closed as
+    `UpstreamUnavailable`. A non-empty resolution is cached for a bounded, clock-seam TTL.
+  - **Discovery + code exchange over the hardened fetcher.** `fetch_discovery` resolves an
+    issuer-form connector through `FetchPurpose::FederationDiscovery` (parsing and mix-up-checking
+    via `ironauth-connector`), and `exchange_code` posts the code through `FetchPurpose::FederationToken`.
+    Every federation outbound rides `ironauth-fetch`; a private-range issuer is likewise Blocked.
+  - **Honest `AuthMethod::Federated`** (the covenant). A new registry row achieving the DISTINCT
+    `urn:ironauth:acr:federated` context, deliberately unranked against the local ladder (IronAuth
+    cannot vouch for another operator's assurance level). It contributes NO local `amr` factor: the
+    upstream's OWN asserted `amr` tokens are carried as passthrough DATA on a new
+    `AuthenticationEvent::federated` constructor (never re-asserted as a local factor), and if the
+    upstream asserted no `amr`, IronAuth asserts none. `auth_time` is the upstream `auth_time` when
+    present, else the callback instant. `authn.rs` stays the single honest source for `acr`/`amr`.
+  - **Error taxonomy mapping.** `FetchError` -> `UpstreamUnavailable`, a JOSE verify failure ->
+    `UpstreamProtocol`, a policy/config fault -> `Config`, consuming the `ironauth-connector`
+    `ConnectorError` contract issue #76 builds on.
 - Registration abuse defenses (issue #80), all OFF by default. An invisible, SELF-CONTAINED
   proof-of-work challenge (a Rauthy-spow-style hashcash) issued on the registration,
   password-reset, and OTP-send surfaces: the server issues a random challenge and a

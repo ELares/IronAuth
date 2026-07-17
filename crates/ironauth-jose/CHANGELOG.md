@@ -6,6 +6,11 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Compact-JWS `kid` hint (issue #75): `compact_jws_kid` reads the `kid` from a compact
+  JWS/JWT protected header WITHOUT verifying the token, bounded and allocating no key
+  material. It is a REFETCH HINT only (inbound federation uses it to decide whether a cached
+  upstream JWKS answers to the token's `kid` and so whether to refetch on a key rotation); it
+  reads no trust and never selects or introduces a key, which stays inside `verify`.
 - MDS3 BLOB signature primitive (issue #66 PR B): `verify_jws_signature` verifies a
   JWS/JWT compact-serialization signature (fixed-width ES256 `r||s` per JWA, plus EdDSA
   and RS256) for the FIDO MDS3 BLOB. It is the sibling of `verify_webauthn_signature`,

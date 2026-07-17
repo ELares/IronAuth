@@ -33,8 +33,13 @@
 
 use crate::authn;
 
-/// The default `acr` order (weakest to strongest): the credential-ladder order the
-/// registry advertises. A deployment may override it through `oidc.acr_order`.
+/// The default `acr` order (weakest to strongest): the ranked credential ladder. A
+/// deployment may override it through `oidc.acr_order`.
+///
+/// This is exactly the advertised `acr_values_supported` (which already excludes the
+/// unranked FEDERATED context, issue #75: IronAuth cannot vouch for another operator's
+/// assurance level, so a federated `acr` satisfies only an exact `federated` floor and
+/// never a local `pwd`/`mfa`/`phr` floor, per [`acr_satisfies`]'s absent-value semantics).
 #[must_use]
 pub fn default_acr_order() -> Vec<String> {
     authn::acr_values_supported()

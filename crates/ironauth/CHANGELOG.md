@@ -6,6 +6,15 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Inbound OIDC federation is now WIRED into the server boot path (issue #75, PR B,
+  adversarial review MEDIUM-1). `build_oidc_router` reads the new `oidc.federation` config and,
+  when `oidc.federation.enabled` is set, builds the `FederationRuntime` (its OWN SSRF-hardened
+  outbound fetcher plus the configured discovery / JWKS cache TTLs) and installs it via
+  `OidcState::with_federation`, so a stored connector's `/federation/*` login legs go live.
+  OFF by default: with federation disabled the routes stay a uniform not-found, so an existing
+  deployment is unaffected. A downstream resource server MUST key trust on the local token's
+  `acr` (`urn:ironauth:acr:federated`), NOT on the passed-through `amr`, which reflects the
+  UPSTREAM's own assertion.
 - Guarded SMS OTP factor semantics hardening (issue #70, adversarial review): the SMS
   verify surface the server exposes now honors the no-silent-downgrade invariant on EVERY
   purpose. `POST .../otp/sms/verify` establishes a primary session only for `login`,

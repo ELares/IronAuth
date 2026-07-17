@@ -242,6 +242,17 @@ impl IdorHarness {
         self
     }
 
+    /// Register the federation outbound-login correlation probe (issue #75, PR B): the
+    /// single-use consume of a correlation row planted in another tenant or environment
+    /// must never resolve under the caller's scope, or a federated callback could burn a
+    /// foreign tenant's pending login (and recover its sealed PKCE verifier). The probe's
+    /// foreign identifier is the row's opaque STATE (the natural consume key). Run with
+    /// the data-plane store (`ironauth_app`).
+    pub fn register_federation_probes(&mut self) -> &mut Self {
+        self.register(Box::new(FederationLoginStateConsumeProbe));
+        self
+    }
+
     /// Register the self-service account-credential probes (issue #61): the
     /// mutating removal of an enrolled credential must refuse a credential id from
     /// another tenant or environment as the uniform not-found, never a cross-scope
@@ -694,6 +705,40 @@ impl IsolationProbe for ConnectorDeleteProbe {
                 // Deleting a foreign connector would be a cross-scope mutation.
                 Ok(()) => ProbeOutcome::Leaked,
                 Err(_) => ProbeOutcome::Denied,
+            }
+        })
+    }
+}
+
+/// Built-in probe for `FederationLoginStateRepo::consume` (issue #75, PR B): the
+/// single-use consume of a federation correlation row planted in another tenant or
+/// environment must never resolve under the caller's scope, or a callback could burn a
+/// foreign tenant's pending federated login. The `foreign_id` is the planted row's opaque
+/// STATE value (the consume key), so a match under the caller scope would be a genuine
+/// cross-scope leak of both the correlation and its sealed PKCE verifier.
+struct FederationLoginStateConsumeProbe;
+
+impl IsolationProbe for FederationLoginStateConsumeProbe {
+    fn name(&self) -> &'static str {
+        "federation_login_states.consume"
+    }
+
+    fn probe<'a>(
+        &'a self,
+        store: &'a Store,
+        caller: Scope,
+        foreign_id: &'a str,
+    ) -> BoxProbeFuture<'a> {
+        Box::pin(async move {
+            match store
+                .scoped(caller)
+                .federation_login_states()
+                .consume(foreign_id, 1_000_000)
+                .await
+            {
+                // Consuming a foreign scope's correlation row is a cross-scope leak.
+                Ok(Some(_)) => ProbeOutcome::Leaked,
+                Ok(None) | Err(_) => ProbeOutcome::Denied,
             }
         })
     }

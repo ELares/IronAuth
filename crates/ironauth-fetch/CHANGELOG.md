@@ -6,6 +6,11 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Add the `FederationToken` `FetchPurpose` variant (issue #75, PR B): the federated callback
+  exchanges the authorization code at the upstream token endpoint over the hardened path, so a
+  token URL that resolves to an internal or loopback address is refused exactly like any other
+  blocked destination. It carries a stable `federation_token` metric label. The variant lives in
+  the fetch crate (the one outbound path), so the federation upstream slice adds no HTTP client.
 - Add three federation `FetchPurpose` variants (issue #75, PR A): `FederationDiscovery`,
   `FederationJwks`, and `FederationUserinfo`, for the inbound-federation connector's outbound
   fetches (a connector's issuer / `jwks_uri` / `userinfo_endpoint` are all tenant-controlled,

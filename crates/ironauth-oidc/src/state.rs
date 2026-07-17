@@ -285,6 +285,15 @@ pub struct OidcState {
     // silently no-ops. The many DB-only OIDC tests install a stub provider to drive the
     // breached/clean/fail paths deterministically without the network.
     breach_provider: Option<Arc<dyn ironauth_screening::BreachRangeProvider>>,
+    // The generic OIDC upstream runtime for inbound federation (issue #75, PR B): the
+    // SSRF-hardened fetcher, the per-connector upstream JWKS cache, and the discovery
+    // cache. Kept OUTSIDE `Inner` and installed by the boot path (via `with_federation`)
+    // ONLY when `oidc.federation.enabled` is set, built from the federation config with a
+    // dedicated fetcher and the same env clock so its TTLs advance deterministically under
+    // a test's ManualClock. Default: `None`, which leaves the /federation routes a uniform
+    // not-found (federation disabled), so the many DB-only OIDC tests and a deployment that
+    // has not enabled federation are unaffected.
+    federation: Option<Arc<crate::federation::FederationRuntime>>,
 }
 
 // The per-environment policy flags each mirror an independent, individually
@@ -701,7 +710,34 @@ impl OidcState {
             screening_failure: ironauth_screening::FailurePolicy::FailOpen,
             screen_on_login: false,
             breach_provider: None,
+            federation: None,
         }
+    }
+
+    /// Install the generic OIDC upstream runtime for inbound federation (issue #75, PR B):
+    /// the SSRF-hardened fetcher, the per-connector upstream JWKS cache, and the discovery
+    /// cache. The boot path calls this when `oidc.federation.enabled` is set, building the
+    /// runtime from the federation config; a test installs one over the fetch test-harness
+    /// injected dialer. With no runtime installed (the default) the `/federation` routes are
+    /// a uniform not-found (federation disabled).
+    #[must_use]
+    pub fn with_federation(mut self, runtime: Arc<crate::federation::FederationRuntime>) -> Self {
+        self.federation = Some(runtime);
+        self
+    }
+
+    /// The installed federation runtime, if any (issue #75, PR B). The `/federation`
+    /// handlers consult it; when absent they return a uniform not-found.
+    #[must_use]
+    pub(crate) fn federation(&self) -> Option<&Arc<crate::federation::FederationRuntime>> {
+        self.federation.as_ref()
+    }
+
+    /// The deployment's externally visible base URL (`server.public_url`), from which the
+    /// federated callback redirect URI is built (issue #75, PR B).
+    #[must_use]
+    pub(crate) fn issuer_base(&self) -> &str {
+        &self.inner.issuer_base
     }
 
     /// Install a custom internal revocation-event sink (issue #22), replacing the

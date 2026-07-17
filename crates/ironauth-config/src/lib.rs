@@ -1233,6 +1233,14 @@ pub struct OidcConfig {
     /// until per-environment overrides ride the M5 promotion pipeline.
     pub lazy_migration: LazyMigrationConfig,
 
+    /// Generic OIDC UPSTREAM federation (issue #75, PR B): turn a declarative connector
+    /// into an inbound federated login with zero per-provider code. OFF by default (the
+    /// `/federation` routes stay a uniform not-found), so an existing deployment is
+    /// unaffected. When enabled, the boot path builds the federation runtime (its own
+    /// SSRF-hardened fetcher plus the discovery / JWKS cache TTLs). The connectors
+    /// themselves are per-connector STORED data, not config. See [`FederationConfig`].
+    pub federation: FederationConfig,
+
     /// Credential-abuse regulation and anti-enumeration posture (issue #64): the
     /// risk-based escalating throttle, the durable ban policy, and the closed-
     /// registration switch. The default posture is account-DoS-safe (no hard lockout).
@@ -1679,6 +1687,7 @@ impl Default for OidcConfig {
             backchannel_logout_poll_interval_secs: 5,
             backchannel_logout_request_timeout_secs: 10,
             lazy_migration: LazyMigrationConfig::default(),
+            federation: FederationConfig::default(),
             webauthn_enabled: true,
             webauthn_rp_id: None,
             webauthn_related_origins: Vec::new(),
@@ -1818,6 +1827,58 @@ impl Default for LazyMigrationConfig {
             breaker_failure_threshold: 5,
             breaker_window_secs: 30,
             breaker_cooldown_secs: 30,
+        }
+    }
+}
+
+/// The largest cache TTL (in seconds) the federation discovery / JWKS caches may be
+/// configured to (issue #75). A stale upstream discovery document or key set beyond a day
+/// is almost always a misconfiguration (a key rotation should propagate well within it, and
+/// a kid-miss triggers an immediate refetch regardless), so config load rejects a larger
+/// value.
+pub const OIDC_MAX_FEDERATION_TTL_SECS: u64 = 86_400;
+
+/// The generic OIDC upstream federation settings (issue #75, PR B).
+///
+/// When enabled, the boot path builds the federation runtime that turns a declarative,
+/// DATA-ONLY connector (issue #75, PR A) into a full inbound federated login WITHOUT any
+/// per-provider code: it resolves the connector's endpoints (discovery), exchanges the
+/// authorization code, and validates the upstream ID token through the one JOSE core, then
+/// provisions a local identity keyed on the upstream ISSUER + `sub`. Every federation
+/// outbound rides the one SSRF-hardened fetcher.
+///
+/// DISABLED BY DEFAULT (`enabled = false`): the `/federation` routes are a uniform
+/// not-found, so an existing deployment is unaffected. The TTLs govern how long a resolved
+/// discovery document and a fetched upstream key set are cached (both refetched on expiry,
+/// and a JWKS is refetched immediately when an ID token names an unknown `kid`).
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields, default)]
+pub struct FederationConfig {
+    /// Whether inbound federation is wired. False (the default) leaves the `/federation`
+    /// routes a uniform not-found and builds no federation runtime. When true, the boot
+    /// path constructs the runtime (a dedicated SSRF-hardened fetcher plus the caches
+    /// below) and installs it, so a stored connector's federated login legs go live.
+    pub enabled: bool,
+
+    /// How long a resolved upstream discovery document is cached, in seconds (issue #75).
+    /// The default (3600, one hour) balances freshness against refetch load; a change to an
+    /// upstream's advertised endpoints propagates within it. Must be at least 1 and at most
+    /// `OIDC_MAX_FEDERATION_TTL_SECS`.
+    pub discovery_ttl_secs: u64,
+
+    /// How long a fetched upstream JWKS is cached, in seconds (issue #75). The default
+    /// (3600, one hour) bounds how long a rotated-OUT key stays trusted; a rotated-IN key
+    /// naming a new `kid` is picked up immediately by the kid-miss refetch, so this TTL need
+    /// not be short. Must be at least 1 and at most `OIDC_MAX_FEDERATION_TTL_SECS`.
+    pub jwks_ttl_secs: u64,
+}
+
+impl Default for FederationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            discovery_ttl_secs: 3600,
+            jwks_ttl_secs: 3600,
         }
     }
 }
@@ -2980,6 +3041,7 @@ impl Config {
         validate_device_authorization(&self.oidc)?;
         validate_backchannel_logout(&self.oidc)?;
         validate_lazy_migration(&self.oidc)?;
+        validate_federation(&self.oidc)?;
         validate_regulation(&self.oidc)?;
         validate_risk(&self.oidc)?;
         validate_registration_abuse(&self.oidc)?;
@@ -3947,6 +4009,38 @@ fn validate_lazy_migration(oidc: &OidcConfig) -> Result<(), ConfigError> {
     Ok(())
 }
 
+/// Validate the generic OIDC upstream federation settings (issue #75, PR B), kept out of
+/// [`Config::validate`] so each stays within the readable-length lint. The TTL bounds are
+/// enforced ALWAYS (they have safe in-range defaults), so a misconfigured cache window fails
+/// fast at load even while federation is otherwise disabled.
+///
+/// # Errors
+///
+/// [`ConfigError::Invalid`] if a discovery / JWKS TTL is zero or above
+/// [`OIDC_MAX_FEDERATION_TTL_SECS`].
+fn validate_federation(oidc: &OidcConfig) -> Result<(), ConfigError> {
+    let federation = &oidc.federation;
+    for (name, value) in [
+        ("discovery_ttl_secs", federation.discovery_ttl_secs),
+        ("jwks_ttl_secs", federation.jwks_ttl_secs),
+    ] {
+        if value < 1 {
+            return Err(ConfigError::Invalid {
+                message: format!("oidc.federation.{name} must be at least 1 second"),
+            });
+        }
+        if value > OIDC_MAX_FEDERATION_TTL_SECS {
+            return Err(ConfigError::Invalid {
+                message: format!(
+                    "oidc.federation.{name} ({value}) must not exceed \
+                     {OIDC_MAX_FEDERATION_TTL_SECS} seconds"
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Whether `endpoint` is a well-formed absolute https URL with a non-empty host and no
 /// userinfo: the syntactic gate the lazy-migration endpoint must pass at config LOAD.
 ///
@@ -4889,6 +4983,37 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("max_page_size"), "{msg}");
         assert!(msg.contains(&MANAGEMENT_LIST_HARD_CAP.to_string()), "{msg}");
+    }
+
+    #[test]
+    fn federation_is_disabled_by_default_with_sane_ttls_and_validates_bounds() {
+        // Default: OFF, with the one-hour discovery/JWKS cache TTLs.
+        let config = Config::from_toml_str("", "<inline>").expect("valid").config;
+        assert!(!config.oidc.federation.enabled);
+        assert_eq!(config.oidc.federation.discovery_ttl_secs, 3600);
+        assert_eq!(config.oidc.federation.jwks_ttl_secs, 3600);
+
+        // It parses on and accepts in-range TTLs.
+        let input = "[oidc.federation]\nenabled = true\n\
+                     discovery_ttl_secs = 600\njwks_ttl_secs = 900\n";
+        let config = Config::from_toml_str(input, "<inline>")
+            .expect("valid")
+            .config;
+        assert!(config.oidc.federation.enabled);
+        assert_eq!(config.oidc.federation.discovery_ttl_secs, 600);
+        assert_eq!(config.oidc.federation.jwks_ttl_secs, 900);
+
+        // A zero TTL and an over-cap TTL both fail at load, naming the offending key.
+        let zero = "[oidc.federation]\njwks_ttl_secs = 0\n";
+        let err = Config::from_toml_str(zero, "ironauth.toml").expect_err("zero ttl");
+        assert!(err.to_string().contains("jwks_ttl_secs"), "{err}");
+
+        let over = format!(
+            "[oidc.federation]\ndiscovery_ttl_secs = {}\n",
+            OIDC_MAX_FEDERATION_TTL_SECS + 1
+        );
+        let err = Config::from_toml_str(&over, "ironauth.toml").expect_err("over cap");
+        assert!(err.to_string().contains("discovery_ttl_secs"), "{err}");
     }
 
     #[test]
