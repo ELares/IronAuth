@@ -589,7 +589,7 @@ async fn issue_code(
     //     9470 with `unmet_authentication_requirements`. The achieved `acr` always
     //     reflects the real authentication event (issue #14), never a copied-through
     //     request value, so a stepped-up token is honest.
-    let step_up_age_bound = match evaluate_step_up(
+    let (step_up_age_bound, auth_methods_override) = match evaluate_step_up(
         state,
         scope,
         &client,
@@ -601,10 +601,14 @@ async fn issue_code(
         prompt,
         &hints,
         pushed,
+        headers,
     )
     .await
     {
-        StepUpOutcome::Satisfied { age_bound } => age_bound,
+        StepUpOutcome::Satisfied {
+            age_bound,
+            auth_methods,
+        } => (age_bound, auth_methods),
         StepUpOutcome::Interaction(response) => return Ok(response),
         StepUpOutcome::Fail(code, description) => return Err(redirect_error(code, description)),
     };
@@ -629,6 +633,14 @@ async fn issue_code(
     let auth_time_micros = auth_time_required.then_some(session.auth_time_unix_micros);
 
     let session_ref = session.session_id.to_string();
+    // A remembered device that satisfied the tenant baseline MFA floor (issue #71)
+    // upgrades the frozen methods to the honest `[<primary>, trusted_device]` token, so
+    // the code (and the minted ID/access token) records the trusted-device contribution
+    // (acr `mfa_remembered`, no fabricated `mfa` amr). Otherwise the session's recorded
+    // methods are frozen verbatim.
+    let frozen_auth_methods = auth_methods_override
+        .as_deref()
+        .unwrap_or(&session.auth_methods);
     let resolved = Resolved {
         nonce,
         oauth_scope: effective_scope.as_deref(),
@@ -636,7 +648,7 @@ async fn issue_code(
         code_challenge_method,
         state_echo,
         subject: &session.subject,
-        auth_methods: &session.auth_methods,
+        auth_methods: frozen_auth_methods,
         auth_time_micros,
         session_ref: &session_ref,
         consent_ref: consent_ref.as_deref(),
@@ -1313,6 +1325,12 @@ enum StepUpOutcome {
     Satisfied {
         /// Whether a max-age requirement applied (forces freezing `auth_time`).
         age_bound: bool,
+        /// An OVERRIDE of the methods to freeze onto the code (issue #71): `Some` when a
+        /// remembered device satisfied the tenant baseline MFA floor, carrying the
+        /// upgraded `[<primary>, trusted_device]` token so the code (and thus the ID
+        /// token) honestly records the trusted-device contribution (acr `mfa_remembered`,
+        /// no fabricated `mfa` amr). `None` uses the session's recorded methods verbatim.
+        auth_methods: Option<String>,
     },
     /// A local interaction is needed (a second-factor challenge or a full re-login).
     Interaction(Response),
@@ -1331,7 +1349,11 @@ enum StepUpOutcome {
 /// #14), and either reports the request ready, redirects to run the required
 /// authentication, or fails per spec. Under `prompt=none` an interaction need
 /// becomes the matching negotiated-mode error rather than a page.
-#[allow(clippy::too_many_arguments)]
+// The step-up composition (explicit floors, the tenant baseline MFA floor, the
+// conditional-credential skip, and the remembered-device path, issues #72/#66/#71) reads
+// best as one gate: the ORDER of the checks is the security property, so splitting it
+// would scatter the precedence across helpers.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn evaluate_step_up(
     state: &OidcState,
     scope: Scope,
@@ -1344,6 +1366,7 @@ async fn evaluate_step_up(
     prompt: PromptSet,
     hints: &InteractionHints,
     pushed: Option<&PushedContext>,
+    headers: &HeaderMap,
 ) -> StepUpOutcome {
     let order = state.acr_order();
     // Assemble the requirement from the request, the client floor, and the per-scope
@@ -1352,7 +1375,7 @@ async fn evaluate_step_up(
     // Authorize is the PRIMARY gate and re-runs on every request, so a transient
     // policy-read fault is best-effort here (ignored); the token/refresh path fails
     // closed on it (issue #72 INFO).
-    let (mut requirement, _policy_read_faulted) = step_up::requirement_for_request(
+    let assembled = step_up::requirement_for_request(
         state,
         scope,
         client,
@@ -1361,6 +1384,8 @@ async fn evaluate_step_up(
         max_age_secs,
     )
     .await;
+    let mut requirement = assembled.requirement;
+    let mfa_baseline_required = assembled.mfa_baseline_required;
     let essential = claims_request.essential_acr_values();
     if !essential.is_empty() {
         let essential_join = essential.join(" ");
@@ -1370,38 +1395,93 @@ async fn evaluate_step_up(
         );
     }
     let age_bound = requirement.max_auth_age_secs.is_some();
-    if requirement.is_empty() {
-        return StepUpOutcome::Satisfied { age_bound };
-    }
 
-    let achieved = authn::achieved_acr(&authn::parse_methods(&session.auth_methods));
+    // The recorded methods drive both the achieved acr (the EXPLICIT step-up floors) and
+    // whether a GENUINE second factor was performed (the tenant baseline MFA floor,
+    // issue #71).
+    let methods = authn::parse_methods(&session.auth_methods);
+    let achieved = authn::achieved_acr(&methods);
     let now_micros = epoch_micros(state.now());
-    let satisfaction = step_up::evaluate(
-        &requirement,
-        achieved,
-        Some(session.auth_time_unix_micros),
-        now_micros,
-        &order,
-    );
-    let step_up::Satisfaction::NeedsStepUp {
-        acr_unmet,
-        age_lapsed,
-    } = satisfaction
-    else {
-        return StepUpOutcome::Satisfied { age_bound };
+
+    // 1. The EXPLICIT step-up requirement (request acr_values / max_age, client floor,
+    //    per-scope policy, essential claims, and the passkey/attested credential-class
+    //    floors). A remembered device NEVER satisfies any of these: RFC 9470 / issue #72
+    //    ALWAYS overrides a remembered device, and a trusted device can never stand in
+    //    for a phishing-resistant passkey. So this is evaluated FIRST and, if it needs a
+    //    step-up, the trusted-device path is not even consulted.
+    let explicit_step_up = if requirement.is_empty() {
+        None
+    } else {
+        match step_up::evaluate(
+            &requirement,
+            achieved,
+            Some(session.auth_time_unix_micros),
+            now_micros,
+            &order,
+        ) {
+            step_up::Satisfaction::Satisfied => None,
+            step_up::Satisfaction::NeedsStepUp {
+                acr_unmet,
+                age_lapsed,
+            } => Some((acr_unmet, age_lapsed)),
+        }
     };
 
-    // The subject the factor probe binds to. A session subject that will not parse
-    // in scope cannot be probed, so the requirement can never be met here.
+    // The subject the factor probe (and the trusted-device validation) binds to. A
+    // session subject that will not parse in scope cannot be probed, so the requirement
+    // can never be met here.
     let Ok(subject) = UserId::parse_in_scope(&session.subject, &scope) else {
         return StepUpOutcome::Fail(
             AuthzErrorCode::UnmetAuthenticationRequirements,
             "the requested authentication context cannot be satisfied",
         );
     };
-    let remediation =
+
+    // 2. Compose the requirement to remediate. The explicit step-up (if any) is stricter
+    //    and takes precedence. Otherwise, when the tenant baseline MFA floor applies and
+    //    the login did NOT perform a genuine second factor (issue #71: a bare password or
+    //    a PRESENCE-ONLY passkey), a valid remembered-device cookie SATISFIES the baseline
+    //    (the second factor is skipped and the token honestly records the trusted-device
+    //    contribution), and otherwise a real second factor must be challenged. A UV
+    //    passkey and a real TOTP/recovery code already `performed_second_factor`, so they
+    //    satisfy the baseline with NO extra prompt (the conditional-credential skip).
+    let remediation = if let Some((acr_unmet, age_lapsed)) = explicit_step_up {
         step_up::decide_remediation(state, scope, &subject, &requirement, acr_unmet, age_lapsed)
-            .await;
+            .await
+    } else if mfa_baseline_required && !authn::performed_second_factor(&methods) {
+        // The tenant baseline MFA floor is unmet by a genuine factor. A valid remembered
+        // device satisfies it: consume the device (sliding its idle window), UPGRADE the
+        // frozen methods to record the honest `[<primary>, TrustedDevice]` contribution
+        // (acr `mfa_remembered`, no fabricated `mfa` amr), and issue the code.
+        if crate::trusted_device::validate_and_consume(state, scope, &subject, headers)
+            .await
+            .is_some()
+        {
+            let upgraded = authn::AuthenticationEvent::with_trusted_device(
+                &methods,
+                session.auth_time_unix_micros,
+            );
+            return StepUpOutcome::Satisfied {
+                age_bound,
+                auth_methods: Some(upgraded.methods_token()),
+            };
+        }
+        // No trusted device: a genuine second factor must be proven. Route through the
+        // SAME remediation machinery with a synthetic `mfa` floor, so an enrolled TOTP is
+        // a live second-factor challenge, a passkey holder runs the passkey ceremony, and
+        // an unenrolled subject is steered to enrollment (or fails closed).
+        let mfa_requirement = step_up::AuthnRequirement {
+            min_acr: Some(authn::acr_for_mfa().to_owned()),
+            max_auth_age_secs: None,
+        };
+        step_up::decide_remediation(state, scope, &subject, &mfa_requirement, true, false).await
+    } else {
+        // Every applicable requirement is satisfied by the login as it stands.
+        return StepUpOutcome::Satisfied {
+            age_bound,
+            auth_methods: None,
+        };
+    };
 
     // Under prompt=none NO UI is rendered: an interaction need becomes the matching
     // negotiated-mode error (OIDC Core 3.1.2.6, RFC 9470).

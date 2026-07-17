@@ -6,6 +6,28 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Trusted devices (remember-device 2FA) and the conditional-credential skip (issue #71),
+  off by default behind `oidc.trusted_devices_enabled`. After a COMPLETED multi-factor
+  login the `POST /login/mfa` path may plant a `__Host-ironauth_trusted_device` cookie
+  (`<tdv_ id>.<secret>`, HttpOnly, Secure, SameSite=Lax); only the secret's SHA-256 DIGEST
+  is stored server-side, so the cookie is not a self-contained skip token. On a subsequent
+  login the authorize gate (`evaluate_step_up`) validates the cookie server-side
+  (subject-bound, not revoked, within the per-tenant max-age and idle windows) and, when
+  the ONLY unmet requirement is the tenant baseline MFA credential-class floor, SKIPS the
+  second factor while primary authentication still runs. The honesty crux: a new
+  `AuthMethod::TrustedDevice` (amr contributes NOTHING) yields a DISTINCT, weaker
+  `urn:ironauth:acr:mfa_remembered` acr ranked BELOW `mfa`, so the token records
+  `[<primary>, trusted_device]` (acr `mfa_remembered`, and an amr that NEVER fabricates
+  `mfa`/`otp` from the cookie). Precedence: an explicit RFC 9470 / issue #72 step-up acr
+  floor and a passkey/attested credential-class floor are NEVER satisfied by a remembered
+  device; the conditional-credential skip keys on `performed_second_factor` (a genuine
+  TOTP/recovery code or a USER-VERIFIED passkey carries `mfa`), so a UV passkey satisfies
+  the MFA requirement with no extra prompt while a non-UV passkey does NOT. Trusted devices
+  appear in the M6 device list and are revocable one or all
+  (`GET/POST .../account/trusted-devices[/revoke|/revoke-all]`); revocation is server-side
+  IMMEDIATE (a replayed cookie then fails), and a password change invalidates trust per
+  the `oidc.trusted_device_revoke_on_password_change` policy. The token endpoint mirrors
+  the composition, honoring a frozen `trusted_device` contribution.
 - WebAuthn Level 3 Signal API and conditional-create, EXPLORATORY and off by default
   (issue #73). Behind the new per-environment `oidc.webauthn_signal_api_enabled` flag, the
   hosted passkey-management page (`GET .../webauthn/manage`) emits ONE nonce-guarded,

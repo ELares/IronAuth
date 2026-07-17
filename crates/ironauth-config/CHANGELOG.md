@@ -6,6 +6,15 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Remember-device (trusted-device) policy for issue #71, off by default: the
+  `oidc.trusted_devices_enabled` toggle, the `oidc.trusted_device_user_opt_in` choice
+  (user checkbox vs the tenant decides), the `oidc.trusted_device_max_age_secs` absolute
+  cap (bounded to 3600..=2592000, the NIST SP 800-63B 30-day reauthentication ceiling,
+  default 30 days), the `oidc.trusted_device_idle_secs` idle window (at least one hour and
+  never wider than the max age, default 7 days), and the
+  `oidc.trusted_device_revoke_on_password_change` invalidation policy (default on). The
+  duration bounds are validated at load even when the feature is off, so an out-of-band
+  value cannot take effect the moment it is enabled.
 - Two EXPLORATORY per-environment feature flags for issue #73, both default OFF and
   independently toggleable: `oidc.webauthn_signal_api_enabled` (the WebAuthn L3 Signal API
   hosted-page surface) plus its `oidc.webauthn_conditional_create_enabled` policy and

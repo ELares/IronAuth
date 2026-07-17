@@ -6,6 +6,18 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Trusted devices (issue #71): migration 0053 adds the tenant-scoped, forced-RLS
+  `trusted_devices` table (the SHA-256 DIGEST of the cookie secret as server-side state,
+  the subject + `ses_` session-lineage binding, the SEALED User-Agent and coarse geo, the
+  max-age and idle expiry columns, and the immediate `revoked_at` kill switch with a
+  closed revoke-reason CHECK), a `tdv_` scoped id, and the `TrustedDeviceRepo`
+  (`validate`, subject-bound `list`) / `ActingTrustedDeviceRepo` (`remember`, `touch` idle
+  slide, `self_revoke`, `self_revoke_all`) accessors with the `trusted_device.remember` /
+  `trusted_device.revoke` audit actions. Every read and write is subject-bound (a device
+  cookie for user A can never reach user B), and the sealed metadata uses a per-row,
+  per-column AAD. Classified `Runtime` in the resource-model registry, granted to the app
+  and control-plane roles, and registered in the migration guard test and
+  `scripts/query-audit.sh`.
 - Admin sudo elevation ledger (issue #73): migration 0052 adds the tenant-scoped,
   forced-RLS `admin_sudo_elevations` append-only table (the acting principal, the achieved
   acr, the recorded elevation instant, and the window expiry), an `elv_` scoped id, the

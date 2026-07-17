@@ -606,6 +606,18 @@ pub const OIDC_EMAIL_OTP_MAX_TTL_SECS: u64 = 600;
 /// short-lived; a per-tenant value sits inside 300..=3600.
 pub const OIDC_MAGIC_LINK_MAX_TTL_SECS: u64 = 3_600;
 
+/// The FLOOR of the remembered-device max-age band, in seconds (issue #71): one hour. A
+/// device remembered for less than this is not worth the state; the real value sits far
+/// higher, up to the NIST SP 800-63B reauthentication ceiling.
+pub const OIDC_TRUSTED_DEVICE_MIN_MAX_AGE_SECS: u64 = 3_600;
+/// The CEILING of the remembered-device max-age band, in seconds (issue #71): thirty
+/// days, the NIST SP 800-63B reauthentication ceiling. Trust must be re-established at
+/// least this often, so a misconfiguration cannot extend a remembered device indefinitely.
+pub const OIDC_TRUSTED_DEVICE_MAX_MAX_AGE_SECS: u64 = 2_592_000;
+/// The FLOOR of the remembered-device idle window, in seconds (issue #71): one hour. The
+/// idle window must be at least this and never wider than the absolute max age.
+pub const OIDC_TRUSTED_DEVICE_MIN_IDLE_SECS: u64 = 3_600;
+
 /// The FLOOR of the SMS-OTP TTL band, in seconds (issue #70): two minutes. An SMS
 /// arrives quickly, so a short window is both usable and tighter than the email band;
 /// a shorter lifetime than this risks expiring before a slow carrier delivers the text.
@@ -1369,6 +1381,46 @@ pub struct OidcConfig {
     /// how the other per-environment config is handled.
     pub acr_order: Vec<String>,
 
+    /// Whether the remember-device (trusted-device) feature is enabled (issue #71). OFF
+    /// by default: a tenant opts INTO letting a completed multi-factor login remember the
+    /// device so a subsequent login from it skips the second factor (primary
+    /// authentication is still required). When off, no remember-device cookie is ever
+    /// issued, a presented one is ignored, and the account device list shows no trusted
+    /// devices, so the feature is fully inert. The skip NEVER satisfies a step-up acr
+    /// floor (RFC 9470 / issue #72 always overrides a remembered device) or a
+    /// passkey/attested credential-class floor; it only satisfies a tenant's baseline
+    /// MFA requirement.
+    pub trusted_devices_enabled: bool,
+
+    /// Whether the user gets an OPT-IN "remember this device" checkbox (issue #71) or the
+    /// TENANT decides. When true (the safer default), the device is remembered only if the
+    /// user checks the box after a completed multi-factor login; when false, a completed
+    /// multi-factor login always remembers the device (the tenant's choice). Only
+    /// consulted when [`OidcConfig::trusted_devices_enabled`] is on.
+    pub trusted_device_user_opt_in: bool,
+
+    /// The absolute maximum age of a remembered device, in seconds (issue #71): past it
+    /// the device never skips again and must re-prove a second factor. Bounded to
+    /// `OIDC_TRUSTED_DEVICE_MIN_MAX_AGE_SECS..=OIDC_TRUSTED_DEVICE_MAX_MAX_AGE_SECS`
+    /// (3600..=2592000), so a misconfiguration cannot extend trust indefinitely; the
+    /// default (2592000) is the NIST SP 800-63B reauthentication ceiling of 30 days.
+    pub trusted_device_max_age_secs: u64,
+
+    /// The idle window of a remembered device, in seconds (issue #71): an unused device
+    /// expires after this, while an actively used one lives to the absolute max age. Must
+    /// be at least `OIDC_TRUSTED_DEVICE_MIN_IDLE_SECS` (3600) and no greater than
+    /// [`OidcConfig::trusted_device_max_age_secs`] (a boot-time [`ConfigError::Invalid`]
+    /// otherwise, since an idle window wider than the absolute cap is meaningless); the
+    /// default (604800) is seven days.
+    pub trusted_device_idle_secs: u64,
+
+    /// Whether a password change or reset INVALIDATES the subject's remembered devices
+    /// (issue #71). On by default: a credential change is a strong signal that trust
+    /// should be re-established, so every remembered device is revoked server-side. A
+    /// tenant that separates device trust from password lifecycle can turn it off. Only
+    /// consulted when [`OidcConfig::trusted_devices_enabled`] is on.
+    pub trusted_device_revoke_on_password_change: bool,
+
     /// Whether the email-OTP factor endpoints are mounted (issue #68). On by default:
     /// email OTP is the recovery-of-last-resort factor every product ships. When off,
     /// the send/verify endpoints fail closed with a uniform 404, so a deployment that
@@ -1583,6 +1635,11 @@ impl Default for OidcConfig {
                 "phr".to_owned(),
                 "phrh".to_owned(),
             ],
+            trusted_devices_enabled: false,
+            trusted_device_user_opt_in: true,
+            trusted_device_max_age_secs: 2_592_000,
+            trusted_device_idle_secs: 604_800,
+            trusted_device_revoke_on_password_change: true,
             email_otp_enabled: true,
             email_otp_code_digits: 6,
             email_otp_code_ttl_secs: 600,
@@ -2531,6 +2588,7 @@ impl Config {
         validate_regulation(&self.oidc)?;
         validate_webauthn(&self.oidc, &self.server)?;
         validate_totp(&self.oidc)?;
+        validate_trusted_device(&self.oidc)?;
         validate_email_otp(&self.oidc)?;
         validate_sms_otp(&self.oidc)?;
         validate_quota(&self.quota)?;
@@ -2670,6 +2728,40 @@ fn validate_totp(oidc: &OidcConfig) -> Result<(), ConfigError> {
 /// # Errors
 ///
 /// [`ConfigError::Invalid`] if any parameter is outside its documented range.
+/// Validate the remembered-device (trusted-device) duration policy (issue #71): the
+/// absolute max age must sit inside the accepted band, and the idle window must be at
+/// least the floor and no wider than the absolute max age (an idle window wider than the
+/// absolute cap is meaningless). The bounds hold even when the feature is off, so a
+/// deployment cannot ship an out-of-band value that would take effect the moment it is
+/// enabled.
+fn validate_trusted_device(oidc: &OidcConfig) -> Result<(), ConfigError> {
+    if !(OIDC_TRUSTED_DEVICE_MIN_MAX_AGE_SECS..=OIDC_TRUSTED_DEVICE_MAX_MAX_AGE_SECS)
+        .contains(&oidc.trusted_device_max_age_secs)
+    {
+        return Err(ConfigError::Invalid {
+            message: format!(
+                "oidc.trusted_device_max_age_secs ({}) must be in \
+                 {OIDC_TRUSTED_DEVICE_MIN_MAX_AGE_SECS}..={OIDC_TRUSTED_DEVICE_MAX_MAX_AGE_SECS} \
+                 (up to the NIST SP 800-63B 30-day reauthentication ceiling)",
+                oidc.trusted_device_max_age_secs
+            ),
+        });
+    }
+    if oidc.trusted_device_idle_secs < OIDC_TRUSTED_DEVICE_MIN_IDLE_SECS
+        || oidc.trusted_device_idle_secs > oidc.trusted_device_max_age_secs
+    {
+        return Err(ConfigError::Invalid {
+            message: format!(
+                "oidc.trusted_device_idle_secs ({}) must be at least \
+                 {OIDC_TRUSTED_DEVICE_MIN_IDLE_SECS} and no greater than \
+                 oidc.trusted_device_max_age_secs ({})",
+                oidc.trusted_device_idle_secs, oidc.trusted_device_max_age_secs
+            ),
+        });
+    }
+    Ok(())
+}
+
 fn validate_email_otp(oidc: &OidcConfig) -> Result<(), ConfigError> {
     if !(6..=8).contains(&oidc.email_otp_code_digits) {
         return Err(ConfigError::Invalid {
@@ -5007,5 +5099,50 @@ mod tests {
             "passkey".to_owned(),
         ];
         validate_totp(&oidc).expect("the closed set is valid in any order");
+    }
+
+    /// The remembered-device duration policy (issue #71): the defaults are valid and off,
+    /// the max age must sit inside the accepted band, and the idle window must be at least
+    /// the floor and never wider than the absolute max age.
+    #[test]
+    #[allow(clippy::field_reassign_with_default)] // one-field mutations off a large default read clearest
+    fn validate_trusted_device_enforces_the_duration_bounds() {
+        let default = OidcConfig::default();
+        assert!(!default.trusted_devices_enabled);
+        validate_trusted_device(&default).expect("defaults are valid");
+
+        // The max age must sit inside the accepted band (up to the NIST 30-day ceiling).
+        for bad in [
+            OIDC_TRUSTED_DEVICE_MIN_MAX_AGE_SECS - 1,
+            OIDC_TRUSTED_DEVICE_MAX_MAX_AGE_SECS + 1,
+        ] {
+            let mut oidc = OidcConfig::default();
+            oidc.trusted_device_max_age_secs = bad;
+            assert!(
+                matches!(
+                    validate_trusted_device(&oidc),
+                    Err(ConfigError::Invalid { .. })
+                ),
+                "trusted_device_max_age_secs {bad} must be rejected"
+            );
+        }
+
+        // The idle window must be at least the floor and never wider than the max age.
+        let mut too_small = OidcConfig::default();
+        too_small.trusted_device_idle_secs = OIDC_TRUSTED_DEVICE_MIN_IDLE_SECS - 1;
+        assert!(matches!(
+            validate_trusted_device(&too_small),
+            Err(ConfigError::Invalid { .. })
+        ));
+        let mut wider_than_max = OidcConfig::default();
+        wider_than_max.trusted_device_max_age_secs = OIDC_TRUSTED_DEVICE_MIN_MAX_AGE_SECS;
+        wider_than_max.trusted_device_idle_secs = OIDC_TRUSTED_DEVICE_MIN_MAX_AGE_SECS + 1;
+        assert!(
+            matches!(
+                validate_trusted_device(&wider_than_max),
+                Err(ConfigError::Invalid { .. })
+            ),
+            "an idle window wider than the absolute max age must be rejected"
+        );
     }
 }

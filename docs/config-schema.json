@@ -936,6 +936,35 @@
           "minimum": 0,
           "type": "integer"
         },
+        "trusted_device_idle_secs": {
+          "default": 604800,
+          "description": "The idle window of a remembered device, in seconds (issue #71): an unused device\nexpires after this, while an actively used one lives to the absolute max age. Must\nbe at least `OIDC_TRUSTED_DEVICE_MIN_IDLE_SECS` (3600) and no greater than\n[`OidcConfig::trusted_device_max_age_secs`] (a boot-time [`ConfigError::Invalid`]\notherwise, since an idle window wider than the absolute cap is meaningless); the\ndefault (604800) is seven days.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "trusted_device_max_age_secs": {
+          "default": 2592000,
+          "description": "The absolute maximum age of a remembered device, in seconds (issue #71): past it\nthe device never skips again and must re-prove a second factor. Bounded to\n`OIDC_TRUSTED_DEVICE_MIN_MAX_AGE_SECS..=OIDC_TRUSTED_DEVICE_MAX_MAX_AGE_SECS`\n(3600..=2592000), so a misconfiguration cannot extend trust indefinitely; the\ndefault (2592000) is the NIST SP 800-63B reauthentication ceiling of 30 days.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "trusted_device_revoke_on_password_change": {
+          "default": true,
+          "description": "Whether a password change or reset INVALIDATES the subject's remembered devices\n(issue #71). On by default: a credential change is a strong signal that trust\nshould be re-established, so every remembered device is revoked server-side. A\ntenant that separates device trust from password lifecycle can turn it off. Only\nconsulted when [`OidcConfig::trusted_devices_enabled`] is on.",
+          "type": "boolean"
+        },
+        "trusted_device_user_opt_in": {
+          "default": true,
+          "description": "Whether the user gets an OPT-IN \"remember this device\" checkbox (issue #71) or the\nTENANT decides. When true (the safer default), the device is remembered only if the\nuser checks the box after a completed multi-factor login; when false, a completed\nmulti-factor login always remembers the device (the tenant's choice). Only\nconsulted when [`OidcConfig::trusted_devices_enabled`] is on.",
+          "type": "boolean"
+        },
+        "trusted_devices_enabled": {
+          "default": false,
+          "description": "Whether the remember-device (trusted-device) feature is enabled (issue #71). OFF\nby default: a tenant opts INTO letting a completed multi-factor login remember the\ndevice so a subsequent login from it skips the second factor (primary\nauthentication is still required). When off, no remember-device cookie is ever\nissued, a presented one is ignored, and the account device list shows no trusted\ndevices, so the feature is fully inert. The skip NEVER satisfies a step-up acr\nfloor (RFC 9470 / issue #72 always overrides a remembered device) or a\npasskey/attested credential-class floor; it only satisfies a tenant's baseline\nMFA requirement.",
+          "type": "boolean"
+        },
         "userinfo_cors_origins": {
           "default": [],
           "description": "The web origins (scheme + host + optional port, no path) of registered\nsingle-page-app clients allowed to call the `UserInfo` endpoint cross-origin\n(issue #15). Empty by default, so no CORS is offered. Each entry is matched\nEXACTLY against a request's `Origin`; a match echoes that origin back in the\n`UserInfo` CORS headers (never a wildcard), and an unmatched origin gets no\nCORS headers at all. CORS is offered on `UserInfo` ONLY and never on the\nauthorization endpoint. This is a promotable per-environment setting: it\nappears in config snapshots and rides the M5 promotion pipeline; the process\nvalue is the deployment default until per-environment overrides land.",
@@ -1680,6 +1709,11 @@
         "totp_issuer": null,
         "totp_period_secs": 30,
         "totp_recovery_code_count": 10,
+        "trusted_device_idle_secs": 604800,
+        "trusted_device_max_age_secs": 2592000,
+        "trusted_device_revoke_on_password_change": true,
+        "trusted_device_user_opt_in": true,
+        "trusted_devices_enabled": false,
         "userinfo_cors_origins": [],
         "webauthn_challenge_ttl_secs": 300,
         "webauthn_clone_detection_block": false,

@@ -259,6 +259,20 @@ impl ScopedKind for CredentialKind {
     const PREFIX: &'static str = "crd";
 }
 
+/// Marker for a remembered device (`tdv_`), one row in a user's trusted-device
+/// registry (issue #71): the remember-device second-factor state a subsequent
+/// login skips the second factor against. The id is the value the __Host- device
+/// cookie names; it embeds its `(tenant, environment)`, so a device minted in one
+/// scope parses as a uniform not-found under another, and a device is only ever
+/// reachable by the subject it is bound to. The id is NOT a bearer secret on its
+/// own: the cookie additionally carries a high-entropy secret whose digest is the
+/// server-side state, so a stolen id alone cannot skip anything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TrustedDeviceKind;
+impl ScopedKind for TrustedDeviceKind {
+    const PREFIX: &'static str = "tdv";
+}
+
 /// Marker for a registered WebAuthn passkey credential (`pky_`), one row in the
 /// per-user passkey registry (issue #65): the COSE public key, sign counter,
 /// AAGUID, transports, BE/BS flags, and the sealed nickname of one authenticator.
@@ -942,6 +956,10 @@ pub type ClientSessionId = ScopedId<ClientSessionKind>;
 /// An account-credential identifier (`crd_...`), one enrolled credential in a
 /// user's self-service credential registry (issue #61).
 pub type CredentialId = ScopedId<CredentialKind>;
+
+/// A remembered-device id (`tdv_...`), one row in a user's trusted-device
+/// registry and the value the `__Host-` device cookie names (issue #71).
+pub type TrustedDeviceId = ScopedId<TrustedDeviceKind>;
 
 /// A registered WebAuthn passkey credential id (`pky_`, issue #65).
 pub type WebauthnCredentialId = ScopedId<WebauthnCredentialKind>;

@@ -620,9 +620,20 @@ pub fn mfa_challenge_page(
     return_to: &str,
     error: Option<&str>,
     enroll_url: Option<&str>,
+    remember_device: bool,
     hints: &InteractionHints,
     environment_banner: Option<&str>,
 ) -> String {
+    // The remember-device opt-in (issue #71): only rendered when the tenant enables
+    // trusted devices AND leaves the choice to the user. The field name matches the
+    // `MfaChallengeForm.remember_device` the POST reads; when absent the device is not
+    // remembered (or, when the tenant decides, remembered regardless of the box).
+    let remember_field = if remember_device {
+        "<p><label><input type=\"checkbox\" name=\"remember_device\" value=\"1\"> \
+         Remember this device for future sign-ins</label></p>"
+    } else {
+        ""
+    };
     let body = match enroll_url {
         Some(url) => format!(
             "<h1>Additional verification required</h1>{error}\
@@ -638,6 +649,7 @@ pub fn mfa_challenge_page(
              <form method=\"post\" action=\"/login/mfa\">{return_to}\
              <p><label>Code <input type=\"text\" name=\"code\" inputmode=\"numeric\" \
              autocomplete=\"one-time-code\" autofocus required></label></p>\
+             {remember_field}\
              <p><button type=\"submit\">Verify</button></p></form>",
             error = error_banner(error),
             return_to = return_to_field(return_to),

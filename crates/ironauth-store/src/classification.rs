@@ -140,13 +140,16 @@ pub enum ResourceType {
     /// A pending user invitation (issue #60): the single-use, expiring token that
     /// provisions and activates an invited user.
     Invitation,
+    /// A remembered device (issue #71): the server-side trusted-device state a
+    /// subsequent login skips the second factor against.
+    TrustedDevice,
 }
 
 impl ResourceType {
     /// Every resource type, in a stable order. The classification lint and the
     /// metadata endpoint both iterate this; a variant missing here is caught by
     /// the `all_lists_every_variant` test and by `scripts/classification-lint.sh`.
-    pub const ALL: [ResourceType; 16] = [
+    pub const ALL: [ResourceType; 17] = [
         ResourceType::Operator,
         ResourceType::Tenant,
         ResourceType::Environment,
@@ -163,6 +166,7 @@ impl ResourceType {
         ResourceType::Session,
         ResourceType::AccountCredential,
         ResourceType::Invitation,
+        ResourceType::TrustedDevice,
     ];
 
     /// The stable wire name of this resource type (for example `organization`).
@@ -185,6 +189,7 @@ impl ResourceType {
             ResourceType::Session => "session",
             ResourceType::AccountCredential => "account_credential",
             ResourceType::Invitation => "invitation",
+            ResourceType::TrustedDevice => "trusted_device",
         }
     }
 
@@ -208,7 +213,8 @@ impl ResourceType {
             | ResourceType::User
             | ResourceType::Session
             | ResourceType::AccountCredential
-            | ResourceType::Invitation => ResourceLevel::Environment,
+            | ResourceType::Invitation
+            | ResourceType::TrustedDevice => ResourceLevel::Environment,
         }
     }
 
@@ -262,7 +268,11 @@ pub fn classify(resource: ResourceType) -> ResourceClassification {
         | ResourceType::User
         | ResourceType::Session
         | ResourceType::AccountCredential
-        | ResourceType::Invitation => Runtime,
+        | ResourceType::Invitation
+        // A remembered device (issue #71) is dynamic per-environment data, bound to a
+        // specific environment's users and sessions: it never travels in a config
+        // snapshot, exactly like a session or an account credential.
+        | ResourceType::TrustedDevice => Runtime,
     }
 }
 

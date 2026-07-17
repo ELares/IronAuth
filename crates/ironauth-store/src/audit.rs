@@ -638,6 +638,15 @@ pub enum Action {
     /// attributed to the end user; the `detail` records the step-up policy the
     /// sensitive change declared.
     AccountSessionsRevokeOthers,
+    /// A device was REMEMBERED as trusted after a completed multi-factor login (issue
+    /// #71): the remember-device state a subsequent login skips the second factor
+    /// against. The row targets the `tdv_` device and is attributed to the end user.
+    TrustedDeviceRemember,
+    /// A remembered device was REVOKED (issue #71): the user (through the self-service
+    /// account surface), an admin, or a password/factor-change invalidation flipped it,
+    /// so a replayed device cookie fails server-side IMMEDIATELY. The row targets the
+    /// `tdv_` device; the `detail` records the revocation reason.
+    TrustedDeviceRevoke,
     /// A credential-abuse BAN was placed on a regulated dimension (issue #64): an
     /// operator, through the CLI or the admin API, banned an attacker IP, an account,
     /// or a canonical identifier on ONE authentication path. The row targets the
@@ -878,6 +887,8 @@ impl Action {
             Action::RecoveryCodesGenerate => "account.recovery_codes.generate",
             Action::RecoveryCodeRedeem => "account.recovery_code.redeem",
             Action::AccountSessionRevoke => "account.session.revoke",
+            Action::TrustedDeviceRemember => "trusted_device.remember",
+            Action::TrustedDeviceRevoke => "trusted_device.revoke",
             Action::AccountSessionsRevokeOthers => "account.sessions.revoke_others",
             Action::AbuseBanCreate => "abuse.ban.create",
             Action::AbuseBanLift => "abuse.ban.lift",

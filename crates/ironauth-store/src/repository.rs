@@ -78,8 +78,8 @@ use crate::id::{
     MigrationRunId, MigrationRunRecordId, OperatorId, OrganizationId, PushedRequestId,
     RecoveryCodeId, RefreshFamilyId, RefreshTokenId, ResourceServerId, ScopeStepUpPolicyId,
     ServiceAccountId, SessionEventId, SessionId, SigningKeyId, SmsOtpCodeId, SmsRouteStatId,
-    TenantId, TotpCredentialId, TraitMigrationJobId, TraitSchemaId, UserId, UserIdentifierId,
-    VariableId, WebauthnChallengeId, WebauthnCredentialId,
+    TenantId, TotpCredentialId, TraitMigrationJobId, TraitSchemaId, TrustedDeviceId, UserId,
+    UserIdentifierId, VariableId, WebauthnChallengeId, WebauthnCredentialId,
 };
 use crate::identifier::{
     CanonicalIdentifier, IdentifierType, UniquenessMode, canonicalize_identifier,
@@ -351,6 +351,18 @@ impl<'a> ScopedStore<'a> {
     #[must_use]
     pub fn account_credentials(&self) -> AccountCredentialRepo<'a> {
         AccountCredentialRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
+    /// The read-only trusted-device repository for this scope (issue #71): list and
+    /// VALIDATE a subject's OWN remembered devices; remember, touch, and revoke live on
+    /// [`ActingStore::trusted_devices`]. Every read is subject-bound, so a device of
+    /// another subject is not reachable.
+    #[must_use]
+    pub fn trusted_devices(&self) -> TrustedDeviceRepo<'a> {
+        TrustedDeviceRepo {
             store: self.store,
             scope: self.scope,
         }
@@ -931,6 +943,19 @@ impl<'a> ActingStore<'a> {
     #[must_use]
     pub fn account_credentials(&self) -> ActingAccountCredentialRepo<'a> {
         ActingAccountCredentialRepo {
+            store: self.store,
+            scope: self.scope,
+            acting: self.acting,
+        }
+    }
+
+    /// The mutating trusted-device repository for this scope and actor (issue #71):
+    /// remember a device after a completed multi-factor login, slide its idle window on
+    /// a use, and revoke it (self, admin, or a password/factor-change invalidation).
+    /// Every write is subject-bound and audited.
+    #[must_use]
+    pub fn trusted_devices(&self) -> ActingTrustedDeviceRepo<'a> {
+        ActingTrustedDeviceRepo {
             store: self.store,
             scope: self.scope,
             acting: self.acting,
@@ -16596,6 +16621,514 @@ impl ActingAccountCredentialRepo<'_> {
 }
 
 // ===========================================================================
+// Trusted devices (issue #71)
+// ===========================================================================
+
+/// Why a remembered device was revoked (issue #71). The closed set the
+/// `trusted_devices_revoke_reason_known` CHECK enforces, so an unknown reason can
+/// never be written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrustedDeviceRevokeReason {
+    /// The end user revoked it through the self-service account surface.
+    User,
+    /// An admin revoked it.
+    Admin,
+    /// A password change or reset invalidated the device's trust (per policy).
+    PasswordChange,
+    /// An MFA factor removal/regeneration invalidated the device's trust (per policy).
+    FactorChange,
+}
+
+impl TrustedDeviceRevokeReason {
+    /// The stored wire string (the closed CHECK set).
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TrustedDeviceRevokeReason::User => "user",
+            TrustedDeviceRevokeReason::Admin => "admin",
+            TrustedDeviceRevokeReason::PasswordChange => "password_change",
+            TrustedDeviceRevokeReason::FactorChange => "factor_change",
+        }
+    }
+}
+
+/// A remembered device as the self-service account surface reports it (issue #71):
+/// its id, the session lineage it descends from, the decrypted User-Agent and coarse
+/// location at enrollment, and the created / last-seen / expiry timestamps the M6
+/// device list shows. Every timestamp is microseconds since the Unix epoch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrustedDeviceSummary {
+    /// The remembered-device identifier (a `tdv_` id string).
+    pub id: String,
+    /// The `ses_` session the device was remembered from (the trust lineage).
+    pub session_lineage: String,
+    /// The observed User-Agent at enrollment (decrypted from the sealed column).
+    pub user_agent: String,
+    /// The coarse location at enrollment (decrypted from the sealed column).
+    pub coarse_location: String,
+    /// When the device was remembered (the pagination key).
+    pub created_at_unix_micros: i64,
+    /// When the device was last used to skip a second factor, if ever.
+    pub last_seen_at_unix_micros: Option<i64>,
+    /// The absolute max-age cap the device was minted under.
+    pub max_age_expires_at_unix_micros: i64,
+    /// The current sliding idle-window expiry.
+    pub idle_expires_at_unix_micros: i64,
+}
+
+/// Parameters to remember a device (issue #71). The cookie secret is never stored;
+/// only its `device_secret_hash` digest is.
+pub struct NewTrustedDevice<'a> {
+    /// The SHA-256 digest of the cookie's high-entropy device secret (server-side
+    /// state, never the secret itself).
+    pub device_secret_hash: &'a [u8],
+    /// The `ses_` session the device is remembered from (the trust lineage).
+    pub session_lineage: &'a str,
+    /// The observed User-Agent at enrollment (sealed at rest).
+    pub user_agent: &'a str,
+    /// The coarse location at enrollment (sealed at rest).
+    pub coarse_location: &'a str,
+    /// The absolute max-age cap, in microseconds since the epoch.
+    pub max_age_expires_micros: i64,
+    /// The initial idle-window expiry, in microseconds since the epoch.
+    pub idle_expires_micros: i64,
+}
+
+/// The read-only trusted-device repository (issue #71): list and VALIDATE a subject's
+/// remembered devices. The scope is fixed AND every read is subject-bound, so a device
+/// of another subject, tenant, or environment is not reachable (a device cookie for
+/// user A can never skip for user B).
+pub struct TrustedDeviceRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl TrustedDeviceRepo<'_> {
+    /// Parse an untrusted device identifier under this scope. A malformed identifier
+    /// and one minted in another scope both return the uniform not-found.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the identifier is malformed or out of scope.
+    pub fn parse_id(&self, raw: &str) -> Result<TrustedDeviceId, StoreError> {
+        Ok(TrustedDeviceId::parse_in_scope(raw, &self.scope)?)
+    }
+
+    /// VALIDATE a presented device cookie server-side (issue #71): resolve the ONE
+    /// row whose `device_secret_hash` matches `secret_hash`, and return its id ONLY
+    /// when the row belongs to `subject`, names `device_id`, is NOT revoked, and is
+    /// within BOTH its max-age and idle windows at `now_micros`. Every check is
+    /// server-side state, so a replayed cookie after revocation FAILS here (not merely
+    /// by signature), a forged/tampered cookie whose secret does not hash to a stored
+    /// digest finds no row, and a device cookie for another subject is rejected.
+    ///
+    /// This is a pure read: the idle-window slide and last-seen stamp happen on
+    /// [`ActingTrustedDeviceRepo::touch`] when the skip is actually applied.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn validate(
+        &self,
+        device_id: &TrustedDeviceId,
+        subject: &UserId,
+        secret_hash: &[u8],
+        now_micros: i64,
+    ) -> Result<Option<TrustedDeviceId>, StoreError> {
+        if device_id.scope() != self.scope || subject.scope() != self.scope {
+            return Ok(None);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT id FROM trusted_devices \
+             WHERE tenant_id = $1 AND environment_id = $2 AND subject = $3 \
+             AND id = $4 AND device_secret_hash = $5 AND revoked_at IS NULL \
+             AND max_age_expires_at > (TIMESTAMPTZ 'epoch' + ($6::text || ' microseconds')::interval) \
+             AND idle_expires_at > (TIMESTAMPTZ 'epoch' + ($6::text || ' microseconds')::interval)",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(subject.to_string())
+        .bind(device_id.to_string())
+        .bind(secret_hash)
+        .bind(now_micros)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(row.map(|_| *device_id))
+    }
+
+    /// One page of `subject`'s remembered devices, ordered by `(created_at, id)`,
+    /// starting strictly after `after`. Filtered on the subject, so it lists ONLY that
+    /// subject's own devices. Only LIVE devices (not revoked, still within their
+    /// max-age window at `now_micros`) are returned, so the account UI never shows a
+    /// device that can no longer skip. The User-Agent and coarse location are decrypted
+    /// from their sealed columns under the row's DEK version.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Encryption`] if no platform master key is configured or a sealed
+    /// value cannot be authenticated and decrypted; [`StoreError::Database`] on a
+    /// persistence failure.
+    pub async fn list(
+        &self,
+        subject: &UserId,
+        now_micros: i64,
+        limit: i64,
+        after: Option<&CursorPosition>,
+    ) -> Result<Vec<TrustedDeviceSummary>, StoreError> {
+        if subject.scope() != self.scope {
+            return Ok(Vec::new());
+        }
+        let master = self.store.master().ok_or(StoreError::Encryption)?;
+        let (after_micros, after_id) = split_cursor(after);
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let rows = sqlx::query(
+            "SELECT id, session_lineage, user_agent_sealed, geo_sealed, pii_dek_version, \
+             (EXTRACT(EPOCH FROM created_at) * 1000000)::bigint AS created_us, \
+             (EXTRACT(EPOCH FROM last_seen_at) * 1000000)::bigint AS last_seen_us, \
+             (EXTRACT(EPOCH FROM max_age_expires_at) * 1000000)::bigint AS max_age_us, \
+             (EXTRACT(EPOCH FROM idle_expires_at) * 1000000)::bigint AS idle_us \
+             FROM trusted_devices \
+             WHERE tenant_id = $1 AND environment_id = $2 AND subject = $3 \
+             AND revoked_at IS NULL \
+             AND max_age_expires_at > (TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval) \
+             AND ($5::bigint IS NULL OR (created_at, id) > \
+                  (TIMESTAMPTZ 'epoch' + ($5::text || ' microseconds')::interval, $6::text)) \
+             ORDER BY created_at, id LIMIT $7",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(subject.to_string())
+        .bind(now_micros)
+        .bind(after_micros)
+        .bind(after_id)
+        .bind(limit.clamp(0, MANAGEMENT_LIST_HARD_CAP + 1))
+        .fetch_all(&mut *tx)
+        .await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let id: String = row.get("id");
+            let dek_version: i32 = row.get("pii_dek_version");
+            let dek = fetch_dek_by_version(&mut tx, self.scope, master, dek_version).await?;
+            let ua_sealed: Vec<u8> = row.get("user_agent_sealed");
+            let ua_plain = dek.open(
+                &trusted_device_meta_seal_aad(
+                    self.scope,
+                    &id,
+                    TRUSTED_DEVICE_USER_AGENT_PURPOSE,
+                    dek_version,
+                ),
+                &Sealed::from_bytes(ua_sealed)?,
+            )?;
+            let geo_sealed: Vec<u8> = row.get("geo_sealed");
+            let geo_plain = dek.open(
+                &trusted_device_meta_seal_aad(
+                    self.scope,
+                    &id,
+                    TRUSTED_DEVICE_GEO_PURPOSE,
+                    dek_version,
+                ),
+                &Sealed::from_bytes(geo_sealed)?,
+            )?;
+            out.push(TrustedDeviceSummary {
+                id,
+                session_lineage: row.get("session_lineage"),
+                user_agent: String::from_utf8(ua_plain).map_err(|_| StoreError::Encryption)?,
+                coarse_location: String::from_utf8(geo_plain)
+                    .map_err(|_| StoreError::Encryption)?,
+                created_at_unix_micros: row.get("created_us"),
+                last_seen_at_unix_micros: row.get("last_seen_us"),
+                max_age_expires_at_unix_micros: row.get("max_age_us"),
+                idle_expires_at_unix_micros: row.get("idle_us"),
+            });
+        }
+        tx.commit().await?;
+        Ok(out)
+    }
+}
+
+/// The mutating trusted-device repository (issue #71): remember, touch (slide the idle
+/// window on a use), and revoke a subject's own remembered devices, audited and
+/// subject-bound.
+pub struct ActingTrustedDeviceRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+    acting: ActingContext,
+}
+
+impl ActingTrustedDeviceRepo<'_> {
+    /// Ensure the scope has a live KEK and DEK to seal the device metadata under,
+    /// provisioning each lazily on first use (idempotent). Mirrors the credential-PII
+    /// path so device metadata is sealed exactly like a credential nickname.
+    async fn ensure_scope_keys(&self, env: &Env, master: &MasterKey) -> Result<(), StoreError> {
+        let envelope = ActingEnvelopeRepo {
+            store: self.store,
+            scope: self.scope,
+            acting: self.acting,
+        };
+        match envelope.provision_kek(env, master).await {
+            Ok(_) | Err(StoreError::Conflict) => {}
+            Err(error) => return Err(error),
+        }
+        match envelope.provision_dek(env, master).await {
+            Ok(_) | Err(StoreError::Conflict) => {}
+            Err(error) => return Err(error),
+        }
+        Ok(())
+    }
+
+    /// REMEMBER `subject`'s device (issue #71) after a completed multi-factor login,
+    /// sealing the observed User-Agent and coarse location under the scope's DEK (issue
+    /// #48) and returning the fresh `tdv_` id. Only the `device_secret_hash` digest is
+    /// stored, never the cookie secret. Writes one `trusted_device.remember` audit row
+    /// targeting the device. The device is bound to `subject`, so a later validation,
+    /// list, or revoke by that subject reaches it and no other subject ever can.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if `subject` is out of this scope;
+    /// [`StoreError::Encryption`] if no platform master key is configured;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn remember(
+        &self,
+        env: &Env,
+        subject: &UserId,
+        device: NewTrustedDevice<'_>,
+    ) -> Result<TrustedDeviceId, StoreError> {
+        if subject.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let master = self.store.master().ok_or(StoreError::Encryption)?;
+        self.ensure_scope_keys(env, master).await?;
+        let id = TrustedDeviceId::generate(env, &self.scope);
+        let scope = self.scope;
+        let subject_text = subject.to_string();
+        let id_text = id.to_string();
+        write_audited_detailed(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::TrustedDeviceRemember,
+                target: &id,
+            },
+            async move |tx| {
+                let (dek_version, dek) = fetch_active_dek(tx, scope, master).await?;
+                let ua_sealed = dek.seal(
+                    env.entropy(),
+                    &trusted_device_meta_seal_aad(
+                        scope,
+                        &id_text,
+                        TRUSTED_DEVICE_USER_AGENT_PURPOSE,
+                        dek_version,
+                    ),
+                    device.user_agent.as_bytes(),
+                );
+                let geo_sealed = dek.seal(
+                    env.entropy(),
+                    &trusted_device_meta_seal_aad(
+                        scope,
+                        &id_text,
+                        TRUSTED_DEVICE_GEO_PURPOSE,
+                        dek_version,
+                    ),
+                    device.coarse_location.as_bytes(),
+                );
+                sqlx::query(
+                    "INSERT INTO trusted_devices \
+                     (id, tenant_id, environment_id, subject, device_secret_hash, \
+                      session_lineage, user_agent_sealed, geo_sealed, pii_dek_version, \
+                      max_age_expires_at, idle_expires_at) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, \
+                      TIMESTAMPTZ 'epoch' + ($10::text || ' microseconds')::interval, \
+                      TIMESTAMPTZ 'epoch' + ($11::text || ' microseconds')::interval)",
+                )
+                .bind(&id_text)
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(&subject_text)
+                .bind(device.device_secret_hash)
+                .bind(device.session_lineage)
+                .bind(ua_sealed.into_bytes())
+                .bind(geo_sealed.into_bytes())
+                .bind(dek_version)
+                .bind(device.max_age_expires_micros)
+                .bind(device.idle_expires_micros)
+                .execute(&mut **tx)
+                .await?;
+                Ok(())
+            },
+            false,
+            None,
+        )
+        .await?;
+        Ok(id)
+    }
+
+    /// SLIDE the idle window and stamp last-seen on a device that just skipped a second
+    /// factor (issue #71). A hot-path use, so it is a COLUMN-scoped UPDATE and writes no
+    /// audit row (exactly like the session idle slide). Subject-bound and only advances
+    /// a LIVE row, so a revoked or expired device is never resurrected. `new_idle_micros`
+    /// is capped at the row's absolute max-age in SQL, so a slide can never push a device
+    /// past its absolute cap.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn touch(
+        &self,
+        subject: &UserId,
+        device_id: &TrustedDeviceId,
+        now_micros: i64,
+        new_idle_micros: i64,
+    ) -> Result<(), StoreError> {
+        if device_id.scope() != self.scope || subject.scope() != self.scope {
+            return Ok(());
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        sqlx::query(
+            "UPDATE trusted_devices SET \
+             last_seen_at = TIMESTAMPTZ 'epoch' + ($5::text || ' microseconds')::interval, \
+             idle_expires_at = LEAST( \
+                 TIMESTAMPTZ 'epoch' + ($6::text || ' microseconds')::interval, \
+                 max_age_expires_at) \
+             WHERE id = $1 AND tenant_id = $2 AND environment_id = $3 AND subject = $4 \
+             AND revoked_at IS NULL",
+        )
+        .bind(device_id.to_string())
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(subject.to_string())
+        .bind(now_micros)
+        .bind(new_idle_micros)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// REVOKE `subject`'s device `id` (issue #71): a COLUMN-scoped UPDATE that sets
+    /// `revoked_at`/`revoke_reason` on the LIVE, subject-bound row, so a replayed cookie
+    /// fails server-side IMMEDIATELY. Another subject's id (or a cross-scope id) is the
+    /// uniform not-found and flips nothing. A successful revoke writes one
+    /// `trusted_device.revoke` audit row targeting the device with the reason in
+    /// `detail`; a no-op writes nothing. Returns whether a row was flipped.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn self_revoke(
+        &self,
+        env: &Env,
+        subject: &UserId,
+        id: &TrustedDeviceId,
+        reason: TrustedDeviceRevokeReason,
+    ) -> Result<bool, StoreError> {
+        if id.scope() != self.scope || subject.scope() != self.scope {
+            return Ok(false);
+        }
+        let scope = self.scope;
+        let subject_text = subject.to_string();
+        let id_text = id.to_string();
+        let now_micros = epoch_micros(env.clock().now_utc());
+        let mut flipped = false;
+        write_audited_detailed(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::TrustedDeviceRevoke,
+                target: id,
+            },
+            async |tx| {
+                let affected = sqlx::query(
+                    "UPDATE trusted_devices SET \
+                     revoked_at = TIMESTAMPTZ 'epoch' + ($5::text || ' microseconds')::interval, \
+                     revoke_reason = $6 \
+                     WHERE id = $1 AND tenant_id = $2 AND environment_id = $3 AND subject = $4 \
+                     AND revoked_at IS NULL",
+                )
+                .bind(&id_text)
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(&subject_text)
+                .bind(now_micros)
+                .bind(reason.as_str())
+                .execute(&mut **tx)
+                .await?
+                .rows_affected();
+                flipped = affected > 0;
+                Ok(())
+            },
+            false,
+            Some(reason.as_str()),
+        )
+        .await?;
+        Ok(flipped)
+    }
+
+    /// REVOKE every LIVE remembered device of `subject` (issue #71): the "forget all my
+    /// devices" action, and the invalidation a password change/reset or a factor change
+    /// runs (per tenant policy). A single COLUMN-scoped bulk UPDATE, then one
+    /// `trusted_device.revoke` audit row targeting the USER (mirroring the bulk
+    /// session revoke), with the reason in `detail`. Returns the number of devices
+    /// revoked.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn self_revoke_all(
+        &self,
+        env: &Env,
+        subject: &UserId,
+        reason: TrustedDeviceRevokeReason,
+    ) -> Result<u64, StoreError> {
+        if subject.scope() != self.scope {
+            return Ok(0);
+        }
+        let scope = self.scope;
+        let subject_text = subject.to_string();
+        let now_micros = epoch_micros(env.clock().now_utc());
+        let mut revoked = 0_u64;
+        write_audited_detailed(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::TrustedDeviceRevoke,
+                target: subject,
+            },
+            async |tx| {
+                revoked = sqlx::query(
+                    "UPDATE trusted_devices SET \
+                     revoked_at = TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval, \
+                     revoke_reason = $5 \
+                     WHERE tenant_id = $1 AND environment_id = $2 AND subject = $3 \
+                     AND revoked_at IS NULL",
+                )
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(&subject_text)
+                .bind(now_micros)
+                .bind(reason.as_str())
+                .execute(&mut **tx)
+                .await?
+                .rows_affected();
+                Ok(())
+            },
+            false,
+            Some(reason.as_str()),
+        )
+        .await?;
+        Ok(revoked)
+    }
+}
+
+// ===========================================================================
 // WebAuthn passkeys (issue #65)
 // ===========================================================================
 
@@ -23067,6 +23600,16 @@ const FLEXIBLE_IDENTIFIER_SEAL_LABEL: &str = "ironauth.envelope.user-identifier.
 /// index, so the same string as a bootstrap handle and as a flexible identifier never
 /// produces a colliding tag.
 const FLEXIBLE_IDENTIFIER_BIDX_LABEL: &str = "ironauth.envelope.user-identifier-bidx.v1";
+/// The AAD label domain-separating a sealed `trusted_devices` metadata payload (the
+/// observed User-Agent or the coarse location at enrollment, issue #71) from every
+/// other envelope context, so a device-metadata seal never authenticates under
+/// another column's context. The per-column `purpose` and the row id are additionally
+/// bound in the AAD (see [`trusted_device_meta_seal_aad`]).
+const TRUSTED_DEVICE_META_SEAL_LABEL: &str = "ironauth.envelope.trusted-device-meta.v1";
+/// The purpose label bound into a sealed `trusted_devices.user_agent_sealed` value.
+const TRUSTED_DEVICE_USER_AGENT_PURPOSE: &str = "user_agent";
+/// The purpose label bound into a sealed `trusted_devices.geo_sealed` value.
+const TRUSTED_DEVICE_GEO_PURPOSE: &str = "geo";
 /// The AAD label domain-separating a sealed `abuse_bans.subject` value (the regulated
 /// dimension value, issue #64) from every other envelope context, so a ban-subject
 /// seal never authenticates under the users-PII, invitation, or secret-store context.
@@ -23172,6 +23715,27 @@ fn totp_seed_seal_aad(scope: Scope, credential_id: &str, dek_version: i32) -> Aa
         .text(&scope.tenant().to_string())
         .text(&scope.environment().to_string())
         .field(credential_id.as_bytes())
+        .version(i64::from(dek_version))
+        .build()
+}
+
+/// The AAD binding a sealed `trusted_devices` metadata value (issue #71): the label,
+/// the scope, the per-column `purpose` (`user_agent` or `geo`), the `tdv_` row id (the
+/// per-row transplant binding, exactly like the TOTP seed), and the DEK version. A
+/// device-metadata ciphertext therefore cannot be lifted to another row, subject,
+/// tenant, environment, column, or key version and still open.
+fn trusted_device_meta_seal_aad(
+    scope: Scope,
+    device_id: &str,
+    purpose: &str,
+    dek_version: i32,
+) -> Aad {
+    Aad::builder()
+        .text(TRUSTED_DEVICE_META_SEAL_LABEL)
+        .text(&scope.tenant().to_string())
+        .text(&scope.environment().to_string())
+        .field(device_id.as_bytes())
+        .text(purpose)
         .version(i64::from(dek_version))
         .build()
 }

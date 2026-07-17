@@ -327,7 +327,7 @@ async fn expand_contract_example_chain_runs_all_three_phases_and_contract_remove
 // per real table); splitting it would not make it clearer.
 #[allow(clippy::too_many_lines)]
 #[tokio::test]
-async fn production_chain_is_only_the_fifty_two_real_migrations_and_ships_no_demo_object() {
+async fn production_chain_is_only_the_fifty_three_real_migrations_and_ships_no_demo_object() {
     // TestDatabase::start runs Store::migrate() (the production chain) on a
     // fresh, empty database.
     let db = TestDatabase::start().await;
@@ -344,8 +344,8 @@ async fn production_chain_is_only_the_fifty_two_real_migrations_and_ships_no_dem
     );
     assert_eq!(
         report.already_applied(),
-        52,
-        "the production chain is exactly fifty-two migrations (isolation, audit log, management \
+        53,
+        "the production chain is exactly fifty-three migrations (isolation, audit log, management \
          API, OIDC authorization, signing keys, login/consent, authentication context, redirect \
          registration, UserInfo claims, consent scope upsert, resource servers, opaque access \
          tokens, client auth suite, dynamic client registration, pushed authorization requests, \
@@ -358,16 +358,16 @@ async fn production_chain_is_only_the_fifty_two_real_migrations_and_ships_no_dem
          import, user invitations, flexible identifiers, exit-export credential grants, \
          migration state machine, webauthn credentials, totp credentials, credential abuse \
          defenses, step-up policies, email OTP and scanner-safe magic links, credential-class \
-         policies, guarded SMS OTP, passkey attestation, admin sudo elevations)"
+         policies, guarded SMS OTP, passkey attestation, admin sudo elevations, trusted devices)"
     );
 
-    // The ledger holds exactly versions 1 through 51.
+    // The ledger holds exactly versions 1 through 53.
     assert_eq!(
         applied_versions(pool).await,
         vec![
             1_i64, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
             24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45,
-            46, 47, 48, 49, 50, 51, 52
+            46, 47, 48, 49, 50, 51, 52, 53
         ]
     );
     let phase_of = |version: i64| async move {
@@ -561,6 +561,9 @@ async fn production_chain_is_only_the_fifty_two_real_migrations_and_ships_no_dem
     // The admin-sudo-elevations migration (issue #73) is an EXPAND: one new
     // tenant-scoped append-only ledger table, no rewrite of existing state.
     assert_eq!(phase_of(52).await, "expand");
+    // The trusted-devices migration (issue #71) is an EXPAND: one new tenant-scoped
+    // remember-device state table, no rewrite of existing state.
+    assert_eq!(phase_of(53).await, "expand");
 
     // The step-up second-factor abuse path (issue #72): migration 0047 WIDENED the
     // abuse_bans auth_path CHECK (0046 pinned the closed set) to also admit
@@ -660,6 +663,68 @@ async fn production_chain_is_only_the_fifty_two_real_migrations_and_ships_no_dem
         !column_exists(pool, "account_credentials", "friendly_name").await,
         "account_credentials must have no plaintext friendly_name column after 0036"
     );
+    // The trusted-devices remember-device state (issue #71): a tenant-scoped, RLS-forced
+    // table with the server-side secret digest (never a self-contained token), the
+    // subject+session lineage binding, sealed UA/geo (PII), the max-age/idle duration
+    // columns, and the immediate revoked_at kill switch.
+    assert!(
+        table_exists(pool, "trusted_devices").await,
+        "trusted_devices exists after 0053"
+    );
+    assert!(
+        rls_enabled_and_forced(pool, "trusted_devices").await,
+        "trusted_devices has row-level security ENABLED and FORCED"
+    );
+    for column in [
+        "id",
+        "tenant_id",
+        "environment_id",
+        "subject",
+        "device_secret_hash",
+        "session_lineage",
+        "user_agent_sealed",
+        "geo_sealed",
+        "pii_dek_version",
+        "created_at",
+        "last_seen_at",
+        "max_age_expires_at",
+        "idle_expires_at",
+        "revoked_at",
+        "revoke_reason",
+    ] {
+        assert!(
+            column_exists(pool, "trusted_devices", column).await,
+            "trusted_devices.{column} exists after 0053"
+        );
+    }
+    // The device metadata is end-user PII, sealed under the scope DEK (issue #48): the
+    // plaintext User-Agent and location never land on a column.
+    assert!(
+        !column_exists(pool, "trusted_devices", "user_agent").await,
+        "trusted_devices must have no plaintext user_agent column after 0053"
+    );
+    assert!(
+        !column_exists(pool, "trusted_devices", "geo").await,
+        "trusted_devices must have no plaintext geo column after 0053"
+    );
+    // The revoke-reason CHECK pins the closed set, so an unknown reason can never be
+    // written and the reason is present exactly when the row is revoked.
+    let trusted_device_revoke_check: String = sqlx::query(
+        "SELECT pg_get_constraintdef(oid) AS def FROM pg_catalog.pg_constraint \
+         WHERE conrelid = 'trusted_devices'::regclass \
+         AND conname = 'trusted_devices_revoke_reason_known'",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("trusted_devices revoke-reason check lookup")
+    .get("def");
+    for reason in ["user", "admin", "password_change", "factor_change"] {
+        assert!(
+            trusted_device_revoke_check.contains(reason),
+            "the trusted_devices revoke-reason CHECK must admit {reason}, got: \
+             {trusted_device_revoke_check}"
+        );
+    }
     // The authentication-context columns (issue #14) exist: the recorded login
     // methods on sessions and codes, the frozen auth_time on codes, and the
     // client's require_auth_time registration flag.

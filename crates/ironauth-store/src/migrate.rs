@@ -584,6 +584,12 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0052_admin_sudo_elevations.sql"),
         },
+        Migration {
+            version: 53,
+            name: "trusted_devices",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0053_trusted_devices.sql"),
+        },
     ]
 }
 

@@ -909,32 +909,54 @@ async fn enforce_step_up_policy(
         Err(StoreError::NotFound) => return None,
         Err(_) => return Some(TokenError::ServerError),
     };
-    let (requirement, policy_read_faulted) =
+    let assembled =
         step_up::requirement_for_request(state, scope, &client, oauth_scope, None, None).await;
-    if policy_read_faulted {
+    if assembled.policy_read_faulted {
         return Some(TokenError::ServerError);
     }
-    if requirement.is_empty() {
+    let requirement = assembled.requirement;
+    let methods = authn::parse_methods(auth_methods);
+    // The tenant baseline MFA floor (issue #71) is satisfied at the token endpoint by a
+    // GENUINE second factor on the frozen event OR by the frozen TRUSTED-DEVICE
+    // contribution the authorize gate recorded (the device was validated server-side at
+    // authorize; there is no cookie to re-check here, so the frozen `trusted_device`
+    // method IS the honest attestation). A frozen event that carries neither must
+    // re-authenticate a second factor.
+    let mfa_baseline_unmet = assembled.mfa_baseline_required
+        && !authn::performed_second_factor(&methods)
+        && !authn::includes_trusted_device(&methods);
+    if requirement.is_empty() && !mfa_baseline_unmet {
         return None;
     }
     let order = state.acr_order();
-    let achieved = authn::achieved_acr(&authn::parse_methods(auth_methods));
+    let achieved = authn::achieved_acr(&methods);
     let now_micros = epoch_micros(state.now());
-    match step_up::evaluate(
-        &requirement,
-        achieved,
-        auth_time_unix_micros,
-        now_micros,
-        &order,
-    ) {
-        step_up::Satisfaction::Satisfied => None,
-        step_up::Satisfaction::NeedsStepUp { .. } => {
-            Some(TokenError::InsufficientUserAuthentication {
-                acr_values: requirement.min_acr,
-                max_age: requirement.max_auth_age_secs,
-            })
-        }
+    let explicit_needs_step_up = !requirement.is_empty()
+        && matches!(
+            step_up::evaluate(
+                &requirement,
+                achieved,
+                auth_time_unix_micros,
+                now_micros,
+                &order,
+            ),
+            step_up::Satisfaction::NeedsStepUp { .. }
+        );
+    if explicit_needs_step_up {
+        return Some(TokenError::InsufficientUserAuthentication {
+            acr_values: requirement.min_acr,
+            max_age: requirement.max_auth_age_secs,
+        });
     }
+    if mfa_baseline_unmet {
+        // The tenant baseline MFA floor is unmet: the client must retry after proving a
+        // second factor (its acr is the multi-factor level).
+        return Some(TokenError::InsufficientUserAuthentication {
+            acr_values: Some(authn::acr_for_mfa().to_owned()),
+            max_age: None,
+        });
+    }
+    None
 }
 
 async fn issue_refresh_for_code(

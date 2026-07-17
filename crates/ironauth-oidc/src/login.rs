@@ -132,6 +132,11 @@ pub struct MfaChallengeForm {
     pub code: Option<String>,
     /// The authorization URL to resume at.
     pub return_to: Option<String>,
+    /// The "remember this device" opt-in (issue #71): present (`1`/`on`) when the user
+    /// checked the box on the challenge page. Consulted only when the tenant enables
+    /// trusted devices AND leaves the choice to the user; when the tenant decides, the
+    /// device is remembered regardless of this field.
+    pub remember_device: Option<String>,
 }
 
 /// `GET /login/mfa`: render the step-up second-factor challenge for a valid resume
@@ -172,10 +177,19 @@ pub async fn mfa_challenge_get(
             &resume.return_to,
             None,
             enroll_url.as_deref(),
+            remember_device_offered(&state),
             &resume.hints,
             banner,
         ),
     )
+}
+
+/// Whether the "remember this device" opt-in checkbox is offered on the challenge page
+/// (issue #71): only when the tenant enables trusted devices AND leaves the choice to the
+/// user. When the tenant decides, no checkbox is shown (the device is remembered
+/// regardless); when the feature is off, none is shown either.
+fn remember_device_offered(state: &OidcState) -> bool {
+    state.trusted_devices_enabled() && state.trusted_device_user_opt_in()
 }
 
 /// `POST /login/mfa`: verify the presented second factor and, on success, UPGRADE
@@ -207,6 +221,7 @@ pub async fn mfa_challenge_post(
         return interaction::server_error_page();
     };
     let code = form.code.as_deref().map(str::trim).unwrap_or_default();
+    let show_remember = remember_device_offered(&state);
     let rerender = |message: &str| {
         pages::secure_html(
             StatusCode::OK,
@@ -214,6 +229,7 @@ pub async fn mfa_challenge_post(
                 &resume.return_to,
                 Some(message),
                 None,
+                show_remember,
                 &resume.hints,
                 banner,
             ),
@@ -270,9 +286,53 @@ pub async fn mfa_challenge_post(
             // not throttled for the rest of the window. Best-effort and per-PATH, so it
             // never touches the password or passkey path.
             state.reset_after_success(&ctx).await;
-            interaction::redirect_setting_cookie(&resume.return_to, &cookie)
+            let response = interaction::redirect_setting_cookie(&resume.return_to, &cookie);
+            // Remember-device (issue #71): a COMPLETED multi-factor login may remember
+            // this device so a subsequent login SKIPS the second factor. The trust
+            // descends from the session that just proved the second factor (the lineage).
+            // Best-effort: a failed remember never fails the successful login.
+            maybe_remember_device(
+                &state,
+                resume.scope,
+                &subject,
+                &session.session_id,
+                &headers,
+                form.remember_device.as_deref(),
+                response,
+            )
+            .await
         }
         Err(_) => interaction::server_error_page(),
+    }
+}
+
+/// Decide whether to REMEMBER this device after a completed multi-factor login (issue
+/// #71) and, when so, plant the remember-device cookie on `response`. The device is
+/// remembered when the tenant enables trusted devices AND either the tenant decides
+/// (no user opt-in) or the user checked the "remember this device" box. Best-effort: a
+/// disabled feature, an unchecked box, or a persistence fault simply leaves `response`
+/// unchanged, so the successful login is never affected.
+async fn maybe_remember_device(
+    state: &OidcState,
+    scope: Scope,
+    subject: &UserId,
+    session_id: &ironauth_store::SessionId,
+    headers: &HeaderMap,
+    remember_opt_in: Option<&str>,
+    response: Response,
+) -> Response {
+    if !state.trusted_devices_enabled() {
+        return response;
+    }
+    // When the tenant leaves the choice to the user, honor the checkbox; when the tenant
+    // decides, always remember.
+    let opted_in = matches!(remember_opt_in, Some("1" | "on" | "true"));
+    if state.trusted_device_user_opt_in() && !opted_in {
+        return response;
+    }
+    match crate::trusted_device::remember_device(state, scope, subject, session_id, headers).await {
+        Some(cookie) => interaction::append_set_cookie(response, &cookie),
+        None => response,
     }
 }
 
@@ -294,6 +354,9 @@ fn throttled_mfa_challenge_page(
             return_to,
             Some("Too many attempts. Wait a moment and try again."),
             None,
+            // A throttle response is a dead-end retry page; the remember-device opt-in is
+            // offered on the real challenge page, not here.
+            false,
             hints,
             environment_banner,
         ),
