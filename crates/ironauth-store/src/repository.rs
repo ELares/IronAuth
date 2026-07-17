@@ -78,12 +78,12 @@ use crate::id::{
     EncryptedSecretId, EnvironmentId, EnvironmentSecretId, ExternalIssuerId,
     FederationLoginStateId, GrantId, InitialAccessTokenId, InvitationId, IssuedTokenId, KekId,
     MagicLinkTokenId, ManagementKeyId, Mds3BlobCacheId, MigrationRunId, MigrationRunRecordId,
-    OperatorId, OrganizationId, PowChallengeId, PushedRequestId, RecoveryCodeId, RecoveryFlowId,
-    RefreshFamilyId, RefreshTokenId, ResourceServerId, RiskDecisionId, RiskDisavowalId,
-    RiskLoginGeoId, ScopeStepUpPolicyId, ServiceAccountId, SessionEventId, SessionId, SigningKeyId,
-    SmsOtpCodeId, SmsRouteStatId, TenantId, TotpCredentialId, TraitMigrationJobId, TraitSchemaId,
-    TrustedDeviceId, UserId, UserIdentifierId, VariableId, WebauthnChallengeId,
-    WebauthnCredentialId,
+    OperatorId, OrgConnectionId, OrganizationId, PowChallengeId, PushedRequestId, RecoveryCodeId,
+    RecoveryFlowId, RefreshFamilyId, RefreshTokenId, ResourceServerId, RiskDecisionId,
+    RiskDisavowalId, RiskLoginGeoId, RoutingRuleId, ScopeStepUpPolicyId, ServiceAccountId,
+    SessionEventId, SessionId, SigningKeyId, SmsOtpCodeId, SmsRouteStatId, TenantId,
+    TotpCredentialId, TraitMigrationJobId, TraitSchemaId, TrustedDeviceId, UserId,
+    UserIdentifierId, VariableId, WebauthnChallengeId, WebauthnCredentialId,
 };
 use crate::identifier::{
     CanonicalIdentifier, IdentifierType, UniquenessMode, canonicalize_identifier,
@@ -439,6 +439,31 @@ impl<'a> ScopedStore<'a> {
     #[must_use]
     pub fn federation_login_states(&self) -> FederationLoginStateRepo<'a> {
         FederationLoginStateRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
+    /// The read-only organization-to-connector binding repository for this scope
+    /// (issue #77): read a binding by id and list the scope's bindings (for the login
+    /// routing path and the config-snapshot export). The mutating create lives on
+    /// [`ActingStore::org_connections`].
+    #[must_use]
+    pub fn org_connections(&self) -> OrgConnectionRepo<'a> {
+        OrgConnectionRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
+    /// The read-only routing-rule repository for this scope (issue #77): resolve the
+    /// routing rule that matches a submitted email domain, an app client id, or a
+    /// canonical user identifier (each a single row through its per-scope unique
+    /// index), and list the scope's rules for the config-snapshot export. The mutating
+    /// create lives on [`ActingStore::routing_rules`].
+    #[must_use]
+    pub fn routing_rules(&self) -> RoutingRuleRepo<'a> {
+        RoutingRuleRepo {
             store: self.store,
             scope: self.scope,
         }
@@ -1071,6 +1096,31 @@ impl<'a> ActingStore<'a> {
     #[must_use]
     pub fn connectors(&self) -> ActingConnectorRepo<'a> {
         ActingConnectorRepo {
+            store: self.store,
+            scope: self.scope,
+            acting: self.acting,
+        }
+    }
+
+    /// The mutating organization-to-connector binding repository for this scope and
+    /// actor (issue #77): create a binding (audited). Every write carries the actor
+    /// and correlation id into its audit row.
+    #[must_use]
+    pub fn org_connections(&self) -> ActingOrgConnectionRepo<'a> {
+        ActingOrgConnectionRepo {
+            store: self.store,
+            scope: self.scope,
+            acting: self.acting,
+        }
+    }
+
+    /// The mutating routing-rule repository for this scope and actor (issue #77):
+    /// create a domain, app, or user routing rule (audited). A conflicting second
+    /// mapping for the same selector in the scope is refused by the per-scope unique
+    /// index (the structural routing-confusion defence).
+    #[must_use]
+    pub fn routing_rules(&self) -> ActingRoutingRuleRepo<'a> {
+        ActingRoutingRuleRepo {
             store: self.store,
             scope: self.scope,
             acting: self.acting,
@@ -11669,6 +11719,35 @@ impl UserRepo<'_> {
         Ok(Some(record))
     }
 
+    /// The organization-to-connector binding stamped on a user (issue #77), or [`None`]
+    /// when the user was not provisioned through org routing. Read scope-bound; a
+    /// tombstoned user reads as absent (an out-of-scope or malformed stored value is
+    /// the uniform not-found).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the user is out of scope or absent;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn org_connection(&self, id: &UserId) -> Result<Option<OrgConnectionId>, StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT org_connection_id FROM users \
+             WHERE id = $1 AND tenant_id = $2 AND environment_id = $3 AND deleted_at IS NULL",
+        )
+        .bind(id.to_string())
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        let row = row.ok_or(StoreError::NotFound)?;
+        let stored: Option<String> = row.get("org_connection_id");
+        Ok(stored.and_then(|value| OrgConnectionId::parse_in_scope(&value, &self.scope).ok()))
+    }
+
     /// One page of live users matching `filter`, ordered by `(created_at, id)`,
     /// starting strictly after `after` (issue #52). The filter searches by
     /// lifecycle state, by external id, and by login handle within this scope; the
@@ -12299,6 +12378,65 @@ impl ActingUserRepo<'_> {
         )
         .await?;
         Ok(id)
+    }
+
+    /// STAMP the organization-to-connector binding on a user (issue #77), auditing
+    /// `user.update` in the same transaction. The JIT federated-provisioning path calls
+    /// this after a routed login so the (new or returning) user records which org
+    /// connection routed it; the identity key stays the verified `(issuer, sub)`
+    /// composite (issue #75 HIGH-1), so a returning login updates the stamp in place
+    /// without ever creating a second user. Idempotent: re-stamping the same binding is
+    /// a no-op write. The org connection must be in this scope.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the user or org connection is out of scope, or the
+    /// user is absent; [`StoreError::Database`] on a persistence failure.
+    pub async fn set_org_connection(
+        &self,
+        env: &Env,
+        id: &UserId,
+        org_connection_id: &OrgConnectionId,
+    ) -> Result<(), StoreError> {
+        if id.scope() != self.scope || org_connection_id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let id = *id;
+        let scope = self.scope;
+        let org_connection = org_connection_id.to_string();
+        let updated_micros = epoch_micros(env.clock().now_utc());
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::UserUpdate,
+                target: &id,
+            },
+            async move |tx| {
+                let affected = sqlx::query(
+                    "UPDATE users SET org_connection_id = $4, \
+                     updated_at = TIMESTAMPTZ 'epoch' + ($5::text || ' microseconds')::interval \
+                     WHERE id = $1 AND tenant_id = $2 AND environment_id = $3 \
+                       AND deleted_at IS NULL",
+                )
+                .bind(id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(&org_connection)
+                .bind(updated_micros)
+                .execute(&mut **tx)
+                .await?
+                .rows_affected();
+                if affected == 0 {
+                    return Err(StoreError::NotFound);
+                }
+                Ok(())
+            },
+            false,
+        )
+        .await
     }
 
     /// Record that a full identity EXPORT was served for this scope (issue #58),
@@ -18773,9 +18911,9 @@ impl FederationLoginStateRepo<'_> {
         let result = sqlx::query(
             "INSERT INTO federation_login_states \
              (id, tenant_id, environment_id, state, nonce, code_verifier_sealed, \
-              code_verifier_dek_version, connector_id, return_to, expires_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, \
-                     TIMESTAMPTZ 'epoch' + ($10::text || ' microseconds')::interval)",
+              code_verifier_dek_version, connector_id, return_to, org_connection_id, expires_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, \
+                     TIMESTAMPTZ 'epoch' + ($11::text || ' microseconds')::interval)",
         )
         .bind(id.to_string())
         .bind(scope.tenant().to_string())
@@ -18786,6 +18924,7 @@ impl FederationLoginStateRepo<'_> {
         .bind(dek_version)
         .bind(params.connector_id)
         .bind(params.return_to)
+        .bind(params.org_connection_id)
         .bind(params.expires_at_unix_micros)
         .execute(&mut *tx)
         .await;
@@ -18824,7 +18963,7 @@ impl FederationLoginStateRepo<'_> {
                AND consumed_at IS NULL \
                AND expires_at > TIMESTAMPTZ 'epoch' + ($2::text || ' microseconds')::interval \
              RETURNING id, nonce, code_verifier_sealed, code_verifier_dek_version, \
-                       connector_id, return_to",
+                       connector_id, return_to, org_connection_id",
         )
         .bind(state)
         .bind(now_unix_micros)
@@ -18851,6 +18990,7 @@ impl FederationLoginStateRepo<'_> {
             code_verifier,
             connector_id: row.get("connector_id"),
             return_to: row.get("return_to"),
+            org_connection_id: row.get("org_connection_id"),
         };
         tx.commit().await?;
         Ok(Some(consumed))
@@ -19121,6 +19261,703 @@ impl From<ConnectorCapabilities<'_>> for OwnedConnectorCapabilities {
             logout_propagation: caps.logout_propagation,
             email_verified_trust: caps.email_verified_trust.to_owned(),
         }
+    }
+}
+
+// ===========================================================================
+// Enterprise inbound routing: org connections and routing rules (issue #77)
+// ===========================================================================
+
+/// A secret-free organization-to-connector binding record (issue #77). The broker
+/// overlay policy columns are shipped NULLABLE and a later PR fills and enforces them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrgConnectionRecord {
+    /// The `ocn_` binding id.
+    pub id: OrgConnectionId,
+    /// The `org_` organization this binding belongs to.
+    pub organization_id: String,
+    /// The `cnr_` connector describing the organization's upstream.
+    pub connector_id: String,
+    /// The broker overlay minimum acr (a later PR enforces it), or [`None`].
+    pub overlay_min_acr: Option<String>,
+    /// The broker overlay maximum authentication age in seconds, or [`None`].
+    pub max_age_secs: Option<i64>,
+    /// The broker overlay minimum credential class (a rung of the ladder), or [`None`].
+    pub overlay_min_class: Option<String>,
+    /// Whether a later PR captures the upstream tokens after a brokered login.
+    pub capture_upstream_tokens: bool,
+    /// Whether the binding is active.
+    pub enabled: bool,
+    /// The creation instant in epoch microseconds (from the clock seam at write time).
+    pub created_at_unix_micros: i64,
+    /// The last-update instant in epoch microseconds.
+    pub updated_at_unix_micros: i64,
+}
+
+/// A routing-rule record (issue #77). Exactly one selector is present, matching
+/// `rule_kind`; the user selector is an opaque blind index, never a plaintext handle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoutingRuleRecord {
+    /// The `rrl_` rule id.
+    pub id: RoutingRuleId,
+    /// The selector kind (`domain`, `app`, or `user`).
+    pub rule_kind: String,
+    /// The normalized email domain, present iff `rule_kind` is `domain`.
+    pub domain_norm: Option<String>,
+    /// The app client id, present iff `rule_kind` is `app`.
+    pub client_id: Option<String>,
+    /// The blind index of the canonical login identifier, present iff `rule_kind` is
+    /// `user`. Never a plaintext identifier.
+    pub user_bidx: Option<Vec<u8>>,
+    /// The `ocn_` org connection a matching login routes to.
+    pub org_connection_id: String,
+    /// The evaluation priority.
+    pub priority: i32,
+    /// Whether the rule is active.
+    pub enabled: bool,
+    /// The creation instant in epoch microseconds.
+    pub created_at_unix_micros: i64,
+    /// The last-update instant in epoch microseconds.
+    pub updated_at_unix_micros: i64,
+}
+
+/// The columns an org-connection read projects (issue #77). No secret column exists.
+const ORG_CONNECTION_READ_COLUMNS: &str = "id, organization_id, connector_id, overlay_min_acr, \
+     max_age_secs, overlay_min_class, capture_upstream_tokens, enabled, \
+     (EXTRACT(EPOCH FROM created_at) * 1000000)::bigint AS created_us, \
+     (EXTRACT(EPOCH FROM updated_at) * 1000000)::bigint AS updated_us";
+
+/// The columns a routing-rule read projects (issue #77).
+const ROUTING_RULE_READ_COLUMNS: &str = "id, rule_kind, domain_norm, client_id, user_bidx, \
+     org_connection_id, priority, enabled, \
+     (EXTRACT(EPOCH FROM created_at) * 1000000)::bigint AS created_us, \
+     (EXTRACT(EPOCH FROM updated_at) * 1000000)::bigint AS updated_us";
+
+/// Reconstruct an [`OrgConnectionRecord`] from a read row.
+fn org_connection_record_from_row(
+    row: &sqlx::postgres::PgRow,
+    scope: Scope,
+) -> Result<OrgConnectionRecord, StoreError> {
+    let id_text: String = row.get("id");
+    let id = OrgConnectionId::parse_in_scope(&id_text, &scope).map_err(|_| StoreError::NotFound)?;
+    Ok(OrgConnectionRecord {
+        id,
+        organization_id: row.get("organization_id"),
+        connector_id: row.get("connector_id"),
+        overlay_min_acr: row.get("overlay_min_acr"),
+        max_age_secs: row.get("max_age_secs"),
+        overlay_min_class: row.get("overlay_min_class"),
+        capture_upstream_tokens: row.get("capture_upstream_tokens"),
+        enabled: row.get("enabled"),
+        created_at_unix_micros: row.get("created_us"),
+        updated_at_unix_micros: row.get("updated_us"),
+    })
+}
+
+/// Reconstruct a [`RoutingRuleRecord`] from a read row.
+fn routing_rule_record_from_row(
+    row: &sqlx::postgres::PgRow,
+    scope: Scope,
+) -> Result<RoutingRuleRecord, StoreError> {
+    let id_text: String = row.get("id");
+    let id = RoutingRuleId::parse_in_scope(&id_text, &scope).map_err(|_| StoreError::NotFound)?;
+    Ok(RoutingRuleRecord {
+        id,
+        rule_kind: row.get("rule_kind"),
+        domain_norm: row.get("domain_norm"),
+        client_id: row.get("client_id"),
+        user_bidx: row.get("user_bidx"),
+        org_connection_id: row.get("org_connection_id"),
+        priority: row.get("priority"),
+        enabled: row.get("enabled"),
+        created_at_unix_micros: row.get("created_us"),
+        updated_at_unix_micros: row.get("updated_us"),
+    })
+}
+
+/// Infer the [`IdentifierType`] of a raw login handle for a per-user routing rule
+/// (issue #77): an `@` is an email, everything else a username. The inference need only
+/// be STABLE so the routing-rule write and the login lookup blind-index the same handle
+/// identically; phones are not a routing selector.
+fn routing_identifier_kind(raw: &str) -> IdentifierType {
+    if raw.contains('@') {
+        IdentifierType::Email
+    } else {
+        IdentifierType::Username
+    }
+}
+
+/// The blind-index context for a `routing_rules.user_bidx` (issue #77): its own label
+/// (domain-separated from the users blind index), the scope, and the CANONICAL login
+/// identifier, length-prefixed. The per-tenant HMAC key means the same handle in two
+/// tenants maps to two different tags, so a routing selector never leaks across scopes.
+fn routing_user_bidx_aad(scope: Scope, canonical_identifier: &str) -> Aad {
+    Aad::builder()
+        .text("ironauth.envelope.routing-user-bidx.v1")
+        .text(&scope.tenant().to_string())
+        .text(&scope.environment().to_string())
+        .field(canonical_identifier.as_bytes())
+        .build()
+}
+
+/// The deterministic blind index for a per-user routing rule (issue #77): canonicalize
+/// the raw login handle through the one identifier seam, then HMAC it under the scope's
+/// per-tenant key. The write and the lookup both call this, so a rule stored for a user
+/// matches the login they submit.
+fn routing_user_blind_index(master: &MasterKey, scope: Scope, raw_identifier: &str) -> BlindIndex {
+    let canonical =
+        canonicalize_identifier(routing_identifier_kind(raw_identifier), raw_identifier);
+    master.blind_index(&routing_user_bidx_aad(scope, canonical.as_str()))
+}
+
+/// The domain-separation label of a federation routing token's keyed MAC (issue #77
+/// security fix). Distinct from every other blind-index label so a token MAC can never
+/// be confused with, or replayed as, another index under the same master key.
+const ROUTING_TOKEN_LABEL: &str = "federation.routing.token.v1";
+
+/// The maximum accepted length of a routing token string. A well-formed token is well
+/// under this (an `ocn_` id, an 8-byte expiry, and a 32-byte MAC, each base64url). The
+/// bound makes `verify_routing_token` fail closed on a hostile oversized input before it
+/// allocates, rather than decode an unbounded blob.
+const ROUTING_TOKEN_MAX_LEN: usize = 256;
+
+/// The keyed-MAC context for a federation routing token (issue #77 security fix). It
+/// binds, length-prefixed and domain-separated: the token label, the scope
+/// (tenant + environment), the connector slug the token is minted for, the org
+/// connection id it authorizes, and the expiry instant. Because ALL of these are under
+/// the MAC, a token cannot be swapped to another org connection under the same
+/// connector, replayed on another connector, used cross-scope, or replayed after expiry.
+fn routing_token_aad(
+    scope: Scope,
+    connector_slug: &str,
+    org_connection_id: &str,
+    expires_at_micros: i64,
+) -> Aad {
+    Aad::builder()
+        .text(ROUTING_TOKEN_LABEL)
+        .text(&scope.tenant().to_string())
+        .text(&scope.environment().to_string())
+        .text(connector_slug)
+        .text(org_connection_id)
+        .version(expires_at_micros)
+        .build()
+}
+
+/// Encode a routing token as `base64url(org_connection_id) "." base64url(expiry LE) "."
+/// base64url(mac)` (issue #77 security fix). The three parts are the value the verifier
+/// re-binds into the MAC context; the MAC authenticates all of them.
+fn encode_routing_token(org_connection_id: &str, expires_at_micros: i64, mac: &[u8]) -> String {
+    format!(
+        "{}.{}.{}",
+        URL_SAFE_NO_PAD.encode(org_connection_id.as_bytes()),
+        URL_SAFE_NO_PAD.encode(expires_at_micros.to_le_bytes()),
+        URL_SAFE_NO_PAD.encode(mac),
+    )
+}
+
+/// Parse a routing token into `(org_connection_id, expires_at_micros, mac)`, failing
+/// closed to [`None`] on ANY malformed or oversized input (issue #77 security fix): an
+/// oversized string, not exactly three `.`-separated parts, a non-base64url part, a
+/// non-UTF-8 org connection id, or an expiry that is not exactly eight bytes. No branch
+/// here depends on the MAC value, so a malformed token is uniformly rejected.
+fn decode_routing_token(token: &str) -> Option<(String, i64, Vec<u8>)> {
+    if token.len() > ROUTING_TOKEN_MAX_LEN {
+        return None;
+    }
+    let mut parts = token.split('.');
+    let ocn_b64 = parts.next()?;
+    let expiry_b64 = parts.next()?;
+    let mac_b64 = parts.next()?;
+    if parts.next().is_some() {
+        // More than three parts: not a well-formed token.
+        return None;
+    }
+    let ocn_bytes = URL_SAFE_NO_PAD.decode(ocn_b64).ok()?;
+    let org_connection_id = String::from_utf8(ocn_bytes).ok()?;
+    let expiry_bytes = URL_SAFE_NO_PAD.decode(expiry_b64).ok()?;
+    let expiry_arr: [u8; 8] = expiry_bytes.try_into().ok()?;
+    let expires_at_micros = i64::from_le_bytes(expiry_arr);
+    let mac = URL_SAFE_NO_PAD.decode(mac_b64).ok()?;
+    Some((org_connection_id, expires_at_micros, mac))
+}
+
+/// The read-only organization-to-connector binding repository (issue #77). Every read
+/// is scope-bound; a binding holds no secret, so a read is secret-free by construction.
+pub struct OrgConnectionRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl OrgConnectionRepo<'_> {
+    /// Parse an org-connection id string, confirming it is in this scope. A malformed
+    /// or out-of-scope id is the uniform [`StoreError::NotFound`] (the anti-oracle
+    /// boundary).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the id is malformed or out of scope.
+    pub fn parse_id(&self, raw: &str) -> Result<OrgConnectionId, StoreError> {
+        OrgConnectionId::parse_in_scope(raw, &self.scope).map_err(|_| StoreError::NotFound)
+    }
+
+    /// A binding by id (issue #77): the callback re-derives the organization from the
+    /// consumed correlation row's `ocn_` id and reads it here.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the id is out of scope or absent;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn get(&self, id: &OrgConnectionId) -> Result<OrgConnectionRecord, StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(&format!(
+            "SELECT {ORG_CONNECTION_READ_COLUMNS} FROM org_connections \
+             WHERE tenant_id = $1 AND environment_id = $2 AND id = $3"
+        ))
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(id.to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        let row = row.ok_or(StoreError::NotFound)?;
+        org_connection_record_from_row(&row, self.scope)
+    }
+
+    /// Mint a server-authenticated routing token for a login that has been routed to
+    /// `org_connection_id` under this connector (issue #77 security fix). The token is a
+    /// keyed MAC (a domain-separated subkey of the master key, the SAME primitive as the
+    /// blind indexes) over the scope, the connector slug, the org connection id, and the
+    /// expiry, so the browser cannot swap the org connection to another one that shares
+    /// the connector on the login -> authorize redirect hop. `expires_at_micros` is the
+    /// CALLER's clock plus a short TTL (the token only needs to survive that one hop); the
+    /// store never reads the wall clock. The verifier is [`Self::verify_routing_token`].
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Encryption`] if no platform master key is configured (the token path
+    /// fails closed rather than mint an unauthenticated selector).
+    pub fn mint_routing_token(
+        &self,
+        org_connection_id: &str,
+        connector_slug: &str,
+        expires_at_micros: i64,
+    ) -> Result<String, StoreError> {
+        let master = self.store.master().ok_or(StoreError::Encryption)?;
+        let mac = master.blind_index(&routing_token_aad(
+            self.scope,
+            connector_slug,
+            org_connection_id,
+            expires_at_micros,
+        ));
+        Ok(encode_routing_token(
+            org_connection_id,
+            expires_at_micros,
+            mac.as_bytes(),
+        ))
+    }
+
+    /// Verify a routing token presented at the federated authorize leg (issue #77
+    /// security fix), returning the org connection id it authorizes ONLY when the MAC is
+    /// valid and the token is unexpired, else [`None`]. Fail-closed and oracle-free: any
+    /// malformed, oversized, tampered, cross-connector, cross-scope, or expired token is
+    /// uniformly [`None`]. The MAC is recomputed under THIS scope and the passed
+    /// `connector_slug` and compared in CONSTANT TIME, so a token minted for one org
+    /// connection cannot be swapped to a sibling under the same connector, replayed on
+    /// another connector, used cross-scope, or replayed past `now_micros`. `now_micros` is
+    /// the CALLER's clock; the store never reads the wall clock.
+    #[must_use]
+    pub fn verify_routing_token(
+        &self,
+        token: &str,
+        connector_slug: &str,
+        now_micros: i64,
+    ) -> Option<String> {
+        // No master key means no way to authenticate the token: fail closed.
+        let master = self.store.master()?;
+        let (org_connection_id, expires_at_micros, presented_mac) = decode_routing_token(token)?;
+        // Expiry via the caller's clock. Reject at or after the expiry instant.
+        if now_micros >= expires_at_micros {
+            return None;
+        }
+        let expected = master.blind_index(&routing_token_aad(
+            self.scope,
+            connector_slug,
+            &org_connection_id,
+            expires_at_micros,
+        ));
+        // Constant-time compare: never `==` on the raw MAC bytes.
+        if expected.ct_eq(&presented_mac) {
+            Some(org_connection_id)
+        } else {
+            None
+        }
+    }
+
+    /// Every binding in the scope, ordered by the stable `(created_at, id)` key, for
+    /// the config-snapshot export (issue #77). Scope-bound.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn list_all(&self) -> Result<Vec<OrgConnectionRecord>, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let rows = sqlx::query(&format!(
+            "SELECT {ORG_CONNECTION_READ_COLUMNS} FROM org_connections \
+             WHERE tenant_id = $1 AND environment_id = $2 ORDER BY created_at, id"
+        ))
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        rows.iter()
+            .map(|row| org_connection_record_from_row(row, self.scope))
+            .collect()
+    }
+}
+
+/// The read-only routing-rule repository (issue #77). Each selector lookup resolves at
+/// most one enabled row through its per-scope unique index; the pure precedence
+/// decision (per-user > per-app > per-domain) lives in the OIDC routing module.
+pub struct RoutingRuleRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl RoutingRuleRepo<'_> {
+    /// The enabled domain rule for `domain_norm` (already NFKC-normalized and case-
+    /// folded by the caller, via `ironauth_store::normalize_routing_domain`), or
+    /// [`None`]. At most one exists per scope (the per-scope domain unique index).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn by_domain(
+        &self,
+        domain_norm: &str,
+    ) -> Result<Option<RoutingRuleRecord>, StoreError> {
+        self.by_selector("domain", "domain_norm", domain_norm).await
+    }
+
+    /// The enabled app rule for `client_id`, or [`None`]. At most one exists per scope.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn by_app(&self, client_id: &str) -> Result<Option<RoutingRuleRecord>, StoreError> {
+        self.by_selector("app", "client_id", client_id).await
+    }
+
+    /// The enabled user rule for the canonical form of `identifier`, or [`None`]. The
+    /// identifier is canonicalized and blind-indexed through the one routing blind
+    /// index, so a rule stored for a user matches the handle they submit. At most one
+    /// exists per scope.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Encryption`] if no platform master key is configured;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn by_user_identifier(
+        &self,
+        identifier: &str,
+    ) -> Result<Option<RoutingRuleRecord>, StoreError> {
+        let master = self.store.master().ok_or(StoreError::Encryption)?;
+        let bidx = routing_user_blind_index(master, self.scope, identifier);
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(&format!(
+            "SELECT {ROUTING_RULE_READ_COLUMNS} FROM routing_rules \
+             WHERE tenant_id = $1 AND environment_id = $2 \
+             AND rule_kind = 'user' AND enabled AND user_bidx = $3"
+        ))
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(bidx.into_bytes())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        row.map(|row| routing_rule_record_from_row(&row, self.scope))
+            .transpose()
+    }
+
+    /// The shared selector lookup for the plaintext-selector kinds (`domain`, `app`).
+    async fn by_selector(
+        &self,
+        rule_kind: &str,
+        column: &str,
+        value: &str,
+    ) -> Result<Option<RoutingRuleRecord>, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        // `column` is one of the two fixed literals passed by the two public callers,
+        // never caller input, so the format is not an injection surface.
+        let row = sqlx::query(&format!(
+            "SELECT {ROUTING_RULE_READ_COLUMNS} FROM routing_rules \
+             WHERE tenant_id = $1 AND environment_id = $2 \
+             AND rule_kind = $3 AND enabled AND {column} = $4"
+        ))
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(rule_kind)
+        .bind(value)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        row.map(|row| routing_rule_record_from_row(&row, self.scope))
+            .transpose()
+    }
+
+    /// Every routing rule in the scope, ordered by the stable `(created_at, id)` key,
+    /// for the config-snapshot export (issue #77). Scope-bound.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn list_all(&self) -> Result<Vec<RoutingRuleRecord>, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let rows = sqlx::query(&format!(
+            "SELECT {ROUTING_RULE_READ_COLUMNS} FROM routing_rules \
+             WHERE tenant_id = $1 AND environment_id = $2 ORDER BY created_at, id"
+        ))
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        rows.iter()
+            .map(|row| routing_rule_record_from_row(row, self.scope))
+            .collect()
+    }
+}
+
+/// A new organization-to-connector binding (issue #77). The broker overlay policy
+/// columns ship NULLABLE and unset in PR 1; a later PR fills and enforces them.
+#[derive(Debug, Clone, Copy)]
+pub struct NewOrgConnection<'a> {
+    /// The organization this binding belongs to (validated in scope on write).
+    pub organization_id: &'a OrganizationId,
+    /// The connector describing the organization's upstream (validated in scope).
+    pub connector_id: &'a ConnectorId,
+    /// Whether a later PR captures the upstream tokens after a brokered login.
+    pub capture_upstream_tokens: bool,
+    /// Whether the binding is active.
+    pub enabled: bool,
+}
+
+/// The one selector a routing rule carries (issue #77): exactly one, matching the
+/// stored `rule_kind`. A domain is normalized and a user handle is blind-indexed on
+/// write; an app selector is a client id.
+#[derive(Debug, Clone, Copy)]
+pub enum RoutingSelector<'a> {
+    /// Route by email DOMAIN. The value is normalized on write.
+    Domain(&'a str),
+    /// Route by the OAuth CLIENT initiating the login.
+    App(&'a str),
+    /// Route a single USER by their raw login identifier (blind-indexed on write).
+    User(&'a str),
+}
+
+/// A new routing rule (issue #77): one selector mapped to an org connection.
+#[derive(Debug, Clone, Copy)]
+pub struct NewRoutingRule<'a> {
+    /// The single selector this rule matches.
+    pub selector: RoutingSelector<'a>,
+    /// The org connection a matching login routes to (validated in scope on write).
+    pub org_connection_id: &'a OrgConnectionId,
+    /// The evaluation priority.
+    pub priority: i32,
+    /// Whether the rule is active.
+    pub enabled: bool,
+}
+
+/// The mutating organization-to-connector binding repository (issue #77): create a
+/// binding (audited). Every write is scope-bound and carries the actor into its audit
+/// row.
+pub struct ActingOrgConnectionRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+    acting: ActingContext,
+}
+
+impl ActingOrgConnectionRepo<'_> {
+    /// CREATE an organization-to-connector binding (issue #77), auditing
+    /// `org_connection.create` in the same transaction. The `id` and
+    /// `created_at_micros` are supplied by the caller (minted from the entropy and
+    /// clock seams). The organization and connector must both be in this scope.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the id, organization, or connector is out of scope;
+    /// [`StoreError::Conflict`] if a binding for the same (organization, connector)
+    /// already exists in this scope; [`StoreError::Database`] on a persistence failure.
+    pub async fn create(
+        &self,
+        env: &Env,
+        id: &OrgConnectionId,
+        created_at_micros: i64,
+        params: NewOrgConnection<'_>,
+    ) -> Result<(), StoreError> {
+        if id.scope() != self.scope
+            || params.organization_id.scope() != self.scope
+            || params.connector_id.scope() != self.scope
+        {
+            return Err(StoreError::NotFound);
+        }
+        let id = *id;
+        let scope = self.scope;
+        let organization_id = params.organization_id.to_string();
+        let connector_id = params.connector_id.to_string();
+        let capture = params.capture_upstream_tokens;
+        let enabled = params.enabled;
+        let detail = format!("organization={organization_id} connector={connector_id}");
+        write_audited_detailed(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::OrgConnectionCreate,
+                target: &id,
+            },
+            async move |tx| {
+                let result = sqlx::query(
+                    "INSERT INTO org_connections \
+                     (id, tenant_id, environment_id, organization_id, connector_id, \
+                      capture_upstream_tokens, enabled, created_at, updated_at) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, \
+                             TIMESTAMPTZ 'epoch' + ($8::text || ' microseconds')::interval, \
+                             TIMESTAMPTZ 'epoch' + ($8::text || ' microseconds')::interval)",
+                )
+                .bind(id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(&organization_id)
+                .bind(&connector_id)
+                .bind(capture)
+                .bind(enabled)
+                .bind(created_at_micros)
+                .execute(&mut **tx)
+                .await;
+                match result {
+                    Ok(_) => {}
+                    Err(error) if is_unique_violation(&error) => return Err(StoreError::Conflict),
+                    Err(error) => return Err(error.into()),
+                }
+                Ok(())
+            },
+            false,
+            Some(&detail),
+        )
+        .await
+    }
+}
+
+/// The mutating routing-rule repository (issue #77): create a domain, app, or user
+/// rule (audited). A conflicting second mapping for the same selector in the scope is
+/// REFUSED by the per-scope unique index (the structural routing-confusion defence),
+/// surfaced as [`StoreError::Conflict`].
+pub struct ActingRoutingRuleRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+    acting: ActingContext,
+}
+
+impl ActingRoutingRuleRepo<'_> {
+    /// CREATE a routing rule (issue #77), auditing `routing_rule.create` in the same
+    /// transaction. A domain selector is normalized and a user selector is blind-
+    /// indexed on write, so a stored rule matches a submitted login identically.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the id or org connection is out of scope, or the
+    /// selector normalizes to empty; [`StoreError::Encryption`] if a user selector is
+    /// used with no platform master key; [`StoreError::Conflict`] if an enabled rule
+    /// for the same selector already exists in this scope (the per-scope unique index);
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn create(
+        &self,
+        env: &Env,
+        id: &RoutingRuleId,
+        created_at_micros: i64,
+        params: NewRoutingRule<'_>,
+    ) -> Result<(), StoreError> {
+        if id.scope() != self.scope || params.org_connection_id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        // Resolve the selector to its (rule_kind, domain_norm, client_id, user_bidx)
+        // columns BEFORE the transaction, so a shapeless selector fails cleanly.
+        let (rule_kind, domain_norm, client_id_sel, user_bidx): (
+            &str,
+            Option<String>,
+            Option<String>,
+            Option<Vec<u8>>,
+        ) = match params.selector {
+            RoutingSelector::Domain(raw) => {
+                let normalized =
+                    crate::identifier::normalize_routing_domain(raw).ok_or(StoreError::NotFound)?;
+                ("domain", Some(normalized), None, None)
+            }
+            RoutingSelector::App(client_id) => {
+                if client_id.is_empty() {
+                    return Err(StoreError::NotFound);
+                }
+                ("app", None, Some(client_id.to_owned()), None)
+            }
+            RoutingSelector::User(raw) => {
+                let master = self.store.master().ok_or(StoreError::Encryption)?;
+                let bidx = routing_user_blind_index(master, self.scope, raw);
+                ("user", None, None, Some(bidx.into_bytes()))
+            }
+        };
+        let id = *id;
+        let scope = self.scope;
+        let org_connection_id = params.org_connection_id.to_string();
+        let priority = params.priority;
+        let enabled = params.enabled;
+        let detail = format!("kind={rule_kind}");
+        write_audited_detailed(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::RoutingRuleCreate,
+                target: &id,
+            },
+            async move |tx| {
+                let result = sqlx::query(
+                    "INSERT INTO routing_rules \
+                     (id, tenant_id, environment_id, rule_kind, domain_norm, client_id, \
+                      user_bidx, org_connection_id, priority, enabled, created_at, updated_at) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, \
+                             TIMESTAMPTZ 'epoch' + ($11::text || ' microseconds')::interval, \
+                             TIMESTAMPTZ 'epoch' + ($11::text || ' microseconds')::interval)",
+                )
+                .bind(id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(rule_kind)
+                .bind(&domain_norm)
+                .bind(&client_id_sel)
+                .bind(&user_bidx)
+                .bind(&org_connection_id)
+                .bind(priority)
+                .bind(enabled)
+                .bind(created_at_micros)
+                .execute(&mut **tx)
+                .await;
+                match result {
+                    Ok(_) => {}
+                    Err(error) if is_unique_violation(&error) => return Err(StoreError::Conflict),
+                    Err(error) => return Err(error.into()),
+                }
+                Ok(())
+            },
+            false,
+            Some(&detail),
+        )
+        .await
     }
 }
 
@@ -28917,6 +29754,10 @@ async fn read_promoted_snapshot(
             // later slice), so the promoted target read omits them exactly like
             // `client`, keeping the promotion revision consistent.
             connector: Vec::new(),
+            // Org connections and routing rules (issue #77) are likewise not promoted
+            // by the engine yet, so the promoted target read omits them too.
+            org_connection: Vec::new(),
+            routing_rule: Vec::new(),
         },
     })
 }

@@ -48,8 +48,8 @@ use ironauth_env::Clock;
 use ironauth_fetch::{FetchError, FetchPurpose, FetchRequest, Fetcher};
 use ironauth_jose::{JwsAlgorithm, TrustedKey, VerificationPolicy, verify};
 use ironauth_store::{
-    ConnectorId, FederationLoginStateId, NewAdminUser, NewFederationLoginState, Scope, StoreError,
-    TraitSchema, UserId, UserState,
+    ConnectorId, FederationLoginStateId, NewAdminUser, NewFederationLoginState, OrgConnectionId,
+    Scope, StoreError, TraitSchema, UserId, UserState,
 };
 use sha2::{Digest, Sha256};
 
@@ -682,6 +682,42 @@ pub async fn federation_authorize(
     let redirect_uri =
         federation_callback_url(&state, &tenant_id, &environment_id, &connector_slug);
 
+    // The routed org connection (issue #77 security fix): the login surface, having routed
+    // a login by domain/app/user, passes a server-authenticated ROUTING TOKEN (a keyed MAC
+    // minted in the store, binding the org connection to THIS connector, this scope, and a
+    // short expiry). We verify the token here, so the browser cannot swap the org to a
+    // sibling that shares the connector, replay it on another connector, or replay it after
+    // expiry: a tampered, cross-connector, cross-scope, or expired token fails closed to the
+    // uniform not-found (no oracle). An ABSENT param is a direct (non-routed) federated
+    // login, which carries no org binding. Verifying the token proves PROVENANCE; the store
+    // lookup below still re-proves the binding is in scope, references this connector, and is
+    // enabled (defence in depth). The callback re-derives the org from the CONSUMED row,
+    // never from the callback query.
+    let routed_org_connection = match query.as_deref().and_then(|q| query_get(q, "routing")) {
+        Some(raw) => {
+            let scoped = state.store().scoped(scope);
+            let now_micros = epoch_micros(now);
+            let Some(ocn_string) =
+                scoped
+                    .org_connections()
+                    .verify_routing_token(&raw, &connector_slug, now_micros)
+            else {
+                return not_found();
+            };
+            let Ok(ocn_id) = scoped.org_connections().parse_id(&ocn_string) else {
+                return not_found();
+            };
+            match scoped.org_connections().get(&ocn_id).await {
+                Ok(binding) if binding.enabled && binding.connector_id == record.id.to_string() => {
+                    Some(ocn_id.to_string())
+                }
+                Ok(_) | Err(StoreError::NotFound) => return not_found(),
+                Err(_) => return interaction::server_error_page(),
+            }
+        }
+        None => None,
+    };
+
     // Persist the single-use correlation row. The verifier is sealed by the store; an
     // absent verifier is sealed empty.
     let fls_id = FederationLoginStateId::generate(state.env(), &scope);
@@ -700,6 +736,7 @@ pub async fn federation_authorize(
                 code_verifier: verifier_bytes,
                 connector_id: &record.id.to_string(),
                 return_to: &resume.return_to,
+                org_connection_id: routed_org_connection.as_deref(),
                 expires_at_unix_micros: expires_at,
             },
         )
@@ -1020,6 +1057,7 @@ pub async fn federation_callback(
         issuer: &expected_issuer,
         definition: &definition,
         identity: &identity,
+        org_connection_id: consumed.org_connection_id.as_deref(),
         headers: &headers,
         return_to: &consumed.return_to,
         now,
@@ -1051,6 +1089,10 @@ pub(crate) struct FinalizeLogin<'a> {
     pub definition: &'a ConnectorRuntimeConfig,
     /// The verified upstream identity (a validated ID token, or an OAuth 2.0 profile over TLS).
     pub identity: &'a VerifiedUpstreamIdentity,
+    /// The routed `ocn_` org connection this login was bound to at the authorize leg
+    /// (issue #77), re-derived from the CONSUMED correlation row (never the browser), or
+    /// [`None`] for a direct federated login. Stamped on the provisioned user.
+    pub org_connection_id: Option<&'a str>,
     /// The inbound request headers (for the session cookie binding).
     pub headers: &'a HeaderMap,
     /// The pending LOCAL authorization request to resume after the federated login.
@@ -1084,6 +1126,7 @@ pub(crate) async fn finalize_federated_login(finalize: FinalizeLogin<'_>) -> Res
         issuer,
         definition,
         identity,
+        org_connection_id,
         headers,
         return_to,
         now,
@@ -1195,6 +1238,7 @@ pub(crate) async fn finalize_federated_login(finalize: FinalizeLogin<'_>) -> Res
         identity,
         &trait_doc,
         schema_version,
+        org_connection_id,
     )
     .await
     else {
@@ -1293,6 +1337,9 @@ impl TraitSchemaView for StoreTraitSchema<'_> {
 /// # Errors
 ///
 /// [`StoreError`] on a persistence, serialization, or trait-validation failure.
+// One provisioning entry point threading the identity, mapped traits, schema version,
+// and org binding; bundling them would only obscure the single create-or-update flow.
+#[allow(clippy::too_many_arguments)]
 async fn provision_federated_user(
     state: &OidcState,
     scope: Scope,
@@ -1301,6 +1348,7 @@ async fn provision_federated_user(
     identity: &VerifiedUpstreamIdentity,
     trait_doc: &TraitDocument,
     schema_version: Option<i32>,
+    org_connection_id: Option<&str>,
 ) -> Result<UserId, StoreError> {
     // The federated external-id is namespaced by the upstream ISSUER, because a `sub` is
     // unique only within one issuer (see `federated_external_id`).
@@ -1334,6 +1382,10 @@ async fn provision_federated_user(
                 .set_traits(state.env(), &existing.id, traits_json)
                 .await?;
         }
+        // Refresh the org binding on the returning identity (issue #77): the identity
+        // KEY stays the verified (issuer, sub) composite, so a returning login updates
+        // the stamp in place without ever creating a second user.
+        stamp_org_binding(state, scope, &existing.id, org_connection_id).await?;
         return Ok(existing.id);
     }
     // A namespaced, per-connector login handle keeps a federated account from colliding with
@@ -1367,6 +1419,42 @@ async fn provision_federated_user(
             now_micros,
             None,
         )
+        .await?;
+    // Stamp the org binding on the newly provisioned identity (issue #77).
+    stamp_org_binding(state, scope, &user_id, org_connection_id).await?;
+    Ok(user_id)
+}
+
+/// STAMP the routed org connection on a JIT-provisioned federated user (issue #77), when
+/// the login was routed to an organization. A NULL (non-routed) binding is a no-op; a
+/// malformed stored id is likewise skipped (the callback already re-derived it from the
+/// consumed correlation row, so it is a well-formed `ocn_` string). The stamp is bound to
+/// the SAME (new or returning) user the (issuer, sub) identity key resolved, so it never
+/// forks the account (issue #75 HIGH-1).
+///
+/// # Errors
+///
+/// [`StoreError`] on a persistence failure.
+async fn stamp_org_binding(
+    state: &OidcState,
+    scope: Scope,
+    user_id: &UserId,
+    org_connection_id: Option<&str>,
+) -> Result<(), StoreError> {
+    let Some(raw) = org_connection_id else {
+        return Ok(());
+    };
+    let Ok(ocn_id) = OrgConnectionId::parse_in_scope(raw, &scope) else {
+        return Ok(());
+    };
+    let actor = interaction::user_actor(user_id);
+    let correlation = ironauth_store::CorrelationId::generate(state.env());
+    state
+        .store()
+        .scoped(scope)
+        .acting(actor, correlation)
+        .users()
+        .set_org_connection(state.env(), user_id, &ocn_id)
         .await
 }
 

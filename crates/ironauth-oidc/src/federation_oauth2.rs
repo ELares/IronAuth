@@ -127,6 +127,9 @@ pub(crate) async fn oauth2_callback(cb: Oauth2Callback<'_>) -> Response {
         issuer: &cb.endpoints.identity_issuer,
         definition: cb.definition,
         identity: &identity,
+        // An OAuth 2.0 social login is never enterprise-routed (issue #77), so it
+        // carries no org binding.
+        org_connection_id: None,
         headers: cb.headers,
         return_to: cb.return_to,
         now: cb.now,

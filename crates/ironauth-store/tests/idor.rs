@@ -347,6 +347,7 @@ async fn plant_federation_state(db: &TestDatabase, env: &Env, scope: Scope) -> S
                 code_verifier: b"verifier-probe",
                 connector_id: "cnr_probe",
                 return_to: "/authorize?client_id=probe",
+                org_connection_id: None,
                 expires_at_unix_micros: FAR_FUTURE_MICROS,
             },
         )

@@ -240,13 +240,22 @@ cd "$(git rev-parse --show-toplevel)"
 # local resume target); TENANT-SCOPED with forced row-level security and consumed by one
 # atomic UPDATE, so its SQL stays in the repository module too. It stores no plaintext secret.
 #
+# org_connections / routing_rules (#77) are the enterprise inbound routing tables: one row
+# per organization-to-connector binding (a SECRET-FREE row: the organization, the connector,
+# and the broker overlay policy the later PR fills), and one row per routing rule mapping a
+# single selector (an email domain, an app client, or a user BLIND INDEX, never a plaintext
+# identifier) to an org connection. Both TENANT-SCOPED with forced row-level security, so
+# their SQL stays in the repository module too. Neither stores a plaintext user identifier or
+# a secret; three partial unique indexes on routing_rules are the structural routing-confusion
+# defence (one domain / app / user maps to at most one enabled org connection per scope).
+#
 # pow_challenges (#80) is the registration-abuse proof-of-work challenge state: one row per
 # issued challenge (the non-secret challenge bytes, the difficulty, the endpoint+context
 # binding SHA-256, the single-use spent latch, and the expiry). Data-plane state minted and
 # consumed on the request path. TENANT-SCOPED with forced row-level security, so its SQL
 # stays in the repository module too. It stores no plaintext PII or secret (the challenge is
 # handed to the client to solve, never a bearer credential).
-SCOPED_TABLES='clients|organizations|audit_log|management_credentials|idempotency_keys|grants|authorization_codes|issued_tokens|signing_keys|users|sessions|consents|resource_servers|opaque_access_tokens|client_assertion_jtis|client_auth_diagnostics|pushed_authorization_requests|refresh_families|refresh_tokens|service_accounts|dcr_policies|dcr_initial_access_tokens|dcr_rate_counters|external_assertion_issuers|external_assertion_subject_mappings|external_assertion_jtis|device_codes|client_sessions|session_ended_events|backchannel_logout_deliveries|tenant_keks|tenant_deks|encrypted_secrets|environment_states|tenant_byok_bindings|environment_guardrails|custom_domains|acme_challenges|environment_variables|environment_secrets|account_credentials|trait_schemas|trait_migration_jobs|user_invitations|user_identifiers|migration_runs|migration_run_records|webauthn_credentials|webauthn_challenges|abuse_bans|totp_credentials|recovery_codes|scope_step_up_policies|email_otp_codes|magic_link_tokens|credential_class_policies|attestation_config|sms_otp_codes|sms_config|sms_country_allowlist|sms_route_stats|mds3_blob_cache|aaguid_rules|admin_sudo_elevations|trusted_devices|risk_login_geo|risk_decisions|risk_disavowal_tokens|recovery_flows|connectors|pow_challenges|federation_login_states'
+SCOPED_TABLES='clients|organizations|audit_log|management_credentials|idempotency_keys|grants|authorization_codes|issued_tokens|signing_keys|users|sessions|consents|resource_servers|opaque_access_tokens|client_assertion_jtis|client_auth_diagnostics|pushed_authorization_requests|refresh_families|refresh_tokens|service_accounts|dcr_policies|dcr_initial_access_tokens|dcr_rate_counters|external_assertion_issuers|external_assertion_subject_mappings|external_assertion_jtis|device_codes|client_sessions|session_ended_events|backchannel_logout_deliveries|tenant_keks|tenant_deks|encrypted_secrets|environment_states|tenant_byok_bindings|environment_guardrails|custom_domains|acme_challenges|environment_variables|environment_secrets|account_credentials|trait_schemas|trait_migration_jobs|user_invitations|user_identifiers|migration_runs|migration_run_records|webauthn_credentials|webauthn_challenges|abuse_bans|totp_credentials|recovery_codes|scope_step_up_policies|email_otp_codes|magic_link_tokens|credential_class_policies|attestation_config|sms_otp_codes|sms_config|sms_country_allowlist|sms_route_stats|mds3_blob_cache|aaguid_rules|admin_sudo_elevations|trusted_devices|risk_login_geo|risk_decisions|risk_disavowal_tokens|recovery_flows|connectors|pow_challenges|federation_login_states|org_connections|routing_rules'
 
 # The one module allowed to name a scoped table in SQL.
 REPO_MODULE='crates/ironauth-store/src/repository.rs'

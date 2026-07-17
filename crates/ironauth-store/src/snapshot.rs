@@ -44,6 +44,8 @@
 //! issue #45. [`validate_document`] therefore VALIDATES-then-stops (it never
 //! mutates state); the apply half is the promotion engine's.
 
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::{Deserialize, Serialize};
 
 use crate::classification::{ResourceClassification, ResourceType, classify};
@@ -80,12 +82,14 @@ pub const CONNECTOR_CLIENT_SECRET_REFERENCE: &str = "connector_client_secret";
 /// (and by the export), and an environment-identity or runtime type can never be
 /// added without failing it. This is the live binding between the snapshot and the
 /// single source of truth, not a hand-maintained parallel list.
-pub const SNAPSHOT_RESOURCE_TYPES: [ResourceType; 5] = [
+pub const SNAPSHOT_RESOURCE_TYPES: [ResourceType; 7] = [
     ResourceType::Client,
     ResourceType::ResourceServer,
     ResourceType::DcrPolicy,
     ResourceType::Variable,
     ResourceType::Connector,
+    ResourceType::OrgConnection,
+    ResourceType::RoutingRule,
 ];
 
 /// A named reference to a secret in the environment-scoped secret store (issue
@@ -233,6 +237,58 @@ pub struct ConnectorSnapshot {
     pub secret: Option<SecretRef>,
 }
 
+/// The secret-free projection of one organization-to-connector binding (issue #77).
+/// A binding holds NO secret material: it names the organization and the connector it
+/// binds (the connector's OWN upstream secret never travels; only a reference in the
+/// connector projection does), the broker overlay policy (a later PR fills these), and
+/// whether it captures upstream tokens.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrgConnectionSnapshot {
+    /// The organization this binding belongs to.
+    pub organization_id: String,
+    /// The connector describing the organization's upstream. Part of the stable
+    /// natural key the export orders by.
+    pub connector_id: String,
+    /// The broker overlay minimum acr, if set (a later PR enforces it).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub overlay_min_acr: Option<String>,
+    /// The broker overlay maximum authentication age in seconds, if set.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub max_age_secs: Option<i64>,
+    /// The broker overlay minimum credential class, if set (a rung of the ladder).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub overlay_min_class: Option<String>,
+    /// Whether a later PR captures the upstream tokens after a brokered login.
+    pub capture_upstream_tokens: bool,
+    /// Whether the binding is active.
+    pub enabled: bool,
+}
+
+/// The secret-free projection of one routing rule (issue #77). Exactly one selector is
+/// present, matching the rule kind; a user selector is carried as an OPAQUE blind index
+/// (base64), never a plaintext identifier, so the export stays free of user PII.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoutingRuleSnapshot {
+    /// The selector kind (`domain`, `app`, or `user`).
+    pub rule_kind: String,
+    /// The normalized email domain, present iff `rule_kind` is `domain`.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub domain: Option<String>,
+    /// The app client id, present iff `rule_kind` is `app`.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub client_id: Option<String>,
+    /// The OPAQUE base64 blind index of the canonical login identifier, present iff
+    /// `rule_kind` is `user`. Never a plaintext identifier.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub user_bidx: Option<String>,
+    /// The org connection a matching login routes to.
+    pub org_connection_id: String,
+    /// The evaluation priority.
+    pub priority: i64,
+    /// Whether the rule is active.
+    pub enabled: bool,
+}
+
 /// The promotable resources a snapshot carries, keyed by resource-type wire name
 /// (issue #41 classification). Each array is ordered by its type's stable natural
 /// key, so the collection order is deterministic and documented.
@@ -256,6 +312,14 @@ pub struct SnapshotResources {
     /// client secret, never the secret value.
     #[serde(default)]
     pub connector: Vec<ConnectorSnapshot>,
+    /// The environment's organization-to-connector bindings (`org_connection`). Each
+    /// is secret-free (issue #77).
+    #[serde(default)]
+    pub org_connection: Vec<OrgConnectionSnapshot>,
+    /// The environment's routing rules (`routing_rule`). Each carries an opaque user
+    /// selector, never a plaintext identifier (issue #77).
+    #[serde(default)]
+    pub routing_rule: Vec<RoutingRuleSnapshot>,
 }
 
 /// A canonical, deterministic, secret-free snapshot of one environment's
@@ -389,6 +453,9 @@ fn write_json_string(text: &str, out: &mut String) {
 ///
 /// [`StoreError::Database`] on a persistence failure, or if a stored row fails to
 /// decode.
+// One linear export sweep (one block per promotable resource type); splitting it would
+// scatter the single "read every promotable type, secret-free" narrative.
+#[allow(clippy::too_many_lines)]
 pub async fn export(scoped: &ScopedStore<'_>) -> Result<Snapshot, StoreError> {
     let mut clients = Vec::new();
     for record in scoped.clients().list().await? {
@@ -503,6 +570,48 @@ pub async fn export(scoped: &ScopedStore<'_>) -> Result<Snapshot, StoreError> {
     // reason as the resources above.
     connector.sort_by(|a, b| a.connector_slug.cmp(&b.connector_slug));
 
+    // Organization-to-connector bindings (issue #77): secret-free per-environment
+    // config. Ordered by the stable (organization_id, connector_id) natural key.
+    let mut org_connection: Vec<OrgConnectionSnapshot> = scoped
+        .org_connections()
+        .list_all()
+        .await?
+        .into_iter()
+        .map(|record| OrgConnectionSnapshot {
+            organization_id: record.organization_id,
+            connector_id: record.connector_id,
+            overlay_min_acr: record.overlay_min_acr,
+            max_age_secs: record.max_age_secs,
+            overlay_min_class: record.overlay_min_class,
+            capture_upstream_tokens: record.capture_upstream_tokens,
+            enabled: record.enabled,
+        })
+        .collect();
+    org_connection.sort_by(|a, b| {
+        (a.organization_id.as_str(), a.connector_id.as_str())
+            .cmp(&(b.organization_id.as_str(), b.connector_id.as_str()))
+    });
+
+    // Routing rules (issue #77): the user selector travels as an OPAQUE base64 blind
+    // index, never a plaintext identifier, so the export stays free of user PII.
+    // Ordered by the stable (rule_kind, selector, org_connection_id) natural key.
+    let mut routing_rule: Vec<RoutingRuleSnapshot> = scoped
+        .routing_rules()
+        .list_all()
+        .await?
+        .into_iter()
+        .map(|record| RoutingRuleSnapshot {
+            rule_kind: record.rule_kind,
+            domain: record.domain_norm,
+            client_id: record.client_id,
+            user_bidx: record.user_bidx.map(|bytes| URL_SAFE_NO_PAD.encode(bytes)),
+            org_connection_id: record.org_connection_id,
+            priority: i64::from(record.priority),
+            enabled: record.enabled,
+        })
+        .collect();
+    routing_rule.sort_by(|a, b| routing_rule_order_key(a).cmp(&routing_rule_order_key(b)));
+
     Ok(Snapshot {
         schema_version: SNAPSHOT_SCHEMA_VERSION.to_string(),
         resources: SnapshotResources {
@@ -511,8 +620,27 @@ pub async fn export(scoped: &ScopedStore<'_>) -> Result<Snapshot, StoreError> {
             dcr_policy,
             variable,
             connector,
+            org_connection,
+            routing_rule,
         },
     })
+}
+
+/// The stable natural-key tuple a routing-rule snapshot array is ordered by (issue
+/// #77): the kind, then the present selector, then the target org connection. Every
+/// component is a `&str`, so the comparison is collation-independent and reproducible.
+fn routing_rule_order_key(rule: &RoutingRuleSnapshot) -> (&str, &str, &str) {
+    let selector = rule
+        .domain
+        .as_deref()
+        .or(rule.client_id.as_deref())
+        .or(rule.user_bidx.as_deref())
+        .unwrap_or("");
+    (
+        rule.rule_kind.as_str(),
+        selector,
+        rule.org_connection_id.as_str(),
+    )
 }
 
 /// Project a stored client JWK Set to its PUBLIC members only, making the export
@@ -641,6 +769,33 @@ const VARIABLE_KEYS: [&str; 2] = ["name", "value"];
 /// Every key a snapshot `connector` element may carry, besides the secret REFERENCE
 /// slot (issue #75). The published schema pins `additionalProperties: false`.
 const CONNECTOR_KEYS: [&str; 3] = ["connector_slug", "definition", "enabled"];
+
+/// Every key a snapshot `org_connection` element may carry (issue #77). No secret
+/// slot: a binding holds no secret material.
+const ORG_CONNECTION_KEYS: [&str; 7] = [
+    "organization_id",
+    "connector_id",
+    "overlay_min_acr",
+    "max_age_secs",
+    "overlay_min_class",
+    "capture_upstream_tokens",
+    "enabled",
+];
+
+/// Every key a snapshot `routing_rule` element may carry (issue #77). The user
+/// selector is an opaque blind index, never a plaintext identifier.
+const ROUTING_RULE_KEYS: [&str; 7] = [
+    "rule_kind",
+    "domain",
+    "client_id",
+    "user_bidx",
+    "org_connection_id",
+    "priority",
+    "enabled",
+];
+
+/// The recognized `rule_kind` values a snapshot routing rule may carry (issue #77).
+const ROUTING_RULE_KINDS: [&str; 3] = ["domain", "app", "user"];
 
 /// Object keys that would carry RAW secret material and must never appear in a
 /// snapshot: the presence of any is a hard rejection (issue #43, "an import
@@ -782,6 +937,9 @@ fn validate_value(value: &serde_json::Value, violations: &mut Vec<SnapshotViolat
 }
 
 /// Validate a single resource element of `resource_type` at `path`.
+// One flat per-resource-type match (one arm per promotable type); splitting it would
+// scatter the field-by-field validation the reviewer reads in one place.
+#[allow(clippy::too_many_lines)]
 fn validate_resource(
     resource_type: ResourceType,
     item: &serde_json::Value,
@@ -884,6 +1042,16 @@ fn validate_resource(
             // The upstream client secret is a REFERENCE, never inline (the #75 / #58
             // proof), validated exactly like a client's secret slot.
             validate_secret_field(object, path, violations);
+        }
+        ResourceType::OrgConnection => {
+            reject_unknown_keys(object, &ORG_CONNECTION_KEYS, None, path, violations);
+            require_nonempty_string(object, "organization_id", path, violations);
+            require_nonempty_string(object, "connector_id", path, violations);
+        }
+        ResourceType::RoutingRule => {
+            reject_unknown_keys(object, &ROUTING_RULE_KEYS, None, path, violations);
+            require_enum(object, "rule_kind", &ROUTING_RULE_KINDS, path, violations);
+            require_nonempty_string(object, "org_connection_id", path, violations);
         }
         // Only the promotable set is ever passed here (the caller iterates
         // SNAPSHOT_RESOURCE_TYPES); a non-promotable type is a programmer error, not
@@ -1169,8 +1337,9 @@ mod tests {
         // variable) regardless of struct field order.
         assert_eq!(
             text,
-            "{\"resources\":{\"client\":[],\"connector\":[],\"dcr_policy\":[],\"resource_server\":[],\
-             \"variable\":[]},\"schema_version\":\"ironauth.config-snapshot/v1\"}"
+            "{\"resources\":{\"client\":[],\"connector\":[],\"dcr_policy\":[],\"org_connection\":[],\
+             \"resource_server\":[],\"routing_rule\":[],\"variable\":[]},\
+             \"schema_version\":\"ironauth.config-snapshot/v1\"}"
         );
     }
 

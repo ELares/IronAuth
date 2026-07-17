@@ -159,6 +159,15 @@ The export omits fields that are re-created at the destination rather than carri
   table grows an unclassified column. The portable identity (the user and its
   password hash) round-trips as before; the non-portable device keys are documented
   here as the honest exception.
+- The federation org binding (the `users.org_connection_id` stamp, issue #77) is NOT
+  carried in a record. It is instance-local routing state: it references an org
+  connection whose id embeds the source scope, and the enterprise routing config (the
+  org connections and routing rules) is exported and imported separately as promotable
+  configuration, where the ids are re-minted for the target scope. The binding
+  self-heals on the destination: a returning federated login re-routes through the
+  imported config and re-stamps the user. It is classified as OPERATIONAL in the
+  field-coverage test, so the guard still fails the build if the users table grows an
+  unclassified column. The portable identity round-trips as before.
 
 ## Password hash formats
 

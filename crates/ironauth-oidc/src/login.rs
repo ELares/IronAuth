@@ -10,6 +10,8 @@
 //! unknown account), and an unknown account still spends a full Argon2id
 //! verification so the endpoint is not a user-enumeration oracle.
 
+use std::time::Duration;
+
 use axum::extract::{Form, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
@@ -26,6 +28,11 @@ use crate::pages;
 use crate::state::OidcState;
 use crate::totp::{self, SecondFactorOutcome};
 use crate::util::epoch_micros;
+
+/// How long a federation routing token (issue #77 security fix) stays valid. The token
+/// only needs to survive the login -> authorize redirect hop, so a short window is
+/// enough and bounds any replay of a leaked redirect URL.
+const ROUTING_TOKEN_TTL: Duration = Duration::from_secs(300);
 
 /// The `return_to` carried on the `GET /login` query.
 #[derive(Deserialize)]
@@ -381,6 +388,88 @@ pub(crate) fn passkey_nonce(state: &OidcState) -> String {
     nonce
 }
 
+/// Route a submitted login identifier to its organization's upstream provider (issue
+/// #77), returning the 302 to `federation/{slug}/authorize` when a routing rule matches,
+/// or [`None`] to fall through to the ordinary LOCAL login (fail-safe to local).
+///
+/// The pure precedence decision (per-user > per-app > per-domain) lives in
+/// [`crate::routing`]; this function is the I/O side: it reads the three candidate rules
+/// through the scope's row-level-security-forced repositories, resolves the winner, and
+/// loads its org connection and connector to build the redirect. Any store error, an
+/// absent federation runtime, a disabled binding or connector, or no match yields
+/// [`None`] so the caller keeps serving the local prompt. The routed `ocn_` id is
+/// threaded to the authorize leg, which writes it into the correlation row; the browser
+/// therefore never chooses the organization the callback provisions against.
+async fn federation_route_redirect(
+    state: &OidcState,
+    resume: &crate::interaction::ResumeTarget,
+    identifier: &str,
+) -> Option<Response> {
+    // Only route when the federation runtime is installed; otherwise the authorize
+    // endpoint is a uniform not-found and routing would strand the user.
+    state.federation()?;
+
+    let scope = resume.scope;
+    let scoped = state.store().scoped(scope);
+    let rules = scoped.routing_rules();
+
+    // The three candidate lookups, each a single row through its per-scope unique index.
+    // A store error fails safe to local (the `.ok().flatten()`), never a 500 on the
+    // login page.
+    let user = rules.by_user_identifier(identifier).await.ok().flatten();
+    let app = rules
+        .by_app(&resume.client_id.to_string())
+        .await
+        .ok()
+        .flatten();
+    let domain = match crate::routing::normalize_email_domain(identifier) {
+        Some(domain_norm) => rules.by_domain(&domain_norm).await.ok().flatten(),
+        None => None,
+    };
+
+    let candidates = crate::routing::RouteCandidates { user, app, domain };
+    let matched = crate::routing::resolve_route(&candidates)?;
+
+    // Resolve the matched org connection and its connector to build the redirect. A
+    // disabled binding or connector is treated as no route (fail-safe to local).
+    let org_connections = scoped.org_connections();
+    let ocn_id = org_connections.parse_id(&matched.org_connection_id).ok()?;
+    let binding = org_connections.get(&ocn_id).await.ok()?;
+    if !binding.enabled {
+        return None;
+    }
+    let connector_id = scoped.connectors().parse_id(&binding.connector_id).ok()?;
+    let connector = scoped.connectors().get(&connector_id).await.ok()?;
+    if !connector.enabled {
+        return None;
+    }
+
+    // Mint a server-authenticated routing token (issue #77 security fix): a keyed MAC,
+    // minted in the STORE where the master key lives, binding the routed org connection to
+    // THIS connector, this scope, and a short expiry. The token, not a plaintext org
+    // connection id, travels in the redirect, so the browser can neither swap the org to a
+    // sibling under the same connector nor replay the id on another connector. The master
+    // key never leaves the store.
+    let now = state.now();
+    let expires_at_micros = epoch_micros(now.checked_add(ROUTING_TOKEN_TTL).unwrap_or(now));
+    let token = org_connections
+        .mint_routing_token(&ocn_id.to_string(), &connector.slug, expires_at_micros)
+        .ok()?;
+
+    // Build the redirect to the federated authorize leg, carrying the ORIGINAL local
+    // resume target (so a successful federated login resumes it) and the routing token
+    // (verified at the authorize leg against this connector and this scope).
+    let location = format!(
+        "/t/{}/e/{}/federation/{}/authorize?return_to={}&routing={}",
+        scope.tenant(),
+        scope.environment(),
+        crate::util::percent_encode_query(&connector.slug),
+        crate::util::percent_encode_query(&resume.return_to),
+        crate::util::percent_encode_query(&token),
+    );
+    Some(interaction::redirect(&location))
+}
+
 /// `POST /login`: verify the password and, on success, establish a session and
 /// resume the authorization request.
 // The linear flow (parse, CSRF, lookup, regulate, verify, session, per-arm failure
@@ -413,6 +502,16 @@ pub async fn login_post(
         .map(str::trim)
         .unwrap_or_default();
     let password = form.password.as_deref().unwrap_or_default();
+
+    // Enterprise inbound routing (issue #77): once the identifier is submitted, a
+    // routed identifier (by user, app, or domain, in that precedence) is redirected to
+    // its organization's upstream provider BEFORE any local password work. No match
+    // falls through to the ordinary local login below (fail-safe to local).
+    if !identifier.is_empty() {
+        if let Some(redirect) = federation_route_redirect(&state, &resume, identifier).await {
+            return redirect;
+        }
+    }
 
     // The environment-kind chrome (issue #42) for a re-rendered failure page.
     let banner = state.environment_banner(&resume.scope).await;

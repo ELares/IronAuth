@@ -386,6 +386,14 @@ async fn every_identity_column_is_exported_or_a_documented_non_exported_field() 
                 // on the destination, so it is not carried across, exactly like the passkey
                 // credential material it links.
                 "webauthn_user_handle",
+                // The federation org binding (issue #77) is instance-local routing state:
+                // it references an ocn_ id that embeds the source scope (re-minted when the
+                // org_connections config is imported separately as Promotable), and it
+                // self-heals -- a returning federated login on the destination re-stamps it
+                // through the imported routing config. It is not part of the user's portable
+                // identity and is not re-linked at import, so it is not carried across,
+                // exactly like the WebAuthn handle above.
+                "org_connection_id",
             ],
         },
         // The account_credentials registry (issue #61): a user's enrolled MFA / login

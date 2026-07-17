@@ -152,13 +152,22 @@ pub enum ResourceType {
     /// configuration; its upstream client SECRET never travels (only a named
     /// reference does).
     Connector,
+    /// An organization-to-connector binding (issue #77): ties an organization to the
+    /// connector describing its upstream and carries the broker overlay policy.
+    /// Promotable per-environment configuration with NO secret column.
+    OrgConnection,
+    /// A routing rule (issue #77): maps one selector (an email domain, an app client,
+    /// or a single user) to an org connection so an inbound login is routed to the
+    /// right organization. Promotable per-environment configuration (its user selector
+    /// is an opaque blind index, never a plaintext identifier).
+    RoutingRule,
 }
 
 impl ResourceType {
     /// Every resource type, in a stable order. The classification lint and the
     /// metadata endpoint both iterate this; a variant missing here is caught by
     /// the `all_lists_every_variant` test and by `scripts/classification-lint.sh`.
-    pub const ALL: [ResourceType; 19] = [
+    pub const ALL: [ResourceType; 21] = [
         ResourceType::Operator,
         ResourceType::Tenant,
         ResourceType::Environment,
@@ -178,6 +187,8 @@ impl ResourceType {
         ResourceType::TrustedDevice,
         ResourceType::RecoveryFlow,
         ResourceType::Connector,
+        ResourceType::OrgConnection,
+        ResourceType::RoutingRule,
     ];
 
     /// The stable wire name of this resource type (for example `organization`).
@@ -203,6 +214,8 @@ impl ResourceType {
             ResourceType::TrustedDevice => "trusted_device",
             ResourceType::RecoveryFlow => "recovery_flow",
             ResourceType::Connector => "connector",
+            ResourceType::OrgConnection => "org_connection",
+            ResourceType::RoutingRule => "routing_rule",
         }
     }
 
@@ -229,7 +242,9 @@ impl ResourceType {
             | ResourceType::Invitation
             | ResourceType::TrustedDevice
             | ResourceType::RecoveryFlow
-            | ResourceType::Connector => ResourceLevel::Environment,
+            | ResourceType::Connector
+            | ResourceType::OrgConnection
+            | ResourceType::RoutingRule => ResourceLevel::Environment,
         }
     }
 
@@ -261,11 +276,18 @@ pub fn classify(resource: ResourceType) -> ResourceClassification {
         // moves between environments. The upstream client SECRET is NOT part of the
         // promotable projection (only a named reference travels; the value is sealed
         // per environment, issue #48), exactly like a confidential client's secret.
+        // An organization-to-connector binding and a routing rule (issue #77) are
+        // per-environment federation configuration a snapshot carries and a promotion
+        // replays: a binding holds no secret (only a reference to the connector, whose
+        // own upstream secret never travels), and a routing rule's user selector is an
+        // opaque blind index, so both are Promotable and snapshot-exported.
         ResourceType::Client
         | ResourceType::ResourceServer
         | ResourceType::DcrPolicy
         | ResourceType::Variable
-        | ResourceType::Connector => Promotable,
+        | ResourceType::Connector
+        | ResourceType::OrgConnection
+        | ResourceType::RoutingRule => Promotable,
 
         // Environment-intrinsic identity, excluded from every snapshot so a
         // promotion never copies one environment's identity onto another: the

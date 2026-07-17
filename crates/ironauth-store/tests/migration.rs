@@ -327,7 +327,7 @@ async fn expand_contract_example_chain_runs_all_three_phases_and_contract_remove
 // per real table); splitting it would not make it clearer.
 #[allow(clippy::too_many_lines)]
 #[tokio::test]
-async fn production_chain_is_only_the_fifty_eight_real_migrations_and_ships_no_demo_object() {
+async fn production_chain_is_only_the_fifty_nine_real_migrations_and_ships_no_demo_object() {
     // TestDatabase::start runs Store::migrate() (the production chain) on a
     // fresh, empty database.
     let db = TestDatabase::start().await;
@@ -344,8 +344,8 @@ async fn production_chain_is_only_the_fifty_eight_real_migrations_and_ships_no_d
     );
     assert_eq!(
         report.already_applied(),
-        58,
-        "the production chain is exactly fifty-eight migrations (isolation, audit log, management \
+        59,
+        "the production chain is exactly fifty-nine migrations (isolation, audit log, management \
          API, OIDC authorization, signing keys, login/consent, authentication context, redirect \
          registration, UserInfo claims, consent scope upsert, resource servers, opaque access \
          tokens, client auth suite, dynamic client registration, pushed authorization requests, \
@@ -360,16 +360,16 @@ async fn production_chain_is_only_the_fifty_eight_real_migrations_and_ships_no_d
          defenses, step-up policies, email OTP and scanner-safe magic links, credential-class \
          policies, guarded SMS OTP, passkey attestation, admin sudo elevations, trusted devices, \
          risk engine, account recovery, federation connectors, registration abuse defenses, \
-         federation login state)"
+         federation login state, enterprise inbound routing)"
     );
 
-    // The ledger holds exactly versions 1 through 58.
+    // The ledger holds exactly versions 1 through 59.
     assert_eq!(
         applied_versions(pool).await,
         vec![
             1_i64, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
             24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45,
-            46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58
+            46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59
         ]
     );
     let phase_of = |version: i64| async move {
@@ -583,6 +583,11 @@ async fn production_chain_is_only_the_fifty_eight_real_migrations_and_ships_no_d
     // tenant-scoped single-use correlation table (federation_login_states), no rewrite of
     // existing state.
     assert_eq!(phase_of(58).await, "expand");
+    // The enterprise-inbound-routing migration (issue #77) is an EXPAND: two new
+    // tenant-scoped tables (org_connections, routing_rules) plus additive nullable
+    // org_connection_id columns on federation_login_states and users, no rewrite of
+    // existing state.
+    assert_eq!(phase_of(59).await, "expand");
 
     // The step-up second-factor abuse path (issue #72): migration 0047 WIDENED the
     // abuse_bans auth_path CHECK (0046 pinned the closed set) to also admit
@@ -2873,6 +2878,130 @@ async fn production_chain_is_only_the_fifty_eight_real_migrations_and_ships_no_d
         .await,
         "federation_login_states must carry the nonempty-scope CHECK constraint"
     );
+    // Enterprise inbound routing (issue #77, migration 0059): two new tenant-scoped
+    // tables plus additive org-binding columns. The AUTHORIZE leg writes the routed org
+    // connection into the correlation row, and the JIT provisioning stamps it on the user.
+    assert!(
+        column_exists(pool, "federation_login_states", "org_connection_id").await,
+        "federation_login_states.org_connection_id exists after 0059"
+    );
+    assert!(
+        column_exists(pool, "users", "org_connection_id").await,
+        "users.org_connection_id exists after 0059"
+    );
+
+    // The org-connection binding table.
+    assert!(
+        table_exists(pool, "org_connections").await,
+        "org_connections exists after 0059"
+    );
+    for column in [
+        "id",
+        "tenant_id",
+        "environment_id",
+        "organization_id",
+        "connector_id",
+        "overlay_min_acr",
+        "max_age_secs",
+        "overlay_min_class",
+        "capture_upstream_tokens",
+        "enabled",
+    ] {
+        assert!(
+            column_exists(pool, "org_connections", column).await,
+            "org_connections.{column} exists after 0059"
+        );
+    }
+    // A binding holds NO secret column (classified Promotable).
+    for forbidden in ["client_secret", "secret", "sealed"] {
+        assert!(
+            !column_exists(pool, "org_connections", forbidden).await,
+            "org_connections must have no secret column ({forbidden}) after 0059"
+        );
+    }
+    assert!(
+        rls_enabled_and_forced(pool, "org_connections").await,
+        "org_connections must ENABLE and FORCE row-level security"
+    );
+    assert!(
+        policy_exists(pool, "org_connections", "org_connections_tenant_isolation").await,
+        "the (tenant, environment) isolation policy must exist on org_connections"
+    );
+    for constraint in [
+        "org_connections_scope_nonempty",
+        "org_connections_overlay_min_class_known",
+    ] {
+        assert!(
+            check_constraint_exists(pool, "org_connections", constraint).await,
+            "org_connections must carry the {constraint} CHECK constraint"
+        );
+    }
+
+    // The routing-rule table.
+    assert!(
+        table_exists(pool, "routing_rules").await,
+        "routing_rules exists after 0059"
+    );
+    for column in [
+        "id",
+        "tenant_id",
+        "environment_id",
+        "rule_kind",
+        "domain_norm",
+        "client_id",
+        "user_bidx",
+        "org_connection_id",
+        "priority",
+        "enabled",
+    ] {
+        assert!(
+            column_exists(pool, "routing_rules", column).await,
+            "routing_rules.{column} exists after 0059"
+        );
+    }
+    // The per-user selector is a BLIND INDEX (bytea), never a plaintext identifier.
+    assert_eq!(
+        column_data_type(pool, "routing_rules", "user_bidx").await,
+        "bytea",
+        "the routing_rules user selector must be a blind-index bytea column, never plaintext"
+    );
+    for forbidden in ["user_identifier", "email", "identifier"] {
+        assert!(
+            !column_exists(pool, "routing_rules", forbidden).await,
+            "routing_rules must have no plaintext user selector column ({forbidden}) after 0059"
+        );
+    }
+    assert!(
+        rls_enabled_and_forced(pool, "routing_rules").await,
+        "routing_rules must ENABLE and FORCE row-level security"
+    );
+    assert!(
+        policy_exists(pool, "routing_rules", "routing_rules_tenant_isolation").await,
+        "the (tenant, environment) isolation policy must exist on routing_rules"
+    );
+    for constraint in [
+        "routing_rules_scope_nonempty",
+        "routing_rules_kind_known",
+        "routing_rules_selector_matches_kind",
+    ] {
+        assert!(
+            check_constraint_exists(pool, "routing_rules", constraint).await,
+            "routing_rules must carry the {constraint} CHECK constraint"
+        );
+    }
+    // The THREE partial UNIQUE indexes, one per selector scope, are the structural
+    // routing-confusion defence: one domain, one app, or one user maps to at most one
+    // enabled org connection within a scope.
+    for index in [
+        "routing_rules_domain_uniq",
+        "routing_rules_app_uniq",
+        "routing_rules_user_uniq",
+    ] {
+        assert!(
+            partial_unique_index_exists(pool, "routing_rules", index).await,
+            "routing_rules must carry the partial unique index {index} after 0059"
+        );
+    }
 }
 
 #[tokio::test]
