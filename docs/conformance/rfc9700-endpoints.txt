@@ -27,6 +27,9 @@
 /t/{tenant_id}/e/{environment_id}/.well-known/openid-configuration
 /t/{tenant_id}/e/{environment_id}/account/credentials
 /t/{tenant_id}/e/{environment_id}/account/credentials/remove
+/t/{tenant_id}/e/{environment_id}/account/linked-identities
+/t/{tenant_id}/e/{environment_id}/account/linked-identities/remove
+/t/{tenant_id}/e/{environment_id}/account/linked-identities/start
 /t/{tenant_id}/e/{environment_id}/account/mfa/plan
 /t/{tenant_id}/e/{environment_id}/account/mfa/recovery-codes
 /t/{tenant_id}/e/{environment_id}/account/mfa/recovery-codes/redeem

@@ -40,9 +40,9 @@ use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use ironauth_store::{
-    CorrelationId, CredentialRemoveOutcome, CredentialType, FirstPasswordOutcome,
-    PasswordRemovalOutcome, Scope, SessionFleetFilter, SessionId, SessionSummary, StoreError,
-    TrustedDeviceRevokeReason, UserId,
+    AccountLinkId, CorrelationId, CredentialRemoveOutcome, CredentialType, FirstPasswordOutcome,
+    IdentifierType, PasswordRemovalOutcome, Scope, SessionFleetFilter, SessionId, SessionSummary,
+    StoreError, TrustedDeviceRevokeReason, UnlinkOutcome, UserId,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -50,6 +50,7 @@ use serde_json::{Value, json};
 use crate::interaction;
 use crate::state::OidcState;
 use crate::util::epoch_micros;
+use crate::verification::VerificationPurpose;
 use crate::wellknown::{not_found, parse_scope};
 
 /// The step-up recent-re-authentication max age (seconds) the sensitive account
@@ -136,6 +137,38 @@ fn reauth_required() -> Response {
         json!({
             "error": "reauthentication_required",
             "error_description": "Re-authenticate with your passkey to change how you sign in.",
+        }),
+    )
+}
+
+/// Whether the caller's session is a FRESH re-authentication of the TARGET account for a
+/// self-service account link (issue #78, section 4.2): its `auth_time` is within
+/// `link_reauth_max_age_secs` (the FORK C config window, default 300). This is the RFC 9470
+/// `auth_time` freshness check, WITHOUT the passkey clause of [`fresh_passkey_reauth`]: any
+/// freshly proven method of the target's own account counts. An active-but-stale session is
+/// insufficient: the gate reads `auth_time` (frozen at authentication), not cookie presence,
+/// so a stolen live cookie whose `auth_time` is old cannot pass, and only a party who can
+/// re-run the target's login can. That is the whole defense against session-riding link
+/// injection.
+fn fresh_reauth(state: &OidcState, account: &Account) -> bool {
+    let now_micros = epoch_micros(state.now());
+    let age_micros = now_micros.saturating_sub(account.auth_time_unix_micros);
+    let max_age_micros = i64::try_from(state.link_reauth_max_age_secs())
+        .unwrap_or(i64::MAX)
+        .saturating_mul(1_000_000);
+    age_micros <= max_age_micros
+}
+
+/// The typed `403` a self-service link or unlink returns when the caller's session is not a
+/// FRESH re-authentication of the target account (issue #78). Actionable: the client re-runs
+/// any login ceremony (password, passkey, OTP) to refresh `auth_time`, then retries. Never
+/// reveals account state.
+fn link_reauth_required() -> Response {
+    json_response(
+        StatusCode::FORBIDDEN,
+        json!({
+            "error": "reauthentication_required",
+            "error_description": "Re-authenticate to link or unlink a sign-in provider.",
         }),
     )
 }
@@ -1175,6 +1208,212 @@ pub async fn remove_password(
         ),
         Err(_) => server_error(),
     }
+}
+
+/// `GET /t/{tenant}/e/{environment}/account/linked-identities`: list the authenticated
+/// user's OWN linked federated identities (issue #78). Each entry is the connector it came
+/// through, the link's immutable trust snapshot, how it was made (`manual` / `auto_verified`),
+/// and when. Reads ONLY the caller's own links (subject-bound), so another user's links are
+/// never listed. The raw federated identifier is never opened here (a read is secret-free).
+pub async fn list_linked_identities(
+    State(state): State<OidcState>,
+    Path((tenant_id, environment_id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Response {
+    let account = match authenticate(&state, &tenant_id, &environment_id, &headers).await {
+        Ok(account) => account,
+        Err(response) => return response,
+    };
+    let listed = state
+        .store()
+        .scoped(account.scope)
+        .account_links()
+        .list_for_user(&account.subject)
+        .await;
+    let Ok(links) = listed else {
+        return server_error();
+    };
+    let linked_identities: Vec<Value> = links
+        .iter()
+        .map(|link| {
+            json!({
+                "id": link.id.to_string(),
+                "connector_id": link.connector_id,
+                "email_verified": link.email_verified,
+                "link_method": link.link_method.as_str(),
+                "created_at": link.created_at_unix_micros,
+            })
+        })
+        .collect();
+    json_response(
+        StatusCode::OK,
+        json!({ "linked_identities": linked_identities }),
+    )
+}
+
+/// The start-a-link request body: the connector slug to link a federated identity through.
+#[derive(Deserialize)]
+pub struct StartLinkBody {
+    /// The per-environment connector slug the caller wants to link (for example `google`).
+    connector: String,
+}
+
+/// `POST /t/{tenant}/e/{environment}/account/linked-identities/start`: begin a self-service
+/// manual link (issue #78, section 4.2, the SECURITY CRUX). Requires a FRESH
+/// re-authentication of the caller's OWN account (never merely an active session): a stale
+/// session is refused with a typed `403 reauthentication_required` and the client must
+/// re-run a login ceremony. On success it mints an upstream authorize leg through the SHARED
+/// federation builder, carrying a SERVER-DERIVED manual-link target (the caller's subject)
+/// on the single-use correlation row, and returns the upstream `location` for the browser to
+/// navigate to. The callback binds the resulting federated identity to THIS account.
+pub async fn start_link(
+    State(state): State<OidcState>,
+    Path((tenant_id, environment_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    Json(body): Json<StartLinkBody>,
+) -> Response {
+    if !interaction::same_origin_ok(&headers, state.self_origin().as_deref()) {
+        return forbidden();
+    }
+    let account = match authenticate(&state, &tenant_id, &environment_id, &headers).await {
+        Ok(account) => account,
+        Err(response) => return response,
+    };
+    // The security crux: a manual link requires a FRESH re-auth of the TARGET account, not a
+    // live session. A stale session is refused; only a party who can re-run this account's
+    // own login can start a link into it.
+    if !fresh_reauth(&state, &account) {
+        return link_reauth_required();
+    }
+    let Some(runtime) = state.federation() else {
+        return not_found_json();
+    };
+    // A benign, same-scope resume target the correlation row carries; the manual-link
+    // callback establishes the session and redirects here on completion.
+    let return_to = format!("/t/{tenant_id}/e/{environment_id}/account/linked-identities");
+    match crate::federation::issue_upstream_authorize(crate::federation::IssueAuthorize {
+        state: &state,
+        runtime,
+        scope: account.scope,
+        tenant_id: &tenant_id,
+        environment_id: &environment_id,
+        connector_slug: &body.connector,
+        return_to: &return_to,
+        routing_param: None,
+        link_target: Some(&account.subject),
+    })
+    .await
+    {
+        Ok(location) => json_response(StatusCode::OK, json!({ "location": location })),
+        Err(response) => response,
+    }
+}
+
+/// The unlink request body: the linked identity to remove.
+#[derive(Deserialize)]
+pub struct RemoveLinkBody {
+    /// The `alk_` link id to remove (subject-bound; a foreign or absent id is the uniform
+    /// not-found).
+    link_id: String,
+}
+
+/// `POST /t/{tenant}/e/{environment}/account/linked-identities/remove`: unlink a federated
+/// identity from the caller's OWN account (issue #78). Requires a FRESH re-authentication
+/// (same gate as `start`) and is CSRF-guarded. The removal runs the write-skew-safe,
+/// last-usable-method guard from PR 1: unlinking the account's SOLE surviving usable method
+/// is refused with a typed `409 last_authentication_method` (the Zitadel anti-bricking
+/// guard). On success the link is deleted (audited) and every verified channel is alerted.
+pub async fn remove_linked_identity(
+    State(state): State<OidcState>,
+    Path((tenant_id, environment_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    Json(body): Json<RemoveLinkBody>,
+) -> Response {
+    if !interaction::same_origin_ok(&headers, state.self_origin().as_deref()) {
+        return forbidden();
+    }
+    let account = match authenticate(&state, &tenant_id, &environment_id, &headers).await {
+        Ok(account) => account,
+        Err(response) => return response,
+    };
+    if !fresh_reauth(&state, &account) {
+        return link_reauth_required();
+    }
+    // Subject-bound: a link id of another scope (or malformed) is the uniform not-found, so
+    // it is never an existence oracle for a foreign link.
+    let Ok(link_id) = AccountLinkId::parse_in_scope(&body.link_id, &account.scope) else {
+        return not_found_json();
+    };
+    let actor = interaction::user_actor(&account.subject);
+    let result = state
+        .store()
+        .scoped(account.scope)
+        .acting(actor, CorrelationId::generate(state.env()))
+        .account_links()
+        .unlink(state.env(), &account.subject, &link_id, &step_up_detail())
+        .await;
+    match result {
+        Ok(UnlinkOutcome::Removed) => {
+            notify_link_channels(
+                &state,
+                account.scope,
+                &account.subject,
+                VerificationPurpose::AccountUnlinked,
+            )
+            .await;
+            json_response(
+                StatusCode::OK,
+                json!({ "id": link_id.to_string(), "removed": true }),
+            )
+        }
+        Ok(UnlinkOutcome::BlockedLastMethod) => json_response(
+            StatusCode::CONFLICT,
+            json!({
+                "error": "last_authentication_method",
+                "error_description": "This is your only remaining way to sign in. Add another \
+                     sign-in method before removing this linked identity, so you are not \
+                     locked out.",
+            }),
+        ),
+        Ok(UnlinkOutcome::NotFound) => not_found_json(),
+        Err(_) => server_error(),
+    }
+}
+
+/// Alert EVERY verified channel (all verified emails and phone numbers) of an account link
+/// or unlink (issue #78), through the #68 verification seam. Returns how many channels were
+/// notified. The channel notification is a COARSE "this was you?" alert (never an OTP), so
+/// the real M11 transport renders it; the send seam records it for tests. Mirrors the
+/// recovery coarse-alert pattern.
+pub(crate) async fn notify_link_channels(
+    state: &OidcState,
+    scope: Scope,
+    subject: &UserId,
+    purpose: VerificationPurpose,
+) -> usize {
+    let identifiers = state
+        .store()
+        .scoped(scope)
+        .user_identifiers()
+        .list_for_user(subject)
+        .await
+        .unwrap_or_default();
+    let mut count = 0;
+    for identifier in identifiers {
+        if !identifier.verified {
+            continue;
+        }
+        if matches!(
+            identifier.identifier_type,
+            IdentifierType::Email | IdentifierType::Phone
+        ) {
+            // A verified, resolved channel (a known recipient), so the alert goes out;
+            // anti-enumeration suppression is decided earlier at existence lookup.
+            state.dispatch_verification(scope, purpose, &identifier.raw, true);
+            count += 1;
+        }
+    }
+    count
 }
 
 /// Whether a fleet session summary is an ACTIVE session (the account UI lists only

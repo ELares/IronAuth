@@ -449,6 +449,24 @@ pub fn oidc_router(state: OidcState) -> Router {
             "/t/{tenant_id}/e/{environment_id}/account/password/remove",
             post(account::remove_password),
         )
+        // Guarded account linking (issue #78): the self-service linked-identities API. List
+        // the caller's OWN linked federated identities, START a manual link (gated by a
+        // FRESH re-authentication of the target account, never merely an active session),
+        // and REMOVE one (the write-skew-safe last-usable-method guard refuses unlinking the
+        // account's sole surviving method). Every link and unlink emits an audit event and a
+        // coarse notification to every verified channel.
+        .route(
+            "/t/{tenant_id}/e/{environment_id}/account/linked-identities",
+            get(account::list_linked_identities),
+        )
+        .route(
+            "/t/{tenant_id}/e/{environment_id}/account/linked-identities/start",
+            post(account::start_link),
+        )
+        .route(
+            "/t/{tenant_id}/e/{environment_id}/account/linked-identities/remove",
+            post(account::remove_linked_identity),
+        )
         // WebAuthn Related Origin Requests document (issue #67, WebAuthn Level 3):
         // GET /.well-known/webauthn serves the {"origins": [...]} list a browser
         // fetches from the RP ID's own origin to accept a ceremony from a related

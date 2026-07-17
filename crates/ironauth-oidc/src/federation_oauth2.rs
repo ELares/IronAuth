@@ -77,6 +77,11 @@ pub(crate) struct Oauth2Callback<'a> {
     pub headers: &'a HeaderMap,
     /// The pending LOCAL authorization request to resume.
     pub return_to: &'a str,
+    /// The self-service manual-link target local user (issue #78, PR 2), re-derived from
+    /// the CONSUMED correlation row, or [`None`] for an ordinary federated login. Threaded
+    /// unchanged into the shared finalizer so a manual link through an OAuth 2.0 connector
+    /// (not just an OIDC one) binds into the target account identically.
+    pub link_target_user_id: Option<&'a str>,
     /// The callback instant from the clock seam.
     pub now: SystemTime,
     /// The callback instant in epoch microseconds.
@@ -148,6 +153,7 @@ pub(crate) async fn oauth2_callback(cb: Oauth2Callback<'_>) -> Response {
         captured_tokens,
         headers: cb.headers,
         return_to: cb.return_to,
+        link_target_user_id: cb.link_target_user_id,
         now: cb.now,
         now_micros: cb.now_micros,
     })

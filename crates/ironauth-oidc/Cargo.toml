@@ -587,6 +587,16 @@ name = "social_providers"
 path = "tests/social_providers.rs"
 required-features = ["testing"]
 
+# Guarded account linking, the PERMANENT adversarial suite (issue #78): the five encoded CVE
+# scenarios (unverified pre-registration then victim social login, forged email_verified from
+# an untrusted connector, untrusted-IdP auto-link, self-service verified-flag escalation, and
+# last-method deletion) plus the per-environment posture and audit/notification assertions,
+# each asserting the attack FAILS, against a mock upstream through the fetch test-harness.
+[[test]]
+name = "account_linking_adversarial"
+path = "tests/account_linking_adversarial.rs"
+required-features = ["testing"]
+
 # The session model on the OIDC surface (issue #32): the per-(client, session) `sid`
 # claim (stable across issuances for one pair, distinct across two clients of the same
 # SSO session, never the session id itself) and the immediate effect of a revocation

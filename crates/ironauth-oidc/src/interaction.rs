@@ -823,6 +823,42 @@ pub fn connector_unavailable_page(kind: &str) -> Response {
     )
 }
 
+/// The Keycloak-safe "an account already exists" interstitial (issue #78): shown when a
+/// federated login collides with an existing local account under the opt-in
+/// verified-to-verified posture but the FULL auto-link trust conditions are not all met
+/// (an unverified local account, a missing upstream `email_verified`, or an untrusted
+/// connector). It creates NO session and links NOTHING; it instructs the account owner to
+/// sign in locally and use the deliberate, fresh-re-auth-gated manual link. This is the
+/// safe shape: a would-be silent merge is refused, never performed.
+#[must_use]
+pub fn link_interstitial_page() -> Response {
+    pages::secure_html(
+        StatusCode::OK,
+        pages::notice_page(
+            "An account already exists",
+            "An account with this email already exists. For your security we did not merge \
+             them automatically. Sign in to that account, then link this provider from your \
+             account settings.",
+        ),
+    )
+}
+
+/// The notice shown when a self-service manual link cannot complete because the federated
+/// identity is ALREADY linked to an account (issue #78): the anti-takeover UNIQUE
+/// constraint refused a second binding. Generic on purpose: it never reveals which account
+/// holds the existing link, so it is not an existence oracle.
+#[must_use]
+pub fn link_conflict_page() -> Response {
+    pages::secure_html(
+        StatusCode::CONFLICT,
+        pages::notice_page(
+            "Already linked",
+            "This sign-in provider is already linked to an account. It cannot be linked to a \
+             second account. Remove the existing link first if you want to move it.",
+        ),
+    )
+}
+
 /// The `403` page shown when a state-changing POST is refused by the CSRF
 /// header allowlist ([`same_origin_ok`], issue #196). Generic on purpose: it never
 /// reveals WHICH signal (Origin or Sec-Fetch-Site) failed, and NO action is

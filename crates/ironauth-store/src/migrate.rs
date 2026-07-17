@@ -638,6 +638,12 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0061_account_links.sql"),
         },
+        Migration {
+            version: 62,
+            name: "account_linking_wiring",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0062_account_linking_wiring.sql"),
+        },
     ]
 }
 
