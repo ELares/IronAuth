@@ -23,6 +23,12 @@ ironauth-config.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 schemars.workspace = true
+# NFKC normalization of the resolved `email` trait value, applied ONCE in the evaluator
+# before the trait-schema type check so the mapped email is canonicalized regardless of
+# the claim path it resolved from (mirrors the NFKC email boundary IronAuth applies
+# elsewhere). A pure, table-only crate already vetted in the workspace tree (used by
+# ironauth-screening): it adds no I/O and keeps the crate fetch-free.
+unicode-normalization.workspace = true
 
 [lints]
 workspace = true
