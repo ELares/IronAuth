@@ -341,6 +341,12 @@ fn promoted_projection(snapshot: &Snapshot) -> Snapshot {
             dcr_policy: snapshot.resources.dcr_policy.clone(),
             variable: snapshot.resources.variable.clone(),
             connector: Vec::new(),
+            // Org connections and routing rules (issue #77) are not promoted by the
+            // transactional engine yet (their organization / connector references must
+            // resolve against the target environment, a later slice), so the promoted
+            // projection omits them exactly like `connector`.
+            org_connection: Vec::new(),
+            routing_rule: Vec::new(),
         },
     }
 }

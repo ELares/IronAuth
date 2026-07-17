@@ -123,6 +123,7 @@ mod resource;
 mod response;
 mod revocation;
 mod risk;
+pub mod routing;
 mod scope_claims;
 mod sector;
 mod session;
@@ -235,6 +236,7 @@ pub use risk::{
     GeoIpProvider, GeoLocation, IpReputation, IpReputationProvider, NullGeoIpProvider,
     NullIpReputationProvider, RiskAction, RiskDecision, RiskLevel, SignalOutcome,
 };
+pub use routing::{RouteCandidates, normalize_email_domain, resolve_route};
 pub use sector::{
     SectorError, check_sector_document, sector_uri_required, validate_sector_identifier,
 };

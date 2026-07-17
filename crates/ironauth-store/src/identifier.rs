@@ -229,6 +229,36 @@ fn case_fold(value: &str) -> String {
     default_case_fold_str(value).nfkc().collect()
 }
 
+/// The normalized form of a routing DOMAIN (issue #77): the same strip, NFKC, and
+/// case-fold steps [`canonicalize_identifier`] applies to the DOMAIN half of an email,
+/// so a routing rule stored for `Example.COM` matches the domain of a login submitted
+/// as `alice@example.com`. Returns [`None`] for a domain that normalizes to empty (a
+/// shapeless selector a routing rule must not carry).
+///
+/// This is the ONE definition of routing-domain normalization: the login routing
+/// lookup and the routing-rule write both go through it, so a stored domain and a
+/// submitted email's domain fold identically.
+#[must_use]
+pub fn normalize_routing_domain(raw: &str) -> Option<String> {
+    // Steps 1..3 of canonicalize_identifier: strip invisibles/controls, NFKC, then
+    // strip all whitespace.
+    let stripped: String = raw
+        .chars()
+        .filter(|&c| !is_invisible_or_control(c))
+        .collect();
+    let normalized: String = stripped.nfkc().collect();
+    let base: String = normalized.chars().filter(|c| !c.is_whitespace()).collect();
+    if base.is_empty() {
+        return None;
+    }
+    let folded = case_fold(&base);
+    if folded.is_empty() {
+        None
+    } else {
+        Some(folded)
+    }
+}
+
 /// The canonical email form: fold the local part and the domain independently and
 /// recombine. Splitting on the LAST `@` keeps a quoted `@` inside the local part
 /// with the local part, and folding never introduces or moves an `@`, so the split

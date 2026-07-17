@@ -802,6 +802,14 @@ pub enum Action {
     /// through the management API. The row targets the `cnr_` connector; the `detail`
     /// records the connector slug.
     ConnectorDelete,
+    /// An organization-to-connector binding was CREATED (issue #77): an organization
+    /// was bound to a connector through the management API. The row targets the `ocn_`
+    /// binding; the `detail` records the organization and connector ids.
+    OrgConnectionCreate,
+    /// A routing rule was CREATED (issue #77): a domain, app, or user selector was
+    /// mapped to an org connection through the management API. The row targets the
+    /// `rrl_` rule; the `detail` records the rule kind.
+    RoutingRuleCreate,
 }
 
 impl Action {
@@ -975,6 +983,8 @@ impl Action {
             Action::ConnectorCreate => "connector.create",
             Action::ConnectorUpdate => "connector.update",
             Action::ConnectorDelete => "connector.delete",
+            Action::OrgConnectionCreate => "org_connection.create",
+            Action::RoutingRuleCreate => "routing_rule.create",
         }
     }
 }

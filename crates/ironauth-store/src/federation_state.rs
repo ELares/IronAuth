@@ -25,6 +25,11 @@ pub struct NewFederationLoginState<'a> {
     pub connector_id: &'a str,
     /// The pending LOCAL `/authorize?...` resume target.
     pub return_to: &'a str,
+    /// The routed `ocn_` org connection this login was bound to at the authorize leg
+    /// (issue #77), or [`None`] for a direct federated login not routed to an
+    /// organization. The callback reads it back from the CONSUMED row, so the
+    /// organization is never influenced by anything the browser sent.
+    pub org_connection_id: Option<&'a str>,
     /// The row expiry in microseconds since the epoch (from the clock seam).
     pub expires_at_unix_micros: i64,
 }
@@ -43,4 +48,8 @@ pub struct ConsumedFederationLoginState {
     pub connector_id: String,
     /// The pending LOCAL `/authorize?...` resume target.
     pub return_to: String,
+    /// The routed `ocn_` org connection this login was bound to at the authorize leg
+    /// (issue #77), or [`None`] for a direct federated login. Re-derived here from the
+    /// consumed row, never from the callback query.
+    pub org_connection_id: Option<String>,
 }

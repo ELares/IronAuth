@@ -513,6 +513,28 @@ impl ScopedKind for FederationLoginStateKind {
     const PREFIX: &'static str = "fls";
 }
 
+/// Marker for an organization to connector binding (`ocn_`), the row that ties an
+/// organization to the declarative federation connector describing its upstream and
+/// carries the broker overlay policy (issue #77). A tenant-scoped resource: the id
+/// embeds its (tenant, environment), so a binding minted in one scope parses as a
+/// uniform not-found under another.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct OrgConnectionKind;
+impl ScopedKind for OrgConnectionKind {
+    const PREFIX: &'static str = "ocn";
+}
+
+/// Marker for a routing rule (`rrl_`), the row that maps one selector (an email
+/// domain, an app client, or a single user) to an org connection so an inbound login
+/// is routed to the right organization's upstream (issue #77). A tenant-scoped
+/// resource: the id embeds its (tenant, environment), so a rule minted in one scope
+/// parses as a uniform not-found under another.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RoutingRuleKind;
+impl ScopedKind for RoutingRuleKind {
+    const PREFIX: &'static str = "rrl";
+}
+
 /// Marker for a signing key (`sik_`), an environment's per-issuer signing key
 /// (issue #19). A tenant-scoped resource: the identifier embeds its
 /// `(tenant, environment)`, so a key row can never be read across a tenant or
@@ -1146,6 +1168,12 @@ pub type ConnectorId = ScopedId<ConnectorKind>;
 /// short-lived single-use row correlating an upstream authorize leg to its callback
 /// (issue #75, PR B).
 pub type FederationLoginStateId = ScopedId<FederationLoginStateKind>;
+/// An organization-to-connector binding identifier (`ocn_...`), one per (organization,
+/// connector) binding per environment (issue #77).
+pub type OrgConnectionId = ScopedId<OrgConnectionKind>;
+/// A routing-rule identifier (`rrl_...`), one per domain / app / user routing rule per
+/// environment (issue #77).
+pub type RoutingRuleId = ScopedId<RoutingRuleKind>;
 /// A signing-key identifier (`sik_...`), which doubles as the JOSE `kid` of a
 /// per-environment signing key (issue #19).
 pub type SigningKeyId = ScopedId<SigningKeyKind>;
