@@ -1564,7 +1564,8 @@ mod tests {
     fn an_oauth2_connector_with_pkce_required_is_rejected_on_the_pkce_field() {
         // The baseline oauth2 fixture (default pkce auto_where_supported) validates.
         let def = parse(VALID_OAUTH2).expect("parses");
-        def.validate().expect("the baseline oauth2 fixture validates");
+        def.validate()
+            .expect("the baseline oauth2 fixture validates");
 
         // pkce "required" is rejected on an oauth2 connector: the oauth2 token exchange threads no
         // code_verifier, so a required challenge would be emitted upstream with no verifier and
@@ -1574,7 +1575,9 @@ mod tests {
             "\"client_id\": \"ironauth-at-acme\", \"pkce\": \"required\",",
         );
         let def = parse(&json).expect("parses");
-        let errors = def.validate().expect_err("pkce required rejected on oauth2");
+        let errors = def
+            .validate()
+            .expect_err("pkce required rejected on oauth2");
         assert!(
             errors.iter().any(|error| error.pointer == "/pkce"),
             "{errors:?}"
