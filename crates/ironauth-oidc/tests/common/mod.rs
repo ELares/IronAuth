@@ -1198,6 +1198,29 @@ impl Harness {
             .to_string()
     }
 
+    /// Register a bootstrap user directly in `state` and return its subject (issue #80).
+    /// The waitlist / pending states are CREATION-time only (never a transition target),
+    /// so a test that needs a non-Active account seeds it here rather than transitioning
+    /// into it. The password is a usable credential, so the account can also be driven on
+    /// the password path.
+    pub async fn seed_user_in_state(
+        &self,
+        identifier: &str,
+        password: &str,
+        state: ironauth_store::UserState,
+    ) -> String {
+        let hash = ironauth_oidc::hash_password(&self.env, password).expect("hash password");
+        let (actor, corr) = self.seeding_actor();
+        self.store()
+            .scoped(self.scope)
+            .acting(actor, corr)
+            .users()
+            .register_in_state(&self.env, identifier, &hash, state)
+            .await
+            .expect("register user in state")
+            .to_string()
+    }
+
     /// Register a bootstrap user with a PRE-BUILT password hash and return its
     /// subject, so a test can seed a credential written at specific Argon2id
     /// parameters (issue #62): the native rehash-on-login upgrade needs a user whose

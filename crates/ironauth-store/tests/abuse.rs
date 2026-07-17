@@ -391,3 +391,80 @@ async fn the_fail_closed_security_cells_deny_when_the_master_key_is_missing() {
         "the per-identifier counter clear must fail closed without a master key"
     );
 }
+
+#[tokio::test]
+async fn expired_pow_challenges_are_reclaimed_on_the_issue_path_and_live_ones_are_kept() {
+    // The bounded request-path reclaim (issue #80 LOW-3): the DELETE grant added to
+    // migration 0057 lets the issue path clear its OWN already-expired challenge rows, so
+    // the table cannot grow without bound. A LIVE (unexpired) challenge is never reclaimed.
+    let db = TestDatabase::start().await;
+    let (env, _clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0x80);
+    let scope = db.seed_scope(&env).await;
+    let store = db.store();
+
+    // One challenge that expires 1ms after the epoch (already expired) and one that expires
+    // far in the future (still live).
+    let expired_id = ironauth_store::PowChallengeId::generate(&env, &scope);
+    let live_id = ironauth_store::PowChallengeId::generate(&env, &scope);
+    store
+        .scoped(scope)
+        .pow_challenges()
+        .mint(
+            &expired_id,
+            &ironauth_store::NewPowChallenge {
+                challenge: b"expired-challenge",
+                difficulty_bits: 8,
+                context_hash: b"ctx-a",
+                expires_at_micros: 1_000,
+            },
+        )
+        .await
+        .expect("mint expired");
+    store
+        .scoped(scope)
+        .pow_challenges()
+        .mint(
+            &live_id,
+            &ironauth_store::NewPowChallenge {
+                challenge: b"live-challenge",
+                difficulty_bits: 8,
+                context_hash: b"ctx-b",
+                expires_at_micros: 10_000_000_000,
+            },
+        )
+        .await
+        .expect("mint live");
+
+    // Reclaiming at 2s past the epoch removes exactly the expired row (the live one is not
+    // yet expired), and a second reclaim at the same instant is a no-op (bounded, idempotent).
+    let reclaimed = store
+        .scoped(scope)
+        .pow_challenges()
+        .reclaim_expired(2_000_000, 32)
+        .await
+        .expect("reclaim");
+    assert_eq!(reclaimed, 1, "exactly the expired challenge is reclaimed");
+    let again = store
+        .scoped(scope)
+        .pow_challenges()
+        .reclaim_expired(2_000_000, 32)
+        .await
+        .expect("reclaim again");
+    assert_eq!(
+        again, 0,
+        "nothing else is expired yet, so the reclaim is a no-op"
+    );
+
+    // Only once the live challenge's own expiry passes is it reclaimable, proving it was
+    // KEPT until then.
+    let live_reclaimed = store
+        .scoped(scope)
+        .pow_challenges()
+        .reclaim_expired(20_000_000_000, 32)
+        .await
+        .expect("reclaim live");
+    assert_eq!(
+        live_reclaimed, 1,
+        "the previously-live challenge is reclaimed only after it expires"
+    );
+}

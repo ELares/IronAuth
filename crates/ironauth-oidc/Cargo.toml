@@ -244,6 +244,16 @@ name = "abuse_defenses"
 path = "tests/abuse_defenses.rs"
 required-features = ["testing"]
 
+# Registration abuse defenses (issue #80): the offline self-contained proof-of-work
+# challenge (a naive bot loop blocked with ZERO third-party calls; single-use, expiring,
+# context-bound), the disposable-domain block/flag with anti-enumeration uniformity, and the
+# waitlist pending-cannot-authenticate gate, driven through the full HTTP path against a real
+# Postgres.
+[[test]]
+name = "registration_abuse"
+path = "tests/registration_abuse.rs"
+required-features = ["testing"]
+
 # The self-service end-user account API (issue #61): a user lists and revokes their
 # OWN sessions, changes their OWN password, and enrolls/lists/removes their OWN
 # credentials, always bound to the authenticated subject (a cross-user id is the

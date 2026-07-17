@@ -8781,7 +8781,8 @@
           "blocked",
           "disabled",
           "pending_verification",
-          "scheduled_offboarding"
+          "scheduled_offboarding",
+          "waitlisted"
         ]
       },
       "UserView": {

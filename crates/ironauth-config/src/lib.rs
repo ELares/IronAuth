@@ -1253,6 +1253,13 @@ pub struct OidcConfig {
     /// [`RiskConfig`].
     pub risk: RiskConfig,
 
+    /// The registration abuse defenses (issue #80): the invisible self-contained
+    /// proof-of-work challenge (the default, with ZERO third-party calls; Turnstile and
+    /// reCAPTCHA are optional adapters), the disposable / low-reputation email defense,
+    /// and the waitlist gate. All OFF by default (fully inert). See
+    /// [`RegistrationAbuseConfig`].
+    pub registration_abuse: RegistrationAbuseConfig,
+
     /// Whether the WebAuthn passkey ceremony endpoints are mounted and the hosted
     /// login page offers conditional-UI passkey sign-in (issue #65). On by default:
     /// passkeys are the headline primary credential for the platform. When on,
@@ -1660,6 +1667,7 @@ impl Default for OidcConfig {
             registration_mode: RegistrationMode::TokenGated,
             regulation: RegulationConfig::default(),
             risk: RiskConfig::default(),
+            registration_abuse: RegistrationAbuseConfig::default(),
             registration_max_clients: 100,
             registration_rate_limit: 20,
             registration_rate_window_secs: 60,
@@ -2134,6 +2142,175 @@ impl Default for RiskConfig {
             disavowal_ttl_secs: 604_800,
         }
     }
+}
+
+/// The lower bound on the proof-of-work difficulty, in leading zero bits (issue #80). A
+/// difficulty of 0 would demand no work at all; the floor of 1 keeps an enabled `PoW`
+/// meaningful.
+pub const OIDC_POW_MIN_DIFFICULTY_BITS: u8 = 1;
+/// The upper bound on the proof-of-work difficulty, in leading zero bits (issue #80).
+/// Beyond this an honest browser could take unbounded time to solve the invisible
+/// challenge; 24 bits keeps the worst case tractable while still costing a bot farm.
+pub const OIDC_POW_MAX_DIFFICULTY_BITS: u8 = 24;
+/// The closed set of disposable-email modes (issue #80): `off` (no check), `flag` (feed
+/// the risk engine a signal but admit), or `block` (refuse with an anti-enumeration
+/// uniform failure).
+pub const OIDC_DISPOSABLE_EMAIL_MODES: [&str; 3] = ["off", "flag", "block"];
+
+/// Which challenge provider verifies a registration/reset/OTP-send proof-of-work (issue
+/// #80). A closed set. The built-in invisible `PoW` is the DEFAULT and never depends on an
+/// external service (the no-mandatory-third-party-infrastructure covenant); Turnstile and
+/// reCAPTCHA are OPTIONAL adapters that make an outbound verify call through the audited
+/// `ironauth-fetch` seam.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PowProvider {
+    /// The built-in, self-contained hashcash proof-of-work (the default). ZERO external
+    /// calls, so it can never fail-open/closed on an outage.
+    #[default]
+    Builtin,
+    /// Cloudflare Turnstile (external adapter; brings Apple Private Access Tokens).
+    Turnstile,
+    /// Google reCAPTCHA (external adapter).
+    Recaptcha,
+}
+
+/// How an EXTERNAL challenge adapter (Turnstile/reCAPTCHA) degrades when the provider is
+/// unreachable (issue #80). The built-in `PoW` never depends on an external service, so this
+/// policy applies ONLY to the adapters. Default fail-CLOSED (an outage refuses the
+/// attempt); a deployment that prizes availability over abuse resistance may opt into
+/// fail-OPEN.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AdapterFailPolicy {
+    /// An adapter outage REFUSES the attempt (abuse-resistant; the default).
+    #[default]
+    FailClosed,
+    /// An adapter outage ADMITS the attempt (availability-biased).
+    FailOpen,
+}
+
+/// The proof-of-work challenge settings (issue #80). OFF by default: the challenge is
+/// never issued or required until a tenant opts in. `challenge_at` reuses the #79 risk
+/// threshold vocabulary (`off`/`low`/`med`/`high`): the challenge is required when the
+/// anonymous registration/verification risk level meets the threshold, so `low` challenges
+/// every attempt while `med` challenges only an elevated one (a suspect IP or a flagged
+/// disposable domain).
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields, default)]
+pub struct PowConfig {
+    /// Whether proof-of-work challenges are issued and required. OFF by default (inert).
+    pub enabled: bool,
+
+    /// The challenge difficulty, in leading zero bits a solving nonce must produce
+    /// (issue #80). Configurable per environment. Bounded to
+    /// [`OIDC_POW_MIN_DIFFICULTY_BITS`]`..=`[`OIDC_POW_MAX_DIFFICULTY_BITS`] so a
+    /// misconfiguration cannot demand impossible or trivial work. Default 12.
+    pub difficulty_bits: u8,
+
+    /// The risk threshold at or above which a challenge is required (issue #80): one of
+    /// `off` (never), `low` (always, once `enabled`), `med`, or `high`. Reuses the #79
+    /// score vocabulary; the anonymous level is computed from the IP-reputation signal
+    /// and, at registration, a flagged disposable-domain signal. Default `low`.
+    pub challenge_at: String,
+
+    /// How long, in seconds, an issued challenge remains solvable before it expires
+    /// (issue #80). Default 300 (five minutes). Must be at least 1 and at most
+    /// `OIDC_MAX_LIFETIME_SECS`.
+    pub challenge_ttl_secs: u64,
+
+    /// Which provider verifies the challenge (issue #80). Default the built-in
+    /// self-contained `PoW` ([`PowProvider::Builtin`]); Turnstile and reCAPTCHA are
+    /// optional adapters.
+    pub provider: PowProvider,
+
+    /// How an external adapter degrades on an outage (issue #80). Ignored by the built-in
+    /// `PoW` (which never calls out). Default fail-CLOSED.
+    pub fail_policy: AdapterFailPolicy,
+
+    /// The external adapter's site SECRET (issue #80), for Turnstile/reCAPTCHA server-side
+    /// verification. A [`Secret`] indirection (env/file), so the VALUE never lands in a
+    /// config dump or a config snapshot; only a named reference travels. `None` for the
+    /// built-in `PoW` (which has no secret).
+    pub adapter_secret: Option<Secret>,
+}
+
+impl Default for PowConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            difficulty_bits: 12,
+            challenge_at: "low".to_owned(),
+            challenge_ttl_secs: 300,
+            provider: PowProvider::Builtin,
+            fail_policy: AdapterFailPolicy::FailClosed,
+            adapter_secret: None,
+        }
+    }
+}
+
+/// The disposable / low-reputation email defense (issue #80). Evaluated at signup on the
+/// NFKC-normalized email domain. OFF by default. The lists are updateable per-environment
+/// data (like the #79 IP allow/deny lists) that promote with the config snapshot: `denylist`
+/// names domains treated as disposable, and `allowlist` is the override that always admits a
+/// domain even if it matches a heuristic or the deny list.
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields, default)]
+pub struct DisposableEmailConfig {
+    /// The mode (issue #80): `off` (no check), `flag` (admit but feed the risk engine a
+    /// MED signal, so a challenge may be required), or `block` (refuse with an
+    /// anti-enumeration uniform failure indistinguishable from an ordinary validation
+    /// error). Default `off`.
+    pub mode: String,
+
+    /// The per-environment DENY list of email domains treated as disposable /
+    /// low-reputation (issue #80). Lower-cased and compared against the normalized email
+    /// domain. Empty by default.
+    pub denylist: Vec<String>,
+
+    /// The per-environment ALLOW override (issue #80): domains always admitted even if
+    /// they match `denylist`. Empty by default.
+    pub allowlist: Vec<String>,
+}
+
+impl Default for DisposableEmailConfig {
+    fn default() -> Self {
+        Self {
+            mode: "off".to_owned(),
+            denylist: Vec::new(),
+            allowlist: Vec::new(),
+        }
+    }
+}
+
+/// The waitlist gate (issue #80). OFF by default. When on, a self-service registration
+/// lands in a PENDING (`waitlisted`) lifecycle state that CANNOT authenticate until an
+/// admin approves it (transition to active) or rejects it (transition to disabled) through
+/// the user-lifecycle management API.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields, default)]
+pub struct WaitlistConfig {
+    /// Whether self-service signup is waitlist-gated (issue #80). OFF by default.
+    pub enabled: bool,
+}
+
+/// The registration abuse defenses (issue #80): proof-of-work challenges, the disposable
+/// email defense, and the waitlist gate. Every sub-feature is independently toggleable per
+/// environment and OFF by default, and the whole struct promotes with the config snapshot
+/// (only a named reference to an adapter secret ever travels, never the value).
+#[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields, default)]
+pub struct RegistrationAbuseConfig {
+    /// The invisible, self-contained proof-of-work challenge (issue #80). See
+    /// [`PowConfig`].
+    pub pow: PowConfig,
+
+    /// The disposable / low-reputation email defense (issue #80). See
+    /// [`DisposableEmailConfig`].
+    pub disposable_email: DisposableEmailConfig,
+
+    /// The waitlist gate (issue #80). See [`WaitlistConfig`].
+    pub waitlist: WaitlistConfig,
 }
 
 /// The OWASP-recommended Argon2id memory cost, in KiB (issue #62). The shipped
@@ -2867,6 +3044,7 @@ impl Config {
         validate_federation(&self.oidc)?;
         validate_regulation(&self.oidc)?;
         validate_risk(&self.oidc)?;
+        validate_registration_abuse(&self.oidc)?;
         validate_webauthn(&self.oidc, &self.server)?;
         validate_totp(&self.oidc)?;
         validate_trusted_device(&self.oidc)?;
@@ -3017,6 +3195,52 @@ fn validate_risk(oidc: &OidcConfig) -> Result<(), ConfigError> {
                 "oidc.risk.disavowal_ttl_secs ({}) must be between \
                  {OIDC_RISK_MIN_DISAVOWAL_TTL_SECS} and {OIDC_RISK_MAX_DISAVOWAL_TTL_SECS} seconds",
                 risk.disavowal_ttl_secs
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// Validate the registration abuse defenses (issue #80), kept out of
+/// [`Config::validate`] so each stays within the readable-length lint. Bounds the `PoW`
+/// difficulty and TTL, pins the `PoW` challenge threshold to the closed #79 risk set, and
+/// pins the disposable-email mode to its closed set, so a misconfiguration is a boot-time
+/// error rather than a per-request surprise.
+fn validate_registration_abuse(oidc: &OidcConfig) -> Result<(), ConfigError> {
+    let pow = &oidc.registration_abuse.pow;
+    if !OIDC_RISK_THRESHOLDS.contains(&pow.challenge_at.as_str()) {
+        return Err(ConfigError::Invalid {
+            message: format!(
+                "oidc.registration_abuse.pow.challenge_at ({}) must be one of off, low, med, high",
+                pow.challenge_at
+            ),
+        });
+    }
+    if !(OIDC_POW_MIN_DIFFICULTY_BITS..=OIDC_POW_MAX_DIFFICULTY_BITS).contains(&pow.difficulty_bits)
+    {
+        return Err(ConfigError::Invalid {
+            message: format!(
+                "oidc.registration_abuse.pow.difficulty_bits ({}) must be between \
+                 {OIDC_POW_MIN_DIFFICULTY_BITS} and {OIDC_POW_MAX_DIFFICULTY_BITS} leading zero bits",
+                pow.difficulty_bits
+            ),
+        });
+    }
+    if pow.challenge_ttl_secs < 1 || pow.challenge_ttl_secs > OIDC_MAX_LIFETIME_SECS {
+        return Err(ConfigError::Invalid {
+            message: format!(
+                "oidc.registration_abuse.pow.challenge_ttl_secs ({}) must be between 1 and \
+                 {OIDC_MAX_LIFETIME_SECS} seconds",
+                pow.challenge_ttl_secs
+            ),
+        });
+    }
+    let mode = oidc.registration_abuse.disposable_email.mode.as_str();
+    if !OIDC_DISPOSABLE_EMAIL_MODES.contains(&mode) {
+        return Err(ConfigError::Invalid {
+            message: format!(
+                "oidc.registration_abuse.disposable_email.mode ({mode}) must be one of \
+                 off, flag, block"
             ),
         });
     }
@@ -5336,6 +5560,70 @@ mod tests {
         // Guards the expect() in DatabaseConfig::default.
         let config = DatabaseConfig::default();
         assert_eq!(config.url.scheme(), "postgres");
+    }
+
+    #[test]
+    fn registration_abuse_config_round_trips_and_the_adapter_secret_is_a_reference() {
+        // The registration-abuse settings are per-environment config that promotes with the
+        // config snapshot (issue #80); the adapter secret is a REFERENCE, never a value.
+        let input = "\
+[oidc.registration_abuse.pow]
+enabled = true
+difficulty_bits = 14
+challenge_at = \"med\"
+provider = \"turnstile\"
+fail_policy = \"fail_open\"
+adapter_secret = \"site-secret-value\"
+
+[oidc.registration_abuse.disposable_email]
+mode = \"block\"
+denylist = [\"mailinator.com\"]
+allowlist = [\"vip.mailinator.com\"]
+
+[oidc.registration_abuse.waitlist]
+enabled = true
+";
+        let loaded = Config::from_toml_str(input, "<inline>").expect("valid");
+        let abuse = &loaded.config.oidc.registration_abuse;
+        assert!(abuse.pow.enabled);
+        assert_eq!(abuse.pow.difficulty_bits, 14);
+        assert_eq!(abuse.pow.challenge_at, "med");
+        assert_eq!(abuse.pow.provider, PowProvider::Turnstile);
+        assert_eq!(abuse.pow.fail_policy, AdapterFailPolicy::FailOpen);
+        assert_eq!(abuse.disposable_email.mode, "block");
+        assert_eq!(abuse.disposable_email.denylist, vec!["mailinator.com"]);
+        assert_eq!(abuse.disposable_email.allowlist, vec!["vip.mailinator.com"]);
+        assert!(abuse.waitlist.enabled);
+
+        // A config dump (the snapshot vehicle) carries the promotable settings but the
+        // adapter SECRET value NEVER appears: it degrades to the redaction placeholder.
+        let dump = toml::to_string(&loaded.config).expect("dumps");
+        assert!(
+            dump.contains("difficulty_bits = 14"),
+            "settings export: {dump}"
+        );
+        assert!(
+            dump.contains("mailinator.com"),
+            "the domain list exports: {dump}"
+        );
+        assert!(
+            !dump.contains("site-secret-value"),
+            "the adapter secret VALUE must never appear in a config dump: {dump}"
+        );
+        assert!(
+            dump.contains(REDACTED),
+            "the secret degrades to the placeholder: {dump}"
+        );
+
+        // An env-indirection secret round-trips as a NAMED REFERENCE (never a value).
+        let env_input =
+            "[oidc.registration_abuse.pow]\nadapter_secret = { env = \"TURNSTILE_SECRET\" }\n";
+        let loaded = Config::from_toml_str(env_input, "<inline>").expect("valid");
+        let dump = toml::to_string(&loaded.config).expect("dumps");
+        assert!(
+            dump.contains("TURNSTILE_SECRET"),
+            "only the reference to the secret travels: {dump}"
+        );
     }
 
     #[test]

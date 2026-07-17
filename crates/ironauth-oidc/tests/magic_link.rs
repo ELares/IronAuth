@@ -579,3 +579,109 @@ async fn the_endpoints_fail_closed_when_the_factor_is_disabled() {
         "a disabled factor renders the invalid-link page"
     );
 }
+
+/// Whether the response sets a session cookie.
+fn sets_session(headers: &HeaderMap) -> bool {
+    headers.get_all(header::SET_COOKIE).iter().any(|value| {
+        value
+            .to_str()
+            .unwrap_or_default()
+            .starts_with(SESSION_COOKIE)
+    })
+}
+
+/// The magic-link consume path funnels through `establish_session`, so the CENTRAL
+/// lifecycle fence (issue #80 / #52) refuses a non-authenticatable account (waitlisted /
+/// blocked / disabled) there with the SAME uniform invalid-link page a spent/expired link
+/// returns (no session, no state oracle). An ACTIVE account still signs in on the same
+/// path, and after admin approval (waitlisted -> active) the account can authenticate.
+#[tokio::test]
+async fn the_lifecycle_fence_blocks_the_magic_link_path_for_a_non_authenticatable_account() {
+    let mut harness = Harness::start_store_backed_with(OidcConfig::default()).await;
+    let sender = Arc::new(RecordingSender::default());
+    harness.install_verification_sender(sender.clone());
+    let base = base(&harness);
+    let password = "correct horse battery staple";
+
+    // Each non-authenticatable state: a valid link + short code still yields NO session,
+    // and the refusal is the uniform invalid-link page (400), never a distinct oracle.
+    for (recipient, state) in [
+        (
+            "waitlisted@example.test",
+            ironauth_store::UserState::Waitlisted,
+        ),
+        ("blocked@example.test", ironauth_store::UserState::Blocked),
+        ("disabled@example.test", ironauth_store::UserState::Disabled),
+    ] {
+        harness.seed_user_in_state(recipient, password, state).await;
+        let (binding, _token, short_code) = send_link(&harness, &sender, recipient).await;
+        let (status, headers, body) = post_form(
+            &harness,
+            &format!("{base}/magic/consume"),
+            &format!("short_code={short_code}"),
+            Some(&binding),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "{state:?}: the fence renders the uniform invalid-link page: {body}"
+        );
+        assert!(
+            !sets_session(&headers),
+            "{state:?}: a fenced account obtains NO session on the magic-link path"
+        );
+    }
+
+    // An ACTIVE account still authenticates on the same path.
+    let active = "active@example.test";
+    harness.seed_user(active, password).await;
+    let (binding, _token, short_code) = send_link(&harness, &sender, active).await;
+    let (status, headers, body) = post_form(
+        &harness,
+        &format!("{base}/magic/consume"),
+        &format!("short_code={short_code}"),
+        Some(&binding),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "an active account authenticates on the magic-link path: {body}"
+    );
+    assert!(
+        sets_session(&headers),
+        "an active account mints a session on the magic-link path"
+    );
+
+    // Admin approval (waitlisted -> active) lets the previously-fenced account in.
+    let approved = harness
+        .store()
+        .scoped(harness.scope())
+        .users()
+        .by_identifier("waitlisted@example.test")
+        .await
+        .expect("lookup")
+        .expect("the waitlisted account exists");
+    harness
+        .set_user_state(&approved.id.to_string(), ironauth_store::UserState::Active)
+        .await;
+    let (binding, _token, short_code) =
+        send_link(&harness, &sender, "waitlisted@example.test").await;
+    let (status, headers, body) = post_form(
+        &harness,
+        &format!("{base}/magic/consume"),
+        &format!("short_code={short_code}"),
+        Some(&binding),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "an approved account authenticates on the magic-link path: {body}"
+    );
+    assert!(
+        sets_session(&headers),
+        "an approved account mints a session on the magic-link path"
+    );
+}

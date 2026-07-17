@@ -639,6 +639,46 @@ fn f64_from_u64(value: u64) -> f64 {
 }
 
 // ===========================================================================
+// The subject-less registration/verification challenge level (issue #80)
+// ===========================================================================
+
+/// The ANONYMOUS risk level for a pre-account surface (registration, password reset, OTP
+/// send) that has no subject yet (issue #80). The full login [`evaluate`] is subject-keyed
+/// (velocity, geo, new-device); this reuses only the SUBJECT-INDEPENDENT signals so the
+/// proof-of-work gate can condition issuance on risk exactly the way the login step-up gate
+/// conditions on [`RiskAction::Challenge`]:
+///
+/// - the IP-reputation signal (the per-environment allow/deny lists plus the pluggable
+///   provider seam), evaluated only when `oidc.risk.ip_reputation_enabled`, and
+/// - a `disposable_domain` signal contributing MED when the signup email domain was FLAGGED
+///   as disposable (the #80 flag-mode "feed the risk engine a signal" path).
+///
+/// The two are combined with the SAME deterministic [`combine`] rule the login engine uses,
+/// so two MED signals corroborate to HIGH. When the risk engine is off the level is LOW
+/// (the IP signal is skipped), but a flagged disposable domain still contributes, so the
+/// disposable flag can raise the challenge level even without the full engine enabled.
+pub(crate) fn anonymous_challenge_level(
+    state: &OidcState,
+    ip: Option<&str>,
+    disposable_flagged: bool,
+) -> RiskLevel {
+    let cfg = state.risk_config();
+    let mut outcomes = Vec::new();
+    if cfg.enabled && cfg.ip_reputation_enabled {
+        outcomes.push(ip_reputation_outcome(ip_reputation_verdict(state, ip)));
+    }
+    if disposable_flagged {
+        outcomes.push(SignalOutcome {
+            name: "disposable_domain",
+            level: RiskLevel::Med,
+            hard_deny: false,
+            value: "flagged".to_owned(),
+        });
+    }
+    combine(&outcomes)
+}
+
+// ===========================================================================
 // The evaluation entry point
 // ===========================================================================
 

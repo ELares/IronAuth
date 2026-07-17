@@ -31,7 +31,27 @@ pub struct RegisterForm {
     pub password: Option<String>,
     /// The authorization URL to resume at.
     pub return_to: Option<String>,
+    /// The proof-of-work challenge id the client solved (issue #80), when a challenge is
+    /// required. Paired with `pow_nonce` and `pow_context` for the built-in `PoW`.
+    pub pow_challenge_id: Option<String>,
+    /// The proof-of-work nonce (base64url no-pad) the client found (issue #80).
+    pub pow_nonce: Option<String>,
+    /// The request context the challenge was issued for (issue #80), echoed back so the
+    /// server can recompute the context binding.
+    pub pow_context: Option<String>,
+    /// An external adapter (Turnstile/reCAPTCHA) response token (issue #80), when an adapter
+    /// provider is configured instead of the built-in `PoW`.
+    pub pow_token: Option<String>,
 }
+
+/// The anti-enumeration-uniform message for a disposable-domain block (issue #80): an
+/// ORDINARY validation failure (a form re-render at 200), leaking nothing about whether the
+/// identifier already exists.
+const DISPOSABLE_BLOCK_MESSAGE: &str =
+    "That email address cannot be used to register. Please use a different address.";
+
+/// The message shown when a required proof-of-work challenge was not satisfied (issue #80).
+const POW_REQUIRED_MESSAGE: &str = "Additional verification is required. Please try again.";
 
 /// `GET /register`: render the registration form for a valid resume target. The
 /// `display` / `ui_locales` hints carried on the resuming request shape the page
@@ -168,6 +188,57 @@ pub async fn register_post(
             banner,
         );
     }
+
+    // Disposable / low-reputation email defense (issue #80), evaluated on the
+    // NFKC-normalized email domain per the per-environment config (off / flag / block). A
+    // BLOCK is an anti-enumeration UNIFORM failure: the same 200 form re-render an ordinary
+    // validation failure produces, leaking nothing about whether the identifier exists. A
+    // FLAG admits but feeds the risk engine a signal (raising the PoW challenge level below).
+    let disposable = crate::disposable::evaluate(
+        &state.registration_abuse_config().disposable_email,
+        &ironauth_screening::normalize_nfkc(identifier),
+    );
+    if disposable.is_block() {
+        return register_error(
+            identifier,
+            &resume.return_to,
+            DISPOSABLE_BLOCK_MESSAGE,
+            &resume.hints,
+            banner,
+        );
+    }
+
+    // Proof-of-work gate (issue #80), CONDITIONED on the #79 risk level (a flagged
+    // disposable domain or a suspect IP raises it). Runs BEFORE the Argon2 hash so an
+    // unsolved bot attempt spends no password work. The built-in PoW is fully server-side
+    // (ZERO third-party calls); an unsolved or missing solution re-renders the form.
+    let peer_ip = crate::abuse::resolved_client_ip(&headers);
+    if crate::pow_gate::challenge_required(&state, peer_ip.as_deref(), disposable.is_flagged()) {
+        let solution = crate::pow_gate::PresentedSolution {
+            challenge_id: form.pow_challenge_id.as_deref(),
+            nonce: form.pow_nonce.as_deref(),
+            context: form.pow_context.as_deref().unwrap_or_default(),
+            token: form.pow_token.as_deref(),
+            remote_ip: peer_ip.as_deref(),
+        };
+        if !crate::pow_gate::verify_solution(
+            &state,
+            resume.scope,
+            crate::pow_gate::ENDPOINT_REGISTER,
+            &solution,
+        )
+        .await
+        {
+            return register_error(
+                identifier,
+                &resume.return_to,
+                POW_REQUIRED_MESSAGE,
+                &resume.hints,
+                banner,
+            );
+        }
+    }
+
     // NFKC-normalize ONCE (issue #63): the 800-63B-4 length check (counted in code
     // points) and breach screening both operate on the normalized form, and the hash is
     // derived from the same normalized form, so a Unicode password round-trips.
@@ -239,18 +310,41 @@ pub async fn register_post(
         Err(rejection) => return rejection.to_response(),
     };
 
+    // Waitlist gate (issue #80): with waitlist mode on, a self-service signup lands in the
+    // PENDING `waitlisted` lifecycle state, which CANNOT authenticate (it holds no session
+    // or token capability) until an admin APPROVES it (transition to active) or REJECTS it
+    // (transition to disabled) through the user-lifecycle management API. Approval then
+    // resumes the normal verification/login flow.
+    let waitlisted = state.registration_abuse_config().waitlist.enabled;
+
     // A fresh human actor for the self-registration audit; the audit target is the
     // new user id, so the created account is still identified.
     let actor = ActorRef::human(HumanId::generate(state.env()));
-    let result = state
+    let scoped = state
         .store()
         .scoped(resume.scope)
-        .acting(actor, CorrelationId::generate(state.env()))
-        .users()
-        .register(state.env(), identifier, &password_hash)
-        .await;
+        .acting(actor, CorrelationId::generate(state.env()));
+    let result = if waitlisted {
+        scoped
+            .users()
+            .register_in_state(
+                state.env(),
+                identifier,
+                &password_hash,
+                ironauth_store::UserState::Waitlisted,
+            )
+            .await
+    } else {
+        scoped
+            .users()
+            .register(state.env(), identifier, &password_hash)
+            .await
+    };
 
     match result {
+        // A waitlisted account cannot authenticate: do NOT establish a session; return the
+        // uniform pending acknowledgment. Approval later resumes the normal flow.
+        Ok(_) if waitlisted => registration_pending_page(banner),
         Ok(user_id) => {
             let subject = user_id.to_string();
             let session_actor = interaction::user_actor(&user_id);
@@ -295,6 +389,22 @@ fn registration_ack_page(environment_banner: Option<&str>) -> Response {
             "Check your email",
             "If registration is available for that address, we have sent instructions to \
              complete it.",
+        ),
+    )
+}
+
+/// The waitlist PENDING acknowledgment (issue #80): a self-service signup made while
+/// waitlist mode is on lands in the pending state and CANNOT authenticate until an admin
+/// approves it, so no session is established and the page tells the user their registration
+/// is awaiting approval.
+fn registration_pending_page(environment_banner: Option<&str>) -> Response {
+    let _ = environment_banner;
+    pages::secure_html(
+        StatusCode::OK,
+        pages::notice_page(
+            "Registration received",
+            "Your registration is pending approval. We will be in touch once your account has \
+             been reviewed.",
         ),
     )
 }

@@ -83,6 +83,7 @@ mod dcr_policy;
 mod device;
 mod device_verify;
 mod discovery;
+mod disposable;
 mod email_otp;
 mod error;
 mod federation;
@@ -106,6 +107,8 @@ mod par;
 mod password;
 mod phone;
 mod pkce;
+pub mod pow;
+mod pow_gate;
 mod probe;
 mod quota;
 mod recover;
@@ -567,6 +570,15 @@ pub fn oidc_router(state: OidcState) -> Router {
         .route(
             "/t/{tenant_id}/e/{environment_id}/magic/consume",
             post(magic_link::consume_post),
+        )
+        // The registration-abuse proof-of-work challenge issuance (issue #80), scope-routed
+        // so the challenge is minted under the right row-level-security scope. Issues a
+        // self-contained hashcash challenge for the registration / reset / OTP-send
+        // surfaces with ZERO third-party calls; a uniform 404 when the PoW defense is off or
+        // an external adapter is configured (which issues its own client-side widget).
+        .route(
+            "/t/{tenant_id}/e/{environment_id}/pow/challenge",
+            post(pow_gate::pow_challenge_issue),
         )
         // Guarded SMS OTP (issue #70), scope-routed under the per-environment path so the
         // send/verify run under the right row-level-security scope. Both handlers fail

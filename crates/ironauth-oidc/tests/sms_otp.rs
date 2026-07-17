@@ -1076,3 +1076,78 @@ async fn a_still_pumping_route_re_throttles_after_the_throttle_lapses_within_the
         "a still-pumping route re-throttles on the next send after the throttle lapses"
     );
 }
+
+/// The SMS-OTP verify path funnels through `establish_session`, so the CENTRAL lifecycle
+/// fence (issue #80 / #52) refuses a non-authenticatable account (waitlisted / blocked /
+/// disabled) there with the SAME uniform invalid-code result a wrong code returns (no
+/// session, no state oracle). An ACTIVE account still signs in on the same path, and after
+/// admin approval (waitlisted -> active) the account can authenticate.
+#[tokio::test]
+async fn the_lifecycle_fence_blocks_the_sms_otp_path_for_a_non_authenticatable_account() {
+    let mut harness = Harness::start_store_backed_with(sms_config()).await;
+    let sender = Arc::new(RecordingSms::default());
+    harness.install_sms_sender(sender.clone());
+    harness.enable_sms(false, &["1"]).await;
+    let base = base(&harness);
+    let password = "correct horse battery staple";
+
+    // Each non-authenticatable state: a correct code still yields NO session, and the
+    // refusal is the uniform invalid-code shape (401), never a distinct oracle.
+    for (phone, state) in [
+        ("+14155550111", ironauth_store::UserState::Waitlisted),
+        ("+14155550112", ironauth_store::UserState::Blocked),
+        ("+14155550113", ironauth_store::UserState::Disabled),
+    ] {
+        harness.seed_user_in_state(phone, password, state).await;
+        let (status, headers, body) =
+            send_then_verify_purpose(&harness, &sender, &base, phone, "login").await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "{state:?}: the fence returns the uniform invalid-code shape: {body:?}"
+        );
+        assert!(
+            !sets_session_cookie(&headers),
+            "{state:?}: a fenced account obtains NO session on the SMS path"
+        );
+    }
+
+    // An ACTIVE account still authenticates on the same path.
+    let active = "+14155550110";
+    harness.seed_user(active, password).await;
+    let (status, headers, body) =
+        send_then_verify_purpose(&harness, &sender, &base, active, "login").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "an active account authenticates on the SMS path: {body:?}"
+    );
+    assert!(
+        sets_session_cookie(&headers),
+        "an active account mints a session on the SMS path"
+    );
+
+    // Admin approval (waitlisted -> active) lets the previously-fenced account in.
+    let approved = harness
+        .store()
+        .scoped(harness.scope())
+        .users()
+        .by_identifier("+14155550111")
+        .await
+        .expect("lookup")
+        .expect("the waitlisted account exists");
+    harness
+        .set_user_state(&approved.id.to_string(), ironauth_store::UserState::Active)
+        .await;
+    let (status, headers, body) =
+        send_then_verify_purpose(&harness, &sender, &base, "+14155550111", "login").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "an approved account authenticates on the SMS path: {body:?}"
+    );
+    assert!(
+        sets_session_cookie(&headers),
+        "an approved account mints a session on the SMS path"
+    );
+}

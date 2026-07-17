@@ -610,9 +610,15 @@ fn registry() -> Vec<Migration> {
         },
         Migration {
             version: 57,
+            name: "registration_abuse_defenses",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0057_registration_abuse_defenses.sql"),
+        },
+        Migration {
+            version: 58,
             name: "federation_login_state",
             phase: Phase::Expand,
-            sql: include_str!("../migrations/0057_federation_login_state.sql"),
+            sql: include_str!("../migrations/0058_federation_login_state.sql"),
         },
     ]
 }
