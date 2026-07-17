@@ -53,6 +53,11 @@ pub(crate) struct Oauth2Callback<'a> {
     pub connector_key: &'a str,
     /// The connector's per-environment slug.
     pub connector_slug: &'a str,
+    /// The routed `ocn_` org connection re-derived from the CONSUMED, single-use correlation
+    /// row (never a browser value), or [`None`] for a direct, non-routed federated login. It
+    /// carries the same server-authenticated org binding the OIDC path threads, so a broker
+    /// overlay on an OAuth 2.0 backed org connection is enforced identically (issue #77 PR 2).
+    pub org_connection_id: Option<&'a str>,
     /// The route tenant id (for the redirect URI).
     pub tenant_id: &'a str,
     /// The route environment id (for the redirect URI).
@@ -127,9 +132,11 @@ pub(crate) async fn oauth2_callback(cb: Oauth2Callback<'_>) -> Response {
         issuer: &cb.endpoints.identity_issuer,
         definition: cb.definition,
         identity: &identity,
-        // An OAuth 2.0 social login is never enterprise-routed (issue #77), so it
-        // carries no org binding.
-        org_connection_id: None,
+        // The OAuth 2.0 path carries the SAME server-authenticated org binding from the
+        // consumed, single-use correlation row as the OIDC path, so a broker overlay on an
+        // OAuth 2.0 backed org connection (for example a GitHub connector fronting an MFA
+        // overlay) is stamped and enforced identically (issue #77 PR 2).
+        org_connection_id: cb.org_connection_id,
         headers: cb.headers,
         return_to: cb.return_to,
         now: cb.now,

@@ -199,11 +199,14 @@ pub(crate) struct CallbackContext<'a> {
 /// composes it strongest-wins with the pending request's client and per-scope floor (so
 /// the callback routes STRAIGHT to the strongest required ceremony, never a weaker one),
 /// and evaluates it against the federated session. On a satisfied (or absent) overlay it
-/// resumes. On an unmet overlay it fires the broker-then-migrate cutover mark and redirects
-/// to the EXISTING second-factor or passkey ceremony (carrying the session cookies and the
-/// `return_to`), so the user completes a REAL local factor and the resumed request issues a
-/// token whose `amr` honestly reflects it. A store fault or an unsatisfiable requirement
-/// FAILS CLOSED with no usable session.
+/// resumes. On an unmet overlay it redirects to the EXISTING second-factor or passkey
+/// ceremony (carrying the session cookies and the `return_to`), so the user completes a REAL
+/// local factor and the resumed request issues a token whose `amr` honestly reflects it. A
+/// store fault or an unsatisfiable requirement FAILS CLOSED with no usable session.
+///
+/// The broker-then-migrate lazy-migration composition (marking this brokered account for a
+/// real local-credential cutover) is DEFERRED to a follow-up; it needs a per-account cutover
+/// marker and a real cutover trigger that the migration 0059 columns do not carry.
 ///
 /// The authorization step-up gate ([`requirement_for_session_org`]) independently enforces
 /// the same overlay on every request, so this callback redirect is the immediate-UX path,
@@ -273,13 +276,13 @@ pub(crate) async fn enforce_on_callback(ctx: CallbackContext<'_>) -> CallbackOve
         } => (acr_unmet, age_lapsed),
     };
 
-    // The overlay is forcing a local-credential step-up: this IS the broker-then-migrate
-    // cutover for this login (the account is pushed to establish / use a local factor on
-    // top of the upstream). Mark it when a lazy-migration hook is armed (issue #56), reusing
-    // the hook's existing "moved toward local credentials" signal. Inert with no hook armed.
-    if ctx.state.migration_hook().is_some() {
-        crate::migration::LazyMigrationHook::record_migrated();
-    }
+    // The overlay is forcing a local-credential step-up. Composing this with the lazy-migration
+    // hook (the broker-then-migrate cutover that would mark THIS brokered account for a real
+    // local-credential cutover) is DEFERRED to a follow-up: it needs a per-account cutover
+    // marker column plus a real cutover trigger, neither of which the columns migration 0059
+    // shipped, so PR 2 deliberately composes NO migration signal here (the hook's global
+    // "migrated users" counter means "created locally by a verified first login", which a
+    // step-up is not).
 
     // Remediate with a REAL local ceremony. For a pure age lapse (the acr is met but the
     // authentication is stale) synthesize an `mfa` floor so remediation forces a fresh

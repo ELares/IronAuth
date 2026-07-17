@@ -1118,6 +1118,7 @@ async fn brokered_login(
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn a_broker_mfa_overlay_forces_a_real_ceremony_and_the_token_amr_is_honest() {
     let harness = Harness::start().await;
     // The org keeps its (permissive) upstream, but the broker overlays an MFA requirement.
@@ -1246,7 +1247,7 @@ async fn a_broker_mfa_overlay_forces_a_real_ceremony_and_the_token_amr_is_honest
 #[tokio::test]
 async fn a_no_overlay_federated_login_resumes_unchanged_at_the_federated_acr() {
     let harness = Harness::start().await;
-    // A binding with NULL overlay columns: the broker-then-migrate wedge is not configured.
+    // A binding with NULL overlay columns: no broker overlay is configured.
     let ocn_id = seed_binding(&harness, "acme").await;
     seed_rule(&harness, RoutingSelector::Domain(ROUTED_DOMAIN), &ocn_id).await;
     let upstream = start_upstream().await;
@@ -1348,5 +1349,372 @@ async fn a_max_age_overlay_forces_reauth_when_the_federated_auth_time_is_stale()
     assert!(
         ceremony.starts_with("/login/mfa"),
         "a stale federated auth_time under a max-age overlay forces re-auth, got {ceremony}"
+    );
+}
+
+// ---- Broker overlay over an OAuth 2.0 (GitHub) backed org connection (issue #77 PR 2) ----
+//
+// The routing machinery and the shared finalize path are protocol-agnostic: an org connection
+// whose connector is a plain OAuth 2.0 (GitHub) connector carries the SAME server-authenticated
+// org binding on the consumed correlation row as an OIDC connector, so a broker overlay layered
+// on top of a PERMISSIVE upstream like GitHub is enforced IDENTICALLY (a real local ceremony at
+// the callback and the same non-bypassable authorization-gate backstop). This is exactly the
+// feature's use case: brokering MFA over a permissive social upstream.
+
+/// A mock GitHub OAuth 2.0 upstream: an access-token endpoint plus FIXED profile and email
+/// endpoints (no ID token). The identity keys on the stable numeric id; the primary verified
+/// email is the routed-domain address so the JIT-provisioned user matches the login identifier.
+struct GithubUpstream {
+    addr: SocketAddr,
+}
+
+async fn start_github_upstream() -> GithubUpstream {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let mut buf = vec![0_u8; 8192];
+                let n = socket.read(&mut buf).await.unwrap_or(0);
+                let request = String::from_utf8_lossy(&buf[..n]);
+                let first = request.lines().next().unwrap_or("");
+                // `/user/emails` must be matched BEFORE `/user` (it contains it).
+                let body = if first.contains("/access_token") {
+                    String::from(r#"{"access_token":"gh-broker-at","token_type":"bearer"}"#)
+                } else if first.contains("/user/emails") {
+                    String::from(
+                        r#"[{"email":"alice@acme.example","primary":true,"verified":true}]"#,
+                    )
+                } else if first.contains("/user") {
+                    String::from(
+                        r#"{"id":77770001,"login":"brokeroct","name":"Broker Octocat","email":null}"#,
+                    )
+                } else {
+                    String::from("{}")
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.flush().await;
+            });
+        }
+    });
+    GithubUpstream { addr }
+}
+
+/// The federated external id the mock GitHub identity provisions under (the stable numeric id
+/// namespaced by the connector's `identity_issuer`, which is `UPSTREAM_ISSUER` here).
+fn github_external_id() -> String {
+    federated_external_id(UPSTREAM_ISSUER, "77770001")
+}
+
+/// Seed an org, a GitHub OAuth 2.0 (non-OIDC) connector at `slug` pointing at the mock, and a
+/// binding between them stamping the broker overlay `overlay_min_class` (issue #77 PR 2);
+/// return the binding id.
+async fn seed_github_binding_with_overlay(
+    harness: &Harness,
+    slug: &str,
+    overlay_min_class: Option<&str>,
+) -> OrgConnectionId {
+    let env = harness.env().clone();
+    let scope = harness.scope();
+    let control = harness.db().control_store();
+
+    let org_id = OrganizationId::generate(&env, &scope);
+    control
+        .management()
+        .acting(harness.db().test_actor(&env), CorrelationId::generate(&env))
+        .organizations(scope)
+        .create(&env, &org_id, 1_000_000, "Acme Corp", None)
+        .await
+        .expect("create organization");
+
+    let connector_id = ConnectorId::generate(&env, &scope);
+    let definition = serde_json::json!({
+        "connector_id": slug,
+        "display_name": "Acme GitHub",
+        "protocol": "oauth2",
+        "endpoints": {
+            "authorization_endpoint": format!("{UPSTREAM_ISSUER}/login/oauth/authorize"),
+            "token_endpoint": format!("{UPSTREAM_ISSUER}/login/oauth/access_token"),
+            "profile_endpoint": format!("{UPSTREAM_ISSUER}/user"),
+            "email_endpoint": format!("{UPSTREAM_ISSUER}/user/emails"),
+            "identity_issuer": UPSTREAM_ISSUER
+        },
+        "scopes": ["read:user", "user:email"],
+        "client_id": UPSTREAM_CLIENT_ID
+    })
+    .to_string();
+    control
+        .scoped(scope)
+        .acting(harness.db().test_actor(&env), CorrelationId::generate(&env))
+        .connectors()
+        .create(
+            &env,
+            &connector_id,
+            1_000_000,
+            NewConnector {
+                slug,
+                definition_json: &definition,
+                client_secret: b"github-secret",
+                capabilities: ConnectorCapabilities {
+                    refresh: false,
+                    groups: false,
+                    logout_propagation: false,
+                    email_verified_trust: "untrusted",
+                },
+                enabled: true,
+            },
+            None,
+        )
+        .await
+        .expect("create connector");
+
+    let ocn_id = OrgConnectionId::generate(&env, &scope);
+    control
+        .scoped(scope)
+        .acting(harness.db().test_actor(&env), CorrelationId::generate(&env))
+        .org_connections()
+        .create(
+            &env,
+            &ocn_id,
+            1_000_000,
+            NewOrgConnection {
+                organization_id: &org_id,
+                connector_id: &connector_id,
+                overlay_min_acr: None,
+                max_age_secs: None,
+                overlay_min_class,
+                capture_upstream_tokens: false,
+                enabled: true,
+            },
+        )
+        .await
+        .expect("create org connection");
+    ocn_id
+}
+
+/// Follow a federated OAuth 2.0 `authorize_uri` (302 to the upstream, NO nonce) and drive the
+/// callback, returning its response. The mock GitHub upstream serves a fixed identity.
+async fn complete_github_federation(
+    harness: &Harness,
+    runtime: &Arc<FederationRuntime>,
+    authorize_uri: &str,
+) -> axum::response::Response {
+    let authorize = get(router(harness, runtime), authorize_uri).await;
+    assert_eq!(authorize.status(), StatusCode::SEE_OTHER);
+    let upstream_redirect = location(&authorize);
+    assert!(
+        upstream_redirect.starts_with(&format!("{UPSTREAM_ISSUER}/login/oauth/authorize")),
+        "the OAuth 2.0 authorize leg redirects to the upstream: {upstream_redirect}"
+    );
+    let state = param(&upstream_redirect, "state");
+    let scope = harness.scope();
+    let callback_uri = format!(
+        "/t/{}/e/{}/federation/{}/callback?state={state}&code=gh-code",
+        scope.tenant(),
+        scope.environment(),
+        authorize_uri
+            .split("/federation/")
+            .nth(1)
+            .and_then(|rest| rest.split('/').next())
+            .expect("slug"),
+    );
+    get(router(harness, runtime), &callback_uri).await
+}
+
+/// Drive the full routed brokered GitHub (OAuth 2.0) login (POST /login -> federated authorize
+/// -> callback) for `identifier` resuming at `return_to`, returning the callback response.
+async fn brokered_github_login(
+    harness: &Harness,
+    runtime: &Arc<FederationRuntime>,
+    identifier: &str,
+    return_to: &str,
+) -> axum::response::Response {
+    let login = post_login_return_to(router(harness, runtime), identifier, return_to).await;
+    assert_eq!(
+        login.status(),
+        StatusCode::SEE_OTHER,
+        "a routed login redirects to federation"
+    );
+    let authorize_uri = location(&login);
+    complete_github_federation(harness, runtime, &authorize_uri).await
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn a_broker_mfa_overlay_over_an_oauth2_connector_forces_a_real_ceremony_and_stamps_the_org() {
+    let harness = Harness::start().await;
+    // The org fronts a PERMISSIVE GitHub (OAuth 2.0) upstream, but the broker overlays MFA.
+    let ocn_id = seed_github_binding_with_overlay(&harness, "acme-gh", Some("mfa")).await;
+    seed_rule(&harness, RoutingSelector::Domain(ROUTED_DOMAIN), &ocn_id).await;
+    let upstream = start_github_upstream().await;
+    let runtime = build_runtime(upstream.addr);
+    let client = harness.client_id().to_string();
+    let return_to = full_authorize_return_to(&harness);
+
+    // The brokered GitHub login: the callback establishes the federated session but, because
+    // the overlay requires MFA and the federated context is UNRANKED, routes STRAIGHT to the
+    // second-factor ceremony rather than resuming (identical to the OIDC flagship).
+    let callback =
+        brokered_github_login(&harness, &runtime, "alice@acme.example", &return_to).await;
+    assert_eq!(callback.status(), StatusCode::SEE_OTHER);
+    let ceremony = location(&callback);
+    assert!(
+        ceremony.starts_with("/login/mfa"),
+        "an mfa overlay on a permissive OAuth 2.0 upstream forces a real ceremony, got {ceremony}"
+    );
+    let fed_cookie = session_cookie_from_headers(callback.headers());
+    let mfa_return_to =
+        location_param(callback.headers(), "return_to").expect("return_to on the ceremony");
+
+    // The federated user is provisioned (keyed on the stable numeric id) and STAMPED with the
+    // routed org connection, exactly like the OIDC path.
+    let subject_id = harness
+        .store()
+        .scoped(harness.scope())
+        .users()
+        .by_external_id(&github_external_id())
+        .await
+        .expect("by_external_id")
+        .expect("the GitHub federated user is provisioned")
+        .id;
+    let stamped = harness
+        .store()
+        .scoped(harness.scope())
+        .users()
+        .org_connection(&subject_id)
+        .await
+        .expect("org_connection read")
+        .expect("the OAuth 2.0 federated user is stamped with the org connection");
+    assert_eq!(
+        stamped.to_string(),
+        ocn_id.to_string(),
+        "the OAuth 2.0 path stamps the same server-authenticated org binding as OIDC"
+    );
+    let subject = subject_id.to_string();
+    harness.grant_consent(&subject, &client).await;
+
+    // Non-bypassable backstop: skip the callback ceremony and hit the resume /authorize DIRECTLY
+    // with the federated session; the authorization gate enforces the SAME overlay, so it still
+    // routes to the second factor. A user cannot escape it at the federated acr.
+    let (status, headers, _) = harness
+        .get_with_cookie(&mfa_return_to, Some(&fed_cookie))
+        .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    let backstop = common::location(&headers).expect("a Location on the backstop redirect");
+    assert!(
+        backstop.starts_with("/login/mfa"),
+        "the overlay is enforced at the authorization gate for an OAuth 2.0 connection too: \
+         {backstop}"
+    );
+
+    // Complete a REAL second factor and prove the resumed token's amr is HONEST.
+    harness.seed_active_totp(&subject).await;
+    harness.clock().advance(Duration::from_secs(60));
+    let code = code_at(
+        &[0x0A; 20],
+        TotpParams::authenticator_default(),
+        now_secs(&harness),
+    );
+    let mfa_form = form(&[("code", &code), ("return_to", &mfa_return_to)]);
+    let (status, headers, _) = harness
+        .post_form("/login/mfa", &mfa_form, Some(&fed_cookie))
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::SEE_OTHER,
+        "the ceremony upgrades the session"
+    );
+    let upgraded = session_cookie_from_headers(&headers);
+
+    let (status, headers, _) = harness
+        .get_with_cookie(&mfa_return_to, Some(&upgraded))
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::SEE_OTHER,
+        "the resumed request issues a code"
+    );
+    let auth_code = location_param(&headers, "code").expect("a code after the ceremony");
+
+    let (status, _, body) = harness.token(&token_form_pkce(&auth_code, &client)).await;
+    assert_eq!(status, StatusCode::OK, "token exchange: {body}");
+    let id_token = json(&body)["id_token"]
+        .as_str()
+        .expect("id_token")
+        .to_owned();
+    let policy = harness.policy(&client);
+    let verified = verify(&id_token, &policy, &verify_clock()).expect("id token verifies");
+    let claims = serde_json::Value::Object(verified.claims().raw().clone());
+    assert_eq!(
+        claims["acr"], "urn:ironauth:acr:mfa",
+        "the overlay-stepped-up token carries the honest multi-factor acr"
+    );
+    let amr: Vec<&str> = claims["amr"]
+        .as_array()
+        .expect("amr array")
+        .iter()
+        .map(|value| value.as_str().expect("amr token"))
+        .collect();
+    assert!(
+        amr.contains(&"mfa") && amr.contains(&"otp"),
+        "amr reflects the real second factor, got {amr:?}"
+    );
+    assert!(
+        !amr.contains(&"pwd"),
+        "the GitHub federated login ran no password; amr must not fabricate one, got {amr:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_no_overlay_oauth2_federated_login_resumes_unchanged() {
+    let harness = Harness::start().await;
+    // A GitHub (OAuth 2.0) binding with NULL overlay columns: no policy is layered on, so the
+    // login must resume exactly as a plain federated login (no regression to issue #74).
+    let ocn_id = seed_github_binding_with_overlay(&harness, "acme-gh", None).await;
+    seed_rule(&harness, RoutingSelector::Domain(ROUTED_DOMAIN), &ocn_id).await;
+    let upstream = start_github_upstream().await;
+    let runtime = build_runtime(upstream.addr);
+    let return_to = full_authorize_return_to(&harness);
+
+    let callback =
+        brokered_github_login(&harness, &runtime, "alice@acme.example", &return_to).await;
+    assert_eq!(callback.status(), StatusCode::SEE_OTHER);
+    let resumed = location(&callback);
+    assert!(
+        !resumed.starts_with("/login/mfa"),
+        "a no-overlay OAuth 2.0 federated login must not force a ceremony, got {resumed}"
+    );
+    assert!(
+        resumed.starts_with("/authorize"),
+        "a no-overlay OAuth 2.0 federated login resumes the pending request, got {resumed}"
+    );
+    // Still provisioned and stamped with the org (the stamp is independent of the overlay).
+    let subject_id = harness
+        .store()
+        .scoped(harness.scope())
+        .users()
+        .by_external_id(&github_external_id())
+        .await
+        .expect("by_external_id")
+        .expect("the GitHub federated user is provisioned")
+        .id;
+    assert_eq!(
+        harness
+            .store()
+            .scoped(harness.scope())
+            .users()
+            .org_connection(&subject_id)
+            .await
+            .expect("org_connection read")
+            .expect("stamped")
+            .to_string(),
+        ocn_id.to_string()
     );
 }

@@ -884,6 +884,11 @@ pub async fn federation_callback(
                 runtime: runtime_ref,
                 connector_key: &connector_key,
                 connector_slug: &connector_slug,
+                // The consumed correlation row carries the server-authenticated org binding
+                // (written by the authorize leg from the routing token, never the browser);
+                // thread it so an overlay on an OAuth 2.0 backed org connection is enforced
+                // through the same shared finalize path as OIDC (issue #77 PR 2).
+                org_connection_id: consumed.org_connection_id.as_deref(),
                 tenant_id: &tenant_id,
                 environment_id: &environment_id,
                 fingerprint,
@@ -1276,8 +1281,9 @@ pub(crate) async fn finalize_federated_login(finalize: FinalizeLogin<'_>) -> Res
     // connection re-derived from the CONSUMED correlation row (never the browser). On an
     // unmet overlay the user is routed STRAIGHT to a real local ceremony (carrying the
     // session cookies and the return_to) whose completion records the honest combined
-    // factors, and the broker-then-migrate cutover is marked. The authorization gate
-    // enforces the SAME overlay independently on every request, so it is never bypassable.
+    // factors. The authorization gate enforces the SAME overlay independently on every
+    // request, so it is never bypassable. (The broker-then-migrate lazy-migration cutover is
+    // DEFERRED to a follow-up; it needs a per-account cutover marker the 0059 columns lack.)
     match broker_overlay::enforce_on_callback(broker_overlay::CallbackContext {
         state,
         scope,
