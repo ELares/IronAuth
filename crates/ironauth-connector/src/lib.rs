@@ -804,6 +804,43 @@ impl ConnectorDefinition {
             }
         }
 
+        // An `oauth2` connector's token exchange
+        // (`federation_oauth2::exchange_code_for_access_token`) builds a token form with a
+        // verbatim static `client_secret` and NO `code_verifier`, and the oauth2 callback never
+        // consults `client_auth`. Two connector settings would therefore emit an upstream request
+        // the exchange cannot honor, turning a config mistake into an opaque per-login upstream
+        // failure. Reject both at WRITE time when the endpoints are the OAuth2 form, so an
+        // operator gets a clear config error instead of a login-time `invalid_grant`.
+        if let Endpoints::OAuth2(_) = &self.endpoints {
+            // `pkce: required` advertises an S256 challenge on the authorize leg, but the oauth2
+            // token exchange threads no verifier, so the upstream rejects the exchange for the
+            // missing `code_verifier`. The `auto_where_supported` default and `disabled` are fine
+            // (the shipped GitHub preset uses `auto_where_supported` with `advertises_s256: false`,
+            // so it never emits a challenge and is unaffected).
+            if self.pkce == PkceMode::Required {
+                errors.push(ValidationError::new(
+                    "/pkce",
+                    "pkce \"required\" is not supported on an oauth2 connector: the oauth2 token \
+                     exchange threads no code_verifier, so a required PKCE challenge would be sent \
+                     upstream with no verifier and every login would fail; use \
+                     \"auto_where_supported\" or \"disabled\"",
+                ));
+            }
+            // `client_auth: signed_jwt` (the Apple ES256 assertion) is meaningful only on the OIDC
+            // path. The oauth2 callback reads the sealed secret bytes as a verbatim UTF-8
+            // `client_secret` and never builds an assertion, so an EC private key would be sent
+            // upstream as a literal secret string.
+            if matches!(self.client_auth, ClientAuth::SignedJwt { .. }) {
+                errors.push(ValidationError::new(
+                    "/client_auth",
+                    "client_auth \"signed_jwt\" is not supported on an oauth2 connector: the \
+                     oauth2 token exchange sends the sealed secret as a verbatim client_secret and \
+                     never generates a signed assertion, so the key material would be sent as a \
+                     literal secret; signed_jwt is only meaningful on an oidc (Apple) connector",
+                ));
+            }
+        }
+
         // The `oidc` protocol requires the `openid` scope; `oauth2` does not (a plain OAuth2
         // upstream like GitHub uses provider-specific scopes such as `read:user user:email`).
         if self.protocol == Protocol::Oidc && !self.scopes.iter().any(|scope| scope == "openid") {
@@ -1503,5 +1540,147 @@ mod tests {
         let email = mapping.traits.get("email").expect("email rule");
         assert!(!email.required);
         assert_eq!(email.source.len(), 2);
+    }
+
+    // A valid `oauth2` connector fixture: protocol `oauth2` with the OAuth2 endpoint set. The
+    // `openid` scope is not required for `oauth2`, and the defaults (pkce auto_where_supported,
+    // client_auth static) are the ones the oauth2 login path can actually drive.
+    const VALID_OAUTH2: &str = r#"{
+        "connector_id": "acme-oauth2",
+        "display_name": "Acme OAuth2",
+        "protocol": "oauth2",
+        "endpoints": {
+            "authorization_endpoint": "https://up.example.com/authorize",
+            "token_endpoint": "https://up.example.com/token",
+            "profile_endpoint": "https://up.example.com/user",
+            "identity_issuer": "https://up.example.com"
+        },
+        "scopes": ["read:user"],
+        "client_id": "ironauth-at-acme",
+        "client_secret": { "env": "ACME_CLIENT_SECRET" }
+    }"#;
+
+    #[test]
+    fn an_oauth2_connector_with_pkce_required_is_rejected_on_the_pkce_field() {
+        // The baseline oauth2 fixture (default pkce auto_where_supported) validates.
+        let def = parse(VALID_OAUTH2).expect("parses");
+        def.validate().expect("the baseline oauth2 fixture validates");
+
+        // pkce "required" is rejected on an oauth2 connector: the oauth2 token exchange threads no
+        // code_verifier, so a required challenge would be emitted upstream with no verifier and
+        // every login would fail. The rejection points at /pkce.
+        let json = VALID_OAUTH2.replace(
+            "\"client_id\": \"ironauth-at-acme\",",
+            "\"client_id\": \"ironauth-at-acme\", \"pkce\": \"required\",",
+        );
+        let def = parse(&json).expect("parses");
+        let errors = def.validate().expect_err("pkce required rejected on oauth2");
+        assert!(
+            errors.iter().any(|error| error.pointer == "/pkce"),
+            "{errors:?}"
+        );
+
+        // "disabled" is accepted on oauth2 (no challenge is emitted).
+        let json = VALID_OAUTH2.replace(
+            "\"client_id\": \"ironauth-at-acme\",",
+            "\"client_id\": \"ironauth-at-acme\", \"pkce\": \"disabled\",",
+        );
+        let def = parse(&json).expect("parses");
+        def.validate().expect("pkce disabled is accepted on oauth2");
+
+        // pkce "required" remains valid on an OIDC connector: the guard is scoped to the OAuth2
+        // endpoint form and must not reject the OIDC path (which threads a verifier).
+        let json = VALID.replace(
+            "\"client_id\": \"ironauth-at-acme\",",
+            "\"client_id\": \"ironauth-at-acme\", \"pkce\": \"required\",",
+        );
+        let def = parse(&json).expect("parses");
+        def.validate().expect("pkce required is accepted on oidc");
+    }
+
+    #[test]
+    fn an_oauth2_connector_with_signed_jwt_client_auth_is_rejected_on_the_client_auth_field() {
+        // client_auth "signed_jwt" (the Apple ES256 assertion) is rejected on an oauth2 connector:
+        // the oauth2 callback reads the sealed secret bytes as a verbatim client_secret and never
+        // builds an assertion, so the EC key material would be sent upstream as a literal secret.
+        let json = VALID_OAUTH2.replace(
+            "\"client_id\": \"ironauth-at-acme\",",
+            "\"client_id\": \"ironauth-at-acme\", \"client_auth\": { \"kind\": \"signed_jwt\", \
+               \"team_id\": \"TEAMID\", \"key_id\": \"KEYID\", \
+               \"audience\": \"https://appleid.apple.com\" },",
+        );
+        let def = parse(&json).expect("parses");
+        let errors = def
+            .validate()
+            .expect_err("signed_jwt client_auth rejected on oauth2");
+        assert!(
+            errors.iter().any(|error| error.pointer == "/client_auth"),
+            "{errors:?}"
+        );
+
+        // The static default remains accepted on oauth2 (the verbatim shared secret is what the
+        // exchange sends).
+        let def = parse(VALID_OAUTH2).expect("parses");
+        def.validate()
+            .expect("static client_auth is accepted on oauth2");
+    }
+
+    #[test]
+    fn the_shipped_presets_still_validate_after_the_oauth2_guards() {
+        // The new oauth2 pkce/client_auth guards must not create a false-positive rejection for
+        // any shipped preset. The GitHub oauth2 preset uses auto_where_supported + static auth
+        // (unaffected), and the OIDC presets (Google, Microsoft, Apple's signed_jwt on the OIDC
+        // path) all still validate cleanly.
+        let secret = || Secret::Env("PRESET_SECRET".to_owned());
+        presets::github("github", "ghid", secret())
+            .validate()
+            .expect("the github oauth2 preset still validates");
+        presets::google("google", "gid", secret())
+            .validate()
+            .expect("the google oidc preset still validates");
+        presets::microsoft("microsoft", "common", "mid", secret())
+            .validate()
+            .expect("the microsoft oidc preset still validates");
+        presets::apple("apple", "com.example.app", "TEAMID", "KEYID", secret())
+            .validate()
+            .expect("the apple oidc preset (signed_jwt) still validates");
+    }
+
+    #[test]
+    fn a_protocol_endpoint_mismatch_is_rejected_on_the_endpoints_field() {
+        // INFO-4: the protocol and endpoint form must agree. An oidc-declared connector carrying
+        // the OAuth2 endpoint set (profile_endpoint + identity_issuer, no jwks_uri / ID token) is
+        // rejected on /endpoints, because the OIDC login path has no ID token to validate.
+        let json = VALID.replace(
+            "{ \"issuer\": \"https://issuer.example.com\" }",
+            "{ \"authorization_endpoint\": \"https://up.example.com/authorize\", \
+               \"token_endpoint\": \"https://up.example.com/token\", \
+               \"profile_endpoint\": \"https://up.example.com/user\", \
+               \"identity_issuer\": \"https://up.example.com\" }",
+        );
+        let def = parse(&json).expect("parses");
+        assert_eq!(def.protocol, Protocol::Oidc);
+        assert!(matches!(def.endpoints, Endpoints::OAuth2(_)));
+        let errors = def
+            .validate()
+            .expect_err("oidc protocol with an OAuth2 endpoint set rejected");
+        assert!(
+            errors.iter().any(|error| error.pointer == "/endpoints"),
+            "{errors:?}"
+        );
+
+        // The reverse: an oauth2-declared connector carrying a discovery issuer (an OIDC form) is
+        // rejected on /endpoints.
+        let json = VALID.replace("\"protocol\": \"oidc\",", "\"protocol\": \"oauth2\",");
+        let def = parse(&json).expect("parses");
+        assert_eq!(def.protocol, Protocol::Oauth2);
+        assert!(matches!(def.endpoints, Endpoints::Discovery(_)));
+        let errors = def
+            .validate()
+            .expect_err("oauth2 protocol with a discovery issuer rejected");
+        assert!(
+            errors.iter().any(|error| error.pointer == "/endpoints"),
+            "{errors:?}"
+        );
     }
 }
