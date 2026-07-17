@@ -290,6 +290,16 @@ name = "trusted_devices"
 path = "tests/trusted_devices.rs"
 required-features = ["testing"]
 
+# The account-recovery subsystem end to end (issue #81): the downgrade invariant (an
+# email-OTP recovery cannot remove a passkey without a fresh equal-or-stronger reverify or
+# the elapsed delay window), multi-channel notification, cancellation-revokes-the-pending
+# recovery, the per-account cooldown, audit completeness, and the risk seam. Needs a real
+# database (DATABASE_URL) and drives the injected clock.
+[[test]]
+name = "recovery"
+path = "tests/recovery.rs"
+required-features = ["testing"]
+
 # The minimal risk engine end to end (issue #79): a MED signal forces step-up and a LOW
 # one does not; the decision record enumerates its signals and is reconstructable from the
 # audit trail; a new-device login notifies and the "this wasn't me" path revokes the

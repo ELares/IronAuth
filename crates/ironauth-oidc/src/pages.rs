@@ -747,6 +747,26 @@ pub fn magic_cross_device_page() -> String {
     notice_document("Finish on your other device", body)
 }
 
+/// The recovery cancellation CONFIRM page (issue #81): shown when a recovery
+/// notification link is opened. Scanner-safe: a prefetching GET renders this page but
+/// never cancels; the user must POST the token back (same-origin, riding the CSRF gate
+/// and the `form-action 'self'` CSP of [`secure_html`]) to actually revoke the pending
+/// recovery. It carries no script, so no nonce is needed.
+#[must_use]
+pub fn recover_cancel_page(cancel_action: &str, token: &str) -> String {
+    let body = format!(
+        "<h1>Cancel account recovery</h1>\
+         <p>A recovery request was started for your account. If this was not you, cancel \
+         it below. Your existing sign-in factors stay in place.</p>\
+         <form method=\"post\" action=\"{action}\">\
+         <input type=\"hidden\" name=\"token\" value=\"{token}\">\
+         <p><button type=\"submit\">Cancel this recovery</button></p></form>",
+        action = escape_html(cancel_action),
+        token = escape_html(token),
+    );
+    notice_document("Cancel account recovery", &body)
+}
+
 /// A minimal server-authored notice page (for example after a denied consent).
 /// `message` is server text; it is escaped defensively regardless.
 #[must_use]

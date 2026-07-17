@@ -682,6 +682,37 @@ pub async fn remove_credential(
     let Ok(id) = credentials.parse_id(&body.credential_id) else {
         return not_found_json();
     };
+    // THE downgrade-invariant gate (issue #81 HIGH-1): if a recovery is pending for this
+    // subject, removing a factor STRONGER than the one the recovery was performed with is
+    // BLOCKED while the flow is held (unless a fresh equal-or-stronger re-verify is proven);
+    // the decision is audited either way. An unknown/absent credential kind is not gated
+    // (it falls through to the uniform not-found from `remove`).
+    match credentials.factor_kind(&account.subject, &id).await {
+        Ok(Some(kind)) => {
+            if let Some(target) = crate::recovery::factor_for_account_credential(&kind) {
+                let reverify = crate::recovery::fresh_session_reverify_acr(
+                    &state,
+                    account.auth_time_unix_micros,
+                    &account.auth_methods,
+                );
+                if !crate::recovery::gate_factor_removal(
+                    &state,
+                    account.scope,
+                    &account.subject,
+                    target,
+                    reverify,
+                )
+                .await
+                .is_allowed()
+                {
+                    return recovery_downgrade_blocked();
+                }
+            }
+        }
+        Ok(None) => {}
+        // Fail CLOSED on a kind read fault: refuse rather than remove blind.
+        Err(_) => return recovery_downgrade_blocked(),
+    }
     let actor = interaction::user_actor(&account.subject);
     let result = state
         .store()
@@ -1081,6 +1112,28 @@ pub async fn remove_password(
     if !fresh_passkey_reauth(&state, &account) {
         return reauth_required();
     }
+    // THE downgrade-invariant gate (issue #81 HIGH-1): password removal after a recovery is
+    // NOT a downgrade (removing `pwd` when the recovery was `pwd`-strength), and the fresh
+    // passkey re-auth above already proves an equal-or-stronger factor, so this NEVER blocks
+    // a legitimate conversion. It is wired for a complete audit trail: the proven passkey
+    // acr is threaded as the fresh re-verify.
+    let reverify = crate::recovery::fresh_session_reverify_acr(
+        &state,
+        account.auth_time_unix_micros,
+        &account.auth_methods,
+    );
+    if !crate::recovery::gate_factor_removal(
+        &state,
+        account.scope,
+        &account.subject,
+        crate::recovery::RecoveryFactor::Password,
+        reverify,
+    )
+    .await
+    .is_allowed()
+    {
+        return recovery_downgrade_blocked();
+    }
     let actor = interaction::user_actor(&account.subject);
     let result = state
         .store()
@@ -1221,6 +1274,23 @@ fn forbidden() -> Response {
         json!({
             "error": "forbidden",
             "error_description": "This request could not be verified.",
+        }),
+    )
+}
+
+/// The `409` a removal returns when THE downgrade invariant blocks it (issue #81 HIGH-1):
+/// a recovery is pending and removing this factor would silently drop a factor STRONGER
+/// than the one used to recover, before the delay window has elapsed and without a fresh
+/// equal-or-stronger re-verification. Non-enumerating (it names the invariant, never
+/// account state) and actionable (re-verify or wait out the delay, then retry).
+fn recovery_downgrade_blocked() -> Response {
+    json_response(
+        StatusCode::CONFLICT,
+        json!({
+            "error": "recovery_downgrade_blocked",
+            "error_description": "A recovery is pending on this account. Removing a stronger \
+                 sign-in factor is held until the recovery delay elapses, or until you \
+                 re-verify with an equal-or-stronger factor.",
         }),
     )
 }

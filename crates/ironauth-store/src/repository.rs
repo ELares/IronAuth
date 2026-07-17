@@ -76,14 +76,17 @@ use crate::id::{
     EnvironmentId, EnvironmentSecretId, ExternalIssuerId, GrantId, InitialAccessTokenId,
     InvitationId, IssuedTokenId, KekId, MagicLinkTokenId, ManagementKeyId, Mds3BlobCacheId,
     MigrationRunId, MigrationRunRecordId, OperatorId, OrganizationId, PushedRequestId,
-    RecoveryCodeId, RefreshFamilyId, RefreshTokenId, ResourceServerId, RiskDecisionId,
-    RiskDisavowalId, RiskLoginGeoId, ScopeStepUpPolicyId, ServiceAccountId, SessionEventId,
-    SessionId, SigningKeyId, SmsOtpCodeId, SmsRouteStatId, TenantId, TotpCredentialId,
-    TraitMigrationJobId, TraitSchemaId, TrustedDeviceId, UserId, UserIdentifierId, VariableId,
-    WebauthnChallengeId, WebauthnCredentialId,
+    RecoveryCodeId, RecoveryFlowId, RefreshFamilyId, RefreshTokenId, ResourceServerId,
+    RiskDecisionId, RiskDisavowalId, RiskLoginGeoId, ScopeStepUpPolicyId, ServiceAccountId,
+    SessionEventId, SessionId, SigningKeyId, SmsOtpCodeId, SmsRouteStatId, TenantId,
+    TotpCredentialId, TraitMigrationJobId, TraitSchemaId, TrustedDeviceId, UserId,
+    UserIdentifierId, VariableId, WebauthnChallengeId, WebauthnCredentialId,
 };
 use crate::identifier::{
     CanonicalIdentifier, IdentifierType, UniquenessMode, canonicalize_identifier,
+};
+use crate::recovery::{
+    NewRecoveryFlow, RecoveryCancelReason, RecoveryEntryPoint, RecoveryFlowRecord, RecoveryState,
 };
 use crate::risk::{
     DisavowalResolution, LoginGeoView, NewDisavowalToken, NewLoginGeo, NewRiskDecision,
@@ -368,6 +371,19 @@ impl<'a> ScopedStore<'a> {
     #[must_use]
     pub fn trusted_devices(&self) -> TrustedDeviceRepo<'a> {
         TrustedDeviceRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
+    /// The read repository for account-recovery flows in this scope (issue #81): read
+    /// a flow for a status/cancellation/downgrade-invariant check, resolve a flow by
+    /// its cancellation-token digest, and count a subject's recent initiations for the
+    /// cooldown. Initiate, cancel, complete, and factor-change audit live on
+    /// [`ActingStore::recovery_flows`].
+    #[must_use]
+    pub fn recovery_flows(&self) -> RecoveryFlowRepo<'a> {
+        RecoveryFlowRepo {
             store: self.store,
             scope: self.scope,
         }
@@ -975,6 +991,19 @@ impl<'a> ActingStore<'a> {
     #[must_use]
     pub fn trusted_devices(&self) -> ActingTrustedDeviceRepo<'a> {
         ActingTrustedDeviceRepo {
+            store: self.store,
+            scope: self.scope,
+            acting: self.acting,
+        }
+    }
+
+    /// The mutating account-recovery repository for this scope and actor (issue #81):
+    /// initiate a flow (sealing the recipient and stamping the delay window), cancel a
+    /// held flow, complete it, and record a factor-change decision against the
+    /// downgrade invariant. Every write is subject-bound and audited.
+    #[must_use]
+    pub fn recovery_flows(&self) -> ActingRecoveryFlowRepo<'a> {
+        ActingRecoveryFlowRepo {
             store: self.store,
             scope: self.scope,
             acting: self.acting,
@@ -16383,6 +16412,37 @@ impl AccountCredentialRepo<'_> {
         tx.commit().await?;
         Ok(out)
     }
+
+    /// The factor KIND wire string (`passkey`, `totp`, `recovery_code`) of `subject`'s
+    /// credential `id` (issue #81 HIGH-1): the recovery downgrade gate reads it to compare
+    /// a credential REMOVAL at its factor strength. Subject-bound, so another subject's id
+    /// (or a cross-scope id) is the uniform not-found (`None`). No PII is opened.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn factor_kind(
+        &self,
+        subject: &UserId,
+        id: &CredentialId,
+    ) -> Result<Option<String>, StoreError> {
+        if id.scope() != self.scope || subject.scope() != self.scope {
+            return Ok(None);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT credential_type FROM account_credentials \
+             WHERE tenant_id = $1 AND environment_id = $2 AND subject = $3 AND id = $4",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(subject.to_string())
+        .bind(id.to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(row.map(|row| row.get::<String, _>("credential_type")))
+    }
 }
 
 /// The operator-safe step-up detail recorded on the audit row of a credential
@@ -17167,6 +17227,461 @@ impl ActingTrustedDeviceRepo<'_> {
 }
 
 // ===========================================================================
+// Account recovery (issue #81)
+//
+// The first-class recovery state machine: initiate a flow (sealing the recipient
+// and stamping the delay window from the env clock), read it for a status /
+// cancellation / downgrade-invariant check, cancel a held flow, complete it, and
+// record a factor-change decision against the downgrade invariant. Every write goes
+// through `write_audited_detailed`, so every state transition carries an audit row.
+// ===========================================================================
+
+/// The read repository for account-recovery flows in a scope (issue #81).
+pub struct RecoveryFlowRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl RecoveryFlowRepo<'_> {
+    /// Parse an untrusted recovery-flow identifier under this scope. A malformed
+    /// identifier and one minted in another scope both return the uniform not-found.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the identifier is malformed or out of scope.
+    pub fn parse_id(&self, raw: &str) -> Result<RecoveryFlowId, StoreError> {
+        Ok(RecoveryFlowId::parse_in_scope(raw, &self.scope)?)
+    }
+
+    /// Read a recovery flow by its id for a status / cancellation / downgrade-invariant
+    /// check (issue #81). A cross-scope id, or a row whose closed-set columns do not
+    /// parse, is the uniform not-found.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn get(&self, id: &RecoveryFlowId) -> Result<Option<RecoveryFlowRecord>, StoreError> {
+        if id.scope() != self.scope {
+            return Ok(None);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT id, subject, state, entry_point, recover_acr, \
+             (EXTRACT(EPOCH FROM initiated_at) * 1000000)::bigint AS initiated_us, \
+             (EXTRACT(EPOCH FROM hold_until) * 1000000)::bigint AS hold_us \
+             FROM recovery_flows \
+             WHERE tenant_id = $1 AND environment_id = $2 AND id = $3",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(id.to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(row.and_then(|row| recovery_flow_from_row(&row)))
+    }
+
+    /// Resolve the ONE pending recovery flow whose `cancel_token_digest` matches
+    /// `digest` (issue #81): the cancellation-from-notification-link path. The
+    /// high-entropy token IS the authorization, so no subject is required; a forged
+    /// or stale token whose digest matches no row is the uniform not-found.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn by_cancel_digest(
+        &self,
+        digest: &[u8],
+    ) -> Result<Option<RecoveryFlowRecord>, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT id, subject, state, entry_point, recover_acr, \
+             (EXTRACT(EPOCH FROM initiated_at) * 1000000)::bigint AS initiated_us, \
+             (EXTRACT(EPOCH FROM hold_until) * 1000000)::bigint AS hold_us \
+             FROM recovery_flows \
+             WHERE tenant_id = $1 AND environment_id = $2 AND cancel_token_digest = $3",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(digest)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(row.and_then(|row| recovery_flow_from_row(&row)))
+    }
+
+    /// Resolve the ONE pending recovery flow for `subject` (issue #81 HIGH-1): the
+    /// newest flow still `initiated` or `held`, which the live factor-removal gate reads
+    /// to enforce the downgrade invariant. Filtered on the subject (the anti-IDOR
+    /// contract) and bounded by the `recovery_flows_subject_idx`.
+    ///
+    /// Two initiations racing at the cooldown boundary can both create pending flows (the
+    /// cooldown is a read-then-insert without a uniqueness constraint); rather than a
+    /// unique index (which would also refuse a legitimate post-cooldown re-initiation
+    /// while an earlier flow is still non-terminal), this deterministically returns the
+    /// NEWEST by `initiated_at`, so the gate always evaluates against the most recent
+    /// recovery (issue #81 LOW).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn pending_for_subject(
+        &self,
+        subject: &UserId,
+    ) -> Result<Option<RecoveryFlowRecord>, StoreError> {
+        if subject.scope() != self.scope {
+            return Ok(None);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT id, subject, state, entry_point, recover_acr, \
+             (EXTRACT(EPOCH FROM initiated_at) * 1000000)::bigint AS initiated_us, \
+             (EXTRACT(EPOCH FROM hold_until) * 1000000)::bigint AS hold_us \
+             FROM recovery_flows \
+             WHERE tenant_id = $1 AND environment_id = $2 AND subject = $3 \
+             AND state IN ('initiated', 'held') \
+             ORDER BY initiated_at DESC, id DESC LIMIT 1",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(subject.to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(row.and_then(|row| recovery_flow_from_row(&row)))
+    }
+
+    /// Count `subject`'s recovery flows initiated at or after `since_micros` (issue
+    /// #81): the per-account COOLDOWN signal. A non-zero count inside the cooldown
+    /// window means a repeated initiation must be refused.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn initiations_since(
+        &self,
+        subject: &UserId,
+        since_micros: i64,
+    ) -> Result<i64, StoreError> {
+        if subject.scope() != self.scope {
+            return Ok(0);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let count: i64 = sqlx::query(
+            "SELECT count(*) AS c FROM recovery_flows \
+             WHERE tenant_id = $1 AND environment_id = $2 AND subject = $3 \
+             AND initiated_at >= \
+                 (TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval)",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(subject.to_string())
+        .bind(since_micros)
+        .fetch_one(&mut *tx)
+        .await?
+        .get("c");
+        tx.commit().await?;
+        Ok(count)
+    }
+}
+
+/// Reconstruct a [`RecoveryFlowRecord`] from a row, returning [`None`] when a
+/// closed-set column does not parse (a foreign or corrupted row is the uniform
+/// not-found rather than a guess).
+fn recovery_flow_from_row(row: &PgRow) -> Option<RecoveryFlowRecord> {
+    let id_text: String = row.get("id");
+    let id = RecoveryFlowId::parse_declared_scope(&id_text).ok()?;
+    let state = RecoveryState::from_wire(&row.get::<String, _>("state"))?;
+    let entry_point = RecoveryEntryPoint::from_wire(&row.get::<String, _>("entry_point"))?;
+    Some(RecoveryFlowRecord {
+        id,
+        subject: row.get("subject"),
+        state,
+        entry_point,
+        recover_acr: row.get("recover_acr"),
+        initiated_at_unix_micros: row.get("initiated_us"),
+        hold_until_unix_micros: row.get("hold_us"),
+    })
+}
+
+/// The mutating account-recovery repository (issue #81): initiate, cancel, complete,
+/// and record a factor-change decision, subject-bound and audited.
+pub struct ActingRecoveryFlowRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+    acting: ActingContext,
+}
+
+impl ActingRecoveryFlowRepo<'_> {
+    /// Ensure the scope has a live KEK and DEK to seal the recovery recipient under,
+    /// provisioning each lazily on first use (idempotent). Mirrors the trusted-device
+    /// metadata path so a recovery recipient is sealed exactly like device metadata.
+    async fn ensure_scope_keys(&self, env: &Env, master: &MasterKey) -> Result<(), StoreError> {
+        let envelope = ActingEnvelopeRepo {
+            store: self.store,
+            scope: self.scope,
+            acting: self.acting,
+        };
+        match envelope.provision_kek(env, master).await {
+            Ok(_) | Err(StoreError::Conflict) => {}
+            Err(error) => return Err(error),
+        }
+        match envelope.provision_dek(env, master).await {
+            Ok(_) | Err(StoreError::Conflict) => {}
+            Err(error) => return Err(error),
+        }
+        Ok(())
+    }
+
+    /// INITIATE a recovery flow for `subject` (issue #81): seal the recipient under the
+    /// scope's DEK (issue #48), stamp `initiated_at` from the env clock, and set the
+    /// state to `held` when a delay window applies (a security-reducing recovery) or
+    /// `initiated` otherwise. Writes one `recovery.initiate` audit row targeting the
+    /// flow; `detail` records the entry point, the recover-factor strength, whether a
+    /// delay was applied, and how many channels were notified (never the sealed
+    /// recipient). Returns the flow id the notification/cancellation links carry.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if `subject` is out of this scope;
+    /// [`StoreError::Encryption`] if no platform master key is configured;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn initiate(
+        &self,
+        env: &Env,
+        spec: NewRecoveryFlow<'_>,
+        channels_notified: usize,
+    ) -> Result<RecoveryFlowId, StoreError> {
+        if spec.subject.scope() != self.scope || spec.id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let master = self.store.master().ok_or(StoreError::Encryption)?;
+        self.ensure_scope_keys(env, master).await?;
+        let scope = self.scope;
+        let id = *spec.id;
+        let id_text = id.to_string();
+        let subject_text = spec.subject.to_string();
+        let held = spec.hold_until_unix_micros.is_some();
+        let state = if held {
+            RecoveryState::Held
+        } else {
+            RecoveryState::Initiated
+        };
+        let now_micros = epoch_micros(env.clock().now_utc());
+        let detail = format!(
+            "entry={};acr={};delay={};channels={}",
+            spec.entry_point.as_str(),
+            spec.recover_acr,
+            if held { "held" } else { "none" },
+            channels_notified,
+        );
+        write_audited_detailed(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::RecoveryInitiate,
+                target: &id,
+            },
+            async move |tx| {
+                let (dek_version, dek) = fetch_active_dek(tx, scope, master).await?;
+                let recipient_sealed = dek.seal(
+                    env.entropy(),
+                    &recovery_recipient_seal_aad(scope, &id_text, dek_version),
+                    spec.recipient.as_bytes(),
+                );
+                sqlx::query(
+                    "INSERT INTO recovery_flows \
+                     (id, tenant_id, environment_id, subject, state, entry_point, \
+                      recover_acr, cancel_token_digest, recipient_sealed, pii_dek_version, \
+                      initiated_at, hold_until) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, \
+                      TIMESTAMPTZ 'epoch' + ($11::text || ' microseconds')::interval, \
+                      CASE WHEN $12::bigint IS NULL THEN NULL ELSE \
+                       TIMESTAMPTZ 'epoch' + ($12::text || ' microseconds')::interval END)",
+                )
+                .bind(&id_text)
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(&subject_text)
+                .bind(state.as_str())
+                .bind(spec.entry_point.as_str())
+                .bind(spec.recover_acr)
+                .bind(spec.cancel_token_digest)
+                .bind(recipient_sealed.into_bytes())
+                .bind(dek_version)
+                .bind(now_micros)
+                .bind(spec.hold_until_unix_micros)
+                .execute(&mut **tx)
+                .await?;
+                Ok(())
+            },
+            false,
+            Some(&detail),
+        )
+        .await?;
+        Ok(id)
+    }
+
+    /// CANCEL a pending recovery flow (issue #81): a COLUMN-scoped UPDATE that sets
+    /// `state='cancelled'`, `cancelled_at`, and `cancel_reason` on a flow still
+    /// `initiated` or `held`, so the pending recovery can never complete. A terminal
+    /// (already cancelled/completed) or cross-scope flow is the uniform no-op. A
+    /// successful cancel writes one `recovery.cancel` audit row targeting the flow with
+    /// the reason in `detail`. Returns whether a row was flipped.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn cancel(
+        &self,
+        env: &Env,
+        id: &RecoveryFlowId,
+        reason: RecoveryCancelReason,
+    ) -> Result<bool, StoreError> {
+        if id.scope() != self.scope {
+            return Ok(false);
+        }
+        let scope = self.scope;
+        let id_text = id.to_string();
+        let now_micros = epoch_micros(env.clock().now_utc());
+        let mut flipped = false;
+        write_audited_detailed(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::RecoveryCancel,
+                target: id,
+            },
+            async |tx| {
+                let affected = sqlx::query(
+                    "UPDATE recovery_flows SET state = 'cancelled', \
+                     cancelled_at = TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval, \
+                     cancel_reason = $5 \
+                     WHERE id = $1 AND tenant_id = $2 AND environment_id = $3 \
+                     AND state IN ('initiated', 'held')",
+                )
+                .bind(&id_text)
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(now_micros)
+                .bind(reason.as_str())
+                .execute(&mut **tx)
+                .await?
+                .rows_affected();
+                flipped = affected > 0;
+                Ok(())
+            },
+            false,
+            Some(reason.as_str()),
+        )
+        .await?;
+        Ok(flipped)
+    }
+
+    /// COMPLETE a pending recovery flow (issue #81): a COLUMN-scoped UPDATE that sets
+    /// `state='completed'` and `completed_at` on a flow still `initiated` or `held`.
+    /// A cancelled flow is never completed (the UPDATE matches no row). A successful
+    /// completion writes one `recovery.complete` audit row targeting the flow with the
+    /// recover-factor strength in `detail`. Returns whether a row was flipped.
+    ///
+    /// DEFENSE IN DEPTH (issue #81 MEDIUM-3): a `held` flow whose `hold_until` is still in
+    /// the FUTURE is REFUSED (the UPDATE guards `hold_until IS NULL OR hold_until <= now`),
+    /// so completion can never erase the delay gate before the notified window has elapsed.
+    /// An `initiated` flow (no hold) completes as before. Completion is M9-deferred, so
+    /// there is no live caller today; the guard closes the trap for whoever wires it.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn complete(
+        &self,
+        env: &Env,
+        id: &RecoveryFlowId,
+        recover_acr: &str,
+    ) -> Result<bool, StoreError> {
+        if id.scope() != self.scope {
+            return Ok(false);
+        }
+        let scope = self.scope;
+        let id_text = id.to_string();
+        let now_micros = epoch_micros(env.clock().now_utc());
+        let mut flipped = false;
+        write_audited_detailed(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::RecoveryComplete,
+                target: id,
+            },
+            async |tx| {
+                let affected = sqlx::query(
+                    "UPDATE recovery_flows SET state = 'completed', \
+                     completed_at = TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval \
+                     WHERE id = $1 AND tenant_id = $2 AND environment_id = $3 \
+                     AND state IN ('initiated', 'held') \
+                     AND (hold_until IS NULL OR hold_until <= \
+                          TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval)",
+                )
+                .bind(&id_text)
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(now_micros)
+                .execute(&mut **tx)
+                .await?
+                .rows_affected();
+                flipped = affected > 0;
+                Ok(())
+            },
+            false,
+            Some(recover_acr),
+        )
+        .await?;
+        Ok(flipped)
+    }
+
+    /// RECORD a factor-change decision against the downgrade invariant (issue #81): an
+    /// audit-only `recovery.factor_change` row targeting the flow, so an
+    /// attacker-initiated attempt to remove a factor STRONGER than the one used to
+    /// recover is always reconstructable from the log. `detail` records the decision
+    /// (allowed / blocked) and the target factor strength. No data row changes.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn record_factor_change(
+        &self,
+        env: &Env,
+        id: &RecoveryFlowId,
+        detail: &str,
+    ) -> Result<(), StoreError> {
+        if id.scope() != self.scope {
+            return Ok(());
+        }
+        write_audited_detailed(
+            AuditedWrite {
+                store: self.store,
+                scope: self.scope,
+                acting: &self.acting,
+                env,
+                action: Action::RecoveryFactorChange,
+                target: id,
+            },
+            async |_tx| Ok(()),
+            false,
+            Some(detail),
+        )
+        .await?;
+        Ok(())
+    }
+}
+
+// ===========================================================================
 // Minimal risk engine (issue #79)
 // ===========================================================================
 
@@ -17799,6 +18314,21 @@ pub struct WebauthnAssertionTarget {
     pub attestation_verified: bool,
 }
 
+/// The strength-defining flags of ONE registered passkey (issue #81 HIGH-1): its
+/// registration-time backup eligibility (synced vs device-bound) and whether its
+/// attestation was verified. The recovery downgrade gate projects these onto the issue
+/// #66 credential ladder (attested > device-bound `phrh` > synced `phr`) so a passkey
+/// removal is compared at its TRUE strength, never under-counted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WebauthnFactorStrength {
+    /// Backup-eligible (BE): a synced passkey sets it (`phr`), a device-bound key
+    /// clears it (`phrh`).
+    pub backup_eligible: bool,
+    /// Whether the credential's attestation was verified at registration (issue #66):
+    /// the strongest rung (`attested_passkey`).
+    pub attestation_verified: bool,
+}
+
 /// The outcome of a rename or remove of a WebAuthn credential.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WebauthnCredentialOutcome {
@@ -18098,6 +18628,74 @@ impl WebauthnCredentialRepo<'_> {
                 backup_eligible: row.get("backup_eligible"),
                 attestation_verified: row.get("attestation_verified"),
             }
+        }))
+    }
+
+    /// The strength-defining flags of `subject`'s passkey `id` (issue #81 HIGH-1): the
+    /// recovery downgrade gate reads these to compare a passkey REMOVAL at its true rung.
+    /// Subject-bound, so another subject's id (or a cross-scope id) is the uniform
+    /// not-found (`None`), never actionable. No PII is opened (no nickname decrypt).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn factor_strength(
+        &self,
+        subject: &UserId,
+        id: &WebauthnCredentialId,
+    ) -> Result<Option<WebauthnFactorStrength>, StoreError> {
+        if id.scope() != self.scope || subject.scope() != self.scope {
+            return Ok(None);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT backup_eligible, attestation_verified FROM webauthn_credentials \
+             WHERE tenant_id = $1 AND environment_id = $2 AND subject = $3 AND id = $4",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(subject.to_string())
+        .bind(id.to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(row.map(|row| WebauthnFactorStrength {
+            backup_eligible: row.get("backup_eligible"),
+            attestation_verified: row.get("attestation_verified"),
+        }))
+    }
+
+    /// The STRONGEST enrolled passkey rung for `subject` (issue #81): the recovery
+    /// hold decision projects the true strongest factor so an attested/device-bound
+    /// passkey holder is never under-held. Ordered attestation-verified first, then
+    /// device-bound (BE false) ahead of synced (BE true), so the returned row is the
+    /// top rung the subject holds. `None` when the subject has no passkey.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn strongest_strength(
+        &self,
+        subject: &UserId,
+    ) -> Result<Option<WebauthnFactorStrength>, StoreError> {
+        if subject.scope() != self.scope {
+            return Ok(None);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT backup_eligible, attestation_verified FROM webauthn_credentials \
+             WHERE tenant_id = $1 AND environment_id = $2 AND subject = $3 \
+             ORDER BY attestation_verified DESC, backup_eligible ASC LIMIT 1",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(subject.to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(row.map(|row| WebauthnFactorStrength {
+            backup_eligible: row.get("backup_eligible"),
+            attestation_verified: row.get("attestation_verified"),
         }))
     }
 }
@@ -24167,6 +24765,12 @@ const TRUSTED_DEVICE_META_SEAL_LABEL: &str = "ironauth.envelope.trusted-device-m
 const TRUSTED_DEVICE_USER_AGENT_PURPOSE: &str = "user_agent";
 /// The purpose label bound into a sealed `trusted_devices.geo_sealed` value.
 const TRUSTED_DEVICE_GEO_PURPOSE: &str = "geo";
+/// The AAD label domain-separating a sealed `recovery_flows.recipient_sealed` value
+/// (the recipient/channel a recovery was initiated on, issue #81) from every other
+/// envelope context, so a recovery-recipient seal never authenticates under another
+/// column's context. The row id is additionally bound in the AAD (see
+/// [`recovery_recipient_seal_aad`]).
+const RECOVERY_RECIPIENT_SEAL_LABEL: &str = "ironauth.envelope.recovery-recipient.v1";
 /// The AAD label domain-separating a sealed `risk_login_geo` PII payload (the observed
 /// IP, coarse location, or User-Agent at a login, issue #79) from every other envelope
 /// context. The per-column `purpose` and the `rgl_` row id are additionally bound in
@@ -24304,6 +24908,20 @@ fn trusted_device_meta_seal_aad(
         .text(&scope.environment().to_string())
         .field(device_id.as_bytes())
         .text(purpose)
+        .version(i64::from(dek_version))
+        .build()
+}
+
+/// The AAD binding a sealed `recovery_flows.recipient_sealed` value (issue #81) to its
+/// scope, the row id, and the DEK version that sealed it. A ciphertext lifted to
+/// another row, tenant, environment, or claimed under another DEK version fails
+/// authenticated decryption.
+fn recovery_recipient_seal_aad(scope: Scope, flow_id: &str, dek_version: i32) -> Aad {
+    Aad::builder()
+        .text(RECOVERY_RECIPIENT_SEAL_LABEL)
+        .text(&scope.tenant().to_string())
+        .text(&scope.environment().to_string())
+        .field(flow_id.as_bytes())
         .version(i64::from(dek_version))
         .build()
 }

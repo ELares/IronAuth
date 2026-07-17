@@ -237,6 +237,12 @@ pub struct OidcState {
     // Default: the no-op NullSmsSender (no transport wired yet), so the guarded
     // acknowledgment is identical whether or not a text goes out.
     sms_sender: Arc<dyn crate::verification::SmsSender>,
+    // The account-recovery risk-scoring seam (issue #81). Kept OUTSIDE `Inner` so the
+    // issue #79 risk engine installs its evaluator here later without a wire change.
+    // Default: the null/allow NullRiskEvaluator (every recovery proceeds on the normal
+    // path), so an un-wired deployment behaves exactly as before and this subsystem
+    // takes no hard dependency on #79.
+    risk_evaluator: Arc<dyn crate::recovery::RiskEvaluator>,
     // The risk-engine `GeoIP` provider seam (issue #79). Kept OUTSIDE `Inner` so a
     // deployment installs a provider here without a wire change; NO third-party provider
     // is bundled. Default: the NullGeoIpProvider (resolves no coordinates), so the
@@ -491,6 +497,9 @@ struct Inner {
     sms_conversion_min_samples: u32,
     sms_conversion_alarm_threshold_percent: u32,
     sms_route_throttle_secs: u64,
+    // Account recovery (issue #81). Validated at config load.
+    recovery_cooldown_secs: u64,
+    recovery_delay_secs: u64,
 }
 
 impl OidcState {
@@ -658,6 +667,8 @@ impl OidcState {
                 sms_conversion_alarm_threshold_percent: config
                     .sms_conversion_alarm_threshold_percent,
                 sms_route_throttle_secs: config.sms_route_throttle_secs,
+                recovery_cooldown_secs: config.recovery_cooldown_secs,
+                recovery_delay_secs: config.recovery_delay_secs,
             }),
             revocation_sink: default_sink(),
             introspection_serializer: default_serializer(),
@@ -670,6 +681,7 @@ impl OidcState {
             ip_reputation_provider: Arc::new(crate::risk::NullIpReputationProvider),
             verification_sender: Arc::new(crate::verification::NullVerificationSender),
             sms_sender: Arc::new(crate::verification::NullSmsSender),
+            risk_evaluator: Arc::new(crate::recovery::NullRiskEvaluator),
             password_policy: ironauth_screening::PasswordPolicy::default(),
             screening_failure: ironauth_screening::FailurePolicy::FailOpen,
             screen_on_login: false,
@@ -890,6 +902,19 @@ impl OidcState {
     #[must_use]
     pub fn with_sms_sender(mut self, sender: Arc<dyn crate::verification::SmsSender>) -> Self {
         self.sms_sender = sender;
+        self
+    }
+
+    /// Install the account-recovery risk evaluator (issue #81), replacing the default
+    /// null/allow [`NullRiskEvaluator`](crate::recovery::NullRiskEvaluator). The issue
+    /// #79 risk engine wires its evaluator here to force the delay path or block a
+    /// recovery; a test wires a stub to drive the forced-delay and blocked paths.
+    #[must_use]
+    pub fn with_risk_evaluator(
+        mut self,
+        evaluator: Arc<dyn crate::recovery::RiskEvaluator>,
+    ) -> Self {
+        self.risk_evaluator = evaluator;
         self
     }
 
@@ -2083,6 +2108,28 @@ impl OidcState {
     #[must_use]
     pub fn magic_link_ttl(&self) -> std::time::Duration {
         std::time::Duration::from_secs(self.inner.magic_link_ttl_secs)
+    }
+
+    /// The resolved per-environment account-recovery windows (issue #81): the per-account
+    /// cooldown between initiations and the delay a security-reducing recovery is held
+    /// for. Both are validated at config load.
+    #[must_use]
+    pub fn recovery_settings(&self) -> crate::recovery::RecoverySettings {
+        crate::recovery::RecoverySettings {
+            cooldown_secs: self.inner.recovery_cooldown_secs,
+            delay_secs: self.inner.recovery_delay_secs,
+        }
+    }
+
+    /// Score a recovery attempt through the installed risk-evaluator seam (issue #81):
+    /// the issue #79 risk engine can force the delay path or block per the action
+    /// vocabulary. The default null evaluator allows every recovery.
+    #[must_use]
+    pub fn evaluate_recovery_risk(
+        &self,
+        event: &crate::recovery::RiskEvent<'_>,
+    ) -> crate::recovery::RiskDirective {
+        self.risk_evaluator.evaluate_recovery(event)
     }
 
     /// Whether the magic-link token rides the URL FRAGMENT rather than the query string

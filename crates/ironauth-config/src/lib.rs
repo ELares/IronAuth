@@ -594,6 +594,12 @@ impl Default for AdminConfig {
 /// long-lived code). The safe defaults are far below this ceiling.
 pub const OIDC_MAX_LIFETIME_SECS: u64 = 86_400;
 
+/// The largest the account-recovery DELAY window may be configured to, in seconds
+/// (issue #81): 30 days. The delay is a security feature (a security-reducing recovery
+/// is held, notified, and cancellable throughout), but an unbounded hold would strand a
+/// legitimate user forever, so config load caps it.
+pub const RECOVERY_MAX_DELAY_SECS: u64 = 2_592_000;
+
 /// The FLOOR of the email-OTP / magic-link TTL band, in seconds (issue #68): five
 /// minutes. NIST SP 800-63B recommends a short out-of-band code lifetime; a shorter
 /// window than this frustrates a legitimate user retrieving the code from their inbox.
@@ -1587,6 +1593,22 @@ pub struct OidcConfig {
     /// intervention, while healthy routes keep sending. Must be at least 1. The default
     /// (3600) is one hour.
     pub sms_route_throttle_secs: u64,
+
+    /// The cooldown between two account-recovery initiations for the SAME account, in
+    /// seconds (issue #81): a repeated recovery request inside this window is refused, so
+    /// recovery-request spam against one account is rate-limited on the recovery path
+    /// independently of the login path. Must be at least 1. The default (300) is five
+    /// minutes.
+    pub recovery_cooldown_secs: u64,
+
+    /// The delay window a security-REDUCING account recovery is HELD for before it can
+    /// complete, in seconds (issue #81): a recovery that would remove or bypass a factor
+    /// STRONGER than the one used to recover is held for this long, notified on every
+    /// registered channel and cancellable throughout, so an attacker-initiated recovery
+    /// can never silently downgrade an account inside the window. Must be between 1 and
+    /// 2592000 (30 days). The default (259200) is 72 hours, matching the platform-level
+    /// recovery-delay patterns Apple and Google ship.
+    pub recovery_delay_secs: u64,
 }
 
 impl Default for OidcConfig {
@@ -1701,6 +1723,8 @@ impl Default for OidcConfig {
             sms_conversion_min_samples: 20,
             sms_conversion_alarm_threshold_percent: 30,
             sms_route_throttle_secs: 3600,
+            recovery_cooldown_secs: 300,
+            recovery_delay_secs: 259_200,
         }
     }
 }
@@ -2786,11 +2810,33 @@ impl Config {
         validate_trusted_device(&self.oidc)?;
         validate_email_otp(&self.oidc)?;
         validate_sms_otp(&self.oidc)?;
+        validate_recovery(&self.oidc)?;
         validate_quota(&self.quota)?;
         validate_password_hashing(&self.password_hashing)?;
         validate_password_policy(&self.password_policy)?;
         Ok(())
     }
+}
+
+/// Validate the account-recovery cooldown and delay windows (issue #81), kept out of
+/// [`Config::validate`] so each stays within the readable-length lint. Validated at
+/// load even when recovery is otherwise idle, so a misconfigured window fails fast.
+fn validate_recovery(oidc: &OidcConfig) -> Result<(), ConfigError> {
+    if oidc.recovery_cooldown_secs < 1 {
+        return Err(ConfigError::Invalid {
+            message: "oidc.recovery_cooldown_secs must be at least 1 second".to_owned(),
+        });
+    }
+    if oidc.recovery_delay_secs < 1 || oidc.recovery_delay_secs > RECOVERY_MAX_DELAY_SECS {
+        return Err(ConfigError::Invalid {
+            message: format!(
+                "oidc.recovery_delay_secs ({}) must be between 1 and \
+                 {RECOVERY_MAX_DELAY_SECS} seconds",
+                oidc.recovery_delay_secs
+            ),
+        });
+    }
+    Ok(())
 }
 
 /// Validate the credential-abuse regulation settings (issue #64), kept out of

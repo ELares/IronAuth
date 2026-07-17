@@ -69,7 +69,11 @@ jobs:
           POSTGRES_PASSWORD: postgres
         ports:
           - 5432:5432
+        # The default 64MB /dev/shm exhausts the Postgres dynamic-shared-memory
+        # segments (error 53100) under the growing parallel test suite, where every
+        # test spins up an isolated database. Give the container a larger shm.
         options: >-
+          --shm-size=1g
           --health-cmd "pg_isready -U postgres"
           --health-interval 10s
           --health-timeout 5s

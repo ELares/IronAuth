@@ -579,21 +579,49 @@ pub async fn remove(
     if !interaction::same_origin_ok(&headers, state.self_origin().as_deref()) {
         return forbidden();
     }
-    let account = match authenticate(&state, &tenant_id, &environment_id, &headers).await {
-        Ok(account) => account,
-        Err(response) => return response,
+    // Resolve the session directly (not the shared `authenticate`) so the downgrade gate
+    // can read the session's freshness/strength for a fresh-reverify unblock (issue #81).
+    let Some(scope) = parse_scope(&tenant_id, &environment_id) else {
+        return not_found();
     };
-    let credentials = state.store().scoped(account.scope).totp_credentials();
+    let Some(session) = interaction::resolve_session(&state, scope, &headers).await else {
+        return unauthenticated();
+    };
+    let Ok(subject) = UserId::parse_in_scope(&session.subject, &scope) else {
+        return unauthenticated();
+    };
+    let credentials = state.store().scoped(scope).totp_credentials();
     let Ok(id) = credentials.parse_id(&body.credential_id) else {
         return not_found_json();
     };
-    let actor = interaction::user_actor(&account.subject);
+    // THE downgrade-invariant gate (issue #81 HIGH-1): TOTP is an `mfa`-strength second
+    // factor, so removing it while a WEAKER recovery (an email-OTP `pwd` session) is pending
+    // is BLOCKED until the delay window elapses or a fresh equal-or-stronger factor is
+    // re-verified; the decision is audited either way.
+    let reverify = crate::recovery::fresh_session_reverify_acr(
+        &state,
+        session.auth_time_unix_micros,
+        &session.auth_methods,
+    );
+    if !crate::recovery::gate_factor_removal(
+        &state,
+        scope,
+        &subject,
+        crate::recovery::RecoveryFactor::Totp,
+        reverify,
+    )
+    .await
+    .is_allowed()
+    {
+        return recovery_downgrade_blocked();
+    }
+    let actor = interaction::user_actor(&subject);
     let result = state
         .store()
-        .scoped(account.scope)
+        .scoped(scope)
         .acting(actor, CorrelationId::generate(state.env()))
         .totp_credentials()
-        .remove(state.env(), &account.subject, &id)
+        .remove(state.env(), &subject, &id)
         .await;
     match result {
         Ok(CredentialRemoveOutcome::Removed) => {
@@ -601,12 +629,7 @@ pub async fn remove(
             // so invalidate the subject's remembered devices (reason FactorChange): a
             // replayed device cookie then re-prompts for a second factor. Best-effort; a
             // no-op when the trusted-device feature is off.
-            crate::trusted_device::invalidate_on_factor_change(
-                &state,
-                account.scope,
-                &account.subject,
-            )
-            .await;
+            crate::trusted_device::invalidate_on_factor_change(&state, scope, &subject).await;
             json_response(
                 StatusCode::OK,
                 json!({ "id": id.to_string(), "removed": true }),
@@ -1177,6 +1200,22 @@ fn not_found_json() -> Response {
         json!({
             "error": "not_found",
             "error_description": "No such resource.",
+        }),
+    )
+}
+
+/// The `409` a removal returns when THE downgrade invariant blocks it (issue #81 HIGH-1):
+/// a recovery is pending and removing this second factor would silently drop a factor
+/// STRONGER than the one used to recover, before the delay window has elapsed and without a
+/// fresh equal-or-stronger re-verification. Non-enumerating and actionable.
+fn recovery_downgrade_blocked() -> Response {
+    json_response(
+        StatusCode::CONFLICT,
+        json!({
+            "error": "recovery_downgrade_blocked",
+            "error_description": "A recovery is pending on this account. Removing a stronger \
+                 sign-in factor is held until the recovery delay elapses, or until you \
+                 re-verify with an equal-or-stronger factor.",
         }),
     )
 }

@@ -103,6 +103,14 @@ name = "abuse"
 path = "tests/abuse.rs"
 required-features = ["testing"]
 
+# Account-recovery flow persistence (issue #81): the state machine round-trip
+# (initiated/held -> completed / cancelled), recipient sealing at rest, cancellation by
+# token digest, the cooldown count, and per-transition audit. Needs a real database.
+[[test]]
+name = "recovery_flows"
+path = "tests/recovery_flows.rs"
+required-features = ["testing"]
+
 # Credential-class policy persistence + attestation config + WebAuthn user-handle
 # immutability (issue #66), against a real database.
 [[test]]
