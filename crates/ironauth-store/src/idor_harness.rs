@@ -1401,6 +1401,15 @@ impl IsolationProbe for AccountCredentialRemoveProbe {
     }
 }
 
+/// The connector id the upstream-token IDOR probe reads under, and the one a planting
+/// helper MUST capture the victim token beneath, so the probe's read is filtered on the
+/// SAME connector the victim was captured under (issue #77, PR 3 coherence hardening). If
+/// the probe read a different connector the read would return no row for a benign reason
+/// (the connector filter, not the scope boundary), making the isolation assertion vacuous;
+/// pinning both sides to this one connector keeps ONLY the scope boundary between the
+/// probe and the victim token.
+pub const UPSTREAM_TOKEN_PROBE_CONNECTOR: &str = "cnr_probe";
+
 /// Built-in probe for `ActingUpstreamTokenRepo::read_for_session` (issue #77, PR 3): a
 /// session's captured upstream tokens must never resolve under another tenant or
 /// environment's scope. The `foreign_id` is a session id planted in another scope; it is
@@ -1433,7 +1442,7 @@ impl IsolationProbe for UpstreamTokenReadProbe {
                 .scoped(caller)
                 .acting(actor, correlation)
                 .upstream_tokens()
-                .read_for_session(&env, &session_id)
+                .read_for_session(&env, &session_id, UPSTREAM_TOKEN_PROBE_CONNECTOR)
                 .await
             {
                 // Resolving a foreign session's captured tokens would be a leak.

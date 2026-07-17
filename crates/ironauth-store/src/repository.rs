@@ -20289,6 +20289,16 @@ impl ActingUpstreamTokenRepo<'_> {
     /// captured token is a uniform [`None`] (the anti-oracle boundary), so the endpoint
     /// renders it as the same not-found a foreign id produces.
     ///
+    /// `connector_id` is the connector of the GRANT-AUTHORIZED org connection (the
+    /// endpoint resolves the session's org connection to check the client capability, then
+    /// passes THAT org connection's connector here). The read is filtered on BOTH the
+    /// session AND that connector, so a client granted for one org connection can never
+    /// read a token captured while the same session was routed through a DIFFERENT org
+    /// connection that happens to share a connector (a coherence gap if an operator ever
+    /// maps two org connections onto one shared connector with different grant policies).
+    /// The `(session, connector)` pair is UNIQUE per scope, so at most one row matches; the
+    /// explicit `LIMIT 1` is belt and suspenders with that constraint for any future flow.
+    ///
     /// # Errors
     ///
     /// [`StoreError::NotFound`] if the session is out of scope or the stored id is
@@ -20298,6 +20308,7 @@ impl ActingUpstreamTokenRepo<'_> {
         &self,
         env: &Env,
         session_id: &SessionId,
+        connector_id: &str,
     ) -> Result<Option<UpstreamTokenMaterial>, StoreError> {
         if session_id.scope() != self.scope {
             return Ok(None);
@@ -20310,11 +20321,14 @@ impl ActingUpstreamTokenRepo<'_> {
                     (EXTRACT(EPOCH FROM access_expires_at) * 1000000)::bigint AS access_expires_us, \
                     token_scope \
              FROM upstream_tokens \
-             WHERE tenant_id = $1 AND environment_id = $2 AND session_id = $3",
+             WHERE tenant_id = $1 AND environment_id = $2 AND session_id = $3 \
+                   AND connector_id = $4 \
+             LIMIT 1",
         )
         .bind(self.scope.tenant().to_string())
         .bind(self.scope.environment().to_string())
         .bind(session_id.to_string())
+        .bind(connector_id.to_owned())
         .fetch_optional(&mut *tx)
         .await?;
         let Some(row) = row else {

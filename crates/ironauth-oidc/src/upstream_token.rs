@@ -141,6 +141,23 @@ pub async fn retrieve_upstream_token(
         return not_found();
     };
 
+    // The grant-authorized org connection's CONNECTOR. The token read below is filtered on
+    // BOTH the session AND this connector, so a client granted for this org connection can
+    // never read a token captured while the same session was routed through a DIFFERENT org
+    // connection that happens to share a connector (a coherence gap if an operator ever maps
+    // two org connections onto one shared connector with different grant policies). A missing
+    // binding is the uniform not-found.
+    let Ok(org_connection) = state
+        .store()
+        .scoped(scope)
+        .org_connections()
+        .get(&org_connection_id)
+        .await
+    else {
+        return not_found();
+    };
+    let connector_id = org_connection.connector_id;
+
     // CLIENT CAPABILITY (part 2): an ENABLED grant must exist for (this client, the
     // session's org connection). Absent means a TYPED unauthorized_client denial, never a
     // leak of whether a token exists for the session.
@@ -174,7 +191,7 @@ pub async fn retrieve_upstream_token(
         .scoped(scope)
         .acting(actor, correlation)
         .upstream_tokens()
-        .read_for_session(state.env(), &session.session_id)
+        .read_for_session(state.env(), &session.session_id, &connector_id)
         .await
     else {
         return not_found();

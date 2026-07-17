@@ -4,7 +4,7 @@
 //! database, over every scoped-repository operation that exists today.
 
 use ironauth_env::Env;
-use ironauth_store::idor_harness::IdorHarness;
+use ironauth_store::idor_harness::{IdorHarness, UPSTREAM_TOKEN_PROBE_CONNECTOR};
 use ironauth_store::test_support::TestDatabase;
 use ironauth_store::{
     AuthorizationCodeId, ClientId, ConnectorCapabilities, ConnectorId, CorrelationId,
@@ -544,7 +544,7 @@ async fn upstream_token_read_is_cross_scope_isolated() {
             .scoped(scope)
             .acting(db.test_actor(&env), CorrelationId::generate(&env))
             .upstream_tokens()
-            .read_for_session(&env, session)
+            .read_for_session(&env, session, UPSTREAM_TOKEN_PROBE_CONNECTOR)
             .await
             .expect("read in own scope")
             .expect("the token survives every cross-scope probe");
@@ -554,6 +554,57 @@ async fn upstream_token_read_is_cross_scope_isolated() {
             "the token round-trips in its own scope"
         );
     }
+}
+
+#[tokio::test]
+async fn upstream_token_read_is_connector_filtered() {
+    // LOW-1 coherence hardening (issue #77, PR 3): read_for_session filters on BOTH the
+    // session AND the grant-authorized connector, so a client granted for one org
+    // connection can never read a token that was captured while the SAME session was routed
+    // through a DIFFERENT org connection sharing a connector under a different grant policy.
+    // Construct the shared-connector case directly at the store: a token captured under one
+    // connector is invisible to a read scoped to a different connector, and visible only to
+    // a read scoped to the connector it was captured under. Run on the DATA store
+    // (ironauth_app), which carries the platform master key the seal path needs.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+
+    // The helper captures the token under UPSTREAM_TOKEN_PROBE_CONNECTOR.
+    let session = plant_upstream_token(&db, &env, scope).await;
+
+    // A read scoped to a DIFFERENT connector returns the uniform None: the coherence gap is
+    // closed, because a grant authorizing a sibling org connection's connector reads no
+    // token that was captured under another connector for this session.
+    let mismatched = db
+        .store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .upstream_tokens()
+        .read_for_session(&env, &session, "cnr_other_connector")
+        .await
+        .expect("a connector mismatch is an infallible None, never an error");
+    assert!(
+        mismatched.is_none(),
+        "a token captured under one connector must not resolve for a different connector"
+    );
+
+    // The SAME session's token IS readable under the connector it was captured under, so the
+    // filter is a genuine connector boundary and not a blanket miss.
+    let matched = db
+        .store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .upstream_tokens()
+        .read_for_session(&env, &session, UPSTREAM_TOKEN_PROBE_CONNECTOR)
+        .await
+        .expect("read in own scope")
+        .expect("the token resolves under the connector it was captured under");
+    assert_eq!(
+        matched.access_token.open(),
+        b"upstream-at",
+        "the token round-trips when the read connector matches the capture connector"
+    );
 }
 
 /// Plant a captured upstream token keyed on a fresh session in `scope`, returning the
@@ -570,7 +621,7 @@ async fn plant_upstream_token(db: &TestDatabase, env: &Env, scope: Scope) -> Ses
             1_000_000,
             NewUpstreamTokens {
                 session_id: &session,
-                connector_id: "cnr_probe",
+                connector_id: UPSTREAM_TOKEN_PROBE_CONNECTOR,
                 access_token: b"upstream-at",
                 refresh_token: Some(b"upstream-rt"),
                 access_expires_at_unix_micros: Some(FAR_FUTURE_MICROS),
