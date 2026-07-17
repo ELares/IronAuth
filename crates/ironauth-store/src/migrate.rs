@@ -598,9 +598,15 @@ fn registry() -> Vec<Migration> {
         },
         Migration {
             version: 55,
+            name: "account_recovery",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0055_account_recovery.sql"),
+        },
+        Migration {
+            version: 56,
             name: "connectors",
             phase: Phase::Expand,
-            sql: include_str!("../migrations/0055_connectors.sql"),
+            sql: include_str!("../migrations/0056_connectors.sql"),
         },
     ]
 }

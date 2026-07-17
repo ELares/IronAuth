@@ -60,6 +60,7 @@ mod id;
 pub mod identifier;
 mod migrate;
 pub mod promotion;
+pub mod recovery;
 mod redirect;
 mod repository;
 pub mod risk;
@@ -116,16 +117,17 @@ pub use id::{
     LevelKind, MagicLinkTokenId, MagicLinkTokenKind, ManagementKeyId, ManagementKeyKind,
     MigrationRunId, MigrationRunKind, MigrationRunRecordId, MigrationRunRecordKind, NotInScope,
     OperatorId, OperatorKind, OrganizationId, OrganizationKind, PushedRequestId, PushedRequestKind,
-    RecoveryCodeId, RecoveryCodeKind, RefreshFamilyId, RefreshFamilyKind, RefreshTokenId,
-    RefreshTokenKind, ResourceServerId, ResourceServerKind, RiskDecisionId, RiskDecisionKind,
-    RiskDisavowalId, RiskDisavowalKind, RiskLoginGeoId, RiskLoginGeoKind, ScopeStepUpPolicyId,
-    ScopeStepUpPolicyKind, ScopedId, ScopedKind, ServiceAccountId, ServiceAccountKind, ServiceId,
-    ServiceKind, SessionEventId, SessionEventKind, SessionId, SessionKind, SigningKeyId,
-    SigningKeyKind, SmsOtpCodeId, SmsOtpCodeKind, SmsRouteStatId, SmsRouteStatKind, TenantId,
-    TenantKind, TotpCredentialId, TotpCredentialKind, TraitMigrationJobId, TraitMigrationJobKind,
-    TraitSchemaId, TraitSchemaKind, TrustedDeviceId, TrustedDeviceKind, UserId, UserIdentifierId,
-    UserIdentifierKind, UserKind, VariableId, VariableKind, WebauthnChallengeId,
-    WebauthnChallengeKind, WebauthnCredentialId, WebauthnCredentialKind,
+    RecoveryCodeId, RecoveryCodeKind, RecoveryFlowId, RecoveryFlowKind, RefreshFamilyId,
+    RefreshFamilyKind, RefreshTokenId, RefreshTokenKind, ResourceServerId, ResourceServerKind,
+    RiskDecisionId, RiskDecisionKind, RiskDisavowalId, RiskDisavowalKind, RiskLoginGeoId,
+    RiskLoginGeoKind, ScopeStepUpPolicyId, ScopeStepUpPolicyKind, ScopedId, ScopedKind,
+    ServiceAccountId, ServiceAccountKind, ServiceId, ServiceKind, SessionEventId, SessionEventKind,
+    SessionId, SessionKind, SigningKeyId, SigningKeyKind, SmsOtpCodeId, SmsOtpCodeKind,
+    SmsRouteStatId, SmsRouteStatKind, TenantId, TenantKind, TotpCredentialId, TotpCredentialKind,
+    TraitMigrationJobId, TraitMigrationJobKind, TraitSchemaId, TraitSchemaKind, TrustedDeviceId,
+    TrustedDeviceKind, UserId, UserIdentifierId, UserIdentifierKind, UserKind, VariableId,
+    VariableKind, WebauthnChallengeId, WebauthnChallengeKind, WebauthnCredentialId,
+    WebauthnCredentialKind,
 };
 pub use identifier::{
     CanonicalIdentifier, IdentifierType, UniquenessMode, canonicalize_identifier,
@@ -135,6 +137,9 @@ pub use promotion::{
     ChangeKind, ConfigDiff, PROMOTED_RESOURCE_TYPES, Plan, PlanError, PromotionApplyError,
     PromotionOutcome, ResourceChange, collect_references, diff as diff_snapshots, evaluate_plan,
     plan_promotion, revision as promotion_revision,
+};
+pub use recovery::{
+    NewRecoveryFlow, RecoveryCancelReason, RecoveryEntryPoint, RecoveryFlowRecord, RecoveryState,
 };
 pub use redirect::{redirect_uri_is_registrable, redirect_uri_matches};
 pub use repository::{
@@ -200,7 +205,7 @@ pub use repository::{
     UserRepo, UserRevocation, UserState, WEBAUTHN_CHALLENGE_TTL_SECS, WebauthnAssertionTarget,
     WebauthnCeremony, WebauthnChallengeRepo, WebauthnCredentialDescriptor,
     WebauthnCredentialOutcome, WebauthnCredentialRecord, WebauthnCredentialRepo,
-    device_code_digest, invitation_token_digest, magic_link_binding_digest,
+    WebauthnFactorStrength, device_code_digest, invitation_token_digest, magic_link_binding_digest,
     magic_link_token_digest, mint_invitation_token, mint_invitation_token_for,
     opaque_access_token_digest, refresh_token_digest, user_code_hash,
 };

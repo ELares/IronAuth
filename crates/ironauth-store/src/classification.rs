@@ -143,6 +143,10 @@ pub enum ResourceType {
     /// A remembered device (issue #71): the server-side trusted-device state a
     /// subsequent login skips the second factor against.
     TrustedDevice,
+    /// A recovery flow (issue #81): one row of the account-recovery state machine
+    /// (the delay window, the notification/cancellation context, and the factor
+    /// strength the downgrade invariant protects). Dynamic per-environment data.
+    RecoveryFlow,
     /// A declarative inbound-federation connector (issue #75): the OIDC-shaped
     /// upstream definition the generic federation upstream reads. Promotable
     /// configuration; its upstream client SECRET never travels (only a named
@@ -154,7 +158,7 @@ impl ResourceType {
     /// Every resource type, in a stable order. The classification lint and the
     /// metadata endpoint both iterate this; a variant missing here is caught by
     /// the `all_lists_every_variant` test and by `scripts/classification-lint.sh`.
-    pub const ALL: [ResourceType; 18] = [
+    pub const ALL: [ResourceType; 19] = [
         ResourceType::Operator,
         ResourceType::Tenant,
         ResourceType::Environment,
@@ -172,6 +176,7 @@ impl ResourceType {
         ResourceType::AccountCredential,
         ResourceType::Invitation,
         ResourceType::TrustedDevice,
+        ResourceType::RecoveryFlow,
         ResourceType::Connector,
     ];
 
@@ -196,6 +201,7 @@ impl ResourceType {
             ResourceType::AccountCredential => "account_credential",
             ResourceType::Invitation => "invitation",
             ResourceType::TrustedDevice => "trusted_device",
+            ResourceType::RecoveryFlow => "recovery_flow",
             ResourceType::Connector => "connector",
         }
     }
@@ -222,6 +228,7 @@ impl ResourceType {
             | ResourceType::AccountCredential
             | ResourceType::Invitation
             | ResourceType::TrustedDevice
+            | ResourceType::RecoveryFlow
             | ResourceType::Connector => ResourceLevel::Environment,
         }
     }
@@ -287,7 +294,10 @@ pub fn classify(resource: ResourceType) -> ResourceClassification {
         // A remembered device (issue #71) is dynamic per-environment data, bound to a
         // specific environment's users and sessions: it never travels in a config
         // snapshot, exactly like a session or an account credential.
-        | ResourceType::TrustedDevice => Runtime,
+        | ResourceType::TrustedDevice
+        // A recovery flow (issue #81) is dynamic per-environment data, bound to a
+        // specific environment's users: it never travels in a config snapshot.
+        | ResourceType::RecoveryFlow => Runtime,
     }
 }
 

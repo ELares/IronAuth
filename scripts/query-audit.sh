@@ -222,7 +222,20 @@ cd "$(git rev-parse --show-toplevel)"
 # latch that doubles as the credentials-flagged-for-review marker). All TENANT-SCOPED
 # with forced row-level security, and every read/write additionally subject-bound, so
 # their SQL stays in the repository module too.
-SCOPED_TABLES='clients|organizations|audit_log|management_credentials|idempotency_keys|grants|authorization_codes|issued_tokens|signing_keys|users|sessions|consents|resource_servers|opaque_access_tokens|client_assertion_jtis|client_auth_diagnostics|pushed_authorization_requests|refresh_families|refresh_tokens|service_accounts|dcr_policies|dcr_initial_access_tokens|dcr_rate_counters|external_assertion_issuers|external_assertion_subject_mappings|external_assertion_jtis|device_codes|client_sessions|session_ended_events|backchannel_logout_deliveries|tenant_keks|tenant_deks|encrypted_secrets|environment_states|tenant_byok_bindings|environment_guardrails|custom_domains|acme_challenges|environment_variables|environment_secrets|account_credentials|trait_schemas|trait_migration_jobs|user_invitations|user_identifiers|migration_runs|migration_run_records|webauthn_credentials|webauthn_challenges|abuse_bans|totp_credentials|recovery_codes|scope_step_up_policies|email_otp_codes|magic_link_tokens|credential_class_policies|attestation_config|sms_otp_codes|sms_config|sms_country_allowlist|sms_route_stats|mds3_blob_cache|aaguid_rules|admin_sudo_elevations|trusted_devices|risk_login_geo|risk_decisions|risk_disavowal_tokens|connectors'
+#
+# recovery_flows (#81) is the account-recovery state machine: one row per recovery flow
+# (its state-machine position and entry point as closed CHECK sets, the recover-factor
+# strength the downgrade invariant protects, the SHA-256 DIGEST of the notification-link
+# cancellation token as server-side state, the SEALED recipient with its DEK version, and
+# the delay-window / lifecycle timestamps). TENANT-SCOPED with forced row-level security,
+# so its SQL stays in the repository module too. It stores no plaintext PII.
+#
+# connectors (#75, PR A) is the declarative federation connector table: one row per
+# inbound-federation upstream (a SECRET-FREE definition_json, the capability columns, and
+# the upstream client secret SEALED INLINE under the scope DEK, never a plaintext column).
+# TENANT-SCOPED with forced row-level security, so its SQL stays in the repository module
+# too. It stores no plaintext PII or secret.
+SCOPED_TABLES='clients|organizations|audit_log|management_credentials|idempotency_keys|grants|authorization_codes|issued_tokens|signing_keys|users|sessions|consents|resource_servers|opaque_access_tokens|client_assertion_jtis|client_auth_diagnostics|pushed_authorization_requests|refresh_families|refresh_tokens|service_accounts|dcr_policies|dcr_initial_access_tokens|dcr_rate_counters|external_assertion_issuers|external_assertion_subject_mappings|external_assertion_jtis|device_codes|client_sessions|session_ended_events|backchannel_logout_deliveries|tenant_keks|tenant_deks|encrypted_secrets|environment_states|tenant_byok_bindings|environment_guardrails|custom_domains|acme_challenges|environment_variables|environment_secrets|account_credentials|trait_schemas|trait_migration_jobs|user_invitations|user_identifiers|migration_runs|migration_run_records|webauthn_credentials|webauthn_challenges|abuse_bans|totp_credentials|recovery_codes|scope_step_up_policies|email_otp_codes|magic_link_tokens|credential_class_policies|attestation_config|sms_otp_codes|sms_config|sms_country_allowlist|sms_route_stats|mds3_blob_cache|aaguid_rules|admin_sudo_elevations|trusted_devices|risk_login_geo|risk_decisions|risk_disavowal_tokens|recovery_flows|connectors'
 
 # The one module allowed to name a scoped table in SQL.
 REPO_MODULE='crates/ironauth-store/src/repository.rs'

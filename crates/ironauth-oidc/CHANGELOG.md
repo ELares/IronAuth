@@ -6,6 +6,58 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Account recovery as a first-class subsystem (issue #81): a distinct recovery state
+  machine, NOT a branch of password reset, governed by three pillars. DELAY as a security
+  feature: a recovery that would REDUCE account security is HELD for the configured
+  `oidc.recovery_delay_secs` window before it can complete, cancellable throughout.
+  NOTIFICATION everywhere: initiating recovery notifies EVERY registered channel (all
+  verified emails and phone numbers) through the #68 verification seam, with a
+  cancellation path; completion and factor changes notify again. THE DOWNGRADE INVARIANT:
+  recovery can NEVER silently remove or bypass a factor STRONGER than the one used to
+  recover; removing such a factor requires EITHER a fresh equal-or-stronger re-verification
+  OR the elapsed delay window. "Stronger" REUSES the issue #66 credential-ladder / `acr`
+  strength order via `step_up::acr_satisfies` and `AuthMethod::acr` (no parallel ordering):
+  an email-OTP recovery restores access but leaves a passkey or TOTP intact and its removal
+  BLOCKED until the rule is satisfied. Adds the `recovery` domain module
+  (`initiate_recovery`, `cancel_from_token`, `evaluate_factor_change`,
+  `factor_change_decision`, the `RecoveryFactor` projection onto `AuthMethod`), the
+  `RiskEvaluator` SEAM (a null/allow default, installed with `OidcState::with_risk_evaluator`)
+  so issue #79's risk engine can force the delay path or block a recovery without a hard
+  dependency, and a `POST /recover/cancel` scanner-safe cancellation surface (a GET renders
+  a confirm page but never cancels; a same-origin POST with the high-entropy token revokes
+  the pending recovery). The `POST /recover` surface now, for a KNOWN account, creates the
+  (possibly delay-held) flow and notifies every channel side-effect-only, so it stays
+  byte-identical to an unknown identifier (anti-enumeration). The per-account cooldown
+  (`oidc.recovery_cooldown_secs`) rate-limits repeated initiations. All timers run through
+  the env clock seam (no wall-clock sleeps) and the cancellation token through the entropy
+  seam.
+- Review fix (issue #81): the downgrade invariant is now ENFORCED on the LIVE
+  factor-removal surface, not just in `evaluate_factor_change`. The three removal handlers
+  (`POST /webauthn/credentials/remove`, `POST /account/credentials/remove`,
+  `POST /account/mfa/totp/remove`) and the password-removal path
+  (`POST /account/password/remove`) consult a subject's pending recovery flow before
+  removing a factor: if a recovery is pending, removing a factor STRONGER than the one the
+  recovery was performed with is refused with a non-enumerating `409`
+  (`recovery_downgrade_blocked`) while the flow is held (`hold_until` in the future) and no
+  fresh equal-or-stronger re-verification is proven, and the `recovery.factor_change`
+  transition is audited live either way. The webauthn removal projects the credential's TRUE
+  passkey rung (attested > device-bound `phrh` > synced `phr`); a fresh session within the
+  step-up window unblocks a downgrade at its achieved strength (`AllowedByReverify`), and a
+  removal past `hold_until` proceeds (`AllowedByDelay`), so a stale delay-elapsed flow never
+  perpetually locks removals. The gate keys off the PRESENCE of a pending recovery flow
+  (recovery access is an ordinary email-OTP session, not a special session type). The
+  `POST /recover` unknown-identifier branch now runs an anti-timing DECOY performing the
+  SAME risk-seam call and store round-trips as a known initiation before the identical
+  acknowledgment, so a registered identifier is not distinguishable by latency (the #68/#70
+  discipline). The recovery hold decision now fails CLOSED (a strongest-factor read fault is
+  treated as the ladder's top rung, routing to the HELD delay path) and projects the TRUE
+  strongest enrolled passkey rung, so a device-bound / attested passkey holder is never
+  under-held.
+- Known limitation (issue #81, M11): the recovery cancellation link is minted but not yet
+  DELIVERED. `recover_post` discards the cancellation token and the notify transport is the
+  M11 stub, so the "cancellable from a notification link" path is structurally correct
+  (token minted, digest stored, `GET/POST /recover/cancel` wired) but not reachable end to
+  end until M11 wires the token into the delivered message.
 - Minimal risk engine (issue #79), off by default behind `oidc.risk.enabled`. The design
   bet is LEGIBILITY over ML: a small set of explainable signals feed a LOW/MED/HIGH score
   through a documented, deterministic combination rule (the base is the max signal

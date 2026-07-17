@@ -6,7 +6,7 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
-- Declarative federation connectors (issue #75, PR A): migration 0055 adds the
+- Declarative federation connectors (issue #75, PR A): migration 0056 adds the
   tenant-scoped, forced-RLS `connectors` table and the `ConnectorRepo` /
   `ActingConnectorRepo` accessors. A connector row holds a `cnr_` scope-embedded id
   (a NEW `ScopedKind`; the prefix is `cnr`, distinct from consent's `con`, so the two
@@ -23,7 +23,7 @@ range per docs/RELEASING.md.
   reference must resolve against the target environment, a later slice), so they are
   emptied from the promoted projection exactly like clients. `connectors` is registered
   in the query-audit lint and the IDOR harness (`connectors.get` / `connectors.delete`).
-  The migration guard pins the chain at 55 and asserts the table's forced RLS, isolation
+  The migration guard pins the chain at 56 and asserts the table's forced RLS, isolation
   policy, scope-nonempty and email-verified-trust CHECKs, sealed-secret column, and the
   absence of any plaintext `client_secret` column.
   - Review fix (MEDIUM 1): the inline connector-secret seal AAD is now bound to the
@@ -34,6 +34,28 @@ range per docs/RELEASING.md.
     read path stays secret-free. The `ConnectorKind` doc (review LOW 2) is rewritten to
     describe the shipped INLINE seal (on the row's `client_secret_sealed` bytea) rather
     than the never-shipped `encrypted_secrets` reference.
+- Account recovery (issue #81): migration 0055 adds the tenant-scoped, forced-RLS
+  `recovery_flows` table (the recovery state machine position and entry point as closed
+  CHECK sets, the `recover_acr` credential-ladder strength the downgrade invariant
+  protects, the SHA-256 DIGEST of the notification-link cancellation token as server-side
+  state, the SEALED recipient with its DEK version, and the delay-window / lifecycle
+  timestamps stamped from the env clock), a `rcv_` scoped id, the `RecoveryFlow` resource
+  classification (runtime), and the `RecoveryFlowRepo` (`get`, `by_cancel_digest`,
+  `initiations_since` for the cooldown) / `ActingRecoveryFlowRepo` (`initiate` sealing the
+  recipient and stamping the delay, `cancel`, `complete`, `record_factor_change`). Adds the
+  `recovery.initiate` / `recovery.cancel` / `recovery.complete` / `recovery.factor_change`
+  audit actions, so every recovery state transition is audited with actor, action, and
+  factor/channel context.
+- Review fix (issue #81): adds `RecoveryFlowRepo::pending_for_subject` (the newest
+  `initiated`/`held` flow for a subject, `initiated_at DESC, id DESC` so two flows racing
+  the cooldown boundary resolve deterministically to the newest and a terminal flow is
+  never returned) so the live factor-removal gate can consult a pending recovery;
+  `WebauthnCredentialRepo::factor_strength` / `strongest_strength` (a passkey's
+  backup-eligible + attestation-verified flags, for one credential and for the strongest
+  enrolled rung) and `AccountCredentialRepo::factor_kind`, so the gate compares a removal at
+  its TRUE factor strength. `ActingRecoveryFlowRepo::complete` now REFUSES to complete a
+  `held` flow whose `hold_until` is still in the FUTURE (defense in depth for M9), so
+  completion can never erase the delay gate early.
 - Minimal risk engine state (issue #79): migration 0054 adds three tenant-scoped,
   forced-RLS tables and the `RiskRepo` / `ActingRiskRepo` accessors. `risk_login_geo`
   holds one per-subject last-seen login geo (the observed IP, coarse location, and
