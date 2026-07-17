@@ -54,6 +54,7 @@
 pub mod claim_mapping;
 pub mod discovery;
 pub mod error;
+pub mod presets;
 
 pub use claim_mapping::{
     ClaimMappingError, ClaimSources, TraitDocument, TraitPointerFailure, TraitSchemaView, evaluate,
@@ -70,15 +71,25 @@ use serde::de::{self, Deserializer};
 use serde::ser::{SerializeMap, Serializer};
 use serde::{Deserialize, Serialize};
 
-/// The federation protocol a connector speaks. A CLOSED enum with one variant:
-/// SAML is deliberately UNREPRESENTABLE (the hostile-parser SAML SP inbound is a
-/// later milestone), so a definition can never assert a protocol this slice does
-/// not implement.
+/// The federation protocol a connector speaks. A CLOSED enum: SAML is deliberately
+/// UNREPRESENTABLE (the hostile-parser SAML SP inbound is a later milestone), so a
+/// definition can never assert a protocol this slice does not implement.
+///
+/// `oauth2` (issue #74) is the honest model for a NON-OIDC upstream like GitHub: a
+/// plain OAuth 2.0 code grant with NO ID token, whose identity is read from a
+/// profile/userinfo endpoint over TLS rather than a signed ID token. It carries an
+/// [`Endpoints::OAuth 2.0`] endpoint set and never runs the ID-token validation spine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Protocol {
-    /// OpenID Connect (the generic OIDC upstream).
+    /// OpenID Connect (the generic OIDC upstream: Google, Apple, Microsoft, and any
+    /// discovery-form or explicit OIDC provider). The identity is a validated ID token.
     Oidc,
+    /// Plain OAuth 2.0 code grant with NO ID token (issue #74, for example GitHub).
+    /// The identity is assembled from a profile endpoint (and an optional email
+    /// endpoint) fetched over the SSRF-hardened path; there is no ID-token signature
+    /// to validate, so the profile response over TLS is the identity source.
+    Oauth2,
 }
 
 /// How PKCE is applied to the UPSTREAM authorization request (RFC 7636). Only the
@@ -218,13 +229,63 @@ impl Default for CapabilityMatrix {
 #[serde(deny_unknown_fields, default)]
 pub struct Quirks {
     /// The upstream delivers the user profile only on the FIRST authorization (for
-    /// example Apple); a subsequent login must reuse the stored profile.
+    /// example Apple); a subsequent login must reuse the stored profile. When set, the
+    /// federation callback feeds a RETURNING user's stored traits into the claim-mapping
+    /// evaluator, so a subsequent Apple login that omits name and email still succeeds
+    /// with the persisted profile instead of failing the required-email check (issue #74).
     pub profile_delivered_first_auth_only: bool,
     /// Where the email address is sourced from.
     pub email_source: EmailSource,
     /// Whether a `UserInfo` request is required to assemble the identity (some
     /// upstreams omit standard claims from the ID token).
     pub userinfo_required: bool,
+    /// The email domain an upstream uses for a PRIVATE RELAY address (Apple's
+    /// `privaterelay.appleid.com` Hide My Email, issue #74). When set, an email whose
+    /// host matches this domain is classified VERIFIED-BUT-UNROUTABLE: it satisfies
+    /// verification but is never selected as an operational mail routing target without
+    /// the documented relay setup. The federation callback records a `email_relay` trait
+    /// for such an address. Expressed as DATA (a domain string), never a provider switch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_email_domain: Option<String>,
+    /// Whether the upstream has STICKY SCOPES: once a user has authorized, a later
+    /// authorization with a CHANGED scope set does NOT re-deliver the profile (Apple,
+    /// issue #74). Documentation and capability metadata only; it does not change the
+    /// login flow (the `profile_delivered_first_auth_only` reuse already covers the
+    /// missing-profile case), but it is surfaced so an operator knows a scope change
+    /// will not backfill a profile the first authorization never captured.
+    pub sticky_scopes: bool,
+}
+
+/// How a connector authenticates to the upstream TOKEN endpoint (issue #74). Expressed
+/// as DATA so a provider's non-standard client authentication is a field value, never a
+/// code branch keyed on a provider name.
+///
+/// The default [`ClientAuth::Static`] is the OIDC-standard shared secret: the sealed
+/// `client_secret` is sent verbatim as the `client_secret` form parameter. Apple "Sign
+/// in with Apple" instead requires [`ClientAuth::SignedJwt`]: a per-request, short-lived
+/// ES256 JWT assertion generated from the operator's configured EC private key (the
+/// sealed `client_secret` holds the PKCS#8 key, PEM or DER). The signed-JWT generation
+/// lives in a documented handler in the federation slice; this type carries only the
+/// data it needs (the team id, key id, and audience).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ClientAuth {
+    /// A static shared client secret (the OIDC-standard default): the sealed
+    /// `client_secret` value is sent verbatim in the token exchange.
+    #[default]
+    Static,
+    /// A per-request signed ES256 JWT client-secret assertion (Apple): the sealed
+    /// `client_secret` holds the operator's EC P-256 private key (PKCS#8, PEM or DER);
+    /// each token exchange generates a fresh short-lived JWT signed with `key_id`,
+    /// carrying `iss = team_id`, `sub = client_id`, and `aud = audience`.
+    SignedJwt {
+        /// The Apple team identifier, placed in the assertion `iss` claim.
+        team_id: String,
+        /// The Apple key identifier (the private key's id), placed in the JWS `kid` header.
+        key_id: String,
+        /// The assertion `aud` (Apple: `https://appleid.apple.com`), an absolute `https` URL.
+        audience: String,
+    },
 }
 
 /// One declarative claim-mapping rule: an ordered list of upstream claim paths to
@@ -287,42 +348,143 @@ pub struct ExplicitEndpoints {
     pub userinfo_endpoint: Option<String>,
 }
 
-/// A connector's endpoints: EITHER a discovery `issuer` OR an explicit endpoint
-/// set, never both. Hand-validated (like `ironauth_config`'s `Secret`) so a
-/// malformed value fails with the accepted forms spelled out, not serde's opaque
-/// "did not match any variant".
+/// The OAuth 2.0 endpoint form (issue #74): a NON-OIDC upstream (for example GitHub)
+/// with no ID token and no JWKS. The identity is read from the `profile_endpoint`
+/// (with the primary/verified email resolved from the optional `email_endpoint`),
+/// never a signed token.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OAuth2Endpoints {
+    /// The upstream authorization endpoint (mandatory).
+    pub authorization_endpoint: String,
+    /// The upstream token endpoint (mandatory; exchanges the code for an access token).
+    pub token_endpoint: String,
+    /// The upstream profile/userinfo endpoint (mandatory: the identity is read from it
+    /// with the access token, for example GitHub `/user`).
+    pub profile_endpoint: String,
+    /// The upstream email endpoint (optional: some providers omit a usable email from
+    /// the profile, so the primary verified email is resolved here, for example GitHub
+    /// `/user/emails`).
+    pub email_endpoint: Option<String>,
+    /// The stable identity NAMESPACE for the federated external id (an absolute `https`
+    /// URL with no query or fragment, for example `https://api.github.com`). An OAuth 2.0
+    /// upstream has no `iss`, so this fixed operator-declared value namespaces the
+    /// upstream subject exactly as an OIDC issuer does, keeping the `(namespace, subject)`
+    /// identity key injective across connectors.
+    pub identity_issuer: String,
+}
+
+impl OAuth2Endpoints {
+    /// Build an OAuth 2.0 endpoint set from its URLs, so a caller (the presets) never has to NAME
+    /// the individual endpoint fields (the self-discovery lint reserves those metadata field names
+    /// for the generator; this constructor keeps preset DATA free of them).
+    #[must_use]
+    pub fn new(
+        authorize: impl Into<String>,
+        token: impl Into<String>,
+        profile: impl Into<String>,
+        email: Option<String>,
+        identity_issuer: impl Into<String>,
+    ) -> Self {
+        Self {
+            authorization_endpoint: authorize.into(),
+            token_endpoint: token.into(),
+            profile_endpoint: profile.into(),
+            email_endpoint: email,
+            identity_issuer: identity_issuer.into(),
+        }
+    }
+
+    /// The upstream authorization URL the browser is redirected to. Named `authorize_url`
+    /// (mirroring [`crate::ResolvedEndpoints::authorize_url`]) so a federation consumer never
+    /// has to NAME the OIDC-metadata field the self-discovery lint reserves for the generator.
+    #[must_use]
+    pub fn authorize_url(&self) -> &str {
+        &self.authorization_endpoint
+    }
+}
+
+/// A connector's endpoints: a discovery `issuer`, an explicit OIDC endpoint set, or an
+/// OAuth 2.0 endpoint set (issue #74), never more than one. Hand-validated (like
+/// `ironauth_config`'s `Secret`) so a malformed value fails with the accepted forms
+/// spelled out, not serde's opaque "did not match any variant".
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Endpoints {
     /// The discovery form (`{ issuer }`).
     Discovery(DiscoveryEndpoints),
-    /// The explicit form (`{ authorization_endpoint, token_endpoint, jwks_uri,
+    /// The explicit OIDC form (`{ authorization_endpoint, token_endpoint, jwks_uri,
     /// userinfo_endpoint? }`).
     Explicit(ExplicitEndpoints),
+    /// The OAuth 2.0 form (`{ authorization_endpoint, token_endpoint, profile_endpoint,
+    /// email_endpoint?, identity_issuer }`), for a non-OIDC upstream (issue #74).
+    OAuth2(OAuth2Endpoints),
 }
 
 /// The accepted endpoint forms, named in every rejection so an operator can fix a
 /// malformed definition.
-const ENDPOINTS_FORMS: &str = "endpoints must be EITHER { issuer } for discovery \
-     OR { authorization_endpoint, token_endpoint, jwks_uri, userinfo_endpoint? } \
-     for an explicit set";
+const ENDPOINTS_FORMS: &str = "endpoints must be EXACTLY ONE OF { issuer } for discovery, \
+     { authorization_endpoint, token_endpoint, jwks_uri, userinfo_endpoint? } for an \
+     explicit OIDC set, OR { authorization_endpoint, token_endpoint, profile_endpoint, \
+     email_endpoint?, identity_issuer } for an OAuth2 set";
 
 impl Endpoints {
     /// Assemble the endpoints from the flat, deny-unknown-fields raw form,
-    /// enforcing the one-of and the mandatory explicit fields, naming the accepted
-    /// forms on any failure.
+    /// enforcing the one-of and the mandatory fields, naming the accepted forms on
+    /// any failure. The form is discriminated by its defining key: `issuer` alone is
+    /// discovery, a `jwks_uri` is an explicit OIDC set, and a `profile_endpoint` is an
+    /// OAuth 2.0 set; the three defining keys are mutually exclusive.
     fn from_raw(raw: RawEndpoints) -> Result<Self, String> {
-        let explicit_present = raw.authorization_endpoint.is_some()
-            || raw.token_endpoint.is_some()
-            || raw.jwks_uri.is_some()
-            || raw.userinfo_endpoint.is_some();
+        let has_discovery = raw.issuer.is_some();
+        let has_oidc = raw.jwks_uri.is_some();
+        let has_oauth2 = raw.profile_endpoint.is_some()
+            || raw.email_endpoint.is_some()
+            || raw.identity_issuer.is_some();
+        let defining = usize::from(has_discovery) + usize::from(has_oidc) + usize::from(has_oauth2);
+        if defining > 1 {
+            return Err(format!(
+                "endpoints mixes more than one form; {ENDPOINTS_FORMS}, never combined"
+            ));
+        }
         if let Some(issuer) = raw.issuer {
-            if explicit_present {
+            if raw.authorization_endpoint.is_some()
+                || raw.token_endpoint.is_some()
+                || raw.userinfo_endpoint.is_some()
+            {
                 return Err(format!(
-                    "endpoints carries both an issuer and explicit endpoints; {ENDPOINTS_FORMS}, not both"
+                    "endpoints carries both an issuer and explicit endpoints; {ENDPOINTS_FORMS}"
                 ));
             }
             return Ok(Endpoints::Discovery(DiscoveryEndpoints { issuer }));
         }
+        if has_oauth2 {
+            return match (
+                raw.authorization_endpoint,
+                raw.token_endpoint,
+                raw.profile_endpoint,
+                raw.identity_issuer,
+            ) {
+                (
+                    Some(authorization_endpoint),
+                    Some(token_endpoint),
+                    Some(profile_endpoint),
+                    Some(identity_issuer),
+                ) => Ok(Endpoints::OAuth2(OAuth2Endpoints {
+                    authorization_endpoint,
+                    token_endpoint,
+                    profile_endpoint,
+                    email_endpoint: raw.email_endpoint,
+                    identity_issuer,
+                })),
+                _ => Err(format!(
+                    "the OAuth2 endpoint set requires authorization_endpoint, token_endpoint, \
+                     profile_endpoint, and identity_issuer (email_endpoint is optional); \
+                     {ENDPOINTS_FORMS}"
+                )),
+            };
+        }
+        let explicit_present = raw.authorization_endpoint.is_some()
+            || raw.token_endpoint.is_some()
+            || raw.jwks_uri.is_some()
+            || raw.userinfo_endpoint.is_some();
         if !explicit_present {
             return Err(format!("endpoints is empty; {ENDPOINTS_FORMS}"));
         }
@@ -336,7 +498,7 @@ impl Endpoints {
                 }))
             }
             _ => Err(format!(
-                "the explicit endpoint set requires authorization_endpoint, token_endpoint, \
+                "the explicit OIDC endpoint set requires authorization_endpoint, token_endpoint, \
                  and jwks_uri (userinfo_endpoint is optional); {ENDPOINTS_FORMS}"
             )),
         }
@@ -354,6 +516,9 @@ struct RawEndpoints {
     token_endpoint: Option<String>,
     userinfo_endpoint: Option<String>,
     jwks_uri: Option<String>,
+    profile_endpoint: Option<String>,
+    email_endpoint: Option<String>,
+    identity_issuer: Option<String>,
 }
 
 impl<'de> Deserialize<'de> for Endpoints {
@@ -380,6 +545,18 @@ impl Serialize for Endpoints {
                     map.serialize_entry("userinfo_endpoint", userinfo)?;
                 }
                 map.serialize_entry("jwks_uri", &explicit.jwks_uri)?;
+                map.end()
+            }
+            Endpoints::OAuth2(oauth2) => {
+                let len = 4 + usize::from(oauth2.email_endpoint.is_some());
+                let mut map = serializer.serialize_map(Some(len))?;
+                map.serialize_entry("authorization_endpoint", &oauth2.authorization_endpoint)?;
+                map.serialize_entry("token_endpoint", &oauth2.token_endpoint)?;
+                map.serialize_entry("profile_endpoint", &oauth2.profile_endpoint)?;
+                if let Some(email) = &oauth2.email_endpoint {
+                    map.serialize_entry("email_endpoint", email)?;
+                }
+                map.serialize_entry("identity_issuer", &oauth2.identity_issuer)?;
                 map.end()
             }
         }
@@ -419,6 +596,18 @@ impl JsonSchema for Endpoints {
                         "userinfo_endpoint": { "type": "string", "description": "The upstream UserInfo endpoint (an absolute https URL), optional." }
                     },
                     "required": ["authorization_endpoint", "token_endpoint", "jwks_uri"],
+                    "additionalProperties": false
+                },
+                {
+                    "type": "object",
+                    "properties": {
+                        "authorization_endpoint": { "type": "string", "description": "The upstream authorization endpoint (an absolute https URL)." },
+                        "token_endpoint": { "type": "string", "description": "The upstream token endpoint (an absolute https URL)." },
+                        "profile_endpoint": { "type": "string", "description": "The upstream profile/userinfo endpoint the identity is read from (an absolute https URL)." },
+                        "email_endpoint": { "type": "string", "description": "The upstream email endpoint the primary verified email is resolved from (an absolute https URL), optional." },
+                        "identity_issuer": { "type": "string", "description": "The stable identity namespace for the federated external id (an absolute https URL with no query or fragment)." }
+                    },
+                    "required": ["authorization_endpoint", "token_endpoint", "profile_endpoint", "identity_issuer"],
                     "additionalProperties": false
                 }
             ]
@@ -461,6 +650,11 @@ pub struct ConnectorDefinition {
     /// Provider quirks expressed as data.
     #[serde(default)]
     pub quirks: Quirks,
+    /// How the connector authenticates to the upstream token endpoint (issue #74):
+    /// a static shared secret (the default) or a per-request signed ES256 JWT
+    /// assertion (Apple). The sealed `client_secret` supplies the key material for both.
+    #[serde(default)]
+    pub client_auth: ClientAuth,
     /// The downstream-parameter passthrough policy (issue #76): which of `prompt`,
     /// `login_hint`, and `ui_locales` are forwarded to the upstream authorize request.
     /// Defaults to forwarding all three.
@@ -498,6 +692,11 @@ pub struct ConnectorRuntimeConfig {
     pub scopes: Vec<String>,
     /// The client identifier IronAuth registers at the upstream (the ID token audience).
     pub client_id: String,
+    /// How the connector authenticates to the upstream token endpoint (issue #74),
+    /// read back so the callback knows whether to send the static secret verbatim or
+    /// generate an Apple signed-JWT assertion from the unsealed key.
+    #[serde(default)]
+    pub client_auth: ClientAuth,
     /// How PKCE is applied to the upstream authorization request.
     #[serde(default)]
     pub pkce: PkceMode,
@@ -555,6 +754,10 @@ impl ConnectorDefinition {
     /// # Errors
     ///
     /// A non-empty `Vec<ValidationError>` of every violation found.
+    // The validation is one linear sequence of independent field checks (slug, names, the
+    // protocol/endpoint agreement, the scope rule, every URL, the client-auth kind, the subject
+    // and UserInfo guards); splitting it would scatter the one list a reviewer reads top to bottom.
+    #[allow(clippy::too_many_lines)]
     pub fn validate(&self) -> Result<(), Vec<ValidationError>> {
         let mut errors = Vec::new();
 
@@ -577,8 +780,33 @@ impl ConnectorDefinition {
             ));
         }
 
-        // The `oidc` protocol requires the `openid` scope.
-        if !self.scopes.iter().any(|scope| scope == "openid") {
+        // Protocol and endpoint form must AGREE (issue #74): an `oidc` connector carries a
+        // discovery issuer or an explicit OIDC set (jwks_uri present, an ID token to
+        // validate); an `oauth2` connector carries an OAuth2 set (a profile endpoint, no ID
+        // token). A mismatch is rejected at write time so a login never reaches a code path
+        // its endpoints cannot drive.
+        match (self.protocol, &self.endpoints) {
+            (Protocol::Oidc, Endpoints::Discovery(_) | Endpoints::Explicit(_))
+            | (Protocol::Oauth2, Endpoints::OAuth2(_)) => {}
+            (Protocol::Oidc, Endpoints::OAuth2(_)) => errors.push(ValidationError::new(
+                "/endpoints",
+                "an oidc connector must use a discovery { issuer } or explicit OIDC endpoint \
+                 set, not the OAuth2 set (which has no jwks_uri / ID token); use protocol \
+                 \"oauth2\" for a profile-endpoint upstream",
+            )),
+            (Protocol::Oauth2, Endpoints::Discovery(_) | Endpoints::Explicit(_)) => {
+                errors.push(ValidationError::new(
+                    "/endpoints",
+                    "an oauth2 connector must use the OAuth2 endpoint set { \
+                     authorization_endpoint, token_endpoint, profile_endpoint, identity_issuer }, \
+                     not an OIDC issuer or explicit set",
+                ));
+            }
+        }
+
+        // The `oidc` protocol requires the `openid` scope; `oauth2` does not (a plain OAuth2
+        // upstream like GitHub uses provider-specific scopes such as `read:user user:email`).
+        if self.protocol == Protocol::Oidc && !self.scopes.iter().any(|scope| scope == "openid") {
             errors.push(ValidationError::new(
                 "/scopes",
                 "the openid scope is required for an oidc connector",
@@ -623,6 +851,68 @@ impl ConnectorDefinition {
                     );
                 }
             }
+            Endpoints::OAuth2(oauth2) => {
+                check_url(
+                    &oauth2.authorization_endpoint,
+                    "/endpoints/authorization_endpoint",
+                    UrlShape::AbsoluteHttps,
+                    &mut errors,
+                );
+                check_url(
+                    &oauth2.token_endpoint,
+                    "/endpoints/token_endpoint",
+                    UrlShape::AbsoluteHttps,
+                    &mut errors,
+                );
+                check_url(
+                    &oauth2.profile_endpoint,
+                    "/endpoints/profile_endpoint",
+                    UrlShape::AbsoluteHttps,
+                    &mut errors,
+                );
+                if let Some(email) = &oauth2.email_endpoint {
+                    check_url(
+                        email,
+                        "/endpoints/email_endpoint",
+                        UrlShape::AbsoluteHttps,
+                        &mut errors,
+                    );
+                }
+                check_url(
+                    &oauth2.identity_issuer,
+                    "/endpoints/identity_issuer",
+                    UrlShape::IssuerNoQueryFragment,
+                    &mut errors,
+                );
+            }
+        }
+
+        // A signed-JWT client secret (Apple) needs a non-empty team id and key id and an
+        // absolute https audience; the sealed client_secret then carries the private key.
+        if let ClientAuth::SignedJwt {
+            team_id,
+            key_id,
+            audience,
+        } = &self.client_auth
+        {
+            if team_id.is_empty() {
+                errors.push(ValidationError::new(
+                    "/client_auth/team_id",
+                    "must be a non-empty string for a signed_jwt client secret",
+                ));
+            }
+            if key_id.is_empty() {
+                errors.push(ValidationError::new(
+                    "/client_auth/key_id",
+                    "must be a non-empty string for a signed_jwt client secret",
+                ));
+            }
+            check_url(
+                audience,
+                "/client_auth/audience",
+                UrlShape::AbsoluteHttps,
+                &mut errors,
+            );
         }
 
         // The subject cannot be remapped. A federated identity is ALWAYS keyed on the
@@ -657,7 +947,10 @@ impl ConnectorDefinition {
         // config error. Two forms require UserInfo: `email_source: "userinfo"` (email sourced
         // ONLY from UserInfo) and `userinfo_required: true`. `fallback_order` always tries the
         // ID token first, so it does not require UserInfo and is accepted.
-        if self.quirks.userinfo_required {
+        // These two guards concern the OIDC UserInfo fetch, which remains deferred; an
+        // `oauth2` connector does not use the OIDC email-source quirk (it reads its own
+        // profile/email endpoints), so the guards apply only to the OIDC protocol.
+        if self.protocol == Protocol::Oidc && self.quirks.userinfo_required {
             errors.push(ValidationError::new(
                 "/quirks/userinfo_required",
                 "userinfo_required is not yet supported: the UserInfo fetch is deferred \
@@ -665,7 +958,7 @@ impl ConnectorDefinition {
                  false until UserInfo fetch lands",
             ));
         }
-        if self.quirks.email_source == EmailSource::Userinfo {
+        if self.protocol == Protocol::Oidc && self.quirks.email_source == EmailSource::Userinfo {
             errors.push(ValidationError::new(
                 "/quirks/email_source",
                 "email_source \"userinfo\" is not yet supported: the UserInfo fetch is deferred \
@@ -896,7 +1189,7 @@ mod tests {
             Endpoints::Explicit(explicit) => {
                 assert!(explicit.userinfo_endpoint.is_none());
             }
-            Endpoints::Discovery(_) => panic!("expected explicit"),
+            Endpoints::Discovery(_) | Endpoints::OAuth2(_) => panic!("expected explicit"),
         }
     }
 

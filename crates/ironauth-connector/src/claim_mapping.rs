@@ -222,11 +222,23 @@ impl From<ClaimMappingError> for ConnectorError {
 /// claim is malformed; [`ClaimMappingError::MappingInvalid`] if the assembled traits
 /// fail the active schema's type check or the scope has no active schema for the
 /// mapped traits.
+///
+/// # The Apple first-authorization-only reuse (issue #74)
+///
+/// `prior_traits` is the RETURNING federated user's stored trait document, or [`None`]
+/// for a first login. When [`Quirks::profile_delivered_first_auth_only`] is set (Apple),
+/// the upstream delivers name and email ONLY on the first authorization; a subsequent
+/// login omits them. So for any trait field the upstream did not deliver, a stored value
+/// from `prior_traits` is reused (the persisted profile IS the provisioned traits),
+/// letting a returning Apple login succeed instead of failing the required-email check.
+/// A FIRST login has no `prior_traits`, so a missing required field still fails closed
+/// exactly as before: the crux is that the reuse never weakens the first-login contract.
 pub fn evaluate(
     mapping: &ClaimMapping,
     quirks: &Quirks,
     sources: ClaimSources<'_>,
     schema: Option<&dyn TraitSchemaView>,
+    prior_traits: Option<&Map<String, Value>>,
 ) -> Result<TraitDocument, ClaimMappingError> {
     let mut missing: Vec<String> = Vec::new();
 
@@ -254,22 +266,38 @@ pub fn evaluate(
     let mut traits = Map::new();
     for (field, rule) in &mapping.traits {
         let views = views_for_field(field, quirks, &sources);
-        match resolve_rule(rule, &views) {
-            Some(value) => {
-                // Canonicalize the resolved `email` value with NFKC BEFORE the type check,
-                // so the mapped email is normalized regardless of the claim path it came from
-                // (a top-level `email` or a nested path like `emails.0`) and the value that is
-                // type-checked is byte-identical to the value that is provisioned. Only the
-                // `email` trait is normalized; every other trait is passed through unchanged.
-                let value = if field == EMAIL_FIELD {
-                    normalize_email_value(value)
+        if let Some(value) = resolve_rule(rule, &views) {
+            // Canonicalize the resolved `email` value with NFKC BEFORE the type check, so the
+            // mapped email is normalized regardless of the claim path it came from (a top-level
+            // `email` or a nested path like `emails.0`) and the value that is type-checked is
+            // byte-identical to the value provisioned. Only the `email` trait is normalized;
+            // every other trait is passed through unchanged.
+            let value = if field == EMAIL_FIELD {
+                normalize_email_value(value)
+            } else {
+                value
+            };
+            traits.insert(field.clone(), value);
+        } else {
+            // Apple first-authorization-only reuse (issue #74): the upstream omitted this field
+            // on a returning login. When the quirk is set and the stored profile carries it,
+            // reuse the stored value (email re-normalized) so the returning login succeeds with
+            // the persisted profile. A first login has no `prior_traits`, so a missing required
+            // field still fails closed below.
+            let reused = prior_traits
+                .filter(|_| quirks.profile_delivered_first_auth_only)
+                .and_then(|prior| prior.get(field))
+                .filter(|stored| !stored.is_null());
+            if let Some(stored) = reused {
+                let stored = if field == EMAIL_FIELD {
+                    normalize_email_value(stored.clone())
                 } else {
-                    value
+                    stored.clone()
                 };
-                traits.insert(field.clone(), value);
+                traits.insert(field.clone(), stored);
+            } else if rule.required {
+                missing.push(pointer_for(field));
             }
-            None if rule.required => missing.push(pointer_for(field)),
-            None => {}
         }
     }
 
@@ -515,8 +543,14 @@ mod tests {
         let id = obj(json!({ "sub": "u-1", "emails": ["fallback@x.test"] }));
         let schema = schema(vec![("email", "string")]);
         let map = mapping(vec![("email", rule(&["email", "emails.0"], true))]);
-        let doc = evaluate(&map, &Quirks::default(), sources_of(&id), Some(&schema))
-            .expect("resolves via fallback");
+        let doc = evaluate(
+            &map,
+            &Quirks::default(),
+            sources_of(&id),
+            Some(&schema),
+            None,
+        )
+        .expect("resolves via fallback");
         assert_eq!(doc.traits.get("email"), Some(&json!("fallback@x.test")));
         assert_eq!(doc.subject, "u-1");
     }
@@ -526,8 +560,14 @@ mod tests {
         let id = obj(json!({ "sub": "u-1" }));
         let schema = schema(vec![("email", "string")]);
         let map = mapping(vec![("email", rule(&["email"], true))]);
-        let error = evaluate(&map, &Quirks::default(), sources_of(&id), Some(&schema))
-            .expect_err("missing required email");
+        let error = evaluate(
+            &map,
+            &Quirks::default(),
+            sources_of(&id),
+            Some(&schema),
+            None,
+        )
+        .expect_err("missing required email");
         match error {
             ClaimMappingError::UpstreamClaim { pointers, .. } => {
                 assert_eq!(pointers, vec!["/email".to_owned()]);
@@ -537,7 +577,14 @@ mod tests {
         // And it folds to the UpstreamProtocol connector error.
         assert!(matches!(
             ConnectorError::from(
-                evaluate(&map, &Quirks::default(), sources_of(&id), Some(&schema)).unwrap_err()
+                evaluate(
+                    &map,
+                    &Quirks::default(),
+                    sources_of(&id),
+                    Some(&schema),
+                    None
+                )
+                .unwrap_err()
             ),
             ConnectorError::UpstreamProtocol(_)
         ));
@@ -548,8 +595,14 @@ mod tests {
         let id = obj(json!({ "sub": "u-1" }));
         let schema = schema(vec![("email", "string"), ("nickname", "string")]);
         let map = mapping(vec![("nickname", rule(&["nickname"], false))]);
-        let doc = evaluate(&map, &Quirks::default(), sources_of(&id), Some(&schema))
-            .expect("optional omitted");
+        let doc = evaluate(
+            &map,
+            &Quirks::default(),
+            sources_of(&id),
+            Some(&schema),
+            None,
+        )
+        .expect("optional omitted");
         assert!(!doc.traits.contains_key("nickname"));
     }
 
@@ -560,8 +613,14 @@ mod tests {
         let id = obj(json!({ "sub": "u-1", "email": 42 }));
         let schema = schema(vec![("email", "string")]);
         let map = mapping(vec![("email", rule(&["email"], true))]);
-        let error = evaluate(&map, &Quirks::default(), sources_of(&id), Some(&schema))
-            .expect_err("email is a number");
+        let error = evaluate(
+            &map,
+            &Quirks::default(),
+            sources_of(&id),
+            Some(&schema),
+            None,
+        )
+        .expect_err("email is a number");
         match error {
             ClaimMappingError::MappingInvalid { pointers, .. } => {
                 assert_eq!(pointers, vec!["/email".to_owned()]);
@@ -570,7 +629,14 @@ mod tests {
         }
         assert!(matches!(
             ConnectorError::from(
-                evaluate(&map, &Quirks::default(), sources_of(&id), Some(&schema)).unwrap_err()
+                evaluate(
+                    &map,
+                    &Quirks::default(),
+                    sources_of(&id),
+                    Some(&schema),
+                    None
+                )
+                .unwrap_err()
             ),
             ConnectorError::Config(_)
         ));
@@ -582,8 +648,14 @@ mod tests {
         // The schema does NOT declare `email`, so mapping to it is a definition fault.
         let schema = schema(vec![("name", "string")]);
         let map = mapping(vec![("email", rule(&["email"], true))]);
-        let error = evaluate(&map, &Quirks::default(), sources_of(&id), Some(&schema))
-            .expect_err("undeclared trait");
+        let error = evaluate(
+            &map,
+            &Quirks::default(),
+            sources_of(&id),
+            Some(&schema),
+            None,
+        )
+        .expect_err("undeclared trait");
         assert!(matches!(error, ClaimMappingError::MappingInvalid { .. }));
     }
 
@@ -592,7 +664,7 @@ mod tests {
         let id = obj(json!({ "sub": "u-1", "email": "a@b.test" }));
         let map = mapping(vec![("email", rule(&["email"], true))]);
         let error =
-            evaluate(&map, &Quirks::default(), sources_of(&id), None).expect_err("no schema");
+            evaluate(&map, &Quirks::default(), sources_of(&id), None, None).expect_err("no schema");
         assert!(matches!(error, ClaimMappingError::MappingInvalid { .. }));
     }
 
@@ -603,6 +675,7 @@ mod tests {
             &ClaimMapping::default(),
             &Quirks::default(),
             sources_of(&id),
+            None,
             None,
         )
         .expect("empty mapping provisions a minimal identity");
@@ -628,6 +701,7 @@ mod tests {
                 userinfo: Some(&userinfo),
             },
             Some(&schema),
+            None,
         )
         .expect("resolves from userinfo");
         assert_eq!(doc.traits.get("email"), Some(&json!("userinfo@x.test")));
@@ -651,6 +725,7 @@ mod tests {
                 userinfo: Some(&userinfo),
             },
             Some(&schema),
+            None,
         )
         .expect("resolves");
         assert_eq!(doc.traits.get("email"), Some(&json!("idtoken@x.test")));
@@ -667,7 +742,7 @@ mod tests {
             email_source: EmailSource::Userinfo,
             ..Quirks::default()
         };
-        let error = evaluate(&map, &quirks, sources_of(&id), Some(&schema))
+        let error = evaluate(&map, &quirks, sources_of(&id), Some(&schema), None)
             .expect_err("no userinfo, required email");
         assert!(matches!(error, ClaimMappingError::UpstreamClaim { .. }));
     }
@@ -679,8 +754,8 @@ mod tests {
             subject: Some(rule(&["oid"], true)),
             traits: std::collections::BTreeMap::new(),
         };
-        let doc =
-            evaluate(&map, &Quirks::default(), sources_of(&id), None).expect("custom subject");
+        let doc = evaluate(&map, &Quirks::default(), sources_of(&id), None, None)
+            .expect("custom subject");
         assert_eq!(doc.subject, "provider-oid-9");
     }
 
@@ -692,8 +767,14 @@ mod tests {
         let id = obj(json!({ "sub": "u-1", "emails": ["user\u{FF20}x.test"] }));
         let schema = schema(vec![("email", "string")]);
         let map = mapping(vec![("email", rule(&["emails.0"], true))]);
-        let doc = evaluate(&map, &Quirks::default(), sources_of(&id), Some(&schema))
-            .expect("resolves and normalizes");
+        let doc = evaluate(
+            &map,
+            &Quirks::default(),
+            sources_of(&id),
+            Some(&schema),
+            None,
+        )
+        .expect("resolves and normalizes");
         assert_eq!(doc.traits.get("email"), Some(&json!("user@x.test")));
     }
 
@@ -704,6 +785,7 @@ mod tests {
             &ClaimMapping::default(),
             &Quirks::default(),
             sources_of(&id),
+            None,
             None,
         )
         .expect_err("numeric subject");

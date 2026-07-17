@@ -87,8 +87,11 @@ mod disposable;
 mod email_otp;
 mod error;
 mod federation;
+mod federation_client_secret;
 mod federation_health;
 mod federation_jwks;
+mod federation_oauth2;
+mod federation_relay;
 mod global_revocation;
 mod hashing_pool;
 mod hints;
@@ -185,6 +188,8 @@ pub use federation_health::{
     describe_connector_health_metrics,
 };
 pub use federation_jwks::FederationKeyResolver;
+pub use federation_oauth2::resolve_primary_verified_email;
+pub use federation_relay::{EMAIL_RELAY_TRAIT, is_relay_email, routable_email};
 pub use global_revocation::GLOBAL_TOKEN_REVOCATION_PATH;
 pub use hashing_pool::{
     ADMISSION_REJECTED_TOTAL, HASH_DURATION_SECONDS, HashRejection, HashingPool,

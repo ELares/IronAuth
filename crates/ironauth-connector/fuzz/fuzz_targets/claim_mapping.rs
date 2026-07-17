@@ -110,7 +110,7 @@ fuzz_target!(|data: &[u8]| {
 
     // With a schema: any Ok document MUST itself pass the type check (the fail-closed
     // invariant: a returned document is fully valid, never partial). No input panics.
-    if let Ok(document) = evaluate(&mapping, &quirks, sources, Some(&schema)) {
+    if let Ok(document) = evaluate(&mapping, &quirks, sources, Some(&schema), None) {
         assert!(
             schema.type_check(&document.traits_value()).is_empty(),
             "a returned document must be fully type-valid, never partial"
@@ -126,6 +126,7 @@ fuzz_target!(|data: &[u8]| {
             id_token: &claims,
             userinfo,
         },
+        None,
         None,
     );
 });

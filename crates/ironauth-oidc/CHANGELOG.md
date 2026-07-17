@@ -6,6 +6,27 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- First-party social providers with the sharp edges handled natively (issue #74): Google,
+  Apple, Microsoft, and GitHub complete a full brokered login, all expressed as connector DATA
+  with the provider quirks in documented, data-driven handlers (no provider-specific code in the
+  login path).
+  - **Apple signed-JWT client secret** (`federation_client_secret`): a per-request short-lived
+    ES256 JWT assertion generated through the one `ironauth-jose` ES256 path from the operator's
+    sealed EC private key (PEM or DER), with `iat`/`exp` from the clock seam. Selected by the new
+    `client_auth: signed_jwt` connector kind.
+  - **Apple first-authorization-only profile.** The federated finalizer feeds a RETURNING user's
+    stored traits to the claim-mapping evaluator, so a subsequent Apple login that omits name and
+    email SUCCEEDS with the persisted profile instead of failing the required-email check, while a
+    FIRST login still fails closed on a missing required email.
+  - **Apple Hide My Email relay** (`federation_relay`): a `privaterelay.appleid.com` address is
+    classified verified-but-unroutable and recorded as an `email_relay` trait; `routable_email`
+    never selects it as an operational mail routing target.
+  - **GitHub OAuth 2.0 login** (`federation_oauth2`): the non-OIDC code-grant path (no ID token)
+    that reads the profile and resolves the PRIMARY VERIFIED email from the email endpoint when the
+    profile omits it, keying the identity on the stable numeric GitHub id. Every outbound call rides
+    `ironauth-fetch`.
+  - The OIDC and OAuth 2.0 callbacks converge on one shared `finalize_federated_login` (claim
+    mapping, provisioning, session, resume) so the quirk handling lives in exactly one place.
 - Connector failure isolation and upstream parameter passthrough (issue #76): hardens the
   federation runtime's operational behavior with ZERO schema change (health is in-memory
   runtime state; passthrough is per-connector config).

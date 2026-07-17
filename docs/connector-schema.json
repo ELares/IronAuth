@@ -76,6 +76,54 @@
       ],
       "type": "object"
     },
+    "ClientAuth": {
+      "description": "How a connector authenticates to the upstream TOKEN endpoint (issue #74). Expressed\nas DATA so a provider's non-standard client authentication is a field value, never a\ncode branch keyed on a provider name.\n\nThe default [`ClientAuth::Static`] is the OIDC-standard shared secret: the sealed\n`client_secret` is sent verbatim as the `client_secret` form parameter. Apple \"Sign\nin with Apple\" instead requires [`ClientAuth::SignedJwt`]: a per-request, short-lived\nES256 JWT assertion generated from the operator's configured EC private key (the\nsealed `client_secret` holds the PKCS#8 key, PEM or DER). The signed-JWT generation\nlives in a documented handler in the federation slice; this type carries only the\ndata it needs (the team id, key id, and audience).",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "A static shared client secret (the OIDC-standard default): the sealed\n`client_secret` value is sent verbatim in the token exchange.",
+          "properties": {
+            "kind": {
+              "const": "static",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "A per-request signed ES256 JWT client-secret assertion (Apple): the sealed\n`client_secret` holds the operator's EC P-256 private key (PKCS#8, PEM or DER);\neach token exchange generates a fresh short-lived JWT signed with `key_id`,\ncarrying `iss = team_id`, `sub = client_id`, and `aud = audience`.",
+          "properties": {
+            "audience": {
+              "description": "The assertion `aud` (Apple: `https://appleid.apple.com`), an absolute `https` URL.",
+              "type": "string"
+            },
+            "key_id": {
+              "description": "The Apple key identifier (the private key's id), placed in the JWS `kid` header.",
+              "type": "string"
+            },
+            "kind": {
+              "const": "signed_jwt",
+              "type": "string"
+            },
+            "team_id": {
+              "description": "The Apple team identifier, placed in the assertion `iss` claim.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "team_id",
+            "key_id",
+            "audience"
+          ],
+          "type": "object"
+        }
+      ]
+    },
     "EmailSource": {
       "description": "Where a connector's email address is sourced from. Expressed as DATA (a new\nupstream's non-standard email resolution is a new field value, never a new\ncode branch).",
       "oneOf": [
@@ -153,6 +201,38 @@
             "jwks_uri"
           ],
           "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "authorization_endpoint": {
+              "description": "The upstream authorization endpoint (an absolute https URL).",
+              "type": "string"
+            },
+            "email_endpoint": {
+              "description": "The upstream email endpoint the primary verified email is resolved from (an absolute https URL), optional.",
+              "type": "string"
+            },
+            "identity_issuer": {
+              "description": "The stable identity namespace for the federated external id (an absolute https URL with no query or fragment).",
+              "type": "string"
+            },
+            "profile_endpoint": {
+              "description": "The upstream profile/userinfo endpoint the identity is read from (an absolute https URL).",
+              "type": "string"
+            },
+            "token_endpoint": {
+              "description": "The upstream token endpoint (an absolute https URL).",
+              "type": "string"
+            }
+          },
+          "required": [
+            "authorization_endpoint",
+            "token_endpoint",
+            "profile_endpoint",
+            "identity_issuer"
+          ],
+          "type": "object"
         }
       ]
     },
@@ -199,11 +279,16 @@
       ]
     },
     "Protocol": {
-      "description": "The federation protocol a connector speaks. A CLOSED enum with one variant:\nSAML is deliberately UNREPRESENTABLE (the hostile-parser SAML SP inbound is a\nlater milestone), so a definition can never assert a protocol this slice does\nnot implement.",
+      "description": "The federation protocol a connector speaks. A CLOSED enum: SAML is deliberately\nUNREPRESENTABLE (the hostile-parser SAML SP inbound is a later milestone), so a\ndefinition can never assert a protocol this slice does not implement.\n\n`oauth2` (issue #74) is the honest model for a NON-OIDC upstream like GitHub: a\nplain OAuth 2.0 code grant with NO ID token, whose identity is read from a\nprofile/userinfo endpoint over TLS rather than a signed ID token. It carries an\n[`Endpoints::OAuth 2.0`] endpoint set and never runs the ID-token validation spine.",
       "oneOf": [
         {
           "const": "oidc",
-          "description": "OpenID Connect (the generic OIDC upstream).",
+          "description": "OpenID Connect (the generic OIDC upstream: Google, Apple, Microsoft, and any\ndiscovery-form or explicit OIDC provider). The identity is a validated ID token.",
+          "type": "string"
+        },
+        {
+          "const": "oauth2",
+          "description": "Plain OAuth 2.0 code grant with NO ID token (issue #74, for example GitHub).\nThe identity is assembled from a profile endpoint (and an optional email\nendpoint) fetched over the SSRF-hardened path; there is no ID-token signature\nto validate, so the profile response over TLS is the identity source.",
           "type": "string"
         }
       ]
@@ -219,7 +304,19 @@
         },
         "profile_delivered_first_auth_only": {
           "default": false,
-          "description": "The upstream delivers the user profile only on the FIRST authorization (for\nexample Apple); a subsequent login must reuse the stored profile.",
+          "description": "The upstream delivers the user profile only on the FIRST authorization (for\nexample Apple); a subsequent login must reuse the stored profile. When set, the\nfederation callback feeds a RETURNING user's stored traits into the claim-mapping\nevaluator, so a subsequent Apple login that omits name and email still succeeds\nwith the persisted profile instead of failing the required-email check (issue #74).",
+          "type": "boolean"
+        },
+        "relay_email_domain": {
+          "description": "The email domain an upstream uses for a PRIVATE RELAY address (Apple's\n`privaterelay.appleid.com` Hide My Email, issue #74). When set, an email whose\nhost matches this domain is classified VERIFIED-BUT-UNROUTABLE: it satisfies\nverification but is never selected as an operational mail routing target without\nthe documented relay setup. The federation callback records a `email_relay` trait\nfor such an address. Expressed as DATA (a domain string), never a provider switch.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "sticky_scopes": {
+          "default": false,
+          "description": "Whether the upstream has STICKY SCOPES: once a user has authorized, a later\nauthorization with a CHANGED scope set does NOT re-deliver the profile (Apple,\nissue #74). Documentation and capability metadata only; it does not change the\nlogin flow (the `profile_delivered_first_auth_only` reuse already covers the\nmissing-profile case), but it is surfaced so an operator knows a scope change\nwill not backfill a profile the first authorization never captured.",
           "type": "boolean"
         },
         "userinfo_required": {
@@ -287,6 +384,13 @@
       },
       "description": "The declarative claim mapping (the stored SHAPE; the evaluator is later)."
     },
+    "client_auth": {
+      "$ref": "#/$defs/ClientAuth",
+      "default": {
+        "kind": "static"
+      },
+      "description": "How the connector authenticates to the upstream token endpoint (issue #74):\na static shared secret (the default) or a per-request signed ES256 JWT\nassertion (Apple). The sealed `client_secret` supplies the key material for both."
+    },
     "client_id": {
       "description": "The client identifier IronAuth registers at the upstream.",
       "type": "string"
@@ -335,6 +439,7 @@
       "default": {
         "email_source": "id_token",
         "profile_delivered_first_auth_only": false,
+        "sticky_scopes": false,
         "userinfo_required": false
       },
       "description": "Provider quirks expressed as data."

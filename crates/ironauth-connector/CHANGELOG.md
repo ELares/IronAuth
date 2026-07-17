@@ -6,6 +6,24 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- First-party social-provider connector DATA for issue #74. The declarative framework grows the
+  data every social provider needs, with the login logic staying in the federation slice:
+  - **`oauth2` protocol + `OAuth2Endpoints`.** A first-class non-OIDC protocol variant (GitHub)
+    with its own endpoint set (`authorization_endpoint`, `token_endpoint`, `profile_endpoint`,
+    `email_endpoint?`, `identity_issuer`) and no ID token. `Protocol` and `Endpoints` gain the
+    variants; `validate` enforces protocol/endpoint agreement (an `oidc` connector rejects the
+    OAuth2 set and vice versa) and drops the `openid`-scope requirement for `oauth2`.
+  - **`client_auth` (signed-JWT client secret).** A new `ClientAuth` field: `static` (the default
+    shared secret) or `signed_jwt { team_id, key_id, audience }` for Apple, whose sealed
+    `client_secret` holds the EC private key. `validate` checks the signed-JWT fields.
+  - **Quirks.** `relay_email_domain` (Apple Hide My Email classification) and `sticky_scopes`
+    (metadata) are added; `profile_delivered_first_auth_only` is now wired.
+  - **Claim-mapping reuse.** `evaluate` gains a `prior_traits` argument: with
+    `profile_delivered_first_auth_only`, a field the upstream omitted is reused from a returning
+    user's stored profile, so a returning Apple login succeeds without re-failing the required check.
+  - **`presets` module.** Ready-to-use `google`, `apple`, `microsoft`, `github`, and `generic_oidc`
+    connector-definition builders with accurate capability matrices, taking only per-environment
+    credentials. The connector JSON schema (`docs/connector-schema.json`) regenerates.
 - Per-connector downstream-parameter passthrough policy for issue #76: the `passthrough` block
   on `ConnectorDefinition` (and mirrored on the secret-free `ConnectorRuntimeConfig` read
   projection), a `PassthroughPolicy` with three `deny_unknown_fields` booleans -- `prompt`,

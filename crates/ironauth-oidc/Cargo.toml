@@ -568,6 +568,15 @@ name = "federation"
 path = "tests/federation.rs"
 required-features = ["testing"]
 
+# The first-party social providers (issue #74): Google, Apple, Microsoft (OIDC) and GitHub
+# (OAuth2) each complete an end-to-end login as connector DATA, including the Apple
+# first-auth-only profile, Hide My Email relay, signed-JWT client secret, and GitHub email
+# resolution, against a mock upstream driven through the fetch test-harness.
+[[test]]
+name = "social_providers"
+path = "tests/social_providers.rs"
+required-features = ["testing"]
+
 # The session model on the OIDC surface (issue #32): the per-(client, session) `sid`
 # claim (stable across issuances for one pair, distinct across two clients of the same
 # SSO session, never the session id itself) and the immediate effect of a revocation
