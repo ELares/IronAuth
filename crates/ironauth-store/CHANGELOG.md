@@ -6,6 +6,22 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Registration abuse defenses (issue #80): migration 0057 adds the tenant-scoped,
+  forced-RLS `pow_challenges` table (a `pow_` scope-embedded id via a NEW `ScopedKind`, the
+  non-secret challenge bytes, the difficulty, the endpoint+context binding SHA-256, the
+  single-use `spent_at` latch, and the expiry) and the data-plane `PowChallengeRepo`
+  (`mint` + an atomic single-use, expiry- and context-checked `consume`). The migration also
+  WIDENS the closed `users.state` CHECK to admit a new `waitlisted` lifecycle state, added
+  to `UserState` (cannot authenticate; a creation-time-only state that an admin transitions
+  to active/disabled to approve/reject); `UserRepo::register_in_state` lands a self-service
+  signup in it. The migration guard bumps to 57 and asserts the new table's RLS, columns,
+  and CHECKs plus the widened `users.state` set; `scripts/query-audit.sh` registers
+  `pow_challenges`. An additive EXPAND. Migration 0057 additionally grants the data plane a
+  scoped `DELETE` on `pow_challenges` and `PowChallengeRepo` gains a BOUNDED
+  `reclaim_expired` (issue #80 LOW-3): the challenge-issue path reclaims a capped batch of
+  the scope's already-expired rows on each mint (RLS-scoped, expiry-filtered, so a live
+  challenge is never removed), bounding growth on the request path without an external
+  janitor.
 - Declarative federation connectors (issue #75, PR A): migration 0056 adds the
   tenant-scoped, forced-RLS `connectors` table and the `ConnectorRepo` /
   `ActingConnectorRepo` accessors. A connector row holds a `cnr_` scope-embedded id

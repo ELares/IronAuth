@@ -397,6 +397,33 @@ fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
     headers.get(name)?.to_str().ok()
 }
 
+/// Why [`establish_session`] refused to mint a session.
+///
+/// The two variants map to DIFFERENT uniform responses at every call site: a
+/// [`NotAuthenticatable`](EstablishSessionError::NotAuthenticatable) refusal is the
+/// account-lifecycle fence (issue #80 / #52) and callers render it as their normal
+/// auth-failure shape (a wrong code / failed ceremony), so it is never an
+/// existence/state oracle; a [`Store`](EstablishSessionError::Store) fault is the
+/// neutral server error. Keeping them distinct is load-bearing: mapping a fenced but
+/// otherwise-correct login to a 500 would itself be a state oracle.
+#[derive(Debug)]
+pub enum EstablishSessionError {
+    /// The subject's account-lifecycle state forbids authentication (waitlisted,
+    /// blocked, disabled, pending-verification) or the subject is absent/deleted. Fail
+    /// CLOSED; the caller returns its uniform auth-failure response.
+    NotAuthenticatable,
+    /// A persistence fault while resolving state or rotating the session. The caller
+    /// returns its neutral server-error response (the underlying [`StoreError`] is
+    /// deliberately not surfaced, exactly as the callers already discarded it).
+    Store,
+}
+
+impl From<StoreError> for EstablishSessionError {
+    fn from(_: StoreError) -> Self {
+        EstablishSessionError::Store
+    }
+}
+
 /// Establish a session for `subject` in `scope` at a privilege transition (login,
 /// registration, and the future MFA / step-up seam), recording the authentication
 /// `event` (its methods and time), and return the `Set-Cookie` value that sets it,
@@ -416,7 +443,9 @@ fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
 ///
 /// # Errors
 ///
-/// [`StoreError`] on a persistence failure.
+/// [`EstablishSessionError::NotAuthenticatable`] when the subject's account-lifecycle
+/// state forbids authentication (the central fence, issue #80 / #52), or
+/// [`EstablishSessionError::Store`] on a persistence failure (fail closed).
 pub async fn establish_session(
     state: &OidcState,
     scope: Scope,
@@ -424,7 +453,29 @@ pub async fn establish_session(
     event: &AuthenticationEvent,
     actor: ActorRef,
     headers: &HeaderMap,
-) -> Result<SessionCookies, StoreError> {
+) -> Result<SessionCookies, EstablishSessionError> {
+    // The CENTRAL lifecycle fence (issue #80 / #52): EVERY session-minting path funnels
+    // through this one choke point, so the account-state gate lives HERE and cannot be
+    // forgotten by any caller. A user whose state cannot authenticate (waitlisted,
+    // blocked, disabled, pending-verification) or is absent/deleted mints NO session on
+    // ANY factor -- password, email-OTP, magic-link, SMS-OTP, WebAuthn, device, or
+    // registration alike. The state is resolved from the store here (never trusted from a
+    // caller) so a stale or omitted caller-side state cannot bypass it, and the refusal is
+    // a uniform [`EstablishSessionError::NotAuthenticatable`] the callers render as their
+    // OWN normal auth-failure shape (never an existence/state oracle). A store fault fails
+    // CLOSED. Active and scheduled-offboarding accounts are authenticatable, so a normal
+    // login on any path is unaffected.
+    match state
+        .store()
+        .scoped(scope)
+        .users()
+        .state_for_subject(subject)
+        .await
+    {
+        Ok(Some(user_state)) if user_state.can_authenticate() => {}
+        Ok(_) => return Err(EstablishSessionError::NotAuthenticatable),
+        Err(_) => return Err(EstablishSessionError::Store),
+    }
     let now = state.now();
     let session_id = SessionId::generate(state.env(), &scope);
     let idle_micros = epoch_micros(now.checked_add(state.session_idle_ttl()).unwrap_or(now));

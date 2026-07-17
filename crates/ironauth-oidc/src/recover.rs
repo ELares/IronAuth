@@ -28,6 +28,15 @@ pub struct RecoverForm {
     pub identifier: Option<String>,
     /// The authorization URL to resume at after recovery (carries the scope).
     pub return_to: Option<String>,
+    /// The proof-of-work challenge id the client solved (issue #80), when a challenge is
+    /// required on the reset surface.
+    pub pow_challenge_id: Option<String>,
+    /// The proof-of-work nonce (base64url no-pad) the client found (issue #80).
+    pub pow_nonce: Option<String>,
+    /// The request context the challenge was issued for (issue #80), echoed back.
+    pub pow_context: Option<String>,
+    /// An external adapter (Turnstile/reCAPTCHA) response token (issue #80).
+    pub pow_token: Option<String>,
 }
 
 /// `GET /recover`: render the recovery request form for a valid resume target.
@@ -77,6 +86,32 @@ pub async fn recover_post(
         .map(str::trim)
         .unwrap_or_default();
     let banner = state.environment_banner(&resume.scope).await;
+
+    // Proof-of-work gate (issue #80), conditioned on the #79 risk level. Existence-
+    // INDEPENDENT (it keys on the challenge and the IP, never on whether the identifier
+    // resolves), and on failure it returns the SAME uniform acknowledgment a successful
+    // request returns, performing NO recovery, so it adds no enumeration oracle. The
+    // built-in PoW is fully server-side (ZERO third-party calls).
+    let peer_ip = crate::abuse::resolved_client_ip(&headers);
+    if crate::pow_gate::challenge_required(&state, peer_ip.as_deref(), false) {
+        let solution = crate::pow_gate::PresentedSolution {
+            challenge_id: form.pow_challenge_id.as_deref(),
+            nonce: form.pow_nonce.as_deref(),
+            context: form.pow_context.as_deref().unwrap_or_default(),
+            token: form.pow_token.as_deref(),
+            remote_ip: peer_ip.as_deref(),
+        };
+        if !crate::pow_gate::verify_solution(
+            &state,
+            resume.scope,
+            crate::pow_gate::ENDPOINT_RECOVER,
+            &solution,
+        )
+        .await
+        {
+            return recovery_ack_page(banner);
+        }
+    }
 
     // Regulation for the RECOVERY path (issue #64), keyed on the canonical identifier and
     // the resolved peer IP, INDEPENDENTLY of the password path. Every processed attempt is

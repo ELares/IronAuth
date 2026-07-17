@@ -443,3 +443,132 @@ async fn a_wrong_purpose_is_a_bad_request() {
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
+
+/// Whether the response sets a session cookie.
+fn sets_session(headers: &axum::http::HeaderMap) -> bool {
+    headers.get_all(header::SET_COOKIE).iter().any(|value| {
+        value
+            .to_str()
+            .unwrap_or_default()
+            .starts_with(SESSION_COOKIE)
+    })
+}
+
+/// The email-OTP verify path funnels through `establish_session`, so the CENTRAL lifecycle
+/// fence (issue #80 / #52) refuses a non-authenticatable account (waitlisted / blocked /
+/// disabled) there with the SAME uniform invalid-code result a wrong code returns (no
+/// session, no state oracle). An ACTIVE account still signs in on the same path, and after
+/// admin approval (waitlisted -> active) the previously-fenced account can authenticate.
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn the_lifecycle_fence_blocks_the_email_otp_path_for_a_non_authenticatable_account() {
+    let mut harness = Harness::start_store_backed_with(OidcConfig {
+        require_pkce_for_confidential_clients: false,
+        ..OidcConfig::default()
+    })
+    .await;
+    let sender = Arc::new(RecordingSender::default());
+    harness.install_verification_sender(sender.clone());
+    let base = base(&harness);
+    let password = "correct horse battery staple";
+
+    // Each non-authenticatable state: a correct code still yields NO session, and the
+    // refusal is the uniform invalid-code shape (401), never a distinct oracle.
+    for (recipient, state) in [
+        (
+            "waitlisted@example.test",
+            ironauth_store::UserState::Waitlisted,
+        ),
+        ("blocked@example.test", ironauth_store::UserState::Blocked),
+        ("disabled@example.test", ironauth_store::UserState::Disabled),
+    ] {
+        harness.seed_user_in_state(recipient, password, state).await;
+        let (status, _) = post_json(
+            &harness,
+            &format!("{base}/otp/send"),
+            &json!({ "identifier": recipient, "purpose": "login" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{state:?}: send is uniform");
+        let code = last_code(&sender, recipient);
+        let (status, headers, body) = verify_response(
+            &harness,
+            &format!("{base}/otp/verify"),
+            &json!({ "identifier": recipient, "purpose": "login", "code": code }),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "{state:?}: the fence returns the uniform invalid-code shape: {body:?}"
+        );
+        assert!(
+            !sets_session(&headers),
+            "{state:?}: a fenced account obtains NO session on the OTP path"
+        );
+    }
+
+    // An ACTIVE account still authenticates on the same path (the fence never breaks a
+    // legitimate login).
+    let active = "active@example.test";
+    harness.seed_user(active, password).await;
+    let (status, _) = post_json(
+        &harness,
+        &format!("{base}/otp/send"),
+        &json!({ "identifier": active, "purpose": "login" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let code = last_code(&sender, active);
+    let (status, headers, body) = verify_response(
+        &harness,
+        &format!("{base}/otp/verify"),
+        &json!({ "identifier": active, "purpose": "login", "code": code }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "an active account authenticates on the OTP path: {body:?}"
+    );
+    assert!(
+        sets_session(&headers),
+        "an active account mints a session on the OTP path"
+    );
+
+    // Admin approval (waitlisted -> active) lets the previously-fenced account in.
+    let approved = harness
+        .store()
+        .scoped(harness.scope())
+        .users()
+        .by_identifier("waitlisted@example.test")
+        .await
+        .expect("lookup")
+        .expect("the waitlisted account exists");
+    harness
+        .set_user_state(&approved.id.to_string(), ironauth_store::UserState::Active)
+        .await;
+    let (status, _) = post_json(
+        &harness,
+        &format!("{base}/otp/send"),
+        &json!({ "identifier": "waitlisted@example.test", "purpose": "login" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let code = last_code(&sender, "waitlisted@example.test");
+    let (status, headers, body) = verify_response(
+        &harness,
+        &format!("{base}/otp/verify"),
+        &json!({ "identifier": "waitlisted@example.test", "purpose": "login", "code": code }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "an approved account authenticates on the OTP path: {body:?}"
+    );
+    assert!(
+        sets_session(&headers),
+        "an approved account mints a session on the OTP path"
+    );
+}

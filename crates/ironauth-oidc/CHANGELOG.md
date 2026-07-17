@@ -6,6 +6,61 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Registration abuse defenses (issue #80), all OFF by default. An invisible, SELF-CONTAINED
+  proof-of-work challenge (a Rauthy-spow-style hashcash) issued on the registration,
+  password-reset, and OTP-send surfaces: the server issues a random challenge and a
+  difficulty via the env entropy/clock seam, the client finds a nonce such that
+  `SHA-256(challenge || nonce)` has N leading zero bits, and the server verifies it FULLY
+  server-side with ZERO third-party calls (so it works self-hosted and air-gapped and can
+  never fail open/closed on an outage). Challenges are SINGLE-USE (an atomic spent-latch
+  consume in the new `pow_challenges` store table), EXPIRING (`env.clock()`), and
+  CONTEXT-BOUND to the endpoint plus a request context (a solution for one endpoint/context
+  cannot be replayed or outsourced to another). Issuance is CONDITIONED on the #79 risk
+  level (`pow.challenge_at` reuses the `off`/`low`/`med`/`high` threshold vocabulary via a
+  new subject-less `anonymous_challenge_level`), and a new `POST /pow/challenge` endpoint
+  mints a challenge for the built-in path. A pluggable `ChallengeProvider` trait (`pow`
+  module) has the built-in `BuiltinPowProvider` as the DEFAULT and ships Turnstile and
+  reCAPTCHA as `SiteverifyProvider` adapters behind a `RemoteChallengeVerifier` seam (the
+  real verify goes through `ironauth-fetch`; a mock satisfies the contract test); an adapter
+  outage degrades per a configurable fail-open/fail-closed policy, and the built-in PoW is
+  installed via `OidcState::with_challenge_provider`.
+- Disposable / low-reputation email defense (issue #80): evaluated at signup on the
+  NFKC-normalized email domain, per-environment `off` / `flag` (feed the risk engine a MED
+  signal) / `block`. A BLOCK is an ANTI-ENUMERATION uniform failure (an ordinary validation
+  re-render that never leaks whether the account exists), reusing the #64/#68 discipline.
+  The deny list and an allow override are updateable per-environment config data (the #79 IP
+  allow/deny-list precedent) that promotes with the config snapshot.
+- Waitlist gate (issue #80): a per-environment toggle that lands a self-service signup in a
+  PENDING `waitlisted` lifecycle state that CANNOT authenticate (fenced at login, holds no
+  session/token capability) until an admin approves it (transition to active) or rejects it
+  (transition to disabled) through the existing user-lifecycle management API.
+- Registration-abuse hardening follow-ups (issue #80):
+  - The account-lifecycle fence is now CENTRALIZED in `interaction::establish_session`, the
+    single choke point EVERY session-minting path funnels through, so no factor can mint a
+    session for a non-authenticatable account. Previously only the password, token/refresh,
+    and device paths consulted `UserState::can_authenticate()`; the passwordless paths
+    (email-OTP verify, magic-link consume, SMS-OTP verify, WebAuthn assertion) omitted it, so
+    a waitlisted, blocked, disabled, or pending-verification account could obtain a full
+    session through them. `establish_session` now resolves the subject's state and REFUSES
+    with a `NotAuthenticatable` outcome that each caller renders as its OWN uniform
+    auth-failure shape (the same wrong-code / failed-ceremony response a normal failure
+    returns), so it is never an existence/state oracle; Active and ScheduledOffboarding are
+    unaffected and the already-gating paths are unchanged. This closes a systemic
+    pre-existing hole that the #80 waitlist surfaced.
+  - `magic/send` is now proof-of-work gated at parity with `otp/send` (via a new
+    `magic_send` challenge endpoint label with its own context binding), so every
+    OTP-send-class endpoint (register, recover, otp/send, magic/send) is consistently
+    protected when PoW is enabled.
+  - `POST /pow/challenge` is now per-IP mint-rate throttled through the #64 abuse layer and
+    eagerly reclaims a bounded batch of the scope's already-expired challenge rows on each
+    mint, so an unauthenticated caller cannot grow `pow_challenges` without bound.
+  - KNOWN LIMITATIONS / future work: waitlist approval is today a plain `waitlisted ->
+    active` flip, which satisfies "approval triggers the normal verification flow" only
+    vacuously because open registration has no email-verification step yet; when the
+    email-verification milestone lands, approved-waitlist accounts MUST be routed through it.
+    Disposable-domain normalization folds fullwidth / compatibility forms via NFKC (closing
+    the classic dodges) but does NOT yet defend against genuine punycode / IDN homographs, a
+    deeper homograph-normalization follow-up.
 - Account recovery as a first-class subsystem (issue #81): a distinct recovery state
   machine, NOT a branch of password reset, governed by three pillars. DELAY as a security
   feature: a recovery that would REDUCE account security is HELD for the configured

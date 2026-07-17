@@ -344,8 +344,8 @@ async fn production_chain_is_only_the_fifty_six_real_migrations_and_ships_no_dem
     );
     assert_eq!(
         report.already_applied(),
-        56,
-        "the production chain is exactly fifty-six migrations (isolation, audit log, management \
+        57,
+        "the production chain is exactly fifty-seven migrations (isolation, audit log, management \
          API, OIDC authorization, signing keys, login/consent, authentication context, redirect \
          registration, UserInfo claims, consent scope upsert, resource servers, opaque access \
          tokens, client auth suite, dynamic client registration, pushed authorization requests, \
@@ -359,16 +359,16 @@ async fn production_chain_is_only_the_fifty_six_real_migrations_and_ships_no_dem
          migration state machine, webauthn credentials, totp credentials, credential abuse \
          defenses, step-up policies, email OTP and scanner-safe magic links, credential-class \
          policies, guarded SMS OTP, passkey attestation, admin sudo elevations, trusted devices, \
-         risk engine, account recovery, federation connectors)"
+         risk engine, account recovery, federation connectors, registration abuse defenses)"
     );
 
-    // The ledger holds exactly versions 1 through 56.
+    // The ledger holds exactly versions 1 through 57.
     assert_eq!(
         applied_versions(pool).await,
         vec![
             1_i64, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
             24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45,
-            46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56
+            46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57
         ]
     );
     let phase_of = |version: i64| async move {
@@ -574,6 +574,10 @@ async fn production_chain_is_only_the_fifty_six_real_migrations_and_ships_no_dem
     // The federation-connectors migration (issue #75) is an EXPAND: one new tenant-scoped
     // table (connectors), no rewrite of existing state.
     assert_eq!(phase_of(56).await, "expand");
+    // The registration-abuse-defenses migration (issue #80) is an EXPAND: one new
+    // tenant-scoped table (pow_challenges) plus an additive widen of the users.state CHECK
+    // to admit 'waitlisted', no rewrite of existing state.
+    assert_eq!(phase_of(57).await, "expand");
 
     // The step-up second-factor abuse path (issue #72): migration 0047 WIDENED the
     // abuse_bans auth_path CHECK (0046 pinned the closed set) to also admit
@@ -811,6 +815,61 @@ async fn production_chain_is_only_the_fifty_six_real_migrations_and_ships_no_dem
             "the recovery_flows entry-point CHECK must admit {entry}, got: {recovery_entry_check}"
         );
     }
+    // The proof-of-work challenge state (issue #80): a tenant-scoped, RLS-forced table with
+    // the (non-secret) challenge bytes, the difficulty, the endpoint+context binding, the
+    // single-use spent latch, and the expiry.
+    assert!(
+        table_exists(pool, "pow_challenges").await,
+        "pow_challenges exists after 0057"
+    );
+    assert!(
+        rls_enabled_and_forced(pool, "pow_challenges").await,
+        "pow_challenges has row-level security ENABLED and FORCED"
+    );
+    assert!(
+        policy_exists(pool, "pow_challenges", "pow_challenges_tenant_isolation").await,
+        "pow_challenges has the tenant-isolation policy"
+    );
+    for column in [
+        "id",
+        "tenant_id",
+        "environment_id",
+        "challenge",
+        "difficulty_bits",
+        "context_hash",
+        "spent_at",
+        "expires_at",
+        "created_at",
+    ] {
+        assert!(
+            column_exists(pool, "pow_challenges", column).await,
+            "pow_challenges.{column} exists after 0057"
+        );
+    }
+    for constraint in [
+        "pow_challenges_scope_nonempty",
+        "pow_challenges_difficulty_range",
+    ] {
+        assert!(
+            check_constraint_exists(pool, "pow_challenges", constraint).await,
+            "pow_challenges has the {constraint} CHECK"
+        );
+    }
+    // The waitlist state (issue #80): the users.state CHECK was WIDENED to admit
+    // 'waitlisted', so a self-service signup made while waitlist mode is on can land in the
+    // pending state that cannot authenticate.
+    let users_state_check: String = sqlx::query(
+        "SELECT pg_get_constraintdef(oid) AS def FROM pg_catalog.pg_constraint \
+         WHERE conrelid = 'users'::regclass AND conname = 'users_state_valid'",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("users_state_valid check lookup")
+    .get("def");
+    assert!(
+        users_state_check.contains("waitlisted"),
+        "the users.state CHECK must admit the waitlist 'waitlisted' state, got: {users_state_check}"
+    );
     // The authentication-context columns (issue #14) exist: the recorded login
     // methods on sessions and codes, the frozen auth_time on codes, and the
     // client's require_auth_time registration flag.

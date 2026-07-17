@@ -1392,3 +1392,133 @@ async fn manage_page_emits_signal_script_only_when_the_flag_is_on() {
     );
     assert!(!body.contains("<script"), "no script at all when off");
 }
+
+/// Enroll a synced UV passkey for a user seeded directly in `state` and return its
+/// subject. The enrollment rides a DIRECTLY-minted session (not the login fence), so it
+/// works for any lifecycle state; only the later assertion exercises the fence.
+async fn enrolled_passkey_in_state(
+    harness: &Harness,
+    identifier: &str,
+    seed: &[u8; 32],
+    cred: &[u8],
+    state: ironauth_store::UserState,
+) -> String {
+    let subject = harness
+        .seed_user_in_state(identifier, "correct horse battery", state)
+        .await;
+    let (_id, cookie) = harness.session_with_id(&subject, "pwd", 0).await;
+    let (status, body) = register_flags(harness, &cookie, seed, cred, REG_SYNCED_UV).await;
+    assert_eq!(status, StatusCode::CREATED, "register ({state:?}): {body}");
+    subject
+}
+
+/// The WebAuthn assertion path funnels through `establish_session`, so the CENTRAL
+/// lifecycle fence (issue #80 / #52) refuses a non-authenticatable account (waitlisted /
+/// blocked / disabled) there with the SAME uniform ceremony error a failed assertion
+/// returns (no session, no state oracle). An ACTIVE account still signs in on the same
+/// path, and after admin approval (waitlisted -> active) the account can authenticate.
+#[tokio::test]
+async fn the_lifecycle_fence_blocks_the_webauthn_path_for_a_non_authenticatable_account() {
+    let harness = Harness::start().await;
+
+    // Each non-authenticatable state: a valid assertion still yields NO session, and the
+    // refusal is the uniform ceremony error (400), never a distinct oracle.
+    for (i, (identifier, state)) in [
+        (
+            "waitlisted@example.test",
+            ironauth_store::UserState::Waitlisted,
+        ),
+        ("blocked@example.test", ironauth_store::UserState::Blocked),
+        ("disabled@example.test", ironauth_store::UserState::Disabled),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let seed = [100 + u8::try_from(i).unwrap(); 32];
+        let cred = format!("fence-cred-{i}").into_bytes();
+        let subject = enrolled_passkey_in_state(&harness, identifier, &seed, &cred, state).await;
+        let (status, headers, body) = authenticate_flags(
+            &harness,
+            &seed,
+            &cred,
+            Some(subject.as_bytes()),
+            ASSERT_SYNCED_UV,
+            1,
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "{state:?}: the fence returns the uniform ceremony error: {body}"
+        );
+        assert_eq!(
+            headers.get_all(header::SET_COOKIE).iter().count(),
+            0,
+            "{state:?}: a fenced account obtains NO session on the WebAuthn path"
+        );
+    }
+
+    // An ACTIVE account still authenticates on the same path.
+    let active_seed = [200_u8; 32];
+    let active_cred = b"fence-cred-active".to_vec();
+    let active_subject = enrolled_passkey_in_state(
+        &harness,
+        "active@example.test",
+        &active_seed,
+        &active_cred,
+        ironauth_store::UserState::Active,
+    )
+    .await;
+    let (status, headers, body) = authenticate_flags(
+        &harness,
+        &active_seed,
+        &active_cred,
+        Some(active_subject.as_bytes()),
+        ASSERT_SYNCED_UV,
+        1,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "an active account authenticates on the WebAuthn path: {body}"
+    );
+    assert!(
+        headers.get_all(header::SET_COOKIE).iter().count() >= 1,
+        "an active account mints a session on the WebAuthn path"
+    );
+
+    // Admin approval (waitlisted -> active): the previously-fenced account's SAME passkey
+    // now signs in (a fresh, higher sign count keeps the clone-detection policy happy).
+    let approved = harness
+        .store()
+        .scoped(harness.scope())
+        .users()
+        .by_identifier("waitlisted@example.test")
+        .await
+        .expect("lookup")
+        .expect("the waitlisted account exists");
+    harness
+        .set_user_state(&approved.id.to_string(), ironauth_store::UserState::Active)
+        .await;
+    let waitlisted_seed = [100_u8; 32];
+    let waitlisted_cred = b"fence-cred-0".to_vec();
+    let (status, headers, body) = authenticate_flags(
+        &harness,
+        &waitlisted_seed,
+        &waitlisted_cred,
+        Some(approved.id.to_string().as_bytes()),
+        ASSERT_SYNCED_UV,
+        2,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "an approved account authenticates on the WebAuthn path: {body}"
+    );
+    assert!(
+        headers.get_all(header::SET_COOKIE).iter().count() >= 1,
+        "an approved account mints a session on the WebAuthn path"
+    );
+}

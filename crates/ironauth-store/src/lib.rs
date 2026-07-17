@@ -59,6 +59,7 @@ pub mod esv;
 mod id;
 pub mod identifier;
 mod migrate;
+pub mod pow_challenge;
 pub mod promotion;
 pub mod recovery;
 mod redirect;
@@ -116,23 +117,24 @@ pub use id::{
     InvitationId, InvitationKind, IssuedTokenId, IssuedTokenKind, KekId, KekKind, LevelId,
     LevelKind, MagicLinkTokenId, MagicLinkTokenKind, ManagementKeyId, ManagementKeyKind,
     MigrationRunId, MigrationRunKind, MigrationRunRecordId, MigrationRunRecordKind, NotInScope,
-    OperatorId, OperatorKind, OrganizationId, OrganizationKind, PushedRequestId, PushedRequestKind,
-    RecoveryCodeId, RecoveryCodeKind, RecoveryFlowId, RecoveryFlowKind, RefreshFamilyId,
-    RefreshFamilyKind, RefreshTokenId, RefreshTokenKind, ResourceServerId, ResourceServerKind,
-    RiskDecisionId, RiskDecisionKind, RiskDisavowalId, RiskDisavowalKind, RiskLoginGeoId,
-    RiskLoginGeoKind, ScopeStepUpPolicyId, ScopeStepUpPolicyKind, ScopedId, ScopedKind,
-    ServiceAccountId, ServiceAccountKind, ServiceId, ServiceKind, SessionEventId, SessionEventKind,
-    SessionId, SessionKind, SigningKeyId, SigningKeyKind, SmsOtpCodeId, SmsOtpCodeKind,
-    SmsRouteStatId, SmsRouteStatKind, TenantId, TenantKind, TotpCredentialId, TotpCredentialKind,
-    TraitMigrationJobId, TraitMigrationJobKind, TraitSchemaId, TraitSchemaKind, TrustedDeviceId,
-    TrustedDeviceKind, UserId, UserIdentifierId, UserIdentifierKind, UserKind, VariableId,
-    VariableKind, WebauthnChallengeId, WebauthnChallengeKind, WebauthnCredentialId,
-    WebauthnCredentialKind,
+    OperatorId, OperatorKind, OrganizationId, OrganizationKind, PowChallengeId, PowChallengeKind,
+    PushedRequestId, PushedRequestKind, RecoveryCodeId, RecoveryCodeKind, RecoveryFlowId,
+    RecoveryFlowKind, RefreshFamilyId, RefreshFamilyKind, RefreshTokenId, RefreshTokenKind,
+    ResourceServerId, ResourceServerKind, RiskDecisionId, RiskDecisionKind, RiskDisavowalId,
+    RiskDisavowalKind, RiskLoginGeoId, RiskLoginGeoKind, ScopeStepUpPolicyId,
+    ScopeStepUpPolicyKind, ScopedId, ScopedKind, ServiceAccountId, ServiceAccountKind, ServiceId,
+    ServiceKind, SessionEventId, SessionEventKind, SessionId, SessionKind, SigningKeyId,
+    SigningKeyKind, SmsOtpCodeId, SmsOtpCodeKind, SmsRouteStatId, SmsRouteStatKind, TenantId,
+    TenantKind, TotpCredentialId, TotpCredentialKind, TraitMigrationJobId, TraitMigrationJobKind,
+    TraitSchemaId, TraitSchemaKind, TrustedDeviceId, TrustedDeviceKind, UserId, UserIdentifierId,
+    UserIdentifierKind, UserKind, VariableId, VariableKind, WebauthnChallengeId,
+    WebauthnChallengeKind, WebauthnCredentialId, WebauthnCredentialKind,
 };
 pub use identifier::{
     CanonicalIdentifier, IdentifierType, UniquenessMode, canonicalize_identifier,
 };
 pub use migrate::{Migration, MigrationError, MigrationReport, MigrationRunner, Phase};
+pub use pow_challenge::{NewPowChallenge, PowChallengeView};
 pub use promotion::{
     ChangeKind, ConfigDiff, PROMOTED_RESOURCE_TYPES, Plan, PlanError, PromotionApplyError,
     PromotionOutcome, ResourceChange, collect_references, diff as diff_snapshots, evaluate_plan,

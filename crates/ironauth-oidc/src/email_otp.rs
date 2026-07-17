@@ -43,6 +43,15 @@ pub struct SendBody {
     /// The flow the code authorizes (`login`, `register`, `mfa`, `recovery`,
     /// `verify_address`). Defaults to `login`.
     pub purpose: Option<String>,
+    /// The proof-of-work challenge id the client solved (issue #80), when a challenge is
+    /// required on the OTP-send surface.
+    pub pow_challenge_id: Option<String>,
+    /// The proof-of-work nonce (base64url no-pad) the client found (issue #80).
+    pub pow_nonce: Option<String>,
+    /// The request context the challenge was issued for (issue #80), echoed back.
+    pub pow_context: Option<String>,
+    /// An external adapter (Turnstile/reCAPTCHA) response token (issue #80).
+    pub pow_token: Option<String>,
 }
 
 /// The verify-OTP request body.
@@ -122,6 +131,10 @@ pub(crate) fn attempt_context(
 /// `POST /t/{tenant}/e/{environment}/otp/send`: issue and send a numeric email-OTP code.
 /// Abuse-throttled per recipient and per tenant; a send to an unknown recipient is
 /// SUPPRESSED with an IDENTICAL acknowledgment (the #64 anti-enumeration contract).
+// The linear send flow (enable/quota gate, PoW gate, throttle, existence-independent
+// resolve, issue-or-suppress) reads best as one function; splitting it would scatter the
+// anti-enumeration invariant, so the length lint is allowed here (issues #64, #80).
+#[allow(clippy::too_many_lines)]
 pub async fn send(
     State(state): State<OidcState>,
     Path((tenant_id, environment_id)): Path<(String, String)>,
@@ -148,6 +161,31 @@ pub async fn send(
     if identifier.is_empty() {
         // No recipient: the uniform ack, no send, no oracle.
         return ack();
+    }
+
+    // Proof-of-work gate (issue #80), conditioned on the #79 risk level. Runs BEFORE the
+    // recipient lookup and is existence-INDEPENDENT (it keys on the challenge and the IP,
+    // never on whether the identifier resolves), so it introduces no enumeration oracle.
+    // The built-in PoW is fully server-side (ZERO third-party calls).
+    let peer_ip = crate::abuse::resolved_client_ip(&headers);
+    if crate::pow_gate::challenge_required(&state, peer_ip.as_deref(), false) {
+        let solution = crate::pow_gate::PresentedSolution {
+            challenge_id: body.pow_challenge_id.as_deref(),
+            nonce: body.pow_nonce.as_deref(),
+            context: body.pow_context.as_deref().unwrap_or_default(),
+            token: body.pow_token.as_deref(),
+            remote_ip: peer_ip.as_deref(),
+        };
+        if !crate::pow_gate::verify_solution(
+            &state,
+            scope,
+            crate::pow_gate::ENDPOINT_OTP_SEND,
+            &solution,
+        )
+        .await
+        {
+            return bad_request("challenge required");
+        }
     }
 
     // Throttle the SEND per recipient and per tenant BEFORE resolving whether the
@@ -378,7 +416,12 @@ pub(crate) async fn establish_and_respond(
             );
             interaction::attach_session_cookies(body, &cookies)
         }
-        Err(_) => server_error(),
+        // The central lifecycle fence refused (issue #80 / #52): a waitlisted, blocked,
+        // disabled, or pending-verification account. Render the SAME uniform invalid-code
+        // result a wrong/expired code returns, so a fenced-but-correct code is not an
+        // account-state oracle.
+        Err(interaction::EstablishSessionError::NotAuthenticatable) => invalid_code(),
+        Err(interaction::EstablishSessionError::Store) => server_error(),
     }
 }
 
