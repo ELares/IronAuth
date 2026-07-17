@@ -6,6 +6,34 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Declarative federation connectors (issue #75, PR A): migration 0056 adds the
+  tenant-scoped, forced-RLS `connectors` table and the `ConnectorRepo` /
+  `ActingConnectorRepo` accessors. A connector row holds a `cnr_` scope-embedded id
+  (a NEW `ScopedKind`; the prefix is `cnr`, distinct from consent's `con`, so the two
+  kinds never share a wire prefix), a SECRET-FREE `definition_json`, the capability
+  columns written from the definition, and the upstream client secret SEALED INLINE
+  under the scope DEK (issue #48) rather than in the shared `encrypted_secrets` store:
+  the management API seals it on the control-plane role, which holds the KEK/DEK
+  provisioning grants (issue #37) but is deliberately NOT granted the shared secret
+  store. A read never returns the sealed secret. `ResourceType::Connector` is added and
+  classified PROMOTABLE; the snapshot export carries the connector definition and a
+  NAMED REFERENCE to its upstream secret (`connector_client_secret`), never the value
+  (the #58 proof, covered by a real-database test and the classification-binding test).
+  The transactional promotion ENGINE does not yet apply connectors (their secret
+  reference must resolve against the target environment, a later slice), so they are
+  emptied from the promoted projection exactly like clients. `connectors` is registered
+  in the query-audit lint and the IDOR harness (`connectors.get` / `connectors.delete`).
+  The migration guard pins the chain at 56 and asserts the table's forced RLS, isolation
+  policy, scope-nonempty and email-verified-trust CHECKs, sealed-secret column, and the
+  absence of any plaintext `client_secret` column.
+  - Review fix (MEDIUM 1): the inline connector-secret seal AAD is now bound to the
+    connector's IMMUTABLE `cnr_` id (`connector_secret_purpose` keys on the id, not the
+    mutable slug), so a resealed secret stays decryptable across any future definition
+    edit. A testing-only `ConnectorRepo::open_client_secret_for_test` reconstructs the
+    AAD from the id to prove the create -> update -> unseal round-trip; the production
+    read path stays secret-free. The `ConnectorKind` doc (review LOW 2) is rewritten to
+    describe the shipped INLINE seal (on the row's `client_secret_sealed` bytea) rather
+    than the never-shipped `encrypted_secrets` reference.
 - Account recovery (issue #81): migration 0055 adds the tenant-scoped, forced-RLS
   `recovery_flows` table (the recovery state machine position and entry point as closed
   CHECK sets, the `recover_acr` credential-ladder strength the downgrade invariant

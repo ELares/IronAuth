@@ -788,6 +788,20 @@ pub enum Action {
     /// subject's credentials were marked for review. The row targets the `dis_`
     /// disavowal; the `detail` records how many sessions and devices were revoked.
     RiskDisavow,
+    /// A federation connector was CREATED (issue #75): a declarative OIDC-shaped
+    /// upstream definition was registered through the management API. The row targets
+    /// the `cnr_` connector; the `detail` records the connector slug. The definition
+    /// is validated before it lands, and the upstream client secret is sealed inline
+    /// under the scope DEK.
+    ConnectorCreate,
+    /// A federation connector was UPDATED (issue #75): its definition, sealed secret,
+    /// capability matrix, or enabled flag was replaced through the management API. The
+    /// row targets the `cnr_` connector; the `detail` records the connector slug.
+    ConnectorUpdate,
+    /// A federation connector was DELETED (issue #75): the definition was removed
+    /// through the management API. The row targets the `cnr_` connector; the `detail`
+    /// records the connector slug.
+    ConnectorDelete,
 }
 
 impl Action {
@@ -958,6 +972,9 @@ impl Action {
             Action::RiskDecisionRecord => "risk.decision",
             Action::RiskDisavowalIssue => "risk.disavowal.issue",
             Action::RiskDisavow => "risk.disavow",
+            Action::ConnectorCreate => "connector.create",
+            Action::ConnectorUpdate => "connector.update",
+            Action::ConnectorDelete => "connector.delete",
         }
     }
 }

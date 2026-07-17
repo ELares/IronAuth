@@ -21,18 +21,19 @@ use utoipa::{Modify, OpenApi};
 
 use crate::error::ErrorBody;
 use crate::views::{
-    BulkRevocationView, BulkRevokeSessionsRequest, ClientVerificationView, CreateDcrPolicyRequest,
-    CreateEnvironmentRequest, CreateInitialAccessTokenRequest, CreateInvitationRequest,
-    CreateManagementKeyRequest, CreateOrganizationRequest, CreateTenantRequest, CreateUserRequest,
-    DcrPolicyList, DcrPolicyView, EnvironmentList, EnvironmentView, GuardrailView,
-    InitialAccessTokenCreated, InvitationCreatedView, InvitationCredentialTypeView, InvitationList,
-    InvitationStateChangeView, InvitationStateView, InvitationView, LinkExternalIdRequest,
-    ManagementKeyCreated, ManagementKeyList, ManagementKeyView, OperatorList, OperatorView,
-    OrganizationList, OrganizationView, RefreshFamilyList, RefreshFamilyView, ResourceTypeView,
-    ResourceTypesList, RevokeSessionsRequest, SessionList, SessionRevocationView, SessionView,
-    SetUserStateRequest, TenantCreated, TenantList, TenantStatusView, TenantView,
-    UpdateUserRequest, UserExternalIdView, UserList, UserRevocationView, UserStateChangeView,
-    UserStateView, UserView,
+    BulkRevocationView, BulkRevokeSessionsRequest, ClientVerificationView,
+    ConnectorCapabilitiesView, ConnectorList, ConnectorView, CreateConnectorRequest,
+    CreateDcrPolicyRequest, CreateEnvironmentRequest, CreateInitialAccessTokenRequest,
+    CreateInvitationRequest, CreateManagementKeyRequest, CreateOrganizationRequest,
+    CreateTenantRequest, CreateUserRequest, DcrPolicyList, DcrPolicyView, EnvironmentList,
+    EnvironmentView, GuardrailView, InitialAccessTokenCreated, InvitationCreatedView,
+    InvitationCredentialTypeView, InvitationList, InvitationStateChangeView, InvitationStateView,
+    InvitationView, LinkExternalIdRequest, ManagementKeyCreated, ManagementKeyList,
+    ManagementKeyView, OperatorList, OperatorView, OrganizationList, OrganizationView,
+    RefreshFamilyList, RefreshFamilyView, ResourceTypeView, ResourceTypesList,
+    RevokeSessionsRequest, SessionList, SessionRevocationView, SessionView, SetUserStateRequest,
+    TenantCreated, TenantList, TenantStatusView, TenantView, UpdateUserRequest, UserExternalIdView,
+    UserList, UserRevocationView, UserStateChangeView, UserStateView, UserView,
 };
 
 /// The management API's OpenAPI document. The handlers listed in `paths(...)`
@@ -66,6 +67,9 @@ use crate::views::{
         (name = "keys", description = "Environment-scoped management API keys"),
         (name = "dcr", description = "Dynamic Client Registration abuse controls: \
                                      policies, initial access tokens, client verification"),
+        (name = "connectors", description = "Declarative inbound-federation connectors: \
+                                            strict-validated OIDC-shaped upstream definitions \
+                                            (CRUD) and the machine-readable capability matrix"),
         (name = "sessions", description = "Session and refresh-family fleet operations: \
                                           search, inspect, revoke (single, bulk, and \
                                           everything-for-a-user with a token-family cascade)"),
@@ -119,6 +123,12 @@ use crate::views::{
         crate::dcr::create_initial_access_token,
         crate::dcr::get_dcr_client,
         crate::dcr::verify_dcr_client,
+        crate::connectors::create_connector,
+        crate::connectors::list_connectors,
+        crate::connectors::get_connector,
+        crate::connectors::get_connector_capabilities,
+        crate::connectors::update_connector,
+        crate::connectors::delete_connector,
         crate::sessions::list_sessions,
         crate::sessions::get_session,
         crate::sessions::revoke_session,
@@ -181,6 +191,10 @@ use crate::views::{
         CreateInitialAccessTokenRequest,
         InitialAccessTokenCreated,
         ClientVerificationView,
+        CreateConnectorRequest,
+        ConnectorView,
+        ConnectorList,
+        ConnectorCapabilitiesView,
         SessionView,
         SessionList,
         RefreshFamilyView,

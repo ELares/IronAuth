@@ -476,6 +476,32 @@ impl ScopedKind for ConsentKind {
     const PREFIX: &'static str = "con";
 }
 
+/// Marker for a federation connector (`cnr_`), one declarative inbound-federation
+/// upstream definition per environment (issue #75): the OIDC-shaped connector the
+/// generic upstream reads (issuer or explicit endpoints, scopes, client id, PKCE
+/// mode, claim mapping, quirks, and the capability matrix). A tenant-scoped
+/// resource: the identifier embeds its `(tenant, environment)`, so a connector
+/// minted in one scope parses as a uniform not-found under another, and a
+/// definition is per-environment with the standard tenant-isolation guarantees.
+/// The prefix is `cnr` (NOT the `con` of [`ConsentKind`], which is already the
+/// consent-decision prefix: two `ScopedKind`s must not share a wire prefix, or a
+/// `ScopedId` of one kind would parse as the other). The upstream client SECRET is
+/// never plaintext and never appears in the row's `definition_json` (that document
+/// is secret-free); it is sealed INLINE on the connector row itself, in the
+/// `client_secret_sealed` bytea under `client_secret_dek_version`, envelope-encrypted
+/// under the scope DEK with the seal AAD bound to this IMMUTABLE connector id plus
+/// the tenant, environment, and DEK version. Every read projection excludes the
+/// sealed column, so a read is secret-free by construction, and because the AAD keys
+/// on the id (not the mutable slug), a resealed secret stays decryptable across any
+/// definition edit. The id is a public handle, so its debug form stays legible. A
+/// connector definition is PROMOTABLE (issue #41): the definition travels in a
+/// config snapshot, but the secret's VALUE never does (only a named reference).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ConnectorKind;
+impl ScopedKind for ConnectorKind {
+    const PREFIX: &'static str = "cnr";
+}
+
 /// Marker for a signing key (`sik_`), an environment's per-issuer signing key
 /// (issue #19). A tenant-scoped resource: the identifier embeds its
 /// `(tenant, environment)`, so a key row can never be read across a tenant or
@@ -1084,6 +1110,10 @@ pub type BackChannelDeliveryId = ScopedId<BackChannelDeliveryKind>;
 /// A recorded-consent identifier (`con_...`), the decision row a grant references
 /// (issue #20).
 pub type ConsentId = ScopedId<ConsentKind>;
+/// A federation connector identifier (`cnr_...`), one declarative
+/// inbound-federation upstream definition per environment (issue #75). The prefix
+/// is `cnr` (distinct from consent's `con`).
+pub type ConnectorId = ScopedId<ConnectorKind>;
 /// A signing-key identifier (`sik_...`), which doubles as the JOSE `kid` of a
 /// per-environment signing key (issue #19).
 pub type SigningKeyId = ScopedId<SigningKeyKind>;

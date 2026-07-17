@@ -1,0 +1,28 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+[package]
+name = "ironauth-connector"
+version = "0.1.0"
+description = "IronAuth declarative federation connector definitions and the machine-readable capability matrix (issue #75): a pure, I/O-free crate that parses and strictly validates an attacker-influenced OIDC connector specification (strict serde with deny_unknown_fields plus a semantic validator emitting RFC 6901 JSON-pointer errors), models per-connector capabilities with conservative defaults (email-verified trust defaults to untrusted), and carries claim-mapping and quirks as data. It has NO ironauth-fetch and NO HTTP dependency by construction, so a connector definition can never name a raw outbound fetch; every federation fetch rides the SSRF-hardened ironauth-fetch path in a later slice"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# The Secret indirection type (file/env/literal, redacted) a connector's upstream
+# client secret is declared through; reusing it keeps the redaction invariant and
+# means no new dependency is introduced for secret handling.
+ironauth-config.workspace = true
+# serde derives the connector-definition shape; deny_unknown_fields on every nested
+# struct is half of the two-phase strict validation (unknown keys fail at parse
+# time). serde_json canonicalizes the secret-free stored projection and backs the
+# fuzz target. schemars publishes the JSON Schema editors and CI freshness-check
+# the definition and capability-matrix against. NO url or jsonschema crate: the
+# syntactic URL check is inline and the strict validator is hand-written, so the
+# workspace dependency graph and cargo-deny are untouched.
+serde.workspace = true
+serde_json.workspace = true
+schemars.workspace = true
+
+[lints]
+workspace = true

@@ -6,6 +6,26 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Declarative federation connector management (issue #75, PR A): CRUD plus a
+  capability-matrix read endpoint on the management API. `POST .../connectors` parses
+  the body with the strict, I/O-free `ironauth-connector` layer (`deny_unknown_fields`
+  plus the semantic validator) and REJECTS an unknown key or a semantic fault with a 400
+  carrying its RFC 6901 JSON POINTER; a valid definition seals the upstream client
+  secret and writes the capability matrix. `GET .../connectors` (cursor paginated),
+  `GET .../connectors/{id}`, `GET .../connectors/{id}/capabilities`,
+  `PUT .../connectors/{id}`, and `DELETE .../connectors/{id}` round out the surface.
+  Every response is SECRET-FREE: the sealed upstream secret is never returned, and a
+  new connector's `email_verified_trust` reads back `untrusted`. Six routes and their
+  schemas are added to the OpenAPI spec, the served router, and the hardcoded contract
+  test (op-id set, path set, and the served-route count 62 -> 68).
+  - Review fix (MEDIUM 1): `PUT .../connectors/{id}` now REJECTS a slug change with a
+    409 (the `connector_id` in the body must equal the stored `connector_slug`, the
+    immutable natural key the sealed-secret AAD anchors on), before any mutation, so the
+    stored slug and the definition can never diverge. The error names no secret value.
+  - Review fix (LOW 4): create and update now honor the definition's `enabled` flag
+    (default `true` on create; an update honors the submitted value), so an operator can
+    disable a connector without deleting it, instead of the previously hardcoded `true`.
+    An integration test covers the slug-change rejection and the enabled round-trip.
 - Admin session privilege separation (sudo mode), EXPLORATORY and off by default (issue
   #73). Behind the new per-environment `admin.sudo_mode_enabled` flag, admin READS are
   unaffected but an environment-scoped MUTATION requires a RECENT re-authentication: the

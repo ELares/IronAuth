@@ -440,6 +440,19 @@ impl Harness {
         self.send(request).await
     }
 
+    /// An authenticated operator PUT with a JSON body (no Idempotency-Key: PUT is the
+    /// idempotent replace).
+    pub async fn put(&self, path: &str, body: &str) -> (StatusCode, HeaderMap, String) {
+        let request = Request::builder()
+            .method("PUT")
+            .uri(path)
+            .header(header::AUTHORIZATION, bearer(OPERATOR_TOKEN))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_owned()))
+            .expect("request builds");
+        self.send(request).await
+    }
+
     /// An authenticated operator DELETE.
     pub async fn delete(&self, path: &str) -> (StatusCode, HeaderMap, String) {
         let request = Request::builder()

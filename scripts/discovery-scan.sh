@@ -13,13 +13,32 @@ cd "$(git rev-parse --show-toplevel)"
 # The ONE place the discovery document is built.
 generator="crates/ironauth-oidc/src/discovery.rs"
 
+# Inbound federation (issue #75) legitimately NAMES an UPSTREAM provider's OIDC
+# endpoints (a connector's authorization_endpoint / token_endpoint / jwks_uri) and
+# the upstream's `.well-known/openid-configuration` discovery path. That is the
+# REMOTE provider's metadata a connector definition points at, NOT IronAuth's own
+# served discovery document (which only the generator assembles), so these
+# federation files are exempt from the self-discovery duplication check: the
+# ironauth-connector definition types, the admin connector request-body doc, and
+# the ironauth-fetch FederationDiscovery purpose doc.
+federation_allow=(
+  "crates/ironauth-connector/src/lib.rs"
+  "crates/ironauth-admin/src/views.rs"
+  "crates/ironauth-fetch/src/lib.rs"
+)
+
 fail=0
 
 # 1. No committed JSON artifact that is a discovery document. A discovery document
-#    is unmistakable by its required OIDC metadata keys.
+#    is unmistakable by its required OIDC metadata keys. The published connector JSON
+#    SCHEMA (docs/connector-schema.json, issue #75) legitimately NAMES an inbound
+#    UPSTREAM's `authorization_endpoint` as a schema property (it describes the shape
+#    of a connector definition, not a served IronAuth discovery document), so it is
+#    excluded; it carries no `response_types_supported`, so it is not a discovery doc.
 json_hits=$(
   git ls-files -z '*.json' \
     | xargs -0 grep -l -e '"authorization_endpoint"' -e '"response_types_supported"' 2>/dev/null \
+    | grep -vFx "docs/connector-schema.json" \
     || true
 )
 if [ -n "$json_hits" ]; then
@@ -33,11 +52,15 @@ fi
 #    assertions in tests/** are fine and are not scanned. The pathspec wildcard
 #    crosses directory separators (git fnmatch without FNM_PATHNAME), so this also
 #    catches nested modules like crates/*/src/foo/bar.rs, not just top-level files.
+exclude_args=(-e "$generator")
+for allowed in "${federation_allow[@]}"; do
+  exclude_args+=(-e "$allowed")
+done
 src_hits=$(
   {
     git ls-files -z 'crates/*/src/*.rs' \
       | xargs -0 grep -ln -e 'authorization_endpoint' -e 'openid-configuration' 2>/dev/null \
-      | grep -v -x "$generator"
+      | grep -vxF "${exclude_args[@]}"
   } || true
 )
 if [ -n "$src_hits" ]; then

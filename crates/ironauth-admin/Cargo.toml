@@ -17,6 +17,7 @@ autotests = false
 [dependencies]
 ironauth-env.workspace = true
 ironauth-config.workspace = true
+ironauth-connector.workspace = true
 ironauth-store.workspace = true
 # The DCR abuse controls (issue #31) mint initial access tokens carrying named,
 # reusable policy chains. The policy-primitive type and its parse/serialize helpers
@@ -214,6 +215,13 @@ required-features = ["testing"]
 [[test]]
 name = "export"
 path = "tests/export.rs"
+required-features = ["testing"]
+
+# Federation connectors (issue #75): the immutable-slug guard on update and the
+# honest enabled toggle. Needs a real database (DATABASE_URL).
+[[test]]
+name = "connectors"
+path = "tests/connectors.rs"
 required-features = ["testing"]
 
 [lints]

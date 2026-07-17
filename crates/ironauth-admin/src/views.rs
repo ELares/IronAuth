@@ -1160,3 +1160,107 @@ pub struct InvitationStateChangeView {
     /// The state the invitation is now in.
     pub state: InvitationStateView,
 }
+
+// ---------------------------------------------------------------------------
+// Federation connectors (issue #75).
+// ---------------------------------------------------------------------------
+
+/// The body to create or replace a federation connector (issue #75): the declarative
+/// connector definition itself. The management API parses it with the strict
+/// `ironauth-connector` layer (`deny_unknown_fields` plus the semantic validator), so
+/// an unknown key or a semantic fault is a 400 carrying a JSON-pointer error. This
+/// view documents the top-level shape; the FULL, authoritative JSON Schema is
+/// published at `docs/connector-schema.json`.
+// Doc-only: the management API parses the request body directly into
+// `ironauth_connector::ConnectorDefinition` (the single source of truth for the
+// definition shape and its strict validation), so these fields are referenced only
+// by the generated OpenAPI schema, never read in code.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct CreateConnectorRequest {
+    /// The connector slug (lowercase ASCII alphanumerics, hyphen, underscore), unique
+    /// per environment.
+    #[schema(example = "acme-oidc")]
+    pub connector_id: String,
+    /// The human-facing display name.
+    pub display_name: String,
+    /// The federation protocol (`oidc` only in this slice).
+    #[schema(example = "oidc")]
+    pub protocol: String,
+    /// The upstream endpoints: EITHER `{ "issuer": "..." }` OR
+    /// `{ "authorization_endpoint", "token_endpoint", "jwks_uri", "userinfo_endpoint"? }`.
+    pub endpoints: serde_json::Value,
+    /// The scopes requested from the upstream (`openid` is required).
+    pub scopes: Vec<String>,
+    /// The client identifier IronAuth registers at the upstream.
+    pub client_id: String,
+    /// The upstream client secret by indirection (`"..."`, `{ "file": "/path" }`, or
+    /// `{ "env": "VAR" }`); sealed at rest, never returned by a read.
+    pub client_secret: serde_json::Value,
+    /// How PKCE is applied to the upstream (`auto_where_supported` / `required` /
+    /// `disabled`).
+    #[serde(default)]
+    pub pkce: Option<String>,
+    /// The declarative claim mapping (the stored shape).
+    #[serde(default)]
+    pub claim_mapping: Option<serde_json::Value>,
+    /// The capability matrix (conservative defaults; `email_verified_trust` defaults
+    /// to `untrusted`).
+    #[serde(default)]
+    pub capabilities: Option<serde_json::Value>,
+    /// Provider quirks expressed as data.
+    #[serde(default)]
+    pub quirks: Option<serde_json::Value>,
+    /// Whether the connector is active. Defaults to `true` on create; an update
+    /// honors the submitted value, so an operator can disable a connector without
+    /// deleting it.
+    #[serde(default)]
+    pub enabled: Option<bool>,
+}
+
+/// The per-connector capability matrix (issue #75), exposed by the management API.
+/// SECRET-FREE: the upstream client secret is never part of this view.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct ConnectorCapabilitiesView {
+    /// Whether the upstream supports refresh tokens.
+    pub refresh: bool,
+    /// Whether the upstream delivers group memberships.
+    pub groups: bool,
+    /// Whether the upstream supports logout propagation.
+    pub logout_propagation: bool,
+    /// How much the upstream's `email_verified` claim is trusted (`untrusted` /
+    /// `trusted`); defaults to `untrusted` for a new connector.
+    #[schema(example = "untrusted")]
+    pub email_verified_trust: String,
+}
+
+/// A federation connector, as returned by the management API (issue #75). SECRET-FREE:
+/// the `definition` carries no `client_secret` and the sealed upstream secret is never
+/// projected.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct ConnectorView {
+    /// The connector identifier (`cnr_...`).
+    pub id: String,
+    /// The connector slug (unique per environment).
+    pub connector_slug: String,
+    /// The connector's secret-free definition document (no `client_secret`).
+    pub definition: serde_json::Value,
+    /// Whether the connector is active.
+    pub enabled: bool,
+    /// The capability matrix derived from the definition.
+    pub capabilities: ConnectorCapabilitiesView,
+    /// Creation time, milliseconds since the Unix epoch.
+    pub created_at_unix_ms: i64,
+    /// Last-update time, milliseconds since the Unix epoch.
+    pub updated_at_unix_ms: i64,
+}
+
+/// A cursor-paginated page of federation connectors (issue #75).
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct ConnectorList {
+    /// The connectors on this page.
+    pub items: Vec<ConnectorView>,
+    /// The opaque cursor for the next page, or absent on the last page.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}

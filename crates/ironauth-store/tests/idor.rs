@@ -7,9 +7,9 @@ use ironauth_env::Env;
 use ironauth_store::idor_harness::IdorHarness;
 use ironauth_store::test_support::TestDatabase;
 use ironauth_store::{
-    AuthorizationCodeId, ClientId, CorrelationId, CredentialType, GrantId, IssueCode,
-    NewRefreshFamily, NewSession, RefreshFamilyId, RefreshTokenId, Scope, SessionId, StoreError,
-    UserId, refresh_token_digest,
+    AuthorizationCodeId, ClientId, ConnectorCapabilities, ConnectorId, CorrelationId,
+    CredentialType, GrantId, IssueCode, NewConnector, NewRefreshFamily, NewSession,
+    RefreshFamilyId, RefreshTokenId, Scope, SessionId, StoreError, UserId, refresh_token_digest,
 };
 
 /// A timestamp far past any test's clock, so a planted fixture never expires mid-test.
@@ -237,6 +237,79 @@ async fn account_credential_surfaces_are_cross_tenant_and_cross_environment_isol
             "a foreign credential must survive every probe"
         );
     }
+}
+
+#[tokio::test]
+async fn connector_surfaces_are_cross_tenant_and_cross_environment_isolated() {
+    // A federation connector (issue #75) registered in another tenant or environment
+    // must be the uniform not-found on both the read and the delete surface, never a
+    // cross-scope read or removal. Run on the CONTROL store, the plane that owns the
+    // connector lifecycle (it holds the delete grant).
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+
+    let scope_a = db.seed_scope(&env).await;
+    let scope_b = db.seed_scope(&env).await;
+    let env_a2 = db.seed_environment(&env, scope_a.tenant()).await;
+    let scope_a2 = Scope::new(scope_a.tenant(), env_a2);
+
+    let victim_b = plant_connector(&db, &env, scope_b).await;
+    let victim_a2 = plant_connector(&db, &env, scope_a2).await;
+
+    let mut harness = IdorHarness::new();
+    harness.register_connector_probes();
+    assert_eq!(
+        harness.probe_names(),
+        vec!["connectors.get", "connectors.delete"],
+        "every connector surface is registered with the harness"
+    );
+
+    let foreign = [victim_b.clone(), victim_a2.clone()];
+    let refs: Vec<&str> = foreign.iter().map(String::as_str).collect();
+    let leaks = harness.run(db.control_store(), scope_a, &refs).await;
+    assert!(leaks.is_empty(), "cross-scope leak detected: {leaks:?}");
+
+    // Neither victim connector was deleted: both still resolve in their own scope.
+    for (scope, id) in [(scope_b, victim_b), (scope_a2, victim_a2)] {
+        let parsed = ConnectorId::parse_in_scope(&id, &scope).expect("id parses in its own scope");
+        db.control_store()
+            .scoped(scope)
+            .connectors()
+            .get(&parsed)
+            .await
+            .expect("a foreign connector must survive every probe");
+    }
+}
+
+/// Plant a federation connector in `scope` and return its id string.
+async fn plant_connector(db: &TestDatabase, env: &Env, scope: Scope) -> String {
+    let id = ConnectorId::generate(env, &scope);
+    let definition = r#"{"connector_id":"probe","display_name":"Probe","protocol":"oidc","endpoints":{"issuer":"https://probe.example.com"},"scopes":["openid"],"client_id":"ic"}"#;
+    db.control_store()
+        .scoped(scope)
+        .acting(db.test_actor(env), CorrelationId::generate(env))
+        .connectors()
+        .create(
+            env,
+            &id,
+            1_000_000,
+            NewConnector {
+                slug: "probe",
+                definition_json: definition,
+                client_secret: b"probe-secret",
+                capabilities: ConnectorCapabilities {
+                    refresh: false,
+                    groups: false,
+                    logout_propagation: false,
+                    email_verified_trust: "untrusted",
+                },
+                enabled: true,
+            },
+            None,
+        )
+        .await
+        .expect("plant connector");
+    id.to_string()
 }
 
 /// Plant a live account credential in `scope` and return its owning subject and id.

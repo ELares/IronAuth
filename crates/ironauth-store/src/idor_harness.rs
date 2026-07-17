@@ -45,7 +45,8 @@ use ironauth_env::Env;
 
 use crate::audit::ActorRef;
 use crate::id::{
-    CorrelationId, CredentialId, GrantId, IssuedTokenId, ServiceId, SessionId, SigningKeyId, UserId,
+    ConnectorId, CorrelationId, CredentialId, GrantId, IssuedTokenId, ServiceId, SessionId,
+    SigningKeyId, UserId,
 };
 use crate::repository::{
     CredentialRemoveOutcome, RedeemOutcome, RefreshFamilyFleetFilter, SessionEndCause,
@@ -227,6 +228,17 @@ impl IdorHarness {
         self.register(Box::new(UserAdminUpdateClaimsProbe));
         self.register(Box::new(UserAdminExternalIdLinkProbe));
         self.register(Box::new(UserAdminExternalIdUnlinkProbe));
+        self
+    }
+
+    /// Register the federation-connector probes (issue #75): a connector definition
+    /// registered in another tenant or environment must never be readable under the
+    /// caller's scope, or a management read would expose a foreign tenant's upstream
+    /// configuration. Run these with the control-plane store (`ironauth_control`), the
+    /// plane that owns the connector lifecycle.
+    pub fn register_connector_probes(&mut self) -> &mut Self {
+        self.register(Box::new(ConnectorGetProbe));
+        self.register(Box::new(ConnectorDeleteProbe));
         self
     }
 
@@ -619,6 +631,68 @@ impl IsolationProbe for SigningKeyGetProbe {
             match store.scoped(caller).signing_keys().get(&id).await {
                 // Reading a foreign key's material or metadata would be a leak.
                 Ok(_) => ProbeOutcome::Leaked,
+                Err(_) => ProbeOutcome::Denied,
+            }
+        })
+    }
+}
+
+/// Built-in probe for `ConnectorRepo::get` (issue #75): a federation connector
+/// definition registered in another tenant or environment must never resolve under
+/// the caller's scope, or a management read would expose a foreign tenant's upstream
+/// configuration.
+struct ConnectorGetProbe;
+
+impl IsolationProbe for ConnectorGetProbe {
+    fn name(&self) -> &'static str {
+        "connectors.get"
+    }
+
+    fn probe<'a>(
+        &'a self,
+        store: &'a Store,
+        caller: Scope,
+        foreign_id: &'a str,
+    ) -> BoxProbeFuture<'a> {
+        Box::pin(async move {
+            let Ok(id) = ConnectorId::parse_in_scope(foreign_id, &caller) else {
+                return ProbeOutcome::Denied;
+            };
+            match store.scoped(caller).connectors().get(&id).await {
+                // Reading a foreign connector's definition or capabilities is a leak.
+                Ok(_) => ProbeOutcome::Leaked,
+                Err(_) => ProbeOutcome::Denied,
+            }
+        })
+    }
+}
+
+/// Built-in probe for `ActingConnectorRepo::delete` (issue #75): the mutating delete
+/// of a foreign connector must be the uniform not-found, never a cross-scope removal.
+struct ConnectorDeleteProbe;
+
+impl IsolationProbe for ConnectorDeleteProbe {
+    fn name(&self) -> &'static str {
+        "connectors.delete"
+    }
+
+    fn probe<'a>(
+        &'a self,
+        store: &'a Store,
+        caller: Scope,
+        foreign_id: &'a str,
+    ) -> BoxProbeFuture<'a> {
+        Box::pin(async move {
+            let env = Env::system();
+            let Ok(id) = ConnectorId::parse_in_scope(foreign_id, &caller) else {
+                return ProbeOutcome::Denied;
+            };
+            let actor = ActorRef::service(ServiceId::generate(&env));
+            let correlation = CorrelationId::generate(&env);
+            let acting = store.scoped(caller).acting(actor, correlation);
+            match acting.connectors().delete(&env, &id).await {
+                // Deleting a foreign connector would be a cross-scope mutation.
+                Ok(()) => ProbeOutcome::Leaked,
                 Err(_) => ProbeOutcome::Denied,
             }
         })

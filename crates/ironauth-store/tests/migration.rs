@@ -327,7 +327,7 @@ async fn expand_contract_example_chain_runs_all_three_phases_and_contract_remove
 // per real table); splitting it would not make it clearer.
 #[allow(clippy::too_many_lines)]
 #[tokio::test]
-async fn production_chain_is_only_the_fifty_five_real_migrations_and_ships_no_demo_object() {
+async fn production_chain_is_only_the_fifty_six_real_migrations_and_ships_no_demo_object() {
     // TestDatabase::start runs Store::migrate() (the production chain) on a
     // fresh, empty database.
     let db = TestDatabase::start().await;
@@ -344,8 +344,8 @@ async fn production_chain_is_only_the_fifty_five_real_migrations_and_ships_no_de
     );
     assert_eq!(
         report.already_applied(),
-        55,
-        "the production chain is exactly fifty-five migrations (isolation, audit log, management \
+        56,
+        "the production chain is exactly fifty-six migrations (isolation, audit log, management \
          API, OIDC authorization, signing keys, login/consent, authentication context, redirect \
          registration, UserInfo claims, consent scope upsert, resource servers, opaque access \
          tokens, client auth suite, dynamic client registration, pushed authorization requests, \
@@ -359,16 +359,16 @@ async fn production_chain_is_only_the_fifty_five_real_migrations_and_ships_no_de
          migration state machine, webauthn credentials, totp credentials, credential abuse \
          defenses, step-up policies, email OTP and scanner-safe magic links, credential-class \
          policies, guarded SMS OTP, passkey attestation, admin sudo elevations, trusted devices, \
-         risk engine, account recovery)"
+         risk engine, account recovery, federation connectors)"
     );
 
-    // The ledger holds exactly versions 1 through 55.
+    // The ledger holds exactly versions 1 through 56.
     assert_eq!(
         applied_versions(pool).await,
         vec![
             1_i64, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
             24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45,
-            46, 47, 48, 49, 50, 51, 52, 53, 54, 55
+            46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56
         ]
     );
     let phase_of = |version: i64| async move {
@@ -571,6 +571,9 @@ async fn production_chain_is_only_the_fifty_five_real_migrations_and_ships_no_de
     // The account-recovery migration (issue #81) is an EXPAND: one new tenant-scoped
     // recovery-flow state-machine table, no rewrite of existing state.
     assert_eq!(phase_of(55).await, "expand");
+    // The federation-connectors migration (issue #75) is an EXPAND: one new tenant-scoped
+    // table (connectors), no rewrite of existing state.
+    assert_eq!(phase_of(56).await, "expand");
 
     // The step-up second-factor abuse path (issue #72): migration 0047 WIDENED the
     // abuse_bans auth_path CHECK (0046 pinned the closed set) to also admit
@@ -2688,6 +2691,62 @@ async fn production_chain_is_only_the_fifty_five_real_migrations_and_ships_no_de
         assert!(
             check_constraint_exists(pool, "risk_decisions", constraint).await,
             "risk_decisions must carry the {constraint} CHECK constraint"
+        );
+    }
+
+    // Federation connectors (issue #75, migration 0056): one new tenant-scoped table.
+    assert!(
+        table_exists(pool, "connectors").await,
+        "connectors exists after 0056"
+    );
+    for column in [
+        "id",
+        "tenant_id",
+        "environment_id",
+        "connector_slug",
+        "definition_json",
+        "client_secret_sealed",
+        "client_secret_dek_version",
+        "cap_refresh",
+        "cap_groups",
+        "cap_logout_propagation",
+        "cap_email_verified_trust",
+        "enabled",
+    ] {
+        assert!(
+            column_exists(pool, "connectors", column).await,
+            "connectors.{column} exists after 0056"
+        );
+    }
+    // The upstream client secret is SEALED, never a plaintext column.
+    assert_eq!(
+        column_data_type(pool, "connectors", "client_secret_sealed").await,
+        "bytea",
+        "the connector client secret must be a sealed bytea column, never plaintext"
+    );
+    // The definition column is jsonb and SECRET-FREE (the client_secret field is stripped
+    // before storage), so a raw plaintext client_secret column can never exist here.
+    assert!(
+        !column_exists(pool, "connectors", "client_secret").await,
+        "connectors must have no plaintext client_secret column after 0056"
+    );
+    // The tenant-scoped-table obligations: forced RLS, the isolation policy, and the
+    // nonempty-scope CHECK, plus the closed email-verified-trust CHECK.
+    assert!(
+        rls_enabled_and_forced(pool, "connectors").await,
+        "connectors must ENABLE and FORCE row-level security"
+    );
+    assert!(
+        policy_exists(pool, "connectors", "connectors_tenant_isolation").await,
+        "the (tenant, environment) isolation policy must exist on connectors"
+    );
+    for constraint in [
+        "connectors_scope_nonempty",
+        "connectors_email_verified_trust_known",
+    ] {
+        assert!(
+            check_constraint_exists(pool, "connectors", constraint).await,
+            "connectors must carry the {constraint} CHECK constraint"
         );
     }
 }

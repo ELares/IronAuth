@@ -64,6 +64,13 @@ pub const SNAPSHOT_SCHEMA_VERSION: &str = "ironauth.config-snapshot/v1";
 /// import resolves it against the TARGET environment.
 pub const CLIENT_SECRET_REFERENCE: &str = "client_secret";
 
+/// The logical secret-store slot a federation connector's UPSTREAM client secret is
+/// referenced by in a snapshot ([`SecretRef::reference`]). The value itself is sealed
+/// per environment (issue #48) and NEVER travels; the snapshot names the slot, and a
+/// promotion resolves it against the TARGET environment (issue #75). This is the #58
+/// proof that a connector's secret can never leak into an export.
+pub const CONNECTOR_CLIENT_SECRET_REFERENCE: &str = "connector_client_secret";
+
 /// The resource types a snapshot carries.
 ///
 /// This MUST equal exactly the set [`classify`] marks
@@ -73,11 +80,12 @@ pub const CLIENT_SECRET_REFERENCE: &str = "client_secret";
 /// (and by the export), and an environment-identity or runtime type can never be
 /// added without failing it. This is the live binding between the snapshot and the
 /// single source of truth, not a hand-maintained parallel list.
-pub const SNAPSHOT_RESOURCE_TYPES: [ResourceType; 4] = [
+pub const SNAPSHOT_RESOURCE_TYPES: [ResourceType; 5] = [
     ResourceType::Client,
     ResourceType::ResourceServer,
     ResourceType::DcrPolicy,
     ResourceType::Variable,
+    ResourceType::Connector,
 ];
 
 /// A named reference to a secret in the environment-scoped secret store (issue
@@ -200,6 +208,31 @@ pub struct VariableSnapshot {
     pub value: String,
 }
 
+/// The secret-free projection of one federation connector (issue #75). Its
+/// `definition` is the connector's SECRET-FREE definition document (the upstream
+/// client secret is stripped before it is ever stored). A confidential connector
+/// carries a [`SecretRef`] in [`ConnectorSnapshot::secret`] instead of any secret
+/// material: the upstream client secret's VALUE never travels, only the named
+/// reference does, resolved per target environment.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConnectorSnapshot {
+    /// The connector slug, unique per scope: the stable natural key the export
+    /// orders by.
+    pub connector_slug: String,
+    /// The connector's SECRET-FREE definition document (issuer or explicit
+    /// endpoints, scopes, client id, PKCE mode, claim mapping, quirks, and the
+    /// capability matrix). Embedded as parsed JSON so it canonicalizes recursively.
+    /// The upstream `client_secret` field is NOT present.
+    pub definition: serde_json::Value,
+    /// Whether the connector is active.
+    pub enabled: bool,
+    /// A NAMED REFERENCE to the connector's upstream client secret in the
+    /// environment secret store. Never the secret. Resolved against the TARGET
+    /// environment on import.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub secret: Option<SecretRef>,
+}
+
 /// The promotable resources a snapshot carries, keyed by resource-type wire name
 /// (issue #41 classification). Each array is ordered by its type's stable natural
 /// key, so the collection order is deterministic and documented.
@@ -218,6 +251,11 @@ pub struct SnapshotResources {
     /// secret value never appears here; only a variable's plain value does.
     #[serde(default)]
     pub variable: Vec<VariableSnapshot>,
+    /// The environment's federation connectors (`connector`). Each carries the
+    /// connector's secret-free definition and a NAMED REFERENCE to its upstream
+    /// client secret, never the secret value.
+    #[serde(default)]
+    pub connector: Vec<ConnectorSnapshot>,
 }
 
 /// A canonical, deterministic, secret-free snapshot of one environment's
@@ -440,6 +478,31 @@ pub async fn export(scoped: &ScopedStore<'_>) -> Result<Snapshot, StoreError> {
     // the resource servers and policies above.
     variable.sort_by(|a, b| a.name.cmp(&b.name));
 
+    // Federation connectors (issue #75): the connector DEFINITION is promotable
+    // config a snapshot carries; the upstream client SECRET is NEVER read here (its
+    // value is sealed per environment and never travels), so the export carries only
+    // a NAMED REFERENCE to it and stays secret-free by construction. The stored
+    // `definition_json` is already the secret-free projection (the client_secret
+    // field was stripped before it was ever persisted).
+    let mut connector = Vec::new();
+    for record in scoped.connectors().list_all().await? {
+        let definition: serde_json::Value =
+            serde_json::from_str(&record.definition_json).map_err(serde_fault)?;
+        connector.push(ConnectorSnapshot {
+            connector_slug: record.slug,
+            definition,
+            enabled: record.enabled,
+            // Every connector carries an upstream client secret, exported as a named
+            // REFERENCE, never the value (the #58 proof).
+            secret: Some(SecretRef {
+                reference: CONNECTOR_CLIENT_SECRET_REFERENCE.to_string(),
+            }),
+        });
+    }
+    // Re-sort by the stable natural key in Rust for the same collation-independence
+    // reason as the resources above.
+    connector.sort_by(|a, b| a.connector_slug.cmp(&b.connector_slug));
+
     Ok(Snapshot {
         schema_version: SNAPSHOT_SCHEMA_VERSION.to_string(),
         resources: SnapshotResources {
@@ -447,6 +510,7 @@ pub async fn export(scoped: &ScopedStore<'_>) -> Result<Snapshot, StoreError> {
             resource_server,
             dcr_policy,
             variable,
+            connector,
         },
     })
 }
@@ -573,6 +637,10 @@ const DCR_POLICY_KEYS: [&str; 2] = ["name", "primitives"];
 
 /// Every key a snapshot `variable` element may carry (issue #45).
 const VARIABLE_KEYS: [&str; 2] = ["name", "value"];
+
+/// Every key a snapshot `connector` element may carry, besides the secret REFERENCE
+/// slot (issue #75). The published schema pins `additionalProperties: false`.
+const CONNECTOR_KEYS: [&str; 3] = ["connector_slug", "definition", "enabled"];
 
 /// Object keys that would carry RAW secret material and must never appear in a
 /// snapshot: the presence of any is a hard rejection (issue #43, "an import
@@ -792,6 +860,30 @@ fn validate_resource(
                     "missing required string field",
                 )),
             }
+        }
+        ResourceType::Connector => {
+            reject_unknown_keys(
+                object,
+                &CONNECTOR_KEYS,
+                Some(CLIENT_SECRET_KEY),
+                path,
+                violations,
+            );
+            require_nonempty_string(object, "connector_slug", path, violations);
+            match object.get("definition") {
+                Some(serde_json::Value::Object(_)) => {}
+                Some(_) => violations.push(SnapshotViolation::new(
+                    format!("{path}/definition"),
+                    "must be a JSON object",
+                )),
+                None => violations.push(SnapshotViolation::new(
+                    format!("{path}/definition"),
+                    "missing required object field",
+                )),
+            }
+            // The upstream client secret is a REFERENCE, never inline (the #75 / #58
+            // proof), validated exactly like a client's secret slot.
+            validate_secret_field(object, path, violations);
         }
         // Only the promotable set is ever passed here (the caller iterates
         // SNAPSHOT_RESOURCE_TYPES); a non-promotable type is a programmer error, not
@@ -1077,8 +1169,8 @@ mod tests {
         // variable) regardless of struct field order.
         assert_eq!(
             text,
-            "{\"resources\":{\"client\":[],\"dcr_policy\":[],\"resource_server\":[],\"variable\":[]},\
-             \"schema_version\":\"ironauth.config-snapshot/v1\"}"
+            "{\"resources\":{\"client\":[],\"connector\":[],\"dcr_policy\":[],\"resource_server\":[],\
+             \"variable\":[]},\"schema_version\":\"ironauth.config-snapshot/v1\"}"
         );
     }
 
@@ -1132,6 +1224,28 @@ mod tests {
                 .iter()
                 .any(|v| v.path == "/resources/client/0/secret"),
             "a raw secret string must be rejected with its path: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn validate_accepts_a_connector_secret_reference_but_rejects_a_raw_secret() {
+        // A connector's upstream client secret is a REFERENCE, never inline (the #75
+        // / #58 proof). A reference object validates; a raw string is rejected.
+        let definition = r#"{"connector_id":"acme","display_name":"Acme","protocol":"oidc","endpoints":{"issuer":"https://acme.example.com"},"scopes":["openid"],"client_id":"ic"}"#;
+        let ok = format!(
+            r#"{{"schema_version":"{SNAPSHOT_SCHEMA_VERSION}","resources":{{"connector":[{{"connector_slug":"acme","definition":{definition},"enabled":true,"secret":{{"reference":"connector_client_secret"}}}}]}}}}"#
+        );
+        validate_document(ok.as_bytes()).expect("a connector secret reference is valid");
+
+        let bad = format!(
+            r#"{{"schema_version":"{SNAPSHOT_SCHEMA_VERSION}","resources":{{"connector":[{{"connector_slug":"acme","definition":{definition},"enabled":true,"secret":"raw-upstream-secret"}}]}}}}"#
+        );
+        let violations = validate_document(bad.as_bytes()).expect_err("raw secret rejected");
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.path == "/resources/connector/0/secret"),
+            "a raw connector secret must be rejected with its path: {violations:?}"
         );
     }
 
