@@ -180,6 +180,10 @@ pub enum Action {
     EnvironmentCreate,
     /// An environment was deactivated (management plane, issue #11).
     EnvironmentDelete,
+    /// An environment's per-environment auto-link posture override was set (management
+    /// plane, issue #78): the operator opted this environment into (or back out of) the
+    /// verified-to-verified auto-link posture, overriding the deployment default.
+    EnvironmentAutoLinkPostureSet,
     /// A management API key was minted (management plane, issue #11).
     ManagementKeyCreate,
     /// A management API key was revoked (management plane, issue #11).
@@ -864,6 +868,7 @@ impl Action {
             Action::TenantResume => "tenant.resume",
             Action::EnvironmentCreate => "environment.create",
             Action::EnvironmentDelete => "environment.delete",
+            Action::EnvironmentAutoLinkPostureSet => "environment.auto_link_posture.set",
             Action::ManagementKeyCreate => "management_key.create",
             Action::ManagementKeyDelete => "management_key.delete",
             Action::OrganizationCreate => "organization.create",

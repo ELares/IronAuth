@@ -522,6 +522,12 @@ struct Inner {
     // Account recovery (issue #81). Validated at config load.
     recovery_cooldown_secs: u64,
     recovery_delay_secs: u64,
+    // Guarded account linking (issue #78). The DEPLOYMENT-DEFAULT auto-link posture (a
+    // per-environment override in the environments table takes precedence, resolved
+    // lazily on the callback), and the fresh-re-auth window a manual link accepts. Both
+    // validated at config load.
+    auto_link_posture: ironauth_config::AutoLinkPosture,
+    link_reauth_max_age_secs: u64,
 }
 
 impl OidcState {
@@ -692,6 +698,8 @@ impl OidcState {
                 sms_route_throttle_secs: config.sms_route_throttle_secs,
                 recovery_cooldown_secs: config.recovery_cooldown_secs,
                 recovery_delay_secs: config.recovery_delay_secs,
+                auto_link_posture: config.federation.auto_link_posture,
+                link_reauth_max_age_secs: config.federation.link_reauth_max_age_secs,
             }),
             revocation_sink: default_sink(),
             introspection_serializer: default_serializer(),
@@ -2198,6 +2206,39 @@ impl OidcState {
         crate::recovery::RecoverySettings {
             cooldown_secs: self.inner.recovery_cooldown_secs,
             delay_secs: self.inner.recovery_delay_secs,
+        }
+    }
+
+    /// The fresh-re-authentication window (in seconds) a self-service manual account
+    /// link accepts (issue #78, FORK C): the `start` leg refuses unless
+    /// `now - auth_time <= link_reauth_max_age_secs`. Validated at config load.
+    #[must_use]
+    pub(crate) fn link_reauth_max_age_secs(&self) -> u64 {
+        self.inner.link_reauth_max_age_secs
+    }
+
+    /// Resolve the EFFECTIVE auto-link posture for `scope` (issue #78, FORK B): the
+    /// PER-ENVIRONMENT override from the `environments` table when the operator set one,
+    /// else the deployment-config default. The override is read through the scope-forced
+    /// `environment_guardrails` projection (the data plane holds no direct grant on the
+    /// level table), so an environment can only ever read its own posture. A store fault
+    /// or an unprovisioned/unparseable value falls back to the deployment default, so the
+    /// resolution is fail-safe (never MORE permissive than the default on an error, since
+    /// the default is the conservative `Off`).
+    pub(crate) async fn effective_auto_link_posture(
+        &self,
+        scope: Scope,
+    ) -> ironauth_config::AutoLinkPosture {
+        match self
+            .store()
+            .scoped(scope)
+            .environment_guardrails()
+            .auto_link_posture()
+            .await
+        {
+            Ok(Some(token)) => ironauth_config::AutoLinkPosture::parse(&token)
+                .unwrap_or(self.inner.auto_link_posture),
+            Ok(None) | Err(_) => self.inner.auto_link_posture,
         }
     }
 

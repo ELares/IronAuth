@@ -1883,6 +1883,19 @@ impl AutoLinkPosture {
             AutoLinkPosture::VerifiedToVerified => "verified_to_verified",
         }
     }
+
+    /// Parse the stable wire string (`off`, `verified_to_verified`) back into a posture,
+    /// or [`None`] for any other token. Used by the per-environment override read (issue
+    /// #78, FORK B): the stored column token round-trips through this, and an
+    /// unrecognized token falls back to the deployment default rather than coercing.
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "off" => Some(AutoLinkPosture::Off),
+            "verified_to_verified" => Some(AutoLinkPosture::VerifiedToVerified),
+            _ => None,
+        }
+    }
 }
 
 /// The largest fresh-re-auth window (in seconds) manual account linking may be

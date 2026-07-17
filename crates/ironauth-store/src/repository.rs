@@ -8657,6 +8657,35 @@ impl EnvironmentGuardrailRepo<'_> {
         })?;
         Ok(GuardrailSet::for_kind(kind))
     }
+
+    /// Resolve this environment's PER-ENVIRONMENT auto-link posture override (issue #78,
+    /// FORK B), or [`None`] when the environment inherits the deployment default. Read
+    /// through the SAME scope-forced `environment_guardrails` projection as the guardrail
+    /// kind, so a request can never read another environment's posture, and the data
+    /// plane needs no direct grant on the `environments` level table. The stored token is
+    /// the raw column value (`off` / `verified_to_verified`, pinned by the column CHECK);
+    /// the OIDC layer parses it into its typed posture, falling back to the deployment
+    /// default on [`None`].
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the environment has no projection row in scope (an
+    /// unprovisioned or cross-scope environment); [`StoreError::Database`] on a
+    /// persistence fault.
+    pub async fn auto_link_posture(&self) -> Result<Option<String>, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT auto_link_posture FROM environment_guardrails \
+             WHERE tenant_id = $1 AND environment_id = $2",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        let row = row.ok_or(StoreError::NotFound)?;
+        Ok(row.get::<Option<String>, _>("auto_link_posture"))
+    }
 }
 
 /// The mutating signing-key repository (issue #19). Reachable only through
@@ -19058,9 +19087,10 @@ impl FederationLoginStateRepo<'_> {
         let result = sqlx::query(
             "INSERT INTO federation_login_states \
              (id, tenant_id, environment_id, state, nonce, code_verifier_sealed, \
-              code_verifier_dek_version, connector_id, return_to, org_connection_id, expires_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, \
-                     TIMESTAMPTZ 'epoch' + ($11::text || ' microseconds')::interval)",
+              code_verifier_dek_version, connector_id, return_to, org_connection_id, \
+              link_target_user_id, expires_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, \
+                     TIMESTAMPTZ 'epoch' + ($12::text || ' microseconds')::interval)",
         )
         .bind(id.to_string())
         .bind(scope.tenant().to_string())
@@ -19072,6 +19102,7 @@ impl FederationLoginStateRepo<'_> {
         .bind(params.connector_id)
         .bind(params.return_to)
         .bind(params.org_connection_id)
+        .bind(params.link_target_user_id)
         .bind(params.expires_at_unix_micros)
         .execute(&mut *tx)
         .await;
@@ -19110,7 +19141,7 @@ impl FederationLoginStateRepo<'_> {
                AND consumed_at IS NULL \
                AND expires_at > TIMESTAMPTZ 'epoch' + ($2::text || ' microseconds')::interval \
              RETURNING id, nonce, code_verifier_sealed, code_verifier_dek_version, \
-                       connector_id, return_to, org_connection_id",
+                       connector_id, return_to, org_connection_id, link_target_user_id",
         )
         .bind(state)
         .bind(now_unix_micros)
@@ -19138,6 +19169,7 @@ impl FederationLoginStateRepo<'_> {
             connector_id: row.get("connector_id"),
             return_to: row.get("return_to"),
             org_connection_id: row.get("org_connection_id"),
+            link_target_user_id: row.get("link_target_user_id"),
         };
         tx.commit().await?;
         Ok(Some(consumed))
@@ -27146,6 +27178,57 @@ impl ActingEnvironmentRepo<'_> {
                 // its keys are its own identity from creation.
                 insert_signing_key_row(tx, &scope, &signing_key).await?;
                 insert_idempotency(tx, idempotency).await?;
+                Ok(())
+            },
+            false,
+        )
+        .await
+    }
+
+    /// Set (or clear) an environment's PER-ENVIRONMENT auto-link posture override
+    /// (issue #78, FORK B): the control-plane write behind the deployment default.
+    /// `posture` is the wire token (`off` / `verified_to_verified`) the column CHECK
+    /// pins, or [`None`] to CLEAR the override so the environment inherits the
+    /// deployment default. Audited `environment.auto_link_posture.set` in the same
+    /// transaction. The write is scoped to `(tenant, environment)` and touches ONLY the
+    /// `auto_link_posture` column (the control role holds a column-scoped UPDATE grant).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if no live environment matched under this tenant;
+    /// [`StoreError::Database`] on a persistence failure (a token outside the closed set
+    /// is rejected by the column CHECK).
+    pub async fn set_auto_link_posture(
+        &self,
+        env: &Env,
+        id: &EnvironmentId,
+        posture: Option<&str>,
+    ) -> Result<(), StoreError> {
+        let scope = Scope::new(self.tenant, *id);
+        let tenant = self.tenant;
+        let posture = posture.map(str::to_owned);
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::EnvironmentAutoLinkPostureSet,
+                target: id,
+            },
+            async move |tx| {
+                let updated = sqlx::query(
+                    "UPDATE environments SET auto_link_posture = $1 \
+                     WHERE id = $2 AND tenant_id = $3 AND deleted_at IS NULL",
+                )
+                .bind(posture.as_deref())
+                .bind(id.to_string())
+                .bind(tenant.to_string())
+                .execute(&mut **tx)
+                .await?;
+                if updated.rows_affected() == 0 {
+                    return Err(StoreError::NotFound);
+                }
                 Ok(())
             },
             false,

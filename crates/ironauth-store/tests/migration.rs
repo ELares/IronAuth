@@ -435,7 +435,7 @@ async fn expand_contract_example_chain_runs_all_three_phases_and_contract_remove
 // per real table); splitting it would not make it clearer.
 #[allow(clippy::too_many_lines)]
 #[tokio::test]
-async fn production_chain_is_only_the_sixty_one_real_migrations_and_ships_no_demo_object() {
+async fn production_chain_is_only_the_sixty_two_real_migrations_and_ships_no_demo_object() {
     // TestDatabase::start runs Store::migrate() (the production chain) on a
     // fresh, empty database.
     let db = TestDatabase::start().await;
@@ -452,8 +452,8 @@ async fn production_chain_is_only_the_sixty_one_real_migrations_and_ships_no_dem
     );
     assert_eq!(
         report.already_applied(),
-        61,
-        "the production chain is exactly sixty-one migrations (isolation, audit log, management \
+        62,
+        "the production chain is exactly sixty-two migrations (isolation, audit log, management \
          API, OIDC authorization, signing keys, login/consent, authentication context, redirect \
          registration, UserInfo claims, consent scope upsert, resource servers, opaque access \
          tokens, client auth suite, dynamic client registration, pushed authorization requests, \
@@ -469,16 +469,16 @@ async fn production_chain_is_only_the_sixty_one_real_migrations_and_ships_no_dem
          policies, guarded SMS OTP, passkey attestation, admin sudo elevations, trusted devices, \
          risk engine, account recovery, federation connectors, registration abuse defenses, \
          federation login state, enterprise inbound routing, upstream token vault, \
-         guarded account links)"
+         guarded account links, account linking wiring)"
     );
 
-    // The ledger holds exactly versions 1 through 61.
+    // The ledger holds exactly versions 1 through 62.
     assert_eq!(
         applied_versions(pool).await,
         vec![
             1_i64, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
             24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45,
-            46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61
+            46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62
         ]
     );
     let phase_of = |version: i64| async move {
@@ -704,6 +704,10 @@ async fn production_chain_is_only_the_sixty_one_real_migrations_and_ships_no_dem
     // The guarded-account-linking migration (issue #78, PR 1) is an EXPAND: one new
     // tenant-scoped table (account_links), no rewrite of existing state.
     assert_eq!(phase_of(61).await, "expand");
+    // The account-linking wiring migration (issue #78, PR 2) is an EXPAND: two additive
+    // nullable columns (federation_login_states.link_target_user_id and
+    // environments.auto_link_posture) plus one view replace and one column grant.
+    assert_eq!(phase_of(62).await, "expand");
 
     // The step-up second-factor abuse path (issue #72): migration 0047 WIDENED the
     // abuse_bans auth_path CHECK (0046 pinned the closed set) to also admit
@@ -3329,6 +3333,28 @@ async fn production_chain_is_only_the_sixty_one_real_migrations_and_ships_no_dem
     assert!(
         fk_references(pool, "account_links", "user_id").await,
         "account_links.user_id must be a FOREIGN KEY into users"
+    );
+
+    // The account-linking wiring migration (issue #78, PR 2): two additive nullable
+    // columns. The manual-link purpose marker on the single-use correlation row, and the
+    // per-environment auto-link posture override on the environments level table.
+    assert!(
+        column_exists(pool, "federation_login_states", "link_target_user_id").await,
+        "federation_login_states.link_target_user_id exists after 0062"
+    );
+    assert!(
+        column_exists(pool, "environments", "auto_link_posture").await,
+        "environments.auto_link_posture exists after 0062"
+    );
+    // The per-environment posture is a nullable override (NULL inherits the deployment
+    // default), and its closed vocabulary is pinned by a CHECK.
+    assert!(
+        !column_is_not_null(pool, "environments", "auto_link_posture").await,
+        "environments.auto_link_posture must be nullable (NULL inherits the deployment default)"
+    );
+    assert!(
+        check_constraint_exists(pool, "environments", "environments_auto_link_posture_valid").await,
+        "environments must carry the auto_link_posture closed-vocabulary CHECK"
     );
 }
 

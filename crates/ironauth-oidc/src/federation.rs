@@ -40,19 +40,21 @@ use axum::response::Response;
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use ironauth_connector::{
-    ClaimSources, ClientAuth, ConnectorError, ConnectorRuntimeConfig, Endpoints, PkceMode,
-    ResolvedEndpoints, TraitDocument, TraitPointerFailure, TraitSchemaView, discovery_url,
-    evaluate, parse_discovery,
+    ClaimSources, ClientAuth, ConnectorError, ConnectorRuntimeConfig, EmailVerifiedTrust,
+    Endpoints, PkceMode, ResolvedEndpoints, TraitDocument, TraitPointerFailure, TraitSchemaView,
+    discovery_url, evaluate, parse_discovery,
 };
 use ironauth_env::Clock;
 use ironauth_fetch::{FetchError, FetchPurpose, FetchRequest, Fetcher};
 use ironauth_jose::{JwsAlgorithm, TrustedKey, VerificationPolicy, verify};
 use ironauth_store::{
-    ConnectorId, FederationLoginStateId, NewAdminUser, NewFederationLoginState, NewUpstreamTokens,
-    OrgConnectionId, Scope, SessionId, StoreError, TraitSchema, UpstreamTokenId, UserId, UserState,
+    AccountLinkId, AccountLinkMethod, ConnectorId, FederationLoginStateId, IdentifierType,
+    NewAccountLink, NewAdminUser, NewFederationLoginState, NewUpstreamTokens, OrgConnectionId,
+    Scope, SessionId, StoreError, TraitSchema, UpstreamTokenId, UserId, UserState,
 };
 use sha2::{Digest, Sha256};
 
+use crate::account_linking::{self, LinkDecision};
 use crate::authn::{self, AuthenticationEvent};
 use crate::broker_overlay;
 use crate::federation_client_secret::{SignedJwtInputs, generate_signed_jwt};
@@ -62,6 +64,7 @@ use crate::federation_relay::{EMAIL_RELAY_TRAIT, is_relay_email};
 use crate::interaction;
 use crate::state::OidcState;
 use crate::util::{append_query, epoch_micros, percent_encode_query, query_get};
+use crate::verification::VerificationPurpose;
 use crate::wellknown::{not_found, parse_scope};
 
 /// The verified, honest identity recovered from a validated upstream ID token (issue
@@ -660,22 +663,96 @@ pub async fn federation_authorize(
         return interaction::invalid_link_page();
     }
 
+    // Mint the upstream authorize leg through the SHARED builder (issue #78): it loads the
+    // connector, applies the health backoff, resolves the endpoint and PKCE, verifies any
+    // routed org token, and persists the single-use correlation row. A direct login carries
+    // NO manual-link target; the self-service manual-link `start` leg (account.rs) calls the
+    // SAME builder with a target so the linking purpose is bound to the correlation row
+    // identically and the two entry points cannot drift.
+    let routing_param = query.as_deref().and_then(|q| query_get(q, "routing"));
+    match issue_upstream_authorize(IssueAuthorize {
+        state: &state,
+        runtime,
+        scope,
+        tenant_id: &tenant_id,
+        environment_id: &environment_id,
+        connector_slug: &connector_slug,
+        return_to: &resume.return_to,
+        routing_param: routing_param.as_deref(),
+        link_target: None,
+    })
+    .await
+    {
+        Ok(location) => interaction::redirect(&location),
+        Err(response) => response,
+    }
+}
+
+/// The inputs to the shared upstream-authorize builder (issue #75, PR B / issue #78, PR 2).
+pub(crate) struct IssueAuthorize<'a> {
+    /// The OIDC application state.
+    pub state: &'a OidcState,
+    /// The installed federation runtime (health registry and fetch path).
+    pub runtime: &'a FederationRuntime,
+    /// The tenant/environment scope.
+    pub scope: Scope,
+    /// The route tenant id (for the redirect URI).
+    pub tenant_id: &'a str,
+    /// The route environment id (for the redirect URI).
+    pub environment_id: &'a str,
+    /// The connector's per-environment slug.
+    pub connector_slug: &'a str,
+    /// The pending resume target persisted on the correlation row (a local `/authorize` for
+    /// an ordinary login, or a benign account path for a manual link).
+    pub return_to: &'a str,
+    /// A routed org-connection routing token to verify (issue #77), or [`None`].
+    pub routing_param: Option<&'a str>,
+    /// The self-service manual-link TARGET local user (issue #78), persisted on the
+    /// correlation row so the callback binds this federated identity to that account, or
+    /// [`None`] for an ordinary federated login.
+    pub link_target: Option<&'a UserId>,
+}
+
+/// Build the upstream authorize URL for a federated login leg and persist its single-use
+/// correlation row (issue #75, PR B). Shared by the public federation authorize handler and
+/// the self-service manual-link `start` leg (issue #78 section 4): both load the connector,
+/// apply the per-connector health backoff, resolve the upstream endpoint and PKCE, verify
+/// any routed org token, and persist the correlation row (carrying the optional manual-link
+/// target), so the two entry points cannot drift in how a leg is minted or how its purpose
+/// is bound. Returns the upstream `Location` on success, or the typed response to send.
+// One linear authorize-leg build (connector -> health -> endpoint -> PKCE -> routing ->
+// persist -> URL); splitting it would scatter the single leg-minting flow.
+#[allow(clippy::too_many_lines)]
+pub(crate) async fn issue_upstream_authorize(
+    input: IssueAuthorize<'_>,
+) -> Result<String, Response> {
+    let IssueAuthorize {
+        state,
+        runtime,
+        scope,
+        tenant_id,
+        environment_id,
+        connector_slug,
+        return_to,
+        routing_param,
+        link_target,
+    } = input;
     // Load the connector by its per-environment slug. An absent or disabled connector is a
     // uniform not-found (no oracle for which slugs exist).
     let record = match state
         .store()
         .scoped(scope)
         .connectors()
-        .by_slug(&connector_slug)
+        .by_slug(connector_slug)
         .await
     {
         Ok(Some(record)) if record.enabled => record,
-        Ok(_) => return not_found(),
-        Err(_) => return interaction::server_error_page(),
+        Ok(_) => return Err(not_found()),
+        Err(_) => return Err(interaction::server_error_page()),
     };
     let Ok(definition) = serde_json::from_str::<ConnectorRuntimeConfig>(&record.definition_json)
     else {
-        return interaction::server_error_page();
+        return Err(interaction::server_error_page());
     };
 
     // Reject an explicit-endpoint connector UP FRONT (issue #75, LOW-3), before any `state`
@@ -683,7 +760,7 @@ pub async fn federation_authorize(
     // connector, so an explicit set cannot complete the callback. Failing here gives the
     // operator a clean, documented error instead of a 500 after the user has authenticated.
     if matches!(definition.endpoints, Endpoints::Explicit(_)) {
-        return interaction::federation_unsupported_page();
+        return Err(interaction::federation_unsupported_page());
     }
 
     let now = state.now();
@@ -697,30 +774,19 @@ pub async fn federation_authorize(
     // upstream still inside its backoff window fails THIS connector cleanly and typed, without
     // hammering the upstream, while every sibling connector and the core OP surface keep serving.
     if let Admission::Deny(reason) = runtime.health().admit(now, &connector_key, fingerprint) {
-        return interaction::connector_unavailable_page(reason.as_str());
+        return Err(interaction::connector_unavailable_page(reason.as_str()));
     }
-    // Resolve the connector's endpoints, recording a FAILURE against the connector's health. A
-    // blocked, timed-out, or malformed discovery fetch is an UpstreamUnavailable / UpstreamProtocol
-    // fault: it arms the backoff and surfaces the TYPED connector-unavailable error for this
-    // connector only, never a process-wide failure.
-    //
-    // The success side is DELIBERATELY not recorded here (issue #76, review MEDIUM): a discovery-
-    // form connector resolves from the discovery CACHE with no network, so treating that as a
-    // success would clear the backoff and flap the health gauge to healthy for a connector whose
-    // token endpoint / JWKS / ID-token validation is down -- pinning the backoff at its base
-    // window and lying about the connector's health. record_success is reserved for the CALLBACK's
-    // COMPLETED login (a fully provisioned session), the only real success signal. The authorize
-    // leg still admit-gates above (denying during backoff); resolving cached discovery is not a win.
     // Resolve the upstream authorize endpoint per protocol (issue #74). An OIDC discovery
     // connector fetches (and caches) its discovery document to learn the endpoint and its
     // PKCE support, sends a `nonce`, and binds the ID token's `iss`. An OAuth2 connector
     // (GitHub) has explicit endpoints and NO ID token, so it takes the authorize endpoint
-    // directly and sends no `nonce` (there is no ID token to bind it to).
+    // directly and sends no `nonce`. The success side is DELIBERATELY not recorded here
+    // (issue #76): record_success is reserved for the callback's COMPLETED login.
     let (authorize_url, advertises_s256, send_nonce) = match &definition.endpoints {
         Endpoints::OAuth2(oauth2) => (oauth2.authorize_url().to_owned(), false, false),
         Endpoints::Explicit(_) => {
             // Rejected up front above; unreachable, but fail closed rather than panic.
-            return interaction::federation_unsupported_page();
+            return Err(interaction::federation_unsupported_page());
         }
         Endpoints::Discovery(_) => match runtime
             .resolve_endpoints(now, &connector_key, &definition.endpoints)
@@ -735,13 +801,13 @@ pub async fn federation_authorize(
                 runtime
                     .health()
                     .record_failure(now, &connector_key, fingerprint, &error);
-                return interaction::connector_unavailable_page(error.kind());
+                return Err(interaction::connector_unavailable_page(error.kind()));
             }
         },
     };
 
-    let state_value = random_token(&state);
-    let nonce = random_token(&state);
+    let state_value = random_token(state);
+    let nonce = random_token(state);
     // PKCE to the upstream: send an S256 challenge when the connector requires it, or when
     // it is auto and the upstream advertises S256. An explicit-endpoint upstream advertises
     // nothing, so auto omits PKCE there (the conservative interoperable default).
@@ -750,53 +816,48 @@ pub async fn federation_authorize(
         PkceMode::Required => true,
         PkceMode::AutoWhereSupported => advertises_s256,
     };
-    let code_verifier = use_pkce.then(|| random_token(&state));
+    let code_verifier = use_pkce.then(|| random_token(state));
     let code_challenge = code_verifier.as_deref().map(s256_challenge);
 
-    let redirect_uri =
-        federation_callback_url(&state, &tenant_id, &environment_id, &connector_slug);
+    let redirect_uri = federation_callback_url(state, tenant_id, environment_id, connector_slug);
 
-    // The routed org connection (issue #77 security fix): the login surface, having routed
-    // a login by domain/app/user, passes a server-authenticated ROUTING TOKEN (a keyed MAC
-    // minted in the store, binding the org connection to THIS connector, this scope, and a
-    // short expiry). We verify the token here, so the browser cannot swap the org to a
-    // sibling that shares the connector, replay it on another connector, or replay it after
-    // expiry: a tampered, cross-connector, cross-scope, or expired token fails closed to the
-    // uniform not-found (no oracle). An ABSENT param is a direct (non-routed) federated
-    // login, which carries no org binding. Verifying the token proves PROVENANCE; the store
-    // lookup below still re-proves the binding is in scope, references this connector, and is
-    // enabled (defence in depth). The callback re-derives the org from the CONSUMED row,
-    // never from the callback query.
-    let routed_org_connection = match query.as_deref().and_then(|q| query_get(q, "routing")) {
+    // The routed org connection (issue #77 security fix): a server-authenticated routing
+    // token binds the org connection to THIS connector, scope, and a short expiry. A
+    // tampered, cross-connector, cross-scope, or expired token fails closed to the uniform
+    // not-found. An ABSENT param is a direct (non-routed) login. The callback re-derives the
+    // org from the CONSUMED row, never from the callback query.
+    let routed_org_connection = match routing_param {
         Some(raw) => {
             let scoped = state.store().scoped(scope);
             let now_micros = epoch_micros(now);
             let Some(ocn_string) =
                 scoped
                     .org_connections()
-                    .verify_routing_token(&raw, &connector_slug, now_micros)
+                    .verify_routing_token(raw, connector_slug, now_micros)
             else {
-                return not_found();
+                return Err(not_found());
             };
             let Ok(ocn_id) = scoped.org_connections().parse_id(&ocn_string) else {
-                return not_found();
+                return Err(not_found());
             };
             match scoped.org_connections().get(&ocn_id).await {
                 Ok(binding) if binding.enabled && binding.connector_id == record.id.to_string() => {
                     Some(ocn_id.to_string())
                 }
-                Ok(_) | Err(StoreError::NotFound) => return not_found(),
-                Err(_) => return interaction::server_error_page(),
+                Ok(_) | Err(StoreError::NotFound) => return Err(not_found()),
+                Err(_) => return Err(interaction::server_error_page()),
             }
         }
         None => None,
     };
 
     // Persist the single-use correlation row. The verifier is sealed by the store; an
-    // absent verifier is sealed empty.
+    // absent verifier is sealed empty. The manual-link target (issue #78) rides the row so
+    // the callback re-derives it server-side, never from the browser.
     let fls_id = FederationLoginStateId::generate(state.env(), &scope);
     let expires_at = epoch_micros(now.checked_add(FEDERATION_STATE_TTL).unwrap_or(now));
     let verifier_bytes = code_verifier.as_deref().unwrap_or("").as_bytes();
+    let link_target_str = link_target.map(std::string::ToString::to_string);
     let persisted = state
         .store()
         .scoped(scope)
@@ -809,14 +870,15 @@ pub async fn federation_authorize(
                 nonce: &nonce,
                 code_verifier: verifier_bytes,
                 connector_id: &record.id.to_string(),
-                return_to: &resume.return_to,
+                return_to,
                 org_connection_id: routed_org_connection.as_deref(),
+                link_target_user_id: link_target_str.as_deref(),
                 expires_at_unix_micros: expires_at,
             },
         )
         .await;
     if persisted.is_err() {
-        return interaction::server_error_page();
+        return Err(interaction::server_error_page());
     }
 
     // Build the upstream authorization URL.
@@ -837,23 +899,16 @@ pub async fn federation_authorize(
         params.push(("code_challenge", Some(challenge)));
         params.push(("code_challenge_method", Some("S256")));
     }
-    // Parameter passthrough (issue #76): forward EXACTLY the three OIDC Core 3.1.2.1
-    // authentication-request params on the STRICT allowlist (prompt, login_hint, ui_locales)
-    // from the DOWNSTREAM authorization request (the validated resume target's query) to the
-    // UPSTREAM authorize request, each gated by the connector's per-param disable flag. NOTHING
-    // outside the allowlist is ever read or forwarded (a downstream param not on the list can
-    // never reach the upstream). Each value is bounded and rides ONLY this query, percent-encoded
-    // by append_query -- never a header, path, or log (no injection surface).
-    let downstream_query = resume
-        .return_to
-        .split_once('?')
-        .map_or("", |(_, query)| query);
+    // Parameter passthrough (issue #76): forward EXACTLY the three OIDC Core 3.1.2.1 params on
+    // the STRICT allowlist (prompt, login_hint, ui_locales) from the DOWNSTREAM authorization
+    // request, each gated by the connector's per-param disable flag. A manual-link `start`
+    // return target carries no downstream query, so nothing is forwarded there.
+    let downstream_query = return_to.split_once('?').map_or("", |(_, query)| query);
     let forwarded = passthrough_params(downstream_query, definition.passthrough);
     for (name, value) in &forwarded {
         params.push((name, Some(value.as_str())));
     }
-    let location = append_query(&authorize_url, &params);
-    interaction::redirect(&location)
+    Ok(append_query(&authorize_url, &params))
 }
 
 /// GET `/t/{tenant}/e/{env}/federation/{connector_slug}/callback` (issue #75, PR B): the
@@ -971,6 +1026,7 @@ pub async fn federation_callback(
                 code: &code,
                 headers: &headers,
                 return_to: &consumed.return_to,
+                link_target_user_id: consumed.link_target_user_id.as_deref(),
                 now,
                 now_micros,
             },
@@ -1144,6 +1200,7 @@ pub async fn federation_callback(
         captured_tokens,
         headers: &headers,
         return_to: &consumed.return_to,
+        link_target_user_id: consumed.link_target_user_id.as_deref(),
         now,
         now_micros,
     })
@@ -1186,6 +1243,12 @@ pub(crate) struct FinalizeLogin<'a> {
     pub headers: &'a HeaderMap,
     /// The pending LOCAL authorization request to resume after the federated login.
     pub return_to: &'a str,
+    /// The SELF-SERVICE manual-link target local user (issue #78, PR 2): re-derived from
+    /// the CONSUMED correlation row (never the browser), it is [`Some`] only for a manual
+    /// link the account owner started after a fresh re-authentication of THAT account. It
+    /// binds this federated identity to that local user instead of provisioning a
+    /// separate account. [`None`] is an ordinary federated login.
+    pub link_target_user_id: Option<&'a str>,
     /// The callback instant from the clock seam.
     pub now: SystemTime,
     /// The callback instant in epoch microseconds.
@@ -1219,6 +1282,7 @@ pub(crate) async fn finalize_federated_login(finalize: FinalizeLogin<'_>) -> Res
         captured_tokens,
         headers,
         return_to,
+        link_target_user_id,
         now,
         now_micros,
     } = finalize;
@@ -1316,23 +1380,48 @@ pub(crate) async fn finalize_federated_login(finalize: FinalizeLogin<'_>) -> Res
         }
     };
 
-    // Provision the local identity keyed on the verified, issuer-namespaced `(issuer, sub)`
-    // composite (never the mapped subject). A first login creates it with the mapped traits; a
-    // returning login refreshes them (Apple's reused profile round-trips to the same values).
+    // Guarded account linking (issue #78, PR 2): BEFORE provisioning a separate federated
+    // account, dispatch on the trust decision. It either binds this federated identity to an
+    // EXISTING local account (a self-service manual link, an auto-link, or a returning linked
+    // login) or falls through to today's separate-account provisioning. The dispatch NEVER
+    // promotes a local identity's server-owned verified flag; the only verified state a link
+    // touches is the link's OWN immutable snapshot (issue #78 section 5).
     let schema_version = active_schema.as_ref().map(|version| version.version);
-    let Ok(user_id) = provision_federated_user(
+    let user_id = match dispatch_account_linking(AccountLinkingDispatch {
         state,
         scope,
-        connector_slug,
+        connector_key,
         issuer,
         identity,
-        &trait_doc,
-        schema_version,
-        org_connection_id,
-    )
+        definition,
+        link_target_user_id,
+    })
     .await
-    else {
-        return interaction::server_error_page();
+    {
+        // The interstitial or a fail-closed page: return WITHOUT a session and without a link.
+        LinkDispatch::Respond(response) => return response,
+        // Bind the session to the local account the decision resolved (the link row, when a
+        // new one is warranted, was already created and notified inside the dispatch).
+        LinkDispatch::Session(user_id) => user_id,
+        // The safe default: provision the separate federated identity exactly as issue #77
+        // does today, keyed on the verified, issuer-namespaced `(issuer, sub)` composite.
+        LinkDispatch::Provision => {
+            let Ok(user_id) = provision_federated_user(
+                state,
+                scope,
+                connector_slug,
+                issuer,
+                identity,
+                &trait_doc,
+                schema_version,
+                org_connection_id,
+            )
+            .await
+            else {
+                return interaction::server_error_page();
+            };
+            user_id
+        }
     };
 
     // Establish the LOCAL session with the HONEST federated authentication event: the local
@@ -1408,6 +1497,306 @@ pub(crate) async fn finalize_federated_login(finalize: FinalizeLogin<'_>) -> Res
         // An unmet overlay: return the ceremony redirect (or fail-closed page) instead.
         broker_overlay::CallbackOverlay::Respond(response) => response,
     }
+}
+
+/// The inputs the guarded account-linking dispatch reads (issue #78, PR 2).
+struct AccountLinkingDispatch<'a> {
+    /// The OIDC application state.
+    state: &'a OidcState,
+    /// The tenant/environment scope.
+    scope: Scope,
+    /// The connector id (the `cnr_` health-registry key), the `account_links` connector.
+    connector_key: &'a str,
+    /// The identity NAMESPACE for the federated external id (the upstream issuer).
+    issuer: &'a str,
+    /// The verified upstream identity (email, subject, and the JOSE-verified claim map).
+    identity: &'a VerifiedUpstreamIdentity,
+    /// The connector's secret-free runtime config (its capability matrix carries the
+    /// `email_verified` trust flag the decision reads).
+    definition: &'a ConnectorRuntimeConfig,
+    /// The self-service manual-link target local user id, re-derived from the CONSUMED
+    /// correlation row, or [`None`] for an ordinary federated login.
+    link_target_user_id: Option<&'a str>,
+}
+
+/// What the account-linking dispatch resolved a federated login to (issue #78, PR 2).
+enum LinkDispatch {
+    /// Provision a SEPARATE federated account (today's issue #77 default).
+    Provision,
+    /// Establish the session AS this LOCAL user: a returning linked login, an auto-link, or
+    /// a completed manual link. Any NEW `account_links` row was already created (audited)
+    /// and the account notified inside the dispatch.
+    Session(UserId),
+    /// Return this response verbatim WITHOUT a session or a link: the manual-link
+    /// interstitial, an already-linked notice, or a fail-closed page.
+    Respond(Response),
+}
+
+/// Dispatch a federated login through the guarded account-linking decision (issue #78,
+/// section 7). In order:
+///
+///   1. A self-service MANUAL LINK whose target was authorized by a fresh re-authentication
+///      of THAT account (the purpose re-derived from the consumed correlation row): bind
+///      this federated identity to the target local user.
+///   2. A RETURNING linked login: this federated identity is already bound to a local user,
+///      so establish the session AS that user, never re-provisioning a separate account.
+///   3. Otherwise the pure trust decision table: an auto-link into a verified local account
+///      (the single all-green arm), the manual-link interstitial, or the separate-account
+///      default.
+///
+/// The dispatch NEVER writes a local identity's `user_identifiers.verified` flag (issue #78
+/// section 5); the only verified state it records is the link's OWN immutable snapshot.
+async fn dispatch_account_linking(dispatch: AccountLinkingDispatch<'_>) -> LinkDispatch {
+    let AccountLinkingDispatch {
+        state,
+        scope,
+        connector_key,
+        issuer,
+        identity,
+        definition,
+        link_target_user_id,
+    } = dispatch;
+    let external_id = federated_external_id(issuer, &identity.subject);
+
+    // 1. A self-service manual link in progress. The target is server-derived; it can bind
+    //    ONLY into the account whose fresh re-auth minted the correlation row.
+    if let Some(target) = link_target_user_id {
+        return complete_manual_link(
+            state,
+            scope,
+            connector_key,
+            &external_id,
+            identity,
+            definition,
+            target,
+        )
+        .await;
+    }
+
+    // 2. A returning linked login: resolve the existing binding for this federated identity
+    //    and establish the session as the local user it is linked to.
+    match state
+        .store()
+        .scoped(scope)
+        .account_links()
+        .resolve(connector_key, &external_id)
+        .await
+    {
+        Ok(Some(link)) => {
+            let Ok(user_id) = UserId::parse_in_scope(&link.user_id, &scope) else {
+                return LinkDispatch::Respond(interaction::server_error_page());
+            };
+            return LinkDispatch::Session(user_id);
+        }
+        Ok(None) => {}
+        Err(_) => return LinkDispatch::Respond(interaction::server_error_page()),
+    }
+
+    // 3. No link yet: consult the pure trust decision with the EFFECTIVE per-environment
+    //    posture (FORK B), the local email match against the server-owned verified state, the
+    //    JOSE-verified upstream email_verified claim, and the connector's trust capability.
+    let posture = state.effective_auto_link_posture(scope).await;
+    let upstream_verified = matches!(
+        identity.claims.get("email_verified"),
+        Some(serde_json::Value::Bool(true))
+    );
+    let connector_trust = definition.capabilities.email_verified_trust;
+    // The local match is BY EMAIL via the blind-index lookup (never a plaintext scan). A
+    // relay or absent email finds no local account (relay logins never auto-link).
+    let (local_exists, verified_local_user) = match identity.email.as_deref() {
+        Some(email) => match resolve_local_email_match(state, scope, email).await {
+            Ok(pair) => pair,
+            Err(_) => return LinkDispatch::Respond(interaction::server_error_page()),
+        },
+        None => (false, None),
+    };
+    let local_verified = verified_local_user.is_some();
+
+    match account_linking::link_decision(
+        posture,
+        local_exists,
+        local_verified,
+        upstream_verified,
+        connector_trust,
+    ) {
+        LinkDecision::SeparateFederatedAccount => LinkDispatch::Provision,
+        LinkDecision::ManualLinkInterstitial => {
+            LinkDispatch::Respond(interaction::link_interstitial_page())
+        }
+        // The reserved never-produced arm: fail closed (never a silent merge).
+        LinkDecision::Refuse => LinkDispatch::Respond(interaction::server_error_page()),
+        LinkDecision::AutoLink => {
+            // The single AutoLink arm is reached only with a verified local match present.
+            let Some(local_user) = verified_local_user else {
+                return LinkDispatch::Respond(interaction::server_error_page());
+            };
+            complete_auto_link(state, scope, connector_key, &external_id, &local_user).await
+        }
+    }
+}
+
+/// Resolve whether a LOCAL account matches `email` and, if a VERIFIED one does, which local
+/// user it is (issue #78, section 3). The lookup is the existing identifier-first blind-index
+/// resolution (never a plaintext scan). `local_exists` is any match (verified or not); the
+/// verified user is the auto-link target (the single `AutoLink` arm requires `local_verified`).
+async fn resolve_local_email_match(
+    state: &OidcState,
+    scope: Scope,
+    email: &str,
+) -> Result<(bool, Option<UserId>), StoreError> {
+    let resolutions = state
+        .store()
+        .scoped(scope)
+        .user_identifiers()
+        .resolve(IdentifierType::Email, email)
+        .await?;
+    let exists = !resolutions.is_empty();
+    let verified_user = resolutions
+        .into_iter()
+        .find(|resolution| resolution.verified)
+        .map(|resolution| resolution.user_id);
+    Ok((exists, verified_user))
+}
+
+/// Auto-link a federated identity into a VERIFIED local account (issue #78): the single
+/// all-green arm of the decision table. Creates the `account_links` row (`auto_verified`,
+/// audited), alerts the account's verified channels, and binds the session to the local
+/// user. A concurrent first login that already linked the identity (a UNIQUE violation)
+/// resolves to that same local user rather than failing the login.
+async fn complete_auto_link(
+    state: &OidcState,
+    scope: Scope,
+    connector_key: &str,
+    external_id: &str,
+    local_user: &UserId,
+) -> LinkDispatch {
+    match create_account_link(
+        state,
+        scope,
+        connector_key,
+        external_id,
+        local_user,
+        true,
+        AccountLinkMethod::AutoVerified,
+    )
+    .await
+    {
+        Ok(()) => {
+            crate::account::notify_link_channels(
+                state,
+                scope,
+                local_user,
+                VerificationPurpose::AccountLinked,
+            )
+            .await;
+            LinkDispatch::Session(*local_user)
+        }
+        // A concurrent first login linked the same identity: resolve and reuse that binding
+        // (the anti-takeover UNIQUE guarantees it is at most one local user).
+        Err(StoreError::Conflict) => match state
+            .store()
+            .scoped(scope)
+            .account_links()
+            .resolve(connector_key, external_id)
+            .await
+        {
+            Ok(Some(link)) => match UserId::parse_in_scope(&link.user_id, &scope) {
+                Ok(user_id) => LinkDispatch::Session(user_id),
+                Err(_) => LinkDispatch::Respond(interaction::server_error_page()),
+            },
+            _ => LinkDispatch::Respond(interaction::server_error_page()),
+        },
+        Err(_) => LinkDispatch::Respond(interaction::server_error_page()),
+    }
+}
+
+/// Complete a self-service MANUAL LINK (issue #78, section 4.3): bind the federated identity
+/// to the target local account whose fresh re-authentication authorized the link. The
+/// authority is that re-auth (captured when the correlation row was minted), NOT the email
+/// match, so the link is allowed even when the trust snapshot is not verified-to-verified;
+/// the snapshot is recorded informationally. Creates the `account_links` row (`manual`,
+/// audited), alerts the account's verified channels, and binds the session to the target.
+/// A federated identity already linked elsewhere is a conflict notice, never a silent
+/// re-home.
+async fn complete_manual_link(
+    state: &OidcState,
+    scope: Scope,
+    connector_key: &str,
+    external_id: &str,
+    identity: &VerifiedUpstreamIdentity,
+    definition: &ConnectorRuntimeConfig,
+    target: &str,
+) -> LinkDispatch {
+    let Ok(target_user) = UserId::parse_in_scope(target, &scope) else {
+        return LinkDispatch::Respond(interaction::server_error_page());
+    };
+    // The link's own trust snapshot (informational): whether the upstream asserted a
+    // trusted, verified email. It NEVER promotes the local identity's verified flag.
+    let upstream_verified = matches!(
+        identity.claims.get("email_verified"),
+        Some(serde_json::Value::Bool(true))
+    );
+    let trusted = definition.capabilities.email_verified_trust == EmailVerifiedTrust::Trusted;
+    let snapshot = upstream_verified && trusted;
+    match create_account_link(
+        state,
+        scope,
+        connector_key,
+        external_id,
+        &target_user,
+        snapshot,
+        AccountLinkMethod::Manual,
+    )
+    .await
+    {
+        Ok(()) => {
+            crate::account::notify_link_channels(
+                state,
+                scope,
+                &target_user,
+                VerificationPurpose::AccountLinked,
+            )
+            .await;
+            LinkDispatch::Session(target_user)
+        }
+        Err(StoreError::Conflict) => LinkDispatch::Respond(interaction::link_conflict_page()),
+        Err(_) => LinkDispatch::Respond(interaction::server_error_page()),
+    }
+}
+
+/// Create one `account_links` row binding a federated identity to a local user (issue #78),
+/// audited in the same transaction by the store. The `email_verified` snapshot is the
+/// LINK'S OWN immutable trust record; this write touches `account_links` only and NEVER a
+/// local identity's `verified` flag.
+async fn create_account_link(
+    state: &OidcState,
+    scope: Scope,
+    connector_key: &str,
+    external_id: &str,
+    user_id: &UserId,
+    email_verified: bool,
+    link_method: AccountLinkMethod,
+) -> Result<(), StoreError> {
+    let id = AccountLinkId::generate(state.env(), &scope);
+    let actor = interaction::user_actor(user_id);
+    let correlation = ironauth_store::CorrelationId::generate(state.env());
+    state
+        .store()
+        .scoped(scope)
+        .acting(actor, correlation)
+        .account_links()
+        .create(
+            state.env(),
+            &id,
+            NewAccountLink {
+                user_id,
+                connector_id: connector_key,
+                external_id,
+                email_verified,
+                link_method,
+            },
+        )
+        .await
 }
 
 /// The namespaced external-id for a federated identity (issue #75, HIGH-1): the upstream

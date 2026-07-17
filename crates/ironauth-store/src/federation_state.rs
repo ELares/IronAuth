@@ -30,6 +30,12 @@ pub struct NewFederationLoginState<'a> {
     /// organization. The callback reads it back from the CONSUMED row, so the
     /// organization is never influenced by anything the browser sent.
     pub org_connection_id: Option<&'a str>,
+    /// The SELF-SERVICE manual-link purpose marker (issue #78, PR 2): the TARGET local
+    /// `usr_` user id a fresh-re-auth-gated manual link binds the resulting federated
+    /// identity to, or [`None`] for an ordinary federated login. The callback reads it
+    /// back from the CONSUMED row, so the account being linked into is bound to the
+    /// re-authentication that authorized it and is never influenced by the browser.
+    pub link_target_user_id: Option<&'a str>,
     /// The row expiry in microseconds since the epoch (from the clock seam).
     pub expires_at_unix_micros: i64,
 }
@@ -52,4 +58,9 @@ pub struct ConsumedFederationLoginState {
     /// (issue #77), or [`None`] for a direct federated login. Re-derived here from the
     /// consumed row, never from the callback query.
     pub org_connection_id: Option<String>,
+    /// The self-service manual-link TARGET local user id (issue #78, PR 2), or [`None`]
+    /// for an ordinary federated login. Re-derived here from the consumed row, never
+    /// from the callback query, so a manual link can only ever bind into the account
+    /// whose fresh re-authentication minted this row.
+    pub link_target_user_id: Option<String>,
 }
