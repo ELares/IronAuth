@@ -1233,6 +1233,12 @@ pub struct OidcConfig {
     /// See [`RegulationConfig`].
     pub regulation: RegulationConfig,
 
+    /// The minimal risk engine (issue #79): the explainable signals, the LOW/MED/HIGH
+    /// scoring, the block/challenge/notify action vocabulary, the risk-driven step-up
+    /// threshold, and the new-device notification. OFF by default (fully inert). See
+    /// [`RiskConfig`].
+    pub risk: RiskConfig,
+
     /// Whether the WebAuthn passkey ceremony endpoints are mounted and the hosted
     /// login page offers conditional-UI passkey sign-in (issue #65). On by default:
     /// passkeys are the headline primary credential for the platform. When on,
@@ -1623,6 +1629,7 @@ impl Default for OidcConfig {
             registration_enabled: false,
             registration_mode: RegistrationMode::TokenGated,
             regulation: RegulationConfig::default(),
+            risk: RiskConfig::default(),
             registration_max_clients: 100,
             registration_rate_limit: 20,
             registration_rate_window_secs: 60,
@@ -1882,6 +1889,164 @@ impl Default for RegulationConfig {
             hard_lockout_threshold: 20,
             hard_lockout_duration_secs: 900,
             registration_closed: false,
+        }
+    }
+}
+
+/// The lower bound on the impossible-travel superhuman-velocity floor, in km/h (issue
+/// #79). A floor below this would flag ordinary intercontinental travel as impossible.
+pub const OIDC_RISK_MIN_IMPOSSIBLE_TRAVEL_KMH: u64 = 100;
+/// The lower bound on the "this wasn't me" disavowal-token TTL, in seconds (issue #79).
+pub const OIDC_RISK_MIN_DISAVOWAL_TTL_SECS: u64 = 300;
+/// The upper bound on the "this wasn't me" disavowal-token TTL, in seconds (issue #79):
+/// thirty days, matching the trusted-device max-age ceiling.
+pub const OIDC_RISK_MAX_DISAVOWAL_TTL_SECS: u64 = 2_592_000;
+/// The closed set of risk-score thresholds an authentication policy can require step-up
+/// AT (issue #79): `off` (never), or the LOW/MED/HIGH rung at or above which a MED-or-
+/// stronger score forces MFA. `oidc.risk.require_mfa_at` must be one of these.
+pub const OIDC_RISK_THRESHOLDS: [&str; 4] = ["off", "low", "med", "high"];
+
+/// The minimal risk-engine settings (issue #79).
+///
+/// The design bet is LEGIBILITY over ML: a small set of EXPLAINABLE signals feed a
+/// three-level score (LOW/MED/HIGH) and a three-verb action vocabulary
+/// (block/challenge/notify), and every decision is traceable and auditable. Each signal
+/// is INDEPENDENTLY toggleable per environment, so a deployment enables only the signals
+/// it wants. OFF by default ([`enabled`](Self::enabled) false): the whole engine is inert
+/// until a tenant opts in, so no decision is recorded, no notification is sent, and
+/// step-up is never forced by risk. The `GeoIP` and IP-reputation providers are PLUGGABLE
+/// SEAMS with null defaults (no bundled third-party dependency), so the engine runs
+/// complete with ZERO third-party services; the allow/deny lists below are the only
+/// built-in IP-reputation input.
+// The per-signal toggles are inherently a set of independent booleans (each signal is
+// independently toggleable per environment, issue #79), so more than three bools is the
+// legible shape here, exactly as the signal vocabulary demands.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields, default)]
+pub struct RiskConfig {
+    /// Whether the minimal risk engine is active (issue #79). OFF by default: the engine
+    /// is fully inert (no signals evaluated, no decision recorded, no notification sent,
+    /// step-up never forced by risk). When on, the per-signal toggles below select which
+    /// signals contribute.
+    pub enabled: bool,
+
+    /// Whether the NEW-DEVICE signal is evaluated (issue #79): a login from a device with
+    /// no valid trusted-device row (the #71 signed cookie / `trusted_devices` state) is a
+    /// new device. On by default (consulted only when `enabled`). Drives the new-device
+    /// notification and contributes MED to the score.
+    pub new_device_enabled: bool,
+
+    /// Whether the IMPOSSIBLE-TRAVEL signal is evaluated (issue #79): a superhuman
+    /// geo-velocity between consecutive logins, computed from the previous login's coarse
+    /// location and instant against this login via a pluggable `GeoIP` provider. On by
+    /// default, but INERT unless a `GeoIP` provider is wired (the null default resolves no
+    /// coordinates). Contributes HIGH to the score.
+    pub impossible_travel_enabled: bool,
+
+    /// Whether the IP-REPUTATION signal is evaluated (issue #79): the per-environment
+    /// allow/deny lists below plus a pluggable provider seam. On by default. A deny-list
+    /// hit contributes HIGH; a provider "suspect" verdict contributes MED; an allow-list
+    /// hit neutralizes the signal.
+    pub ip_reputation_enabled: bool,
+
+    /// Whether the VELOCITY signal is evaluated (issue #79): per-account, per-IP, and
+    /// per-ASN attempt rates over `velocity_window_secs`, building on the #64 counter
+    /// layer. On by default. Contributes MED at `velocity_med_threshold` and HIGH at
+    /// `velocity_high_threshold`.
+    pub velocity_enabled: bool,
+
+    /// The risk-score threshold at or above which the authentication policy forces step-up
+    /// (issue #79): one of `off` (never), `low`, `med`, or `high`. The canonical
+    /// "require MFA at MED or above" is `med`: a MED-or-stronger score raises the effective
+    /// requirement so the step-up gate (issue #72) challenges a second factor, while a LOW
+    /// score does not. Default `off`.
+    ///
+    /// NOTE (enforcement): with `require_mfa_at="off"` and no IP deny-list configured,
+    /// enabling the engine does NOTHING enforcement-wise for a non-deny HIGH score (a new
+    /// device, impossible travel, a velocity flood, or a provider "suspect" verdict): such a
+    /// score only Allows or Notifies. To actually ENFORCE on risk, set `require_mfa_at` to
+    /// `low`/`med`/`high` (so a qualifying score forces step-up) and/or populate the IP
+    /// deny-list (a deny-list hit hard-blocks when `block_on_high`).
+    pub require_mfa_at: String,
+
+    /// Whether a hard-deny HIGH score BLOCKS the login with a uniform, anti-enumeration
+    /// failure (issue #79). ONLY an explicit IP deny-list hit is a hard deny (a block);
+    /// every other signal, including a VELOCITY flood, raises the score (and can force
+    /// step-up via `require_mfa_at`) but NEVER blocks, so a shared NAT or ASN cannot become
+    /// a victim lockout. On by default. When off, a would-be block degrades to a challenge.
+    /// A block is indistinguishable from an ordinary login failure (reusing the #64
+    /// uniformity discipline).
+    pub block_on_high: bool,
+
+    /// Whether a new-device (or new-location) login sends the user a notification (issue
+    /// #79) with the device, User-Agent, and geo context plus the single-use "this wasn't
+    /// me" link. On by default (consulted only when `new_device_enabled`). The delivery
+    /// uses the #68 `VerificationSender` seam (the default sender performs no delivery).
+    pub notify_on_new_device: bool,
+
+    /// The cooldown window, in seconds, over which repeated new-device notifications to the
+    /// SAME (subject, device/User-Agent fingerprint) are SUPPRESSED (issue #79). At most one
+    /// new-device notice (and one minted "this wasn't me" token) is sent per new device per
+    /// window, so an attacker WITH valid credentials who logs in repeatedly WITHOUT the
+    /// remember-device cookie (each read as a new device) cannot flood the victim's inbox or
+    /// accumulate unbounded disavowal-token rows. Reuses the #64 counter layer. Default 3600
+    /// (one hour). 0 disables the throttle (every new device notifies).
+    pub notify_cooldown_secs: u64,
+
+    /// The fixed window, in seconds, over which the velocity signal counts attempts per
+    /// dimension (issue #79). Default 300 (five minutes). Must be at least 1 and at most
+    /// `OIDC_MAX_LIFETIME_SECS`.
+    pub velocity_window_secs: u64,
+
+    /// The per-dimension attempt count within `velocity_window_secs` at which the velocity
+    /// signal contributes MED (issue #79). Default 10. Must be at least 1.
+    pub velocity_med_threshold: u32,
+
+    /// The per-dimension attempt count within `velocity_window_secs` at which the velocity
+    /// signal contributes HIGH (issue #79). Default 30. Must be at least
+    /// `velocity_med_threshold`.
+    pub velocity_high_threshold: u32,
+
+    /// The superhuman geo-velocity floor, in km/h, above which the impossible-travel
+    /// signal fires (issue #79). Default 1000 (faster than a commercial flight). Must be at
+    /// least `OIDC_RISK_MIN_IMPOSSIBLE_TRAVEL_KMH`.
+    pub impossible_travel_kmh: u64,
+
+    /// The per-environment IP ALLOW list (issue #79): plain IPs or CIDR ranges a login is
+    /// trusted from, which neutralize the IP-reputation signal. Empty by default.
+    pub ip_allowlist: Vec<String>,
+
+    /// The per-environment IP DENY list (issue #79): plain IPs or CIDR ranges a login is
+    /// refused from, which contribute HIGH (and block when `block_on_high`). Empty by
+    /// default.
+    pub ip_denylist: Vec<String>,
+
+    /// The "this wasn't me" disavowal-token time-to-live, in seconds (issue #79). Default
+    /// 604800 (seven days). Must be in
+    /// `OIDC_RISK_MIN_DISAVOWAL_TTL_SECS..=OIDC_RISK_MAX_DISAVOWAL_TTL_SECS`.
+    pub disavowal_ttl_secs: u64,
+}
+
+impl Default for RiskConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            new_device_enabled: true,
+            impossible_travel_enabled: true,
+            ip_reputation_enabled: true,
+            velocity_enabled: true,
+            require_mfa_at: "off".to_owned(),
+            block_on_high: true,
+            notify_on_new_device: true,
+            notify_cooldown_secs: 3600,
+            velocity_window_secs: 300,
+            velocity_med_threshold: 10,
+            velocity_high_threshold: 30,
+            impossible_travel_kmh: 1000,
+            ip_allowlist: Vec::new(),
+            ip_denylist: Vec::new(),
+            disavowal_ttl_secs: 604_800,
         }
     }
 }
@@ -2615,6 +2780,7 @@ impl Config {
         validate_backchannel_logout(&self.oidc)?;
         validate_lazy_migration(&self.oidc)?;
         validate_regulation(&self.oidc)?;
+        validate_risk(&self.oidc)?;
         validate_webauthn(&self.oidc, &self.server)?;
         validate_totp(&self.oidc)?;
         validate_trusted_device(&self.oidc)?;
@@ -2672,6 +2838,77 @@ fn validate_regulation(oidc: &OidcConfig) -> Result<(), ConfigError> {
                 "oidc.regulation.hard_lockout_duration_secs ({}) must be between 1 and \
                  {OIDC_MAX_LIFETIME_SECS} seconds",
                 regulation.hard_lockout_duration_secs
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// Validate the minimal risk-engine settings (issue #79), kept out of
+/// [`Config::validate`] so each stays within the readable-length lint. The bounds hold
+/// even when the engine is off, so an out-of-band value cannot take effect the moment it
+/// is enabled. The step-up threshold is a closed set, the velocity thresholds are ordered
+/// and non-degenerate, the impossible-travel floor stays above ordinary travel, and the
+/// disavowal TTL is bounded.
+fn validate_risk(oidc: &OidcConfig) -> Result<(), ConfigError> {
+    let risk = &oidc.risk;
+    if !OIDC_RISK_THRESHOLDS.contains(&risk.require_mfa_at.as_str()) {
+        return Err(ConfigError::Invalid {
+            message: format!(
+                "oidc.risk.require_mfa_at ({}) must be one of off, low, med, high",
+                risk.require_mfa_at
+            ),
+        });
+    }
+    if risk.velocity_window_secs < 1 || risk.velocity_window_secs > OIDC_MAX_LIFETIME_SECS {
+        return Err(ConfigError::Invalid {
+            message: format!(
+                "oidc.risk.velocity_window_secs ({}) must be between 1 and \
+                 {OIDC_MAX_LIFETIME_SECS} seconds",
+                risk.velocity_window_secs
+            ),
+        });
+    }
+    if risk.notify_cooldown_secs > OIDC_MAX_LIFETIME_SECS {
+        return Err(ConfigError::Invalid {
+            message: format!(
+                "oidc.risk.notify_cooldown_secs ({}) must be at most \
+                 {OIDC_MAX_LIFETIME_SECS} seconds (0 disables the throttle)",
+                risk.notify_cooldown_secs
+            ),
+        });
+    }
+    if risk.velocity_med_threshold < 1 {
+        return Err(ConfigError::Invalid {
+            message: "oidc.risk.velocity_med_threshold must be at least 1".to_owned(),
+        });
+    }
+    if risk.velocity_high_threshold < risk.velocity_med_threshold {
+        return Err(ConfigError::Invalid {
+            message: format!(
+                "oidc.risk.velocity_high_threshold ({}) must be at least \
+                 velocity_med_threshold ({})",
+                risk.velocity_high_threshold, risk.velocity_med_threshold
+            ),
+        });
+    }
+    if risk.impossible_travel_kmh < OIDC_RISK_MIN_IMPOSSIBLE_TRAVEL_KMH {
+        return Err(ConfigError::Invalid {
+            message: format!(
+                "oidc.risk.impossible_travel_kmh ({}) must be at least \
+                 {OIDC_RISK_MIN_IMPOSSIBLE_TRAVEL_KMH} km/h",
+                risk.impossible_travel_kmh
+            ),
+        });
+    }
+    if !(OIDC_RISK_MIN_DISAVOWAL_TTL_SECS..=OIDC_RISK_MAX_DISAVOWAL_TTL_SECS)
+        .contains(&risk.disavowal_ttl_secs)
+    {
+        return Err(ConfigError::Invalid {
+            message: format!(
+                "oidc.risk.disavowal_ttl_secs ({}) must be between \
+                 {OIDC_RISK_MIN_DISAVOWAL_TTL_SECS} and {OIDC_RISK_MAX_DISAVOWAL_TTL_SECS} seconds",
+                risk.disavowal_ttl_secs
             ),
         });
     }

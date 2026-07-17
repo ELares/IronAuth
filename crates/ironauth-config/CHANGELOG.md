@@ -6,6 +6,28 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Minimal risk-engine settings for issue #79, off by default: the `oidc.risk` block
+  (`RiskConfig`). `oidc.risk.enabled` (default false) is the master switch; each signal is
+  independently toggleable per environment (`new_device_enabled`,
+  `impossible_travel_enabled`, `ip_reputation_enabled`, `velocity_enabled`, all default
+  true but gated by the master switch). `oidc.risk.require_mfa_at` (`off` / `low` / `med` /
+  `high`, default `off`) is the step-up threshold a MED-or-stronger score forces MFA at;
+  `block_on_high` (default true) blocks a hard-deny HIGH with a uniform failure;
+  `notify_on_new_device` (default true) sends the new-device notification. The velocity
+  window and MED/HIGH thresholds, the impossible-travel km/h floor, the per-environment IP
+  allow/deny lists, and the disavowal-token TTL round it out. All bounds are validated at
+  load even when the engine is off (the threshold is a closed set, the velocity thresholds
+  are ordered, the km/h floor stays above ordinary travel, the TTL is bounded), so an
+  out-of-band value cannot take effect the moment it is enabled.
+- Adversarial-review hardening (issue #79): adds `oidc.risk.notify_cooldown_secs` (default
+  3600, one hour; 0 disables), the window over which repeated new-device notifications to
+  the same (subject, device/User-Agent fingerprint) are suppressed, bounding a
+  notification-flood abuse (bounded to at most `OIDC_MAX_LIFETIME_SECS`, validated at load).
+  Corrects the `block_on_high` field doc (ONLY an IP deny-list hit hard-denies; a velocity
+  flood raises the score and can force step-up but NEVER blocks, so a shared NAT cannot lock
+  a victim out) and adds an enforcement NOTE to `require_mfa_at` (enabling the engine with
+  `require_mfa_at="off"` and no IP deny-list is inert for non-deny HIGH scores, which only
+  Allow/Notify; set `require_mfa_at` and/or the deny-list to actually enforce).
 - Remember-device (trusted-device) policy for issue #71, off by default: the
   `oidc.trusted_devices_enabled` toggle, the `oidc.trusted_device_user_opt_in` choice
   (user checkbox vs the tenant decides), the `oidc.trusted_device_max_age_secs` absolute

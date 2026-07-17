@@ -755,6 +755,28 @@
           "minimum": 0,
           "type": "integer"
         },
+        "risk": {
+          "$ref": "#/$defs/RiskConfig",
+          "default": {
+            "block_on_high": true,
+            "disavowal_ttl_secs": 604800,
+            "enabled": false,
+            "impossible_travel_enabled": true,
+            "impossible_travel_kmh": 1000,
+            "ip_allowlist": [],
+            "ip_denylist": [],
+            "ip_reputation_enabled": true,
+            "new_device_enabled": true,
+            "notify_cooldown_secs": 3600,
+            "notify_on_new_device": true,
+            "require_mfa_at": "off",
+            "velocity_enabled": true,
+            "velocity_high_threshold": 30,
+            "velocity_med_threshold": 10,
+            "velocity_window_secs": 300
+          },
+          "description": "The minimal risk engine (issue #79): the explainable signals, the LOW/MED/HIGH\nscoring, the block/challenge/notify action vocabulary, the risk-driven step-up\nthreshold, and the new-device notification. OFF by default (fully inert). See\n[`RiskConfig`]."
+        },
         "session_device_binding": {
           "default": false,
           "description": "Bind the session to the device / user agent it was established from (issue\n#32). The safe default (`false`) leaves it OFF (the tunability principle).\nEnable it to fail closed when the device/user-agent fingerprint changes.",
@@ -1340,6 +1362,111 @@
       },
       "type": "object"
     },
+    "RiskConfig": {
+      "additionalProperties": false,
+      "description": "The minimal risk-engine settings (issue #79).\n\nThe design bet is LEGIBILITY over ML: a small set of EXPLAINABLE signals feed a\nthree-level score (LOW/MED/HIGH) and a three-verb action vocabulary\n(block/challenge/notify), and every decision is traceable and auditable. Each signal\nis INDEPENDENTLY toggleable per environment, so a deployment enables only the signals\nit wants. OFF by default ([`enabled`](Self::enabled) false): the whole engine is inert\nuntil a tenant opts in, so no decision is recorded, no notification is sent, and\nstep-up is never forced by risk. The `GeoIP` and IP-reputation providers are PLUGGABLE\nSEAMS with null defaults (no bundled third-party dependency), so the engine runs\ncomplete with ZERO third-party services; the allow/deny lists below are the only\nbuilt-in IP-reputation input.",
+      "properties": {
+        "block_on_high": {
+          "default": true,
+          "description": "Whether a hard-deny HIGH score BLOCKS the login with a uniform, anti-enumeration\nfailure (issue #79). ONLY an explicit IP deny-list hit is a hard deny (a block);\nevery other signal, including a VELOCITY flood, raises the score (and can force\nstep-up via `require_mfa_at`) but NEVER blocks, so a shared NAT or ASN cannot become\na victim lockout. On by default. When off, a would-be block degrades to a challenge.\nA block is indistinguishable from an ordinary login failure (reusing the #64\nuniformity discipline).",
+          "type": "boolean"
+        },
+        "disavowal_ttl_secs": {
+          "default": 604800,
+          "description": "The \"this wasn't me\" disavowal-token time-to-live, in seconds (issue #79). Default\n604800 (seven days). Must be in\n`OIDC_RISK_MIN_DISAVOWAL_TTL_SECS..=OIDC_RISK_MAX_DISAVOWAL_TTL_SECS`.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "enabled": {
+          "default": false,
+          "description": "Whether the minimal risk engine is active (issue #79). OFF by default: the engine\nis fully inert (no signals evaluated, no decision recorded, no notification sent,\nstep-up never forced by risk). When on, the per-signal toggles below select which\nsignals contribute.",
+          "type": "boolean"
+        },
+        "impossible_travel_enabled": {
+          "default": true,
+          "description": "Whether the IMPOSSIBLE-TRAVEL signal is evaluated (issue #79): a superhuman\ngeo-velocity between consecutive logins, computed from the previous login's coarse\nlocation and instant against this login via a pluggable `GeoIP` provider. On by\ndefault, but INERT unless a `GeoIP` provider is wired (the null default resolves no\ncoordinates). Contributes HIGH to the score.",
+          "type": "boolean"
+        },
+        "impossible_travel_kmh": {
+          "default": 1000,
+          "description": "The superhuman geo-velocity floor, in km/h, above which the impossible-travel\nsignal fires (issue #79). Default 1000 (faster than a commercial flight). Must be at\nleast `OIDC_RISK_MIN_IMPOSSIBLE_TRAVEL_KMH`.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "ip_allowlist": {
+          "default": [],
+          "description": "The per-environment IP ALLOW list (issue #79): plain IPs or CIDR ranges a login is\ntrusted from, which neutralize the IP-reputation signal. Empty by default.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "ip_denylist": {
+          "default": [],
+          "description": "The per-environment IP DENY list (issue #79): plain IPs or CIDR ranges a login is\nrefused from, which contribute HIGH (and block when `block_on_high`). Empty by\ndefault.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "ip_reputation_enabled": {
+          "default": true,
+          "description": "Whether the IP-REPUTATION signal is evaluated (issue #79): the per-environment\nallow/deny lists below plus a pluggable provider seam. On by default. A deny-list\nhit contributes HIGH; a provider \"suspect\" verdict contributes MED; an allow-list\nhit neutralizes the signal.",
+          "type": "boolean"
+        },
+        "new_device_enabled": {
+          "default": true,
+          "description": "Whether the NEW-DEVICE signal is evaluated (issue #79): a login from a device with\nno valid trusted-device row (the #71 signed cookie / `trusted_devices` state) is a\nnew device. On by default (consulted only when `enabled`). Drives the new-device\nnotification and contributes MED to the score.",
+          "type": "boolean"
+        },
+        "notify_cooldown_secs": {
+          "default": 3600,
+          "description": "The cooldown window, in seconds, over which repeated new-device notifications to the\nSAME (subject, device/User-Agent fingerprint) are SUPPRESSED (issue #79). At most one\nnew-device notice (and one minted \"this wasn't me\" token) is sent per new device per\nwindow, so an attacker WITH valid credentials who logs in repeatedly WITHOUT the\nremember-device cookie (each read as a new device) cannot flood the victim's inbox or\naccumulate unbounded disavowal-token rows. Reuses the #64 counter layer. Default 3600\n(one hour). 0 disables the throttle (every new device notifies).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "notify_on_new_device": {
+          "default": true,
+          "description": "Whether a new-device (or new-location) login sends the user a notification (issue\n#79) with the device, User-Agent, and geo context plus the single-use \"this wasn't\nme\" link. On by default (consulted only when `new_device_enabled`). The delivery\nuses the #68 `VerificationSender` seam (the default sender performs no delivery).",
+          "type": "boolean"
+        },
+        "require_mfa_at": {
+          "default": "off",
+          "description": "The risk-score threshold at or above which the authentication policy forces step-up\n(issue #79): one of `off` (never), `low`, `med`, or `high`. The canonical\n\"require MFA at MED or above\" is `med`: a MED-or-stronger score raises the effective\nrequirement so the step-up gate (issue #72) challenges a second factor, while a LOW\nscore does not. Default `off`.\n\nNOTE (enforcement): with `require_mfa_at=\"off\"` and no IP deny-list configured,\nenabling the engine does NOTHING enforcement-wise for a non-deny HIGH score (a new\ndevice, impossible travel, a velocity flood, or a provider \"suspect\" verdict): such a\nscore only Allows or Notifies. To actually ENFORCE on risk, set `require_mfa_at` to\n`low`/`med`/`high` (so a qualifying score forces step-up) and/or populate the IP\ndeny-list (a deny-list hit hard-blocks when `block_on_high`).",
+          "type": "string"
+        },
+        "velocity_enabled": {
+          "default": true,
+          "description": "Whether the VELOCITY signal is evaluated (issue #79): per-account, per-IP, and\nper-ASN attempt rates over `velocity_window_secs`, building on the #64 counter\nlayer. On by default. Contributes MED at `velocity_med_threshold` and HIGH at\n`velocity_high_threshold`.",
+          "type": "boolean"
+        },
+        "velocity_high_threshold": {
+          "default": 30,
+          "description": "The per-dimension attempt count within `velocity_window_secs` at which the velocity\nsignal contributes HIGH (issue #79). Default 30. Must be at least\n`velocity_med_threshold`.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "velocity_med_threshold": {
+          "default": 10,
+          "description": "The per-dimension attempt count within `velocity_window_secs` at which the velocity\nsignal contributes MED (issue #79). Default 10. Must be at least 1.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "velocity_window_secs": {
+          "default": 300,
+          "description": "The fixed window, in seconds, over which the velocity signal counts attempts per\ndimension (issue #79). Default 300 (five minutes). Must be at least 1 and at most\n`OIDC_MAX_LIFETIME_SECS`.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
     "ScopeQuotaConfig": {
       "additionalProperties": false,
       "description": "The limits for one quota tier (issue #50), over the three enforced\ndimensions. Each dimension is a token bucket with a sustained refill rate\n(`*_per_second`) and a burst capacity (`*_burst`); the dimensions enforce\nindependently, so exhausting one does not affect another. A `*_burst` of 0\ndisables that dimension (unlimited), which is how a single-tenant self-hoster\nexpresses no quota.",
@@ -1685,6 +1812,24 @@
         "require_pkce_for_confidential_clients": true,
         "require_pushed_authorization_requests": false,
         "reuse_grace_secs": 10,
+        "risk": {
+          "block_on_high": true,
+          "disavowal_ttl_secs": 604800,
+          "enabled": false,
+          "impossible_travel_enabled": true,
+          "impossible_travel_kmh": 1000,
+          "ip_allowlist": [],
+          "ip_denylist": [],
+          "ip_reputation_enabled": true,
+          "new_device_enabled": true,
+          "notify_cooldown_secs": 3600,
+          "notify_on_new_device": true,
+          "require_mfa_at": "off",
+          "velocity_enabled": true,
+          "velocity_high_threshold": 30,
+          "velocity_med_threshold": 10,
+          "velocity_window_secs": 300
+        },
         "session_device_binding": false,
         "session_idle_ttl_secs": 3600,
         "session_management_enabled": false,

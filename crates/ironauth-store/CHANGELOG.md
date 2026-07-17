@@ -6,6 +6,28 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Minimal risk engine state (issue #79): migration 0054 adds three tenant-scoped,
+  forced-RLS tables and the `RiskRepo` / `ActingRiskRepo` accessors. `risk_login_geo`
+  holds one per-subject last-seen login geo (the observed IP, coarse location, and
+  User-Agent each SEALED under the scope DEK, issue #48, no plaintext PII) the
+  impossible-travel signal reads; `risk_decisions` holds the persisted LOW/MED/HIGH
+  decision records with their enumerated contributing signals in a jsonb document (no
+  plaintext PII, closed score/action CHECK sets), reconstructable from the audit trail;
+  `risk_disavowal_tokens` holds the "this wasn't me" single-use tokens (the SHA-256 token
+  DIGEST as server-side state, the sessions to revoke, and the single-use `consumed_at`
+  latch that doubles as the credentials-flagged-for-review marker). Adds the `rsk_` / `rgl_`
+  / `dis_` scoped ids, the `risk.decision` / `risk.disavowal.issue` / `risk.disavow` audit
+  actions, and registers the tables in the migration guard test (count 54) and
+  `scripts/query-audit.sh`. `record_decision`, `issue_disavowal`, and `consume_disavowal`
+  are audited; `consume_disavowal` atomically claims the single-use token and revokes the
+  named sessions (or all of the subject's, signing out everywhere).
+- Adversarial-review hardening (issue #79): `NewRiskDecision` gains a `signals_summary`
+  field, and `record_decision` now writes a compact, operator-safe enumerated signal
+  summary (`signals=[kind:level,...]`, PII-free) into the `risk.decision` audit detail
+  alongside the score and action, so a sampled decision is reconstructable from the audit
+  trail ALONE even if the append-only `risk_decisions` row is pruned (both tables are
+  append-only). The migration 0054 comment is corrected to describe this (previously it
+  claimed the full signal set was in the audit row). Migration count unchanged (54).
 - Trusted devices (issue #71): migration 0053 adds the tenant-scoped, forced-RLS
   `trusted_devices` table (the SHA-256 DIGEST of the cookie secret as server-side state,
   the subject + `ses_` session-lineage binding, the SEALED User-Agent and coarse geo, the
