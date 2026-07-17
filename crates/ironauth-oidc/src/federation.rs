@@ -40,8 +40,9 @@ use axum::response::Response;
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use ironauth_connector::{
-    ClaimSources, ConnectorError, ConnectorRuntimeConfig, Endpoints, PkceMode, ResolvedEndpoints,
-    TraitDocument, TraitPointerFailure, TraitSchemaView, discovery_url, evaluate, parse_discovery,
+    ClaimSources, ClientAuth, ConnectorError, ConnectorRuntimeConfig, Endpoints, PkceMode,
+    ResolvedEndpoints, TraitDocument, TraitPointerFailure, TraitSchemaView, discovery_url,
+    evaluate, parse_discovery,
 };
 use ironauth_env::Clock;
 use ironauth_fetch::{FetchError, FetchPurpose, FetchRequest, Fetcher};
@@ -53,8 +54,10 @@ use ironauth_store::{
 use sha2::{Digest, Sha256};
 
 use crate::authn::AuthenticationEvent;
+use crate::federation_client_secret::{SignedJwtInputs, generate_signed_jwt};
 use crate::federation_health::{Admission, ConnectorHealthRegistry};
 use crate::federation_jwks::FederationKeyResolver;
+use crate::federation_relay::{EMAIL_RELAY_TRAIT, is_relay_email};
 use crate::interaction;
 use crate::state::OidcState;
 use crate::util::{append_query, epoch_micros, percent_encode_query, query_get};
@@ -476,6 +479,19 @@ impl FederationRuntime {
         &self.health
     }
 
+    /// The one SSRF-hardened fetcher every federation outbound rides. Exposed so the OAuth 2.0
+    /// login path (issue #74) can drive its token, profile, and email fetches through the
+    /// same hardened path as the OIDC path.
+    pub(crate) fn fetcher(&self) -> &Fetcher {
+        &self.fetcher
+    }
+
+    /// Whether a plaintext `http` upstream is permitted (the test constructor only). Read by
+    /// the OAuth 2.0 login path so an in-process loopback upstream can be driven in tests.
+    pub(crate) fn allow_http(&self) -> bool {
+        self.allow_http
+    }
+
     /// Resolve a connector's endpoints: an explicit set directly, or a discovery-form
     /// connector through its cached-or-fetched discovery document (mix-up-checked).
     async fn resolve_endpoints(
@@ -495,6 +511,11 @@ impl FederationRuntime {
                 self.store_discovery(now, connector_id, resolved.clone());
                 Ok(resolved)
             }
+            // An OAuth2 connector (issue #74) resolves no OIDC ID-token endpoint set; it is
+            // dispatched to the OAuth2 login path before this is ever reached.
+            Endpoints::OAuth2(_) => Err(ConnectorError::Config(
+                "an oauth2 connector has no OIDC endpoint set to resolve".to_owned(),
+            )),
         }
     }
 
@@ -616,17 +637,33 @@ pub async fn federation_authorize(
     // window and lying about the connector's health. record_success is reserved for the CALLBACK's
     // COMPLETED login (a fully provisioned session), the only real success signal. The authorize
     // leg still admit-gates above (denying during backoff); resolving cached discovery is not a win.
-    let resolved = match runtime
-        .resolve_endpoints(now, &connector_key, &definition.endpoints)
-        .await
-    {
-        Ok(resolved) => resolved,
-        Err(error) => {
-            runtime
-                .health()
-                .record_failure(now, &connector_key, fingerprint, &error);
-            return interaction::connector_unavailable_page(error.kind());
+    // Resolve the upstream authorize endpoint per protocol (issue #74). An OIDC discovery
+    // connector fetches (and caches) its discovery document to learn the endpoint and its
+    // PKCE support, sends a `nonce`, and binds the ID token's `iss`. An OAuth2 connector
+    // (GitHub) has explicit endpoints and NO ID token, so it takes the authorize endpoint
+    // directly and sends no `nonce` (there is no ID token to bind it to).
+    let (authorize_url, advertises_s256, send_nonce) = match &definition.endpoints {
+        Endpoints::OAuth2(oauth2) => (oauth2.authorize_url().to_owned(), false, false),
+        Endpoints::Explicit(_) => {
+            // Rejected up front above; unreachable, but fail closed rather than panic.
+            return interaction::federation_unsupported_page();
         }
+        Endpoints::Discovery(_) => match runtime
+            .resolve_endpoints(now, &connector_key, &definition.endpoints)
+            .await
+        {
+            Ok(resolved) => (
+                resolved.authorize_url.clone(),
+                resolved.advertises_s256(),
+                true,
+            ),
+            Err(error) => {
+                runtime
+                    .health()
+                    .record_failure(now, &connector_key, fingerprint, &error);
+                return interaction::connector_unavailable_page(error.kind());
+            }
+        },
     };
 
     let state_value = random_token(&state);
@@ -637,7 +674,7 @@ pub async fn federation_authorize(
     let use_pkce = match definition.pkce {
         PkceMode::Disabled => false,
         PkceMode::Required => true,
-        PkceMode::AutoWhereSupported => resolved.advertises_s256(),
+        PkceMode::AutoWhereSupported => advertises_s256,
     };
     let code_verifier = use_pkce.then(|| random_token(&state));
     let code_challenge = code_verifier.as_deref().map(s256_challenge);
@@ -679,8 +716,12 @@ pub async fn federation_authorize(
         ("redirect_uri", Some(redirect_uri.as_str())),
         ("scope", Some(scope_param.as_str())),
         ("state", Some(state_value.as_str())),
-        ("nonce", Some(nonce.as_str())),
     ];
+    // The `nonce` binds the OIDC ID token to this authorize leg; an OAuth2 upstream has no
+    // ID token, so it is omitted there (the stored correlation-row nonce is unused).
+    if send_nonce {
+        params.push(("nonce", Some(nonce.as_str())));
+    }
     if let Some(challenge) = code_challenge.as_deref() {
         params.push(("code_challenge", Some(challenge)));
         params.push(("code_challenge_method", Some("S256")));
@@ -700,7 +741,7 @@ pub async fn federation_authorize(
     for (name, value) in &forwarded {
         params.push((name, Some(value.as_str())));
     }
-    let location = append_query(&resolved.authorize_url, &params);
+    let location = append_query(&authorize_url, &params);
     interaction::redirect(&location)
 }
 
@@ -785,15 +826,42 @@ pub async fn federation_callback(
     else {
         return interaction::server_error_page();
     };
-    let Ok(client_secret) = String::from_utf8(secret_bytes) else {
-        return interaction::server_error_page();
-    };
 
     let now = state.now();
     let connector_key = connector_id.to_string();
     // The connector-definition fingerprint (issue #76) for the per-connector health record;
     // a change (a reconfiguration) resets this connector's health without touching siblings.
     let fingerprint = record.updated_at_unix_micros;
+
+    // OAuth2 (non-OIDC, for example GitHub, issue #74) has NO ID token: it exchanges the code
+    // for an access token, then reads the profile (and resolves the primary verified email)
+    // over the hardened fetch path, and finalizes through the SHARED provisioning path. Dispatch
+    // here so the OIDC ID-token validation spine below runs only for an OIDC connector.
+    if let Endpoints::OAuth2(oauth2) = &definition.endpoints {
+        let runtime_ref: &FederationRuntime = runtime;
+        return crate::federation_oauth2::oauth2_callback(
+            crate::federation_oauth2::Oauth2Callback {
+                state: &state,
+                scope,
+                runtime: runtime_ref,
+                connector_key: &connector_key,
+                connector_slug: &connector_slug,
+                tenant_id: &tenant_id,
+                environment_id: &environment_id,
+                fingerprint,
+                endpoints: oauth2,
+                definition: &definition,
+                client_secret: &secret_bytes,
+                code: &code,
+                headers: &headers,
+                return_to: &consumed.return_to,
+                now,
+                now_micros,
+            },
+        )
+        .await;
+    }
+
     let resolved = match runtime
         .resolve_endpoints(now, &connector_key, &definition.endpoints)
         .await
@@ -822,6 +890,39 @@ pub async fn federation_callback(
     let verifier = String::from_utf8(consumed.code_verifier).ok();
     let verifier = verifier.as_deref().filter(|v| !v.is_empty());
 
+    // The client secret sent in the exchange (issue #74): a static connector sends the sealed
+    // secret verbatim; an Apple `signed_jwt` connector generates a fresh short-lived ES256 JWT
+    // assertion from the sealed EC private key (the documented quirk handler), using the clock
+    // seam for `iat`/`exp`. A key/sign failure is a clean connector-level config fault.
+    let exchange_secret = match &definition.client_auth {
+        ClientAuth::Static => match String::from_utf8(secret_bytes) {
+            Ok(secret) => secret,
+            Err(_) => return interaction::server_error_page(),
+        },
+        ClientAuth::SignedJwt {
+            team_id,
+            key_id,
+            audience,
+        } => match generate_signed_jwt(
+            &secret_bytes,
+            SignedJwtInputs {
+                team_id,
+                key_id,
+                audience,
+                client_id: &definition.client_id,
+            },
+            now,
+        ) {
+            Ok(jwt) => jwt,
+            Err(error) => {
+                runtime
+                    .health()
+                    .record_failure(now, &connector_key, fingerprint, &error);
+                return interaction::server_error_page();
+            }
+        },
+    };
+
     // Exchange the code at the upstream token endpoint. Any failure fails the login WITHOUT
     // provisioning a user. A dead or misbehaving token endpoint mid-run is recorded against
     // THIS connector's health (a token-endpoint outage the discovery cache would otherwise hide).
@@ -832,7 +933,7 @@ pub async fn federation_callback(
             code: &code,
             redirect_uri: &redirect_uri,
             client_id: &definition.client_id,
-            client_secret: &client_secret,
+            client_secret: &exchange_secret,
             code_verifier: verifier,
         },
         runtime.allow_http,
@@ -904,60 +1005,194 @@ pub async fn federation_callback(
         }
     };
 
-    // Evaluate the declarative claim mapping (issue #75, PR C) against the VERIFIED upstream
-    // claims to assemble the local identity's trait document, TYPE-CHECKED against the scope's
-    // active trait schema. This is the acceptance-critical fail-closed crux: on ANY mapping
-    // failure (a missing required claim, a wrong type, a trait the schema does not declare) the
-    // evaluator returns a typed error and the login aborts HERE, BEFORE any user row is written.
-    // A mapping-definition fault is a Config error and an upstream claim fault is an
-    // UpstreamProtocol error; both fail the login with NO partial identity provisioned.
+    // The remainder is SHARED with the OAuth2 login path (issue #74): the declarative claim
+    // mapping (with the Apple first-authorization-only reuse and Hide My Email relay
+    // classification), the fail-closed provisioning, the honest federated session, and the
+    // resume. Both the OIDC and OAuth2 callbacks converge here once they hold a verified
+    // identity, so the acceptance-critical quirk handling lives in exactly one place.
+    finalize_federated_login(FinalizeLogin {
+        state: &state,
+        scope,
+        runtime,
+        connector_slug: &connector_slug,
+        connector_key: &connector_key,
+        fingerprint,
+        issuer: &expected_issuer,
+        definition: &definition,
+        identity: &identity,
+        headers: &headers,
+        return_to: &consumed.return_to,
+        now,
+        now_micros,
+    })
+    .await
+}
+
+/// The inputs the shared federated-login finalizer needs (issue #74), bundled to keep the
+/// argument count readable. Both the OIDC and OAuth 2.0 callbacks build one of these once they
+/// hold a verified [`VerifiedUpstreamIdentity`].
+pub(crate) struct FinalizeLogin<'a> {
+    /// The OIDC application state.
+    pub state: &'a OidcState,
+    /// The tenant/environment scope.
+    pub scope: Scope,
+    /// The installed federation runtime (health registry and fetch path).
+    pub runtime: &'a FederationRuntime,
+    /// The connector's per-environment slug (the federated login handle prefix).
+    pub connector_slug: &'a str,
+    /// The connector's health-registry key (its immutable id as a string).
+    pub connector_key: &'a str,
+    /// The connector-definition fingerprint for the per-connector health record.
+    pub fingerprint: i64,
+    /// The identity NAMESPACE for the federated external id (the OIDC issuer, or an OAuth 2.0
+    /// connector's `identity_issuer`).
+    pub issuer: &'a str,
+    /// The connector's secret-free runtime config (claim mapping and quirks).
+    pub definition: &'a ConnectorRuntimeConfig,
+    /// The verified upstream identity (a validated ID token, or an OAuth 2.0 profile over TLS).
+    pub identity: &'a VerifiedUpstreamIdentity,
+    /// The inbound request headers (for the session cookie binding).
+    pub headers: &'a HeaderMap,
+    /// The pending LOCAL authorization request to resume after the federated login.
+    pub return_to: &'a str,
+    /// The callback instant from the clock seam.
+    pub now: SystemTime,
+    /// The callback instant in epoch microseconds.
+    pub now_micros: i64,
+}
+
+/// Finalize a federated login once a verified upstream identity is in hand (issue #74): apply
+/// the Apple first-authorization-only profile reuse and Hide My Email relay classification,
+/// evaluate the declarative claim mapping fail-closed, provision (create-or-update) the local
+/// identity keyed on the verified `(issuer, sub)` composite, establish the honest federated
+/// session, mark the connector healthy, and resume the pending local request.
+///
+/// This is the ONE place the acceptance-critical quirk handling lives, shared by the OIDC and
+/// OAuth 2.0 callbacks. On ANY mapping/type-check/provision/session failure it fails closed with
+/// no partial identity and no session.
+// One linear finalize sequence (schema -> prior-profile reuse -> relay -> map -> provision ->
+// session -> resume); splitting it would scatter the single quirk-handling flow a reviewer reads.
+#[allow(clippy::too_many_lines)]
+pub(crate) async fn finalize_federated_login(finalize: FinalizeLogin<'_>) -> Response {
+    let FinalizeLogin {
+        state,
+        scope,
+        runtime,
+        connector_slug,
+        connector_key,
+        fingerprint,
+        issuer,
+        definition,
+        identity,
+        headers,
+        return_to,
+        now,
+        now_micros,
+    } = finalize;
+
+    // The active trait schema the assembled document is type-checked against. Its compilation
+    // and the `&dyn TraitSchemaView` view are deferred until just before `evaluate` (below),
+    // AFTER every await, so the non-Send trait-object reference is never held across an await
+    // (which would make the handler future non-Send).
     let Ok(active_schema) = state.store().scoped(scope).trait_schemas().active().await else {
         return interaction::server_error_page();
     };
-    let compiled = match active_schema
-        .as_ref()
-        .map(|version| TraitSchema::compile(&version.schema_json))
-    {
-        Some(Ok(schema)) => Some(schema),
-        // An active schema that fails to compile is a server-side fault, not a login the user
-        // can fix; fail closed without provisioning.
-        Some(Err(_)) => return interaction::server_error_page(),
-        None => None,
-    };
-    let schema_view = compiled.as_ref().map(StoreTraitSchema);
-    let schema_arg: Option<&dyn TraitSchemaView> = schema_view
-        .as_ref()
-        .map(|view| view as &dyn TraitSchemaView);
 
-    // The evaluator NFKC-normalizes the resolved `email` trait value itself, BEFORE its type
-    // check, so the mapped email is canonicalized regardless of the claim path it resolves from
-    // (a top-level `email` or a nested path like `emails.0`) and the type-checked and provisioned
-    // values are the same canonical form. `userinfo: None` because the UserInfo fetch is deferred
-    // to issue #74; a connector that requires UserInfo is rejected at write-time validation.
-    let Ok(trait_doc) = evaluate(
-        &definition.claim_mapping,
-        &definition.quirks,
-        ClaimSources {
-            id_token: &identity.claims,
-            userinfo: None,
-        },
-        schema_arg,
-    ) else {
-        // Fail-closed: NO user is provisioned from a mapping/type-check failure.
-        return interaction::server_error_page();
+    // Apple first-authorization-only reuse (issue #74): a returning Apple login omits name and
+    // email, so load the stored profile of any EXISTING federated user (keyed on the verified
+    // `(issuer, sub)`) and feed it to the evaluator, which reuses a stored value for any field
+    // the upstream did not deliver. A FIRST login finds no prior profile, so a missing required
+    // email still fails closed. Only fetched when the quirk is set, so an ordinary connector
+    // pays no extra read.
+    let prior_traits_value = if definition.quirks.profile_delivered_first_auth_only {
+        let external_id = federated_external_id(issuer, &identity.subject);
+        match state
+            .store()
+            .scoped(scope)
+            .users()
+            .by_external_id(&external_id)
+            .await
+        {
+            Ok(Some(existing)) => match state
+                .store()
+                .scoped(scope)
+                .users()
+                .traits(&existing.id)
+                .await
+            {
+                Ok(traits) => traits.and_then(|(_, value)| match value {
+                    serde_json::Value::Object(map) => Some(map),
+                    _ => None,
+                }),
+                Err(_) => return interaction::server_error_page(),
+            },
+            Ok(None) => None,
+            Err(_) => return interaction::server_error_page(),
+        }
+    } else {
+        None
+    };
+    let prior_traits = prior_traits_value.as_ref();
+
+    // Hide My Email relay classification (issue #74): when the connector names a relay domain
+    // (Apple's `privaterelay.appleid.com`) and the upstream delivered an email, inject a
+    // synthetic `email_relay` boolean claim so the classification flows through the SAME
+    // declarative claim-mapping pipeline as every other trait (verified-but-unroutable is data,
+    // not a code branch). A returning login that omits the email reuses the stored flag.
+    let mut claims = identity.claims.clone();
+    if let Some(relay_domain) = definition.quirks.relay_email_domain.as_deref() {
+        if let Some(email) = identity.email.as_deref() {
+            let relay = is_relay_email(email, Some(relay_domain));
+            claims.insert(EMAIL_RELAY_TRAIT.to_owned(), serde_json::Value::Bool(relay));
+        }
+    }
+
+    // Compile the active schema into the store-free view and evaluate the declarative claim
+    // mapping in ONE synchronous block, after every await, so the non-Send `&dyn TraitSchemaView`
+    // is confined to this block and never captured across a later await (keeping the handler
+    // future Send). Evaluation is fail-closed: on ANY failure (a missing required claim a first
+    // login cannot backfill, a wrong type, an undeclared trait) it returns Err and the login
+    // aborts BEFORE any user row is written.
+    let trait_doc = {
+        let compiled = match active_schema
+            .as_ref()
+            .map(|version| TraitSchema::compile(&version.schema_json))
+        {
+            Some(Ok(schema)) => Some(schema),
+            // An active schema that fails to compile is a server-side fault, not a login the user
+            // can fix; fail closed without provisioning.
+            Some(Err(_)) => return interaction::server_error_page(),
+            None => None,
+        };
+        let schema_view = compiled.as_ref().map(StoreTraitSchema);
+        let schema_arg: Option<&dyn TraitSchemaView> = schema_view
+            .as_ref()
+            .map(|view| view as &dyn TraitSchemaView);
+        match evaluate(
+            &definition.claim_mapping,
+            &definition.quirks,
+            ClaimSources {
+                id_token: &claims,
+                userinfo: None,
+            },
+            schema_arg,
+            prior_traits,
+        ) {
+            Ok(trait_doc) => trait_doc,
+            Err(_) => return interaction::server_error_page(),
+        }
     };
 
-    // Provision the local identity from the mapped traits (PR C), still keying on the VERIFIED,
-    // issuer-namespaced (issuer, sub) composite PR B established (never the mapped subject). A
-    // first login provisions the mapped traits; a returning login refreshes them. Only a fully
-    // valid, type-checked document ever reaches this write.
+    // Provision the local identity keyed on the verified, issuer-namespaced `(issuer, sub)`
+    // composite (never the mapped subject). A first login creates it with the mapped traits; a
+    // returning login refreshes them (Apple's reused profile round-trips to the same values).
     let schema_version = active_schema.as_ref().map(|version| version.version);
     let Ok(user_id) = provision_federated_user(
-        &state,
+        state,
         scope,
-        &connector_slug,
-        &expected_issuer,
-        &identity,
+        connector_slug,
+        issuer,
+        identity,
         &trait_doc,
         schema_version,
     )
@@ -968,8 +1203,7 @@ pub async fn federation_callback(
 
     // Establish the LOCAL session with the HONEST federated authentication event: the local
     // token's acr is the federated context and its amr is the UPSTREAM's asserted amr
-    // passthrough (never a fabricated local factor). auth_time is the upstream auth_time
-    // when present, else the callback instant.
+    // passthrough. auth_time is the upstream auth_time when present, else the callback instant.
     let auth_time_micros = identity
         .auth_time_secs
         .map_or_else(|| now_micros, |secs| secs.saturating_mul(1_000_000));
@@ -979,15 +1213,9 @@ pub async fn federation_callback(
         identity.upstream_acr.as_deref(),
     );
     let actor = interaction::user_actor(&user_id);
-    let Ok(cookies) = interaction::establish_session(
-        &state,
-        scope,
-        &user_id.to_string(),
-        &event,
-        actor,
-        &headers,
-    )
-    .await
+    let Ok(cookies) =
+        interaction::establish_session(state, scope, &user_id.to_string(), &event, actor, headers)
+            .await
     else {
         return interaction::server_error_page();
     };
@@ -996,11 +1224,10 @@ pub async fn federation_callback(
     // #76), clearing any prior backoff so a recovered upstream is immediately trusted again.
     runtime
         .health()
-        .record_success(now, &connector_key, fingerprint);
+        .record_success(now, connector_key, fingerprint);
 
-    // Resume the pending LOCAL authorization request, which now sees the authenticated
-    // session and issues LOCAL tokens as usual (carrying the honest federated acr/amr).
-    interaction::redirect_setting_cookie(&consumed.return_to, &cookies)
+    // Resume the pending LOCAL authorization request, which now sees the authenticated session.
+    interaction::redirect_setting_cookie(return_to, &cookies)
 }
 
 /// The namespaced external-id for a federated identity (issue #75, HIGH-1): the upstream
@@ -1201,7 +1428,7 @@ fn s256_challenge(code_verifier: &str) -> String {
 /// The federated callback redirect URI for a connector, built from the deployment's public
 /// base URL and the route's scope and slug. It must be byte-identical at the authorize leg
 /// (where it is sent to the upstream) and the callback (where it is echoed in the exchange).
-fn federation_callback_url(
+pub(crate) fn federation_callback_url(
     state: &OidcState,
     tenant_id: &str,
     environment_id: &str,

@@ -251,6 +251,11 @@ pub fn resolve_explicit(endpoints: &Endpoints) -> Result<ResolvedEndpoints, Conn
             "a discovery-form connector must resolve its endpoints through a fetched document"
                 .to_owned(),
         )),
+        Endpoints::OAuth2(_) => Err(ConnectorError::Config(
+            "an oauth2 connector has no OIDC ID-token endpoint set; it resolves its own \
+             profile and email endpoints in the oauth2 login path"
+                .to_owned(),
+        )),
     }
 }
 
