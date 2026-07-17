@@ -632,6 +632,12 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0060_upstream_token_vault.sql"),
         },
+        Migration {
+            version: 61,
+            name: "account_links",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0061_account_links.sql"),
+        },
     ]
 }
 

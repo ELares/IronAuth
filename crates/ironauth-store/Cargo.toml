@@ -145,6 +145,14 @@ name = "passkey_only_accounts"
 path = "tests/passkey_only_accounts.rs"
 required-features = ["testing"]
 
+# Guarded account linking (issue #78, PR 1): the account_links repo round-trips, the
+# anti-takeover UNIQUE invariant, and the cross-source last-usable-method guard. Needs a
+# real database (DATABASE_URL).
+[[test]]
+name = "account_links"
+path = "tests/account_links.rs"
+required-features = ["testing"]
+
 # Cross-tenant / cross-environment IDOR harness against every scoped repository
 # operation that exists today. Needs a real database (DATABASE_URL).
 [[test]]

@@ -61,6 +61,55 @@ async fn column_data_type(pool: &sqlx::PgPool, table: &str, column: &str) -> Str
     .get("data_type")
 }
 
+/// Whether `table.column` is declared `NOT NULL` (`information_schema.columns`).
+async fn column_is_not_null(pool: &sqlx::PgPool, table: &str, column: &str) -> bool {
+    let is_nullable: String = sqlx::query(
+        "SELECT is_nullable FROM information_schema.columns \
+         WHERE table_name = $1 AND column_name = $2",
+    )
+    .bind(table)
+    .bind(column)
+    .fetch_one(pool)
+    .await
+    .expect("nullability lookup")
+    .get("is_nullable");
+    is_nullable == "NO"
+}
+
+/// The `column_default` expression of `table.column` (`information_schema.columns`), or
+/// `None` when the column carries no default.
+async fn column_default(pool: &sqlx::PgPool, table: &str, column: &str) -> Option<String> {
+    sqlx::query(
+        "SELECT column_default FROM information_schema.columns \
+         WHERE table_name = $1 AND column_name = $2",
+    )
+    .bind(table)
+    .bind(column)
+    .fetch_one(pool)
+    .await
+    .expect("default lookup")
+    .get("column_default")
+}
+
+/// Whether `role` holds `privilege` (e.g. `UPDATE`) on `table` (`has_table_privilege`).
+/// Used to prove a security-immutability property physically: the app role must NOT hold
+/// UPDATE on an immutable snapshot table, so a widened grant fails the guard closed.
+async fn role_has_table_privilege(
+    pool: &sqlx::PgPool,
+    role: &str,
+    table: &str,
+    privilege: &str,
+) -> bool {
+    sqlx::query("SELECT has_table_privilege($1, $2, $3) AS present")
+        .bind(role)
+        .bind(table)
+        .bind(privilege)
+        .fetch_one(pool)
+        .await
+        .expect("table privilege lookup")
+        .get("present")
+}
+
 /// Whether `table` has BOTH `ENABLE` and `FORCE` row-level security on (`pg_class`).
 async fn rls_enabled_and_forced(pool: &sqlx::PgPool, table: &str) -> bool {
     sqlx::query(
@@ -124,6 +173,44 @@ async fn fk_on_delete_cascade(pool: &sqlx::PgPool, table: &str, column: &str) ->
     .fetch_one(pool)
     .await
     .expect("fk cascade lookup")
+    .get("present")
+}
+
+/// Whether `table` has a FOREIGN KEY constraint on `column` (any referential action).
+/// Used to prove `account_links` references its owning local user.
+async fn fk_references(pool: &sqlx::PgPool, table: &str, column: &str) -> bool {
+    sqlx::query(
+        "SELECT EXISTS ( \
+            SELECT 1 FROM pg_catalog.pg_constraint con \
+            JOIN pg_catalog.pg_attribute att \
+              ON att.attrelid = con.conrelid AND att.attnum = ANY (con.conkey) \
+            WHERE con.conrelid = $1::regclass AND con.contype = 'f' \
+              AND att.attname = $2 \
+         ) AS present",
+    )
+    .bind(table)
+    .bind(column)
+    .fetch_one(pool)
+    .await
+    .expect("fk lookup")
+    .get("present")
+}
+
+/// Whether a UNIQUE constraint named `constraint_name` exists on `table`
+/// (`pg_constraint.contype = 'u'`). Used to prove the `account_links` anti-takeover
+/// invariant: a federated identity resolves to at most one local user per scope.
+async fn unique_constraint_exists(pool: &sqlx::PgPool, table: &str, constraint_name: &str) -> bool {
+    sqlx::query(
+        "SELECT EXISTS ( \
+            SELECT 1 FROM pg_catalog.pg_constraint \
+            WHERE conrelid = $1::regclass AND contype = 'u' AND conname = $2 \
+         ) AS present",
+    )
+    .bind(table)
+    .bind(constraint_name)
+    .fetch_one(pool)
+    .await
+    .expect("unique constraint lookup")
     .get("present")
 }
 
@@ -342,13 +429,13 @@ async fn expand_contract_example_chain_runs_all_three_phases_and_contract_remove
     );
 }
 
-/// The PRODUCTION chain (`MigrationRunner::new`) contains exactly the fifty-one
+/// The PRODUCTION chain (`MigrationRunner::new`) contains exactly the sixty-one
 /// real migrations and leaves no throwaway demo object in a real database.
 // A long but linear ledger-and-table assertion sweep (one line per migration and
 // per real table); splitting it would not make it clearer.
 #[allow(clippy::too_many_lines)]
 #[tokio::test]
-async fn production_chain_is_only_the_sixty_real_migrations_and_ships_no_demo_object() {
+async fn production_chain_is_only_the_sixty_one_real_migrations_and_ships_no_demo_object() {
     // TestDatabase::start runs Store::migrate() (the production chain) on a
     // fresh, empty database.
     let db = TestDatabase::start().await;
@@ -365,8 +452,8 @@ async fn production_chain_is_only_the_sixty_real_migrations_and_ships_no_demo_ob
     );
     assert_eq!(
         report.already_applied(),
-        60,
-        "the production chain is exactly sixty migrations (isolation, audit log, management \
+        61,
+        "the production chain is exactly sixty-one migrations (isolation, audit log, management \
          API, OIDC authorization, signing keys, login/consent, authentication context, redirect \
          registration, UserInfo claims, consent scope upsert, resource servers, opaque access \
          tokens, client auth suite, dynamic client registration, pushed authorization requests, \
@@ -381,16 +468,17 @@ async fn production_chain_is_only_the_sixty_real_migrations_and_ships_no_demo_ob
          defenses, step-up policies, email OTP and scanner-safe magic links, credential-class \
          policies, guarded SMS OTP, passkey attestation, admin sudo elevations, trusted devices, \
          risk engine, account recovery, federation connectors, registration abuse defenses, \
-         federation login state, enterprise inbound routing, upstream token vault)"
+         federation login state, enterprise inbound routing, upstream token vault, \
+         guarded account links)"
     );
 
-    // The ledger holds exactly versions 1 through 60.
+    // The ledger holds exactly versions 1 through 61.
     assert_eq!(
         applied_versions(pool).await,
         vec![
             1_i64, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
             24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45,
-            46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60
+            46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61
         ]
     );
     let phase_of = |version: i64| async move {
@@ -613,6 +701,9 @@ async fn production_chain_is_only_the_sixty_real_migrations_and_ships_no_demo_ob
     // tenant-scoped tables (upstream_tokens, upstream_token_grants), no rewrite of
     // existing state.
     assert_eq!(phase_of(60).await, "expand");
+    // The guarded-account-linking migration (issue #78, PR 1) is an EXPAND: one new
+    // tenant-scoped table (account_links), no rewrite of existing state.
+    assert_eq!(phase_of(61).await, "expand");
 
     // The step-up second-factor abuse path (issue #72): migration 0047 WIDENED the
     // abuse_bans auth_path CHECK (0046 pinned the closed set) to also admit
@@ -3131,6 +3222,113 @@ async fn production_chain_is_only_the_sixty_real_migrations_and_ships_no_demo_ob
         )
         .await,
         "upstream_token_grants must carry the nonempty-scope CHECK constraint"
+    );
+
+    // The guarded account links table (issue #78, migration 0061): one row per (local
+    // user) to (federated identity) binding.
+    assert!(
+        table_exists(pool, "account_links").await,
+        "account_links exists after 0061"
+    );
+    for column in [
+        "id",
+        "tenant_id",
+        "environment_id",
+        "user_id",
+        "connector_id",
+        "external_id_bidx",
+        "external_id_sealed",
+        "external_id_dek_version",
+        "email_verified",
+        "link_method",
+        "created_at",
+    ] {
+        assert!(
+            column_exists(pool, "account_links", column).await,
+            "account_links.{column} exists after 0061"
+        );
+    }
+    // The federated identifier lands as a keyed BLIND INDEX and a SEALED ciphertext,
+    // never a plaintext queryable column.
+    assert_eq!(
+        column_data_type(pool, "account_links", "external_id_bidx").await,
+        "bytea",
+        "the account_links federated selector must be a blind-index bytea column"
+    );
+    assert_eq!(
+        column_data_type(pool, "account_links", "external_id_sealed").await,
+        "bytea",
+        "the account_links display identifier must be a sealed-ciphertext bytea column"
+    );
+    for forbidden in ["external_id", "issuer", "subject", "sub", "email"] {
+        assert!(
+            !column_exists(pool, "account_links", forbidden).await,
+            "account_links must have no plaintext federated identifier column ({forbidden}) after \
+             0061"
+        );
+    }
+    // The email_verified trust snapshot is a boolean property of the link.
+    assert_eq!(
+        column_data_type(pool, "account_links", "email_verified").await,
+        "boolean",
+        "account_links.email_verified must be a boolean trust snapshot"
+    );
+    // The email_verified trust snapshot is IMMUTABLE (a security property of issue #78):
+    // captured at link time and never rewritten. Its immutability is enforced physically,
+    // not by convention:
+    //   1. the column is NOT NULL DEFAULT false, so a link always carries a definite,
+    //      fail-safe (untrusted) snapshot rather than a NULL that could read as trusted;
+    //   2. the data-plane app role holds NO UPDATE privilege on account_links at all, so
+    //      the snapshot cannot be flipped after the fact even by the application. Asserted
+    //      here so a future grant widening (or a dropped NOT NULL / DEFAULT) fails closed.
+    assert!(
+        column_is_not_null(pool, "account_links", "email_verified").await,
+        "account_links.email_verified must be NOT NULL (a link always carries a definite \
+         trust snapshot)"
+    );
+    assert_eq!(
+        column_default(pool, "account_links", "email_verified")
+            .await
+            .as_deref(),
+        Some("false"),
+        "account_links.email_verified must DEFAULT false (fail-safe untrusted)"
+    );
+    assert!(
+        !role_has_table_privilege(pool, "ironauth_app", "account_links", "UPDATE").await,
+        "the app role must hold NO UPDATE on account_links: the email_verified trust \
+         snapshot is physically immutable"
+    );
+    assert!(
+        rls_enabled_and_forced(pool, "account_links").await,
+        "account_links must ENABLE and FORCE row-level security"
+    );
+    assert!(
+        policy_exists(pool, "account_links", "account_links_tenant_isolation").await,
+        "the (tenant, environment) isolation policy must exist on account_links"
+    );
+    for constraint in [
+        "account_links_scope_nonempty",
+        "account_links_link_method_known",
+    ] {
+        assert!(
+            check_constraint_exists(pool, "account_links", constraint).await,
+            "account_links must carry the {constraint} CHECK constraint"
+        );
+    }
+    // The structural anti-takeover invariant: a federated identity resolves to AT MOST
+    // one local user per scope. The UNIQUE (tenant, environment, connector,
+    // external_id_bidx) constraint is what makes a second local user claiming the same
+    // (connector, issuer, sub) a unique violation rather than a silent re-home.
+    assert!(
+        unique_constraint_exists(pool, "account_links", "account_links_identity_uniq").await,
+        "account_links must carry the (connector, external_id_bidx) UNIQUE anti-takeover constraint"
+    );
+    // The user_id column is a PLAIN foreign key into users(id), exactly like
+    // user_identifiers: no ON DELETE CASCADE (users are soft-deleted, so a link is never
+    // hard-deleted out from under an account by the users lifecycle).
+    assert!(
+        fk_references(pool, "account_links", "user_id").await,
+        "account_links.user_id must be a FOREIGN KEY into users"
     );
 }
 

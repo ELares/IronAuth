@@ -69,6 +69,9 @@
 
 mod abuse;
 mod account;
+/// The pure trust decision for guarded account linking (issue #78), unit-tested in
+/// isolation and correct-but-unwired in PR 1 (PR 2 wires it into the callback).
+pub mod account_linking;
 mod acme;
 mod authn;
 mod authorize;

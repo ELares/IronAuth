@@ -1842,6 +1842,55 @@ impl Default for LazyMigrationConfig {
 /// value.
 pub const OIDC_MAX_FEDERATION_TTL_SECS: u64 = 86_400;
 
+/// The posture governing whether a federated login may AUTO-LINK into a pre-existing
+/// local account (issue #78). The default is the most conservative one: a federated
+/// login NEVER silently merges into a pre-existing local account. An operator opts into
+/// verified-to-verified auto-linking per environment.
+///
+/// This is one structural floor of the guarded linking subsystem: even under
+/// `VerifiedToVerified` an auto-link fires only when the FULL trust decision table
+/// agrees (a verified local email, an upstream `email_verified`, and a trusted
+/// connector), so the "unverified local" and "untrusted upstream" cells are unreachable
+/// TWICE OVER (once by this posture, once by the trust table). Under `Off` (the default)
+/// no arm of the trust table can return `AutoLink` at all.
+///
+/// FORK B (issue #78): the intended tenancy grain is PER ENVIRONMENT. In PR 1 this ships
+/// as the deployment default; the per-environment override the pure trust decision
+/// consumes is threaded by the PR 2 wiring (the decision function takes the posture as an
+/// input, so its source is the caller's concern).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AutoLinkPosture {
+    /// A federated login NEVER auto-links into a pre-existing local account (the
+    /// conservative default). A first-ever federated login still provisions its own
+    /// separate account; a collision with an existing local account is surfaced for a
+    /// deliberate, fresh-re-auth-gated manual link, never merged automatically.
+    #[default]
+    Off,
+    /// A federated login MAY auto-link into a pre-existing local account, but ONLY when
+    /// the full trust decision table agrees (verified local email, upstream
+    /// `email_verified` true, and a trusted connector). Any weaker cell falls back to the
+    /// manual-link interstitial or a separate account.
+    VerifiedToVerified,
+}
+
+impl AutoLinkPosture {
+    /// The stable wire string (`off`, `verified_to_verified`).
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AutoLinkPosture::Off => "off",
+            AutoLinkPosture::VerifiedToVerified => "verified_to_verified",
+        }
+    }
+}
+
+/// The largest fresh-re-auth window (in seconds) manual account linking may be
+/// configured to (issue #78). A link freshness window beyond a day defeats the purpose
+/// of demanding a FRESH re-authentication of the target account, so config load rejects a
+/// larger value.
+pub const OIDC_MAX_LINK_REAUTH_MAX_AGE_SECS: u64 = 86_400;
+
 /// The generic OIDC upstream federation settings (issue #75, PR B).
 ///
 /// When enabled, the boot path builds the federation runtime that turns a declarative,
@@ -1884,6 +1933,23 @@ pub struct FederationConfig {
     /// measured. The default (30) is a responsive-but-gentle probe cadence. Must be at least 1
     /// and at most `OIDC_MAX_FEDERATION_TTL_SECS`.
     pub health_probe_window_secs: u64,
+
+    /// The posture governing whether a federated login may AUTO-LINK into a pre-existing
+    /// local account (issue #78). `Off` (the default) is the most conservative posture: a
+    /// federated login never silently merges into a pre-existing local account. An
+    /// operator opts into `verified_to_verified` to permit auto-linking, and even then an
+    /// auto-link fires only when the full trust decision table agrees (verified local
+    /// email, upstream `email_verified`, trusted connector). See [`AutoLinkPosture`].
+    pub auto_link_posture: AutoLinkPosture,
+
+    /// The maximum age, in seconds, of the caller's re-authentication that a manual
+    /// account link accepts (issue #78, FORK C). Manual linking requires a FRESH
+    /// re-authentication of the TARGET account (never merely an active session): the
+    /// `start` leg refuses unless `now - auth_time <= link_reauth_max_age_secs`. The
+    /// default (300, five minutes) matches the passkey-conversion freshness window
+    /// without reusing that hardcoded const, so linking freshness is tunable
+    /// independently. Must be at least 1 and at most `OIDC_MAX_LINK_REAUTH_MAX_AGE_SECS`.
+    pub link_reauth_max_age_secs: u64,
 }
 
 impl Default for FederationConfig {
@@ -1893,6 +1959,8 @@ impl Default for FederationConfig {
             discovery_ttl_secs: 3600,
             jwks_ttl_secs: 3600,
             health_probe_window_secs: 30,
+            auto_link_posture: AutoLinkPosture::Off,
+            link_reauth_max_age_secs: 300,
         }
     }
 }
@@ -4055,6 +4123,23 @@ fn validate_federation(oidc: &OidcConfig) -> Result<(), ConfigError> {
                 ),
             });
         }
+    }
+    // The manual-link fresh-re-auth window (issue #78, FORK C) has its own bound: a
+    // freshness window beyond a day defeats the "fresh re-auth of the target" defense.
+    let link_reauth = federation.link_reauth_max_age_secs;
+    if link_reauth < 1 {
+        return Err(ConfigError::Invalid {
+            message: "oidc.federation.link_reauth_max_age_secs must be at least 1 second"
+                .to_string(),
+        });
+    }
+    if link_reauth > OIDC_MAX_LINK_REAUTH_MAX_AGE_SECS {
+        return Err(ConfigError::Invalid {
+            message: format!(
+                "oidc.federation.link_reauth_max_age_secs ({link_reauth}) must not exceed \
+                 {OIDC_MAX_LINK_REAUTH_MAX_AGE_SECS} seconds"
+            ),
+        });
     }
     Ok(())
 }

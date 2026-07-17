@@ -20,6 +20,14 @@ pub enum VerificationPurpose {
     Registration,
     /// An account-recovery message (a reset link / OTP).
     Recovery,
+    /// A coarse security alert that a federated identity was LINKED to the account (issue
+    /// #78): a "this was you?" notice to every verified channel, never an OTP. Reserved
+    /// for the PR 2 wiring, which fires it from the link-completion path; inert in PR 1.
+    AccountLinked,
+    /// A coarse security alert that a federated identity was UNLINKED from the account
+    /// (issue #78): the same coarse notice as [`AccountLinked`](Self::AccountLinked),
+    /// never an OTP. Reserved for the PR 2 wiring; inert in PR 1.
+    AccountUnlinked,
 }
 
 /// An email-OTP delivery (issue #68): the numeric code to deliver to `recipient`, with
@@ -88,6 +96,8 @@ impl VerificationPurpose {
         match self {
             VerificationPurpose::Registration => "registration",
             VerificationPurpose::Recovery => "recovery",
+            VerificationPurpose::AccountLinked => "account_linked",
+            VerificationPurpose::AccountUnlinked => "account_unlinked",
         }
     }
 }
