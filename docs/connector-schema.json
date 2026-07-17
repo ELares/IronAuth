@@ -281,6 +281,11 @@
       "description": "The human-facing display name.",
       "type": "string"
     },
+    "enabled": {
+      "default": true,
+      "description": "Whether the connector is active. Defaults to `true` (a new connector is\nenabled); an operator can set it `false` on an update to disable the\nconnector without deleting it. This is operational state the management API\ncarries on the definition body; the store persists it in the `enabled`\ncolumn and every read projects it.",
+      "type": "boolean"
+    },
     "endpoints": {
       "$ref": "#/$defs/Endpoints",
       "description": "The upstream endpoints: a discovery issuer or an explicit set."

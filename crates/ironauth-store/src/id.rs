@@ -472,12 +472,17 @@ impl ScopedKind for ConsentKind {
 /// definition is per-environment with the standard tenant-isolation guarantees.
 /// The prefix is `cnr` (NOT the `con` of [`ConsentKind`], which is already the
 /// consent-decision prefix: two `ScopedKind`s must not share a wire prefix, or a
-/// `ScopedId` of one kind would parse as the other). The upstream client SECRET
-/// never lives on the connector row (the row's `definition_json` is secret-free);
-/// it is sealed in `encrypted_secrets` (`sec_`, issue #48) and referenced by id, so
-/// the id is a public handle and its debug form stays legible. A connector
-/// definition is PROMOTABLE (issue #41): the definition travels in a config
-/// snapshot, but the secret's VALUE never does (only the named reference).
+/// `ScopedId` of one kind would parse as the other). The upstream client SECRET is
+/// never plaintext and never appears in the row's `definition_json` (that document
+/// is secret-free); it is sealed INLINE on the connector row itself, in the
+/// `client_secret_sealed` bytea under `client_secret_dek_version`, envelope-encrypted
+/// under the scope DEK with the seal AAD bound to this IMMUTABLE connector id plus
+/// the tenant, environment, and DEK version. Every read projection excludes the
+/// sealed column, so a read is secret-free by construction, and because the AAD keys
+/// on the id (not the mutable slug), a resealed secret stays decryptable across any
+/// definition edit. The id is a public handle, so its debug form stays legible. A
+/// connector definition is PROMOTABLE (issue #41): the definition travels in a
+/// config snapshot, but the secret's VALUE never does (only a named reference).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ConnectorKind;
 impl ScopedKind for ConnectorKind {

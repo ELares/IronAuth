@@ -209,6 +209,97 @@ async fn connector_crud_seals_the_secret_and_exports_a_reference() {
     assert!(after.is_err(), "a deleted connector must not resolve");
 }
 
+// A create -> update -> unseal round-trip proving the sealed-secret AAD is bound to
+// the connector's IMMUTABLE id, so a reseal on update stays decryptable (the MEDIUM-1
+// fix: were the AAD keyed on the slug, this would still pass, but the property the fix
+// guarantees is that a resealed secret ALWAYS authenticates under the id-reconstructed
+// AAD, which is what a later unseal path relies on).
+#[tokio::test]
+async fn a_resealed_secret_unseals_under_the_immutable_id_bound_aad() {
+    use ironauth_store::ConnectorId;
+
+    const FIRST_SECRET: &[u8] = b"UPSTREAM-CLIENT-SECRET-v1-cnr";
+    const SECOND_SECRET: &[u8] = b"UPSTREAM-CLIENT-SECRET-v2-RESEALED-cnr";
+
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let control = db.control_store();
+    let master = db.master_key();
+
+    let id = ConnectorId::generate(&env, &scope);
+    control
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .connectors()
+        .create(
+            &env,
+            &id,
+            1_000_000,
+            NewConnector {
+                slug: "acme-oidc",
+                definition_json: &definition_json("acme-oidc"),
+                client_secret: FIRST_SECRET,
+                capabilities: conservative_caps(),
+                enabled: true,
+            },
+            None,
+        )
+        .await
+        .expect("create connector");
+
+    // The sealed secret opens under the id-bound AAD right after create.
+    let opened = control
+        .scoped(scope)
+        .connectors()
+        .open_client_secret_for_test(&master, &id)
+        .await
+        .expect("open after create");
+    assert_eq!(opened, FIRST_SECRET, "the created secret must round-trip");
+
+    // UPDATE reseals under a fresh secret (slug unchanged, definition edited).
+    let updated_definition = definition_json("acme-oidc").replace("Acme", "Acme Renamed");
+    control
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .connectors()
+        .update(
+            &env,
+            &id,
+            NewConnector {
+                slug: "acme-oidc",
+                definition_json: &updated_definition,
+                client_secret: SECOND_SECRET,
+                capabilities: conservative_caps(),
+                enabled: false,
+            },
+        )
+        .await
+        .expect("update connector");
+
+    // The RESEALED secret still authenticates under the AAD reconstructed from the
+    // IMMUTABLE id (the property MEDIUM-1 guarantees), and reads back the new value.
+    let reopened = control
+        .scoped(scope)
+        .connectors()
+        .open_client_secret_for_test(&master, &id)
+        .await
+        .expect("open after update");
+    assert_eq!(
+        reopened, SECOND_SECRET,
+        "a resealed secret must unseal under the id-bound AAD"
+    );
+
+    // The enabled toggle round-trips through the store read.
+    let record = control
+        .scoped(scope)
+        .connectors()
+        .get(&id)
+        .await
+        .expect("re-get");
+    assert!(!record.enabled, "the update disabled the connector");
+}
+
 #[tokio::test]
 async fn connectors_are_cross_tenant_isolated() {
     let db = TestDatabase::start().await;

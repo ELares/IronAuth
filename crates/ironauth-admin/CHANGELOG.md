@@ -18,6 +18,14 @@ range per docs/RELEASING.md.
   new connector's `email_verified_trust` reads back `untrusted`. Six routes and their
   schemas are added to the OpenAPI spec, the served router, and the hardcoded contract
   test (op-id set, path set, and the served-route count 62 -> 68).
+  - Review fix (MEDIUM 1): `PUT .../connectors/{id}` now REJECTS a slug change with a
+    409 (the `connector_id` in the body must equal the stored `connector_slug`, the
+    immutable natural key the sealed-secret AAD anchors on), before any mutation, so the
+    stored slug and the definition can never diverge. The error names no secret value.
+  - Review fix (LOW 4): create and update now honor the definition's `enabled` flag
+    (default `true` on create; an update honors the submitted value), so an operator can
+    disable a connector without deleting it, instead of the previously hardcoded `true`.
+    An integration test covers the slug-change rejection and the enabled round-trip.
 - Admin session privilege separation (sudo mode), EXPLORATORY and off by default (issue
   #73). Behind the new per-environment `admin.sudo_mode_enabled` flag, admin READS are
   unaffected but an environment-scoped MUTATION requires a RECENT re-authentication: the

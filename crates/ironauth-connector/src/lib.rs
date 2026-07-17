@@ -409,6 +409,18 @@ pub struct ConnectorDefinition {
     /// Provider quirks expressed as data.
     #[serde(default)]
     pub quirks: Quirks,
+    /// Whether the connector is active. Defaults to `true` (a new connector is
+    /// enabled); an operator can set it `false` on an update to disable the
+    /// connector without deleting it. This is operational state the management API
+    /// carries on the definition body; the store persists it in the `enabled`
+    /// column and every read projects it.
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
+}
+
+/// A connector is enabled by default (the `enabled` field's serde default).
+fn default_enabled() -> bool {
+    true
 }
 
 /// One semantic validation failure, carrying an RFC 6901 JSON POINTER to the
@@ -532,13 +544,18 @@ impl ConnectorDefinition {
     /// column. The `client_secret` field is removed entirely (its VALUE is sealed
     /// separately under the envelope substrate and referenced by id), so the stored
     /// document can never carry secret material even in principle.
-    #[must_use]
-    pub fn secret_free_json(&self) -> serde_json::Value {
-        let mut value = serde_json::to_value(self).unwrap_or(serde_json::Value::Null);
+    ///
+    /// # Errors
+    ///
+    /// The underlying [`serde_json::Error`] if the definition cannot be serialized to
+    /// a JSON value. A serialize fault is surfaced rather than swallowed to `null`, so
+    /// a corrupt projection can never be persisted silently as the stored definition.
+    pub fn secret_free_json(&self) -> Result<serde_json::Value, serde_json::Error> {
+        let mut value = serde_json::to_value(self)?;
         if let Some(object) = value.as_object_mut() {
             object.remove("client_secret");
         }
-        value
+        Ok(value)
     }
 
     /// The capability matrix, the single source the persisted capability columns
@@ -616,6 +633,13 @@ fn validate_https_url(url: &str, shape: UrlShape) -> Result<(), String> {
         .any(|c| c.is_whitespace() || c.is_control())
     {
         return Err("the host contains an invalid character".to_owned());
+    }
+    // Reject userinfo (`user:pass@host`) in the authority: a credential-bearing
+    // authority is a host-confusion vector (the host a human reads is not the host
+    // resolved), so it is barred at validation time exactly like the #13 redirect
+    // userinfo-reject. The network SSRF block is a later, fetch-time concern.
+    if authority.contains('@') {
+        return Err("must not contain userinfo credentials (user:pass@host)".to_owned());
     }
     if let UrlShape::IssuerNoQueryFragment = shape {
         if url.contains('?') || url.contains('#') {
@@ -776,6 +800,58 @@ mod tests {
     }
 
     #[test]
+    fn an_issuer_with_userinfo_credentials_is_rejected() {
+        // A credential-bearing authority (user:pass@host) is a host-confusion vector
+        // and is barred at validation time (mirrors the #13 redirect userinfo-reject).
+        let json = VALID.replace(
+            "https://issuer.example.com",
+            "https://user:pass@issuer.example.com",
+        );
+        let def = parse(&json).expect("parses");
+        let errors = def.validate().expect_err("issuer with userinfo");
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.pointer == "/endpoints/issuer"
+                    && error.message.contains("userinfo")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn an_explicit_endpoint_with_userinfo_credentials_is_rejected() {
+        let json = VALID.replace(
+            "{ \"issuer\": \"https://issuer.example.com\" }",
+            "{ \"authorization_endpoint\": \"https://user:pass@up.example.com/authorize\", \
+               \"token_endpoint\": \"https://up.example.com/token\", \
+               \"jwks_uri\": \"https://up.example.com/jwks\" }",
+        );
+        let def = parse(&json).expect("parses");
+        let errors = def.validate().expect_err("endpoint with userinfo");
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.pointer == "/endpoints/authorization_endpoint"
+                    && error.message.contains("userinfo")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn a_connector_is_enabled_by_default_and_the_flag_parses() {
+        // Absent, a connector is enabled; the flag round-trips when set false.
+        let def = parse(VALID).expect("parses");
+        assert!(def.enabled, "a new connector defaults to enabled");
+        let json = VALID.replace(
+            "\"client_id\": \"ironauth-at-acme\",",
+            "\"client_id\": \"ironauth-at-acme\", \"enabled\": false,",
+        );
+        let def = parse(&json).expect("parses");
+        def.validate().expect("valid");
+        assert!(!def.enabled, "the enabled flag round-trips as submitted");
+    }
+
+    #[test]
     fn the_capability_matrix_default_is_untrusted() {
         // The NAMED conservative default, checked directly on the Default impl.
         let matrix = CapabilityMatrix::default();
@@ -809,7 +885,7 @@ mod tests {
             "\"super-secret-value\"",
         );
         let def = parse(&json).expect("parses");
-        let projection = def.secret_free_json();
+        let projection = def.secret_free_json().expect("projection serializes");
         let object = projection.as_object().expect("object");
         assert!(
             !object.contains_key("client_secret"),

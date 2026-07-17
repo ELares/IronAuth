@@ -44,3 +44,15 @@ range per docs/RELEASING.md.
     `docs/capability-matrix.schema.json`, CI-freshness-checked like the config
     schema. A cargo-fuzz target drives arbitrary bytes at the deserializer and
     validator (never a panic).
+  - **Userinfo rejected in URLs (review INFO 5).** The syntactic URL check now
+    rejects a credential-bearing authority (`user:pass@host`) in the issuer and
+    every explicit endpoint with an RFC 6901 pointer error; a userinfo authority
+    is a host-confusion vector (mirrors the redirect userinfo-reject). The
+    network SSRF block remains the fetch-time concern.
+  - **`enabled` toggle on the definition (review LOW 4).** A new
+    `enabled: bool` field (default `true`) lets the management API disable a
+    connector without deleting it; the store already carried the column.
+  - **`secret_free_json` propagates its error (review LOW 3).** The secret-free
+    projection returns `Result<Value, serde_json::Error>` instead of swallowing a
+    serialize failure to `null`, so a corrupt projection can never be persisted
+    silently.

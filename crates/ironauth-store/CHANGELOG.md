@@ -26,6 +26,14 @@ range per docs/RELEASING.md.
   The migration guard pins the chain at 55 and asserts the table's forced RLS, isolation
   policy, scope-nonempty and email-verified-trust CHECKs, sealed-secret column, and the
   absence of any plaintext `client_secret` column.
+  - Review fix (MEDIUM 1): the inline connector-secret seal AAD is now bound to the
+    connector's IMMUTABLE `cnr_` id (`connector_secret_purpose` keys on the id, not the
+    mutable slug), so a resealed secret stays decryptable across any future definition
+    edit. A testing-only `ConnectorRepo::open_client_secret_for_test` reconstructs the
+    AAD from the id to prove the create -> update -> unseal round-trip; the production
+    read path stays secret-free. The `ConnectorKind` doc (review LOW 2) is rewritten to
+    describe the shipped INLINE seal (on the row's `client_secret_sealed` bytea) rather
+    than the never-shipped `encrypted_secrets` reference.
 - Minimal risk engine state (issue #79): migration 0054 adds three tenant-scoped,
   forced-RLS tables and the `RiskRepo` / `ActingRiskRepo` accessors. `risk_login_geo`
   holds one per-subject last-seen login geo (the observed IP, coarse location, and

@@ -1211,6 +1211,11 @@ pub struct CreateConnectorRequest {
     /// Provider quirks expressed as data.
     #[serde(default)]
     pub quirks: Option<serde_json::Value>,
+    /// Whether the connector is active. Defaults to `true` on create; an update
+    /// honors the submitted value, so an operator can disable a connector without
+    /// deleting it.
+    #[serde(default)]
+    pub enabled: Option<bool>,
 }
 
 /// The per-connector capability matrix (issue #75), exposed by the management API.

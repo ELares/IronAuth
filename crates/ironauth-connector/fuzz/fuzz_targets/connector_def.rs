@@ -16,13 +16,16 @@ fuzz_target!(|data: &[u8]| {
         if let Err(errors) = definition.validate() {
             assert!(!errors.is_empty(), "a rejection must carry at least one error");
         }
-        // The secret-free projection must never carry the client_secret field.
-        let projection = definition.secret_free_json();
-        if let Some(object) = projection.as_object() {
-            assert!(
-                !object.contains_key("client_secret"),
-                "the secret-free projection must omit client_secret"
-            );
+        // The secret-free projection must never carry the client_secret field. A
+        // serialize fault surfaces as an Err (never a silent null); a parsed
+        // definition serializes, so the projection is expected to be present.
+        if let Ok(projection) = definition.secret_free_json() {
+            if let Some(object) = projection.as_object() {
+                assert!(
+                    !object.contains_key("client_secret"),
+                    "the secret-free projection must omit client_secret"
+                );
+            }
         }
     }
 });

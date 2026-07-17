@@ -17718,9 +17718,16 @@ impl ActingRiskRepo<'_> {
 
 /// The `client_secret_sealed` column purpose for a connector's sealed upstream
 /// client secret, bound into the seal AAD so a ciphertext lifted to another
-/// connector slug, row, scope, or DEK version fails authenticated decryption.
-fn connector_secret_purpose(slug: &str) -> String {
-    format!("connector_client_secret:{slug}")
+/// connector, row, scope, or DEK version fails authenticated decryption.
+///
+/// The purpose keys on the connector's IMMUTABLE scoped id (`cnr_...`), NOT the
+/// mutable-in-body slug: the slug is a natural key an operator could (attempt to)
+/// change on an update, whereas the id is stable for the connector's whole life.
+/// Binding the AAD to the id keeps a resealed secret decryptable across any future
+/// definition edit, so a reader that reconstructs the AAD from the persisted id
+/// always authenticates.
+fn connector_secret_purpose(id: &ConnectorId) -> String {
+    format!("connector_client_secret:{id}")
 }
 
 /// Reconstruct a secret-free [`ConnectorRecord`] from a connector row. The sealed
@@ -17868,6 +17875,51 @@ impl ConnectorRepo<'_> {
             .map(|row| connector_record_from_row(row, self.scope))
             .collect()
     }
+
+    /// Open the inline-sealed upstream client secret for a connector, reconstructing
+    /// the seal AAD from the connector's IMMUTABLE id. TEST-ONLY (the production read
+    /// path is secret-free by construction; the federation slice, PR B, owns the real
+    /// unseal): this exists so a test can prove a resealed secret still authenticates
+    /// under the id-bound AAD after a definition edit.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the connector is out of scope or absent;
+    /// [`StoreError::Encryption`] if the ciphertext cannot be authenticated and
+    /// decrypted; [`StoreError::Database`] on a persistence failure.
+    #[cfg(feature = "testing")]
+    pub async fn open_client_secret_for_test(
+        &self,
+        master: &MasterKey,
+        id: &ConnectorId,
+    ) -> Result<Vec<u8>, StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT client_secret_sealed, client_secret_dek_version FROM connectors \
+             WHERE tenant_id = $1 AND environment_id = $2 AND id = $3",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(id.to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(row) = row else {
+            tx.commit().await?;
+            return Err(StoreError::NotFound);
+        };
+        let sealed: Vec<u8> = row.get("client_secret_sealed");
+        let dek_version: i32 = row.get("client_secret_dek_version");
+        let dek = fetch_dek_by_version(&mut tx, self.scope, master, dek_version).await?;
+        let plaintext = dek.open(
+            &secret_seal_aad(self.scope, &connector_secret_purpose(id), dek_version),
+            &Sealed::from_bytes(sealed)?,
+        )?;
+        tx.commit().await?;
+        Ok(plaintext)
+    }
 }
 
 /// The mutating federation connector repository (issue #75): create (seal the
@@ -17952,7 +18004,7 @@ impl ActingConnectorRepo<'_> {
                 let (dek_version, dek) = fetch_active_dek(tx, scope, master).await?;
                 let sealed = dek.seal(
                     env.entropy(),
-                    &secret_seal_aad(scope, &connector_secret_purpose(&slug), dek_version),
+                    &secret_seal_aad(scope, &connector_secret_purpose(&id), dek_version),
                     &secret,
                 );
                 let result = sqlx::query(
@@ -18036,7 +18088,7 @@ impl ActingConnectorRepo<'_> {
                 let (dek_version, dek) = fetch_active_dek(tx, scope, master).await?;
                 let sealed = dek.seal(
                     env.entropy(),
-                    &secret_seal_aad(scope, &connector_secret_purpose(&slug), dek_version),
+                    &secret_seal_aad(scope, &connector_secret_purpose(&id), dek_version),
                     &secret,
                 );
                 let affected = sqlx::query(

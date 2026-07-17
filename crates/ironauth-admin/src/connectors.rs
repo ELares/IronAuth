@@ -159,8 +159,10 @@ pub async fn create_connector(
 
     let definition = parse_and_validate(&body)?;
     let secret = resolve_client_secret(&definition)?;
-    let definition_json =
-        serde_json::to_string(&definition.secret_free_json()).map_err(|_| ApiError::Internal)?;
+    let projection = definition
+        .secret_free_json()
+        .map_err(|_| ApiError::Internal)?;
+    let definition_json = serde_json::to_string(&projection).map_err(|_| ApiError::Internal)?;
     let capabilities = definition.capabilities();
 
     // The environment must exist (a clean 404 rather than a foreign-key error).
@@ -183,7 +185,7 @@ pub async fn create_connector(
             logout_propagation: capabilities.logout_propagation,
             email_verified_trust: capabilities.email_verified_trust.as_str().to_owned(),
         },
-        enabled: true,
+        enabled: definition.enabled,
         created_at_unix_micros: created_at_micros,
         updated_at_unix_micros: created_at_micros,
     };
@@ -216,7 +218,7 @@ pub async fn create_connector(
                     logout_propagation: capabilities.logout_propagation,
                     email_verified_trust: capabilities.email_verified_trust.as_str(),
                 },
-                enabled: true,
+                enabled: definition.enabled,
             },
             Some(write),
         )
@@ -388,9 +390,23 @@ pub async fn update_connector(
         .parse_id(&connector_id)?;
 
     let definition = parse_and_validate(&body)?;
+
+    // The slug is the IMMUTABLE natural key (and the anchor the sealed-secret AAD is
+    // bound to on the store's immutable id): it cannot be changed via an update. A body
+    // whose `connector_id` differs from the stored slug is rejected outright, before any
+    // mutation, so the stored slug and the definition's `connector_id` can never diverge.
+    let stored = state.store().scoped(scope).connectors().get(&id).await?;
+    if definition.connector_id != stored.slug {
+        return Err(ApiError::Conflict(
+            "the connector slug is immutable and cannot be changed on update".to_owned(),
+        ));
+    }
+
     let secret = resolve_client_secret(&definition)?;
-    let definition_json =
-        serde_json::to_string(&definition.secret_free_json()).map_err(|_| ApiError::Internal)?;
+    let projection = definition
+        .secret_free_json()
+        .map_err(|_| ApiError::Internal)?;
+    let definition_json = serde_json::to_string(&projection).map_err(|_| ApiError::Internal)?;
     let capabilities = definition.capabilities();
 
     state
@@ -411,7 +427,7 @@ pub async fn update_connector(
                     logout_propagation: capabilities.logout_propagation,
                     email_verified_trust: capabilities.email_verified_trust.as_str(),
                 },
-                enabled: true,
+                enabled: definition.enabled,
             },
         )
         .await?;

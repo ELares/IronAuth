@@ -217,5 +217,12 @@ name = "export"
 path = "tests/export.rs"
 required-features = ["testing"]
 
+# Federation connectors (issue #75): the immutable-slug guard on update and the
+# honest enabled toggle. Needs a real database (DATABASE_URL).
+[[test]]
+name = "connectors"
+path = "tests/connectors.rs"
+required-features = ["testing"]
+
 [lints]
 workspace = true

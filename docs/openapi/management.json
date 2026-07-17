@@ -6814,6 +6814,13 @@
             "type": "string",
             "description": "The human-facing display name."
           },
+          "enabled": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Whether the connector is active. Defaults to `true` on create; an update\nhonors the submitted value, so an operator can disable a connector without\ndeleting it."
+          },
           "endpoints": {
             "description": "The upstream endpoints: EITHER `{ \"issuer\": \"...\" }` OR\n`{ \"authorization_endpoint\", \"token_endpoint\", \"jwks_uri\", \"userinfo_endpoint\"? }`."
           },
