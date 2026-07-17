@@ -73,6 +73,7 @@ mod acme;
 mod authn;
 mod authorize;
 mod backchannel;
+mod broker_overlay;
 mod claims_request;
 mod client_auth;
 mod client_credentials;
