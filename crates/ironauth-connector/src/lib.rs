@@ -40,16 +40,24 @@
 //! passes syntax here and blocks on the wire later. No `url` crate is pulled in
 //! for the syntactic check; it is done inline.
 //!
-//! # What is deferred
+//! # The claim-mapping evaluator
 //!
-//! This crate is the data plane. The generic OIDC upstream (discovery, JWKS
-//! cache, ID-token validation, federated login) and the claim-mapping EVALUATOR
-//! are later slices; [`ClaimMapping`] here is the parsed-and-stored declarative
-//! SHAPE only, with no evaluator.
+//! [`ClaimMapping`] is the parsed-and-stored declarative SHAPE; the [`claim_mapping`]
+//! module is its EVALUATOR (issue #75, PR C). [`claim_mapping::evaluate`] is a pure,
+//! I/O-free transform from an upstream's verified claims to an IronAuth trait
+//! document, with a fail-closed contract: on any missing required claim, malformed
+//! claim, or trait-schema type-check failure it returns a typed error and NO document,
+//! so a mapping failure never provisions a partial identity. It stays store-free (the
+//! trait-schema type check is injected via [`claim_mapping::TraitSchemaView`]), so this
+//! crate remains pure and fetch-free.
 
+pub mod claim_mapping;
 pub mod discovery;
 pub mod error;
 
+pub use claim_mapping::{
+    ClaimMappingError, ClaimSources, TraitDocument, TraitPointerFailure, TraitSchemaView, evaluate,
+};
 pub use discovery::{ResolvedEndpoints, discovery_url, parse_discovery, resolve_explicit};
 pub use error::ConnectorError;
 
@@ -184,9 +192,9 @@ pub struct Quirks {
 /// One declarative claim-mapping rule: an ordered list of upstream claim paths to
 /// try (the first that resolves wins) and whether a value is required.
 ///
-/// This is the parsed-and-stored SHAPE only. The evaluator (resolving a path
-/// against merged ID-token / `UserInfo` claims, type-checking against the trait
-/// schema, and fail-closed provisioning) is a later slice.
+/// [`claim_mapping::evaluate`] resolves a rule against the merged ID-token /
+/// `UserInfo` claims, type-checks the assembled document against the trait schema,
+/// and fails closed on a missing required or malformed claim.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ClaimRule {
@@ -205,7 +213,7 @@ const fn default_true() -> bool {
 }
 
 /// The declarative mapping from upstream claims to IronAuth identity traits (issue
-/// #75). The parsed-and-stored SHAPE only in this slice; the evaluator is later.
+/// #75). The stored SHAPE; [`claim_mapping::evaluate`] is its evaluator.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields, default)]
 pub struct ClaimMapping {
@@ -450,6 +458,14 @@ pub struct ConnectorRuntimeConfig {
     /// How PKCE is applied to the upstream authorization request.
     #[serde(default)]
     pub pkce: PkceMode,
+    /// The declarative claim mapping the callback evaluates the verified upstream claims
+    /// through to assemble the local identity's traits (issue #75, PR C).
+    #[serde(default)]
+    pub claim_mapping: ClaimMapping,
+    /// Provider quirks read as data (issue #75, PR C): the email source order the claim
+    /// mapping resolves email through, and whether `UserInfo` is required.
+    #[serde(default)]
+    pub quirks: Quirks,
 }
 
 /// One semantic validation failure, carrying an RFC 6901 JSON POINTER to the

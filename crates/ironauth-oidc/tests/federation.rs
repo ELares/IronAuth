@@ -34,7 +34,7 @@ use ironauth_oidc::{
     federated_external_id, oidc_router,
 };
 use ironauth_store::{
-    ConnectorCapabilities, ConnectorId, CorrelationId, NewConnector, Scope, SessionId,
+    ConnectorCapabilities, ConnectorId, CorrelationId, NewConnector, Scope, SessionId, UserId,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -292,6 +292,340 @@ async fn user_provisioned(harness: &Harness, external_id: &str) -> bool {
         .await
         .expect("by_external_id")
         .is_some()
+}
+
+/// The provisioned user id for `external_id`, or `None` when no such federated user
+/// exists in scope.
+async fn provisioned_user_id(harness: &Harness, external_id: &str) -> Option<UserId> {
+    harness
+        .store()
+        .scoped(harness.scope())
+        .users()
+        .by_external_id(external_id)
+        .await
+        .expect("by_external_id")
+        .map(|record| record.id)
+}
+
+/// Register and activate a trait schema in the harness scope (issue #75, PR C): the
+/// active schema the callback type-checks the mapped traits against. Registered on
+/// the control plane, which provisions the scope's envelope keys.
+async fn seed_trait_schema(harness: &Harness, schema_json: &str) {
+    let env = harness.env().clone();
+    let scope = harness.scope();
+    let (_, version) = harness
+        .db()
+        .control_store()
+        .scoped(scope)
+        .acting(harness.db().test_actor(&env), CorrelationId::generate(&env))
+        .trait_schemas()
+        .create_version(&env, schema_json, 1_000_000)
+        .await
+        .expect("create schema version");
+    harness
+        .db()
+        .control_store()
+        .scoped(scope)
+        .acting(harness.db().test_actor(&env), CorrelationId::generate(&env))
+        .trait_schemas()
+        .activate_version(&env, version)
+        .await
+        .expect("activate schema version");
+}
+
+/// Seed an issuer-form connector at `slug` carrying an explicit `definition_json` (so a
+/// test can install a claim mapping), pointing at the mock upstream. A DATA-ONLY
+/// definition, created on the control plane.
+async fn seed_connector_json(harness: &Harness, slug: &str, definition_json: &str) {
+    let env = harness.env().clone();
+    let scope = harness.scope();
+    let id = ConnectorId::generate(&env, &scope);
+    harness
+        .db()
+        .control_store()
+        .scoped(scope)
+        .acting(harness.db().test_actor(&env), CorrelationId::generate(&env))
+        .connectors()
+        .create(
+            &env,
+            &id,
+            1_000_000,
+            NewConnector {
+                slug,
+                definition_json,
+                client_secret: b"upstream-client-secret",
+                capabilities: ConnectorCapabilities {
+                    refresh: false,
+                    groups: false,
+                    logout_propagation: false,
+                    email_verified_trust: "untrusted",
+                },
+                enabled: true,
+            },
+            None,
+        )
+        .await
+        .expect("seed connector");
+}
+
+/// The trait schema the claim-mapping tests type-check against: `email` (a string of at
+/// least 3 chars) and `name` (a string), with NO additional properties (so a mapping
+/// targeting an undeclared trait is a Config fault).
+fn mapping_trait_schema() -> String {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "email": {"type": "string", "minLength": 3},
+            "name": {"type": "string"}
+        },
+        "additionalProperties": false
+    })
+    .to_string()
+}
+
+/// An issuer-form connector definition mapping the upstream `email` (required) and
+/// `name` (optional) claims to IronAuth traits: a DATA-ONLY connector added with ZERO
+/// code change.
+fn mapped_connector_definition(slug: &str) -> String {
+    format!(
+        r#"{{"connector_id":"{slug}","display_name":"Mapped","protocol":"oidc","endpoints":{{"issuer":"{UPSTREAM_ISSUER}"}},"scopes":["openid","email"],"client_id":"{UPSTREAM_CLIENT_ID}","claim_mapping":{{"traits":{{"email":{{"source":["email"]}},"name":{{"source":["name"],"required":false}}}}}}}}"#
+    )
+}
+
+/// Drive a full federated login for `slug` with an `id_token` built from `overrides`
+/// merged onto the base claims (bound to the login's nonce and `sub`), returning the
+/// callback response.
+async fn login_with_overrides(
+    harness: &Harness,
+    runtime: &Arc<FederationRuntime>,
+    upstream: &Upstream,
+    slug: &str,
+    sub: &str,
+    overrides: serde_json::Value,
+) -> axum::response::Response {
+    let location = authorize_for(
+        harness,
+        federation_router(harness, Arc::clone(runtime)),
+        slug,
+    )
+    .await;
+    let location = location
+        .headers()
+        .get(header::LOCATION)
+        .expect("location")
+        .to_str()
+        .expect("location str")
+        .to_owned();
+    let state = param(&location, "state");
+    let nonce = param(&location, "nonce");
+    let token = id_token(&upstream.key, base_claims(&nonce, sub), overrides);
+    *upstream.token_response.lock().unwrap() = token_response(&token);
+    callback_for(
+        harness,
+        federation_router(harness, Arc::clone(runtime)),
+        slug,
+        &state,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn a_data_only_connector_provisions_mapped_traits_end_to_end_with_zero_code_change() {
+    // The PR C acceptance crux: a connector's declarative claim mapping maps upstream
+    // claims (email, name) to IronAuth traits, and the provisioned user CARRIES them,
+    // added purely as a stored definition (zero code change).
+    let harness = Harness::start().await;
+    seed_trait_schema(&harness, &mapping_trait_schema()).await;
+    seed_connector_json(
+        &harness,
+        CONNECTOR_SLUG,
+        &mapped_connector_definition(CONNECTOR_SLUG),
+    )
+    .await;
+    let upstream = start_upstream().await;
+    let runtime = build_runtime(upstream.addr, vec![IpAddr::from([93, 184, 216, 34])]);
+
+    let response = login_with_overrides(
+        &harness,
+        &runtime,
+        &upstream,
+        CONNECTOR_SLUG,
+        "mapped-sub-1",
+        serde_json::json!({ "email": "user@upstream.example", "name": "Ada Lovelace" }),
+    )
+    .await;
+    assert_eq!(
+        response.status(),
+        StatusCode::SEE_OTHER,
+        "the mapped login resumes the local authorize"
+    );
+
+    let external_id = federated_external_id(UPSTREAM_ISSUER, "mapped-sub-1");
+    let user_id = provisioned_user_id(&harness, &external_id)
+        .await
+        .expect("the federated user is provisioned");
+    let (version, traits) = harness
+        .store()
+        .scoped(harness.scope())
+        .users()
+        .traits(&user_id)
+        .await
+        .expect("traits read")
+        .expect("the provisioned user carries mapped traits");
+    assert_eq!(version, 1, "the traits record the active schema version");
+    assert_eq!(
+        traits.get("email"),
+        Some(&serde_json::json!("user@upstream.example"))
+    );
+    assert_eq!(traits.get("name"), Some(&serde_json::json!("Ada Lovelace")));
+}
+
+#[tokio::test]
+async fn a_missing_required_claim_fails_closed_and_provisions_no_user_upstream_protocol() {
+    // FAIL-CLOSED (UpstreamProtocol class): the mapping requires `email` but the upstream
+    // OMITS it, so the evaluator returns an UpstreamClaim error and the login aborts BEFORE
+    // any user row is written (the "never a partially provisioned user" criterion).
+    let harness = Harness::start().await;
+    seed_trait_schema(&harness, &mapping_trait_schema()).await;
+    seed_connector_json(
+        &harness,
+        CONNECTOR_SLUG,
+        &mapped_connector_definition(CONNECTOR_SLUG),
+    )
+    .await;
+    let upstream = start_upstream().await;
+    let runtime = build_runtime(upstream.addr, vec![IpAddr::from([93, 184, 216, 34])]);
+
+    // The upstream token carries no `email` (only the optional `name`).
+    let response = login_with_overrides(
+        &harness,
+        &runtime,
+        &upstream,
+        CONNECTOR_SLUG,
+        "no-email-sub",
+        serde_json::json!({ "name": "No Email" }),
+    )
+    .await;
+    assert_ne!(
+        response.status(),
+        StatusCode::SEE_OTHER,
+        "a missing required claim must not complete the login"
+    );
+    assert!(session_id_from_cookies(&response, &harness.scope()).is_none());
+    assert!(
+        provisioned_user_id(
+            &harness,
+            &federated_external_id(UPSTREAM_ISSUER, "no-email-sub")
+        )
+        .await
+        .is_none(),
+        "NO user is provisioned when a required claim is absent (fail-closed)"
+    );
+}
+
+#[tokio::test]
+async fn a_type_mismatch_fails_closed_and_provisions_no_user_config() {
+    // FAIL-CLOSED (Config class): the upstream sends `email` as a NUMBER, a well-formed value
+    // that fails the trait schema's type check. That is a mapping-definition fault (Config),
+    // distinct from the missing-claim UpstreamProtocol case, and it likewise provisions NO user.
+    let harness = Harness::start().await;
+    seed_trait_schema(&harness, &mapping_trait_schema()).await;
+    seed_connector_json(
+        &harness,
+        CONNECTOR_SLUG,
+        &mapped_connector_definition(CONNECTOR_SLUG),
+    )
+    .await;
+    let upstream = start_upstream().await;
+    let runtime = build_runtime(upstream.addr, vec![IpAddr::from([93, 184, 216, 34])]);
+
+    let response = login_with_overrides(
+        &harness,
+        &runtime,
+        &upstream,
+        CONNECTOR_SLUG,
+        "num-email-sub",
+        serde_json::json!({ "email": 42 }),
+    )
+    .await;
+    assert_ne!(
+        response.status(),
+        StatusCode::SEE_OTHER,
+        "a trait type mismatch must not complete the login"
+    );
+    assert!(session_id_from_cookies(&response, &harness.scope()).is_none());
+    assert!(
+        provisioned_user_id(
+            &harness,
+            &federated_external_id(UPSTREAM_ISSUER, "num-email-sub")
+        )
+        .await
+        .is_none(),
+        "NO user is provisioned when a mapped trait fails the type check (fail-closed)"
+    );
+}
+
+#[tokio::test]
+async fn a_returning_login_refreshes_the_mapped_traits() {
+    // The documented returning-login policy: a re-login re-applies the mapping so upstream
+    // trait drift is reflected, still on the ONE issuer-namespaced identity (no second user).
+    let harness = Harness::start().await;
+    seed_trait_schema(&harness, &mapping_trait_schema()).await;
+    seed_connector_json(
+        &harness,
+        CONNECTOR_SLUG,
+        &mapped_connector_definition(CONNECTOR_SLUG),
+    )
+    .await;
+    let upstream = start_upstream().await;
+    let runtime = build_runtime(upstream.addr, vec![IpAddr::from([93, 184, 216, 34])]);
+
+    let first = login_with_overrides(
+        &harness,
+        &runtime,
+        &upstream,
+        CONNECTOR_SLUG,
+        "returning-sub",
+        serde_json::json!({ "email": "old@upstream.example", "name": "Old Name" }),
+    )
+    .await;
+    assert_eq!(first.status(), StatusCode::SEE_OTHER);
+    let external_id = federated_external_id(UPSTREAM_ISSUER, "returning-sub");
+    let user_id = provisioned_user_id(&harness, &external_id)
+        .await
+        .expect("first login");
+
+    // Second login: the upstream now asserts a different name; the traits refresh in place.
+    let second = login_with_overrides(
+        &harness,
+        &runtime,
+        &upstream,
+        CONNECTOR_SLUG,
+        "returning-sub",
+        serde_json::json!({ "email": "new@upstream.example", "name": "New Name" }),
+    )
+    .await;
+    assert_eq!(second.status(), StatusCode::SEE_OTHER);
+    let user_id_again = provisioned_user_id(&harness, &external_id)
+        .await
+        .expect("returning login");
+    assert_eq!(
+        user_id, user_id_again,
+        "a returning login reuses the one identity"
+    );
+    let (_, traits) = harness
+        .store()
+        .scoped(harness.scope())
+        .users()
+        .traits(&user_id)
+        .await
+        .expect("traits read")
+        .expect("traits present");
+    assert_eq!(
+        traits.get("email"),
+        Some(&serde_json::json!("new@upstream.example"))
+    );
+    assert_eq!(traits.get("name"), Some(&serde_json::json!("New Name")));
 }
 
 /// The session id from a `Set-Cookie` response, or `None` when no session cookie is set.

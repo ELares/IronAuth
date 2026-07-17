@@ -6,6 +6,27 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Declarative claim-mapped provisioning for federated login (issue #75, PR C): the callback now
+  provisions a federated user's identity TRAITS from the connector's declarative claim mapping,
+  completing the "login works with zero code changes" acceptance criterion (PR B half-met it).
+  - **The evaluator seam.** After the upstream ID token is validated, the callback evaluates the
+    connector's `claim_mapping` (via `ironauth_connector::evaluate`) against the VERIFIED
+    id-token claims, type-checked against the scope's active `TraitSchema` (adapted to the
+    connector crate's store-free `TraitSchemaView`). The upstream `email` claim is NFKC-normalized
+    before mapping so the type-checked and stored values are the same canonical form.
+  - **Fail-closed (the acceptance-critical crux).** On ANY mapping failure (a missing required
+    claim, a wrong type, an undeclared trait, or no active schema for mapped traits) the login
+    aborts BEFORE any user row is written or mutated: NO partial identity is ever provisioned. A
+    mapping-definition fault is a `Config` error and an upstream claim fault is an
+    `UpstreamProtocol` error (distinguished so an operator can tell "my mapping is wrong" from
+    "the IdP is misbehaving").
+  - **Provisioning.** The local identity still keys on the VERIFIED, issuer-namespaced
+    `(issuer, sub)` composite (unchanged from PR B), never the mapped subject. A first login
+    creates the user with the mapped traits (or a minimal identity when the mapping maps none); a
+    returning login refreshes the mapped traits in place (a documented policy) on the one identity.
+  - `VerifiedUpstreamIdentity` now retains the full verified id-token claims (so the mapping can
+    resolve trait fields from them); `ConnectorRuntimeConfig` reads back the connector's
+    `claim_mapping` and `quirks`.
 - Generic OIDC UPSTREAM for inbound federation (issue #75, PR B): the wire that turns a
   declarative connector (PR A) into a full federated login with ZERO per-provider code.
   - **The federated login legs** (string-literal routes on `oidc_router`):

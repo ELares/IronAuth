@@ -6,6 +6,35 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Declarative claim-mapping EVALUATOR (issue #75, PR C), still pure and I/O-free (the crate
+  stays fetch-free and now also store-free): the new `claim_mapping` module turns the stored
+  `ClaimMapping` SHAPE into a transform.
+  - **`claim_mapping::evaluate`.** Resolves the subject and each trait field's ordered
+    claim-path fallback (a dotted path like `address.locality` or `emails.0`, the first that
+    resolves to a non-null value winning) against the verified `{ id_token, optional userinfo }`
+    claims (`ClaimSources`), assembles a `TraitDocument`, TYPE-CHECKS it against the scope's
+    active trait schema, and returns `Result<TraitDocument, ClaimMappingError>`. Declarative
+    ONLY: no transforms or programmable logic (the pre-token hook and claims engine are M11).
+    The `email` field's source order is governed by the connector's `email_source` quirk (data,
+    never a code branch).
+  - **Fail-closed.** On ANY failure (a missing required claim, a malformed subject, or a
+    trait-schema type-check failure) it returns `Err` and NO document, so the federation
+    callback aborts before any user row is written: a mapping failure never provisions a partial
+    identity. The document is assembled and type-checked in full first.
+  - **Two error classes.** `ClaimMappingError::MappingInvalid` (folds to `ConnectorError::Config`):
+    a resolved value fails the trait schema's type check, a rule targets a trait the schema does
+    not declare, or the scope has no active schema for the mapped traits (the mapping definition
+    is wrong). `ClaimMappingError::UpstreamClaim` (folds to `ConnectorError::UpstreamProtocol`):
+    a required claim is absent or a claim is malformed (the upstream misbehaved). Every error
+    carries RFC 6901 pointers and operator-safe messages, never a claim value.
+  - **`TraitSchemaView`.** The minimal, store-free seam the evaluator type-checks through
+    (implemented in `ironauth-oidc` over `ironauth_store::TraitSchema`), so the crate takes no
+    store dependency.
+  - **`ConnectorRuntimeConfig`** gained `claim_mapping` and `quirks` (both `#[serde(default)]`),
+    the fields the federation callback reads back from the stored `definition_json` to evaluate.
+  - A second fuzz target (`claim_mapping`): arbitrary claims through a mapping never panic,
+    always return a typed result (never a partial document), and any Ok document is fully
+    type-valid.
 - Federation login wiring (issue #75, PR B, follow-on): the secret-free `ConnectorRuntimeConfig`
   read projection (endpoints, scopes, client id, PKCE policy) the federation login path
   deserializes from the STORED `definition_json` (which strips the client secret, so it
