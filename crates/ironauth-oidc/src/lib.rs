@@ -483,10 +483,10 @@ pub fn oidc_router(state: OidcState) -> Router {
         // Management). The origin-level /.well-known/web-identity is deployment-root
         // (a browser fetches it from the bare host and it points at the single
         // designated env's scoped config); the config and accounts endpoints are
-        // scope-routed. The handlers fail closed with a 404 when the `fedcm`
-        // experimental feature is off, so the route literals stay UNCONDITIONAL for the
-        // RFC 9700 endpoint inventory (the credential-issuing /assertion endpoint is
-        // PR 2). Redirect flows are unaffected; with the flag off nothing here answers.
+        // scope-routed, as is the credential-issuing /assertion endpoint (PR 2). The
+        // handlers fail closed with a 404 when the `fedcm` experimental feature is off,
+        // so the route literals stay UNCONDITIONAL for the RFC 9700 endpoint inventory.
+        // Redirect flows are unaffected; with the flag off nothing here answers.
         .route("/.well-known/web-identity", get(fedcm::well_known))
         .route(
             "/t/{tenant_id}/e/{environment_id}/fedcm/config.json",
@@ -495,6 +495,15 @@ pub fn oidc_router(state: OidcState) -> Router {
         .route(
             "/t/{tenant_id}/e/{environment_id}/fedcm/accounts",
             get(fedcm::accounts),
+        )
+        // The credential-issuing FedCM ID assertion endpoint (issue #83, PR 2): a form
+        // POST from the browser's FedCM machinery that mints an ID token DIRECTLY to a
+        // relying party, under the SAME client/origin/consent/nonce discipline as the
+        // redirect flow (no bypass). Fails closed with a 404 when the feature is off, so
+        // the literal stays UNCONDITIONAL for the RFC 9700 endpoint inventory.
+        .route(
+            "/t/{tenant_id}/e/{environment_id}/fedcm/assertion",
+            post(fedcm::assertion),
         )
         // WebAuthn passkey ceremonies (issue #65), scope-routed so the RP ID/origin
         // and the credential reads/writes run under the right per-environment scope.

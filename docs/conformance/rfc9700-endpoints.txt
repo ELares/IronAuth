@@ -50,6 +50,7 @@
 /t/{tenant_id}/e/{environment_id}/connect/register/{client_id}
 /t/{tenant_id}/e/{environment_id}/device
 /t/{tenant_id}/e/{environment_id}/fedcm/accounts
+/t/{tenant_id}/e/{environment_id}/fedcm/assertion
 /t/{tenant_id}/e/{environment_id}/fedcm/config.json
 /t/{tenant_id}/e/{environment_id}/federation/upstream-token
 /t/{tenant_id}/e/{environment_id}/federation/{connector_slug}/authorize

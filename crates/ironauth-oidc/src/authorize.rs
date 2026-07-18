@@ -1881,7 +1881,7 @@ async fn record_skipped_consent(
 /// Whether a recorded consent has passed its expiry at `now_micros` (issue #21). A
 /// consent with no expiry (explicit/implicit) never lapses; a `remembered` consent
 /// past its TTL is treated as absent so the next authorization re-prompts.
-fn consent_expired(consent: &GrantedConsent, now_micros: i64) -> bool {
+pub(crate) fn consent_expired(consent: &GrantedConsent, now_micros: i64) -> bool {
     consent
         .expires_at_unix_micros
         .is_some_and(|expiry| expiry <= now_micros)
@@ -1941,7 +1941,10 @@ fn effective_granted_scope(requested_scope: Option<&str>, issues_code: bool) -> 
 /// `openid`) does NOT cover a later broader request (`openid profile email`), which
 /// must re-prompt; a same-or-narrower request stays covered. A missing consent
 /// ([`None`]) covers nothing.
-fn consent_covers_scope(recorded: Option<&GrantedConsent>, requested_scope: Option<&str>) -> bool {
+pub(crate) fn consent_covers_scope(
+    recorded: Option<&GrantedConsent>,
+    requested_scope: Option<&str>,
+) -> bool {
     let Some(consent) = recorded else {
         return false;
     };

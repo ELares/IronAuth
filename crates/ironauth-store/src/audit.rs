@@ -839,6 +839,14 @@ pub enum Action {
     /// authorized to retrieve a session's captured upstream tokens for an org connection.
     /// The row targets the `utg_` grant; the `detail` records the client and org connection.
     UpstreamTokenGrantCreate,
+    /// An IdP-side FedCM ID assertion was issued (issue #83, EXPLORATORY): the
+    /// credential-issuing endpoint minted an ID token directly to a relying party
+    /// after the same client, origin, consent, and single-use-nonce discipline the
+    /// redirect flow enforces. The row targets the `fdn_` single-use nonce it
+    /// consumed; the `detail` records the RP `client_id` and the session subject, and
+    /// the actor is the RP client, so the trail reads "client X issued a FedCM
+    /// assertion for subject Y". The token value is NEVER recorded.
+    FedcmAssertionIssue,
 }
 
 impl Action {
@@ -1019,6 +1027,7 @@ impl Action {
             Action::UpstreamTokenCapture => "upstream_token.capture",
             Action::UpstreamTokenRead => "upstream_token.read",
             Action::UpstreamTokenGrantCreate => "upstream_token_grant.create",
+            Action::FedcmAssertionIssue => "fedcm.assertion.issue",
             Action::RoutingRuleCreate => "routing_rule.create",
         }
     }

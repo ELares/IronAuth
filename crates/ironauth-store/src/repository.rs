@@ -943,6 +943,20 @@ impl<'a> ActingStore<'a> {
         }
     }
 
+    /// The mutating FedCM assertion audit repository for this scope and actor (issue
+    /// #83): record the `fedcm.assertion.issue` audit row for a minted ID assertion.
+    /// The single-use nonce reserve/consume reads/writes live on the non-acting
+    /// [`ScopedStore::fedcm_nonces`]; this carries the actor and correlation id into
+    /// the issuance audit trail.
+    #[must_use]
+    pub fn fedcm_nonces(&self) -> ActingFedcmNonceRepo<'a> {
+        ActingFedcmNonceRepo {
+            store: self.store,
+            scope: self.scope,
+            acting: self.acting,
+        }
+    }
+
     /// The mutating credential-class policy repository for this scope and actor (issue
     /// #66): set (upsert) or remove a minimum-credential-class row for a subject (the
     /// tenant, a group, or an org), each audited.
@@ -20983,6 +20997,57 @@ impl FedcmNonceRepo<'_> {
         .await?;
         tx.commit().await?;
         Ok(row.is_some())
+    }
+}
+
+/// The mutating FedCM assertion audit repository for a scope and actor (issue #83,
+/// EXPLORATORY). Reachable only through [`ScopedStore::acting`], so every recorded
+/// issuance carries its acting principal (the RP client) and correlation id and
+/// routes through the audited-write primitive.
+pub struct ActingFedcmNonceRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+    acting: ActingContext,
+}
+
+impl ActingFedcmNonceRepo<'_> {
+    /// Audit a minted FedCM ID assertion (issue #83), writing `fedcm.assertion.issue`
+    /// in its own transaction. The audit target is the `fdn_` single-use nonce the
+    /// assertion consumed (so the row ties to the exact nonce), the actor is the RP
+    /// client, and the operator-safe `detail` records the RP `client_id` and the
+    /// session subject. The minted token value is NEVER recorded. Called AFTER a
+    /// successful mint, so the trail records only assertions that were actually
+    /// issued.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the nonce id is out of scope;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn record_assertion_issued(
+        &self,
+        env: &Env,
+        nonce_id: &FedcmNonceId,
+        client_id: &ClientId,
+        subject: &str,
+    ) -> Result<(), StoreError> {
+        if nonce_id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let detail = format!("client_id={client_id}; subject={subject}");
+        write_audited_detailed(
+            AuditedWrite {
+                store: self.store,
+                scope: self.scope,
+                acting: &self.acting,
+                env,
+                action: Action::FedcmAssertionIssue,
+                target: nonce_id,
+            },
+            async move |_tx| Ok(()),
+            false,
+            Some(&detail),
+        )
+        .await
     }
 }
 
