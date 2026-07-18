@@ -90,6 +90,7 @@ mod discovery;
 mod disposable;
 mod email_otp;
 mod error;
+mod fedcm;
 mod federation;
 mod federation_client_secret;
 mod federation_health;
@@ -477,6 +478,23 @@ pub fn oidc_router(state: OidcState) -> Router {
         .route(
             "/.well-known/webauthn",
             get(webauthn_wellknown::related_origins),
+        )
+        // IdP-side FedCM READ surface (issue #83, EXPLORATORY, W3C Federated Credential
+        // Management). The origin-level /.well-known/web-identity is deployment-root
+        // (a browser fetches it from the bare host and it points at the single
+        // designated env's scoped config); the config and accounts endpoints are
+        // scope-routed. The handlers fail closed with a 404 when the `fedcm`
+        // experimental feature is off, so the route literals stay UNCONDITIONAL for the
+        // RFC 9700 endpoint inventory (the credential-issuing /assertion endpoint is
+        // PR 2). Redirect flows are unaffected; with the flag off nothing here answers.
+        .route("/.well-known/web-identity", get(fedcm::well_known))
+        .route(
+            "/t/{tenant_id}/e/{environment_id}/fedcm/config.json",
+            get(fedcm::config),
+        )
+        .route(
+            "/t/{tenant_id}/e/{environment_id}/fedcm/accounts",
+            get(fedcm::accounts),
         )
         // WebAuthn passkey ceremonies (issue #65), scope-routed so the RP ID/origin
         // and the credential reads/writes run under the right per-environment scope.

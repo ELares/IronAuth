@@ -570,6 +570,19 @@ impl ScopedKind for AccountLinkKind {
     const PREFIX: &'static str = "alk";
 }
 
+/// Marker for a FedCM assertion nonce (`fdn_`), one row of the single-use replay
+/// store the IdP-side FedCM id-assertion endpoint consumes (issue #83). A
+/// tenant-scoped resource: the id embeds its (tenant, environment), so a nonce row
+/// minted in one scope parses as a uniform not found under another. Runtime
+/// single-use anti-replay state (never exported); the RP-supplied nonce it records is
+/// an opaque anti-replay token, not a bearer credential, so its debug form is not
+/// redacted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct FedcmNonceKind;
+impl ScopedKind for FedcmNonceKind {
+    const PREFIX: &'static str = "fdn";
+}
+
 /// Marker for a signing key (`sik_`), an environment's per-issuer signing key
 /// (issue #19). A tenant-scoped resource: the identifier embeds its
 /// `(tenant, environment)`, so a key row can never be read across a tenant or
@@ -1218,6 +1231,9 @@ pub type UpstreamTokenGrantId = ScopedId<UpstreamTokenGrantKind>;
 /// An account-link identifier (`alk_...`), one per (local user) to (federated identity)
 /// binding of the guarded account linking subsystem (issue #78).
 pub type AccountLinkId = ScopedId<AccountLinkKind>;
+/// A FedCM assertion-nonce identifier (`fdn_...`), one row of the single-use replay
+/// store the IdP-side FedCM id-assertion endpoint consumes (issue #83).
+pub type FedcmNonceId = ScopedId<FedcmNonceKind>;
 /// A signing-key identifier (`sik_...`), which doubles as the JOSE `kid` of a
 /// per-environment signing key (issue #19).
 pub type SigningKeyId = ScopedId<SigningKeyKind>;

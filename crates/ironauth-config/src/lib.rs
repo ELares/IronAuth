@@ -33,9 +33,9 @@ use serde::{Deserialize, Serialize};
 
 pub use dsn::{Dsn, DsnError, KNOWN_SCHEMES};
 pub use features::{
-    CUSTOM_DOMAINS_ACME_FEATURE, CUSTOM_DOMAINS_ACME_VERSION, Feature, FeatureRegistry,
-    FeatureValidationError, FeatureViolation, GLOBAL_TOKEN_REVOCATION_DRAFT,
-    GLOBAL_TOKEN_REVOCATION_FEATURE, Maturity,
+    CUSTOM_DOMAINS_ACME_FEATURE, CUSTOM_DOMAINS_ACME_VERSION, FEDCM_FEATURE, FEDCM_VERSION,
+    Feature, FeatureRegistry, FeatureValidationError, FeatureViolation,
+    GLOBAL_TOKEN_REVOCATION_DRAFT, GLOBAL_TOKEN_REVOCATION_FEATURE, Maturity,
 };
 pub use secret::{REDACTED, Secret, SecretError, SecretString};
 
@@ -1245,6 +1245,16 @@ pub struct OidcConfig {
     /// stored data) to suppress it. See [`FederationConfig`].
     pub federation: FederationConfig,
 
+    /// The IdP-side FedCM surface settings (issue #83, EXPLORATORY): the single
+    /// designated `(tenant, environment)` this origin exposes over FedCM plus the
+    /// branding metadata the browser account chooser renders. This section only
+    /// SHAPES the FedCM documents; it can never ARM the endpoints. The arming switch
+    /// is the `fedcm` experimental feature flag, resolved to a state-builder bool at
+    /// boot (never an `[oidc]` toggle), so a designated env configured here still
+    /// answers a uniform 404 on every FedCM route until the feature is enabled AND
+    /// acknowledged. See [`FedcmConfig`].
+    pub fedcm: FedcmConfig,
+
     /// Credential-abuse regulation and anti-enumeration posture (issue #64): the
     /// risk-based escalating throttle, the durable ban policy, and the closed-
     /// registration switch. The default posture is account-DoS-safe (no hard lockout).
@@ -1692,6 +1702,7 @@ impl Default for OidcConfig {
             backchannel_logout_request_timeout_secs: 10,
             lazy_migration: LazyMigrationConfig::default(),
             federation: FederationConfig::default(),
+            fedcm: FedcmConfig::default(),
             webauthn_enabled: true,
             webauthn_rp_id: None,
             webauthn_related_origins: Vec::new(),
@@ -1976,6 +1987,59 @@ impl Default for FederationConfig {
             link_reauth_max_age_secs: 300,
         }
     }
+}
+
+/// The IdP-side FedCM surface settings (issue #83, EXPLORATORY).
+///
+/// FedCM's `/.well-known/web-identity` is an ORIGIN-level document, but IronAuth
+/// serves everything else per `(tenant, environment)` and has no origin-level
+/// default env. This section names the SINGLE designated `(tenant, environment)`
+/// this origin exposes over FedCM (mirroring the WebAuthn related-origins
+/// process-level model), so the origin-level well-known points at that env's
+/// path-scoped config, and it carries the branding metadata the browser account
+/// chooser renders. Multi-tenant-per-origin FedCM is a graduation trigger, not a
+/// goal of the experiment.
+///
+/// This section can only SHAPE the FedCM documents; it can never ARM the endpoints.
+/// The arming switch is the `fedcm` experimental feature flag, resolved to a
+/// state-builder bool at boot (never an `[oidc]` toggle, so the experimental ack
+/// gate can never be bypassed). With a designated env configured here but the
+/// feature disabled, every FedCM route still answers a uniform 404.
+///
+/// Empty by default: no designated env means the FedCM well-known and config 404
+/// even when the feature is enabled, disclosing nothing on an origin that has not
+/// opted a specific env into the experiment.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields, default)]
+pub struct FedcmConfig {
+    /// The tenant id of the single `(tenant, environment)` this origin exposes over
+    /// FedCM (issue #83). Unset by default; when unset (or `designated_environment`
+    /// is unset) the FedCM well-known and config answer a uniform 404. The value is a
+    /// `ten_` id string; it is resolved to a live scope at boot, and a malformed or
+    /// unknown value simply yields the same non-disclosing 404.
+    pub designated_tenant: Option<String>,
+
+    /// The environment id of the single `(tenant, environment)` this origin exposes
+    /// over FedCM (issue #83). Unset by default; see [`Self::designated_tenant`]. Both
+    /// must be set together for the FedCM well-known and config to serve a document.
+    pub designated_environment: Option<String>,
+
+    /// The provider display name the browser account chooser shows (issue #83). Falls
+    /// back to a neutral default when unset, so the config document is always
+    /// well-formed. Non-secret branding metadata.
+    pub provider_name: Option<String>,
+
+    /// The provider icon URL the browser account chooser renders (issue #83). Non-secret
+    /// branding metadata; omitted from the config document when unset.
+    pub icon_url: Option<String>,
+
+    /// The account chooser background color, a CSS color string (issue #83). Non-secret
+    /// branding metadata; omitted from the config document when unset.
+    pub background_color: Option<String>,
+
+    /// The account chooser text color, a CSS color string (issue #83). Non-secret
+    /// branding metadata; omitted from the config document when unset.
+    pub text_color: Option<String>,
 }
 
 /// The credential-abuse regulation settings (issue #64).
@@ -3146,6 +3210,7 @@ impl Config {
         validate_email_otp(&self.oidc)?;
         validate_sms_otp(&self.oidc)?;
         validate_recovery(&self.oidc)?;
+        validate_fedcm(&self.oidc)?;
         validate_quota(&self.quota)?;
         validate_password_hashing(&self.password_hashing)?;
         validate_password_policy(&self.password_policy)?;
@@ -3169,6 +3234,33 @@ fn validate_recovery(oidc: &OidcConfig) -> Result<(), ConfigError> {
                  {RECOVERY_MAX_DELAY_SECS} seconds",
                 oidc.recovery_delay_secs
             ),
+        });
+    }
+    Ok(())
+}
+
+/// Validate the IdP-side FedCM surface settings (issue #83). The designated
+/// `(tenant, environment)` must be given as BOTH ids or NEITHER: a lone tenant or a
+/// lone environment is an operator mistake that would otherwise silently leave the
+/// well-known 404 with no diagnostic. The exact id shape is validated at boot when
+/// the pair is resolved to a live scope (this crate does not depend on the id
+/// parser), so a malformed pair fails safe to the same non-disclosing 404.
+fn validate_fedcm(oidc: &OidcConfig) -> Result<(), ConfigError> {
+    let tenant = oidc.fedcm.designated_tenant.as_deref();
+    let environment = oidc.fedcm.designated_environment.as_deref();
+    if tenant.is_some() != environment.is_some() {
+        return Err(ConfigError::Invalid {
+            message: "oidc.fedcm.designated_tenant and oidc.fedcm.designated_environment must be \
+                      set together (both name the single (tenant, environment) this origin \
+                      exposes over FedCM) or both left unset"
+                .to_owned(),
+        });
+    }
+    if tenant.is_some_and(str::is_empty) || environment.is_some_and(str::is_empty) {
+        return Err(ConfigError::Invalid {
+            message: "oidc.fedcm.designated_tenant and oidc.fedcm.designated_environment must not \
+                      be empty strings when set"
+                .to_owned(),
         });
     }
     Ok(())

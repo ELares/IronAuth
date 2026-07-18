@@ -477,7 +477,7 @@ async fn expand_contract_example_chain_runs_all_three_phases_and_contract_remove
 // per real table); splitting it would not make it clearer.
 #[allow(clippy::too_many_lines)]
 #[tokio::test]
-async fn production_chain_is_only_the_sixty_two_real_migrations_and_ships_no_demo_object() {
+async fn production_chain_is_only_the_sixty_three_real_migrations_and_ships_no_demo_object() {
     // TestDatabase::start runs Store::migrate() (the production chain) on a
     // fresh, empty database.
     let db = TestDatabase::start().await;
@@ -494,8 +494,8 @@ async fn production_chain_is_only_the_sixty_two_real_migrations_and_ships_no_dem
     );
     assert_eq!(
         report.already_applied(),
-        62,
-        "the production chain is exactly sixty-two migrations (isolation, audit log, management \
+        63,
+        "the production chain is exactly sixty-three migrations (isolation, audit log, management \
          API, OIDC authorization, signing keys, login/consent, authentication context, redirect \
          registration, UserInfo claims, consent scope upsert, resource servers, opaque access \
          tokens, client auth suite, dynamic client registration, pushed authorization requests, \
@@ -511,16 +511,16 @@ async fn production_chain_is_only_the_sixty_two_real_migrations_and_ships_no_dem
          policies, guarded SMS OTP, passkey attestation, admin sudo elevations, trusted devices, \
          risk engine, account recovery, federation connectors, registration abuse defenses, \
          federation login state, enterprise inbound routing, upstream token vault, \
-         guarded account links, account linking wiring)"
+         guarded account links, account linking wiring, FedCM assertion nonces)"
     );
 
-    // The ledger holds exactly versions 1 through 62.
+    // The ledger holds exactly versions 1 through 63.
     assert_eq!(
         applied_versions(pool).await,
         vec![
             1_i64, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
             24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45,
-            46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62
+            46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63
         ]
     );
     let phase_of = |version: i64| async move {
@@ -750,6 +750,42 @@ async fn production_chain_is_only_the_sixty_two_real_migrations_and_ships_no_dem
     // nullable columns (federation_login_states.link_target_user_id and
     // environments.auto_link_posture) plus one view replace and one column grant.
     assert_eq!(phase_of(62).await, "expand");
+    // The FedCM assertion-nonce migration (issue #83) is an EXPAND: one new tenant-scoped
+    // single-use replay table (fedcm_assertion_nonces) with its index, isolation policy,
+    // nonempty-scope CHECK, and a no-DELETE column grant. No rewrite of existing state.
+    assert_eq!(phase_of(63).await, "expand");
+
+    // The FedCM assertion-nonce store (issue #83) is a NEW tenant-scoped table, so it must
+    // ENABLE and FORCE row-level security, carry the (tenant, environment) isolation policy,
+    // and pin the nonempty-scope CHECK, exactly like every other scoped table.
+    assert!(
+        rls_enabled_and_forced(pool, "fedcm_assertion_nonces").await,
+        "fedcm_assertion_nonces must ENABLE and FORCE row-level security"
+    );
+    assert!(
+        policy_exists(
+            pool,
+            "fedcm_assertion_nonces",
+            "fedcm_assertion_nonces_tenant_isolation"
+        )
+        .await,
+        "fedcm_assertion_nonces must carry the (tenant, environment) isolation policy"
+    );
+    assert!(
+        check_constraint_exists(
+            pool,
+            "fedcm_assertion_nonces",
+            "fedcm_assertion_nonces_scope_nonempty"
+        )
+        .await,
+        "fedcm_assertion_nonces must carry the nonempty-scope CHECK"
+    );
+    // The single-use latch column is present and nullable (NULL until consumed), so a
+    // consumed row is the durable replay evidence.
+    assert!(
+        !column_is_not_null(pool, "fedcm_assertion_nonces", "consumed_at").await,
+        "fedcm_assertion_nonces.consumed_at must be nullable (the single-use latch)"
+    );
 
     // The step-up second-factor abuse path (issue #72): migration 0047 WIDENED the
     // abuse_bans auth_path CHECK (0046 pinned the closed set) to also admit

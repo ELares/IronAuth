@@ -153,6 +153,14 @@ name = "account_links"
 path = "tests/account_links.rs"
 required-features = ["testing"]
 
+# FedCM assertion-nonce single-use replay store (issue #83, PR 1): reserve/consume
+# round-trips, replay rejection, TTL enforcement, and per-client/per-scope isolation.
+# Needs a real database (DATABASE_URL).
+[[test]]
+name = "fedcm_nonces"
+path = "tests/fedcm_nonces.rs"
+required-features = ["testing"]
+
 # Cross-tenant / cross-environment IDOR harness against every scoped repository
 # operation that exists today. Needs a real database (DATABASE_URL).
 [[test]]

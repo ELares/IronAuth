@@ -8,6 +8,7 @@
 # uncovered while the checklist reads complete.
 /.well-known/oauth-authorization-server/t/{tenant_id}/e/{environment_id}
 /.well-known/openid-configuration/t/{tenant_id}/e/{environment_id}
+/.well-known/web-identity
 /.well-known/webauthn
 /authorize
 /connect/check_session
@@ -48,6 +49,8 @@
 /t/{tenant_id}/e/{environment_id}/connect/register
 /t/{tenant_id}/e/{environment_id}/connect/register/{client_id}
 /t/{tenant_id}/e/{environment_id}/device
+/t/{tenant_id}/e/{environment_id}/fedcm/accounts
+/t/{tenant_id}/e/{environment_id}/fedcm/config.json
 /t/{tenant_id}/e/{environment_id}/federation/upstream-token
 /t/{tenant_id}/e/{environment_id}/federation/{connector_slug}/authorize
 /t/{tenant_id}/e/{environment_id}/federation/{connector_slug}/callback

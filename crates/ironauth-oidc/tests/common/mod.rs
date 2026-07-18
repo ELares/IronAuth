@@ -886,6 +886,49 @@ impl Harness {
         self.state = state;
     }
 
+    /// Arm the experimental IdP-side FedCM surface (issue #83) for the harness scope and
+    /// rebuild the protocol router. Builds a fresh state over the SAME master-key-wired
+    /// store, env, and registry, with the harness scope designated as the single FedCM
+    /// env (Fork A1) plus branding, and `with_fedcm_enabled(true)` (the arming bool the
+    /// boot path resolves from the feature ladder). The confidential-client PKCE relax
+    /// matches [`Harness::start`], so the authorize/login/logout flows drive as usual.
+    pub fn enable_fedcm(&mut self) {
+        let config = OidcConfig {
+            require_pkce_for_confidential_clients: false,
+            fedcm: ironauth_config::FedcmConfig {
+                designated_tenant: Some(self.scope.tenant().to_string()),
+                designated_environment: Some(self.scope.environment().to_string()),
+                provider_name: Some("IronAuth Test".to_owned()),
+                background_color: Some("#0b1220".to_owned()),
+                text_color: Some("#ffffff".to_owned()),
+                icon_url: Some("https://issuer.test/fedcm-icon.png".to_owned()),
+            },
+            ..OidcConfig::default()
+        };
+        let state = OidcState::new(
+            self.db.store().clone(),
+            self.env.clone(),
+            Arc::clone(&self.registry),
+            &config,
+            ISSUER_BASE,
+        )
+        .with_fedcm_enabled(true);
+        // Mount the protocol, issuer/JWKS, and discovery routers over the one registry,
+        // exactly as `main.rs` mounts all three, so a test can assert the OIDC discovery
+        // document is UNCHANGED (never advertises FedCM) with the flag on.
+        let issuer_state = IssuerState::new(Arc::clone(&self.registry), self.env.clone());
+        let discovery_state = DiscoveryState::new(
+            ISSUER_BASE,
+            JwksCacheWindow::clamped(config.jwks_cache_max_age_secs),
+            DiscoveryCapabilities::from_config(&config),
+            Arc::clone(&self.registry),
+        );
+        self.router = oidc_router(state.clone())
+            .merge(issuer_router(issuer_state))
+            .merge(discovery_router(discovery_state));
+        self.state = state;
+    }
+
     /// Install a verification / OTP sender (issue #68) on the state and rebuild the
     /// protocol router, so a test can capture the delivered email-OTP code and magic-link
     /// token/short-code from a recording sender. Only the protocol router is rebuilt (the

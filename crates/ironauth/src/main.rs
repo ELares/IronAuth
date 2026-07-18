@@ -13,7 +13,7 @@ use std::sync::Arc;
 use axum::Router;
 use ironauth_admin::AdminState;
 use ironauth_config::{
-    Config, FeatureRegistry, GLOBAL_TOKEN_REVOCATION_FEATURE, Loaded, OidcConfig,
+    Config, FEDCM_FEATURE, FeatureRegistry, GLOBAL_TOKEN_REVOCATION_FEATURE, Loaded, OidcConfig,
     PasswordHashingConfig, PasswordPolicyConfig, QuotaConfig, ScreeningFailurePolicy,
     ScreeningProvider,
 };
@@ -149,6 +149,12 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
         // [oidc] toggle, so the ack can never be bypassed.
         let global_revocation_enabled =
             features.is_enabled(&config, GLOBAL_TOKEN_REVOCATION_FEATURE);
+        // The experimental IdP-side FedCM surface (issue #83) is armed only when its
+        // feature is enabled AND acknowledged; the gate is the ladder, never a plain
+        // [oidc] toggle, so the ack can never be bypassed. Resolved to a bool here and
+        // injected through the OIDC state builder (never OidcConfig), so every FedCM
+        // route stays a 404 and discovery advertises nothing until an operator opts in.
+        let fedcm_enabled = features.is_enabled(&config, FEDCM_FEATURE);
 
         let env = Env::system();
 
@@ -237,6 +243,7 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
                 oidc_env,
                 issuer_base,
                 global_revocation_enabled,
+                fedcm_enabled,
                 master_key,
                 &quota_config,
                 &hashing_config,
@@ -373,12 +380,16 @@ async fn build_management_router(
 // the optional lazy-migration hook; each is an independent input to the one OidcState
 // build, so bundling them into a struct would not make the wiring clearer.
 #[allow(clippy::too_many_arguments)]
+// One flat sequence of independent state-builder installs and startup notices; splitting
+// it would scatter the single OIDC mount the boot path performs.
+#[allow(clippy::too_many_lines)]
 async fn build_oidc_router(
     oidc_config: &OidcConfig,
     data_plane_dsn: &str,
     env: Env,
     issuer_base: String,
     global_revocation_enabled: bool,
+    fedcm_enabled: bool,
     master_key: Option<Arc<MasterKey>>,
     quota_config: &QuotaConfig,
     hashing_config: &PasswordHashingConfig,
@@ -487,6 +498,7 @@ async fn build_oidc_router(
 
     let mut state = OidcState::new(store, env, registry, oidc_config, issuer_base)
         .with_global_token_revocation_enabled(global_revocation_enabled)
+        .with_fedcm_enabled(fedcm_enabled)
         .with_quota_enforcer(quota_enforcer)
         .with_hashing_pool(hashing_pool)
         .with_password_policy(password_policy, screening_failure, screen_on_login)
@@ -528,6 +540,13 @@ async fn build_oidc_router(
         tracing::info!(
             "experimental Global Token Revocation receiver mounted (issue #36); the draft \
              is not WG-adopted and the wire shape may change between releases"
+        );
+    }
+    if fedcm_enabled {
+        tracing::info!(
+            "experimental FedCM IdP surface mounted (issue #83); Chrome only (Firefox \
+             paused, Safari absent), the W3C draft may change between releases, and \
+             redirect flows are unaffected"
         );
     }
     tracing::info!(

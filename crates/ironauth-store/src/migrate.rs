@@ -644,6 +644,12 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0062_account_linking_wiring.sql"),
         },
+        Migration {
+            version: 63,
+            name: "fedcm_assertion_nonces",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0063_fedcm_assertion_nonces.sql"),
+        },
     ]
 }
 

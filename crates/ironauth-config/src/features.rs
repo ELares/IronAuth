@@ -41,6 +41,18 @@ pub const CUSTOM_DOMAINS_ACME_FEATURE: &str = "custom-domains-acme";
 /// acknowledges this exact revision; a graduation that changes the shape bumps it.
 pub const CUSTOM_DOMAINS_ACME_VERSION: &str = "0.1.0-exp.1";
 
+/// The registry name of the IdP-side FedCM (W3C Federated Credential Management)
+/// experimental feature (issue #83). Chosen without a separator so the whole
+/// surface toggles under one plain flag name.
+pub const FEDCM_FEATURE: &str = "fedcm";
+
+/// The experimental `ack` version for the FedCM feature (issue #83). It is
+/// EXPLORATORY: browser support is Chrome only (Firefox paused, Safari absent) and
+/// the W3C draft is a moving target, so the wire shape may break between releases.
+/// Enabling the feature acknowledges this exact revision; a graduation that changes
+/// the shape bumps it and invalidates the old ack.
+pub const FEDCM_VERSION: &str = "0.1.0-exp.1";
+
 /// How mature a feature is, and therefore what enabling it requires.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Maturity {
@@ -170,6 +182,7 @@ impl FeatureRegistry {
         registry.register_sample_experimental();
         registry.register_global_token_revocation();
         registry.register_custom_domains_acme();
+        registry.register_fedcm();
         registry
     }
 
@@ -251,6 +264,28 @@ impl FeatureRegistry {
              provisioned CA account and a reachable domain.",
             CUSTOM_DOMAINS_ACME_VERSION,
             "crates/ironauth-store/CHANGELOG.md",
+        ));
+    }
+
+    /// Registers the IdP-side FedCM feature (issue #83), the W3C Federated
+    /// Credential Management surface: the origin-level well-known, the config file,
+    /// the accounts endpoint, and the id-assertion endpoint, plus the Login Status
+    /// headers. It is EXPLORATORY: browser support is Chrome only (Firefox paused,
+    /// Safari absent) and the spec is a moving W3C draft, so the wire shape may break
+    /// between releases and enabling it must acknowledge the exact implemented
+    /// revision. Redirect flows are UNAFFECTED. Off by default; every FedCM route
+    /// answers a uniform 404 until the feature is enabled AND acknowledged.
+    pub fn register_fedcm(&mut self) {
+        self.register(Feature::experimental(
+            FEDCM_FEATURE,
+            "IdP-side FedCM (W3C Federated Credential Management): the origin-level \
+             /.well-known/web-identity, the config file, the accounts endpoint, and \
+             the id-assertion endpoint, plus Login Status headers. EXPLORATORY: \
+             browser support is Chrome only (Firefox paused, Safari absent) and the \
+             spec is a moving W3C draft. Redirect flows are UNAFFECTED. Graduates \
+             only on Firefox shipping or real embedding demand.",
+            FEDCM_VERSION,
+            "crates/ironauth-oidc/CHANGELOG.md",
         ));
     }
 
@@ -604,5 +639,43 @@ mod tests {
         ));
         registry.validate(&acked).expect("the exact ack boots");
         assert!(registry.is_enabled(&acked, CUSTOM_DOMAINS_ACME_FEATURE));
+    }
+
+    #[test]
+    fn fedcm_is_experimental_and_off_by_default() {
+        // Issue #83 ships the FedCM surface behind a default-off experimental flag:
+        // absent from [features] it resolves disabled, and enabling it without the
+        // exact ack refuses to boot (so every FedCM route stays a uniform 404 until an
+        // operator explicitly enables AND acknowledges the experiment).
+        let registry = FeatureRegistry::builtin();
+        let feature = registry.get(FEDCM_FEATURE).expect("fedcm is registered");
+        assert!(matches!(feature.maturity(), Maturity::Experimental { .. }));
+        assert!(!feature.default_enabled());
+
+        let absent = config_with_features("");
+        registry.validate(&absent).expect("absent is fine");
+        assert!(
+            !registry.is_enabled(&absent, FEDCM_FEATURE),
+            "fedcm is off when absent from [features]"
+        );
+
+        // Enabled without an ack refuses to boot.
+        let no_ack = config_with_features("\"fedcm\" = { enabled = true }");
+        registry
+            .validate(&no_ack)
+            .expect_err("an experimental feature enabled without an ack must refuse to boot");
+
+        // Enabled WITH a WRONG ack still refuses to boot (the ack must be exact).
+        let wrong_ack = config_with_features("\"fedcm\" = { enabled = true, ack = \"0.0.0\" }");
+        registry
+            .validate(&wrong_ack)
+            .expect_err("a mismatched ack must refuse to boot");
+
+        // Enabled WITH the exact ack boots and reports enabled.
+        let acked = config_with_features(&format!(
+            "\"fedcm\" = {{ enabled = true, ack = \"{FEDCM_VERSION}\" }}"
+        ));
+        registry.validate(&acked).expect("the exact ack boots");
+        assert!(registry.is_enabled(&acked, FEDCM_FEATURE));
     }
 }
