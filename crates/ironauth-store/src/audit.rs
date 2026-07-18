@@ -805,6 +805,14 @@ pub enum Action {
     /// subject's credentials were marked for review. The row targets the `dis_`
     /// disavowal; the `detail` records how many sessions and devices were revoked.
     RiskDisavow,
+    /// A third-party risk signal was INGESTED (issue #82, PR 1): an external fraud/risk
+    /// source delivered a signal about a subject as a signed Security Event Token, whose
+    /// signature verified against the source's registered public key. The row targets the
+    /// `rsg_` signal; the `detail` records the source, the event type, the subject format,
+    /// and the resolved local subject (or that it was unresolved), never the raw external
+    /// subject. Written only for a signal that was actually ingested (a verified, fresh,
+    /// non-duplicate delivery).
+    RiskSignalIngest,
     /// A federation connector was CREATED (issue #75): a declarative OIDC-shaped
     /// upstream definition was registered through the management API. The row targets
     /// the `cnr_` connector; the `detail` records the connector slug. The definition
@@ -1019,6 +1027,7 @@ impl Action {
             Action::RecoveryFactorChange => "recovery.factor_change",
             Action::RiskDecisionRecord => "risk.decision",
             Action::RiskDisavowalIssue => "risk.disavowal.issue",
+            Action::RiskSignalIngest => "risk.signal.ingest",
             Action::RiskDisavow => "risk.disavow",
             Action::ConnectorCreate => "connector.create",
             Action::ConnectorUpdate => "connector.update",

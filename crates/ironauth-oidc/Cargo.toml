@@ -327,6 +327,16 @@ name = "risk"
 path = "tests/risk.rs"
 required-features = ["testing"]
 
+# Third-party risk-signal ingestion endpoint end to end (issue #82, PR 1): a signed
+# Security Event Token (JWS) is verified per-source through the JOSE core and ingested; the
+# flag-off 404, and every reject case (unknown source, wrong key, wrong algorithm, expired
+# SET, malformed claims) is a uniform refusal that ingests nothing; a re-delivery is an
+# idempotent no-op. Needs a real database (DATABASE_URL).
+[[test]]
+name = "risk_signals"
+path = "tests/risk_signals.rs"
+required-features = ["testing"]
+
 # WebAuthn passkey ceremonies end to end (issue #65): the four ceremony endpoints
 # driven through the real router by a software authenticator (a CBOR
 # attestationObject / COSE key, real Ed25519 assertion signatures). A passkey

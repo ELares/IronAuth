@@ -989,6 +989,7 @@
             "notify_cooldown_secs": 3600,
             "notify_on_new_device": true,
             "require_mfa_at": "off",
+            "signal_sources": [],
             "velocity_enabled": true,
             "velocity_high_threshold": 30,
             "velocity_med_threshold": 10,
@@ -1767,6 +1768,14 @@
           "description": "The risk-score threshold at or above which the authentication policy forces step-up\n(issue #79): one of `off` (never), `low`, `med`, or `high`. The canonical\n\"require MFA at MED or above\" is `med`: a MED-or-stronger score raises the effective\nrequirement so the step-up gate (issue #72) challenges a second factor, while a LOW\nscore does not. Default `off`.\n\nNOTE (enforcement): with `require_mfa_at=\"off\"` and no IP deny-list configured,\nenabling the engine does NOTHING enforcement-wise for a non-deny HIGH score (a new\ndevice, impossible travel, a velocity flood, or a provider \"suspect\" verdict): such a\nscore only Allows or Notifies. To actually ENFORCE on risk, set `require_mfa_at` to\n`low`/`med`/`high` (so a qualifying score forces step-up) and/or populate the IP\ndeny-list (a deny-list hit hard-blocks when `block_on_high`).",
           "type": "string"
         },
+        "signal_sources": {
+          "default": [],
+          "description": "The registered THIRD-PARTY risk-signal sources (issue #82, PR 1): each external\nfraud/risk source that may deliver a signed Security Event Token (SET) to the\ningestion endpoint, with its registered public keys and its per-source weight,\nthreshold, freshness, and payload-to-RiskLevel mapping. Empty by default (no source\nregistered). A source's rows are read by the engine ONLY while it is listed and\nenabled here, so an unreferenced source is inert; the per-source policy is the ONLY\nthing that turns an ingested signal into a contribution, and `can_hard_deny` defaults\nFALSE so no external source can force a block without an explicit operator opt-in. The\nwhole ingestion surface is additionally gated by the `risk-signals` experimental\nfeature flag.",
+          "items": {
+            "$ref": "#/$defs/RiskSignalSource"
+          },
+          "type": "array"
+        },
         "velocity_enabled": {
           "default": true,
           "description": "Whether the VELOCITY signal is evaluated (issue #79): per-account, per-IP, and\nper-ASN attempt rates over `velocity_window_secs`, building on the #64 counter\nlayer. On by default. Contributes MED at `velocity_med_threshold` and HIGH at\n`velocity_high_threshold`.",
@@ -1792,6 +1801,78 @@
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "RiskSignalSource": {
+      "additionalProperties": false,
+      "description": "A registered third-party risk-signal SOURCE (issue #82, PR 1).\n\nAn external fraud/risk source (a device-reputation vendor, a bot-detection service, a\npartner IdP emitting CAEP events) delivers a signal about a subject as a SIGNED Security\nEvent Token (a JWS). The ingestion endpoint AUTHENTICATES the delivery by verifying the\nJWS SIGNATURE against this source's registered public key(s) through the hardened JOSE\ncore (never a shared bearer secret, never `alg=none`), matching the SET `iss` to\n[`iss`](Self::iss) and the allowed `alg` to [`algorithms`](Self::algorithms). Only a\nverified SET from a listed, enabled source is ingested.\n\nThe remaining fields are the per-source POLICY the #79 engine applies when it folds an\ningested signal in: the payload-to-RiskLevel mapping ([`verdict_map`](Self::verdict_map)\nfor a tagged verdict, the score bands for a tagged score), the per-source weight cap\n([`max_contribution`](Self::max_contribution)) and drop threshold\n([`min_strength`](Self::min_strength)), the freshness window\n([`max_age_secs`](Self::max_age_secs)) past which a signal is STALE and contributes\nnothing, and [`can_hard_deny`](Self::can_hard_deny) (default FALSE): an external signal\ncan never force a block unless the operator explicitly opts this source in.",
+      "properties": {
+        "algorithms": {
+          "default": [],
+          "description": "The JWS algorithm allowlist a SET from this source may be signed with (issue #82),\nas JOSE `alg` names (for example `EdDSA`, `ES256`). A SET whose `alg` is outside this\nlist is rejected. Must be non-empty when the source is enabled; `alg=none` and the\nHMAC families are structurally inexpressible in the JOSE core regardless.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "can_hard_deny": {
+          "default": false,
+          "description": "Whether a signal from this source may set the engine's HARD-DENY bit (issue #82).\nDefault FALSE: an external source can never force a block. Even when true, a block\nstill requires the #79 `block_on_high` dispatch switch, so opting a source in is\nnecessary but not sufficient. This is the structural \"a signal is never a verdict\"\nguarantee: the default-false gate ANDs with any hard-deny the source requests.",
+          "type": "boolean"
+        },
+        "enabled": {
+          "default": true,
+          "description": "Whether this source is active (issue #82). When false, a SET from this source is\nrejected at ingestion AND its already-stored rows are inert (the engine reads only\nenabled sources). Default true: a listed source is active unless disabled.",
+          "type": "boolean"
+        },
+        "iss": {
+          "default": "",
+          "description": "The source identity: the SET `iss` the ingestion verifies the signature under, and\nthe value stored in the `risk_signals.source` column. Must be non-empty and unique\nacross sources.",
+          "type": "string"
+        },
+        "jwks": {
+          "default": "",
+          "description": "The source's registered PUBLIC keys as a JWKS JSON document (issue #82). Only public\nJWK members are read (the JOSE core is fail-closed), and this is the ONLY key source\nthe signature is verified against (never a key from the token header). Must be a\nnon-empty JWKS when the source is enabled.",
+          "type": "string"
+        },
+        "max_age_secs": {
+          "default": 3600,
+          "description": "The FRESHNESS window in seconds (issue #82): a signal whose `event_timestamp` is\nolder than this (measured on the env clock seam) is STALE and contributes nothing, so\na decision never rests on aged risk state. Default 3600 (one hour). Must be between 1\nand `OIDC_MAX_LIFETIME_SECS`.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_contribution": {
+          "default": "med",
+          "description": "The per-source WEIGHT cap (issue #82): the maximum RiskLevel a signal from this\nsource may contribute, one of `low`/`med`/`high`. A mapped contribution stronger than\nthis is capped down, so a low-trust source can never contribute HIGH. Default `med`.",
+          "type": "string"
+        },
+        "min_strength": {
+          "default": "low",
+          "description": "The per-source THRESHOLD (issue #82): a mapped contribution WEAKER than this rung is\ndropped entirely (contributes nothing), one of `low`/`med`/`high`. Default `low` (no\ndrop).",
+          "type": "string"
+        },
+        "score_high_threshold": {
+          "default": 0.8,
+          "description": "The HIGH score band for a tagged `{kind:\"score\"}` payload (issue #82): a numeric\nscore at or above this contributes HIGH. Must be at least\n[`score_med_threshold`](Self::score_med_threshold). Default 0.8.",
+          "format": "double",
+          "type": "number"
+        },
+        "score_med_threshold": {
+          "default": 0.5,
+          "description": "The MED score band for a tagged `{kind:\"score\"}` payload (issue #82): a numeric score\nat or above this (but below [`score_high_threshold`](Self::score_high_threshold))\ncontributes MED. Default 0.5.",
+          "format": "double",
+          "type": "number"
+        },
+        "verdict_map": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {},
+          "description": "The VERDICT-to-RiskLevel map for a tagged `{kind:\"verdict\"}` payload (issue #82):\neach verdict string (for example `deny`, `suspicious`) maps to a `low`/`med`/`high`\ncontribution. A verdict absent from this map contributes nothing. Empty by default.",
+          "type": "object"
         }
       },
       "type": "object"
@@ -2203,6 +2284,7 @@
           "notify_cooldown_secs": 3600,
           "notify_on_new_device": true,
           "require_mfa_at": "off",
+          "signal_sources": [],
           "velocity_enabled": true,
           "velocity_high_threshold": 30,
           "velocity_med_threshold": 10,

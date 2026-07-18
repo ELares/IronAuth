@@ -176,6 +176,11 @@ fn audit_screening_fail_open(scope: &Scope, provider: &str) {
 }
 
 /// Cheaply cloneable state shared by every OIDC handler.
+// The boot-resolved surface-arming flags (global-token-revocation, fedcm, risk-signals) are
+// each an INDEPENDENT experimental-feature gate the boot path sets from the strict feature
+// ladder; they are deliberately separate booleans (never a config field) so no plain toggle
+// can arm a surface outside its ack gate, which is exactly why they cannot be collapsed.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Clone)]
 pub struct OidcState {
     inner: Arc<Inner>,
@@ -206,6 +211,17 @@ pub struct OidcState {
     // uniform 404 and discovery advertises nothing. The designated env and branding
     // that SHAPE the documents live in `Inner` (config data cannot arm the surface).
     fedcm_enabled: bool,
+    // Whether the experimental third-party risk-signal ingestion surface is armed (issue
+    // #82, PR 1). Kept OUTSIDE `Inner` and set through the builder for the SAME anti-bypass
+    // reason as fedcm/global-token-revocation: it is NOT a plain `OidcConfig` toggle an
+    // operator can flip (that would arm the ingestion endpoint and the engine's
+    // external-signal path outside the experimental acknowledgment gate). The ONLY writer is
+    // the boot path, which resolves it from the strict config feature ladder (the
+    // `risk-signals` experimental feature enabled AND acked at the exact version) and sets it
+    // here. Default: false, so the ingestion endpoint answers a uniform 404 and the engine
+    // never reads an external signal. The per-source config that SHAPES ingestion lives in
+    // `RiskConfig` (config data cannot arm the surface).
+    risk_signals_enabled: bool,
     // The per-tenant/per-environment quota enforcer (issue #50), the data plane's
     // tenant-fairness layer. Kept OUTSIDE `Inner` and installed by the boot path
     // (built from the [quota] config, seeded with the SAME env clock), so a spend
@@ -747,6 +763,7 @@ impl OidcState {
             introspection_serializer: default_serializer(),
             global_token_revocation_enabled: false,
             fedcm_enabled: false,
+            risk_signals_enabled: false,
             quota: None,
             migration_hook: None,
             hashing_pool: None,
@@ -843,6 +860,30 @@ impl OidcState {
     #[must_use]
     pub fn fedcm_enabled(&self) -> bool {
         self.fedcm_enabled
+    }
+
+    /// Arm the experimental third-party risk-signal ingestion surface (issue #82, PR 1).
+    ///
+    /// The boot path is the ONLY caller: it resolves `enabled` from the strict config
+    /// feature ladder (the `risk-signals` experimental feature enabled AND acknowledged at
+    /// the exact version) and passes the result here. It is a builder rather than an
+    /// `OidcConfig` field precisely so an operator cannot arm the ingestion endpoint (or the
+    /// engine's external-signal path) from a plain config toggle and bypass the experimental
+    /// ack gate. When false (the default), the ingestion endpoint answers a uniform 404 and
+    /// the engine never reads an external signal.
+    #[must_use]
+    pub fn with_risk_signals_enabled(mut self, enabled: bool) -> Self {
+        self.risk_signals_enabled = enabled;
+        self
+    }
+
+    /// Whether the experimental third-party risk-signal ingestion surface is armed (issue
+    /// #82, PR 1). The ingestion handler's first action is to return a uniform 404 when this
+    /// is false, and the #79 engine folds external signals in ONLY when this is true (and the
+    /// engine itself is enabled).
+    #[must_use]
+    pub fn risk_signals_enabled(&self) -> bool {
+        self.risk_signals_enabled
     }
 
     /// Install the per-tenant/per-environment quota enforcer (issue #50), turning

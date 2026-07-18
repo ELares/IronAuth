@@ -650,6 +650,12 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0063_fedcm_assertion_nonces.sql"),
         },
+        Migration {
+            version: 64,
+            name: "third_party_risk_signals",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0064_third_party_risk_signals.sql"),
+        },
     ]
 }
 
