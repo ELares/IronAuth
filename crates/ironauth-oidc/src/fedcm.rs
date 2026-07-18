@@ -375,9 +375,16 @@ fn origin_matches_client(client: &ClientRecord, request_origin: Option<&str>) ->
 /// subject)`, reusing the SAME primitives as [`crate::authorize::resolve_consent_gate`]
 /// so FedCM can never be a consent bypass:
 ///
-/// - the trusted first-party carve-out (an `implicit`-mode or `skip_consent` client)
-///   is auto-granted, UNLESS the client is QUARANTINED (an unverified client always
-///   re-prompts, so its first-party trust is ignored -- exactly the redirect rule);
+/// - a QUARANTINED (unverified, issue #31) client NEVER satisfies FedCM consent. The
+///   redirect flow forces a fresh consent screen on EVERY authorization for a
+///   quarantined client (`resolve_consent_gate` sets `force_consent = ... ||
+///   client.quarantined`, which disables BOTH its first-party carve-out AND its
+///   recorded-consent fast path, so a pre-recorded consent can never silently
+///   auto-authorize it). FedCM cannot render that screen, so the exact analog is to
+///   REFUSE. This mirrors the SAME `client.quarantined` field the redirect flow reads,
+///   for BOTH the carve-out and the recorded-consent path;
+/// - otherwise the trusted first-party carve-out (an `implicit`-mode or `skip_consent`
+///   client) is auto-granted;
 /// - otherwise a recorded, UNEXPIRED consent whose granted scope COVERS the `openid`
 ///   identity scope authorizes issuance; a narrower, expired, or absent consent does
 ///   not.
@@ -390,11 +397,21 @@ async fn fedcm_consent_satisfied(
     client: &ClientRecord,
     subject: &str,
 ) -> Result<bool, ()> {
+    // A QUARANTINED (unverified) client NEVER satisfies FedCM consent. The redirect
+    // flow forces a fresh consent screen for a quarantined client on EVERY
+    // authorization (resolve_consent_gate's `force_consent || client.quarantined`,
+    // which disables both the first-party carve-out and the recorded-consent fast
+    // path); FedCM cannot render that screen, so its exact analog is to REFUSE. This
+    // is the SAME `client.quarantined` rule the redirect flow uses (issue #31), so a
+    // pre-recorded consent can never silently auto-authorize an unverified client.
+    if client.quarantined {
+        return Ok(false);
+    }
     // The first-party carve-out, byte-for-byte the redirect flow's rule (issue #21,
-    // #31): implicit/skip_consent is auto-granted, but a quarantined client never is.
+    // #31): implicit/skip_consent is auto-granted (the client is not quarantined here,
+    // that case already returned above).
     let consent_mode = ConsentMode::parse(&client.consent_mode);
-    let first_party = !client.quarantined
-        && (matches!(consent_mode, ConsentMode::Implicit) || client.skip_consent);
+    let first_party = matches!(consent_mode, ConsentMode::Implicit) || client.skip_consent;
     if first_party {
         return Ok(true);
     }
@@ -434,10 +451,12 @@ async fn fedcm_consent_satisfied(
 ///    ([`ironauth_store::ClientRepo::get`]);
 /// 8. the request `Origin` EXACT-matches one of the client's registered `https`
 ///    redirect-URI origins (Fork B1);
-/// 9. the single-use `(scope, client_id, nonce)` latch reserves-and-consumes (a
-///    replayed nonce is rejected, migration 0063);
-/// 10. consent is satisfied for `(client, subject)` (the redirect flow's rule; unmet
-///     never mints);
+/// 9. consent is satisfied for `(client, subject)` (the redirect flow's rule; unmet
+///    never mints, and a quarantined client is refused);
+/// 10. the single-use `(scope, client_id, nonce)` latch reserves-and-consumes (a
+///     replayed nonce is rejected, migration 0063). This runs AFTER the consent gate,
+///     so a refused request never BURNS a fresh nonce: a nonce is consumed only for a
+///     request that goes on to mint;
 /// 11. the ID token is minted through [`tokens::mint_id_token`] (`aud = client_id`,
 ///     `sub = resolve_public_subject(session.subject)`, `iss` = the per-env issuer,
 ///     `nonce` echoed, the per-env signing policy) and the issuance is audited.
@@ -515,10 +534,24 @@ pub(crate) async fn assertion(
         return assertion_refused();
     }
 
-    // 9. Nonce / replay: reserve-then-consume the single-use (scope, client_id, nonce)
-    //    latch (migration 0063). A freshly reserved AND freshly consumed nonce passes;
-    //    ANY re-presentation of the same (client_id, nonce) collides on reserve and is
-    //    rejected as a replay. A store fault fails closed to a server error.
+    // 9. Consent: honor the SAME consent discipline as the redirect flow. Unmet
+    //    consent NEVER silently mints (the no-consent-bypass requirement), and a
+    //    quarantined client is refused (the redirect flow's forced re-prompt). This
+    //    runs BEFORE the nonce is consumed, so a refused request does not burn a nonce.
+    match fedcm_consent_satisfied(&state, scope, &client, &session.subject).await {
+        Ok(true) => {}
+        Ok(false) => return assertion_refused(),
+        Err(()) => return assertion_server_error(),
+    }
+
+    // 10. Nonce / replay: reserve-then-consume the single-use (scope, client_id, nonce)
+    //     latch (migration 0063), only AFTER every refusal gate above has passed, so a
+    //     refused (or quarantine/consent-blocked) request never BURNS a fresh nonce. A
+    //     freshly reserved AND freshly consumed nonce passes; ANY re-presentation of the
+    //     same (client_id, nonce) collides on reserve and is rejected as a replay. A
+    //     store fault fails closed to a server error. The consume stays single-use and
+    //     atomic and precedes the mint: a token is issued only for a freshly-consumed
+    //     nonce, and a replay is still refused.
     let nonce_id = FedcmNonceId::generate(state.env(), &scope);
     let expires_at_micros = epoch_micros(
         state
@@ -541,16 +574,7 @@ pub(crate) async fn assertion(
         return assertion_refused();
     }
 
-    // 10. Consent: honor the SAME consent discipline as the redirect flow. Unmet
-    //     consent NEVER silently mints (the no-consent-bypass requirement).
-    match fedcm_consent_satisfied(&state, scope, &client, &session.subject).await {
-        Ok(true) => {}
-        Ok(false) => return assertion_refused(),
-        Err(()) => return assertion_server_error(),
-    }
-
     // 11. Mint the ID token through the EXACT redirect-flow minting core, and audit.
-    let client_id_str = client_id.to_string();
     let Some(token) =
         mint_assertion(&state, scope, &client, &session, &public_subject, nonce).await
     else {
@@ -574,7 +598,7 @@ pub(crate) async fn assertion(
         return assertion_server_error();
     }
 
-    assertion_success(&token, request_origin, &client_id_str)
+    assertion_success(&token, request_origin)
 }
 
 /// Mint the FedCM ID assertion through the token endpoint's EXACT claim + signing path
@@ -646,7 +670,7 @@ async fn mint_assertion(
 /// origin was already exact-matched against the client's registered origins -- and
 /// `Access-Control-Allow-Credentials: true` is required because the FedCM fetch is
 /// credentialed. `Vary: Origin` keeps a shared cache from crossing the per-origin gate.
-fn assertion_success(token: &str, request_origin: Option<&str>, _client_id: &str) -> Response {
+fn assertion_success(token: &str, request_origin: Option<&str>) -> Response {
     let body = serde_json::json!({ "token": token }).to_string();
     let mut response = (
         StatusCode::OK,

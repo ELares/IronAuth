@@ -96,11 +96,11 @@ Every redirect-flow check maps to the SAME primitive, so no check is skipped:
 |---|---|
 | client exists in scope (`ClientRepo::get`) | same lookup in the designated scope; unknown/disabled/cross-tenant -> refuse |
 | RP identity binding (exact-string registered `redirect_uri`) | the request `Origin` must EXACT-match one of the client's registered `https` redirect-uri origins (Fork B1: the SAME registration data, via `origin_of`) |
-| consent honored (`ConsentRepo::granted_ref` + first-party/quarantine rule) | the SAME `(subject, client_id)` consent read and rule; unmet -> refuse, never a silent mint |
+| consent honored (`ConsentRepo::granted_ref` + first-party/quarantine rule) | the SAME `(subject, client_id)` consent read and rule; unmet -> refuse, never a silent mint. A QUARANTINED (unverified, issue #31) client is REFUSED even with a recorded covering consent -- the analog of the redirect flow's forced consent re-prompt (`force_consent \|\| client.quarantined`), which FedCM cannot render, so it refuses |
 | audience (`aud = client_id`) | identical |
 | subject (`resolve_public_subject`, the one subject function) | identical |
 | signing / issuer (per-env issuer registry, `sign_jws_with_policy`) | identical, via `mint_id_token` -- never a parallel or looser mint |
-| single-use code (replay defense) | a single-use `(scope, client_id, nonce)` latch (migration 0063), reserve-then-consume |
+| single-use code (replay defense) | a single-use `(scope, client_id, nonce)` latch (migration 0063), reserve-then-consume. The nonce is consumed only AFTER every refusal gate (including consent/quarantine) passes, so a refused request never burns a fresh nonce; a token is issued only for a freshly-consumed nonce, and a replay is still refused |
 
 The request also carries `account_id` (from the accounts endpoint), which MUST equal the
 OP session's own per-env public subject, so the browser can never request an assertion
@@ -126,6 +126,20 @@ the token value).
 - The account `id` is the per-ENV PUBLIC subject (the pairwise subject if configured),
   through the one shared subject function, never the raw local user id.
 
+### Known limitations (this exploratory surface)
+
+- **First-party issuance records no consent GRANT row.** A trusted first-party client
+  (implicit / `skip_consent`, and NOT quarantined) is auto-granted and does not write a
+  `record_skipped_consent` row the way the redirect flow's first-party carve-out does. The
+  `fedcm.assertion.issue` audit is the issuance trail instead, and FedCM issues no offline
+  token, so there is no offline grant to enumerate or revoke. A follow-up could record the
+  skipped consent for parity with the redirect flow.
+- **Per-client `id_token_signed_response_alg` is not honored.** The assertion is signed
+  with the environment-default signer (`id_token_signer: None`), the same justification the
+  redirect flow's front channel uses. The token still verifies under the published per-env
+  JWKS and the same signing policy; a per-client id-token algorithm is a documented
+  divergence for the experiment.
+
 ## Login Status API
 
 FedCM tracks OP session state via the `Set-Login` response header, emitted only when the
@@ -148,7 +162,8 @@ name/email, uncacheable, empty when no session, `Sec-Fetch-Dest` gated), the ID 
 endpoint (a happy path that mints a JWKS-verifiable token with `aud`/`sub`/`iss`/`nonce`,
 sub-parity with the redirect flow, and every negative -- unknown client, account
 mismatch, origin mismatch, replayed nonce, missing `Sec-Fetch-Dest`, no session, consent
-unmet, flag-off 404), and the `Set-Login` wiring (logged-in on login, logged-out on the
+unmet, a QUARANTINED client with a recorded consent refused while the same
+verified client still mints, flag-off 404), and the `Set-Login` wiring (logged-in on login, logged-out on the
 caller's own logout, never on a cross-user logout). Boot refusal without the exact ack is
 covered in `crates/ironauth-config`.
 

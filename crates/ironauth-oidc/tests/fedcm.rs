@@ -896,6 +896,76 @@ async fn assertion_consent_unmet_is_not_minted() {
 }
 
 #[tokio::test]
+async fn assertion_quarantined_client_with_recorded_consent_is_refused() {
+    // The consent-PARITY proof (the FedCM analog of the redirect flow's forced
+    // re-prompt for a quarantined client): an unverified (QUARANTINED, issue #31)
+    // client with a PRE-RECORDED covering consent, a valid session, its registered
+    // origin, and a fresh nonce must NOT be silently issued a FedCM assertion. The
+    // redirect flow re-prompts consent on every authorization for a quarantined client
+    // (resolve_consent_gate's `force_consent || client.quarantined`, which disables the
+    // recorded-consent fast path); FedCM cannot render that screen, so its analog is to
+    // REFUSE. Then verification lifts the quarantine and the SAME recorded consent mints
+    // (no regression to the happy path).
+    let (harness, client_id, _subject, public_subject, cookie) = armed_assertion_harness().await;
+    let id = *harness.client_id();
+
+    // Quarantine the (already-consented) client: this is exactly the review's repro (a
+    // quarantined client WITH a recorded consent covering openid). Before the fix this
+    // fell through to the recorded-consent branch and minted a token.
+    harness.set_client_quarantined(&id, true).await;
+    assert!(
+        harness.client_quarantined(&id).await,
+        "the client is quarantined for this leg"
+    );
+
+    let (status, headers, body) = assertion_post(
+        &harness,
+        &assertion_form(&client_id, &public_subject, "n-quarantine"),
+        Some(RP_ORIGIN),
+        Some("webidentity"),
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a quarantined client with a recorded consent must be REFUSED, not minted: {body}"
+    );
+    assert!(
+        !body.contains("token"),
+        "a quarantined client must never be issued a FedCM assertion: {body}"
+    );
+    // A refusal carries NO CORS (no readable oracle).
+    assert_eq!(allow_origin(&headers), None);
+
+    // The control: lift the quarantine (as an admin verification does) and the SAME
+    // recorded consent now mints, on a fresh nonce. This proves the fix refuses ONLY
+    // the quarantined case and leaves the verified-client happy path unchanged.
+    harness.set_client_quarantined(&id, false).await;
+    assert!(
+        !harness.client_quarantined(&id).await,
+        "the quarantine is lifted for the control leg"
+    );
+    let (status, _headers, body) = assertion_post(
+        &harness,
+        &assertion_form(&client_id, &public_subject, "n-verified"),
+        Some(RP_ORIGIN),
+        Some("webidentity"),
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a verified client with the SAME recorded consent still mints: {body}"
+    );
+    assert!(
+        json(&body)["token"].as_str().is_some(),
+        "the verified-client happy path is unregressed: {body}"
+    );
+}
+
+#[tokio::test]
 async fn assertion_flag_off_is_404() {
     // With the flag off the credential-issuing endpoint is a uniform 404.
     let harness = Harness::start().await; // fedcm NOT enabled
