@@ -15,8 +15,8 @@
 //!
 //! - `10xxxxx` informational copy (labels, prompts, titles);
 //! - `15xxxxx` success copy;
-//! - `40xxxxx` flow level errors (expiry, completion, malformed input);
-//! - `41xxxxx` login journey errors (the uniform identifier or password failure, the
+//! - `4000xxx` flow level errors (expiry, completion, malformed input);
+//! - `4100xxx` login journey errors (the uniform identifier or password failure, the
 //!   per node validation errors).
 
 use std::collections::BTreeMap;

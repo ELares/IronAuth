@@ -20531,11 +20531,15 @@ impl FlowRepo<'_> {
 
     /// Advance an OPEN flow one mid journey step (issue #84): replace the serialized state
     /// and ROTATE the API transport `submit_token`, but ONLY when the row is still open (the
-    /// completion latch is unset and the row has not expired at `now_unix_micros`). Returns
-    /// `true` on a hit and `false` when no open row matched (an expired or already completed
-    /// flow matches nothing, so a replayed transition never re runs). The transport level
-    /// CSRF check (the API submit token match, or the browser same origin gate) is enforced
-    /// by the caller before this is reached.
+    /// completion latch is unset and the row has not expired at `now_unix_micros`) AND its
+    /// current token still equals `old_submit_token`. Returns `true` on a hit and `false`
+    /// when no open row matched (an expired or already completed flow, OR a stale/rotated
+    /// token, matches nothing, so a replayed transition never re runs). The
+    /// `old_submit_token` guard makes rotation a STRICT single winner: two concurrent
+    /// submits carrying the SAME token can never both rotate (the first swaps the token, so
+    /// the second no longer matches). The transport level CSRF check (the API submit token
+    /// match, or the browser same origin gate) is still enforced by the caller before this
+    /// is reached; this is the durable single winner backstop.
     ///
     /// # Errors
     ///
@@ -20545,6 +20549,7 @@ impl FlowRepo<'_> {
         id: &FlowId,
         new_state: &str,
         new_submit_token: &str,
+        old_submit_token: &str,
         now_unix_micros: i64,
     ) -> Result<bool, StoreError> {
         if id.scope() != self.scope {
@@ -20556,6 +20561,7 @@ impl FlowRepo<'_> {
             "UPDATE flows SET state = $4::jsonb, submit_token = $5 \
              WHERE id = $1 AND tenant_id = $2 AND environment_id = $3 \
                AND consumed_at IS NULL \
+               AND submit_token = $7 \
                AND expires_at > TIMESTAMPTZ 'epoch' + ($6::text || ' microseconds')::interval \
              RETURNING id",
         )
@@ -20565,6 +20571,7 @@ impl FlowRepo<'_> {
         .bind(new_state)
         .bind(new_submit_token)
         .bind(now_unix_micros)
+        .bind(old_submit_token)
         .fetch_optional(&mut *tx)
         .await?;
         tx.commit().await?;

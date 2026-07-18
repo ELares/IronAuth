@@ -793,5 +793,14 @@ name = "flow_api"
 path = "tests/flow_api.rs"
 required-features = ["testing"]
 
+# The flow login credential-abuse hardening (issue #84 PR1 review): the flow login now runs
+# the SAME ban / throttle / risk-block / reset layer as the bootstrap /login (no weaker),
+# consumes the flow only on a genuine mint (no fenced-account completion oracle), and its
+# API ui.action is a registered route. Over a real database (DATABASE_URL).
+[[test]]
+name = "flow_login_hardening"
+path = "tests/flow_login_hardening.rs"
+required-features = ["testing"]
+
 [lints]
 workspace = true

@@ -2,8 +2,10 @@
 
 //! The two transports (issue #84, FORK C): a thin shim over the ONE shared engine
 //! ([`super::drive`] / [`super::create_login_flow`]). The state machine, node rendering,
-//! message ids, error shaping, and anti enumeration recipe are shared byte for byte; the
-//! transports differ in EXACTLY two mechanical places:
+//! message ids, error shaping, and anti enumeration recipe are ONE type, ONE state
+//! machine, ONE code path (the found vs unknown equality holds WITHIN a transport; the
+//! transport tag, `ui.action`, and browser hidden node differ by design); the transports
+//! differ in EXACTLY two mechanical places:
 //!
 //! 1. submission ingestion: the browser decodes `application/x-www-form-urlencoded` and
 //!    runs the [`same_origin_ok`](crate::interaction::same_origin_ok) CSRF check; the API

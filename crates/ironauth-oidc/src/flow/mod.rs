@@ -15,7 +15,11 @@
 //! reuses the #64 uniform response recipe (see [`login`]).
 //!
 //! Two transports, ONE object (FORK C): the state machine, node rendering, message ids,
-//! error shaping, and the anti enumeration recipe are shared byte for byte. The transports
+//! error shaping, and the anti enumeration recipe are ONE type, ONE state machine, ONE
+//! code path. The rendered object is NOT literally byte identical across transports (the
+//! transport tag, the `ui.action`, and the browser only hidden `flow` node differ by
+//! design); the load bearing equality is that a FOUND and an UNKNOWN identifier are
+//! indistinguishable WITHIN a transport, which holds. The transports
 //! ([`transport`]) differ in EXACTLY two mechanical places: submission ingestion (form
 //! urlencoded plus the [`same_origin_ok`](crate::interaction::same_origin_ok) CSRF check vs
 //! `application/json` plus a per flow submit token) and continuation (a 303 redirect
@@ -200,9 +204,10 @@ fn submit_action(scope: Scope, transport: Transport, journey: Journey) -> String
             journey.as_str()
         ),
         Transport::Api => format!(
-            "/t/{}/e/{}/flow/api/submit",
+            "/t/{}/e/{}/flow/api/{}/submit",
             scope.tenant(),
-            scope.environment()
+            scope.environment(),
+            journey.as_str()
         ),
     }
 }
@@ -407,11 +412,14 @@ pub async fn drive(
         return Err(FlowError::NotFound);
     }
 
-    let step = login::advance_login(state, scope, &record, &submission).await?;
+    let step = login::advance_login(state, scope, &record, &submission, headers).await?;
     match step {
         login::LoginStep::Render { nodes } => {
             // Rotate the submit token and persist the (possibly unchanged) state on every
-            // transition, so a captured API token is single use per step.
+            // transition, so a captured API token is single use per step. The advance is
+            // gated on the OLD token (strict single winner rotation): a stale or already
+            // rotated token advances nothing, and two concurrent submits with the same
+            // token can never both rotate.
             let new_token = generate_submit_token(state);
             let persisted = PersistedState {
                 step: login::render_state_tag(),
@@ -421,7 +429,13 @@ pub async fn drive(
                 .store()
                 .scoped(scope)
                 .flows()
-                .advance(flow_id, &state_json, &new_token, now_micros)
+                .advance(
+                    flow_id,
+                    &state_json,
+                    &new_token,
+                    &record.submit_token,
+                    now_micros,
+                )
                 .await
                 .map_err(|_| FlowError::Store)?;
             if !advanced {
@@ -442,13 +456,13 @@ pub async fn drive(
                 submit_token: new_token,
             })
         }
-        login::LoginStep::Complete {
-            subject,
-            actor,
-            event,
-        } => {
-            // Trip the single use completion latch FIRST (atomic), so a replayed completion
-            // mints no second session. Then mint the session through the ONE choke point.
+        login::LoginStep::Complete(success) => {
+            // A flow is consumed ONLY on a GENUINELY completing submit: `advance_login`
+            // already proved the credential is correct AND the account is authenticatable
+            // AND risk did not block (a fenced/blocked account or a risk block took the
+            // Render arm above, leaving the flow OPEN). Trip the single use completion latch
+            // FIRST (atomic single winner), so a replayed or concurrent completion mints no
+            // second session. Then mint through the ONE choke point.
             let consumed = state
                 .store()
                 .scoped(scope)
@@ -459,17 +473,50 @@ pub async fn drive(
             if !consumed {
                 return Err(FlowError::AlreadyCompleted);
             }
-            match interaction::establish_session(state, scope, &subject, &event, actor, headers)
-                .await
+            match interaction::establish_session(
+                state,
+                scope,
+                &success.subject,
+                &success.event,
+                success.actor,
+                headers,
+            )
+            .await
             {
-                Ok(session) => Ok(Continuation::Complete {
-                    session: Box::new(session),
-                    return_to: record.return_to.clone(),
-                }),
+                Ok(session) => {
+                    // The post success credential abuse follow through, exactly as
+                    // `login_post`: relax THIS attempt's failure counters so a user who
+                    // fumbled before the correct password is not throttled for the rest of
+                    // the window, then persist the audited risk decision (and, on a new
+                    // device, notify). All best effort; the login has already succeeded.
+                    state.reset_after_success(&success.ctx).await;
+                    let user_agent = login::user_agent_of(headers);
+                    let risk_ctx = crate::risk::RiskContext {
+                        ip: success.ctx.ip.as_deref(),
+                        user_agent: &user_agent,
+                        headers,
+                    };
+                    crate::risk::after_successful_login(
+                        state,
+                        scope,
+                        &success.user_id,
+                        &success.risk_decision,
+                        &risk_ctx,
+                        &success.identifier,
+                    )
+                    .await;
+                    Ok(Continuation::Complete {
+                        session: Box::new(session),
+                        return_to: record.return_to.clone(),
+                    })
+                }
                 Err(interaction::EstablishSessionError::NotAuthenticatable) => {
-                    // The central lifecycle fence refused a fenced but correct login. The
-                    // flow is already consumed; the response stays the UNIFORM authentication
-                    // failure (never a 500, never an existence or state oracle).
+                    // Defense in depth: the central lifecycle fence refused a login that
+                    // `advance_login`'s pre check had passed (a rare TOCTOU where the
+                    // account was fenced between the check and the mint). The response stays
+                    // the UNIFORM authentication failure (never a 500, never an existence or
+                    // state oracle). The flow is consumed here (the latch gates the mint),
+                    // which the common statically fenced case never reaches.
                     let nodes = login::uniform_incorrect_render(transport, &record.id);
                     let flow = build_flow(
                         scope,
