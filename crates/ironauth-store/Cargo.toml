@@ -178,6 +178,14 @@ name = "signup_quarantine"
 path = "tests/signup_quarantine.rs"
 required-features = ["testing"]
 
+# The advanced-recovery mode repositories (issue #82, PR 3): the admin-approval queue,
+# trusted-contact enrollment and single-use confirmations, and the IDV single-use case-bound
+# session, plus cross-scope isolation. Needs a real database (DATABASE_URL).
+[[test]]
+name = "advanced_recovery"
+path = "tests/advanced_recovery.rs"
+required-features = ["testing"]
+
 # Cross-tenant / cross-environment IDOR harness against every scoped repository
 # operation that exists today. Needs a real database (DATABASE_URL).
 [[test]]

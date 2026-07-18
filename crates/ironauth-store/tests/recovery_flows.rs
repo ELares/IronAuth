@@ -58,6 +58,7 @@ async fn initiate(
         cancel_token_digest: &token_digest,
         recipient: RECIPIENT,
         hold_until_unix_micros: hold_until,
+        method: ironauth_store::RecoveryMethod::Standard,
     };
     db.store()
         .scoped(scope)

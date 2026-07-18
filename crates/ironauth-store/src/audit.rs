@@ -828,6 +828,26 @@ pub enum Action {
     /// case's review deadline through the management queue; the account stays quarantined.
     /// The row targets the `usr_` subject; the actor is the deciding admin.
     SignupQuarantineExtended,
+    /// An admin-approved recovery was APPROVED (issue #82, PR 3): an admin approved a pending
+    /// admin-approved recovery flow through the management review queue, satisfying its method
+    /// precondition (completion still runs THROUGH the #81 delay/downgrade gate). The row
+    /// targets the `rcv_` recovery flow; the actor is the deciding admin, so the trail names
+    /// WHO approved the recovery.
+    RecoveryApproved,
+    /// An admin-approved recovery was REJECTED (issue #82, PR 3): an admin refused a pending
+    /// admin-approved recovery flow through the management review queue. The row targets the
+    /// `rcv_` recovery flow; the actor is the deciding admin.
+    RecoveryApprovalRejected,
+    /// A trusted contact CONFIRMED a recovery out of band (issue #82, PR 3): one designated
+    /// contact spent its single-use confirmation token toward a trusted-contact recovery's
+    /// threshold. The row targets the `rcv_` recovery flow; the `detail` records the
+    /// contact id (never the contact address).
+    RecoveryContactConfirmed,
+    /// An IDV-gated recovery consumed a signed provider CALLBACK (issue #82, PR 3): a
+    /// single-use, case-bound, JOSE-verified callback asserted a verification result. The row
+    /// targets the `rcv_` recovery flow; the `detail` records the provider and the verdict
+    /// (never any document data; IronAuth only consumes the provider's signed assertion).
+    RecoveryIdvCallback,
     /// A federation connector was CREATED (issue #75): a declarative OIDC-shaped
     /// upstream definition was registered through the management API. The row targets
     /// the `cnr_` connector; the `detail` records the connector slug. The definition
@@ -1046,6 +1066,10 @@ impl Action {
             Action::SignupQuarantineApproved => "signup_quarantine.approved",
             Action::SignupQuarantineRejected => "signup_quarantine.rejected",
             Action::SignupQuarantineExtended => "signup_quarantine.extended",
+            Action::RecoveryApproved => "recovery.approved",
+            Action::RecoveryApprovalRejected => "recovery.approval.rejected",
+            Action::RecoveryContactConfirmed => "recovery.contact.confirmed",
+            Action::RecoveryIdvCallback => "recovery.idv.callback",
             Action::RiskDisavow => "risk.disavow",
             Action::ConnectorCreate => "connector.create",
             Action::ConnectorUpdate => "connector.update",

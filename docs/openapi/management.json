@@ -4612,6 +4612,320 @@
         ]
       }
     },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/recovery-approvals": {
+      "get": {
+        "tags": [
+          "recovery-approvals"
+        ],
+        "summary": "List the OPEN admin-approved recovery approvals under an environment (cursor paginated).",
+        "operationId": "listRecoveryApprovals",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "The desired page size, a positive integer. Clamped to\n`[1, max_page_size]`; defaults to the configured default when absent.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "The opaque cursor from a previous page's `next_cursor`. Absent for the\nfirst page (keyset pagination; there is no offset).",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "A page of open recovery approvals",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RecoveryApprovalList"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed cursor",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The advanced-recovery feature is not enabled",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/recovery-approvals/{flow_id}/approve": {
+      "post": {
+        "tags": [
+          "recovery-approvals"
+        ],
+        "summary": "APPROVE an admin-approved recovery: satisfy the method precondition, then complete the\nrecovery THROUGH the #81 delay/downgrade gate.",
+        "operationId": "approveRecoveryApproval",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "flow_id",
+            "in": "path",
+            "description": "The recovery flow (rcv_...)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Required. Replaying a POST with the same key returns the original response without re-executing.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The recovery is approved",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RecoveryApprovalDecisionView"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found (no open approval, absent, or feature disabled)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency-Key reused with a different request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/recovery-approvals/{flow_id}/reject": {
+      "post": {
+        "tags": [
+          "recovery-approvals"
+        ],
+        "summary": "REJECT an admin-approved recovery: the recovery can never complete via this method.",
+        "operationId": "rejectRecoveryApproval",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "flow_id",
+            "in": "path",
+            "description": "The recovery flow (rcv_...)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Required. Replaying a POST with the same key returns the original response without re-executing.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The recovery is rejected",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RecoveryApprovalDecisionView"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found (no open approval, absent, or feature disabled)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency-Key reused with a different request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/v1/tenants/{tenant_id}/environments/{environment_id}/refresh-families": {
       "get": {
         "tags": [
@@ -8856,6 +9170,122 @@
         },
         "additionalProperties": false
       },
+      "RecoveryApprovalCaseView": {
+        "type": "object",
+        "description": "An admin-approved recovery approval (issue #82, PR 3), as the management API returns it.\nCarries no secret and no raw PII: the subject is the opaque `usr_` id.",
+        "required": [
+          "id",
+          "tenant_id",
+          "environment_id",
+          "flow_id",
+          "subject",
+          "state",
+          "created_at_unix_ms"
+        ],
+        "properties": {
+          "created_at_unix_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "When the approval was opened, milliseconds since the Unix epoch."
+          },
+          "environment_id": {
+            "type": "string",
+            "description": "The environment the case lives in (`env_...`)."
+          },
+          "flow_id": {
+            "type": "string",
+            "description": "The recovery flow (`rcv_...`) this approval decides."
+          },
+          "id": {
+            "type": "string",
+            "description": "The approval identifier (`rap_...`, embeds its scope)."
+          },
+          "reviewed_at_unix_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "When a review action ran, milliseconds since the Unix epoch, or null."
+          },
+          "reviewed_by_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The id of the reviewing admin actor, or null before any review action."
+          },
+          "reviewed_by_kind": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The kind of the reviewing admin actor, or null before any review action."
+          },
+          "state": {
+            "$ref": "#/components/schemas/RecoveryApprovalStateView",
+            "description": "The review position."
+          },
+          "subject": {
+            "type": "string",
+            "description": "The recovering account (`usr_...`) the case is about."
+          },
+          "tenant_id": {
+            "type": "string",
+            "description": "The tenant the case belongs to (`ten_...`)."
+          }
+        }
+      },
+      "RecoveryApprovalDecisionView": {
+        "type": "object",
+        "description": "An admin-approved recovery's position after a review action (issue #82, PR 3): the\ndeterministic post-condition, so an Idempotency-Key replay is byte-identical. Completion\n(running THROUGH the #81 delay gate) is a side effect of an approve reflected in the audit\nlog and the recovery flow state, not in this body, so the body stays deterministic.",
+        "required": [
+          "flow_id",
+          "state"
+        ],
+        "properties": {
+          "flow_id": {
+            "type": "string",
+            "description": "The recovery flow (`rcv_...`) the decision was about."
+          },
+          "state": {
+            "$ref": "#/components/schemas/RecoveryApprovalStateView",
+            "description": "The state the approval is now in."
+          }
+        }
+      },
+      "RecoveryApprovalList": {
+        "type": "object",
+        "description": "A page of admin-approved recovery approvals.",
+        "required": [
+          "items"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RecoveryApprovalCaseView"
+            },
+            "description": "The open approvals on this page, oldest first."
+          },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The opaque cursor for the next page, or null if this is the last page."
+          }
+        }
+      },
+      "RecoveryApprovalStateView": {
+        "type": "string",
+        "description": "An admin-approved recovery approval's review position, as the admin queue reports it.",
+        "enum": [
+          "pending",
+          "approved",
+          "rejected"
+        ]
+      },
       "RefreshFamilyList": {
         "type": "object",
         "description": "A page of refresh-token families.",
@@ -9731,6 +10161,10 @@
     {
       "name": "signup-quarantine",
       "description": "Signup fraud review queue (issue #82): list the open quarantine cases and release, reject, or extend one (experimental, feature-gated)"
+    },
+    {
+      "name": "recovery-approvals",
+      "description": "Admin-approved recovery review queue (issue #82): list the open recovery approvals and approve or reject one; approving completes the recovery through the delay and downgrade gate (experimental, feature-gated)"
     },
     {
       "name": "exit",

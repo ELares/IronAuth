@@ -44,6 +44,10 @@ pub struct AdminState {
     inner: Arc<Inner>,
 }
 
+// The admin state aggregates several independent experimental feature-gate flags (sudo mode,
+// signup quarantine, advanced recovery); each is a distinct on/off surface arm, so they read
+// clearer as separate bools than folded into an enum.
+#[allow(clippy::struct_excessive_bools)]
 struct Inner {
     store: Store,
     env: Env,
@@ -104,6 +108,13 @@ struct Inner {
     // review-queue endpoints outside the experimental ack gate. Off by default; when off
     // every signup-quarantine review-queue endpoint answers a uniform 404.
     signup_quarantine_enabled: bool,
+    // Whether the experimental advanced-recovery-modes surface is armed (issue #82, PR 3).
+    // Resolved by the boot path from the strict config feature ladder (the
+    // `advanced-recovery` experimental feature enabled AND acked at the exact version) and
+    // installed via the builder, NOT an AdminConfig toggle, so an operator cannot arm the
+    // recovery-approval review-queue endpoints outside the experimental ack gate. Off by
+    // default; when off every recovery-approval endpoint answers a uniform 404.
+    advanced_recovery_enabled: bool,
 }
 
 impl AdminState {
@@ -190,6 +201,7 @@ impl AdminState {
                 sudo_mode_enabled: config.sudo_mode_enabled,
                 sudo_mode_window_secs: config.sudo_mode_window_secs,
                 signup_quarantine_enabled: false,
+                advanced_recovery_enabled: false,
             }),
         })
     }
@@ -216,6 +228,31 @@ impl AdminState {
     #[must_use]
     pub fn signup_quarantine_enabled(&self) -> bool {
         self.inner.signup_quarantine_enabled
+    }
+
+    /// Arm the experimental advanced-recovery-modes admin surface (issue #82, PR 3).
+    ///
+    /// The boot path is the ONLY caller: it resolves `enabled` from the strict config feature
+    /// ladder (the `advanced-recovery` experimental feature enabled AND acknowledged at the
+    /// exact version) and installs the SAME bool it installs on the OIDC data plane. A builder
+    /// rather than an `AdminConfig` field precisely so an operator cannot arm the
+    /// recovery-approval review-queue endpoints from a plain config toggle and bypass the
+    /// experimental acknowledgment gate. When false (the default), every recovery-approval
+    /// endpoint answers a uniform 404.
+    #[must_use]
+    pub fn with_advanced_recovery_enabled(mut self, enabled: bool) -> Self {
+        if let Some(inner) = Arc::get_mut(&mut self.inner) {
+            inner.advanced_recovery_enabled = enabled;
+        }
+        self
+    }
+
+    /// Whether the experimental advanced-recovery-modes admin surface is armed (issue #82,
+    /// PR 3). Every recovery-approval handler's first action is to return a uniform 404 when
+    /// this is false.
+    #[must_use]
+    pub fn advanced_recovery_enabled(&self) -> bool {
+        self.inner.advanced_recovery_enabled
     }
 
     /// Share the inbound lazy-migration hook (issue #56) with the management plane, so the

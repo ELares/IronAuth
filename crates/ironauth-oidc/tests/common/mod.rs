@@ -976,6 +976,32 @@ impl Harness {
         self.state = state;
     }
 
+    /// Arm the experimental advanced-recovery-modes surface (issue #82, PR 3) for the harness
+    /// scope and rebuild the protocol router. Builds a fresh state over the SAME master-wired
+    /// store, env, and registry from `config`, plus `with_advanced_recovery_enabled(true)`, an
+    /// installed recovery risk `evaluator` (a test installs a force-delay evaluator so every
+    /// recovery is HELD, exercising the #81 delay gate), and a verification `sender` (so the
+    /// out-of-band contact notifications are recorded).
+    pub fn enable_advanced_recovery(
+        &mut self,
+        config: &OidcConfig,
+        evaluator: Arc<dyn ironauth_oidc::recovery::RiskEvaluator>,
+        sender: Arc<dyn ironauth_oidc::VerificationSender>,
+    ) {
+        let state = OidcState::new(
+            self.db.store().clone(),
+            self.env.clone(),
+            Arc::clone(&self.registry),
+            config,
+            ISSUER_BASE,
+        )
+        .with_advanced_recovery_enabled(true)
+        .with_risk_evaluator(evaluator)
+        .with_verification_sender(sender);
+        self.router = oidc_router(state.clone());
+        self.state = state;
+    }
+
     /// Install a verification / OTP sender (issue #68) on the state and rebuild the
     /// protocol router, so a test can capture the delivered email-OTP code and magic-link
     /// token/short-code from a recording sender. Only the protocol router is rebuilt (the

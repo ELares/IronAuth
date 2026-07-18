@@ -345,6 +345,15 @@ name = "signup_quarantine"
 path = "tests/signup_quarantine.rs"
 required-features = ["testing"]
 
+# Advanced recovery modes (issue #82, PR 3): admin-approved, trusted-contact, and IDV-gated
+# recovery each complete THROUGH the #81 delay window and downgrade invariant; the IDV callback
+# is a single-use, case-bound, JOSE-verified signed callback driven by an in-repo fixture
+# provider. Needs a real database.
+[[test]]
+name = "advanced_recovery"
+path = "tests/advanced_recovery.rs"
+required-features = ["testing"]
+
 # WebAuthn passkey ceremonies end to end (issue #65): the four ceremony endpoints
 # driven through the real router by a software authenticator (a CBOR
 # attestationObject / COSE key, real Ed25519 assertion signatures). A passkey

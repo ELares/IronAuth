@@ -66,6 +66,7 @@ mod password_hashing;
 mod promotion;
 mod provision;
 mod ratelimit;
+mod recovery_approvals;
 mod resource_types;
 mod response;
 mod sessions;
@@ -368,6 +369,21 @@ pub fn management_router(state: AdminState) -> Router {
         .route(
             "/v1/tenants/{tenant_id}/environments/{environment_id}/signup-quarantine/{user_id}/extend",
             post(signup_quarantine::extend_signup_quarantine),
+        )
+        // Admin-approved recovery review queue (issue #82, PR 3). The static action suffixes
+        // (/approve, /reject) are registered on their parameterized sibling. Every handler
+        // 404s until the advanced-recovery feature is enabled AND acknowledged.
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/recovery-approvals",
+            get(recovery_approvals::list_recovery_approvals),
+        )
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/recovery-approvals/{flow_id}/approve",
+            post(recovery_approvals::approve_recovery_approval),
+        )
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/recovery-approvals/{flow_id}/reject",
+            post(recovery_approvals::reject_recovery_approval),
         )
         .route(
             "/v1/tenants/{tenant_id}/environments/{environment_id}/refresh-families",

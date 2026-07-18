@@ -477,7 +477,7 @@ async fn expand_contract_example_chain_runs_all_three_phases_and_contract_remove
 // per real table); splitting it would not make it clearer.
 #[allow(clippy::too_many_lines)]
 #[tokio::test]
-async fn production_chain_is_only_the_sixty_five_real_migrations_and_ships_no_demo_object() {
+async fn production_chain_is_only_the_sixty_six_real_migrations_and_ships_no_demo_object() {
     // TestDatabase::start runs Store::migrate() (the production chain) on a
     // fresh, empty database.
     let db = TestDatabase::start().await;
@@ -494,8 +494,8 @@ async fn production_chain_is_only_the_sixty_five_real_migrations_and_ships_no_de
     );
     assert_eq!(
         report.already_applied(),
-        65,
-        "the production chain is exactly sixty-five migrations (isolation, audit log, management \
+        66,
+        "the production chain is exactly sixty-six migrations (isolation, audit log, management \
          API, OIDC authorization, signing keys, login/consent, authentication context, redirect \
          registration, UserInfo claims, consent scope upsert, resource servers, opaque access \
          tokens, client auth suite, dynamic client registration, pushed authorization requests, \
@@ -512,16 +512,16 @@ async fn production_chain_is_only_the_sixty_five_real_migrations_and_ships_no_de
          risk engine, account recovery, federation connectors, registration abuse defenses, \
          federation login state, enterprise inbound routing, upstream token vault, \
          guarded account links, account linking wiring, FedCM assertion nonces, third-party \
-         risk signals, signup fraud review)"
+         risk signals, signup fraud review, advanced recovery modes)"
     );
 
-    // The ledger holds exactly versions 1 through 65.
+    // The ledger holds exactly versions 1 through 66.
     assert_eq!(
         applied_versions(pool).await,
         vec![
             1_i64, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
             24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45,
-            46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65
+            46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66
         ]
     );
     let phase_of = |version: i64| async move {
@@ -988,6 +988,163 @@ async fn production_chain_is_only_the_sixty_five_real_migrations_and_ships_no_de
         partial_unique_index_exists(pool, "signup_quarantines", "signup_quarantines_open_uniq")
             .await,
         "signup_quarantines must carry the one-open-case-per-account partial unique index"
+    );
+
+    // The advanced recovery modes (issue #82, PR 3): an additive recovery_flows.method ALTER
+    // ADD COLUMN with a CHECK pinning the closed method set, plus four new tenant-scoped tables
+    // (recovery_approvals, recovery_trusted_contacts, recovery_contact_confirmations,
+    // recovery_idv_sessions) with their indexes, policies, nonempty-scope CHECKs, and
+    // column-scoped grants. All additive, so it is an expand.
+    assert_eq!(phase_of(66).await, "expand");
+
+    // recovery_flows.method (issue #82, PR 3): the recovery-method seam, additive with a
+    // NOT NULL DEFAULT 'standard', so every existing flow back-fills to the unchanged path,
+    // and a CHECK pins the closed method set.
+    assert!(
+        column_exists(pool, "recovery_flows", "method").await,
+        "recovery_flows.method exists after 0066"
+    );
+    let method_check: String = sqlx::query(
+        "SELECT pg_get_constraintdef(oid) AS def FROM pg_catalog.pg_constraint \
+         WHERE conrelid = 'recovery_flows'::regclass AND conname = 'recovery_flows_method_known'",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("recovery_flows method check lookup")
+    .get("def");
+    for method in ["standard", "admin_approved", "trusted_contact", "idv"] {
+        assert!(
+            method_check.contains(method),
+            "the recovery_flows method CHECK must admit {method}, got: {method_check}"
+        );
+    }
+
+    // Each of the four new tables is a tenant-scoped table, so it must ENABLE and FORCE
+    // row-level security, carry the (tenant, environment) isolation policy, and pin the
+    // nonempty-scope CHECK, exactly like every other scoped table.
+    for table in [
+        "recovery_approvals",
+        "recovery_trusted_contacts",
+        "recovery_contact_confirmations",
+        "recovery_idv_sessions",
+    ] {
+        assert!(
+            rls_enabled_and_forced(pool, table).await,
+            "{table} must ENABLE and FORCE row-level security"
+        );
+        assert!(
+            policy_exists(pool, table, &format!("{table}_tenant_isolation")).await,
+            "{table} must carry the (tenant, environment) isolation policy"
+        );
+        assert!(
+            check_constraint_exists(pool, table, &format!("{table}_scope_nonempty")).await,
+            "{table} must carry the nonempty-scope CHECK"
+        );
+    }
+
+    // recovery_approvals: the control plane OWNS the verdict (a column-scoped UPDATE over the
+    // review columns), and the data-plane role holds NONE, so only an admin can approve or
+    // reject a recovery (the self-approval-impossible guarantee at the grant level).
+    for column in [
+        "state",
+        "reviewed_by_kind",
+        "reviewed_by_id",
+        "reviewed_at",
+        "note",
+    ] {
+        assert!(
+            role_has_column_privilege(
+                pool,
+                "ironauth_control",
+                "recovery_approvals",
+                column,
+                "UPDATE"
+            )
+            .await,
+            "the control role must hold column-scoped UPDATE on recovery_approvals.{column}"
+        );
+        assert!(
+            !role_has_column_privilege(
+                pool,
+                "ironauth_app",
+                "recovery_approvals",
+                column,
+                "UPDATE"
+            )
+            .await,
+            "the data-plane role must NOT hold UPDATE on recovery_approvals.{column}"
+        );
+    }
+    // The IDENTITY columns are NOT in the control grant: an admin decides a case but can never
+    // rewrite WHAT recovery it is about (its flow or subject).
+    for column in ["flow_id", "subject"] {
+        assert!(
+            !role_has_column_privilege(
+                pool,
+                "ironauth_control",
+                "recovery_approvals",
+                column,
+                "UPDATE"
+            )
+            .await,
+            "the control role must NOT hold UPDATE on the identity column recovery_approvals.{column}"
+        );
+    }
+
+    // recovery_contact_confirmations: the no-double-count invariant is a UNIQUE index over
+    // (tenant, environment, flow_id, contact_id), so one contact can confirm a flow at most
+    // once (a single contact can never reach a threshold of two by confirming twice). The
+    // single-use latch column (confirmed_at) is nullable (NULL until confirmed).
+    let confirm_uniq: String = sqlx::query(
+        "SELECT pg_get_indexdef(indexrelid) AS def FROM pg_catalog.pg_index i \
+         JOIN pg_catalog.pg_class c ON c.oid = i.indexrelid \
+         WHERE c.relname = 'recovery_contact_confirmations_flow_contact_uniq'",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("confirmation flow+contact unique index lookup")
+    .get("def");
+    assert!(
+        confirm_uniq.contains("UNIQUE")
+            && confirm_uniq.contains("flow_id")
+            && confirm_uniq.contains("contact_id"),
+        "recovery_contact_confirmations must pin the no-double-count UNIQUE on (flow_id, contact_id), \
+         got: {confirm_uniq}"
+    );
+    assert!(
+        !column_is_not_null(pool, "recovery_contact_confirmations", "confirmed_at").await,
+        "recovery_contact_confirmations.confirmed_at must be nullable (the single-use latch)"
+    );
+
+    // recovery_idv_sessions: the case binding is a UNIQUE index over
+    // (tenant, environment, flow_id, redirect_state_digest), so a state minted for another
+    // flow selects no row (no cross-case). The single-use latch column (consumed_at) is
+    // nullable (NULL until a callback is consumed).
+    let idv_uniq: String = sqlx::query(
+        "SELECT pg_get_indexdef(indexrelid) AS def FROM pg_catalog.pg_index i \
+         JOIN pg_catalog.pg_class c ON c.oid = i.indexrelid \
+         WHERE c.relname = 'recovery_idv_sessions_state_uniq'",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("idv session state unique index lookup")
+    .get("def");
+    assert!(
+        idv_uniq.contains("UNIQUE")
+            && idv_uniq.contains("flow_id")
+            && idv_uniq.contains("redirect_state_digest"),
+        "recovery_idv_sessions must pin the case-binding UNIQUE on (flow_id, redirect_state_digest), \
+         got: {idv_uniq}"
+    );
+    assert!(
+        !column_is_not_null(pool, "recovery_idv_sessions", "consumed_at").await,
+        "recovery_idv_sessions.consumed_at must be nullable (the single-use latch)"
+    );
+    // The trusted-contact address is a SEALED bytea (issue #48), never a plaintext PII column.
+    assert_eq!(
+        column_data_type(pool, "recovery_trusted_contacts", "contact_sealed").await,
+        "bytea",
+        "recovery_trusted_contacts.contact_sealed must be a sealed bytea (no plaintext contact PII)"
     );
 
     // The step-up second-factor abuse path (issue #72): migration 0047 WIDENED the

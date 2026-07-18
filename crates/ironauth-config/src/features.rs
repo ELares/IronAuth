@@ -79,6 +79,20 @@ pub const SIGNUP_QUARANTINE_FEATURE: &str = "signup-quarantine";
 /// the shape bumps it and invalidates the old ack.
 pub const SIGNUP_QUARANTINE_VERSION: &str = "0.1.0-exp.1";
 
+/// The registry name of the advanced-recovery-modes experimental feature (issue #82, PR 3).
+/// One plain umbrella flag so the whole advanced-recovery surface (admin-approved,
+/// trusted-contact, and IDV-gated recovery) toggles under one ack, mirroring the
+/// one-flag-per-surface precedent; the three modes are config sub-toggles under this single
+/// acknowledgment.
+pub const ADVANCED_RECOVERY_FEATURE: &str = "advanced-recovery";
+
+/// The experimental `ack` version for the advanced-recovery-modes feature (issue #82, PR 3).
+/// It is EXPLORATORY: the recovery-method seam, the trusted-contact confirmation model, and
+/// the generic IDV external-verification step are early and may change between releases, so
+/// enabling it must acknowledge this exact revision; a graduation that changes the shape
+/// bumps it and invalidates the old ack.
+pub const ADVANCED_RECOVERY_VERSION: &str = "0.1.0-exp.1";
+
 /// How mature a feature is, and therefore what enabling it requires.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Maturity {
@@ -211,6 +225,7 @@ impl FeatureRegistry {
         registry.register_fedcm();
         registry.register_risk_signals();
         registry.register_signup_quarantine();
+        registry.register_advanced_recovery();
         registry
     }
 
@@ -358,6 +373,30 @@ impl FeatureRegistry {
              rejects, or extends the case through the management review queue. EXPLORATORY: \
              the quarantine model is early and may break between releases.",
             SIGNUP_QUARANTINE_VERSION,
+            "crates/ironauth-oidc/CHANGELOG.md",
+        ));
+    }
+
+    /// Registers the advanced-recovery-modes feature (issue #82, PR 3): the recovery-method
+    /// seam plus the three modes (admin-approved recovery through a control-plane review
+    /// queue, trusted-contact recovery via single-use out-of-band confirmations, and
+    /// IDV-gated recovery via a generic external-verification step consuming a signed
+    /// provider callback). The three modes are config sub-toggles under this one ack; each
+    /// completes THROUGH the existing recovery delay window and downgrade invariant, never
+    /// around them. It is EXPLORATORY: the seam and the IDV integration shape are early and
+    /// may change between releases. Off by default; with the flag off every advanced-recovery
+    /// path answers a uniform 404 and standard recovery is unchanged.
+    pub fn register_advanced_recovery(&mut self) {
+        self.register(Feature::experimental(
+            ADVANCED_RECOVERY_FEATURE,
+            "Advanced recovery modes (issue #82): the recovery-method seam plus admin-approved \
+             recovery (a control-plane admin review queue), trusted-contact recovery (designated \
+             contacts confirm out of band with single-use links), and IDV-gated recovery (a \
+             generic external-verification step consuming a signed provider callback; IronAuth \
+             never verifies documents in house). The three modes are config sub-toggles under \
+             this one ack, and every mode completes THROUGH the recovery delay window and the \
+             downgrade invariant. EXPLORATORY: the seam is early and may break between releases.",
+            ADVANCED_RECOVERY_VERSION,
             "crates/ironauth-oidc/CHANGELOG.md",
         ));
     }
@@ -835,5 +874,47 @@ mod tests {
         ));
         registry.validate(&acked).expect("the exact ack boots");
         assert!(registry.is_enabled(&acked, SIGNUP_QUARANTINE_FEATURE));
+    }
+
+    #[test]
+    fn advanced_recovery_is_experimental_and_off_by_default() {
+        // Issue #82 (PR 3) ships the advanced recovery modes behind a default-off experimental
+        // flag: absent from [features] it resolves disabled, and enabling it without the exact
+        // ack refuses to boot (so every advanced-recovery path stays a uniform 404 and standard
+        // recovery is unchanged until an operator explicitly enables AND acknowledges the
+        // experiment).
+        let registry = FeatureRegistry::builtin();
+        let feature = registry
+            .get(ADVANCED_RECOVERY_FEATURE)
+            .expect("advanced-recovery is registered");
+        assert!(matches!(feature.maturity(), Maturity::Experimental { .. }));
+        assert!(!feature.default_enabled());
+
+        let absent = config_with_features("");
+        registry.validate(&absent).expect("absent is fine");
+        assert!(
+            !registry.is_enabled(&absent, ADVANCED_RECOVERY_FEATURE),
+            "advanced-recovery is off when absent from [features]"
+        );
+
+        // Enabled without an ack refuses to boot.
+        let no_ack = config_with_features("\"advanced-recovery\" = { enabled = true }");
+        registry
+            .validate(&no_ack)
+            .expect_err("an experimental feature enabled without an ack must refuse to boot");
+
+        // Enabled WITH a WRONG ack still refuses to boot (the ack must be exact).
+        let wrong_ack =
+            config_with_features("\"advanced-recovery\" = { enabled = true, ack = \"0.0.0\" }");
+        registry
+            .validate(&wrong_ack)
+            .expect_err("a mismatched ack must refuse to boot");
+
+        // Enabled WITH the exact ack boots and reports enabled.
+        let acked = config_with_features(&format!(
+            "\"advanced-recovery\" = {{ enabled = true, ack = \"{ADVANCED_RECOVERY_VERSION}\" }}"
+        ));
+        registry.validate(&acked).expect("the exact ack boots");
+        assert!(registry.is_enabled(&acked, ADVANCED_RECOVERY_FEATURE));
     }
 }

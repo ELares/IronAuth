@@ -30,9 +30,10 @@ use crate::views::{
     InitialAccessTokenCreated, InvitationCreatedView, InvitationCredentialTypeView, InvitationList,
     InvitationStateChangeView, InvitationStateView, InvitationView, LinkExternalIdRequest,
     ManagementKeyCreated, ManagementKeyList, ManagementKeyView, OperatorList, OperatorView,
-    OrganizationList, OrganizationView, RefreshFamilyList, RefreshFamilyView, ResourceTypeView,
-    ResourceTypesList, RevokeSessionsRequest, SessionList, SessionRevocationView, SessionView,
-    SetUserStateRequest, SignupQuarantineCaseView, SignupQuarantineDecisionView,
+    OrganizationList, OrganizationView, RecoveryApprovalCaseView, RecoveryApprovalDecisionView,
+    RecoveryApprovalList, RecoveryApprovalStateView, RefreshFamilyList, RefreshFamilyView,
+    ResourceTypeView, ResourceTypesList, RevokeSessionsRequest, SessionList, SessionRevocationView,
+    SessionView, SetUserStateRequest, SignupQuarantineCaseView, SignupQuarantineDecisionView,
     SignupQuarantineList, SignupQuarantineReasonView, SignupQuarantineStateView, TenantCreated,
     TenantList, TenantStatusView, TenantView, UpdateUserRequest, UserExternalIdView, UserList,
     UserRevocationView, UserStateChangeView, UserStateView, UserView,
@@ -84,6 +85,11 @@ use crate::views::{
         (name = "signup-quarantine", description = "Signup fraud review queue (issue #82): \
                                              list the open quarantine cases and release, \
                                              reject, or extend one (experimental, feature-gated)"),
+        (name = "recovery-approvals", description = "Admin-approved recovery review queue \
+                                             (issue #82): list the open recovery approvals and \
+                                             approve or reject one; approving completes the \
+                                             recovery through the delay and downgrade gate \
+                                             (experimental, feature-gated)"),
         (name = "exit", description = "The exit-friendliness covenant (issue #58): the full \
                                      identity export (users, traits, states, external ids, and \
                                      password hashes with their algorithm tags) in the \
@@ -159,6 +165,9 @@ use crate::views::{
         crate::signup_quarantine::approve_signup_quarantine,
         crate::signup_quarantine::reject_signup_quarantine,
         crate::signup_quarantine::extend_signup_quarantine,
+        crate::recovery_approvals::list_recovery_approvals,
+        crate::recovery_approvals::approve_recovery_approval,
+        crate::recovery_approvals::reject_recovery_approval,
         crate::export::export_identities,
         crate::migration::verify_credential,
         crate::migration_status::get_migration_progress,
@@ -237,6 +246,10 @@ use crate::views::{
         SignupQuarantineList,
         SignupQuarantineDecisionView,
         ExtendSignupQuarantineRequest,
+        RecoveryApprovalStateView,
+        RecoveryApprovalCaseView,
+        RecoveryApprovalList,
+        RecoveryApprovalDecisionView,
         crate::migration::VerifyCredentialRequest,
         crate::migration::VerifyCredentialResponse,
         crate::migration::VerifyProfile,

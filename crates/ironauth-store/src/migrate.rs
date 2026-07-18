@@ -662,6 +662,12 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0065_signup_fraud_review.sql"),
         },
+        Migration {
+            version: 66,
+            name: "advanced_recovery_modes",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0066_advanced_recovery_modes.sql"),
+        },
     ]
 }
 

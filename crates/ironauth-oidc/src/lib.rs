@@ -73,6 +73,7 @@ mod account;
 /// isolation and correct-but-unwired in PR 1 (PR 2 wires it into the callback).
 pub mod account_linking;
 mod acme;
+pub mod advanced_recovery;
 mod authn;
 mod authorize;
 mod backchannel;
@@ -516,6 +517,21 @@ pub fn oidc_router(state: OidcState) -> Router {
         .route(
             "/t/{tenant_id}/e/{environment_id}/risk/signals",
             post(risk_signals::ingest),
+        )
+        // Advanced recovery modes (issue #82, PR 3, EXPLORATORY): the trusted-contact
+        // confirmation surface (a designated contact confirms a recovery out of band with a
+        // single-use link) and the IDV-gated recovery callback (consume a provider's signed,
+        // single-use, case-bound JOSE-verified callback). Both handlers fail closed with a
+        // 404 when the `advanced-recovery` experimental feature is off (or the mode's config
+        // sub-toggle is disabled), so the route literals stay UNCONDITIONAL for the RFC 9700
+        // endpoint inventory. Standard recovery is unchanged.
+        .route(
+            "/t/{tenant_id}/e/{environment_id}/recover/trusted-contact/confirm",
+            post(advanced_recovery::trusted_contact_confirm),
+        )
+        .route(
+            "/t/{tenant_id}/e/{environment_id}/recover/idv/callback",
+            post(advanced_recovery::idv_callback),
         )
         // WebAuthn passkey ceremonies (issue #65), scope-routed so the RP ID/origin
         // and the credential reads/writes run under the right per-environment scope.

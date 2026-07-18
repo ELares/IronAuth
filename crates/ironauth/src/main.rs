@@ -13,9 +13,10 @@ use std::sync::Arc;
 use axum::Router;
 use ironauth_admin::AdminState;
 use ironauth_config::{
-    Config, FEDCM_FEATURE, FeatureRegistry, GLOBAL_TOKEN_REVOCATION_FEATURE, Loaded, OidcConfig,
-    PasswordHashingConfig, PasswordPolicyConfig, QuotaConfig, RISK_SIGNALS_FEATURE,
-    SIGNUP_QUARANTINE_FEATURE, ScreeningFailurePolicy, ScreeningProvider,
+    ADVANCED_RECOVERY_FEATURE, Config, FEDCM_FEATURE, FeatureRegistry,
+    GLOBAL_TOKEN_REVOCATION_FEATURE, Loaded, OidcConfig, PasswordHashingConfig,
+    PasswordPolicyConfig, QuotaConfig, RISK_SIGNALS_FEATURE, SIGNUP_QUARANTINE_FEATURE,
+    ScreeningFailurePolicy, ScreeningProvider,
 };
 use ironauth_env::Env;
 use ironauth_jose::MasterKey;
@@ -170,6 +171,14 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
         // so the register path keeps BLOCKING a risky signup and the review-queue endpoints
         // stay 404s until an operator opts in.
         let signup_quarantine_enabled = features.is_enabled(&config, SIGNUP_QUARANTINE_FEATURE);
+        // The experimental advanced-recovery-modes surface (issue #82, PR 3) is armed only
+        // when its feature is enabled AND acknowledged; the gate is the ladder, never a plain
+        // config toggle, so the ack can never be bypassed. Resolved to a bool here and
+        // injected through BOTH the OIDC state builder (the recovery-method seam and the
+        // trusted-contact / IDV data-plane routes) and the admin state builder (the
+        // recovery-approval review queue), so every advanced-recovery path stays a 404 and
+        // standard recovery is unchanged until an operator opts in.
+        let advanced_recovery_enabled = features.is_enabled(&config, ADVANCED_RECOVERY_FEATURE);
 
         let env = Env::system();
 
@@ -206,6 +215,7 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
             migration_hook.clone(),
             federation_runtime.clone(),
             signup_quarantine_enabled,
+            advanced_recovery_enabled,
         )
         .await;
 
@@ -262,6 +272,7 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
                 fedcm_enabled,
                 risk_signals_enabled,
                 signup_quarantine_enabled,
+                advanced_recovery_enabled,
                 master_key,
                 &quota_config,
                 &hashing_config,
@@ -312,6 +323,7 @@ async fn build_management_router(
     migration_hook: Option<Arc<LazyMigrationHook>>,
     federation_runtime: Option<Arc<FederationRuntime>>,
     signup_quarantine_enabled: bool,
+    advanced_recovery_enabled: bool,
 ) -> Option<Router> {
     if config.admin.bootstrap_operator_token.is_none() {
         tracing::info!(
@@ -360,6 +372,10 @@ async fn build_management_router(
             // when the ladder resolved the feature enabled AND acked; otherwise every
             // review-queue endpoint stays a uniform 404.
             let state = state.with_signup_quarantine_enabled(signup_quarantine_enabled);
+            // Arm the experimental admin-approved recovery review-queue endpoints (issue #82,
+            // PR 3) only when the ladder resolved the feature enabled AND acked; otherwise
+            // every recovery-approval endpoint stays a uniform 404.
+            let state = state.with_advanced_recovery_enabled(advanced_recovery_enabled);
             tracing::info!("management API mounted on the management plane");
             Some(ironauth_admin::management_router(state))
         }
@@ -418,6 +434,7 @@ async fn build_oidc_router(
     fedcm_enabled: bool,
     risk_signals_enabled: bool,
     signup_quarantine_enabled: bool,
+    advanced_recovery_enabled: bool,
     master_key: Option<Arc<MasterKey>>,
     quota_config: &QuotaConfig,
     hashing_config: &PasswordHashingConfig,
@@ -529,6 +546,7 @@ async fn build_oidc_router(
         .with_fedcm_enabled(fedcm_enabled)
         .with_risk_signals_enabled(risk_signals_enabled)
         .with_signup_quarantine_enabled(signup_quarantine_enabled)
+        .with_advanced_recovery_enabled(advanced_recovery_enabled)
         .with_quota_enforcer(quota_enforcer)
         .with_hashing_pool(hashing_pool)
         .with_password_policy(password_policy, screening_failure, screen_on_login)
@@ -585,6 +603,15 @@ async fn build_oidc_router(
              Security Event Token is verified per-source through the JOSE core and folded \
              into the risk engine as a WEIGHTED policy input (never a verdict); the wire \
              contract may change between releases"
+        );
+    }
+    if advanced_recovery_enabled {
+        tracing::info!(
+            "experimental advanced recovery modes mounted (issue #82); admin-approved, \
+             trusted-contact, and IDV-gated recovery each complete THROUGH the recovery delay \
+             window and downgrade invariant; IDV consumes a signed provider callback and \
+             IronAuth never verifies documents in house; the wire contract may change between \
+             releases"
         );
     }
     tracing::info!(

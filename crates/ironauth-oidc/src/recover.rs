@@ -161,6 +161,7 @@ pub async fn recover_post(
             crate::recovery::RecoveryFactor::EmailOtp,
             identifier,
             client_ip.as_deref(),
+            ironauth_store::RecoveryMethod::Standard,
         )
         .await;
     } else {

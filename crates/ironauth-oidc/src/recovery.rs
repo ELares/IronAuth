@@ -31,7 +31,7 @@
 
 use ironauth_store::{
     CorrelationId, IdentifierType, NewRecoveryFlow, RecoveryCancelReason, RecoveryEntryPoint,
-    RecoveryFlowId, Scope, UserId,
+    RecoveryFlowId, RecoveryMethod, Scope, UserId,
 };
 use sha2::{Digest, Sha256};
 
@@ -504,6 +504,14 @@ async fn notify_all_channels(state: &OidcState, scope: Scope, subject: &UserId) 
     count
 }
 
+/// Notify every verified channel of a recovery event for `subject` (issue #82, PR 3): the
+/// public wrapper the advanced-recovery modes use so each out-of-band confirmation and each
+/// mode progression alerts the account owner, exactly like the standard recovery path.
+/// Returns how many channels were notified.
+pub async fn notify_owner_channels(state: &OidcState, scope: Scope, subject: &UserId) -> usize {
+    notify_all_channels(state, scope, subject).await
+}
+
 /// INITIATE a recovery for a resolved subject (issue #81): risk-score the event, enforce
 /// the per-account cooldown, decide the delay (held) path, mint the cancellation token,
 /// notify EVERY verified channel, and persist the flow. Returns
@@ -513,6 +521,7 @@ async fn notify_all_channels(state: &OidcState, scope: Scope, subject: &UserId) 
 /// Anti-enumeration: this is called ONLY for a resolved (known) account, so an unknown
 /// identifier never reaches it; both the known and unknown paths return the same
 /// acknowledgment upstream.
+#[allow(clippy::too_many_arguments)]
 pub async fn initiate_recovery(
     state: &OidcState,
     scope: Scope,
@@ -521,6 +530,7 @@ pub async fn initiate_recovery(
     recover_factor: RecoveryFactor,
     recipient: &str,
     client_ip: Option<&str>,
+    method: RecoveryMethod,
 ) -> RecoveryInitiation {
     let settings = state.recovery_settings();
     let recover_acr = recover_factor.strength_acr();
@@ -589,6 +599,7 @@ pub async fn initiate_recovery(
         cancel_token_digest: &digest,
         recipient,
         hold_until_unix_micros: hold_until,
+        method,
     };
     let issued = state
         .store()

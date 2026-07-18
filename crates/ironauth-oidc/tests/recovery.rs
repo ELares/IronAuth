@@ -38,7 +38,8 @@ use ironauth_oidc::{
     VerificationPurpose, VerificationSender,
 };
 use ironauth_store::{
-    IdentifierType, NewUserIdentifier, RecoveryEntryPoint, RecoveryState, UniquenessMode, UserId,
+    IdentifierType, NewUserIdentifier, RecoveryEntryPoint, RecoveryMethod, RecoveryState,
+    UniquenessMode, UserId,
 };
 use serde_json::{Value, json};
 use sqlx::Row;
@@ -168,6 +169,7 @@ async fn email_recovery_against_a_passkey_account_cannot_remove_the_passkey_with
         RecoveryFactor::EmailOtp,
         "ada@example.test",
         Some("203.0.113.7"),
+        RecoveryMethod::Standard,
     )
     .await;
     let flow_id = match outcome {
@@ -243,6 +245,7 @@ async fn email_recovery_can_remove_an_equal_or_weaker_factor_outright() {
         RecoveryFactor::EmailOtp,
         "bob@example.test",
         None,
+        RecoveryMethod::Standard,
     )
     .await;
     let RecoveryInitiation::Created { flow_id, held, .. } = outcome else {
@@ -301,6 +304,7 @@ async fn initiating_recovery_notifies_every_verified_channel() {
         RecoveryFactor::EmailOtp,
         "carol@example.test",
         None,
+        RecoveryMethod::Standard,
     )
     .await;
     let RecoveryInitiation::Created {
@@ -343,6 +347,7 @@ async fn a_held_recovery_is_cancellable_from_its_notification_token_and_cancella
         RecoveryFactor::EmailOtp,
         "dave@example.test",
         None,
+        RecoveryMethod::Standard,
     )
     .await;
     let (flow_id, cancel_token) = match outcome {
@@ -427,6 +432,7 @@ async fn cooldown_rate_limits_repeated_recovery_initiations() {
         RecoveryFactor::EmailOtp,
         "erin@example.test",
         None,
+        RecoveryMethod::Standard,
     )
     .await;
     assert!(matches!(first, RecoveryInitiation::Created { .. }));
@@ -440,6 +446,7 @@ async fn cooldown_rate_limits_repeated_recovery_initiations() {
         RecoveryFactor::EmailOtp,
         "erin@example.test",
         None,
+        RecoveryMethod::Standard,
     )
     .await;
     assert!(
@@ -459,6 +466,7 @@ async fn cooldown_rate_limits_repeated_recovery_initiations() {
         RecoveryFactor::EmailOtp,
         "erin@example.test",
         None,
+        RecoveryMethod::Standard,
     )
     .await;
     assert!(
@@ -489,6 +497,7 @@ async fn every_recovery_step_appears_in_the_audit_log() {
         RecoveryFactor::EmailOtp,
         "frank@example.test",
         Some("203.0.113.9"),
+        RecoveryMethod::Standard,
     )
     .await;
     let (flow_id, cancel_token) = match outcome {
@@ -556,6 +565,7 @@ async fn a_risk_block_suppresses_recovery() {
         RecoveryFactor::EmailOtp,
         "grace@example.test",
         None,
+        RecoveryMethod::Standard,
     )
     .await;
     assert!(
@@ -586,6 +596,7 @@ async fn a_risk_forced_delay_holds_an_otherwise_immediate_recovery() {
         RecoveryFactor::EmailOtp,
         "heidi@example.test",
         None,
+        RecoveryMethod::Standard,
     )
     .await;
     let RecoveryInitiation::Created { held, .. } = outcome else {
@@ -734,6 +745,7 @@ async fn live_endpoint_a_held_recovery_blocks_passkey_removal_until_a_fresh_reve
         RecoveryFactor::EmailOtp,
         "ada@example.test",
         None,
+        RecoveryMethod::Standard,
     )
     .await;
     assert!(matches!(
@@ -805,6 +817,7 @@ async fn live_endpoint_a_held_recovery_blocks_passkey_removal_until_the_delay_el
         RecoveryFactor::EmailOtp,
         "bob@example.test",
         None,
+        RecoveryMethod::Standard,
     )
     .await;
     assert!(matches!(
@@ -873,6 +886,7 @@ async fn live_endpoint_a_held_recovery_blocks_totp_removal_until_the_delay_elaps
         RecoveryFactor::EmailOtp,
         "dave@example.test",
         None,
+        RecoveryMethod::Standard,
     )
     .await;
     assert!(
@@ -946,6 +960,7 @@ async fn live_endpoint_password_removal_still_works_via_fresh_passkey_reauth() {
         RecoveryFactor::EmailOtp,
         "erin@example.test",
         None,
+        RecoveryMethod::Standard,
     )
     .await;
     assert!(matches!(
@@ -1012,6 +1027,7 @@ async fn the_known_and_unknown_init_paths_do_comparable_work() {
         RecoveryFactor::EmailOtp,
         "frank@example.test",
         None,
+        RecoveryMethod::Standard,
     )
     .await;
     let after_known = counter.scored.load(Ordering::SeqCst);
@@ -1064,6 +1080,7 @@ async fn a_device_bound_passkey_holder_is_held_at_its_true_rung() {
         RecoveryFactor::Passkey, // recover at the synced-passkey rung (phr).
         "grace@example.test",
         None,
+        RecoveryMethod::Standard,
     )
     .await;
     let RecoveryInitiation::Created { held, .. } = outcome else {

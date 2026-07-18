@@ -121,6 +121,43 @@
       },
       "type": "object"
     },
+    "AdvancedRecoveryConfig": {
+      "additionalProperties": false,
+      "description": "The advanced-recovery-modes policy (issue #82, PR 3): the three mode sub-toggles under the\nsingle `advanced-recovery` experimental ack, the trusted-contact confirmation threshold\n(fork F7), and the registered IDV providers (fork F8). Consulted ONLY when the\n`advanced-recovery` experimental feature is armed (enabled AND acknowledged); with the\nfeature off every advanced-recovery path is a uniform 404 regardless of these toggles, so\nconfig data can never arm the surface. Each mode completes THROUGH the recovery delay\nwindow and the downgrade invariant, never around them.",
+      "properties": {
+        "admin_approved_enabled": {
+          "default": false,
+          "description": "Whether the ADMIN-APPROVED recovery mode is active (issue #82, PR 3). A recovery\nrequested in this mode lands in the control-plane admin review queue; an admin\napproval satisfies the method precondition (completion still runs through the delay /\ndowngrade gate). Off by default; inert unless the `advanced-recovery` feature is armed.",
+          "type": "boolean"
+        },
+        "idv_enabled": {
+          "default": false,
+          "description": "Whether the IDV-GATED recovery mode is active (issue #82, PR 3). A recovery redirects\nto a configured external identity-verification provider and consumes its signed\ncallback; a valid single-use case-bound PASS callback satisfies the method\nprecondition. Off by default. Requires at least one enabled entry in\n[`idv_providers`](Self::idv_providers).",
+          "type": "boolean"
+        },
+        "idv_providers": {
+          "default": [],
+          "description": "The registered external IDV providers (fork F8): each maps a provider slug to its\nredirect URL and its registered public key(s), so an IDV callback's signature is\nverified against a REGISTERED key through the hardened JOSE core (never a key from the\ntoken, never `alg=none`). IronAuth only ever CONSUMES a provider's signed assertion;\nit never verifies identity documents in house. Empty by default.",
+          "items": {
+            "$ref": "#/$defs/IdvProvider"
+          },
+          "type": "array"
+        },
+        "required_confirmations": {
+          "default": 1,
+          "description": "The trusted-contact confirmation threshold (fork F7): how many DISTINCT designated\ncontacts must confirm before a trusted-contact recovery may complete. Default 1;\ncapped at the number of designated contacts at initiation (a threshold above the\ncontact count would be unreachable). Must be at least 1.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "trusted_contact_enabled": {
+          "default": false,
+          "description": "Whether the TRUSTED-CONTACT recovery mode is active (issue #82, PR 3). A user\ndesignates contacts who confirm a recovery out of band with single-use links; the\nrecovery completes once [`required_confirmations`](Self::required_confirmations)\ndistinct contacts have confirmed AND the delay / downgrade gate passes. Off by default.",
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
     "AutoLinkPosture": {
       "description": "The posture governing whether a federated login may AUTO-LINK into a pre-existing\nlocal account (issue #78). The default is the most conservative one: a federated\nlogin NEVER silently merges into a pre-existing local account. An operator opts into\nverified-to-verified auto-linking per environment.\n\nThis is one structural floor of the guarded linking subsystem: even under\n`VerifiedToVerified` an auto-link fires only when the FULL trust decision table\nagrees (a verified local email, an upstream `email_verified`, and a trusted\nconnector), so the \"unverified local\" and \"untrusted upstream\" cells are unreachable\nTWICE OVER (once by this posture, once by the trust table). Under `Off` (the default)\nno arm of the trust table can return `AutoLink` at all.\n\nFORK B (issue #78): the intended tenancy grain is PER ENVIRONMENT. In PR 1 this ships\nas the deployment default; the per-environment override the pure trust decision\nconsumes is threaded by the PR 2 wiring (the decision function takes the posture as an\ninput, so its source is the caller's concern).",
       "oneOf": [
@@ -445,6 +482,53 @@
       },
       "type": "object"
     },
+    "IdvProvider": {
+      "additionalProperties": false,
+      "description": "A registered external identity-verification (IDV) provider (issue #82, PR 3, fork F8).\n\nAn IDV-gated recovery redirects to this provider's [`redirect_url`](Self::redirect_url),\ncarrying the recovery-case binding, and later consumes a SIGNED callback (a JWS). The\ncallback's signature is verified through the hardened JOSE core against this provider's\nREGISTERED public key(s) ([`jwks`](Self::jwks)), with the algorithm taken from\n[`algorithms`](Self::algorithms) (never the token header, and `alg=none`/HMAC structurally\ninexpressible). Only a verified, single-use, case-bound PASS callback completes the\nrecovery. IronAuth never performs document verification itself; it only consumes the\nprovider's signed assertion.",
+      "properties": {
+        "algorithms": {
+          "default": [],
+          "description": "The JWS algorithm allowlist a callback from this provider may be signed with (issue\n#82), as JOSE `alg` names (for example `EdDSA`, `ES256`). A callback whose `alg` is\noutside this list is rejected. Must be non-empty when the provider is enabled;\n`alg=none` and the HMAC families are structurally inexpressible in the JOSE core\nregardless.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "enabled": {
+          "default": true,
+          "description": "Whether this provider is active (issue #82). When false, an IDV recovery naming it is\nrejected. Default true: a listed provider is active unless disabled.",
+          "type": "boolean"
+        },
+        "iss": {
+          "default": "",
+          "description": "The `iss` the callback is verified under (issue #82): the provider identity the JOSE\ncore enforces `expected_iss == iss` against. Must be non-empty when the provider is\nenabled.",
+          "type": "string"
+        },
+        "jwks": {
+          "default": "",
+          "description": "The provider's registered PUBLIC keys as a JWKS JSON document (issue #82). Only public\nJWK members are read (the JOSE core is fail-closed), and this is the ONLY key source\nthe callback signature is verified against (never a key from the token header). Must\nbe a non-empty JWKS when the provider is enabled.",
+          "type": "string"
+        },
+        "redirect_url": {
+          "default": "",
+          "description": "The provider's redirect URL the recovery redirects the user to, carrying the case\nbinding. Must be a non-empty absolute `https` URL when the provider is enabled.",
+          "type": "string"
+        },
+        "session_ttl_secs": {
+          "default": 900,
+          "description": "The callback-session lifetime in seconds (issue #82): an IDV session older than this\n(measured on the env clock seam) can no longer be completed by a callback. Default\n900 (fifteen minutes). Must be between 1 and `OIDC_MAX_LIFETIME_SECS`.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "slug": {
+          "default": "",
+          "description": "The provider slug: the stable identifier the IDV session records and the callback\nroute selects. Must be non-empty and unique across providers.",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
     "LazyMigrationConfig": {
       "additionalProperties": false,
       "description": "The INBOUND lazy-migration hook settings (issue #56).\n\nWhen enabled, a login whose canonicalized identifier is UNKNOWN locally verifies the\nsubmitted credential against a legacy store through the `endpoint` webhook (delivered\nover the M1 SSRF-hardened outbound fetcher, HTTPS ONLY, authenticated with `secret`).\nOn a positive verdict the user is created locally with a native Argon2id hash and is\nMIGRATED by construction, so their next login verifies natively and never calls the\nhook. Every failure verdict (wrong password, unknown to the legacy store, timeout,\nbreaker open) yields the SAME uniform login failure as a local wrong password, so the\nhook's existence is not observable to an attacker.\n\nDISABLED BY DEFAULT (`enabled = false`): pointing the login path at an external\ncredential oracle is an explicit, per-deployment opt-in. Once the tail of stragglers\nis closed by a standard #55 bulk import, the hook is disabled again by flipping\n`enabled` back to false (a pure config change).",
@@ -545,6 +629,17 @@
             "type": "string"
           },
           "type": "array"
+        },
+        "advanced_recovery": {
+          "$ref": "#/$defs/AdvancedRecoveryConfig",
+          "default": {
+            "admin_approved_enabled": false,
+            "idv_enabled": false,
+            "idv_providers": [],
+            "required_confirmations": 1,
+            "trusted_contact_enabled": false
+          },
+          "description": "The advanced-recovery-modes policy (issue #82, PR 3): the three mode sub-toggles under\nthe single `advanced-recovery` experimental ack, the trusted-contact confirmation\nthreshold, and the registered IDV providers. Consulted only when the\n`advanced-recovery` experimental feature is enabled AND acknowledged. See\n[`AdvancedRecoveryConfig`]."
         },
         "authorization_code_ttl_secs": {
           "default": 60,
@@ -2187,6 +2282,13 @@
           "phrh",
           "urn:ironauth:acr:attested_passkey"
         ],
+        "advanced_recovery": {
+          "admin_approved_enabled": false,
+          "idv_enabled": false,
+          "idv_providers": [],
+          "required_confirmations": 1,
+          "trusted_contact_enabled": false
+        },
         "authorization_code_ttl_secs": 60,
         "backchannel_logout_enabled": false,
         "backchannel_logout_max_attempts": 5,
