@@ -25,6 +25,8 @@ use common::{
     Harness, ISSUER_BASE, PKCE_CHALLENGE, PKCE_VERIFIER, REDIRECT_URI, SEED_PASSWORD, enc, form,
     form_field, json, location, location_param, set_cookie_pair,
 };
+use ironauth_jose::verify;
+use serde_json::Value;
 
 /// The standard-claim document the seeded FedCM account carries.
 const CLAIMS_JSON: &str = r#"{
@@ -554,4 +556,431 @@ async fn no_logged_out_on_a_cross_user_logout() {
         None,
         "a cross-user logout must NEVER emit Set-Login: logged-out (victim-state-flip defense)"
     );
+}
+
+// ---------------------------------------------------------------------------
+// The ID assertion endpoint (PR 2, the credential-issuing surface and the security
+// crux). The negatives are the point: each MUST reject with the redirect flow's
+// strictness, and none may mint. The happy path proves a byte-compatible token.
+
+/// The harness client's single registered `https` redirect-URI origin (Fork B1): the
+/// ONLY `Origin` the assertion endpoint accepts for it.
+const RP_ORIGIN: &str = "https://client.test";
+
+/// A POST through the router to the id-assertion endpoint, with explicit `Origin`,
+/// `Sec-Fetch-Dest`, and cookie headers and a form body.
+async fn assertion_post(
+    harness: &Harness,
+    body: &str,
+    origin: Option<&str>,
+    sec_fetch_dest: Option<&str>,
+    cookie: Option<&str>,
+) -> (StatusCode, HeaderMap, String) {
+    let base = scoped_base(harness);
+    let mut builder = Request::builder()
+        .method("POST")
+        .uri(format!("{base}/fedcm/assertion"))
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded");
+    if let Some(origin) = origin {
+        builder = builder.header(header::ORIGIN, origin);
+    }
+    if let Some(dest) = sec_fetch_dest {
+        builder = builder.header("sec-fetch-dest", dest);
+    }
+    if let Some(cookie) = cookie {
+        builder = builder.header(header::COOKIE, cookie);
+    }
+    harness
+        .send(
+            builder
+                .body(Body::from(body.to_owned()))
+                .expect("request builds"),
+        )
+        .await
+}
+
+/// The FedCM assertion form body for `(client_id, account_id, nonce)`.
+fn assertion_form(client_id: &str, account_id: &str, nonce: &str) -> String {
+    form(&[
+        ("client_id", client_id),
+        ("account_id", account_id),
+        ("nonce", nonce),
+        ("disclosure_text_shown", "true"),
+    ])
+}
+
+/// A fully-armed FedCM harness with a seeded, consenting subject and its session
+/// cookie: returns `(harness, client_id, subject, public_subject, cookie)`. The
+/// subject has consented to the harness client (so consent is satisfied) and its
+/// account id (what the accounts endpoint returns) is the per-env public subject.
+async fn armed_assertion_harness() -> (Harness, String, String, String, String) {
+    let mut harness = Harness::start().await;
+    let client_id = harness.client_id().to_string();
+    let subject = harness
+        .seed_user_with_claims("fedcm-assert@example.test", SEED_PASSWORD, CLAIMS_JSON)
+        .await;
+    harness.grant_consent(&subject, &client_id).await;
+    harness.enable_fedcm();
+    let public_subject = harness.state().resolve_public_subject(&subject);
+    let cookie = harness.session_cookie(&subject).await;
+    (harness, client_id, subject, public_subject, cookie)
+}
+
+fn allow_origin(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned)
+}
+
+fn allow_credentials(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(header::ACCESS_CONTROL_ALLOW_CREDENTIALS)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned)
+}
+
+#[tokio::test]
+async fn assertion_happy_path_mints_a_verifiable_id_token() {
+    let (harness, client_id, _subject, public_subject, cookie) = armed_assertion_harness().await;
+
+    let (status, headers, body) = assertion_post(
+        &harness,
+        &assertion_form(&client_id, &public_subject, "n-fedcm-happy"),
+        Some(RP_ORIGIN),
+        Some("webidentity"),
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "assertion: {body}");
+    // The credential response is never cacheable.
+    assert_eq!(cache_control(&headers), "no-store");
+    // FedCM-required CORS so the browser can READ the token: the EXACT validated RP
+    // origin (never a wildcard) and credentials allowed.
+    assert_eq!(allow_origin(&headers).as_deref(), Some(RP_ORIGIN));
+    assert_eq!(allow_credentials(&headers).as_deref(), Some("true"));
+
+    let token = json(&body)["token"]
+        .as_str()
+        .expect("token present")
+        .to_owned();
+    // The token verifies under the per-env JWKS with aud=client, iss=per-env issuer.
+    let policy = harness.policy(&client_id);
+    let verified = verify(&token, &policy, &common::verify_clock()).expect("id token verifies");
+    let claims = Value::Object(verified.claims().raw().clone());
+    assert_eq!(claims["iss"], Value::String(harness.issuer().to_owned()));
+    assert_eq!(claims["aud"], Value::String(client_id.clone()));
+    // sub is the per-env public subject through the ONE subject function.
+    assert_eq!(claims["sub"], Value::String(public_subject.clone()));
+    // The RP nonce is echoed EXACTLY.
+    assert_eq!(claims["nonce"], Value::String("n-fedcm-happy".to_owned()));
+}
+
+#[tokio::test]
+async fn assertion_sub_is_byte_compatible_with_the_redirect_flow() {
+    // The no-divergence proof: the FedCM-minted sub equals what the redirect flow
+    // (authorize -> token) mints for the SAME (client, subject), through the SAME
+    // subject-derivation function, verified under the SAME per-env key.
+    let (harness, client_id, _subject, public_subject, cookie) = armed_assertion_harness().await;
+
+    let (status, _headers, body) = assertion_post(
+        &harness,
+        &assertion_form(&client_id, &public_subject, "n-parity"),
+        Some(RP_ORIGIN),
+        Some("webidentity"),
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "assertion: {body}");
+    let fedcm_token = json(&body)["token"].as_str().expect("token").to_owned();
+
+    // The redirect flow's ID token for the SAME session cookie (same subject/client).
+    let redirect_token = mint_id_token(&harness, &client_id, &cookie).await;
+
+    let policy = harness.policy(&client_id);
+    let fedcm =
+        verify(&fedcm_token, &policy, &common::verify_clock()).expect("fedcm id token verifies");
+    let redirect = verify(&redirect_token, &policy, &common::verify_clock())
+        .expect("redirect id token verifies");
+    assert_eq!(
+        fedcm.claims().raw().get("sub"),
+        redirect.claims().raw().get("sub"),
+        "the FedCM sub must equal the redirect flow's sub"
+    );
+    assert_eq!(
+        fedcm.claims().raw().get("sub"),
+        Some(&Value::String(public_subject)),
+        "and both equal resolve_public_subject(subject)"
+    );
+    assert_eq!(
+        fedcm.claims().raw().get("aud"),
+        redirect.claims().raw().get("aud"),
+        "the audience binding matches"
+    );
+}
+
+#[tokio::test]
+async fn assertion_unknown_client_is_refused() {
+    let (harness, _client_id, _subject, public_subject, cookie) = armed_assertion_harness().await;
+    // A well-formed, in-scope, but UNREGISTERED client_id: parses cleanly, then
+    // ClientRepo::get returns NotFound (the exact redirect-flow lookup), so this
+    // exercises the registered-client check, not merely a parse failure.
+    let bogus = ironauth_store::ClientId::generate(harness.env(), &harness.scope()).to_string();
+    let (status, headers, _body) = assertion_post(
+        &harness,
+        &assertion_form(&bogus, &public_subject, "n-unknown"),
+        Some(RP_ORIGIN),
+        Some("webidentity"),
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "unknown client is refused");
+    // A refusal carries NO CORS (never a readable oracle for an unregistered client).
+    assert_eq!(allow_origin(&headers), None);
+}
+
+#[tokio::test]
+async fn assertion_account_mismatch_is_refused() {
+    let (harness, client_id, _subject, _public_subject, cookie) = armed_assertion_harness().await;
+    // An account_id that is NOT the session's own public subject: the browser cannot
+    // request an assertion for another account.
+    let (status, _headers, _body) = assertion_post(
+        &harness,
+        &assertion_form(&client_id, "usr_someone_else", "n-mismatch"),
+        Some(RP_ORIGIN),
+        Some("webidentity"),
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "an account_id != the session subject is refused"
+    );
+}
+
+#[tokio::test]
+async fn assertion_origin_mismatch_is_refused() {
+    let (harness, client_id, _subject, public_subject, cookie) = armed_assertion_harness().await;
+    // An Origin that is not one of the client's registered https redirect-uri origins.
+    let (status, headers, _body) = assertion_post(
+        &harness,
+        &assertion_form(&client_id, &public_subject, "n-origin"),
+        Some("https://evil.example"),
+        Some("webidentity"),
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "origin mismatch is refused"
+    );
+    assert_eq!(allow_origin(&headers), None);
+
+    // A MISSING Origin fails closed too (the RP-origin binding is mandatory).
+    let (status, _headers, _body) = assertion_post(
+        &harness,
+        &assertion_form(&client_id, &public_subject, "n-origin-absent"),
+        None,
+        Some("webidentity"),
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a missing Origin is refused"
+    );
+}
+
+#[tokio::test]
+async fn assertion_replayed_nonce_is_refused() {
+    let (harness, client_id, _subject, public_subject, cookie) = armed_assertion_harness().await;
+    let body = assertion_form(&client_id, &public_subject, "n-replay");
+
+    // First use mints.
+    let (status, _headers, out) = assertion_post(
+        &harness,
+        &body,
+        Some(RP_ORIGIN),
+        Some("webidentity"),
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "first use mints: {out}");
+
+    // A second assertion with the SAME (client_id, nonce) is a replay: rejected.
+    let (status, _headers, _out) = assertion_post(
+        &harness,
+        &body,
+        Some(RP_ORIGIN),
+        Some("webidentity"),
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a replayed nonce is refused"
+    );
+}
+
+#[tokio::test]
+async fn assertion_missing_sec_fetch_dest_is_refused() {
+    let (harness, client_id, _subject, public_subject, cookie) = armed_assertion_harness().await;
+    // No Sec-Fetch-Dest: not a browser FedCM fetch, refused before any work.
+    let (status, _headers, body) = assertion_post(
+        &harness,
+        &assertion_form(&client_id, &public_subject, "n-nofetch"),
+        Some(RP_ORIGIN),
+        None,
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        !body.contains("token"),
+        "a non-FedCM request never mints a token: {body}"
+    );
+}
+
+#[tokio::test]
+async fn assertion_no_session_is_refused() {
+    let (harness, client_id, _subject, public_subject, _cookie) = armed_assertion_harness().await;
+    // No cookie: no OP session resolves, so no assertion is minted.
+    let (status, _headers, body) = assertion_post(
+        &harness,
+        &assertion_form(&client_id, &public_subject, "n-nosession"),
+        Some(RP_ORIGIN),
+        Some("webidentity"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(!body.contains("token"), "no session never mints: {body}");
+}
+
+#[tokio::test]
+async fn assertion_consent_unmet_is_not_minted() {
+    // The no-consent-bypass proof: a registered client the subject has NOT consented
+    // to (and which is not first-party) must NOT be issued an assertion, exactly as
+    // the redirect flow would refuse to skip consent.
+    let mut harness = Harness::start().await;
+    let client_id = harness.client_id().to_string();
+    let subject = harness
+        .seed_user_with_claims("fedcm-noconsent@example.test", SEED_PASSWORD, CLAIMS_JSON)
+        .await;
+    // NB: no grant_consent, and the default client is explicit (not first-party).
+    harness.enable_fedcm();
+    let public_subject = harness.state().resolve_public_subject(&subject);
+    let cookie = harness.session_cookie(&subject).await;
+
+    let (status, _headers, body) = assertion_post(
+        &harness,
+        &assertion_form(&client_id, &public_subject, "n-noconsent"),
+        Some(RP_ORIGIN),
+        Some("webidentity"),
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "consent unmet must not mint: {body}"
+    );
+    assert!(
+        !body.contains("token"),
+        "FedCM must never bypass consent: {body}"
+    );
+}
+
+#[tokio::test]
+async fn assertion_quarantined_client_with_recorded_consent_is_refused() {
+    // The consent-PARITY proof (the FedCM analog of the redirect flow's forced
+    // re-prompt for a quarantined client): an unverified (QUARANTINED, issue #31)
+    // client with a PRE-RECORDED covering consent, a valid session, its registered
+    // origin, and a fresh nonce must NOT be silently issued a FedCM assertion. The
+    // redirect flow re-prompts consent on every authorization for a quarantined client
+    // (resolve_consent_gate's `force_consent || client.quarantined`, which disables the
+    // recorded-consent fast path); FedCM cannot render that screen, so its analog is to
+    // REFUSE. Then verification lifts the quarantine and the SAME recorded consent mints
+    // (no regression to the happy path).
+    let (harness, client_id, _subject, public_subject, cookie) = armed_assertion_harness().await;
+    let id = *harness.client_id();
+
+    // Quarantine the (already-consented) client: this is exactly the review's repro (a
+    // quarantined client WITH a recorded consent covering openid). Before the fix this
+    // fell through to the recorded-consent branch and minted a token.
+    harness.set_client_quarantined(&id, true).await;
+    assert!(
+        harness.client_quarantined(&id).await,
+        "the client is quarantined for this leg"
+    );
+
+    let (status, headers, body) = assertion_post(
+        &harness,
+        &assertion_form(&client_id, &public_subject, "n-quarantine"),
+        Some(RP_ORIGIN),
+        Some("webidentity"),
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a quarantined client with a recorded consent must be REFUSED, not minted: {body}"
+    );
+    assert!(
+        !body.contains("token"),
+        "a quarantined client must never be issued a FedCM assertion: {body}"
+    );
+    // A refusal carries NO CORS (no readable oracle).
+    assert_eq!(allow_origin(&headers), None);
+
+    // The control: lift the quarantine (as an admin verification does) and the SAME
+    // recorded consent now mints, on a fresh nonce. This proves the fix refuses ONLY
+    // the quarantined case and leaves the verified-client happy path unchanged.
+    harness.set_client_quarantined(&id, false).await;
+    assert!(
+        !harness.client_quarantined(&id).await,
+        "the quarantine is lifted for the control leg"
+    );
+    let (status, _headers, body) = assertion_post(
+        &harness,
+        &assertion_form(&client_id, &public_subject, "n-verified"),
+        Some(RP_ORIGIN),
+        Some("webidentity"),
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a verified client with the SAME recorded consent still mints: {body}"
+    );
+    assert!(
+        json(&body)["token"].as_str().is_some(),
+        "the verified-client happy path is unregressed: {body}"
+    );
+}
+
+#[tokio::test]
+async fn assertion_flag_off_is_404() {
+    // With the flag off the credential-issuing endpoint is a uniform 404.
+    let harness = Harness::start().await; // fedcm NOT enabled
+    let subject = harness.seed_unique_user().await;
+    let client_id = harness.client_id().to_string();
+    let public_subject = harness.state().resolve_public_subject(&subject);
+    let cookie = harness.session_cookie(&subject).await;
+
+    let (status, _headers, _body) = assertion_post(
+        &harness,
+        &assertion_form(&client_id, &public_subject, "n-flagoff"),
+        Some(RP_ORIGIN),
+        Some("webidentity"),
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "flag off is a uniform 404");
 }

@@ -2104,6 +2104,26 @@ impl Harness {
             .expect("get client")
             .quarantined
     }
+
+    /// Force a client INTO (or out of) the unverified-client quarantine (issue #31),
+    /// for tests that must exercise the quarantine gate on the seeded (non-DCR) client.
+    /// Runs through the owner pool (the migration/provisioning connection), so it can
+    /// flip the flag on a client that `verify_dynamic_client` (which filters on
+    /// `dcr_registered`) cannot touch. The value the redirect flow and the FedCM
+    /// assertion endpoint read is the SAME `clients.quarantined` column.
+    pub async fn set_client_quarantined(&self, client_id: &ClientId, quarantined: bool) {
+        sqlx::query(
+            "UPDATE clients SET quarantined = $1 \
+             WHERE id = $2 AND tenant_id = $3 AND environment_id = $4",
+        )
+        .bind(quarantined)
+        .bind(client_id.to_string())
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .execute(self.db.owner_pool())
+        .await
+        .expect("update client quarantine");
+    }
 }
 
 /// A clock at the token's issuance time (the frozen epoch), for verification.
