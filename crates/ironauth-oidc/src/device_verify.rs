@@ -33,7 +33,7 @@
 use std::net::IpAddr;
 
 use axum::extract::{Form, Path, Query, State};
-use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::Response;
 use ironauth_store::{
     ActiveDeviceFlow, ConsentId, CorrelationId, DeviceApproval, DeviceApproveOutcome,
@@ -534,9 +534,11 @@ async fn render_after_login(
 /// second header (issue #39). A value that is not a valid header value is dropped rather
 /// than panicking (unreachable for a server-built cookie; defense in depth).
 fn with_set_cookie(mut response: Response, cookies: &interaction::SessionCookies) -> Response {
-    for value in cookies.header_values() {
+    // The session cookie AND the FedCM `Set-Login` header (issue #83) ride the SAME choke
+    // point, so the post-sign-in device confirmation emits `Set-Login: logged-in` too.
+    for (name, value) in cookies.response_headers() {
         if let Ok(value) = HeaderValue::from_str(value) {
-            response.headers_mut().append(header::SET_COOKIE, value);
+            response.headers_mut().append(name, value);
         }
     }
     response

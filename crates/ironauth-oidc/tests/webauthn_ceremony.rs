@@ -1522,3 +1522,86 @@ async fn the_lifecycle_fence_blocks_the_webauthn_path_for_a_non_authenticatable_
         "an approved account mints a session on the WebAuthn path"
     );
 }
+
+/// The FedCM `Set-Login` header value on the response, if any.
+fn set_login(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("set-login")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned)
+}
+
+#[tokio::test]
+async fn a_passkey_sign_in_emits_set_login_logged_in_when_fedcm_is_on() {
+    // FedCM Login Status (issue #83): a passkey authenticate-success establishes the
+    // session at the SAME choke point every other factor does, so it must emit
+    // Set-Login: logged-in when the flag is on. Regression guard for the bug where the
+    // header rode only the response-helper layer and the hand-built passkey 200 bypassed
+    // it, leaving the browser FedCM login state stuck logged-out after a passkey sign-in.
+    let mut harness = Harness::start().await;
+    harness.enable_fedcm();
+    let subject = harness
+        .seed_user("fedcm-passkey@example.test", "correct horse battery staple")
+        .await;
+    let (_id, cookie) = harness.session_with_id(&subject, "pwd", 0).await;
+    let seed = [43_u8; 32];
+    let cred = b"fedcm-passkey-credential";
+
+    let (status, body) = register_flags(&harness, &cookie, &seed, cred, REG_SYNCED_UV).await;
+    assert_eq!(status, StatusCode::CREATED, "register: {body}");
+
+    let (status, headers, resp) = authenticate_flags(
+        &harness,
+        &seed,
+        cred,
+        Some(subject.as_bytes()),
+        ASSERT_SYNCED_UV,
+        1,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "passkey sign in: {resp}");
+    assert!(
+        headers.get_all(header::SET_COOKIE).iter().count() >= 1,
+        "a passkey sign-in sets the session cookie"
+    );
+    assert_eq!(
+        set_login(&headers).as_deref(),
+        Some("logged-in"),
+        "a passkey sign-in emits Set-Login: logged-in when FedCM is on"
+    );
+}
+
+#[tokio::test]
+async fn a_passkey_sign_in_emits_no_set_login_when_fedcm_is_off() {
+    // The flag-off invariant: with FedCM off a passkey sign-in is byte-identical to
+    // before and emits no Set-Login header at all.
+    let harness = Harness::start().await; // fedcm NOT enabled
+    let subject = harness
+        .seed_user(
+            "no-fedcm-passkey@example.test",
+            "correct horse battery staple",
+        )
+        .await;
+    let (_id, cookie) = harness.session_with_id(&subject, "pwd", 0).await;
+    let seed = [44_u8; 32];
+    let cred = b"no-fedcm-passkey-credential";
+
+    let (status, body) = register_flags(&harness, &cookie, &seed, cred, REG_SYNCED_UV).await;
+    assert_eq!(status, StatusCode::CREATED, "register: {body}");
+
+    let (status, headers, resp) = authenticate_flags(
+        &harness,
+        &seed,
+        cred,
+        Some(subject.as_bytes()),
+        ASSERT_SYNCED_UV,
+        1,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "passkey sign in: {resp}");
+    assert_eq!(
+        set_login(&headers),
+        None,
+        "with FedCM off a passkey sign-in emits no Set-Login header"
+    );
+}

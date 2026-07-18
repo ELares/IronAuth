@@ -74,6 +74,14 @@ fn login_status(headers: &HeaderMap) -> Option<String> {
         .map(str::to_owned)
 }
 
+fn vary(headers: &HeaderMap) -> String {
+    headers
+        .get(header::VARY)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_owned()
+}
+
 // ---------------------------------------------------------------------------
 // Flag OFF: every FedCM route is a uniform 404, discovery is unchanged.
 
@@ -176,6 +184,13 @@ async fn well_known_flag_on_points_at_the_designated_scoped_config() {
         Some(expected.as_str()),
         "the well-known names the single designated env's scoped config URL: {body}"
     );
+    // The document is cacheable AND branches on Sec-Fetch-Dest, so it must Vary on it,
+    // else a shared cache could serve a cached variant across the Sec-Fetch-Dest gate.
+    assert!(
+        vary(&headers).eq_ignore_ascii_case("sec-fetch-dest"),
+        "the cacheable well-known varies on Sec-Fetch-Dest: {:?}",
+        headers.get(header::VARY)
+    );
 }
 
 #[tokio::test]
@@ -237,6 +252,12 @@ async fn config_flag_on_designated_env_returns_the_four_field_config() {
     assert!(
         cache_control(&headers).contains("max-age"),
         "the config document is cacheable"
+    );
+    // Cacheable AND Sec-Fetch-Dest-gated, so it must Vary on Sec-Fetch-Dest.
+    assert!(
+        vary(&headers).eq_ignore_ascii_case("sec-fetch-dest"),
+        "the cacheable config document varies on Sec-Fetch-Dest: {:?}",
+        headers.get(header::VARY)
     );
 }
 

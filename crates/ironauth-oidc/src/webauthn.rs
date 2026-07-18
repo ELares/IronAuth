@@ -703,8 +703,10 @@ pub async fn authenticate_verify(
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "application/json")
         .header(header::CACHE_CONTROL, "no-store");
-    for value in cookies.header_values() {
-        builder = builder.header(header::SET_COOKIE, value);
+    // The session cookie AND the FedCM `Set-Login` header (issue #83) ride the SAME
+    // choke point, so a passkey sign-in emits `Set-Login: logged-in` when the flag is on.
+    for (name, value) in cookies.response_headers() {
+        builder = builder.header(name, value);
     }
     let payload = json!({
         "status": "ok",
@@ -1016,8 +1018,10 @@ pub async fn register_passkey_signup_verify(
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "application/json")
         .header(header::CACHE_CONTROL, "no-store");
-    for value in cookies.header_values() {
-        builder = builder.header(header::SET_COOKIE, value);
+    // The session cookie AND the FedCM `Set-Login` header (issue #83) ride the SAME
+    // choke point, so a passwordless passkey signup emits `Set-Login: logged-in` too.
+    for (name, value) in cookies.response_headers() {
+        builder = builder.header(name, value);
     }
     let payload = json!({
         "status": "ok",

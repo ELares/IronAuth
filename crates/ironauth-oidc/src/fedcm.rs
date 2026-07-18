@@ -77,6 +77,27 @@ fn not_a_fedcm_request() -> Response {
     (StatusCode::BAD_REQUEST, "not a FedCM request\n").into_response()
 }
 
+/// A cacheable FedCM document response (the well-known pointer or the config document)
+/// carrying `Vary: Sec-Fetch-Dest`. These documents are `Cache-Control: public,
+/// max-age=...` AND the handler branches on `Sec-Fetch-Dest` (a non-FedCM fetch gets a
+/// `400` instead of the document), so the `Vary` stops a shared cache from serving a
+/// stored variant across that gate. The shared [`cacheable_response`] cannot carry it: it
+/// also serves the JWKS/discovery/related-origins documents, which do NOT gate on
+/// `Sec-Fetch-Dest`, so the header is added ONLY here.
+fn cacheable_fedcm_document(headers: &HeaderMap, body: &str) -> Response {
+    let mut response = cacheable_response(
+        headers,
+        "application/json",
+        FEDCM_DOCUMENT_MAX_AGE_SECS,
+        body,
+    );
+    response.headers_mut().insert(
+        header::VARY,
+        header::HeaderValue::from_static(SEC_FETCH_DEST),
+    );
+    response
+}
+
 /// An UNCACHEABLE `application/json` response (`Cache-Control: no-store`), for the
 /// accounts endpoint. The accounts body is credentialed and must NEVER be cached, so a
 /// logged-out browser can never be served a stale populated body.
@@ -107,12 +128,7 @@ pub(crate) async fn well_known(State(state): State<OidcState>, headers: HeaderMa
     let Some(body) = state.fedcm_wellknown_document() else {
         return not_found();
     };
-    cacheable_response(
-        &headers,
-        "application/json",
-        FEDCM_DOCUMENT_MAX_AGE_SECS,
-        &body,
-    )
+    cacheable_fedcm_document(&headers, &body)
 }
 
 /// `GET /t/{t}/e/{e}/fedcm/config.json`: the W3C FedCM config document (issue #83).
@@ -138,12 +154,7 @@ pub(crate) async fn config(
         return not_found();
     }
     let body = state.fedcm_config_document(&scope);
-    cacheable_response(
-        &headers,
-        "application/json",
-        FEDCM_DOCUMENT_MAX_AGE_SECS,
-        &body,
-    )
+    cacheable_fedcm_document(&headers, &body)
 }
 
 /// `GET /t/{t}/e/{e}/fedcm/accounts`: the browser's credentialed account read (issue
