@@ -129,6 +129,13 @@ name = "recovery_flows"
 path = "tests/recovery_flows.rs"
 required-features = ["testing"]
 
+# Headless flow row persistence (issue #84): the single-use advance/consume latches and
+# the strict single-winner submit-token rotation guard. Needs a real database.
+[[test]]
+name = "flows"
+path = "tests/flows.rs"
+required-features = ["testing"]
+
 # Credential-class policy persistence + attestation config + WebAuthn user-handle
 # immutability (issue #66), against a real database.
 [[test]]

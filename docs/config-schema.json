@@ -450,6 +450,18 @@
       },
       "type": "object"
     },
+    "FlowsConfig": {
+      "additionalProperties": false,
+      "description": "Headless flow API settings (issue #84).\n\nThe flow engine generalizes the bootstrap interaction pages into one persisted,\nmachine readable flow object (a state machine plus a typed node/message renderer)\nconsumed identically by the browser and native JSON transports. This gate mirrors\n`oidc.enabled`: a plain operator toggle, off by default, that mounts nothing new on\nthe wire until it is turned on (the flow routes answer a uniform 404 while off, so a\ndeployment that does not use the flow API discloses nothing).",
+      "properties": {
+        "enabled": {
+          "default": false,
+          "description": "Whether to serve the headless flow API. Off by default so the default boot\nexposes only the bootstrap login, consent, and register pages. When on, the\nflow routes (the native JSON transport and the engine driven browser transport)\nanswer, sharing one flow object and one state machine.",
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
     "IdentifierUniqueness": {
       "description": "The per-environment login-identifier UNIQUENESS mode (issue #54).\n\nUniqueness is a POLICY, not a fixed schema rule: a greenfield identity model\nbakes scoped uniqueness in on day one rather than retrofitting it later (Zitadel\n#9535, Auth0's multi-year path to non-unique emails). The safe default\n(`environment_wide`) gives one canonical identifier at most one user per\n(tenant, environment). `org_scoped` makes an identifier unique only within an\norganization (meaningful once M10 org membership ships; a membership-free user\nfalls back to the environment scope). `non_unique` allows several accounts to\nshare one identifier (identifier-first login still resolves deterministically:\nthe M7 factor step disambiguates). Changing the mode on a POPULATED environment\nrequires a validation pass that reports post-canonicalization collisions before\nthe change applies. This is a promotable per-environment setting in spirit; the\nprocess value is the deployment default until per-environment overrides ride the\nM5 promotion pipeline.",
       "oneOf": [
@@ -2262,6 +2274,13 @@
       "default": {},
       "description": "Feature toggles keyed by registered feature name. Enabling an\nexperimental feature additionally requires `ack` equal to the\nfeature's exact current version; see the feature reference in the\ngenerated docs/CONFIG.md.",
       "type": "object"
+    },
+    "flows": {
+      "$ref": "#/$defs/FlowsConfig",
+      "default": {
+        "enabled": false
+      },
+      "description": "Headless flow API settings (issue #84): the machine readable flow contract\n(login, registration, MFA, recovery) served as one JSON flow object across the\nbrowser and native transports. Off by default (an experimental data plane gate\nlike `oidc.enabled`): when off, the flow routes answer a uniform 404 and the\nbootstrap login, consent, and register pages are the only interactive surface."
     },
     "identifiers": {
       "$ref": "#/$defs/IdentifiersConfig",

@@ -170,13 +170,19 @@ pub enum ResourceType {
     /// WHICH client may retrieve a session's captured upstream tokens. Promotable
     /// per-environment configuration with NO secret column.
     UpstreamTokenGrant,
+    /// A headless flow (issue #84): one row of the flow state machine (a login,
+    /// registration, MFA, or recovery journey's persisted position, its API transport
+    /// submit token, and the transient client payload it carries). Dynamic
+    /// per-environment data bound to a specific environment's users and short lived; it
+    /// STRUCTURALLY never enters a config snapshot.
+    Flow,
 }
 
 impl ResourceType {
     /// Every resource type, in a stable order. The classification lint and the
     /// metadata endpoint both iterate this; a variant missing here is caught by
     /// the `all_lists_every_variant` test and by `scripts/classification-lint.sh`.
-    pub const ALL: [ResourceType; 23] = [
+    pub const ALL: [ResourceType; 24] = [
         ResourceType::Operator,
         ResourceType::Tenant,
         ResourceType::Environment,
@@ -200,6 +206,7 @@ impl ResourceType {
         ResourceType::RoutingRule,
         ResourceType::UpstreamToken,
         ResourceType::UpstreamTokenGrant,
+        ResourceType::Flow,
     ];
 
     /// The stable wire name of this resource type (for example `organization`).
@@ -229,6 +236,7 @@ impl ResourceType {
             ResourceType::RoutingRule => "routing_rule",
             ResourceType::UpstreamToken => "upstream_token",
             ResourceType::UpstreamTokenGrant => "upstream_token_grant",
+            ResourceType::Flow => "flow",
         }
     }
 
@@ -259,7 +267,8 @@ impl ResourceType {
             | ResourceType::OrgConnection
             | ResourceType::RoutingRule
             | ResourceType::UpstreamToken
-            | ResourceType::UpstreamTokenGrant => ResourceLevel::Environment,
+            | ResourceType::UpstreamTokenGrant
+            | ResourceType::Flow => ResourceLevel::Environment,
         }
     }
 
@@ -344,7 +353,11 @@ pub fn classify(resource: ResourceType) -> ResourceClassification {
         // data bound to a specific session's lifetime, and its token values are
         // high-value secrets sealed at rest: it STRUCTURALLY never enters a config
         // snapshot (only Promotable types are exported), so it is Runtime.
-        | ResourceType::UpstreamToken => Runtime,
+        | ResourceType::UpstreamToken
+        // A headless flow (issue #84) is dynamic per-environment data bound to a
+        // specific environment's users and short lived: it STRUCTURALLY never enters a
+        // config snapshot, so it is Runtime.
+        | ResourceType::Flow => Runtime,
     }
 }
 

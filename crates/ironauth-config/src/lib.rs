@@ -73,6 +73,13 @@ pub struct Config {
     /// OIDC provider settings (issue #12).
     pub oidc: OidcConfig,
 
+    /// Headless flow API settings (issue #84): the machine readable flow contract
+    /// (login, registration, MFA, recovery) served as one JSON flow object across the
+    /// browser and native transports. Off by default (an experimental data plane gate
+    /// like `oidc.enabled`): when off, the flow routes answer a uniform 404 and the
+    /// bootstrap login, consent, and register pages are the only interactive surface.
+    pub flows: FlowsConfig,
+
     /// Flexible-identifier settings (issue #54): the per-environment uniqueness
     /// policy for typed login identifiers. Safe default: environment-wide uniqueness.
     pub identifiers: IdentifiersConfig,
@@ -111,6 +118,24 @@ pub struct Config {
     /// feature's exact current version; see the feature reference in the
     /// generated docs/CONFIG.md.
     pub features: BTreeMap<String, FeatureToggle>,
+}
+
+/// Headless flow API settings (issue #84).
+///
+/// The flow engine generalizes the bootstrap interaction pages into one persisted,
+/// machine readable flow object (a state machine plus a typed node/message renderer)
+/// consumed identically by the browser and native JSON transports. This gate mirrors
+/// `oidc.enabled`: a plain operator toggle, off by default, that mounts nothing new on
+/// the wire until it is turned on (the flow routes answer a uniform 404 while off, so a
+/// deployment that does not use the flow API discloses nothing).
+#[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields, default)]
+pub struct FlowsConfig {
+    /// Whether to serve the headless flow API. Off by default so the default boot
+    /// exposes only the bootstrap login, consent, and register pages. When on, the
+    /// flow routes (the native JSON transport and the engine driven browser transport)
+    /// answer, sharing one flow object and one state machine.
+    pub enabled: bool,
 }
 
 /// HTTP server settings.
@@ -5833,6 +5858,25 @@ mod tests {
         let err = Config::from_toml_str("[byok]\nenabld = true\n", "<inline>")
             .expect_err("unknown key rejected");
         assert!(format!("{err}").contains("enabld"), "{err}");
+    }
+
+    #[test]
+    fn flows_section_defaults_off_and_parses_the_enable_toggle() {
+        // Default: the headless flow API is OFF (a plain operator toggle like oidc.enabled),
+        // so the default boot exposes only the bootstrap interaction pages.
+        let config = Config::from_toml_str("", "<inline>").expect("valid").config;
+        assert!(!config.flows.enabled, "flows.enabled defaults to false");
+
+        // The [flows] section parses the enable toggle.
+        let on = Config::from_toml_str("[flows]\nenabled = true\n", "<inline>")
+            .expect("valid")
+            .config;
+        assert!(on.flows.enabled, "flows.enabled = true parses");
+
+        // An unknown key in the section is a hard startup failure, never silently ignored.
+        let err = Config::from_toml_str("[flows]\nenbaled = true\n", "<inline>")
+            .expect_err("unknown key rejected");
+        assert!(format!("{err}").contains("enbaled"), "{err}");
     }
 
     #[test]

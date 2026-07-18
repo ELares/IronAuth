@@ -886,6 +886,16 @@ impl Harness {
         self.state = state;
     }
 
+    /// Arm the headless flow API (issue #84) for the harness and rebuild the protocol
+    /// router, so the flow routes answer instead of the flag-off uniform 404. Sets
+    /// `with_flows_enabled(true)` (the operator toggle the boot path resolves from the
+    /// top-level `flows.enabled` config). Preserves any previously installed hashing pool.
+    pub fn enable_flows(&mut self) {
+        let state = self.state.clone().with_flows_enabled(true);
+        self.router = oidc_router(state.clone());
+        self.state = state;
+    }
+
     /// Arm the experimental IdP-side FedCM surface (issue #83) for the harness scope and
     /// rebuild the protocol router. Builds a fresh state over the SAME master-key-wired
     /// store, env, and registry, with the harness scope designated as the single FedCM

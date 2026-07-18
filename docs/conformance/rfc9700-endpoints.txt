@@ -55,6 +55,9 @@
 /t/{tenant_id}/e/{environment_id}/federation/upstream-token
 /t/{tenant_id}/e/{environment_id}/federation/{connector_slug}/authorize
 /t/{tenant_id}/e/{environment_id}/federation/{connector_slug}/callback
+/t/{tenant_id}/e/{environment_id}/flow/api/{journey}
+/t/{tenant_id}/e/{environment_id}/flow/api/{journey}/submit
+/t/{tenant_id}/e/{environment_id}/flow/{journey}
 /t/{tenant_id}/e/{environment_id}/invitations/accept
 /t/{tenant_id}/e/{environment_id}/jwks.json
 /t/{tenant_id}/e/{environment_id}/magic/confirm
