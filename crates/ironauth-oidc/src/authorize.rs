@@ -28,6 +28,7 @@
 use axum::extract::{RawQuery, State};
 use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
+use ironauth_config::QuarantineConfig;
 use ironauth_store::{
     AuthorizationCodeId, ClientId, ClientRecord, ConsumePushedRequest, CorrelationId, GrantId,
     GrantedConsent, IssueCode, PushedRequestId, Scope, SessionId, StoreError, UserId,
@@ -578,6 +579,24 @@ async fn issue_code(
             session,
             consent_ref,
         } => (session, consent_ref),
+    };
+
+    // 6a. Quarantined-account scope strip (issue #82, PR 2). A QUARANTINED account can
+    //     authenticate but with LIMITED privileges: every SENSITIVE scope (offline_access,
+    //     an admin/management scope, a configured payment-class scope) is dropped from the
+    //     grant here, at the single shared choke point, BEFORE the scope is frozen onto the
+    //     authorization code and the grant. Because the token endpoint mints only from that
+    //     frozen scope, a quarantined account can never obtain an OFFLINE (long-lived,
+    //     survives-logout) refresh family via offline_access, nor any other sensitive scope,
+    //     and the strip cannot be bypassed by a caller. Flag-gated and
+    //     applied only to a quarantined subject, so a normal account and a flag-off
+    //     deployment are byte-identical.
+    let effective_scope = if state.signup_quarantine_enabled()
+        && user_is_quarantined(state, scope, &session.subject).await
+    {
+        strip_sensitive_scopes(effective_scope.as_deref(), state.quarantine_config())
+    } else {
+        effective_scope
     };
 
     // 6b. Step-up authentication (RFC 9470, issue #72). Assemble the effective
@@ -1723,6 +1742,40 @@ async fn resolve_gate(
 /// `offline_access` is part of the check for a web client unless the environment
 /// disables it. `prompt=consent` forces a fresh screen; `prompt=none` turns an
 /// interaction need into the matching negotiated-mode error.
+/// Whether the session subject is a QUARANTINED account (issue #82, PR 2). Parses the
+/// subject in scope and reads its `quarantined` flag; any parse or store failure resolves to
+/// `false`. The caller gates this on the experimental flag, so it never runs when the
+/// feature is off (a quarantined-user flag can only ever be set behind the same flag).
+async fn user_is_quarantined(state: &OidcState, scope: Scope, subject_text: &str) -> bool {
+    let Ok(subject) = UserId::parse_in_scope(subject_text, &scope) else {
+        return false;
+    };
+    state
+        .store()
+        .scoped(scope)
+        .users()
+        .is_quarantined(&subject)
+        .await
+        .unwrap_or(false)
+}
+
+/// Strip every SENSITIVE scope (per the quarantine denylist) from a quarantined account's
+/// granted scope (issue #82, PR 2), returning the surviving non-sensitive scope, or `None`
+/// when nothing survives. The single authorize choke point that keeps a sensitive scope out
+/// of a quarantined account's frozen grant (and so out of any token minted from it).
+fn strip_sensitive_scopes(effective_scope: Option<&str>, cfg: &QuarantineConfig) -> Option<String> {
+    let scope = effective_scope?;
+    let kept: Vec<&str> = scope
+        .split_whitespace()
+        .filter(|token| !cfg.is_sensitive(token))
+        .collect();
+    if kept.is_empty() {
+        None
+    } else {
+        Some(kept.join(" "))
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn resolve_consent_gate(
     state: &OidcState,
@@ -1749,6 +1802,30 @@ async fn resolve_consent_gate(
         mode,
     };
     let client_id_str = client_id.to_string();
+    // A QUARANTINED USER (issue #82, PR 2) never gets a SILENT authorization: the
+    // first-party/skip_consent carve-out is disabled below (its trust is ignored, so an
+    // un-consented app always routes to the consent SCREEN), and every sensitive scope is
+    // stripped from the grant at the shared choke point in the authorize handler. Gated on
+    // the experimental flag; when off the read never runs, so the behavior is byte-identical
+    // to before the feature (a quarantined-user flag is only ever set behind the same flag).
+    //
+    // NOTE (issue #82, deliberate divergence from the #31 client mirror): the quarantine is
+    // NOT folded into `force_consent` the way `client.quarantined` is. `force_consent` also
+    // gates the recorded-consent fast path, and because the quarantine flag is a PERSISTENT
+    // server-side flag (unlike the one-shot `prompt=consent`, which the consent resume
+    // strips), folding it into `force_consent` re-forces the screen on the post-consent
+    // resume too and TRAPS the account in a consent loop it can never complete, which would
+    // defeat the acceptance criterion that a quarantined account CAN authenticate. Instead
+    // the quarantine disables the silent CARVE-OUT (so consent is shown for any app the user
+    // has not consented to) while a freshly recorded consent completes the flow, and the
+    // sensitive-scope strip (the real limited-privilege teeth) is enforced UNCONDITIONALLY on
+    // every authorization regardless of consent, so a silent reuse of a prior consent is
+    // still powerless.
+    let user_quarantined = if state.signup_quarantine_enabled() {
+        user_is_quarantined(state, scope, &session.subject).await
+    } else {
+        false
+    };
     // `prompt=consent` forces a fresh consent screen. A QUARANTINED (unverified,
     // possibly phishing) client ALWAYS re-prompts too (issue #31, FIX 4): consent is
     // shown on EVERY authorization until an admin verifies it. This is what disables
@@ -1766,7 +1843,10 @@ async fn resolve_consent_gate(
     // first-party carve-out. Its `implicit`/`skip_consent`/first-party trust is
     // IGNORED and consent is ALWAYS shown, until an admin verifies it (which flips
     // `quarantined` off and restores the carve-out).
+    // A quarantined USER (issue #82, PR 2) also NEVER gets the first-party carve-out, the
+    // exact client-quarantine mirror: its trust is ignored and consent is always shown.
     let first_party = !client.quarantined
+        && !user_quarantined
         && (matches!(consent_mode, ConsentMode::Implicit) || client.skip_consent);
     if first_party && !force_consent {
         // Record the skipped consent so an offline grant stays enumerable and

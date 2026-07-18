@@ -919,6 +919,17 @@ impl ScopedKind for RiskSignalKind {
     const PREFIX: &'static str = "rsg";
 }
 
+/// Marker for a signup fraud-review-queue case (`sqn_`), one row of the per-scope
+/// `signup_quarantines` table (issue #82, PR 2): a risky human signup the register path
+/// quarantined instead of blocking, awaiting an admin release/reject/extend decision. A
+/// tenant-scoped RUNTIME row (never exported); it carries no bearer secret and no raw
+/// PII (the subject is the opaque `usr_` id), so its debug form is not redacted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SignupQuarantineKind;
+impl ScopedKind for SignupQuarantineKind {
+    const PREFIX: &'static str = "sqn";
+}
+
 /// Marker for a "this wasn't me" disavowal token (`dis_`), one row in the per-subject
 /// disavowal set (issue #79): the SHA-256 digest of a high-entropy single-use token
 /// carried in the new-device notification. The id embeds its `(tenant, environment)`
@@ -1204,6 +1215,10 @@ pub type RiskDisavowalId = ScopedId<RiskDisavowalKind>;
 /// An ingested third-party risk-signal id (`rsg_...`), one row of the per-scope
 /// external-signal store the #79 engine folds in as a weighted policy input (issue #82).
 pub type RiskSignalId = ScopedId<RiskSignalKind>;
+
+/// A signup fraud-review-queue case id (`sqn_...`), one row of the per-scope
+/// `signup_quarantines` table a risky signup is parked in for admin review (issue #82).
+pub type SignupQuarantineId = ScopedId<SignupQuarantineKind>;
 
 /// A proof-of-work challenge id (`pow_...`), one row in the per-scope `PoW` challenge
 /// state and the routing handle the client returns with its nonce (issue #80).

@@ -170,6 +170,14 @@ name = "risk_signals"
 path = "tests/risk_signals.rs"
 required-features = ["testing"]
 
+# The signup fraud review queue (issue #82, PR 2): a quarantined signup opens a
+# review case, only an admin release/reject/extend moves it (each audits the actor),
+# and every read and write is scope-bound. Needs a real database (DATABASE_URL).
+[[test]]
+name = "signup_quarantine"
+path = "tests/signup_quarantine.rs"
+required-features = ["testing"]
+
 # Cross-tenant / cross-environment IDOR harness against every scoped repository
 # operation that exists today. Needs a real database (DATABASE_URL).
 [[test]]

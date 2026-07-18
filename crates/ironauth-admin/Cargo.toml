@@ -212,6 +212,14 @@ name = "invitations"
 path = "tests/invitations.rs"
 required-features = ["testing"]
 
+# The signup fraud review queue (issue #82, PR 2): the management review-queue endpoints
+# list open cases and release/reject/extend them (each actor-audited and idempotent),
+# require a management principal, and 404 while the feature is off.
+[[test]]
+name = "signup_quarantine"
+path = "tests/signup_quarantine.rs"
+required-features = ["testing"]
+
 # The exit-friendliness covenant (issue #58): the full identity export round-trips
 # into a fresh instance with logins working (including a user on an imported foreign
 # hash), a field-coverage test fails on an unexported user column, the export is

@@ -394,6 +394,14 @@ async fn every_identity_column_is_exported_or_a_documented_non_exported_field() 
                 // identity and is not re-linked at import, so it is not carried across,
                 // exactly like the WebAuthn handle above.
                 "org_connection_id",
+                // The signup-quarantine flag (issue #82, PR 2) is instance-local RISK state,
+                // not portable identity: it is an orthogonal restriction a risky signup was
+                // parked under on THIS instance, tracked by the runtime signup_quarantines
+                // queue (a Runtime table, structurally never exported), and resolved by an
+                // admin release/reject here. A migrated account starts unquarantined on the
+                // destination (which runs its own risk posture at first login), exactly like
+                // the account-linking stamp above, so it is OPERATIONAL and not carried across.
+                "quarantined",
             ],
         },
         // The account_credentials registry (issue #61): a user's enrolled MFA / login

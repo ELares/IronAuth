@@ -66,6 +66,19 @@ pub const RISK_SIGNALS_FEATURE: &str = "risk-signals";
 /// invalidates the old ack.
 pub const RISK_SIGNALS_VERSION: &str = "0.1.0-exp.1";
 
+/// The registry name of the signup fraud-review-queue experimental feature (issue #82,
+/// PR 2). One plain umbrella flag so the whole quarantine surface (the register-path
+/// quarantine hook, the quarantined-user authorize restrictions, and the admin review
+/// queue) toggles under one ack, mirroring the one-flag-per-surface FedCM precedent.
+pub const SIGNUP_QUARANTINE_FEATURE: &str = "signup-quarantine";
+
+/// The experimental `ack` version for the signup fraud-review-queue feature (issue #82,
+/// PR 2). It is EXPLORATORY: quarantining a risky signup rather than blocking it, and the
+/// limited-privilege model the authorize path enforces, are early and may change between
+/// releases, so enabling it must acknowledge this exact revision; a graduation that changes
+/// the shape bumps it and invalidates the old ack.
+pub const SIGNUP_QUARANTINE_VERSION: &str = "0.1.0-exp.1";
+
 /// How mature a feature is, and therefore what enabling it requires.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Maturity {
@@ -197,6 +210,7 @@ impl FeatureRegistry {
         registry.register_custom_domains_acme();
         registry.register_fedcm();
         registry.register_risk_signals();
+        registry.register_signup_quarantine();
         registry
     }
 
@@ -321,6 +335,29 @@ impl FeatureRegistry {
              EXPLORATORY: the ingestion wire contract and the CAEP/SSF alignment are early \
              and may break between releases.",
             RISK_SIGNALS_VERSION,
+            "crates/ironauth-oidc/CHANGELOG.md",
+        ));
+    }
+
+    /// Registers the signup fraud-review-queue feature (issue #82, PR 2): the register-path
+    /// hook that QUARANTINES a risky signup instead of BLOCKING it (a false positive stays
+    /// recoverable), the quarantined-user authorize restrictions (consent always shown,
+    /// every sensitive scope stripped), and the management-plane admin review queue
+    /// (release / reject / extend). It is EXPLORATORY: the quarantine model is early and may
+    /// change between releases. Off by default; with the flag off the register path BLOCKS a
+    /// risky signup exactly as before, the quarantine authorize restrictions never run, and
+    /// the admin review-queue endpoints answer a uniform 404.
+    pub fn register_signup_quarantine(&mut self) {
+        self.register(Feature::experimental(
+            SIGNUP_QUARANTINE_FEATURE,
+            "Signup fraud review queue (issue #82): a register-path hook that QUARANTINES a \
+             risky signup (a disposable-domain block or a failed proof-of-work challenge) \
+             instead of blocking it, so a false positive stays recoverable. A quarantined \
+             account CAN authenticate but with limited privileges (consent is always shown \
+             and every sensitive scope is stripped from any grant), and an admin releases, \
+             rejects, or extends the case through the management review queue. EXPLORATORY: \
+             the quarantine model is early and may break between releases.",
+            SIGNUP_QUARANTINE_VERSION,
             "crates/ironauth-oidc/CHANGELOG.md",
         ));
     }
@@ -755,5 +792,48 @@ mod tests {
         ));
         registry.validate(&acked).expect("the exact ack boots");
         assert!(registry.is_enabled(&acked, RISK_SIGNALS_FEATURE));
+    }
+
+    #[test]
+    fn signup_quarantine_is_experimental_and_off_by_default() {
+        // Issue #82 (PR 2) ships the signup fraud review queue behind a default-off
+        // experimental flag: absent from [features] it resolves disabled, and enabling it
+        // without the exact ack refuses to boot (so the register path keeps BLOCKING a risky
+        // signup, the quarantine authorize restrictions never run, and the admin review-queue
+        // endpoints stay a uniform 404 until an operator explicitly enables AND acknowledges
+        // the experiment).
+        let registry = FeatureRegistry::builtin();
+        let feature = registry
+            .get(SIGNUP_QUARANTINE_FEATURE)
+            .expect("signup-quarantine is registered");
+        assert!(matches!(feature.maturity(), Maturity::Experimental { .. }));
+        assert!(!feature.default_enabled());
+
+        let absent = config_with_features("");
+        registry.validate(&absent).expect("absent is fine");
+        assert!(
+            !registry.is_enabled(&absent, SIGNUP_QUARANTINE_FEATURE),
+            "signup-quarantine is off when absent from [features]"
+        );
+
+        // Enabled without an ack refuses to boot.
+        let no_ack = config_with_features("\"signup-quarantine\" = { enabled = true }");
+        registry
+            .validate(&no_ack)
+            .expect_err("an experimental feature enabled without an ack must refuse to boot");
+
+        // Enabled WITH a WRONG ack still refuses to boot (the ack must be exact).
+        let wrong_ack =
+            config_with_features("\"signup-quarantine\" = { enabled = true, ack = \"0.0.0\" }");
+        registry
+            .validate(&wrong_ack)
+            .expect_err("a mismatched ack must refuse to boot");
+
+        // Enabled WITH the exact ack boots and reports enabled.
+        let acked = config_with_features(&format!(
+            "\"signup-quarantine\" = {{ enabled = true, ack = \"{SIGNUP_QUARANTINE_VERSION}\" }}"
+        ));
+        registry.validate(&acked).expect("the exact ack boots");
+        assert!(registry.is_enabled(&acked, SIGNUP_QUARANTINE_FEATURE));
     }
 }

@@ -81,10 +81,10 @@ use crate::id::{
     MigrationRunRecordId, OperatorId, OrgConnectionId, OrganizationId, PowChallengeId,
     PushedRequestId, RecoveryCodeId, RecoveryFlowId, RefreshFamilyId, RefreshTokenId,
     ResourceServerId, RiskDecisionId, RiskDisavowalId, RiskLoginGeoId, RiskSignalId, RoutingRuleId,
-    ScopeStepUpPolicyId, ServiceAccountId, SessionEventId, SessionId, SigningKeyId, SmsOtpCodeId,
-    SmsRouteStatId, TenantId, TotpCredentialId, TraitMigrationJobId, TraitSchemaId,
-    TrustedDeviceId, UpstreamTokenGrantId, UpstreamTokenId, UserId, UserIdentifierId, VariableId,
-    WebauthnChallengeId, WebauthnCredentialId,
+    ScopeStepUpPolicyId, ServiceAccountId, SessionEventId, SessionId, SigningKeyId,
+    SignupQuarantineId, SmsOtpCodeId, SmsRouteStatId, TenantId, TotpCredentialId,
+    TraitMigrationJobId, TraitSchemaId, TrustedDeviceId, UpstreamTokenGrantId, UpstreamTokenId,
+    UserId, UserIdentifierId, VariableId, WebauthnChallengeId, WebauthnCredentialId,
 };
 use crate::identifier::{
     CanonicalIdentifier, IdentifierType, UniquenessMode, canonicalize_identifier,
@@ -517,6 +517,18 @@ impl<'a> ScopedStore<'a> {
     #[must_use]
     pub fn risk_signals(&self) -> RiskSignalRepo<'a> {
         RiskSignalRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
+    /// The signup fraud-review-queue READ store for this scope (issue #82, PR 2): list the
+    /// OPEN quarantine cases the admin review queue surfaces, and read whether a subject is
+    /// currently quarantined. Scope-forced; the release/reject/extend writes (audited) live
+    /// on [`ActingStore::signup_quarantines`].
+    #[must_use]
+    pub fn signup_quarantines(&self) -> SignupQuarantineRepo<'a> {
+        SignupQuarantineRepo {
             store: self.store,
             scope: self.scope,
         }
@@ -977,6 +989,20 @@ impl<'a> ActingStore<'a> {
     #[must_use]
     pub fn risk_signals(&self) -> ActingRiskSignalRepo<'a> {
         ActingRiskSignalRepo {
+            store: self.store,
+            scope: self.scope,
+            acting: self.acting,
+        }
+    }
+
+    /// The mutating signup fraud-review-queue repository for this scope and actor (issue
+    /// #82, PR 2): the CONTROL-PLANE admin review actions that decide a quarantine case
+    /// (release, reject, extend), each audited with the deciding admin actor. An end-user
+    /// subject holds no management principal, so it can never reach these writes; only an
+    /// admin action lifts a quarantine, which is the self-approval-impossible guarantee.
+    #[must_use]
+    pub fn signup_quarantines(&self) -> ActingSignupQuarantineRepo<'a> {
+        ActingSignupQuarantineRepo {
             store: self.store,
             scope: self.scope,
             acting: self.acting,
@@ -11714,6 +11740,38 @@ impl UserRepo<'_> {
         }))
     }
 
+    /// Whether a LIVE user is currently QUARANTINED (issue #82, PR 2): a fraud-review-queue
+    /// restriction ORTHOGONAL to the lifecycle state. Reads ONLY the `quarantined` boolean,
+    /// so it needs no platform master key and decrypts no PII, and it filters out the
+    /// soft-delete tombstone (`deleted_at IS NULL`). Returns `false` for an absent, deleted,
+    /// or cross-scope subject (fail closed to the unrestricted answer only for a subject that
+    /// genuinely is not a quarantined account: an unknown subject is simply not quarantined).
+    ///
+    /// The authorize path reads this at the shared consent/scope choke point: a quarantined
+    /// user always re-consents and every sensitive scope is stripped from its grant, until an
+    /// admin releases the case.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn is_quarantined(&self, id: &UserId) -> Result<bool, StoreError> {
+        if id.scope() != self.scope {
+            return Ok(false);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT quarantined FROM users \
+             WHERE id = $1 AND tenant_id = $2 AND environment_id = $3 AND deleted_at IS NULL",
+        )
+        .bind(id.to_string())
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(row.is_some_and(|row| row.get::<bool, _>("quarantined")))
+    }
+
     /// Count the scope's lazy-migration progress (issue #56): the total number of live
     /// users, and how many still carry an imported FOREIGN password hash (the #55 import
     /// tail awaiting a first-login rehash). A user with no foreign hash is on the native
@@ -12149,6 +12207,7 @@ impl ActingUserRepo<'_> {
             "{}",
             false,
             UserState::Active,
+            None,
         )
         .await
     }
@@ -12176,8 +12235,56 @@ impl ActingUserRepo<'_> {
         if !state.is_creatable() {
             return Err(StoreError::Conflict);
         }
-        self.register_inner(env, None, identifier, password_hash, "{}", false, state)
-            .await
+        self.register_inner(
+            env,
+            None,
+            identifier,
+            password_hash,
+            "{}",
+            false,
+            state,
+            None,
+        )
+        .await
+    }
+
+    /// Register a self-service signup the register path chose to QUARANTINE rather than
+    /// BLOCK (issue #82, PR 2), returning the fresh identifier. The account is created
+    /// [`UserState::Active`] (so it CAN authenticate, unlike a Waitlisted signup) but with
+    /// its `quarantined` flag set, and a `signup_quarantines` review-queue case is opened in
+    /// the SAME transaction. The account is thus usable but restricted: the authorize path
+    /// forces consent on every request and strips every sensitive scope from any grant,
+    /// until an admin RELEASES the case (the ONLY path that clears `quarantined`, since the
+    /// data plane holds no UPDATE grant on the column). `reason` records WHY it was
+    /// quarantined (a risk-output block or a failed registration challenge).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Conflict`] if the login handle is already registered in this scope;
+    /// [`StoreError::Encryption`] if no platform master key is configured;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn register_quarantined(
+        &self,
+        env: &Env,
+        identifier: &str,
+        password_hash: &str,
+        reason: SignupQuarantineReason,
+    ) -> Result<UserId, StoreError> {
+        let open = SignupQuarantineOpen {
+            id: SignupQuarantineId::generate(env, &self.scope),
+            reason,
+        };
+        self.register_inner(
+            env,
+            None,
+            identifier,
+            password_hash,
+            "{}",
+            false,
+            UserState::Active,
+            Some(open),
+        )
+        .await
     }
 
     /// Register a PASSKEY-ONLY (passwordless) user with a PRE-ALLOCATED id (issue #66):
@@ -12213,6 +12320,7 @@ impl ActingUserRepo<'_> {
             "{}",
             true,
             UserState::Active,
+            None,
         )
         .await
     }
@@ -12247,6 +12355,7 @@ impl ActingUserRepo<'_> {
             claims_json,
             false,
             UserState::Active,
+            None,
         )
         .await
     }
@@ -12291,6 +12400,13 @@ impl ActingUserRepo<'_> {
         claims_json: &str,
         passwordless: bool,
         state: UserState,
+        // When `Some`, the account is created QUARANTINED (issue #82, PR 2): its
+        // `quarantined` flag is set at INSERT and a `signup_quarantines` review-queue row
+        // is opened in the SAME transaction, so a quarantined signup and its case are
+        // durably created together or neither is. The account stays in the given `state`
+        // (Active for a self-service signup, so it can authenticate) with the orthogonal
+        // quarantine restriction the authorize path enforces.
+        quarantine: Option<SignupQuarantineOpen>,
     ) -> Result<UserId, StoreError> {
         let master = self.store.master().ok_or(StoreError::Encryption)?;
         // The scope needs a live KEK/DEK before the first PII seal; provision them
@@ -12340,8 +12456,8 @@ impl ActingUserRepo<'_> {
                     "INSERT INTO users \
                      (id, tenant_id, environment_id, identifier_bidx, identifier_sealed, \
                       password_hash, claims_sealed, pii_dek_version, passwordless, \
-                      webauthn_user_handle, state) \
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+                      webauthn_user_handle, state, quarantined) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
                 )
                 .bind(id.to_string())
                 .bind(scope.tenant().to_string())
@@ -12354,18 +12470,38 @@ impl ActingUserRepo<'_> {
                 .bind(passwordless)
                 .bind(webauthn_user_handle.clone())
                 .bind(state.as_str())
+                .bind(quarantine.is_some())
                 .execute(&mut **tx)
                 .await;
                 match result {
-                    Ok(_) => Ok(()),
+                    Ok(_) => {}
                     // A duplicate login handle is a caller-facing conflict (the
                     // handle is taken, caught by the blind-index unique
                     // constraint), not a persistence fault. Erroring here rolls the
                     // audited write back, so a rejected registration leaves neither
                     // a user row nor an audit row.
-                    Err(error) if is_unique_violation(&error) => Err(StoreError::Conflict),
-                    Err(error) => Err(error.into()),
+                    Err(error) if is_unique_violation(&error) => return Err(StoreError::Conflict),
+                    Err(error) => return Err(error.into()),
                 }
+                // A quarantined signup (issue #82, PR 2) opens its review-queue case in the
+                // SAME transaction as the account INSERT and its `user.register` audit row,
+                // so a committed quarantined account always has an open case and neither can
+                // exist without the other.
+                if let Some(open) = quarantine {
+                    sqlx::query(
+                        "INSERT INTO signup_quarantines \
+                         (id, tenant_id, environment_id, subject, reason, state) \
+                         VALUES ($1, $2, $3, $4, $5, 'pending')",
+                    )
+                    .bind(open.id.to_string())
+                    .bind(scope.tenant().to_string())
+                    .bind(scope.environment().to_string())
+                    .bind(id.to_string())
+                    .bind(open.reason.as_str())
+                    .execute(&mut **tx)
+                    .await?;
+                }
+                Ok(())
             },
             false,
         )
@@ -21235,6 +21371,457 @@ impl ActingRiskSignalRepo<'_> {
         tx.commit().await?;
         Ok(true)
     }
+}
+
+// ===========================================================================
+// Signup fraud review queue (issue #82, PR 2).
+
+/// Why a self-service signup was QUARANTINED (issue #82, PR 2): a closed set matching the
+/// register-path decisions the fraud queue converts from a BLOCK into a recoverable
+/// quarantine, pinned by the `signup_quarantines_reason_known` CHECK.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignupQuarantineReason {
+    /// A risk-output block: a disposable / low-reputation identifier the register abuse
+    /// defense would have blocked (issue #80).
+    RiskOutput,
+    /// A failed registration challenge: an unsolved proof-of-work gate (issue #80).
+    ChallengeFailure,
+}
+
+impl SignupQuarantineReason {
+    /// The stable wire string persisted in the `reason` column.
+    #[must_use]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SignupQuarantineReason::RiskOutput => "risk_output",
+            SignupQuarantineReason::ChallengeFailure => "challenge_failure",
+        }
+    }
+
+    /// Parse a persisted wire string back to a reason, or [`None`] for an unknown value
+    /// (the CHECK makes an unknown value unwritable, so this is only ever the known set).
+    #[must_use]
+    pub fn from_wire(value: &str) -> Option<Self> {
+        match value {
+            "risk_output" => Some(SignupQuarantineReason::RiskOutput),
+            "challenge_failure" => Some(SignupQuarantineReason::ChallengeFailure),
+            _ => None,
+        }
+    }
+}
+
+/// The review position of a signup-quarantine case (issue #82, PR 2), pinned by the
+/// `signup_quarantines_state_known` CHECK. `Pending` and `Extended` are the OPEN states
+/// (the account stays quarantined); `Approved` released it and `Rejected` cleaned it up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignupQuarantineState {
+    /// Awaiting review; the account is quarantined.
+    Pending,
+    /// Released by an admin: the account's quarantine was cleared.
+    Approved,
+    /// Rejected by an admin: the account was disabled and its sessions ended.
+    Rejected,
+    /// Its review window was extended by an admin; the account stays quarantined.
+    Extended,
+}
+
+impl SignupQuarantineState {
+    /// The stable wire string persisted in the `state` column.
+    #[must_use]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SignupQuarantineState::Pending => "pending",
+            SignupQuarantineState::Approved => "approved",
+            SignupQuarantineState::Rejected => "rejected",
+            SignupQuarantineState::Extended => "extended",
+        }
+    }
+
+    /// Parse a persisted wire string back to a state, or [`None`] for an unknown value.
+    #[must_use]
+    pub fn from_wire(value: &str) -> Option<Self> {
+        match value {
+            "pending" => Some(SignupQuarantineState::Pending),
+            "approved" => Some(SignupQuarantineState::Approved),
+            "rejected" => Some(SignupQuarantineState::Rejected),
+            "extended" => Some(SignupQuarantineState::Extended),
+            _ => None,
+        }
+    }
+}
+
+/// The inputs to OPEN a signup-quarantine case at account creation (issue #82, PR 2),
+/// threaded into the shared registration body so the account and its case are written in
+/// one transaction. Internal (the register path constructs it via `register_quarantined`).
+#[derive(Debug, Clone, Copy)]
+struct SignupQuarantineOpen {
+    id: SignupQuarantineId,
+    reason: SignupQuarantineReason,
+}
+
+/// One signup-quarantine case as the admin review queue surfaces it (issue #82, PR 2).
+/// Carries no secret and no raw PII: the subject is the opaque `usr_` id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignupQuarantineView {
+    /// The `sqn_` case id.
+    pub id: SignupQuarantineId,
+    /// The quarantined `usr_` subject the case is about.
+    pub subject: UserId,
+    /// Why the signup was quarantined.
+    pub reason: SignupQuarantineReason,
+    /// An optional operator-legibility note (non-secret metadata), or [`None`].
+    pub risk_context: Option<String>,
+    /// The review position.
+    pub state: SignupQuarantineState,
+    /// The extend-window horizon in microseconds since the Unix epoch, or [`None`] for an
+    /// indefinite pending case.
+    pub quarantined_until_unix_micros: Option<i64>,
+    /// When the case was opened, in microseconds since the Unix epoch (the keyset order).
+    pub created_at_unix_micros: i64,
+    /// The kind of the reviewing admin actor, or [`None`] before any review action.
+    pub reviewed_by_kind: Option<String>,
+    /// The id of the reviewing admin actor, or [`None`] before any review action.
+    pub reviewed_by_id: Option<String>,
+    /// When a review action ran, in microseconds since the Unix epoch, or [`None`].
+    pub reviewed_at_unix_micros: Option<i64>,
+}
+
+const SIGNUP_QUARANTINE_SELECT: &str = "SELECT id, subject, reason, risk_context, state, \
+     (EXTRACT(EPOCH FROM quarantined_until) * 1000000)::bigint AS until_us, \
+     (EXTRACT(EPOCH FROM created_at) * 1000000)::bigint AS created_us, \
+     reviewed_by_kind, reviewed_by_id, \
+     (EXTRACT(EPOCH FROM reviewed_at) * 1000000)::bigint AS reviewed_us \
+     FROM signup_quarantines";
+
+/// Reconstruct a [`SignupQuarantineView`] from a `signup_quarantines` row, within scope.
+fn signup_quarantine_view_from_row(
+    scope: Scope,
+    row: &PgRow,
+) -> Result<SignupQuarantineView, StoreError> {
+    let id = SignupQuarantineId::parse_in_scope(&row.get::<String, _>("id"), &scope)?;
+    let subject = UserId::parse_in_scope(&row.get::<String, _>("subject"), &scope)?;
+    let reason = SignupQuarantineReason::from_wire(&row.get::<String, _>("reason"))
+        .ok_or(StoreError::NotFound)?;
+    let state = SignupQuarantineState::from_wire(&row.get::<String, _>("state"))
+        .ok_or(StoreError::NotFound)?;
+    Ok(SignupQuarantineView {
+        id,
+        subject,
+        reason,
+        risk_context: row.get("risk_context"),
+        state,
+        quarantined_until_unix_micros: row.get("until_us"),
+        created_at_unix_micros: row.get("created_us"),
+        reviewed_by_kind: row.get("reviewed_by_kind"),
+        reviewed_by_id: row.get("reviewed_by_id"),
+        reviewed_at_unix_micros: row.get("reviewed_us"),
+    })
+}
+
+/// The signup fraud-review-queue READ repository for a scope (issue #82, PR 2): list the
+/// OPEN cases the admin queue surfaces. Scope-forced (RLS); the review WRITES live on the
+/// audited [`ActingSignupQuarantineRepo`].
+pub struct SignupQuarantineRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl SignupQuarantineRepo<'_> {
+    /// List the OPEN (pending or extended) quarantine cases in this scope, oldest first over
+    /// the `(created_at, id)` keyset, bounded by `limit` and resumed after `after`. A
+    /// released or rejected case is a closed decision and is excluded.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn list_open(
+        &self,
+        limit: i64,
+        after: Option<&CursorPosition>,
+    ) -> Result<Vec<SignupQuarantineView>, StoreError> {
+        let (after_micros, after_id) = split_cursor(after);
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let rows = sqlx::query(&format!(
+            "{SIGNUP_QUARANTINE_SELECT} \
+             WHERE tenant_id = $1 AND environment_id = $2 \
+             AND state IN ('pending', 'extended') \
+             AND ($3::bigint IS NULL OR (created_at, id) > \
+                  (TIMESTAMPTZ 'epoch' + ($3::text || ' microseconds')::interval, $4::text)) \
+             ORDER BY created_at, id LIMIT $5"
+        ))
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(after_micros)
+        .bind(after_id)
+        .bind(limit.clamp(0, MANAGEMENT_LIST_HARD_CAP + 1))
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        rows.iter()
+            .map(|row| signup_quarantine_view_from_row(self.scope, row))
+            .collect()
+    }
+}
+
+/// The mutating signup fraud-review-queue repository for a scope and actor (issue #82,
+/// PR 2): the CONTROL-PLANE admin review actions that decide a case, each in one audited
+/// transaction that names the deciding admin actor. Every method keys on the quarantined
+/// `subject` and requires the account to have an OPEN case, so a decision is idempotent
+/// against a re-run and a closed case is a uniform not-found. There is NO data-plane path
+/// to any of these: only a management principal reaches them, which is the
+/// self-approval-impossible guarantee.
+pub struct ActingSignupQuarantineRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+    acting: ActingContext,
+}
+
+impl ActingSignupQuarantineRepo<'_> {
+    /// RELEASE a quarantined account (issue #82, PR 2): clear `users.quarantined` (the
+    /// account becomes a normal, unrestricted account) and mark its open case `approved`,
+    /// stamping the deciding admin actor, in ONE audited transaction
+    /// (`signup_quarantine.approved`, targeting the subject). Clearing the flag is a
+    /// CONTROL-PLANE UPDATE the data plane has no grant for, so this is the only path a
+    /// quarantine is ever lifted.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the subject is out of scope, is not a quarantined
+    /// account, or has no open case; [`StoreError::IdempotencyConflict`] if the idempotency
+    /// key is already stored; [`StoreError::Database`] on a persistence failure.
+    pub async fn approve(
+        &self,
+        env: &Env,
+        subject: &UserId,
+        idempotency: Option<IdempotencyWrite<'_>>,
+    ) -> Result<(), StoreError> {
+        if subject.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let now_micros = epoch_micros(env.clock().now_utc());
+        let actor = self.acting.actor();
+        let (actor_kind, actor_id) = (actor.kind_str().to_owned(), actor.id_string());
+        let subject_text = subject.to_string();
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::SignupQuarantineApproved,
+                target: subject,
+            },
+            async move |tx| {
+                insert_idempotency(tx, idempotency).await?;
+                let cleared = sqlx::query(
+                    "UPDATE users SET quarantined = false, \
+                         updated_at = TIMESTAMPTZ 'epoch' + ($1::text || ' microseconds')::interval \
+                     WHERE id = $2 AND tenant_id = $3 AND environment_id = $4 \
+                     AND deleted_at IS NULL AND quarantined = true",
+                )
+                .bind(now_micros)
+                .bind(&subject_text)
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .execute(&mut **tx)
+                .await?;
+                if cleared.rows_affected() == 0 {
+                    return Err(StoreError::NotFound);
+                }
+                let closed = close_open_case(
+                    tx, scope, &subject_text, "approved", now_micros, &actor_kind, &actor_id, None,
+                )
+                .await?;
+                if !closed {
+                    return Err(StoreError::NotFound);
+                }
+                Ok(())
+            },
+            false,
+        )
+        .await
+    }
+
+    /// REJECT a quarantined signup (issue #82, PR 2): DISABLE the account (so it can no
+    /// longer authenticate) and end its live sessions, and mark its open case `rejected`,
+    /// stamping the deciding admin actor, in ONE audited transaction
+    /// (`signup_quarantine.rejected`, targeting the subject). This is the cleanup path for a
+    /// confirmed fraudulent signup, mirroring the soft-delete/disable lifecycle discipline.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the subject is out of scope, is not a live account, or
+    /// has no open case; [`StoreError::IdempotencyConflict`] if the idempotency key is
+    /// already stored; [`StoreError::Database`] on a persistence failure.
+    pub async fn reject(
+        &self,
+        env: &Env,
+        subject: &UserId,
+        idempotency: Option<IdempotencyWrite<'_>>,
+    ) -> Result<(), StoreError> {
+        if subject.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let now_micros = epoch_micros(env.clock().now_utc());
+        let actor = self.acting.actor();
+        let (actor_kind, actor_id) = (actor.kind_str().to_owned(), actor.id_string());
+        let subject_text = subject.to_string();
+        let emit = SessionEndedEmit::from_acting(env, &self.acting);
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::SignupQuarantineRejected,
+                target: subject,
+            },
+            async move |tx| {
+                insert_idempotency(tx, idempotency).await?;
+                let disabled = sqlx::query(
+                    "UPDATE users SET state = 'disabled', \
+                         updated_at = TIMESTAMPTZ 'epoch' + ($1::text || ' microseconds')::interval \
+                     WHERE id = $2 AND tenant_id = $3 AND environment_id = $4 \
+                     AND deleted_at IS NULL AND state <> 'disabled'",
+                )
+                .bind(now_micros)
+                .bind(&subject_text)
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .execute(&mut **tx)
+                .await?;
+                if disabled.rows_affected() == 0 {
+                    return Err(StoreError::NotFound);
+                }
+                let closed = close_open_case(
+                    tx, scope, &subject_text, "rejected", now_micros, &actor_kind, &actor_id, None,
+                )
+                .await?;
+                if !closed {
+                    return Err(StoreError::NotFound);
+                }
+                // A disabled account ends its sessions (the same cascade the admin
+                // user-state-change path runs), so the freshly-created quarantined session
+                // is revoked when the case is rejected.
+                cascade_user_sessions_ended(
+                    tx,
+                    scope,
+                    &subject_text,
+                    SessionEndCause::UserRevokedAll,
+                    now_micros,
+                    false,
+                    &emit,
+                )
+                .await?;
+                Ok(())
+            },
+            false,
+        )
+        .await
+    }
+
+    /// EXTEND a quarantine review window (issue #82, PR 2): bump the case's
+    /// `quarantined_until` horizon to `quarantined_until_micros` and mark it `extended`,
+    /// stamping the deciding admin actor, in ONE audited transaction
+    /// (`signup_quarantine.extended`, targeting the subject). The account STAYS quarantined
+    /// (its restriction is unchanged); only the review deadline moves.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the subject is out of scope or has no open case;
+    /// [`StoreError::IdempotencyConflict`] if the idempotency key is already stored;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn extend(
+        &self,
+        env: &Env,
+        subject: &UserId,
+        quarantined_until_micros: i64,
+        idempotency: Option<IdempotencyWrite<'_>>,
+    ) -> Result<(), StoreError> {
+        if subject.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let now_micros = epoch_micros(env.clock().now_utc());
+        let actor = self.acting.actor();
+        let (actor_kind, actor_id) = (actor.kind_str().to_owned(), actor.id_string());
+        let subject_text = subject.to_string();
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::SignupQuarantineExtended,
+                target: subject,
+            },
+            async move |tx| {
+                insert_idempotency(tx, idempotency).await?;
+                let extended = sqlx::query(
+                    "UPDATE signup_quarantines SET state = 'extended', \
+                         quarantined_until = \
+                             TIMESTAMPTZ 'epoch' + ($1::text || ' microseconds')::interval, \
+                         reviewed_by_kind = $2, reviewed_by_id = $3, \
+                         reviewed_at = TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval \
+                     WHERE subject = $5 AND tenant_id = $6 AND environment_id = $7 \
+                     AND state IN ('pending', 'extended')",
+                )
+                .bind(quarantined_until_micros)
+                .bind(&actor_kind)
+                .bind(&actor_id)
+                .bind(now_micros)
+                .bind(&subject_text)
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .execute(&mut **tx)
+                .await?;
+                if extended.rows_affected() == 0 {
+                    return Err(StoreError::NotFound);
+                }
+                Ok(())
+            },
+            false,
+        )
+        .await
+    }
+}
+
+/// Close an OPEN signup-quarantine case for `subject` to the terminal `to_state`
+/// (`approved` or `rejected`), stamping the reviewing admin actor and instant, within the
+/// caller's open transaction. Returns whether a row was updated (false when no open case
+/// exists, which the caller maps to a uniform not-found).
+#[allow(clippy::too_many_arguments)]
+async fn close_open_case(
+    tx: &mut Transaction<'_, Postgres>,
+    scope: Scope,
+    subject_text: &str,
+    to_state: &str,
+    now_micros: i64,
+    actor_kind: &str,
+    actor_id: &str,
+    note: Option<&str>,
+) -> Result<bool, StoreError> {
+    let result = sqlx::query(
+        "UPDATE signup_quarantines SET state = $1, \
+             reviewed_by_kind = $2, reviewed_by_id = $3, \
+             reviewed_at = TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval, \
+             review_note = $5 \
+         WHERE subject = $6 AND tenant_id = $7 AND environment_id = $8 \
+         AND state IN ('pending', 'extended')",
+    )
+    .bind(to_state)
+    .bind(actor_kind)
+    .bind(actor_id)
+    .bind(now_micros)
+    .bind(note)
+    .bind(subject_text)
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .execute(&mut **tx)
+    .await?;
+    Ok(result.rows_affected() > 0)
 }
 
 /// The inputs to CREATE an account link (issue #78). The raw federated composite is

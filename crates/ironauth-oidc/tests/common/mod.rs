@@ -957,6 +957,25 @@ impl Harness {
         self.state = state;
     }
 
+    /// Arm the experimental signup fraud-review-queue surface (issue #82, PR 2) for the
+    /// harness scope and rebuild the protocol router. Builds a fresh state over the SAME store,
+    /// env, and registry from `config`, plus `with_signup_quarantine_enabled(true)` (the arming
+    /// bool the boot path resolves from the feature ladder), so the register path quarantines a
+    /// risky signup instead of blocking it and the authorize path applies the quarantined-user
+    /// restrictions.
+    pub fn enable_signup_quarantine(&mut self, config: &OidcConfig) {
+        let state = OidcState::new(
+            self.db.store().clone(),
+            self.env.clone(),
+            Arc::clone(&self.registry),
+            config,
+            ISSUER_BASE,
+        )
+        .with_signup_quarantine_enabled(true);
+        self.router = oidc_router(state.clone());
+        self.state = state;
+    }
+
     /// Install a verification / OTP sender (issue #68) on the state and rebuild the
     /// protocol router, so a test can capture the delivered email-OTP code and magic-link
     /// token/short-code from a recording sender. Only the protocol router is rebuilt (the

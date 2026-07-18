@@ -337,6 +337,14 @@ name = "risk_signals"
 path = "tests/risk_signals.rs"
 required-features = ["testing"]
 
+# Signup fraud review queue (issue #82, PR 2): a quarantined user re-consents on every
+# authorization and never receives a sensitive scope, and a risky signup is quarantined
+# (recoverable) instead of blocked when the flag is on. Needs a real database.
+[[test]]
+name = "signup_quarantine"
+path = "tests/signup_quarantine.rs"
+required-features = ["testing"]
+
 # WebAuthn passkey ceremonies end to end (issue #65): the four ceremony endpoints
 # driven through the real router by a software authenticator (a CBOR
 # attestationObject / COSE key, real Ed25519 assertion signatures). A passkey

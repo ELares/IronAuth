@@ -15,7 +15,7 @@ use ironauth_admin::AdminState;
 use ironauth_config::{
     Config, FEDCM_FEATURE, FeatureRegistry, GLOBAL_TOKEN_REVOCATION_FEATURE, Loaded, OidcConfig,
     PasswordHashingConfig, PasswordPolicyConfig, QuotaConfig, RISK_SIGNALS_FEATURE,
-    ScreeningFailurePolicy, ScreeningProvider,
+    SIGNUP_QUARANTINE_FEATURE, ScreeningFailurePolicy, ScreeningProvider,
 };
 use ironauth_env::Env;
 use ironauth_jose::MasterKey;
@@ -162,6 +162,14 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
         // ingestion endpoint stays a 404 and the engine reads no external signal until an
         // operator opts in.
         let risk_signals_enabled = features.is_enabled(&config, RISK_SIGNALS_FEATURE);
+        // The experimental signup fraud-review-queue surface (issue #82, PR 2) is armed only
+        // when its feature is enabled AND acknowledged; the gate is the ladder, never a plain
+        // config toggle, so the ack can never be bypassed. Resolved to a bool here and
+        // injected through BOTH the OIDC state builder (the register hook and the quarantined
+        // authorize restrictions) and the admin state builder (the review-queue endpoints),
+        // so the register path keeps BLOCKING a risky signup and the review-queue endpoints
+        // stay 404s until an operator opts in.
+        let signup_quarantine_enabled = features.is_enabled(&config, SIGNUP_QUARANTINE_FEATURE);
 
         let env = Env::system();
 
@@ -197,6 +205,7 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
             &env,
             migration_hook.clone(),
             federation_runtime.clone(),
+            signup_quarantine_enabled,
         )
         .await;
 
@@ -252,6 +261,7 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
                 global_revocation_enabled,
                 fedcm_enabled,
                 risk_signals_enabled,
+                signup_quarantine_enabled,
                 master_key,
                 &quota_config,
                 &hashing_config,
@@ -301,6 +311,7 @@ async fn build_management_router(
     env: &Env,
     migration_hook: Option<Arc<LazyMigrationHook>>,
     federation_runtime: Option<Arc<FederationRuntime>>,
+    signup_quarantine_enabled: bool,
 ) -> Option<Router> {
     if config.admin.bootstrap_operator_token.is_none() {
         tracing::info!(
@@ -345,6 +356,10 @@ async fn build_management_router(
                 Some(runtime) => state.with_federation(runtime),
                 None => state,
             };
+            // Arm the experimental signup fraud-review-queue endpoints (issue #82, PR 2) only
+            // when the ladder resolved the feature enabled AND acked; otherwise every
+            // review-queue endpoint stays a uniform 404.
+            let state = state.with_signup_quarantine_enabled(signup_quarantine_enabled);
             tracing::info!("management API mounted on the management plane");
             Some(ironauth_admin::management_router(state))
         }
@@ -390,7 +405,10 @@ async fn build_management_router(
 #[allow(clippy::too_many_arguments)]
 // One flat sequence of independent state-builder installs and startup notices; splitting
 // it would scatter the single OIDC mount the boot path performs.
-#[allow(clippy::too_many_lines)]
+// The mount flags are each resolved from the strict feature ladder (never a plain config
+// toggle) and injected here, so the several experimental-surface booleans are inherent to the
+// boot wiring rather than a design smell.
+#[allow(clippy::too_many_lines, clippy::fn_params_excessive_bools)]
 async fn build_oidc_router(
     oidc_config: &OidcConfig,
     data_plane_dsn: &str,
@@ -399,6 +417,7 @@ async fn build_oidc_router(
     global_revocation_enabled: bool,
     fedcm_enabled: bool,
     risk_signals_enabled: bool,
+    signup_quarantine_enabled: bool,
     master_key: Option<Arc<MasterKey>>,
     quota_config: &QuotaConfig,
     hashing_config: &PasswordHashingConfig,
@@ -509,6 +528,7 @@ async fn build_oidc_router(
         .with_global_token_revocation_enabled(global_revocation_enabled)
         .with_fedcm_enabled(fedcm_enabled)
         .with_risk_signals_enabled(risk_signals_enabled)
+        .with_signup_quarantine_enabled(signup_quarantine_enabled)
         .with_quota_enforcer(quota_enforcer)
         .with_hashing_pool(hashing_pool)
         .with_password_policy(password_policy, screening_failure, screen_on_login)
