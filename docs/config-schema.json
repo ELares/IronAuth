@@ -1846,7 +1846,7 @@
         },
         "max_contribution": {
           "default": "med",
-          "description": "The per-source WEIGHT cap (issue #82): the maximum RiskLevel a signal from this\nsource may contribute, one of `low`/`med`/`high`. A mapped contribution stronger than\nthis is capped down, so a low-trust source can never contribute HIGH. Default `med`.",
+          "description": "The per-source WEIGHT cap (issue #82): the maximum `RiskLevel` a signal from this\nsource may contribute, one of `low`/`med`/`high`. A mapped contribution stronger than\nthis is capped down, so a low-trust source can never contribute HIGH. Default `med`.",
           "type": "string"
         },
         "min_strength": {

@@ -21174,10 +21174,15 @@ impl ActingRiskSignalRepo<'_> {
         let id = RiskSignalId::generate(env, &scope);
         let subject_bidx = risk_signal_subject_blind_index(master, scope, signal.subject_raw);
         let subject_text = signal.resolved_subject.map(ToString::to_string);
-        // The guarded idempotent insert in its OWN transaction: ON CONFLICT DO NOTHING
-        // RETURNING makes the first-delivery decision atomic without sniffing an error code
-        // (a returned row means this delivery won; no row means the (source, source_jti)
-        // already exists, a duplicate re-delivery).
+        // The guarded idempotent insert and its audit row share ONE transaction (issue #7
+        // same-tx audit discipline). ON CONFLICT DO NOTHING RETURNING makes the
+        // first-delivery decision atomic without sniffing an error code (a returned row means
+        // this delivery won; no row means the (source, source_jti) already exists, a
+        // duplicate re-delivery). On a first delivery the row and its `risk.signal.ingest`
+        // audit commit together or NEITHER does, so a committed ingest can never be missing
+        // its audit row: were the audit ever written separately, an audit-write failure could
+        // leave a durable row that a retry (ON CONFLICT DO NOTHING) then treats as an already
+        // ingested duplicate, so the row would exist with NO audit ever written.
         let mut tx = begin_scoped(self.store, scope).await?;
         let row = sqlx::query(
             "INSERT INTO risk_signals \
@@ -21201,33 +21206,33 @@ impl ActingRiskSignalRepo<'_> {
         .bind(signal.source_jti)
         .fetch_optional(&mut *tx)
         .await?;
-        tx.commit().await?;
         if row.is_none() {
-            // An idempotent re-delivery: a clean no-op, not an error that leaks.
+            // An idempotent re-delivery: nothing was inserted. Drop the transaction (a
+            // rollback of the no-op INSERT) and return a clean no-op, not an error that
+            // leaks. No audit row is written for a duplicate; the FIRST delivery already
+            // wrote the row and its audit atomically below.
             return Ok(false);
         }
-        // Audit ONLY an actual ingest. The mutate closure is a no-op (the row is already
-        // durably written above); this records the ingestion with the acting source and a
-        // PII-free detail (never the raw external subject).
+        // The audit row for THIS ingest, in the SAME transaction as the INSERT above and a
+        // PII-free detail (never the raw external subject). This is one of the few custom
+        // write paths that inline their own audited transaction rather than route through
+        // `write_audited`, because the first-vs-duplicate decision is made by the same
+        // INSERT that must be audited.
         let subject_detail = subject_text.as_deref().unwrap_or("unresolved");
         let detail = format!(
             "source={} signal_type={} subject_format={} subject={}",
             signal.source, signal.signal_type, signal.subject_format, subject_detail
         );
-        write_audited_detailed(
-            AuditedWrite {
-                store: self.store,
-                scope,
-                acting: &self.acting,
-                env,
-                action: Action::RiskSignalIngest,
-                target: &id,
-            },
-            async move |_tx| Ok(()),
-            false,
-            Some(&detail),
-        )
-        .await?;
+        let spec = AuditedWrite {
+            store: self.store,
+            scope,
+            acting: &self.acting,
+            env,
+            action: Action::RiskSignalIngest,
+            target: &id,
+        };
+        insert_audit_row(&mut tx, &spec, Some(&detail)).await?;
+        tx.commit().await?;
         Ok(true)
     }
 }

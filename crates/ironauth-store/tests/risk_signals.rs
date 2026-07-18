@@ -98,6 +98,71 @@ async fn ingestion_is_idempotent_and_the_engine_read_is_subject_bound() {
 }
 
 #[tokio::test]
+async fn a_first_ingest_writes_its_audit_atomically_and_a_duplicate_writes_none() {
+    // The ingest row and its `risk.signal.ingest` audit row commit in ONE transaction: a
+    // FIRST delivery writes exactly one row and exactly one audit row; a duplicate re-delivery
+    // (ON CONFLICT DO NOTHING) is a clean no-op that writes NEITHER a row NOR an audit row, so
+    // the audit count can never lag the ingested-row count.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let subject = UserId::generate(&env, &scope);
+
+    let audit_count = async || -> i64 {
+        sqlx::query_scalar(
+            "SELECT count(*) FROM audit_log \
+             WHERE tenant_id = $1 AND environment_id = $2 AND action = 'risk.signal.ingest'",
+        )
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .fetch_one(db.owner_pool())
+        .await
+        .expect("count risk.signal.ingest audit rows")
+    };
+
+    assert_eq!(audit_count().await, 0, "no ingest, no audit yet");
+
+    // A first delivery writes the row AND its audit row together.
+    assert!(ingest_signal(&db, &env, scope, &subject, "jti-1").await);
+    assert_eq!(
+        audit_count().await,
+        1,
+        "a first ingest wrote exactly one audit row"
+    );
+
+    // A duplicate re-delivery is a no-op: NO second audit row.
+    assert!(!ingest_signal(&db, &env, scope, &subject, "jti-1").await);
+    assert_eq!(
+        audit_count().await,
+        1,
+        "a duplicate re-delivery writes no audit row"
+    );
+
+    // A distinct source_jti is a second first-delivery: a second row AND a second audit row.
+    assert!(ingest_signal(&db, &env, scope, &subject, "jti-2").await);
+    assert_eq!(
+        audit_count().await,
+        2,
+        "a second distinct ingest wrote a second audit row"
+    );
+
+    // The audit count equals the ingested-row count: no committed row lacks its audit row.
+    let row_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM risk_signals WHERE tenant_id = $1 AND environment_id = $2",
+    )
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .fetch_one(db.owner_pool())
+    .await
+    .expect("count risk_signals");
+    assert_eq!(
+        row_count,
+        audit_count().await,
+        "every ingested row has its audit row"
+    );
+}
+
+#[tokio::test]
 async fn the_raw_external_subject_is_never_stored_as_plaintext() {
     let db = TestDatabase::start().await;
     let env = Env::system();

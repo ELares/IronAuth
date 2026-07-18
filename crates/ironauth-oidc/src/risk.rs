@@ -31,6 +31,7 @@
 //! `GeoIP` and IP-reputation providers are pluggable seams with null defaults. Off by
 //! default ([`crate::state::OidcState::risk_enabled`] false): the engine is fully inert.
 
+use std::collections::BTreeMap;
 use std::net::IpAddr;
 
 use axum::http::{HeaderMap, StatusCode};
@@ -775,14 +776,17 @@ fn external_signal_is_stale(
 /// signal while keeping the eval read bounded against a flood of stale rows.
 const EXTERNAL_SIGNAL_READ_LIMIT: i64 = 100;
 
-/// Fetch a subject's FRESH third-party risk signals and push each as one weighted
-/// [`SignalOutcome`] into `outcomes` (issue #82, PR 1). A signal contributes ONLY when its
-/// source is listed AND enabled in `cfg.signal_sources` (an unreferenced or disabled
+/// Fetch a subject's FRESH third-party risk signals and push AT MOST ONE weighted
+/// [`SignalOutcome`] PER SOURCE into `outcomes` (issue #82, PR 1). A signal contributes ONLY
+/// when its source is listed AND enabled in `cfg.signal_sources` (an unreferenced or disabled
 /// source's rows are inert), it is not stale (older than the source's `max_age_secs`), and
-/// its capped contribution clears the source's threshold. Best-effort: a store fault leaves
-/// `outcomes` unchanged (the login is still scored on the internal signals). This is the ONE
-/// place an external signal enters the score, and it can only ever ADD a `SignalOutcome` to
-/// the deterministic [`combine`] rule.
+/// its capped contribution clears the source's threshold. A source's many fresh signals are
+/// COLLAPSED to its single STRONGEST capped outcome, so a source can never exceed its
+/// configured `max_contribution` via same-source self-corroboration under the [`combine`]
+/// rule, while cross-source corroboration (two DISTINCT sources) is preserved. Best-effort: a
+/// store fault leaves `outcomes` unchanged (the login is still scored on the internal
+/// signals). This is the ONE place an external signal enters the score, and it can only ever
+/// ADD a `SignalOutcome` to the deterministic [`combine`] rule.
 async fn append_external_signal_outcomes(
     state: &OidcState,
     scope: Scope,
@@ -800,6 +804,9 @@ async fn append_external_signal_outcomes(
         return;
     };
     let now_micros = epoch_micros(state.now());
+    // Map each FRESH, ENABLED, non-stale signal to its capped outcome, tagged by its source,
+    // then collapse to one outcome per source (see `collapse_external_outcomes_per_source`).
+    let mut contributions: Vec<(&str, SignalOutcome)> = Vec::new();
     for signal in &signals {
         // The source must be listed AND enabled in policy; an unreferenced source is inert.
         let Some(source) = cfg
@@ -813,9 +820,42 @@ async fn append_external_signal_outcomes(
             continue;
         }
         if let Some(outcome) = external_signal_outcome(source, &signal.payload_json) {
-            outcomes.push(outcome);
+            contributions.push((source.iss.as_str(), outcome));
         }
     }
+    outcomes.extend(collapse_external_outcomes_per_source(contributions));
+}
+
+/// Collapse a subject's tagged external contributions so EACH SOURCE yields AT MOST ONE
+/// [`SignalOutcome`] -- the STRONGEST (highest mapped level, already capped at that source's
+/// `max_contribution`) among that source's fresh signals (issue #82, PR 1). A PURE function.
+///
+/// This per-source dedup is a correctness requirement of the #79 [`combine`] rule, which
+/// escalates 2+ DISTINCT MED-or-higher outcomes to HIGH. Internal signals are one-per-kind,
+/// so they cannot self-corroborate; external signals are many-per-source, so WITHOUT this
+/// collapse a single capped-MED source that emits two signals for one subject would yield
+/// two MED outcomes and escalate to HIGH, exceeding its own configured weight ceiling.
+/// Collapsing to one outcome per source makes the "distinct signals" assumption `combine`
+/// rests on hold: a source can never exceed its `max_contribution`, while cross-source
+/// corroboration (two DISTINCT sources each at MED -> HIGH) is preserved. The source stays
+/// identifiable in each retained outcome `value`.
+fn collapse_external_outcomes_per_source<'a>(
+    contributions: impl IntoIterator<Item = (&'a str, SignalOutcome)>,
+) -> Vec<SignalOutcome> {
+    let mut strongest_per_source: BTreeMap<&str, SignalOutcome> = BTreeMap::new();
+    for (source_iss, outcome) in contributions {
+        match strongest_per_source.entry(source_iss) {
+            std::collections::btree_map::Entry::Occupied(mut existing) => {
+                if outcome.level.rank() > existing.get().level.rank() {
+                    existing.insert(outcome);
+                }
+            }
+            std::collections::btree_map::Entry::Vacant(slot) => {
+                slot.insert(outcome);
+            }
+        }
+    }
+    strongest_per_source.into_values().collect()
 }
 
 // ===========================================================================
@@ -1935,6 +1975,99 @@ mod tests {
         assert!(external_signal_outcome(&source, r#"{"kind":"other"}"#).is_none());
         assert!(external_signal_outcome(&source, r#"{"kind":"score"}"#).is_none());
         assert!(external_signal_outcome(&source, r#"{"kind":"verdict"}"#).is_none());
+    }
+
+    #[test]
+    fn one_source_cannot_self_escalate_past_its_cap_via_two_signals() {
+        // MEDIUM-1 reproduction: a single source with the default MED ceiling delivers TWO
+        // fresh signals for one subject. Each maps (capped) to MED. WITHOUT the per-source
+        // collapse these would be two MED outcomes and `combine` would escalate to HIGH,
+        // exceeding the source's configured weight. With the collapse the source contributes
+        // ONE MED outcome, so the combined score stays MED.
+        let mut source = signal_source();
+        source.max_contribution = "med".to_owned();
+        let first = external_signal_outcome(&source, r#"{"kind":"verdict","verdict":"deny"}"#)
+            .expect("first signal contributes (capped to MED)");
+        let second = external_signal_outcome(&source, r#"{"kind":"score","score":0.99}"#)
+            .expect("second signal contributes (capped to MED)");
+        assert_eq!(first.level, RiskLevel::Med);
+        assert_eq!(second.level, RiskLevel::Med);
+        let collapsed = collapse_external_outcomes_per_source([
+            (source.iss.as_str(), first),
+            (source.iss.as_str(), second),
+        ]);
+        assert_eq!(
+            collapsed.len(),
+            1,
+            "a single source collapses to ONE outcome"
+        );
+        assert_eq!(
+            combine(&collapsed),
+            RiskLevel::Med,
+            "a source cannot self-escalate past its MED cap"
+        );
+    }
+
+    #[test]
+    fn two_distinct_sources_at_med_still_corroborate_to_high() {
+        // Cross-source corroboration is preserved: two DISTINCT sources each contributing MED
+        // are two distinct outcomes, so `combine` escalates to HIGH (the intended #79 rule).
+        let mut source_a = signal_source();
+        source_a.iss = "https://vendor-a.example".to_owned();
+        source_a.max_contribution = "med".to_owned();
+        let mut source_b = signal_source();
+        source_b.iss = "https://vendor-b.example".to_owned();
+        source_b.max_contribution = "med".to_owned();
+        let a = external_signal_outcome(&source_a, r#"{"kind":"verdict","verdict":"deny"}"#)
+            .expect("source A contributes MED");
+        let b = external_signal_outcome(&source_b, r#"{"kind":"verdict","verdict":"deny"}"#)
+            .expect("source B contributes MED");
+        let collapsed = collapse_external_outcomes_per_source([
+            (source_a.iss.as_str(), a),
+            (source_b.iss.as_str(), b),
+        ]);
+        assert_eq!(collapsed.len(), 2, "two distinct sources stay two outcomes");
+        assert_eq!(
+            combine(&collapsed),
+            RiskLevel::High,
+            "two DISTINCT MED sources corroborate to HIGH"
+        );
+    }
+
+    #[test]
+    fn a_high_trust_source_still_contributes_high_after_collapse() {
+        // The cap is a ceiling, not a forced downgrade: a single high-trust source
+        // (max_contribution=high) whose signal maps HIGH still contributes ONE HIGH outcome.
+        let source = signal_source(); // max_contribution defaults to "high" here
+        assert_eq!(source.max_contribution, "high");
+        let high = external_signal_outcome(&source, r#"{"kind":"verdict","verdict":"deny"}"#)
+            .expect("HIGH verdict contributes");
+        assert_eq!(high.level, RiskLevel::High);
+        let collapsed = collapse_external_outcomes_per_source([(source.iss.as_str(), high)]);
+        assert_eq!(collapsed.len(), 1);
+        assert_eq!(collapsed[0].level, RiskLevel::High);
+        assert_eq!(combine(&collapsed), RiskLevel::High);
+    }
+
+    #[test]
+    fn a_collapsed_high_from_a_no_hard_deny_source_still_never_blocks() {
+        // The never-a-Block guarantee survives the collapse: even a collapsed HIGH outcome
+        // from a default (no-hard-deny) source, fed through the real dispatch with blocking
+        // ON, never produces a Block.
+        let source = signal_source();
+        assert!(!source.can_hard_deny, "the default is no hard deny");
+        let high = external_signal_outcome(&source, r#"{"kind":"verdict","verdict":"deny"}"#)
+            .expect("HIGH verdict contributes");
+        let collapsed = collapse_external_outcomes_per_source([(source.iss.as_str(), high)]);
+        let hard_deny = collapsed.iter().any(|outcome| outcome.hard_deny);
+        assert!(!hard_deny, "no collapsed outcome sets the hard-deny bit");
+        let level = combine(&collapsed);
+        let action = dispatch(level, hard_deny, false, None, true, true);
+        assert_ne!(
+            action,
+            RiskAction::Block,
+            "a collapsed external HIGH from a no-hard-deny source never blocks"
+        );
     }
 
     #[test]

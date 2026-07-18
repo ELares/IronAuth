@@ -128,7 +128,11 @@ CREATE POLICY risk_signals_tenant_isolation ON risk_signals
     );
 
 -- The data plane INGESTS a verified signal (INSERT) and the engine READS a subject's fresh
--- signals (SELECT). A signal is immutable once written (no UPDATE, no DELETE: the
--- append-only posture, a retention sweep runs as the owner role). There is NO control-plane
--- grant: a signal is runtime risk state, structurally never part of an account export.
+-- signals (SELECT). A signal is immutable once written (no UPDATE, no DELETE grant: an
+-- append-only posture). Signal FRESHNESS is config-driven, not a stored column: the engine
+-- treats a signal older than the source's max_age_secs as inert (it never counts as a policy
+-- input), so a stale row simply stops mattering rather than being deleted. Row RETENTION and
+-- pruning of inert rows are a documented follow-up (there is no expires_at column, no age
+-- index, and no DELETE grant or sweep in this PR). There is NO control-plane grant: a signal
+-- is runtime risk state, structurally never part of an account export.
 GRANT SELECT, INSERT ON risk_signals TO ironauth_app;
