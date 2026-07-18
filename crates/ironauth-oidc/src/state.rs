@@ -196,6 +196,16 @@ pub struct OidcState {
     // resolves it from the strict config feature ladder (feature enabled AND acked)
     // and sets it here. Default: false (the endpoint is unmounted).
     global_token_revocation_enabled: bool,
+    // Whether the experimental IdP-side FedCM surface (issue #83) is armed. Kept
+    // OUTSIDE `Inner` and set through the builder for the SAME anti-bypass reason as
+    // global-token-revocation: it is NOT a plain `OidcConfig` toggle an operator can
+    // flip (that would arm the endpoints outside the experimental acknowledgment
+    // gate). The ONLY writer is the boot path, which resolves it from the strict
+    // config feature ladder (the `fedcm` experimental feature enabled AND acked at the
+    // exact version) and sets it here. Default: false, so EVERY FedCM route answers a
+    // uniform 404 and discovery advertises nothing. The designated env and branding
+    // that SHAPE the documents live in `Inner` (config data cannot arm the surface).
+    fedcm_enabled: bool,
     // The per-tenant/per-environment quota enforcer (issue #50), the data plane's
     // tenant-fairness layer. Kept OUTSIDE `Inner` and installed by the boot path
     // (built from the [quota] config, seeded with the SAME env clock), so a spend
@@ -528,6 +538,19 @@ struct Inner {
     // validated at config load.
     auto_link_posture: ironauth_config::AutoLinkPosture,
     link_reauth_max_age_secs: u64,
+    // The IdP-side FedCM surface configuration (issue #83). These SHAPE the documents
+    // but never ARM the endpoints (the arming switch is the `fedcm_enabled` builder
+    // bool). The designated scope is the single (tenant, environment) this origin
+    // exposes over FedCM (Fork A1, mirroring the WebAuthn related-origins model),
+    // resolved from `oidc.fedcm.designated_tenant`/`designated_environment` at boot; a
+    // missing or malformed pair is `None`, which fails the well-known / config closed
+    // to a uniform 404 (disclosing nothing on an origin not opted into the experiment).
+    fedcm_designated_scope: Option<Scope>,
+    // The branding metadata the browser account chooser renders (all non-secret).
+    fedcm_provider_name: Option<String>,
+    fedcm_icon_url: Option<String>,
+    fedcm_background_color: Option<String>,
+    fedcm_text_color: Option<String>,
 }
 
 impl OidcState {
@@ -700,10 +723,30 @@ impl OidcState {
                 recovery_delay_secs: config.recovery_delay_secs,
                 auto_link_posture: config.federation.auto_link_posture,
                 link_reauth_max_age_secs: config.federation.link_reauth_max_age_secs,
+                // Resolve the designated FedCM (tenant, environment) once at boot (issue
+                // #83, Fork A1). Both ids must be present AND parse; a lone or malformed
+                // id yields `None`, so the well-known / config fail closed to a uniform
+                // 404 rather than serving a half-configured document. The config layer
+                // already rejected a lone id, so a `None` here is the deliberate
+                // unconfigured case (no env opted into the experiment).
+                fedcm_designated_scope: match (
+                    config.fedcm.designated_tenant.as_deref(),
+                    config.fedcm.designated_environment.as_deref(),
+                ) {
+                    (Some(tenant), Some(environment)) => {
+                        crate::wellknown::parse_scope(tenant, environment)
+                    }
+                    _ => None,
+                },
+                fedcm_provider_name: config.fedcm.provider_name.clone(),
+                fedcm_icon_url: config.fedcm.icon_url.clone(),
+                fedcm_background_color: config.fedcm.background_color.clone(),
+                fedcm_text_color: config.fedcm.text_color.clone(),
             }),
             revocation_sink: default_sink(),
             introspection_serializer: default_serializer(),
             global_token_revocation_enabled: false,
+            fedcm_enabled: false,
             quota: None,
             migration_hook: None,
             hashing_pool: None,
@@ -776,6 +819,30 @@ impl OidcState {
     #[must_use]
     pub fn global_token_revocation_enabled(&self) -> bool {
         self.global_token_revocation_enabled
+    }
+
+    /// Arm (or not) the experimental IdP-side FedCM surface (issue #83).
+    ///
+    /// The boot path is the ONLY caller: it resolves `enabled` from the strict config
+    /// feature ladder (the `fedcm` experimental feature enabled AND acknowledged at the
+    /// exact version) and passes the result here. It is a builder rather than an
+    /// `OidcConfig` field precisely so an operator cannot arm the endpoints from the
+    /// `[oidc]` table and bypass the experimental ack gate: arming is only ever
+    /// reachable through the ladder. When false (the default), every FedCM handler
+    /// answers a uniform 404 and discovery advertises nothing.
+    #[must_use]
+    pub fn with_fedcm_enabled(mut self, enabled: bool) -> Self {
+        self.fedcm_enabled = enabled;
+        self
+    }
+
+    /// Whether the experimental IdP-side FedCM surface is armed (issue #83). Every
+    /// FedCM handler's first action is to return a uniform 404 when this is false, and
+    /// the well-known / config documents are served only when this is true AND a
+    /// designated FedCM env is configured.
+    #[must_use]
+    pub fn fedcm_enabled(&self) -> bool {
+        self.fedcm_enabled
     }
 
     /// Install the per-tenant/per-environment quota enforcer (issue #50), turning
@@ -2095,6 +2162,80 @@ impl OidcState {
         // serde_json over a borrowed slice of owned Strings: infallible for a Vec of
         // strings, so the document is a plain serialization of the origin list.
         serde_json::to_string(&serde_json::json!({ "origins": rp.origins })).ok()
+    }
+
+    /// The single designated FedCM `(tenant, environment)` this origin exposes (issue
+    /// #83, Fork A1), or [`None`] when no env is configured (or its ids do not parse).
+    /// The scoped FedCM config / accounts endpoints answer only for THIS scope; a
+    /// request naming any other `(tenant, environment)` is a uniform 404, keeping the
+    /// origin single-env for the experiment. Arming is separate (see
+    /// [`OidcState::fedcm_enabled`]): a designated scope with the feature off still 404s.
+    #[must_use]
+    pub fn fedcm_designated_scope(&self) -> Option<Scope> {
+        self.inner.fedcm_designated_scope
+    }
+
+    /// The origin-level FedCM well-known document served at `GET /.well-known/web-identity`
+    /// (issue #83): the JSON `{"provider_urls": [...]}` naming the SINGLE designated
+    /// env's path-scoped config URL, so a browser fetching the well-known from this
+    /// origin's eTLD+1 accepts the scoped configURL an RP passed to
+    /// `navigator.credentials.get`. [`None`] when no designated env is configured, which
+    /// the handler maps (together with the feature-off case) to a uniform 404, so an
+    /// origin not using FedCM serves no document. Built from live state at request time.
+    #[must_use]
+    pub fn fedcm_wellknown_document(&self) -> Option<String> {
+        let scope = self.inner.fedcm_designated_scope?;
+        let config_url = format!("{}/fedcm/config.json", self.issuer_for(&scope));
+        serde_json::to_string(&serde_json::json!({ "provider_urls": [config_url] })).ok()
+    }
+
+    /// The FedCM provider config document served at
+    /// `GET /t/{t}/e/{e}/fedcm/config.json` for the designated `scope` (issue #83): the
+    /// W3C FedCM config naming the accounts and id-assertion endpoint locations, the
+    /// login URL (the existing hosted login page), and the minimal branding metadata the
+    /// browser account chooser renders. Per Fork C the `client_metadata_endpoint` and
+    /// `disconnect_endpoint` are omitted (a login completes without them). Every endpoint
+    /// path is built from `issuer_for(scope)` so it matches the per-environment issuer.
+    #[must_use]
+    pub fn fedcm_config_document(&self, scope: &Scope) -> String {
+        let base = self.issuer_for(scope);
+        let mut branding = serde_json::Map::new();
+        branding.insert(
+            "name".to_owned(),
+            serde_json::Value::String(
+                self.inner
+                    .fedcm_provider_name
+                    .clone()
+                    .unwrap_or_else(|| "IronAuth".to_owned()),
+            ),
+        );
+        if let Some(color) = &self.inner.fedcm_background_color {
+            branding.insert(
+                "background_color".to_owned(),
+                serde_json::Value::String(color.clone()),
+            );
+        }
+        if let Some(color) = &self.inner.fedcm_text_color {
+            branding.insert("color".to_owned(), serde_json::Value::String(color.clone()));
+        }
+        if let Some(icon) = &self.inner.fedcm_icon_url {
+            branding.insert(
+                "icons".to_owned(),
+                serde_json::json!([{ "url": icon, "size": 32 }]),
+            );
+        }
+        // The login URL is the EXISTING hosted login page (mounted at the deployment
+        // root `/login`, never a new endpoint), so the browser sends a logged-out user
+        // there to authenticate before retrying the FedCM flow.
+        let login_url = format!("{}/login", self.inner.issuer_base.trim_end_matches('/'));
+        let document = serde_json::json!({
+            "accounts_endpoint": format!("{base}/fedcm/accounts"),
+            "id_assertion_endpoint": format!("{base}/fedcm/assertion"),
+            "login_url": login_url,
+            "branding": serde_json::Value::Object(branding),
+        });
+        // Infallible: a serde_json::Value always serializes.
+        serde_json::to_string(&document).unwrap_or_else(|_| "{}".to_owned())
     }
 
     /// The single-use WebAuthn challenge lifetime in seconds (issue #65).

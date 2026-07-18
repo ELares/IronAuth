@@ -6,6 +6,34 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- IdP-side FedCM (W3C Federated Credential Management) READ surface behind an experimental
+  flag (issue #83, PR 1, EXPLORATORY). The `fedcm` experimental feature (ack version
+  `0.1.0-exp.1`, this changelog is its ack target) gates the whole surface; it is off by
+  default and boot-refuses when enabled without the exact ack. Redirect flows are UNAFFECTED,
+  and with the flag off every FedCM route is a uniform 404 and OIDC discovery is unchanged.
+  - **Origin-level `/.well-known/web-identity`** returns the FedCM provider config pointer for
+    the SINGLE designated `(tenant, environment)` this origin exposes (Fork A1, a process-level
+    config mirroring the WebAuthn related-origins model), naming that env's path-scoped config.
+  - **`GET /t/{t}/e/{e}/fedcm/config.json`** serves the W3C FedCM config (accounts + id-assertion
+    endpoint locations, the existing hosted `login_url`, and branding) for the designated env only
+    (a non-designated env is a uniform 404). `client_metadata_endpoint` and `disconnect_endpoint`
+    are omitted (Fork C; a login completes without them).
+  - **`GET /t/{t}/e/{e}/fedcm/accounts`** answers ONLY from the OP session: a single account
+    (Fork D) whose `id` is the per-env PUBLIC subject (through the one subject function, never the
+    raw user id) and whose `name`/`email`/`picture` come from the sealed PII opened server-side.
+    No session is an EMPTY, uncacheable body, so a logged-out browser is never served account
+    data. Every FedCM fetch requires `Sec-Fetch-Dest: webidentity` (a forbidden header page script
+    cannot forge), the accounts read is credentialed on the SameSite cookie alone, and the
+    response is always `Cache-Control: no-store`.
+  - **Login Status API**: `Set-Login: logged-in` on session establishment (every login factor)
+    and `Set-Login: logged-out` on the caller's OWN logout, both only when the flag is on. A
+    cross-user (neutral) logout deliberately emits NO `logged-out`, so a crafted logout cannot
+    flip a victim's FedCM state.
+  - **Migration 0063** adds the `fedcm_assertion_nonces` single-use replay store (RLS
+    ENABLE+FORCE, scope isolation, the `consumed_at` latch, no DELETE grant), landed now and INERT;
+    the credential-issuing `POST .../fedcm/assertion` endpoint that consumes it is PR 2.
+  - Browser support is Chrome only (Firefox paused, Safari absent); see `docs/fedcm.md` for the
+    honest support matrix, the graduation triggers, and the manual Chromium E2E repro.
 - First-party social providers with the sharp edges handled natively (issue #74): Google,
   Apple, Microsoft, and GitHub complete a full brokered login, all expressed as connector DATA
   with the provider quirks in documented, data-driven handlers (no provider-specific code in the

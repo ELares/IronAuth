@@ -538,6 +538,14 @@ fn logout_redirect(state: &OidcState, location: &str) -> Response {
     for clear in clear_cookies(state) {
         builder = builder.header(header::SET_COOKIE, clear);
     }
+    // FedCM Login Status (issue #83): announce `Set-Login: logged-out` when the
+    // experiment is on. This path terminates the CALLER'S OWN session (the presenting
+    // browser IS the hint owner), so flipping its FedCM login state is correct. The
+    // cross-user `neutral_logged_out` path deliberately does NOT reach here, so a
+    // crafted cross-user logout can never flip a victim's FedCM state.
+    if state.fedcm_enabled() {
+        builder = builder.header("set-login", "logged-out");
+    }
     builder
         .body(axum::body::Body::empty())
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
@@ -552,6 +560,17 @@ fn set_clear_cookie(state: &OidcState, response: &mut Response) {
         if let Ok(value) = header::HeaderValue::from_str(&clear) {
             response.headers_mut().append(header::SET_COOKIE, value);
         }
+    }
+    // FedCM Login Status (issue #83): announce `Set-Login: logged-out` when the
+    // experiment is on. Reached only from the CALLER'S-OWN terminal logout paths
+    // (`logged_out` and `finish_logout`), never from the cross-user
+    // `neutral_logged_out` page (which clears nothing and does not call this), so a
+    // crafted cross-user logout can never flip a victim's FedCM login state.
+    if state.fedcm_enabled() {
+        response.headers_mut().append(
+            header::HeaderName::from_static("set-login"),
+            header::HeaderValue::from_static("logged-out"),
+        );
     }
 }
 

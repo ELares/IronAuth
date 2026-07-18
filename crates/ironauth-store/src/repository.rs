@@ -76,15 +76,15 @@ use crate::id::{
     BackChannelDeliveryId, ClientId, ClientSessionId, ConnectorId, ConsentId, CorrelationId,
     CredentialClassPolicyId, CredentialId, CustomDomainId, DcrPolicyId, DekId, DeviceCodeId,
     EmailOtpCodeId, EncryptedSecretId, EnvironmentId, EnvironmentSecretId, ExternalIssuerId,
-    FederationLoginStateId, GrantId, InitialAccessTokenId, InvitationId, IssuedTokenId, KekId,
-    MagicLinkTokenId, ManagementKeyId, Mds3BlobCacheId, MigrationRunId, MigrationRunRecordId,
-    OperatorId, OrgConnectionId, OrganizationId, PowChallengeId, PushedRequestId, RecoveryCodeId,
-    RecoveryFlowId, RefreshFamilyId, RefreshTokenId, ResourceServerId, RiskDecisionId,
-    RiskDisavowalId, RiskLoginGeoId, RoutingRuleId, ScopeStepUpPolicyId, ServiceAccountId,
-    SessionEventId, SessionId, SigningKeyId, SmsOtpCodeId, SmsRouteStatId, TenantId,
-    TotpCredentialId, TraitMigrationJobId, TraitSchemaId, TrustedDeviceId, UpstreamTokenGrantId,
-    UpstreamTokenId, UserId, UserIdentifierId, VariableId, WebauthnChallengeId,
-    WebauthnCredentialId,
+    FedcmNonceId, FederationLoginStateId, GrantId, InitialAccessTokenId, InvitationId,
+    IssuedTokenId, KekId, MagicLinkTokenId, ManagementKeyId, Mds3BlobCacheId, MigrationRunId,
+    MigrationRunRecordId, OperatorId, OrgConnectionId, OrganizationId, PowChallengeId,
+    PushedRequestId, RecoveryCodeId, RecoveryFlowId, RefreshFamilyId, RefreshTokenId,
+    ResourceServerId, RiskDecisionId, RiskDisavowalId, RiskLoginGeoId, RoutingRuleId,
+    ScopeStepUpPolicyId, ServiceAccountId, SessionEventId, SessionId, SigningKeyId, SmsOtpCodeId,
+    SmsRouteStatId, TenantId, TotpCredentialId, TraitMigrationJobId, TraitSchemaId,
+    TrustedDeviceId, UpstreamTokenGrantId, UpstreamTokenId, UserId, UserIdentifierId, VariableId,
+    WebauthnChallengeId, WebauthnCredentialId,
 };
 use crate::identifier::{
     CanonicalIdentifier, IdentifierType, UniquenessMode, canonicalize_identifier,
@@ -492,6 +492,19 @@ impl<'a> ScopedStore<'a> {
     #[must_use]
     pub fn account_links(&self) -> AccountLinkRepo<'a> {
         AccountLinkRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
+    /// The FedCM assertion-nonce single-use replay store for this scope (issue #83):
+    /// reserve an RP-supplied `(client_id, nonce)` and atomically consume it exactly
+    /// once. Correct-but-unwired in PR 1: no live assertion path consults it yet (PR 2
+    /// wires it into the id-assertion endpoint). It carries the single-use latch, so
+    /// the model is DB-tested in isolation before it goes live.
+    #[must_use]
+    pub fn fedcm_nonces(&self) -> FedcmNonceRepo<'a> {
+        FedcmNonceRepo {
             store: self.store,
             scope: self.scope,
         }
@@ -20857,6 +20870,119 @@ impl AccountLinkRepo<'_> {
         rows.iter()
             .map(|row| account_link_record_from_row(row, self.scope))
             .collect()
+    }
+}
+
+/// The FedCM assertion-nonce single-use replay store (issue #83, EXPLORATORY).
+///
+/// The IdP-side FedCM id-assertion endpoint mints an ID token directly to the RP;
+/// the credentialed-cookie, Sec-Fetch-Dest, and registered-origin gates already block
+/// a web-attacker replay, but the issue requires rejecting a REPLAYED nonce
+/// server-side too. This store delivers that with the house single-use `consumed_at`
+/// latch keyed on `(tenant, environment, client_id, nonce)`:
+///
+///   - [`FedcmNonceRepo::reserve`] INSERTs the RP-supplied `(client_id, nonce)` the
+///     first time it is seen; a second `reserve` of the SAME pair collides on the
+///     UNIQUE constraint and reports the replay (never a second insert);
+///   - [`FedcmNonceRepo::consume`] flips `consumed_at` for the ONE matching, unexpired,
+///     UNCONSUMED row, so under concurrency exactly one caller wins the mint (the
+///     guarded-UPDATE shape the authorization-code redeem uses).
+///
+/// Correct-but-unwired in PR 1: no live assertion path calls these yet (PR 2 wires
+/// them into the id-assertion endpoint). A consumed row is the durable replay
+/// evidence, so the table carries no DELETE grant on the data plane.
+pub struct FedcmNonceRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl FedcmNonceRepo<'_> {
+    /// Reserve an RP-supplied `(client_id, nonce)` the FIRST time it is seen (issue
+    /// #83), keyed by a fresh `fdn_` id, with `consumed_at` left NULL and the single-use
+    /// TTL boundary `expires_at`. Returns `Ok(true)` when the row was inserted (a fresh,
+    /// never-before-seen nonce) and `Ok(false)` when the `(client_id, nonce)` already
+    /// exists in this scope (a REPLAY): the UNIQUE constraint makes the decision atomic,
+    /// so the caller rejects a replay without a second insert.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the id or client id is out of scope;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn reserve(
+        &self,
+        id: &FedcmNonceId,
+        client_id: &ClientId,
+        nonce: &str,
+        expires_at_micros: i64,
+    ) -> Result<bool, StoreError> {
+        if id.scope() != self.scope || client_id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let mut tx = begin_scoped(self.store, scope).await?;
+        // ON CONFLICT DO NOTHING RETURNING makes the first-use decision atomic without
+        // sniffing a Postgres error code: a returned row means this reserve won (the
+        // nonce is fresh), no row means the (client_id, nonce) already exists (a replay).
+        let row = sqlx::query(
+            "INSERT INTO fedcm_assertion_nonces \
+             (id, tenant_id, environment_id, client_id, nonce, expires_at) \
+             VALUES ($1, $2, $3, $4, $5, \
+                     TIMESTAMPTZ 'epoch' + ($6::text || ' microseconds')::interval) \
+             ON CONFLICT (tenant_id, environment_id, client_id, nonce) DO NOTHING \
+             RETURNING id",
+        )
+        .bind(id.to_string())
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(client_id.to_string())
+        .bind(nonce)
+        .bind(expires_at_micros)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(row.is_some())
+    }
+
+    /// Atomically CONSUME the reserved `(client_id, nonce)` (issue #83): flip
+    /// `consumed_at` for the ONE row that matches, is UNCONSUMED, and is UNEXPIRED at
+    /// `now_micros`, returning `true` when this call won the single-use latch. Returns
+    /// `false` when the pair is out of scope, unknown, already consumed (replay), or
+    /// expired. The `consumed_at IS NULL ... RETURNING` clause makes the consume
+    /// single-use under concurrency: at most one caller wins, so a nonce can never mint
+    /// two assertions (the guarded-UPDATE shape the authorization-code redeem uses).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn consume(
+        &self,
+        client_id: &ClientId,
+        nonce: &str,
+        now_micros: i64,
+    ) -> Result<bool, StoreError> {
+        if client_id.scope() != self.scope {
+            return Ok(false);
+        }
+        let scope = self.scope;
+        let mut tx = begin_scoped(self.store, scope).await?;
+        let row = sqlx::query(
+            "UPDATE fedcm_assertion_nonces SET \
+             consumed_at = TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval \
+             WHERE tenant_id = $1 AND environment_id = $2 AND client_id = $3 \
+             AND nonce = $5 \
+             AND consumed_at IS NULL \
+             AND expires_at > (TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval) \
+             RETURNING id",
+        )
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(client_id.to_string())
+        .bind(now_micros)
+        .bind(nonce)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(row.is_some())
     }
 }
 

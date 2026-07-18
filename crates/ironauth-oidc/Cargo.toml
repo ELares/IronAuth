@@ -617,6 +617,15 @@ required-features = ["testing"]
 name = "logout"
 path = "tests/logout.rs"
 required-features = ["testing"]
+# IdP-side FedCM READ surface (issue #83, EXPLORATORY): the flag-off 404s + discovery
+# unchanged, the well-known provider_urls pointer, the config document shape (designated
+# env only), the accounts endpoint (public-subject id, sealed-PII name/email, uncacheable;
+# empty when no session; Sec-Fetch-Dest gated), and the Login Status Set-Login wiring
+# (logged-in on login, logged-out on the caller's own logout, NEVER on a cross-user logout).
+[[test]]
+name = "fedcm"
+path = "tests/fedcm.rs"
+required-features = ["testing"]
 # OIDC Back-Channel Logout (issue #34): the Logout Token claim set (the RP's OWN sid, the
 # events member, the logout+jwt typ, and NO nonce) verified under the environment key;
 # each participating RP getting its own token with no cross-client sid leak; delivery

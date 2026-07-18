@@ -1069,3 +1069,100 @@ async fn a_device_flow_whose_approving_session_was_revoked_before_redeem_is_inva
     );
     assert_eq!(body["error"], "invalid_grant");
 }
+
+/// The FedCM `Set-Login` header value on the response, if any.
+fn set_login(headers: &axum::http::HeaderMap) -> Option<String> {
+    headers
+        .get("set-login")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned)
+}
+
+#[tokio::test]
+async fn device_sign_in_emits_set_login_logged_in_when_fedcm_is_on() {
+    // FedCM Login Status (issue #83): the device-flow post-sign-in confirmation
+    // establishes the session, so it must emit Set-Login: logged-in when the flag is on.
+    // Regression guard: this response is hand-built via with_set_cookie, which formerly
+    // set the session cookie WITHOUT the login-status header (bypassing the choke point).
+    let mut harness = Harness::start().await;
+    let client = *harness.client_id();
+    harness
+        .enable_device_grant(&client, DEVICE_GRANTS, Some(TEST_LOGO))
+        .await;
+    harness.enable_fedcm();
+    let client_str = client.to_string();
+    harness
+        .seed_user("fedcm-device@example.test", "correct horse battery staple")
+        .await;
+
+    let start = start_flow(&harness, &client_str, Some("openid")).await;
+    let user_code = start["user_code"].as_str().expect("user_code").to_owned();
+
+    // Sign in DURING the device flow (identifier + password + user_code, no prior
+    // cookie): this establishes the session and renders the confirmation with the freshly
+    // minted session cookie set on it.
+    let body = form(&[
+        ("identifier", "fedcm-device@example.test"),
+        ("password", "correct horse battery staple"),
+        ("user_code", &user_code),
+    ]);
+    let path = device_path(&harness);
+    let (status, headers, html) = harness.post_form(&path, &body, None).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "device sign-in confirmation: {html}"
+    );
+    assert!(
+        headers
+            .get_all(axum::http::header::SET_COOKIE)
+            .iter()
+            .count()
+            >= 1,
+        "the device sign-in sets the session cookie"
+    );
+    assert_eq!(
+        set_login(&headers).as_deref(),
+        Some("logged-in"),
+        "a device-flow post-sign-in emits Set-Login: logged-in when FedCM is on"
+    );
+}
+
+#[tokio::test]
+async fn device_sign_in_emits_no_set_login_when_fedcm_is_off() {
+    // The flag-off invariant: with FedCM off the device-flow post-sign-in confirmation is
+    // byte-identical to before and emits no Set-Login header.
+    let harness = Harness::start().await; // fedcm NOT enabled
+    let client = *harness.client_id();
+    harness
+        .enable_device_grant(&client, DEVICE_GRANTS, Some(TEST_LOGO))
+        .await;
+    let client_str = client.to_string();
+    harness
+        .seed_user(
+            "no-fedcm-device@example.test",
+            "correct horse battery staple",
+        )
+        .await;
+
+    let start = start_flow(&harness, &client_str, Some("openid")).await;
+    let user_code = start["user_code"].as_str().expect("user_code").to_owned();
+
+    let body = form(&[
+        ("identifier", "no-fedcm-device@example.test"),
+        ("password", "correct horse battery staple"),
+        ("user_code", &user_code),
+    ]);
+    let path = device_path(&harness);
+    let (status, headers, html) = harness.post_form(&path, &body, None).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "device sign-in confirmation: {html}"
+    );
+    assert_eq!(
+        set_login(&headers),
+        None,
+        "with FedCM off a device-flow post-sign-in emits no Set-Login header"
+    );
+}

@@ -563,6 +563,15 @@ pub async fn establish_session(
         session_id,
         session: session_cookie,
         op_browser_state: op_browser_state_cookie,
+        // FedCM Login Status API (issue #83): remember whether to emit
+        // `Set-Login: logged-in` so the browser's FedCM state tracks the OP session,
+        // but ONLY when the experimental feature is on (otherwise no header is emitted
+        // and the response is byte-identical to before). The header is NOT emitted from
+        // here: it rides `SessionCookies::response_headers`, the SAME layer that emits
+        // the session `Set-Cookie`, so every factor that sets the cookie also sets the
+        // header (password, register, passkey/WebAuthn, OTP, magic link, federation,
+        // device) with no per path wiring and no way to set the cookie while dropping it.
+        set_login: state.fedcm_enabled(),
     })
 }
 
@@ -580,13 +589,46 @@ pub struct SessionCookies {
     /// The `__ironauth_opbs` cookie (see [`session::build_op_browser_state_cookie`]),
     /// present ONLY when session management is enabled.
     op_browser_state: Option<String>,
+    /// Whether to emit the FedCM `Set-Login: logged-in` header (issue #83): true only
+    /// when the experimental `fedcm` feature is on at establish time, so with the flag
+    /// off the login response is byte-identical to before.
+    set_login: bool,
 }
 
 impl SessionCookies {
     /// Every `Set-Cookie` header value to emit, in order: the session cookie first, then
-    /// the OP browser-state cookie when session management is enabled.
-    pub(crate) fn header_values(&self) -> impl Iterator<Item = &str> {
+    /// the OP browser-state cookie when session management is enabled. Private on purpose:
+    /// the ONLY way to emit the session cookie is [`Self::response_headers`], so the FedCM
+    /// `Set-Login` header can never be bypassed by a caller that reaches for the cookie
+    /// alone.
+    fn header_values(&self) -> impl Iterator<Item = &str> {
         std::iter::once(self.session.as_str()).chain(self.op_browser_state.as_deref())
+    }
+
+    /// The FedCM `Set-Login` header value to emit on session establishment (issue #83),
+    /// or [`None`] when the experimental feature is off (no header). Always
+    /// `logged-in`: this rides ONLY the establish path (a login), so it can never
+    /// report `logged-out` for another user.
+    fn login_status_value(&self) -> Option<&'static str> {
+        self.set_login.then_some("logged-in")
+    }
+
+    /// EVERY response header a session establishment must emit, as `(name, value)` pairs:
+    /// the session `Set-Cookie` value(s) first (session cookie, then the OP browser-state
+    /// cookie when session management is on), then, when the FedCM experiment is on (issue
+    /// #83), the `Set-Login: logged-in` header. This is THE choke point: the session cookie
+    /// can only be emitted through here, so the `Set-Login` header rides the SAME layer as
+    /// the cookie and no login factor can set the cookie while dropping the header. With the
+    /// flag off only the cookie value(s) are yielded, so the response is byte-identical to
+    /// before. `Set-Login` is always `logged-in` here: this rides ONLY the establish path,
+    /// so it can never report `logged-out` for another user.
+    pub(crate) fn response_headers(&self) -> impl Iterator<Item = (header::HeaderName, &str)> {
+        self.header_values()
+            .map(|value| (header::SET_COOKIE, value))
+            .chain(
+                self.login_status_value()
+                    .map(|value| (header::HeaderName::from_static("set-login"), value)),
+            )
     }
 
     /// The just-established session's id (issue #77, PR 3): the key the upstream token
@@ -709,8 +751,10 @@ pub fn redirect_setting_cookie(location: &str, cookies: &SessionCookies) -> Resp
         .header(header::LOCATION, location)
         .header(header::CACHE_CONTROL, "no-store")
         .header(header::REFERRER_POLICY, "no-referrer");
-    for value in cookies.header_values() {
-        builder = builder.header(header::SET_COOKIE, value);
+    // The session cookie and the FedCM `Set-Login` header (issue #83) ride the SAME
+    // choke point, so the login-status header can never be dropped while the cookie is set.
+    for (name, value) in cookies.response_headers() {
+        builder = builder.header(name, value);
     }
     builder
         .body(Body::empty())
@@ -723,9 +767,12 @@ pub fn redirect_setting_cookie(location: &str, cookies: &SessionCookies) -> Resp
 #[must_use]
 pub fn attach_session_cookies(mut response: Response, cookies: &SessionCookies) -> Response {
     let headers = response.headers_mut();
-    for value in cookies.header_values() {
+    // The session cookie and the FedCM `Set-Login` header (issue #83) ride the SAME
+    // choke point, so the non-redirect login result (a JSON verify result or a hosted
+    // success page) also gets the login-status header whenever it gets the cookie.
+    for (name, value) in cookies.response_headers() {
         if let Ok(value) = header::HeaderValue::from_str(value) {
-            headers.append(header::SET_COOKIE, value);
+            headers.append(name, value);
         }
     }
     response

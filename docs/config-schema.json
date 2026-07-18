@@ -313,6 +313,61 @@
       },
       "type": "object"
     },
+    "FedcmConfig": {
+      "additionalProperties": false,
+      "description": "The IdP-side FedCM surface settings (issue #83, EXPLORATORY).\n\nFedCM's `/.well-known/web-identity` is an ORIGIN-level document, but IronAuth\nserves everything else per `(tenant, environment)` and has no origin-level\ndefault env. This section names the SINGLE designated `(tenant, environment)`\nthis origin exposes over FedCM (mirroring the WebAuthn related-origins\nprocess-level model), so the origin-level well-known points at that env's\npath-scoped config, and it carries the branding metadata the browser account\nchooser renders. Multi-tenant-per-origin FedCM is a graduation trigger, not a\ngoal of the experiment.\n\nThis section can only SHAPE the FedCM documents; it can never ARM the endpoints.\nThe arming switch is the `fedcm` experimental feature flag, resolved to a\nstate-builder bool at boot (never an `[oidc]` toggle, so the experimental ack\ngate can never be bypassed). With a designated env configured here but the\nfeature disabled, every FedCM route still answers a uniform 404.\n\nEmpty by default: no designated env means the FedCM well-known and config 404\neven when the feature is enabled, disclosing nothing on an origin that has not\nopted a specific env into the experiment.",
+      "properties": {
+        "background_color": {
+          "default": null,
+          "description": "The account chooser background color, a CSS color string (issue #83). Non-secret\nbranding metadata; omitted from the config document when unset.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "designated_environment": {
+          "default": null,
+          "description": "The environment id of the single `(tenant, environment)` this origin exposes\nover FedCM (issue #83). Unset by default; see [`Self::designated_tenant`]. Both\nmust be set together for the FedCM well-known and config to serve a document.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "designated_tenant": {
+          "default": null,
+          "description": "The tenant id of the single `(tenant, environment)` this origin exposes over\nFedCM (issue #83). Unset by default; when unset (or `designated_environment`\nis unset) the FedCM well-known and config answer a uniform 404. The value is a\n`ten_` id string; it is resolved to a live scope at boot, and a malformed or\nunknown value simply yields the same non-disclosing 404.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "icon_url": {
+          "default": null,
+          "description": "The provider icon URL the browser account chooser renders (issue #83). Non-secret\nbranding metadata; omitted from the config document when unset.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "provider_name": {
+          "default": null,
+          "description": "The provider display name the browser account chooser shows (issue #83). Falls\nback to a neutral default when unset, so the config document is always\nwell-formed. Non-secret branding metadata.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "text_color": {
+          "default": null,
+          "description": "The account chooser text color, a CSS color string (issue #83). Non-secret\nbranding metadata; omitted from the config document when unset.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
     "FederationConfig": {
       "additionalProperties": false,
       "description": "The generic OIDC upstream federation settings (issue #75, PR B).\n\nWhen enabled, the boot path builds the federation runtime that turns a declarative,\nDATA-ONLY connector (issue #75, PR A) into a full inbound federated login WITHOUT any\nper-provider code: it resolves the connector's endpoints (discovery), exchanges the\nauthorization code, and validates the upstream ID token through the one JOSE core, then\nprovisions a local identity keyed on the upstream ISSUER + `sub`. Every federation\noutbound rides the one SSRF-hardened fetcher.\n\nDISABLED BY DEFAULT (`enabled = false`): the `/federation` routes are a uniform\nnot-found, so an existing deployment is unaffected. The TTLs govern how long a resolved\ndiscovery document and a fetched upstream key set are cached (both refetched on expiry,\nand a JWKS is refetched immediately when an ID token names an unknown `kid`).",
@@ -650,6 +705,18 @@
           "default": false,
           "description": "Whether to mount the public OIDC endpoints (`/authorize`, `/token`). Off\nby default so the default boot serves only the skeleton and needs no\ndatabase. When on, the provider connects the data-plane store using\n`database.url`.",
           "type": "boolean"
+        },
+        "fedcm": {
+          "$ref": "#/$defs/FedcmConfig",
+          "default": {
+            "background_color": null,
+            "designated_environment": null,
+            "designated_tenant": null,
+            "icon_url": null,
+            "provider_name": null,
+            "text_color": null
+          },
+          "description": "The IdP-side FedCM surface settings (issue #83, EXPLORATORY): the single\ndesignated `(tenant, environment)` this origin exposes over FedCM plus the\nbranding metadata the browser account chooser renders. This section only\nSHAPES the FedCM documents; it can never ARM the endpoints. The arming switch\nis the `fedcm` experimental feature flag, resolved to a state-builder bool at\nboot (never an `[oidc]` toggle), so a designated env configured here still\nanswers a uniform 404 on every FedCM route until the feature is enabled AND\nacknowledged. See [`FedcmConfig`]."
         },
         "federation": {
           "$ref": "#/$defs/FederationConfig",
@@ -2035,6 +2102,14 @@
         "enable_response_type_id_token": false,
         "enable_response_type_none": false,
         "enabled": false,
+        "fedcm": {
+          "background_color": null,
+          "designated_environment": null,
+          "designated_tenant": null,
+          "icon_url": null,
+          "provider_name": null,
+          "text_color": null
+        },
         "federation": {
           "auto_link_posture": "off",
           "discovery_ttl_secs": 3600,
