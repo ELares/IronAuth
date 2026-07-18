@@ -839,6 +839,17 @@
           "minimum": 0,
           "type": "integer"
         },
+        "quarantine": {
+          "$ref": "#/$defs/QuarantineConfig",
+          "default": {
+            "sensitive_scopes": [
+              "offline_access",
+              "admin",
+              "management"
+            ]
+          },
+          "description": "The signup-quarantine sensitive-scope policy (issue #82, PR 2): which scopes a\nquarantined account may never receive, so the shared authorize path strips them from\nits grant. Consulted only when the `signup-quarantine` experimental feature is\nenabled AND acknowledged; the conservative default already strips offline access and\nadmin/management scopes. See [`QuarantineConfig`]."
+        },
         "recovery_cooldown_secs": {
           "default": 300,
           "description": "The cooldown between two account-recovery initiations for the SAME account, in\nseconds (issue #81): a repeated recovery request inside this window is refused, so\nrecovery-request spam against one account is rate-limited on the recovery path\nindependently of the login path. Must be at least 1. The default (300) is five\nminutes.",
@@ -1512,6 +1523,25 @@
           "format": "uint32",
           "minimum": 0,
           "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "QuarantineConfig": {
+      "additionalProperties": false,
+      "description": "The signup-quarantine sensitive-scope policy (issue #82, PR 2): which OAuth scopes a\nQUARANTINED account may NEVER receive. A quarantined signup can authenticate, but with\nlimited privileges: at the shared authorize choke point every requested scope that\nmatches this denylist is DROPPED from the grant, so a quarantined account is usable but\npowerless until an admin releases it. Non-sensitive baseline scopes (`openid`,\n`profile`, `email`) are never on the denylist, so a quarantined user still gets a basic\nidentity token. The denylist is tunable per environment (the tunability principle) with\na CONSERVATIVE default: an operator can add more sensitive scopes (a payment-class scope\nfor example) but the shipped default already strips the classes that most obviously\ngrant power (offline access and admin/management scopes).",
+      "properties": {
+        "sensitive_scopes": {
+          "default": [
+            "offline_access",
+            "admin",
+            "management"
+          ],
+          "description": "The sensitive-scope denylist a quarantined account is never granted. A requested\nscope token is sensitive when it EQUALS a denylist entry or is a NAMESPACED child of\none (the entry followed by `:`, `.`, or `/`, so `admin` also covers `admin:read` and\n`admin.users`). The conservative default is `offline_access` (no refresh token for a\nquarantined account), `admin`, and `management` (no admin/management scope). Add more\n(for example a payment-class scope) per environment; over-stripping is the safe\ndirection, since a quarantined account is meant to be powerless.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
         }
       },
       "type": "object"
@@ -2226,6 +2256,13 @@
         "offline_idle_ttl_secs": 2592000,
         "offline_max_lifetime_secs": 7776000,
         "par_ttl_secs": 60,
+        "quarantine": {
+          "sensitive_scopes": [
+            "offline_access",
+            "admin",
+            "management"
+          ]
+        },
         "recovery_cooldown_secs": 300,
         "recovery_delay_secs": 259200,
         "refresh_idle_ttl_secs": 1209600,

@@ -813,6 +813,21 @@ pub enum Action {
     /// subject. Written only for a signal that was actually ingested (a verified, fresh,
     /// non-duplicate delivery).
     RiskSignalIngest,
+    /// A signup-quarantine case was APPROVED / RELEASED (issue #82, PR 2): an admin cleared
+    /// the account's `quarantined` flag through the management review queue, turning a
+    /// quarantined account into a normal unrestricted one. The row targets the released
+    /// `usr_` subject; the actor is the deciding admin, so the trail names WHO released the
+    /// account. This is the ONLY path that lifts a quarantine.
+    SignupQuarantineApproved,
+    /// A signup-quarantine case was REJECTED (issue #82, PR 2): an admin confirmed a
+    /// fraudulent signup through the management review queue, disabling the account and
+    /// ending its sessions. The row targets the disabled `usr_` subject; the actor is the
+    /// deciding admin, so the trail names WHO rejected the signup.
+    SignupQuarantineRejected,
+    /// A signup-quarantine review window was EXTENDED (issue #82, PR 2): an admin bumped a
+    /// case's review deadline through the management queue; the account stays quarantined.
+    /// The row targets the `usr_` subject; the actor is the deciding admin.
+    SignupQuarantineExtended,
     /// A federation connector was CREATED (issue #75): a declarative OIDC-shaped
     /// upstream definition was registered through the management API. The row targets
     /// the `cnr_` connector; the `detail` records the connector slug. The definition
@@ -1028,6 +1043,9 @@ impl Action {
             Action::RiskDecisionRecord => "risk.decision",
             Action::RiskDisavowalIssue => "risk.disavowal.issue",
             Action::RiskSignalIngest => "risk.signal.ingest",
+            Action::SignupQuarantineApproved => "signup_quarantine.approved",
+            Action::SignupQuarantineRejected => "signup_quarantine.rejected",
+            Action::SignupQuarantineExtended => "signup_quarantine.extended",
             Action::RiskDisavow => "risk.disavow",
             Action::ConnectorCreate => "connector.create",
             Action::ConnectorUpdate => "connector.update",

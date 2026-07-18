@@ -5239,6 +5239,444 @@
         ]
       }
     },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/signup-quarantine": {
+      "get": {
+        "tags": [
+          "signup-quarantine"
+        ],
+        "summary": "List the OPEN signup-quarantine cases under an environment (cursor paginated).",
+        "operationId": "listSignupQuarantines",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "The desired page size, a positive integer. Clamped to\n`[1, max_page_size]`; defaults to the configured default when absent.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "The opaque cursor from a previous page's `next_cursor`. Absent for the\nfirst page (keyset pagination; there is no offset).",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "A page of open quarantine cases",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SignupQuarantineList"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed cursor",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The signup-quarantine feature is not enabled",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/signup-quarantine/{user_id}/approve": {
+      "post": {
+        "tags": [
+          "signup-quarantine"
+        ],
+        "summary": "RELEASE a quarantined account: clear its quarantine so it becomes a normal account.",
+        "operationId": "approveSignupQuarantine",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "user_id",
+            "in": "path",
+            "description": "The quarantined account (usr_...)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Required. Replaying a POST with the same key returns the original response without re-executing.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The account is released",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SignupQuarantineDecisionView"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found (no open case, absent, or feature disabled)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency-Key reused with a different request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/signup-quarantine/{user_id}/extend": {
+      "post": {
+        "tags": [
+          "signup-quarantine"
+        ],
+        "summary": "EXTEND a signup-quarantine review window: bump the review deadline (the account stays\nquarantined).",
+        "operationId": "extendSignupQuarantine",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "user_id",
+            "in": "path",
+            "description": "The quarantined account (usr_...)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Required. Replaying a POST with the same key returns the original response without re-executing.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ExtendSignupQuarantineRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The review window is extended",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SignupQuarantineDecisionView"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed request (extend_secs missing or zero)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found (no open case, absent, or feature disabled)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency-Key reused with a different request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/signup-quarantine/{user_id}/reject": {
+      "post": {
+        "tags": [
+          "signup-quarantine"
+        ],
+        "summary": "REJECT a quarantined signup: disable the account and end its sessions.",
+        "operationId": "rejectSignupQuarantine",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "user_id",
+            "in": "path",
+            "description": "The quarantined account (usr_...)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Required. Replaying a POST with the same key returns the original response without re-executing.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The signup is rejected",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SignupQuarantineDecisionView"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found (no open case, absent, or feature disabled)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency-Key reused with a different request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/v1/tenants/{tenant_id}/environments/{environment_id}/users": {
       "get": {
         "tags": [
@@ -7447,6 +7885,22 @@
           }
         }
       },
+      "ExtendSignupQuarantineRequest": {
+        "type": "object",
+        "description": "The body to EXTEND a signup-quarantine review window (issue #82, PR 2). The window is\nrequired; the new horizon is `now + extend_secs`.",
+        "required": [
+          "extend_secs"
+        ],
+        "properties": {
+          "extend_secs": {
+            "type": "integer",
+            "format": "int64",
+            "description": "How many seconds from now to extend the review window by. Must be at least 1.",
+            "example": 604800,
+            "minimum": 0
+          }
+        }
+      },
       "GuardrailView": {
         "type": "object",
         "description": "The typed guardrails an environment enforces (issue #42), derived purely from\nits kind so the production asymmetry can never drift.",
@@ -8704,6 +9158,154 @@
           }
         }
       },
+      "SignupQuarantineCaseView": {
+        "type": "object",
+        "description": "A signup-quarantine review-queue case (issue #82, PR 2), as the management API returns\nit. Carries no secret and no raw PII: the subject is the opaque `usr_` id.",
+        "required": [
+          "id",
+          "tenant_id",
+          "environment_id",
+          "subject",
+          "reason",
+          "state",
+          "created_at_unix_ms"
+        ],
+        "properties": {
+          "created_at_unix_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "When the case was opened, milliseconds since the Unix epoch."
+          },
+          "environment_id": {
+            "type": "string",
+            "description": "The environment the case lives in (`env_...`)."
+          },
+          "id": {
+            "type": "string",
+            "description": "The case identifier (`sqn_...`, embeds its scope)."
+          },
+          "quarantined_until_unix_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "The extend-window horizon, milliseconds since the Unix epoch, or null for an\nindefinite pending case."
+          },
+          "reason": {
+            "$ref": "#/components/schemas/SignupQuarantineReasonView",
+            "description": "Why the signup was quarantined."
+          },
+          "reviewed_at_unix_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "When a review action ran, milliseconds since the Unix epoch, or null."
+          },
+          "reviewed_by_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The id of the reviewing admin actor, or null before any review action."
+          },
+          "reviewed_by_kind": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The kind of the reviewing admin actor, or null before any review action."
+          },
+          "risk_context": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "An optional operator-legibility note (non-secret), or null."
+          },
+          "state": {
+            "$ref": "#/components/schemas/SignupQuarantineStateView",
+            "description": "The review position."
+          },
+          "subject": {
+            "type": "string",
+            "description": "The quarantined account (`usr_...`) the case is about."
+          },
+          "tenant_id": {
+            "type": "string",
+            "description": "The tenant the case belongs to (`ten_...`)."
+          }
+        }
+      },
+      "SignupQuarantineDecisionView": {
+        "type": "object",
+        "description": "A signup-quarantine case's position after a review action (issue #82, PR 2): the\ndeterministic post-condition, so an Idempotency-Key replay is byte-identical.",
+        "required": [
+          "subject",
+          "state"
+        ],
+        "properties": {
+          "quarantined_until_unix_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "The extend-window horizon after an extend, milliseconds since the Unix epoch, or\nnull (absent on approve/reject)."
+          },
+          "state": {
+            "$ref": "#/components/schemas/SignupQuarantineStateView",
+            "description": "The state the case is now in."
+          },
+          "subject": {
+            "type": "string",
+            "description": "The quarantined account (`usr_...`) the decision was about."
+          }
+        }
+      },
+      "SignupQuarantineList": {
+        "type": "object",
+        "description": "A page of signup-quarantine review-queue cases.",
+        "required": [
+          "items"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SignupQuarantineCaseView"
+            },
+            "description": "The open cases on this page, oldest first."
+          },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The opaque cursor for the next page, or null if this is the last page."
+          }
+        }
+      },
+      "SignupQuarantineReasonView": {
+        "type": "string",
+        "description": "Why a signup was quarantined, as the admin review queue reports it.",
+        "enum": [
+          "risk_output",
+          "challenge_failure"
+        ]
+      },
+      "SignupQuarantineStateView": {
+        "type": "string",
+        "description": "A signup-quarantine case's review position, as the admin queue reports it.",
+        "enum": [
+          "pending",
+          "approved",
+          "rejected",
+          "extended"
+        ]
+      },
       "SudoElevationView": {
         "type": "object",
         "description": "The result of a successful admin sudo elevation (issue #73).",
@@ -9125,6 +9727,10 @@
     {
       "name": "invitations",
       "description": "Admin user-invitation CRUD: create (provisioning a pending-verification user and a single-use, expiring, hashed-at-rest token), list, get, revoke, and resend"
+    },
+    {
+      "name": "signup-quarantine",
+      "description": "Signup fraud review queue (issue #82): list the open quarantine cases and release, reject, or extend one (experimental, feature-gated)"
     },
     {
       "name": "exit",

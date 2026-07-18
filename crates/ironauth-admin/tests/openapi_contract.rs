@@ -46,6 +46,7 @@ fn operation_ids_are_the_stable_set() {
         ids,
         vec![
             "applyConfigPromotion",
+            "approveSignupQuarantine",
             "bulkRevokeSessions",
             "createBan",
             "createConnector",
@@ -66,6 +67,7 @@ fn operation_ids_are_the_stable_set() {
             "elevateAdminSudo",
             "exportConfigSnapshot",
             "exportIdentities",
+            "extendSignupQuarantine",
             "getConnector",
             "getConnectorCapabilities",
             "getConnectorHealth",
@@ -97,10 +99,12 @@ fn operation_ids_are_the_stable_set() {
             "listRefreshFamilies",
             "listResourceTypes",
             "listSessions",
+            "listSignupQuarantines",
             "listTenants",
             "listUsers",
             "planConfigPromotion",
             "probePasswordHashing",
+            "rejectSignupQuarantine",
             "resendInvitation",
             "restoreTenant",
             "resumeTenant",
@@ -146,6 +150,7 @@ fn every_list_endpoint_documents_cursor_pagination() {
         "listRefreshFamilies",
         "listUsers",
         "listInvitations",
+        "listSignupQuarantines",
         "listMigrationRuns",
         "listMigrationRunViolations",
     ] {
@@ -187,6 +192,9 @@ fn every_post_documents_the_idempotency_key_header() {
         "createInvitation",
         "revokeInvitation",
         "resendInvitation",
+        "approveSignupQuarantine",
+        "rejectSignupQuarantine",
+        "extendSignupQuarantine",
     ] {
         let params = find_operation(&doc, op)["parameters"]
             .as_array()
@@ -262,6 +270,7 @@ fn documented_paths_are_the_expected_set() {
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/refresh-families/{family_id}",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/sessions",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/sessions/{session_id}",
+            "GET /v1/tenants/{tenant_id}/environments/{environment_id}/signup-quarantine",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/users",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/webauthn/mds3/health",
@@ -286,6 +295,9 @@ fn documented_paths_are_the_expected_set() {
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/password-hashing/probe",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/sessions/revoke",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/sessions/{session_id}/revoke",
+            "POST /v1/tenants/{tenant_id}/environments/{environment_id}/signup-quarantine/{user_id}/approve",
+            "POST /v1/tenants/{tenant_id}/environments/{environment_id}/signup-quarantine/{user_id}/extend",
+            "POST /v1/tenants/{tenant_id}/environments/{environment_id}/signup-quarantine/{user_id}/reject",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/users",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}/sessions/revoke",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}/state",
@@ -332,7 +344,7 @@ fn committed_artifact_matches_generated_spec() {
 async fn served_routes_match_documented_routes() {
     let router = db_free_router();
     let documented = documented_method_paths();
-    assert_eq!(documented.len(), 69, "the documented route count is pinned");
+    assert_eq!(documented.len(), 73, "the documented route count is pinned");
 
     // The OUTBOUND lazy-migration endpoint (issue #58) is the one documented route
     // that is NOT gated by the management `Principal` at 401. It is DISABLED BY

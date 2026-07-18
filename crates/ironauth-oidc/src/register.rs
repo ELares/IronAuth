@@ -12,7 +12,7 @@
 use axum::extract::{Form, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
-use ironauth_store::{ActorRef, CorrelationId, HumanId, StoreError};
+use ironauth_store::{ActorRef, CorrelationId, HumanId, SignupQuarantineReason, StoreError};
 use serde::Deserialize;
 
 use crate::authn::AuthenticationEvent;
@@ -198,14 +198,24 @@ pub async fn register_post(
         &state.registration_abuse_config().disposable_email,
         &ironauth_screening::normalize_nfkc(identifier),
     );
+    // The fraud review queue (issue #82, PR 2): when the signup-quarantine feature is armed,
+    // a registration the risk path would BLOCK is instead QUARANTINED (created with limited
+    // privileges and parked in the admin review queue) so a false positive is RECOVERABLE.
+    // The reason is captured here and the create below chooses the quarantine path; with the
+    // flag OFF the block returns immediately exactly as before (byte-identical behavior).
+    let mut quarantine_reason: Option<SignupQuarantineReason> = None;
     if disposable.is_block() {
-        return register_error(
-            identifier,
-            &resume.return_to,
-            DISPOSABLE_BLOCK_MESSAGE,
-            &resume.hints,
-            banner,
-        );
+        if state.signup_quarantine_enabled() {
+            quarantine_reason = Some(SignupQuarantineReason::RiskOutput);
+        } else {
+            return register_error(
+                identifier,
+                &resume.return_to,
+                DISPOSABLE_BLOCK_MESSAGE,
+                &resume.hints,
+                banner,
+            );
+        }
     }
 
     // Proof-of-work gate (issue #80), CONDITIONED on the #79 risk level (a flagged
@@ -229,13 +239,20 @@ pub async fn register_post(
         )
         .await
         {
-            return register_error(
-                identifier,
-                &resume.return_to,
-                POW_REQUIRED_MESSAGE,
-                &resume.hints,
-                banner,
-            );
+            // A failed registration challenge (issue #82, PR 2): with the signup-quarantine
+            // feature armed, quarantine the signup instead of blocking it; otherwise block
+            // exactly as before.
+            if state.signup_quarantine_enabled() {
+                quarantine_reason = Some(SignupQuarantineReason::ChallengeFailure);
+            } else {
+                return register_error(
+                    identifier,
+                    &resume.return_to,
+                    POW_REQUIRED_MESSAGE,
+                    &resume.hints,
+                    banner,
+                );
+            }
         }
     }
 
@@ -324,7 +341,15 @@ pub async fn register_post(
         .store()
         .scoped(resume.scope)
         .acting(actor, CorrelationId::generate(state.env()));
-    let result = if waitlisted {
+    let result = if let Some(reason) = quarantine_reason {
+        // The fraud queue takes precedence over the waitlist: a risky signup is created
+        // ACTIVE-but-quarantined (it can authenticate with limited privileges) plus a
+        // pending review-queue row, rather than parked unauthenticatable in the waitlist.
+        scoped
+            .users()
+            .register_quarantined(state.env(), identifier, &password_hash, reason)
+            .await
+    } else if waitlisted {
         scoped
             .users()
             .register_in_state(
@@ -343,8 +368,10 @@ pub async fn register_post(
 
     match result {
         // A waitlisted account cannot authenticate: do NOT establish a session; return the
-        // uniform pending acknowledgment. Approval later resumes the normal flow.
-        Ok(_) if waitlisted => registration_pending_page(banner),
+        // uniform pending acknowledgment. Approval later resumes the normal flow. A
+        // quarantined signup (issue #82) is NOT waitlisted: it falls through to the session
+        // path below (it is Active, so it authenticates with limited privileges).
+        Ok(_) if waitlisted && quarantine_reason.is_none() => registration_pending_page(banner),
         Ok(user_id) => {
             let subject = user_id.to_string();
             let session_actor = interaction::user_actor(&user_id);

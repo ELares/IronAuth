@@ -69,6 +69,7 @@ mod ratelimit;
 mod resource_types;
 mod response;
 mod sessions;
+mod signup_quarantine;
 mod state;
 mod sudo;
 mod tenants;
@@ -347,6 +348,26 @@ pub fn management_router(state: AdminState) -> Router {
         .route(
             "/v1/tenants/{tenant_id}/environments/{environment_id}/invitations/{invitation_id}/resend",
             post(invitations::resend_invitation),
+        )
+        // Signup fraud review queue (issue #82, PR 2). The static action suffixes
+        // (/approve, /reject, /extend) are registered before their parameterized sibling so
+        // the router matches them first. Every handler 404s until the signup-quarantine
+        // feature is enabled AND acknowledged.
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/signup-quarantine",
+            get(signup_quarantine::list_signup_quarantines),
+        )
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/signup-quarantine/{user_id}/approve",
+            post(signup_quarantine::approve_signup_quarantine),
+        )
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/signup-quarantine/{user_id}/reject",
+            post(signup_quarantine::reject_signup_quarantine),
+        )
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/signup-quarantine/{user_id}/extend",
+            post(signup_quarantine::extend_signup_quarantine),
         )
         .route(
             "/v1/tenants/{tenant_id}/environments/{environment_id}/refresh-families",

@@ -36,7 +36,7 @@ pub use features::{
     CUSTOM_DOMAINS_ACME_FEATURE, CUSTOM_DOMAINS_ACME_VERSION, FEDCM_FEATURE, FEDCM_VERSION,
     Feature, FeatureRegistry, FeatureValidationError, FeatureViolation,
     GLOBAL_TOKEN_REVOCATION_DRAFT, GLOBAL_TOKEN_REVOCATION_FEATURE, Maturity, RISK_SIGNALS_FEATURE,
-    RISK_SIGNALS_VERSION,
+    RISK_SIGNALS_VERSION, SIGNUP_QUARANTINE_FEATURE, SIGNUP_QUARANTINE_VERSION,
 };
 pub use secret::{REDACTED, Secret, SecretError, SecretString};
 
@@ -1268,6 +1268,13 @@ pub struct OidcConfig {
     /// [`RiskConfig`].
     pub risk: RiskConfig,
 
+    /// The signup-quarantine sensitive-scope policy (issue #82, PR 2): which scopes a
+    /// quarantined account may never receive, so the shared authorize path strips them from
+    /// its grant. Consulted only when the `signup-quarantine` experimental feature is
+    /// enabled AND acknowledged; the conservative default already strips offline access and
+    /// admin/management scopes. See [`QuarantineConfig`].
+    pub quarantine: QuarantineConfig,
+
     /// The registration abuse defenses (issue #80): the invisible self-contained
     /// proof-of-work challenge (the default, with ZERO third-party calls; Turnstile and
     /// reCAPTCHA are optional adapters), the disposable / low-reputation email defense,
@@ -1682,6 +1689,7 @@ impl Default for OidcConfig {
             registration_mode: RegistrationMode::TokenGated,
             regulation: RegulationConfig::default(),
             risk: RiskConfig::default(),
+            quarantine: QuarantineConfig::default(),
             registration_abuse: RegistrationAbuseConfig::default(),
             registration_max_clients: 100,
             registration_rate_limit: 20,
@@ -2314,6 +2322,58 @@ impl Default for RiskConfig {
             disavowal_ttl_secs: 604_800,
             signal_sources: Vec::new(),
         }
+    }
+}
+
+/// The signup-quarantine sensitive-scope policy (issue #82, PR 2): which OAuth scopes a
+/// QUARANTINED account may NEVER receive. A quarantined signup can authenticate, but with
+/// limited privileges: at the shared authorize choke point every requested scope that
+/// matches this denylist is DROPPED from the grant, so a quarantined account is usable but
+/// powerless until an admin releases it. Non-sensitive baseline scopes (`openid`,
+/// `profile`, `email`) are never on the denylist, so a quarantined user still gets a basic
+/// identity token. The denylist is tunable per environment (the tunability principle) with
+/// a CONSERVATIVE default: an operator can add more sensitive scopes (a payment-class scope
+/// for example) but the shipped default already strips the classes that most obviously
+/// grant power (offline access and admin/management scopes).
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields, default)]
+pub struct QuarantineConfig {
+    /// The sensitive-scope denylist a quarantined account is never granted. A requested
+    /// scope token is sensitive when it EQUALS a denylist entry or is a NAMESPACED child of
+    /// one (the entry followed by `:`, `.`, or `/`, so `admin` also covers `admin:read` and
+    /// `admin.users`). The conservative default is `offline_access` (no refresh token for a
+    /// quarantined account), `admin`, and `management` (no admin/management scope). Add more
+    /// (for example a payment-class scope) per environment; over-stripping is the safe
+    /// direction, since a quarantined account is meant to be powerless.
+    pub sensitive_scopes: Vec<String>,
+}
+
+impl Default for QuarantineConfig {
+    fn default() -> Self {
+        Self {
+            sensitive_scopes: vec![
+                "offline_access".to_owned(),
+                "admin".to_owned(),
+                "management".to_owned(),
+            ],
+        }
+    }
+}
+
+impl QuarantineConfig {
+    /// Whether a requested `scope_token` is sensitive for a quarantined account, so it must
+    /// be stripped from the grant. True when the token EQUALS a denylist entry or is a
+    /// NAMESPACED child of one (the entry followed by `:`, `.`, or `/`). An empty denylist
+    /// strips nothing.
+    #[must_use]
+    pub fn is_sensitive(&self, scope_token: &str) -> bool {
+        self.sensitive_scopes.iter().any(|entry| {
+            !entry.is_empty()
+                && (scope_token == entry
+                    || scope_token.strip_prefix(entry).is_some_and(|rest| {
+                        rest.starts_with(':') || rest.starts_with('.') || rest.starts_with('/')
+                    }))
+        })
     }
 }
 
@@ -4883,6 +4943,84 @@ impl std::error::Error for ConfigError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The signup-quarantine sensitive-scope denylist (issue #82, PR 2): the conservative
+    // default strips offline access and admin/management scopes (exact or namespaced), while
+    // the non-sensitive identity baseline (openid, profile, email) is always allowed.
+    #[test]
+    fn quarantine_denylist_strips_sensitive_scopes_with_a_conservative_default() {
+        let cfg = QuarantineConfig::default();
+        // The conservative default is sensitive.
+        for sensitive in [
+            "offline_access",
+            "admin",
+            "admin:read",
+            "admin.users",
+            "admin/write",
+            "management",
+            "management:tenants",
+        ] {
+            assert!(
+                cfg.is_sensitive(sensitive),
+                "{sensitive} must be sensitive by default"
+            );
+        }
+        // The non-sensitive identity baseline is never stripped.
+        for safe in [
+            "openid",
+            "profile",
+            "email",
+            "administrator",
+            "manage_own_profile",
+        ] {
+            assert!(
+                !cfg.is_sensitive(safe),
+                "{safe} must NOT be sensitive (no false positive on a substring)"
+            );
+        }
+        // A payment-class scope becomes sensitive once the operator adds it (tunable).
+        let tuned = QuarantineConfig {
+            sensitive_scopes: vec!["payments".to_owned()],
+        };
+        assert!(tuned.is_sensitive("payments"));
+        assert!(tuned.is_sensitive("payments:charge"));
+        assert!(
+            !tuned.is_sensitive("offline_access"),
+            "a replaced denylist no longer strips the old default"
+        );
+        // An empty denylist strips nothing.
+        let empty = QuarantineConfig {
+            sensitive_scopes: Vec::new(),
+        };
+        assert!(!empty.is_sensitive("offline_access"));
+    }
+
+    // The signup-quarantine denylist round-trips through the [oidc.quarantine] config table
+    // with its conservative default when unset.
+    #[test]
+    fn quarantine_config_defaults_and_parses() {
+        let default = Config::from_toml_str("", "<inline>")
+            .expect("empty config is valid")
+            .config;
+        assert_eq!(
+            default.oidc.quarantine.sensitive_scopes,
+            vec![
+                "offline_access".to_owned(),
+                "admin".to_owned(),
+                "management".to_owned()
+            ]
+        );
+        let tuned = Config::from_toml_str(
+            "[oidc.quarantine]\nsensitive_scopes = [\"offline_access\", \"payments\"]\n",
+            "<inline>",
+        )
+        .expect("tuned config is valid")
+        .config;
+        assert_eq!(
+            tuned.oidc.quarantine.sensitive_scopes,
+            vec!["offline_access".to_owned(), "payments".to_owned()]
+        );
+    }
 
     // The issue #73 flag matrix: both exploratory features are OFF by default and are
     // independently toggleable per environment, so neither one turns the other on.

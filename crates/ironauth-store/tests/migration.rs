@@ -477,7 +477,7 @@ async fn expand_contract_example_chain_runs_all_three_phases_and_contract_remove
 // per real table); splitting it would not make it clearer.
 #[allow(clippy::too_many_lines)]
 #[tokio::test]
-async fn production_chain_is_only_the_sixty_four_real_migrations_and_ships_no_demo_object() {
+async fn production_chain_is_only_the_sixty_five_real_migrations_and_ships_no_demo_object() {
     // TestDatabase::start runs Store::migrate() (the production chain) on a
     // fresh, empty database.
     let db = TestDatabase::start().await;
@@ -494,8 +494,8 @@ async fn production_chain_is_only_the_sixty_four_real_migrations_and_ships_no_de
     );
     assert_eq!(
         report.already_applied(),
-        64,
-        "the production chain is exactly sixty-four migrations (isolation, audit log, management \
+        65,
+        "the production chain is exactly sixty-five migrations (isolation, audit log, management \
          API, OIDC authorization, signing keys, login/consent, authentication context, redirect \
          registration, UserInfo claims, consent scope upsert, resource servers, opaque access \
          tokens, client auth suite, dynamic client registration, pushed authorization requests, \
@@ -512,16 +512,16 @@ async fn production_chain_is_only_the_sixty_four_real_migrations_and_ships_no_de
          risk engine, account recovery, federation connectors, registration abuse defenses, \
          federation login state, enterprise inbound routing, upstream token vault, \
          guarded account links, account linking wiring, FedCM assertion nonces, third-party \
-         risk signals)"
+         risk signals, signup fraud review)"
     );
 
-    // The ledger holds exactly versions 1 through 64.
+    // The ledger holds exactly versions 1 through 65.
     assert_eq!(
         applied_versions(pool).await,
         vec![
             1_i64, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
             24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45,
-            46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64
+            46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65
         ]
     );
     let phase_of = |version: i64| async move {
@@ -841,6 +841,153 @@ async fn production_chain_is_only_the_sixty_four_real_migrations_and_ships_no_de
     assert!(
         !column_is_not_null(pool, "risk_signals", "subject").await,
         "risk_signals.subject (the resolved local usr_ id) must be nullable"
+    );
+
+    // The signup fraud review queue (issue #82, PR 2): an additive users.quarantined ALTER
+    // ADD COLUMN with a control-only column-scoped UPDATE grant, plus one new
+    // signup_quarantines table with its indexes, policy, nonempty-scope CHECK, closed reason
+    // and state CHECKs, and column-scoped grants. All additive, so it is an expand.
+    assert_eq!(phase_of(65).await, "expand");
+
+    // users.quarantined (issue #82, PR 2): the orthogonal quarantine flag, additive with a
+    // NOT NULL DEFAULT false, so every existing account back-fills to unquarantined.
+    assert!(
+        column_exists(pool, "users", "quarantined").await,
+        "users.quarantined exists after 0065"
+    );
+    assert_eq!(
+        column_data_type(pool, "users", "quarantined").await,
+        "boolean",
+        "users.quarantined is a boolean"
+    );
+    // The quarantine flag is CONTROL-ONLY to clear: the control role holds a column-scoped
+    // UPDATE(quarantined), and the data-plane role holds NONE, so a quarantined account has
+    // no data-plane path to self-approve (the self-approval-impossible guarantee at the grant
+    // level, mirroring the #31 client-quarantine split).
+    assert!(
+        role_has_column_privilege(pool, "ironauth_control", "users", "quarantined", "UPDATE").await,
+        "the control role must hold column-scoped UPDATE on users.quarantined"
+    );
+    assert!(
+        !role_has_column_privilege(pool, "ironauth_app", "users", "quarantined", "UPDATE").await,
+        "the data-plane role must NOT hold UPDATE on users.quarantined (no self-approval path)"
+    );
+
+    // signup_quarantines (issue #82, PR 2) is a NEW tenant-scoped table, so it must ENABLE and
+    // FORCE row-level security, carry the (tenant, environment) isolation policy, and pin the
+    // nonempty-scope CHECK, exactly like every other scoped table.
+    assert!(
+        rls_enabled_and_forced(pool, "signup_quarantines").await,
+        "signup_quarantines must ENABLE and FORCE row-level security"
+    );
+    assert!(
+        policy_exists(
+            pool,
+            "signup_quarantines",
+            "signup_quarantines_tenant_isolation"
+        )
+        .await,
+        "signup_quarantines must carry the (tenant, environment) isolation policy"
+    );
+    assert!(
+        check_constraint_exists(
+            pool,
+            "signup_quarantines",
+            "signup_quarantines_scope_nonempty"
+        )
+        .await,
+        "signup_quarantines must carry the nonempty-scope CHECK"
+    );
+    // The closed reason and state CHECKs pin their sets: an unknown reason or state can never
+    // be written.
+    let reason_check: String = sqlx::query(
+        "SELECT pg_get_constraintdef(oid) AS def FROM pg_catalog.pg_constraint \
+         WHERE conrelid = 'signup_quarantines'::regclass \
+         AND conname = 'signup_quarantines_reason_known'",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("signup_quarantines reason check lookup")
+    .get("def");
+    for reason in ["risk_output", "challenge_failure"] {
+        assert!(
+            reason_check.contains(reason),
+            "the signup_quarantines reason CHECK must admit {reason}, got: {reason_check}"
+        );
+    }
+    let state_check: String = sqlx::query(
+        "SELECT pg_get_constraintdef(oid) AS def FROM pg_catalog.pg_constraint \
+         WHERE conrelid = 'signup_quarantines'::regclass \
+         AND conname = 'signup_quarantines_state_known'",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("signup_quarantines state check lookup")
+    .get("def");
+    for state in ["pending", "approved", "rejected", "extended"] {
+        assert!(
+            state_check.contains(state),
+            "the signup_quarantines state CHECK must admit {state}, got: {state_check}"
+        );
+    }
+    // The verdict columns are control-plane-owned (the #31 split): the control role holds a
+    // column-scoped UPDATE over EXACTLY the review columns (state / quarantined_until / the
+    // reviewer stamp / the note), and the data-plane role holds NONE, so only the admin
+    // review queue can move a case forward.
+    for column in [
+        "state",
+        "quarantined_until",
+        "reviewed_by_kind",
+        "reviewed_by_id",
+        "reviewed_at",
+        "review_note",
+    ] {
+        assert!(
+            role_has_column_privilege(
+                pool,
+                "ironauth_control",
+                "signup_quarantines",
+                column,
+                "UPDATE"
+            )
+            .await,
+            "the control role must hold column-scoped UPDATE on signup_quarantines.{column}"
+        );
+        assert!(
+            !role_has_column_privilege(
+                pool,
+                "ironauth_app",
+                "signup_quarantines",
+                column,
+                "UPDATE"
+            )
+            .await,
+            "the data-plane role must NOT hold UPDATE on signup_quarantines.{column}"
+        );
+    }
+    // The IDENTITY columns are NOT in the control grant: the control role decides a case but
+    // can never rewrite WHAT it is about (its subject or reason).
+    for column in ["subject", "reason"] {
+        assert!(
+            !role_has_column_privilege(
+                pool,
+                "ironauth_control",
+                "signup_quarantines",
+                column,
+                "UPDATE"
+            )
+            .await,
+            "the control role must NOT hold UPDATE on the identity column signup_quarantines.{column}"
+        );
+    }
+    // The one-open-case-per-account invariant: a PARTIAL UNIQUE index over
+    // (tenant, environment, subject) WHERE state IN ('pending','extended'), so an account has
+    // at most one OPEN review case at a time (re-quarantining an already-open subject is a
+    // structural conflict, not a silent duplicate).
+    assert!(
+        partial_unique_index_exists(pool, "signup_quarantines", "signup_quarantines_open_uniq")
+            .await,
+        "signup_quarantines must carry the one-open-case-per-account partial unique index"
     );
 
     // The step-up second-factor abuse path (issue #72): migration 0047 WIDENED the

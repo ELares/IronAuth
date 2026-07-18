@@ -13,7 +13,8 @@ use std::fmt;
 use ironauth_store::{
     EnvironmentRecord, GuardrailSet, InvitationAdminRecord, InvitationCredentialType,
     InvitationState, ManagementCredentialRecord, OperatorRecord, OrganizationRecord,
-    RefreshFamilySummary, ResourceType, SessionSummary, TenantRecord, UserAdminRecord, UserState,
+    RefreshFamilySummary, ResourceType, SessionSummary, SignupQuarantineReason,
+    SignupQuarantineState, SignupQuarantineView, TenantRecord, UserAdminRecord, UserState,
 };
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -1165,6 +1166,146 @@ pub struct InvitationStateChangeView {
     pub id: String,
     /// The state the invitation is now in.
     pub state: InvitationStateView,
+}
+
+// ---------------------------------------------------------------------------
+// Signup fraud review queue (issue #82, PR 2).
+// ---------------------------------------------------------------------------
+
+/// Why a signup was quarantined, as the admin review queue reports it.
+#[derive(Debug, Clone, Copy, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SignupQuarantineReasonView {
+    /// A disposable / low-reputation identifier the risk path would have blocked.
+    RiskOutput,
+    /// A failed registration challenge (an unsolved proof-of-work gate).
+    ChallengeFailure,
+}
+
+impl From<SignupQuarantineReason> for SignupQuarantineReasonView {
+    fn from(reason: SignupQuarantineReason) -> Self {
+        match reason {
+            SignupQuarantineReason::RiskOutput => SignupQuarantineReasonView::RiskOutput,
+            SignupQuarantineReason::ChallengeFailure => {
+                SignupQuarantineReasonView::ChallengeFailure
+            }
+        }
+    }
+}
+
+/// A signup-quarantine case's review position, as the admin queue reports it.
+#[derive(Debug, Clone, Copy, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SignupQuarantineStateView {
+    /// Awaiting review; the account is quarantined.
+    Pending,
+    /// Released by an admin: the account's quarantine was cleared.
+    Approved,
+    /// Rejected by an admin: the account was disabled and its sessions ended.
+    Rejected,
+    /// Its review window was extended by an admin; the account stays quarantined.
+    Extended,
+}
+
+impl From<SignupQuarantineState> for SignupQuarantineStateView {
+    fn from(state: SignupQuarantineState) -> Self {
+        match state {
+            SignupQuarantineState::Pending => SignupQuarantineStateView::Pending,
+            SignupQuarantineState::Approved => SignupQuarantineStateView::Approved,
+            SignupQuarantineState::Rejected => SignupQuarantineStateView::Rejected,
+            SignupQuarantineState::Extended => SignupQuarantineStateView::Extended,
+        }
+    }
+}
+
+/// A signup-quarantine review-queue case (issue #82, PR 2), as the management API returns
+/// it. Carries no secret and no raw PII: the subject is the opaque `usr_` id.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct SignupQuarantineCaseView {
+    /// The case identifier (`sqn_...`, embeds its scope).
+    pub id: String,
+    /// The tenant the case belongs to (`ten_...`).
+    pub tenant_id: String,
+    /// The environment the case lives in (`env_...`).
+    pub environment_id: String,
+    /// The quarantined account (`usr_...`) the case is about.
+    pub subject: String,
+    /// Why the signup was quarantined.
+    pub reason: SignupQuarantineReasonView,
+    /// An optional operator-legibility note (non-secret), or null.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub risk_context: Option<String>,
+    /// The review position.
+    pub state: SignupQuarantineStateView,
+    /// The extend-window horizon, milliseconds since the Unix epoch, or null for an
+    /// indefinite pending case.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quarantined_until_unix_ms: Option<i64>,
+    /// When the case was opened, milliseconds since the Unix epoch.
+    pub created_at_unix_ms: i64,
+    /// The kind of the reviewing admin actor, or null before any review action.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reviewed_by_kind: Option<String>,
+    /// The id of the reviewing admin actor, or null before any review action.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reviewed_by_id: Option<String>,
+    /// When a review action ran, milliseconds since the Unix epoch, or null.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reviewed_at_unix_ms: Option<i64>,
+}
+
+impl SignupQuarantineCaseView {
+    /// Build a view from a stored case.
+    #[must_use]
+    pub fn from_view(view: SignupQuarantineView) -> Self {
+        Self {
+            id: view.id.to_string(),
+            tenant_id: view.id.scope().tenant().to_string(),
+            environment_id: view.id.scope().environment().to_string(),
+            subject: view.subject.to_string(),
+            reason: view.reason.into(),
+            risk_context: view.risk_context,
+            state: view.state.into(),
+            quarantined_until_unix_ms: view.quarantined_until_unix_micros.map(ms),
+            created_at_unix_ms: ms(view.created_at_unix_micros),
+            reviewed_by_kind: view.reviewed_by_kind,
+            reviewed_by_id: view.reviewed_by_id,
+            reviewed_at_unix_ms: view.reviewed_at_unix_micros.map(ms),
+        }
+    }
+}
+
+/// A page of signup-quarantine review-queue cases.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct SignupQuarantineList {
+    /// The open cases on this page, oldest first.
+    pub items: Vec<SignupQuarantineCaseView>,
+    /// The opaque cursor for the next page, or null if this is the last page.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+/// A signup-quarantine case's position after a review action (issue #82, PR 2): the
+/// deterministic post-condition, so an Idempotency-Key replay is byte-identical.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct SignupQuarantineDecisionView {
+    /// The quarantined account (`usr_...`) the decision was about.
+    pub subject: String,
+    /// The state the case is now in.
+    pub state: SignupQuarantineStateView,
+    /// The extend-window horizon after an extend, milliseconds since the Unix epoch, or
+    /// null (absent on approve/reject).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quarantined_until_unix_ms: Option<i64>,
+}
+
+/// The body to EXTEND a signup-quarantine review window (issue #82, PR 2). The window is
+/// required; the new horizon is `now + extend_secs`.
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct ExtendSignupQuarantineRequest {
+    /// How many seconds from now to extend the review window by. Must be at least 1.
+    #[schema(example = 604_800)]
+    pub extend_secs: u64,
 }
 
 // ---------------------------------------------------------------------------

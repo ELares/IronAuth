@@ -26,14 +26,16 @@ use crate::views::{
     CreateConnectorRequest, CreateDcrPolicyRequest, CreateEnvironmentRequest,
     CreateInitialAccessTokenRequest, CreateInvitationRequest, CreateManagementKeyRequest,
     CreateOrganizationRequest, CreateTenantRequest, CreateUserRequest, DcrPolicyList,
-    DcrPolicyView, EnvironmentList, EnvironmentView, GuardrailView, InitialAccessTokenCreated,
-    InvitationCreatedView, InvitationCredentialTypeView, InvitationList, InvitationStateChangeView,
-    InvitationStateView, InvitationView, LinkExternalIdRequest, ManagementKeyCreated,
-    ManagementKeyList, ManagementKeyView, OperatorList, OperatorView, OrganizationList,
-    OrganizationView, RefreshFamilyList, RefreshFamilyView, ResourceTypeView, ResourceTypesList,
-    RevokeSessionsRequest, SessionList, SessionRevocationView, SessionView, SetUserStateRequest,
-    TenantCreated, TenantList, TenantStatusView, TenantView, UpdateUserRequest, UserExternalIdView,
-    UserList, UserRevocationView, UserStateChangeView, UserStateView, UserView,
+    DcrPolicyView, EnvironmentList, EnvironmentView, ExtendSignupQuarantineRequest, GuardrailView,
+    InitialAccessTokenCreated, InvitationCreatedView, InvitationCredentialTypeView, InvitationList,
+    InvitationStateChangeView, InvitationStateView, InvitationView, LinkExternalIdRequest,
+    ManagementKeyCreated, ManagementKeyList, ManagementKeyView, OperatorList, OperatorView,
+    OrganizationList, OrganizationView, RefreshFamilyList, RefreshFamilyView, ResourceTypeView,
+    ResourceTypesList, RevokeSessionsRequest, SessionList, SessionRevocationView, SessionView,
+    SetUserStateRequest, SignupQuarantineCaseView, SignupQuarantineDecisionView,
+    SignupQuarantineList, SignupQuarantineReasonView, SignupQuarantineStateView, TenantCreated,
+    TenantList, TenantStatusView, TenantView, UpdateUserRequest, UserExternalIdView, UserList,
+    UserRevocationView, UserStateChangeView, UserStateView, UserView,
 };
 
 /// The management API's OpenAPI document. The handlers listed in `paths(...)`
@@ -79,6 +81,9 @@ use crate::views::{
         (name = "invitations", description = "Admin user-invitation CRUD: create (provisioning a \
                                              pending-verification user and a single-use, expiring, \
                                              hashed-at-rest token), list, get, revoke, and resend"),
+        (name = "signup-quarantine", description = "Signup fraud review queue (issue #82): \
+                                             list the open quarantine cases and release, \
+                                             reject, or extend one (experimental, feature-gated)"),
         (name = "exit", description = "The exit-friendliness covenant (issue #58): the full \
                                      identity export (users, traits, states, external ids, and \
                                      password hashes with their algorithm tags) in the \
@@ -150,6 +155,10 @@ use crate::views::{
         crate::invitations::get_invitation,
         crate::invitations::revoke_invitation,
         crate::invitations::resend_invitation,
+        crate::signup_quarantine::list_signup_quarantines,
+        crate::signup_quarantine::approve_signup_quarantine,
+        crate::signup_quarantine::reject_signup_quarantine,
+        crate::signup_quarantine::extend_signup_quarantine,
         crate::export::export_identities,
         crate::migration::verify_credential,
         crate::migration_status::get_migration_progress,
@@ -222,6 +231,12 @@ use crate::views::{
         CreateInvitationRequest,
         InvitationCreatedView,
         InvitationStateChangeView,
+        SignupQuarantineReasonView,
+        SignupQuarantineStateView,
+        SignupQuarantineCaseView,
+        SignupQuarantineList,
+        SignupQuarantineDecisionView,
+        ExtendSignupQuarantineRequest,
         crate::migration::VerifyCredentialRequest,
         crate::migration::VerifyCredentialResponse,
         crate::migration::VerifyProfile,

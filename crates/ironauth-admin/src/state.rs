@@ -97,6 +97,13 @@ struct Inner {
     // surface behaves exactly as before.
     sudo_mode_enabled: bool,
     sudo_mode_window_secs: u64,
+    // Whether the experimental signup fraud-review-queue surface is armed (issue #82, PR 2).
+    // Resolved by the boot path from the strict config feature ladder (the
+    // `signup-quarantine` experimental feature enabled AND acked at the exact version) and
+    // installed via the builder, NOT an AdminConfig toggle, so an operator cannot arm the
+    // review-queue endpoints outside the experimental ack gate. Off by default; when off
+    // every signup-quarantine review-queue endpoint answers a uniform 404.
+    signup_quarantine_enabled: bool,
 }
 
 impl AdminState {
@@ -182,8 +189,33 @@ impl AdminState {
                 federation: None,
                 sudo_mode_enabled: config.sudo_mode_enabled,
                 sudo_mode_window_secs: config.sudo_mode_window_secs,
+                signup_quarantine_enabled: false,
             }),
         })
+    }
+
+    /// Arm the experimental signup fraud-review-queue admin surface (issue #82, PR 2).
+    ///
+    /// The boot path is the ONLY caller: it resolves `enabled` from the strict config
+    /// feature ladder (the `signup-quarantine` experimental feature enabled AND acknowledged
+    /// at the exact version) and installs the SAME bool it installs on the OIDC data plane. A
+    /// builder rather than an `AdminConfig` field precisely so an operator cannot arm the
+    /// review-queue endpoints from a plain config toggle and bypass the experimental acknowledgment
+    /// gate. When false (the default), every review-queue endpoint answers a uniform 404.
+    #[must_use]
+    pub fn with_signup_quarantine_enabled(mut self, enabled: bool) -> Self {
+        if let Some(inner) = Arc::get_mut(&mut self.inner) {
+            inner.signup_quarantine_enabled = enabled;
+        }
+        self
+    }
+
+    /// Whether the experimental signup fraud-review-queue admin surface is armed (issue #82,
+    /// PR 2). Every review-queue handler's first action is to return a uniform 404 when this
+    /// is false.
+    #[must_use]
+    pub fn signup_quarantine_enabled(&self) -> bool {
+        self.inner.signup_quarantine_enabled
     }
 
     /// Share the inbound lazy-migration hook (issue #56) with the management plane, so the

@@ -24,7 +24,8 @@ use std::time::{Duration, SystemTime};
 use tokio::sync::Semaphore;
 
 use ironauth_config::{
-    ClientAssertionAudience, ClientCredentialsAudience, OidcConfig, RegistrationMode,
+    ClientAssertionAudience, ClientCredentialsAudience, OidcConfig, QuarantineConfig,
+    RegistrationMode,
 };
 use ironauth_env::Env;
 use ironauth_jose::{JwsAlgorithm, TrustedKey, VerificationPolicy, VerifiedToken, verify};
@@ -222,6 +223,18 @@ pub struct OidcState {
     // never reads an external signal. The per-source config that SHAPES ingestion lives in
     // `RiskConfig` (config data cannot arm the surface).
     risk_signals_enabled: bool,
+    // Whether the experimental signup fraud-review-queue surface is armed (issue #82, PR 2).
+    // Kept OUTSIDE `Inner` and set through the builder for the SAME anti-bypass reason as
+    // fedcm/risk-signals: it is NOT a plain `OidcConfig` toggle an operator can flip (that
+    // would arm the register-path quarantine hook and the quarantined-user authorize
+    // restrictions outside the experimental acknowledgment gate). The ONLY writer is the
+    // boot path, which resolves it from the strict config feature ladder (the
+    // `signup-quarantine` experimental feature enabled AND acked at the exact version) and
+    // sets it here. Default: false, so the register path BLOCKS a risky signup exactly as
+    // before, the quarantine authorize restrictions never run, and the admin review-queue
+    // endpoints answer a uniform 404. The sensitive-scope denylist that SHAPES the strip
+    // lives in `Inner` (config data cannot arm the surface).
+    signup_quarantine_enabled: bool,
     // The per-tenant/per-environment quota enforcer (issue #50), the data plane's
     // tenant-fairness layer. Kept OUTSIDE `Inner` and installed by the boot path
     // (built from the [quota] config, seeded with the SAME env clock), so a spend
@@ -513,6 +526,12 @@ struct Inner {
     // the engine reads every per-signal toggle, threshold, and allow/deny list from one
     // immutable, config-derived source. Off by default (the engine is fully inert).
     risk: ironauth_config::RiskConfig,
+    // The signup-quarantine sensitive-scope policy (issue #82, PR 2): the denylist the
+    // authorize path uses to strip sensitive scopes from a quarantined account's grant, held
+    // verbatim from the validated config. Consulted only when the `signup-quarantine`
+    // experimental feature is armed; the conservative default strips offline access and
+    // admin/management scopes.
+    quarantine: QuarantineConfig,
     // Registration abuse defenses (issue #80): the whole validated config held verbatim
     // so the proof-of-work gate, the disposable-email defense, and the waitlist gate read
     // their per-environment settings (and the promotable domain allow/deny lists) from one
@@ -709,6 +728,7 @@ impl OidcState {
                 trusted_device_revoke_on_password_change: config
                     .trusted_device_revoke_on_password_change,
                 risk: config.risk.clone(),
+                quarantine: config.quarantine.clone(),
                 registration_abuse: config.registration_abuse.clone(),
                 email_otp_enabled: config.email_otp_enabled,
                 email_otp_code_digits: config.email_otp_code_digits,
@@ -764,6 +784,7 @@ impl OidcState {
             global_token_revocation_enabled: false,
             fedcm_enabled: false,
             risk_signals_enabled: false,
+            signup_quarantine_enabled: false,
             quota: None,
             migration_hook: None,
             hashing_pool: None,
@@ -884,6 +905,37 @@ impl OidcState {
     #[must_use]
     pub fn risk_signals_enabled(&self) -> bool {
         self.risk_signals_enabled
+    }
+
+    /// Arm the experimental signup fraud-review-queue surface (issue #82, PR 2).
+    ///
+    /// The boot path is the ONLY caller: it resolves `enabled` from the strict config
+    /// feature ladder (the `signup-quarantine` experimental feature enabled AND acknowledged
+    /// at the exact version) and passes the result here. It is a builder rather than an
+    /// `OidcConfig` field precisely so an operator cannot arm the register-path quarantine
+    /// hook (or the quarantined-user authorize restrictions) from a plain config toggle and
+    /// bypass the experimental ack gate. When false (the default), the register path BLOCKS a
+    /// risky signup exactly as before and the quarantine restrictions never run.
+    #[must_use]
+    pub fn with_signup_quarantine_enabled(mut self, enabled: bool) -> Self {
+        self.signup_quarantine_enabled = enabled;
+        self
+    }
+
+    /// Whether the experimental signup fraud-review-queue surface is armed (issue #82,
+    /// PR 2). The register path quarantines a risky signup (instead of blocking) ONLY when
+    /// this is true, and the authorize path applies the quarantined-user restrictions
+    /// (consent always shown, sensitive scopes stripped) ONLY when this is true.
+    #[must_use]
+    pub fn signup_quarantine_enabled(&self) -> bool {
+        self.signup_quarantine_enabled
+    }
+
+    /// The signup-quarantine sensitive-scope policy (issue #82, PR 2): the denylist the
+    /// authorize path uses to strip sensitive scopes from a quarantined account's grant.
+    #[must_use]
+    pub fn quarantine_config(&self) -> &QuarantineConfig {
+        &self.inner.quarantine
     }
 
     /// Install the per-tenant/per-environment quota enforcer (issue #50), turning
