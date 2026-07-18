@@ -33,10 +33,11 @@ use serde::{Deserialize, Serialize};
 
 pub use dsn::{Dsn, DsnError, KNOWN_SCHEMES};
 pub use features::{
-    CUSTOM_DOMAINS_ACME_FEATURE, CUSTOM_DOMAINS_ACME_VERSION, FEDCM_FEATURE, FEDCM_VERSION,
-    Feature, FeatureRegistry, FeatureValidationError, FeatureViolation,
-    GLOBAL_TOKEN_REVOCATION_DRAFT, GLOBAL_TOKEN_REVOCATION_FEATURE, Maturity, RISK_SIGNALS_FEATURE,
-    RISK_SIGNALS_VERSION, SIGNUP_QUARANTINE_FEATURE, SIGNUP_QUARANTINE_VERSION,
+    ADVANCED_RECOVERY_FEATURE, ADVANCED_RECOVERY_VERSION, CUSTOM_DOMAINS_ACME_FEATURE,
+    CUSTOM_DOMAINS_ACME_VERSION, FEDCM_FEATURE, FEDCM_VERSION, Feature, FeatureRegistry,
+    FeatureValidationError, FeatureViolation, GLOBAL_TOKEN_REVOCATION_DRAFT,
+    GLOBAL_TOKEN_REVOCATION_FEATURE, Maturity, RISK_SIGNALS_FEATURE, RISK_SIGNALS_VERSION,
+    SIGNUP_QUARANTINE_FEATURE, SIGNUP_QUARANTINE_VERSION,
 };
 pub use secret::{REDACTED, Secret, SecretError, SecretString};
 
@@ -1275,6 +1276,13 @@ pub struct OidcConfig {
     /// admin/management scopes. See [`QuarantineConfig`].
     pub quarantine: QuarantineConfig,
 
+    /// The advanced-recovery-modes policy (issue #82, PR 3): the three mode sub-toggles under
+    /// the single `advanced-recovery` experimental ack, the trusted-contact confirmation
+    /// threshold, and the registered IDV providers. Consulted only when the
+    /// `advanced-recovery` experimental feature is enabled AND acknowledged. See
+    /// [`AdvancedRecoveryConfig`].
+    pub advanced_recovery: AdvancedRecoveryConfig,
+
     /// The registration abuse defenses (issue #80): the invisible self-contained
     /// proof-of-work challenge (the default, with ZERO third-party calls; Turnstile and
     /// reCAPTCHA are optional adapters), the disposable / low-reputation email defense,
@@ -1690,6 +1698,7 @@ impl Default for OidcConfig {
             regulation: RegulationConfig::default(),
             risk: RiskConfig::default(),
             quarantine: QuarantineConfig::default(),
+            advanced_recovery: AdvancedRecoveryConfig::default(),
             registration_abuse: RegistrationAbuseConfig::default(),
             registration_max_clients: 100,
             registration_rate_limit: 20,
@@ -2374,6 +2383,135 @@ impl QuarantineConfig {
                         rest.starts_with(':') || rest.starts_with('.') || rest.starts_with('/')
                     }))
         })
+    }
+}
+
+/// The advanced-recovery-modes policy (issue #82, PR 3): the three mode sub-toggles under the
+/// single `advanced-recovery` experimental ack, the trusted-contact confirmation threshold
+/// (fork F7), and the registered IDV providers (fork F8). Consulted ONLY when the
+/// `advanced-recovery` experimental feature is armed (enabled AND acknowledged); with the
+/// feature off every advanced-recovery path is a uniform 404 regardless of these toggles, so
+/// config data can never arm the surface. Each mode completes THROUGH the recovery delay
+/// window and the downgrade invariant, never around them.
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields, default)]
+pub struct AdvancedRecoveryConfig {
+    /// Whether the ADMIN-APPROVED recovery mode is active (issue #82, PR 3). A recovery
+    /// requested in this mode lands in the control-plane admin review queue; an admin
+    /// approval satisfies the method precondition (completion still runs through the delay /
+    /// downgrade gate). Off by default; inert unless the `advanced-recovery` feature is armed.
+    pub admin_approved_enabled: bool,
+
+    /// Whether the TRUSTED-CONTACT recovery mode is active (issue #82, PR 3). A user
+    /// designates contacts who confirm a recovery out of band with single-use links; the
+    /// recovery completes once [`required_confirmations`](Self::required_confirmations)
+    /// distinct contacts have confirmed AND the delay / downgrade gate passes. Off by default.
+    pub trusted_contact_enabled: bool,
+
+    /// Whether the IDV-GATED recovery mode is active (issue #82, PR 3). A recovery redirects
+    /// to a configured external identity-verification provider and consumes its signed
+    /// callback; a valid single-use case-bound PASS callback satisfies the method
+    /// precondition. Off by default. Requires at least one enabled entry in
+    /// [`idv_providers`](Self::idv_providers).
+    pub idv_enabled: bool,
+
+    /// The trusted-contact confirmation threshold (fork F7): how many DISTINCT designated
+    /// contacts must confirm before a trusted-contact recovery may complete. Default 1;
+    /// capped at the number of designated contacts at initiation (a threshold above the
+    /// contact count would be unreachable). Must be at least 1.
+    pub required_confirmations: u32,
+
+    /// The registered external IDV providers (fork F8): each maps a provider slug to its
+    /// redirect URL and its registered public key(s), so an IDV callback's signature is
+    /// verified against a REGISTERED key through the hardened JOSE core (never a key from the
+    /// token, never `alg=none`). IronAuth only ever CONSUMES a provider's signed assertion;
+    /// it never verifies identity documents in house. Empty by default.
+    pub idv_providers: Vec<IdvProvider>,
+}
+
+impl Default for AdvancedRecoveryConfig {
+    fn default() -> Self {
+        Self {
+            admin_approved_enabled: false,
+            trusted_contact_enabled: false,
+            idv_enabled: false,
+            required_confirmations: 1,
+            idv_providers: Vec::new(),
+        }
+    }
+}
+
+impl AdvancedRecoveryConfig {
+    /// The registered IDV provider with the given slug, if it is enabled (issue #82, PR 3).
+    /// A disabled or unknown provider yields [`None`], so an IDV recovery for it is rejected.
+    #[must_use]
+    pub fn idv_provider(&self, slug: &str) -> Option<&IdvProvider> {
+        self.idv_providers
+            .iter()
+            .find(|provider| provider.enabled && provider.slug == slug)
+    }
+}
+
+/// A registered external identity-verification (IDV) provider (issue #82, PR 3, fork F8).
+///
+/// An IDV-gated recovery redirects to this provider's [`redirect_url`](Self::redirect_url),
+/// carrying the recovery-case binding, and later consumes a SIGNED callback (a JWS). The
+/// callback's signature is verified through the hardened JOSE core against this provider's
+/// REGISTERED public key(s) ([`jwks`](Self::jwks)), with the algorithm taken from
+/// [`algorithms`](Self::algorithms) (never the token header, and `alg=none`/HMAC structurally
+/// inexpressible). Only a verified, single-use, case-bound PASS callback completes the
+/// recovery. IronAuth never performs document verification itself; it only consumes the
+/// provider's signed assertion.
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields, default)]
+pub struct IdvProvider {
+    /// The provider slug: the stable identifier the IDV session records and the callback
+    /// route selects. Must be non-empty and unique across providers.
+    pub slug: String,
+
+    /// Whether this provider is active (issue #82). When false, an IDV recovery naming it is
+    /// rejected. Default true: a listed provider is active unless disabled.
+    pub enabled: bool,
+
+    /// The provider's redirect URL the recovery redirects the user to, carrying the case
+    /// binding. Must be a non-empty absolute `https` URL when the provider is enabled.
+    pub redirect_url: String,
+
+    /// The provider's registered PUBLIC keys as a JWKS JSON document (issue #82). Only public
+    /// JWK members are read (the JOSE core is fail-closed), and this is the ONLY key source
+    /// the callback signature is verified against (never a key from the token header). Must
+    /// be a non-empty JWKS when the provider is enabled.
+    pub jwks: String,
+
+    /// The JWS algorithm allowlist a callback from this provider may be signed with (issue
+    /// #82), as JOSE `alg` names (for example `EdDSA`, `ES256`). A callback whose `alg` is
+    /// outside this list is rejected. Must be non-empty when the provider is enabled;
+    /// `alg=none` and the HMAC families are structurally inexpressible in the JOSE core
+    /// regardless.
+    pub algorithms: Vec<String>,
+
+    /// The `iss` the callback is verified under (issue #82): the provider identity the JOSE
+    /// core enforces `expected_iss == iss` against. Must be non-empty when the provider is
+    /// enabled.
+    pub iss: String,
+
+    /// The callback-session lifetime in seconds (issue #82): an IDV session older than this
+    /// (measured on the env clock seam) can no longer be completed by a callback. Default
+    /// 900 (fifteen minutes). Must be between 1 and `OIDC_MAX_LIFETIME_SECS`.
+    pub session_ttl_secs: u64,
+}
+
+impl Default for IdvProvider {
+    fn default() -> Self {
+        Self {
+            slug: String::new(),
+            enabled: true,
+            redirect_url: String::new(),
+            jwks: String::new(),
+            algorithms: Vec::new(),
+            iss: String::new(),
+            session_ttl_secs: 900,
+        }
     }
 }
 
@@ -3385,6 +3523,7 @@ impl Config {
         validate_federation(&self.oidc)?;
         validate_regulation(&self.oidc)?;
         validate_risk(&self.oidc)?;
+        validate_advanced_recovery(&self.oidc)?;
         validate_registration_abuse(&self.oidc)?;
         validate_webauthn(&self.oidc, &self.server)?;
         validate_totp(&self.oidc)?;
@@ -3648,6 +3787,104 @@ fn validate_risk_signal_sources(risk: &RiskConfig) -> Result<(), ConfigError> {
                     "oidc.risk.signal_sources[{}].max_age_secs ({}) must be between 1 and \
                      {OIDC_MAX_LIFETIME_SECS} seconds",
                     source.iss, source.max_age_secs
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Validate the advanced-recovery-modes policy (issue #82, PR 3). The bounds hold even when
+/// the `advanced-recovery` feature is off, so an out-of-band value cannot take effect the
+/// moment the surface is armed: the confirmation threshold is at least 1, and each IDV
+/// provider slug is non-empty and unique, an enabled provider carries an absolute https
+/// redirect URL, a non-empty JWKS, a non-empty algorithm allowlist and an `iss`, and the
+/// session TTL is bounded.
+///
+/// This crate carries no `ironauth-jose` dependency, so it can only check the JWKS is
+/// NON-EMPTY here, not that it PARSES. The parse check (a non-empty but malformed JWKS must
+/// fail boot cleanly, not fail closed at every callback) is enforced at the jose-available
+/// state-build step where the feature is resolved, mirroring the risk-signal JWKS check.
+fn validate_advanced_recovery(oidc: &OidcConfig) -> Result<(), ConfigError> {
+    let cfg = &oidc.advanced_recovery;
+    if cfg.required_confirmations < 1 {
+        return Err(ConfigError::Invalid {
+            message: "oidc.advanced_recovery.required_confirmations must be at least 1".to_owned(),
+        });
+    }
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
+    for provider in &cfg.idv_providers {
+        if provider.slug.is_empty() {
+            return Err(ConfigError::Invalid {
+                message: "oidc.advanced_recovery.idv_providers[].slug must be non-empty".to_owned(),
+            });
+        }
+        if !seen.insert(provider.slug.as_str()) {
+            return Err(ConfigError::Invalid {
+                message: format!(
+                    "oidc.advanced_recovery.idv_providers[].slug ({}) is registered more than once",
+                    provider.slug
+                ),
+            });
+        }
+        if provider.enabled {
+            if provider.redirect_url.trim().is_empty() {
+                return Err(ConfigError::Invalid {
+                    message: format!(
+                        "oidc.advanced_recovery.idv_providers[{}].redirect_url must be non-empty \
+                         when the provider is enabled",
+                        provider.slug
+                    ),
+                });
+            }
+            // The redirect_url is where an IDV recovery sends the user; the doc pins it to an
+            // absolute https URL. A relative or plaintext-http target (or a structurally
+            // malformed URL) must fail at LOAD, not silently break every IDV recovery for this
+            // provider at redirect time. Purely syntactic (no DNS, no network).
+            if !is_well_formed_https_endpoint(provider.redirect_url.trim()) {
+                return Err(ConfigError::Invalid {
+                    message: format!(
+                        "oidc.advanced_recovery.idv_providers[{}].redirect_url must be an \
+                         absolute https URL with a host when the provider is enabled (a \
+                         relative, plaintext http, or malformed URL is refused)",
+                        provider.slug
+                    ),
+                });
+            }
+            if provider.jwks.trim().is_empty() {
+                return Err(ConfigError::Invalid {
+                    message: format!(
+                        "oidc.advanced_recovery.idv_providers[{}].jwks must be a non-empty JWKS \
+                         when the provider is enabled",
+                        provider.slug
+                    ),
+                });
+            }
+            if provider.algorithms.is_empty() {
+                return Err(ConfigError::Invalid {
+                    message: format!(
+                        "oidc.advanced_recovery.idv_providers[{}].algorithms must list at least \
+                         one algorithm when the provider is enabled",
+                        provider.slug
+                    ),
+                });
+            }
+            if provider.iss.trim().is_empty() {
+                return Err(ConfigError::Invalid {
+                    message: format!(
+                        "oidc.advanced_recovery.idv_providers[{}].iss must be non-empty when the \
+                         provider is enabled",
+                        provider.slug
+                    ),
+                });
+            }
+        }
+        if provider.session_ttl_secs < 1 || provider.session_ttl_secs > OIDC_MAX_LIFETIME_SECS {
+            return Err(ConfigError::Invalid {
+                message: format!(
+                    "oidc.advanced_recovery.idv_providers[{}].session_ttl_secs ({}) must be \
+                     between 1 and {OIDC_MAX_LIFETIME_SECS} seconds",
+                    provider.slug, provider.session_ttl_secs
                 ),
             });
         }
@@ -6288,6 +6525,50 @@ enabled = true
                 "{bad}: unexpected error {err}"
             );
         }
+    }
+
+    #[test]
+    fn advanced_recovery_idv_redirect_url_must_be_absolute_https_at_load() {
+        // A well-formed absolute https redirect_url on an enabled IDV provider loads cleanly.
+        let ok = "[oidc.advanced_recovery]\nidv_enabled = true\n\
+                  [[oidc.advanced_recovery.idv_providers]]\nslug = \"acme\"\nenabled = true\n\
+                  redirect_url = \"https://idv.example.test/verify\"\n\
+                  jwks = \"{\\\"keys\\\":[]}\"\nalgorithms = [\"EdDSA\"]\n\
+                  iss = \"https://idv.example.test\"\n";
+        Config::from_toml_str(ok, "<inline>").expect("an absolute https redirect_url loads");
+
+        // A relative, plaintext http, wrong-scheme, or structurally malformed redirect_url is a
+        // LOAD error (the doc pins it to an absolute https URL), not a silent per-recovery
+        // redirect failure at runtime.
+        for bad in [
+            "/verify",                        // relative (no scheme, no host)
+            "http://idv.example.test/verify", // plaintext (refused)
+            "ftp://idv.example.test/verify",  // wrong scheme
+            "https://",                       // no host
+            "https://idv exam.test/verify",   // embedded space
+        ] {
+            let input = format!(
+                "[oidc.advanced_recovery]\nidv_enabled = true\n\
+                 [[oidc.advanced_recovery.idv_providers]]\nslug = \"acme\"\nenabled = true\n\
+                 redirect_url = \"{bad}\"\njwks = \"{{\\\"keys\\\":[]}}\"\n\
+                 algorithms = [\"EdDSA\"]\niss = \"https://idv.example.test\"\n"
+            );
+            let err = Config::from_toml_str(&input, "<inline>")
+                .expect_err(&format!("{bad} must be a load error"));
+            assert!(
+                err.to_string()
+                    .contains("redirect_url must be an absolute https URL"),
+                "{bad}: unexpected error {err}"
+            );
+        }
+
+        // A DISABLED provider with a non-https redirect_url is inert: it never fails boot (the
+        // https gate applies only to an enabled provider, matching the existing gating).
+        let disabled = "[oidc.advanced_recovery]\n\
+                        [[oidc.advanced_recovery.idv_providers]]\nslug = \"acme\"\n\
+                        enabled = false\nredirect_url = \"/relative\"\n";
+        Config::from_toml_str(disabled, "<inline>")
+            .expect("a disabled provider with a non-https redirect_url is inert");
     }
 
     #[test]

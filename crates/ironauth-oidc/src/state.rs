@@ -24,8 +24,8 @@ use std::time::{Duration, SystemTime};
 use tokio::sync::Semaphore;
 
 use ironauth_config::{
-    ClientAssertionAudience, ClientCredentialsAudience, OidcConfig, QuarantineConfig,
-    RegistrationMode,
+    AdvancedRecoveryConfig, ClientAssertionAudience, ClientCredentialsAudience, OidcConfig,
+    QuarantineConfig, RegistrationMode,
 };
 use ironauth_env::Env;
 use ironauth_jose::{JwsAlgorithm, TrustedKey, VerificationPolicy, VerifiedToken, verify};
@@ -235,6 +235,15 @@ pub struct OidcState {
     // endpoints answer a uniform 404. The sensitive-scope denylist that SHAPES the strip
     // lives in `Inner` (config data cannot arm the surface).
     signup_quarantine_enabled: bool,
+    // Whether the experimental advanced-recovery-modes surface is armed (issue #82, PR 3).
+    // Kept OUTSIDE `Inner` and set through the builder for the SAME anti-bypass reason: it is
+    // NOT a plain `OidcConfig` toggle. The ONLY writer is the boot path, which resolves it
+    // from the strict config feature ladder (the `advanced-recovery` experimental feature
+    // enabled AND acked at the exact version). Default false, so every advanced-recovery path
+    // answers a uniform 404 and standard recovery is unchanged. The three mode sub-toggles,
+    // the confirmation threshold, and the IDV providers that SHAPE the modes live in `Inner`
+    // (config data cannot arm the surface).
+    advanced_recovery_enabled: bool,
     // The per-tenant/per-environment quota enforcer (issue #50), the data plane's
     // tenant-fairness layer. Kept OUTSIDE `Inner` and installed by the boot path
     // (built from the [quota] config, seeded with the SAME env clock), so a spend
@@ -532,6 +541,11 @@ struct Inner {
     // experimental feature is armed; the conservative default strips offline access and
     // admin/management scopes.
     quarantine: QuarantineConfig,
+    // The advanced-recovery-modes policy (issue #82, PR 3): the three mode sub-toggles, the
+    // trusted-contact confirmation threshold, and the registered IDV providers, held verbatim
+    // from the validated config. Consulted only when the `advanced-recovery` experimental
+    // feature is armed; every field is off/empty by default (fully inert).
+    advanced_recovery: AdvancedRecoveryConfig,
     // Registration abuse defenses (issue #80): the whole validated config held verbatim
     // so the proof-of-work gate, the disposable-email defense, and the waitlist gate read
     // their per-environment settings (and the promotable domain allow/deny lists) from one
@@ -729,6 +743,7 @@ impl OidcState {
                     .trusted_device_revoke_on_password_change,
                 risk: config.risk.clone(),
                 quarantine: config.quarantine.clone(),
+                advanced_recovery: config.advanced_recovery.clone(),
                 registration_abuse: config.registration_abuse.clone(),
                 email_otp_enabled: config.email_otp_enabled,
                 email_otp_code_digits: config.email_otp_code_digits,
@@ -785,6 +800,7 @@ impl OidcState {
             fedcm_enabled: false,
             risk_signals_enabled: false,
             signup_quarantine_enabled: false,
+            advanced_recovery_enabled: false,
             quota: None,
             migration_hook: None,
             hashing_pool: None,
@@ -936,6 +952,35 @@ impl OidcState {
     #[must_use]
     pub fn quarantine_config(&self) -> &QuarantineConfig {
         &self.inner.quarantine
+    }
+
+    /// Arm the experimental advanced-recovery-modes surface (issue #82, PR 3).
+    ///
+    /// The boot path is the ONLY caller: it resolves `enabled` from the strict config feature
+    /// ladder (the `advanced-recovery` experimental feature enabled AND acknowledged at the
+    /// exact version) and passes the result here. A builder rather than an `OidcConfig` field
+    /// precisely so an operator cannot arm the advanced-recovery surface from a plain config
+    /// toggle and bypass the experimental ack gate. When false (the default), every
+    /// advanced-recovery path answers a uniform 404 and standard recovery is unchanged.
+    #[must_use]
+    pub fn with_advanced_recovery_enabled(mut self, enabled: bool) -> Self {
+        self.advanced_recovery_enabled = enabled;
+        self
+    }
+
+    /// Whether the experimental advanced-recovery-modes surface is armed (issue #82, PR 3).
+    /// Every advanced-recovery handler's first action is to return a uniform 404 when this is
+    /// false; a mode also runs only when its config sub-toggle is on.
+    #[must_use]
+    pub fn advanced_recovery_enabled(&self) -> bool {
+        self.advanced_recovery_enabled
+    }
+
+    /// The advanced-recovery-modes policy (issue #82, PR 3): the three mode sub-toggles, the
+    /// trusted-contact confirmation threshold, and the registered IDV providers.
+    #[must_use]
+    pub fn advanced_recovery_config(&self) -> &AdvancedRecoveryConfig {
+        &self.inner.advanced_recovery
     }
 
     /// Install the per-tenant/per-environment quota enforcer (issue #50), turning

@@ -31,7 +31,7 @@
 
 use ironauth_store::{
     CorrelationId, IdentifierType, NewRecoveryFlow, RecoveryCancelReason, RecoveryEntryPoint,
-    RecoveryFlowId, Scope, UserId,
+    RecoveryFlowId, RecoveryMethod, Scope, UserId,
 };
 use sha2::{Digest, Sha256};
 
@@ -68,6 +68,14 @@ pub struct RecoverySettings {
 /// (issue #66) via [`AuthMethod::acr`]. This is deliberately NOT a parallel ordering: it
 /// is a thin projection onto the existing [`AuthMethod`] table so "stronger" is defined
 /// by the same machinery the login/step-up paths use.
+///
+/// SECURITY INVARIANT (the recover-factor honesty rule): when this value names the factor a
+/// recovery was PROVEN with, it MUST be derived server-side from the actual recovery evidence
+/// (the credential/flow that was really verified), NEVER taken from caller-supplied,
+/// untrusted input. An inflated value (for example claiming [`AttestedPasskey`](Self::AttestedPasskey)
+/// when only an email OTP was proven) would make the reduces-security test pass, SKIP the
+/// `hold_until` delay, and let a recovery complete WITHOUT the security delay. See the guard
+/// on `initiate_recovery`'s `recover_factor` parameter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecoveryFactor {
     /// A password (a knowledge factor). `pwd`-level.
@@ -504,6 +512,14 @@ async fn notify_all_channels(state: &OidcState, scope: Scope, subject: &UserId) 
     count
 }
 
+/// Notify every verified channel of a recovery event for `subject` (issue #82, PR 3): the
+/// public wrapper the advanced-recovery modes use so each out-of-band confirmation and each
+/// mode progression alerts the account owner, exactly like the standard recovery path.
+/// Returns how many channels were notified.
+pub async fn notify_owner_channels(state: &OidcState, scope: Scope, subject: &UserId) -> usize {
+    notify_all_channels(state, scope, subject).await
+}
+
 /// INITIATE a recovery for a resolved subject (issue #81): risk-score the event, enforce
 /// the per-account cooldown, decide the delay (held) path, mint the cancellation token,
 /// notify EVERY verified channel, and persist the flow. Returns
@@ -513,6 +529,23 @@ async fn notify_all_channels(state: &OidcState, scope: Scope, subject: &UserId) 
 /// Anti-enumeration: this is called ONLY for a resolved (known) account, so an unknown
 /// identifier never reaches it; both the known and unknown paths return the same
 /// acknowledgment upstream.
+///
+/// # `recover_factor` is SECURITY-LOAD-BEARING and MUST be server-derived
+///
+/// `recover_factor` names the factor the recovery was ACTUALLY proven with. It drives the
+/// reduces-security test below (`recover_acr` vs the account's strongest factor): a value that
+/// REACHES the account's strength makes `reduces_security = false`, so the flow is NOT held and
+/// the `hold_until` delay is SKIPPED. It therefore MUST be established SERVER-SIDE from the real
+/// recovery evidence (the credential/flow that was genuinely verified), and NEVER accepted from
+/// caller-supplied, untrusted input. The advanced-recovery initiation functions
+/// (`initiate_admin_approved` / `initiate_trusted_contact` / `initiate_idv`) are LIBRARY-ONLY
+/// today and pass a value their trusted caller supplies. WHEN this surface is later wired to a
+/// PUBLIC endpoint, that endpoint MUST derive `recover_factor` from the actually-proven
+/// credential (never a request field): an inflated value would skip the security delay and let
+/// a recovery complete instantly. A cheap future STRUCTURAL hardening is a server-derived
+/// newtype (a `ProvenRecoveryFactor` the public endpoint can only mint from real evidence),
+/// deferred to the wiring PR to keep this change minimal; the doc guard is the invariant now.
+#[allow(clippy::too_many_arguments)]
 pub async fn initiate_recovery(
     state: &OidcState,
     scope: Scope,
@@ -521,6 +554,7 @@ pub async fn initiate_recovery(
     recover_factor: RecoveryFactor,
     recipient: &str,
     client_ip: Option<&str>,
+    method: RecoveryMethod,
 ) -> RecoveryInitiation {
     let settings = state.recovery_settings();
     let recover_acr = recover_factor.strength_acr();
@@ -560,6 +594,11 @@ pub async fn initiate_recovery(
 
     // A recovery would REDUCE security when the recovery factor does not reach the
     // account's strongest factor. That, or a risk-forced delay, holds the flow.
+    //
+    // GUARD: `recover_acr` derives from `recover_factor`, which MUST reflect the ACTUALLY-proven
+    // factor (established server-side; never caller-supplied). An inflated `recover_factor` would
+    // make `reduces_security = false` here and SKIP the `hold_until` delay below, completing a
+    // recovery with no security delay. See this function's `recover_factor` doc guard.
     let account_acr = account_strength_acr(state, scope, subject).await;
     let order = state.acr_order();
     let reduces_security = !step_up::acr_satisfies(recover_acr, account_acr, &order);
@@ -589,6 +628,7 @@ pub async fn initiate_recovery(
         cancel_token_digest: &digest,
         recipient,
         hold_until_unix_micros: hold_until,
+        method,
     };
     let issued = state
         .store()

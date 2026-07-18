@@ -930,6 +930,46 @@ impl ScopedKind for SignupQuarantineKind {
     const PREFIX: &'static str = "sqn";
 }
 
+/// Marker for an admin-approved recovery approval (`rap_`), one row of the per-scope
+/// `recovery_approvals` queue (issue #82, PR 3): a pending admin decision on an
+/// admin-approved recovery flow. A tenant-scoped RUNTIME row (never exported); it carries
+/// no bearer secret and no raw PII, so its debug form is not redacted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RecoveryApprovalKind;
+impl ScopedKind for RecoveryApprovalKind {
+    const PREFIX: &'static str = "rap";
+}
+
+/// Marker for a designated trusted contact (`rtc_`), one row of the per-scope
+/// `recovery_trusted_contacts` enrollment (issue #82, PR 3): a contact a user designated to
+/// confirm a recovery out of band. The contact address is sealed under the scope DEK, so the
+/// id carries no PII; its debug form is not redacted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RecoveryTrustedContactKind;
+impl ScopedKind for RecoveryTrustedContactKind {
+    const PREFIX: &'static str = "rtc";
+}
+
+/// Marker for a per-flow trusted-contact confirmation (`rcc_`), one row of the per-scope
+/// `recovery_contact_confirmations` set (issue #82, PR 3): one contact's single-use
+/// out-of-band confirmation of a recovery. Only the confirmation token's digest is stored,
+/// so the id carries no live secret; its debug form is not redacted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RecoveryContactConfirmationKind;
+impl ScopedKind for RecoveryContactConfirmationKind {
+    const PREFIX: &'static str = "rcc";
+}
+
+/// Marker for an IDV-gated recovery session (`riv_`), one row of the per-scope
+/// `recovery_idv_sessions` set (issue #82, PR 3): the external-verification session bound to
+/// a recovery flow, consuming a single-use signed provider callback. A tenant-scoped RUNTIME
+/// row (never exported); its debug form is not redacted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RecoveryIdvSessionKind;
+impl ScopedKind for RecoveryIdvSessionKind {
+    const PREFIX: &'static str = "riv";
+}
+
 /// Marker for a "this wasn't me" disavowal token (`dis_`), one row in the per-subject
 /// disavowal set (issue #79): the SHA-256 digest of a high-entropy single-use token
 /// carried in the new-device notification. The id embeds its `(tenant, environment)`
@@ -1219,6 +1259,22 @@ pub type RiskSignalId = ScopedId<RiskSignalKind>;
 /// A signup fraud-review-queue case id (`sqn_...`), one row of the per-scope
 /// `signup_quarantines` table a risky signup is parked in for admin review (issue #82).
 pub type SignupQuarantineId = ScopedId<SignupQuarantineKind>;
+
+/// An admin-approved recovery approval id (`rap_...`), one row of the per-scope
+/// `recovery_approvals` queue an admin decides (issue #82, PR 3).
+pub type RecoveryApprovalId = ScopedId<RecoveryApprovalKind>;
+
+/// A designated trusted-contact id (`rtc_...`), one row of the per-scope
+/// `recovery_trusted_contacts` enrollment (issue #82, PR 3).
+pub type RecoveryTrustedContactId = ScopedId<RecoveryTrustedContactKind>;
+
+/// A per-flow trusted-contact confirmation id (`rcc_...`), one row of the per-scope
+/// `recovery_contact_confirmations` set (issue #82, PR 3).
+pub type RecoveryContactConfirmationId = ScopedId<RecoveryContactConfirmationKind>;
+
+/// An IDV-gated recovery session id (`riv_...`), one row of the per-scope
+/// `recovery_idv_sessions` set (issue #82, PR 3).
+pub type RecoveryIdvSessionId = ScopedId<RecoveryIdvSessionKind>;
 
 /// A proof-of-work challenge id (`pow_...`), one row in the per-scope `PoW` challenge
 /// state and the routing handle the client returns with its nonce (issue #80).

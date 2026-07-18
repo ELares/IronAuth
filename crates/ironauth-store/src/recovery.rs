@@ -103,6 +103,49 @@ impl RecoveryState {
     }
 }
 
+/// The recovery METHOD a flow uses (issue #82, PR 3). A closed set pinned by the
+/// `recovery_flows.method` CHECK. The default `Standard` is the unchanged issue #81
+/// self-service email-OTP path; the three advanced modes plug in through their own state
+/// tables and complete THROUGH the same #81 delay/downgrade gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RecoveryMethod {
+    /// The unchanged issue #81 self-service recovery (no advanced mode).
+    Standard,
+    /// Admin-approved recovery: an admin approves the case before it can complete.
+    AdminApproved,
+    /// Trusted-contact recovery: designated contacts confirm the case out of band.
+    TrustedContact,
+    /// IDV-gated recovery: a configured external identity-verification provider's signed
+    /// callback gates the case.
+    Idv,
+}
+
+impl RecoveryMethod {
+    /// The stable wire tag stored in the `method` column.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RecoveryMethod::Standard => "standard",
+            RecoveryMethod::AdminApproved => "admin_approved",
+            RecoveryMethod::TrustedContact => "trusted_contact",
+            RecoveryMethod::Idv => "idv",
+        }
+    }
+
+    /// Parse a stored wire tag back to the typed method. Returns [`None`] for any unknown
+    /// value (a foreign or corrupted row is treated as a uniform skip).
+    #[must_use]
+    pub fn from_wire(value: &str) -> Option<Self> {
+        match value {
+            "standard" => Some(RecoveryMethod::Standard),
+            "admin_approved" => Some(RecoveryMethod::AdminApproved),
+            "trusted_contact" => Some(RecoveryMethod::TrustedContact),
+            "idv" => Some(RecoveryMethod::Idv),
+            _ => None,
+        }
+    }
+}
+
 /// Why a recovery flow was cancelled (issue #81). A closed set pinned by the
 /// `recovery_flows.cancel_reason` CHECK.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -152,6 +195,9 @@ pub struct NewRecoveryFlow<'a> {
     /// is `held` until this instant). [`None`] when the recovery can complete
     /// immediately (no security downgrade).
     pub hold_until_unix_micros: Option<i64>,
+    /// The recovery method (issue #82, PR 3). `Standard` for the unchanged issue #81 path;
+    /// an advanced mode plugs its own completion precondition in.
+    pub method: RecoveryMethod,
 }
 
 /// A recovery flow resolved for a status, cancellation, or downgrade-invariant check
@@ -175,4 +221,6 @@ pub struct RecoveryFlowRecord {
     /// The delay-window horizon in Unix microseconds, when the flow is held. [`None`]
     /// when no delay applies.
     pub hold_until_unix_micros: Option<i64>,
+    /// The recovery method (issue #82, PR 3).
+    pub method: RecoveryMethod,
 }

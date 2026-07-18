@@ -94,6 +94,29 @@ impl Harness {
         }
     }
 
+    /// Start a fresh database and router with the experimental advanced-recovery-modes surface
+    /// ARMED (issue #82, PR 3), so the recovery-approval review-queue endpoints answer instead
+    /// of 404. `armed = false` leaves the feature off (its default), so a test can assert the
+    /// endpoints 404 with the flag off.
+    pub async fn start_with_advanced_recovery(default_page_size: u32, armed: bool) -> Self {
+        let db = TestDatabase::start().await;
+        let config = AdminConfig {
+            bootstrap_operator_token: Some(Secret::Literal(SecretString::new(OPERATOR_TOKEN))),
+            max_page_size: 200,
+            default_page_size,
+            ..AdminConfig::default()
+        };
+        let state = AdminState::new(db.control_store().clone(), Env::system(), &config)
+            .expect("admin state builds")
+            .with_advanced_recovery_enabled(armed);
+        let router = management_router(state);
+        Self {
+            db,
+            router,
+            outbound_scope: None,
+        }
+    }
+
     /// Start a fresh database and router with admin SUDO MODE enabled (issue #73) and a
     /// DETERMINISTIC clock, so a test can drive the freshness lifecycle by advancing the
     /// returned [`ironauth_env::ManualClock`]. `window_secs` is the re-authentication

@@ -13,8 +13,9 @@ use std::fmt;
 use ironauth_store::{
     EnvironmentRecord, GuardrailSet, InvitationAdminRecord, InvitationCredentialType,
     InvitationState, ManagementCredentialRecord, OperatorRecord, OrganizationRecord,
-    RefreshFamilySummary, ResourceType, SessionSummary, SignupQuarantineReason,
-    SignupQuarantineState, SignupQuarantineView, TenantRecord, UserAdminRecord, UserState,
+    RecoveryApprovalState, RecoveryApprovalView, RefreshFamilySummary, ResourceType,
+    SessionSummary, SignupQuarantineReason, SignupQuarantineState, SignupQuarantineView,
+    TenantRecord, UserAdminRecord, UserState,
 };
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -1306,6 +1307,102 @@ pub struct ExtendSignupQuarantineRequest {
     /// How many seconds from now to extend the review window by. Must be at least 1.
     #[schema(example = 604_800)]
     pub extend_secs: u64,
+}
+
+// ---------------------------------------------------------------------------
+// Advanced recovery: admin-approved recovery review queue (issue #82, PR 3).
+// ---------------------------------------------------------------------------
+
+/// An admin-approved recovery approval's review position, as the admin queue reports it.
+#[derive(Debug, Clone, Copy, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RecoveryApprovalStateView {
+    /// Awaiting an admin decision.
+    Pending,
+    /// Approved by an admin (the method precondition is satisfied).
+    Approved,
+    /// Rejected by an admin (the recovery can never complete via this method).
+    Rejected,
+}
+
+impl From<RecoveryApprovalState> for RecoveryApprovalStateView {
+    fn from(state: RecoveryApprovalState) -> Self {
+        match state {
+            RecoveryApprovalState::Pending => RecoveryApprovalStateView::Pending,
+            RecoveryApprovalState::Approved => RecoveryApprovalStateView::Approved,
+            RecoveryApprovalState::Rejected => RecoveryApprovalStateView::Rejected,
+        }
+    }
+}
+
+/// An admin-approved recovery approval (issue #82, PR 3), as the management API returns it.
+/// Carries no secret and no raw PII: the subject is the opaque `usr_` id.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct RecoveryApprovalCaseView {
+    /// The approval identifier (`rap_...`, embeds its scope).
+    pub id: String,
+    /// The tenant the case belongs to (`ten_...`).
+    pub tenant_id: String,
+    /// The environment the case lives in (`env_...`).
+    pub environment_id: String,
+    /// The recovery flow (`rcv_...`) this approval decides.
+    pub flow_id: String,
+    /// The recovering account (`usr_...`) the case is about.
+    pub subject: String,
+    /// The review position.
+    pub state: RecoveryApprovalStateView,
+    /// When the approval was opened, milliseconds since the Unix epoch.
+    pub created_at_unix_ms: i64,
+    /// The kind of the reviewing admin actor, or null before any review action.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reviewed_by_kind: Option<String>,
+    /// The id of the reviewing admin actor, or null before any review action.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reviewed_by_id: Option<String>,
+    /// When a review action ran, milliseconds since the Unix epoch, or null.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reviewed_at_unix_ms: Option<i64>,
+}
+
+impl RecoveryApprovalCaseView {
+    /// Build a view from a stored approval.
+    #[must_use]
+    pub fn from_view(view: RecoveryApprovalView) -> Self {
+        Self {
+            id: view.id.to_string(),
+            tenant_id: view.id.scope().tenant().to_string(),
+            environment_id: view.id.scope().environment().to_string(),
+            flow_id: view.flow_id.to_string(),
+            subject: view.subject.to_string(),
+            state: view.state.into(),
+            created_at_unix_ms: ms(view.created_at_unix_micros),
+            reviewed_by_kind: view.reviewed_by_kind,
+            reviewed_by_id: view.reviewed_by_id,
+            reviewed_at_unix_ms: view.reviewed_at_unix_micros.map(ms),
+        }
+    }
+}
+
+/// A page of admin-approved recovery approvals.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct RecoveryApprovalList {
+    /// The open approvals on this page, oldest first.
+    pub items: Vec<RecoveryApprovalCaseView>,
+    /// The opaque cursor for the next page, or null if this is the last page.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+/// An admin-approved recovery's position after a review action (issue #82, PR 3): the
+/// deterministic post-condition, so an Idempotency-Key replay is byte-identical. Completion
+/// (running THROUGH the #81 delay gate) is a side effect of an approve reflected in the audit
+/// log and the recovery flow state, not in this body, so the body stays deterministic.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct RecoveryApprovalDecisionView {
+    /// The recovery flow (`rcv_...`) the decision was about.
+    pub flow_id: String,
+    /// The state the approval is now in.
+    pub state: RecoveryApprovalStateView,
 }
 
 // ---------------------------------------------------------------------------

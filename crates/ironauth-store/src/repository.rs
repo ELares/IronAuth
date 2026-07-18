@@ -79,10 +79,11 @@ use crate::id::{
     FedcmNonceId, FederationLoginStateId, GrantId, InitialAccessTokenId, InvitationId,
     IssuedTokenId, KekId, MagicLinkTokenId, ManagementKeyId, Mds3BlobCacheId, MigrationRunId,
     MigrationRunRecordId, OperatorId, OrgConnectionId, OrganizationId, PowChallengeId,
-    PushedRequestId, RecoveryCodeId, RecoveryFlowId, RefreshFamilyId, RefreshTokenId,
-    ResourceServerId, RiskDecisionId, RiskDisavowalId, RiskLoginGeoId, RiskSignalId, RoutingRuleId,
-    ScopeStepUpPolicyId, ServiceAccountId, SessionEventId, SessionId, SigningKeyId,
-    SignupQuarantineId, SmsOtpCodeId, SmsRouteStatId, TenantId, TotpCredentialId,
+    PushedRequestId, RecoveryApprovalId, RecoveryCodeId, RecoveryContactConfirmationId,
+    RecoveryFlowId, RecoveryIdvSessionId, RecoveryTrustedContactId, RefreshFamilyId,
+    RefreshTokenId, ResourceServerId, RiskDecisionId, RiskDisavowalId, RiskLoginGeoId,
+    RiskSignalId, RoutingRuleId, ScopeStepUpPolicyId, ServiceAccountId, SessionEventId, SessionId,
+    SigningKeyId, SignupQuarantineId, SmsOtpCodeId, SmsRouteStatId, TenantId, TotpCredentialId,
     TraitMigrationJobId, TraitSchemaId, TrustedDeviceId, UpstreamTokenGrantId, UpstreamTokenId,
     UserId, UserIdentifierId, VariableId, WebauthnChallengeId, WebauthnCredentialId,
 };
@@ -91,7 +92,8 @@ use crate::identifier::{
 };
 use crate::pow_challenge::{NewPowChallenge, PowChallengeView};
 use crate::recovery::{
-    NewRecoveryFlow, RecoveryCancelReason, RecoveryEntryPoint, RecoveryFlowRecord, RecoveryState,
+    NewRecoveryFlow, RecoveryCancelReason, RecoveryEntryPoint, RecoveryFlowRecord, RecoveryMethod,
+    RecoveryState,
 };
 use crate::risk::{
     DisavowalResolution, LoginGeoView, NewDisavowalToken, NewLoginGeo, NewRiskDecision,
@@ -389,6 +391,52 @@ impl<'a> ScopedStore<'a> {
     #[must_use]
     pub fn recovery_flows(&self) -> RecoveryFlowRepo<'a> {
         RecoveryFlowRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
+    /// The read repository for admin-approved recovery approvals in this scope (issue #82,
+    /// PR 3): list the open approval queue and check whether a flow is approved (the
+    /// method precondition). The audited approve/reject writes live on
+    /// [`ActingStore::recovery_approvals`].
+    #[must_use]
+    pub fn recovery_approvals(&self) -> RecoveryApprovalRepo<'a> {
+        RecoveryApprovalRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
+    /// The read repository for trusted-contact recovery enrollment in this scope (issue #82,
+    /// PR 3): list a subject's designated contacts (opened for notification). Enrollment
+    /// writes live on [`ActingStore::recovery_trusted_contacts`].
+    #[must_use]
+    pub fn recovery_trusted_contacts(&self) -> RecoveryTrustedContactRepo<'a> {
+        RecoveryTrustedContactRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
+    /// The read repository for per-flow trusted-contact confirmations in this scope (issue
+    /// #82, PR 3): resolve a confirmation by its single-use token digest and count the
+    /// distinct confirmed contacts (the threshold). The confirm write lives on
+    /// [`ActingStore::recovery_contact_confirmations`].
+    #[must_use]
+    pub fn recovery_contact_confirmations(&self) -> RecoveryContactConfirmationRepo<'a> {
+        RecoveryContactConfirmationRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
+    /// The read repository for IDV-gated recovery sessions in this scope (issue #82, PR 3):
+    /// resolve a session by its flow-bound single-use state nonce. The create/consume writes
+    /// live on [`ActingStore::recovery_idv_sessions`].
+    #[must_use]
+    pub fn recovery_idv_sessions(&self) -> RecoveryIdvSessionRepo<'a> {
+        RecoveryIdvSessionRepo {
             store: self.store,
             scope: self.scope,
         }
@@ -1177,6 +1225,53 @@ impl<'a> ActingStore<'a> {
     #[must_use]
     pub fn recovery_flows(&self) -> ActingRecoveryFlowRepo<'a> {
         ActingRecoveryFlowRepo {
+            store: self.store,
+            scope: self.scope,
+            acting: self.acting,
+        }
+    }
+
+    /// The mutating admin-approved recovery-approval repository for this scope and actor
+    /// (issue #82, PR 3): open a pending approval, and the CONTROL-PLANE approve/reject
+    /// review actions, each audited with the deciding admin actor.
+    #[must_use]
+    pub fn recovery_approvals(&self) -> ActingRecoveryApprovalRepo<'a> {
+        ActingRecoveryApprovalRepo {
+            store: self.store,
+            scope: self.scope,
+            acting: self.acting,
+        }
+    }
+
+    /// The mutating trusted-contact enrollment repository for this scope and actor (issue
+    /// #82, PR 3): designate a contact, sealing its address under the scope DEK.
+    #[must_use]
+    pub fn recovery_trusted_contacts(&self) -> ActingRecoveryTrustedContactRepo<'a> {
+        ActingRecoveryTrustedContactRepo {
+            store: self.store,
+            scope: self.scope,
+            acting: self.acting,
+        }
+    }
+
+    /// The mutating trusted-contact confirmation repository for this scope and actor (issue
+    /// #82, PR 3): open the per-flow pending confirmations, and LATCH a single-use
+    /// confirmation, audited.
+    #[must_use]
+    pub fn recovery_contact_confirmations(&self) -> ActingRecoveryContactConfirmationRepo<'a> {
+        ActingRecoveryContactConfirmationRepo {
+            store: self.store,
+            scope: self.scope,
+            acting: self.acting,
+        }
+    }
+
+    /// The mutating IDV-gated recovery session repository for this scope and actor (issue
+    /// #82, PR 3): create a flow-bound single-use session, and CONSUME a signed callback
+    /// (single-use latch, recorded verdict), audited.
+    #[must_use]
+    pub fn recovery_idv_sessions(&self) -> ActingRecoveryIdvSessionRepo<'a> {
+        ActingRecoveryIdvSessionRepo {
             store: self.store,
             scope: self.scope,
             acting: self.acting,
@@ -17884,7 +17979,7 @@ impl RecoveryFlowRepo<'_> {
         }
         let mut tx = begin_scoped(self.store, self.scope).await?;
         let row = sqlx::query(
-            "SELECT id, subject, state, entry_point, recover_acr, \
+            "SELECT id, subject, state, entry_point, recover_acr, method, \
              (EXTRACT(EPOCH FROM initiated_at) * 1000000)::bigint AS initiated_us, \
              (EXTRACT(EPOCH FROM hold_until) * 1000000)::bigint AS hold_us \
              FROM recovery_flows \
@@ -17913,7 +18008,7 @@ impl RecoveryFlowRepo<'_> {
     ) -> Result<Option<RecoveryFlowRecord>, StoreError> {
         let mut tx = begin_scoped(self.store, self.scope).await?;
         let row = sqlx::query(
-            "SELECT id, subject, state, entry_point, recover_acr, \
+            "SELECT id, subject, state, entry_point, recover_acr, method, \
              (EXTRACT(EPOCH FROM initiated_at) * 1000000)::bigint AS initiated_us, \
              (EXTRACT(EPOCH FROM hold_until) * 1000000)::bigint AS hold_us \
              FROM recovery_flows \
@@ -17952,7 +18047,7 @@ impl RecoveryFlowRepo<'_> {
         }
         let mut tx = begin_scoped(self.store, self.scope).await?;
         let row = sqlx::query(
-            "SELECT id, subject, state, entry_point, recover_acr, \
+            "SELECT id, subject, state, entry_point, recover_acr, method, \
              (EXTRACT(EPOCH FROM initiated_at) * 1000000)::bigint AS initiated_us, \
              (EXTRACT(EPOCH FROM hold_until) * 1000000)::bigint AS hold_us \
              FROM recovery_flows \
@@ -18011,6 +18106,7 @@ fn recovery_flow_from_row(row: &PgRow) -> Option<RecoveryFlowRecord> {
     let id = RecoveryFlowId::parse_declared_scope(&id_text).ok()?;
     let state = RecoveryState::from_wire(&row.get::<String, _>("state"))?;
     let entry_point = RecoveryEntryPoint::from_wire(&row.get::<String, _>("entry_point"))?;
+    let method = RecoveryMethod::from_wire(&row.get::<String, _>("method"))?;
     Some(RecoveryFlowRecord {
         id,
         subject: row.get("subject"),
@@ -18019,6 +18115,7 @@ fn recovery_flow_from_row(row: &PgRow) -> Option<RecoveryFlowRecord> {
         recover_acr: row.get("recover_acr"),
         initiated_at_unix_micros: row.get("initiated_us"),
         hold_until_unix_micros: row.get("hold_us"),
+        method,
     })
 }
 
@@ -18113,11 +18210,11 @@ impl ActingRecoveryFlowRepo<'_> {
                     "INSERT INTO recovery_flows \
                      (id, tenant_id, environment_id, subject, state, entry_point, \
                       recover_acr, cancel_token_digest, recipient_sealed, pii_dek_version, \
-                      initiated_at, hold_until) \
+                      initiated_at, hold_until, method) \
                      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, \
                       TIMESTAMPTZ 'epoch' + ($11::text || ' microseconds')::interval, \
                       CASE WHEN $12::bigint IS NULL THEN NULL ELSE \
-                       TIMESTAMPTZ 'epoch' + ($12::text || ' microseconds')::interval END)",
+                       TIMESTAMPTZ 'epoch' + ($12::text || ' microseconds')::interval END, $13)",
                 )
                 .bind(&id_text)
                 .bind(scope.tenant().to_string())
@@ -18131,6 +18228,7 @@ impl ActingRecoveryFlowRepo<'_> {
                 .bind(dek_version)
                 .bind(now_micros)
                 .bind(spec.hold_until_unix_micros)
+                .bind(spec.method.as_str())
                 .execute(&mut **tx)
                 .await?;
                 Ok(())
@@ -18211,6 +18309,15 @@ impl ActingRecoveryFlowRepo<'_> {
     /// so completion can never erase the delay gate before the notified window has elapsed.
     /// An `initiated` flow (no hold) completes as before. Completion is M9-deferred, so
     /// there is no live caller today; the guard closes the trap for whoever wires it.
+    ///
+    /// BY DESIGN, the `hold_until` delay is enforced in the APPLICATION LAYER: the `now`
+    /// compared against `hold_until` in the WHERE is the env CLOCK SEAM (`env.clock()`, bound
+    /// as `$4`), NOT the database wall clock. A DB-level temporal trigger using `now()` is
+    /// INTENTIONALLY NOT used because it would read the DB WALL CLOCK and break the
+    /// deterministic clock seam: tests advance a frozen clock to cross the delay, and a
+    /// wall-clock trigger would reject those legitimate post-delay completions (and, more
+    /// broadly, ignore any operator-controlled time source). Enforcing the delay here keeps a
+    /// single, deterministic, testable time authority.
     ///
     /// # Errors
     ///
@@ -18296,6 +18403,950 @@ impl ActingRecoveryFlowRepo<'_> {
         )
         .await?;
         Ok(())
+    }
+}
+
+// ===========================================================================
+// Advanced recovery modes (issue #82, PR 3)
+//
+// The recovery flow (issue #81) gains a METHOD dimension and three mode state tables. Every
+// mode completes THROUGH the existing completion gate (`ActingRecoveryFlowRepo::complete`,
+// whose `hold_until <= now` guard is the #81 delay) and the downgrade invariant
+// (`gate_factor_removal` / `factor_change_decision`), never around them. A mode only ADDS a
+// precondition: an admin approval, a trusted-contact confirmation threshold, or a signed IDV
+// callback. The security-meaningful events (an admin approve/reject, a contact confirmation,
+// an IDV callback consume) route through the audited-write primitive; the creation of the
+// pending state (opening an approval, enrolling a contact, minting the pending confirmations
+// or an IDV session) is a plain scoped write like the FedCM nonce reserve.
+// ===========================================================================
+
+/// The AAD binding a sealed `recovery_trusted_contacts.contact_sealed` value (issue #82,
+/// PR 3) to its scope, the row id, and the DEK version that sealed it. A ciphertext lifted
+/// to another row, tenant, environment, or claimed under another DEK version fails
+/// authenticated decryption.
+fn recovery_contact_seal_aad(scope: Scope, contact_id: &str, dek_version: i32) -> Aad {
+    Aad::builder()
+        .text("ironauth.envelope.recovery-trusted-contact.v1")
+        .text(&scope.tenant().to_string())
+        .text(&scope.environment().to_string())
+        .field(contact_id.as_bytes())
+        .version(i64::from(dek_version))
+        .build()
+}
+
+/// The review position of an admin-approved recovery approval (issue #82, PR 3), pinned by
+/// the `recovery_approvals_state_known` CHECK.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RecoveryApprovalState {
+    /// Awaiting an admin decision (the OPEN state).
+    Pending,
+    /// Approved: the method precondition the completion gate ANDs with the delay/downgrade
+    /// rules.
+    Approved,
+    /// Rejected: the terminal refusal (the flow can never complete via this method).
+    Rejected,
+}
+
+impl RecoveryApprovalState {
+    /// The stable wire tag stored in the `state` column.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RecoveryApprovalState::Pending => "pending",
+            RecoveryApprovalState::Approved => "approved",
+            RecoveryApprovalState::Rejected => "rejected",
+        }
+    }
+
+    /// Parse a stored wire tag back to the typed state. [`None`] for any unknown value.
+    #[must_use]
+    pub fn from_wire(value: &str) -> Option<Self> {
+        match value {
+            "pending" => Some(RecoveryApprovalState::Pending),
+            "approved" => Some(RecoveryApprovalState::Approved),
+            "rejected" => Some(RecoveryApprovalState::Rejected),
+            _ => None,
+        }
+    }
+}
+
+/// One admin-approved recovery approval as the admin review queue surfaces it (issue #82,
+/// PR 3). Carries no secret and no raw PII.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecoveryApprovalView {
+    /// The `rap_` approval id.
+    pub id: RecoveryApprovalId,
+    /// The `rcv_` recovery flow the approval decides.
+    pub flow_id: RecoveryFlowId,
+    /// The recovering `usr_` subject the case is about.
+    pub subject: UserId,
+    /// The review position.
+    pub state: RecoveryApprovalState,
+    /// When the approval was opened, in microseconds since the Unix epoch (the keyset order).
+    pub created_at_unix_micros: i64,
+    /// The kind of the reviewing admin actor, or [`None`] before any review action.
+    pub reviewed_by_kind: Option<String>,
+    /// The id of the reviewing admin actor, or [`None`] before any review action.
+    pub reviewed_by_id: Option<String>,
+    /// When a review action ran, in microseconds since the Unix epoch, or [`None`].
+    pub reviewed_at_unix_micros: Option<i64>,
+}
+
+const RECOVERY_APPROVAL_SELECT: &str = "SELECT id, flow_id, subject, state, \
+     (EXTRACT(EPOCH FROM created_at) * 1000000)::bigint AS created_us, \
+     reviewed_by_kind, reviewed_by_id, \
+     (EXTRACT(EPOCH FROM reviewed_at) * 1000000)::bigint AS reviewed_us \
+     FROM recovery_approvals";
+
+/// Reconstruct a [`RecoveryApprovalView`] from a `recovery_approvals` row, within scope.
+fn recovery_approval_view_from_row(
+    scope: Scope,
+    row: &PgRow,
+) -> Result<RecoveryApprovalView, StoreError> {
+    let id = RecoveryApprovalId::parse_in_scope(&row.get::<String, _>("id"), &scope)?;
+    let flow_id = RecoveryFlowId::parse_in_scope(&row.get::<String, _>("flow_id"), &scope)?;
+    let subject = UserId::parse_in_scope(&row.get::<String, _>("subject"), &scope)?;
+    let state = RecoveryApprovalState::from_wire(&row.get::<String, _>("state"))
+        .ok_or(StoreError::NotFound)?;
+    Ok(RecoveryApprovalView {
+        id,
+        flow_id,
+        subject,
+        state,
+        created_at_unix_micros: row.get("created_us"),
+        reviewed_by_kind: row.get("reviewed_by_kind"),
+        reviewed_by_id: row.get("reviewed_by_id"),
+        reviewed_at_unix_micros: row.get("reviewed_us"),
+    })
+}
+
+/// The admin-approved recovery-approval READ repository for a scope (issue #82, PR 3): list
+/// the OPEN approval queue the admin surfaces. Scope-forced (RLS); the audited approve/reject
+/// writes live on [`ActingRecoveryApprovalRepo`].
+pub struct RecoveryApprovalRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl RecoveryApprovalRepo<'_> {
+    /// List the OPEN (pending) approval cases in this scope, oldest first over the
+    /// `(created_at, id)` keyset, bounded by `limit` and resumed after `after`. An approved
+    /// or rejected case is a closed decision and is excluded.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn list_open(
+        &self,
+        limit: i64,
+        after: Option<&CursorPosition>,
+    ) -> Result<Vec<RecoveryApprovalView>, StoreError> {
+        let (after_micros, after_id) = split_cursor(after);
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let rows = sqlx::query(&format!(
+            "{RECOVERY_APPROVAL_SELECT} \
+             WHERE tenant_id = $1 AND environment_id = $2 AND state = 'pending' \
+             AND ($3::bigint IS NULL OR (created_at, id) > \
+                  (TIMESTAMPTZ 'epoch' + ($3::text || ' microseconds')::interval, $4::text)) \
+             ORDER BY created_at, id LIMIT $5"
+        ))
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(after_micros)
+        .bind(after_id)
+        .bind(limit.clamp(0, MANAGEMENT_LIST_HARD_CAP + 1))
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        rows.iter()
+            .map(|row| recovery_approval_view_from_row(self.scope, row))
+            .collect()
+    }
+
+    /// Whether an admin-approved recovery flow has an `approved` approval (issue #82, PR 3):
+    /// the method precondition the completion gate ANDs with the delay/downgrade rules. A
+    /// `pending` or `rejected` (or absent) approval yields `false`.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn is_approved(&self, flow_id: &RecoveryFlowId) -> Result<bool, StoreError> {
+        if flow_id.scope() != self.scope {
+            return Ok(false);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT 1 AS ok FROM recovery_approvals \
+             WHERE tenant_id = $1 AND environment_id = $2 AND flow_id = $3 AND state = 'approved'",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(flow_id.to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(row.is_some())
+    }
+}
+
+/// The mutating admin-approved recovery-approval repository for a scope and actor (issue #82,
+/// PR 3). `open` mints the pending approval (a plain scoped write). `approve` and `reject`
+/// are the CONTROL-PLANE review actions, each audited with the deciding admin actor; an
+/// end-user subject holds no management principal, so it can never reach them (self-approval
+/// is structurally impossible). Completing an approved recovery still runs THROUGH the #81
+/// gate: the admin handler reads the flow and calls [`ActingRecoveryFlowRepo::complete`]
+/// after `approve`, whose `hold_until` guard enforces the delay.
+pub struct ActingRecoveryApprovalRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+    acting: ActingContext,
+}
+
+impl ActingRecoveryApprovalRepo<'_> {
+    /// OPEN a pending approval for an admin-approved recovery flow (issue #82, PR 3). A plain
+    /// scoped write (the data plane lands the case for the admin queue); the audited decision
+    /// is the admin's approve/reject.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the id, flow, or subject is out of scope;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn open(
+        &self,
+        env: &Env,
+        flow_id: &RecoveryFlowId,
+        subject: &UserId,
+    ) -> Result<RecoveryApprovalId, StoreError> {
+        if flow_id.scope() != self.scope || subject.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let id = RecoveryApprovalId::generate(env, &scope);
+        let mut tx = begin_scoped(self.store, scope).await?;
+        sqlx::query(
+            "INSERT INTO recovery_approvals \
+             (id, tenant_id, environment_id, flow_id, subject) \
+             VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind(id.to_string())
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(flow_id.to_string())
+        .bind(subject.to_string())
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(id)
+    }
+
+    /// APPROVE an admin-approved recovery (issue #82, PR 3): mark the open approval `approved`
+    /// and stamp the deciding admin actor, in one audited transaction
+    /// (`recovery.approved`, targeting the flow). Idempotent over `pending`/`approved`, so an
+    /// admin can re-approve after the delay window to finalize. This satisfies the method
+    /// precondition ONLY; the caller then runs [`ActingRecoveryFlowRepo::complete`], whose
+    /// `hold_until` guard still enforces the #81 delay.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the flow is out of scope or has no open approval;
+    /// [`StoreError::IdempotencyConflict`] if the idempotency key is already stored;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn approve(
+        &self,
+        env: &Env,
+        flow_id: &RecoveryFlowId,
+        idempotency: Option<IdempotencyWrite<'_>>,
+    ) -> Result<(), StoreError> {
+        self.decide(
+            env,
+            flow_id,
+            "approved",
+            Action::RecoveryApproved,
+            idempotency,
+        )
+        .await
+    }
+
+    /// REJECT an admin-approved recovery (issue #82, PR 3): mark the open approval `rejected`
+    /// and stamp the deciding admin actor, in one audited transaction
+    /// (`recovery.approval.rejected`, targeting the flow). A rejected approval can never be
+    /// re-approved (the approve UPDATE matches only `pending`/`approved`), so the flow can
+    /// never complete via this method.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the flow is out of scope or has no open approval;
+    /// [`StoreError::IdempotencyConflict`] if the idempotency key is already stored;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn reject(
+        &self,
+        env: &Env,
+        flow_id: &RecoveryFlowId,
+        idempotency: Option<IdempotencyWrite<'_>>,
+    ) -> Result<(), StoreError> {
+        self.decide(
+            env,
+            flow_id,
+            "rejected",
+            Action::RecoveryApprovalRejected,
+            idempotency,
+        )
+        .await
+    }
+
+    /// The shared audited decision write for approve/reject (issue #82, PR 3).
+    async fn decide(
+        &self,
+        env: &Env,
+        flow_id: &RecoveryFlowId,
+        to_state: &str,
+        action: Action,
+        idempotency: Option<IdempotencyWrite<'_>>,
+    ) -> Result<(), StoreError> {
+        if flow_id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let now_micros = epoch_micros(env.clock().now_utc());
+        let actor = self.acting.actor();
+        let (actor_kind, actor_id) = (actor.kind_str().to_owned(), actor.id_string());
+        let flow_text = flow_id.to_string();
+        // Approve is idempotent over pending/approved (an admin can re-approve after the
+        // delay to finalize); reject decides only a still-open pending case.
+        let from_states: &[&str] = if to_state == "approved" {
+            &["pending", "approved"]
+        } else {
+            &["pending"]
+        };
+        let to_state = to_state.to_owned();
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action,
+                target: flow_id,
+            },
+            async move |tx| {
+                insert_idempotency(tx, idempotency).await?;
+                let updated = sqlx::query(
+                    "UPDATE recovery_approvals SET state = $1, \
+                         reviewed_by_kind = $2, reviewed_by_id = $3, \
+                         reviewed_at = TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval \
+                     WHERE flow_id = $5 AND tenant_id = $6 AND environment_id = $7 \
+                     AND state = ANY($8)",
+                )
+                .bind(&to_state)
+                .bind(&actor_kind)
+                .bind(&actor_id)
+                .bind(now_micros)
+                .bind(&flow_text)
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(from_states)
+                .execute(&mut **tx)
+                .await?
+                .rows_affected();
+                if updated == 0 {
+                    return Err(StoreError::NotFound);
+                }
+                Ok(())
+            },
+            false,
+        )
+        .await
+    }
+}
+
+/// One designated trusted contact opened for notification (issue #82, PR 3): the `rtc_` id
+/// and the unsealed contact address. Held only transiently while the initiation fans a
+/// confirmation link out; never persisted in the clear.
+#[derive(Debug, Clone)]
+pub struct OpenedTrustedContact {
+    /// The `rtc_` contact id.
+    pub id: RecoveryTrustedContactId,
+    /// The unsealed contact address (an email/phone), for the out-of-band confirmation send.
+    pub address: String,
+}
+
+/// The trusted-contact enrollment READ repository for a scope (issue #82, PR 3): list a
+/// subject's designated contacts, unsealing each address for the out-of-band send.
+pub struct RecoveryTrustedContactRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl RecoveryTrustedContactRepo<'_> {
+    /// List `subject`'s designated trusted contacts (issue #82, PR 3), unsealing each contact
+    /// address so the initiation can fan a confirmation link out. Subject-bound (anti-IDOR).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Encryption`] if no platform master key is configured or a sealed value
+    /// cannot be authenticated and decrypted; [`StoreError::Database`] on a persistence
+    /// failure.
+    pub async fn list_opened(
+        &self,
+        subject: &UserId,
+    ) -> Result<Vec<OpenedTrustedContact>, StoreError> {
+        if subject.scope() != self.scope {
+            return Ok(Vec::new());
+        }
+        let master = self.store.master().ok_or(StoreError::Encryption)?;
+        let scope = self.scope;
+        let mut tx = begin_scoped(self.store, scope).await?;
+        let rows = sqlx::query(
+            "SELECT id, contact_sealed, pii_dek_version FROM recovery_trusted_contacts \
+             WHERE tenant_id = $1 AND environment_id = $2 AND subject = $3 \
+             ORDER BY created_at, id",
+        )
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(subject.to_string())
+        .fetch_all(&mut *tx)
+        .await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let id_text: String = row.get("id");
+            let Ok(id) = RecoveryTrustedContactId::parse_in_scope(&id_text, &scope) else {
+                continue;
+            };
+            let dek_version: i32 = row.get("pii_dek_version");
+            let dek = fetch_dek_by_version(&mut tx, scope, master, dek_version).await?;
+            let sealed: Vec<u8> = row.get("contact_sealed");
+            let plain = dek.open(
+                &recovery_contact_seal_aad(scope, &id_text, dek_version),
+                &Sealed::from_bytes(sealed)?,
+            )?;
+            let address = String::from_utf8(plain).map_err(|_| StoreError::Encryption)?;
+            out.push(OpenedTrustedContact { id, address });
+        }
+        tx.commit().await?;
+        Ok(out)
+    }
+}
+
+/// The mutating trusted-contact enrollment repository for a scope and actor (issue #82,
+/// PR 3): designate a contact, sealing its address under the scope DEK (issue #48).
+pub struct ActingRecoveryTrustedContactRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+    acting: ActingContext,
+}
+
+impl ActingRecoveryTrustedContactRepo<'_> {
+    /// DESIGNATE a trusted contact for `subject` (issue #82, PR 3): seal the contact address
+    /// under the scope DEK and insert the enrollment row. A plain scoped write (the recovery
+    /// confirmations it later drives are the audited events).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the subject is out of scope; [`StoreError::Encryption`] if
+    /// no platform master key is configured; [`StoreError::Database`] on a persistence
+    /// failure.
+    pub async fn enroll(
+        &self,
+        env: &Env,
+        subject: &UserId,
+        address: &str,
+    ) -> Result<RecoveryTrustedContactId, StoreError> {
+        if subject.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let master = self.store.master().ok_or(StoreError::Encryption)?;
+        let scope = self.scope;
+        // Provision the scope KEK/DEK lazily on first use (idempotent), exactly like the
+        // recovery-recipient sealing path.
+        let envelope = ActingEnvelopeRepo {
+            store: self.store,
+            scope,
+            acting: self.acting,
+        };
+        match envelope.provision_kek(env, master).await {
+            Ok(_) | Err(StoreError::Conflict) => {}
+            Err(error) => return Err(error),
+        }
+        match envelope.provision_dek(env, master).await {
+            Ok(_) | Err(StoreError::Conflict) => {}
+            Err(error) => return Err(error),
+        }
+        let id = RecoveryTrustedContactId::generate(env, &scope);
+        let id_text = id.to_string();
+        let subject_text = subject.to_string();
+        let mut tx = begin_scoped(self.store, scope).await?;
+        let (dek_version, dek) = fetch_active_dek(&mut tx, scope, master).await?;
+        let sealed = dek.seal(
+            env.entropy(),
+            &recovery_contact_seal_aad(scope, &id_text, dek_version),
+            address.as_bytes(),
+        );
+        sqlx::query(
+            "INSERT INTO recovery_trusted_contacts \
+             (id, tenant_id, environment_id, subject, contact_sealed, pii_dek_version) \
+             VALUES ($1, $2, $3, $4, $5, $6)",
+        )
+        .bind(&id_text)
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(&subject_text)
+        .bind(sealed.into_bytes())
+        .bind(dek_version)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(id)
+    }
+}
+
+/// The per-flow trusted-contact confirmation READ repository for a scope (issue #82, PR 3):
+/// count the DISTINCT confirmed contacts (the threshold) and resolve a confirmation by its
+/// single-use token digest.
+pub struct RecoveryContactConfirmationRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl RecoveryContactConfirmationRepo<'_> {
+    /// Count the DISTINCT confirmed contacts for a recovery flow (issue #82, PR 3). Because
+    /// the `(flow_id, contact_id)` UNIQUE index admits at most one row per contact, a
+    /// confirmed-row count IS the distinct-contact count, so a single contact confirming
+    /// twice can never reach a threshold of two.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn count_confirmed(&self, flow_id: &RecoveryFlowId) -> Result<i64, StoreError> {
+        if flow_id.scope() != self.scope {
+            return Ok(0);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let count: i64 = sqlx::query(
+            "SELECT count(*) AS c FROM recovery_contact_confirmations \
+             WHERE tenant_id = $1 AND environment_id = $2 AND flow_id = $3 \
+             AND confirmed_at IS NOT NULL",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(flow_id.to_string())
+        .fetch_one(&mut *tx)
+        .await?
+        .get("c");
+        tx.commit().await?;
+        Ok(count)
+    }
+
+    /// Count ALL pending-or-confirmed contact confirmations minted for a recovery flow (issue
+    /// #82, PR 3): the number of designated contacts the initiation fanned a link out to, so
+    /// the caller can cap the confirmation threshold at the designated-contact count (an
+    /// unreachable threshold above it would deadlock the recovery).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn count_total(&self, flow_id: &RecoveryFlowId) -> Result<i64, StoreError> {
+        if flow_id.scope() != self.scope {
+            return Ok(0);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let count: i64 = sqlx::query(
+            "SELECT count(*) AS c FROM recovery_contact_confirmations \
+             WHERE tenant_id = $1 AND environment_id = $2 AND flow_id = $3",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(flow_id.to_string())
+        .fetch_one(&mut *tx)
+        .await?
+        .get("c");
+        tx.commit().await?;
+        Ok(count)
+    }
+
+    /// Resolve the `(flow, contact)` a pending confirmation token belongs to (issue #82,
+    /// PR 3), for the confirm handler to know which flow to try to advance and which contact
+    /// to attribute. Returns the pair when a matching, still-unconfirmed, unexpired row exists
+    /// at `now_micros`, else [`None`] (a forged, spent, or expired token is the uniform
+    /// no-op).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn pending_for_digest(
+        &self,
+        digest: &[u8],
+        now_micros: i64,
+    ) -> Result<Option<(RecoveryFlowId, RecoveryTrustedContactId)>, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT flow_id, contact_id FROM recovery_contact_confirmations \
+             WHERE tenant_id = $1 AND environment_id = $2 AND confirm_token_digest = $3 \
+             AND confirmed_at IS NULL \
+             AND expires_at > (TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval)",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(digest)
+        .bind(now_micros)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let flow = RecoveryFlowId::parse_in_scope(&row.get::<String, _>("flow_id"), &self.scope);
+        let contact = RecoveryTrustedContactId::parse_in_scope(
+            &row.get::<String, _>("contact_id"),
+            &self.scope,
+        );
+        match (flow, contact) {
+            (Ok(flow), Ok(contact)) => Ok(Some((flow, contact))),
+            _ => Ok(None),
+        }
+    }
+}
+
+/// The mutating per-flow trusted-contact confirmation repository for a scope and actor (issue
+/// #82, PR 3): mint the pending confirmations for a flow, and LATCH a single-use
+/// confirmation.
+pub struct ActingRecoveryContactConfirmationRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+    acting: ActingContext,
+}
+
+impl ActingRecoveryContactConfirmationRepo<'_> {
+    /// Mint one pending confirmation for `(flow, contact)` (issue #82, PR 3): store only the
+    /// SHA-256 digest of the single-use confirmation token, with the expiry horizon. A plain
+    /// scoped write. The `(flow_id, contact_id)` UNIQUE index makes a duplicate mint a no-op.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the flow or contact is out of scope;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn create_pending(
+        &self,
+        env: &Env,
+        flow_id: &RecoveryFlowId,
+        contact_id: &RecoveryTrustedContactId,
+        confirm_token_digest: &[u8],
+        expires_at_micros: i64,
+    ) -> Result<(), StoreError> {
+        if flow_id.scope() != self.scope || contact_id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let id = RecoveryContactConfirmationId::generate(env, &scope);
+        let mut tx = begin_scoped(self.store, scope).await?;
+        sqlx::query(
+            "INSERT INTO recovery_contact_confirmations \
+             (id, tenant_id, environment_id, flow_id, contact_id, confirm_token_digest, \
+              expires_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, \
+                     TIMESTAMPTZ 'epoch' + ($7::text || ' microseconds')::interval) \
+             ON CONFLICT (tenant_id, environment_id, flow_id, contact_id) DO NOTHING",
+        )
+        .bind(id.to_string())
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(flow_id.to_string())
+        .bind(contact_id.to_string())
+        .bind(confirm_token_digest)
+        .bind(expires_at_micros)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// LATCH a single-use trusted-contact confirmation from its token digest (issue #82,
+    /// PR 3): flip `confirmed_at` for the ONE matching, still-unconfirmed, unexpired row, in
+    /// one audited transaction (`recovery.contact.confirmed`, targeting `flow_id`, with the
+    /// contact id in `detail`). The `confirmed_at IS NULL` guard makes it single-use: a
+    /// replayed token latches nothing. Returns `true` when this call won the latch.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn confirm(
+        &self,
+        env: &Env,
+        flow_id: &RecoveryFlowId,
+        contact_id: &RecoveryTrustedContactId,
+        digest: &[u8],
+    ) -> Result<bool, StoreError> {
+        if flow_id.scope() != self.scope {
+            return Ok(false);
+        }
+        let scope = self.scope;
+        let now_micros = epoch_micros(env.clock().now_utc());
+        let digest = digest.to_vec();
+        let flow_text = flow_id.to_string();
+        let detail = format!("contact={contact_id}");
+        let result = write_audited_detailed(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::RecoveryContactConfirmed,
+                target: flow_id,
+            },
+            async move |tx| {
+                let latched = sqlx::query(
+                    "UPDATE recovery_contact_confirmations SET \
+                     confirmed_at = TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval \
+                     WHERE tenant_id = $1 AND environment_id = $2 AND confirm_token_digest = $3 \
+                     AND flow_id = $5 \
+                     AND confirmed_at IS NULL \
+                     AND expires_at > (TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval)",
+                )
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(&digest)
+                .bind(now_micros)
+                .bind(&flow_text)
+                .execute(&mut **tx)
+                .await?
+                .rows_affected();
+                // Nothing latched (spent, expired, or cross-flow): abort so no audit row is
+                // written for a no-op.
+                if latched == 0 {
+                    return Err(StoreError::NotFound);
+                }
+                Ok(())
+            },
+            false,
+            Some(&detail),
+        )
+        .await;
+        match result {
+            Ok(()) => Ok(true),
+            Err(StoreError::NotFound) => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+}
+
+/// One IDV-gated recovery session as the callback handler resolves it (issue #82, PR 3): the
+/// case-bound nonce it must echo, and whether it is still consumable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecoveryIdvSessionRecord {
+    /// The `rcv_` flow this session verifies.
+    pub flow_id: RecoveryFlowId,
+    /// The case nonce the callback must carry to bind it to this session.
+    pub callback_nonce: String,
+    /// Whether the single-use latch has already been spent (a replayed callback).
+    pub consumed: bool,
+    /// The session expiry horizon in microseconds since the Unix epoch.
+    pub expires_at_unix_micros: i64,
+}
+
+/// The IDV-gated recovery session READ repository for a scope (issue #82, PR 3): resolve a
+/// session by its flow-bound single-use state nonce (the case binding).
+pub struct RecoveryIdvSessionRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl RecoveryIdvSessionRepo<'_> {
+    /// Resolve the IDV session for `(flow, redirect_state_digest)` (issue #82, PR 3). The
+    /// state nonce is bound to the flow by the `(flow_id, redirect_state_digest)` UNIQUE
+    /// index, so a state minted for another flow selects no row (no cross-case). Returns
+    /// [`None`] when no matching session exists.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn by_flow_state(
+        &self,
+        flow_id: &RecoveryFlowId,
+        redirect_state_digest: &[u8],
+    ) -> Result<Option<RecoveryIdvSessionRecord>, StoreError> {
+        if flow_id.scope() != self.scope {
+            return Ok(None);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT flow_id, callback_nonce, (consumed_at IS NOT NULL) AS consumed, \
+             (EXTRACT(EPOCH FROM expires_at) * 1000000)::bigint AS expires_us \
+             FROM recovery_idv_sessions \
+             WHERE tenant_id = $1 AND environment_id = $2 AND flow_id = $3 \
+             AND redirect_state_digest = $4",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(flow_id.to_string())
+        .bind(redirect_state_digest)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let Ok(flow_id) =
+            RecoveryFlowId::parse_in_scope(&row.get::<String, _>("flow_id"), &self.scope)
+        else {
+            return Ok(None);
+        };
+        Ok(Some(RecoveryIdvSessionRecord {
+            flow_id,
+            callback_nonce: row.get("callback_nonce"),
+            consumed: row.get("consumed"),
+            expires_at_unix_micros: row.get("expires_us"),
+        }))
+    }
+
+    /// Whether an IDV-gated recovery flow has a CONSUMED session with a `pass` verdict (issue
+    /// #82, PR 3): the method precondition the completion gate ANDs with the delay/downgrade
+    /// rules. A never-consumed, or a consumed-but-`fail`, session yields `false`.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn passed_for_flow(&self, flow_id: &RecoveryFlowId) -> Result<bool, StoreError> {
+        if flow_id.scope() != self.scope {
+            return Ok(false);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT 1 AS ok FROM recovery_idv_sessions \
+             WHERE tenant_id = $1 AND environment_id = $2 AND flow_id = $3 \
+             AND consumed_at IS NOT NULL AND verdict = 'pass'",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(flow_id.to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(row.is_some())
+    }
+}
+
+/// The mutating IDV-gated recovery session repository for a scope and actor (issue #82,
+/// PR 3): create a flow-bound single-use session, and CONSUME a verified callback.
+pub struct ActingRecoveryIdvSessionRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+    acting: ActingContext,
+}
+
+impl ActingRecoveryIdvSessionRepo<'_> {
+    /// Create a flow-bound IDV session (issue #82, PR 3): store the provider slug, the
+    /// single-use `redirect_state_digest` bound to the flow, the case nonce the callback must
+    /// echo, and the expiry. A plain scoped write.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the flow is out of scope; [`StoreError::Database`] on a
+    /// persistence failure.
+    pub async fn create(
+        &self,
+        env: &Env,
+        flow_id: &RecoveryFlowId,
+        provider: &str,
+        redirect_state_digest: &[u8],
+        callback_nonce: &str,
+        expires_at_micros: i64,
+    ) -> Result<RecoveryIdvSessionId, StoreError> {
+        if flow_id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let id = RecoveryIdvSessionId::generate(env, &scope);
+        let mut tx = begin_scoped(self.store, scope).await?;
+        sqlx::query(
+            "INSERT INTO recovery_idv_sessions \
+             (id, tenant_id, environment_id, flow_id, provider, redirect_state_digest, \
+              callback_nonce, expires_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, \
+                     TIMESTAMPTZ 'epoch' + ($8::text || ' microseconds')::interval)",
+        )
+        .bind(id.to_string())
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(flow_id.to_string())
+        .bind(provider)
+        .bind(redirect_state_digest)
+        .bind(callback_nonce)
+        .bind(expires_at_micros)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(id)
+    }
+
+    /// CONSUME a verified IDV callback (issue #82, PR 3): flip the single-use `consumed_at`
+    /// latch and record the asserted `verdict` for the ONE matching, still-unconsumed,
+    /// unexpired session, in one audited transaction (`recovery.idv.callback`, targeting
+    /// `flow_id`, with the provider and verdict in `detail`). The `consumed_at IS NULL`
+    /// guard makes it single-use: a replayed callback latches nothing. Returns `true` when
+    /// this call won the latch (regardless of verdict); the caller completes the recovery
+    /// ONLY on a `pass`.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn consume(
+        &self,
+        env: &Env,
+        flow_id: &RecoveryFlowId,
+        redirect_state_digest: &[u8],
+        provider: &str,
+        verdict: &str,
+    ) -> Result<bool, StoreError> {
+        if flow_id.scope() != self.scope {
+            return Ok(false);
+        }
+        let scope = self.scope;
+        let now_micros = epoch_micros(env.clock().now_utc());
+        let digest = redirect_state_digest.to_vec();
+        let flow_text = flow_id.to_string();
+        let verdict_owned = verdict.to_owned();
+        let detail = format!("provider={provider};verdict={verdict}");
+        let result = write_audited_detailed(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::RecoveryIdvCallback,
+                target: flow_id,
+            },
+            async move |tx| {
+                let row = sqlx::query(
+                    "UPDATE recovery_idv_sessions SET \
+                     consumed_at = TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval, \
+                     verdict = $6 \
+                     WHERE tenant_id = $1 AND environment_id = $2 AND flow_id = $5 \
+                     AND redirect_state_digest = $3 \
+                     AND consumed_at IS NULL \
+                     AND expires_at > (TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval) \
+                     RETURNING id",
+                )
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(&digest)
+                .bind(now_micros)
+                .bind(&flow_text)
+                .bind(&verdict_owned)
+                .fetch_optional(&mut **tx)
+                .await?;
+                match row {
+                    Some(_) => Ok(()),
+                    None => Err(StoreError::NotFound),
+                }
+            },
+            false,
+            Some(&detail),
+        )
+        .await;
+        match result {
+            Ok(()) => Ok(true),
+            Err(StoreError::NotFound) => Ok(false),
+            Err(error) => Err(error),
+        }
     }
 }
 

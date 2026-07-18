@@ -13,9 +13,10 @@ use std::sync::Arc;
 use axum::Router;
 use ironauth_admin::AdminState;
 use ironauth_config::{
-    Config, FEDCM_FEATURE, FeatureRegistry, GLOBAL_TOKEN_REVOCATION_FEATURE, Loaded, OidcConfig,
-    PasswordHashingConfig, PasswordPolicyConfig, QuotaConfig, RISK_SIGNALS_FEATURE,
-    SIGNUP_QUARANTINE_FEATURE, ScreeningFailurePolicy, ScreeningProvider,
+    ADVANCED_RECOVERY_FEATURE, Config, FEDCM_FEATURE, FeatureRegistry,
+    GLOBAL_TOKEN_REVOCATION_FEATURE, Loaded, OidcConfig, PasswordHashingConfig,
+    PasswordPolicyConfig, QuotaConfig, RISK_SIGNALS_FEATURE, SIGNUP_QUARANTINE_FEATURE,
+    ScreeningFailurePolicy, ScreeningProvider,
 };
 use ironauth_env::Env;
 use ironauth_jose::MasterKey;
@@ -170,6 +171,28 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
         // so the register path keeps BLOCKING a risky signup and the review-queue endpoints
         // stay 404s until an operator opts in.
         let signup_quarantine_enabled = features.is_enabled(&config, SIGNUP_QUARANTINE_FEATURE);
+        // The experimental advanced-recovery-modes surface (issue #82, PR 3) is armed only
+        // when its feature is enabled AND acknowledged; the gate is the ladder, never a plain
+        // config toggle, so the ack can never be bypassed. Resolved to a bool here and
+        // injected through BOTH the OIDC state builder (the recovery-method seam and the
+        // trusted-contact / IDV data-plane routes) and the admin state builder (the
+        // recovery-approval review queue), so every advanced-recovery path stays a 404 and
+        // standard recovery is unchanged until an operator opts in.
+        let advanced_recovery_enabled = features.is_enabled(&config, ADVANCED_RECOVERY_FEATURE);
+
+        // When advanced-recovery is armed, an IDV callback's signature is verified against each
+        // provider's REGISTERED JWKS through the JOSE core. The config layer can only prove the
+        // JWKS is NON-EMPTY (it carries no jose dep); parse it HERE, where jose IS available, so
+        // a non-empty but MALFORMED JWKS (or one that yields zero usable keys) fails boot
+        // CLEANLY instead of booting and then failing closed at every IDV recovery callback.
+        // Only checked when the feature is armed (a malformed JWKS with the feature off is
+        // inert), and only for enabled providers (mirroring the config non-empty check).
+        if advanced_recovery_enabled {
+            if let Err(error) = validate_idv_provider_jwks(&config.oidc.advanced_recovery) {
+                tracing::error!(%error, "advanced-recovery IDV provider JWKS is invalid");
+                return ExitCode::FAILURE;
+            }
+        }
 
         let env = Env::system();
 
@@ -206,6 +229,7 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
             migration_hook.clone(),
             federation_runtime.clone(),
             signup_quarantine_enabled,
+            advanced_recovery_enabled,
         )
         .await;
 
@@ -262,6 +286,7 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
                 fedcm_enabled,
                 risk_signals_enabled,
                 signup_quarantine_enabled,
+                advanced_recovery_enabled,
                 master_key,
                 &quota_config,
                 &hashing_config,
@@ -312,6 +337,7 @@ async fn build_management_router(
     migration_hook: Option<Arc<LazyMigrationHook>>,
     federation_runtime: Option<Arc<FederationRuntime>>,
     signup_quarantine_enabled: bool,
+    advanced_recovery_enabled: bool,
 ) -> Option<Router> {
     if config.admin.bootstrap_operator_token.is_none() {
         tracing::info!(
@@ -360,6 +386,10 @@ async fn build_management_router(
             // when the ladder resolved the feature enabled AND acked; otherwise every
             // review-queue endpoint stays a uniform 404.
             let state = state.with_signup_quarantine_enabled(signup_quarantine_enabled);
+            // Arm the experimental admin-approved recovery review-queue endpoints (issue #82,
+            // PR 3) only when the ladder resolved the feature enabled AND acked; otherwise
+            // every recovery-approval endpoint stays a uniform 404.
+            let state = state.with_advanced_recovery_enabled(advanced_recovery_enabled);
             tracing::info!("management API mounted on the management plane");
             Some(ironauth_admin::management_router(state))
         }
@@ -418,6 +448,7 @@ async fn build_oidc_router(
     fedcm_enabled: bool,
     risk_signals_enabled: bool,
     signup_quarantine_enabled: bool,
+    advanced_recovery_enabled: bool,
     master_key: Option<Arc<MasterKey>>,
     quota_config: &QuotaConfig,
     hashing_config: &PasswordHashingConfig,
@@ -529,6 +560,7 @@ async fn build_oidc_router(
         .with_fedcm_enabled(fedcm_enabled)
         .with_risk_signals_enabled(risk_signals_enabled)
         .with_signup_quarantine_enabled(signup_quarantine_enabled)
+        .with_advanced_recovery_enabled(advanced_recovery_enabled)
         .with_quota_enforcer(quota_enforcer)
         .with_hashing_pool(hashing_pool)
         .with_password_policy(password_policy, screening_failure, screen_on_login)
@@ -587,6 +619,15 @@ async fn build_oidc_router(
              contract may change between releases"
         );
     }
+    if advanced_recovery_enabled {
+        tracing::info!(
+            "experimental advanced recovery modes mounted (issue #82); admin-approved, \
+             trusted-contact, and IDV-gated recovery each complete THROUGH the recovery delay \
+             window and downgrade invariant; IDV consumes a signed provider callback and \
+             IronAuth never verifies documents in house; the wire contract may change between \
+             releases"
+        );
+    }
     tracing::info!(
         "OIDC provider, discovery, and per-environment JWKS mounted on the public plane; \
          per-environment signing keys load lazily from the store on first use"
@@ -628,6 +669,36 @@ fn build_federation_runtime(cfg: &OidcConfig) -> Option<Arc<FederationRuntime>> 
         discovery_ttl,
         probe_window,
     )))
+}
+
+/// Parse each ENABLED IDV provider's registered JWKS through the JOSE core (issue #82, PR 3),
+/// so a non-empty but MALFORMED JWKS (or one that yields zero usable keys) is a clean BOOT
+/// error rather than a per-callback fail-closed surprise at runtime.
+///
+/// The config layer already proves the JWKS is non-empty, but it carries no `ironauth-jose`
+/// dependency, so it structurally cannot prove the JWKS PARSES. This runs at boot where jose
+/// IS available, and only for enabled providers (mirroring the config non-empty check); the
+/// caller gates it on the advanced-recovery feature being armed.
+///
+/// # Errors
+///
+/// A message naming the first provider whose JWKS does not parse into at least one usable key
+/// (the exact fault the callback would otherwise fail closed on).
+fn validate_idv_provider_jwks(cfg: &ironauth_config::AdvancedRecoveryConfig) -> Result<(), String> {
+    for provider in &cfg.idv_providers {
+        if !provider.enabled {
+            continue;
+        }
+        if ironauth_jose::trusted_keys_from_jwks(provider.jwks.as_bytes()).is_empty() {
+            return Err(format!(
+                "oidc.advanced_recovery.idv_providers[{}].jwks does not parse into any usable \
+                 key: an enabled IDV provider must carry a well-formed JWKS with at least one \
+                 supported public key, or every IDV recovery for it would fail at callback",
+                provider.slug
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Resolve the top-level `[password_policy]` config into the runtime 800-63B-4 policy
@@ -2066,5 +2137,58 @@ mod tests {
             build_federation_runtime(&enabled.oidc).is_some(),
             "an enabled federation config builds the runtime the boot path installs"
         );
+    }
+
+    #[test]
+    fn advanced_recovery_rejects_a_malformed_idv_jwks_at_boot() {
+        use ironauth_config::{AdvancedRecoveryConfig, IdvProvider};
+
+        // A well-formed single Ed25519 JWKS (the jose inbound parser recovers one usable key).
+        let good_jwks = r#"{"keys":[{"kty":"OKP","crv":"Ed25519","x":"11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo","kid":"ok"}]}"#;
+        let ok = AdvancedRecoveryConfig {
+            idv_enabled: true,
+            idv_providers: vec![IdvProvider {
+                slug: "acme".to_owned(),
+                enabled: true,
+                jwks: good_jwks.to_owned(),
+                ..IdvProvider::default()
+            }],
+            ..AdvancedRecoveryConfig::default()
+        };
+        validate_idv_provider_jwks(&ok).expect("a well-formed IDV JWKS boots");
+
+        // A non-empty but MALFORMED JWKS passes the config non-empty check yet parses to zero
+        // usable keys: it must FAIL boot cleanly, naming the offending provider, rather than
+        // failing closed at every IDV recovery callback.
+        let bad = AdvancedRecoveryConfig {
+            idv_enabled: true,
+            idv_providers: vec![IdvProvider {
+                slug: "acme".to_owned(),
+                enabled: true,
+                jwks: "definitely not a jwks".to_owned(),
+                ..IdvProvider::default()
+            }],
+            ..AdvancedRecoveryConfig::default()
+        };
+        let err =
+            validate_idv_provider_jwks(&bad).expect_err("a malformed IDV JWKS must fail boot");
+        assert!(
+            err.contains("acme") && err.contains("does not parse"),
+            "the boot error must name the provider and the parse fault: {err}"
+        );
+
+        // A DISABLED provider with a malformed JWKS is inert: it is never parsed (a malformed
+        // JWKS on a disabled provider need not fail boot).
+        let disabled = AdvancedRecoveryConfig {
+            idv_providers: vec![IdvProvider {
+                slug: "acme".to_owned(),
+                enabled: false,
+                jwks: "definitely not a jwks".to_owned(),
+                ..IdvProvider::default()
+            }],
+            ..AdvancedRecoveryConfig::default()
+        };
+        validate_idv_provider_jwks(&disabled)
+            .expect("a disabled provider's JWKS is not parsed at boot");
     }
 }
