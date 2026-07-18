@@ -515,7 +515,7 @@ async fn production_chain_is_only_the_sixty_five_real_migrations_and_ships_no_de
          risk signals, signup fraud review)"
     );
 
-    // The ledger holds exactly versions 1 through 64.
+    // The ledger holds exactly versions 1 through 65.
     assert_eq!(
         applied_versions(pool).await,
         vec![
@@ -931,29 +931,63 @@ async fn production_chain_is_only_the_sixty_five_real_migrations_and_ships_no_de
         );
     }
     // The verdict columns are control-plane-owned (the #31 split): the control role holds a
-    // column-scoped UPDATE(state), and the data-plane role does NOT, so only the admin review
-    // queue can move a case forward.
+    // column-scoped UPDATE over EXACTLY the review columns (state / quarantined_until / the
+    // reviewer stamp / the note), and the data-plane role holds NONE, so only the admin
+    // review queue can move a case forward.
+    for column in [
+        "state",
+        "quarantined_until",
+        "reviewed_by_kind",
+        "reviewed_by_id",
+        "reviewed_at",
+        "review_note",
+    ] {
+        assert!(
+            role_has_column_privilege(
+                pool,
+                "ironauth_control",
+                "signup_quarantines",
+                column,
+                "UPDATE"
+            )
+            .await,
+            "the control role must hold column-scoped UPDATE on signup_quarantines.{column}"
+        );
+        assert!(
+            !role_has_column_privilege(
+                pool,
+                "ironauth_app",
+                "signup_quarantines",
+                column,
+                "UPDATE"
+            )
+            .await,
+            "the data-plane role must NOT hold UPDATE on signup_quarantines.{column}"
+        );
+    }
+    // The IDENTITY columns are NOT in the control grant: the control role decides a case but
+    // can never rewrite WHAT it is about (its subject or reason).
+    for column in ["subject", "reason"] {
+        assert!(
+            !role_has_column_privilege(
+                pool,
+                "ironauth_control",
+                "signup_quarantines",
+                column,
+                "UPDATE"
+            )
+            .await,
+            "the control role must NOT hold UPDATE on the identity column signup_quarantines.{column}"
+        );
+    }
+    // The one-open-case-per-account invariant: a PARTIAL UNIQUE index over
+    // (tenant, environment, subject) WHERE state IN ('pending','extended'), so an account has
+    // at most one OPEN review case at a time (re-quarantining an already-open subject is a
+    // structural conflict, not a silent duplicate).
     assert!(
-        role_has_column_privilege(
-            pool,
-            "ironauth_control",
-            "signup_quarantines",
-            "state",
-            "UPDATE"
-        )
-        .await,
-        "the control role must hold column-scoped UPDATE on signup_quarantines.state"
-    );
-    assert!(
-        !role_has_column_privilege(
-            pool,
-            "ironauth_app",
-            "signup_quarantines",
-            "state",
-            "UPDATE"
-        )
-        .await,
-        "the data-plane role must NOT hold UPDATE on signup_quarantines.state"
+        partial_unique_index_exists(pool, "signup_quarantines", "signup_quarantines_open_uniq")
+            .await,
+        "signup_quarantines must carry the one-open-case-per-account partial unique index"
     );
 
     // The step-up second-factor abuse path (issue #72): migration 0047 WIDENED the

@@ -2171,6 +2171,37 @@ impl Harness {
         .await
         .expect("update client quarantine");
     }
+
+    /// Additionally arm the signup fraud-review queue (issue #82, PR 2) on the CURRENT
+    /// state and rebuild the protocol router, COMPOSING with an already-armed feature such
+    /// as FedCM (unlike [`Self::enable_signup_quarantine`], which builds a fresh default
+    /// state). Preserves the current state's other flags (the cloned state keeps
+    /// `fedcm_enabled`), so a FedCM assertion test can exercise the quarantined-USER
+    /// refusal. The assertion endpoint lives on the protocol router, which is rebuilt here.
+    pub fn also_enable_signup_quarantine(&mut self) {
+        let state = self.state.clone().with_signup_quarantine_enabled(true);
+        self.router = oidc_router(state.clone());
+        self.state = state;
+    }
+
+    /// Force a user INTO (or out of) the signup quarantine (issue #82, PR 2), for tests
+    /// that must exercise the quarantined-USER gate. Runs through the owner pool (the
+    /// migration/provisioning connection), mirroring [`Self::set_client_quarantined`]. The
+    /// value the redirect flow and the FedCM assertion endpoint read is the SAME
+    /// `users.quarantined` column.
+    pub async fn set_user_quarantined(&self, subject: &str, quarantined: bool) {
+        sqlx::query(
+            "UPDATE users SET quarantined = $1 \
+             WHERE id = $2 AND tenant_id = $3 AND environment_id = $4",
+        )
+        .bind(quarantined)
+        .bind(subject)
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .execute(self.db.owner_pool())
+        .await
+        .expect("update user quarantine");
+    }
 }
 
 /// A clock at the token's issuance time (the frozen epoch), for verification.

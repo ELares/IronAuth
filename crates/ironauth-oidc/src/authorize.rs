@@ -591,9 +591,22 @@ async fn issue_code(
     //     and the strip cannot be bypassed by a caller. Flag-gated and
     //     applied only to a quarantined subject, so a normal account and a flag-off
     //     deployment are byte-identical.
-    let effective_scope = if state.signup_quarantine_enabled()
-        && user_is_quarantined(state, scope, &session.subject).await
-    {
+    let user_quarantined = if state.signup_quarantine_enabled() {
+        match user_is_quarantined(state, scope, &session.subject).await {
+            Ok(quarantined) => quarantined,
+            // FAIL CLOSED on a store fault (consistent with the sibling security reads): a
+            // transient blip must NOT silently skip the sensitive-scope strip below.
+            Err(()) => {
+                return Err(redirect_error(
+                    AuthzErrorCode::ServerError,
+                    "the authorization request could not be processed",
+                ));
+            }
+        }
+    } else {
+        false
+    };
+    let effective_scope = if user_quarantined {
         strip_sensitive_scopes(effective_scope.as_deref(), state.quarantine_config())
     } else {
         effective_scope
@@ -1743,12 +1756,22 @@ async fn resolve_gate(
 /// disables it. `prompt=consent` forces a fresh screen; `prompt=none` turns an
 /// interaction need into the matching negotiated-mode error.
 /// Whether the session subject is a QUARANTINED account (issue #82, PR 2). Parses the
-/// subject in scope and reads its `quarantined` flag; any parse or store failure resolves to
-/// `false`. The caller gates this on the experimental flag, so it never runs when the
-/// feature is off (a quarantined-user flag can only ever be set behind the same flag).
-async fn user_is_quarantined(state: &OidcState, scope: Scope, subject_text: &str) -> bool {
+/// subject in scope and reads its `quarantined` flag. A subject that fails to parse is
+/// reported as NOT quarantined (an unparseable subject carries no quarantine flag). A STORE
+/// FAULT is surfaced as `Err(())` so every caller FAILS CLOSED, the same posture as the
+/// sibling security reads `enforce_step_up_policy` and `fedcm_consent_satisfied` (each of
+/// which turns a store fault into a server error): a transient store blip must never
+/// silently skip the sensitive-scope strip or re-enable the first-party carve-out for a
+/// subject that may be quarantined. The caller gates this on the experimental flag, so it
+/// never runs when the feature is off (a quarantined-user flag can only ever be set behind
+/// the same flag).
+async fn user_is_quarantined(
+    state: &OidcState,
+    scope: Scope,
+    subject_text: &str,
+) -> Result<bool, ()> {
     let Ok(subject) = UserId::parse_in_scope(subject_text, &scope) else {
-        return false;
+        return Ok(false);
     };
     state
         .store()
@@ -1756,7 +1779,7 @@ async fn user_is_quarantined(state: &OidcState, scope: Scope, subject_text: &str
         .users()
         .is_quarantined(&subject)
         .await
-        .unwrap_or(false)
+        .map_err(|_| ())
 }
 
 /// Strip every SENSITIVE scope (per the quarantine denylist) from a quarantined account's
@@ -1822,7 +1845,18 @@ async fn resolve_consent_gate(
     // every authorization regardless of consent, so a silent reuse of a prior consent is
     // still powerless.
     let user_quarantined = if state.signup_quarantine_enabled() {
-        user_is_quarantined(state, scope, &session.subject).await
+        match user_is_quarantined(state, scope, &session.subject).await {
+            Ok(quarantined) => quarantined,
+            // FAIL CLOSED on a store fault (consistent with the sibling security reads): a
+            // transient blip must NOT silently re-enable the first-party carve-out for a
+            // possibly quarantined subject.
+            Err(()) => {
+                return Err(gate_error(
+                    AuthzErrorCode::ServerError,
+                    "the authorization request could not be processed",
+                ));
+            }
+        }
     } else {
         false
     };

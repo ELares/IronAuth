@@ -155,7 +155,7 @@ async fn reject_disables_the_account_and_extend_bumps_the_window() {
         .reject(&env, &rejected, None)
         .await
         .expect("reject the signup");
-    let (state, _) = user_row(&db, scope, &rejected).await;
+    let (state, quarantined) = user_row(&db, scope, &rejected).await;
     assert_eq!(state, "disabled", "reject disables the account");
     assert!(
         !UserState::from_wire(&state)
@@ -163,10 +163,38 @@ async fn reject_disables_the_account_and_extend_bumps_the_window() {
             .can_authenticate(),
         "a disabled account cannot authenticate"
     );
+    // Reject also CLEARS the quarantine flag in the SAME transaction, so a later
+    // reactivation cannot leave the account stuck permanently restricted (approve needs an
+    // OPEN case, which the reject already closed as `rejected`).
+    assert!(!quarantined, "reject cleared the quarantine flag");
+    assert!(
+        !db.store()
+            .scoped(scope)
+            .users()
+            .is_quarantined(&rejected)
+            .await
+            .expect("read quarantine flag"),
+        "is_quarantined reports the flag cleared after reject"
+    );
     assert_eq!(
         audited_by(&db, scope, "signup_quarantine.rejected", &admin_id).await,
         1,
         "the reject audits the deciding admin actor"
+    );
+    // Reactivating the account (disabled -> active) leaves it a NORMAL account, NOT stuck
+    // quarantined: the flag is already clear, so the reactivated account is unrestricted.
+    db.store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .users()
+        .set_state(&env, &rejected, UserState::Active, None, false, None)
+        .await
+        .expect("reactivate the rejected account");
+    let (reactivated_state, reactivated_quarantined) = user_row(&db, scope, &rejected).await;
+    assert_eq!(reactivated_state, "active", "the account reactivates");
+    assert!(
+        !reactivated_quarantined,
+        "a reactivated account is not stuck quarantined"
     );
 
     // EXTEND bumps the window and keeps the case OPEN (the account stays quarantined).

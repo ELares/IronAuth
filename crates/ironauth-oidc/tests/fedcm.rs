@@ -966,6 +966,65 @@ async fn assertion_quarantined_client_with_recorded_consent_is_refused() {
 }
 
 #[tokio::test]
+async fn assertion_quarantined_user_is_refused_when_the_flag_is_on() {
+    // The subject-quarantine analog of the client-quarantine parity proof (issue #82, PR
+    // 2): a QUARANTINED USER on a fully-consented client, a valid session, its registered
+    // origin, and a fresh nonce must NOT be silently issued a FedCM assertion when the
+    // signup-quarantine feature is on. The redirect flow routes a quarantined subject to
+    // the consent SCREEN (disabling its first-party carve-out); FedCM cannot render that
+    // screen, so its analog is to REFUSE. Lifting the quarantine then mints the SAME
+    // recorded consent on a fresh nonce (no regression to the happy path).
+    let (mut harness, client_id, subject, public_subject, cookie) = armed_assertion_harness().await;
+    harness.also_enable_signup_quarantine();
+
+    // Quarantine the (already-consented) USER: the exact FedCM analog of the
+    // quarantined-CLIENT repro, but on the users.quarantined flag.
+    harness.set_user_quarantined(&subject, true).await;
+
+    let (status, headers, body) = assertion_post(
+        &harness,
+        &assertion_form(&client_id, &public_subject, "n-user-quarantine"),
+        Some(RP_ORIGIN),
+        Some("webidentity"),
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a quarantined user with a recorded consent must be REFUSED, not minted: {body}"
+    );
+    assert!(
+        !body.contains("token"),
+        "a quarantined user must never be issued a silent FedCM assertion: {body}"
+    );
+    // A refusal carries NO CORS (no readable oracle).
+    assert_eq!(allow_origin(&headers), None);
+
+    // The control: lift the quarantine (as an admin release does) and the SAME recorded
+    // consent now mints, on a fresh nonce. This proves the gate refuses ONLY the
+    // quarantined-user case and leaves the happy path unregressed.
+    harness.set_user_quarantined(&subject, false).await;
+    let (status, _headers, body) = assertion_post(
+        &harness,
+        &assertion_form(&client_id, &public_subject, "n-user-released"),
+        Some(RP_ORIGIN),
+        Some("webidentity"),
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a released user with the SAME recorded consent still mints: {body}"
+    );
+    assert!(
+        json(&body)["token"].as_str().is_some(),
+        "the released-user happy path is unregressed: {body}"
+    );
+}
+
+#[tokio::test]
 async fn assertion_flag_off_is_404() {
     // With the flag off the credential-issuing endpoint is a uniform 404.
     let harness = Harness::start().await; // fedcm NOT enabled

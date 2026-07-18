@@ -21644,10 +21644,14 @@ impl ActingSignupQuarantineRepo<'_> {
     }
 
     /// REJECT a quarantined signup (issue #82, PR 2): DISABLE the account (so it can no
-    /// longer authenticate) and end its live sessions, and mark its open case `rejected`,
-    /// stamping the deciding admin actor, in ONE audited transaction
-    /// (`signup_quarantine.rejected`, targeting the subject). This is the cleanup path for a
-    /// confirmed fraudulent signup, mirroring the soft-delete/disable lifecycle discipline.
+    /// longer authenticate), CLEAR its `quarantined` flag, and end its live sessions, and
+    /// mark its open case `rejected`, stamping the deciding admin actor, in ONE audited
+    /// transaction (`signup_quarantine.rejected`, targeting the subject). This is the cleanup
+    /// path for a confirmed fraudulent signup, mirroring the soft-delete/disable lifecycle
+    /// discipline. Clearing `quarantined` here (a rejected account is disabled anyway) removes
+    /// the stuck-quarantined trap: without it, a later reactivation would leave the account
+    /// PERMANENTLY restricted with no release path (approve requires an OPEN case, which the
+    /// reject already closed).
     ///
     /// # Errors
     ///
@@ -21680,8 +21684,13 @@ impl ActingSignupQuarantineRepo<'_> {
             },
             async move |tx| {
                 insert_idempotency(tx, idempotency).await?;
+                // Clear `quarantined` in the SAME transaction as the disable + case-close:
+                // a rejected account is disabled anyway, and clearing the flag removes the
+                // stuck-quarantined trap where a later reactivation (set_state back to Active)
+                // would leave the account PERMANENTLY restricted with no release path (approve
+                // requires an OPEN case, but this reject already closed it as `rejected`).
                 let disabled = sqlx::query(
-                    "UPDATE users SET state = 'disabled', \
+                    "UPDATE users SET state = 'disabled', quarantined = false, \
                          updated_at = TIMESTAMPTZ 'epoch' + ($1::text || ' microseconds')::interval \
                      WHERE id = $2 AND tenant_id = $3 AND environment_id = $4 \
                      AND deleted_at IS NULL AND state <> 'disabled'",

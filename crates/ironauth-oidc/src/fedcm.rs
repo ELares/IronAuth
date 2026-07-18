@@ -60,7 +60,7 @@
 use axum::extract::{Form, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use ironauth_store::{ClientId, ClientRecord, CorrelationId, FedcmNonceId, StoreError};
+use ironauth_store::{ClientId, ClientRecord, CorrelationId, FedcmNonceId, StoreError, UserId};
 use serde::Deserialize;
 use serde_json::{Map, Value};
 
@@ -383,6 +383,10 @@ fn origin_matches_client(client: &ClientRecord, request_origin: Option<&str>) ->
 ///   auto-authorize it). FedCM cannot render that screen, so the exact analog is to
 ///   REFUSE. This mirrors the SAME `client.quarantined` field the redirect flow reads,
 ///   for BOTH the carve-out and the recorded-consent path;
+/// - a QUARANTINED USER (issue #82, PR 2) likewise NEVER satisfies FedCM consent, the
+///   analog of the redirect flow routing a quarantined SUBJECT to the consent screen.
+///   Gated on the experimental signup-quarantine flag; bounded to the openid identity
+///   assertion (no access/refresh token, no client scope);
 /// - otherwise the trusted first-party carve-out (an `implicit`-mode or `skip_consent`
 ///   client) is auto-granted;
 /// - otherwise a recorded, UNEXPIRED consent whose granted scope COVERS the `openid`
@@ -406,6 +410,30 @@ async fn fedcm_consent_satisfied(
     // pre-recorded consent can never silently auto-authorize an unverified client.
     if client.quarantined {
         return Ok(false);
+    }
+    // A QUARANTINED USER (issue #82, PR 2) likewise NEVER satisfies FedCM consent, the exact
+    // analog of the redirect flow routing a quarantined subject to the consent SCREEN (which
+    // disables its first-party carve-out so an un-consented app is always shown consent).
+    // FedCM cannot render that screen, so refuse, mirroring the `client.quarantined` line
+    // right above. This is bounded to the openid identity assertion (no access/refresh token,
+    // no client scope), but it keeps FedCM consistent with the "no silent auto-grant for a
+    // quarantined SUBJECT" discipline the redirect flow enforces. Gated on the experimental
+    // signup-quarantine flag, so when the feature is off the read never runs and behavior is
+    // byte-identical. A subject that fails to parse is treated as not quarantined; a store
+    // fault fails CLOSED (`Err(())`), the same posture as the recorded-consent read below.
+    if state.signup_quarantine_enabled() {
+        if let Ok(subject_id) = UserId::parse_in_scope(subject, &scope) {
+            if state
+                .store()
+                .scoped(scope)
+                .users()
+                .is_quarantined(&subject_id)
+                .await
+                .map_err(|_| ())?
+            {
+                return Ok(false);
+            }
+        }
     }
     // The first-party carve-out, byte-for-byte the redirect flow's rule (issue #21,
     // #31): implicit/skip_consent is auto-granted (the client is not quarantined here,
