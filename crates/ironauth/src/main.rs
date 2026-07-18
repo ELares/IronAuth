@@ -180,6 +180,11 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
         // standard recovery is unchanged until an operator opts in.
         let advanced_recovery_enabled = features.is_enabled(&config, ADVANCED_RECOVERY_FEATURE);
 
+        // The headless flow API (issue #84): a plain top-level operator toggle (like
+        // `oidc.enabled`), off by default, resolved here before `config` is moved so the flow
+        // routes answer a uniform 404 until an operator turns it on.
+        let flows_enabled = config.flows.enabled;
+
         // When advanced-recovery is armed, an IDV callback's signature is verified against each
         // provider's REGISTERED JWKS through the JOSE core. The config layer can only prove the
         // JWKS is NON-EMPTY (it carries no jose dep); parse it HERE, where jose IS available, so
@@ -287,6 +292,7 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
                 risk_signals_enabled,
                 signup_quarantine_enabled,
                 advanced_recovery_enabled,
+                flows_enabled,
                 master_key,
                 &quota_config,
                 &hashing_config,
@@ -449,6 +455,7 @@ async fn build_oidc_router(
     risk_signals_enabled: bool,
     signup_quarantine_enabled: bool,
     advanced_recovery_enabled: bool,
+    flows_enabled: bool,
     master_key: Option<Arc<MasterKey>>,
     quota_config: &QuotaConfig,
     hashing_config: &PasswordHashingConfig,
@@ -561,6 +568,7 @@ async fn build_oidc_router(
         .with_risk_signals_enabled(risk_signals_enabled)
         .with_signup_quarantine_enabled(signup_quarantine_enabled)
         .with_advanced_recovery_enabled(advanced_recovery_enabled)
+        .with_flows_enabled(flows_enabled)
         .with_quota_enforcer(quota_enforcer)
         .with_hashing_pool(hashing_pool)
         .with_password_policy(password_policy, screening_failure, screen_on_login)

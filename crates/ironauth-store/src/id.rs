@@ -286,6 +286,20 @@ impl ScopedKind for RecoveryFlowKind {
     const PREFIX: &'static str = "rcv";
 }
 
+/// Marker for a headless flow id (`flw_`), one row of the flow state machine
+/// (issue #84): the persisted position of a login, registration, MFA, or recovery
+/// journey the flow API serves as one JSON flow object. A tenant-scoped resource:
+/// the id embeds its `(tenant, environment)`, so a flow minted in one scope parses
+/// as a uniform not-found under another, and a flow is only ever loadable within its
+/// own scope. The id is NOT a bearer secret: the API transport additionally carries a
+/// high-entropy, single-use per step `submit_token` (the machine transport CSRF),
+/// so a stolen flow id alone advances nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct FlowKind;
+impl ScopedKind for FlowKind {
+    const PREFIX: &'static str = "flw";
+}
+
 /// Marker for a registered WebAuthn passkey credential (`pky_`), one row in the
 /// per-user passkey registry (issue #65): the COSE public key, sign counter,
 /// AAGUID, transports, BE/BS flags, and the sealed nickname of one authenticator.
@@ -1198,6 +1212,10 @@ pub type TrustedDeviceId = ScopedId<TrustedDeviceKind>;
 /// A recovery-flow id (`rcv_...`), one row of the account-recovery state machine
 /// (issue #81) and the routing handle the notification/cancellation links carry.
 pub type RecoveryFlowId = ScopedId<RecoveryFlowKind>;
+
+/// A headless-flow id (`flw_...`), one row of the flow state machine (issue #84) and
+/// the routing handle both transports carry to load and advance a journey.
+pub type FlowId = ScopedId<FlowKind>;
 
 /// A registered WebAuthn passkey credential id (`pky_`, issue #65).
 pub type WebauthnCredentialId = ScopedId<WebauthnCredentialKind>;

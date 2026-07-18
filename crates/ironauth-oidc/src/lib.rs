@@ -98,6 +98,7 @@ mod federation_health;
 mod federation_jwks;
 mod federation_oauth2;
 mod federation_relay;
+pub mod flow;
 mod global_revocation;
 mod hashing_pool;
 mod hints;
@@ -693,7 +694,22 @@ pub fn oidc_router(state: OidcState) -> Router {
         .route(
             "/t/{tenant_id}/e/{environment_id}/otp/sms/verify",
             post(sms_otp::verify),
-        );
+        )
+        // The headless flow API (issue #84), scope-routed under the per-environment issuer
+        // path so a flow runs under the right row-level-security scope. ONE machine-readable
+        // flow object served to the browser transport (form POST + same-origin CSRF +
+        // cookie/303) and the native JSON transport (a per-flow submit token + a 200
+        // envelope), sharing ONE state machine, node renderer, message-id registry, error
+        // shaping, and anti-enumeration recipe. The handlers fail closed with a uniform 404
+        // when `flows.enabled` is off (FORK D), so the route literals stay UNCONDITIONAL for
+        // the RFC 9700 endpoint inventory while the bootstrap `/login`, `/consent`, and
+        // `/register` pages are untouched (their cutover onto this engine is issue #85).
+        .route(
+            flow::FLOW_BROWSER_PATH,
+            get(flow::flow_browser_get).post(flow::flow_browser_post),
+        )
+        .route(flow::FLOW_CREATE_API_PATH, post(flow::flow_api_create))
+        .route(flow::FLOW_API_SUBMIT_PATH, post(flow::flow_api_submit));
 
     // Dynamic Client Registration (issue #30, RFC 7591 + RFC 7592), mounted ONLY
     // when enabled (default off; issue #31 owns the real abuse gating). The routes

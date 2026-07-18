@@ -668,6 +668,12 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0066_advanced_recovery_modes.sql"),
         },
+        Migration {
+            version: 67,
+            name: "headless_flows",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0067_headless_flows.sql"),
+        },
     ]
 }
 

@@ -1163,6 +1163,7 @@ dependencies = [
  "metrics",
  "metrics-exporter-prometheus",
  "oauth2",
+ "schemars",
  "serde",
  "serde_json",
  "serde_urlencoded",

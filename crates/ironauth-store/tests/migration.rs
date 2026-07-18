@@ -477,7 +477,7 @@ async fn expand_contract_example_chain_runs_all_three_phases_and_contract_remove
 // per real table); splitting it would not make it clearer.
 #[allow(clippy::too_many_lines)]
 #[tokio::test]
-async fn production_chain_is_only_the_sixty_six_real_migrations_and_ships_no_demo_object() {
+async fn production_chain_is_only_the_sixty_seven_real_migrations_and_ships_no_demo_object() {
     // TestDatabase::start runs Store::migrate() (the production chain) on a
     // fresh, empty database.
     let db = TestDatabase::start().await;
@@ -494,8 +494,8 @@ async fn production_chain_is_only_the_sixty_six_real_migrations_and_ships_no_dem
     );
     assert_eq!(
         report.already_applied(),
-        66,
-        "the production chain is exactly sixty-six migrations (isolation, audit log, management \
+        67,
+        "the production chain is exactly sixty-seven migrations (isolation, audit log, management \
          API, OIDC authorization, signing keys, login/consent, authentication context, redirect \
          registration, UserInfo claims, consent scope upsert, resource servers, opaque access \
          tokens, client auth suite, dynamic client registration, pushed authorization requests, \
@@ -512,16 +512,16 @@ async fn production_chain_is_only_the_sixty_six_real_migrations_and_ships_no_dem
          risk engine, account recovery, federation connectors, registration abuse defenses, \
          federation login state, enterprise inbound routing, upstream token vault, \
          guarded account links, account linking wiring, FedCM assertion nonces, third-party \
-         risk signals, signup fraud review, advanced recovery modes)"
+         risk signals, signup fraud review, advanced recovery modes, headless flows)"
     );
 
-    // The ledger holds exactly versions 1 through 66.
+    // The ledger holds exactly versions 1 through 67.
     assert_eq!(
         applied_versions(pool).await,
         vec![
             1_i64, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
             24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45,
-            46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66
+            46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67
         ]
     );
     let phase_of = |version: i64| async move {
@@ -1221,6 +1221,39 @@ async fn production_chain_is_only_the_sixty_six_real_migrations_and_ships_no_dem
         auth_path_check.contains("second_factor"),
         "the abuse_bans auth_path CHECK must admit the step-up second-factor path, got: \
          {auth_path_check}"
+    );
+
+    // The headless flows migration (issue #84) is an EXPAND: one new tenant-scoped
+    // single-use completion table (flows) with its submit-token index, isolation policy,
+    // nonempty-scope CHECK, and a no-DELETE column grant. No rewrite of existing state.
+    assert_eq!(phase_of(67).await, "expand");
+
+    // The flows store (issue #84) is a NEW tenant-scoped table, so it must ENABLE and
+    // FORCE row-level security, carry the (tenant, environment) isolation policy, and pin
+    // the nonempty-scope CHECK, exactly like every other scoped table.
+    assert!(
+        rls_enabled_and_forced(pool, "flows").await,
+        "flows must ENABLE and FORCE row-level security"
+    );
+    assert!(
+        policy_exists(pool, "flows", "flows_tenant_isolation").await,
+        "flows must carry the (tenant, environment) isolation policy"
+    );
+    assert!(
+        check_constraint_exists(pool, "flows", "flows_scope_nonempty").await,
+        "flows must carry the nonempty-scope CHECK"
+    );
+    // The single-use completion latch column is present and nullable (NULL until the flow
+    // completes), so a completed row is the durable single-use evidence.
+    assert!(
+        !column_is_not_null(pool, "flows", "consumed_at").await,
+        "flows.consumed_at must be nullable (the single-use completion latch)"
+    );
+    // The transient client payload lives ONLY on the flow row (never on an identity table),
+    // so the passthrough cannot persist on the identity by construction.
+    assert!(
+        column_exists(pool, "flows", "transient_payload").await,
+        "flows.transient_payload exists (the transient payload lives only here)"
     );
 
     // The demo object never reaches a production database.

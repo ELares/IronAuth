@@ -202,6 +202,10 @@ jobs:
         run: |
           scripts/connector-schema.sh
           git diff --exit-code docs/connector-schema.json docs/capability-matrix.schema.json
+      - name: flow schema freshness (flow object schema + message id registry)
+        run: |
+          scripts/flow-schema.sh
+          git diff --exit-code docs/flow-schema.json docs/flow-messages.json
       - name: openapi freshness (served management spec vs committed artifact)
         run: scripts/openapi-check.sh
       - name: governance files present

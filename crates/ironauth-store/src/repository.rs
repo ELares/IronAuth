@@ -70,13 +70,14 @@ use crate::email_otp::{
 use crate::environment::{EnvironmentType, GuardrailSet};
 use crate::error::StoreError;
 use crate::federation_state::{ConsumedFederationLoginState, NewFederationLoginState};
+use crate::flow::{FlowRecord, NewFlow};
 use crate::id::{
     AaguidRuleId, AbuseBanId, AccountLinkId, AcmeChallengeId, AdminSudoElevationId,
     AssertionMappingId, AttestationConfigId, AuditId, AuditTarget, AuthorizationCodeId,
     BackChannelDeliveryId, ClientId, ClientSessionId, ConnectorId, ConsentId, CorrelationId,
     CredentialClassPolicyId, CredentialId, CustomDomainId, DcrPolicyId, DekId, DeviceCodeId,
     EmailOtpCodeId, EncryptedSecretId, EnvironmentId, EnvironmentSecretId, ExternalIssuerId,
-    FedcmNonceId, FederationLoginStateId, GrantId, InitialAccessTokenId, InvitationId,
+    FedcmNonceId, FederationLoginStateId, FlowId, GrantId, InitialAccessTokenId, InvitationId,
     IssuedTokenId, KekId, MagicLinkTokenId, ManagementKeyId, Mds3BlobCacheId, MigrationRunId,
     MigrationRunRecordId, OperatorId, OrgConnectionId, OrganizationId, PowChallengeId,
     PushedRequestId, RecoveryApprovalId, RecoveryCodeId, RecoveryContactConfirmationId,
@@ -488,6 +489,19 @@ impl<'a> ScopedStore<'a> {
     #[must_use]
     pub fn federation_login_states(&self) -> FederationLoginStateRepo<'a> {
         FederationLoginStateRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
+    /// The data-plane headless flow store for this scope (issue #84): persist a flow row
+    /// at creation, load it (scope forced) to render or advance a journey, rotate the API
+    /// transport `submit_token` on each transition, and trip the single use completion
+    /// latch ATOMICALLY exactly once. Every operation runs on the least privilege
+    /// `ironauth_app` role under the (tenant, environment) row level security policy.
+    #[must_use]
+    pub fn flows(&self) -> FlowRepo<'a> {
+        FlowRepo {
             store: self.store,
             scope: self.scope,
         }
@@ -20413,6 +20427,181 @@ impl FederationLoginStateRepo<'_> {
         };
         tx.commit().await?;
         Ok(Some(consumed))
+    }
+}
+
+/// The data-plane headless flow store (issue #84): a short lived, single use completion
+/// row holding an in progress journey's position between submissions. Every operation is
+/// scope-bound and runs on the least privilege `ironauth_app` role. The `state` and
+/// `transient_payload` are opaque application JSON owned by the OIDC flow engine; this
+/// layer never interprets them.
+pub struct FlowRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl FlowRepo<'_> {
+    /// Persist a new flow row (issue #84). The `id` is minted from the entropy seam by
+    /// the caller and embeds this scope; a cross scope id is a uniform not found. The
+    /// `submit_token` is stored as the API transport CSRF handle and rotated on each
+    /// later transition. `expires_at` is the application clock instant (never the database
+    /// clock), so expiry is deterministic under a manual clock.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if `id` is out of scope; [`StoreError::Conflict`] if the
+    /// id or submit token already exists in scope; [`StoreError::Database`] on a
+    /// persistence failure.
+    pub async fn create(&self, id: &FlowId, params: NewFlow<'_>) -> Result<(), StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let mut tx = begin_scoped(self.store, scope).await?;
+        let result = sqlx::query(
+            "INSERT INTO flows \
+             (id, tenant_id, environment_id, journey, transport, state, submit_token, \
+              transient_payload, return_to, contract_version, expires_at) \
+             VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8::jsonb, $9, $10, \
+                     TIMESTAMPTZ 'epoch' + ($11::text || ' microseconds')::interval)",
+        )
+        .bind(id.to_string())
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(params.journey)
+        .bind(params.transport)
+        .bind(params.state)
+        .bind(params.submit_token)
+        .bind(params.transient_payload)
+        .bind(params.return_to)
+        .bind(params.contract_version)
+        .bind(params.expires_at_unix_micros)
+        .execute(&mut *tx)
+        .await;
+        match result {
+            Ok(_) => {}
+            Err(error) if is_unique_violation(&error) => return Err(StoreError::Conflict),
+            Err(error) => return Err(error.into()),
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Load a flow row by id within scope (issue #84), or [`None`] when no such row exists
+    /// in this scope (a cross scope id, an unknown id, and a wrong scope id are all the
+    /// same uniform not found). The returned record carries the completion latch and
+    /// expiry so the caller maps a closed row to the right typed flow error without a
+    /// second round trip.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn load(&self, id: &FlowId) -> Result<Option<FlowRecord>, StoreError> {
+        if id.scope() != self.scope {
+            return Ok(None);
+        }
+        let scope = self.scope;
+        let mut tx = begin_scoped(self.store, scope).await?;
+        let row = sqlx::query(
+            "SELECT id, journey, transport, state::text AS state, submit_token, \
+                    transient_payload::text AS transient_payload, return_to, contract_version, \
+                    (EXTRACT(EPOCH FROM consumed_at) * 1000000)::bigint AS consumed_us, \
+                    (EXTRACT(EPOCH FROM expires_at) * 1000000)::bigint AS expires_us \
+             FROM flows WHERE id = $1 AND tenant_id = $2 AND environment_id = $3",
+        )
+        .bind(id.to_string())
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(row.map(|row| FlowRecord {
+            id: row.get("id"),
+            journey: row.get("journey"),
+            transport: row.get("transport"),
+            state: row.get("state"),
+            submit_token: row.get("submit_token"),
+            transient_payload: row.get("transient_payload"),
+            return_to: row.get("return_to"),
+            contract_version: row.get("contract_version"),
+            consumed_at_unix_micros: row.get("consumed_us"),
+            expires_at_unix_micros: row.get("expires_us"),
+        }))
+    }
+
+    /// Advance an OPEN flow one mid journey step (issue #84): replace the serialized state
+    /// and ROTATE the API transport `submit_token`, but ONLY when the row is still open (the
+    /// completion latch is unset and the row has not expired at `now_unix_micros`). Returns
+    /// `true` on a hit and `false` when no open row matched (an expired or already completed
+    /// flow matches nothing, so a replayed transition never re runs). The transport level
+    /// CSRF check (the API submit token match, or the browser same origin gate) is enforced
+    /// by the caller before this is reached.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn advance(
+        &self,
+        id: &FlowId,
+        new_state: &str,
+        new_submit_token: &str,
+        now_unix_micros: i64,
+    ) -> Result<bool, StoreError> {
+        if id.scope() != self.scope {
+            return Ok(false);
+        }
+        let scope = self.scope;
+        let mut tx = begin_scoped(self.store, scope).await?;
+        let row = sqlx::query(
+            "UPDATE flows SET state = $4::jsonb, submit_token = $5 \
+             WHERE id = $1 AND tenant_id = $2 AND environment_id = $3 \
+               AND consumed_at IS NULL \
+               AND expires_at > TIMESTAMPTZ 'epoch' + ($6::text || ' microseconds')::interval \
+             RETURNING id",
+        )
+        .bind(id.to_string())
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(new_state)
+        .bind(new_submit_token)
+        .bind(now_unix_micros)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(row.is_some())
+    }
+
+    /// Trip the single use completion latch ATOMICALLY exactly once (issue #84, the flow
+    /// completion crux): one guarded `UPDATE` that sets `consumed_at` only on a still open,
+    /// unexpired row and returns it, so a replayed completed or expired flow matches no row
+    /// and yields `false`. The session mint is funnelled through `establish_session` by the
+    /// caller; this latch is what makes a completed flow single use.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn consume(&self, id: &FlowId, now_unix_micros: i64) -> Result<bool, StoreError> {
+        if id.scope() != self.scope {
+            return Ok(false);
+        }
+        let scope = self.scope;
+        let mut tx = begin_scoped(self.store, scope).await?;
+        let row = sqlx::query(
+            "UPDATE flows \
+             SET consumed_at = TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval \
+             WHERE id = $1 AND tenant_id = $2 AND environment_id = $3 \
+               AND consumed_at IS NULL \
+               AND expires_at > TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval \
+             RETURNING id",
+        )
+        .bind(id.to_string())
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(now_unix_micros)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(row.is_some())
     }
 }
 

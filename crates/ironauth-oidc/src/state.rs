@@ -244,6 +244,14 @@ pub struct OidcState {
     // the confirmation threshold, and the IDV providers that SHAPE the modes live in `Inner`
     // (config data cannot arm the surface).
     advanced_recovery_enabled: bool,
+    // Whether the headless flow API (issue #84) is served. Kept OUTSIDE `Inner` and set
+    // through the builder because it is sourced from the TOP-LEVEL `[flows]` config section
+    // (`flows.enabled`), not from `OidcConfig`: the boot path resolves `config.flows.enabled`
+    // and sets it here. Unlike the experimental feature-ladder flags above, this is a plain
+    // operator toggle (like `oidc.enabled`), off by default. Default: false, so every flow
+    // route answers a uniform 404 and the bootstrap login/consent/register pages are the only
+    // interactive surface (the flow-object contract is inert until an operator turns it on).
+    flows_enabled: bool,
     // The per-tenant/per-environment quota enforcer (issue #50), the data plane's
     // tenant-fairness layer. Kept OUTSIDE `Inner` and installed by the boot path
     // (built from the [quota] config, seeded with the SAME env clock), so a spend
@@ -801,6 +809,7 @@ impl OidcState {
             risk_signals_enabled: false,
             signup_quarantine_enabled: false,
             advanced_recovery_enabled: false,
+            flows_enabled: false,
             quota: None,
             migration_hook: None,
             hashing_pool: None,
@@ -974,6 +983,24 @@ impl OidcState {
     #[must_use]
     pub fn advanced_recovery_enabled(&self) -> bool {
         self.advanced_recovery_enabled
+    }
+
+    /// Arm the headless flow API (issue #84). The boot path resolves the top-level
+    /// `flows.enabled` config toggle and passes it here (a plain operator toggle like
+    /// `oidc.enabled`, off by default). When false, every flow route answers a uniform 404
+    /// and the bootstrap login/consent/register pages are the only interactive surface.
+    #[must_use]
+    pub fn with_flows_enabled(mut self, enabled: bool) -> Self {
+        self.flows_enabled = enabled;
+        self
+    }
+
+    /// Whether the headless flow API (issue #84) is served. Every flow handler's first action
+    /// is to return a uniform 404 when this is false, so the flow-object contract is inert and
+    /// the bootstrap pages are untouched until an operator turns it on.
+    #[must_use]
+    pub fn flows_enabled(&self) -> bool {
+        self.flows_enabled
     }
 
     /// The advanced-recovery-modes policy (issue #82, PR 3): the three mode sub-toggles, the
