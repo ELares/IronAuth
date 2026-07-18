@@ -104,6 +104,11 @@ pub struct IdvInitiation {
 /// `method=admin_approved` and open a pending admin-approval queue row. Returns the flow id,
 /// or [`None`] when the mode is inert (the feature is off or the sub-toggle is disabled) or
 /// the initiation was suppressed (anti-enumeration / cooldown / risk block).
+///
+/// SECURITY: `recover_factor` is security-load-bearing (it gates the `hold_until` delay) and
+/// MUST be server-derived from the ACTUALLY-proven factor, never caller-supplied. This is
+/// library-only today; a future public initiation endpoint MUST establish it from the real
+/// recovery evidence. See [`recovery::initiate_recovery`]'s `recover_factor` doc guard.
 pub async fn initiate_admin_approved(
     state: &OidcState,
     scope: Scope,
@@ -153,6 +158,11 @@ pub async fn initiate_admin_approved(
 /// (storing only the digest), and notify each contact out of band. Returns the flow id and
 /// the confirmation tokens, or [`None`] when the mode is inert, the initiation was
 /// suppressed, or the subject has designated no contacts (an unreachable recovery).
+///
+/// SECURITY: `recover_factor` is security-load-bearing (it gates the `hold_until` delay) and
+/// MUST be server-derived from the ACTUALLY-proven factor, never caller-supplied. This is
+/// library-only today; a future public initiation endpoint MUST establish it from the real
+/// recovery evidence. See [`recovery::initiate_recovery`]'s `recover_factor` doc guard.
 pub async fn initiate_trusted_contact(
     state: &OidcState,
     scope: Scope,
@@ -227,6 +237,11 @@ pub async fn initiate_trusted_contact(
 /// the IDV session, and build the provider redirect URL carrying the case binding. Returns
 /// the initiation, or [`None`] when the mode is inert, the provider is unknown/disabled, or
 /// the initiation was suppressed.
+///
+/// SECURITY: `recover_factor` is security-load-bearing (it gates the `hold_until` delay) and
+/// MUST be server-derived from the ACTUALLY-proven factor, never caller-supplied. This is
+/// library-only today; a future public initiation endpoint MUST establish it from the real
+/// recovery evidence. See [`recovery::initiate_recovery`]'s `recover_factor` doc guard.
 #[allow(clippy::too_many_arguments)]
 pub async fn initiate_idv(
     state: &OidcState,

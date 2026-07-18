@@ -10,8 +10,8 @@ use std::time::SystemTime;
 use ironauth_env::Env;
 use ironauth_store::test_support::TestDatabase;
 use ironauth_store::{
-    CorrelationId, NewRecoveryFlow, RecoveryEntryPoint, RecoveryFlowId, RecoveryMethod, Scope,
-    StoreError, UserId,
+    CorrelationId, NewRecoveryFlow, RecoveryApprovalId, RecoveryEntryPoint, RecoveryFlowId,
+    RecoveryMethod, Scope, StoreError, UserId,
 };
 
 /// The current instant in microseconds since the Unix epoch, read through the env clock seam
@@ -355,4 +355,110 @@ async fn advanced_recovery_rows_are_scope_isolated() {
             .expect("cross-scope confirmed"),
         0
     );
+}
+
+#[tokio::test]
+async fn the_app_role_cannot_insert_an_approved_recovery_approval() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let (flow, subject) = seed_flow(&db, &env, scope, RecoveryMethod::AdminApproved, 1).await;
+    let tenant = scope.tenant().to_string();
+    let environment = scope.environment().to_string();
+
+    // The legitimate open() path lands a PENDING approval: the INSERT omits state, so it falls
+    // to the DEFAULT 'pending' (the data plane never chooses a review state).
+    db.store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .recovery_approvals()
+        .open(&env, &flow, &subject)
+        .await
+        .expect("open lands a pending approval");
+    assert!(
+        !db.store()
+            .scoped(scope)
+            .recovery_approvals()
+            .is_approved(&flow)
+            .await
+            .expect("is_approved"),
+        "the opened approval is pending, not approved"
+    );
+
+    // The app role CAN insert a fresh PENDING row directly (its column-scoped INSERT grant,
+    // omitting state so it falls to the DEFAULT 'pending').
+    let pending_id = RecoveryApprovalId::generate(&env, &scope);
+    let pending_flow = RecoveryFlowId::generate(&env, &scope);
+    {
+        let mut tx = db.app_pool().begin().await.expect("begin app tx");
+        bind_scope(&mut tx, &tenant, &environment).await;
+        let inserted = sqlx::query(
+            "INSERT INTO recovery_approvals (id, tenant_id, environment_id, flow_id, subject) \
+             VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind(pending_id.to_string())
+        .bind(&tenant)
+        .bind(&environment)
+        .bind(pending_flow.to_string())
+        .bind(subject.to_string())
+        .execute(&mut *tx)
+        .await
+        .expect("the app role opens a pending approval")
+        .rows_affected();
+        assert_eq!(inserted, 1, "the app role can open a pending approval");
+        tx.commit().await.expect("commit pending open");
+    }
+
+    // The app role is REFUSED (permission denied, 42501) when it NAMES `state` to forge an
+    // 'approved' row: the column-scoped INSERT grant EXCLUDES state, so a self-approve INSERT
+    // can never land. This is the structural self-approve defense on the INSERT path.
+    let approved_id = RecoveryApprovalId::generate(&env, &scope);
+    let approved_flow = RecoveryFlowId::generate(&env, &scope);
+    let mut tx = db.app_pool().begin().await.expect("begin app tx");
+    bind_scope(&mut tx, &tenant, &environment).await;
+    let denied = sqlx::query(
+        "INSERT INTO recovery_approvals \
+         (id, tenant_id, environment_id, flow_id, subject, state) \
+         VALUES ($1, $2, $3, $4, $5, 'approved')",
+    )
+    .bind(approved_id.to_string())
+    .bind(&tenant)
+    .bind(&environment)
+    .bind(approved_flow.to_string())
+    .bind(subject.to_string())
+    .execute(&mut *tx)
+    .await;
+    assert_permission_denied(denied, "INSERT recovery_approvals with state='approved'");
+    let _ = tx.rollback().await;
+}
+
+/// Bind the transaction-local row-level-security scope variables, exactly as the repository
+/// does, so a raw adversarial query runs under the same scope a real connection would.
+async fn bind_scope(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    tenant: &str,
+    environment: &str,
+) {
+    sqlx::query("SELECT set_config('ironauth.tenant_id', $1, true)")
+        .bind(tenant)
+        .execute(&mut **tx)
+        .await
+        .expect("bind tenant scope");
+    sqlx::query("SELECT set_config('ironauth.environment_id', $1, true)")
+        .bind(environment)
+        .execute(&mut **tx)
+        .await
+        .expect("bind environment scope");
+}
+
+/// Assert a statement was refused with the PostgreSQL insufficient-privilege error (SQLSTATE
+/// 42501), the signal that a column-level grant blocked the write.
+fn assert_permission_denied(
+    result: Result<sqlx::postgres::PgQueryResult, sqlx::Error>,
+    what: &str,
+) {
+    match result {
+        Err(sqlx::Error::Database(error)) if error.code().as_deref() == Some("42501") => {}
+        other => panic!("expected permission denied (42501) for `{what}`, got: {other:?}"),
+    }
 }

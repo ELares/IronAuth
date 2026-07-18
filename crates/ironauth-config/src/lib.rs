@@ -3797,8 +3797,14 @@ fn validate_risk_signal_sources(risk: &RiskConfig) -> Result<(), ConfigError> {
 /// Validate the advanced-recovery-modes policy (issue #82, PR 3). The bounds hold even when
 /// the `advanced-recovery` feature is off, so an out-of-band value cannot take effect the
 /// moment the surface is armed: the confirmation threshold is at least 1, and each IDV
-/// provider slug is non-empty and unique, an enabled provider carries a redirect URL, a JWKS,
-/// a non-empty algorithm allowlist and an `iss`, and the session TTL is bounded.
+/// provider slug is non-empty and unique, an enabled provider carries an absolute https
+/// redirect URL, a non-empty JWKS, a non-empty algorithm allowlist and an `iss`, and the
+/// session TTL is bounded.
+///
+/// This crate carries no `ironauth-jose` dependency, so it can only check the JWKS is
+/// NON-EMPTY here, not that it PARSES. The parse check (a non-empty but malformed JWKS must
+/// fail boot cleanly, not fail closed at every callback) is enforced at the jose-available
+/// state-build step where the feature is resolved, mirroring the risk-signal JWKS check.
 fn validate_advanced_recovery(oidc: &OidcConfig) -> Result<(), ConfigError> {
     let cfg = &oidc.advanced_recovery;
     if cfg.required_confirmations < 1 {
@@ -3827,6 +3833,20 @@ fn validate_advanced_recovery(oidc: &OidcConfig) -> Result<(), ConfigError> {
                     message: format!(
                         "oidc.advanced_recovery.idv_providers[{}].redirect_url must be non-empty \
                          when the provider is enabled",
+                        provider.slug
+                    ),
+                });
+            }
+            // The redirect_url is where an IDV recovery sends the user; the doc pins it to an
+            // absolute https URL. A relative or plaintext-http target (or a structurally
+            // malformed URL) must fail at LOAD, not silently break every IDV recovery for this
+            // provider at redirect time. Purely syntactic (no DNS, no network).
+            if !is_well_formed_https_endpoint(provider.redirect_url.trim()) {
+                return Err(ConfigError::Invalid {
+                    message: format!(
+                        "oidc.advanced_recovery.idv_providers[{}].redirect_url must be an \
+                         absolute https URL with a host when the provider is enabled (a \
+                         relative, plaintext http, or malformed URL is refused)",
                         provider.slug
                     ),
                 });
@@ -6505,6 +6525,50 @@ enabled = true
                 "{bad}: unexpected error {err}"
             );
         }
+    }
+
+    #[test]
+    fn advanced_recovery_idv_redirect_url_must_be_absolute_https_at_load() {
+        // A well-formed absolute https redirect_url on an enabled IDV provider loads cleanly.
+        let ok = "[oidc.advanced_recovery]\nidv_enabled = true\n\
+                  [[oidc.advanced_recovery.idv_providers]]\nslug = \"acme\"\nenabled = true\n\
+                  redirect_url = \"https://idv.example.test/verify\"\n\
+                  jwks = \"{\\\"keys\\\":[]}\"\nalgorithms = [\"EdDSA\"]\n\
+                  iss = \"https://idv.example.test\"\n";
+        Config::from_toml_str(ok, "<inline>").expect("an absolute https redirect_url loads");
+
+        // A relative, plaintext http, wrong-scheme, or structurally malformed redirect_url is a
+        // LOAD error (the doc pins it to an absolute https URL), not a silent per-recovery
+        // redirect failure at runtime.
+        for bad in [
+            "/verify",                        // relative (no scheme, no host)
+            "http://idv.example.test/verify", // plaintext (refused)
+            "ftp://idv.example.test/verify",  // wrong scheme
+            "https://",                       // no host
+            "https://idv exam.test/verify",   // embedded space
+        ] {
+            let input = format!(
+                "[oidc.advanced_recovery]\nidv_enabled = true\n\
+                 [[oidc.advanced_recovery.idv_providers]]\nslug = \"acme\"\nenabled = true\n\
+                 redirect_url = \"{bad}\"\njwks = \"{{\\\"keys\\\":[]}}\"\n\
+                 algorithms = [\"EdDSA\"]\niss = \"https://idv.example.test\"\n"
+            );
+            let err = Config::from_toml_str(&input, "<inline>")
+                .expect_err(&format!("{bad} must be a load error"));
+            assert!(
+                err.to_string()
+                    .contains("redirect_url must be an absolute https URL"),
+                "{bad}: unexpected error {err}"
+            );
+        }
+
+        // A DISABLED provider with a non-https redirect_url is inert: it never fails boot (the
+        // https gate applies only to an enabled provider, matching the existing gating).
+        let disabled = "[oidc.advanced_recovery]\n\
+                        [[oidc.advanced_recovery.idv_providers]]\nslug = \"acme\"\n\
+                        enabled = false\nredirect_url = \"/relative\"\n";
+        Config::from_toml_str(disabled, "<inline>")
+            .expect("a disabled provider with a non-https redirect_url is inert");
     }
 
     #[test]

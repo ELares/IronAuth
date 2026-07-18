@@ -180,6 +180,20 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
         // standard recovery is unchanged until an operator opts in.
         let advanced_recovery_enabled = features.is_enabled(&config, ADVANCED_RECOVERY_FEATURE);
 
+        // When advanced-recovery is armed, an IDV callback's signature is verified against each
+        // provider's REGISTERED JWKS through the JOSE core. The config layer can only prove the
+        // JWKS is NON-EMPTY (it carries no jose dep); parse it HERE, where jose IS available, so
+        // a non-empty but MALFORMED JWKS (or one that yields zero usable keys) fails boot
+        // CLEANLY instead of booting and then failing closed at every IDV recovery callback.
+        // Only checked when the feature is armed (a malformed JWKS with the feature off is
+        // inert), and only for enabled providers (mirroring the config non-empty check).
+        if advanced_recovery_enabled {
+            if let Err(error) = validate_idv_provider_jwks(&config.oidc.advanced_recovery) {
+                tracing::error!(%error, "advanced-recovery IDV provider JWKS is invalid");
+                return ExitCode::FAILURE;
+            }
+        }
+
         let env = Env::system();
 
         // The inbound lazy-migration hook (issue #56), built once and shared: it arms the
@@ -655,6 +669,36 @@ fn build_federation_runtime(cfg: &OidcConfig) -> Option<Arc<FederationRuntime>> 
         discovery_ttl,
         probe_window,
     )))
+}
+
+/// Parse each ENABLED IDV provider's registered JWKS through the JOSE core (issue #82, PR 3),
+/// so a non-empty but MALFORMED JWKS (or one that yields zero usable keys) is a clean BOOT
+/// error rather than a per-callback fail-closed surprise at runtime.
+///
+/// The config layer already proves the JWKS is non-empty, but it carries no `ironauth-jose`
+/// dependency, so it structurally cannot prove the JWKS PARSES. This runs at boot where jose
+/// IS available, and only for enabled providers (mirroring the config non-empty check); the
+/// caller gates it on the advanced-recovery feature being armed.
+///
+/// # Errors
+///
+/// A message naming the first provider whose JWKS does not parse into at least one usable key
+/// (the exact fault the callback would otherwise fail closed on).
+fn validate_idv_provider_jwks(cfg: &ironauth_config::AdvancedRecoveryConfig) -> Result<(), String> {
+    for provider in &cfg.idv_providers {
+        if !provider.enabled {
+            continue;
+        }
+        if ironauth_jose::trusted_keys_from_jwks(provider.jwks.as_bytes()).is_empty() {
+            return Err(format!(
+                "oidc.advanced_recovery.idv_providers[{}].jwks does not parse into any usable \
+                 key: an enabled IDV provider must carry a well-formed JWKS with at least one \
+                 supported public key, or every IDV recovery for it would fail at callback",
+                provider.slug
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Resolve the top-level `[password_policy]` config into the runtime 800-63B-4 policy
@@ -2093,5 +2137,58 @@ mod tests {
             build_federation_runtime(&enabled.oidc).is_some(),
             "an enabled federation config builds the runtime the boot path installs"
         );
+    }
+
+    #[test]
+    fn advanced_recovery_rejects_a_malformed_idv_jwks_at_boot() {
+        use ironauth_config::{AdvancedRecoveryConfig, IdvProvider};
+
+        // A well-formed single Ed25519 JWKS (the jose inbound parser recovers one usable key).
+        let good_jwks = r#"{"keys":[{"kty":"OKP","crv":"Ed25519","x":"11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo","kid":"ok"}]}"#;
+        let ok = AdvancedRecoveryConfig {
+            idv_enabled: true,
+            idv_providers: vec![IdvProvider {
+                slug: "acme".to_owned(),
+                enabled: true,
+                jwks: good_jwks.to_owned(),
+                ..IdvProvider::default()
+            }],
+            ..AdvancedRecoveryConfig::default()
+        };
+        validate_idv_provider_jwks(&ok).expect("a well-formed IDV JWKS boots");
+
+        // A non-empty but MALFORMED JWKS passes the config non-empty check yet parses to zero
+        // usable keys: it must FAIL boot cleanly, naming the offending provider, rather than
+        // failing closed at every IDV recovery callback.
+        let bad = AdvancedRecoveryConfig {
+            idv_enabled: true,
+            idv_providers: vec![IdvProvider {
+                slug: "acme".to_owned(),
+                enabled: true,
+                jwks: "definitely not a jwks".to_owned(),
+                ..IdvProvider::default()
+            }],
+            ..AdvancedRecoveryConfig::default()
+        };
+        let err =
+            validate_idv_provider_jwks(&bad).expect_err("a malformed IDV JWKS must fail boot");
+        assert!(
+            err.contains("acme") && err.contains("does not parse"),
+            "the boot error must name the provider and the parse fault: {err}"
+        );
+
+        // A DISABLED provider with a malformed JWKS is inert: it is never parsed (a malformed
+        // JWKS on a disabled provider need not fail boot).
+        let disabled = AdvancedRecoveryConfig {
+            idv_providers: vec![IdvProvider {
+                slug: "acme".to_owned(),
+                enabled: false,
+                jwks: "definitely not a jwks".to_owned(),
+                ..IdvProvider::default()
+            }],
+            ..AdvancedRecoveryConfig::default()
+        };
+        validate_idv_provider_jwks(&disabled)
+            .expect("a disabled provider's JWKS is not parsed at boot");
     }
 }

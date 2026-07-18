@@ -18310,6 +18310,15 @@ impl ActingRecoveryFlowRepo<'_> {
     /// An `initiated` flow (no hold) completes as before. Completion is M9-deferred, so
     /// there is no live caller today; the guard closes the trap for whoever wires it.
     ///
+    /// BY DESIGN, the `hold_until` delay is enforced in the APPLICATION LAYER: the `now`
+    /// compared against `hold_until` in the WHERE is the env CLOCK SEAM (`env.clock()`, bound
+    /// as `$4`), NOT the database wall clock. A DB-level temporal trigger using `now()` is
+    /// INTENTIONALLY NOT used because it would read the DB WALL CLOCK and break the
+    /// deterministic clock seam: tests advance a frozen clock to cross the delay, and a
+    /// wall-clock trigger would reject those legitimate post-delay completions (and, more
+    /// broadly, ignore any operator-controlled time source). Enforcing the delay here keeps a
+    /// single, deterministic, testable time authority.
+    ///
     /// # Errors
     ///
     /// [`StoreError::Database`] on a persistence failure.

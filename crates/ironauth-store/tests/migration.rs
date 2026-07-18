@@ -1091,6 +1091,63 @@ async fn production_chain_is_only_the_sixty_six_real_migrations_and_ships_no_dem
         );
     }
 
+    // recovery_approvals: the data-plane INSERT is COLUMN-SCOPED to exactly the open() columns
+    // and EXCLUDES `state`, so the app role can never INSERT a chosen (non-pending) state: a
+    // self-approve INSERT of state='approved' is denied at the grant level, and every app-opened
+    // row falls to the DEFAULT 'pending'. This is the structural self-approve defense on the
+    // INSERT path (mirroring the control-only UPDATE split above).
+    for column in [
+        "id",
+        "tenant_id",
+        "environment_id",
+        "flow_id",
+        "subject",
+        "created_at",
+    ] {
+        assert!(
+            role_has_column_privilege(pool, "ironauth_app", "recovery_approvals", column, "INSERT")
+                .await,
+            "the data-plane role must hold column-scoped INSERT on the open() column recovery_approvals.{column}"
+        );
+    }
+    // The `state` and review-attribution columns are EXCLUDED from the data-plane INSERT grant,
+    // so the app role cannot choose an approved/rejected state or forge a reviewer at INSERT.
+    for column in [
+        "state",
+        "reviewed_by_kind",
+        "reviewed_by_id",
+        "reviewed_at",
+        "note",
+    ] {
+        assert!(
+            !role_has_column_privilege(
+                pool,
+                "ironauth_app",
+                "recovery_approvals",
+                column,
+                "INSERT"
+            )
+            .await,
+            "the data-plane role must NOT hold INSERT on recovery_approvals.{column} (self-approve defense)"
+        );
+    }
+    // recovery_approvals.state must carry the DEFAULT 'pending', so an app INSERT that omits it
+    // (the open() path) lands a pending row without the app choosing the state.
+    let approvals_state_default: Option<String> = sqlx::query(
+        "SELECT column_default FROM information_schema.columns \
+         WHERE table_name = 'recovery_approvals' AND column_name = 'state'",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("recovery_approvals.state default lookup")
+    .get("column_default");
+    assert!(
+        approvals_state_default
+            .as_deref()
+            .is_some_and(|d| d.contains("pending")),
+        "recovery_approvals.state must DEFAULT to 'pending', got: {approvals_state_default:?}"
+    );
+
     // recovery_contact_confirmations: the no-double-count invariant is a UNIQUE index over
     // (tenant, environment, flow_id, contact_id), so one contact can confirm a flow at most
     // once (a single contact can never reach a threshold of two by confirming twice). The

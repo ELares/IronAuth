@@ -138,7 +138,16 @@ CREATE POLICY recovery_approvals_tenant_isolation ON recovery_approvals
 -- (SELECT) and OWNS the verdict: a COLUMN-SCOPED UPDATE over exactly the review columns, so
 -- the data plane can never move a case forward and the control plane can never rewrite the
 -- case's identity (its flow_id or subject). This mirrors the #31 / PR 2 split.
-GRANT SELECT, INSERT ON recovery_approvals TO ironauth_app;
+--
+-- The data-plane INSERT is COLUMN-SCOPED to exactly the columns the open() path writes and
+-- EXCLUDES the `state` column, so the app role can never choose a non-pending state: a
+-- self-approve INSERT of state='approved' is denied at the grant level, and every app-opened
+-- row falls to the DEFAULT 'pending'. The review-attribution columns (reviewed_by_*,
+-- reviewed_at, note) are excluded too (control-plane only). This makes self-approval
+-- structurally impossible on the INSERT path, matching the control-only UPDATE split above.
+GRANT SELECT ON recovery_approvals TO ironauth_app;
+GRANT INSERT (id, tenant_id, environment_id, flow_id, subject, created_at)
+    ON recovery_approvals TO ironauth_app;
 GRANT SELECT ON recovery_approvals TO ironauth_control;
 GRANT UPDATE (state, reviewed_by_kind, reviewed_by_id, reviewed_at, note)
     ON recovery_approvals TO ironauth_control;
