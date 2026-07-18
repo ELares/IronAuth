@@ -14,8 +14,8 @@ use axum::Router;
 use ironauth_admin::AdminState;
 use ironauth_config::{
     Config, FEDCM_FEATURE, FeatureRegistry, GLOBAL_TOKEN_REVOCATION_FEATURE, Loaded, OidcConfig,
-    PasswordHashingConfig, PasswordPolicyConfig, QuotaConfig, ScreeningFailurePolicy,
-    ScreeningProvider,
+    PasswordHashingConfig, PasswordPolicyConfig, QuotaConfig, RISK_SIGNALS_FEATURE,
+    ScreeningFailurePolicy, ScreeningProvider,
 };
 use ironauth_env::Env;
 use ironauth_jose::MasterKey;
@@ -155,6 +155,13 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
         // injected through the OIDC state builder (never OidcConfig), so every FedCM
         // route stays a 404 and discovery advertises nothing until an operator opts in.
         let fedcm_enabled = features.is_enabled(&config, FEDCM_FEATURE);
+        // The experimental third-party risk-signal ingestion surface (issue #82, PR 1) is
+        // armed only when its feature is enabled AND acknowledged; the gate is the ladder,
+        // never a plain [oidc] toggle, so the ack can never be bypassed. Resolved to a bool
+        // here and injected through the OIDC state builder (never OidcConfig), so the
+        // ingestion endpoint stays a 404 and the engine reads no external signal until an
+        // operator opts in.
+        let risk_signals_enabled = features.is_enabled(&config, RISK_SIGNALS_FEATURE);
 
         let env = Env::system();
 
@@ -244,6 +251,7 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
                 issuer_base,
                 global_revocation_enabled,
                 fedcm_enabled,
+                risk_signals_enabled,
                 master_key,
                 &quota_config,
                 &hashing_config,
@@ -390,6 +398,7 @@ async fn build_oidc_router(
     issuer_base: String,
     global_revocation_enabled: bool,
     fedcm_enabled: bool,
+    risk_signals_enabled: bool,
     master_key: Option<Arc<MasterKey>>,
     quota_config: &QuotaConfig,
     hashing_config: &PasswordHashingConfig,
@@ -499,6 +508,7 @@ async fn build_oidc_router(
     let mut state = OidcState::new(store, env, registry, oidc_config, issuer_base)
         .with_global_token_revocation_enabled(global_revocation_enabled)
         .with_fedcm_enabled(fedcm_enabled)
+        .with_risk_signals_enabled(risk_signals_enabled)
         .with_quota_enforcer(quota_enforcer)
         .with_hashing_pool(hashing_pool)
         .with_password_policy(password_policy, screening_failure, screen_on_login)
@@ -547,6 +557,14 @@ async fn build_oidc_router(
             "experimental FedCM IdP surface mounted (issue #83); Chrome only (Firefox \
              paused, Safari absent), the W3C draft may change between releases, and \
              redirect flows are unaffected"
+        );
+    }
+    if risk_signals_enabled {
+        tracing::info!(
+            "experimental third-party risk-signal ingestion mounted (issue #82); a signed \
+             Security Event Token is verified per-source through the JOSE core and folded \
+             into the risk engine as a WEIGHTED policy input (never a verdict); the wire \
+             contract may change between releases"
         );
     }
     tracing::info!(

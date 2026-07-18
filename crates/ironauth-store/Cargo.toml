@@ -161,6 +161,15 @@ name = "fedcm_nonces"
 path = "tests/fedcm_nonces.rs"
 required-features = ["testing"]
 
+# Third-party risk-signal ingestion store (issue #82, PR 1): idempotent single-delivery
+# (the source_jti dedup UNIQUE), the subject-bound fresh-signal read the #79 engine uses,
+# the blind-index subject binding (no plaintext external subject in a dump), and
+# cross-tenant IDOR isolation. Needs a real database (DATABASE_URL).
+[[test]]
+name = "risk_signals"
+path = "tests/risk_signals.rs"
+required-features = ["testing"]
+
 # Cross-tenant / cross-environment IDOR harness against every scoped repository
 # operation that exists today. Needs a real database (DATABASE_URL).
 [[test]]

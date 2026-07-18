@@ -53,6 +53,19 @@ pub const FEDCM_FEATURE: &str = "fedcm";
 /// the shape bumps it and invalidates the old ack.
 pub const FEDCM_VERSION: &str = "0.1.0-exp.1";
 
+/// The registry name of the third-party risk-signal ingestion experimental feature
+/// (issue #82, PR 1). Chosen as one plain umbrella flag so the whole ingestion surface
+/// (the endpoint and the engine's external-signal path) toggles under one ack, mirroring
+/// the one-flag-per-surface FedCM precedent.
+pub const RISK_SIGNALS_FEATURE: &str = "risk-signals";
+
+/// The experimental `ack` version for the risk-signal ingestion feature (issue #82). It is
+/// EXPLORATORY: the ingestion wire shape (the signed SET contract and the per-source config)
+/// and the CAEP/SSF alignment are early and may break between releases, so enabling it must
+/// acknowledge this exact revision; a graduation that changes the shape bumps it and
+/// invalidates the old ack.
+pub const RISK_SIGNALS_VERSION: &str = "0.1.0-exp.1";
+
 /// How mature a feature is, and therefore what enabling it requires.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Maturity {
@@ -183,6 +196,7 @@ impl FeatureRegistry {
         registry.register_global_token_revocation();
         registry.register_custom_domains_acme();
         registry.register_fedcm();
+        registry.register_risk_signals();
         registry
     }
 
@@ -285,6 +299,28 @@ impl FeatureRegistry {
              spec is a moving W3C draft. Redirect flows are UNAFFECTED. Graduates \
              only on Firefox shipping or real embedding demand.",
             FEDCM_VERSION,
+            "crates/ironauth-oidc/CHANGELOG.md",
+        ));
+    }
+
+    /// Registers the third-party risk-signal ingestion feature (issue #82, PR 1): the
+    /// signed-SET (JWS) authenticated ingestion endpoint and the #79 engine's
+    /// external-signal path. It is EXPLORATORY: the ingestion wire contract and the
+    /// CAEP/SSF forward-compatibility are early and may break between releases. Off by
+    /// default; when enabled AND acked, the OIDC provider arms `POST .../risk/signals` and
+    /// the engine folds a subject's fresh external signals in as WEIGHTED policy inputs
+    /// (never a verdict). With the flag off the endpoint answers a uniform 404 and the
+    /// engine's external-signal path never runs.
+    pub fn register_risk_signals(&mut self) {
+        self.register(Feature::experimental(
+            RISK_SIGNALS_FEATURE,
+            "Third-party risk-signal ingestion (issue #82): a signed Security Event Token \
+             (JWS) authenticated ingestion endpoint verified per-source through the hardened \
+             JOSE core, plus the #79 risk-engine path that folds a subject's fresh external \
+             signals in as WEIGHTED policy inputs that structurally can never be a verdict. \
+             EXPLORATORY: the ingestion wire contract and the CAEP/SSF alignment are early \
+             and may break between releases.",
+            RISK_SIGNALS_VERSION,
             "crates/ironauth-oidc/CHANGELOG.md",
         ));
     }
@@ -677,5 +713,47 @@ mod tests {
         ));
         registry.validate(&acked).expect("the exact ack boots");
         assert!(registry.is_enabled(&acked, FEDCM_FEATURE));
+    }
+
+    #[test]
+    fn risk_signals_is_experimental_and_off_by_default() {
+        // Issue #82 (PR 1) ships the third-party risk-signal ingestion surface behind a
+        // default-off experimental flag: absent from [features] it resolves disabled, and
+        // enabling it without the exact ack refuses to boot (so the ingestion endpoint stays
+        // a uniform 404 and the engine's external-signal path never runs until an operator
+        // explicitly enables AND acknowledges the experiment).
+        let registry = FeatureRegistry::builtin();
+        let feature = registry
+            .get(RISK_SIGNALS_FEATURE)
+            .expect("risk-signals is registered");
+        assert!(matches!(feature.maturity(), Maturity::Experimental { .. }));
+        assert!(!feature.default_enabled());
+
+        let absent = config_with_features("");
+        registry.validate(&absent).expect("absent is fine");
+        assert!(
+            !registry.is_enabled(&absent, RISK_SIGNALS_FEATURE),
+            "risk-signals is off when absent from [features]"
+        );
+
+        // Enabled without an ack refuses to boot.
+        let no_ack = config_with_features("\"risk-signals\" = { enabled = true }");
+        registry
+            .validate(&no_ack)
+            .expect_err("an experimental feature enabled without an ack must refuse to boot");
+
+        // Enabled WITH a WRONG ack still refuses to boot (the ack must be exact).
+        let wrong_ack =
+            config_with_features("\"risk-signals\" = { enabled = true, ack = \"0.0.0\" }");
+        registry
+            .validate(&wrong_ack)
+            .expect_err("a mismatched ack must refuse to boot");
+
+        // Enabled WITH the exact ack boots and reports enabled.
+        let acked = config_with_features(&format!(
+            "\"risk-signals\" = {{ enabled = true, ack = \"{RISK_SIGNALS_VERSION}\" }}"
+        ));
+        registry.validate(&acked).expect("the exact ack boots");
+        assert!(registry.is_enabled(&acked, RISK_SIGNALS_FEATURE));
     }
 }

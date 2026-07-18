@@ -125,16 +125,16 @@ pub use id::{
     PowChallengeKind, PushedRequestId, PushedRequestKind, RecoveryCodeId, RecoveryCodeKind,
     RecoveryFlowId, RecoveryFlowKind, RefreshFamilyId, RefreshFamilyKind, RefreshTokenId,
     RefreshTokenKind, ResourceServerId, ResourceServerKind, RiskDecisionId, RiskDecisionKind,
-    RiskDisavowalId, RiskDisavowalKind, RiskLoginGeoId, RiskLoginGeoKind, RoutingRuleId,
-    RoutingRuleKind, ScopeStepUpPolicyId, ScopeStepUpPolicyKind, ScopedId, ScopedKind,
-    ServiceAccountId, ServiceAccountKind, ServiceId, ServiceKind, SessionEventId, SessionEventKind,
-    SessionId, SessionKind, SigningKeyId, SigningKeyKind, SmsOtpCodeId, SmsOtpCodeKind,
-    SmsRouteStatId, SmsRouteStatKind, TenantId, TenantKind, TotpCredentialId, TotpCredentialKind,
-    TraitMigrationJobId, TraitMigrationJobKind, TraitSchemaId, TraitSchemaKind, TrustedDeviceId,
-    TrustedDeviceKind, UpstreamTokenGrantId, UpstreamTokenGrantKind, UpstreamTokenId,
-    UpstreamTokenKind, UserId, UserIdentifierId, UserIdentifierKind, UserKind, VariableId,
-    VariableKind, WebauthnChallengeId, WebauthnChallengeKind, WebauthnCredentialId,
-    WebauthnCredentialKind,
+    RiskDisavowalId, RiskDisavowalKind, RiskLoginGeoId, RiskLoginGeoKind, RiskSignalId,
+    RiskSignalKind, RoutingRuleId, RoutingRuleKind, ScopeStepUpPolicyId, ScopeStepUpPolicyKind,
+    ScopedId, ScopedKind, ServiceAccountId, ServiceAccountKind, ServiceId, ServiceKind,
+    SessionEventId, SessionEventKind, SessionId, SessionKind, SigningKeyId, SigningKeyKind,
+    SmsOtpCodeId, SmsOtpCodeKind, SmsRouteStatId, SmsRouteStatKind, TenantId, TenantKind,
+    TotpCredentialId, TotpCredentialKind, TraitMigrationJobId, TraitMigrationJobKind,
+    TraitSchemaId, TraitSchemaKind, TrustedDeviceId, TrustedDeviceKind, UpstreamTokenGrantId,
+    UpstreamTokenGrantKind, UpstreamTokenId, UpstreamTokenKind, UserId, UserIdentifierId,
+    UserIdentifierKind, UserKind, VariableId, VariableKind, WebauthnChallengeId,
+    WebauthnChallengeKind, WebauthnCredentialId, WebauthnCredentialKind,
 };
 pub use identifier::{
     CanonicalIdentifier, IdentifierType, UniquenessMode, canonicalize_identifier,
@@ -225,7 +225,7 @@ pub use repository::{
 };
 pub use risk::{
     DisavowalResolution, LoginGeoView, NewDisavowalToken, NewLoginGeo, NewRiskDecision,
-    RiskDecisionView,
+    NewRiskSignal, RiskDecisionView, RiskSignalView,
 };
 pub use scope::Scope;
 pub use sms_otp::{ActiveSmsOtpCode, NewSmsOtpCode, SmsRouteStat, SmsTenantConfig};

@@ -274,6 +274,18 @@ impl IdorHarness {
         self
     }
 
+    /// Register the third-party risk-signal read probe (issue #82, PR 1): a subject's
+    /// ingested external risk signals must never be readable under another tenant or
+    /// environment's scope, or the #79 engine could fold a FOREIGN tenant's signals into a
+    /// login decision. The read is keyed on the subject (a `usr_` id, the IDOR scoping key),
+    /// so the probe's `foreign_id` is a subject planted in another scope: it must parse as a
+    /// uniform not-found (or resolve to no row) under the caller's scope. Run with the
+    /// data-plane store (`ironauth_app`), which carries the platform master key.
+    pub fn register_risk_signal_probes(&mut self) -> &mut Self {
+        self.register(Box::new(RiskSignalReadProbe));
+        self
+    }
+
     /// The names of the registered probes, in registration order.
     #[must_use]
     pub fn probe_names(&self) -> Vec<&'static str> {
@@ -1448,6 +1460,45 @@ impl IsolationProbe for UpstreamTokenReadProbe {
                 // Resolving a foreign session's captured tokens would be a leak.
                 Ok(Some(_)) => ProbeOutcome::Leaked,
                 Ok(None) | Err(_) => ProbeOutcome::Denied,
+            }
+        })
+    }
+}
+
+/// Built-in probe for `RiskSignalRepo::fresh_signals_for_subject` (issue #82, PR 1): a
+/// subject's ingested external risk signals must never be readable under another tenant or
+/// environment's scope, or the #79 engine could fold a FOREIGN tenant's signals into a
+/// login decision. The read is keyed on the subject (a `usr_` id), so the probe's
+/// `foreign_id` is a subject planted in another scope: it must parse as a uniform not-found
+/// (or resolve to no row) under the caller's scope.
+struct RiskSignalReadProbe;
+
+impl IsolationProbe for RiskSignalReadProbe {
+    fn name(&self) -> &'static str {
+        "risk_signals.fresh_signals_for_subject"
+    }
+
+    fn probe<'a>(
+        &'a self,
+        store: &'a Store,
+        caller: Scope,
+        foreign_id: &'a str,
+    ) -> BoxProbeFuture<'a> {
+        Box::pin(async move {
+            // Parse the untrusted subject id under the caller's OWN scope; a subject minted
+            // in another scope fails here as a uniform not-found.
+            let Ok(subject) = UserId::parse_in_scope(foreign_id, &caller) else {
+                return ProbeOutcome::Denied;
+            };
+            match store
+                .scoped(caller)
+                .risk_signals()
+                .fresh_signals_for_subject(&subject, 100)
+                .await
+            {
+                // Reading a foreign subject's ingested signals would be a leak.
+                Ok(signals) if !signals.is_empty() => ProbeOutcome::Leaked,
+                Ok(_) | Err(_) => ProbeOutcome::Denied,
             }
         })
     }

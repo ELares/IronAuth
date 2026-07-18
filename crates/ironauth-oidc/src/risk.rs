@@ -31,6 +31,7 @@
 //! `GeoIP` and IP-reputation providers are pluggable seams with null defaults. Off by
 //! default ([`crate::state::OidcState::risk_enabled`] false): the engine is fully inert.
 
+use std::collections::BTreeMap;
 use std::net::IpAddr;
 
 use axum::http::{HeaderMap, StatusCode};
@@ -679,6 +680,185 @@ pub(crate) fn anonymous_challenge_level(
 }
 
 // ===========================================================================
+// Third-party risk signals as WEIGHTED POLICY INPUTS (issue #82, PR 1)
+// ===========================================================================
+
+/// The fixed, PII-free signal name every ingested third-party signal contributes under
+/// (issue #82). One static name keeps [`SignalOutcome`] allocation-free; the specific source
+/// is carried in the outcome's `value` for the decision record, so a decision remains
+/// reconstructable while a source id never has to become a leaked `&'static str`.
+const EXTERNAL_SIGNAL_NAME: &str = "external_signal";
+
+/// Map ONE ingested third-party risk signal to a weighted [`SignalOutcome`] through its
+/// source's policy (issue #82, PR 1), a PURE function so the "a signal is never a verdict"
+/// guarantee is unit-testable in isolation:
+///
+/// 1. The tagged `payload` resolves to a raw [`RiskLevel`]: a `{kind:"verdict"}` maps its
+///    verdict string through `source.verdict_map` (an unmapped verdict contributes nothing),
+///    and a `{kind:"score"}` maps its numeric score through the source's score bands.
+/// 2. The raw level is CAPPED at `source.max_contribution` (the per-source weight), so a
+///    low-trust source can never contribute HIGH.
+/// 3. A capped level BELOW `source.min_strength` (the per-source threshold) is DROPPED
+///    (returns [`None`], contributes nothing).
+/// 4. The hard-deny bit is `source.can_hard_deny && level == High`, AND-gated by the
+///    per-source opt-in (default FALSE), so an external signal can NEVER force a block unless
+///    the operator explicitly opted the source in. This is the structural guarantee: the
+///    function can only ever return a `SignalOutcome` fed to [`combine`]; there is NO path
+///    from here to a [`RiskAction`].
+///
+/// Returns [`None`] when the payload is malformed, its verdict is unmapped, or the capped
+/// contribution is below the source's threshold: an inert signal, never an error.
+#[must_use]
+pub fn external_signal_outcome(
+    source: &ironauth_config::RiskSignalSource,
+    payload_json: &str,
+) -> Option<SignalOutcome> {
+    let payload: serde_json::Value = serde_json::from_str(payload_json).ok()?;
+    let kind = payload.get("kind").and_then(serde_json::Value::as_str)?;
+    let raw = match kind {
+        "verdict" => {
+            let verdict = payload.get("verdict").and_then(serde_json::Value::as_str)?;
+            let mapped = source.verdict_map.get(verdict)?;
+            RiskLevel::parse_threshold(mapped)?
+        }
+        "score" => {
+            let score = payload.get("score").and_then(serde_json::Value::as_f64)?;
+            if score >= source.score_high_threshold {
+                RiskLevel::High
+            } else if score >= source.score_med_threshold {
+                RiskLevel::Med
+            } else {
+                RiskLevel::Low
+            }
+        }
+        _ => return None,
+    };
+    // Cap at the per-source weight: a mapped level stronger than the source's ceiling is
+    // capped down, so a low-weight source can never contribute HIGH.
+    let cap = RiskLevel::parse_threshold(&source.max_contribution).unwrap_or(RiskLevel::High);
+    let level = if raw.rank() <= cap.rank() { raw } else { cap };
+    // Drop a contribution below the per-source threshold entirely (it contributes nothing).
+    let floor = RiskLevel::parse_threshold(&source.min_strength).unwrap_or(RiskLevel::Low);
+    if level.rank() < floor.rank() {
+        return None;
+    }
+    // The hard-deny bit is AND-gated by the per-source opt-in (default false): an external
+    // signal can never force a block unless the operator explicitly opted the source in.
+    let hard_deny = source.can_hard_deny && level == RiskLevel::High;
+    Some(SignalOutcome {
+        name: EXTERNAL_SIGNAL_NAME,
+        level,
+        hard_deny,
+        value: format!("{}:{}:{}", source.iss, kind, level.as_str()),
+    })
+}
+
+/// Whether an ingested signal whose event instant is `event_ts_micros` is STALE for
+/// `source` at `now_micros` (issue #82): a signal older than the source's `max_age_secs` on
+/// the clock seam does NOT count as a policy input. A future event instant (clock skew) is
+/// treated as fresh. Deterministic (both instants come from the env clock).
+#[must_use]
+fn external_signal_is_stale(
+    source: &ironauth_config::RiskSignalSource,
+    event_ts_micros: i64,
+    now_micros: i64,
+) -> bool {
+    let age_micros = now_micros.saturating_sub(event_ts_micros);
+    if age_micros <= 0 {
+        return false;
+    }
+    let max_age_micros = i128::from(source.max_age_secs) * 1_000_000;
+    i128::from(age_micros) > max_age_micros
+}
+
+/// The bound on how many of a subject's most recent ingested signals the engine reads per
+/// evaluation (issue #82): a generous ceiling that admits every realistic source's latest
+/// signal while keeping the eval read bounded against a flood of stale rows.
+const EXTERNAL_SIGNAL_READ_LIMIT: i64 = 100;
+
+/// Fetch a subject's FRESH third-party risk signals and push AT MOST ONE weighted
+/// [`SignalOutcome`] PER SOURCE into `outcomes` (issue #82, PR 1). A signal contributes ONLY
+/// when its source is listed AND enabled in `cfg.signal_sources` (an unreferenced or disabled
+/// source's rows are inert), it is not stale (older than the source's `max_age_secs`), and
+/// its capped contribution clears the source's threshold. A source's many fresh signals are
+/// COLLAPSED to its single STRONGEST capped outcome, so a source can never exceed its
+/// configured `max_contribution` via same-source self-corroboration under the [`combine`]
+/// rule, while cross-source corroboration (two DISTINCT sources) is preserved. Best-effort: a
+/// store fault leaves `outcomes` unchanged (the login is still scored on the internal
+/// signals). This is the ONE place an external signal enters the score, and it can only ever
+/// ADD a `SignalOutcome` to the deterministic [`combine`] rule.
+async fn append_external_signal_outcomes(
+    state: &OidcState,
+    scope: Scope,
+    subject: &UserId,
+    outcomes: &mut Vec<SignalOutcome>,
+) {
+    let cfg = state.risk_config();
+    let Ok(signals) = state
+        .store()
+        .scoped(scope)
+        .risk_signals()
+        .fresh_signals_for_subject(subject, EXTERNAL_SIGNAL_READ_LIMIT)
+        .await
+    else {
+        return;
+    };
+    let now_micros = epoch_micros(state.now());
+    // Map each FRESH, ENABLED, non-stale signal to its capped outcome, tagged by its source,
+    // then collapse to one outcome per source (see `collapse_external_outcomes_per_source`).
+    let mut contributions: Vec<(&str, SignalOutcome)> = Vec::new();
+    for signal in &signals {
+        // The source must be listed AND enabled in policy; an unreferenced source is inert.
+        let Some(source) = cfg
+            .signal_sources
+            .iter()
+            .find(|source| source.enabled && source.iss == signal.source)
+        else {
+            continue;
+        };
+        if external_signal_is_stale(source, signal.event_timestamp_unix_micros, now_micros) {
+            continue;
+        }
+        if let Some(outcome) = external_signal_outcome(source, &signal.payload_json) {
+            contributions.push((source.iss.as_str(), outcome));
+        }
+    }
+    outcomes.extend(collapse_external_outcomes_per_source(contributions));
+}
+
+/// Collapse a subject's tagged external contributions so EACH SOURCE yields AT MOST ONE
+/// [`SignalOutcome`] -- the STRONGEST (highest mapped level, already capped at that source's
+/// `max_contribution`) among that source's fresh signals (issue #82, PR 1). A PURE function.
+///
+/// This per-source dedup is a correctness requirement of the #79 [`combine`] rule, which
+/// escalates 2+ DISTINCT MED-or-higher outcomes to HIGH. Internal signals are one-per-kind,
+/// so they cannot self-corroborate; external signals are many-per-source, so WITHOUT this
+/// collapse a single capped-MED source that emits two signals for one subject would yield
+/// two MED outcomes and escalate to HIGH, exceeding its own configured weight ceiling.
+/// Collapsing to one outcome per source makes the "distinct signals" assumption `combine`
+/// rests on hold: a source can never exceed its `max_contribution`, while cross-source
+/// corroboration (two DISTINCT sources each at MED -> HIGH) is preserved. The source stays
+/// identifiable in each retained outcome `value`.
+fn collapse_external_outcomes_per_source<'a>(
+    contributions: impl IntoIterator<Item = (&'a str, SignalOutcome)>,
+) -> Vec<SignalOutcome> {
+    let mut strongest_per_source: BTreeMap<&str, SignalOutcome> = BTreeMap::new();
+    for (source_iss, outcome) in contributions {
+        match strongest_per_source.entry(source_iss) {
+            std::collections::btree_map::Entry::Occupied(mut existing) => {
+                if outcome.level.rank() > existing.get().level.rank() {
+                    existing.insert(outcome);
+                }
+            }
+            std::collections::btree_map::Entry::Vacant(slot) => {
+                slot.insert(outcome);
+            }
+        }
+    }
+    strongest_per_source.into_values().collect()
+}
+
+// ===========================================================================
 // The evaluation entry point
 // ===========================================================================
 
@@ -751,6 +931,17 @@ pub(crate) async fn evaluate(
     // Velocity signal (reuses the #64 counter layer).
     if cfg.velocity_enabled {
         outcomes.push(velocity_outcome(state, subject, ctx.ip, location));
+    }
+
+    // Third-party risk signals (issue #82, PR 1): fold each FRESH ingested signal from an
+    // ENABLED, policy-referenced source in as ONE weighted contribution, exactly like an
+    // internal signal. Gated by the experimental `risk-signals` flag (armed only through the
+    // feature ladder). A signal is a POLICY INPUT, never a verdict: it can only ADD a
+    // SignalOutcome to `combine` below, capped at the source's weight and dropped below its
+    // threshold, and it sets the hard-deny bit only when the source's can_hard_deny is
+    // explicitly opted in (default false). With the flag off this path never runs.
+    if state.risk_signals_enabled() && !cfg.signal_sources.is_empty() {
+        append_external_signal_outcomes(state, scope, subject, &mut outcomes).await;
     }
 
     let level = combine(&outcomes);
@@ -1645,5 +1836,257 @@ mod tests {
         assert!(split_disavowal_token("ira_~secret").is_none());
         assert_eq!(disavowal_digest("secret"), disavowal_digest("secret"));
         assert_ne!(disavowal_digest("secret"), disavowal_digest("other"));
+    }
+
+    // === Third-party risk signals as weighted policy inputs (issue #82, PR 1) ===
+
+    /// A source config for the mapping tests, with a permissive weight cap and floor so the
+    /// mapping/cap/threshold behavior is what the individual test isolates.
+    fn signal_source() -> ironauth_config::RiskSignalSource {
+        let mut source = ironauth_config::RiskSignalSource {
+            iss: "https://vendor.example".to_owned(),
+            max_contribution: "high".to_owned(),
+            min_strength: "low".to_owned(),
+            ..ironauth_config::RiskSignalSource::default()
+        };
+        source
+            .verdict_map
+            .insert("deny".to_owned(), "high".to_owned());
+        source
+            .verdict_map
+            .insert("suspicious".to_owned(), "med".to_owned());
+        source
+    }
+
+    #[test]
+    fn a_verdict_payload_maps_through_the_source_verdict_map() {
+        let source = signal_source();
+        let outcome = external_signal_outcome(&source, r#"{"kind":"verdict","verdict":"deny"}"#)
+            .expect("mapped verdict contributes");
+        assert_eq!(outcome.level, RiskLevel::High);
+        assert_eq!(outcome.name, EXTERNAL_SIGNAL_NAME);
+        // An UNMAPPED verdict contributes nothing (inert, not an error).
+        assert!(
+            external_signal_outcome(&source, r#"{"kind":"verdict","verdict":"unknown"}"#).is_none()
+        );
+    }
+
+    #[test]
+    fn a_score_payload_maps_through_the_score_bands() {
+        let source = signal_source();
+        // Default bands: >=0.8 HIGH, >=0.5 MED, else LOW.
+        assert_eq!(
+            external_signal_outcome(&source, r#"{"kind":"score","score":0.95}"#)
+                .unwrap()
+                .level,
+            RiskLevel::High
+        );
+        assert_eq!(
+            external_signal_outcome(&source, r#"{"kind":"score","score":0.6}"#)
+                .unwrap()
+                .level,
+            RiskLevel::Med
+        );
+        assert_eq!(
+            external_signal_outcome(&source, r#"{"kind":"score","score":0.1}"#)
+                .unwrap()
+                .level,
+            RiskLevel::Low
+        );
+    }
+
+    #[test]
+    fn the_per_source_weight_caps_the_contribution() {
+        // A low-weight source can never contribute HIGH even from a max verdict/score.
+        let mut source = signal_source();
+        source.max_contribution = "med".to_owned();
+        assert_eq!(
+            external_signal_outcome(&source, r#"{"kind":"verdict","verdict":"deny"}"#)
+                .unwrap()
+                .level,
+            RiskLevel::Med,
+            "a HIGH verdict is capped to the source's MED weight"
+        );
+        assert_eq!(
+            external_signal_outcome(&source, r#"{"kind":"score","score":0.99}"#)
+                .unwrap()
+                .level,
+            RiskLevel::Med,
+            "a HIGH score is capped to the source's MED weight"
+        );
+    }
+
+    #[test]
+    fn a_contribution_below_the_threshold_is_dropped() {
+        let mut source = signal_source();
+        source.min_strength = "high".to_owned();
+        // A MED contribution is below a HIGH threshold: dropped entirely (contributes nothing).
+        assert!(
+            external_signal_outcome(&source, r#"{"kind":"verdict","verdict":"suspicious"}"#)
+                .is_none()
+        );
+        // A HIGH contribution clears the HIGH threshold.
+        assert!(
+            external_signal_outcome(&source, r#"{"kind":"verdict","verdict":"deny"}"#).is_some()
+        );
+    }
+
+    #[test]
+    fn a_max_signal_from_a_no_hard_deny_source_never_sets_hard_deny() {
+        // THE STRUCTURAL "a signal is never a verdict" guarantee: even a max-score/max-verdict
+        // signal from a source with the default can_hard_deny=false NEVER sets the hard-deny
+        // bit, so it can never (through dispatch) force a Block. Only per-source policy opt-in
+        // could, and it defaults off.
+        let source = signal_source();
+        assert!(!source.can_hard_deny, "the default is no hard deny");
+        let verdict = external_signal_outcome(&source, r#"{"kind":"verdict","verdict":"deny"}"#)
+            .expect("a HIGH verdict still contributes");
+        assert_eq!(verdict.level, RiskLevel::High);
+        assert!(
+            !verdict.hard_deny,
+            "a HIGH external signal from a no-hard-deny source must NOT set the hard-deny bit"
+        );
+        // Even fed straight into the real dispatch with blocking ON, a lone external HIGH
+        // (no hard deny, no step-up threshold, no new device) never becomes a Block.
+        let level = combine(std::slice::from_ref(&verdict));
+        let action = dispatch(level, verdict.hard_deny, false, None, true, true);
+        assert_ne!(
+            action,
+            RiskAction::Block,
+            "an external signal alone can never produce a Block"
+        );
+
+        // Only an EXPLICIT per-source opt-in lets a HIGH external signal set the hard-deny bit.
+        let mut opted_in = signal_source();
+        opted_in.can_hard_deny = true;
+        let opted = external_signal_outcome(&opted_in, r#"{"kind":"verdict","verdict":"deny"}"#)
+            .expect("contributes");
+        assert!(
+            opted.hard_deny,
+            "an opted-in source's HIGH signal may set the hard-deny bit"
+        );
+    }
+
+    #[test]
+    fn a_malformed_or_untagged_payload_contributes_nothing() {
+        let source = signal_source();
+        assert!(external_signal_outcome(&source, "not json").is_none());
+        assert!(external_signal_outcome(&source, r#"{"no_kind":true}"#).is_none());
+        assert!(external_signal_outcome(&source, r#"{"kind":"other"}"#).is_none());
+        assert!(external_signal_outcome(&source, r#"{"kind":"score"}"#).is_none());
+        assert!(external_signal_outcome(&source, r#"{"kind":"verdict"}"#).is_none());
+    }
+
+    #[test]
+    fn one_source_cannot_self_escalate_past_its_cap_via_two_signals() {
+        // MEDIUM-1 reproduction: a single source with the default MED ceiling delivers TWO
+        // fresh signals for one subject. Each maps (capped) to MED. WITHOUT the per-source
+        // collapse these would be two MED outcomes and `combine` would escalate to HIGH,
+        // exceeding the source's configured weight. With the collapse the source contributes
+        // ONE MED outcome, so the combined score stays MED.
+        let mut source = signal_source();
+        source.max_contribution = "med".to_owned();
+        let first = external_signal_outcome(&source, r#"{"kind":"verdict","verdict":"deny"}"#)
+            .expect("first signal contributes (capped to MED)");
+        let second = external_signal_outcome(&source, r#"{"kind":"score","score":0.99}"#)
+            .expect("second signal contributes (capped to MED)");
+        assert_eq!(first.level, RiskLevel::Med);
+        assert_eq!(second.level, RiskLevel::Med);
+        let collapsed = collapse_external_outcomes_per_source([
+            (source.iss.as_str(), first),
+            (source.iss.as_str(), second),
+        ]);
+        assert_eq!(
+            collapsed.len(),
+            1,
+            "a single source collapses to ONE outcome"
+        );
+        assert_eq!(
+            combine(&collapsed),
+            RiskLevel::Med,
+            "a source cannot self-escalate past its MED cap"
+        );
+    }
+
+    #[test]
+    fn two_distinct_sources_at_med_still_corroborate_to_high() {
+        // Cross-source corroboration is preserved: two DISTINCT sources each contributing MED
+        // are two distinct outcomes, so `combine` escalates to HIGH (the intended #79 rule).
+        let mut source_a = signal_source();
+        source_a.iss = "https://vendor-a.example".to_owned();
+        source_a.max_contribution = "med".to_owned();
+        let mut source_b = signal_source();
+        source_b.iss = "https://vendor-b.example".to_owned();
+        source_b.max_contribution = "med".to_owned();
+        let a = external_signal_outcome(&source_a, r#"{"kind":"verdict","verdict":"deny"}"#)
+            .expect("source A contributes MED");
+        let b = external_signal_outcome(&source_b, r#"{"kind":"verdict","verdict":"deny"}"#)
+            .expect("source B contributes MED");
+        let collapsed = collapse_external_outcomes_per_source([
+            (source_a.iss.as_str(), a),
+            (source_b.iss.as_str(), b),
+        ]);
+        assert_eq!(collapsed.len(), 2, "two distinct sources stay two outcomes");
+        assert_eq!(
+            combine(&collapsed),
+            RiskLevel::High,
+            "two DISTINCT MED sources corroborate to HIGH"
+        );
+    }
+
+    #[test]
+    fn a_high_trust_source_still_contributes_high_after_collapse() {
+        // The cap is a ceiling, not a forced downgrade: a single high-trust source
+        // (max_contribution=high) whose signal maps HIGH still contributes ONE HIGH outcome.
+        let source = signal_source(); // max_contribution defaults to "high" here
+        assert_eq!(source.max_contribution, "high");
+        let high = external_signal_outcome(&source, r#"{"kind":"verdict","verdict":"deny"}"#)
+            .expect("HIGH verdict contributes");
+        assert_eq!(high.level, RiskLevel::High);
+        let collapsed = collapse_external_outcomes_per_source([(source.iss.as_str(), high)]);
+        assert_eq!(collapsed.len(), 1);
+        assert_eq!(collapsed[0].level, RiskLevel::High);
+        assert_eq!(combine(&collapsed), RiskLevel::High);
+    }
+
+    #[test]
+    fn a_collapsed_high_from_a_no_hard_deny_source_still_never_blocks() {
+        // The never-a-Block guarantee survives the collapse: even a collapsed HIGH outcome
+        // from a default (no-hard-deny) source, fed through the real dispatch with blocking
+        // ON, never produces a Block.
+        let source = signal_source();
+        assert!(!source.can_hard_deny, "the default is no hard deny");
+        let high = external_signal_outcome(&source, r#"{"kind":"verdict","verdict":"deny"}"#)
+            .expect("HIGH verdict contributes");
+        let collapsed = collapse_external_outcomes_per_source([(source.iss.as_str(), high)]);
+        let hard_deny = collapsed.iter().any(|outcome| outcome.hard_deny);
+        assert!(!hard_deny, "no collapsed outcome sets the hard-deny bit");
+        let level = combine(&collapsed);
+        let action = dispatch(level, hard_deny, false, None, true, true);
+        assert_ne!(
+            action,
+            RiskAction::Block,
+            "a collapsed external HIGH from a no-hard-deny source never blocks"
+        );
+    }
+
+    #[test]
+    fn a_signal_older_than_the_source_max_age_is_stale() {
+        let mut source = signal_source();
+        source.max_age_secs = 60;
+        let now = 1_000_000 * 1_000_000; // an arbitrary now in micros
+        // A 30-second-old signal is fresh; a 120-second-old one is stale.
+        assert!(!external_signal_is_stale(
+            &source,
+            now - 30 * 1_000_000,
+            now
+        ));
+        assert!(external_signal_is_stale(
+            &source,
+            now - 120 * 1_000_000,
+            now
+        ));
+        // A future event instant (clock skew) is treated as fresh, never stale.
+        assert!(!external_signal_is_stale(&source, now + 5 * 1_000_000, now));
     }
 }

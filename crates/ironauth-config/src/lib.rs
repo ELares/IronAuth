@@ -35,7 +35,8 @@ pub use dsn::{Dsn, DsnError, KNOWN_SCHEMES};
 pub use features::{
     CUSTOM_DOMAINS_ACME_FEATURE, CUSTOM_DOMAINS_ACME_VERSION, FEDCM_FEATURE, FEDCM_VERSION,
     Feature, FeatureRegistry, FeatureValidationError, FeatureViolation,
-    GLOBAL_TOKEN_REVOCATION_DRAFT, GLOBAL_TOKEN_REVOCATION_FEATURE, Maturity,
+    GLOBAL_TOKEN_REVOCATION_DRAFT, GLOBAL_TOKEN_REVOCATION_FEATURE, Maturity, RISK_SIGNALS_FEATURE,
+    RISK_SIGNALS_VERSION,
 };
 pub use secret::{REDACTED, Secret, SecretError, SecretString};
 
@@ -2278,6 +2279,18 @@ pub struct RiskConfig {
     /// 604800 (seven days). Must be in
     /// `OIDC_RISK_MIN_DISAVOWAL_TTL_SECS..=OIDC_RISK_MAX_DISAVOWAL_TTL_SECS`.
     pub disavowal_ttl_secs: u64,
+
+    /// The registered THIRD-PARTY risk-signal sources (issue #82, PR 1): each external
+    /// fraud/risk source that may deliver a signed Security Event Token (SET) to the
+    /// ingestion endpoint, with its registered public keys and its per-source weight,
+    /// threshold, freshness, and payload-to-RiskLevel mapping. Empty by default (no source
+    /// registered). A source's rows are read by the engine ONLY while it is listed and
+    /// enabled here, so an unreferenced source is inert; the per-source policy is the ONLY
+    /// thing that turns an ingested signal into a contribution, and `can_hard_deny` defaults
+    /// FALSE so no external source can force a block without an explicit operator opt-in. The
+    /// whole ingestion surface is additionally gated by the `risk-signals` experimental
+    /// feature flag.
+    pub signal_sources: Vec<RiskSignalSource>,
 }
 
 impl Default for RiskConfig {
@@ -2299,6 +2312,115 @@ impl Default for RiskConfig {
             ip_allowlist: Vec::new(),
             ip_denylist: Vec::new(),
             disavowal_ttl_secs: 604_800,
+            signal_sources: Vec::new(),
+        }
+    }
+}
+
+/// The closed set of per-source `RiskLevel` tokens a third-party risk-signal source config
+/// may name (issue #82, PR 1): the `low`/`med`/`high` rung a verdict, a score band, the
+/// per-source weight cap (`max_contribution`), or the per-source threshold (`min_strength`)
+/// resolves to. An external signal can only ever CONTRIBUTE one of these levels; it can
+/// never name an action (block/challenge/notify), which is exactly why an ingested signal
+/// is structurally a policy input and never a verdict.
+pub const OIDC_RISK_SIGNAL_LEVELS: [&str; 3] = ["low", "med", "high"];
+
+/// A registered third-party risk-signal SOURCE (issue #82, PR 1).
+///
+/// An external fraud/risk source (a device-reputation vendor, a bot-detection service, a
+/// partner IdP emitting CAEP events) delivers a signal about a subject as a SIGNED Security
+/// Event Token (a JWS). The ingestion endpoint AUTHENTICATES the delivery by verifying the
+/// JWS SIGNATURE against this source's registered public key(s) through the hardened JOSE
+/// core (never a shared bearer secret, never `alg=none`), matching the SET `iss` to
+/// [`iss`](Self::iss) and the allowed `alg` to [`algorithms`](Self::algorithms). Only a
+/// verified SET from a listed, enabled source is ingested.
+///
+/// The remaining fields are the per-source POLICY the #79 engine applies when it folds an
+/// ingested signal in: the payload-to-RiskLevel mapping ([`verdict_map`](Self::verdict_map)
+/// for a tagged verdict, the score bands for a tagged score), the per-source weight cap
+/// ([`max_contribution`](Self::max_contribution)) and drop threshold
+/// ([`min_strength`](Self::min_strength)), the freshness window
+/// ([`max_age_secs`](Self::max_age_secs)) past which a signal is STALE and contributes
+/// nothing, and [`can_hard_deny`](Self::can_hard_deny) (default FALSE): an external signal
+/// can never force a block unless the operator explicitly opts this source in.
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields, default)]
+pub struct RiskSignalSource {
+    /// The source identity: the SET `iss` the ingestion verifies the signature under, and
+    /// the value stored in the `risk_signals.source` column. Must be non-empty and unique
+    /// across sources.
+    pub iss: String,
+
+    /// Whether this source is active (issue #82). When false, a SET from this source is
+    /// rejected at ingestion AND its already-stored rows are inert (the engine reads only
+    /// enabled sources). Default true: a listed source is active unless disabled.
+    pub enabled: bool,
+
+    /// The source's registered PUBLIC keys as a JWKS JSON document (issue #82). Only public
+    /// JWK members are read (the JOSE core is fail-closed), and this is the ONLY key source
+    /// the signature is verified against (never a key from the token header). Must be a
+    /// non-empty JWKS when the source is enabled.
+    pub jwks: String,
+
+    /// The JWS algorithm allowlist a SET from this source may be signed with (issue #82),
+    /// as JOSE `alg` names (for example `EdDSA`, `ES256`). A SET whose `alg` is outside this
+    /// list is rejected. Must be non-empty when the source is enabled; `alg=none` and the
+    /// HMAC families are structurally inexpressible in the JOSE core regardless.
+    pub algorithms: Vec<String>,
+
+    /// The per-source WEIGHT cap (issue #82): the maximum `RiskLevel` a signal from this
+    /// source may contribute, one of `low`/`med`/`high`. A mapped contribution stronger than
+    /// this is capped down, so a low-trust source can never contribute HIGH. Default `med`.
+    pub max_contribution: String,
+
+    /// The per-source THRESHOLD (issue #82): a mapped contribution WEAKER than this rung is
+    /// dropped entirely (contributes nothing), one of `low`/`med`/`high`. Default `low` (no
+    /// drop).
+    pub min_strength: String,
+
+    /// Whether a signal from this source may set the engine's HARD-DENY bit (issue #82).
+    /// Default FALSE: an external source can never force a block. Even when true, a block
+    /// still requires the #79 `block_on_high` dispatch switch, so opting a source in is
+    /// necessary but not sufficient. This is the structural "a signal is never a verdict"
+    /// guarantee: the default-false gate ANDs with any hard-deny the source requests.
+    pub can_hard_deny: bool,
+
+    /// The FRESHNESS window in seconds (issue #82): a signal whose `event_timestamp` is
+    /// older than this (measured on the env clock seam) is STALE and contributes nothing, so
+    /// a decision never rests on aged risk state. Default 3600 (one hour). Must be between 1
+    /// and `OIDC_MAX_LIFETIME_SECS`.
+    pub max_age_secs: u64,
+
+    /// The VERDICT-to-RiskLevel map for a tagged `{kind:"verdict"}` payload (issue #82):
+    /// each verdict string (for example `deny`, `suspicious`) maps to a `low`/`med`/`high`
+    /// contribution. A verdict absent from this map contributes nothing. Empty by default.
+    pub verdict_map: BTreeMap<String, String>,
+
+    /// The MED score band for a tagged `{kind:"score"}` payload (issue #82): a numeric score
+    /// at or above this (but below [`score_high_threshold`](Self::score_high_threshold))
+    /// contributes MED. Default 0.5.
+    pub score_med_threshold: f64,
+
+    /// The HIGH score band for a tagged `{kind:"score"}` payload (issue #82): a numeric
+    /// score at or above this contributes HIGH. Must be at least
+    /// [`score_med_threshold`](Self::score_med_threshold). Default 0.8.
+    pub score_high_threshold: f64,
+}
+
+impl Default for RiskSignalSource {
+    fn default() -> Self {
+        Self {
+            iss: String::new(),
+            enabled: true,
+            jwks: String::new(),
+            algorithms: Vec::new(),
+            max_contribution: "med".to_owned(),
+            min_strength: "low".to_owned(),
+            can_hard_deny: false,
+            max_age_secs: 3600,
+            verdict_map: BTreeMap::new(),
+            score_med_threshold: 0.5,
+            score_high_threshold: 0.8,
         }
     }
 }
@@ -3384,6 +3506,91 @@ fn validate_risk(oidc: &OidcConfig) -> Result<(), ConfigError> {
                 risk.disavowal_ttl_secs
             ),
         });
+    }
+    validate_risk_signal_sources(risk)?;
+    Ok(())
+}
+
+/// Validate the registered third-party risk-signal sources (issue #82, PR 1). The bounds
+/// hold even when the `risk-signals` feature is off, so an out-of-band value cannot take
+/// effect the moment the surface is armed: each source id is non-empty and unique, an
+/// enabled source carries a JWKS and a non-empty algorithm allowlist, every `RiskLevel` token
+/// (the weight cap, the drop threshold, and each verdict mapping) is in the closed
+/// `low`/`med`/`high` set, the score bands are ordered, and the freshness window is bounded.
+fn validate_risk_signal_sources(risk: &RiskConfig) -> Result<(), ConfigError> {
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
+    for source in &risk.signal_sources {
+        if source.iss.is_empty() {
+            return Err(ConfigError::Invalid {
+                message: "oidc.risk.signal_sources[].iss must be non-empty".to_owned(),
+            });
+        }
+        if !seen.insert(source.iss.as_str()) {
+            return Err(ConfigError::Invalid {
+                message: format!(
+                    "oidc.risk.signal_sources[].iss ({}) is registered more than once",
+                    source.iss
+                ),
+            });
+        }
+        if source.enabled && source.jwks.trim().is_empty() {
+            return Err(ConfigError::Invalid {
+                message: format!(
+                    "oidc.risk.signal_sources[{}].jwks must be a non-empty JWKS when the source \
+                     is enabled",
+                    source.iss
+                ),
+            });
+        }
+        if source.enabled && source.algorithms.is_empty() {
+            return Err(ConfigError::Invalid {
+                message: format!(
+                    "oidc.risk.signal_sources[{}].algorithms must list at least one algorithm \
+                     when the source is enabled",
+                    source.iss
+                ),
+            });
+        }
+        for level in [&source.max_contribution, &source.min_strength] {
+            if !OIDC_RISK_SIGNAL_LEVELS.contains(&level.as_str()) {
+                return Err(ConfigError::Invalid {
+                    message: format!(
+                        "oidc.risk.signal_sources[{}] level ({level}) must be one of low, med, \
+                         high",
+                        source.iss
+                    ),
+                });
+            }
+        }
+        for (verdict, level) in &source.verdict_map {
+            if !OIDC_RISK_SIGNAL_LEVELS.contains(&level.as_str()) {
+                return Err(ConfigError::Invalid {
+                    message: format!(
+                        "oidc.risk.signal_sources[{}].verdict_map[{verdict}] ({level}) must be one \
+                         of low, med, high",
+                        source.iss
+                    ),
+                });
+            }
+        }
+        if source.score_high_threshold < source.score_med_threshold {
+            return Err(ConfigError::Invalid {
+                message: format!(
+                    "oidc.risk.signal_sources[{}].score_high_threshold ({}) must be at least \
+                     score_med_threshold ({})",
+                    source.iss, source.score_high_threshold, source.score_med_threshold
+                ),
+            });
+        }
+        if source.max_age_secs < 1 || source.max_age_secs > OIDC_MAX_LIFETIME_SECS {
+            return Err(ConfigError::Invalid {
+                message: format!(
+                    "oidc.risk.signal_sources[{}].max_age_secs ({}) must be between 1 and \
+                     {OIDC_MAX_LIFETIME_SECS} seconds",
+                    source.iss, source.max_age_secs
+                ),
+            });
+        }
     }
     Ok(())
 }

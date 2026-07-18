@@ -929,6 +929,34 @@ impl Harness {
         self.state = state;
     }
 
+    /// Arm the experimental third-party risk-signal ingestion surface (issue #82, PR 1) for
+    /// the harness scope and rebuild the protocol router. Builds a fresh state over the SAME
+    /// master-key-wired store, env, and registry, with the risk engine ENABLED and the given
+    /// per-source `signal_sources` in the risk config, plus `with_risk_signals_enabled(true)`
+    /// (the arming bool the boot path resolves from the feature ladder), so the ingestion
+    /// endpoint answers and the engine folds fresh external signals in.
+    pub fn enable_risk_signals(&mut self, sources: Vec<ironauth_config::RiskSignalSource>) {
+        let config = OidcConfig {
+            require_pkce_for_confidential_clients: false,
+            risk: ironauth_config::RiskConfig {
+                enabled: true,
+                signal_sources: sources,
+                ..ironauth_config::RiskConfig::default()
+            },
+            ..OidcConfig::default()
+        };
+        let state = OidcState::new(
+            self.db.store().clone(),
+            self.env.clone(),
+            Arc::clone(&self.registry),
+            &config,
+            ISSUER_BASE,
+        )
+        .with_risk_signals_enabled(true);
+        self.router = oidc_router(state.clone());
+        self.state = state;
+    }
+
     /// Install a verification / OTP sender (issue #68) on the state and rebuild the
     /// protocol router, so a test can capture the delivered email-OTP code and magic-link
     /// token/short-code from a recording sender. Only the protocol router is rebuilt (the

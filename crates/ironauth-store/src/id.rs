@@ -907,6 +907,18 @@ impl ScopedKind for RiskLoginGeoKind {
     const PREFIX: &'static str = "rgl";
 }
 
+/// Marker for an ingested third-party risk signal (`rsg_`), one row of the
+/// per-scope external-signal store (issue #82, PR 1): a signal delivered by an external
+/// fraud/risk source as a signed Security Event Token and folded into the #79 engine as
+/// one weighted policy input. A tenant-scoped RUNTIME row (never exported); the raw
+/// external subject is stored only as a keyed blind index, never a plaintext column, and
+/// the signal carries no bearer secret, so its debug form is not redacted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RiskSignalKind;
+impl ScopedKind for RiskSignalKind {
+    const PREFIX: &'static str = "rsg";
+}
+
 /// Marker for a "this wasn't me" disavowal token (`dis_`), one row in the per-subject
 /// disavowal set (issue #79): the SHA-256 digest of a high-entropy single-use token
 /// carried in the new-device notification. The id embeds its `(tenant, environment)`
@@ -1188,6 +1200,10 @@ pub type RiskLoginGeoId = ScopedId<RiskLoginGeoKind>;
 /// A "this wasn't me" disavowal-token id (`dis_...`), one row in the per-subject
 /// disavowal set and the routing handle embedded in its single-use token (issue #79).
 pub type RiskDisavowalId = ScopedId<RiskDisavowalKind>;
+
+/// An ingested third-party risk-signal id (`rsg_...`), one row of the per-scope
+/// external-signal store the #79 engine folds in as a weighted policy input (issue #82).
+pub type RiskSignalId = ScopedId<RiskSignalKind>;
 
 /// A proof-of-work challenge id (`pow_...`), one row in the per-scope `PoW` challenge
 /// state and the routing handle the client returns with its nonce (issue #80).

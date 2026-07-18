@@ -128,6 +128,7 @@ mod resource;
 mod response;
 mod revocation;
 mod risk;
+mod risk_signals;
 pub mod routing;
 mod scope_claims;
 mod sector;
@@ -504,6 +505,17 @@ pub fn oidc_router(state: OidcState) -> Router {
         .route(
             "/t/{tenant_id}/e/{environment_id}/fedcm/assertion",
             post(fedcm::assertion),
+        )
+        // The third-party risk-signal ingestion endpoint (issue #82, PR 1, EXPLORATORY): a
+        // signed Security Event Token (SET, a compact JWS) pushed by an external fraud/risk
+        // source, authenticated by its SIGNATURE against the source's registered public key
+        // (never a shared secret) and ingested as one weighted policy input for the #79
+        // engine (never a verdict). The handler fails closed with a 404 when the
+        // `risk-signals` experimental feature is off, so the route literal stays
+        // UNCONDITIONAL for the RFC 9700 endpoint inventory.
+        .route(
+            "/t/{tenant_id}/e/{environment_id}/risk/signals",
+            post(risk_signals::ingest),
         )
         // WebAuthn passkey ceremonies (issue #65), scope-routed so the RP ID/origin
         // and the credential reads/writes run under the right per-environment scope.

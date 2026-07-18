@@ -80,7 +80,7 @@ use crate::id::{
     IssuedTokenId, KekId, MagicLinkTokenId, ManagementKeyId, Mds3BlobCacheId, MigrationRunId,
     MigrationRunRecordId, OperatorId, OrgConnectionId, OrganizationId, PowChallengeId,
     PushedRequestId, RecoveryCodeId, RecoveryFlowId, RefreshFamilyId, RefreshTokenId,
-    ResourceServerId, RiskDecisionId, RiskDisavowalId, RiskLoginGeoId, RoutingRuleId,
+    ResourceServerId, RiskDecisionId, RiskDisavowalId, RiskLoginGeoId, RiskSignalId, RoutingRuleId,
     ScopeStepUpPolicyId, ServiceAccountId, SessionEventId, SessionId, SigningKeyId, SmsOtpCodeId,
     SmsRouteStatId, TenantId, TotpCredentialId, TraitMigrationJobId, TraitSchemaId,
     TrustedDeviceId, UpstreamTokenGrantId, UpstreamTokenId, UserId, UserIdentifierId, VariableId,
@@ -95,7 +95,7 @@ use crate::recovery::{
 };
 use crate::risk::{
     DisavowalResolution, LoginGeoView, NewDisavowalToken, NewLoginGeo, NewRiskDecision,
-    RiskDecisionView,
+    NewRiskSignal, RiskDecisionView, RiskSignalView,
 };
 use crate::scope::Scope;
 use crate::sms_otp::{ActiveSmsOtpCode, NewSmsOtpCode, SmsRouteStat, SmsTenantConfig};
@@ -505,6 +505,18 @@ impl<'a> ScopedStore<'a> {
     #[must_use]
     pub fn fedcm_nonces(&self) -> FedcmNonceRepo<'a> {
         FedcmNonceRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
+    /// The third-party risk-signal READ store for this scope (issue #82, PR 1): fetch a
+    /// subject's most recent ingested external signals so the #79 engine can fold each in
+    /// as one weighted policy input. Subject-bound and scope-forced; ingestion (an audited
+    /// write) lives on [`ActingStore::risk_signals`].
+    #[must_use]
+    pub fn risk_signals(&self) -> RiskSignalRepo<'a> {
+        RiskSignalRepo {
             store: self.store,
             scope: self.scope,
         }
@@ -951,6 +963,20 @@ impl<'a> ActingStore<'a> {
     #[must_use]
     pub fn fedcm_nonces(&self) -> ActingFedcmNonceRepo<'a> {
         ActingFedcmNonceRepo {
+            store: self.store,
+            scope: self.scope,
+            acting: self.acting,
+        }
+    }
+
+    /// The mutating third-party risk-signal ingestion repository for this scope and actor
+    /// (issue #82, PR 1): INGEST a verified external signal as one `risk_signals` row plus
+    /// one `risk.signal.ingest` audit row, idempotent on `(source, source_jti)`. The actor
+    /// is the (service) source the ingestion authenticated by JWS signature. The engine's
+    /// fresh-signal read lives on the non-acting [`ScopedStore::risk_signals`].
+    #[must_use]
+    pub fn risk_signals(&self) -> ActingRiskSignalRepo<'a> {
+        ActingRiskSignalRepo {
             store: self.store,
             scope: self.scope,
             acting: self.acting,
@@ -21051,6 +21077,166 @@ impl ActingFedcmNonceRepo<'_> {
     }
 }
 
+/// The third-party risk-signal READ store for a scope (issue #82, PR 1).
+///
+/// The #79 risk engine reads a subject's FRESH ingested external signals through this
+/// repository and folds each in as ONE weighted contribution to its deterministic
+/// LOW/MED/HIGH score. Every read is scope-forced and subject-bound. The raw external
+/// subject is NEVER returned (only its keyed blind index was ever stored); the engine keys
+/// on the resolved local `usr_` subject the ingestion bound the row to.
+pub struct RiskSignalRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl RiskSignalRepo<'_> {
+    /// Read a subject's most recent ingested external signals (issue #82), newest first,
+    /// bounded by `limit`. The engine applies the per-source freshness (max-age) and
+    /// weight/threshold policy in memory, so a stale or unreferenced-source row simply
+    /// contributes nothing. Returns an empty vector when the subject is out of scope or has
+    /// no signals. Subject-bound.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn fresh_signals_for_subject(
+        &self,
+        subject: &UserId,
+        limit: i64,
+    ) -> Result<Vec<RiskSignalView>, StoreError> {
+        if subject.scope() != self.scope {
+            return Ok(Vec::new());
+        }
+        let scope = self.scope;
+        let mut tx = begin_scoped(self.store, scope).await?;
+        let rows = sqlx::query(
+            "SELECT source, signal_type, payload::text AS payload, \
+             (EXTRACT(EPOCH FROM event_timestamp) * 1000000)::bigint AS event_us \
+             FROM risk_signals \
+             WHERE tenant_id = $1 AND environment_id = $2 AND subject = $3 \
+             ORDER BY event_timestamp DESC, id DESC LIMIT $4",
+        )
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(subject.to_string())
+        .bind(limit)
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(rows
+            .iter()
+            .map(|row| RiskSignalView {
+                source: row.get("source"),
+                signal_type: row.get("signal_type"),
+                payload_json: row.get("payload"),
+                event_timestamp_unix_micros: row.get("event_us"),
+            })
+            .collect())
+    }
+}
+
+/// The mutating third-party risk-signal ingestion repository for a scope and actor (issue
+/// #82, PR 1). Reachable only through [`ScopedStore::acting`], so every ingested signal
+/// carries its acting principal (the source, a service) and correlation id and routes
+/// through the audited-write primitive. Ingestion is IDEMPOTENT on `(source, source_jti)`:
+/// a re-delivery of the same SET is a no-op, never a duplicate row and never an error.
+pub struct ActingRiskSignalRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+    acting: ActingContext,
+}
+
+impl ActingRiskSignalRepo<'_> {
+    /// INGEST a verified third-party risk signal (issue #82): blind-index the raw external
+    /// subject, write one `risk_signals` row keyed by `(source, source_jti)`, and (only when
+    /// the row was actually inserted) one `risk.signal.ingest` audit row attributed to the
+    /// source. Returns `Ok(true)` on a first delivery and `Ok(false)` on an idempotent
+    /// re-delivery of the same `(source, source_jti)` (a no-op, not an error that leaks).
+    ///
+    /// The row carries no resolved action: a signal is a policy input, never a verdict. The
+    /// raw external subject lands ONLY as a keyed blind index; the audit detail records the
+    /// resolved local subject (or that it was unresolved), never the raw external subject.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if a resolved subject is out of this scope;
+    /// [`StoreError::Encryption`] if no platform master key is configured (the blind-index
+    /// path fails closed rather than store a plaintext external subject);
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn ingest(&self, env: &Env, signal: NewRiskSignal<'_>) -> Result<bool, StoreError> {
+        if let Some(subject) = signal.resolved_subject {
+            if subject.scope() != self.scope {
+                return Err(StoreError::NotFound);
+            }
+        }
+        let master = self.store.master().ok_or(StoreError::Encryption)?;
+        let scope = self.scope;
+        let id = RiskSignalId::generate(env, &scope);
+        let subject_bidx = risk_signal_subject_blind_index(master, scope, signal.subject_raw);
+        let subject_text = signal.resolved_subject.map(ToString::to_string);
+        // The guarded idempotent insert and its audit row share ONE transaction (issue #7
+        // same-tx audit discipline). ON CONFLICT DO NOTHING RETURNING makes the
+        // first-delivery decision atomic without sniffing an error code (a returned row means
+        // this delivery won; no row means the (source, source_jti) already exists, a
+        // duplicate re-delivery). On a first delivery the row and its `risk.signal.ingest`
+        // audit commit together or NEITHER does, so a committed ingest can never be missing
+        // its audit row: were the audit ever written separately, an audit-write failure could
+        // leave a durable row that a retry (ON CONFLICT DO NOTHING) then treats as an already
+        // ingested duplicate, so the row would exist with NO audit ever written.
+        let mut tx = begin_scoped(self.store, scope).await?;
+        let row = sqlx::query(
+            "INSERT INTO risk_signals \
+             (id, tenant_id, environment_id, source, signal_type, subject_format, \
+              subject_bidx, subject, payload, event_timestamp, source_jti) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, \
+                     TIMESTAMPTZ 'epoch' + ($10::text || ' microseconds')::interval, $11) \
+             ON CONFLICT (tenant_id, environment_id, source, source_jti) DO NOTHING \
+             RETURNING id",
+        )
+        .bind(id.to_string())
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(signal.source)
+        .bind(signal.signal_type)
+        .bind(signal.subject_format)
+        .bind(subject_bidx.into_bytes())
+        .bind(subject_text.as_deref())
+        .bind(signal.payload_json)
+        .bind(signal.event_timestamp_micros)
+        .bind(signal.source_jti)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if row.is_none() {
+            // An idempotent re-delivery: nothing was inserted. Drop the transaction (a
+            // rollback of the no-op INSERT) and return a clean no-op, not an error that
+            // leaks. No audit row is written for a duplicate; the FIRST delivery already
+            // wrote the row and its audit atomically below.
+            return Ok(false);
+        }
+        // The audit row for THIS ingest, in the SAME transaction as the INSERT above and a
+        // PII-free detail (never the raw external subject). This is one of the few custom
+        // write paths that inline their own audited transaction rather than route through
+        // `write_audited`, because the first-vs-duplicate decision is made by the same
+        // INSERT that must be audited.
+        let subject_detail = subject_text.as_deref().unwrap_or("unresolved");
+        let detail = format!(
+            "source={} signal_type={} subject_format={} subject={}",
+            signal.source, signal.signal_type, signal.subject_format, subject_detail
+        );
+        let spec = AuditedWrite {
+            store: self.store,
+            scope,
+            acting: &self.acting,
+            env,
+            action: Action::RiskSignalIngest,
+            target: &id,
+        };
+        insert_audit_row(&mut tx, &spec, Some(&detail)).await?;
+        tx.commit().await?;
+        Ok(true)
+    }
+}
+
 /// The inputs to CREATE an account link (issue #78). The raw federated composite is
 /// borrowed (never owned by a long-lived struct); it is sealed and blind-indexed
 /// immediately and never lands in plaintext.
@@ -27900,6 +28086,10 @@ const USER_PII_SEAL_LABEL: &str = "ironauth.envelope.user-pii.v1";
 /// The AAD label domain-separating the `users.identifier` blind index from every
 /// other keyed derivation.
 const USER_IDENTIFIER_BIDX_LABEL: &str = "ironauth.envelope.user-identifier-bidx.v1";
+/// The AAD label domain-separating a `risk_signals.subject_bidx` (the raw external
+/// subject a third-party risk source asserted, issue #82) from every other keyed
+/// derivation, so a risk-signal subject index never collides with a login-handle index.
+const RISK_SIGNAL_SUBJECT_BIDX_LABEL: &str = "ironauth.bidx.risk-signal-subject.v1";
 /// The AAD label domain-separating a sealed `account_credentials.friendly_name`
 /// (the user-authored credential label, issue #61) from every other envelope
 /// context, so a credential-name seal never authenticates under another column's.
@@ -28209,6 +28399,30 @@ fn user_identifier_bidx_aad(scope: Scope, identifier: &str) -> Aad {
 /// value an equality lookup queries against `users.identifier_bidx`.
 fn user_identifier_blind_index(master: &MasterKey, scope: Scope, identifier: &str) -> BlindIndex {
     master.blind_index(&user_identifier_bidx_aad(scope, identifier))
+}
+
+/// The blind-index context for a raw EXTERNAL subject a third-party risk source asserted
+/// (issue #82, PR 1): the label, the scope, and the raw subject value, length-prefixed. The
+/// per-tenant HMAC key means the SAME external subject in two tenants maps to two different
+/// tags, so a stored risk-signal subject index can never leak or link a subject across
+/// tenants, and the raw external subject (which can be PII) never lands as plaintext.
+fn risk_signal_subject_bidx_aad(scope: Scope, subject_raw: &str) -> Aad {
+    Aad::builder()
+        .text(RISK_SIGNAL_SUBJECT_BIDX_LABEL)
+        .text(&scope.tenant().to_string())
+        .text(&scope.environment().to_string())
+        .field(subject_raw.as_bytes())
+        .build()
+}
+
+/// The deterministic blind index for a raw external `subject_raw` in `scope` under
+/// `master`, the value stored in `risk_signals.subject_bidx` (issue #82).
+fn risk_signal_subject_blind_index(
+    master: &MasterKey,
+    scope: Scope,
+    subject_raw: &str,
+) -> BlindIndex {
+    master.blind_index(&risk_signal_subject_bidx_aad(scope, subject_raw))
 }
 
 /// The blind-index context for a `users.external_id` (issue #52): the label, the

@@ -10,6 +10,49 @@
 
 use crate::id::{RiskDecisionId, UserId};
 
+/// A third-party risk signal to INGEST (issue #82, PR 1): the verified fields of a signed
+/// Security Event Token an external fraud/risk source delivered. The repository blind-indexes
+/// `subject_raw` before it lands (the raw external subject is never a plaintext column) and
+/// records the row keyed by `(source, source_jti)` for idempotent single delivery. Nothing
+/// here carries a resolved action: a signal is a policy input, never a verdict.
+#[derive(Debug, Clone, Copy)]
+pub struct NewRiskSignal<'a> {
+    /// The signal source identity (the SET `iss` the signature verified under).
+    pub source: &'a str,
+    /// The free-text, URI-capable event-type token (a CAEP event-type URI fits verbatim).
+    pub signal_type: &'a str,
+    /// The RFC 9493 Subject Identifier format the source asserted (a closed set).
+    pub subject_format: &'a str,
+    /// The RAW external subject the source asserted. Blind-indexed by the repository before
+    /// it lands; NEVER stored as a plaintext column.
+    pub subject_raw: &'a str,
+    /// The resolved local `usr_` id the external subject maps to, or `None` when it maps to
+    /// no local account (an inert row the engine never reads for any real subject).
+    pub resolved_subject: Option<&'a UserId>,
+    /// The tagged signal body `{kind:"verdict"|"score", ...}` serialized as a JSON document.
+    pub payload_json: &'a str,
+    /// The source's event instant (CAEP `event_timestamp`) in microseconds since the epoch:
+    /// the freshness input the engine compares against the per-source max age.
+    pub event_timestamp_micros: i64,
+    /// The SET `jti`: the single-delivery dedup key.
+    pub source_jti: &'a str,
+}
+
+/// A fresh third-party risk signal read for a subject (issue #82, PR 1), one contribution
+/// the #79 engine maps to a weighted `SignalOutcome`. Every field derives from the stored
+/// row; the raw external subject is never returned (only its keyed blind index was stored).
+#[derive(Debug, Clone)]
+pub struct RiskSignalView {
+    /// The signal source identity (the enabled `RiskConfig` source the engine keys policy on).
+    pub source: String,
+    /// The free-text event-type token.
+    pub signal_type: String,
+    /// The tagged signal body as a JSON document (mapped to a `RiskLevel` by the source config).
+    pub payload_json: String,
+    /// The source's event instant in microseconds since the epoch (the freshness input).
+    pub event_timestamp_unix_micros: i64,
+}
+
 /// A login-geo observation to record (issue #79): the observed peer IP, the resolved
 /// coarse location (a small JSON document of latitude, longitude, and optional ASN),
 /// and the observed User-Agent at a login, plus the login instant. The three PII

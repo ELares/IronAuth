@@ -477,7 +477,7 @@ async fn expand_contract_example_chain_runs_all_three_phases_and_contract_remove
 // per real table); splitting it would not make it clearer.
 #[allow(clippy::too_many_lines)]
 #[tokio::test]
-async fn production_chain_is_only_the_sixty_three_real_migrations_and_ships_no_demo_object() {
+async fn production_chain_is_only_the_sixty_four_real_migrations_and_ships_no_demo_object() {
     // TestDatabase::start runs Store::migrate() (the production chain) on a
     // fresh, empty database.
     let db = TestDatabase::start().await;
@@ -494,8 +494,8 @@ async fn production_chain_is_only_the_sixty_three_real_migrations_and_ships_no_d
     );
     assert_eq!(
         report.already_applied(),
-        63,
-        "the production chain is exactly sixty-three migrations (isolation, audit log, management \
+        64,
+        "the production chain is exactly sixty-four migrations (isolation, audit log, management \
          API, OIDC authorization, signing keys, login/consent, authentication context, redirect \
          registration, UserInfo claims, consent scope upsert, resource servers, opaque access \
          tokens, client auth suite, dynamic client registration, pushed authorization requests, \
@@ -511,16 +511,17 @@ async fn production_chain_is_only_the_sixty_three_real_migrations_and_ships_no_d
          policies, guarded SMS OTP, passkey attestation, admin sudo elevations, trusted devices, \
          risk engine, account recovery, federation connectors, registration abuse defenses, \
          federation login state, enterprise inbound routing, upstream token vault, \
-         guarded account links, account linking wiring, FedCM assertion nonces)"
+         guarded account links, account linking wiring, FedCM assertion nonces, third-party \
+         risk signals)"
     );
 
-    // The ledger holds exactly versions 1 through 63.
+    // The ledger holds exactly versions 1 through 64.
     assert_eq!(
         applied_versions(pool).await,
         vec![
             1_i64, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
             24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45,
-            46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63
+            46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64
         ]
     );
     let phase_of = |version: i64| async move {
@@ -754,6 +755,11 @@ async fn production_chain_is_only_the_sixty_three_real_migrations_and_ships_no_d
     // single-use replay table (fedcm_assertion_nonces) with its index, isolation policy,
     // nonempty-scope CHECK, and a no-DELETE column grant. No rewrite of existing state.
     assert_eq!(phase_of(63).await, "expand");
+    // The third-party risk-signal migration (issue #82, PR 1) is an EXPAND: one new
+    // tenant-scoped table (risk_signals) with its indexes, isolation policy,
+    // nonempty-scope CHECK, subject-format CHECK, single-delivery UNIQUE, and a no-DELETE
+    // append-only grant. No rewrite of existing state.
+    assert_eq!(phase_of(64).await, "expand");
 
     // The FedCM assertion-nonce store (issue #83) is a NEW tenant-scoped table, so it must
     // ENABLE and FORCE row-level security, carry the (tenant, environment) isolation policy,
@@ -785,6 +791,56 @@ async fn production_chain_is_only_the_sixty_three_real_migrations_and_ships_no_d
     assert!(
         !column_is_not_null(pool, "fedcm_assertion_nonces", "consumed_at").await,
         "fedcm_assertion_nonces.consumed_at must be nullable (the single-use latch)"
+    );
+
+    // The third-party risk-signal store (issue #82, PR 1) is a NEW tenant-scoped table, so
+    // it must ENABLE and FORCE row-level security, carry the (tenant, environment) isolation
+    // policy, and pin the nonempty-scope CHECK, exactly like every other scoped table.
+    assert!(
+        rls_enabled_and_forced(pool, "risk_signals").await,
+        "risk_signals must ENABLE and FORCE row-level security"
+    );
+    assert!(
+        policy_exists(pool, "risk_signals", "risk_signals_tenant_isolation").await,
+        "risk_signals must carry the (tenant, environment) isolation policy"
+    );
+    assert!(
+        check_constraint_exists(pool, "risk_signals", "risk_signals_scope_nonempty").await,
+        "risk_signals must carry the nonempty-scope CHECK"
+    );
+    // The RFC 9493 subject-format CHECK pins the closed set: an unknown format can never be
+    // written, so the subject binding is always one of the recognized identifier formats.
+    assert!(
+        check_constraint_exists(pool, "risk_signals", "risk_signals_subject_format_known").await,
+        "risk_signals must pin the closed RFC 9493 subject-format set"
+    );
+    // The STRUCTURAL single-delivery invariant: a source's SET is ingested at most once per
+    // scope (the idempotent-delivery / dedup UNIQUE on (tenant, env, source, source_jti)).
+    let risk_signals_uniq: String = sqlx::query(
+        "SELECT pg_get_constraintdef(oid) AS def FROM pg_catalog.pg_constraint \
+         WHERE conrelid = 'risk_signals'::regclass AND conname = 'risk_signals_delivery_uniq'",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("risk_signals delivery UNIQUE lookup")
+    .get("def");
+    assert!(
+        risk_signals_uniq.contains("source_jti")
+            && risk_signals_uniq.contains("source")
+            && risk_signals_uniq.starts_with("UNIQUE"),
+        "risk_signals must pin the single-delivery UNIQUE on source + source_jti, got: \
+         {risk_signals_uniq}"
+    );
+    // The external subject is a keyed blind index (bytea), never a plaintext column: a
+    // database dump reveals no external subject. The resolved local subject is nullable
+    // (NULL when the external subject maps to no local account, an inert row).
+    assert!(
+        column_exists(pool, "risk_signals", "subject_bidx").await,
+        "risk_signals must carry the blind-index external-subject column"
+    );
+    assert!(
+        !column_is_not_null(pool, "risk_signals", "subject").await,
+        "risk_signals.subject (the resolved local usr_ id) must be nullable"
     );
 
     // The step-up second-factor abuse path (issue #72): migration 0047 WIDENED the

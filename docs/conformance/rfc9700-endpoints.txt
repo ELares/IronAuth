@@ -65,6 +65,7 @@
 /t/{tenant_id}/e/{environment_id}/otp/sms/verify
 /t/{tenant_id}/e/{environment_id}/otp/verify
 /t/{tenant_id}/e/{environment_id}/pow/challenge
+/t/{tenant_id}/e/{environment_id}/risk/signals
 /t/{tenant_id}/e/{environment_id}/webauthn/authenticate/options
 /t/{tenant_id}/e/{environment_id}/webauthn/authenticate/verify
 /t/{tenant_id}/e/{environment_id}/webauthn/credentials
