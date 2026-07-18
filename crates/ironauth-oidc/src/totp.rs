@@ -556,6 +556,158 @@ pub(crate) async fn has_passkey(state: &OidcState, scope: Scope, subject: &UserI
         .is_ok_and(|descriptors| !descriptors.is_empty())
 }
 
+/// The provisioning material for a pending TOTP enrollment driven by the headless flow
+/// engine (issue #84): the `tot_` credential id to carry on the flow row, plus the
+/// `otpauth://` URI and grouped Base32 secret to render so the user can add the factor.
+pub(crate) struct FlowEnrollBegin {
+    /// The pending `tot_` credential id.
+    pub credential_id: String,
+    /// The `otpauth://` provisioning URI (for a QR render).
+    pub otpauth_uri: String,
+    /// The grouped Base32 secret (for manual entry).
+    pub secret: String,
+}
+
+/// The outcome of confirming a headless flow TOTP enrollment (issue #84).
+pub(crate) enum FlowEnrollOutcome {
+    /// The factor was activated by a valid current code (the just proven code is a
+    /// GENUINE second factor). The one time recovery codes are returned to show once.
+    Activated {
+        /// The plaintext recovery codes, shown exactly once.
+        recovery_codes: Vec<String>,
+    },
+    /// The presented code did not match (a uniform failure, never an oracle).
+    Invalid,
+    /// The pending enrollment could not be found (an unknown or already consumed id).
+    NotFound,
+    /// A store fault or a retryable server condition (the hashing pool was unavailable when
+    /// minting the recovery codes): the neutral store error, never a wrong code signal.
+    Error,
+}
+
+/// Begin a TOTP enrollment for the headless flow engine (issue #84): mint a fresh seed
+/// from the entropy seam, seal it in a PENDING credential through the SAME store
+/// primitive the account enroll handler uses ([`enroll_begin`]), and return the
+/// provisioning material to render. The factor is NOT active until [`flow_enroll_verify`]
+/// proves possession, exactly as the account surface requires.
+pub(crate) async fn flow_enroll_begin(
+    state: &OidcState,
+    scope: Scope,
+    subject: &UserId,
+) -> Result<FlowEnrollBegin, ()> {
+    let mut seed = [0u8; TOTP_SEED_BYTES];
+    state.env().entropy().fill_bytes(&mut seed);
+    let params = state.totp_params();
+    let actor = interaction::user_actor(subject);
+    let enrollment = ironauth_store::NewTotpEnrollment {
+        seed: &seed,
+        friendly_name: DEFAULT_TOTP_NAME,
+        algorithm: params.algorithm().as_str(),
+        digits: i32::try_from(params.digits()).unwrap_or(6),
+        period_secs: i32::try_from(params.period_secs()).unwrap_or(30),
+    };
+    let id = state
+        .store()
+        .scoped(scope)
+        .acting(actor, CorrelationId::generate(state.env()))
+        .totp_credentials()
+        .begin_enroll(state.env(), subject, &enrollment)
+        .await
+        .map_err(|_| ())?;
+    let subject_str = subject.to_string();
+    let uri = provisioning_uri(&state.totp_issuer(), &subject_str, &seed, params);
+    Ok(FlowEnrollBegin {
+        credential_id: id.to_string(),
+        otpauth_uri: uri,
+        secret: grouped_secret(&seed),
+    })
+}
+
+/// Rebuild the provisioning material for an already begun pending TOTP enrollment (issue
+/// #84), so a re-render after a wrong confirmation code shows the SAME secret without
+/// minting a new one. Returns [`None`] when the pending credential is gone (expired or
+/// consumed). The secret lives only in the sealed pending row, never on the flow row.
+pub(crate) async fn flow_enroll_material(
+    state: &OidcState,
+    scope: Scope,
+    subject: &UserId,
+    credential_id: &str,
+) -> Option<FlowEnrollBegin> {
+    let credentials = state.store().scoped(scope).totp_credentials();
+    let id = credentials.parse_id(credential_id).ok()?;
+    let material = match credentials.open_material(subject, &id).await {
+        Ok(Some(material)) if material.status == "pending" => material,
+        _ => return None,
+    };
+    let params = params_from_material(&material)?;
+    let subject_str = subject.to_string();
+    let uri = provisioning_uri(&state.totp_issuer(), &subject_str, &material.seed, params);
+    Some(FlowEnrollBegin {
+        credential_id: credential_id.to_owned(),
+        otpauth_uri: uri,
+        secret: grouped_secret(&material.seed),
+    })
+}
+
+/// Confirm a headless flow TOTP enrollment (issue #84): verify the presented current code
+/// against the PENDING seed, activate the factor through the SAME store primitives the
+/// account [`enroll_verify`] handler uses, and mint the one time recovery codes. This is
+/// the shared enroll ceremony, so a factor enrolled through the flow is proven and audited
+/// exactly like one enrolled through the account surface.
+pub(crate) async fn flow_enroll_verify(
+    state: &OidcState,
+    scope: Scope,
+    subject: &UserId,
+    credential_id: &str,
+    code: &str,
+) -> FlowEnrollOutcome {
+    let credentials = state.store().scoped(scope).totp_credentials();
+    let Ok(id) = credentials.parse_id(credential_id) else {
+        return FlowEnrollOutcome::NotFound;
+    };
+    let material = match credentials.open_material(subject, &id).await {
+        Ok(Some(material)) if material.status == "pending" => material,
+        Ok(_) => return FlowEnrollOutcome::NotFound,
+        Err(_) => return FlowEnrollOutcome::Error,
+    };
+    let Some(params) = params_from_material(&material) else {
+        return FlowEnrollOutcome::Error;
+    };
+    let now = now_unix_secs(state);
+    let Some(step) = verify_totp(
+        &material.seed,
+        params,
+        now,
+        u64::from(state.totp_drift_steps()),
+        code.trim(),
+    ) else {
+        return FlowEnrollOutcome::Invalid;
+    };
+    let matched_step = i64::try_from(step).unwrap_or(i64::MAX);
+    let actor = interaction::user_actor(subject);
+    let activate = state
+        .store()
+        .scoped(scope)
+        .acting(actor, CorrelationId::generate(state.env()))
+        .totp_credentials()
+        .activate(state.env(), subject, &id, matched_step)
+        .await;
+    match activate {
+        Ok(TotpActivateOutcome::Activated | TotpActivateOutcome::AlreadyActive) => {}
+        Ok(TotpActivateOutcome::NotFound) => return FlowEnrollOutcome::NotFound,
+        Err(_) => return FlowEnrollOutcome::Error,
+    }
+    let account = Account {
+        scope,
+        subject: *subject,
+        subject_str: subject.to_string(),
+    };
+    match generate_and_store_recovery_codes(state, &account).await {
+        Ok(recovery_codes) => FlowEnrollOutcome::Activated { recovery_codes },
+        Err(_) => FlowEnrollOutcome::Error,
+    }
+}
+
 /// The remove request body: the TOTP factor to remove.
 #[derive(Debug, Deserialize)]
 pub struct RemoveBody {

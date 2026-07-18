@@ -802,5 +802,16 @@ name = "flow_login_hardening"
 path = "tests/flow_login_hardening.rs"
 required-features = ["testing"]
 
+# The headless flow API PR2 (issue #84): the REGISTRATION and MFA (challenge + enrollment)
+# journeys. A native JSON client completes registration and login+MFA end to end; the
+# registration duplicate-address anti-enumeration is uniform on both transports (body / status
+# / Argon2-op timing); the #80/#82 abuse defenses are not bypassed; a real second factor mints
+# an HONEST pwd+totp amr and skipping never completes; enrollment reuses the enroll ceremony.
+# Over a real database (DATABASE_URL).
+[[test]]
+name = "flow_register_mfa"
+path = "tests/flow_register_mfa.rs"
+required-features = ["testing"]
+
 [lints]
 workspace = true

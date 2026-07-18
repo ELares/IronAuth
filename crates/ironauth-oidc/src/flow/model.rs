@@ -98,6 +98,12 @@ impl Transport {
 pub enum FlowStateTag {
     /// The login identifier plus password first factor (also the login start state).
     IdentifierPassword,
+    /// The registration details (identifier plus password) first factor, the registration
+    /// start state.
+    RegistrationDetails,
+    /// The uniform registration acknowledgment (the #64 closed mode ack or the waitlist
+    /// pending notice): a terminal render that discloses nothing, so the flow stays OPEN.
+    RegistrationAck,
     /// A second factor challenge is required.
     MfaChallenge,
     /// A second factor enrollment is required.
