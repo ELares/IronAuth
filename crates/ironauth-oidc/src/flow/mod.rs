@@ -386,6 +386,22 @@ pub async fn create_flow(
     if journey == Journey::Federation && return_to.is_none() {
         return Err(FlowError::InvalidSubmission);
     }
+    // Open redirect fix (issue #84, inherited from PR 1): a PRESENT `return_to` is validated
+    // at creation the SAME way the bootstrap `/login` and `/recover` validate theirs, via
+    // [`interaction::parse_resume`]. It must be a LOCAL `/authorize?...` resume target whose
+    // client id resolves into THIS flow's scope; an absolute or scheme relative external URL,
+    // a non `/authorize` local path, or a cross scope target is rejected here with a typed
+    // 400 (never stored). Because the check is at creation, EVERY completion (the browser 303
+    // and the API `continue_with.redirect_to`, across the login, registration, and recovery
+    // journeys) can only ever target a validated local resume. An ABSENT `return_to` is left
+    // as is: those journeys complete on the default landing (a hardened success notice), never
+    // a redirect, so there is nothing to validate.
+    if let Some(raw) = return_to {
+        match interaction::parse_resume(Some(raw)) {
+            Some(resume) if resume.scope == scope => {}
+            _ => return Err(FlowError::InvalidSubmission),
+        }
+    }
     let transient = normalize_transient_payload(transient_payload)?;
     let flow_id = FlowId::generate(state.env(), &scope);
     let (persisted, nodes) = start_state(journey, transport, &flow_id.to_string(), connector)

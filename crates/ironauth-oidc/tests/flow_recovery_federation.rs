@@ -27,14 +27,16 @@ use std::time::Duration;
 
 use axum::body::Body;
 use axum::http::{HeaderMap, Request, StatusCode, header};
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use common::Harness;
-use ironauth_config::{OidcConfig, RegulationConfig};
+use ironauth_config::{OidcConfig, PowConfig, RegistrationAbuseConfig, RegulationConfig};
 use ironauth_oidc::recovery::{FactorChangeDecision, RecoveryFactor, gate_factor_removal};
 use ironauth_oidc::{
     Argon2Params, EmailOtpMessage, HashingPool, MagicLinkMessage, SESSION_COOKIE,
-    VerificationSender,
+    VerificationSender, pow,
 };
-use ironauth_store::UserId;
+use ironauth_store::{ClientId, EnvironmentId, Scope, TenantId, UserId};
 use serde_json::{Value, json};
 
 const PASSWORD: &str = "correct-horse-battery-staple";
@@ -452,16 +454,302 @@ async fn a_flow_recovery_still_blocks_removing_a_stronger_factor_before_the_dela
 }
 
 // ==========================================================================================
+// The open-redirect fix (issue #84, inherited from PR 1): a flow validates its `return_to` at
+// creation via `parse_resume` (a local `/authorize` resume only), so a completion can never
+// 303 / continue_with.redirect_to an external URL. Engine-wide, so every journey inherits it.
+// ==========================================================================================
+
+/// A same-origin browser form POST to a flow route, returning `(status, headers, body)`.
+async fn browser_post(
+    harness: &Harness,
+    path: &str,
+    body: String,
+) -> (StatusCode, HeaderMap, String) {
+    harness
+        .send(
+            Request::builder()
+                .method("POST")
+                .uri(path)
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .header("Sec-Fetch-Site", "same-origin")
+                .body(Body::from(body))
+                .expect("request builds"),
+        )
+        .await
+}
+
+#[tokio::test]
+async fn flow_creation_rejects_an_external_or_non_local_return_to_on_both_transports() {
+    let (harness, _sender, _pool) = setup(false).await;
+
+    // A syntactically valid `/authorize` resume for a DIFFERENT scope: `parse_resume` admits the
+    // shape but the recovered scope does not match the flow's route scope (the cross-scope case).
+    let env = harness.env();
+    let foreign_scope = Scope::new(TenantId::generate(env), EnvironmentId::generate(env));
+    let foreign_client = ClientId::generate(env, &foreign_scope);
+    let cross_scope = format!("/authorize?client_id={foreign_client}");
+
+    let hostile: [&str; 5] = [
+        "https://evil.example",                  // an absolute external URL
+        "//evil.example/authorize?client_id=x",  // a scheme-relative (protocol-relative) external
+        "https://ironauth.example@evil.example", // a userinfo-confusion external
+        "/account/sessions",                     // a local but NON-/authorize path
+        &cross_scope,                            // a cross-scope /authorize (wrong tenant/env)
+    ];
+
+    for value in hostile {
+        // API transport: a login-flow create with the hostile return_to is a typed 400 (no flow
+        // minted, nothing stored raw).
+        let (status, _h, body) = post_json(
+            &harness,
+            &create_path(&harness, "login"),
+            &json!({ "return_to": value }),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "the API create rejects the hostile return_to `{value}`: {body}"
+        );
+
+        // Browser transport: the GET create edge rejects it identically.
+        let get_path = format!(
+            "{}?return_to={}",
+            browser_path(&harness, "login"),
+            urlencode(value)
+        );
+        let (bstatus, _h, _html) = harness.get_with_cookie(&get_path, None).await;
+        assert_eq!(
+            bstatus,
+            StatusCode::BAD_REQUEST,
+            "the browser create rejects the hostile return_to `{value}`"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_valid_local_return_to_survives_and_is_reflected_on_the_recovery_completion() {
+    let (harness, sender, _pool) = setup(false).await;
+    harness.seed_user(KNOWN, PASSWORD).await;
+    // The canonical local `/authorize?...` resume the authorization endpoint mints; the scope is
+    // recovered from the client id and matches the flow's route scope, so `parse_resume` admits it.
+    let resume = format!("/authorize?client_id={}", harness.client_id());
+
+    // API: a recovery flow created WITH the valid resume completes, and the completion envelope's
+    // continue_with.redirect_to is EXACTLY that validated target (never an attacker URL).
+    let (flow_id, token0, _c) =
+        api_create(&harness, "recovery", &json!({ "return_to": resume })).await;
+    let (_s, _h, ack) = post_json(
+        &harness,
+        &submit_path(&harness, "recovery"),
+        &json!({ "id": flow_id, "submit_token": token0, "nodes": { "identifier": KNOWN } }),
+    )
+    .await;
+    let token1 = ack["submit_token"]
+        .as_str()
+        .expect("rotated token")
+        .to_owned();
+    let code = last_code(&sender, KNOWN);
+    let (status, _h, done) = post_json(
+        &harness,
+        &submit_path(&harness, "recovery"),
+        &json!({ "id": flow_id, "submit_token": token1, "nodes": { "code": code } }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "completion: {done}");
+    assert_eq!(done["state"], "completed", "recovery completed: {done}");
+    assert_eq!(
+        done["continue_with"]["redirect_to"].as_str(),
+        Some(resume.as_str()),
+        "the API completion redirect targets the VALIDATED local resume: {done}"
+    );
+
+    // Browser: the SAME validated resume rides the recovery completion 303 Location.
+    let create_get = format!(
+        "{}?return_to={}",
+        browser_path(&harness, "recovery"),
+        urlencode(&resume)
+    );
+    let (_s, _h, html) = harness.get_with_cookie(&create_get, None).await;
+    let bflow = extract_flow_id(&html);
+    let (_s, _h, _b) = browser_post(
+        &harness,
+        &browser_path(&harness, "recovery"),
+        format!("flow={}&identifier={}", urlencode(&bflow), urlencode(KNOWN)),
+    )
+    .await;
+    let bcode = last_code(&sender, KNOWN);
+    let (bstatus, bheaders, _b) = browser_post(
+        &harness,
+        &browser_path(&harness, "recovery"),
+        format!("flow={}&code={}", urlencode(&bflow), urlencode(&bcode)),
+    )
+    .await;
+    assert!(
+        bstatus.is_redirection(),
+        "the browser recovery completion 303 redirects: {bstatus}"
+    );
+    assert_eq!(
+        bheaders.get(header::LOCATION).and_then(|v| v.to_str().ok()),
+        Some(resume.as_str()),
+        "the browser 303 Location is the VALIDATED local resume"
+    );
+}
+
+// ==========================================================================================
+// The #80 proof-of-work gate on the flow recovery initiation, at PARITY with /recover.
+// ==========================================================================================
+
+/// A flows-enabled harness with the #80 proof-of-work gate ARMED for every attempt
+/// (`challenge_at = low`, low difficulty), plus a recording sender and a cheap Argon2 pool, so
+/// the recovery-flow `PoW` test can observe that an UNSOLVED initiation delivers no code while a
+/// SOLVED one does.
+async fn setup_pow() -> (Harness, Arc<RecordingSender>) {
+    let mut harness = Harness::start_store_backed_with(OidcConfig {
+        require_pkce_for_confidential_clients: false,
+        regulation: RegulationConfig {
+            enabled: false,
+            ..RegulationConfig::default()
+        },
+        registration_abuse: RegistrationAbuseConfig {
+            pow: PowConfig {
+                enabled: true,
+                difficulty_bits: 8,
+                challenge_at: "low".to_owned(),
+                ..PowConfig::default()
+            },
+            ..RegistrationAbuseConfig::default()
+        },
+        ..OidcConfig::default()
+    })
+    .await;
+    harness.enable_flows();
+    let sender = Arc::new(RecordingSender::default());
+    harness.install_verification_sender(sender.clone());
+    let pool = Arc::new(HashingPool::new(
+        harness.env().clone(),
+        Argon2Params::new(8, 1, 1),
+        1,
+        64,
+        None,
+    ));
+    harness.install_hashing_pool(pool);
+    (harness, sender)
+}
+
+/// The `/pow/challenge` path for the harness scope.
+fn pow_challenge_path(harness: &Harness) -> String {
+    let scope = harness.scope();
+    format!(
+        "/t/{}/e/{}/pow/challenge",
+        scope.tenant(),
+        scope.environment()
+    )
+}
+
+/// Issue a built-in `recover` `PoW` challenge bound to `context`, solve it offline (ZERO
+/// third-party calls), and return the `(challenge_id, nonce_base64url)` the flow submit carries.
+async fn issue_and_solve_recover(harness: &Harness, context: &str) -> (String, String) {
+    let (status, _h, body) = post_json(
+        harness,
+        &pow_challenge_path(harness),
+        &json!({ "endpoint": "recover", "context": context }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "challenge issuance: {body}");
+    let challenge_id = body["challenge_id"]
+        .as_str()
+        .expect("challenge_id")
+        .to_owned();
+    let challenge_b64 = body["challenge"].as_str().expect("challenge");
+    let difficulty = u8::try_from(body["difficulty_bits"].as_u64().expect("difficulty")).unwrap();
+    let challenge = URL_SAFE_NO_PAD
+        .decode(challenge_b64)
+        .expect("challenge decodes");
+    let nonce = pow::solve(&challenge, difficulty, 5_000_000).expect("a nonce exists at low bits");
+    (challenge_id, URL_SAFE_NO_PAD.encode(nonce))
+}
+
+/// The number of non-empty OTP codes the recording sender delivered to `recipient`.
+fn code_count(sender: &RecordingSender, recipient: &str) -> usize {
+    sender
+        .otp
+        .lock()
+        .expect("lock")
+        .iter()
+        .filter(|(to, code)| to == recipient && !code.is_empty())
+        .count()
+}
+
+#[tokio::test]
+async fn a_flow_recovery_initiation_requires_the_pow_when_configured() {
+    const CONTEXT: &str = "flow-recover-ctx";
+    let (harness, sender) = setup_pow().await;
+    harness.seed_user(KNOWN, PASSWORD).await;
+
+    // Initiation WITHOUT a solved challenge: the gate short-circuits to the SAME uniform ack
+    // (existence-independent, no enum oracle) but performs NO recovery send -- exactly as the
+    // bootstrap `recover_post` does on a PoW failure. So NO code is delivered.
+    let (flow_id, token, _c) = api_create(&harness, "recovery", &json!({})).await;
+    let (status, _h, ack) = post_json(
+        &harness,
+        &submit_path(&harness, "recovery"),
+        &json!({ "id": flow_id, "submit_token": token, "nodes": { "identifier": KNOWN } }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "unsolved initiation is a uniform 200: {ack}"
+    );
+    assert_eq!(
+        ack["flow"]["state"], "recovery_ack",
+        "the ack is the uniform acknowledgment (never a PoW-shaped oracle)"
+    );
+    assert_eq!(
+        code_count(&sender, KNOWN),
+        0,
+        "an UNSOLVED PoW delivers NO recovery code (the gate is enforced at parity with /recover)"
+    );
+
+    // Initiation WITH a solved challenge: the gate passes, so the recovery send runs and a code
+    // is delivered (the flow can then complete through the existing verify core).
+    let (challenge_id, nonce) = issue_and_solve_recover(&harness, CONTEXT).await;
+    let (flow_id2, token2, _c) = api_create(&harness, "recovery", &json!({})).await;
+    let (status2, _h, ack2) = post_json(
+        &harness,
+        &submit_path(&harness, "recovery"),
+        &json!({
+            "id": flow_id2,
+            "submit_token": token2,
+            "nodes": {
+                "identifier": KNOWN,
+                "pow_challenge_id": challenge_id,
+                "pow_nonce": nonce,
+                "pow_context": CONTEXT,
+            },
+        }),
+    )
+    .await;
+    assert_eq!(status2, StatusCode::OK, "solved initiation: {ack2}");
+    assert_eq!(ack2["flow"]["state"], "recovery_ack");
+    assert!(
+        code_count(&sender, KNOWN) >= 1,
+        "a SOLVED PoW lets the recovery send run and deliver a code"
+    );
+}
+
+// ==========================================================================================
 // The FEDERATION launcher: a redirect to the EXISTING authorize leg, no security reimplemented.
 // ==========================================================================================
 
-/// A valid local resume target (a per-environment `/authorize`) the federation launcher threads.
+/// A valid local resume target the federation launcher threads: the canonical local
+/// `/authorize?...` form the authorization endpoint mints (the scope is recovered from the
+/// client id, matching `parse_resume`), so it survives the creation-time validation and the
+/// `federation_authorize` re-validation identically to a real pending request.
 fn return_to(harness: &Harness) -> String {
-    let scope = harness.scope();
     format!(
-        "/t/{}/e/{}/authorize?client_id={}&response_type=code&redirect_uri=https://app.test/cb&scope=openid&state=xyz",
-        scope.tenant(),
-        scope.environment(),
+        "/authorize?client_id={}&response_type=code&redirect_uri=https://app.test/cb&scope=openid&state=xyz",
         harness.client_id()
     )
 }

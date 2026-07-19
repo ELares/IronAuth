@@ -271,6 +271,42 @@ pub(super) async fn advance_start(
         });
     }
 
+    // Proof of work gate (issue #80), at PARITY with the bootstrap `recover_post`. CONDITIONED
+    // on the #79 risk level, keyed on the challenge and the peer IP (NEVER on whether the
+    // identifier resolves), so it never becomes an enumeration oracle. On an unsolved or absent
+    // challenge it renders the SAME uniform acknowledgment a successful initiation renders,
+    // performing NO recovery and NO code send, so a known and an unknown identifier stay
+    // INDISTINGUISHABLE. The pow fields ride the submission node values on both transports (the
+    // browser form and the API `nodes` map), exactly like the registration journey.
+    let peer_ip = crate::abuse::resolved_client_ip(headers);
+    if crate::pow_gate::challenge_required(state, peer_ip.as_deref(), false) {
+        let node_str = |name: &str| {
+            submission
+                .node_values
+                .get(name)
+                .and_then(|value| value.as_str())
+        };
+        let solution = crate::pow_gate::PresentedSolution {
+            challenge_id: node_str("pow_challenge_id"),
+            nonce: node_str("pow_nonce"),
+            context: node_str("pow_context").unwrap_or_default(),
+            token: node_str("pow_token"),
+            remote_ip: peer_ip.as_deref(),
+        };
+        if !crate::pow_gate::verify_solution(
+            state,
+            scope,
+            crate::pow_gate::ENDPOINT_RECOVER,
+            &solution,
+        )
+        .await
+        {
+            return Ok(RecoveryStartStep::Ack {
+                identifier: identifier.to_owned(),
+            });
+        }
+    }
+
     // Recovery path regulation (issue #64), keyed on the canonical identifier and the resolved
     // peer IP, INDEPENDENTLY of the password path. A throttle renders the SAME uniform ack (no
     // send, no #81 case), existence independent, so it is never an enumeration oracle. Every
