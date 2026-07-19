@@ -40,6 +40,16 @@
           "type": "string"
         },
         {
+          "const": "registration_details",
+          "description": "The registration details (identifier plus password) first factor, the registration\nstart state.",
+          "type": "string"
+        },
+        {
+          "const": "registration_ack",
+          "description": "The uniform registration acknowledgment (the #64 closed mode ack or the waitlist\npending notice): a terminal render that discloses nothing, so the flow stays OPEN.",
+          "type": "string"
+        },
+        {
           "const": "mfa_challenge",
           "description": "A second factor challenge is required.",
           "type": "string"

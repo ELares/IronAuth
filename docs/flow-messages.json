@@ -32,10 +32,101 @@
     },
     {
       "context_keys": [],
+      "id": 1020001,
+      "kind": "info",
+      "name": "register.title",
+      "text": "Create account"
+    },
+    {
+      "context_keys": [],
+      "id": 1020002,
+      "kind": "info",
+      "name": "register.identifier.label",
+      "text": "Identifier"
+    },
+    {
+      "context_keys": [],
+      "id": 1020003,
+      "kind": "info",
+      "name": "register.password.label",
+      "text": "Password"
+    },
+    {
+      "context_keys": [],
+      "id": 1020004,
+      "kind": "info",
+      "name": "register.submit.label",
+      "text": "Create account"
+    },
+    {
+      "context_keys": [],
+      "id": 1020005,
+      "kind": "info",
+      "name": "register.ack",
+      "text": "If registration is available for that address, we have sent instructions to complete it."
+    },
+    {
+      "context_keys": [],
+      "id": 1020006,
+      "kind": "info",
+      "name": "register.pending",
+      "text": "Your registration is pending approval. We will be in touch once your account has been reviewed."
+    },
+    {
+      "context_keys": [],
+      "id": 1030001,
+      "kind": "info",
+      "name": "mfa.challenge.title",
+      "text": "Verify your identity"
+    },
+    {
+      "context_keys": [],
+      "id": 1030002,
+      "kind": "info",
+      "name": "mfa.code.label",
+      "text": "Authentication code"
+    },
+    {
+      "context_keys": [],
+      "id": 1030003,
+      "kind": "info",
+      "name": "mfa.submit.label",
+      "text": "Verify"
+    },
+    {
+      "context_keys": [],
+      "id": 1030004,
+      "kind": "info",
+      "name": "mfa.enroll.title",
+      "text": "Set up an authenticator"
+    },
+    {
+      "context_keys": [],
+      "id": 1030005,
+      "kind": "info",
+      "name": "mfa.enroll.instructions",
+      "text": "Add this secret to your authenticator app, then enter a code to confirm."
+    },
+    {
+      "context_keys": [],
       "id": 1500001,
       "kind": "success",
       "name": "login.success",
       "text": "You are signed in."
+    },
+    {
+      "context_keys": [],
+      "id": 1520001,
+      "kind": "success",
+      "name": "register.success",
+      "text": "Your account has been created."
+    },
+    {
+      "context_keys": [],
+      "id": 1530001,
+      "kind": "success",
+      "name": "mfa.success",
+      "text": "Your identity has been verified."
     },
     {
       "context_keys": [],
@@ -92,6 +183,76 @@
       "kind": "error",
       "name": "login.password_required",
       "text": "Enter your password."
+    },
+    {
+      "context_keys": [],
+      "id": 4200001,
+      "kind": "error",
+      "name": "register.identifier_required",
+      "text": "Enter an identifier."
+    },
+    {
+      "context_keys": [],
+      "id": 4200002,
+      "kind": "error",
+      "name": "register.password_required",
+      "text": "Choose a password."
+    },
+    {
+      "context_keys": [],
+      "id": 4200003,
+      "kind": "error",
+      "name": "register.password_rejected",
+      "text": "That password cannot be used. Choose a different one."
+    },
+    {
+      "context_keys": [],
+      "id": 4200004,
+      "kind": "error",
+      "name": "register.address_unusable",
+      "text": "That address cannot be used to register. Use a different address."
+    },
+    {
+      "context_keys": [],
+      "id": 4200005,
+      "kind": "error",
+      "name": "register.verification_required",
+      "text": "Additional verification is required. Please try again."
+    },
+    {
+      "context_keys": [],
+      "id": 4200006,
+      "kind": "error",
+      "name": "register.throttled",
+      "text": "Too many attempts. Wait a moment and try again."
+    },
+    {
+      "context_keys": [],
+      "id": 4200007,
+      "kind": "error",
+      "name": "register.already_registered",
+      "text": "That identifier is already registered."
+    },
+    {
+      "context_keys": [],
+      "id": 4300001,
+      "kind": "error",
+      "name": "mfa.code_incorrect",
+      "text": "Incorrect or expired code."
+    },
+    {
+      "context_keys": [],
+      "id": 4300002,
+      "kind": "error",
+      "name": "mfa.code_required",
+      "text": "Enter a code to continue."
+    },
+    {
+      "context_keys": [],
+      "id": 4300003,
+      "kind": "error",
+      "name": "mfa.throttled",
+      "text": "Too many attempts. Wait a moment and try again."
     }
   ]
 }

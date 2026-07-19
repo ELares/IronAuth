@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! The two transports (issue #84, FORK C): a thin shim over the ONE shared engine
-//! ([`super::drive`] / [`super::create_login_flow`]). The state machine, node rendering,
+//! ([`super::drive`] / [`super::create_flow`]). The state machine, node rendering,
 //! message ids, error shaping, and anti enumeration recipe are ONE type, ONE state
 //! machine, ONE code path (the found vs unknown equality holds WITHIN a transport; the
 //! transport tag, `ui.action`, and browser hidden node differ by design); the transports
@@ -26,8 +26,8 @@ use serde_json::{Value, json};
 
 use super::model::{Flow, Journey, Transport};
 use super::{
-    Continuation, FLOW_CONTRACT_HEADER, FlowError, Submission, TransportAuth, create_login_flow,
-    drive, message::Message,
+    Continuation, FLOW_CONTRACT_HEADER, FlowError, Submission, TransportAuth, create_flow, drive,
+    message::{self, Message},
 };
 use crate::interaction;
 use crate::pages;
@@ -36,7 +36,8 @@ use crate::wellknown::parse_scope;
 
 /// The browser transport path (GET creates and renders, POST submits): scope routed under
 /// the per environment issuer path so the flow runs under the right row level security
-/// scope. The `{journey}` is the journey to start (only `login` in PR1).
+/// scope. The `{journey}` is the journey to start (`login` or `registration`; the MFA states
+/// are reached from a login flow, recovery lands in a later PR).
 pub const FLOW_BROWSER_PATH: &str = "/t/{tenant_id}/e/{environment_id}/flow/{journey}";
 
 /// The API transport creation path: POST a JSON body to create a flow and receive the flow
@@ -132,12 +133,27 @@ pub struct BrowserSubmitForm {
     /// The flow id carried back from the hidden field.
     #[serde(default)]
     flow: String,
-    /// The identifier field.
+    /// The identifier field (login and registration).
     #[serde(default)]
     identifier: Option<String>,
-    /// The password field.
+    /// The password field (login and registration).
     #[serde(default)]
     password: Option<String>,
+    /// The MFA code field (a TOTP or recovery code on the challenge/enroll states).
+    #[serde(default)]
+    code: Option<String>,
+    /// The proof of work challenge id (issue #80), when a registration challenge is required.
+    #[serde(default)]
+    pow_challenge_id: Option<String>,
+    /// The proof of work nonce (issue #80).
+    #[serde(default)]
+    pow_nonce: Option<String>,
+    /// The proof of work request context (issue #80).
+    #[serde(default)]
+    pow_context: Option<String>,
+    /// An external adapter response token (issue #80).
+    #[serde(default)]
+    pow_token: Option<String>,
     /// The transient payload as a JSON string, or absent.
     #[serde(default)]
     transient_payload: Option<String>,
@@ -160,14 +176,16 @@ pub async fn flow_api_create(
     let Some(scope) = parse_scope(&tenant_id, &environment_id) else {
         return error_json(FlowError::NotFound);
     };
-    // PR1 ships the login journey only; any other journey is a typed not found.
-    if Journey::parse(&journey) != Some(Journey::Login) {
+    // The login and registration journeys are creation entries; the MFA states are reached
+    // FROM a login flow and recovery lands in a later PR, so those are a typed not found.
+    let Some(journey) = creation_journey(&journey) else {
         return error_json(FlowError::NotFound);
-    }
-    match create_login_flow(
+    };
+    match create_flow(
         &state,
         scope,
         Transport::Api,
+        journey,
         body.return_to.as_deref(),
         body.transient_payload.as_ref(),
     )
@@ -175,6 +193,16 @@ pub async fn flow_api_create(
     {
         Ok((_id, submit_token, flow)) => api_flow_envelope(StatusCode::OK, &flow, &submit_token),
         Err(error) => error_json(error),
+    }
+}
+
+/// Parse a creation journey (issue #84): [`Journey::Login`] or [`Journey::Registration`],
+/// or [`None`] for an unknown journey or one that is not a creation entry (the MFA states
+/// are reached from a login flow; recovery lands in a later PR).
+fn creation_journey(raw: &str) -> Option<Journey> {
+    match Journey::parse(raw) {
+        Some(journey @ (Journey::Login | Journey::Registration)) => Some(journey),
+        _ => None,
     }
 }
 
@@ -257,13 +285,14 @@ pub async fn flow_browser_get(
     let Some(scope) = parse_scope(&tenant_id, &environment_id) else {
         return error_html(FlowError::NotFound);
     };
-    if Journey::parse(&journey) != Some(Journey::Login) {
+    let Some(journey) = creation_journey(&journey) else {
         return error_html(FlowError::NotFound);
-    }
-    match create_login_flow(
+    };
+    match create_flow(
         &state,
         scope,
         Transport::Browser,
+        journey,
         query.return_to.as_deref(),
         None,
     )
@@ -308,12 +337,18 @@ pub async fn flow_browser_post(
         },
     };
     let mut node_values = std::collections::BTreeMap::new();
-    if let Some(identifier) = form.identifier {
-        node_values.insert("identifier".to_owned(), Value::String(identifier));
-    }
-    if let Some(password) = form.password {
-        node_values.insert("password".to_owned(), Value::String(password));
-    }
+    let mut insert = |name: &str, value: Option<String>| {
+        if let Some(value) = value {
+            node_values.insert(name.to_owned(), Value::String(value));
+        }
+    };
+    insert("identifier", form.identifier);
+    insert("password", form.password);
+    insert("code", form.code);
+    insert("pow_challenge_id", form.pow_challenge_id);
+    insert("pow_nonce", form.pow_nonce);
+    insert("pow_context", form.pow_context);
+    insert("pow_token", form.pow_token);
     let submission = Submission {
         node_values,
         transient_payload,
@@ -357,7 +392,7 @@ pub async fn flow_browser_post(
 fn render_flow_html(flow: &Flow) -> String {
     let mut body = String::new();
     body.push_str("<h1>");
-    body.push_str(&escape(&Message::of(super::message::LOGIN_TITLE).text));
+    body.push_str(&escape(&Message::of(flow_title(flow)).text));
     body.push_str("</h1>");
     // Flow level messages.
     for message in &flow.ui.messages {
@@ -373,6 +408,20 @@ fn render_flow_html(flow: &Flow) -> String {
     }
     body.push_str("</form>");
     body
+}
+
+/// The page title message for a flow's journey and state (issue #84), so the browser render
+/// heads the right form. The title is a registered message, localized like every other.
+fn flow_title(flow: &Flow) -> message::MessageId {
+    use super::model::FlowStateTag;
+    match flow.state {
+        FlowStateTag::RegistrationDetails | FlowStateTag::RegistrationAck => {
+            message::REGISTER_TITLE
+        }
+        FlowStateTag::MfaChallenge => message::MFA_CHALLENGE_TITLE,
+        FlowStateTag::MfaEnroll => message::MFA_ENROLL_TITLE,
+        FlowStateTag::IdentifierPassword | FlowStateTag::Completed => message::LOGIN_TITLE,
+    }
 }
 
 /// Render one node into the form body.

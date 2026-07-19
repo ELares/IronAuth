@@ -13,11 +13,16 @@
 //! id. New ids are additive. The numeric scheme groups by intent so the ranges stay
 //! legible:
 //!
-//! - `10xxxxx` informational copy (labels, prompts, titles);
+//! - `10xxxxx` informational copy (labels, prompts, titles): `1010xxx` login, `1020xxx`
+//!   registration, `1030xxx` MFA (challenge and enrollment);
 //! - `15xxxxx` success copy;
 //! - `4000xxx` flow level errors (expiry, completion, malformed input);
 //! - `4100xxx` login journey errors (the uniform identifier or password failure, the
-//!   per node validation errors).
+//!   per node validation errors);
+//! - `4200xxx` registration journey errors (the per node validation errors, the uniform
+//!   abuse and policy failures, the open mode duplicate disclosure);
+//! - `4300xxx` MFA journey errors (the uniform second factor failure, the per node
+//!   validation errors).
 
 use std::collections::BTreeMap;
 
@@ -143,8 +148,36 @@ pub const LOGIN_PASSWORD_LABEL: MessageId = MessageId(1_010_003);
 /// The sign in submit button label.
 pub const LOGIN_SUBMIT_LABEL: MessageId = MessageId(1_010_004);
 
+/// The registration page title.
+pub const REGISTER_TITLE: MessageId = MessageId(1_020_001);
+/// The registration identifier field label.
+pub const REGISTER_IDENTIFIER_LABEL: MessageId = MessageId(1_020_002);
+/// The registration password field label.
+pub const REGISTER_PASSWORD_LABEL: MessageId = MessageId(1_020_003);
+/// The registration submit button label.
+pub const REGISTER_SUBMIT_LABEL: MessageId = MessageId(1_020_004);
+/// The uniform closed registration acknowledgment (the #64 anti enumeration ack).
+pub const REGISTER_ACK: MessageId = MessageId(1_020_005);
+/// The waitlist pending acknowledgment.
+pub const REGISTER_PENDING: MessageId = MessageId(1_020_006);
+
+/// The MFA challenge page title.
+pub const MFA_CHALLENGE_TITLE: MessageId = MessageId(1_030_001);
+/// The MFA code field label (a TOTP or recovery code).
+pub const MFA_CODE_LABEL: MessageId = MessageId(1_030_002);
+/// The MFA submit button label.
+pub const MFA_SUBMIT_LABEL: MessageId = MessageId(1_030_003);
+/// The MFA enrollment page title.
+pub const MFA_ENROLL_TITLE: MessageId = MessageId(1_030_004);
+/// The MFA enrollment instructions (scan the code, then enter a code to confirm).
+pub const MFA_ENROLL_INSTRUCTIONS: MessageId = MessageId(1_030_005);
+
 /// The login success note.
 pub const LOGIN_SUCCESS: MessageId = MessageId(1_500_001);
+/// The registration success note (a new account was created and signed in).
+pub const REGISTER_SUCCESS: MessageId = MessageId(1_520_001);
+/// The MFA success note (a second factor was proven).
+pub const MFA_SUCCESS: MessageId = MessageId(1_530_001);
 
 /// The flow has expired.
 pub const FLOW_EXPIRED: MessageId = MessageId(4_000_001);
@@ -164,6 +197,34 @@ pub const LOGIN_IDENTIFIER_OR_PASSWORD_INCORRECT: MessageId = MessageId(4_100_00
 pub const LOGIN_IDENTIFIER_REQUIRED: MessageId = MessageId(4_100_002);
 /// The password field is required (a per node validation error).
 pub const LOGIN_PASSWORD_REQUIRED: MessageId = MessageId(4_100_003);
+
+/// The registration identifier field is required (a per node validation error). NOT an
+/// enumeration oracle: an empty field does not depend on whether the identifier exists.
+pub const REGISTER_IDENTIFIER_REQUIRED: MessageId = MessageId(4_200_001);
+/// The registration password field is required (a per node validation error).
+pub const REGISTER_PASSWORD_REQUIRED: MessageId = MessageId(4_200_002);
+/// The chosen password was refused by policy, strength, or breach screening (a per node
+/// validation error). Existence INDEPENDENT, so it is never an enumeration oracle.
+pub const REGISTER_PASSWORD_REJECTED: MessageId = MessageId(4_200_003);
+/// The address cannot be used to register (the #80 disposable/low reputation block), an
+/// ORDINARY validation failure that leaks nothing about whether the identifier exists.
+pub const REGISTER_ADDRESS_UNUSABLE: MessageId = MessageId(4_200_004);
+/// Additional verification is required (the #80 proof of work gate was not satisfied).
+pub const REGISTER_VERIFICATION_REQUIRED: MessageId = MessageId(4_200_005);
+/// Too many registration attempts (the #64 register path throttle). Existence
+/// independent, keyed only on the identifier and IP dimensions.
+pub const REGISTER_THROTTLED: MessageId = MessageId(4_200_006);
+/// That identifier is already registered. Emitted ONLY under OPEN registration, where
+/// duplicate disclosure is the accepted posture; the closed/uniform path never emits it.
+pub const REGISTER_ALREADY_REGISTERED: MessageId = MessageId(4_200_007);
+
+/// The uniform MFA failure: the code was incorrect or expired. The SAME id whether the
+/// code was a wrong TOTP, a replay, or a wrong recovery code (never an oracle).
+pub const MFA_CODE_INCORRECT: MessageId = MessageId(4_300_001);
+/// The MFA code field is required (a per node validation error).
+pub const MFA_CODE_REQUIRED: MessageId = MessageId(4_300_002);
+/// Too many second factor attempts (the #64/#72 second factor path throttle).
+pub const MFA_THROTTLED: MessageId = MessageId(4_300_003);
 
 /// The complete message registry (issue #84): the single source of truth the runtime and
 /// the committed `docs/flow-messages.json` snapshot both read. Ordered by ascending id so
@@ -198,10 +259,103 @@ pub const REGISTRY: &[MessageSpec] = &[
         context_keys: &[],
     },
     MessageSpec {
+        id: REGISTER_TITLE,
+        name: "register.title",
+        kind: MessageKind::Info,
+        text: "Create account",
+        context_keys: &[],
+    },
+    MessageSpec {
+        id: REGISTER_IDENTIFIER_LABEL,
+        name: "register.identifier.label",
+        kind: MessageKind::Info,
+        text: "Identifier",
+        context_keys: &[],
+    },
+    MessageSpec {
+        id: REGISTER_PASSWORD_LABEL,
+        name: "register.password.label",
+        kind: MessageKind::Info,
+        text: "Password",
+        context_keys: &[],
+    },
+    MessageSpec {
+        id: REGISTER_SUBMIT_LABEL,
+        name: "register.submit.label",
+        kind: MessageKind::Info,
+        text: "Create account",
+        context_keys: &[],
+    },
+    MessageSpec {
+        id: REGISTER_ACK,
+        name: "register.ack",
+        kind: MessageKind::Info,
+        text: "If registration is available for that address, we have sent instructions to \
+               complete it.",
+        context_keys: &[],
+    },
+    MessageSpec {
+        id: REGISTER_PENDING,
+        name: "register.pending",
+        kind: MessageKind::Info,
+        text: "Your registration is pending approval. We will be in touch once your account \
+               has been reviewed.",
+        context_keys: &[],
+    },
+    MessageSpec {
+        id: MFA_CHALLENGE_TITLE,
+        name: "mfa.challenge.title",
+        kind: MessageKind::Info,
+        text: "Verify your identity",
+        context_keys: &[],
+    },
+    MessageSpec {
+        id: MFA_CODE_LABEL,
+        name: "mfa.code.label",
+        kind: MessageKind::Info,
+        text: "Authentication code",
+        context_keys: &[],
+    },
+    MessageSpec {
+        id: MFA_SUBMIT_LABEL,
+        name: "mfa.submit.label",
+        kind: MessageKind::Info,
+        text: "Verify",
+        context_keys: &[],
+    },
+    MessageSpec {
+        id: MFA_ENROLL_TITLE,
+        name: "mfa.enroll.title",
+        kind: MessageKind::Info,
+        text: "Set up an authenticator",
+        context_keys: &[],
+    },
+    MessageSpec {
+        id: MFA_ENROLL_INSTRUCTIONS,
+        name: "mfa.enroll.instructions",
+        kind: MessageKind::Info,
+        text: "Add this secret to your authenticator app, then enter a code to confirm.",
+        context_keys: &[],
+    },
+    MessageSpec {
         id: LOGIN_SUCCESS,
         name: "login.success",
         kind: MessageKind::Success,
         text: "You are signed in.",
+        context_keys: &[],
+    },
+    MessageSpec {
+        id: REGISTER_SUCCESS,
+        name: "register.success",
+        kind: MessageKind::Success,
+        text: "Your account has been created.",
+        context_keys: &[],
+    },
+    MessageSpec {
+        id: MFA_SUCCESS,
+        name: "mfa.success",
+        kind: MessageKind::Success,
+        text: "Your identity has been verified.",
         context_keys: &[],
     },
     MessageSpec {
@@ -258,6 +412,76 @@ pub const REGISTRY: &[MessageSpec] = &[
         name: "login.password_required",
         kind: MessageKind::Error,
         text: "Enter your password.",
+        context_keys: &[],
+    },
+    MessageSpec {
+        id: REGISTER_IDENTIFIER_REQUIRED,
+        name: "register.identifier_required",
+        kind: MessageKind::Error,
+        text: "Enter an identifier.",
+        context_keys: &[],
+    },
+    MessageSpec {
+        id: REGISTER_PASSWORD_REQUIRED,
+        name: "register.password_required",
+        kind: MessageKind::Error,
+        text: "Choose a password.",
+        context_keys: &[],
+    },
+    MessageSpec {
+        id: REGISTER_PASSWORD_REJECTED,
+        name: "register.password_rejected",
+        kind: MessageKind::Error,
+        text: "That password cannot be used. Choose a different one.",
+        context_keys: &[],
+    },
+    MessageSpec {
+        id: REGISTER_ADDRESS_UNUSABLE,
+        name: "register.address_unusable",
+        kind: MessageKind::Error,
+        text: "That address cannot be used to register. Use a different address.",
+        context_keys: &[],
+    },
+    MessageSpec {
+        id: REGISTER_VERIFICATION_REQUIRED,
+        name: "register.verification_required",
+        kind: MessageKind::Error,
+        text: "Additional verification is required. Please try again.",
+        context_keys: &[],
+    },
+    MessageSpec {
+        id: REGISTER_THROTTLED,
+        name: "register.throttled",
+        kind: MessageKind::Error,
+        text: "Too many attempts. Wait a moment and try again.",
+        context_keys: &[],
+    },
+    MessageSpec {
+        id: REGISTER_ALREADY_REGISTERED,
+        name: "register.already_registered",
+        kind: MessageKind::Error,
+        text: "That identifier is already registered.",
+        context_keys: &[],
+    },
+    MessageSpec {
+        id: MFA_CODE_INCORRECT,
+        name: "mfa.code_incorrect",
+        kind: MessageKind::Error,
+        text: "Incorrect or expired code.",
+        context_keys: &[],
+    },
+    MessageSpec {
+        id: MFA_CODE_REQUIRED,
+        name: "mfa.code_required",
+        kind: MessageKind::Error,
+        text: "Enter a code to continue.",
+        context_keys: &[],
+    },
+    MessageSpec {
+        id: MFA_THROTTLED,
+        name: "mfa.throttled",
+        kind: MessageKind::Error,
+        text: "Too many attempts. Wait a moment and try again.",
         context_keys: &[],
     },
 ];

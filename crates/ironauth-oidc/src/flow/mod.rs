@@ -34,6 +34,8 @@ pub mod model;
 pub mod schema;
 
 mod login;
+mod mfa;
+mod registration;
 mod transport;
 
 pub use schema::{flow_messages_snapshot, flow_object_schema};
@@ -164,10 +166,39 @@ pub enum Continuation {
 }
 
 /// The serialized state machine position stored in the `flows.state` column (issue #84).
+///
+/// Beyond the current `step`, it carries the SERVER SIDE scratch a multi step journey needs
+/// between submissions: the subject the primary factor authenticated (for the MFA states,
+/// written by the server after a genuine password verify, NEVER a client value), the primary
+/// auth method tokens proven so far (so the MFA completion mints an HONEST combined amr), and
+/// the pending TOTP credential id being enrolled. None of this is client controllable: the
+/// client only ever supplies node values and its submit token.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PersistedState {
     /// The current state machine step.
     step: FlowStateTag,
+    /// The subject (a `usr_` id string) the primary factor authenticated, for the MFA states.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    subject: Option<String>,
+    /// The primary auth method tokens proven so far (for example `["pwd"]`), so the MFA
+    /// completion builds the honest combined authentication event.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    methods: Vec<String>,
+    /// The pending `tot_` credential id being enrolled during the MFA enroll state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    enroll_credential: Option<String>,
+}
+
+impl PersistedState {
+    /// A single step state (the login/registration start and render states).
+    fn step(step: FlowStateTag) -> Self {
+        Self {
+            step,
+            subject: None,
+            methods: Vec::new(),
+            enroll_credential: None,
+        }
+    }
 }
 
 /// A fresh API transport submit token minted from the entropy seam (issue #84), base64url
@@ -267,24 +298,52 @@ fn build_flow(
     }
 }
 
-/// Create a new login flow (issue #84): mint the id and the submit token, seed the start
-/// state, persist the row (carrying the transient payload, which lives ONLY here), and
+/// The start state (step + nodes) for a journey (issue #84). The login and registration
+/// journeys each seed their own first factor state; the MFA states are never a creation
+/// entry (they are reached FROM the login journey after the primary factor), so a `Mfa` or
+/// `Recovery` creation is rejected by the caller.
+fn start_state(
+    journey: Journey,
+    transport: Transport,
+    flow_id: &str,
+) -> Option<(FlowStateTag, Vec<Node>)> {
+    match journey {
+        Journey::Login => Some((
+            FlowStateTag::IdentifierPassword,
+            login::start_nodes(transport, flow_id),
+        )),
+        Journey::Registration => Some((
+            FlowStateTag::RegistrationDetails,
+            registration::start_nodes(transport, flow_id),
+        )),
+        Journey::Mfa | Journey::Recovery => None,
+    }
+}
+
+/// Create a new flow for a journey (issue #84): mint the id and the submit token, seed the
+/// start state, persist the row (carrying the transient payload, which lives ONLY here), and
 /// return the id, the submit token, and the initial flow object. Used by both transports'
-/// creation edge.
+/// creation edge. The MFA and recovery journeys are not a creation entry (a login flow
+/// transitions INTO the MFA states; recovery lands in a later PR), so they are a typed not
+/// found.
 ///
 /// # Errors
 ///
+/// [`FlowError::NotFound`] for a journey that is not a creation entry;
 /// [`FlowError::MalformedTransientPayload`] when the transient payload is not well formed
 /// JSON or exceeds the size cap; [`FlowError::Store`] on a persistence fault.
-pub async fn create_login_flow(
+pub async fn create_flow(
     state: &OidcState,
     scope: Scope,
     transport: Transport,
+    journey: Journey,
     return_to: Option<&str>,
     transient_payload: Option<&serde_json::Value>,
 ) -> Result<(FlowId, String, Flow), FlowError> {
     let transient = normalize_transient_payload(transient_payload)?;
     let flow_id = FlowId::generate(state.env(), &scope);
+    let (start_step, nodes) =
+        start_state(journey, transport, &flow_id.to_string()).ok_or(FlowError::NotFound)?;
     let submit_token = generate_submit_token(state);
     let now = state.now();
     let expires_at_micros = epoch_micros(
@@ -292,9 +351,7 @@ pub async fn create_login_flow(
             .unwrap_or(now),
     );
 
-    let persisted = PersistedState {
-        step: FlowStateTag::IdentifierPassword,
-    };
+    let persisted = PersistedState::step(start_step);
     let state_json = serde_json::to_string(&persisted).map_err(|_| FlowError::Store)?;
 
     state
@@ -304,7 +361,7 @@ pub async fn create_login_flow(
         .create(
             &flow_id,
             NewFlow {
-                journey: Journey::Login.as_str(),
+                journey: journey.as_str(),
                 transport: transport.as_str(),
                 state: &state_json,
                 submit_token: &submit_token,
@@ -320,7 +377,7 @@ pub async fn create_login_flow(
     // Build the initial flow object from an in memory record (no extra round trip).
     let record = FlowRecord {
         id: flow_id.to_string(),
-        journey: Journey::Login.as_str().to_owned(),
+        journey: journey.as_str().to_owned(),
         transport: transport.as_str().to_owned(),
         state: state_json,
         submit_token: submit_token.clone(),
@@ -330,13 +387,12 @@ pub async fn create_login_flow(
         consumed_at_unix_micros: None,
         expires_at_unix_micros: expires_at_micros,
     };
-    let nodes = login::start_nodes(transport, &record.id);
     let flow = build_flow(
         scope,
         &record,
         transport,
-        Journey::Login,
-        FlowStateTag::IdentifierPassword,
+        journey,
+        start_step,
         nodes,
         Vec::new(),
     );
@@ -357,9 +413,6 @@ pub async fn create_login_flow(
 /// [`NotFound`](FlowError::NotFound) on an unknown, cross scope, or cross transport id,
 /// [`InvalidSubmission`](FlowError::InvalidSubmission) on a submit token mismatch, and
 /// [`Store`](FlowError::Store) on a genuine persistence fault (the ONLY 500).
-// One flat state machine driver; splitting it would scatter the single shared code path the
-// two transports fork from.
-#[allow(clippy::too_many_lines)]
 pub async fn drive(
     state: &OidcState,
     scope: Scope,
@@ -384,8 +437,7 @@ pub async fn drive(
         return Err(FlowError::NotFound);
     }
 
-    let now = state.now();
-    let now_micros = epoch_micros(now);
+    let now_micros = epoch_micros(state.now());
     if record.is_expired(now_micros) {
         return Err(FlowError::Expired);
     }
@@ -406,63 +458,242 @@ pub async fn drive(
     }
 
     let journey = Journey::parse(&record.journey).ok_or(FlowError::NotFound)?;
-    // PR1 ships the login journey; the other journeys land in later PRs and are a typed not
-    // found until then (never a 500).
-    if journey != Journey::Login {
-        return Err(FlowError::NotFound);
-    }
+    let persisted: PersistedState =
+        serde_json::from_str(&record.state).map_err(|_| FlowError::Store)?;
 
-    let step = login::advance_login(state, scope, &record, &submission, headers).await?;
-    match step {
-        login::LoginStep::Render { nodes } => {
-            // Rotate the submit token and persist the (possibly unchanged) state on every
-            // transition, so a captured API token is single use per step. The advance is
-            // gated on the OLD token (strict single winner rotation): a stale or already
-            // rotated token advances nothing, and two concurrent submits with the same
-            // token can never both rotate.
-            let new_token = generate_submit_token(state);
-            let persisted = PersistedState {
-                step: login::render_state_tag(),
-            };
-            let state_json = serde_json::to_string(&persisted).map_err(|_| FlowError::Store)?;
-            let advanced = state
-                .store()
-                .scoped(scope)
-                .flows()
-                .advance(
-                    flow_id,
-                    &state_json,
-                    &new_token,
-                    &record.submit_token,
-                    now_micros,
-                )
-                .await
-                .map_err(|_| FlowError::Store)?;
-            if !advanced {
-                // A concurrent completion or expiry raced us to the row.
-                return Err(FlowError::AlreadyCompleted);
-            }
+    match journey {
+        Journey::Login => {
+            drive_login(
+                state,
+                scope,
+                flow_id,
+                transport,
+                &record,
+                &persisted,
+                &submission,
+                headers,
+                now_micros,
+            )
+            .await
+        }
+        Journey::Registration => {
+            drive_registration(
+                state,
+                scope,
+                flow_id,
+                transport,
+                &record,
+                &submission,
+                headers,
+                now_micros,
+            )
+            .await
+        }
+        // The MFA states are reached FROM a login flow, never a creation entry; a standalone
+        // MFA or recovery journey lands in a later PR. Typed not found, never a 500.
+        Journey::Mfa | Journey::Recovery => Err(FlowError::NotFound),
+    }
+}
+
+/// Rotate the submit token and persist the next state atomically (issue #84), then return a
+/// re-render continuation. The advance is gated on the OLD token (strict single winner
+/// rotation): a stale or already rotated token advances nothing, and two concurrent submits
+/// carrying the same token can never both rotate. The flow stays OPEN, so a re-render is
+/// never a completion oracle.
+#[allow(clippy::too_many_arguments)]
+async fn persist_and_render(
+    state: &OidcState,
+    scope: Scope,
+    flow_id: &FlowId,
+    transport: Transport,
+    journey: Journey,
+    record: &FlowRecord,
+    next: &PersistedState,
+    nodes: Vec<Node>,
+    messages: Vec<Message>,
+    now_micros: i64,
+) -> Result<Continuation, FlowError> {
+    let new_token = generate_submit_token(state);
+    let state_json = serde_json::to_string(next).map_err(|_| FlowError::Store)?;
+    let advanced = state
+        .store()
+        .scoped(scope)
+        .flows()
+        .advance(
+            flow_id,
+            &state_json,
+            &new_token,
+            &record.submit_token,
+            now_micros,
+        )
+        .await
+        .map_err(|_| FlowError::Store)?;
+    if !advanced {
+        // A concurrent completion or expiry raced us to the row.
+        return Err(FlowError::AlreadyCompleted);
+    }
+    let flow = build_flow(
+        scope, record, transport, journey, next.step, nodes, messages,
+    );
+    Ok(Continuation::Render {
+        flow: Box::new(flow),
+        submit_token: new_token,
+    })
+}
+
+/// Trip the single use completion latch (issue #84, consume ONLY on a genuine outcome) then
+/// mint the session through the ONE choke point. A replayed or concurrent completion mints
+/// no second session (the latch is an atomic single winner). On the rare TOCTOU where the
+/// central fence refuses the session after the latch tripped, re-render `fenced_nodes`
+/// UNIFORMLY (never a 500, never an existence or state oracle).
+#[allow(clippy::too_many_arguments)]
+async fn consume_and_complete(
+    state: &OidcState,
+    scope: Scope,
+    flow_id: &FlowId,
+    transport: Transport,
+    journey: Journey,
+    record: &FlowRecord,
+    subject: &str,
+    actor: ironauth_store::ActorRef,
+    event: &crate::authn::AuthenticationEvent,
+    fenced_nodes: Vec<Node>,
+    headers: &axum::http::HeaderMap,
+    now_micros: i64,
+) -> Result<Continuation, FlowError> {
+    let consumed = state
+        .store()
+        .scoped(scope)
+        .flows()
+        .consume(flow_id, now_micros)
+        .await
+        .map_err(|_| FlowError::Store)?;
+    if !consumed {
+        return Err(FlowError::AlreadyCompleted);
+    }
+    match interaction::establish_session(state, scope, subject, event, actor, headers).await {
+        Ok(session) => Ok(Continuation::Complete {
+            session: Box::new(session),
+            return_to: record.return_to.clone(),
+        }),
+        Err(interaction::EstablishSessionError::NotAuthenticatable) => {
+            // The central lifecycle fence refused the mint after the latch tripped (a rare
+            // TOCTOU). The response stays the UNIFORM failure; the flow is consumed (the latch
+            // gates the mint), so a resubmit is `AlreadyCompleted`, never an oracle.
             let flow = build_flow(
                 scope,
-                &record,
+                record,
                 transport,
                 journey,
-                login::render_state_tag(),
-                nodes,
+                persisted_step_for(&record.state),
+                fenced_nodes,
                 Vec::new(),
             );
             Ok(Continuation::Render {
                 flow: Box::new(flow),
-                submit_token: new_token,
+                submit_token: record.submit_token.clone(),
             })
         }
-        login::LoginStep::Complete(success) => {
-            // A flow is consumed ONLY on a GENUINELY completing submit: `advance_login`
-            // already proved the credential is correct AND the account is authenticatable
-            // AND risk did not block (a fenced/blocked account or a risk block took the
-            // Render arm above, leaving the flow OPEN). Trip the single use completion latch
-            // FIRST (atomic single winner), so a replayed or concurrent completion mints no
-            // second session. Then mint through the ONE choke point.
+        Err(interaction::EstablishSessionError::Store) => Err(FlowError::Store),
+    }
+}
+
+/// The current step tag recorded on a row's serialized state (used only to re-render the
+/// uniform fenced failure on the state the row is on). A parse fault falls back to the login
+/// first factor state (the safe default; the row is consumed regardless).
+fn persisted_step_for(state_json: &str) -> FlowStateTag {
+    serde_json::from_str::<PersistedState>(state_json)
+        .map_or(FlowStateTag::IdentifierPassword, |persisted| persisted.step)
+}
+
+/// Drive the login journey one step (issue #84), including its composition with the MFA
+/// challenge and enrollment states. The primary factor funnels through
+/// [`login::advance_login`]; on a genuine primary success the MFA plan (reusing the SAME
+/// step up machinery the `/authorize` gate uses) decides whether to complete straight away
+/// or transition to an in flow second factor. The MFA states funnel through the SAME
+/// [`totp::verify_second_factor`] / enroll ceremonies, and completion mints the honest
+/// combined amr/acr.
+#[allow(clippy::too_many_arguments)]
+async fn drive_login(
+    state: &OidcState,
+    scope: Scope,
+    flow_id: &FlowId,
+    transport: Transport,
+    record: &FlowRecord,
+    persisted: &PersistedState,
+    submission: &Submission,
+    headers: &axum::http::HeaderMap,
+    now_micros: i64,
+) -> Result<Continuation, FlowError> {
+    match persisted.step {
+        FlowStateTag::IdentifierPassword => {
+            match login::advance_login(state, scope, record, submission, headers).await? {
+                login::LoginStep::Render { nodes } => {
+                    persist_and_render(
+                        state,
+                        scope,
+                        flow_id,
+                        transport,
+                        Journey::Login,
+                        record,
+                        &PersistedState::step(login::render_state_tag()),
+                        nodes,
+                        Vec::new(),
+                        now_micros,
+                    )
+                    .await
+                }
+                login::LoginStep::Complete(success) => {
+                    complete_primary_or_step_up(
+                        state, scope, flow_id, transport, record, &success, headers, now_micros,
+                    )
+                    .await
+                }
+            }
+        }
+        FlowStateTag::MfaChallenge => {
+            drive_mfa_challenge(
+                state, scope, flow_id, transport, record, persisted, submission, headers,
+                now_micros,
+            )
+            .await
+        }
+        FlowStateTag::MfaEnroll => {
+            drive_mfa_enroll(
+                state, scope, flow_id, transport, record, persisted, submission, headers,
+                now_micros,
+            )
+            .await
+        }
+        // A login row on a registration/completed/ack state is corrupt; a uniform not found.
+        FlowStateTag::RegistrationDetails
+        | FlowStateTag::RegistrationAck
+        | FlowStateTag::Completed => Err(FlowError::NotFound),
+    }
+}
+
+/// Handle a genuine PRIMARY factor success (issue #84): run the SAME post success credential
+/// abuse follow through the bootstrap `login_post` does (the password was genuinely correct),
+/// then consult the MFA plan. When no in flow second factor is required, complete now; when a
+/// challenge or enrollment is required, transition to that state WITHOUT minting a session or
+/// consuming the flow (the single mint happens once, at the MFA completion, with the honest
+/// combined amr).
+#[allow(clippy::too_many_arguments)]
+async fn complete_primary_or_step_up(
+    state: &OidcState,
+    scope: Scope,
+    flow_id: &FlowId,
+    transport: Transport,
+    record: &FlowRecord,
+    success: &login::LoginSuccess,
+    headers: &axum::http::HeaderMap,
+    now_micros: i64,
+) -> Result<Continuation, FlowError> {
+    let primary_methods = vec![crate::authn::AuthMethod::Password];
+    match mfa::plan_after_primary(state, scope, &success.user_id, &primary_methods).await {
+        // No in flow second factor: complete now, running the PR1 post success follow through
+        // AFTER a successful mint (exactly as the bootstrap `login_post` / the PR1 flow login).
+        mfa::MfaPlan::Complete => {
             let consumed = state
                 .store()
                 .scoped(scope)
@@ -484,47 +715,23 @@ pub async fn drive(
             .await
             {
                 Ok(session) => {
-                    // The post success credential abuse follow through, exactly as
-                    // `login_post`: relax THIS attempt's failure counters so a user who
-                    // fumbled before the correct password is not throttled for the rest of
-                    // the window, then persist the audited risk decision (and, on a new
-                    // device, notify). All best effort; the login has already succeeded.
-                    state.reset_after_success(&success.ctx).await;
-                    let user_agent = login::user_agent_of(headers);
-                    let risk_ctx = crate::risk::RiskContext {
-                        ip: success.ctx.ip.as_deref(),
-                        user_agent: &user_agent,
-                        headers,
-                    };
-                    crate::risk::after_successful_login(
-                        state,
-                        scope,
-                        &success.user_id,
-                        &success.risk_decision,
-                        &risk_ctx,
-                        &success.identifier,
-                    )
-                    .await;
+                    login_follow_through(state, scope, success, headers).await;
                     Ok(Continuation::Complete {
                         session: Box::new(session),
                         return_to: record.return_to.clone(),
                     })
                 }
                 Err(interaction::EstablishSessionError::NotAuthenticatable) => {
-                    // Defense in depth: the central lifecycle fence refused a login that
-                    // `advance_login`'s pre check had passed (a rare TOCTOU where the
-                    // account was fenced between the check and the mint). The response stays
-                    // the UNIFORM authentication failure (never a 500, never an existence or
-                    // state oracle). The flow is consumed here (the latch gates the mint),
-                    // which the common statically fenced case never reaches.
-                    let nodes = login::uniform_incorrect_render(transport, &record.id);
+                    // The central fence refused the mint after the latch tripped (a rare
+                    // TOCTOU). The response stays the UNIFORM authentication failure; the flow
+                    // is consumed, so a resubmit is `AlreadyCompleted`, never an oracle.
                     let flow = build_flow(
                         scope,
-                        &record,
+                        record,
                         transport,
-                        journey,
+                        Journey::Login,
                         FlowStateTag::IdentifierPassword,
-                        nodes,
+                        login::uniform_incorrect_render(transport, &record.id),
                         Vec::new(),
                     );
                     Ok(Continuation::Render {
@@ -534,6 +741,324 @@ pub async fn drive(
                 }
                 Err(interaction::EstablishSessionError::Store) => Err(FlowError::Store),
             }
+        }
+        // A second factor is required: run the primary follow through NOW (the password
+        // genuinely verified, exactly as `login_post` records the pwd login BEFORE the
+        // `/authorize` gate forces step up), then transition to the MFA state WITHOUT minting a
+        // session or consuming the flow. The single mint happens once, at the MFA completion,
+        // with the honest combined amr.
+        mfa::MfaPlan::Challenge => {
+            login_follow_through(state, scope, success, headers).await;
+            let next = PersistedState {
+                step: mfa::challenge_state_tag(),
+                subject: Some(success.subject.clone()),
+                methods: method_tokens(&primary_methods),
+                enroll_credential: None,
+            };
+            let nodes = mfa::challenge_start_nodes(transport, &record.id);
+            persist_and_render(
+                state,
+                scope,
+                flow_id,
+                transport,
+                Journey::Login,
+                record,
+                &next,
+                nodes,
+                Vec::new(),
+                now_micros,
+            )
+            .await
+        }
+        mfa::MfaPlan::Enroll => {
+            login_follow_through(state, scope, success, headers).await;
+            let begin = mfa::begin_enroll(state, scope, &success.user_id).await?;
+            let next = PersistedState {
+                step: mfa::enroll_state_tag(),
+                subject: Some(success.subject.clone()),
+                methods: method_tokens(&primary_methods),
+                enroll_credential: Some(begin.credential_id.clone()),
+            };
+            let nodes = mfa::enroll_nodes(transport, &record.id, &begin, false);
+            persist_and_render(
+                state,
+                scope,
+                flow_id,
+                transport,
+                Journey::Login,
+                record,
+                &next,
+                nodes,
+                Vec::new(),
+                now_micros,
+            )
+            .await
+        }
+    }
+}
+
+/// The PR1 post success credential abuse follow through for a genuine PRIMARY factor (issue
+/// #84), exactly as the bootstrap `login_post`: relax THIS attempt's failure counters (so a
+/// user who fumbled before the correct password is not throttled for the rest of the window),
+/// then persist the audited risk decision (and, on a new device, notify). All best effort.
+async fn login_follow_through(
+    state: &OidcState,
+    scope: Scope,
+    success: &login::LoginSuccess,
+    headers: &axum::http::HeaderMap,
+) {
+    state.reset_after_success(&success.ctx).await;
+    let user_agent = login::user_agent_of(headers);
+    let risk_ctx = crate::risk::RiskContext {
+        ip: success.ctx.ip.as_deref(),
+        user_agent: &user_agent,
+        headers,
+    };
+    crate::risk::after_successful_login(
+        state,
+        scope,
+        &success.user_id,
+        &success.risk_decision,
+        &risk_ctx,
+        &success.identifier,
+    )
+    .await;
+}
+
+/// The `auth_methods` token strings for a set of methods (the honest amr source).
+fn method_tokens(methods: &[crate::authn::AuthMethod]) -> Vec<String> {
+    methods
+        .iter()
+        .map(|method| method.as_token().to_owned())
+        .collect()
+}
+
+/// Resolve the subject and the primary methods carried on the MFA state, or a uniform not
+/// found when the row is malformed (a login row on an MFA step MUST carry them).
+fn mfa_context(
+    scope: Scope,
+    persisted: &PersistedState,
+) -> Result<(ironauth_store::UserId, Vec<crate::authn::AuthMethod>), FlowError> {
+    let subject = persisted.subject.as_deref().ok_or(FlowError::NotFound)?;
+    let subject_id =
+        ironauth_store::UserId::parse_in_scope(subject, &scope).map_err(|_| FlowError::NotFound)?;
+    let methods = persisted
+        .methods
+        .iter()
+        .filter_map(|token| crate::authn::AuthMethod::from_token(token))
+        .collect();
+    Ok((subject_id, methods))
+}
+
+/// Drive the MFA challenge state (issue #84): verify the second factor and, on a genuine
+/// proof, complete with the honest combined amr.
+#[allow(clippy::too_many_arguments)]
+async fn drive_mfa_challenge(
+    state: &OidcState,
+    scope: Scope,
+    flow_id: &FlowId,
+    transport: Transport,
+    record: &FlowRecord,
+    persisted: &PersistedState,
+    submission: &Submission,
+    headers: &axum::http::HeaderMap,
+    now_micros: i64,
+) -> Result<Continuation, FlowError> {
+    let (subject_id, primary_methods) = mfa_context(scope, persisted)?;
+    match mfa::advance_challenge(state, scope, record, &subject_id, submission, headers).await? {
+        mfa::MfaStep::Render { nodes, messages } => {
+            persist_and_render(
+                state,
+                scope,
+                flow_id,
+                transport,
+                Journey::Login,
+                record,
+                persisted,
+                nodes,
+                messages,
+                now_micros,
+            )
+            .await
+        }
+        mfa::MfaStep::Complete { new_method } => {
+            complete_with_second_factor(
+                state,
+                scope,
+                flow_id,
+                transport,
+                record,
+                &subject_id,
+                &primary_methods,
+                new_method,
+                headers,
+                now_micros,
+            )
+            .await
+        }
+    }
+}
+
+/// Drive the MFA enrollment state (issue #84): confirm the enrollment code (activating the
+/// factor through the shared ceremony) and, on success, complete with the honest combined amr.
+#[allow(clippy::too_many_arguments)]
+async fn drive_mfa_enroll(
+    state: &OidcState,
+    scope: Scope,
+    flow_id: &FlowId,
+    transport: Transport,
+    record: &FlowRecord,
+    persisted: &PersistedState,
+    submission: &Submission,
+    headers: &axum::http::HeaderMap,
+    now_micros: i64,
+) -> Result<Continuation, FlowError> {
+    let (subject_id, primary_methods) = mfa_context(scope, persisted)?;
+    let credential_id = persisted
+        .enroll_credential
+        .as_deref()
+        .ok_or(FlowError::NotFound)?;
+    match mfa::advance_enroll(state, scope, record, &subject_id, credential_id, submission).await? {
+        mfa::MfaStep::Render { nodes, messages } => {
+            persist_and_render(
+                state,
+                scope,
+                flow_id,
+                transport,
+                Journey::Login,
+                record,
+                persisted,
+                nodes,
+                messages,
+                now_micros,
+            )
+            .await
+        }
+        mfa::MfaStep::Complete { new_method } => {
+            complete_with_second_factor(
+                state,
+                scope,
+                flow_id,
+                transport,
+                record,
+                &subject_id,
+                &primary_methods,
+                new_method,
+                headers,
+                now_micros,
+            )
+            .await
+        }
+    }
+}
+
+/// Mint the session for a completed login plus second factor (issue #84): combine the primary
+/// factor with the factor the REAL ceremony just proved and record the event at the CURRENT
+/// instant, so the token's amr/acr HONESTLY reflects what happened (never a fabricated `mfa`).
+#[allow(clippy::too_many_arguments)]
+async fn complete_with_second_factor(
+    state: &OidcState,
+    scope: Scope,
+    flow_id: &FlowId,
+    transport: Transport,
+    record: &FlowRecord,
+    subject_id: &ironauth_store::UserId,
+    primary_methods: &[crate::authn::AuthMethod],
+    new_method: crate::authn::AuthMethod,
+    headers: &axum::http::HeaderMap,
+    now_micros: i64,
+) -> Result<Continuation, FlowError> {
+    let mut methods = primary_methods.to_vec();
+    if !methods.contains(&new_method) {
+        methods.push(new_method);
+    }
+    let event = crate::authn::AuthenticationEvent::from_methods(&methods, now_micros);
+    let actor = interaction::user_actor(subject_id);
+    let subject = subject_id.to_string();
+    // On the rare fence at the mint, re-render the challenge uniformly (the flow is consumed).
+    let fenced = mfa::challenge_start_nodes(transport, &record.id);
+    consume_and_complete(
+        state,
+        scope,
+        flow_id,
+        transport,
+        Journey::Login,
+        record,
+        &subject,
+        actor,
+        &event,
+        fenced,
+        headers,
+        now_micros,
+    )
+    .await
+}
+
+/// Drive the registration journey one step (issue #84): the details funnel through
+/// [`registration::advance_registration`] (reusing the SAME #64/#80/#82 defenses the
+/// bootstrap `register_post` uses); a genuine account create consumes the flow and mints the
+/// first session; the uniform acknowledgment (closed mode anti enum, or waitlist pending)
+/// re-renders the ack state with the flow OPEN, so it is never a completion or enumeration
+/// oracle.
+#[allow(clippy::too_many_arguments)]
+async fn drive_registration(
+    state: &OidcState,
+    scope: Scope,
+    flow_id: &FlowId,
+    transport: Transport,
+    record: &FlowRecord,
+    submission: &Submission,
+    headers: &axum::http::HeaderMap,
+    now_micros: i64,
+) -> Result<Continuation, FlowError> {
+    match registration::advance_registration(state, scope, record, submission, headers).await? {
+        registration::RegistrationStep::Render { nodes, messages } => {
+            persist_and_render(
+                state,
+                scope,
+                flow_id,
+                transport,
+                Journey::Registration,
+                record,
+                &PersistedState::step(registration::render_state_tag()),
+                nodes,
+                messages,
+                now_micros,
+            )
+            .await
+        }
+        registration::RegistrationStep::Ack { message_id } => {
+            persist_and_render(
+                state,
+                scope,
+                flow_id,
+                transport,
+                Journey::Registration,
+                record,
+                &PersistedState::step(FlowStateTag::RegistrationAck),
+                registration::ack_nodes(),
+                vec![Message::of(message_id)],
+                now_micros,
+            )
+            .await
+        }
+        registration::RegistrationStep::Complete(success) => {
+            let fenced = registration::start_nodes(transport, &record.id);
+            consume_and_complete(
+                state,
+                scope,
+                flow_id,
+                transport,
+                Journey::Registration,
+                record,
+                &success.subject,
+                success.actor,
+                &success.event,
+                fenced,
+                headers,
+                now_micros,
+            )
+            .await
         }
     }
 }
