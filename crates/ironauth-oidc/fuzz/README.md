@@ -7,14 +7,14 @@ the untrusted edge every flow advance ingests.
 
 ## Targets
 
-- **`flow_submission_parse`** — fuzzes the two submission decoders the live
+- **`flow_submission_parse`** -- fuzzes the two submission decoders the live
   transports route through:
-  - `ironauth_oidc::flow::parse_api_submission` — the API JSON submit envelope
+  - `ironauth_oidc::flow::parse_api_submission` -- the API JSON submit envelope
     (flow id, submit token, node values, transient payload), and
-  - `ironauth_oidc::flow::parse_form_transient_payload` — the browser
+  - `ironauth_oidc::flow::parse_form_transient_payload` -- the browser
     transient-payload field (a JSON string).
 
-  The property: for **every** input, both parsers are **total** — they return
+  The property: for **every** input, both parsers are **total** -- they return
   either a decoded submission or a **typed** `FlowError`
   (`InvalidSubmission` / `MalformedTransientPayload`), never a panic, never a
   500, never a partial value. A malformed node payload, an oversized or non-JSON
